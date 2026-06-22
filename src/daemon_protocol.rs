@@ -1048,13 +1048,22 @@ async fn handle_connection(
                     if let Some(pane_id) = pane_id_env {
                         state.write().await.unregister_pane(&pane_id);
                     }
-                    // PRD #120 M2.4: if this agent was dispatched into a per-issue
-                    // worktree, the tab close is its cleanup trigger — `git
-                    // worktree remove` the worktree (the clone is preserved) and
-                    // drop the registry entry. The child is already reaped (the
-                    // close above ran the SIGTERM-with-grace loop), so the
-                    // worktree is no longer a live cwd. No-op for ordinary agents.
+                    // PRD #120 M2.4 + S1: if this agent was dispatched into a
+                    // per-issue worktree, the tab close is its cleanup trigger.
+                    // But a multi-role orchestration shares ONE worktree across
+                    // every role pane, so removing it on the first role's close
+                    // would nuke it under still-live siblings. `close_agent` has
+                    // already dropped the closing agent, so only when NO live
+                    // agent still resolves to this worktree was it the LAST one —
+                    // then `git worktree remove` the worktree (the clone is
+                    // preserved) and drop the registry entry. The child is already
+                    // reaped, so the worktree is no longer a live cwd. No-op for
+                    // ordinary agents and for earlier sibling-role closes.
                     if let Some(worktree) = dispatched_worktree
+                        && !crate::issue_dispatch_run::worktree_still_in_use(
+                            &registry.agent_records(),
+                            &worktree,
+                        )
                         && let Some(clone) =
                             crate::issue_dispatch_run::take_worktree(&worktree_registry, &worktree)
                     {

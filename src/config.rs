@@ -804,7 +804,21 @@ fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, Sch
     // spawn derives its command from each cloned repo's `.dot-agent-deck.toml`
     // (orchestration roles, or the single-agent default). Only the #127
     // single-spawn task type requires `command`.
-    if task.issue_dispatch.is_some() {
+    if let Some(disp) = &task.issue_dispatch {
+        // M1: `repo`/`label`/`query` come from hand-edited TOML and flow into
+        // `gh`/`git` argv (an argument-injection vector run unattended by the
+        // daemon). Reject a malformed slug or a leading-`-` filter here rather
+        // than at fire time.
+        if let Err(message) = crate::issue_dispatch::validate_issue_dispatch_config(
+            &disp.repo,
+            disp.label.as_deref(),
+            disp.query.as_deref(),
+        ) {
+            return Err(ScheduleLoadError {
+                entry: Some(index),
+                message: format!("scheduled task {:?}: {message}", task.name),
+            });
+        }
         return Ok(expand_task(task));
     }
     match &task.command {
@@ -2186,6 +2200,54 @@ prompt = "hi"
         let loaded = LoadedSchedules::parse(plain);
         assert!(loaded.errors.is_empty());
         assert!(loaded.tasks[0].issue_dispatch.is_none());
+    }
+
+    // PRD #120 (M1) — a hand-edited issue-dispatch task with a malformed `repo`
+    // is rejected at load time (the value flows into `gh`/`git` argv), surfaced
+    // as a per-entry error and skipped, while valid siblings still load.
+    #[test]
+    fn issue_dispatch_rejects_invalid_repo() {
+        let toml_str = r#"
+[[scheduled_tasks]]
+name = "bad repo"
+cron = "0 9 * * *"
+working_dir = "/work/space"
+prompt = "Work on issue {{issue_number}}"
+
+[scheduled_tasks.issue_dispatch]
+repo = "ext::sh -c id"
+max_per_run = 3
+"#;
+        let loaded = LoadedSchedules::parse(toml_str);
+        assert!(loaded.tasks.is_empty(), "malformed repo must be rejected");
+        assert_eq!(loaded.errors.len(), 1);
+        assert!(
+            loaded.errors[0].message.contains("owner/name"),
+            "error should explain the slug requirement: {:?}",
+            loaded.errors[0].message
+        );
+    }
+
+    #[test]
+    fn issue_dispatch_rejects_leading_dash_label() {
+        let toml_str = r#"
+[[scheduled_tasks]]
+name = "bad label"
+cron = "0 9 * * *"
+working_dir = "/work/space"
+prompt = "Work on issue {{issue_number}}"
+
+[scheduled_tasks.issue_dispatch]
+repo = "acme/widgets"
+max_per_run = 3
+label = "-rf"
+"#;
+        let loaded = LoadedSchedules::parse(toml_str);
+        assert!(
+            loaded.tasks.is_empty(),
+            "a leading-`-` label must be rejected"
+        );
+        assert_eq!(loaded.errors.len(), 1);
     }
 
     #[test]

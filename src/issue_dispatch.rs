@@ -72,9 +72,12 @@ pub fn issue_branch(issue_number: u64) -> String {
 
 /// Derive the clone dir, per-issue worktree dir, and branch for `issue_number`,
 /// given the task's `working_dir` (the workspace root) and `name` (the reuse
-/// key, also the clone's directory name). See [`IssuePaths`].
+/// key). The clone-dir path component is a SANITIZED single segment of `name`
+/// (see [`sanitize_clone_segment`]), so the human-friendly reuse key — including
+/// the default seed `Issues <owner>/<repo>`, which carries a `/` — can never nest
+/// or escape `<working_dir>/<segment>`. See [`IssuePaths`].
 pub fn derive_issue_paths(working_dir: &Path, name: &str, issue_number: u64) -> IssuePaths {
-    let clone_dir = working_dir.join(name);
+    let clone_dir = working_dir.join(sanitize_clone_segment(name));
     let worktree_dir = clone_dir
         .join(".worktrees")
         .join(format!("issue-{issue_number}"));
@@ -82,6 +85,29 @@ pub fn derive_issue_paths(working_dir: &Path, name: &str, issue_number: u64) -> 
         clone_dir,
         worktree_dir,
         branch: issue_branch(issue_number),
+    }
+}
+
+/// Reduce `name` to a SINGLE filesystem segment safe to join under a workspace
+/// root: path separators (`/`, `\`) collapse to `-` and `..`/NUL are stripped, so
+/// the result can never contain a separator or a parent reference and therefore
+/// can never escape or nest outside `<working_dir>/<segment>` (L2 + S4).
+///
+/// `name` itself stays the human-friendly reuse key — only the *path component*
+/// derived from it is sanitized. A name with no surviving alphanumeric character
+/// (empty, or only separators/`..`/punctuation) falls back to a fixed `issues`
+/// segment so a path is always derivable. An already-safe single segment (e.g.
+/// `dispatch-task`) is returned unchanged.
+pub fn sanitize_clone_segment(name: &str) -> String {
+    let collapsed = name
+        .replace(['/', '\\'], "-")
+        .replace('\0', "")
+        .replace("..", "");
+    let trimmed = collapsed.trim();
+    if trimmed.chars().any(char::is_alphanumeric) {
+        trimmed.to_string()
+    } else {
+        "issues".to_string()
     }
 }
 
@@ -122,6 +148,11 @@ pub fn issue_list_argv(
         argv.push("--search".to_string());
         argv.push(query.to_string());
     }
+    // M1: end-of-options marker. `gh issue list` takes no positionals, so this is
+    // a belt-and-suspenders second layer behind the leading-`-` rejection in
+    // [`validate_issue_dispatch_config`] — it guarantees no later argv element can
+    // be reinterpreted as a flag.
+    argv.push("--".to_string());
     argv
 }
 
@@ -141,7 +172,71 @@ pub fn pr_list_for_issue_argv(repo: &str, issue_number: u64) -> Vec<String> {
         issue_branch(issue_number),
         "--json".to_string(),
         "number".to_string(),
+        // M1: end-of-options marker (see `issue_list_argv`).
+        "--".to_string(),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// M1 — validate the user-config GitHub knobs that flow into `gh`/`git` argv
+// ---------------------------------------------------------------------------
+
+/// Validate the GitHub-specific knobs of an `issue_dispatch` task before they
+/// reach `gh`/`git`. `repo`/`label`/`query` come from hand-edited TOML and flow
+/// into `gh repo clone <repo>` and `gh issue list --repo <repo> [--label …]
+/// [--search …]`; even via `Command::args` (no shell) a value beginning with `-`
+/// is parsed as a FLAG, and `repo` is an argument-injection vector (e.g. `ext::`,
+/// `file://`, a local repo carrying hooks) run unattended by the daemon.
+///
+/// `repo` must be a strict GitHub `owner/name` slug — letters, digits, `.`, `_`,
+/// `-` in each segment (`^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$`) — AND must not start
+/// with `-` (the regex's character class permits a leading `-`, which `gh` would
+/// still read as a flag). `label`/`query` are rejected when they start with `-`.
+pub fn validate_issue_dispatch_config(
+    repo: &str,
+    label: Option<&str>,
+    query: Option<&str>,
+) -> Result<(), String> {
+    if repo.starts_with('-') || !is_owner_name(repo) {
+        return Err(format!(
+            "issue_dispatch repo {repo:?} must be a GitHub `owner/name` slug \
+             (letters, digits, '.', '_', '-' in each segment; no leading '-')"
+        ));
+    }
+    if let Some(label) = label
+        && label.starts_with('-')
+    {
+        return Err(format!(
+            "issue_dispatch label {label:?} must not start with '-' (it would be parsed as a `gh` flag)"
+        ));
+    }
+    if let Some(query) = query
+        && query.starts_with('-')
+    {
+        return Err(format!(
+            "issue_dispatch query {query:?} must not start with '-' (it would be parsed as a `gh` flag)"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `repo` matches `^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$` — exactly one `/`
+/// with a non-empty allowed-char segment on each side.
+fn is_owner_name(repo: &str) -> bool {
+    let mut parts = repo.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(name), None) => {
+            !owner.is_empty()
+                && !name.is_empty()
+                && owner.chars().all(is_repo_char)
+                && name.chars().all(is_repo_char)
+        }
+        _ => false,
+    }
+}
+
+fn is_repo_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
 }
 
 // ---------------------------------------------------------------------------
@@ -218,16 +313,73 @@ mod tests {
 
     #[test]
     fn derive_issue_paths_exact_layout() {
+        // A plain single-segment name is used verbatim as the clone dir.
+        let paths = derive_issue_paths(Path::new("/work/space"), "dispatch-task", 17);
+        assert_eq!(paths.clone_dir, PathBuf::from("/work/space/dispatch-task"));
+        assert_eq!(
+            paths.worktree_dir,
+            PathBuf::from("/work/space/dispatch-task/.worktrees/issue-17")
+        );
+        assert_eq!(paths.branch, "agent/issue-17");
+    }
+
+    #[test]
+    fn derive_issue_paths_sanitizes_default_seed_name_with_slash() {
+        // The default-seeded name `Issues <owner>/<repo>` carries a `/`; it must
+        // collapse to a single clone-dir segment, never nesting `owner/repo`.
         let paths = derive_issue_paths(Path::new("/work/space"), "Issues vfarcic/dot-ai", 17);
         assert_eq!(
             paths.clone_dir,
-            PathBuf::from("/work/space/Issues vfarcic/dot-ai")
+            PathBuf::from("/work/space/Issues vfarcic-dot-ai")
         );
         assert_eq!(
             paths.worktree_dir,
-            PathBuf::from("/work/space/Issues vfarcic/dot-ai/.worktrees/issue-17")
+            PathBuf::from("/work/space/Issues vfarcic-dot-ai/.worktrees/issue-17")
         );
-        assert_eq!(paths.branch, "agent/issue-17");
+    }
+
+    #[test]
+    fn derive_issue_paths_never_escapes_working_dir() {
+        // L2 + S4: absolute, `..`, and slash-laden names all map to a single safe
+        // segment strictly inside the working dir.
+        let wd = Path::new("/work/space");
+        for name in [
+            "/etc/passwd",
+            "../../escape",
+            "a/b/c",
+            "Issues vfarcic/dot-ai",
+            r"..\..\windows",
+        ] {
+            let clone = derive_issue_paths(wd, name, 1).clone_dir;
+            assert!(
+                clone.starts_with(wd),
+                "clone dir {clone:?} escaped working dir for name {name:?}"
+            );
+            let rel = clone.strip_prefix(wd).expect("clone dir under working dir");
+            assert_eq!(
+                rel.components().count(),
+                1,
+                "clone dir {clone:?} must be ONE segment under the working dir (name {name:?})"
+            );
+            assert!(
+                !clone.to_string_lossy().contains(".."),
+                "clone dir {clone:?} must not contain `..` (name {name:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_clone_segment_passthrough_and_fallback() {
+        assert_eq!(sanitize_clone_segment("dispatch-task"), "dispatch-task");
+        assert_eq!(
+            sanitize_clone_segment("Issues vfarcic/dot-ai"),
+            "Issues vfarcic-dot-ai"
+        );
+        // Reduces-to-nothing inputs fall back to a fixed segment.
+        assert_eq!(sanitize_clone_segment(".."), "issues");
+        assert_eq!(sanitize_clone_segment("/"), "issues");
+        assert_eq!(sanitize_clone_segment(""), "issues");
+        assert_eq!(sanitize_clone_segment("."), "issues");
     }
 
     #[test]
@@ -253,6 +405,7 @@ mod tests {
                 "number",
                 "--limit",
                 "5",
+                "--",
             ]
         );
     }
@@ -274,6 +427,7 @@ mod tests {
                 "3",
                 "--label",
                 "agent-eligible",
+                "--",
             ]
         );
     }
@@ -295,6 +449,7 @@ mod tests {
                 "10",
                 "--search",
                 "is:open sort:created-asc",
+                "--",
             ]
         );
     }
@@ -318,8 +473,16 @@ mod tests {
                 "bug",
                 "--search",
                 "milestone:v1",
+                "--",
             ]
         );
+    }
+
+    #[test]
+    fn argv_builders_carry_end_of_options_separator() {
+        // M1: both builders terminate with the `--` end-of-options marker.
+        assert!(issue_list_argv("o/r", 1, None, None).contains(&"--".to_string()));
+        assert!(pr_list_for_issue_argv("o/r", 1).contains(&"--".to_string()));
     }
 
     #[test]
@@ -337,8 +500,47 @@ mod tests {
                 "agent/issue-17",
                 "--json",
                 "number",
+                "--",
             ]
         );
+    }
+
+    // --- M1: user-config validation ---
+
+    #[test]
+    fn validate_issue_dispatch_config_accepts_valid_slug_and_filters() {
+        assert!(validate_issue_dispatch_config("vfarcic/dot-ai", None, None).is_ok());
+        assert!(
+            validate_issue_dispatch_config(
+                "acme/widgets.v2",
+                Some("agent-eligible"),
+                Some("is:open sort:created-asc")
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_issue_dispatch_config_rejects_bad_repo() {
+        // Not an owner/name slug.
+        assert!(validate_issue_dispatch_config("not-a-slug", None, None).is_err());
+        assert!(validate_issue_dispatch_config("a/b/c", None, None).is_err());
+        assert!(validate_issue_dispatch_config("owner/", None, None).is_err());
+        assert!(validate_issue_dispatch_config("/name", None, None).is_err());
+        // Injection-shaped values.
+        assert!(validate_issue_dispatch_config("ext::sh -c id", None, None).is_err());
+        assert!(validate_issue_dispatch_config("file:///etc", None, None).is_err());
+        // Leading `-` would be read as a `gh` flag even though the char is in the
+        // slug character class.
+        assert!(validate_issue_dispatch_config("-x/y", None, None).is_err());
+    }
+
+    #[test]
+    fn validate_issue_dispatch_config_rejects_leading_dash_label_or_query() {
+        assert!(validate_issue_dispatch_config("o/r", Some("-rf"), None).is_err());
+        assert!(validate_issue_dispatch_config("o/r", None, Some("--owner")).is_err());
+        // Non-leading dashes are fine.
+        assert!(validate_issue_dispatch_config("o/r", Some("agent-eligible"), None).is_ok());
     }
 
     // --- U5: idempotency decision (truth table) ---

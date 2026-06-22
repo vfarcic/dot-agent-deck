@@ -7,18 +7,22 @@
 //!
 //!   1. **M2.1** — provision the repo clone under the task's `working_dir`:
 //!      clone-if-missing (`gh repo clone`) / fetch + fast-forward-pull-if-present
-//!      (`git -C <clone> fetch` then `git -C <clone> pull --ff-only`).
+//!      (`git -C <clone> fetch` then `git -C <clone> pull --ff-only`). An existing
+//!      clone is verified to be the right repo by its `origin` before being
+//!      touched (L3, fail-closed), and a refresh failure on it is non-fatal —
+//!      the run continues with the refs already on disk (S3).
 //!   2. enumerate the repo's open issues (`gh issue list`), capping at
 //!      `max_per_run` **in code** on the returned order — the issue list may
 //!      ignore `--limit`.
 //!   3. **M2.2** — for each issue, decide dispatch-vs-skip from the two
 //!      idempotency signals (per-issue worktree already on disk; an open PR whose
 //!      head is `agent/issue-<n>`) via [`crate::issue_dispatch::dispatch_decision`].
-//!   4. **M2.2 / M2.3** — on dispatch, create the per-issue worktree
-//!      (`git -C <clone> worktree add <worktree> -b agent/issue-<n>`) and
-//!      [`spawn`] one agent into it, delivering the substituted prompt. The spawn
-//!      primitive already branches on the worktree's `.dot-agent-deck.toml`
-//!      (orchestration tab vs single-agent card) — reused, not duplicated.
+//!   4. **M2.2 / M2.3** — on dispatch, create the per-issue worktree on
+//!      `agent/issue-<n>` (creating the branch with `-b`, or attaching a branch
+//!      left behind by an earlier closed-without-PR run — B1) and [`spawn`] one
+//!      agent into it, delivering the substituted prompt. The spawn primitive
+//!      already branches on the worktree's `.dot-agent-deck.toml` (orchestration
+//!      tab vs single-agent card) — reused, not duplicated.
 //!   5. **M2.4** — record each spawned pane → worktree in a daemon-side
 //!      [`WorktreeRegistry`] so closing the tab later removes the worktree (while
 //!      PRESERVING the clone). See [`record_worktree`] / [`take_worktree`] /
@@ -81,7 +85,7 @@ pub fn new_worktree_registry() -> WorktreeRegistry {
 pub fn record_worktree(worktrees: &WorktreeRegistry, worktree_dir: &Path, clone_dir: &Path) {
     worktrees
         .lock()
-        .expect("worktree registry poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .insert(worktree_dir.to_path_buf(), clone_dir.to_path_buf());
 }
 
@@ -99,13 +103,27 @@ pub fn worktree_of_record(record: &AgentRecord) -> Option<PathBuf> {
 
 /// If `worktree_dir` is a dispatched issue worktree, drop its registry entry and
 /// return the owning clone dir; `None` otherwise (an ordinary agent's cwd, or an
-/// already-cleaned sibling-role close). The first close of a multi-role tab
-/// takes the entry; later sibling closes find nothing and no-op.
+/// entry already taken). The close watcher only calls this once it has confirmed
+/// (via [`worktree_still_in_use`]) that the LAST agent rooted in the worktree has
+/// closed, so for a multi-role orchestration the entry survives every earlier
+/// sibling close and is taken exactly once, on the final close.
 pub fn take_worktree(worktrees: &WorktreeRegistry, worktree_dir: &Path) -> Option<PathBuf> {
     worktrees
         .lock()
-        .expect("worktree registry poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .remove(worktree_dir)
+}
+
+/// S1: whether any live agent in `records` is still rooted in `worktree_dir` —
+/// its orchestration cwd (shared by EVERY role pane of a multi-role
+/// orchestration) or a single-agent card's cwd. The close watcher calls this
+/// AFTER `close_agent` has dropped the closing agent, so an empty result means
+/// the just-closed agent was the LAST one in the worktree and it is safe to
+/// remove. While a sibling role is still live the shared worktree must survive.
+pub fn worktree_still_in_use(records: &[AgentRecord], worktree_dir: &Path) -> bool {
+    records
+        .iter()
+        .any(|r| worktree_of_record(r).as_deref() == Some(worktree_dir))
 }
 
 /// Remove a dispatched worktree from its clone (`git -C <clone> worktree remove
@@ -157,17 +175,35 @@ pub async fn run_issue_dispatch(
     prompt_template: &str,
     cfg: &IssueDispatchConfig,
     default_command: Option<String>,
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     worktrees: &WorktreeRegistry,
     notifier: &dyn Notifier,
     event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
 ) {
-    let workspace = Path::new(working_dir);
-    // `<working_dir>/<task name>` — identical to `derive_issue_paths(..).clone_dir`.
-    let clone_dir = workspace.join(task_name);
+    // S5 — every derived path (clone, worktree, the spawn's orchestration_cwd)
+    // must be absolute: a relative workspace root would double-nest the worktree
+    // under `git -C <clone> worktree add <relative>` and drop orchestration_cwd
+    // (`is_valid_orchestration_cwd` requires an absolute path) → no tab-close
+    // cleanup. The schedules loader already resolves relatives against $HOME, so a
+    // non-absolute value here is a misconfiguration: reject this run.
+    let workspace = match canonical_workspace(working_dir) {
+        Ok(p) => p,
+        Err(message) => {
+            notifier.notify(NotifyEvent::IssueDispatchRepoError {
+                task: task_name.to_string(),
+                repo: cfg.repo.clone(),
+                message,
+            });
+            return;
+        }
+    };
+    // L2 + S4 — the clone-dir path component is a SANITIZED single segment of the
+    // task name (never `/`, `..`, or absolute), so it can't nest or escape the
+    // workspace. Identical to `derive_issue_paths(..).clone_dir`.
+    let clone_dir = workspace.join(crate::issue_dispatch::sanitize_clone_segment(task_name));
 
     // M2.1 — provision the repo clone (clone-if-missing / fetch+ff-pull-if-present).
-    if let Err(message) = provision_repo(workspace, &clone_dir, &cfg.repo).await {
+    if let Err(message) = provision_repo(&workspace, &clone_dir, &cfg.repo).await {
         notifier.notify(NotifyEvent::IssueDispatchRepoError {
             task: task_name.to_string(),
             repo: cfg.repo.clone(),
@@ -189,11 +225,15 @@ pub async fn run_issue_dispatch(
         }
     };
 
+    // S2 — `max_per_run` caps the issues CONSIDERED per run (not the number newly
+    // dispatched): already-claimed issues inside the cap are skipped, yielding a
+    // clean "≤ max_per_run concurrent in-flight" ceiling (PRD concurrency model —
+    // today's run only picks up slots yesterday's run vacated).
     for issue in issues.into_iter().take(cfg.max_per_run) {
         // M3.2 — per-issue error boundary: one failure never aborts the rest.
         if let Err(message) = dispatch_one_issue(
             task_name,
-            working_dir,
+            &workspace,
             prompt_template,
             cfg,
             default_command.as_deref(),
@@ -222,18 +262,18 @@ pub async fn run_issue_dispatch(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_one_issue(
     task_name: &str,
-    working_dir: &str,
+    workspace: &Path,
     prompt_template: &str,
     cfg: &IssueDispatchConfig,
     default_command: Option<&str>,
     issue: u64,
     clone_dir: &Path,
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     worktrees: &WorktreeRegistry,
     notifier: &dyn Notifier,
     event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
 ) -> Result<(), String> {
-    let paths = derive_issue_paths(Path::new(working_dir), task_name, issue);
+    let paths = derive_issue_paths(workspace, task_name, issue);
 
     // M2.2 — idempotency BEFORE any work. Primary: the worktree already exists.
     // Secondary: an open PR whose head is `agent/issue-<n>`. A `gh` failure on
@@ -263,13 +303,22 @@ async fn dispatch_one_issue(
 
     // M2.3 — spawn one agent into the worktree, delivering the substituted
     // prompt. `spawn` branches on the worktree's `.dot-agent-deck.toml`.
+    //
+    // `detach_delivery = true`: the agent is still registered synchronously (so
+    // the idempotency/worktree state is consistent the moment this returns), but
+    // the prompt-delivery wait — which can sit out the multi-second `SessionStart`
+    // fallback for a hook-less command — runs in the background. This frees the
+    // scheduler's run-active window as soon as the dispatch WORK is done, so a
+    // re-fire right after a tab close (PRD #120 B1 / dispatch/008) isn't skipped
+    // behind the prior run's lingering delivery wait. The worktree-on-disk
+    // idempotency signal still serializes overlapping fires safely.
     let req = SpawnRequest {
         task_name: task_name.to_string(),
         working_dir: paths.worktree_dir.to_string_lossy().into_owned(),
         command: default_command.map(str::to_string),
         prompt: substitute_issue_number(prompt_template, issue),
     };
-    if let Err(e) = spawn(req, registry, notifier, event_tx).await {
+    if let Err(e) = spawn(req, registry, notifier, event_tx, true).await {
         // The spawn failed after the worktree was created/recorded: no agent
         // will ever close to trigger cleanup, so drop the registry entry here.
         // The worktree dir itself is left on disk — the next fire's
@@ -287,19 +336,117 @@ async fn dispatch_one_issue(
     Ok(())
 }
 
+/// S5: resolve the task's `working_dir` to an ABSOLUTE workspace root. The
+/// schedules loader already expands `~`/`$VAR` and resolves relatives against
+/// `$HOME`, so a non-absolute value reaching the dispatch flow is a
+/// misconfiguration — reject it rather than silently resolving against the
+/// daemon's cwd (which would derive the wrong clone/worktree paths and drop
+/// orchestration cleanup). An absolute input is normalized via
+/// [`std::path::absolute`].
+fn canonical_workspace(working_dir: &str) -> Result<PathBuf, String> {
+    let p = Path::new(working_dir);
+    if !p.is_absolute() {
+        return Err(format!(
+            "working_dir {working_dir:?} is not absolute; issue-dispatch requires an absolute \
+             workspace root"
+        ));
+    }
+    std::path::absolute(p)
+        .map_err(|e| format!("failed to absolutize working_dir {working_dir:?}: {e}"))
+}
+
 /// M2.1: clone the repo if its dir is missing, else refresh the existing clone
 /// (fetch + fast-forward pull). `gh` / `git` are resolved from `PATH` and inherit
 /// the daemon's environment.
+///
+/// L3 (fail-closed): before touching a pre-existing clone dir, verify it is OUR
+/// clone of `repo` by reading its `origin` — a missing origin (not a clone) or a
+/// github.com origin for a DIFFERENT repo aborts the run without fetching,
+/// pulling, writing, or deleting the dir.
+///
+/// S3: a refresh failure on an EXISTING clone is non-fatal — worktrees branch off
+/// whatever refs are already on disk, so a transient `fetch`/`pull` error is
+/// logged and the run continues. A MISSING clone that fails to clone stays fatal
+/// (the run can't proceed without the repo).
 async fn provision_repo(workspace: &Path, clone_dir: &Path, repo: &str) -> Result<(), String> {
     if clone_dir.is_dir() {
         let clone = clone_dir.to_string_lossy();
-        run_status("git", &["-C", &clone, "fetch"]).await?;
-        run_status("git", &["-C", &clone, "pull", "--ff-only"]).await?;
+        let origin = run_capture_args("git", &["-C", &clone, "remote", "get-url", "origin"])
+            .await
+            .map_err(|e| {
+                format!(
+                    "clone dir {} has no usable git origin; refusing to refresh a foreign dir: {e}",
+                    clone_dir.display()
+                )
+            })?;
+        let origin = origin.trim();
+        if !origin_matches_repo(origin, repo) {
+            return Err(format!(
+                "clone dir {} has origin {origin:?}, which does not match configured repo \
+                 {repo:?}; refusing to fetch/pull (fail-closed)",
+                clone_dir.display()
+            ));
+        }
+        if let Err(e) = refresh_clone(&clone).await {
+            tracing::warn!(
+                clone = %clone_dir.display(),
+                error = %e,
+                "issue-dispatch: clone refresh failed; continuing with current refs"
+            );
+        }
         return Ok(());
     }
     std::fs::create_dir_all(workspace)
         .map_err(|e| format!("failed to create workspace {}: {e}", workspace.display()))?;
     run_status("gh", &["repo", "clone", repo, &clone_dir.to_string_lossy()]).await
+}
+
+/// S3: refresh an existing clone in place — `git fetch` then `git pull --ff-only`.
+/// The caller treats any failure here as non-fatal (warn + continue).
+async fn refresh_clone(clone: &str) -> Result<(), String> {
+    run_status("git", &["-C", clone, "fetch"]).await?;
+    run_status("git", &["-C", clone, "pull", "--ff-only"]).await
+}
+
+/// L3: whether an existing clone's `origin` is consistent with the configured
+/// `repo`. A recognizable github.com origin must resolve to the same
+/// `owner/name` (case-insensitive); a non-github origin — a self-hosted host or
+/// the local fixture remote used in tests — cannot be attributed to an
+/// `owner/name`, so it is accepted (we provisioned it). The strict case this
+/// guards is a clone-dir collision where `origin` points at a DIFFERENT GitHub
+/// repo than configured.
+fn origin_matches_repo(origin: &str, repo: &str) -> bool {
+    match github_owner_name(origin) {
+        Some(found) => found == repo.to_ascii_lowercase(),
+        None => true,
+    }
+}
+
+/// Normalize a github.com remote URL to lowercase `owner/name`, or `None` if it
+/// is not a recognizable github.com remote (other hosts, local paths, …).
+/// Handles the `https://`, `http://`, `ssh://git@`, `git://`, and `git@…:` forms,
+/// with or without a trailing `.git`.
+fn github_owner_name(origin: &str) -> Option<String> {
+    let s = origin.trim();
+    let rest = s
+        .strip_prefix("https://github.com/")
+        .or_else(|| s.strip_prefix("http://github.com/"))
+        .or_else(|| s.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| s.strip_prefix("git://github.com/"))
+        .or_else(|| s.strip_prefix("git@github.com:"))?;
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let rest = rest.trim_end_matches('/');
+    let mut parts = rest.split('/');
+    let owner = parts.next()?;
+    let name = parts.next()?;
+    if owner.is_empty() || name.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some(format!(
+        "{}/{}",
+        owner.to_ascii_lowercase(),
+        name.to_ascii_lowercase()
+    ))
 }
 
 /// Enumerate the repo's open issue numbers in returned order.
@@ -319,13 +466,33 @@ async fn list_open_issues(cfg: &IssueDispatchConfig) -> Result<Vec<u64>, String>
 async fn issue_has_open_pr(repo: &str, issue: u64) -> Result<bool, String> {
     let argv = pr_list_for_issue_argv(repo, issue);
     let stdout = run_capture("gh", &argv).await?;
-    let value: serde_json::Value = serde_json::from_str(stdout.trim())
-        .map_err(|e| format!("failed to parse `gh pr list` JSON: {e}"))?;
-    Ok(value.as_array().is_some_and(|a| !a.is_empty()))
+    parse_open_pr_present(&stdout)
 }
 
-/// M2.2: `git -C <clone> worktree add <worktree> -b agent/issue-<n>`. The
-/// `.worktrees` parent is created first so the add never trips on a missing dir.
+/// N1: parse `gh pr list --json number` into "is there an open PR?". Malformed
+/// output (invalid JSON, or valid JSON that is NOT an array) PROPAGATES as an
+/// error — symmetric with [`parse_issue_numbers`] — so the per-issue boundary
+/// skips + logs the issue (fail-safe) rather than silently reading it as "no PR
+/// → dispatch", which would risk a duplicate dispatch.
+fn parse_open_pr_present(json: &str) -> Result<bool, String> {
+    let value: serde_json::Value = serde_json::from_str(json.trim())
+        .map_err(|e| format!("failed to parse `gh pr list` JSON: {e}"))?;
+    let arr = value
+        .as_array()
+        .ok_or_else(|| "`gh pr list` did not return a JSON array".to_string())?;
+    Ok(!arr.is_empty())
+}
+
+/// M2.2: create the per-issue worktree on `agent/issue-<n>`. The `.worktrees`
+/// parent is created first so the add never trips on a missing dir.
+///
+/// B1: `git worktree remove` PRESERVES the branch, so an issue that was
+/// dispatched, had its tab closed without a PR, and is still open leaves
+/// `agent/issue-<n>` behind. A naive `worktree add -b <branch>` would then fail
+/// ("a branch named … already exists") on EVERY later fire, permanently wedging
+/// the reuse-the-vacated-slot model. So probe for the branch first: attach the
+/// existing branch (no `-b`) when it is already there, and only create it (`-b`)
+/// when it is not.
 async fn create_worktree(
     clone_dir: &Path,
     worktree_dir: &Path,
@@ -335,19 +502,27 @@ async fn create_worktree(
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create worktree parent {}: {e}", parent.display()))?;
     }
-    run_status(
+    let clone = clone_dir.to_string_lossy();
+    let wt = worktree_dir.to_string_lossy();
+    let branch_ref = format!("refs/heads/{branch}");
+    let branch_exists = run_status(
         "git",
         &[
             "-C",
-            &clone_dir.to_string_lossy(),
-            "worktree",
-            "add",
-            &worktree_dir.to_string_lossy(),
-            "-b",
-            branch,
+            &clone,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &branch_ref,
         ],
     )
     .await
+    .is_ok();
+    if branch_exists {
+        run_status("git", &["-C", &clone, "worktree", "add", &wt, branch]).await
+    } else {
+        run_status("git", &["-C", &clone, "worktree", "add", &wt, "-b", branch]).await
+    }
 }
 
 /// Parse a `gh issue list --json number` array into issue numbers, in order.
@@ -388,6 +563,13 @@ async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
 /// Run a subprocess that must exit zero and return its captured stdout. Accepts
 /// `String` args (the `gh` argv helpers produce `Vec<String>`).
 async fn run_capture(program: &str, args: &[String]) -> Result<String, String> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_capture_args(program, &refs).await
+}
+
+/// Like [`run_capture`] but for `&str` args — the fixed-shape `git` probes
+/// (e.g. `remote get-url origin`) build their argv inline.
+async fn run_capture_args(program: &str, args: &[&str]) -> Result<String, String> {
     let output = tokio::process::Command::new(program)
         .args(args)
         .output()
@@ -435,8 +617,11 @@ mod tests {
         record_worktree(&reg, &wt7, &clone);
         record_worktree(&reg, &wt8, &clone);
 
-        // The first close of issue-7's tab returns its clone and drops the entry;
-        // a second close (a sibling role) finds nothing. issue-8 is untouched.
+        // The registry primitive returns a recorded worktree's clone exactly
+        // once, then drops the entry (a re-take finds nothing). The close watcher
+        // only calls `take_worktree` after `worktree_still_in_use` confirms the
+        // last rooted agent has closed, so this once-only take is correct even
+        // for a multi-role tab. issue-8 is untouched.
         assert_eq!(take_worktree(&reg, &wt7), Some(clone.clone()));
         assert_eq!(take_worktree(&reg, &wt7), None);
         assert_eq!(take_worktree(&reg, &wt8), Some(clone));
@@ -492,5 +677,109 @@ mod tests {
 
         // Neither → None.
         assert_eq!(worktree_of_record(&record(None, None)), None);
+    }
+
+    // --- N1: pr-list parsing is symmetric with issue enumeration ---
+
+    #[test]
+    fn parse_open_pr_present_array_handling() {
+        assert!(parse_open_pr_present(r#"[{"number":4242}]"#).unwrap());
+        assert!(!parse_open_pr_present("[]\n").unwrap());
+    }
+
+    #[test]
+    fn parse_open_pr_present_rejects_malformed_output() {
+        // A non-array (valid JSON) and invalid JSON both PROPAGATE — not a silent
+        // "no PR → dispatch".
+        assert!(parse_open_pr_present("{}").is_err());
+        assert!(parse_open_pr_present("not json").is_err());
+    }
+
+    // --- L3: origin attribution ---
+
+    #[test]
+    fn github_owner_name_normalizes_known_forms() {
+        for url in [
+            "https://github.com/Acme/Widgets.git",
+            "https://github.com/Acme/Widgets",
+            "http://github.com/acme/widgets",
+            "git@github.com:acme/widgets.git",
+            "ssh://git@github.com/acme/widgets.git",
+            "git://github.com/acme/widgets",
+        ] {
+            assert_eq!(
+                github_owner_name(url).as_deref(),
+                Some("acme/widgets"),
+                "failed to normalize {url:?}"
+            );
+        }
+        // Non-github origins are not attributable.
+        assert_eq!(github_owner_name("/tmp/ghstub/acme_widgets/remote"), None);
+        assert_eq!(github_owner_name("https://gitlab.com/acme/widgets"), None);
+        assert_eq!(github_owner_name("https://github.com/onlyowner"), None);
+    }
+
+    #[test]
+    fn origin_matches_repo_fail_closed_on_github_mismatch_lenient_otherwise() {
+        // Same GitHub repo (case-insensitive) → consistent.
+        assert!(origin_matches_repo(
+            "git@github.com:Acme/Widgets.git",
+            "acme/widgets"
+        ));
+        // A DIFFERENT GitHub repo → rejected (fail-closed).
+        assert!(!origin_matches_repo(
+            "https://github.com/other/repo.git",
+            "acme/widgets"
+        ));
+        // A non-github origin (the local fixture remote in tests) can't be
+        // attributed → accepted.
+        assert!(origin_matches_repo(
+            "/tmp/ghstub/acme_widgets/remote",
+            "acme/widgets"
+        ));
+    }
+
+    // --- S1: shared-worktree last-close detection ---
+
+    #[test]
+    fn worktree_still_in_use_tracks_live_siblings() {
+        let wt = Path::new("/ws/task/.worktrees/issue-7");
+        let orch_in = |role: &str| {
+            record(
+                None,
+                Some(TabMembership::Orchestration {
+                    name: "o".into(),
+                    role_index: 0,
+                    role_name: role.into(),
+                    is_start_role: role == "orchestrator",
+                    orchestration_cwd: Some("/ws/task/.worktrees/issue-7".into()),
+                    display_title: None,
+                }),
+            )
+        };
+
+        // Two role panes share the worktree → in use.
+        let both = vec![orch_in("orchestrator"), orch_in("reviewer")];
+        assert!(worktree_still_in_use(&both, wt));
+
+        // After the reviewer closes, the orchestrator still roots it → in use.
+        let one = vec![orch_in("orchestrator")];
+        assert!(worktree_still_in_use(&one, wt));
+
+        // After the last role closes → free. An unrelated agent doesn't count.
+        let other = vec![record(Some("/somewhere/else"), None)];
+        assert!(!worktree_still_in_use(&other, wt));
+        assert!(!worktree_still_in_use(&[], wt));
+    }
+
+    // --- S5: workspace absolutization ---
+
+    #[test]
+    fn canonical_workspace_requires_absolute() {
+        assert!(canonical_workspace("relative/dir").is_err());
+        assert!(canonical_workspace("./also/relative").is_err());
+        let abs = canonical_workspace("/work/space").expect("absolute path accepted");
+        assert!(abs.is_absolute());
+        assert_eq!(abs, PathBuf::from("/work/space"));
     }
 }

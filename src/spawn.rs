@@ -213,11 +213,24 @@ pub fn orchestrator_role_index(roles: &[RoleSpawn]) -> usize {
 /// Open a tab for `req` and deliver its prompt. See the module docs for the
 /// full contract. On `working_dir` creation or spawn failure, surfaces the
 /// reason via `notifier` and returns `Err` without panicking.
+///
+/// `detach_delivery` controls only WHEN this future returns relative to the
+/// prompt-delivery wait — never WHETHER the agent is registered: every pane is
+/// always spawned and registered synchronously before `spawn` returns, so a
+/// caller that inspects the registry immediately afterwards always sees the
+/// agents. When `false` (the #127 single-spawn path), the prompt-delivery wait
+/// (which can sit out the multi-second `SessionStart` fallback for a
+/// hook-less command) is awaited before returning. When `true` (the PRD #120
+/// issue-dispatch path), that wait runs in a detached task so the caller — the
+/// scheduler's run-active window — is freed the instant the dispatch WORK is
+/// done; a rapid re-fire after a tab close is then not blocked behind the prior
+/// run's lingering delivery wait. The prompt is still delivered either way.
 pub async fn spawn(
     req: SpawnRequest,
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     notifier: &dyn Notifier,
     event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
+    detach_delivery: bool,
 ) -> Result<SpawnHandle, SpawnError> {
     // 1. mkdir -p the working_dir; fail loud via the notifier.
     let dir = Path::new(&req.working_dir);
@@ -280,7 +293,15 @@ pub async fn spawn(
                     &req.task_name,
                 );
             }
-            deliver(registry, &pane_id, &id, event_rx, &req.prompt).await;
+            run_delivery(
+                registry,
+                pane_id.clone(),
+                id.clone(),
+                event_rx,
+                req.prompt.clone(),
+                detach_delivery,
+            )
+            .await;
             Ok(SpawnHandle {
                 task_name: req.task_name,
                 kind: SpawnKind::SingleAgent,
@@ -330,12 +351,13 @@ pub async fn spawn(
             // pane's readiness (its registry agent_id is the gate's match key).
             let delivery_pane_id = agents[orch_idx].pane_id.clone();
             let delivery_agent_id = agents[orch_idx].id.clone();
-            deliver(
+            run_delivery(
                 registry,
-                &delivery_pane_id,
-                &delivery_agent_id,
+                delivery_pane_id.clone(),
+                delivery_agent_id,
                 event_rx,
-                &req.prompt,
+                req.prompt.clone(),
+                detach_delivery,
             )
             .await;
             Ok(SpawnHandle {
@@ -434,6 +456,29 @@ fn session_start_wait_timeout() -> Duration {
 /// `event_rx == None` (a direct caller with no event bus) preserves the legacy
 /// short fixed buffer delay so the child + pump reader are wired before bytes
 /// flow.
+/// Run the prompt-delivery wait either inline (await it) or detached (spawn it
+/// onto a background task and return immediately). The agent is already
+/// registered by the time this is called; detaching only frees the caller from
+/// the (possibly multi-second) `SessionStart` fallback wait. See [`spawn`]'s
+/// `detach_delivery` parameter for why the issue-dispatch path detaches.
+async fn run_delivery(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: String,
+    agent_id: String,
+    event_rx: Option<broadcast::Receiver<BroadcastMsg>>,
+    prompt: String,
+    detach: bool,
+) {
+    if detach {
+        let registry = Arc::clone(registry);
+        tokio::spawn(async move {
+            deliver(&registry, &pane_id, &agent_id, event_rx, &prompt).await;
+        });
+    } else {
+        deliver(registry, &pane_id, &agent_id, event_rx, &prompt).await;
+    }
+}
+
 async fn deliver(
     registry: &AgentPtyRegistry,
     pane_id: &str,
@@ -668,7 +713,7 @@ pub fn decide_delivery_capped(
 pub async fn spawn_or_reuse(
     req: SpawnRequest,
     new_tab_per_fire: bool,
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     reuse: &ReuseRegistry,
     notifier: &dyn Notifier,
     debounce: Duration,
@@ -696,7 +741,10 @@ pub async fn spawn_or_reuse(
         }
         ReuseDecision::SpawnFresh => {
             let task_name = req.task_name.clone();
-            let handle = spawn(req, registry, notifier, event_tx).await?;
+            // #127 single-spawn keeps awaiting delivery (detach_delivery = false):
+            // its callback has no rapid-refire-after-close concern and existing
+            // tests expect the prior behavior.
+            let handle = spawn(req, registry, notifier, event_tx, false).await?;
             // Record the tab for reuse only when the task opts into reuse.
             if !new_tab_per_fire {
                 let entry = ReuseEntry {
