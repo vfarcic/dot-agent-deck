@@ -14,35 +14,12 @@ fn xdg_config_root(home: &Path) -> PathBuf {
         .unwrap_or_else(|_| home.join(".config"))
 }
 
-/// Detect the active OpenCode config root, if any. Priority:
-///  1. XDG layout: `$XDG_CONFIG_HOME/opencode` (defaults to `$HOME/.config/opencode`) — used by OpenCode 1.x
-///  2. Legacy layout: `$HOME/.opencode`
-fn detect_opencode_root_in(home: &Path, xdg_config_home: Option<&Path>) -> Option<PathBuf> {
-    let xdg_root = match xdg_config_home {
-        Some(p) => p.join("opencode"),
-        None => home.join(".config").join("opencode"),
-    };
-    if xdg_root.exists() {
-        return Some(xdg_root);
-    }
-    let legacy_root = home.join(".opencode");
-    if legacy_root.exists() {
-        return Some(legacy_root);
-    }
-    None
-}
-
-fn detect_opencode_root() -> Option<PathBuf> {
-    let home = home_dir();
-    let xdg = std::env::var("XDG_CONFIG_HOME").ok().map(PathBuf::from);
-    detect_opencode_root_in(&home, xdg.as_deref())
-}
-
-/// Plugin dir target for explicit install: detected root, falling back to XDG layout.
-fn plugin_dir_for_install() -> PathBuf {
-    if let Some(root) = detect_opencode_root() {
-        return plugin_subpath(&root);
-    }
+/// The XDG-default plugin dir (`$XDG_CONFIG_HOME/opencode/plugin/dot-agent-deck`,
+/// defaulting to `$HOME/.config/opencode/...`). Used as the explicit-install fallback
+/// when no existing layout is found. Deliberately performs **no** existence checks:
+/// it is only ever evaluated after the caller has already determined that none of the
+/// candidate roots exist, so re-detecting them would be dead work.
+fn xdg_default_plugin_dir() -> PathBuf {
     let home = home_dir();
     let xdg_default = xdg_config_root(&home).join("opencode");
     plugin_subpath(&xdg_default)
@@ -475,7 +452,7 @@ pub fn install() -> std::io::Result<()> {
 
     install_to_roots(
         &candidate_roots(),
-        plugin_dir_for_install,
+        xdg_default_plugin_dir,
         &binary_path,
         &mut std::io::stdout(),
     )
