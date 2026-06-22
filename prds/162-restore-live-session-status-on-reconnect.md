@@ -1,6 +1,6 @@
 # PRD #162: Restore live session status on daemon reconnect
 
-**Status**: Planning
+**Status**: In Progress — implementation, tests, review, and e2e gate complete; changelog + PR/merge pending (M4.2–M4.3)
 **Priority**: High
 **Created**: 2026-06-14
 **GitHub Issue**: [#162](https://github.com/vfarcic/dot-agent-deck/issues/162)
@@ -88,22 +88,22 @@ When more than one historical session maps to the same agent (e.g. a `/clear` re
 
 ### Phase 1: Snapshot on the wire (daemon side)
 
-- [ ] **M1.1** — Define `SessionSnapshot` (serde, additive). Add `live: Option<SessionSnapshot>` to `AgentRecord` with `#[serde(default, skip_serializing_if = "Option::is_none")]`; serde round-trip + older-shape-deserializes-to-None tests in `daemon_protocol.rs` / `agent_pty.rs`.
-- [ ] **M1.2** — In the `ListAgents` handler, join `registry.agent_records()` against the daemon's `AppState.sessions` (on `agent_id` + `pane_id`, newest-`last_activity`-wins) and attach the snapshot. Dummy-state path yields `None` (today's behavior). The join reads only the already-in-scope `state: SharedState`.
+- [x] **M1.1** — Define `SessionSnapshot` (serde, additive). Add `live: Option<SessionSnapshot>` to `AgentRecord` with `#[serde(default, skip_serializing_if = "Option::is_none")]`; serde round-trip + older-shape-deserializes-to-None tests in `daemon_protocol.rs` / `agent_pty.rs`. — Done (5549f08; `SessionSnapshot` in `crate::state`; test `session/live/001`).
+- [x] **M1.2** — In the `ListAgents` handler, join `registry.agent_records()` against the daemon's `AppState.sessions` (on `agent_id` + `pane_id`, newest-`last_activity`-wins) and attach the snapshot. Dummy-state path yields `None` (today's behavior). The join reads only the already-in-scope `state: SharedState`. — Done (5549f08, tiebreak hardened in 61125a9; tests `session/live/002`, `session/live/003`).
 
 ### Phase 2: Seed the reconnected session (TUI side)
 
-- [ ] **M2.1** — Carry the snapshot through `HydratedPane` (`src/embedded_pane.rs`).
-- [ ] **M2.2** — Seed the hydrated session from the snapshot in the hydration block (`src/ui.rs:~5512-5560`): a snapshot-aware insert that sets `status` / `agent_type` / `active_tool` / `tool_count` / `first_prompts` / `last_user_prompt` when present, and the current bare-placeholder defaults when absent. Preserve PRD #110 `agent_id` minting. Drop / supersede the "No agent until SessionStart" fallback comment where the snapshot now covers it.
+- [x] **M2.1** — Carry the snapshot through `HydratedPane` (`src/embedded_pane.rs`). — Done (1c6fe58; `HydratedPane.live`, set from `record.live` in `hydrate_from_daemon`).
+- [x] **M2.2** — Seed the hydrated session from the snapshot in the hydration block (`src/ui.rs:~5512-5560`): a snapshot-aware insert that sets `status` / `agent_type` / `active_tool` / `tool_count` / `first_prompts` / `last_user_prompt` when present, and the current bare-placeholder defaults when absent. Preserve PRD #110 `agent_id` minting. Drop / supersede the "No agent until SessionStart" fallback comment where the snapshot now covers it. — Done (1c6fe58; `AppState::seed_hydrated_session` delegates to `insert_placeholder_session` then overlays the snapshot; agent_type precedence fixed in 61125a9; tests `session/live/004`, `session/live/008`).
 
 ### Phase 3: Tests
 
-- [ ] **M3.1** — State/protocol tests: `SessionSnapshot` round-trip + back-compat (`None` from older shape); the `ListAgents` join (status/agent_type/active_tool/tool_count/prompts populated; newest-wins on duplicate agent; dummy-state → `None`).
-- [ ] **M3.2** — TUI hydration tests: a hydrated session reflects the snapshot status/label instead of `Idle`/"No agent" (L1 render/state); no-snapshot path falls back to bare placeholder; post-reconnect `SessionStart` remaps onto the hydrated card (no duplicate). L2 (`e2e_*`, gated) for the disconnect→reconnect-against-real-daemon path where the spawned binary + attach protocol are exercised. Run `cargo test-e2e` before the PR.
+- [x] **M3.1** — State/protocol tests: `SessionSnapshot` round-trip + back-compat (`None` from older shape); the `ListAgents` join (status/agent_type/active_tool/tool_count/prompts populated; newest-wins on duplicate agent; dummy-state → `None`). — Done (`session/live/001`–`003`; 31b450e). Plus security-hardening tests from review: wire-boundary sanitize + clamp (`session/live/007`) and agent_type precedence (`session/live/008`) — df94e58.
+- [x] **M3.2** — TUI hydration tests: a hydrated session reflects the snapshot status/label instead of `Idle`/"No agent" (L1 render/state); no-snapshot path falls back to bare placeholder; post-reconnect `SessionStart` remaps onto the hydrated card (no duplicate). L2 (`e2e_*`, gated) for the disconnect→reconnect-against-real-daemon path where the spawned binary + attach protocol are exercised. Run `cargo test-e2e` before the PR. — Done (`session/live/004`–`006`; 44ebf2e). E2E gate green: `DOT_AGENT_DECK_RECORD=1 cargo test-e2e` → 1449/1449 passed, `session/live/006` passing under parallel load after a test-sync fix (7246c02).
 
 ### Phase 4: Docs and release
 
-- [ ] **M4.1** — Docs: note in the daemon/reconnect documentation that a reconnected dashboard restores live status (not just the list of agents). Keep it dual-render (Docusaurus + GitHub) per repo convention.
+- [x] **M4.1** — Docs: note in the daemon/reconnect documentation that a reconnected dashboard restores live status (not just the list of agents). Keep it dual-render (Docusaurus + GitHub) per repo convention. — Done (d789667; `docs/session-management.md` "Resuming Sessions").
 - [ ] **M4.2** — Changelog fragment (`dot-ai-changelog-fragment`) on the first push to the PR.
 - [ ] **M4.3** — PR, Greptile review, audit, merge, close.
 
