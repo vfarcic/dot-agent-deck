@@ -654,6 +654,33 @@ impl TuiDeck {
         }
     }
 
+    /// Like [`wait_for_stream_string`] but with a caller-supplied
+    /// timeout instead of the fixed 10-second [`WAIT_TIMEOUT`]. Scans
+    /// the entire rolling byte history (from offset 0) so a needle that
+    /// already scrolled out of the visible vt100 grid is still found.
+    /// Real-agent L2 tests (a daemon clone from live GitHub + a real
+    /// cheap-model agent run) need a generous ceiling — minutes, not
+    /// seconds — that the 10s default cannot express. Returns `true`
+    /// once `needle` is seen, `false` if `timeout` elapses first (the
+    /// caller decides whether a miss is a hard failure or a flaky-network
+    /// observation to report).
+    pub fn wait_for_stream_string_within(&self, needle: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let hist = self.byte_history.lock().unwrap();
+                let text = String::from_utf8_lossy(&hist);
+                if text.contains(needle) {
+                    return true;
+                }
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Wait for `needles` to appear, in order, in the cumulative
     /// byte stream the deck has emitted since this call started.
     ///
