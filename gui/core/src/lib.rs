@@ -42,8 +42,10 @@ pub use daemon::{DAEMON_BIN_ENV, EnsureDaemonError, ensure_daemon};
 
 /// The per-agent snapshot the daemon echoes over `list-agents`, re-exported so
 /// the Tauri shell names the same wire type the core returns from
-/// [`list_agents`] (PRD #176 M1.3).
-pub use protocol::AgentRecord;
+/// [`list_agents`] (PRD #176 M1.3). [`TabMembership`] travels with it so the
+/// shell can bucket agents into the TUI's Mode-vs-Orchestration tab structure
+/// (PRD #176 M2.1) without re-deriving the wire shape.
+pub use protocol::{AgentRecord, TabMembership};
 
 /// The shared socket-path discovery, re-exported so the Tauri shell resolves
 /// the daemon socket through the same function the TUI does (PRD #93).

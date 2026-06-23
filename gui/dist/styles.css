@@ -168,10 +168,49 @@ body {
   border-color: var(--accent);
   background: #21304f;
 }
+.agent-list .aname {
+  display: block;
+}
 .agent-list .aid {
   display: block;
   color: var(--muted);
   font-size: 10px;
+}
+
+/* ---- Agent grouping: Mode / Orchestration / Dashboard tab buckets (M2.1) ---- */
+.agent-list .group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 10px 2px 3px;
+}
+.agent-list .group-head:first-child {
+  padding-top: 2px;
+}
+.kind {
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--bg);
+  flex: 0 0 auto;
+}
+.kind-mode {
+  background: var(--accent);
+}
+.kind-orchestration {
+  background: var(--ok);
+}
+.kind-dashboard {
+  background: var(--muted);
+}
+.group-name {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 11px;
+  word-break: break-all;
 }
 
 /* ---- Terminal pane ---- */

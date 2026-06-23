@@ -123,7 +123,7 @@ It does not re-implement the TUI's rendering, does not hold orchestration logic,
 
 ### Phase 2 — GUI-native chrome
 
-- [ ] **M2.1** — Decks, tabs, and multi-pane layout from `ListAgents`/`AgentRecord` (Mode vs Orchestration buckets); focus and keyboard routing to the focused pane.
+- [ ] **M2.1** — Decks, tabs, and multi-pane layout from `ListAgents`/`AgentRecord` (Mode vs Orchestration buckets); focus and keyboard routing to the focused pane. _Implemented, pending hand-validation: the shell projects `tab_membership` into a bucket (`mode`/`orchestration`/`dashboard`) + tab name + role index/name (`AgentSummary`), and the frontend groups the agent list into Mode/Orchestration/Dashboard tab sections (orchestration ordered by role index), with one focused terminal + keystroke routing to it. Per the maintainer's parity-first working agreement (2026-06-23), a **simultaneous multi-visible-pane layout** (grid/splits/draggable) is treated as GUI-native net-new and **deferred to later** — the parity model here is "decks/tabs + one focused pane," like the TUI._
 - [ ] **M2.2** — Pane lifecycle from the GUI: `StartAgent`, `StopAgent`, `SetAgentLabel`, `Resize`, `WriteAndSubmit`; pane-status surface (running / waiting-for-input / finished) driven by `SubscribeEvents`. _Current state (spike): the frontend lists agents via a one-shot `agents` call with a **manual Refresh button** as a stand-in; the live, event-driven agent-list + status updates (no manual reload) land here once the GUI subscribes to `SubscribeEvents` — the daemon already emits these, the GUI just doesn't consume them yet._
 
 ### Phase 3 — Flagship: agents-communication graph (the one daemon change)

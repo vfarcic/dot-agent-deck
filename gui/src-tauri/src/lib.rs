@@ -24,7 +24,7 @@ use std::sync::Mutex;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use dad_gui_core::{
-    AgentRecord, ConnectionState, ResizeHandle, attach_socket_path, attach_stream,
+    AgentRecord, ConnectionState, ResizeHandle, TabMembership, attach_socket_path, attach_stream,
     connect_or_autostart, list_agents, resize_channel, run_resize_worker,
 };
 use serde::Serialize;
@@ -155,19 +155,64 @@ async fn bootstrap_connection(app: AppHandle) {
     }
 }
 
-/// A listed agent, projected to just what the webview's pane picker needs.
+/// Which navigation bucket an agent falls into — mirrors the TUI's
+/// Mode-vs-Orchestration tab split (PRD #176 M2.1). Serializes lowercase
+/// (`"mode"` / `"orchestration"` / `"dashboard"`) for the webview to group on.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Bucket {
+    Mode,
+    Orchestration,
+    Dashboard,
+}
+
+/// A listed agent, projected to just what the webview's pane picker needs:
+/// the id/label plus the tab-bucketing fields so the chrome can rebuild the
+/// TUI's Mode/Orchestration tab structure from `AgentRecord.tab_membership`.
 #[derive(Debug, Clone, Serialize)]
 struct AgentSummary {
     id: String,
     /// `display_name` when the daemon has one, else the id (so there is always
     /// a label to show), mirroring the TUI's hydration fallback.
     label: String,
+    /// Mode / Orchestration / Dashboard navigation bucket.
+    bucket: Bucket,
+    /// The mode or orchestration tab name; `None` for dashboard panes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tab_name: Option<String>,
+    /// Orchestration role position, so the webview can order role panes within
+    /// a tab the way the TUI does; `None` outside an orchestration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role_index: Option<usize>,
+    /// Orchestration role name (e.g. `coder`), when the daemon carries one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role_name: Option<String>,
 }
 
 impl From<AgentRecord> for AgentSummary {
     fn from(r: AgentRecord) -> Self {
         let label = r.display_name.unwrap_or_else(|| r.id.clone());
-        AgentSummary { id: r.id, label }
+        let (bucket, tab_name, role_index, role_name) = match r.tab_membership {
+            None => (Bucket::Dashboard, None, None, None),
+            Some(TabMembership::Mode { name }) => (Bucket::Mode, Some(name), None, None),
+            Some(TabMembership::Orchestration {
+                name,
+                role_index,
+                role_name,
+                ..
+            }) => {
+                let role = (!role_name.is_empty()).then_some(role_name);
+                (Bucket::Orchestration, Some(name), Some(role_index), role)
+            }
+        };
+        AgentSummary {
+            id: r.id,
+            label,
+            bucket,
+            tab_name,
+            role_index,
+            role_name,
+        }
     }
 }
 
