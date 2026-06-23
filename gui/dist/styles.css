@@ -168,6 +168,10 @@ body {
   border-color: var(--accent);
   background: #21304f;
 }
+/* Command-mode keyboard selection (distinct from the attached/active pane). */
+.agent-list button.selected {
+  border-color: var(--warn);
+}
 .agent-list .aname {
   display: block;
 }
@@ -177,26 +181,59 @@ body {
   font-size: 10px;
 }
 
-/* ---- Agent grouping: Mode / Orchestration / Dashboard tab buckets (M2.1) ---- */
-.agent-list .group-head {
+/* ---- Right column: top tab bar (decks) above the terminal pane ---- */
+.rightcol {
+  flex: 1;
   display: flex;
-  align-items: baseline;
+  flex-direction: column;
+  min-width: 0;
+}
+.tabbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  min-height: 38px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+.tab {
+  display: flex;
+  align-items: center;
   gap: 6px;
-  padding: 10px 2px 3px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 5px 10px;
+  cursor: pointer;
+  font-size: 12px;
+  white-space: nowrap;
 }
-.agent-list .group-head:first-child {
-  padding-top: 2px;
+.tab:hover {
+  border-color: var(--border);
 }
-.kind {
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  font-size: 9px;
-  font-weight: 700;
-  padding: 1px 5px;
-  border-radius: 4px;
-  color: var(--bg);
+.tab.active {
+  border-color: var(--accent);
+  background: #21304f;
+}
+.tab-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
   flex: 0 0 auto;
 }
+.tab-count {
+  color: var(--muted);
+  font-size: 10px;
+}
+.tab-empty {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 4px 6px;
+}
+/* Deck kind colors — shared by the tab dots. */
 .kind-mode {
   background: var(--accent);
 }
@@ -206,11 +243,26 @@ body {
 .kind-dashboard {
   background: var(--muted);
 }
-.group-name {
-  color: var(--muted);
-  font-weight: 600;
+
+/* Command mode: accent the tab bar and show the bottom hint strip. */
+.app.command-mode .tabbar {
+  box-shadow: inset 0 -2px 0 var(--warn);
+}
+.cmdhint {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 10;
+  padding: 3px 8px;
+  background: var(--warn);
+  color: #0d1017;
   font-size: 11px;
-  word-break: break-all;
+  font-weight: 600;
+  text-align: center;
+}
+.cmdhint[hidden] {
+  display: none;
 }
 
 /* ---- Terminal pane ---- */

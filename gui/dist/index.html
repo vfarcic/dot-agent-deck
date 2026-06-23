@@ -8,7 +8,7 @@
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <div class="app">
+    <div class="app" id="app">
       <aside class="sidebar">
         <header class="brand">
           <h1>dot-agent-deck</h1>
@@ -24,7 +24,7 @@
 
         <section class="agents">
           <div class="agents-head">
-            <h2>Agents</h2>
+            <h2>Panes</h2>
             <button id="refresh" class="btn small" title="Refresh agent list">↻</button>
           </div>
           <ul id="agent-list" class="agent-list">
@@ -33,16 +33,23 @@
         </section>
       </aside>
 
-      <main class="pane">
-        <header class="pane-head">
-          <span id="pane-title">No terminal attached</span>
-          <button id="detach" class="btn small" hidden>Detach</button>
-        </header>
-        <div id="terminal" class="terminal"></div>
-        <div id="overlay" class="overlay">
-          <p>Select an agent on the left to open its live terminal.</p>
-        </div>
-      </main>
+      <div class="rightcol">
+        <nav id="tabbar" class="tabbar" aria-label="Decks"></nav>
+        <main class="pane">
+          <header class="pane-head">
+            <span id="pane-title">No terminal attached</span>
+            <button id="detach" class="btn small" hidden>Detach</button>
+          </header>
+          <div id="terminal" class="terminal"></div>
+          <div id="overlay" class="overlay">
+            <p>Select a deck above and an agent on the left to open its live terminal.</p>
+          </div>
+        </main>
+      </div>
+
+      <div id="cmdhint" class="cmdhint" hidden>
+        command mode · ←/→ or h/l decks · ↑/↓ or j/k panes · Enter focus · Esc exit
+      </div>
     </div>
 
     <script src="vendor/xterm/xterm.js"></script>
