@@ -275,19 +275,38 @@ async fn dispatch_one_issue(
 ) -> Result<(), String> {
     let paths = derive_issue_paths(workspace, task_name, issue);
 
-    // M2.2 — idempotency BEFORE any work. Primary: the worktree already exists.
-    // Secondary: an open PR whose head is `agent/issue-<n>`. A `gh` failure on
-    // the PR check is a per-issue error (e.g. the stub's simulated API error).
-    let worktree_exists = paths.worktree_dir.exists();
-    let open_pr = issue_has_open_pr(&cfg.repo, issue).await?;
-
-    if dispatch_decision(worktree_exists, open_pr) == DispatchDecision::Skip {
+    let notify_skip = || {
         notifier.notify(NotifyEvent::IssueDispatchSkipped {
             task: task_name.to_string(),
             repo: cfg.repo.clone(),
             issue,
             branch: paths.branch.clone(),
         });
+    };
+
+    // M2.2 — idempotency BEFORE any work, evaluated as a SHORT-CIRCUIT on the
+    // two signals so the secondary check only runs when the primary leaves the
+    // verdict open.
+    //
+    // PRIMARY (the worktree is the ledger): if the per-issue worktree already
+    // exists the issue is already claimed — emit a SKIP and return IMMEDIATELY,
+    // WITHOUT consulting the open-PR signal. Probing `issue_has_open_pr` here
+    // would be both redundant (a present worktree skips regardless of the PR
+    // check) and a correctness hazard: a transient `gh pr list` failure would,
+    // via the per-issue error boundary, turn this clean SKIP into a spurious
+    // IssueDispatchFailed notification.
+    let worktree_exists = paths.worktree_dir.exists();
+    if worktree_exists {
+        notify_skip();
+        return Ok(());
+    }
+
+    // SECONDARY — reached ONLY when the worktree is absent: an open PR whose
+    // head is `agent/issue-<n>`. A `gh` failure here is a genuine per-issue
+    // error (e.g. the stub's simulated API error) and propagates via `?`.
+    let open_pr = issue_has_open_pr(&cfg.repo, issue).await?;
+    if dispatch_decision(worktree_exists, open_pr) == DispatchDecision::Skip {
+        notify_skip();
         return Ok(());
     }
 
