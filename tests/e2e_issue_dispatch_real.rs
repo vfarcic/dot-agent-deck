@@ -14,6 +14,12 @@
 //! sentinel filename (`DISPATCH_E2E_SENTINEL.md`) appearing in the dispatched
 //! agent's rendered pane output.
 //!
+//! And per CLAUDE.md rule 4's "AS A USER ACTUALLY USES AND SEES IT" bar, the
+//! agent here is a FULLY INTERACTIVE `claude` (not `claude -p`): the focused
+//! card shows the genuine live claude TUI — its status (Thinking/Working/Bash)
+//! and the Bash `ls` output streaming in — exactly what a user sees, not a
+//! one-shot print piped to `cat`.
+//!
 //! Fixture (permanent, created out-of-band): the public repo
 //! `vfarcic/dot-agent-deck-tests` carries a committed `DISPATCH_E2E_SENTINEL.md`,
 //! a plain `.dot-agent-deck.toml` with NO `[[orchestrations]]` (so the dispatch
@@ -30,11 +36,15 @@
 //!     spawned deck's env to a pinned set, so the token is passed explicitly so
 //!     the daemon and the `gh` it runs inherit it.
 //!   - REAL cheap agent: `default_command` (via a `DOT_AGENT_DECK_CONFIG` scratch
-//!     config, the same mechanism `dispatch/011` used for `cat`) launches a real
-//!     `claude -p` run pinned to Haiku — the same launch mechanism + model id the
-//!     `chain-smoke/claude/001` test uses. A trailing `; cat` keeps the pane
-//!     alive after the one-shot print-mode agent exits, so the surfaced card
-//!     persists for the assertion (and the demo reel).
+//!     config, the same mechanism `dispatch/011` used for `cat`) launches a
+//!     FULLY INTERACTIVE `claude` pinned to Haiku — the proven
+//!     `delegate_work_done_chain_claude` launch mechanism + model id. NO `-p`
+//!     and NO trailing `; cat`: interactive claude keeps its own pane alive and
+//!     auto-submits the list-files directive the dispatch injects through its
+//!     NORMAL prompt-delivery primitive (`write_to_pane_and_submit`). The deck
+//!     builder seeds project-trust into the per-test HOME (via
+//!     `with_claude_project_trust`) for the exact per-issue worktree cwd, so
+//!     claude's first-run onboarding + trust gates clear with no human keystroke.
 //!   - The live-fire seam from `scheduler/live/*`: the fire is driven by `RunNow`
 //!     over the deck's attach socket (no real cron wait).
 //!
@@ -47,7 +57,7 @@
 //! fixture repo has no `agent/issue-1` branch after the run. All on-disk state
 //! (clone + worktree) lives under a `tempfile::tempdir()` removed on drop.
 //!
-//! Decision 23 cost: one Haiku print-mode invocation listing a handful of files
+//! Decision 23 cost: one short interactive Haiku turn listing a handful of files
 //! — well under the <$0.05/run bound. Local-only (Decision 8 / rule 5): gated on
 //! the `e2e` feature so CI's `cargo test-fast` never compiles it; flaky-tolerant
 //! (real LLM + real network) per rule 4 — it is NOT looped for flakiness.
@@ -75,7 +85,7 @@ fn dispatch_schedule_toml(working_dir: &str) -> String {
          name = \"{SCHEDULE_NAME}\"\n\
          cron = \"0 0 1 1 *\"\n\
          working_dir = \"{working_dir}\"\n\
-         prompt = \"List every file in the current directory and print each filename verbatim.\"\n\
+         prompt = \"Use the Bash tool to run ls -a in the current directory, then print the complete file listing verbatim, one filename per line, with no other commentary.\"\n\
          enabled = true\n\
          \n\
          [scheduled_tasks.issue_dispatch]\n\
@@ -88,22 +98,25 @@ fn dispatch_schedule_toml(working_dir: &str) -> String {
 
 /// The real-agent `default_command` for the dispatched single-agent card.
 ///
-/// A `claude -p` print-mode run (the `chain-smoke/claude/001` launch mechanism)
-/// pinned to Haiku, directed to list the worktree's files verbatim via the Bash
-/// tool. Print mode needs no project-trust/onboarding seeding (it never shows
-/// the interactive trust dialog — that is exactly why `chain-smoke` uses `-p`).
-/// The trailing `; cat` keeps the pane process alive after the one-shot agent
-/// exits so the surfaced card persists for the focus + assertion.
+/// A FULLY INTERACTIVE `claude` (the proven `delegate_work_done_chain_claude`
+/// launch mechanism) pinned to Haiku, with the Bash tool pre-allowed. NO `-p`
+/// (so the user sees the genuine live claude TUI working in the pane — the
+/// real user-visible experience, not a one-shot print) and NO trailing `; cat`
+/// (interactive claude keeps the pane alive on its own). NO
+/// `--dangerously-skip-permissions` (claude refuses it under root); `--allowedTools
+/// Bash` is enough for the directive, which lands via the dispatch's NORMAL
+/// prompt injection (interactive claude auto-submits it — the same primitive
+/// the delegate dispatch uses).
+///
+/// Interactive claude shows a first-run trust dialog in a fresh worktree cwd, so
+/// the deck builder seeds project-trust into the per-test HOME via
+/// `with_claude_project_trust` for the exact per-issue worktree the agent runs
+/// in — without that, the dialog would swallow the injected prompt.
 ///
 /// No backticks (the daemon shell-wraps this under `/bin/sh -c`, and a backtick
-/// would trigger command substitution); the directive is single-quoted so its
-/// spaces stay one argument to `claude -p`.
+/// would trigger command substitution).
 fn real_agent_default_command() -> String {
-    format!(
-        "claude -p 'Use the Bash tool to run ls -a in the current directory, then output the \
-         complete file listing verbatim, one filename per line, with no other commentary.' \
-         --model {PINNED_MODEL} --allowedTools Bash ; cat"
-    )
+    format!("claude --model {PINNED_MODEL} --allowedTools Bash")
 }
 
 /// Fire a registered task on the deck's own daemon via the `RunNow` control
@@ -159,19 +172,22 @@ fn remote_branch_exists(branch: &str) -> Option<bool> {
 /// Scenario: Launch the deck attached to a daemon configured with one enabled
 /// `issue_dispatch` schedule that targets the LIVE public fixture repo
 /// `vfarcic/dot-agent-deck-tests` (filtered to the permanent label-gated issue
-/// #1, `max_per_run = 1`) whose single-agent `default_command` is a REAL
-/// Haiku-pinned `claude -p` run told to list the worktree's files verbatim, then
-/// fire it via `RunNow` over the attach socket WITHOUT detaching. With the REAL
-/// `gh` on PATH and `GITHUB_TOKEN` threaded through, the daemon enumerates,
-/// clones from GitHub, creates the per-issue worktree `…/.worktrees/issue-1`, and
-/// spawns the agent into it. After the dispatched agent registers under the
-/// schedule name and its per-issue card surfaces live, focus the card and assert
-/// the committed sentinel filename `DISPATCH_E2E_SENTINEL.md` appears in the
-/// agent's rendered pane output — proving the daemon really cloned the repo and a
-/// real agent ran in the per-issue worktree and saw the repo files. Finally
-/// assert (best-effort) the fixture repo has no pushed `agent/issue-1` branch.
-/// Reel-eligible (PTY-attached, records a `full-stream.cast`); flaky-tolerant
-/// (real LLM + real network) — run once, not looped.
+/// #1, `max_per_run = 1`) whose single-agent `default_command` is a FULLY
+/// INTERACTIVE Haiku-pinned `claude` (no `-p`, no `; cat`), then fire it via
+/// `RunNow` over the attach socket WITHOUT detaching. With the REAL `gh` on PATH
+/// and `GITHUB_TOKEN` threaded through, the daemon enumerates, clones from
+/// GitHub, creates the per-issue worktree `…/.worktrees/issue-1`, and spawns the
+/// interactive agent into it — auto-submitting the injected list-files directive
+/// (the per-issue worktree cwd was pre-trusted in the per-test HOME so claude's
+/// first-run gates clear without a keystroke). After the dispatched agent
+/// registers under the schedule name and its per-issue card surfaces live, focus
+/// the card — now showing the genuine live claude TUI + status — and assert the
+/// committed sentinel filename `DISPATCH_E2E_SENTINEL.md` appears in the agent's
+/// rendered pane output, proving the daemon really cloned the repo and a real
+/// interactive agent ran in the per-issue worktree and listed the repo files.
+/// Finally assert (best-effort) the fixture repo has no pushed `agent/issue-1`
+/// branch. Reel-eligible (PTY-attached, records a `full-stream.cast`);
+/// flaky-tolerant (real LLM + real network) — run once, not looped.
 #[spec("scheduler/dispatch/013")]
 #[test]
 fn dispatch_013_real_agent_lists_repo_files_from_github() {
@@ -215,9 +231,27 @@ fn dispatch_013_real_agent_lists_repo_files_from_github() {
     let sched_path = sched_td.path().join("schedules.toml");
     std::fs::write(&sched_path, dispatch_schedule_toml(&work_str)).expect("write schedules.toml");
 
+    // The EXACT per-issue worktree cwd the dispatched interactive `claude` will
+    // run in. Derived the same way the daemon does: `std::path::absolute` of the
+    // workspace root (the daemon's `canonical_workspace` — lexical, no symlink
+    // resolution) → `derive_issue_paths(.., SCHEDULE_NAME, 1)`. Seeding trust for
+    // this exact path lets interactive claude clear its first-run trust dialog so
+    // the injected list-files prompt isn't swallowed. Seeded BEFORE the dispatch
+    // fires (the builder writes it into the per-test HOME at launch).
+    let workspace_abs = std::path::absolute(&work).expect("absolutize workspace root");
+    let worktree_cwd =
+        dot_agent_deck::issue_dispatch::derive_issue_paths(&workspace_abs, SCHEDULE_NAME, 1)
+            .worktree_dir
+            .to_string_lossy()
+            .into_owned();
+
     let deck = TuiDeck::builder()
-        // Real Claude credentials so the daemon-spawned `claude -p` authenticates.
+        // Real Claude credentials so the daemon-spawned interactive `claude`
+        // authenticates.
         .with_imported_claude_credentials()
+        // Pre-trust the per-issue worktree cwd so interactive claude clears its
+        // first-run onboarding + trust gates and auto-submits the injected prompt.
+        .with_claude_project_trust(worktree_cwd)
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .with_env("DOT_AGENT_DECK_CONFIG", cfg_str)
         // The harness scrubs the spawned deck's env to a pinned set, so thread
@@ -263,11 +297,11 @@ fn dispatch_013_real_agent_lists_repo_files_from_github() {
     // the daemon really cloned `vfarcic/dot-agent-deck-tests` from GitHub and the
     // real Haiku agent ran inside the per-issue worktree and listed its files.
     //
-    // Scanned over the cumulative byte history (not a single grid frame): a real
-    // `claude -p` run can redraw/clear its screen, but every byte it ever emitted
-    // while the pane was focused stays in history. Generous timeout absorbs the
-    // real LLM round-trip. Assert on the SENTINEL FILENAME, not on exact agent
-    // phrasing.
+    // Scanned over the cumulative byte history (not a single grid frame): a live
+    // interactive `claude` redraws/clears its screen constantly, but every byte
+    // it ever emitted while the pane was focused stays in history. Generous
+    // timeout absorbs the real LLM round-trip. Assert on the SENTINEL FILENAME,
+    // not on exact agent phrasing.
     let saw_sentinel = deck.wait_for_stream_string_within(SENTINEL, Duration::from_secs(150));
     assert!(
         saw_sentinel,

@@ -80,6 +80,7 @@ pub struct TuiDeckBuilder {
     continue_session: Option<ContinueSession>,
     credential_imports: Vec<CredentialImport>,
     keybindings_toml: Option<String>,
+    claude_trust_paths: Vec<String>,
 }
 
 impl TuiDeckBuilder {
@@ -143,6 +144,27 @@ impl TuiDeckBuilder {
     /// `~/.opencode/plugin/` directory on the host is NOT copied.
     pub fn with_imported_opencode_credentials(mut self) -> Self {
         self.credential_imports.push(CredentialImport::OpenCode);
+        self
+    }
+
+    /// Pre-trust `path` for a daemon-spawned interactive `claude`, so it clears
+    /// BOTH first-run gates with no human keystroke: the global onboarding gate
+    /// (`hasCompletedOnboarding`) and the per-folder trust gate
+    /// (`projects.<path>.hasTrustDialogAccepted`). At launch a `~/.claude.json`
+    /// is written into the per-test HOME (the same HOME the daemon — and every
+    /// agent it spawns — inherits): it starts from the host's `~/.claude.json`
+    /// (preserving `oauthAccount` + `hasCompletedOnboarding` so the global
+    /// onboarding flow is skipped) and marks each `path` as a trusted project.
+    ///
+    /// In production a dispatched agent runs in the user's already-trusted repo,
+    /// so the trust dialog never appears; a fresh per-issue worktree cwd would
+    /// otherwise trip it and swallow the daemon-injected prompt. `path` must be
+    /// the EXACT cwd string the spawned agent runs in (e.g. the per-issue
+    /// worktree dir from `dot_agent_deck::issue_dispatch::derive_issue_paths`).
+    /// Call once per trusted folder. Ported from
+    /// `e2e_delegate_work_done_chain.rs::prepare_claude_home`.
+    pub fn with_claude_project_trust(mut self, path: impl Into<String>) -> Self {
+        self.claude_trust_paths.push(path.into());
         self
     }
 
@@ -233,6 +255,7 @@ impl TuiDeck {
             continue_session: None,
             credential_imports: Vec::new(),
             keybindings_toml: None,
+            claude_trust_paths: Vec::new(),
         }
     }
 
@@ -317,6 +340,15 @@ impl TuiDeck {
                     import_opencode_credentials(&home).map_err(|e| e.to_string())?;
                 }
             }
+        }
+
+        // Pre-trust folders for a daemon-spawned interactive `claude` so it
+        // clears its first-run onboarding + per-folder trust gates without a
+        // human keystroke. The `~/.claude.json` lands in the SAME per-test HOME
+        // the daemon (and every agent it spawns) inherits.
+        if !builder.claude_trust_paths.is_empty() {
+            seed_claude_project_trust(&home, &builder.claude_trust_paths)
+                .map_err(|e| e.to_string())?;
         }
 
         // Write the saved-session file the deck auto-restores on startup
@@ -1433,6 +1465,40 @@ fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
         copy_dir_recursively(&src_plugins, &dst_root.join("plugins"))?;
     }
     Ok(())
+}
+
+/// Seed the per-test HOME's `~/.claude.json` so a daemon-spawned interactive
+/// `claude` clears BOTH first-run gates without a human keystroke: the global
+/// onboarding gate (`hasCompletedOnboarding`) and the per-folder trust gate
+/// (`projects.<cwd>.hasTrustDialogAccepted`). Ported from
+/// `e2e_delegate_work_done_chain.rs::prepare_claude_home`: start from the host's
+/// `~/.claude.json` (preserving `oauthAccount` + `hasCompletedOnboarding` so the
+/// global onboarding flow is skipped), then mark each `trust_paths` entry as a
+/// trusted project.
+///
+/// `trust_paths` are the EXACT cwd strings the spawned agent will run in. The
+/// destination is written atomically with mode 0o600 — `.claude.json` carries
+/// the host `oauthAccount` (M3.1 auditor S2, same stance as the other imported
+/// credential files).
+fn seed_claude_project_trust(test_home: &Path, trust_paths: &[String]) -> std::io::Result<()> {
+    let host_cfg_path = host_home().join(".claude.json");
+    let mut cfg: serde_json::Value = std::fs::read_to_string(&host_cfg_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({ "hasCompletedOnboarding": true }));
+    if !cfg["projects"].is_object() {
+        cfg["projects"] = serde_json::json!({});
+    }
+    for path in trust_paths {
+        cfg["projects"][path] = serde_json::json!({
+            "hasTrustDialogAccepted": true,
+            "hasCompletedProjectOnboarding": true,
+            "projectOnboardingSeenCount": 1,
+        });
+    }
+    let bytes = serde_json::to_vec(&cfg)
+        .map_err(|e| std::io::Error::other(format!("serialize .claude.json: {e}")))?;
+    write_credential_file_atomic_0o600(&test_home.join(".claude.json"), &bytes)
 }
 
 /// Strip the top-level `hooks` key from a Claude Code settings.json.
