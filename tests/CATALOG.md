@@ -2007,6 +2007,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the clone/worktree/branch derivation or skip/dedup/cap/cleanup logic (covered by the headless `scheduler/dispatch/001-010`); the orchestration-tab dispatch path (NOT live-surfaced by `spawn` — rebuilt by the TUI's hydration path on reconnect, the #140 session-partitioning concern); prompt-echo delivery into the card.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/dispatch/012 — A worktree-present second fire short-circuits to a SKIP BEFORE the open-PR check, so a transient `gh pr list` error on that issue never surfaces as a failure (PRD #120 / Greptile P1 regression guard — primary signal short-circuits the secondary, commit 212bc73).
+- **Layer:** L2 (as `scheduler/dispatch/001`; first run-now dispatches issue 7, then the stub is armed so `gh pr list --head agent/issue-7` exits non-zero, then a second run-now fires with the worktree already present).
+- **Agent:** none (run-now ×2; observes the orchestrator count + on-disk worktree/clone + daemon stderr).
+- **Asserts:** the second fire does NOT grow the orchestrator count (no duplicate spawn/re-creation), surfaces an `IssueDispatchSkipped` ("already-claimed issue #7") for the present worktree, does NOT surface an `IssueDispatchFailed` ("issue #7 … failed") despite the armed `gh pr list` error, and leaves the worktree and clone in place.
+- **Does not assert:** the worktree-absent path that DOES consult the open-PR signal and propagates a `gh` error as a failure (covered by `scheduler/dispatch/007`); the plain worktree-present skip without a PR-check hazard (covered by `scheduler/dispatch/002`); the exact skip/failure wording (loose substring on the issue-7 key).
+- **Note:** the fix is in current code, so this is GREEN as a regression guard, not RED-first; it pins that the primary (worktree-exists) signal short-circuits the secondary (open-PR) check, which `scheduler/dispatch/002` cannot catch because it never forces the PR check to error.
+- **Platform coverage:** mac+linux.
+
 #### scheduler/reuse
 
 ##### scheduler/reuse/001 — Two fires of a `new_tab_per_fire = false` task reuse one tab and re-deliver the prompt into the same pane (PRD #127 M2.2).

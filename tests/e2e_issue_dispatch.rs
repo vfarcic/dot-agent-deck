@@ -1181,3 +1181,109 @@ fn dispatch_010_inert_when_flag_off() {
         "flag OFF: the deck must surface a one-line notice referencing 'experimental' and how to enable it"
     );
 }
+
+/// Scenario: Dispatch one open issue so its worktree exists, then arm the stub so
+/// `gh pr list --head agent/issue-7` ERRORS, and fire again. Because a present
+/// worktree is the primary idempotency signal, the second fire must short-circuit
+/// to a SKIP and return BEFORE consulting the open-PR check — so the simulated
+/// `gh` error never runs and never surfaces as a per-issue failure. Assert the
+/// issue is reported SKIPPED (not FAILED), with no duplicate spawn and the
+/// worktree/clone preserved (regression guard for the PRD #120 / Greptile P1
+/// short-circuit fix, commit 212bc73).
+#[spec("scheduler/dispatch/012")]
+#[test]
+fn dispatch_012_worktree_present_skips_without_pr_check() {
+    let stub = GhStub::new();
+    let repo = "acme/widgets";
+    stub.add_repo(repo, true);
+    stub.set_issues(repo, &[7]);
+
+    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+
+    let toml = dispatch_task(
+        "dispatch-task",
+        &work_str,
+        "ISSUEDISPATCH-{{issue_number}}",
+        repo,
+        5,
+    );
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![
+        ("PATH", path.as_str()),
+        ("GHSTUB_DIR", ghdir.as_str()),
+        // PRD #120 ships issue_dispatch behind the experimental flag; turn it ON
+        // so the dispatch flow runs once the activation gate lands.
+        ("DOT_AGENT_DECK_EXPERIMENTAL", "1"),
+    ];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+
+    let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
+
+    // First fire (no fail marker yet): issue 7 dispatches normally, so its
+    // worktree and one orchestrator exist — the precondition for the short-circuit.
+    daemon.run_now("dispatch-task").expect("run-now (first)");
+    assert!(
+        common::wait_for_path(&paths.worktree_dir, W),
+        "the first fire must create the issue-7 worktree"
+    );
+    assert!(
+        daemon
+            .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), W)
+            .is_some(),
+        "the first fire must spawn an orchestrator agent for issue 7"
+    );
+    assert_eq!(
+        count_orchestrators(&daemon),
+        1,
+        "exactly one dispatch after the first fire"
+    );
+
+    // Arm the hazard: from now on `gh pr list --head agent/issue-7` exits
+    // non-zero. With the OLD code this transient error — reached because the PR
+    // check ran unconditionally — turned the worktree-present SKIP into a
+    // spurious IssueDispatchFailed. The fix short-circuits before the check.
+    stub.fail_pr(repo, 7);
+
+    // Second fire: the worktree already exists → primary signal → SKIP without
+    // ever calling `issue_has_open_pr`.
+    daemon.run_now("dispatch-task").expect("run-now (second)");
+
+    // No duplicate spawn / re-creation: the orchestrator count must NOT grow.
+    let grew = common::wait_until(Duration::from_secs(5), || count_orchestrators(&daemon) > 1);
+    assert!(
+        !grew,
+        "a worktree-present second fire must NOT re-dispatch or re-spawn issue 7"
+    );
+
+    // The present worktree must short-circuit to an IssueDispatchSkipped notice.
+    // (With the OLD code the PR-check error fires first and no skip is surfaced,
+    // so this wait would time out — making the test RED against the regression.)
+    let skipped = common::wait_until(Duration::from_secs(10), || {
+        daemon.stderr_contains("already-claimed issue #7")
+    });
+    assert!(
+        skipped,
+        "the present worktree must short-circuit to a SKIP (IssueDispatchSkipped) for issue 7"
+    );
+
+    // ...and because the PR check is never reached, the simulated `gh pr list`
+    // error must NEVER surface as a per-issue failure for issue 7.
+    assert!(
+        !daemon.stderr_contains("issue #7 of acme/widgets failed"),
+        "the worktree-present skip must short-circuit before issue_has_open_pr, so the simulated gh pr list error must NOT surface as IssueDispatchFailed"
+    );
+
+    // The existing worktree and clone are preserved (no re-creation, no re-clone).
+    assert!(
+        paths.worktree_dir.is_dir(),
+        "the existing issue-7 worktree must be preserved"
+    );
+    assert!(
+        paths.clone_dir.is_dir(),
+        "the clone must be preserved (no re-clone)"
+    );
+}
