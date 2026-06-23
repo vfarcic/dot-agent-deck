@@ -148,9 +148,9 @@ The user (PRD owner) does final pre-PR sign-off per `feedback_validate_pre_pr.md
 ## References
 
 - `.dot-agent-deck.toml:18-44` — this repo's orchestrator role definition (the failure mode's primary subject)
-- `src/hook.rs:84-101` — Claude Code hook event type mapping (current `PreCompact` / `PostCompact` handling)
+- `src/hook.rs:84-101` — Claude Code hook event type mapping (`PreCompact` handling; the `PostCompact` arm is dead — Claude Code never emits it, see `## Solution`)
 - `src/hook.rs:177-199` — OpenCode hook event type mapping (no compaction event mapped today)
-- `src/hooks_manage.rs:5-16` — Claude Code hook auto-install list (`PostCompact` is **not** in this list today)
+- `src/hooks_manage.rs:5-16` — Claude Code hook auto-install list (`PreCompact` only; `PostCompact` is not a real Claude Code event, so it is correctly absent — see `## Solution`)
 - `src/opencode_manage.rs` — OpenCode plugin auto-install path
 - `assets/roles.toml` — embedded role library (worker roles only; orchestrator is project-defined)
 - `assets/config_gen_prompt.md` — config-gen prompt that produces orchestrator `prompt_template`s
