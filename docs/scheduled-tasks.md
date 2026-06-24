@@ -192,9 +192,9 @@ The daemon also auto-exits after a short idle window when there are no clients a
 
 ## Dispatching agents onto open GitHub issues (`issue_dispatch`)
 
-> **Experimental — off by default**
+> **The task type itself is always available; only the guided creation UI is experimental.**
 >
-> This task type ships behind the `experimental` feature flag while it is being road-tested, so a normal install ignores it. To turn it on, set `experimental = true` under a `[features]` table in your `.dot-agent-deck.toml`, or launch with `DOT_AGENT_DECK_EXPERIMENTAL=1` (the environment variable wins over the file). With the flag **off**, an `issue_dispatch` schedule still loads but stays **inert** — it never fires — and the deck surfaces a one-line notice telling you to enable the flag. Everything below applies once the flag is on.
+> A configured `issue_dispatch` task **always runs** — once the `[scheduled_tasks.issue_dispatch]` sub-table below is present (whether you hand-write it or author it with the CLI), the daemon fires it on schedule with no flag required. What *is* gated behind the `experimental` feature flag is the in-deck **guided `schedule: issues` authoring option** in the new-pane dialog (a convenience for building one of these tasks conversationally). To enable that option, set `experimental = true` under a `[features]` table in your `.dot-agent-deck.toml`, or launch with `DOT_AGENT_DECK_EXPERIMENTAL=1` (the environment variable wins over the file). Everything below describes the task type, which works regardless of the flag.
 
 The examples so far run **one** prompt in **one** directory per fire. An **`issue_dispatch`** task is a specialized variant that, on each fire, looks at the **open GitHub issues of one repo** and spins up an agent **per issue** — so *"every weekday at 09:00, pull up to five open issues from `vfarcic/dot-ai` and start an agent on each"* becomes a single schedule instead of a morning of manual cloning, worktree-making, and prompt-pasting.
 
@@ -218,6 +218,21 @@ max_per_run = 5                       # hard cap on how many issues a single fir
 > **`command` is not used here**
 >
 > Unlike a plain scheduled task, an `issue_dispatch` task does **not** need a `command`. The per-issue agent command is resolved at fire time: if the cloned repo defines an `[[orchestrations]]` block the dispatch opens an **orchestration tab** (the orchestration's role commands win); otherwise it opens a **single-agent card** running your [`default_command`](configuration.md#default-command) (which falls back to `claude` when unset).
+
+Rather than hand-write the sub-table, you can author the same task with the validated CLI — pass `--repo` (and the optional `--max-per-run` / `--label` / `--query`) and omit `--command`:
+
+```bash
+dot-agent-deck schedule add \
+  --repo vfarcic/dot-ai \
+  --max-per-run 5 \
+  --name "Issues vfarcic/dot-ai" \
+  --cron "0 9 * * MON-FRI" \
+  --working-dir ~/dispatch \
+  --prompt "Work on issue {{issue_number}}" \
+  --label agent-eligible      # optional
+```
+
+A malformed `--repo` (not an `owner/name` slug) is rejected before anything is written. The CLI validates, writes the global config atomically, and triggers a live daemon reload — exactly as for a plain task.
 
 ### What a fire does, issue by issue
 

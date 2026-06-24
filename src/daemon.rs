@@ -704,22 +704,13 @@ fn make_schedule_callback(
             let task_command = task_command.clone();
             Box::pin(async move {
                 let notifier = crate::scheduler::StderrNotifier;
-                // PRD #120 LATE DECISION (2026-06-22): issue_dispatch ships behind
-                // the `experimental` flag. Read it AT FIRE TIME (not captured at
-                // registration) so a live toggle takes effect. Flag OFF → the task
-                // is inert (no clone / worktree / spawn); surface a one-line notice
-                // through the same notifier the other IssueDispatch* events use,
-                // then return. Config parsing stays flag-free — only activation is
-                // gated. (#127's non-issue_dispatch spawn path below is untouched.)
-                if !crate::features::issue_dispatch_enabled() {
-                    crate::scheduler::Notifier::notify(
-                        &notifier,
-                        crate::scheduler::NotifyEvent::IssueDispatchGatedOff {
-                            task: task_name.clone(),
-                        },
-                    );
-                    return;
-                }
+                // PRD #120 (flag redesign 2026-06-24): a configured `issue_dispatch`
+                // task runs UNCONDITIONALLY — the `experimental` flag no longer gates
+                // the dispatch behavior, only the new-pane modal creation option
+                // (a render-seam presentation switch; see `features::show_*`). The
+                // task-type discriminator is purely the presence of the
+                // `issue_dispatch` sub-table. (#127's non-issue_dispatch spawn path
+                // below is untouched.)
                 let default_command = task_command.or_else(|| {
                     let dc = crate::config::DashboardConfig::load().default_command;
                     let dc = dc.trim().to_string();

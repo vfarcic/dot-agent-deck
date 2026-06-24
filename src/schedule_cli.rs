@@ -19,7 +19,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::config::{ScheduledTask, expand_path};
+use crate::config::{IssueDispatchConfig, ScheduledTask, expand_path};
 use crate::scheduler::validate_cron;
 
 /// Parsed fields for `schedule add`.
@@ -31,6 +31,12 @@ pub struct AddArgs {
     pub prompt: String,
     pub new_tab_per_fire: bool,
     pub enabled: bool,
+    /// PRD #120: when present, this `schedule add` authors an ISSUE-DISPATCH
+    /// task — it writes a `[scheduled_tasks.issue_dispatch]` sub-table and the
+    /// `command` requirement is relaxed (the per-issue command comes from each
+    /// cloned repo's config / the global `default_command`). `None` is the
+    /// ordinary #127 single-spawn task.
+    pub issue_dispatch: Option<IssueDispatchConfig>,
 }
 
 /// Parsed fields for `schedule update`. Every field except `name` is optional;
@@ -50,19 +56,34 @@ pub struct UpdateArgs {
 /// Append a new task. Errors if the cron is malformed or a task with the same
 /// name already exists (use `update` to change one).
 pub fn add(tasks: &mut Vec<ScheduledTask>, args: AddArgs) -> Result<(), String> {
-    // PRD #127 follow-up (USER DECISION): a scheduled task's `command` is now
-    // REQUIRED — there is no silent `$SHELL` fallback, because a bare shell
-    // can't act on the scheduled prompt. `schedule update` deliberately does
-    // NOT re-require it (a stored task already has one).
-    match &args.command {
-        Some(cmd) if !cmd.trim().is_empty() => {}
-        _ => {
-            return Err(
-                "--command is required: a scheduled task needs an agent command \
-                 (e.g. claude) to act on its prompt"
-                    .to_string(),
-            );
+    // PRD #120: an issue-dispatch task (`--repo` present) needs no `--command`
+    // — the per-issue agent command comes from each cloned repo's config / the
+    // global `default_command`. For an ordinary #127 single-spawn task `command`
+    // is still REQUIRED (USER DECISION): there is no silent `$SHELL` fallback,
+    // because a bare shell can't act on the scheduled prompt. `schedule update`
+    // deliberately does NOT re-require it (a stored task already has one).
+    if args.issue_dispatch.is_none() {
+        match &args.command {
+            Some(cmd) if !cmd.trim().is_empty() => {}
+            _ => {
+                return Err(
+                    "--command is required: a scheduled task needs an agent command \
+                     (e.g. claude) to act on its prompt"
+                        .to_string(),
+                );
+            }
         }
+    }
+    // PRD #120: validate the issue-dispatch repo/label/query through the same
+    // strict `owner/name`-slug check the loader and the audit fix use, so a
+    // malformed `--repo` is rejected at write time (before any file write)
+    // rather than producing a task the daemon would reject at load.
+    if let Some(cfg) = &args.issue_dispatch {
+        crate::issue_dispatch::validate_issue_dispatch_config(
+            &cfg.repo,
+            cfg.label.as_deref(),
+            cfg.query.as_deref(),
+        )?;
     }
     validate_cron(&args.cron).map_err(|e| format!("invalid cron expression: {e}"))?;
     if tasks.iter().any(|t| t.name == args.name) {
@@ -79,9 +100,7 @@ pub fn add(tasks: &mut Vec<ScheduledTask>, args: AddArgs) -> Result<(), String> 
         prompt: args.prompt,
         new_tab_per_fire: args.new_tab_per_fire,
         enabled: args.enabled,
-        // PRD #120 issue-dispatch tasks are authored by a separate door; the
-        // #127 `schedule add` CLI only writes single-spawn tasks.
-        issue_dispatch: None,
+        issue_dispatch: args.issue_dispatch,
     });
     Ok(())
 }
@@ -267,6 +286,8 @@ mod tests {
             prompt: "hi".to_string(),
             new_tab_per_fire: false,
             enabled: true,
+            // PRD #120: ordinary single-spawn task by default.
+            issue_dispatch: None,
         }
     }
 
@@ -315,6 +336,98 @@ mod tests {
         add(&mut tasks, sample_add("dup", "0 9 * * *")).unwrap();
         let err = add(&mut tasks, sample_add("dup", "0 9 * * *")).unwrap_err();
         assert!(err.contains("already exists"), "got: {err}");
+    }
+
+    fn sample_issue_dispatch_add(name: &str, repo: &str) -> AddArgs {
+        AddArgs {
+            name: name.to_string(),
+            cron: "0 9 * * *".to_string(),
+            working_dir: "/tmp".to_string(),
+            // PRD #120: an issue-dispatch task carries NO --command.
+            command: None,
+            prompt: "fix {{issue_number}}".to_string(),
+            new_tab_per_fire: false,
+            enabled: true,
+            issue_dispatch: Some(IssueDispatchConfig {
+                repo: repo.to_string(),
+                max_per_run: 2,
+                label: Some("agent-eligible".to_string()),
+                query: Some("is:open label:bug".to_string()),
+            }),
+        }
+    }
+
+    // scheduler/cli/004 (arg→config mapping) — an issue-dispatch `add` needs NO
+    // --command, appends a task carrying the `issue_dispatch` sub-table, and the
+    // serialized TOML round-trips every field back into an `IssueDispatchConfig`.
+    #[test]
+    fn add_issue_dispatch_without_command_round_trips() {
+        let mut tasks = Vec::new();
+        add(
+            &mut tasks,
+            sample_issue_dispatch_add("issues-task", "acme/widgets"),
+        )
+        .expect("issue-dispatch add (no --command) should succeed");
+        assert_eq!(tasks.len(), 1);
+        let disp = tasks[0]
+            .issue_dispatch
+            .as_ref()
+            .expect("issue_dispatch sub-table present");
+        assert_eq!(disp.repo, "acme/widgets");
+        assert_eq!(disp.max_per_run, 2);
+        assert_eq!(disp.label.as_deref(), Some("agent-eligible"));
+        assert_eq!(disp.query.as_deref(), Some("is:open label:bug"));
+
+        // The serialized form carries the sub-table and round-trips with no
+        // load errors — the same contract the CLI e2e (scheduler/cli/004) checks.
+        let doc = SchedulesDoc {
+            scheduled_tasks: &tasks,
+        };
+        let toml = toml::to_string_pretty(&doc).unwrap();
+        assert!(
+            toml.contains("[scheduled_tasks.issue_dispatch]"),
+            "serialized TOML must carry the issue_dispatch sub-table, got:\n{toml}"
+        );
+        let reloaded = crate::config::LoadedSchedules::parse(&toml);
+        assert!(reloaded.errors.is_empty(), "errors: {:?}", reloaded.errors);
+        assert_eq!(reloaded.tasks.len(), 1);
+        assert!(reloaded.tasks[0].issue_dispatch.is_some());
+    }
+
+    // scheduler/cli/004 (repo validation) — a malformed `--repo` (not an
+    // `owner/name` slug) is rejected before any write, with a clear message that
+    // names `repo` and the `owner/name` form.
+    #[test]
+    fn add_issue_dispatch_rejects_malformed_repo() {
+        for bad in ["not-a-valid-slug", "a/b/c", "owner/", "/name", "-x/y"] {
+            let mut tasks = Vec::new();
+            let err = add(&mut tasks, sample_issue_dispatch_add("bad", bad)).unwrap_err();
+            let lowered = err.to_lowercase();
+            assert!(
+                lowered.contains("repo") && lowered.contains("owner/name"),
+                "error must name repo + owner/name slug, got: {err} (for {bad:?})"
+            );
+            assert!(
+                tasks.is_empty(),
+                "no task should be added on a malformed repo (for {bad:?})"
+            );
+        }
+    }
+
+    // PRD #120 — a malformed `--label` / `--query` (leading `-`, a `gh` flag
+    // injection vector) is rejected at write time too.
+    #[test]
+    fn add_issue_dispatch_rejects_dash_label_or_query() {
+        let mut tasks = Vec::new();
+        let mut args = sample_issue_dispatch_add("dash-label", "acme/widgets");
+        args.issue_dispatch = Some(IssueDispatchConfig {
+            repo: "acme/widgets".to_string(),
+            max_per_run: 1,
+            label: Some("-rf".to_string()),
+            query: None,
+        });
+        assert!(add(&mut tasks, args).is_err());
+        assert!(tasks.is_empty());
     }
 
     // scheduler/cli/001 (rename rejection) — `update` keys by name and there is

@@ -95,12 +95,6 @@ pub enum NotifyEvent {
         repo: String,
         message: String,
     },
-    /// PRD #120 LATE DECISION (2026-06-22): a configured `issue_dispatch` task
-    /// fired while the `experimental` feature flag is OFF, so the dispatch flow
-    /// is gated off (no clone / worktree / spawn). The task is inert; this
-    /// surfaces a one-line notice telling the user the feature is experimental
-    /// and how to enable it.
-    IssueDispatchGatedOff { task: String },
 }
 
 /// Default [`Notifier`] that logs to stderr. Stand-in until the PRD #126
@@ -162,13 +156,6 @@ impl Notifier for StderrNotifier {
                 message,
             } => {
                 eprintln!("[scheduler] task {task:?}: repo {repo} dispatch error: {message}");
-            }
-            NotifyEvent::IssueDispatchGatedOff { task } => {
-                eprintln!(
-                    "[scheduler] task {task:?}: issue_dispatch is experimental and is gated off; \
-                     set [features] experimental = true in .dot-agent-deck.toml \
-                     (or DOT_AGENT_DECK_EXPERIMENTAL=1) to enable it"
-                );
             }
         }
     }

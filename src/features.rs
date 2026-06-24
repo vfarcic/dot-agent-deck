@@ -86,15 +86,15 @@ pub fn show_experimental_footer() -> bool {
     experimental_enabled()
 }
 
-/// Production wrapper for scheduled GitHub issue-dispatch (PRD #120, LATE
-/// DECISION 2026-06-22). One wrapper per feature (CLAUDE.md #9) so
-/// `grep issue_dispatch_enabled` finds the single gate at graduation. Unlike
-/// the other wrappers this gates a daemon *activation* seam rather than a TUI
-/// render — issue-dispatch has no user-visible surface, so the documented
-/// behavior gate lives in `make_schedule_callback` (read at fire time, not
-/// captured at registration, so a live toggle takes effect). Config parsing
-/// stays flag-free; only the dispatch flow's activation is gated.
-pub fn issue_dispatch_enabled() -> bool {
+/// Production wrapper for the scheduled GitHub issue-dispatch CREATION UX
+/// (PRD #120, flag redesign 2026-06-24). One wrapper per feature (CLAUDE.md #9)
+/// so `grep show_issue_dispatch_authoring` finds the single gate at graduation.
+/// This is a *presentation* switch (rule-9-proper): it gates ONLY the new-pane
+/// Mode-cycler `schedule: issues` authoring option (a render/input seam in
+/// `src/ui.rs`). It does NOT gate the dispatch behavior — a configured
+/// `issue_dispatch` task runs unconditionally — nor config parsing nor the
+/// `schedule add --repo` CLI; those are flag-free.
+pub fn show_issue_dispatch_authoring() -> bool {
     experimental_enabled()
 }
 
