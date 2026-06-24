@@ -31,6 +31,13 @@ thiserror = "2"
 # — setsid(2), flock(2), getuid(2), and the O_NOFOLLOW daemon-log open all go
 # through libc, the same as the binary's daemon-spawn path.
 libc = "0.2"
+# PRD #176: the GUI navigates with the SAME shortcuts as the TUI, resolved from
+# the shared keybinding model (honoring the user's keybindings.toml) rather than
+# a hardcoded JS copy. crossterm supplies the KeyCode/KeyModifiers types the
+# bindings carry; the projection into DOM-shaped chords for the webview is in
+# `keys.rs`.
+keybindings = { path = "../../crates/keybindings" }
+crossterm = "0.28"
 
 [dev-dependencies]
 tempfile = "3"

@@ -24,8 +24,9 @@ use std::sync::Mutex;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use dad_gui_core::{
-    AgentRecord, ConnectionState, ResizeHandle, TabMembership, attach_socket_path, attach_stream,
-    connect_or_autostart, list_agents, resize_channel, run_resize_worker,
+    AgentRecord, ConnectionState, KeyBinding, ResizeHandle, TabMembership, attach_socket_path,
+    attach_stream, connect_or_autostart, list_agents, nav_keybindings, resize_channel,
+    run_resize_worker,
 };
 use serde::Serialize;
 use tauri::async_runtime::JoinHandle;
@@ -229,6 +230,15 @@ async fn reconnect(app: AppHandle) {
     bootstrap_connection(app).await;
 }
 
+/// M2.1: the GUI navigation keybindings, resolved from the shared `keybindings`
+/// crate (the user's `keybindings.toml` + identical defaults) so the webview's
+/// command-mode shortcuts match the TUI's. The frontend matches `KeyboardEvent`s
+/// against this table; remapping a key in the config moves both front-ends.
+#[tauri::command]
+fn keybindings() -> Vec<KeyBinding> {
+    nav_keybindings()
+}
+
 /// M1.3: list the agents the daemon is managing so the webview can pick one to
 /// attach a terminal to.
 #[tauri::command]
@@ -388,6 +398,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             connection_state,
             reconnect,
+            keybindings,
             agents,
             attach,
             terminal_input,

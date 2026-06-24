@@ -29,6 +29,7 @@
 mod agent;
 mod client;
 mod daemon;
+mod keys;
 
 pub use agent::{
     AgentStream, AgentStreamReader, AgentStreamWriter, ClientError, ResizeHandle, attach_stream,
@@ -39,6 +40,10 @@ pub use client::{
     connect_and_handshake, connect_or_autostart, run_bridge,
 };
 pub use daemon::{DAEMON_BIN_ENV, EnsureDaemonError, ensure_daemon};
+
+/// The GUI navigation keybindings, projected from the shared `keybindings`
+/// crate so the webview resolves the SAME shortcuts as the TUI (PRD #176).
+pub use keys::{KeyBinding, nav_keybindings};
 
 /// The per-agent snapshot the daemon echoes over `list-agents`, re-exported so
 /// the Tauri shell names the same wire type the core returns from
