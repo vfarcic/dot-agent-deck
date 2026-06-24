@@ -297,6 +297,13 @@ pub struct Daemon {
     /// handler so a reloaded task keeps reusing its tab. Wiped on restart
     /// (not persisted) — the first post-restart fire spawns fresh.
     pub reuse_registry: crate::spawn::ReuseRegistry,
+    /// PRD #120 M2.4: in-memory map of dispatched issue-agent id → its per-issue
+    /// worktree. The issue-dispatch fire flow records each spawned pane here;
+    /// the attach server's `StopAgent` handler consults it on close so the
+    /// worktree is `git worktree remove`d (the clone is preserved). Shared
+    /// between the scheduler callback factory and the attach server; wiped on
+    /// restart (the worktree-exists idempotency signal reclaims entries).
+    pub worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
 }
 
 impl Daemon {
@@ -318,6 +325,7 @@ impl Daemon {
             lock_dir_override: None,
             scheduler: Arc::new(Scheduler::with_stderr_notifier()),
             reuse_registry: crate::spawn::new_reuse_registry(),
+            worktree_registry: crate::issue_dispatch_run::new_worktree_registry(),
         }
     }
 
@@ -342,6 +350,7 @@ impl Daemon {
             lock_dir_override: None,
             scheduler: Arc::new(Scheduler::with_stderr_notifier()),
             reuse_registry: crate::spawn::new_reuse_registry(),
+            worktree_registry: crate::issue_dispatch_run::new_worktree_registry(),
         }
     }
 
@@ -446,6 +455,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     let idle_shutdown = daemon.idle_shutdown;
     let scheduler = daemon.scheduler;
     let reuse_registry = daemon.reuse_registry;
+    let worktree_registry = daemon.worktree_registry;
 
     // PRD #127 M1.3/M1.4: load the global `schedules.toml` and register each
     // enabled task before the idle monitor starts, so a registered schedule is
@@ -461,6 +471,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
             schedule_callback_factory(
                 pty_registry.clone(),
                 reuse_registry.clone(),
+                worktree_registry.clone(),
                 event_tx.clone(),
             ),
         );
@@ -564,6 +575,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         let attach_shutdown = shutdown.clone();
         let attach_scheduler = scheduler.clone();
         let attach_reuse = reuse_registry.clone();
+        let attach_worktrees = worktree_registry.clone();
         Some(tokio::spawn(async move {
             if let Err(e) = crate::daemon_protocol::serve_attach_with_counter(
                 listener,
@@ -574,6 +586,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
                 Some(attach_shutdown),
                 attach_scheduler,
                 attach_reuse,
+                attach_worktrees,
             )
             .await
             {
@@ -638,9 +651,18 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
 pub(crate) fn schedule_callback_factory(
     registry: Arc<AgentPtyRegistry>,
     reuse: crate::spawn::ReuseRegistry,
+    worktrees: crate::issue_dispatch_run::WorktreeRegistry,
     event_tx: broadcast::Sender<BroadcastMsg>,
 ) -> impl FnMut(&crate::config::ScheduledTask) -> crate::scheduler::Callback {
-    move |task| make_schedule_callback(task, registry.clone(), reuse.clone(), event_tx.clone())
+    move |task| {
+        make_schedule_callback(
+            task,
+            registry.clone(),
+            reuse.clone(),
+            worktrees.clone(),
+            event_tx.clone(),
+        )
+    }
 }
 
 /// One task's firing callback: rebuild the [`crate::spawn::SpawnRequest`] from
@@ -655,8 +677,61 @@ fn make_schedule_callback(
     task: &crate::config::ScheduledTask,
     registry: Arc<AgentPtyRegistry>,
     reuse: crate::spawn::ReuseRegistry,
+    worktrees: crate::issue_dispatch_run::WorktreeRegistry,
     event_tx: broadcast::Sender<BroadcastMsg>,
 ) -> crate::scheduler::Callback {
+    // PRD #120: an `issue_dispatch` task runs the GitHub-dispatch FLOW instead of
+    // the single #127 spawn — enumerate the repo's open issues and dispatch one
+    // agent per issue into a per-issue worktree (composing the existing spawn
+    // primitive + the pure `crate::issue_dispatch` helpers). The presence of the
+    // `issue_dispatch` sub-table is the task-type discriminator.
+    if let Some(cfg) = task.issue_dispatch.clone() {
+        let task_name = task.name.clone();
+        let working_dir = task.working_dir.clone();
+        let prompt_template = task.prompt.clone();
+        // An explicit `command` on the task wins; otherwise a single-agent
+        // dispatch (a clone with no orchestration config) falls back to the
+        // global `default_command`. Orchestration clones ignore this entirely.
+        let task_command = task.command.clone();
+        return Arc::new(move || {
+            let registry = registry.clone();
+            let worktrees = worktrees.clone();
+            let event_tx = event_tx.clone();
+            let task_name = task_name.clone();
+            let working_dir = working_dir.clone();
+            let prompt_template = prompt_template.clone();
+            let cfg = cfg.clone();
+            let task_command = task_command.clone();
+            Box::pin(async move {
+                let notifier = crate::scheduler::StderrNotifier;
+                // PRD #120 (flag redesign 2026-06-24): a configured `issue_dispatch`
+                // task runs UNCONDITIONALLY — the `experimental` flag no longer gates
+                // the dispatch behavior, only the new-pane modal creation option
+                // (a render-seam presentation switch; see `features::show_*`). The
+                // task-type discriminator is purely the presence of the
+                // `issue_dispatch` sub-table. (#127's non-issue_dispatch spawn path
+                // below is untouched.)
+                let default_command = task_command.or_else(|| {
+                    let dc = crate::config::DashboardConfig::load().default_command;
+                    let dc = dc.trim().to_string();
+                    if dc.is_empty() { None } else { Some(dc) }
+                });
+                crate::issue_dispatch_run::run_issue_dispatch(
+                    &task_name,
+                    &working_dir,
+                    &prompt_template,
+                    &cfg,
+                    default_command,
+                    &registry,
+                    &worktrees,
+                    &notifier,
+                    Some(&event_tx),
+                )
+                .await;
+            })
+        });
+    }
+
     let req = crate::spawn::SpawnRequest {
         task_name: task.name.clone(),
         working_dir: task.working_dir.clone(),

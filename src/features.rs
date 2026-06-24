@@ -86,6 +86,18 @@ pub fn show_experimental_footer() -> bool {
     experimental_enabled()
 }
 
+/// Production wrapper for the scheduled GitHub issue-dispatch CREATION UX
+/// (PRD #120, flag redesign 2026-06-24). One wrapper per feature (CLAUDE.md #9)
+/// so `grep show_issue_dispatch_authoring` finds the single gate at graduation.
+/// This is a *presentation* switch (rule-9-proper): it gates ONLY the new-pane
+/// Mode-cycler `schedule: issues` authoring option (a render/input seam in
+/// `src/ui.rs`). It does NOT gate the dispatch behavior — a configured
+/// `issue_dispatch` task runs unconditionally — nor config parsing nor the
+/// `schedule add --repo` CLI; those are flag-free.
+pub fn show_issue_dispatch_authoring() -> bool {
+    experimental_enabled()
+}
+
 /// Guards [`init_and_watch`] so the periodic watcher thread is spawned at
 /// most once per process (reviewer #4 / audit INFO-3): a second call is a
 /// no-op rather than leaking a duplicate poll thread.

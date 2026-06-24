@@ -552,6 +552,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the exact layout used to keep the chip visible (wrap vs. window/scroll); the visibility of the non-selected chips when the row overflows; the authoring hint text (covered by `prompt/new-pane/007`).
 - **Platform coverage:** mac+linux.
 
+##### prompt/new-pane/010 — The new-pane Mode cycler offers an experimental `schedule: issues` issue-dispatch authoring option only when the experimental flag is ON; it is hidden when OFF while the plain `[schedule]` option still shows (PRD #120).
+- **Layer:** L2 (no public L1 render seam for the dialog — same constraint as `prompt/new-pane/007`; the real TUI is driven via PTY keystrokes and asserted on the rendered vt100 grid).
+- **Agent:** none (drives Ctrl+n → dir-picker → new-pane form in two flag states).
+- **Asserts:** launched with `DOT_AGENT_DECK_EXPERIMENTAL=1`, opening the new-pane form shows a `schedule: issues` option on the Mode cycler alongside the existing `[schedule]` option; a control launch with no env var (flag OFF) renders the plain `[schedule]` option but NOT `schedule: issues`. RED until the option exists: today no flag state carries `schedule: issues`, so the experimental-ON grid never contains it.
+- **Does not assert:** the authoring seed delivered when the option is selected (covered by `scheduler/form/007`); the post-submit layout; the chip's exact position in the cycler.
+- **Platform coverage:** mac+linux.
+
 ### Focus / navigation
 
 #### focus/dashboard
@@ -1889,6 +1896,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the exact error wording (loose substring on "command" + "required"); validation of any other field; on-disk write effects.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/cli/004 — `dot-agent-deck schedule add` accepts the issue-dispatch flags (`--repo`/`--max-per-run`/`--label`/`--query`, `--command` optional) and writes a `[scheduled_tasks.issue_dispatch]` sub-table that round-trips + reloads (PRD #120).
+- **Layer:** L2.
+- **Agent:** none (runs the `schedule` CLI subprocess against a live `daemon serve`).
+- **Asserts:** running `schedule add --repo acme/widgets --max-per-run 2 --label … --query …` (plus name/cron/working-dir/prompt) WITHOUT `--command` succeeds; the global `schedules.toml` gains a `[scheduled_tasks.issue_dispatch]` sub-table whose repo/max_per_run/label/query round-trip back into an `IssueDispatchConfig` through the loader; the running daemon registers the task via the add-triggered reload; and a malformed `--repo` (not `owner/name`) exits non-zero with a clear error. RED until the flags exist: today `schedule add` has no `--repo`/`--max-per-run`/`--label`/`--query`, so clap rejects the unknown `--repo` and the add exits non-zero.
+- **Does not assert:** the dispatch flow on fire (covered by `scheduler/dispatch/*`); the exact malformed-repo wording (loose substring on "repo" + owner/name/slug).
+- **Platform coverage:** mac+linux.
+
 #### scheduler/spawn
 
 ##### scheduler/spawn/001 — A fire into a missing working_dir creates it (`mkdir -p`) then spawns; a fire into an uncreatable path surfaces a notification without crashing the daemon, and other tasks keep working (PRD #127 M2.1).
@@ -1925,6 +1939,95 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (run-now; observes PTY prompt echo + injects the agent's real `SessionStart` hook carrying the spawned pane's `pane_id` + registry `agent_id`).
 - **Asserts:** firing a `cat` task (no hook of its own) leaves the prompt UNDELIVERED for a window well past the old flat 300ms buffer while no matching `SessionStart` has been observed; once the real `SessionStart` hook (pane_id + agent_id) is injected, the prompt IS delivered (echoed by `cat`), well inside the 10s gate fallback so delivery is attributable to readiness, not the timeout.
 - **Does not assert:** the 10s fallback-on-timeout delivery path (a separate readiness facet); orchestration-tab delivery gating (covered structurally by spawn/002).
+- **Platform coverage:** mac+linux.
+
+#### scheduler/dispatch
+
+##### scheduler/dispatch/001 — Firing an `issue_dispatch` task clones the repo, creates a per-issue worktree on `agent/issue-<n>`, and spawns an agent into it with the substituted prompt (PRD #120 M2.1–M2.3).
+- **Layer:** L2 (headless `dot-agent-deck daemon serve` driven via the `RunNow` control message — no PTY/grid, same shape as `scheduler/spawn/*`). All GitHub access is isolated offline behind a stub `gh` on PATH (`issue list`/`pr list` → canned JSON; `repo clone` → `git clone` of a local one-commit fixture remote that carries a committed `.dot-agent-deck.toml`).
+- **Agent:** none (run-now; the fixture orchestration role runs `cat`, which echoes the delivered prompt).
+- **Asserts:** the repo is cloned to `<working_dir>/<name>`, the worktree appears at `<clone>/.worktrees/issue-7` with branch `agent/issue-7` (via `git`), and an `orchestrator`-role agent rooted at that worktree (`orchestration_cwd`) receives the substituted per-issue prompt (`ISSUEDISPATCH-7`, echoed by `cat`).
+- **Does not assert:** the single-agent-card branch (covered by `scheduler/dispatch/004`); fetch+pull refresh of an existing clone; the exact `gh` argv (covered by the pure-data `issue_dispatch` unit tests).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/002 — A second fire with no intervening close skips an issue whose worktree already exists: no re-clone error, no duplicate spawn, and the skip is surfaced (PRD #120 M2.2 idempotency, primary signal).
+- **Layer:** L2 (as `scheduler/dispatch/001`).
+- **Agent:** none (run-now; observes the registry orchestrator count + on-disk worktree/clone + daemon stderr).
+- **Asserts:** the first fire creates the issue-7 worktree and one orchestrator agent; a second fire leaves the worktree and clone in place, does NOT grow the orchestrator count beyond one (no duplicate spawn), and surfaces a skip for the already-claimed issue.
+- **Does not assert:** the open-PR secondary signal (covered by `scheduler/dispatch/003`); the exact skip-message wording (loose substring on the issue key / "skip").
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/003 — An issue whose `gh pr list` reports an open PR on `agent/issue-<n>` is skipped while a sibling issue with no PR dispatches (PRD #120 M2.2 idempotency, secondary signal).
+- **Layer:** L2 (as `scheduler/dispatch/001`; the stub `gh pr list --head agent/issue-7` returns a non-empty array, while issue 8 returns `[]`).
+- **Agent:** none (run-now; observes per-issue worktrees + orchestrator count).
+- **Asserts:** issue 8 (no PR) dispatches — worktree present, orchestrator agent running — proving the flow ran; issue 7 (open PR) is skipped — no `issue-7` worktree, and the run's orchestrator count is one.
+- **Does not assert:** parsing `Closes #n` from PR bodies (the check keys on the deterministic head branch only); the worktree-exists primary signal (covered by `scheduler/dispatch/002`).
+- **Note:** a control issue (8, no PR) is included so "the flow ran AND issue 7 was skipped" is observable from end-state alone.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/004 — A clone with an `[[orchestrations]]` block opens an orchestration tab (prompt to the `orchestrator` role); a clone without one opens a single-agent card (prompt delivered) — reached through the dispatch path (PRD #120 M2.3).
+- **Layer:** L2 (as `scheduler/dispatch/001`; two `issue_dispatch` tasks, one fixture remote with a committed `.dot-agent-deck.toml`, one without; `default_command = cat` via `DOT_AGENT_DECK_CONFIG` so the single-agent card runs `cat`).
+- **Agent:** none (run-now; observes `ListAgents` tab_membership + spawn cwd + PTY prompt echo).
+- **Asserts:** the orchestration clone spawns an `orchestrator`-role agent in its worktree and the substituted prompt (`ORCHDISP-11`) reaches it; the plain clone spawns a non-orchestration single-agent card whose cwd is its worktree and the substituted prompt (`PLAINDISP-22`) reaches it.
+- **Does not assert:** the clone/worktree/branch derivation (covered by `scheduler/dispatch/001`); the orchestration-vs-card branch outside the dispatch path (covered by `scheduler/spawn/002`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/005 — When `gh` returns more open issues than `max_per_run`, only the first N (in returned order) get worktrees + spawns; the rest are left untouched (PRD #120 M3.1 cap).
+- **Layer:** L2 (as `scheduler/dispatch/001`; the stub returns five issues while `max_per_run = 2`, so the flow's own cap — not the stub — bounds the run).
+- **Agent:** none (run-now; observes per-issue worktrees + orchestrator count).
+- **Asserts:** issues 1 and 2 are dispatched (worktrees present), issues 3–5 are left untouched (no worktrees), and exactly two orchestrator agents exist.
+- **Does not assert:** issue ordering/scoring beyond "returned order" (out of scope per the PRD); the label/query filters (pure-data `issue_dispatch` argv tests cover those).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/006 — Closing a dispatched tab removes its worktree from disk and `git worktree list` while preserving the clone (PRD #120 M2.4 tab-close → cleanup plumbing).
+- **Layer:** L2 (as `scheduler/dispatch/001`; close is driven via the `StopAgent` control message on the dispatched orchestrator).
+- **Agent:** none (run-now to dispatch; `StopAgent` to close; observes on-disk worktree/clone + `git worktree list`).
+- **Asserts:** after dispatch the issue worktree exists; after closing the tab the worktree is gone from disk and from `git worktree list`, while the clone directory remains.
+- **Does not assert:** the in-deck close gesture (`Ctrl+w`) — the daemon-side close→cleanup contract is exercised over the protocol; auto-restoration of dispatched tabs (out of scope per the PRD).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/007 — One issue's dispatch failing (a simulated `gh` error for that issue) does not abort the others, and the failure is surfaced as a notification, not swallowed (PRD #120 M3.2 per-issue resilience).
+- **Layer:** L2 (as `scheduler/dispatch/001`; the stub `gh pr list --head agent/issue-11` exits non-zero while issue 10 is healthy).
+- **Agent:** none (run-now; observes survivor worktrees + orchestrator count + daemon stderr).
+- **Asserts:** issue 10 still dispatches (worktree + orchestrator agent) despite issue 11 failing; issue 11 produces no worktree; and a failure referencing issue 11 is surfaced through the notifier (daemon stderr).
+- **Does not assert:** cross-repo fan-out resilience (one repo per task — removed from scope); the exact failure-message wording (loose substring on the issue 11 key).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/008 — An issue dispatched, then closed without a PR (worktree removed, branch left behind), is re-dispatched on a later fire: the worktree is re-created and an agent spawns again, with no failure surfaced (PRD #120 B1 — `worktree add` must tolerate the leftover `agent/issue-<n>` branch).
+- **Layer:** L2 (as `scheduler/dispatch/001`; first run-now to dispatch, `StopAgent` to close, second run-now while the stub still reports the issue open with no PR).
+- **Agent:** none (run-now ×2 + `StopAgent`; observes the re-created worktree, a re-spawned orchestrator, and daemon stderr).
+- **Asserts:** after close the worktree is gone but branch `agent/issue-7` survives; the second fire re-creates the issue-7 worktree and spawns the orchestrator again; no per-issue failure (`failed:` / "already exists") is surfaced.
+- **Does not assert:** the exact branch-reattach git mechanics (probe vs. retry-without-`-b`) — only the observable re-dispatch; behavior when an open PR exists (covered by `scheduler/dispatch/003`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/009 — Closing ONE role of a multi-role orchestration dispatch leaves the shared issue worktree on disk; only closing the LAST role removes it, clone preserved (PRD #120 S1 — refcount the worktree, remove on last close).
+- **Layer:** L2 (as `scheduler/dispatch/001`; the fixture remote commits a two-role `[[orchestrations]]` config — `orchestrator` + `reviewer`, both `cat` — so a dispatch opens two role panes sharing one `orchestration_cwd`).
+- **Agent:** none (run-now to dispatch; `StopAgent` per role; observes on-disk worktree + `git worktree list` + clone dir).
+- **Asserts:** both role panes spawn into the same issue worktree; closing the reviewer leaves the worktree present (disk + `git worktree list`); closing the orchestrator (last role) removes the worktree while the clone directory remains.
+- **Does not assert:** the refcount/registry internals (counted at spawn, decremented per close) — only the observable last-close-removes contract; the single-role close path (covered by `scheduler/dispatch/006`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/011 — A fired `issue_dispatch` task surfaces its per-issue card LIVE on an already-attached TUI — the user-visible showcase (and demo-reel clip) the headless `scheduler/dispatch/001-009` family can't observe (PRD #120 M2.3 live surfacing).
+- **Layer:** L2 PTY (the real `dot-agent-deck` binary in an isolated PTY via the `TuiDeck` harness, asserted on the rendered vt100 grid — same harness as `scheduler/live/*`, NOT the headless `daemon serve` of `scheduler/dispatch/001-009`). Composes the OFFLINE GitHub seam (stub `gh` on PATH: `issue list`/`pr list` → canned JSON, `repo clone` → `git clone` of a local one-commit fixture remote with NO `.dot-agent-deck.toml`) with the live-fire seam (`DOT_AGENT_DECK_SCHEDULES` loaded by the lazily-spawned daemon; fire via the `RunNow` control message over the deck's attach socket). The dispatch behavior is ungated, so the env carries no `DOT_AGENT_DECK_EXPERIMENTAL`; `default_command = cat` (via `DOT_AGENT_DECK_CONFIG`) makes the dispatched single-agent card a long-lived `cat`.
+- **Agent:** none (run-now; the dispatched single-agent card runs `cat`, no real LLM, no real GitHub).
+- **Asserts:** after the fire the daemon registers the dispatched agent under the schedule's friendly name `github-issues` (precondition), then a per-issue card surfaces LIVE on the rendered dashboard — its `Dir:` line shows the issue worktree basename `issue-7` (the per-issue identity) and its title shows the schedule name `github-issues`.
+- **Does not assert:** the clone/worktree/branch derivation or skip/dedup/cap/cleanup logic (covered by the headless `scheduler/dispatch/001-009`); the orchestration-tab dispatch path (NOT live-surfaced by `spawn` — rebuilt by the TUI's hydration path on reconnect, the #140 session-partitioning concern); prompt-echo delivery into the card.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/012 — A worktree-present second fire short-circuits to a SKIP BEFORE the open-PR check, so a transient `gh pr list` error on that issue never surfaces as a failure (PRD #120 / Greptile P1 regression guard — primary signal short-circuits the secondary, commit 212bc73).
+- **Layer:** L2 (as `scheduler/dispatch/001`; first run-now dispatches issue 7, then the stub is armed so `gh pr list --head agent/issue-7` exits non-zero, then a second run-now fires with the worktree already present).
+- **Agent:** none (run-now ×2; observes the orchestrator count + on-disk worktree/clone + daemon stderr).
+- **Asserts:** the second fire does NOT grow the orchestrator count (no duplicate spawn/re-creation), surfaces an `IssueDispatchSkipped` ("already-claimed issue #7") for the present worktree, does NOT surface an `IssueDispatchFailed` ("issue #7 … failed") despite the armed `gh pr list` error, and leaves the worktree and clone in place.
+- **Does not assert:** the worktree-absent path that DOES consult the open-PR signal and propagates a `gh` error as a failure (covered by `scheduler/dispatch/007`); the plain worktree-present skip without a PR-check hazard (covered by `scheduler/dispatch/002`); the exact skip/failure wording (loose substring on the issue-7 key).
+- **Note:** the fix is in current code, so this is GREEN as a regression guard, not RED-first; it pins that the primary (worktree-exists) signal short-circuits the secondary (open-PR) check, which `scheduler/dispatch/002` cannot catch because it never forces the PR check to error.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/dispatch/013 — A fired `issue_dispatch` task against an ORCHESTRATION repo drives the GENUINE `gh` → clone → per-issue worktree → real-agent path against LIVE GitHub, and the dispatched orchestration must surface LIVE as an orchestration TAB (with its orchestrator + worker role panes) on the already-attached TUI — the real-scenario multi-agent showcase (CLAUDE.md rule 4) a `cat`/stub stand-in can never prove (PRD #120). RED until the daemon live-surfaces a dispatched orchestration tab.
+- **Layer:** L2 PTY (the real `dot-agent-deck` binary in an isolated PTY via the `TuiDeck` harness, asserted on the rendered vt100 grid — same harness as `scheduler/dispatch/011`). REAL seams, no stand-ins: REAL `gh` on the normal PATH (no `gh` stub) really enumerates/PR-checks/clones against live GitHub, with `GITHUB_TOKEN` threaded through the scrubbed deck env so the daemon's `gh` inherits auth; the clone's `[[orchestrations]]` resolves to two FULLY INTERACTIVE `claude` role panes pinned to Haiku (`claude-haiku-4-5-20251001`, `--allowedTools Bash`, no `-p`); the freshly-built `dot-agent-deck` binary's dir is prepended to the deck→daemon→agents PATH (`with_env("PATH", …)` wins over the harness scrub) so the orchestrator's `dot-agent-deck delegate --to worker` resolves. The dispatch behavior is ungated, so the env carries no `DOT_AGENT_DECK_EXPERIMENTAL`; the fire is driven by `RunNow` over the attach socket.
+- **Fixture:** the permanent public repo `vfarcic/dot-agent-deck-tests` — a committed `DISPATCH_E2E_SENTINEL.md`, a `.dot-agent-deck.toml` with `[[orchestrations]] name = "issue-work"` (roles `orchestrator` (start) + `worker`, both Haiku `claude`; the orchestrator's `prompt_template` delegates the task to the worker), and a PERMANENT open issue #1 labelled `agent-dispatch-test`. The schedule filters on that label with `max_per_run = 1`, so ONLY issue #1 is enumerated (deterministic). Both role panes share the per-issue worktree cwd (pre-trusted in the per-test HOME so claude's first-run gates clear with no keystroke). Clone + worktree live under a `tempfile::tempdir()` removed on drop.
+- **Agent:** REAL Claude Code (Haiku) ×2 role panes, cheap interactive turns (<$0.05/run). Flaky-tolerant pre-PR tier (real LLM + real network) — run once, not looped (rule 4). Runtime-skipped (Decision 26) when the `claude` CLI/credentials or `GITHUB_TOKEN` are absent.
+- **Asserts:** after the fire the daemon registers the dispatched orchestration's role agents under the schedule name `github-issues` (precondition — proves the live clone + worktree + spawn happened); the dispatched ORCHESTRATION then surfaces LIVE as an orchestration TAB labelled `issue-work` (the fixture's `[[orchestrations]] name`) in the attached TUI's tab strip, with no reconnect/relaunch — RED today, because `spawn::spawn`'s orchestration branch does not call `surface_spawned_pane` and orchestration tabs are rebuilt only at hydration, so the role panes appear only as flat dashboard cards and no `issue-work` tab paints live. Best-effort (once GREEN, logged not gated): switching to the orchestration tab, the worker (delegated to by the orchestrator) lists the cloned repo's files including the committed sentinel `DISPATCH_E2E_SENTINEL.md`; and the fixture repo has no pushed `agent/issue-1` branch afterward (NO REMOTE WRITES).
+- **Does not assert:** the delegation chain / sentinel as a hard gate (logged best-effort — too LLM/timing-dependent); exact agent phrasing; the clone/worktree/branch derivation or skip/dedup/cap/cleanup logic (covered by the headless `scheduler/dispatch/001-009` and the deterministic-stub `scheduler/dispatch/011-012`); the single-agent live-surfacing path (covered by `scheduler/dispatch/011`).
 - **Platform coverage:** mac+linux.
 
 #### scheduler/reuse
@@ -2049,6 +2152,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** the shimmed `stub-repick-authoring` authoring agent (records spawn cwd + the gated-delivered seed).
 - **Asserts:** pressing `e` (Edit) opens the dir picker started at the row's `working_dir` (`ROWDIRALPHA`); going UP one level (`h`) and descending into the DIFFERENT sibling `PICKDIRBRAVO` (double-click, confirmed via its `INNERMARK` child) then confirming with Space, and submitting via `[Submit]`, spawns the seeded authoring agent whose recorded seed — once delivered through its `EDITPROMPTF3` prompt line (which follows the `working_dir:` line) — carries `PICKDIRBRAVO` but ZERO occurrences of the row's stale `ROWDIRALPHA`. RED today: the edit seed appends the row's `working_dir: .../ROWDIRALPHA` as a conflicting current value alongside the picked `working_dir DEFAULT: .../PICKDIRBRAVO`.
 - **Does not assert:** the unchanged-pick / pre-fill path (covered by `scheduler/form/003`); the in-`src` `build_schedule_authoring_mode` seed unit tests (the coder's); the Add path (covered by `scheduler/form/002`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/form/007 — Selecting the experimental `schedule: issues` Mode option seeds the authoring agent with ISSUE-DISPATCH instructions (calls `schedule add --repo …`, gathers `max_per_run`), distinct from the plain `schedule` seed (PRD #120).
+- **Layer:** L2 (drives the real new-pane dialog via PTY — the experimental issue-dispatch option lives on the Ctrl+n Mode cycler, not the mode-locked manager form, so this drives Ctrl+n directly; observed via a `stub-issue-authoring` recorder shim on disk that records the gated-delivered seed). `default_command = "stub-issue-authoring"`; the deck is launched with `DOT_AGENT_DECK_EXPERIMENTAL=1`.
+- **Agent:** the shimmed `stub-issue-authoring` authoring agent (records the gated-delivered seed).
+- **Asserts:** opening the new-pane form (Ctrl+n → Space confirms the dir) and cycling the Mode field to the `schedule: issues` option (waited on via the selection-dependent ` … — schedule: issues mode ` title), then submitting via `[Submit]`, spawns the seeded authoring agent whose recorded seed contains the issue-dispatch guidance `schedule add --repo` AND `max_per_run` — neither present in the plain `schedule` seed (which calls `schedule add --name`). RED today: no `schedule: issues` option exists, so cycling never lands on it and the `schedule: issues mode` title wait times out.
+- **Does not assert:** the flag-gated visibility of the option in the cycler (covered by `prompt/new-pane/010`); the CLI write the agent ultimately performs (covered by `scheduler/cli/004`); the full seed-prompt text (loose substring on the issue-dispatch-specific tokens); the plain `schedule` seed (covered by `scheduler/form/002`).
 - **Platform coverage:** mac+linux.
 
 #### scheduler/live

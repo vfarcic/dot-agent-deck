@@ -63,6 +63,38 @@ pub enum NotifyEvent {
     /// PRD #127 M2.1: a fire created/resolved its `working_dir` but the agent
     /// spawn itself failed. The fire is abandoned; other tasks keep running.
     SpawnFailed { task: String, message: String },
+    /// PRD #120 M1.3: an `issue_dispatch` task successfully dispatched one issue
+    /// (per-issue worktree created + agent spawned).
+    IssueDispatched {
+        task: String,
+        repo: String,
+        issue: u64,
+    },
+    /// PRD #120 M1.3/M2.2: an issue was skipped because it is already claimed —
+    /// its per-issue worktree exists, or an open PR already targets `branch`
+    /// (`agent/issue-<n>`).
+    IssueDispatchSkipped {
+        task: String,
+        repo: String,
+        issue: u64,
+        branch: String,
+    },
+    /// PRD #120 M3.2: dispatching ONE issue failed (clone/worktree/`gh` error).
+    /// The failing issue is abandoned; the rest of the run continues.
+    IssueDispatchFailed {
+        task: String,
+        repo: String,
+        issue: u64,
+        message: String,
+    },
+    /// PRD #120 M2.1/M3.2: a repo-level step (provision or issue enumeration)
+    /// failed. The whole fire for this repo is abandoned (one repo per task — no
+    /// cross-repo fan-out).
+    IssueDispatchRepoError {
+        task: String,
+        repo: String,
+        message: String,
+    },
 }
 
 /// Default [`Notifier`] that logs to stderr. Stand-in until the PRD #126
@@ -94,6 +126,36 @@ impl Notifier for StderrNotifier {
             }
             NotifyEvent::SpawnFailed { task, message } => {
                 eprintln!("[scheduler] task {task:?}: spawn failed: {message}");
+            }
+            NotifyEvent::IssueDispatched { task, repo, issue } => {
+                eprintln!(
+                    "[scheduler] task {task:?}: dispatched issue #{issue} of {repo} (agent/issue-{issue})"
+                );
+            }
+            NotifyEvent::IssueDispatchSkipped {
+                task,
+                repo,
+                issue,
+                branch,
+            } => {
+                eprintln!(
+                    "[scheduler] task {task:?}: skipping already-claimed issue #{issue} of {repo} ({branch})"
+                );
+            }
+            NotifyEvent::IssueDispatchFailed {
+                task,
+                repo,
+                issue,
+                message,
+            } => {
+                eprintln!("[scheduler] task {task:?}: issue #{issue} of {repo} failed: {message}");
+            }
+            NotifyEvent::IssueDispatchRepoError {
+                task,
+                repo,
+                message,
+            } => {
+                eprintln!("[scheduler] task {task:?}: repo {repo} dispatch error: {message}");
             }
         }
     }
@@ -195,6 +257,11 @@ struct FireFields {
     command: Option<String>,
     prompt: String,
     new_tab_per_fire: bool,
+    /// PRD #120: the issue-dispatch config (repo / cap / label / query). It is
+    /// fire-affecting too — an edit to e.g. the label filter must rebuild the
+    /// callback so the next fire enumerates the new set, exactly as a prompt
+    /// edit does. `None` for #127 single-spawn tasks.
+    issue_dispatch: Option<crate::config::IssueDispatchConfig>,
 }
 
 impl FireFields {
@@ -206,6 +273,7 @@ impl FireFields {
             command: task.command.clone(),
             prompt: task.prompt.clone(),
             new_tab_per_fire: task.new_tab_per_fire,
+            issue_dispatch: task.issue_dispatch.clone(),
         }
     }
 
@@ -220,6 +288,7 @@ impl FireFields {
             command: None,
             prompt: String::new(),
             new_tab_per_fire: false,
+            issue_dispatch: None,
         }
     }
 }
@@ -769,6 +838,7 @@ mod tests {
             prompt: "p".to_string(),
             new_tab_per_fire: false,
             enabled,
+            issue_dispatch: None,
         };
 
         // Initial load: two tasks.
@@ -862,6 +932,7 @@ mod tests {
             prompt: "p".to_string(),
             new_tab_per_fire: false,
             enabled: true,
+            issue_dispatch: None,
         };
         let noop: Callback = Arc::new(|| Box::pin(async {}));
         scheduler.reload_apply(&[desired], |_| noop.clone());

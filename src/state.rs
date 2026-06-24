@@ -9,11 +9,18 @@ use crate::agent_pty::AgentPtyRegistry;
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
     AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
-    WorkDoneSignal,
+    OrchestrationSurface, WorkDoneSignal,
 };
 use crate::project_config::{OrchestrationRoleConfig, load_project_config};
 
 const MAX_RECENT_EVENTS: usize = 50;
+/// PRD #120 L1: cap on [`AppState::pending_orchestration_surfaces`]. The render
+/// loop drains the queue one surface per frame, so a daemon flooding surface
+/// events faster than it drains can't grow the Vec unbounded — beyond this the
+/// OLDEST queued surface is dropped (the newer dispatch is the more relevant one
+/// to build). Sized well above any realistic concurrent-dispatch burst (a fire's
+/// `max_per_run` issue dispatches is single/low-double digits).
+const MAX_PENDING_ORCHESTRATION_SURFACES: usize = 64;
 /// Maximum number of first-prompt entries retained per session. The live-side
 /// cap in `apply_event` and the wire-boundary clamp in
 /// [`crate::daemon_client`] (which re-clamps a hostile/oversized daemon
@@ -196,6 +203,18 @@ pub struct AppState {
     /// share that cwd, so within-orchestration scoping still finds all
     /// the right panes.
     pub pane_orchestration_map: HashMap<String, (String, String)>,
+    /// PRD #120: orchestrations the daemon spawned WHILE this TUI is attached
+    /// (the issue-dispatch path), queued for the TUI event loop to build into
+    /// live tabs. The daemon publishes a
+    /// [`BroadcastMsg::OrchestrationSurface`]; the event subscriber records it
+    /// here (it has no access to the `TabManager` / pane controller), and the
+    /// render loop drains ONE entry per frame (M2/S3: each build does bounded
+    /// per-role attach round-trips, so one-per-frame keeps a burst from freezing
+    /// the UI), attaches each role's PTY, and builds the orchestration tab via
+    /// the existing `open_orchestration_tab_with_existing_role_panes` machinery.
+    /// Empty in the common case; bounded by `MAX_PENDING_ORCHESTRATION_SURFACES`
+    /// (L1) so a flood can't grow it unbounded.
+    pub pending_orchestration_surfaces: Vec<OrchestrationSurface>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -318,6 +337,8 @@ pub(crate) async fn wait_for_session_start(
                     return true;
                 }
             }
+            // PRD #120: not a hook event — keep waiting for the SessionStart.
+            Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Closed)) => return false,
             Err(_) => return false,
@@ -600,6 +621,26 @@ impl AppState {
     /// Register a pane ID as managed by our app.
     pub fn register_pane(&mut self, pane_id: String) {
         self.managed_pane_ids.insert(pane_id);
+    }
+
+    /// PRD #120: record a daemon-spawned orchestration for the render loop to
+    /// build into a live tab. Called from the event subscriber, which receives
+    /// the [`BroadcastMsg::OrchestrationSurface`] but cannot touch the
+    /// `TabManager` / pane controller (those live on the TUI render thread).
+    pub fn queue_orchestration_surface(&mut self, surface: OrchestrationSurface) {
+        // PRD #120 L1: bound the queue. If it's already at the cap, drop the
+        // OLDEST entry to make room — a flood can't grow it unbounded, and the
+        // freshest dispatch is the one most worth surfacing. Log the drop so it
+        // stays observable.
+        if self.pending_orchestration_surfaces.len() >= MAX_PENDING_ORCHESTRATION_SURFACES {
+            let dropped = self.pending_orchestration_surfaces.remove(0);
+            tracing::warn!(
+                orchestration = %dropped.name,
+                cap = MAX_PENDING_ORCHESTRATION_SURFACES,
+                "queue_orchestration_surface: pending queue at cap; dropping oldest surface"
+            );
+        }
+        self.pending_orchestration_surfaces.push(surface);
     }
 
     /// Create a placeholder session for a newly created pane so it always

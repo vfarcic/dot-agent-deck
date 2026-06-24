@@ -213,11 +213,24 @@ pub fn orchestrator_role_index(roles: &[RoleSpawn]) -> usize {
 /// Open a tab for `req` and deliver its prompt. See the module docs for the
 /// full contract. On `working_dir` creation or spawn failure, surfaces the
 /// reason via `notifier` and returns `Err` without panicking.
+///
+/// `detach_delivery` controls only WHEN this future returns relative to the
+/// prompt-delivery wait — never WHETHER the agent is registered: every pane is
+/// always spawned and registered synchronously before `spawn` returns, so a
+/// caller that inspects the registry immediately afterwards always sees the
+/// agents. When `false` (the #127 single-spawn path), the prompt-delivery wait
+/// (which can sit out the multi-second `SessionStart` fallback for a
+/// hook-less command) is awaited before returning. When `true` (the PRD #120
+/// issue-dispatch path), that wait runs in a detached task so the caller — the
+/// scheduler's run-active window — is freed the instant the dispatch WORK is
+/// done; a rapid re-fire after a tab close is then not blocked behind the prior
+/// run's lingering delivery wait. The prompt is still delivered either way.
 pub async fn spawn(
     req: SpawnRequest,
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     notifier: &dyn Notifier,
     event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
+    detach_delivery: bool,
 ) -> Result<SpawnHandle, SpawnError> {
     // 1. mkdir -p the working_dir; fail loud via the notifier.
     let dir = Path::new(&req.working_dir);
@@ -266,11 +279,11 @@ pub async fn spawn(
             // PRD #127 finding #2: surface this single-agent card LIVE to any
             // already-attached TUI (the daemon otherwise only hydrates its
             // agents at TUI startup). Reuses the existing hook-event broadcast
-            // — no new broadcast variant. Orchestration fires are intentionally
-            // NOT surfaced this way: a proper orchestration tab is rebuilt by
-            // the TUI's hydration/partition path, which a flat SessionStart
-            // can't reconstruct, and live multi-orchestration surfacing is the
-            // #140 session-partitioning concern.
+            // — no new broadcast variant. The ORCHESTRATION branch below surfaces
+            // its tab LIVE too (PRD #120) but needs the structural membership a
+            // flat `SessionStart` can't carry, so it rides the typed
+            // [`BroadcastMsg::OrchestrationSurface`] variant instead of this
+            // synthetic-`SessionStart` path.
             if let Some(tx) = event_tx {
                 surface_spawned_pane(
                     tx,
@@ -280,7 +293,15 @@ pub async fn spawn(
                     &req.task_name,
                 );
             }
-            deliver(registry, &pane_id, &id, event_rx, &req.prompt).await;
+            run_delivery(
+                registry,
+                pane_id.clone(),
+                id.clone(),
+                event_rx,
+                req.prompt.clone(),
+                detach_delivery,
+            )
+            .await;
             Ok(SpawnHandle {
                 task_name: req.task_name,
                 kind: SpawnKind::SingleAgent,
@@ -326,16 +347,28 @@ pub async fn spawn(
                     role_name: Some(role.role_name.clone()),
                 });
             }
+            // PRD #120: surface this orchestration LIVE to any already-attached
+            // TUI. Unlike the single-agent card above (a synthetic
+            // `SessionStart`), a multi-role tab can only be rebuilt from the
+            // structural membership the TUI's partition / open-orchestration
+            // machinery consumes, so we push it via the typed
+            // `BroadcastMsg::OrchestrationSurface` variant. The TUI attaches each
+            // role's PTY and builds the tab mid-session. Best-effort: `send`
+            // errs only when no TUI is attached (the standalone-daemon case).
+            if let Some(tx) = event_tx {
+                surface_spawned_orchestration(tx, &name, &req.working_dir, &roles, &agents);
+            }
             // Deliver the prompt to the orchestrator role pane, gated on that
             // pane's readiness (its registry agent_id is the gate's match key).
             let delivery_pane_id = agents[orch_idx].pane_id.clone();
             let delivery_agent_id = agents[orch_idx].id.clone();
-            deliver(
+            run_delivery(
                 registry,
-                &delivery_pane_id,
-                &delivery_agent_id,
+                delivery_pane_id.clone(),
+                delivery_agent_id,
                 event_rx,
-                &req.prompt,
+                req.prompt.clone(),
+                detach_delivery,
             )
             .await;
             Ok(SpawnHandle {
@@ -434,6 +467,29 @@ fn session_start_wait_timeout() -> Duration {
 /// `event_rx == None` (a direct caller with no event bus) preserves the legacy
 /// short fixed buffer delay so the child + pump reader are wired before bytes
 /// flow.
+/// Run the prompt-delivery wait either inline (await it) or detached (spawn it
+/// onto a background task and return immediately). The agent is already
+/// registered by the time this is called; detaching only frees the caller from
+/// the (possibly multi-second) `SessionStart` fallback wait. See [`spawn`]'s
+/// `detach_delivery` parameter for why the issue-dispatch path detaches.
+async fn run_delivery(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: String,
+    agent_id: String,
+    event_rx: Option<broadcast::Receiver<BroadcastMsg>>,
+    prompt: String,
+    detach: bool,
+) {
+    if detach {
+        let registry = Arc::clone(registry);
+        tokio::spawn(async move {
+            deliver(&registry, &pane_id, &agent_id, event_rx, &prompt).await;
+        });
+    } else {
+        deliver(registry, &pane_id, &agent_id, event_rx, &prompt).await;
+    }
+}
+
 async fn deliver(
     registry: &AgentPtyRegistry,
     pane_id: &str,
@@ -509,6 +565,61 @@ fn surface_spawned_pane(
         agent_id: None,
     };
     let _ = event_tx.send(BroadcastMsg::Event(event));
+}
+
+/// PRD #120: surface a freshly-spawned ORCHESTRATION to attached TUIs by
+/// publishing its structural membership through the daemon's existing
+/// `BroadcastMsg` fan-out as a typed [`BroadcastMsg::OrchestrationSurface`].
+///
+/// Where [`surface_spawned_pane`] forges a flat `SessionStart` (enough for a
+/// single dashboard card), an orchestration TAB groups several role panes and
+/// can only be rebuilt from the per-role index / name / start-flag / cwd the
+/// TUI's `open_orchestration_tab_with_existing_role_panes` machinery consumes.
+/// `roles` and `agents` are parallel (each role was pushed in iteration order),
+/// so the i-th role's spawned pane is `agents[i]`. The `pane_id` is reused
+/// TUI-side as the local pane id (so hook routing stays correct) AND is how the
+/// TUI attaches to the live PTY — it resolves the pane id through `list_agents`
+/// rather than via a registry agent id, so no `agent_id` rides on the wire.
+/// Delivery is best-effort: `send` errs only when there are no subscribers.
+fn surface_spawned_orchestration(
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    name: &str,
+    cwd: &str,
+    roles: &[RoleSpawn],
+    agents: &[SpawnedAgent],
+) {
+    let surface_roles = roles
+        .iter()
+        .zip(agents.iter())
+        .map(|(role, agent)| crate::event::OrchestrationSurfaceRole {
+            pane_id: agent.pane_id.clone(),
+            role_index: role.role_index,
+            role_name: role.role_name.clone(),
+            is_start_role: role.is_start_role,
+        })
+        .collect();
+    // PRD #120 S1: disambiguate concurrent dispatched orchestration tabs. The
+    // daemon-initiated path carries no user-typed title, so N concurrent issue
+    // dispatches would all paint identically-labelled tabs (the shared
+    // orchestration `name`, e.g. `issue-work`) — indistinguishable in the tab
+    // strip. Append the per-spawn identity: the cwd basename, which for issue
+    // dispatch is the per-issue worktree `issue-<n>`. `name` stays the PREFIX so
+    // the canonical label reads first and survives the tab strip's
+    // trailing-ellipsis truncation. When the basename already equals `name` (an
+    // unnamed orchestration whose name resolved to its own cwd basename) there's
+    // nothing to add — fall back to `None`, i.e. the canonical `name`.
+    let display_title = Path::new(cwd)
+        .file_name()
+        .map(|b| b.to_string_lossy().into_owned())
+        .filter(|b| b != name)
+        .map(|b| format!("{name} · {b}"));
+    let surface = crate::event::OrchestrationSurface {
+        name: name.to_string(),
+        cwd: cwd.to_string(),
+        display_title,
+        roles: surface_roles,
+    };
+    let _ = event_tx.send(BroadcastMsg::OrchestrationSurface(surface));
 }
 
 /// A fresh, valid `DOT_AGENT_DECK_PANE_ID` for a spawned pane. Sanitizes the
@@ -668,7 +779,7 @@ pub fn decide_delivery_capped(
 pub async fn spawn_or_reuse(
     req: SpawnRequest,
     new_tab_per_fire: bool,
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     reuse: &ReuseRegistry,
     notifier: &dyn Notifier,
     debounce: Duration,
@@ -696,7 +807,10 @@ pub async fn spawn_or_reuse(
         }
         ReuseDecision::SpawnFresh => {
             let task_name = req.task_name.clone();
-            let handle = spawn(req, registry, notifier, event_tx).await?;
+            // #127 single-spawn keeps awaiting delivery (detach_delivery = false):
+            // its callback has no rapid-refire-after-close concern and existing
+            // tests expect the prior behavior.
+            let handle = spawn(req, registry, notifier, event_tx, false).await?;
             // Record the tab for reuse only when the task opts into reuse.
             if !new_tab_per_fire {
                 let entry = ReuseEntry {
@@ -1037,7 +1151,9 @@ mod tests {
             Some("cat"),
             "morning-digest",
         );
-        let BroadcastMsg::Event(e) = rx.try_recv().expect("a broadcast must be queued");
+        let BroadcastMsg::Event(e) = rx.try_recv().expect("a broadcast must be queued") else {
+            panic!("expected a BroadcastMsg::Event");
+        };
         assert_eq!(e.event_type, EventType::SessionStart);
         assert_eq!(e.pane_id.as_deref(), Some("sched-morning-digest-0"));
         assert_eq!(e.cwd.as_deref(), Some("/tmp/scratch/runbox"));

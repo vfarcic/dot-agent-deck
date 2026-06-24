@@ -19,7 +19,7 @@ use crate::ascii_art::{AsciiArtResult, generate_ascii_art};
 use crate::config;
 use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
 use crate::embedded_pane::{EmbeddedPaneController, HydratedPane};
-use crate::event::{AgentType, EventType};
+use crate::event::{AgentType, EventType, OrchestrationSurface};
 use crate::features::Features;
 // PRD #80 introduced a UI-dispatch `Action` enum in this module (the renamed
 // `KeyResult`), which collides with the keybinding-action enum. Import the
@@ -386,6 +386,14 @@ impl DirPickerState {
 /// authoring agent pre-seeded with [`SCHEDULE_AUTHORING_SEED_PROMPT`].
 const SCHEDULE_MODE_NAME: &str = "schedule";
 
+/// PRD #120: display name of the flag-gated issue-dispatch authoring option in
+/// the new-pane Mode cycler — distinct from the plain `schedule` option. It is
+/// appended AFTER `schedule` and shown only when
+/// [`crate::features::show_issue_dispatch_authoring`] is true. Selecting it
+/// spawns a throwaway authoring agent seeded with
+/// [`ISSUE_DISPATCH_AUTHORING_SEED_PROMPT`], which calls `schedule add --repo …`.
+const ISSUE_DISPATCH_MODE_NAME: &str = "schedule: issues";
+
 /// PRD #170 round 2 (reviewer finding 1): the fallback agent command for a
 /// scheduled-task authoring session when no `default_command` is configured. The
 /// Command field is free-text (the clickable preset picker is gone), so only this
@@ -435,6 +443,38 @@ Rules:
 - The user can TEST the prompt in THIS session before committing — offer to run it now and show them the result (\"run it now, show me\").
 - CONFIRM the full entry (every field) with the user before you call `schedule add`.
 - AFTER `schedule add` succeeds, tell the user this authoring pane existed ONLY to create the schedule and can be closed now — when the schedule fires, a single-agent run surfaces live in its own pane on the deck, while an orchestration-targeted run appears in its tab when the deck is (re)opened.";
+
+/// PRD #120: the seed prompt for the flag-gated `schedule: issues` authoring
+/// option. DISTINCT from [`SCHEDULE_AUTHORING_SEED_PROMPT`]: it authors an
+/// ISSUE-DISPATCH task — on each fire the daemon enumerates a repo's open issues
+/// and dispatches one agent per issue into a per-issue worktree — so it gathers
+/// the GitHub knobs (`repo`, `max_per_run`, optional `label`/`query`) and calls
+/// `dot-agent-deck schedule add --repo …` (NOT the plain `schedule add --name`
+/// single-spawn form). The `{{issue_number}}` placeholder in the prompt template
+/// is substituted per issue at fire time.
+const ISSUE_DISPATCH_AUTHORING_SEED_PROMPT: &str = "\
+You are helping the user create a SCHEDULED GITHUB ISSUE-DISPATCH task for dot-agent-deck. \
+This is a throwaway authoring session: converse to build ONE issue-dispatch schedule, write it, then you are done.
+
+On each fire this task enumerates the OPEN ISSUES of a single GitHub repo and dispatches one agent per issue, \
+each in its own per-issue git worktree (branch `agent/issue-<n>`), reusing the prompt as a per-issue template.
+
+Collect these fields:
+- name: unique id for the schedule (also the reuse-tab key; renaming is forbidden — to rename, remove + add).
+- repo: the target GitHub repo as an `owner/name` slug (e.g. \"vfarcic/dot-ai\"). EXACTLY ONE repo per task — for several repos, create several schedules.
+- cron: a cron expression (5-field POSIX, e.g. \"0 9 * * MON-FRI\", evaluated in local time).
+- working_dir: the workspace ROOT the repo is cloned under on each fire (the CLI expands ~ and $VAR — pass them literally).
+- max_per_run: the per-fire cap on how many open issues are dispatched (default 3). Keep it small so a backlog doesn't fan out into dozens of agents at once.
+- label (optional): only dispatch issues carrying this label (e.g. \"agent-eligible\").
+- query (optional): an advanced raw `gh` search-query override; leave it off to use the default \"all open issues up to max_per_run\" listing.
+- prompt: the per-issue prompt template delivered to each dispatched agent. Use the `{{issue_number}}` placeholder — it is substituted with each issue's number at fire time (e.g. \"fix issue {{issue_number}}\").
+
+Rules:
+- NEVER edit the TOML file directly. ALWAYS write via the validated CLI, which checks the cron, validates the repo slug, expands paths, and writes the global config atomically:
+  dot-agent-deck schedule add --repo <owner/name> --max-per-run <N> --name <name> --cron <cron> --working-dir <dir> --prompt <template> [--label <label>] [--query <query>]
+- Do NOT pass --command: an issue-dispatch task needs none (the per-issue agent command comes from each cloned repo's config / the deck's default_command).
+- CONFIRM the full entry (every field, especially repo and max_per_run) with the user before you call `schedule add`.
+- AFTER `schedule add` succeeds, tell the user this authoring pane existed ONLY to create the schedule and can be closed now — when the schedule fires, each dispatched issue surfaces live as its own tab on the deck.";
 
 // ---------------------------------------------------------------------------
 // "Scheduled Tasks" management dialog (PRD #127 M3.3)
@@ -537,6 +577,23 @@ fn build_schedule_authoring_mode(
         rules: Vec::new(),
         reactive_panes: 0,
     }
+}
+
+/// PRD #120: build the issue-dispatch authoring seed (base
+/// [`ISSUE_DISPATCH_AUTHORING_SEED_PROMPT`] + the picked dir as the workspace
+/// `working_dir` DEFAULT). Like the plain-schedule seed, the picked directory is
+/// appended so the agent's `schedule add --repo …` naturally targets it unless
+/// the user names another. There is no Edit variant — the manager's Add/Edit is
+/// the plain-schedule door; issue-dispatch authoring is created fresh from the
+/// new-pane cycler only.
+fn build_issue_dispatch_authoring_seed(working_dir: &std::path::Path) -> String {
+    format!(
+        "{seed}\n\n\
+         working_dir DEFAULT: {dir} (the directory this authoring session was launched in) \
+         — use it as the schedule's working_dir unless the user names another.",
+        seed = ISSUE_DISPATCH_AUTHORING_SEED_PROMPT,
+        dir = working_dir.display(),
+    )
 }
 
 /// Send a one-shot `AttachRequest` to the local daemon over the attach socket
@@ -647,7 +704,17 @@ struct NewPaneFormState {
     /// a pre-seeded conversational agent via the same gated delivery path
     /// modes use (Phase 3A).
     schedule_authoring: ModeConfig,
-    selection_index: usize, // 0 = "No mode", 1..M = modes, M+1..M+O = orchestrations, last = "schedule"
+    /// PRD #120: the flag-gated issue-dispatch authoring option, appended AFTER
+    /// `schedule_authoring` in the cycler. Only the display `name` matters (the
+    /// seed is derived at submit time by [`build_issue_dispatch_authoring_seed`]);
+    /// it is offered only when `show_issue_dispatch` is true.
+    issue_dispatch_authoring: ModeConfig,
+    /// PRD #120: snapshot of [`crate::features::show_issue_dispatch_authoring`]
+    /// taken at form-construction time (the input seam). When true the cycler
+    /// offers the `schedule: issues` option after `schedule`; when false it is
+    /// hidden and the cycler shape is byte-for-byte the pre-feature baseline.
+    show_issue_dispatch: bool,
+    selection_index: usize, // 0 = "No mode", 1..M = modes, M+1..M+O = orchestrations, then "schedule" [, "schedule: issues"]
     has_mode_field: bool,
     focused: FormField,
     /// PRD #170 (unify): when `true` the form is MODE-LOCKED to schedule
@@ -711,6 +778,16 @@ impl NewPaneFormState {
             rules: Vec::new(),
             reactive_panes: 0,
         };
+        // PRD #120: synthetic issue-dispatch authoring option (name only; seed
+        // derived at submit time). Whether it is offered is the flag snapshot.
+        let issue_dispatch_authoring = ModeConfig {
+            name: ISSUE_DISPATCH_MODE_NAME.to_string(),
+            init_command: None,
+            seed_prompt: None,
+            panes: Vec::new(),
+            rules: Vec::new(),
+            reactive_panes: 0,
+        };
         Self {
             dir,
             name,
@@ -718,6 +795,11 @@ impl NewPaneFormState {
             modes,
             orchestrations,
             schedule_authoring,
+            issue_dispatch_authoring,
+            // PRD #120: gate at the input seam (CLAUDE.md #9) — snapshot the
+            // render wrapper once at construction so the count/name/cycler-cap
+            // all observe one consistent value.
+            show_issue_dispatch: crate::features::show_issue_dispatch_authoring(),
             selection_index: 0,
             has_mode_field,
             focused: FormField::Mode,
@@ -753,6 +835,14 @@ impl NewPaneFormState {
             rules: Vec::new(),
             reactive_panes: 0,
         };
+        let issue_dispatch_authoring = ModeConfig {
+            name: ISSUE_DISPATCH_MODE_NAME.to_string(),
+            init_command: None,
+            seed_prompt: None,
+            panes: Vec::new(),
+            rules: Vec::new(),
+            reactive_panes: 0,
+        };
         let mut form = Self {
             dir,
             name: SCHEDULE_MODE_NAME.to_string(),
@@ -760,6 +850,11 @@ impl NewPaneFormState {
             modes: Vec::new(),
             orchestrations: Vec::new(),
             schedule_authoring,
+            issue_dispatch_authoring,
+            // PRD #120: the manager's mode-locked form is plain-schedule authoring
+            // only — the issue-dispatch option lives on the `Ctrl+n` cycler, and
+            // the locked form hides the cycler entirely, so it never appears here.
+            show_issue_dispatch: false,
             selection_index: 0,
             has_mode_field: true,
             focused: FormField::Command,
@@ -772,10 +867,18 @@ impl NewPaneFormState {
         form
     }
 
-    /// Cycler index of the built-in "schedule" authoring option — the last one,
-    /// after the project's workload modes and orchestrations.
+    /// Cycler index of the built-in "schedule" authoring option — after the
+    /// project's workload modes and orchestrations (PRD #120: the optional
+    /// `schedule: issues` option, when shown, follows it).
     fn schedule_index(&self) -> usize {
         1 + self.modes.len() + self.orchestrations.len()
+    }
+
+    /// PRD #120: cycler index of the flag-gated `schedule: issues` option —
+    /// appended directly after `schedule`. Only meaningful when
+    /// `show_issue_dispatch` is true.
+    fn issue_dispatch_index(&self) -> usize {
+        self.schedule_index() + 1
     }
 
     /// Whether the built-in "schedule" authoring option is currently selected.
@@ -783,9 +886,25 @@ impl NewPaneFormState {
         self.selection_index == self.schedule_index()
     }
 
+    /// PRD #120: whether the flag-gated `schedule: issues` option is selected.
+    fn is_issue_dispatch_selected(&self) -> bool {
+        self.show_issue_dispatch && self.selection_index == self.issue_dispatch_index()
+    }
+
+    /// PRD #120: whether the current selection is a throwaway authoring option
+    /// (plain `schedule` OR `schedule: issues`). Drives the shared
+    /// "↳ authoring (one-off)" hint + its reserved render row.
+    fn is_authoring_selected(&self) -> bool {
+        self.is_schedule_selected() || self.is_issue_dispatch_selected()
+    }
+
     fn mode_option_count(&self) -> usize {
-        // +1 for the built-in "schedule" authoring option appended at the end.
-        1 + self.modes.len() + self.orchestrations.len() + 1
+        // +1 for the built-in "schedule" authoring option appended at the end,
+        // +1 more for the flag-gated "schedule: issues" option when shown.
+        1 + self.modes.len()
+            + self.orchestrations.len()
+            + 1
+            + if self.show_issue_dispatch { 1 } else { 0 }
     }
 
     fn select_next_mode(&mut self) {
@@ -799,6 +918,13 @@ impl NewPaneFormState {
     }
 
     fn selected_mode(&self) -> Option<&ModeConfig> {
+        // PRD #120: the flag-gated issue-dispatch authoring option — its synthetic
+        // mode supplies the cycler's title/chip ("schedule: issues mode"); the
+        // spawned request swaps in the issue-dispatch seed (see
+        // `build_new_pane_request`).
+        if self.is_issue_dispatch_selected() {
+            return Some(&self.issue_dispatch_authoring);
+        }
         if self.is_schedule_selected() {
             // The built-in authoring mode — spawns a seeded agent like any
             // mode with a `seed_prompt`.
@@ -837,8 +963,11 @@ impl NewPaneFormState {
             } else {
                 format!("Orch: {name}")
             }
+        } else if self.show_issue_dispatch && idx == self.issue_dispatch_index() {
+            // PRD #120: the flag-gated issue-dispatch authoring option.
+            ISSUE_DISPATCH_MODE_NAME.to_string()
         } else {
-            // PRD #127 M3.2: built-in "schedule" authoring option at the last position.
+            // PRD #127 M3.2: built-in "schedule" authoring option.
             SCHEDULE_MODE_NAME.to_string()
         }
     }
@@ -2178,6 +2307,228 @@ fn process_pending_seed_prompts(
         }
         true
     });
+}
+
+// ---------------------------------------------------------------------------
+// PRD #120: live orchestration surfacing
+// ---------------------------------------------------------------------------
+
+/// PRD #120: build live orchestration tabs for any orchestrations the daemon
+/// spawned while this TUI is attached (the issue-dispatch path), queued by the
+/// event subscriber into [`AppState::pending_orchestration_surfaces`].
+///
+/// Drains the queue, attaches each role's daemon PTY, and rebuilds the
+/// orchestration tab through the SAME config-resolution + tab-build machinery
+/// the reconnect-hydration path uses ([`resolve_orch_config_for_hydration`] →
+/// [`TabManager::open_orchestration_tab_with_existing_role_panes`]). So a
+/// dispatch opened mid-session appears as a real tab (e.g. `issue-work`) with no
+/// reconnect, instead of only flat per-role dashboard cards.
+///
+/// A no-op unless the controller is the daemon-backed [`EmbeddedPaneController`]
+/// — the only production controller, and the only one that can attach live
+/// daemon PTYs (this path only ever fires for daemon-dispatched orchestrations).
+fn process_pending_orchestration_surfaces(
+    state: &SharedState,
+    pane: &Arc<dyn PaneController>,
+    tab_manager: &mut TabManager,
+) {
+    // S2: cheap READ-lock peek. The steady-state idle cost is one read lock +
+    // is_empty — not the exclusive write lock the drain needs, taken every frame
+    // just to find the queue empty.
+    if state
+        .blocking_read()
+        .pending_orchestration_surfaces
+        .is_empty()
+    {
+        return;
+    }
+    let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() else {
+        // Non-embedded controller (tests / non-production): can't attach live
+        // daemon PTYs. Drain and drop so the (capped) queue can't accumulate.
+        let mut st = state.blocking_write();
+        let count = st.pending_orchestration_surfaces.len();
+        if count > 0 {
+            st.pending_orchestration_surfaces.clear();
+            tracing::debug!(
+                count,
+                "live orchestration surface: non-embedded controller; dropping queued surfaces"
+            );
+        }
+        return;
+    };
+    // M2/S3: process at most ONE surface per frame. `surface_one_orchestration`
+    // does a bounded `block_on(hydrate_pane)` per role (list 5s + attach 3s);
+    // draining the whole queue in a single frame would compound that into a
+    // multi-second UI freeze under a flood. One-per-frame caps the per-frame
+    // cost at a single surface's bounded round-trips — the rest drain on the
+    // following frames (the render loop ticks ~every 16ms while idle).
+    let surface = {
+        let mut st = state.blocking_write();
+        if st.pending_orchestration_surfaces.is_empty() {
+            return; // a concurrent path drained it between the peek and here
+        }
+        st.pending_orchestration_surfaces.remove(0)
+    };
+    surface_one_orchestration(state, embedded, tab_manager, surface);
+}
+
+/// Build one live orchestration tab from a daemon [`OrchestrationSurface`].
+/// Idempotent on the role pane ids, so a duplicate broadcast (or a race with a
+/// reconnect that already hydrated the tab) doesn't double-build.
+fn surface_one_orchestration(
+    state: &SharedState,
+    embedded: &EmbeddedPaneController,
+    tab_manager: &mut TabManager,
+    surface: OrchestrationSurface,
+) {
+    // Idempotency: skip if an existing tab already owns any of this surface's
+    // role panes (a duplicate broadcast, or reconnect-hydration that beat us to
+    // it). Matching on the globally-unique role pane ids is more robust than a
+    // (cwd, name) compare — an unnamed orchestration's surface `name` is the
+    // resolved cwd-basename while the tab's `config.name` may be the raw
+    // (possibly empty) config name, so they wouldn't compare equal.
+    let already_built = surface
+        .roles
+        .iter()
+        .any(|r| tab_manager.tab_index_for_pane(&r.pane_id).is_some());
+    if already_built {
+        tracing::debug!(
+            cwd = %surface.cwd,
+            orchestration = %surface.name,
+            "live orchestration surface: tab already owns a role pane, skipping"
+        );
+        return;
+    }
+
+    // Reuse the hydration partition's config resolution: the local project
+    // config when present, else a minimal config synthesised from the surface's
+    // role metadata (same as a remote reconnect whose local config is absent).
+    let bucket = OrchestrationHydrationBucket {
+        cwd: surface.cwd.clone(),
+        orchestration_name: surface.name.clone(),
+        display_title: surface.display_title.clone(),
+        role_slots: surface
+            .roles
+            .iter()
+            .map(|r| OrchestrationRoleSlot {
+                role_index: r.role_index,
+                pane_id: r.pane_id.clone(),
+                role_name: r.role_name.clone(),
+                is_start_role: r.is_start_role,
+            })
+            .collect(),
+    };
+    let local = load_project_config(Path::new(&surface.cwd))
+        .ok()
+        .flatten()
+        .and_then(|c| {
+            c.orchestrations
+                .into_iter()
+                .find(|o| o.name == surface.name)
+        });
+    let orch_config = resolve_orch_config_for_hydration(local, &bucket);
+
+    // Attach each role's live daemon PTY (by its DOT_AGENT_DECK_PANE_ID) and
+    // place it in the role-slot vector, mirroring the reconnect partition.
+    let mut role_pane_ids: Vec<Option<String>> = vec![None; orch_config.roles.len()];
+    for role in &surface.roles {
+        if role.role_index >= orch_config.roles.len() {
+            tracing::error!(
+                cwd = %surface.cwd,
+                orchestration = %surface.name,
+                role_index = role.role_index,
+                role_count = orch_config.roles.len(),
+                "live orchestration surface: role_index out of range; dropping role"
+            );
+            continue;
+        }
+        if role_pane_ids[role.role_index].is_some() {
+            continue;
+        }
+        // `hydrate_pane` attaches the daemon agent carrying this pane id and
+        // wires its PTY locally — the same attach + scrollback-replay path as
+        // reconnect hydration, so the live agent renders in the tab.
+        if embedded.hydrate_pane(&role.pane_id) {
+            role_pane_ids[role.role_index] = Some(role.pane_id.clone());
+        } else {
+            tracing::debug!(
+                cwd = %surface.cwd,
+                orchestration = %surface.name,
+                pane_id = %role.pane_id,
+                "live orchestration surface: role pane attach failed; leaving slot as dead"
+            );
+        }
+    }
+    if role_pane_ids.iter().all(Option::is_none) {
+        tracing::warn!(
+            cwd = %surface.cwd,
+            orchestration = %surface.name,
+            "live orchestration surface: no role panes attached; not building tab"
+        );
+        return;
+    }
+
+    // Fill any missing slot with a synthetic dead-slot id so every role keeps a
+    // card (parity with the reconnect path — a fresh spawn normally has none).
+    let dead_slot_ids =
+        assign_synthetic_dead_slot_ids(&mut role_pane_ids, &surface.cwd, &surface.name);
+
+    // Build the tab WITHOUT yanking the user off their current tab: the open
+    // call activates the new tab, so restore the prior active index afterward.
+    // The tab bar shows whenever `tabs.len() > 1`, so the new label still paints
+    // regardless of which tab is active.
+    let prev_active = tab_manager.active_index();
+    match tab_manager.open_orchestration_tab_with_existing_role_panes(
+        &orch_config,
+        &surface.cwd,
+        role_pane_ids.clone(),
+        bucket.display_title.as_deref(),
+    ) {
+        Ok(_) => {
+            let mut st = state.blocking_write();
+            // Seed placeholder cards for synthetic dead slots only (live roles
+            // get their card from the agent's own SessionStart hook).
+            for synthetic in &dead_slot_ids {
+                st.insert_placeholder_session(
+                    synthetic.clone(),
+                    Some(surface.cwd.clone()),
+                    None,
+                    None,
+                );
+            }
+            // Register live role panes + wire the per-pane maps exactly as the
+            // reconnect-hydration path does (pane_role_map / pane_cwd_map /
+            // orchestrator_pane_ids).
+            for (i, role) in orch_config.roles.iter().enumerate() {
+                if let Some(Some(pane_id)) = role_pane_ids.get(i)
+                    && !is_dead_slot_pane_id(pane_id)
+                {
+                    st.register_pane(pane_id.clone());
+                    st.pane_role_map.insert(pane_id.clone(), role.name.clone());
+                    st.pane_cwd_map.insert(pane_id.clone(), surface.cwd.clone());
+                    if role.start {
+                        st.orchestrator_pane_ids.insert(pane_id.clone());
+                    }
+                }
+            }
+            drop(st);
+            tab_manager.switch_to(prev_active);
+            tracing::info!(
+                cwd = %surface.cwd,
+                orchestration = %surface.name,
+                role_count = orch_config.roles.len(),
+                "live orchestration surface: built tab for daemon-spawned orchestration"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                cwd = %surface.cwd,
+                orchestration = %surface.name,
+                error = %e,
+                "live orchestration surface: failed to build tab; role panes stay on dashboard"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3799,6 +4150,27 @@ fn transition_after_dir_pick(ui: &mut UiState) {
 /// Shared by the Enter-submit key arm and the `[Submit]` button
 /// ([`Action::FormSubmit`]) so click and key spawn an identical pane.
 fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> NewPaneRequest {
+    // PRD #120: the flag-gated "schedule: issues" authoring option — like the
+    // plain "schedule" option it is a throwaway single-agent authoring CARD, but
+    // its seed authors an ISSUE-DISPATCH task (`schedule add --repo …`) instead
+    // of a single-spawn one. Spawn it as a dashboard card carrying the
+    // issue-dispatch seed; `selected_mode()` still returns its synthetic mode for
+    // the cycler title ("schedule: issues mode").
+    if form.is_issue_dispatch_selected() {
+        let command = if form.command.trim().is_empty() {
+            resolve_authoring_command(default_command)
+        } else {
+            form.command.clone()
+        };
+        return NewPaneRequest {
+            dir: form.dir.clone(),
+            name: form.name.clone(),
+            command,
+            mode_config: None,
+            orchestration_config: None,
+            seed_prompt: Some(build_issue_dispatch_authoring_seed(&form.dir)),
+        };
+    }
     // PRD #127: the built-in "schedule" authoring option is NOT a workload mode
     // tab — it is a throwaway single-agent authoring CARD that converses to
     // build a schedule entry. Spawn it as a dashboard card (`mode_config` None)
@@ -6878,6 +7250,11 @@ pub fn run_tui(
         // runs every iteration (including the 16ms idle ticks below), so the
         // trailing write of a coalesced burst lands without further input.
         flush_session_snapshot_if_due(&mut ui, &state);
+
+        // PRD #120: build live tabs for any orchestrations the daemon spawned
+        // mid-session (issue dispatch). Done before the snapshot clone + tab
+        // derivation below so a freshly-surfaced tab paints this same frame.
+        process_pending_orchestration_surfaces(&state, &pane, &mut tab_manager);
 
         let snapshot = state.blocking_read().clone();
 
@@ -11144,10 +11521,11 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // form is two rows shorter — Command's label row plus its spacing row.
     let cmd_visible = form.command_visible();
     let cmd_rows: u16 = if cmd_visible { 2 } else { 0 };
-    // PRD #127 M3.2: the "schedule" authoring option adds one separator/label
-    // row marking it as a throwaway authoring session (only in the unlocked
-    // Mode cycler — the locked schedule form has no mode block).
-    let schedule_rows: u16 = if show_mode && form.is_schedule_selected() {
+    // PRD #127 M3.2 / PRD #120: either authoring option ("schedule" or
+    // "schedule: issues") adds one separator/label row marking it as a throwaway
+    // authoring session (only in the unlocked Mode cycler — the locked schedule
+    // form has no mode block).
+    let schedule_rows: u16 = if show_mode && form.is_authoring_selected() {
         1
     } else {
         0
@@ -11216,10 +11594,11 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
         ));
         lines.push(Line::from(""));
     }
-    // PRD #127 M3.2: subtle visual separation — when the "schedule" authoring
-    // option is selected, the second reserved line shows a throwaway-session
-    // hint (the first holds the chips, the second is spare).
-    if show_mode && form.is_schedule_selected() {
+    // PRD #127 M3.2 / PRD #120: subtle visual separation — when either authoring
+    // option ("schedule" or "schedule: issues") is selected, the second reserved
+    // line shows a throwaway-session hint (the first holds the chips, the second
+    // is spare).
+    if show_mode && form.is_authoring_selected() {
         lines.push(Line::styled(
             "           \u{21b3} authoring (one-off)",
             Style::default()
@@ -12464,6 +12843,7 @@ pub fn render_new_pane_form_schedule_to_buffer(
         prompt: "digest prompt".to_string(),
         new_tab_per_fire: false,
         enabled: true,
+        issue_dispatch: None,
     });
     let form = NewPaneFormState::new_schedule_locked(
         std::path::PathBuf::from("/tmp/project"),
@@ -18032,6 +18412,7 @@ mod tests {
             prompt: format!("{name}-prompt-marker"),
             new_tab_per_fire: false,
             enabled,
+            issue_dispatch: None,
         }
     }
 

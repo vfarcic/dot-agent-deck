@@ -19,7 +19,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
-pub use crate::agent_pty::{AgentRecord, TabMembership, validate_tab_membership};
+pub use crate::agent_pty::{
+    AgentRecord, TabMembership, validate_orchestration_surface, validate_tab_membership,
+};
 use crate::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_DETACH, KIND_EVENT, KIND_REQ, KIND_RESP, KIND_SHUTDOWN,
     KIND_SHUTDOWN_ACK, KIND_STREAM_END, KIND_STREAM_OUT, read_frame, write_frame,
@@ -610,29 +612,57 @@ impl EventSubscription {
     /// `Err(io::Error)` so the caller can decide whether to reconnect
     /// or surface the bug.
     pub async fn next_event(&mut self) -> io::Result<Option<BroadcastMsg>> {
-        match read_frame(&mut self.rd).await? {
-            None => Ok(None),
-            Some((KIND_EVENT, payload)) => match serde_json::from_slice::<BroadcastMsg>(&payload) {
-                Ok(msg) => Ok(Some(msg)),
-                Err(e) => Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("malformed KIND_EVENT payload: {e}"),
-                )),
-            },
-            Some((KIND_STREAM_END, reason)) => {
-                if !reason.is_empty() {
-                    tracing::warn!(
-                        reason = %String::from_utf8_lossy(&reason),
-                        "subscribe_events: daemon ended stream"
-                    );
+        loop {
+            match read_frame(&mut self.rd).await? {
+                None => return Ok(None),
+                Some((KIND_EVENT, payload)) => {
+                    match serde_json::from_slice::<BroadcastMsg>(&payload) {
+                        // PRD #120 H1/M1/L2: validate the daemon-supplied
+                        // orchestration surface at the wire boundary — BEFORE the
+                        // render loop synthesizes a role vec sized to
+                        // `max(role_index) + 1` (which a hostile/buggy index would
+                        // OOM). Mirrors `sanitize_record_tab_membership` for the
+                        // reconnect path. A REJECTED surface is dropped and we read
+                        // the next frame, rather than ending the stream (which
+                        // would trigger a needless reconnect).
+                        Ok(BroadcastMsg::OrchestrationSurface(surface)) => {
+                            match validate_orchestration_surface(surface) {
+                                Some(v) => {
+                                    return Ok(Some(BroadcastMsg::OrchestrationSurface(v)));
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        "subscribe_events: dropping invalid OrchestrationSurface \
+                                         (failed wire-boundary validation)"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        Ok(msg) => return Ok(Some(msg)),
+                        Err(e) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("malformed KIND_EVENT payload: {e}"),
+                            ));
+                        }
+                    }
                 }
-                Ok(None)
-            }
-            Some((kind, _)) => {
-                tracing::warn!(
-                    "unexpected frame kind 0x{kind:02x} on subscribe-events stream — ending"
-                );
-                Ok(None)
+                Some((KIND_STREAM_END, reason)) => {
+                    if !reason.is_empty() {
+                        tracing::warn!(
+                            reason = %String::from_utf8_lossy(&reason),
+                            "subscribe_events: daemon ended stream"
+                        );
+                    }
+                    return Ok(None);
+                }
+                Some((kind, _)) => {
+                    tracing::warn!(
+                        "unexpected frame kind 0x{kind:02x} on subscribe-events stream — ending"
+                    );
+                    return Ok(None);
+                }
             }
         }
     }

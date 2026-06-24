@@ -190,6 +190,91 @@ Scheduling depends on the daemon being up. The behavior on daemon stop / upgrade
 
 The daemon also auto-exits after a short idle window when there are no clients and no live agents — but a **registered enabled schedule keeps it alive**, so a daily task survives the gaps between fires (and the gap before its first fire) as long as the daemon isn't explicitly stopped.
 
+## Dispatching agents onto open GitHub issues (`issue_dispatch`)
+
+> **The task type itself is always available; only the guided creation UI is experimental.**
+>
+> A configured `issue_dispatch` task **always runs** — once the `[scheduled_tasks.issue_dispatch]` sub-table below is present (whether you hand-write it or author it with the CLI), the daemon fires it on schedule with no flag required. What *is* gated behind the `experimental` feature flag is the in-deck **guided `schedule: issues` authoring option** in the new-pane dialog (a convenience for building one of these tasks conversationally). To enable that option, set `experimental = true` under a `[features]` table in your `.dot-agent-deck.toml`, or launch with `DOT_AGENT_DECK_EXPERIMENTAL=1` (the environment variable wins over the file). Everything below describes the task type, which works regardless of the flag.
+
+The examples so far run **one** prompt in **one** directory per fire. An **`issue_dispatch`** task is a specialized variant that, on each fire, looks at the **open GitHub issues of one repo** and spins up an agent **per issue** — so *"every weekday at 09:00, pull up to five open issues from `vfarcic/dot-ai` and start an agent on each"* becomes a single schedule instead of a morning of manual cloning, worktree-making, and prompt-pasting.
+
+You turn an ordinary scheduled task into an issue-dispatch task by adding a `[scheduled_tasks.issue_dispatch]` sub-table to it. The shared fields (`name`, `cron`, `working_dir`, `prompt`, `enabled`) keep their meaning; the sub-table adds the GitHub-specific knobs:
+
+```toml
+[[scheduled_tasks]]
+name = "Issues vfarcic/dot-ai"        # default-seeded to "Issues <repo>"
+cron = "0 9 * * MON-FRI"              # 09:00 on weekdays, local time
+working_dir = "~/dispatch"            # the workspace root — see "Where things land" below
+prompt = "Work on issue {{issue_number}}"   # per-issue template; {{issue_number}} is substituted per issue
+enabled = true
+
+[scheduled_tasks.issue_dispatch]
+repo = "vfarcic/dot-ai"               # ONE repo, "owner/name"
+max_per_run = 5                       # hard cap on how many issues a single fire dispatches
+# label = "agent-eligible"            # optional: only issues carrying this label
+# query = "is:open no:assignee"       # optional: advanced gh search override
+```
+
+> **`command` is not used here**
+>
+> Unlike a plain scheduled task, an `issue_dispatch` task does **not** need a `command`. The per-issue agent command is resolved at fire time: if the cloned repo defines an `[[orchestrations]]` block the dispatch opens an **orchestration tab** (the orchestration's role commands win); otherwise it opens a **single-agent card** running your [`default_command`](configuration.md#default-command) (which falls back to `claude` when unset).
+
+Rather than hand-write the sub-table, you can author the same task with the validated CLI — pass `--repo` (and the optional `--max-per-run` / `--label` / `--query`) and omit `--command`:
+
+```bash
+dot-agent-deck schedule add \
+  --repo vfarcic/dot-ai \
+  --max-per-run 5 \
+  --name "Issues vfarcic/dot-ai" \
+  --cron "0 9 * * MON-FRI" \
+  --working-dir ~/dispatch \
+  --prompt "Work on issue {{issue_number}}" \
+  --label agent-eligible      # optional
+```
+
+A malformed `--repo` (not an `owner/name` slug) is rejected before anything is written. The CLI validates, writes the global config atomically, and triggers a live daemon reload — exactly as for a plain task.
+
+### What a fire does, issue by issue
+
+When an `issue_dispatch` task fires it:
+
+1. **Provisions the repo** under the workspace root — clones it on the first run, `git fetch` + fast-forward `pull` on later runs.
+2. **Enumerates open issues** via `gh` (honoring the optional `label` and `query`), then takes the first `max_per_run` in the order GitHub returns them. Nothing past the cap is touched.
+3. For each candidate issue, **creates a per-issue worktree** on a branch named `agent/issue-<n>`.
+4. **Spawns an agent** rooted in that worktree and delivers your `prompt` with `{{issue_number}}` substituted. Because the agent runs *inside* the issue's worktree, it can deduce the repo and issue from its surroundings — the issue number alone is enough context. Set `prompt = "/prd-full {{issue_number}}"` to drive your own skill instead.
+
+Each issue is handled in its **own error boundary**: if one issue fails (a `gh` rate-limit, a clone error), it is reported as a deck notification and the run **continues** with the remaining issues — one bad issue never aborts the rest.
+
+### Where things land
+
+Everything for a task lives under the task's own `working_dir` (the **workspace root**), so nothing is written to the daemon's launch directory:
+
+| Path | What |
+|---|---|
+| `<working_dir>/<name>` | The **clone** of the repo (created once, reused and pulled thereafter). |
+| `<working_dir>/<name>/.worktrees/issue-<n>` | The **per-issue worktree** for issue `<n>`. |
+| `agent/issue-<n>` | The **branch** each worktree checks out. |
+
+### Idempotency: the worktree is the ledger
+
+There is no separate state file — the **filesystem itself** records which issues are in flight, so re-running a dispatch (whether the cron fires again or you press **Run now**) does not double-dispatch work already underway. Before dispatching an issue, the task **skips** it when either:
+
+- its `.worktrees/issue-<n>` worktree **already exists** (the primary signal), or
+- an **open PR** already has head branch `agent/issue-<n>` (the secondary signal — a deterministic check, not fuzzy `Closes #n` body parsing).
+
+A skipped issue is logged/surfaced and left alone. Concurrency falls out of the same mechanism: a fire only fills the slots that earlier dispatches vacated by being closed, up to `max_per_run`.
+
+### Cleanup: closing a tab removes its worktree
+
+Dispatched tabs/cards persist until **you** close them — you stay in control of review, further iteration, or discarding the work. **Closing a dispatched tab/card removes its worktree** (`git worktree remove`) so the slot is freed for a future run; the **clone is preserved** (only the per-issue worktree goes away). Until you close it, the worktree keeps "claiming" its issue, so subsequent fires skip it.
+
+> **Requirements & caveats**
+>
+> - The **GitHub CLI (`gh`) must be installed and authenticated** — all GitHub access (issue enumeration, the PR idempotency check, and the initial clone) goes through it.
+> - **GitHub only, for now.** Issue dispatch is built on the GitHub CLI, so other forges (GitLab, Gitea, Bitbucket, …) aren't supported yet. If you'd like dispatch for another provider, please [open an issue](https://github.com/vfarcic/dot-agent-deck/issues) — it helps us gauge demand.
+> - Like every scheduled task, this runs in the **daemon**: fires that come due while the daemon is down are **not** replayed (see [Daemon must be running](#daemon-must-be-running)).
+> - **Detaching vs. stopping.** *Detaching* (closing the deck/TUI window) leaves the dispatched agents and their tabs **running in the daemon** — reconnect and they're still there. Only **stopping the daemon** (`daemon stop`, a restart, an upgrade, or a crash) terminates them. After a stop, the per-issue worktrees **remain on disk** (so they keep claiming their issues and the scheduler won't re-dispatch them), but the tabs themselves are **not** auto-restored on the next launch. Run `git worktree remove` (or reopen and close the tab) to release a slot manually.
+
 ## Worked examples
 
 ### A daily single-agent digest

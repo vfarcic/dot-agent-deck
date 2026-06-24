@@ -162,6 +162,19 @@ enum ScheduleAction {
         new_tab_per_fire: bool,
         #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
         enabled: bool,
+        // PRD #120: issue-dispatch knobs. When `--repo` is present this `add`
+        // authors an ISSUE-DISPATCH task (writes `[scheduled_tasks.issue_dispatch]`,
+        // and `--command` is optional — the per-issue command comes from each
+        // cloned repo's config). `--repo` is validated as a strict `owner/name`
+        // slug.
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long = "max-per-run")]
+        max_per_run: Option<usize>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        query: Option<String>,
     },
     /// Update fields of an existing task. Rename is forbidden — there is no
     /// name-change flag; `name` selects the task to edit.
@@ -905,6 +918,13 @@ fn spawn_event_subscriber(
                             Ok(Some(BroadcastMsg::Event(event))) => {
                                 state.write().await.apply_event(event);
                             }
+                            // PRD #120: a daemon-spawned orchestration (issue
+                            // dispatch). Queue it for the render loop, which owns
+                            // the TabManager + pane controller and builds the
+                            // live tab. The subscriber task can't touch those.
+                            Ok(Some(BroadcastMsg::OrchestrationSurface(surface))) => {
+                                state.write().await.queue_orchestration_surface(surface);
+                            }
                             Ok(None) => break,
                             Err(e) => {
                                 tracing::warn!(
@@ -1193,18 +1213,36 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
             prompt,
             new_tab_per_fire,
             enabled,
-        } => schedule_cli::add(
-            &mut tasks,
-            schedule_cli::AddArgs {
-                name,
-                cron,
-                working_dir,
-                command,
-                prompt,
-                new_tab_per_fire,
-                enabled,
-            },
-        ),
+            repo,
+            max_per_run,
+            label,
+            query,
+        } => {
+            // PRD #120: `--repo` turns this into an issue-dispatch `add`. Build
+            // the sub-table here (defaulting `max_per_run` to the documented 3
+            // when omitted); `schedule_cli::add` validates the slug + relaxes the
+            // `--command` requirement.
+            use dot_agent_deck::config::{IssueDispatchConfig, default_max_per_run};
+            let issue_dispatch = repo.map(|repo| IssueDispatchConfig {
+                repo,
+                max_per_run: max_per_run.unwrap_or_else(default_max_per_run),
+                label,
+                query,
+            });
+            schedule_cli::add(
+                &mut tasks,
+                schedule_cli::AddArgs {
+                    name,
+                    cron,
+                    working_dir,
+                    command,
+                    prompt,
+                    new_tab_per_fire,
+                    enabled,
+                    issue_dispatch,
+                },
+            )
+        }
         ScheduleAction::Update {
             name,
             cron,

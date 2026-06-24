@@ -143,7 +143,15 @@ pub const KIND_SHUTDOWN_ACK: u8 = 0x16;
 /// Additive `#[serde(default, skip_serializing_if = "Option::is_none")]`
 /// fields do NOT require a bump — they're forward-compatible by design. See
 /// the module-level "Protocol versioning" section for the full bump policy.
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// PRD #120 bumped 3 → 4: the `KIND_EVENT` payload
+/// ([`crate::event::BroadcastMsg`]) gained a new
+/// [`crate::event::BroadcastMsg::OrchestrationSurface`] variant (a new `kind`
+/// tag) so the daemon can surface a freshly-spawned orchestration tab to
+/// already-attached TUIs. An older client receiving the new tag would fail to
+/// deserialize the frame, so this is a non-forward-compatible payload-schema
+/// change.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -613,6 +621,7 @@ pub async fn serve_attach(
     // resolve against an empty registry rather than needing a real one.
     let dummy_scheduler = Arc::new(crate::scheduler::Scheduler::with_stderr_notifier());
     let dummy_reuse = crate::spawn::new_reuse_registry();
+    let dummy_worktrees = crate::issue_dispatch_run::new_worktree_registry();
     serve_attach_with_counter(
         listener,
         registry,
@@ -622,6 +631,7 @@ pub async fn serve_attach(
         None,
         dummy_scheduler,
         dummy_reuse,
+        dummy_worktrees,
     )
     .await
 }
@@ -644,6 +654,7 @@ pub async fn serve_attach_with_counter(
     shutdown: Option<Arc<tokio::sync::Notify>>,
     scheduler: Arc<crate::scheduler::Scheduler>,
     reuse_registry: crate::spawn::ReuseRegistry,
+    worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
 ) -> io::Result<()> {
     use std::sync::atomic::Ordering;
     use tokio::sync::Notify;
@@ -666,6 +677,7 @@ pub async fn serve_attach_with_counter(
                 let shutdown = shutdown.clone();
                 let scheduler = scheduler.clone();
                 let reuse_registry = reuse_registry.clone();
+                let worktree_registry = worktree_registry.clone();
                 tokio::spawn(async move {
                     // RAII guard: increments on creation, decrements on drop,
                     // so a `handle_connection` task that panics or is dropped
@@ -703,6 +715,7 @@ pub async fn serve_attach_with_counter(
                         shutdown,
                         scheduler,
                         reuse_registry,
+                        worktree_registry,
                     )
                     .await
                     {
@@ -745,6 +758,7 @@ pub async fn run_attach_server_with_counter(
     info!("Attach protocol listening on {}", path.display());
     let dummy_scheduler = Arc::new(crate::scheduler::Scheduler::with_stderr_notifier());
     let dummy_reuse = crate::spawn::new_reuse_registry();
+    let dummy_worktrees = crate::issue_dispatch_run::new_worktree_registry();
     serve_attach_with_counter(
         listener,
         registry,
@@ -754,10 +768,12 @@ pub async fn run_attach_server_with_counter(
         None,
         dummy_scheduler,
         dummy_reuse,
+        dummy_worktrees,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: UnixStream,
     registry: Arc<AgentPtyRegistry>,
@@ -766,6 +782,7 @@ async fn handle_connection(
     shutdown: Option<Arc<tokio::sync::Notify>>,
     scheduler: Arc<crate::scheduler::Scheduler>,
     reuse_registry: crate::spawn::ReuseRegistry,
+    worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
 ) -> io::Result<()> {
     let frame = match read_frame(&mut stream).await? {
         Some(f) => f,
@@ -1031,11 +1048,15 @@ async fn handle_connection(
             // close. Without this, a closed pane's role/cwd would linger
             // in the maps and a subsequent `handle_delegate` aimed at
             // that role would still resolve the dead pane.
-            let pane_id_env = registry
-                .agent_records()
-                .into_iter()
-                .find(|r| r.id == id)
-                .and_then(|r| r.pane_id_env);
+            // Capture the agent's record once, BEFORE close_agent removes it.
+            // `pane_id_env` cleans up the daemon's per-pane role maps; the
+            // record's cwd/orchestration-cwd is how the PRD #120 M2.4 close
+            // watcher matches a dispatched issue agent to its worktree.
+            let stopping_record = registry.agent_records().into_iter().find(|r| r.id == id);
+            let pane_id_env = stopping_record.as_ref().and_then(|r| r.pane_id_env.clone());
+            let dispatched_worktree = stopping_record
+                .as_ref()
+                .and_then(crate::issue_dispatch_run::worktree_of_record);
             // PRD #92 F8 followup (auditor #1): `close_agent` runs the
             // synchronous SIGTERM-with-grace loop in
             // `terminate_child_with_grace_and_wait`, which calls
@@ -1069,6 +1090,27 @@ async fn handle_connection(
                 Ok(()) => {
                     if let Some(pane_id) = pane_id_env {
                         state.write().await.unregister_pane(&pane_id);
+                    }
+                    // PRD #120 M2.4 + S1: if this agent was dispatched into a
+                    // per-issue worktree, the tab close is its cleanup trigger.
+                    // But a multi-role orchestration shares ONE worktree across
+                    // every role pane, so removing it on the first role's close
+                    // would nuke it under still-live siblings. `close_agent` has
+                    // already dropped the closing agent, so only when NO live
+                    // agent still resolves to this worktree was it the LAST one —
+                    // then `git worktree remove` the worktree (the clone is
+                    // preserved) and drop the registry entry. The child is already
+                    // reaped, so the worktree is no longer a live cwd. No-op for
+                    // ordinary agents and for earlier sibling-role closes.
+                    if let Some(worktree) = dispatched_worktree
+                        && !crate::issue_dispatch_run::worktree_still_in_use(
+                            &registry.agent_records(),
+                            &worktree,
+                        )
+                        && let Some(clone) =
+                            crate::issue_dispatch_run::take_worktree(&worktree_registry, &worktree)
+                    {
+                        crate::issue_dispatch_run::remove_worktree(&worktree, &clone).await;
                     }
                     write_resp(&mut stream, &AttachResponse::ok()).await?
                 }
@@ -1196,6 +1238,7 @@ async fn handle_connection(
                 crate::daemon::schedule_callback_factory(
                     registry.clone(),
                     reuse_registry.clone(),
+                    worktree_registry.clone(),
                     event_tx.clone(),
                 ),
             );
@@ -2090,7 +2133,9 @@ mod tests {
         let (kind, body) = read_frame(&mut cursor).await.unwrap().unwrap();
         assert_eq!(kind, KIND_EVENT);
         let back: BroadcastMsg = serde_json::from_slice(&body).unwrap();
-        let BroadcastMsg::Event(e) = back;
+        let BroadcastMsg::Event(e) = back else {
+            panic!("expected a BroadcastMsg::Event");
+        };
         assert_eq!(e.session_id, "sess-1");
         assert_eq!(e.event_type, EventType::ToolStart);
         assert_eq!(e.tool_name.as_deref(), Some("Read"));

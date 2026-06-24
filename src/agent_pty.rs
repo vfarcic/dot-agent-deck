@@ -16,7 +16,7 @@ use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast};
 
-use crate::event::AgentType;
+use crate::event::{AgentType, OrchestrationSurface};
 use crate::pane_input::{PaneInputError, SUBMIT_DELAY, encode_pane_payload, escape_bytes_for_log};
 
 /// Trigger flag the deck client honors to mean "the daemon is already
@@ -365,6 +365,74 @@ pub fn validate_tab_membership(mut tm: TabMembership) -> Option<TabMembership> {
 /// front instead.
 pub fn is_valid_orchestration_cwd(value: &str) -> bool {
     is_valid_cwd(value) && value.starts_with('/')
+}
+
+/// PRD #120 (H1/M1/L2): wire-boundary validation for the live
+/// [`OrchestrationSurface`] broadcast, mirroring [`validate_tab_membership`]
+/// for the reconnect path. The receive path
+/// (`EventSubscription::next_event` → `AppState::queue_orchestration_surface`
+/// → `resolve_orch_config_for_hydration` →
+/// `OrchestrationConfig::synthesize_from_bucket_metadata`) would otherwise feed
+/// an UNVALIDATED, daemon-supplied surface straight into synthesis, which sizes
+/// a role vec to `max(role_index) + 1`. A hostile/buggy `role_index` (e.g.
+/// `1e9`) OOMs the TUI and `usize::MAX` panics in debug — the exact OOM
+/// [`ORCHESTRATION_ROLE_INDEX_MAX`] was added to defend on the reconnect path,
+/// which the new path bypassed entirely.
+///
+/// Returns the sanitized surface on accept, `None` when it is structurally
+/// untrustworthy (the caller drops it without ending the event stream). Checks,
+/// applied BEFORE any allocation/use:
+/// - **H1:** every role whose `role_index > ORCHESTRATION_ROLE_INDEX_MAX` (the
+///   OOM cap) is dropped, so synthesis can never size a giant placeholder vec.
+/// - **M1:** `name`, `role_name`, and `display_title` feed the tab label /
+///   role cards exactly like the reconnect path's validated fields, so they get
+///   the same control-byte/ANSI guard. `name` is the tab IDENTITY + bucket key
+///   with no safe fallback → an invalid value rejects the whole surface. A role
+///   whose non-empty `role_name` carries control bytes is dropped (its slot
+///   falls back to a `role-{i}` placeholder). `display_title` is purely
+///   cosmetic with a defined `None` fallback (→ `name`), so an invalid value is
+///   nulled out rather than rejecting the surface (matches
+///   [`validate_tab_membership`]).
+/// - **L2:** `cwd` drives `load_project_config` and is the bucket key, so it
+///   must be a valid ABSOLUTE orchestration cwd → reject otherwise.
+///
+/// A surface left with no roles after the per-role drops is rejected: an
+/// orchestration always has ≥1 role, and a zero-role surface can only build a
+/// dead/empty tab.
+pub fn validate_orchestration_surface(
+    mut surface: OrchestrationSurface,
+) -> Option<OrchestrationSurface> {
+    // `name` is the tab identity + hydration bucket key — there is no safe
+    // fallback for a corrupt identity, so reject the whole surface.
+    if !is_valid_display_name(&surface.name) {
+        return None;
+    }
+    // `cwd` drives `load_project_config` and keys the bucket; require a valid
+    // absolute path free of control bytes.
+    if !is_valid_orchestration_cwd(&surface.cwd) {
+        return None;
+    }
+    // Cosmetic title with a defined `None` fallback: null it out on a bad value
+    // rather than dropping the orchestration tab over a bad label string.
+    if surface
+        .display_title
+        .as_deref()
+        .is_some_and(|t| !is_valid_display_name(t))
+    {
+        surface.display_title = None;
+    }
+    // Drop any role that would OOM the synthesis allocation (role_index over the
+    // cap) or smuggle control bytes into the tab via a non-empty role_name. An
+    // empty role_name is legitimate — synthesis falls back to a `role-{i}`
+    // placeholder.
+    surface.roles.retain(|r| {
+        r.role_index <= ORCHESTRATION_ROLE_INDEX_MAX
+            && (r.role_name.is_empty() || is_valid_display_name(&r.role_name))
+    });
+    if surface.roles.is_empty() {
+        return None;
+    }
+    Some(surface)
 }
 
 #[derive(Debug, Error)]
@@ -2422,6 +2490,7 @@ impl Drop for AgentPtyRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::OrchestrationSurfaceRole;
     use std::time::Duration;
 
     // PRD #92 F1 followup (auditor #3) — defensive boundary check on the
@@ -2734,6 +2803,181 @@ mod tests {
             display_title: None,
         };
         assert!(validate_tab_membership(tm).is_some());
+    }
+
+    // ---------------------------------------------------------------------
+    // PRD #120 — validate_orchestration_surface (the live-surface wire path
+    // analogue of validate_tab_membership). H1/M1/L2 coverage.
+    // ---------------------------------------------------------------------
+
+    fn surface_role(role_index: usize, role_name: &str) -> OrchestrationSurfaceRole {
+        OrchestrationSurfaceRole {
+            pane_id: format!("pane-{role_index}"),
+            role_index,
+            role_name: role_name.into(),
+            is_start_role: role_index == 0,
+        }
+    }
+
+    fn well_formed_surface() -> OrchestrationSurface {
+        OrchestrationSurface {
+            name: "issue-work".into(),
+            cwd: "/work/github-issues/.worktrees/issue-1".into(),
+            display_title: None,
+            roles: vec![surface_role(0, "orchestrator"), surface_role(1, "worker")],
+        }
+    }
+
+    #[test]
+    fn validate_orchestration_surface_accepts_well_formed() {
+        assert!(validate_orchestration_surface(well_formed_surface()).is_some());
+    }
+
+    // H1: a role_index over the OOM cap must not reach synthesis (which would
+    // size a `max_index + 1` placeholder vec). The offending role is dropped;
+    // the surviving roles still build the tab.
+    #[test]
+    fn validate_orchestration_surface_drops_role_over_index_cap() {
+        let mut surface = well_formed_surface();
+        surface
+            .roles
+            .push(surface_role(ORCHESTRATION_ROLE_INDEX_MAX + 1, "rogue"));
+        // A pathological 1e9 index — the OOM the cap exists to prevent.
+        surface.roles.push(surface_role(1_000_000_000, "oom"));
+        let validated =
+            validate_orchestration_surface(surface).expect("valid roles survive the drop");
+        assert_eq!(validated.roles.len(), 2, "over-cap roles dropped");
+        assert!(
+            validated
+                .roles
+                .iter()
+                .all(|r| r.role_index <= ORCHESTRATION_ROLE_INDEX_MAX)
+        );
+    }
+
+    #[test]
+    fn validate_orchestration_surface_accepts_role_index_at_ceiling() {
+        let mut surface = well_formed_surface();
+        surface
+            .roles
+            .push(surface_role(ORCHESTRATION_ROLE_INDEX_MAX, "edge"));
+        let validated = validate_orchestration_surface(surface).expect("ceiling index accepted");
+        assert_eq!(validated.roles.len(), 3);
+    }
+
+    // If EVERY role is over the cap the surface can only build a dead tab, so
+    // it's rejected outright.
+    #[test]
+    fn validate_orchestration_surface_rejects_when_all_roles_over_cap() {
+        let surface = OrchestrationSurface {
+            name: "issue-work".into(),
+            cwd: "/work/issue-1".into(),
+            display_title: None,
+            roles: vec![surface_role(ORCHESTRATION_ROLE_INDEX_MAX + 1, "rogue")],
+        };
+        assert!(validate_orchestration_surface(surface).is_none());
+    }
+
+    #[test]
+    fn validate_orchestration_surface_rejects_empty_roles() {
+        let mut surface = well_formed_surface();
+        surface.roles.clear();
+        assert!(validate_orchestration_surface(surface).is_none());
+    }
+
+    // M1: name feeds the tab label and is the bucket identity — a control-byte
+    // value rejects the whole surface (no safe fallback for an identity).
+    #[test]
+    fn validate_orchestration_surface_rejects_name_with_ansi_escape() {
+        let mut surface = well_formed_surface();
+        surface.name = "\x1b[31mpwn".into();
+        assert!(validate_orchestration_surface(surface).is_none());
+    }
+
+    #[test]
+    fn validate_orchestration_surface_rejects_name_with_nul_byte() {
+        let mut surface = well_formed_surface();
+        surface.name = "iss\0ue".into();
+        assert!(validate_orchestration_surface(surface).is_none());
+    }
+
+    // L2: cwd drives load_project_config and keys the bucket — control bytes,
+    // NUL, oversized, and relative paths are all rejected.
+    #[test]
+    fn validate_orchestration_surface_rejects_cwd_with_control_char() {
+        let mut surface = well_formed_surface();
+        surface.cwd = "/work/\x1b[31mevil".into();
+        assert!(validate_orchestration_surface(surface).is_none());
+    }
+
+    #[test]
+    fn validate_orchestration_surface_rejects_cwd_with_nul_byte() {
+        let mut surface = well_formed_surface();
+        surface.cwd = "/work/\0evil".into();
+        assert!(validate_orchestration_surface(surface).is_none());
+    }
+
+    #[test]
+    fn validate_orchestration_surface_rejects_relative_cwd() {
+        let mut surface = well_formed_surface();
+        surface.cwd = "relative/work".into();
+        assert!(validate_orchestration_surface(surface).is_none());
+    }
+
+    #[test]
+    fn validate_orchestration_surface_rejects_oversized_cwd() {
+        let mut surface = well_formed_surface();
+        surface.cwd = "/".to_string() + &"a".repeat(CWD_MAX_LEN);
+        assert!(validate_orchestration_surface(surface).is_none());
+    }
+
+    // M1: role_name flows to the role card/label like name does — drop a role
+    // whose non-empty role_name smuggles control bytes.
+    #[test]
+    fn validate_orchestration_surface_drops_role_with_ansi_role_name() {
+        let mut surface = well_formed_surface();
+        surface.roles.push(surface_role(2, "\x1b[31mpwn"));
+        let validated = validate_orchestration_surface(surface).expect("clean roles survive");
+        assert_eq!(validated.roles.len(), 2);
+        assert!(validated.roles.iter().all(|r| r.role_name != "\x1b[31mpwn"));
+    }
+
+    // An empty role_name is the older-daemon wire shape — synthesis falls back
+    // to a `role-{i}` placeholder, so it must NOT be dropped.
+    #[test]
+    fn validate_orchestration_surface_keeps_role_with_empty_role_name() {
+        let surface = OrchestrationSurface {
+            name: "issue-work".into(),
+            cwd: "/work/issue-1".into(),
+            display_title: None,
+            roles: vec![surface_role(0, "")],
+        };
+        let validated = validate_orchestration_surface(surface).expect("empty role_name accepted");
+        assert_eq!(validated.roles.len(), 1);
+    }
+
+    // M1: display_title is cosmetic with a defined `None` fallback (→ name), so
+    // an invalid value is nulled out — the surface is preserved.
+    #[test]
+    fn validate_orchestration_surface_nulls_out_display_title_with_control_bytes() {
+        let mut surface = well_formed_surface();
+        surface.display_title = Some("\x1b[31mpwn".into());
+        let validated = validate_orchestration_surface(surface).expect("surface preserved");
+        assert_eq!(
+            validated.display_title, None,
+            "invalid display_title nulled out, not rejected"
+        );
+    }
+
+    #[test]
+    fn validate_orchestration_surface_preserves_well_formed_display_title() {
+        let mut surface = well_formed_surface();
+        surface.display_title = Some("issue-work · issue-1".into());
+        let validated = validate_orchestration_surface(surface).expect("surface preserved");
+        assert_eq!(
+            validated.display_title.as_deref(),
+            Some("issue-work · issue-1")
+        );
     }
 
     #[test]

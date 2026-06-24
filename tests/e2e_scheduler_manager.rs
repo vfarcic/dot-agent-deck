@@ -1218,3 +1218,104 @@ fn form_006_edit_repick_different_dir_wins_in_seed() {
     drop(scratch);
     drop(parent);
 }
+
+// ---------------------------------------------------------------------------
+// scheduler/form/007 — the experimental `schedule: issues` authoring option (PRD
+// #120) seeds the authoring agent with ISSUE-DISPATCH instructions, distinct
+// from the plain `schedule` seed. The option lives on the new-pane Mode cycler
+// (reached via Ctrl+n, NOT the mode-locked manager Add/Edit form), so this test
+// drives Ctrl+n directly; it reuses the form family's `write_recorder_shim` to
+// capture the gated-delivered seed.
+// ---------------------------------------------------------------------------
+
+/// Scenario: With `default_command` set to a `stub-issue-authoring` recorder shim
+/// (posts SessionStart, then records every gated-delivered seed line) and the
+/// `experimental` flag ON, open the new-pane dialog (Ctrl+n → Space confirms the
+/// dir → the new-pane form) and cycle the Mode field to the experimental
+/// `schedule: issues` authoring option (appended after the plain `schedule`
+/// option; the cycler caps at the last option so an over-count of Rights is
+/// safe). Submitting via `[Submit]` spawns the seeded authoring agent. Assert the
+/// delivered seed is ISSUE-DISPATCH specific — it tells the agent to call
+/// `dot-agent-deck schedule add --repo …` and gathers `max_per_run` — neither of
+/// which appears in the plain-`schedule` seed (which calls `schedule add --name`
+/// and never mentions repo/max_per_run). RED today: no `schedule: issues` option
+/// exists, so cycling never lands on it and the `schedule: issues mode` title
+/// wait times out.
+#[spec("scheduler/form/007")]
+#[test]
+fn form_007_issue_dispatch_option_seeds_issue_dispatch_authoring() {
+    // One benign row so the daemon has a schedules file (the new-pane authoring
+    // flow itself uses no row).
+    let (scratch, sched_path) = scratch_with_schedules(
+        "[[scheduled_tasks]]\n\
+         name = \"placeholder\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"placeholder prompt\"\n\
+         enabled = true\n",
+    );
+
+    let shim_dir = scratch.path().join("shim");
+    std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+    let authoring_record = scratch.path().join("authoring-record.log");
+    write_recorder_shim(&shim_dir, "stub-issue-authoring", &authoring_record);
+
+    let config_path = scratch.path().join("config.toml");
+    std::fs::write(&config_path, "default_command = \"stub-issue-authoring\"\n")
+        .expect("write config.toml");
+
+    let path_env = format!(
+        "{}:{}",
+        shim_dir.to_string_lossy(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
+        // PRD #120: the `schedule: issues` modal option ships behind the
+        // experimental flag — turn it ON so the cycler offers it.
+        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+        .with_env("PATH", path_env)
+        .launch_with_fixture("schedule-mode");
+    deck.wait_for_string("No active sessions");
+
+    // Open the new-pane form and cycle the Mode field to the experimental
+    // `schedule: issues` authoring option.
+    deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
+    deck.send_keys(b" "); // Space → confirm current dir → new-pane form
+    deck.wait_for_string("No mode"); // Mode field is up (cycler at "No mode")
+    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8
+    // The dialog title becomes "… — schedule: issues mode" only when the
+    // issue-dispatch option is the SELECTED one, so it is a selection-dependent
+    // signal (the bare `[schedule: issues]` chip renders at every cycler index).
+    deck.wait_for_string("schedule: issues mode");
+
+    let (scol, srow) = deck
+        .find_in_grid("[Submit]")
+        .expect("the new-pane form should render a [Submit] button");
+    deck.click(scol, srow); // submit → spawn the seeded authoring agent
+
+    // The delivered seed must be the ISSUE-DISPATCH authoring seed: it tells the
+    // agent to write the schedule via `dot-agent-deck schedule add --repo …`.
+    assert!(
+        common::wait_for_file_substr_count(
+            &authoring_record,
+            "schedule add --repo",
+            1,
+            Duration::from_secs(15),
+        ),
+        "selecting `schedule: issues` must seed the authoring agent with issue-dispatch \
+         instructions calling `dot-agent-deck schedule add --repo …` (DISTINCT from the plain \
+         `schedule` seed's `schedule add --name`), but the recorder never received that guidance"
+    );
+    // ...and it gathers the issue-dispatch-specific `max_per_run` knob, absent
+    // from the plain `schedule` seed.
+    assert!(
+        common::count_file_substr(&authoring_record, "max_per_run") >= 1,
+        "the issue-dispatch authoring seed must gather `max_per_run` (not present in the plain \
+         `schedule` seed), but the recorder never received it"
+    );
+    drop(scratch);
+}
