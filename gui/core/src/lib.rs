@@ -32,8 +32,8 @@ mod daemon;
 mod keys;
 
 pub use agent::{
-    AgentStream, AgentStreamReader, AgentStreamWriter, ClientError, ResizeHandle, attach_stream,
-    list_agents, resize_agent, resize_channel, run_resize_worker,
+    AgentStream, AgentStreamReader, AgentStreamWriter, ClientError, EventStream, ResizeHandle,
+    attach_stream, list_agents, resize_agent, resize_channel, run_resize_worker, subscribe_events,
 };
 pub use client::{
     BridgeFrame, BridgeReader, BridgeWriter, ConnectError, ConnectionState, DaemonConnection,
@@ -50,7 +50,7 @@ pub use keys::{KeyBinding, nav_keybindings};
 /// [`list_agents`] (PRD #176 M1.3). [`TabMembership`] travels with it so the
 /// shell can bucket agents into the TUI's Mode-vs-Orchestration tab structure
 /// (PRD #176 M2.1) without re-deriving the wire shape.
-pub use protocol::{AgentRecord, TabMembership};
+pub use protocol::{AgentEvent, AgentRecord, EventType, TabMembership};
 
 /// The shared socket-path discovery, re-exported so the Tauri shell resolves
 /// the daemon socket through the same function the TUI does (PRD #93).

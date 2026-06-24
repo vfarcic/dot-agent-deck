@@ -126,7 +126,7 @@ It does not re-implement the TUI's rendering, does not hold orchestration logic,
 ### Phase 2 — GUI-native chrome
 
 - [ ] **M2.1** — Decks, tabs, and multi-pane layout from `ListAgents`/`AgentRecord` (Mode vs Orchestration buckets); focus and keyboard routing to the focused pane. _Implemented, pending hand-validation: the shell projects `tab_membership` into a bucket (`mode`/`orchestration`/`dashboard`) + tab name + role index/name (`AgentSummary`); the frontend renders the decks as a **top tab bar** (Design Decision #9), the focused deck's panes in the sidebar, and one focused terminal. **Keyboard navigation mirrors the TUI** via a command mode (`Ctrl+d` leader → `h`/`l`/`←`/`→` decks, `j`/`k`/`↑`/`↓` panes, `Enter` focus, `Esc` exit), with the leader intercepted in a capture-phase handler before xterm.js. Per the maintainer's parity-first working agreement (2026-06-23), a **simultaneous multi-visible-pane layout** (grid/splits/draggable) is treated as GUI-native net-new and **deferred to later** — the parity model here is "decks/tabs + one focused pane," like the TUI._
-- [ ] **M2.2** — Pane lifecycle from the GUI: `StartAgent`, `StopAgent`, `SetAgentLabel`, `Resize`, `WriteAndSubmit`; pane-status surface (running / waiting-for-input / finished) driven by `SubscribeEvents`. _Current state (spike): the frontend lists agents via a one-shot `agents` call with a **manual Refresh button** as a stand-in; the live, event-driven agent-list + status updates (no manual reload) land here once the GUI subscribes to `SubscribeEvents` — the daemon already emits these, the GUI just doesn't consume them yet._
+- [ ] **M2.2** — Pane lifecycle from the GUI: `StartAgent`, `StopAgent`, `SetAgentLabel`, `Resize`, `WriteAndSubmit`; pane-status surface (running / waiting-for-input / finished) driven by `SubscribeEvents`. _Partial: the **pane-status surface + live roster are done** — the GUI core subscribes to `SubscribeEvents`, the shell pumps events to the webview, and the frontend shows per-pane status dots (with a "needs you" cue on waiting panes + their deck tab) and auto-refreshes the agent list on session start/end, so the manual Refresh is no longer required (kept as a fallback). The status mapping mirrors `src/state.rs`. **Still pending: the lifecycle commands** (`StartAgent`/`StopAgent`/`SetAgentLabel`/`WriteAndSubmit`)._
 
 ### Phase 3 — Flagship: agents-communication graph (the one daemon change)
 
@@ -176,7 +176,7 @@ This is the answer to "how do we know we've ported everything we should?" — ev
 |---|---|---|
 | Embedded terminal pane (live PTY) | ✅ M1.3 | xterm.js |
 | Scrollback / truecolor / mouse / copy-paste / resize | ✅ M1.3 | |
-| Pane status (running / waiting-for-input / finished) | 🔲 M2.2 | via `SubscribeEvents` (also retires the manual Refresh) |
+| Pane status (running / waiting-for-input / finished) | ✅ (pending hand-validation) | live via `SubscribeEvents`; status dots + "needs you" cue on waiting panes/decks; mapping mirrors `src/state.rs` |
 | Send prompt (`WriteAndSubmit`) | 🔲 M2.2 | |
 
 ### Lifecycle / connection
@@ -184,7 +184,7 @@ This is the answer to "how do we know we've ported everything we should?" — ev
 |---|---|---|
 | Daemon auto-start on launch | ✅ | mirrors PRD #93 |
 | Connect / retry state | ✅ M1.2 | |
-| Reconnect / hydrate agents on connect | ✅ partial | lists on connect; live updates pending (M2.2) |
+| Reconnect / hydrate agents on connect | ✅ | lists on connect; live roster updates via `SubscribeEvents` (session start/end) — no manual refresh needed |
 
 ### Deliberate non-ports (TUI-only by nature)
 | TUI capability | GUI status | Notes |
@@ -199,6 +199,7 @@ This is the answer to "how do we know we've ported everything we should?" — ev
 | OS-native notifications | ➕ Phase 4 | adapts PRD #126's bell signal |
 | App zoom / font size (`Ctrl` `+`/`−`/`0`) | ✅ (pending hand-validation) | no TUI analog (terminal-emulator's job there); webview `set_zoom` scales chrome + terminal uniformly, terminal re-fits |
 | Collapsible sidebar deck groups | ➕ optional | small frontend follow-up |
+| App icon / branding | 🔲 blocked, **do last** | currently scaffolding placeholders. The repo has no real logo (`site/static/img/logo.svg` is not it, per the maintainer 2026-06-24) — needs a **separate logo-design task** first; then `npx tauri icon <logo>` regenerates the full set. Scheduled at the end. |
 
 ## Risks & Mitigations
 

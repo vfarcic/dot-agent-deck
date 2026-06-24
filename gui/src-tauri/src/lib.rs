@@ -24,9 +24,9 @@ use std::sync::Mutex;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use dad_gui_core::{
-    AgentRecord, ConnectionState, KeyBinding, ResizeHandle, TabMembership, attach_socket_path,
-    attach_stream, connect_or_autostart, list_agents, nav_keybindings, resize_channel,
-    run_resize_worker,
+    AgentRecord, ConnectionState, EventType, KeyBinding, ResizeHandle, TabMembership,
+    attach_socket_path, attach_stream, connect_or_autostart, list_agents, nav_keybindings,
+    resize_channel, run_resize_worker, subscribe_events,
 };
 use serde::Serialize;
 use tauri::async_runtime::JoinHandle;
@@ -70,6 +70,9 @@ impl Attachment {
 struct AppState {
     last: Mutex<Option<ConnectionState>>,
     attachment: Mutex<Option<Attachment>>,
+    /// The live `SubscribeEvents` pump task. Replaced (old one aborted) on each
+    /// (re)connect so there's never more than one event subscription running.
+    event_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl AppState {
@@ -148,12 +151,78 @@ async fn bootstrap_connection(app: AppHandle) {
     publish(&app, ConnectionState::Connecting);
     let socket = attach_socket_path();
     match connect_or_autostart(&socket, Some(client_build_version())).await {
-        Ok(conn) => publish(&app, conn.state()),
+        Ok(conn) => {
+            publish(&app, conn.state());
+            // Start the live event subscription so the agent list + pane
+            // statuses update without a manual refresh.
+            start_event_pump(app.clone());
+        }
         Err(err) => {
             tracing::info!(error = %err, "daemon connect/auto-start failed");
             publish(&app, ConnectionState::from_connect_error(&err));
         }
     }
+}
+
+/// One hook event projected for the webview: enough to drive pane-status badges
+/// and the live roster. `event_type` serializes snake_case (e.g.
+/// `"waiting_for_input"`), matching what the frontend switches on.
+#[derive(Debug, Clone, Serialize)]
+struct AgentEventMsg {
+    /// Daemon registry id (matches `AgentRecord.id`); `None` for events from
+    /// agents the daemon doesn't track (external hooks).
+    agent_id: Option<String>,
+    pane_id: Option<String>,
+    session_id: String,
+    event_type: EventType,
+}
+
+/// Subscribe to the daemon's event stream and forward each hook event to the
+/// webview as an `agent-event` event. Aborts any prior pump so a reconnect
+/// never leaves two subscriptions running. Ends quietly on stream EOF/error;
+/// the next (re)connect starts a fresh pump.
+fn start_event_pump(app: AppHandle) {
+    let state = app.state::<AppState>();
+    if let Some(old) = state.event_task.lock().expect("event_task mutex").take() {
+        old.abort();
+    }
+
+    let socket = attach_socket_path();
+    let pump_app = app.clone();
+    let task = tauri::async_runtime::spawn(async move {
+        let mut stream = match subscribe_events(&socket).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::info!(error = %e, "event subscription failed");
+                return;
+            }
+        };
+        loop {
+            match stream.next_event().await {
+                Ok(Some(ev)) => {
+                    let msg = AgentEventMsg {
+                        agent_id: ev.agent_id,
+                        pane_id: ev.pane_id,
+                        session_id: ev.session_id,
+                        event_type: ev.event_type,
+                    };
+                    if pump_app.emit("agent-event", &msg).is_err() {
+                        break; // webview gone
+                    }
+                }
+                Ok(None) => break, // clean EOF
+                Err(e) => {
+                    tracing::warn!(error = %e, "event stream ended");
+                    break;
+                }
+            }
+        }
+    });
+
+    *app.state::<AppState>()
+        .event_task
+        .lock()
+        .expect("event_task mutex") = Some(task);
 }
 
 /// Which navigation bucket an agent falls into — mirrors the TUI's

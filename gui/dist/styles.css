@@ -172,13 +172,43 @@ body {
 .agent-list button.selected {
   border-color: var(--warn);
 }
-.agent-list .aname {
-  display: block;
-}
 .agent-list .aid {
   display: block;
   color: var(--muted);
   font-size: 10px;
+}
+
+/* ---- Live pane status (driven by SubscribeEvents) ---- */
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 7px;
+  vertical-align: middle;
+  background: var(--border);
+  flex: 0 0 auto;
+}
+.st-waiting {
+  background: var(--warn);
+}
+.st-working,
+.st-thinking,
+.st-compacting {
+  background: var(--accent);
+}
+.st-idle {
+  background: var(--muted);
+}
+.st-error {
+  background: var(--err);
+}
+/* "Needs you" cue: emphasize a waiting pane and its deck tab. */
+.agent-list button.needs-input {
+  border-color: var(--warn);
+}
+.tab.needs-input {
+  box-shadow: inset 0 0 0 1px var(--warn);
 }
 
 /* ---- Right column: top tab bar (decks) above the terminal pane ---- */

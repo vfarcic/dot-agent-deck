@@ -25,8 +25,8 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::watch;
 
 use protocol::{
-    AgentRecord, AttachRequest, AttachResponse, KIND_DETACH, KIND_REQ, KIND_RESP, KIND_STREAM_END,
-    KIND_STREAM_IN, KIND_STREAM_OUT, read_frame, write_frame,
+    AgentEvent, AgentRecord, AttachRequest, AttachResponse, BroadcastMsg, KIND_DETACH, KIND_EVENT,
+    KIND_REQ, KIND_RESP, KIND_STREAM_END, KIND_STREAM_IN, KIND_STREAM_OUT, read_frame, write_frame,
 };
 
 /// Bounded wait for an in-flight daemon `Resize` round-trip, mirroring
@@ -262,6 +262,64 @@ pub async fn attach_stream(socket: &Path, id: &str) -> Result<AgentStream, Clien
         ));
     }
     Ok(AgentStream { rd, wr })
+}
+
+// ---------------------------------------------------------------------------
+// Event subscription (pane status / live roster) — mirrors the TUI's M2.17
+// event consumer.
+// ---------------------------------------------------------------------------
+
+/// A live `SubscribeEvents` subscription. After the daemon acks the request it
+/// streams `KIND_EVENT` frames carrying `BroadcastMsg::Event(AgentEvent)` hook
+/// events (agent activity → pane status, plus session start/end for the live
+/// roster). The GUI surfaces these as status badges and auto-refreshes the
+/// agent list, retiring the manual Refresh.
+#[derive(Debug)]
+pub struct EventStream {
+    rd: OwnedReadHalf,
+    /// Keep the write half alive so the connection stays fully open for the
+    /// subscription's lifetime — the client never writes after the request.
+    _wr: OwnedWriteHalf,
+}
+
+impl EventStream {
+    /// Read the next hook event. `Ok(None)` on clean EOF. Non-event frames and
+    /// unparseable event payloads are skipped (logged) rather than ending the
+    /// stream, so one malformed broadcast can't kill the subscription.
+    pub async fn next_event(&mut self) -> io::Result<Option<AgentEvent>> {
+        loop {
+            match read_frame(&mut self.rd).await? {
+                None => return Ok(None),
+                Some((KIND_EVENT, payload)) => {
+                    match serde_json::from_slice::<BroadcastMsg>(&payload) {
+                        Ok(BroadcastMsg::Event(ev)) => return Ok(Some(ev)),
+                        Err(e) => {
+                            eprintln!("dad-gui-core: skipping unparseable event frame: {e}");
+                            continue;
+                        }
+                    }
+                }
+                // Ignore any non-event frame kinds the daemon might interleave.
+                Some((_other, _)) => continue,
+            }
+        }
+    }
+}
+
+/// Open a `SubscribeEvents` subscription. Returns once the daemon acks with an
+/// OK `RESP`; subsequent reads are `KIND_EVENT` broadcasts via
+/// [`EventStream::next_event`].
+pub async fn subscribe_events(socket: &Path) -> Result<EventStream, ClientError> {
+    let stream = connect(socket).await?;
+    let (mut rd, mut wr) = stream.into_split();
+    let resp = issue(&mut rd, &mut wr, &AttachRequest::SubscribeEvents).await?;
+    if !resp.ok {
+        return Err(ClientError::Server(
+            resp.error
+                .unwrap_or_else(|| "subscribe-events failed".into()),
+        ));
+    }
+    Ok(EventStream { rd, _wr: wr })
 }
 
 // ---------------------------------------------------------------------------
