@@ -552,6 +552,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the exact layout used to keep the chip visible (wrap vs. window/scroll); the visibility of the non-selected chips when the row overflows; the authoring hint text (covered by `prompt/new-pane/007`).
 - **Platform coverage:** mac+linux.
 
+##### prompt/new-pane/010 — The new-pane Mode cycler offers an experimental `schedule: issues` issue-dispatch authoring option only when the experimental flag is ON; it is hidden when OFF while the plain `[schedule]` option still shows (PRD #120).
+- **Layer:** L2 (no public L1 render seam for the dialog — same constraint as `prompt/new-pane/007`; the real TUI is driven via PTY keystrokes and asserted on the rendered vt100 grid).
+- **Agent:** none (drives Ctrl+n → dir-picker → new-pane form in two flag states).
+- **Asserts:** launched with `DOT_AGENT_DECK_EXPERIMENTAL=1`, opening the new-pane form shows a `schedule: issues` option on the Mode cycler alongside the existing `[schedule]` option; a control launch with no env var (flag OFF) renders the plain `[schedule]` option but NOT `schedule: issues`. RED until the option exists: today no flag state carries `schedule: issues`, so the experimental-ON grid never contains it.
+- **Does not assert:** the authoring seed delivered when the option is selected (covered by `scheduler/form/007`); the post-submit layout; the chip's exact position in the cycler.
+- **Platform coverage:** mac+linux.
+
 ### Focus / navigation
 
 #### focus/dashboard
@@ -1889,6 +1896,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the exact error wording (loose substring on "command" + "required"); validation of any other field; on-disk write effects.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/cli/004 — `dot-agent-deck schedule add` accepts the issue-dispatch flags (`--repo`/`--max-per-run`/`--label`/`--query`, `--command` optional) and writes a `[scheduled_tasks.issue_dispatch]` sub-table that round-trips + reloads (PRD #120).
+- **Layer:** L2.
+- **Agent:** none (runs the `schedule` CLI subprocess against a live `daemon serve`).
+- **Asserts:** running `schedule add --repo acme/widgets --max-per-run 2 --label … --query …` (plus name/cron/working-dir/prompt) WITHOUT `--command` succeeds; the global `schedules.toml` gains a `[scheduled_tasks.issue_dispatch]` sub-table whose repo/max_per_run/label/query round-trip back into an `IssueDispatchConfig` through the loader; the running daemon registers the task via the add-triggered reload; and a malformed `--repo` (not `owner/name`) exits non-zero with a clear error. RED until the flags exist: today `schedule add` has no `--repo`/`--max-per-run`/`--label`/`--query`, so clap rejects the unknown `--repo` and the add exits non-zero.
+- **Does not assert:** the dispatch flow on fire (covered by `scheduler/dispatch/*`); the experimental gate on activation (covered by `scheduler/dispatch/010`); the exact malformed-repo wording (loose substring on "repo" + owner/name/slug).
+- **Platform coverage:** mac+linux.
+
 #### scheduler/spawn
 
 ##### scheduler/spawn/001 — A fire into a missing working_dir creates it (`mkdir -p`) then spawns; a fire into an uncreatable path surfaces a notification without crashing the daemon, and other tasks keep working (PRD #127 M2.1).
@@ -2145,6 +2159,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** the shimmed `stub-repick-authoring` authoring agent (records spawn cwd + the gated-delivered seed).
 - **Asserts:** pressing `e` (Edit) opens the dir picker started at the row's `working_dir` (`ROWDIRALPHA`); going UP one level (`h`) and descending into the DIFFERENT sibling `PICKDIRBRAVO` (double-click, confirmed via its `INNERMARK` child) then confirming with Space, and submitting via `[Submit]`, spawns the seeded authoring agent whose recorded seed — once delivered through its `EDITPROMPTF3` prompt line (which follows the `working_dir:` line) — carries `PICKDIRBRAVO` but ZERO occurrences of the row's stale `ROWDIRALPHA`. RED today: the edit seed appends the row's `working_dir: .../ROWDIRALPHA` as a conflicting current value alongside the picked `working_dir DEFAULT: .../PICKDIRBRAVO`.
 - **Does not assert:** the unchanged-pick / pre-fill path (covered by `scheduler/form/003`); the in-`src` `build_schedule_authoring_mode` seed unit tests (the coder's); the Add path (covered by `scheduler/form/002`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/form/007 — Selecting the experimental `schedule: issues` Mode option seeds the authoring agent with ISSUE-DISPATCH instructions (calls `schedule add --repo …`, gathers `max_per_run`), distinct from the plain `schedule` seed (PRD #120).
+- **Layer:** L2 (drives the real new-pane dialog via PTY — the experimental issue-dispatch option lives on the Ctrl+n Mode cycler, not the mode-locked manager form, so this drives Ctrl+n directly; observed via a `stub-issue-authoring` recorder shim on disk that records the gated-delivered seed). `default_command = "stub-issue-authoring"`; the deck is launched with `DOT_AGENT_DECK_EXPERIMENTAL=1`.
+- **Agent:** the shimmed `stub-issue-authoring` authoring agent (records the gated-delivered seed).
+- **Asserts:** opening the new-pane form (Ctrl+n → Space confirms the dir) and cycling the Mode field to the `schedule: issues` option (waited on via the selection-dependent ` … — schedule: issues mode ` title), then submitting via `[Submit]`, spawns the seeded authoring agent whose recorded seed contains the issue-dispatch guidance `schedule add --repo` AND `max_per_run` — neither present in the plain `schedule` seed (which calls `schedule add --name`). RED today: no `schedule: issues` option exists, so cycling never lands on it and the `schedule: issues mode` title wait times out.
+- **Does not assert:** the flag-gated visibility of the option in the cycler (covered by `prompt/new-pane/010`); the CLI write the agent ultimately performs (covered by `scheduler/cli/004`); the full seed-prompt text (loose substring on the issue-dispatch-specific tokens); the plain `schedule` seed (covered by `scheduler/form/002`).
 - **Platform coverage:** mac+linux.
 
 #### scheduler/live

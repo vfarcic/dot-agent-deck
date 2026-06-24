@@ -247,3 +247,61 @@ fn new_pane_009_schedule_chip_contained_when_row_overflows() {
          between any row's `│ … │` borders.\nGrid:\n{grid}"
     );
 }
+
+/// Scenario: Open the new-pane dialog (Ctrl+n → Space confirms the dir) in the
+/// `schedule-mode` fixture and inspect the Mode cycler in two flag states. With
+/// the `experimental` flag ON (`DOT_AGENT_DECK_EXPERIMENTAL=1`) the cycler must
+/// offer a NEW issue-dispatch authoring option labelled `schedule: issues`
+/// ALONGSIDE the existing built-in `[schedule]` option. With the flag OFF
+/// (control launch, no env var) the `schedule: issues` option must be HIDDEN
+/// while the plain `[schedule]` option still shows. L2 like
+/// `prompt/new-pane/007-009` (the dialog renderer + `NewPaneFormState` are
+/// private — no public L1 render seam — so the real dialog is driven via PTY and
+/// asserted on the rendered vt100 grid). RED today: no `schedule: issues` option
+/// exists in any flag state, so the experimental-ON grid never carries it.
+#[spec("prompt/new-pane/010")]
+#[test]
+fn new_pane_010_issue_dispatch_option_flag_gated() {
+    // The exact label of the new flag-gated issue-dispatch authoring option.
+    const ISSUE_OPTION: &str = "schedule: issues";
+
+    // --- experimental ON: the issue-dispatch authoring option is offered. ---
+    let on = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
+        .launch_with_fixture("schedule-mode");
+    on.wait_for_string("No active sessions");
+    on.send_keys(b"\x0e"); // Ctrl+n → directory picker
+    on.send_keys(b" "); // Space → confirm current dir → new-pane form
+    // The Mode field is up at "No mode"; the chip row (all options) paints in the
+    // SAME frame, so once "No mode" is on the grid the issue-dispatch chip — if
+    // the flag enables it — is already painted alongside it.
+    on.wait_for_string("No mode");
+    let on_grid = on.snapshot_grid();
+    assert!(
+        on_grid.contains(ISSUE_OPTION),
+        "with experimental ON the new-pane Mode cycler must offer a `{ISSUE_OPTION}` \
+         issue-dispatch authoring option alongside the plain `[schedule]` option, but the \
+         option is absent.\nGrid:\n{on_grid}"
+    );
+
+    // --- experimental OFF (control): the option is hidden; plain schedule stays. ---
+    let off = TuiDeck::launch_with_fixture("schedule-mode");
+    off.wait_for_string("No active sessions");
+    off.send_keys(b"\x0e");
+    off.send_keys(b" ");
+    off.wait_for_string("No mode");
+    let off_grid = off.snapshot_grid();
+    // The plain built-in `[schedule]` option still shows when the flag is OFF.
+    // (`[schedule]` ends in `]` right after "schedule", so it never matches inside
+    // the longer `[schedule: issues]` chip — it uniquely identifies the plain one.)
+    assert!(
+        off_grid.contains("[schedule]"),
+        "with experimental OFF the plain built-in `[schedule]` option must still show.\n\
+         Grid:\n{off_grid}"
+    );
+    assert!(
+        !off_grid.contains(ISSUE_OPTION),
+        "with experimental OFF the `{ISSUE_OPTION}` issue-dispatch option must be HIDDEN, but \
+         it is present.\nGrid:\n{off_grid}"
+    );
+}
