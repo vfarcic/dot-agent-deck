@@ -3,7 +3,7 @@
 //! L2 PTY showcase for GitHub issue-dispatch (PRD #120): a fired
 //! `issue_dispatch` task must surface its per-issue card LIVE on an
 //! ALREADY-ATTACHED TUI — the user-visible payoff the headless
-//! `scheduler/dispatch/001-010` family (run-now over the attach socket, no PTY)
+//! `scheduler/dispatch/001-009` family (run-now over the attach socket, no PTY)
 //! can't observe, and the clip the demo reel narrates.
 //!
 //! Unlike `tests/e2e_issue_dispatch.rs` (headless `daemon serve`, asserts on the
@@ -29,9 +29,9 @@
 //! `surface_spawned_pane` call). So the single-agent dispatch is the path that
 //! actually paints live, mirroring the proven `scheduler/live/001`.
 //!
-//! PRD #120 ships `issue_dispatch` behind the `experimental` flag, so the deck
-//! env sets `DOT_AGENT_DECK_EXPERIMENTAL=1` to activate the dispatch flow (the
-//! daemon inherits it). Expected GREEN against current code — additive coverage.
+//! PRD #120's `experimental` flag gates only the creation UX, not the dispatch
+//! BEHAVIOR, so a configured `issue_dispatch` task fires regardless of the flag
+//! and this deck env carries no `DOT_AGENT_DECK_EXPERIMENTAL`.
 
 mod common;
 
@@ -297,9 +297,6 @@ fn dispatch_011_card_surfaces_live_in_tui() {
         .with_env("PATH", path)
         .with_env("GHSTUB_DIR", ghdir)
         .with_env("DOT_AGENT_DECK_CONFIG", cfg_str)
-        // PRD #120 ships issue_dispatch behind the experimental flag; turn it ON
-        // so the dispatch flow runs (the daemon inherits this).
-        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
 

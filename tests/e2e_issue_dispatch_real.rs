@@ -63,8 +63,9 @@
 //!   - The live-fire seam from `scheduler/live/*`: the fire is driven by `RunNow`
 //!     over the deck's attach socket (no real cron wait).
 //!
-//! PRD #120 ships `issue_dispatch` behind the `experimental` flag, so the deck
-//! env sets `DOT_AGENT_DECK_EXPERIMENTAL=1`.
+//! PRD #120's `experimental` flag gates only the creation UX, not the dispatch
+//! BEHAVIOR, so a configured `issue_dispatch` task fires regardless of the flag
+//! and this deck env carries no `DOT_AGENT_DECK_EXPERIMENTAL`.
 //!
 //! NO REMOTE WRITES: the dispatch creates the branch `agent/issue-1` only in the
 //! local tempdir clone and never pushes; the task is a list-files directive, so
@@ -283,8 +284,6 @@ fn dispatch_013_orchestration_surfaces_and_delegates() {
         // GITHUB_TOKEN explicitly — the daemon and the real `gh` it runs inherit
         // it for enumerate/clone against live GitHub.
         .with_env("GITHUB_TOKEN", token)
-        // PRD #120 ships issue_dispatch behind the experimental flag; turn it ON.
-        .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
 

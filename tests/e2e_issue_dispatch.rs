@@ -23,14 +23,14 @@
 //! worktree. Each test asserts that observable end-state — clone present,
 //! worktree created, per-issue agent(s) rooted in it — across the seam above.
 //!
-//! PRD #120 LATE DECISION (2026-06-22): `issue_dispatch` now ships behind the
-//! `experimental` flag. The dispatch flow runs only when the flag is ON
-//! (`DOT_AGENT_DECK_EXPERIMENTAL=1`, which the daemon reads). So dispatch/001-009
-//! set that env var in the daemon-spawn env to keep exercising the flow once the
-//! activation gate (in `make_schedule_callback`) lands; `dispatch/010` OMITS it
-//! to assert that with the flag OFF a configured `issue_dispatch` task stays
-//! INERT (no clone, no worktree, no spawn) and surfaces a one-line
-//! "experimental / how to enable" notice through the existing notifier.
+//! PRD #120 FINAL DECISION: the `experimental` flag gates only the CREATION UX
+//! (the new-pane `schedule: issues` option and the issue-dispatch authoring
+//! form), NOT the dispatch BEHAVIOR. A configured `issue_dispatch` task fires
+//! regardless of the flag, so these daemon-spawn envs carry no
+//! `DOT_AGENT_DECK_EXPERIMENTAL`. (The former `dispatch/010`, which asserted the
+//! flow stayed inert with the flag off, was removed when the behavior gate went
+//! away.) Flag-gated creation UX is covered by the `scheduler/cli`,
+//! `new-pane/issue-dispatch`, and `scheduler/manager` catalog families.
 
 mod common;
 
@@ -410,13 +410,7 @@ fn dispatch_001_clone_worktree_spawn() {
     );
     let path = stub.path_env();
     let ghdir = stub.ghstub_dir();
-    let env: Vec<(&str, &str)> = vec![
-        ("PATH", path.as_str()),
-        ("GHSTUB_DIR", ghdir.as_str()),
-        // PRD #120 ships issue_dispatch behind the experimental flag; turn it ON
-        // so the dispatch flow runs once the activation gate lands.
-        ("DOT_AGENT_DECK_EXPERIMENTAL", "1"),
-    ];
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
 
     daemon
@@ -485,13 +479,7 @@ fn dispatch_002_idempotent_skip_existing_worktree() {
     );
     let path = stub.path_env();
     let ghdir = stub.ghstub_dir();
-    let env: Vec<(&str, &str)> = vec![
-        ("PATH", path.as_str()),
-        ("GHSTUB_DIR", ghdir.as_str()),
-        // PRD #120 ships issue_dispatch behind the experimental flag; turn it ON
-        // so the dispatch flow runs once the activation gate lands.
-        ("DOT_AGENT_DECK_EXPERIMENTAL", "1"),
-    ];
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
 
     let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
@@ -572,13 +560,7 @@ fn dispatch_003_skip_open_pr() {
     );
     let path = stub.path_env();
     let ghdir = stub.ghstub_dir();
-    let env: Vec<(&str, &str)> = vec![
-        ("PATH", path.as_str()),
-        ("GHSTUB_DIR", ghdir.as_str()),
-        // PRD #120 ships issue_dispatch behind the experimental flag; turn it ON
-        // so the dispatch flow runs once the activation gate lands.
-        ("DOT_AGENT_DECK_EXPERIMENTAL", "1"),
-    ];
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
 
     daemon
@@ -661,9 +643,6 @@ fn dispatch_004_orchestration_vs_single_agent() {
         ("PATH", path.as_str()),
         ("GHSTUB_DIR", ghdir.as_str()),
         ("DOT_AGENT_DECK_CONFIG", cfg_str.as_str()),
-        // PRD #120 ships issue_dispatch behind the experimental flag; turn it ON
-        // so the dispatch flow runs once the activation gate lands.
-        ("DOT_AGENT_DECK_EXPERIMENTAL", "1"),
     ];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
 
@@ -726,13 +705,7 @@ fn dispatch_005_respects_max_per_run() {
     );
     let path = stub.path_env();
     let ghdir = stub.ghstub_dir();
-    let env: Vec<(&str, &str)> = vec![
-        ("PATH", path.as_str()),
-        ("GHSTUB_DIR", ghdir.as_str()),
-        // PRD #120 ships issue_dispatch behind the experimental flag; turn it ON
-        // so the dispatch flow runs once the activation gate lands.
-        ("DOT_AGENT_DECK_EXPERIMENTAL", "1"),
-    ];
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
 
     daemon
@@ -792,13 +765,7 @@ fn dispatch_006_close_removes_worktree_preserves_clone() {
     );
     let path = stub.path_env();
     let ghdir = stub.ghstub_dir();
-    let env: Vec<(&str, &str)> = vec![
-        ("PATH", path.as_str()),
-        ("GHSTUB_DIR", ghdir.as_str()),
-        // PRD #120 ships issue_dispatch behind the experimental flag; turn it ON
-        // so the dispatch flow runs once the activation gate lands.
-        ("DOT_AGENT_DECK_EXPERIMENTAL", "1"),
-    ];
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
 
     daemon
@@ -864,13 +831,7 @@ fn dispatch_007_one_issue_fails_others_dispatch() {
     );
     let path = stub.path_env();
     let ghdir = stub.ghstub_dir();
-    let env: Vec<(&str, &str)> = vec![
-        ("PATH", path.as_str()),
-        ("GHSTUB_DIR", ghdir.as_str()),
-        // PRD #120 ships issue_dispatch behind the experimental flag; turn it ON
-        // so the dispatch flow runs once the activation gate lands.
-        ("DOT_AGENT_DECK_EXPERIMENTAL", "1"),
-    ];
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
 
     daemon
@@ -944,13 +905,7 @@ fn dispatch_008_refire_after_close_redispatches() {
     );
     let path = stub.path_env();
     let ghdir = stub.ghstub_dir();
-    let env: Vec<(&str, &str)> = vec![
-        ("PATH", path.as_str()),
-        ("GHSTUB_DIR", ghdir.as_str()),
-        // PRD #120 ships issue_dispatch behind the experimental flag; turn it ON
-        // so the dispatch flow runs once the activation gate lands.
-        ("DOT_AGENT_DECK_EXPERIMENTAL", "1"),
-    ];
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
 
     let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
@@ -1042,13 +997,7 @@ fn dispatch_009_multirole_orchestration_cleanup_refcount() {
     );
     let path = stub.path_env();
     let ghdir = stub.ghstub_dir();
-    let env: Vec<(&str, &str)> = vec![
-        ("PATH", path.as_str()),
-        ("GHSTUB_DIR", ghdir.as_str()),
-        // PRD #120 ships issue_dispatch behind the experimental flag; turn it ON
-        // so the dispatch flow runs once the activation gate lands.
-        ("DOT_AGENT_DECK_EXPERIMENTAL", "1"),
-    ];
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
 
     daemon
@@ -1110,78 +1059,6 @@ fn dispatch_009_multirole_orchestration_cleanup_refcount() {
     );
 }
 
-/// Scenario: With the `experimental` flag OFF (the daemon env does NOT carry
-/// `DOT_AGENT_DECK_EXPERIMENTAL`), fire a valid `[scheduled_tasks.issue_dispatch]`
-/// task via run-now while the stub `gh` reports one open issue and the fixture
-/// remote is present. The task must stay INERT — no clone dir, no per-issue
-/// worktree, and no agent spawned — yet still surface a one-line notice through
-/// the notifier telling the user the feature is experimental and how to enable it.
-#[spec("scheduler/dispatch/010")]
-#[test]
-fn dispatch_010_inert_when_flag_off() {
-    let stub = GhStub::new();
-    let repo = "acme/widgets";
-    stub.add_repo(repo, true);
-    stub.set_issues(repo, &[7]);
-
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
-    let work = work_td.path().join("ws");
-    std::fs::create_dir_all(&work).expect("create workspace root");
-    let work_str = work.to_string_lossy().into_owned();
-
-    let toml = dispatch_task(
-        "dispatch-task",
-        &work_str,
-        "ISSUEDISPATCH-{{issue_number}}",
-        repo,
-        5,
-    );
-    let path = stub.path_env();
-    let ghdir = stub.ghstub_dir();
-    // Flag OFF on purpose: DOT_AGENT_DECK_EXPERIMENTAL is intentionally absent so
-    // the activation gate keeps the configured issue_dispatch task inert.
-    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
-    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
-
-    daemon
-        .run_now("dispatch-task")
-        .expect("run-now dispatch-task");
-
-    let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
-
-    // With the flag OFF the task is INERT. Give the dispatch flow time to
-    // (wrongly) provision a per-issue worktree; in the gated build it never does.
-    let dispatched = common::wait_until(Duration::from_secs(5), || paths.worktree_dir.exists());
-    assert!(
-        !dispatched,
-        "flag OFF: a configured issue_dispatch task must stay inert — no per-issue worktree at {:?}",
-        paths.worktree_dir
-    );
-    assert!(
-        !paths.clone_dir.exists(),
-        "flag OFF: the repo must NOT be cloned — clone dir {:?} must not exist",
-        paths.clone_dir
-    );
-    assert_eq!(
-        count_orchestrators(&daemon),
-        0,
-        "flag OFF: no agent may be spawned for a gated issue_dispatch task"
-    );
-
-    // The inert task must still tell the user it's experimental and how to enable
-    // it. The startup banner always logs "experimental flag: OFF", so the
-    // distinguishing signal is the how-to-enable instruction ("enable"), which
-    // baseline daemon stderr never emits.
-    let noticed = common::wait_until(W, || {
-        (daemon.stderr_contains("experimental") || daemon.stderr_contains("Experimental"))
-            && (daemon.stderr_contains("enable") || daemon.stderr_contains("Enable"))
-    });
-    assert!(
-        noticed,
-        "flag OFF: the deck must surface a one-line notice referencing 'experimental' and how to enable it"
-    );
-}
-
 /// Scenario: Dispatch one open issue so its worktree exists, then arm the stub so
 /// `gh pr list --head agent/issue-7` ERRORS, and fire again. Because a present
 /// worktree is the primary idempotency signal, the second fire must short-circuit
@@ -1212,13 +1089,7 @@ fn dispatch_012_worktree_present_skips_without_pr_check() {
     );
     let path = stub.path_env();
     let ghdir = stub.ghstub_dir();
-    let env: Vec<(&str, &str)> = vec![
-        ("PATH", path.as_str()),
-        ("GHSTUB_DIR", ghdir.as_str()),
-        // PRD #120 ships issue_dispatch behind the experimental flag; turn it ON
-        // so the dispatch flow runs once the activation gate lands.
-        ("DOT_AGENT_DECK_EXPERIMENTAL", "1"),
-    ];
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
 
     let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
