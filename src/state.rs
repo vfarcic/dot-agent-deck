@@ -14,6 +14,13 @@ use crate::event::{
 use crate::project_config::{OrchestrationRoleConfig, load_project_config};
 
 const MAX_RECENT_EVENTS: usize = 50;
+/// PRD #120 L1: cap on [`AppState::pending_orchestration_surfaces`]. The render
+/// loop drains the queue one surface per frame, so a daemon flooding surface
+/// events faster than it drains can't grow the Vec unbounded — beyond this the
+/// OLDEST queued surface is dropped (the newer dispatch is the more relevant one
+/// to build). Sized well above any realistic concurrent-dispatch burst (a fire's
+/// `max_per_run` issue dispatches is single/low-double digits).
+const MAX_PENDING_ORCHESTRATION_SURFACES: usize = 64;
 /// Maximum number of first-prompt entries retained per session. The live-side
 /// cap in `apply_event` and the wire-boundary clamp in
 /// [`crate::daemon_client`] (which re-clamps a hostile/oversized daemon
@@ -201,10 +208,12 @@ pub struct AppState {
     /// live tabs. The daemon publishes a
     /// [`BroadcastMsg::OrchestrationSurface`]; the event subscriber records it
     /// here (it has no access to the `TabManager` / pane controller), and the
-    /// render loop drains the queue, attaches each role's PTY, and builds the
-    /// orchestration tab via the existing
-    /// `open_orchestration_tab_with_existing_role_panes` machinery. Empty in
-    /// the common case; drained to empty each tick it has entries.
+    /// render loop drains ONE entry per frame (M2/S3: each build does bounded
+    /// per-role attach round-trips, so one-per-frame keeps a burst from freezing
+    /// the UI), attaches each role's PTY, and builds the orchestration tab via
+    /// the existing `open_orchestration_tab_with_existing_role_panes` machinery.
+    /// Empty in the common case; bounded by `MAX_PENDING_ORCHESTRATION_SURFACES`
+    /// (L1) so a flood can't grow it unbounded.
     pub pending_orchestration_surfaces: Vec<OrchestrationSurface>,
 }
 
@@ -619,14 +628,19 @@ impl AppState {
     /// the [`BroadcastMsg::OrchestrationSurface`] but cannot touch the
     /// `TabManager` / pane controller (those live on the TUI render thread).
     pub fn queue_orchestration_surface(&mut self, surface: OrchestrationSurface) {
+        // PRD #120 L1: bound the queue. If it's already at the cap, drop the
+        // OLDEST entry to make room — a flood can't grow it unbounded, and the
+        // freshest dispatch is the one most worth surfacing. Log the drop so it
+        // stays observable.
+        if self.pending_orchestration_surfaces.len() >= MAX_PENDING_ORCHESTRATION_SURFACES {
+            let dropped = self.pending_orchestration_surfaces.remove(0);
+            tracing::warn!(
+                orchestration = %dropped.name,
+                cap = MAX_PENDING_ORCHESTRATION_SURFACES,
+                "queue_orchestration_surface: pending queue at cap; dropping oldest surface"
+            );
+        }
         self.pending_orchestration_surfaces.push(surface);
-    }
-
-    /// PRD #120: take and clear the queued orchestration surfaces. The render
-    /// loop drains this once per tick (only when non-empty) and builds each
-    /// into a live orchestration tab.
-    pub fn take_pending_orchestration_surfaces(&mut self) -> Vec<OrchestrationSurface> {
-        std::mem::take(&mut self.pending_orchestration_surfaces)
     }
 
     /// Create a placeholder session for a newly created pane so it always

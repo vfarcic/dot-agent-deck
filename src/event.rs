@@ -178,11 +178,11 @@ pub struct OrchestrationSurface {
 /// One role pane of a live-surfaced orchestration (see [`OrchestrationSurface`]).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OrchestrationSurfaceRole {
-    /// Daemon registry id of the spawned agent — the TUI `attach`es to this to
-    /// wire the live PTY into a local pane.
-    pub agent_id: String,
     /// The `DOT_AGENT_DECK_PANE_ID` the daemon tagged the pane with — reused as
-    /// the TUI-side local pane id so hook events keep routing correctly.
+    /// the TUI-side local pane id so hook events keep routing correctly. The TUI
+    /// attaches to the live PTY by resolving THIS pane id through `list_agents`
+    /// (see `EmbeddedPaneController::hydrate_pane`), not by a registry agent id —
+    /// so no `agent_id` rides on the wire.
     pub pane_id: String,
     /// Position of this role in the orchestration config's `roles`.
     pub role_index: usize,
@@ -416,14 +416,12 @@ mod tests {
             display_title: None,
             roles: vec![
                 OrchestrationSurfaceRole {
-                    agent_id: "42".into(),
                     pane_id: "sched-github-issues-0-r0".into(),
                     role_index: 0,
                     role_name: "orchestrator".into(),
                     is_start_role: true,
                 },
                 OrchestrationSurfaceRole {
-                    agent_id: "43".into(),
                     pane_id: "sched-github-issues-0-r1".into(),
                     role_index: 1,
                     role_name: "worker".into(),

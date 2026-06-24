@@ -2203,25 +2203,44 @@ fn process_pending_orchestration_surfaces(
     pane: &Arc<dyn PaneController>,
     tab_manager: &mut TabManager,
 ) {
-    // Drain under a short write lock; bail before any work in the common
-    // empty case so the steady-state tick cost is one lock + is_empty check.
-    let pending = {
-        let mut st = state.blocking_write();
-        if st.pending_orchestration_surfaces.is_empty() {
-            return;
-        }
-        st.take_pending_orchestration_surfaces()
-    };
+    // S2: cheap READ-lock peek. The steady-state idle cost is one read lock +
+    // is_empty — not the exclusive write lock the drain needs, taken every frame
+    // just to find the queue empty.
+    if state
+        .blocking_read()
+        .pending_orchestration_surfaces
+        .is_empty()
+    {
+        return;
+    }
     let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() else {
-        tracing::debug!(
-            count = pending.len(),
-            "live orchestration surface: non-embedded controller; dropping queued surfaces"
-        );
+        // Non-embedded controller (tests / non-production): can't attach live
+        // daemon PTYs. Drain and drop so the (capped) queue can't accumulate.
+        let mut st = state.blocking_write();
+        let count = st.pending_orchestration_surfaces.len();
+        if count > 0 {
+            st.pending_orchestration_surfaces.clear();
+            tracing::debug!(
+                count,
+                "live orchestration surface: non-embedded controller; dropping queued surfaces"
+            );
+        }
         return;
     };
-    for surface in pending {
-        surface_one_orchestration(state, embedded, tab_manager, surface);
-    }
+    // M2/S3: process at most ONE surface per frame. `surface_one_orchestration`
+    // does a bounded `block_on(hydrate_pane)` per role (list 5s + attach 3s);
+    // draining the whole queue in a single frame would compound that into a
+    // multi-second UI freeze under a flood. One-per-frame caps the per-frame
+    // cost at a single surface's bounded round-trips — the rest drain on the
+    // following frames (the render loop ticks ~every 16ms while idle).
+    let surface = {
+        let mut st = state.blocking_write();
+        if st.pending_orchestration_surfaces.is_empty() {
+            return; // a concurrent path drained it between the peek and here
+        }
+        st.pending_orchestration_surfaces.remove(0)
+    };
+    surface_one_orchestration(state, embedded, tab_manager, surface);
 }
 
 /// Build one live orchestration tab from a daemon [`OrchestrationSurface`].

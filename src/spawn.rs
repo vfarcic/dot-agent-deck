@@ -576,10 +576,11 @@ fn surface_spawned_pane(
 /// can only be rebuilt from the per-role index / name / start-flag / cwd the
 /// TUI's `open_orchestration_tab_with_existing_role_panes` machinery consumes.
 /// `roles` and `agents` are parallel (each role was pushed in iteration order),
-/// so the i-th role's spawned pane is `agents[i]`. The agent's registry `id`
-/// rides along so the TUI can `attach` to the live PTY; the `pane_id` is reused
-/// TUI-side as the local pane id so hook routing stays correct. Delivery is
-/// best-effort: `send` errs only when there are no subscribers.
+/// so the i-th role's spawned pane is `agents[i]`. The `pane_id` is reused
+/// TUI-side as the local pane id (so hook routing stays correct) AND is how the
+/// TUI attaches to the live PTY — it resolves the pane id through `list_agents`
+/// rather than via a registry agent id, so no `agent_id` rides on the wire.
+/// Delivery is best-effort: `send` errs only when there are no subscribers.
 fn surface_spawned_orchestration(
     event_tx: &broadcast::Sender<BroadcastMsg>,
     name: &str,
@@ -591,19 +592,31 @@ fn surface_spawned_orchestration(
         .iter()
         .zip(agents.iter())
         .map(|(role, agent)| crate::event::OrchestrationSurfaceRole {
-            agent_id: agent.id.clone(),
             pane_id: agent.pane_id.clone(),
             role_index: role.role_index,
             role_name: role.role_name.clone(),
             is_start_role: role.is_start_role,
         })
         .collect();
+    // PRD #120 S1: disambiguate concurrent dispatched orchestration tabs. The
+    // daemon-initiated path carries no user-typed title, so N concurrent issue
+    // dispatches would all paint identically-labelled tabs (the shared
+    // orchestration `name`, e.g. `issue-work`) — indistinguishable in the tab
+    // strip. Append the per-spawn identity: the cwd basename, which for issue
+    // dispatch is the per-issue worktree `issue-<n>`. `name` stays the PREFIX so
+    // the canonical label reads first and survives the tab strip's
+    // trailing-ellipsis truncation. When the basename already equals `name` (an
+    // unnamed orchestration whose name resolved to its own cwd basename) there's
+    // nothing to add — fall back to `None`, i.e. the canonical `name`.
+    let display_title = Path::new(cwd)
+        .file_name()
+        .map(|b| b.to_string_lossy().into_owned())
+        .filter(|b| b != name)
+        .map(|b| format!("{name} · {b}"));
     let surface = crate::event::OrchestrationSurface {
         name: name.to_string(),
         cwd: cwd.to_string(),
-        // Daemon-initiated orchestrations carry no user-typed title; the tab
-        // falls back to the canonical `name`.
-        display_title: None,
+        display_title,
         roles: surface_roles,
     };
     let _ = event_tx.send(BroadcastMsg::OrchestrationSurface(surface));

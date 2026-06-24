@@ -112,7 +112,23 @@ impl OrchestrationConfig {
     /// show an empty label.
     pub fn synthesize_from_bucket_metadata(name: &str, slots: &[SynthesisRoleSlot]) -> Self {
         let max_index = slots.iter().map(|s| s.role_index).max().unwrap_or(0);
-        let role_count = if slots.is_empty() { 0 } else { max_index + 1 };
+        // PRD #120 H1 (defense in depth): the wire-boundary validators
+        // (`validate_tab_membership` for reconnect, `validate_orchestration_surface`
+        // for the live-surface path) cap `role_index` at
+        // `ORCHESTRATION_ROLE_INDEX_MAX`, but guard here too so a direct/internal
+        // caller can't OOM or hit the debug-mode overflow panic. `saturating_add`
+        // avoids the `usize::MAX + 1` panic; the `.min(..)` bounds the placeholder
+        // allocation even if an over-cap index slips through. A slot whose
+        // `role_index` lands past the clamped count is then skipped by the bounds-
+        // checked `roles.get_mut(..)` below (and `claimed[..]` is only indexed via
+        // the same short-circuit), so the clamp is safe.
+        let role_count = if slots.is_empty() {
+            0
+        } else {
+            max_index
+                .saturating_add(1)
+                .min(crate::agent_pty::ORCHESTRATION_ROLE_INDEX_MAX + 1)
+        };
         let mut roles: Vec<OrchestrationRoleConfig> = (0..role_count)
             .map(|i| OrchestrationRoleConfig {
                 name: format!("role-{i}"),
@@ -605,6 +621,26 @@ start = true
         let cfg = OrchestrationConfig::synthesize_from_bucket_metadata("o", &[]);
         assert!(cfg.roles.is_empty());
         assert_eq!(cfg.name, "o");
+    }
+
+    // PRD #120 H1 (defense in depth): a pathological role_index that slips past
+    // the wire-boundary validators must NOT size a giant placeholder vec
+    // (`usize::MAX + 1` panics in debug; a billion-element vec OOMs). The clamp
+    // bounds role_count and the bounds-checked slot loop skips the over-cap
+    // index without panicking.
+    #[test]
+    fn synthesize_clamps_pathological_role_index() {
+        let slots = vec![SynthesisRoleSlot {
+            role_index: usize::MAX,
+            role_name: "rogue".into(),
+            is_start_role: false,
+        }];
+        let cfg = OrchestrationConfig::synthesize_from_bucket_metadata("o", &slots);
+        assert!(
+            cfg.roles.len() <= crate::agent_pty::ORCHESTRATION_ROLE_INDEX_MAX + 1,
+            "role_count must be clamped, got {}",
+            cfg.roles.len()
+        );
     }
 
     #[test]
