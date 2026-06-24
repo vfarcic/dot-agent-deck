@@ -144,6 +144,61 @@ It does not re-implement the TUI's rendering, does not hold orchestration logic,
 - [ ] **M5.3** — Docs: developer build/run + toolchain doc under `docs/develop/` (linked from `CONTRIBUTING.md`); user doc once past spike quality; changelog fragment via `dot-ai-changelog-fragment`.
 - [ ] **M5.4** — Pre-PR gate: `cargo test-e2e` green; review (Greptile) settled per CLAUDE.md rule 8.
 
+## TUI → GUI feature parity (living checklist)
+
+This is the answer to "how do we know we've ported everything we should?" — every user-facing TUI capability, its GUI status, and the deliberate non-ports. It is a **living checklist**, updated as slices land. Derived from the TUI's `Action` set (`src/keybindings.rs`) plus the broader feature areas. Status legend: ✅ ported · 🔲 pending · 🚫 not porting (TUI-only by nature) · ➕ GUI-native-only (net-new, not a TUI feature, sequenced later). Rows marked **confirm** are divergence/scoping calls for the maintainer (per Design Decision #7 and the 2026-06-23 parity-first working agreement); the rest follow from parity.
+
+**Two navigation axes (clarifies the digit-jump rows):** a deck/tab usually holds *several* panes (orchestration role panes, Mode panes, the multi-card Dashboard), so "deck N" ≠ "pane N". The TUI uses digits `1–9` for **panes** (`FocusCard`) and `h`/`l` for **decks**. The GUI plan diverges to match desktop convention + the top tab bar: **digit → deck**, **Shift+digit → pane**.
+
+### Chrome & navigation
+| TUI capability | GUI status | Notes |
+|---|---|---|
+| Decks/tabs (Mode vs Orchestration) | ✅ M2.1 | top tab bar (Design Decision #9) |
+| Dashboard is the leftmost tab | 🔲 pending | parity fix — currently sorted last |
+| Command mode (`Ctrl+d` leader) | ✅ M2.1 | capture-phase intercept before xterm.js |
+| Move between decks (`h`/`l`, `←`/`→`) | ✅ M2.1 | |
+| Move between panes (`j`/`k`, `↑`/`↓`) | ✅ M2.1 | |
+| Focus pane (`Enter`) | ✅ M2.1 | |
+| Jump by number (`1`–`9`) | 🔲 pending | digit → **deck**; `Shift`+digit → **pane** (two axes) |
+| New pane (`Ctrl+n` / `StartAgent`) | 🔲 M2.2 | |
+| Close pane (`Ctrl+w` / `StopAgent`) | 🔲 M2.2 | |
+| Rename pane (`r` / `SetAgentLabel`) | 🔲 M2.2 | |
+| Filter + clear (`/`, `Esc`) | 🔲 pending | sidebar filter box |
+| Help overlay (`?`) | 🔲 pending | keybinding cheatsheet panel |
+| Toggle layout (`Ctrl+t`) | 🚫 **confirm** | TUI-specific pane layout toggle; GUI layout differs — likely a GUI-native equivalent, not a 1:1 port |
+| Generate config (`GenerateConfig`) | 🚫 **confirm** | TUI setup flow; GUI-N/A? |
+| Open scheduled tasks | 🔲 pending | scheduling view |
+| Approve / deny permission (`y`/`n`) | 🔲 pending | permission-prompt surface |
+
+### Panes / terminals
+| TUI capability | GUI status | Notes |
+|---|---|---|
+| Embedded terminal pane (live PTY) | ✅ M1.3 | xterm.js |
+| Scrollback / truecolor / mouse / copy-paste / resize | ✅ M1.3 | |
+| Pane status (running / waiting-for-input / finished) | 🔲 M2.2 | via `SubscribeEvents` (also retires the manual Refresh) |
+| Send prompt (`WriteAndSubmit`) | 🔲 M2.2 | |
+
+### Lifecycle / connection
+| TUI capability | GUI status | Notes |
+|---|---|---|
+| Daemon auto-start on launch | ✅ | mirrors PRD #93 |
+| Connect / retry state | ✅ M1.2 | |
+| Reconnect / hydrate agents on connect | ✅ partial | lists on connect; live updates pending (M2.2) |
+
+### Deliberate non-ports (TUI-only by nature)
+| TUI capability | GUI status | Notes |
+|---|---|---|
+| SSH/tmux remote operation; `connect` / `remote` CLI | 🚫 | GUI is desktop-only (Non-Goals) |
+| Quit via `Ctrl+C` modal | 🚫 → adapt | window close / app-quit instead |
+
+### GUI-native only (net-new, not TUI parity; sequenced later)
+| Capability | Status | Notes |
+|---|---|---|
+| Agents-communication graph | ➕ Phase 3 | the flagship (M3.1/M3.2) |
+| OS-native notifications | ➕ Phase 4 | adapts PRD #126's bell signal |
+| App zoom / font size (`Ctrl` `+`/`−`/`0`) | ➕ pending | no TUI analog (terminal-emulator's job there); confirmed wanted 2026-06-24 |
+| Collapsible sidebar deck groups | ➕ optional | small frontend follow-up |
+
 ## Risks & Mitigations
 
 - **Terminal-in-webview throughput over Tauri IPC (highest technical risk).** Many busy panes streaming raw PTY bytes across the IPC bridge could lag or drop. Mitigation: M1.3 stress-tests this first, before any chrome polish; use Tauri's fast channel/raw-payload path and xterm.js WebGL/canvas rendering; if it fails the bar, the terminal-in-webview approach is reconsidered while sunk cost is still small.
