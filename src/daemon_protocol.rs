@@ -143,7 +143,15 @@ pub const KIND_SHUTDOWN_ACK: u8 = 0x16;
 /// Additive `#[serde(default, skip_serializing_if = "Option::is_none")]`
 /// fields do NOT require a bump — they're forward-compatible by design. See
 /// the module-level "Protocol versioning" section for the full bump policy.
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// PRD #120 bumped 3 → 4: the `KIND_EVENT` payload
+/// ([`crate::event::BroadcastMsg`]) gained a new
+/// [`crate::event::BroadcastMsg::OrchestrationSurface`] variant (a new `kind`
+/// tag) so the daemon can surface a freshly-spawned orchestration tab to
+/// already-attached TUIs. An older client receiving the new tag would fail to
+/// deserialize the frame, so this is a non-forward-compatible payload-schema
+/// change.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -2125,7 +2133,9 @@ mod tests {
         let (kind, body) = read_frame(&mut cursor).await.unwrap().unwrap();
         assert_eq!(kind, KIND_EVENT);
         let back: BroadcastMsg = serde_json::from_slice(&body).unwrap();
-        let BroadcastMsg::Event(e) = back;
+        let BroadcastMsg::Event(e) = back else {
+            panic!("expected a BroadcastMsg::Event");
+        };
         assert_eq!(e.session_id, "sess-1");
         assert_eq!(e.event_type, EventType::ToolStart);
         assert_eq!(e.tool_name.as_deref(), Some("Read"));

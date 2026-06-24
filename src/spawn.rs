@@ -279,11 +279,11 @@ pub async fn spawn(
             // PRD #127 finding #2: surface this single-agent card LIVE to any
             // already-attached TUI (the daemon otherwise only hydrates its
             // agents at TUI startup). Reuses the existing hook-event broadcast
-            // — no new broadcast variant. Orchestration fires are intentionally
-            // NOT surfaced this way: a proper orchestration tab is rebuilt by
-            // the TUI's hydration/partition path, which a flat SessionStart
-            // can't reconstruct, and live multi-orchestration surfacing is the
-            // #140 session-partitioning concern.
+            // — no new broadcast variant. The ORCHESTRATION branch below surfaces
+            // its tab LIVE too (PRD #120) but needs the structural membership a
+            // flat `SessionStart` can't carry, so it rides the typed
+            // [`BroadcastMsg::OrchestrationSurface`] variant instead of this
+            // synthetic-`SessionStart` path.
             if let Some(tx) = event_tx {
                 surface_spawned_pane(
                     tx,
@@ -346,6 +346,17 @@ pub async fn spawn(
                     pane_id,
                     role_name: Some(role.role_name.clone()),
                 });
+            }
+            // PRD #120: surface this orchestration LIVE to any already-attached
+            // TUI. Unlike the single-agent card above (a synthetic
+            // `SessionStart`), a multi-role tab can only be rebuilt from the
+            // structural membership the TUI's partition / open-orchestration
+            // machinery consumes, so we push it via the typed
+            // `BroadcastMsg::OrchestrationSurface` variant. The TUI attaches each
+            // role's PTY and builds the tab mid-session. Best-effort: `send`
+            // errs only when no TUI is attached (the standalone-daemon case).
+            if let Some(tx) = event_tx {
+                surface_spawned_orchestration(tx, &name, &req.working_dir, &roles, &agents);
             }
             // Deliver the prompt to the orchestrator role pane, gated on that
             // pane's readiness (its registry agent_id is the gate's match key).
@@ -554,6 +565,48 @@ fn surface_spawned_pane(
         agent_id: None,
     };
     let _ = event_tx.send(BroadcastMsg::Event(event));
+}
+
+/// PRD #120: surface a freshly-spawned ORCHESTRATION to attached TUIs by
+/// publishing its structural membership through the daemon's existing
+/// `BroadcastMsg` fan-out as a typed [`BroadcastMsg::OrchestrationSurface`].
+///
+/// Where [`surface_spawned_pane`] forges a flat `SessionStart` (enough for a
+/// single dashboard card), an orchestration TAB groups several role panes and
+/// can only be rebuilt from the per-role index / name / start-flag / cwd the
+/// TUI's `open_orchestration_tab_with_existing_role_panes` machinery consumes.
+/// `roles` and `agents` are parallel (each role was pushed in iteration order),
+/// so the i-th role's spawned pane is `agents[i]`. The agent's registry `id`
+/// rides along so the TUI can `attach` to the live PTY; the `pane_id` is reused
+/// TUI-side as the local pane id so hook routing stays correct. Delivery is
+/// best-effort: `send` errs only when there are no subscribers.
+fn surface_spawned_orchestration(
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    name: &str,
+    cwd: &str,
+    roles: &[RoleSpawn],
+    agents: &[SpawnedAgent],
+) {
+    let surface_roles = roles
+        .iter()
+        .zip(agents.iter())
+        .map(|(role, agent)| crate::event::OrchestrationSurfaceRole {
+            agent_id: agent.id.clone(),
+            pane_id: agent.pane_id.clone(),
+            role_index: role.role_index,
+            role_name: role.role_name.clone(),
+            is_start_role: role.is_start_role,
+        })
+        .collect();
+    let surface = crate::event::OrchestrationSurface {
+        name: name.to_string(),
+        cwd: cwd.to_string(),
+        // Daemon-initiated orchestrations carry no user-typed title; the tab
+        // falls back to the canonical `name`.
+        display_title: None,
+        roles: surface_roles,
+    };
+    let _ = event_tx.send(BroadcastMsg::OrchestrationSurface(surface));
 }
 
 /// A fresh, valid `DOT_AGENT_DECK_PANE_ID` for a spawned pane. Sanitizes the
@@ -1085,7 +1138,9 @@ mod tests {
             Some("cat"),
             "morning-digest",
         );
-        let BroadcastMsg::Event(e) = rx.try_recv().expect("a broadcast must be queued");
+        let BroadcastMsg::Event(e) = rx.try_recv().expect("a broadcast must be queued") else {
+            panic!("expected a BroadcastMsg::Event");
+        };
         assert_eq!(e.event_type, EventType::SessionStart);
         assert_eq!(e.pane_id.as_deref(), Some("sched-morning-digest-0"));
         assert_eq!(e.cwd.as_deref(), Some("/tmp/scratch/runbox"));

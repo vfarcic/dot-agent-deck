@@ -9,7 +9,7 @@ use crate::agent_pty::AgentPtyRegistry;
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
     AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
-    WorkDoneSignal,
+    OrchestrationSurface, WorkDoneSignal,
 };
 use crate::project_config::{OrchestrationRoleConfig, load_project_config};
 
@@ -196,6 +196,16 @@ pub struct AppState {
     /// share that cwd, so within-orchestration scoping still finds all
     /// the right panes.
     pub pane_orchestration_map: HashMap<String, (String, String)>,
+    /// PRD #120: orchestrations the daemon spawned WHILE this TUI is attached
+    /// (the issue-dispatch path), queued for the TUI event loop to build into
+    /// live tabs. The daemon publishes a
+    /// [`BroadcastMsg::OrchestrationSurface`]; the event subscriber records it
+    /// here (it has no access to the `TabManager` / pane controller), and the
+    /// render loop drains the queue, attaches each role's PTY, and builds the
+    /// orchestration tab via the existing
+    /// `open_orchestration_tab_with_existing_role_panes` machinery. Empty in
+    /// the common case; drained to empty each tick it has entries.
+    pub pending_orchestration_surfaces: Vec<OrchestrationSurface>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -318,6 +328,8 @@ pub(crate) async fn wait_for_session_start(
                     return true;
                 }
             }
+            // PRD #120: not a hook event — keep waiting for the SessionStart.
+            Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Closed)) => return false,
             Err(_) => return false,
@@ -600,6 +612,21 @@ impl AppState {
     /// Register a pane ID as managed by our app.
     pub fn register_pane(&mut self, pane_id: String) {
         self.managed_pane_ids.insert(pane_id);
+    }
+
+    /// PRD #120: record a daemon-spawned orchestration for the render loop to
+    /// build into a live tab. Called from the event subscriber, which receives
+    /// the [`BroadcastMsg::OrchestrationSurface`] but cannot touch the
+    /// `TabManager` / pane controller (those live on the TUI render thread).
+    pub fn queue_orchestration_surface(&mut self, surface: OrchestrationSurface) {
+        self.pending_orchestration_surfaces.push(surface);
+    }
+
+    /// PRD #120: take and clear the queued orchestration surfaces. The render
+    /// loop drains this once per tick (only when non-empty) and builds each
+    /// into a live orchestration tab.
+    pub fn take_pending_orchestration_surfaces(&mut self) -> Vec<OrchestrationSurface> {
+        std::mem::take(&mut self.pending_orchestration_surfaces)
     }
 
     /// Create a placeholder session for a newly created pane so it always

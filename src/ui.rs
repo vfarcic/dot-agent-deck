@@ -19,7 +19,7 @@ use crate::ascii_art::{AsciiArtResult, generate_ascii_art};
 use crate::config;
 use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
 use crate::embedded_pane::{EmbeddedPaneController, HydratedPane};
-use crate::event::{AgentType, EventType};
+use crate::event::{AgentType, EventType, OrchestrationSurface};
 use crate::features::Features;
 // PRD #80 introduced a UI-dispatch `Action` enum in this module (the renamed
 // `KeyResult`), which collides with the keybinding-action enum. Import the
@@ -2178,6 +2178,209 @@ fn process_pending_seed_prompts(
         }
         true
     });
+}
+
+// ---------------------------------------------------------------------------
+// PRD #120: live orchestration surfacing
+// ---------------------------------------------------------------------------
+
+/// PRD #120: build live orchestration tabs for any orchestrations the daemon
+/// spawned while this TUI is attached (the issue-dispatch path), queued by the
+/// event subscriber into [`AppState::pending_orchestration_surfaces`].
+///
+/// Drains the queue, attaches each role's daemon PTY, and rebuilds the
+/// orchestration tab through the SAME config-resolution + tab-build machinery
+/// the reconnect-hydration path uses ([`resolve_orch_config_for_hydration`] →
+/// [`TabManager::open_orchestration_tab_with_existing_role_panes`]). So a
+/// dispatch opened mid-session appears as a real tab (e.g. `issue-work`) with no
+/// reconnect, instead of only flat per-role dashboard cards.
+///
+/// A no-op unless the controller is the daemon-backed [`EmbeddedPaneController`]
+/// — the only production controller, and the only one that can attach live
+/// daemon PTYs (this path only ever fires for daemon-dispatched orchestrations).
+fn process_pending_orchestration_surfaces(
+    state: &SharedState,
+    pane: &Arc<dyn PaneController>,
+    tab_manager: &mut TabManager,
+) {
+    // Drain under a short write lock; bail before any work in the common
+    // empty case so the steady-state tick cost is one lock + is_empty check.
+    let pending = {
+        let mut st = state.blocking_write();
+        if st.pending_orchestration_surfaces.is_empty() {
+            return;
+        }
+        st.take_pending_orchestration_surfaces()
+    };
+    let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() else {
+        tracing::debug!(
+            count = pending.len(),
+            "live orchestration surface: non-embedded controller; dropping queued surfaces"
+        );
+        return;
+    };
+    for surface in pending {
+        surface_one_orchestration(state, embedded, tab_manager, surface);
+    }
+}
+
+/// Build one live orchestration tab from a daemon [`OrchestrationSurface`].
+/// Idempotent on the role pane ids, so a duplicate broadcast (or a race with a
+/// reconnect that already hydrated the tab) doesn't double-build.
+fn surface_one_orchestration(
+    state: &SharedState,
+    embedded: &EmbeddedPaneController,
+    tab_manager: &mut TabManager,
+    surface: OrchestrationSurface,
+) {
+    // Idempotency: skip if an existing tab already owns any of this surface's
+    // role panes (a duplicate broadcast, or reconnect-hydration that beat us to
+    // it). Matching on the globally-unique role pane ids is more robust than a
+    // (cwd, name) compare — an unnamed orchestration's surface `name` is the
+    // resolved cwd-basename while the tab's `config.name` may be the raw
+    // (possibly empty) config name, so they wouldn't compare equal.
+    let already_built = surface
+        .roles
+        .iter()
+        .any(|r| tab_manager.tab_index_for_pane(&r.pane_id).is_some());
+    if already_built {
+        tracing::debug!(
+            cwd = %surface.cwd,
+            orchestration = %surface.name,
+            "live orchestration surface: tab already owns a role pane, skipping"
+        );
+        return;
+    }
+
+    // Reuse the hydration partition's config resolution: the local project
+    // config when present, else a minimal config synthesised from the surface's
+    // role metadata (same as a remote reconnect whose local config is absent).
+    let bucket = OrchestrationHydrationBucket {
+        cwd: surface.cwd.clone(),
+        orchestration_name: surface.name.clone(),
+        display_title: surface.display_title.clone(),
+        role_slots: surface
+            .roles
+            .iter()
+            .map(|r| OrchestrationRoleSlot {
+                role_index: r.role_index,
+                pane_id: r.pane_id.clone(),
+                role_name: r.role_name.clone(),
+                is_start_role: r.is_start_role,
+            })
+            .collect(),
+    };
+    let local = load_project_config(Path::new(&surface.cwd))
+        .ok()
+        .flatten()
+        .and_then(|c| {
+            c.orchestrations
+                .into_iter()
+                .find(|o| o.name == surface.name)
+        });
+    let orch_config = resolve_orch_config_for_hydration(local, &bucket);
+
+    // Attach each role's live daemon PTY (by its DOT_AGENT_DECK_PANE_ID) and
+    // place it in the role-slot vector, mirroring the reconnect partition.
+    let mut role_pane_ids: Vec<Option<String>> = vec![None; orch_config.roles.len()];
+    for role in &surface.roles {
+        if role.role_index >= orch_config.roles.len() {
+            tracing::error!(
+                cwd = %surface.cwd,
+                orchestration = %surface.name,
+                role_index = role.role_index,
+                role_count = orch_config.roles.len(),
+                "live orchestration surface: role_index out of range; dropping role"
+            );
+            continue;
+        }
+        if role_pane_ids[role.role_index].is_some() {
+            continue;
+        }
+        // `hydrate_pane` attaches the daemon agent carrying this pane id and
+        // wires its PTY locally — the same attach + scrollback-replay path as
+        // reconnect hydration, so the live agent renders in the tab.
+        if embedded.hydrate_pane(&role.pane_id) {
+            role_pane_ids[role.role_index] = Some(role.pane_id.clone());
+        } else {
+            tracing::debug!(
+                cwd = %surface.cwd,
+                orchestration = %surface.name,
+                pane_id = %role.pane_id,
+                "live orchestration surface: role pane attach failed; leaving slot as dead"
+            );
+        }
+    }
+    if role_pane_ids.iter().all(Option::is_none) {
+        tracing::warn!(
+            cwd = %surface.cwd,
+            orchestration = %surface.name,
+            "live orchestration surface: no role panes attached; not building tab"
+        );
+        return;
+    }
+
+    // Fill any missing slot with a synthetic dead-slot id so every role keeps a
+    // card (parity with the reconnect path — a fresh spawn normally has none).
+    let dead_slot_ids =
+        assign_synthetic_dead_slot_ids(&mut role_pane_ids, &surface.cwd, &surface.name);
+
+    // Build the tab WITHOUT yanking the user off their current tab: the open
+    // call activates the new tab, so restore the prior active index afterward.
+    // The tab bar shows whenever `tabs.len() > 1`, so the new label still paints
+    // regardless of which tab is active.
+    let prev_active = tab_manager.active_index();
+    match tab_manager.open_orchestration_tab_with_existing_role_panes(
+        &orch_config,
+        &surface.cwd,
+        role_pane_ids.clone(),
+        bucket.display_title.as_deref(),
+    ) {
+        Ok(_) => {
+            let mut st = state.blocking_write();
+            // Seed placeholder cards for synthetic dead slots only (live roles
+            // get their card from the agent's own SessionStart hook).
+            for synthetic in &dead_slot_ids {
+                st.insert_placeholder_session(
+                    synthetic.clone(),
+                    Some(surface.cwd.clone()),
+                    None,
+                    None,
+                );
+            }
+            // Register live role panes + wire the per-pane maps exactly as the
+            // reconnect-hydration path does (pane_role_map / pane_cwd_map /
+            // orchestrator_pane_ids).
+            for (i, role) in orch_config.roles.iter().enumerate() {
+                if let Some(Some(pane_id)) = role_pane_ids.get(i)
+                    && !is_dead_slot_pane_id(pane_id)
+                {
+                    st.register_pane(pane_id.clone());
+                    st.pane_role_map.insert(pane_id.clone(), role.name.clone());
+                    st.pane_cwd_map.insert(pane_id.clone(), surface.cwd.clone());
+                    if role.start {
+                        st.orchestrator_pane_ids.insert(pane_id.clone());
+                    }
+                }
+            }
+            drop(st);
+            tab_manager.switch_to(prev_active);
+            tracing::info!(
+                cwd = %surface.cwd,
+                orchestration = %surface.name,
+                role_count = orch_config.roles.len(),
+                "live orchestration surface: built tab for daemon-spawned orchestration"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                cwd = %surface.cwd,
+                orchestration = %surface.name,
+                error = %e,
+                "live orchestration surface: failed to build tab; role panes stay on dashboard"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6878,6 +7081,11 @@ pub fn run_tui(
         // runs every iteration (including the 16ms idle ticks below), so the
         // trailing write of a coalesced burst lands without further input.
         flush_session_snapshot_if_due(&mut ui, &state);
+
+        // PRD #120: build live tabs for any orchestrations the daemon spawned
+        // mid-session (issue dispatch). Done before the snapshot clone + tab
+        // derivation below so a freshly-surfaced tab paints this same frame.
+        process_pending_orchestration_surfaces(&state, &pane, &mut tab_manager);
 
         let snapshot = state.blocking_read().clone();
 

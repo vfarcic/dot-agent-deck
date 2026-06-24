@@ -136,6 +136,60 @@ pub enum BroadcastMsg {
     /// A hook event (existing M2.17 wire shape, now wrapped).
     #[serde(rename = "event")]
     Event(AgentEvent),
+    /// PRD #120: a daemon-spawned ORCHESTRATION (the issue-dispatch path),
+    /// pushed to already-attached TUIs so they can build the orchestration tab
+    /// LIVE — mid-session, with no reconnect. The single-agent live-surface
+    /// path (a synthetic [`EventType::SessionStart`] painted as a flat
+    /// dashboard card by [`crate::state::AppState::apply_event`]) cannot
+    /// reconstruct a multi-role tab, and orchestration tabs were previously
+    /// rebuilt ONLY at TUI hydration (startup / reconnect). This variant
+    /// carries the structural membership the TUI's
+    /// `open_orchestration_tab_with_existing_role_panes` machinery needs to
+    /// build the tab on the fly.
+    ///
+    /// Adding this variant changes the `KIND_EVENT` payload schema (an older
+    /// peer would mis-parse the new `kind` tag), so it bumps
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`].
+    #[serde(rename = "orchestration_surface")]
+    OrchestrationSurface(OrchestrationSurface),
+}
+
+/// PRD #120: the structural membership of a daemon-spawned orchestration,
+/// pushed to attached TUIs (via [`BroadcastMsg::OrchestrationSurface`]) so they
+/// can build the orchestration tab live. Mirrors what the hydration partition
+/// (`OrchestrationHydrationBucket`) reconstructs from per-pane
+/// [`crate::agent_pty::TabMembership`] records at reconnect — but for a spawn
+/// that happens WHILE a TUI is attached.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrchestrationSurface {
+    /// Canonical orchestration name — the tab IDENTITY and (absent a
+    /// `display_title`) the tab-strip LABEL.
+    pub name: String,
+    /// Absolute orchestration cwd shared by every role pane — the tab's cwd and
+    /// the hydration partition's bucket key.
+    pub cwd: String,
+    /// Optional user-facing tab title; `None` falls back to `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_title: Option<String>,
+    /// The spawned role panes, in role order.
+    pub roles: Vec<OrchestrationSurfaceRole>,
+}
+
+/// One role pane of a live-surfaced orchestration (see [`OrchestrationSurface`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrchestrationSurfaceRole {
+    /// Daemon registry id of the spawned agent — the TUI `attach`es to this to
+    /// wire the live PTY into a local pane.
+    pub agent_id: String,
+    /// The `DOT_AGENT_DECK_PANE_ID` the daemon tagged the pane with — reused as
+    /// the TUI-side local pane id so hook events keep routing correctly.
+    pub pane_id: String,
+    /// Position of this role in the orchestration config's `roles`.
+    pub role_index: usize,
+    /// Role name (e.g. `orchestrator`, `worker`).
+    pub role_name: String,
+    /// Whether this is the start (orchestrator) role.
+    pub is_start_role: bool,
 }
 
 /// Signal sent by a worker via `dot-agent-deck work-done`.
@@ -348,6 +402,54 @@ mod tests {
             }
             _ => panic!("expected WorkDone"),
         }
+    }
+
+    // PRD #120: the live-orchestration-surface broadcast must round-trip
+    // through the same `BroadcastMsg` wire the daemon forwards over KIND_EVENT,
+    // and tag itself `orchestration_surface` so it's distinguishable from the
+    // `event` variant an older peer expects (the reason PROTOCOL_VERSION bumped).
+    #[test]
+    fn orchestration_surface_broadcast_round_trips() {
+        let msg = BroadcastMsg::OrchestrationSurface(OrchestrationSurface {
+            name: "issue-work".into(),
+            cwd: "/work/github-issues/.worktrees/issue-1".into(),
+            display_title: None,
+            roles: vec![
+                OrchestrationSurfaceRole {
+                    agent_id: "42".into(),
+                    pane_id: "sched-github-issues-0-r0".into(),
+                    role_index: 0,
+                    role_name: "orchestrator".into(),
+                    is_start_role: true,
+                },
+                OrchestrationSurfaceRole {
+                    agent_id: "43".into(),
+                    pane_id: "sched-github-issues-0-r1".into(),
+                    role_index: 1,
+                    role_name: "worker".into(),
+                    is_start_role: false,
+                },
+            ],
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["kind"], "orchestration_surface");
+        // `display_title: None` is omitted from the wire (skip_serializing_if).
+        assert!(
+            v.as_object().unwrap().get("display_title").is_none(),
+            "None display_title must be omitted from the wire payload"
+        );
+
+        let back: BroadcastMsg = serde_json::from_str(&json).unwrap();
+        let BroadcastMsg::OrchestrationSurface(s) = back else {
+            panic!("expected a BroadcastMsg::OrchestrationSurface");
+        };
+        assert_eq!(s.name, "issue-work");
+        assert_eq!(s.roles.len(), 2);
+        assert_eq!(s.roles[0].role_name, "orchestrator");
+        assert!(s.roles[0].is_start_role);
+        assert_eq!(s.roles[1].pane_id, "sched-github-issues-0-r1");
+        assert_eq!(s.roles[1].role_index, 1);
     }
 
     #[test]

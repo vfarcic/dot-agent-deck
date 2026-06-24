@@ -905,6 +905,13 @@ fn spawn_event_subscriber(
                             Ok(Some(BroadcastMsg::Event(event))) => {
                                 state.write().await.apply_event(event);
                             }
+                            // PRD #120: a daemon-spawned orchestration (issue
+                            // dispatch). Queue it for the render loop, which owns
+                            // the TabManager + pane controller and builds the
+                            // live tab. The subscriber task can't touch those.
+                            Ok(Some(BroadcastMsg::OrchestrationSurface(surface))) => {
+                                state.write().await.queue_orchestration_surface(surface);
+                            }
                             Ok(None) => break,
                             Err(e) => {
                                 tracing::warn!(
