@@ -508,6 +508,7 @@ dependencies = [
  "crossterm 0.28.1",
  "futures-util",
  "insta",
+ "keybindings",
  "libc",
  "open",
  "portable-pty",
@@ -1153,6 +1154,15 @@ dependencies = [
  "hashbrown 0.16.1",
  "portable-atomic",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "keybindings"
+version = "0.1.0"
+dependencies = [
+ "crossterm 0.28.1",
+ "serde",
+ "toml",
 ]
 
 [[package]]

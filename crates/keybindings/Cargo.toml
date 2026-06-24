@@ -1,0 +1,19 @@
+[package]
+name = "keybindings"
+version = "0.1.0"
+edition = "2024"
+
+# PRD #176: the shared keybinding model, extracted from the dot-agent-deck
+# binary (PRD #40's `src/keybindings.rs`) so the TUI and the desktop GUI core
+# resolve IDENTICAL bindings from ONE source — the user's keybindings.toml plus
+# identical compiled-in defaults. Keeping shortcuts the same across both
+# front-ends is a maintainer requirement (2026-06-24); a shared crate makes it
+# true by construction instead of by hand-mirroring.
+#
+# Minimal deps, like `protocol`: crossterm only for the KeyCode/KeyModifiers
+# types the bindings match against, serde + toml for the config file. No
+# TUI/daemon-only crates leak in, so the GUI core links it cheaply.
+[dependencies]
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

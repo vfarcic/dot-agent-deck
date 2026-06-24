@@ -2,6 +2,7 @@
 members = [
     ".",
     "crates/protocol",
+    "crates/keybindings",
     "gui/core",
     "xtask/docs",
     "xtask/linkage-check",
@@ -13,7 +14,12 @@ members = [
 # core are the default members; `crates/protocol` and the `xtask/*` helpers
 # stay members-but-not-default exactly as before (their tests run via `-p` or
 # `--workspace`).
-default-members = [".", "gui/core"]
+#
+# PRD #176: `crates/keybindings` IS a default member (unlike `protocol`): it is
+# consumed by BOTH front-ends and its 33 tests are the contract that keeps TUI
+# and GUI shortcuts identical, so they belong in the per-task `test-fast` gate.
+# The crate is light (crossterm/serde/toml only), so the cost is negligible.
+default-members = [".", "crates/keybindings", "gui/core"]
 # PRD #176 M1.2 / Risks ("JS toolchain must not pollute the Rust gates"): the
 # Tauri shell depends on `tauri`, which needs the system WebKitGTK dev
 # libraries. Excluding it keeps it OUT of every workspace build/lock so a
@@ -31,6 +37,10 @@ edition = "2024"
 # AgentRecord, event structs). The binary re-exports these from
 # `daemon_protocol` / `event` / `agent_pty` so existing call sites are unchanged.
 protocol = { path = "crates/protocol" }
+# PRD #176: shared keybinding model (Action set, notation parser,
+# KeybindingConfig, TOML/defaults loader). `src/keybindings.rs` is now a
+# re-export shim over this crate so the TUI and GUI core share one definition.
+keybindings = { path = "crates/keybindings" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
