@@ -159,8 +159,8 @@ This is the answer to "how do we know we've ported everything we should?" — ev
 | Move between decks (`h`/`l`, `←`/`→`) | ✅ M2.1 | |
 | Move between panes (`j`/`k`, `↑`/`↓`) | ✅ M2.1 | |
 | Focus pane (`Enter`) | ✅ M2.1 | |
-| Jump by number (`1`–`9`) | 🔲 pending | digit → **pane** (`FocusCard`, exact TUI parity); resolved from the shared `keybindings` crate |
-| Bindings resolved from shared `keybindings` crate | ✅ extracted / 🔲 GUI wiring | crate landed (TUI + GUI share one source); GUI core consuming it is the next slice |
+| Jump by number (`1`–`9`) | ✅ | digit → **pane** (`FocusCard`, exact TUI parity), in command mode |
+| Bindings resolved from shared `keybindings` crate | ✅ | crate landed AND the GUI core consumes it — command-mode shortcuts resolve from the user's `keybindings.toml` + defaults, same source as the TUI |
 | New pane (`Ctrl+n` / `StartAgent`) | 🔲 M2.2 | |
 | Close pane (`Ctrl+w` / `StopAgent`) | 🔲 M2.2 | |
 | Rename pane (`r` / `SetAgentLabel`) | 🔲 M2.2 | |
@@ -197,7 +197,7 @@ This is the answer to "how do we know we've ported everything we should?" — ev
 |---|---|---|
 | Agents-communication graph | ➕ Phase 3 | the flagship (M3.1/M3.2) |
 | OS-native notifications | ➕ Phase 4 | adapts PRD #126's bell signal |
-| App zoom / font size (`Ctrl` `+`/`−`/`0`) | ➕ pending | no TUI analog (terminal-emulator's job there); confirmed wanted 2026-06-24 |
+| App zoom / font size (`Ctrl` `+`/`−`/`0`) | ✅ (pending hand-validation) | no TUI analog (terminal-emulator's job there); webview `set_zoom` scales chrome + terminal uniformly, terminal re-fits |
 | Collapsible sidebar deck groups | ➕ optional | small frontend follow-up |
 
 ## Risks & Mitigations

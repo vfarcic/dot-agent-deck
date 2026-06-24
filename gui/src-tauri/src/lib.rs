@@ -239,6 +239,16 @@ fn keybindings() -> Vec<KeyBinding> {
     nav_keybindings()
 }
 
+/// App zoom (`Ctrl` `+`/`−`/`0`). Scales the whole webview — chrome AND the
+/// embedded terminal — uniformly via the webview zoom factor. A GUI-native
+/// affordance with no TUI analog (in the TUI the font is the terminal
+/// emulator's job). The frontend tracks the factor and re-fits the terminal so
+/// its rows/cols recompute at the new scale.
+#[tauri::command]
+fn set_zoom(window: tauri::WebviewWindow, factor: f64) -> Result<(), String> {
+    window.set_zoom(factor).map_err(|e| e.to_string())
+}
+
 /// M1.3: list the agents the daemon is managing so the webview can pick one to
 /// attach a terminal to.
 #[tauri::command]
@@ -399,6 +409,7 @@ pub fn run() {
             connection_state,
             reconnect,
             keybindings,
+            set_zoom,
             agents,
             attach,
             terminal_input,
