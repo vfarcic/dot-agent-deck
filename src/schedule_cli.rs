@@ -81,6 +81,7 @@ pub fn add(tasks: &mut Vec<ScheduledTask>, args: AddArgs) -> Result<(), String> 
     if let Some(cfg) = &args.issue_dispatch {
         crate::issue_dispatch::validate_issue_dispatch_config(
             &cfg.repo,
+            cfg.max_per_run,
             cfg.label.as_deref(),
             cfg.query.as_deref(),
         )?;

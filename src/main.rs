@@ -1222,10 +1222,10 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
             // the sub-table here (defaulting `max_per_run` to the documented 3
             // when omitted); `schedule_cli::add` validates the slug + relaxes the
             // `--command` requirement.
-            use dot_agent_deck::config::IssueDispatchConfig;
+            use dot_agent_deck::config::{IssueDispatchConfig, default_max_per_run};
             let issue_dispatch = repo.map(|repo| IssueDispatchConfig {
                 repo,
-                max_per_run: max_per_run.unwrap_or(3),
+                max_per_run: max_per_run.unwrap_or_else(default_max_per_run),
                 label,
                 query,
             });

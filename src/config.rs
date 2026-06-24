@@ -668,8 +668,10 @@ fn default_enabled() -> bool {
 }
 
 /// Default `issue_dispatch.max_per_run` when the field is omitted: 3, matching
-/// the changelog's documented "enumeration cap, default 3".
-fn default_max_per_run() -> usize {
+/// the changelog's documented "enumeration cap, default 3". `pub` so the CLI
+/// `schedule add` path can reuse it for `--max-per-run`'s default and not drift
+/// from this serde default.
+pub fn default_max_per_run() -> usize {
     3
 }
 
@@ -821,6 +823,7 @@ fn validate_task(task: ScheduledTask, index: usize) -> Result<ScheduledTask, Sch
         // than at fire time.
         if let Err(message) = crate::issue_dispatch::validate_issue_dispatch_config(
             &disp.repo,
+            disp.max_per_run,
             disp.label.as_deref(),
             disp.query.as_deref(),
         ) {

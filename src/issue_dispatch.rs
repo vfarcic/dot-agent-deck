@@ -191,9 +191,13 @@ pub fn pr_list_for_issue_argv(repo: &str, issue_number: u64) -> Vec<String> {
 /// `repo` must be a strict GitHub `owner/name` slug — letters, digits, `.`, `_`,
 /// `-` in each segment (`^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$`) — AND must not start
 /// with `-` (the regex's character class permits a leading `-`, which `gh` would
-/// still read as a flag). `label`/`query` are rejected when they start with `-`.
+/// still read as a flag). `max_per_run` must be at least 1 — a `0` cap makes
+/// `gh issue list --limit 0` enumerate (and dispatch) nothing on every fire.
+/// `label`/`query` are rejected when they are empty (a meaningless filter that
+/// `gh` would still pass through) or start with `-` (parsed as a `gh` flag).
 pub fn validate_issue_dispatch_config(
     repo: &str,
+    max_per_run: usize,
     label: Option<&str>,
     query: Option<&str>,
 ) -> Result<(), String> {
@@ -203,19 +207,31 @@ pub fn validate_issue_dispatch_config(
              (letters, digits, '.', '_', '-' in each segment; no leading '-')"
         ));
     }
-    if let Some(label) = label
-        && label.starts_with('-')
-    {
+    if max_per_run < 1 {
         return Err(format!(
-            "issue_dispatch label {label:?} must not start with '-' (it would be parsed as a `gh` flag)"
+            "issue_dispatch max_per_run must be at least 1 (a cap of {max_per_run} \
+             makes `gh issue list --limit 0` dispatch nothing every fire)"
         ));
     }
-    if let Some(query) = query
-        && query.starts_with('-')
-    {
-        return Err(format!(
-            "issue_dispatch query {query:?} must not start with '-' (it would be parsed as a `gh` flag)"
-        ));
+    if let Some(label) = label {
+        if label.is_empty() {
+            return Err("issue_dispatch label must not be empty".to_string());
+        }
+        if label.starts_with('-') {
+            return Err(format!(
+                "issue_dispatch label {label:?} must not start with '-' (it would be parsed as a `gh` flag)"
+            ));
+        }
+    }
+    if let Some(query) = query {
+        if query.is_empty() {
+            return Err("issue_dispatch query must not be empty".to_string());
+        }
+        if query.starts_with('-') {
+            return Err(format!(
+                "issue_dispatch query {query:?} must not start with '-' (it would be parsed as a `gh` flag)"
+            ));
+        }
     }
     Ok(())
 }
@@ -509,38 +525,68 @@ mod tests {
 
     #[test]
     fn validate_issue_dispatch_config_accepts_valid_slug_and_filters() {
-        assert!(validate_issue_dispatch_config("vfarcic/dot-ai", None, None).is_ok());
+        assert!(validate_issue_dispatch_config("vfarcic/dot-ai", 3, None, None).is_ok());
         assert!(
             validate_issue_dispatch_config(
                 "acme/widgets.v2",
+                5,
                 Some("agent-eligible"),
                 Some("is:open sort:created-asc")
             )
             .is_ok()
         );
+        // The smallest valid cap (1) is accepted.
+        assert!(validate_issue_dispatch_config("o/r", 1, None, None).is_ok());
     }
 
     #[test]
     fn validate_issue_dispatch_config_rejects_bad_repo() {
         // Not an owner/name slug.
-        assert!(validate_issue_dispatch_config("not-a-slug", None, None).is_err());
-        assert!(validate_issue_dispatch_config("a/b/c", None, None).is_err());
-        assert!(validate_issue_dispatch_config("owner/", None, None).is_err());
-        assert!(validate_issue_dispatch_config("/name", None, None).is_err());
+        assert!(validate_issue_dispatch_config("not-a-slug", 3, None, None).is_err());
+        assert!(validate_issue_dispatch_config("a/b/c", 3, None, None).is_err());
+        assert!(validate_issue_dispatch_config("owner/", 3, None, None).is_err());
+        assert!(validate_issue_dispatch_config("/name", 3, None, None).is_err());
         // Injection-shaped values.
-        assert!(validate_issue_dispatch_config("ext::sh -c id", None, None).is_err());
-        assert!(validate_issue_dispatch_config("file:///etc", None, None).is_err());
+        assert!(validate_issue_dispatch_config("ext::sh -c id", 3, None, None).is_err());
+        assert!(validate_issue_dispatch_config("file:///etc", 3, None, None).is_err());
         // Leading `-` would be read as a `gh` flag even though the char is in the
         // slug character class.
-        assert!(validate_issue_dispatch_config("-x/y", None, None).is_err());
+        assert!(validate_issue_dispatch_config("-x/y", 3, None, None).is_err());
+    }
+
+    #[test]
+    fn validate_issue_dispatch_config_rejects_max_per_run_below_one() {
+        // A 0 cap makes `gh issue list --limit 0` dispatch nothing every fire.
+        let err = validate_issue_dispatch_config("o/r", 0, None, None).unwrap_err();
+        assert!(
+            err.contains("max_per_run"),
+            "error should name the offending field, got {err:?}"
+        );
+        // A valid slug with a 0 cap is still rejected (the cap, not the slug).
+        assert!(validate_issue_dispatch_config("vfarcic/dot-ai", 0, None, None).is_err());
+    }
+
+    #[test]
+    fn validate_issue_dispatch_config_rejects_empty_label_or_query() {
+        // An empty filter is meaningless and would still be passed through to `gh`.
+        let label_err = validate_issue_dispatch_config("o/r", 3, Some(""), None).unwrap_err();
+        assert!(
+            label_err.contains("label"),
+            "error should name the label, got {label_err:?}"
+        );
+        let query_err = validate_issue_dispatch_config("o/r", 3, None, Some("")).unwrap_err();
+        assert!(
+            query_err.contains("query"),
+            "error should name the query, got {query_err:?}"
+        );
     }
 
     #[test]
     fn validate_issue_dispatch_config_rejects_leading_dash_label_or_query() {
-        assert!(validate_issue_dispatch_config("o/r", Some("-rf"), None).is_err());
-        assert!(validate_issue_dispatch_config("o/r", None, Some("--owner")).is_err());
+        assert!(validate_issue_dispatch_config("o/r", 3, Some("-rf"), None).is_err());
+        assert!(validate_issue_dispatch_config("o/r", 3, None, Some("--owner")).is_err());
         // Non-leading dashes are fine.
-        assert!(validate_issue_dispatch_config("o/r", Some("agent-eligible"), None).is_ok());
+        assert!(validate_issue_dispatch_config("o/r", 3, Some("agent-eligible"), None).is_ok());
     }
 
     // --- U5: idempotency decision (truth table) ---
