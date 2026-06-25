@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.32.0] - 2026-06-25
+
+### Changed
+
+- **Attach-protocol bump: live orchestration surfacing (`PROTOCOL_VERSION` 3 → 4)**
+  Dispatched orchestrations now surface as a live tab on an already-attached TUI. To carry the orchestration's structural membership (name, cwd, per-role index/name/start-flag/pane) the daemon→TUI event broadcast (`BroadcastMsg`, forwarded over the attach socket's `KIND_EVENT` frame) gained a new `orchestration_surface` variant. That is a wire-shape change an older peer would fail to deserialize, so `PROTOCOL_VERSION` bumped from 3 to 4.
+  Compatibility impact: a TUI and daemon must be on the same `PROTOCOL_VERSION` to interoperate. The local attach/subscribe handshake does not itself compare `PROTOCOL_VERSION` — refusal across a mismatch is delegated to the build-version handshake (`ensure_compatible_daemon_or_die`), which is effective because a protocol bump always rides a new build and therefore a new `DAD_BUILD_ID`. The daemon deliberately outlives the TUI, so after upgrading in place an older still-running daemon and the new TUI differ on `DAD_BUILD_ID`; the build-version handshake detects that and prompts to restart the daemon (the standard recovery) before the new `orchestration_surface` frames can reach an older peer. Hook events and the single-agent live-surface path are unchanged.
+
+### Added
+
+- **Smarter initial configs from the AI config generator**
+  The AI config generator (`dot-agent-deck generate-config`) now produces initial `.dot-agent-deck.toml` files that require less hand-editing. Four targeted improvements were derived from a systematic analysis of hand-improved configs across the author's real projects and landed into `assets/config_gen_prompt.md` and `assets/roles.toml`.
+  **What changed in generated configs:**
+  - **Release role gets a mandatory human merge gate (P1).** The generated release role now produces a two-phase flow — open the PR and wait for CI + automated review, report results back, then **stop** before merging. Auto-merge is gone. Reviewers see the output before the branch lands.
+  - **Test-mandating projects get a tester role and RED/GREEN chain (P2).** When the generator detects that a project requires tests, it now proposes a `tester` role and wires a `tester → coder → tester` feedback loop so the cycle enforces GREEN before declaring the task done.
+  - **Auditor is now a default-on role (P3).** The auditor was previously omitted unless explicitly requested. It now appears in the initial role roster for projects where it is relevant, avoiding a common post-generation hand-addition.
+  - **Coder and tester prompts name the project's actual test/lint command (P4).** Role `prompt_template`s for `coder` and `tester` now include the project's concrete test runner and lint invocation (e.g. `cargo nextest run`, `cargo clippy -- -D warnings`) instead of generic placeholders.
+  These improvements were validated by regenerating configs for five sibling repos after the edits and diffing each against its live `.dot-agent-deck.toml`; two of five showed a measurably smaller structured diff across the targeted regions. The repeatable re-run procedure is documented in `docs/develop/config-gen-regeneration.md` so the comparison can be repeated as more projects are added.
+- **Scheduled issue dispatch (`issue_dispatch` task type)**
+  dot-agent-deck can now automatically spin up agents on open GitHub issues on a cron schedule. A new `issue_dispatch` scheduled-task type — configured in `~/.config/dot-agent-deck/schedules.toml` — clones (or fast-forwards) a target repo, enumerates its open issues up to a configurable cap, and launches one agent worktree per issue, skipping any issue that already has an in-flight worktree or an open PR on the `agent/issue-<n>` branch.
+  The task is defined by four fields: `repo` (`owner/name`), `working_dir` (clone parent), `prompt` (a free-text template with `{{issue_number}}` substituted per issue, default `Work on issue {{issue_number}}`), and `max_per_run` (an enumeration cap, default 3). The agent is spawned with the deck's standard `spawn` primitive and runs against the per-issue worktree, so full orchestration configs in the target repo's `.dot-agent-deck.toml` are picked up automatically. Tab-close cleans up the per-issue worktree (while preserving the clone) via a new daemon-side worktree registry and close-detection watcher.
+  You can author one of these tasks by hand, with `dot-agent-deck schedule add --repo <owner/name> --max-per-run <N> …` (no `--command` needed — the per-issue agent comes from each cloned repo's config), or — behind the `experimental` feature flag — with the guided `schedule: issues` option in the new-pane dialog. A configured `issue_dispatch` task always runs regardless of the flag; the flag gates only that in-deck guided authoring option (enable it with `[features] experimental = true` in `.dot-agent-deck.toml` or `DOT_AGENT_DECK_EXPERIMENTAL=1`).
+  See [Scheduled tasks — issue dispatch](https://agent-deck.devopstoolkit.ai/docs/scheduled-tasks) for configuration examples and a walkthrough.
+  Demo reel for PRD #120: https://youtu.be/IZYdqPqmEMU.
+- **Reconnect Restores Live Session Status**
+  When reconnecting to a running daemon, each agent card now shows the agent's real status immediately — no more cards stuck on "Idle" or "No agent" until the next event arrives.
+  Previously, reconnecting with `dot-agent-deck connect` (after a disconnect, ssh drop, or closing the TUI) rebuilt the dashboard from spawn-time metadata only, resetting every card to `Idle` and dropping any event-derived agent label. An agent that was genuinely idle or waiting for input would never self-heal — its card stayed wrong for the entire session. This was especially visible after the auto-reconnect introduced in PRD #148 (laptop sleep/wake): the ssh session resumed but the dashboard showed stale state.
+  The daemon's live, event-derived session state (`status`, agent type, active tool, tool count, first prompts, and last user prompt) is now attached to the reconnect snapshot and used to seed each card on hydration. An agent mid-tool keeps its active-tool label and tally; a card that earned its "ClaudeCode" or "OpenCode" label via events keeps it across the reconnect instead of reverting to "No agent". Older daemons that don't send the snapshot degrade gracefully to the previous bare-placeholder behavior.
+  See [Session Management](https://agent-deck.devopstoolkit.ai/session-management) for details on resuming sessions.
+  **Demo:** [reconnect restores live status](https://youtu.be/QlmG_dLywU8)
+
+### Fixed
+
+- **Delegated Workers Start Without a Manual Enter**
+  Delegating to a worker role now injects a single-line prompt into the worker pane instead of a multi-line block. Previously the multi-line prompt (which carried the `## When done` completion instructions) could land in the worker's input as a compacted bracketed-paste that sat unsubmitted until an operator pressed Enter — stalling unattended orchestration. The completion instructions now live in the worker's task file (`.dot-agent-deck/worker-task-<role>.md`), so the worker still knows to signal back via `dot-agent-deck work-done` once the single-line pointer auto-submits.
+- **OpenCode plugin install now refreshes every existing layout**
+  Fixes a silent failure where OpenCode panes showed "No agent" / `Tools: 0` indefinitely on machines that have both `~/.config/opencode/` and `~/.opencode/` present. Previously, `auto_install` and the `install` subcommand wrote the plugin only to whichever root `detect_opencode_root` picked first (XDG wins), leaving the other layout's plugin pointing at a stale binary path. The `execFileSync` call in the stale plugin threw `ENOENT`, was silently swallowed, and no events reached the daemon.
+  Both `auto_install` (runs on dashboard startup) and `dot-agent-deck install` now fan out and write the plugin into every existing layout root — mirroring how `uninstall` already sweeps all layouts. If only one root exists, only that one is written. If neither exists, `auto_install` remains a no-op and `install` creates the XDG default as before. The dashboard always overwrites the plugin on startup, so manually-edited plugin files in either layout will be replaced.
+
+
+
 ## [0.31.2] - 2026-06-21
 
 ### Added
