@@ -573,6 +573,20 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the empty-`default_command` fallback to the last command (covered by `prompt/new-pane/011`); persistence across a restart.
 - **Platform coverage:** mac+linux.
 
+##### prompt/new-pane/013 — An authoring-mode spawn does not record a last command, so a freshly reopened regular form stays blank (PRD #196).
+- **Layer:** L2 (no public L1 render seam for the new-pane form — same constraint as `prompt/new-pane/007`; the real TUI is driven via PTY keystrokes and asserted on the rendered vt100 grid).
+- **Agent:** none (`cat` is a real runnable stand-in command — the authoring spawn succeeds and `cat` blocks on stdin so the card stays alive; no LLM tokens).
+- **Asserts:** with an empty `default_command`, cycling the Mode field to the built-in `schedule` AUTHORING option, typing `cat`, and submitting dispatches an authoring-mode spawn; reopening a FRESH regular form (no Mode cycle) then leaves the Command field BLANK — an authoring spawn never records a last command (the submit gate excludes it regardless of the command typed), so the regular form has nothing to seed from. GREEN against the current implementation — a regression guard.
+- **Does not assert:** the plain-spawn seed-from-last-command path (covered by `prompt/new-pane/011`); the `default_command` precedence (covered by `prompt/new-pane/012`); persistence across a restart (covered by `prompt/new-pane/014`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/new-pane/014 — The recorded last command survives a full deck restart and pre-fills the new-agent form on the next launch (PRD #196).
+- **Layer:** L2 (no public L1 render seam for the new-pane form — same constraint as `prompt/new-pane/007`; the real TUI is driven via PTY keystrokes and asserted on the rendered vt100 grid; two launches share one isolated HOME so the persisted session carries over).
+- **Agent:** none (`cat` is a real runnable stand-in command — the spawn succeeds and records a last command, and `cat` blocks on stdin so the pane stays alive; no LLM tokens).
+- **Asserts:** with an empty `default_command`, launch 1 spawns `cat` and quits cleanly so the session flushes to disk; launch 2 (sharing the same HOME) then PRE-FILLS the new-pane Command field with `cat`, read back from the persisted `session.toml` launch 1 wrote — proving the recorded last command round-trips through persist → reload → seed, not just in-process state. GREEN against the current implementation — a regression guard.
+- **Does not assert:** the in-process read-back within one launch (covered by `prompt/new-pane/011`); the `default_command` precedence (covered by `prompt/new-pane/012`); the authoring-mode exclusion (covered by `prompt/new-pane/013`).
+- **Platform coverage:** mac+linux.
+
 ### Focus / navigation
 
 #### focus/dashboard

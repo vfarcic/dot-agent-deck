@@ -23,6 +23,12 @@
 //!   the recorded last command back.
 //! - `prompt/new-pane/012` — GREEN now AND after the feature lands: an explicit
 //!   `default_command` must keep winning over the recorded last command.
+//! - `prompt/new-pane/013` — regression guard: a spawn made through an
+//!   AUTHORING mode (the built-in `schedule` option) must NOT record a last
+//!   command, so a freshly reopened regular form stays blank.
+//! - `prompt/new-pane/014` — regression guard: the recorded last command must
+//!   survive a full deck RESTART (two launches sharing one HOME) — proving the
+//!   value round-trips through the persisted `session.toml`, not just in-process.
 
 mod common;
 
@@ -179,4 +185,151 @@ fn new_pane_012_default_command_precedence() {
     );
 
     drop(cfg_dir);
+}
+
+/// Scenario: Launch the deck with an EMPTY `default_command` in the
+/// `schedule-mode` fixture (so the regular form falls back to the recorded last
+/// command, making a stray recording observable). Open the new-pane form
+/// (Ctrl+n → Space), cycle the Mode field to the built-in `schedule` AUTHORING
+/// option, navigate to the Command field, type `cat`, and submit — dispatching
+/// an authoring-mode spawn. Then reopen a FRESH regular form (Ctrl+d → Ctrl+n →
+/// Space) WITHOUT cycling Mode and assert the Command field is BLANK — proving an
+/// authoring-mode spawn never records a last command (the submit gate excludes it
+/// regardless of the command typed), so the regular form has nothing to seed
+/// from. GREEN against the current implementation; a RED here means the
+/// authoring-exclusion gate regressed and the field would wrongly pre-fill `cat`.
+#[spec("prompt/new-pane/013")]
+#[test]
+fn new_pane_013_authoring_spawn_excluded_from_last_command() {
+    // `default_command` is empty (the schedule-mode fixture sets no value and we
+    // point DOT_AGENT_DECK_CONFIG nowhere), so the regular form's only possible
+    // seed is the last-command fallback — exactly the channel an authoring spawn
+    // must NOT pollute.
+    let deck = TuiDeck::launch_with_fixture("schedule-mode");
+    deck.wait_for_string("No active sessions");
+
+    // (1) Authoring spawn: open the form, cycle Mode to the built-in `schedule`
+    // authoring option, type `cat`, and submit. `cat` is a real binary so the
+    // spawn deterministically succeeds and auto-focuses the card; the
+    // authoring-exclusion decision is gated on the SELECTED MODE (schedule), not
+    // the command, so spawning `cat` here still must NOT record a last command.
+    deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" "); // Space → confirm dir → new-pane form
+    deck.wait_for_string("No mode"); // Mode cycler is up at "No mode"
+    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8 → schedule (caps at last)
+    deck.wait_for_string("schedule mode"); // selection landed on the schedule authoring mode
+    deck.send_keys(b"\r"); // Mode → Name
+    deck.send_keys(b"\r"); // Name → Command
+    deck.send_keys(b"cat");
+    deck.send_keys(b"\r"); // submit the authoring spawn
+    deck.wait_for_string("[Command Mode Ctrl+D]"); // authoring card spawned & auto-focused
+
+    // (2) Reopen a FRESH regular form — do NOT cycle Mode, so it is the ordinary
+    // "No mode" form whose Command field seeds from `default_command` (empty) →
+    // recorded last command → blank.
+    deck.send_keys(b"\x04"); // Ctrl+d → Normal mode
+    deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" "); // Space → confirm dir → new-pane form
+    deck.wait_for_string("Tab: switch"); // form fully painted
+
+    // (3) The Command field must be BLANK — NOT `cat`, NOT the authoring command.
+    // An authoring spawn does not record a last command, so the regular form has
+    // nothing to seed from.
+    let grid = deck.snapshot_grid();
+    assert_eq!(
+        command_field_value(&grid),
+        "",
+        "an authoring-mode (schedule) spawn must NOT record a last command: after spawning \
+         `cat` through the schedule authoring option, reopening a regular new-pane form must \
+         leave the Command field BLANK (not `cat`, not the authoring command), because \
+         `default_command` is empty and no last command was recorded.\nGrid:\n{grid}"
+    );
+}
+
+/// Scenario: Prove the recorded last command survives a full binary RESTART. Two
+/// launches share ONE isolated HOME (so the persisted `session.toml` carries
+/// over). Launch 1 (empty `default_command`): open the new-pane form (Ctrl+n →
+/// Space), type `cat`, submit (spawning a pane), then quit cleanly (Ctrl+d →
+/// Ctrl+c → Ctrl+c) so the session flushes to disk; wait until `session.toml`
+/// records `last_command = "cat"`, then drop launch 1 (its temp working dir is
+/// removed, so the saved pane is skipped on restore and the next launch starts
+/// clean). Launch 2, same HOME: open the new-pane form and assert the Command
+/// field is PRE-FILLED with `cat`, read back from the session file launch 1 wrote
+/// — exercising the persist → reload → seed round-trip, not just in-process
+/// state. GREEN against the current implementation; a RED here means the value
+/// failed to persist or reload across the restart.
+#[spec("prompt/new-pane/014")]
+#[test]
+fn new_pane_014_last_command_survives_restart() {
+    // A single HOME shared by both launches so the persisted `session.toml`
+    // (resolved under $HOME by `session_path()`) carries the recorded last
+    // command from launch 1 into launch 2. Each launch still gets its own temp
+    // working dir, sockets, and daemon — so this is a genuine restart, not a
+    // warm hand-off.
+    let shared_home = tempfile::tempdir().expect("shared HOME tempdir");
+    let home = shared_home.path().to_path_buf();
+    let home_arg = home.to_string_lossy().to_string();
+
+    // --- Launch 1: spawn `cat`, then quit cleanly so the session flushes. ---
+    {
+        let deck = TuiDeck::builder()
+            .with_env("HOME", home_arg.as_str())
+            .launch_with_fixture("minimal");
+        deck.wait_for_string("No active sessions");
+
+        deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
+        deck.wait_for_string("Select Directory");
+        deck.send_keys(b" "); // Space → confirm dir → new-pane form
+        deck.wait_for_string("Tab: switch"); // form fully painted
+        deck.send_keys(b"\r"); // Mode → Name
+        deck.send_keys(b"\r"); // Name → Command
+        deck.send_keys(b"cat");
+        deck.send_keys(b"\r"); // submit → record last_command = `cat`
+        deck.wait_for_string("[Command Mode Ctrl+D]"); // pane spawned & auto-focused
+
+        // Quit cleanly so the session flushes to disk: Ctrl+d leaves the pane's
+        // command mode back to Normal, the first Ctrl+c opens the quit dialog,
+        // the second Ctrl+c confirms the quit (the deck writes its final session
+        // snapshot — including last_command — on the way out).
+        deck.send_keys(b"\x04"); // Ctrl+d → Normal mode
+        deck.send_keys(b"\x03"); // Ctrl+c → quit-confirm dialog
+        deck.send_keys(b"\x03"); // Ctrl+c → confirm quit
+
+        // Wait until the persisted session actually carries the recorded command
+        // before tearing launch 1 down — this is the disk hand-off launch 2 reads.
+        // (The wait sleeps between reads, so it lives in the harness, not here —
+        // Decision 21 forbids sleeping inside e2e test bodies.)
+        let session_path = home.join(".config/dot-agent-deck/session.toml");
+        common::wait_for_file_contains(&session_path, "last_command = \"cat\"");
+        // `deck` drops here: the process is reaped and launch 1's temp working
+        // dir is removed, so the saved `cat` pane (whose dir is now gone) is
+        // skipped on launch 2's restore and the deck starts at "No active
+        // sessions" — while the recorded last command persists in the shared HOME.
+    }
+
+    // --- Launch 2: SAME HOME — the Command field pre-fills from the persisted
+    // last command written by launch 1. ---
+    let deck = TuiDeck::builder()
+        .with_env("HOME", home_arg.as_str())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" "); // Space → confirm dir → new-pane form
+    deck.wait_for_string("Tab: switch"); // form fully painted
+
+    let grid = deck.snapshot_grid();
+    assert_eq!(
+        command_field_value(&grid),
+        "cat",
+        "the recorded last command must survive a full deck restart: launch 1 spawned `cat` \
+         and quit, and launch 2 (sharing the same HOME) must PRE-FILL the new-pane Command \
+         field with `cat`, read back from the persisted session file. A blank field here means \
+         the value failed to persist or reload across the restart.\nGrid:\n{grid}"
+    );
+
+    drop(shared_home);
 }
