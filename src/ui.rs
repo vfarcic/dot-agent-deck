@@ -1353,6 +1353,19 @@ struct UiState {
     /// PRD #89 M1.2 — monotonic reference the coalescer's `Duration` clock is
     /// measured from (`session_epoch.elapsed()`), set once at construction.
     session_epoch: std::time::Instant,
+    /// PRD #196 — the persisted, global "last command": the most recent command
+    /// the user spawned an INTERACTIVE agent with from the new-pane flow. Read by
+    /// the new-pane form seed (`resolve_seed_command`) when `default_command` is
+    /// empty, and persisted in the saved-session file so it survives a restart.
+    /// `None` on a fresh install / before any interactive spawn (form seeds
+    /// blank). Loaded at startup from [`config::SavedSession::last_command`].
+    last_command: Option<String>,
+    /// PRD #196 — the last-command candidate captured at form-submit time
+    /// (`record_candidate`), committed into `last_command` only on a SUCCESSFUL
+    /// interactive spawn. `None` for authoring-mode / empty-command submits, so
+    /// those never overwrite the recorded value. Always (re)set right before each
+    /// `Action::SpawnPane` dispatch, so a failed spawn never leaks a stale value.
+    pending_last_command: Option<String>,
 }
 
 /// PRD #80 review FIX 4: which click region produced a [`LastClick`]. Multi-
@@ -1482,6 +1495,10 @@ impl UiState {
             last_pane_keystroke_at: None,
             session_coalescer: config::SnapshotCoalescer::new(SNAPSHOT_COALESCE_INTERVAL),
             session_epoch: std::time::Instant::now(),
+            // PRD #196: restored from the persisted session in `run_tui` before
+            // the event loop; defaults to None so a fresh install seeds blank.
+            last_command: None,
+            pending_last_command: None,
             button_rects: Vec::new(),
             tab_close_rects: Vec::new(),
             tab_header_rects: Vec::new(),
@@ -4122,7 +4139,10 @@ fn transition_after_dir_pick(ui: &mut UiState) {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let command = ui.config.default_command.clone();
+            // PRD #196: seed via the fallback chain — explicit `default_command`
+            // (unchanged precedence) → recorded `last_command` → blank.
+            let command =
+                resolve_seed_command(&ui.config.default_command, ui.last_command.as_deref());
             let (modes, orchestrations) = match load_project_config(&dir) {
                 Ok(Some(config)) => (config.modes, config.orchestrations),
                 _ => (vec![], vec![]),
@@ -4144,6 +4164,37 @@ fn transition_after_dir_pick(ui: &mut UiState) {
 
     ui.new_pane_form = Some(form);
     ui.mode = UiMode::NewPaneForm;
+}
+
+/// PRD #196: resolve the new-pane Command-field seed via the fallback chain —
+/// an explicit `default_command` always wins; otherwise the recorded
+/// `last_command` (when present and non-empty); otherwise blank. Pure so the
+/// branch logic is unit-testable without a UI. `default_command` semantics are
+/// UNCHANGED — its emptiness is checked verbatim (no added trimming), so this
+/// only affects the previously-blank case.
+fn resolve_seed_command(default_command: &str, last_command: Option<&str>) -> String {
+    if !default_command.is_empty() {
+        default_command.to_string()
+    } else if let Some(last) = last_command.filter(|s| !s.is_empty()) {
+        last.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// PRD #196: decide whether a submitted new-pane command should be recorded as
+/// the global `last_command`. Pure so the decision is unit-testable without a UI.
+/// Records (returns `Some`) ONLY for a plain INTERACTIVE spawn with a non-empty
+/// command; returns `None` for an authoring-mode form (schedule / issue-dispatch,
+/// whose command is the `resolve_authoring_command` fallback the user did not
+/// type) and for an empty/whitespace command. The caller commits the returned
+/// value into `last_command` only after the spawn actually succeeds.
+fn record_candidate(is_authoring: bool, command: &str) -> Option<String> {
+    if is_authoring || command.trim().is_empty() {
+        None
+    } else {
+        Some(command.to_string())
+    }
 }
 
 /// PRD #80 M8: build the [`NewPaneRequest`] from the current form values.
@@ -4273,8 +4324,13 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
                 // lives in `build_new_pane_request`, so both this Enter door and
                 // the [Submit] button door apply it identically.
                 let req = build_new_pane_request(form, &default_command);
+                // PRD #196: capture the last-command candidate BEFORE dropping the
+                // form (the form carries whether it is authoring-mode). Committed
+                // into `last_command` only on a successful interactive spawn.
+                let candidate = record_candidate(form.is_authoring_selected(), &req.command);
                 ui.new_pane_form = None;
                 ui.mode = UiMode::Normal;
+                ui.pending_last_command = candidate;
                 return Action::SpawnPane(Box::new(req));
             }
         },
@@ -5638,8 +5694,17 @@ fn dispatch_action(
                                     orchestration: None,
                                 },
                             );
+                            // PRD #196: this is a successful INTERACTIVE spawn
+                            // (the orchestration path has its own branch above),
+                            // so commit the candidate captured at submit as the
+                            // global last-command. `None` for authoring-mode /
+                            // empty-command submits, so those never overwrite it.
+                            if let Some(cmd) = ui.pending_last_command.take() {
+                                ui.last_command = Some(cmd);
+                            }
                             // PRD #89 M1.2 — a new dashboard pane / mode tab is a
                             // meaningful state change; keep the snapshot fresh.
+                            // PRD #196: also persists the updated last_command.
                             ui.mark_session_dirty();
 
                             if let Some(mode_config) = req.mode_config {
@@ -5930,6 +5995,10 @@ fn dispatch_action(
             if let Some(form) = ui.new_pane_form.take() {
                 ui.mode = UiMode::Normal;
                 let req = build_new_pane_request(&form, &ui.config.default_command);
+                // PRD #196: capture the last-command candidate (None for
+                // authoring-mode / empty); committed on a successful spawn below.
+                ui.pending_last_command =
+                    record_candidate(form.is_authoring_selected(), &req.command);
                 return dispatch_action(
                     Action::SpawnPane(Box::new(req)),
                     ui,
@@ -6097,14 +6166,20 @@ fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
         return;
     }
     let live_panes = state.blocking_read().managed_pane_ids.clone();
-    let session =
+    let mut session =
         config::SavedSession::snapshot(&mut ui.pane_metadata, &ui.pane_display_names, &live_panes);
+    // PRD #196: overlay the runtime last-command onto the live-pane snapshot so
+    // it persists across restarts (the snapshot builder only knows panes).
+    session.last_command = ui.last_command.clone();
     // PRD #89 review-fix F10: only mark the write as done (clearing the dirty
     // flag via `record_write`) when the persist actually SUCCEEDED. On a
     // transient disk error we leave the coalescer dirty so the next loop
     // iteration retries, rather than dropping the pending snapshot until the
     // next unrelated state change re-dirties it.
-    let result = if session.panes.is_empty() {
+    // PRD #196: keep the file (don't clear) when there are no live panes but a
+    // last_command is set, so closing every pane doesn't discard the recorded
+    // command; clear only when BOTH are empty (today's no-state behavior).
+    let result = if session.panes.is_empty() && session.last_command.is_none() {
         config::SavedSession::clear().map_err(|e| format!("Warning: failed to clear session: {e}"))
     } else {
         session
@@ -6295,6 +6370,13 @@ pub fn run_tui(
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, keybindings);
+    // PRD #196: restore the persisted global last-command so the new-pane form
+    // can seed from it from the very first spawn of the session. Loaded
+    // UNCONDITIONALLY — independent of the snapshot-restore gate below (which only
+    // applies when daemon hydration produced zero panes) — because the value is
+    // global preference state, not tied to the live pane set. Missing/unreadable
+    // → None (the form then seeds blank); never a hard failure.
+    ui.last_command = config::SavedSession::load().last_command;
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
     let mut star_state = config::StarPromptState::load();
@@ -8623,12 +8705,15 @@ pub fn run_tui(
     {
         let live_panes = state.blocking_read().managed_pane_ids.clone();
 
-        let session = config::SavedSession::snapshot(
+        let mut session = config::SavedSession::snapshot(
             &mut ui.pane_metadata,
             &ui.pane_display_names,
             &live_panes,
         );
-        if session.panes.is_empty() {
+        // PRD #196: persist the global last-command alongside the panes so it
+        // survives a clean exit/restart; keep the file when only it is set.
+        session.last_command = ui.last_command.clone();
+        if session.panes.is_empty() && session.last_command.is_none() {
             if let Err(e) = config::SavedSession::clear() {
                 ui.session_warnings
                     .push(format!("Warning: failed to clear session: {e}"));
@@ -12869,6 +12954,58 @@ mod tests {
 
     fn default_ui() -> UiState {
         UiState::default()
+    }
+
+    /// PRD #196: the new-pane Command-field seed resolver honors the fallback
+    /// chain — an explicit `default_command` always wins; otherwise the recorded
+    /// `last_command` (when present and non-empty); otherwise blank. Also pins
+    /// that an empty/`None` last command falls through to blank.
+    #[test]
+    fn resolve_seed_command_fallback_chain() {
+        // (1) default_command set → wins regardless of last_command.
+        assert_eq!(
+            resolve_seed_command("opencode", Some("claude")),
+            "opencode",
+            "an explicit default_command must win over the recorded last command"
+        );
+        assert_eq!(resolve_seed_command("opencode", None), "opencode");
+
+        // (2) default_command empty + last present → seed from last.
+        assert_eq!(
+            resolve_seed_command("", Some("claude")),
+            "claude",
+            "an empty default_command must fall back to the recorded last command"
+        );
+
+        // (3) default_command empty + no/empty last → blank.
+        assert_eq!(resolve_seed_command("", None), "");
+        assert_eq!(
+            resolve_seed_command("", Some("")),
+            "",
+            "an empty recorded last command must fall through to blank"
+        );
+    }
+
+    /// PRD #196: the record decision is taken only for a plain INTERACTIVE spawn
+    /// with a non-empty command — an authoring-mode form (schedule /
+    /// issue-dispatch) and an empty/whitespace command both record nothing, so
+    /// the global last_command never picks up a command the user did not type.
+    #[test]
+    fn record_candidate_only_records_interactive_nonempty() {
+        // Interactive + non-empty → records the command verbatim.
+        assert_eq!(record_candidate(false, "cat"), Some("cat".to_string()));
+        assert_eq!(
+            record_candidate(false, "devbox run agent-new"),
+            Some("devbox run agent-new".to_string())
+        );
+
+        // Authoring-mode form → never records (the command is the
+        // resolve_authoring_command fallback, not a user-typed value).
+        assert_eq!(record_candidate(true, "claude"), None);
+
+        // Empty / whitespace-only command → records nothing.
+        assert_eq!(record_candidate(false, ""), None);
+        assert_eq!(record_candidate(false, "   "), None);
     }
 
     // PRD #76 M2.15: pin the layout-math helpers so a future change to the
