@@ -559,6 +559,20 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the authoring seed delivered when the option is selected (covered by `scheduler/form/007`); the post-submit layout; the chip's exact position in the cycler.
 - **Platform coverage:** mac+linux.
 
+##### prompt/new-pane/011 — The new-agent Command field seeds from the last command you spawned when no `default_command` is configured (PRD #196).
+- **Layer:** L2 (no public L1 render seam for the new-pane form — same constraint as `prompt/new-pane/007`; the real TUI is driven via PTY keystrokes and asserted on the rendered vt100 grid).
+- **Agent:** none (`cat` is a real runnable stand-in command — the spawn succeeds and records a last command, and `cat` blocks on stdin so the pane stays alive; no LLM tokens).
+- **Asserts:** with an empty `default_command`, opening the new-pane form the first time leaves the Command field BLANK; after typing `cat` and submitting (spawning a pane), reopening the form pre-fills the Command field with `cat`, seeded from the recorded last command. RED until the feature lands: nothing reads the recorded last command back, so the reopened field renders blank.
+- **Does not assert:** persistence of the last command across a full deck restart (the read-back here is in-process); per-directory last commands (the value is global); the exclusion of authoring-mode fallback commands from the recorded last command.
+- **Platform coverage:** mac+linux.
+
+##### prompt/new-pane/012 — An explicit `default_command` still wins over the recorded last command in the new-agent form — precedence guard (PRD #196).
+- **Layer:** L2 (no public L1 render seam for the new-pane form — same constraint as `prompt/new-pane/007`; the real TUI is driven via PTY keystrokes and asserted on the rendered vt100 grid).
+- **Agent:** none (`cat` is a real runnable stand-in command — the spawn succeeds and records a last command; no LLM tokens).
+- **Asserts:** with `default_command = "configured-default-cmd"`, the new-pane Command field pre-fills from it; after clearing the field, typing `cat`, and submitting (recording `cat` as the last command), reopening the form STILL pre-fills `configured-default-cmd` — the explicit config value wins over the recorded last command. GREEN today and after the feature lands.
+- **Does not assert:** the empty-`default_command` fallback to the last command (covered by `prompt/new-pane/011`); persistence across a restart.
+- **Platform coverage:** mac+linux.
+
 ### Focus / navigation
 
 #### focus/dashboard
