@@ -8,7 +8,7 @@
 
 ## Problem Statement
 
-When a user spins up a new agent, the new-pane form's Command field is pre-seeded from `default_command` (`src/config.rs:179`, applied at `src/ui.rs:4125`). When `default_command` is left empty — its default value (`String::new()`, `src/config.rs:188`) — the field starts **blank**, so the user must type the command (e.g. `claude`, `opencode`, `devbox run agent-new`) by hand on every single spawn. In practice almost everyone re-runs the same command they used last time, so the blank field is repetitive friction for the common case while delivering nothing — the form already records each spawned pane's command to disk (`SavedPane.command`, `src/config.rs:321`), so "the command I ran last" is already sitting in persisted state with nothing reading it back as a starting point.
+When a user spins up a new agent, the new-pane form's Command field is pre-seeded from `default_command` (`src/config.rs:179`, applied at the `DirPickerIntent::NewPane` seam in `transition_after_dir_pick`, `src/ui.rs`). When `default_command` is left empty — its default value (`String::new()`, `src/config.rs:188`) — the field starts **blank**, so the user must type the command (e.g. `claude`, `opencode`, `devbox run agent-new`) by hand on every single spawn. In practice almost everyone re-runs the same command they used last time, so the blank field is repetitive friction for the common case while delivering nothing — the form already records each spawned pane's command to disk (`SavedPane.command`, `src/config.rs:321`), so "the command I ran last" is already sitting in persisted state with nothing reading it back as a starting point.
 
 ## Solution Overview
 
@@ -26,7 +26,7 @@ The value is **global** (one last-command value, not per-directory), **persisted
 
 - A single persisted, global `last_command` value (stored alongside the existing session/config persistence the deck already writes).
 - Recording `last_command` on each successful **interactive** agent spawn from the new-pane flow.
-- Extending the form-seed logic at `src/ui.rs:4125` to resolve the fallback chain: `default_command` if non-empty, else `last_command` if present, else blank.
+- Extending the form-seed logic at the `DirPickerIntent::NewPane` seam in `transition_after_dir_pick` (`src/ui.rs`) to resolve the fallback chain: `default_command` if non-empty, else `last_command` if present, else blank.
 - Excluding authoring-mode fallback commands (`resolve_authoring_command` results for schedule / issue-dispatch) from being recorded as `last_command`.
 - L1 widget/behavior coverage that the form seeds correctly for each branch of the fallback chain (config set; config empty + last present; config empty + no last), and that authoring-mode spawns do not overwrite `last_command`.
 - User docs: a short note that the new-agent command defaults to your last command when no `default_command` is configured.
@@ -68,7 +68,7 @@ The value is **global** (one last-command value, not per-directory), **persisted
 
 ### Phase 2 — Fallback-chain form seeding
 
-- [ ] **M2.1** — Extend the new-pane form seed (`src/ui.rs:4125`) to resolve `default_command` (if non-empty) → `last_command` (if present) → blank.
+- [ ] **M2.1** — Extend the new-pane form seed (`DirPickerIntent::NewPane` seam in `transition_after_dir_pick`, `src/ui.rs`) to resolve `default_command` (if non-empty) → `last_command` (if present) → blank.
 - [ ] **M2.2** — Tests: L1/behavior coverage for all three seed branches and for authoring-mode spawns not overwriting `last_command`.
 
 ### Phase 3 — Docs & release gate

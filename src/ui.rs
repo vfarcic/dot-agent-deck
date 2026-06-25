@@ -4168,14 +4168,17 @@ fn transition_after_dir_pick(ui: &mut UiState) {
 
 /// PRD #196: resolve the new-pane Command-field seed via the fallback chain —
 /// an explicit `default_command` always wins; otherwise the recorded
-/// `last_command` (when present and non-empty); otherwise blank. Pure so the
+/// `last_command` (when present and non-blank); otherwise blank. Pure so the
 /// branch logic is unit-testable without a UI. `default_command` semantics are
 /// UNCHANGED — its emptiness is checked verbatim (no added trimming), so this
-/// only affects the previously-blank case.
+/// only affects the previously-blank case. The `last_command` branch checks
+/// `trim().is_empty()` to MATCH `record_candidate` (which never records a
+/// whitespace-only command): a whitespace-only value can't be recorded today,
+/// so this is defense-in-depth that removes the latent inconsistency.
 fn resolve_seed_command(default_command: &str, last_command: Option<&str>) -> String {
     if !default_command.is_empty() {
         default_command.to_string()
-    } else if let Some(last) = last_command.filter(|s| !s.is_empty()) {
+    } else if let Some(last) = last_command.filter(|s| !s.trim().is_empty()) {
         last.to_string()
     } else {
         String::new()
@@ -5387,6 +5390,15 @@ fn dispatch_action(
 
                 // Orchestration path — manage own panes, no agent pane.
                 if let Some(orch_config) = req.orchestration_config {
+                    // PRD #196: an orchestration spawn never records a
+                    // `last_command`; discard any candidate the submit door
+                    // captured so it can't leak into a later interactive
+                    // spawn. The interactive Ok-arm below still records via
+                    // `pending_last_command.take()`. Clearing it HERE makes the
+                    // "no stale orchestration command" invariant LOCAL to this
+                    // branch rather than relying on the doors re-setting it
+                    // before the next dispatch.
+                    ui.pending_last_command = None;
                     // PRD #107 regression fix: do NOT overwrite
                     // `orch_config.name` with the form name. That override
                     // corrupted the orchestration IDENTITY — the canonical
@@ -6376,6 +6388,14 @@ pub fn run_tui(
     // applies when daemon hydration produced zero panes) — because the value is
     // global preference state, not tied to the live pane set. Missing/unreadable
     // → None (the form then seeds blank); never a hard failure.
+    //
+    // This is a deliberately SEPARATE `load()` from the panes-restore one inside
+    // the `if apply_snapshot` block far below: the two have different gating
+    // (this read is unconditional; the panes restore is gated on hydration
+    // having produced zero panes). Sharing one load would require holding the
+    // whole `SavedSession` across the entire daemon-hydration block and threading
+    // it into the gated branch — entangling the restore path for a negligible
+    // startup disk read. Kept separate on purpose.
     ui.last_command = config::SavedSession::load().last_command;
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
@@ -6815,6 +6835,11 @@ pub fn run_tui(
         // default values because no draw() call has happened yet.
         let _ = terminal.autoresize();
 
+        // PRD #196: a SEPARATE `load()` from the unconditional last_command read
+        // near the top of `run_tui`. Different gating: this one is reached only
+        // when the restore gate (`apply_snapshot`) is true, so it can't be folded
+        // into the unconditional read without entangling the gate. Two loads by
+        // design; see the note at the top-of-function read.
         let saved = config::SavedSession::load();
         // Collect deferred mode pane restores — we need the terminal ready
         // before we can resize PTYs, so mode tabs are opened after the loop.
@@ -12958,8 +12983,9 @@ mod tests {
 
     /// PRD #196: the new-pane Command-field seed resolver honors the fallback
     /// chain — an explicit `default_command` always wins; otherwise the recorded
-    /// `last_command` (when present and non-empty); otherwise blank. Also pins
-    /// that an empty/`None` last command falls through to blank.
+    /// `last_command` (when present and non-blank); otherwise blank. Also pins
+    /// that an empty/whitespace-only/`None` last command falls through to blank
+    /// (the whitespace case aligns with `record_candidate`'s `trim()` check).
     #[test]
     fn resolve_seed_command_fallback_chain() {
         // (1) default_command set → wins regardless of last_command.
@@ -12977,12 +13003,18 @@ mod tests {
             "an empty default_command must fall back to the recorded last command"
         );
 
-        // (3) default_command empty + no/empty last → blank.
+        // (3) default_command empty + no/empty/whitespace last → blank.
         assert_eq!(resolve_seed_command("", None), "");
         assert_eq!(
             resolve_seed_command("", Some("")),
             "",
             "an empty recorded last command must fall through to blank"
+        );
+        assert_eq!(
+            resolve_seed_command("", Some("   ")),
+            "",
+            "a whitespace-only recorded last command must fall through to blank \
+             (aligned with record_candidate's trim().is_empty() check)"
         );
     }
 
