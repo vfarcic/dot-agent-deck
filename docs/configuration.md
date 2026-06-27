@@ -17,6 +17,19 @@ dot-agent-deck config get default_command
 
 `default_command` is the agent command pre-filled in the **new-pane form**'s Command field and the value that seeds the **schedule-authoring** agent. Both the new-pane form and the Scheduled Tasks **Add/Edit** flow use the same form — you type the command directly into the **Command** field (it accepts `claude`, `opencode`, a path, or any command), pre-filled from `default_command`. If `default_command` is unset, the schedule-authoring agent falls back to `claude`.
 
+## Mouse
+
+```bash
+# Disable mouse capture so your terminal handles text selection / copy
+dot-agent-deck config set mouse.enabled false
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `mouse.enabled` | `true` | Capture the mouse for in-TUI interaction (click cards/buttons, click-drag to select within a pane, OSC52 copy-to-clipboard). |
+
+When `mouse.enabled` is `true` (the default) dot-agent-deck puts the terminal into mouse-reporting mode, so click/drag is handled by the TUI. Set it to `false` if you prefer your **terminal's own** text selection and copy (select into the primary buffer, middle-click / your terminal's paste): the deck then leaves mouse reporting off entirely. The tradeoff is that the in-app mouse affordances (clickable cards/buttons and the in-pane mouse selection + its clipboard copy) are unavailable while disabled — every action still has a keyboard shortcut (press `?`). Note: with capture **on**, you can still do a one-off native selection in most terminals by holding **Shift** while dragging.
+
 ## Environment Variables
 
 | Variable | Default | Description |

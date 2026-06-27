@@ -1,0 +1,1 @@
+Add a `mouse.enabled` config option (default `true`). Set it to `false` to disable the TUI's mouse capture so the terminal handles native text selection and copy: `dot-agent-deck config set mouse.enabled false`.

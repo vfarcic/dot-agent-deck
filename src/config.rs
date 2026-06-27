@@ -26,6 +26,10 @@ pub const CONFIG_KEYS: &[(&str, &str)] = &[
     ),
     ("bell.on_error", "Bell on agent error (default: true)"),
     (
+        "mouse.enabled",
+        "Capture the mouse for in-TUI click/drag; set false for native terminal text selection and copy (default: true)",
+    ),
+    (
         "idle_art.enabled",
         "Enable ASCII art in dashboard idle cards (default: false)",
     ),
@@ -151,6 +155,23 @@ impl BellConfig {
     }
 }
 
+/// Mouse capture for the TUI. When `enabled` is false, dot-agent-deck does NOT
+/// put the terminal into mouse-reporting mode, so the terminal's own text
+/// selection / copy works normally. The tradeoff: the in-app mouse selection
+/// (click/drag a pane, click cards/buttons) and its OSC52 "copy to clipboard"
+/// are unavailable while disabled. Default: true (preserves the click/drag UI).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MouseConfig {
+    pub enabled: bool,
+}
+
+impl Default for MouseConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IdleArtConfig {
@@ -178,6 +199,7 @@ impl Default for IdleArtConfig {
 pub struct DashboardConfig {
     pub default_command: String,
     pub bell: BellConfig,
+    pub mouse: MouseConfig,
     pub idle_art: IdleArtConfig,
     pub auto_config_prompt: bool,
 }
@@ -187,6 +209,7 @@ impl Default for DashboardConfig {
         Self {
             default_command: String::new(),
             bell: BellConfig::default(),
+            mouse: MouseConfig::default(),
             idle_art: IdleArtConfig::default(),
             auto_config_prompt: true,
         }
@@ -231,6 +254,7 @@ impl DashboardConfig {
             "bell.on_waiting_for_input" => Ok(self.bell.on_waiting_for_input.to_string()),
             "bell.on_idle" => Ok(self.bell.on_idle.to_string()),
             "bell.on_error" => Ok(self.bell.on_error.to_string()),
+            "mouse.enabled" => Ok(self.mouse.enabled.to_string()),
             "idle_art.enabled" => Ok(self.idle_art.enabled.to_string()),
             "idle_art.provider" => Ok(self.idle_art.provider.clone()),
             "idle_art.model" => Ok(self.idle_art.model.clone()),
@@ -263,6 +287,10 @@ impl DashboardConfig {
             }
             "bell.on_error" => {
                 self.bell.on_error = parse_bool(value)?;
+                Ok(())
+            }
+            "mouse.enabled" => {
+                self.mouse.enabled = parse_bool(value)?;
                 Ok(())
             }
             "idle_art.enabled" => {
@@ -1387,6 +1415,37 @@ on_idle = true
         assert!(!dc.bell.enabled);
         assert!(dc.bell.on_idle);
         assert!(dc.bell.on_waiting_for_input);
+    }
+
+    #[test]
+    fn mouse_config_defaults() {
+        let mc = MouseConfig::default();
+        assert!(mc.enabled);
+    }
+
+    #[test]
+    fn dashboard_config_without_mouse_section() {
+        let dc: DashboardConfig = toml::from_str("default_command = \"x\"").unwrap();
+        assert!(dc.mouse.enabled);
+    }
+
+    #[test]
+    fn dashboard_config_with_mouse_section() {
+        let toml_str = r#"
+[mouse]
+enabled = false
+"#;
+        let dc: DashboardConfig = toml::from_str(toml_str).unwrap();
+        assert!(!dc.mouse.enabled);
+    }
+
+    #[test]
+    fn mouse_enabled_get_set_roundtrip() {
+        let mut dc = DashboardConfig::default();
+        assert_eq!(dc.get_field("mouse.enabled").unwrap(), "true");
+        dc.set_field("mouse.enabled", "false").unwrap();
+        assert_eq!(dc.get_field("mouse.enabled").unwrap(), "false");
+        assert!(!dc.mouse.enabled);
     }
 
     #[test]

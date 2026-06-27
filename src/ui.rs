@@ -6285,12 +6285,18 @@ pub fn run_tui(
         original_hook(info);
     }));
 
-    // Enable mouse capture and bracketed paste so events reach our event loop.
+    // Enable bracketed paste so paste events reach our event loop. Mouse capture
+    // is opt-out via `mouse.enabled` (config): when disabled we leave the
+    // terminal's own mouse handling in place so native text selection / copy
+    // works. The teardown DisableMouseCapture stays unconditional -- it is a
+    // harmless no-op when capture was never enabled.
     crossterm::execute!(
         std::io::stdout(),
-        crossterm::event::EnableMouseCapture,
         crossterm::event::EnableBracketedPaste,
     )?;
+    if config.mouse.enabled {
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+    }
 
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
