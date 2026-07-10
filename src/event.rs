@@ -24,6 +24,7 @@ pub enum EventType {
 pub enum AgentType {
     ClaudeCode,
     OpenCode,
+    Pi,
     None,
 }
 
@@ -35,8 +36,8 @@ impl AgentType {
     /// sessions with the correct type instead of "No agent".
     ///
     /// Returns `Some(AgentType)` only for recognized agent binaries
-    /// (`claude` → `ClaudeCode`, `opencode` → `OpenCode`); unknown
-    /// commands and `None` input return `None` so the daemon stores
+    /// (`claude` → `ClaudeCode`, `opencode` → `OpenCode`, `pi` → `Pi`);
+    /// unknown commands and `None` input return `None` so the daemon stores
     /// "type not known yet" rather than misclassifying. Whitespace
     /// before the binary name is ignored to match shell-style invocations.
     pub fn from_command(cmd: Option<&str>) -> Option<Self> {
@@ -46,6 +47,7 @@ impl AgentType {
         match basename {
             "claude" => Some(AgentType::ClaudeCode),
             "opencode" => Some(AgentType::OpenCode),
+            "pi" => Some(AgentType::Pi),
             _ => None,
         }
     }
@@ -310,6 +312,35 @@ mod tests {
         );
         assert_eq!(
             AgentType::from_command(Some("/opt/bin/opencode --foo")),
+            Some(AgentType::OpenCode)
+        );
+    }
+
+    // PRD #201 M1.1 (test-plan row 1): pin the `pi` → AgentType::Pi mapping
+    // so a plain `pi` pane and a scheduled `pi` job are recognized as a
+    // first-class agent type, and reassert claude/opencode as a regression
+    // guard — the same detection path feeds all three. Mirrors the path/arg
+    // shapes covered for claude/opencode above.
+    #[test]
+    fn agent_type_from_command_recognizes_pi() {
+        assert_eq!(AgentType::from_command(Some("pi")), Some(AgentType::Pi));
+        // Full path also resolves via file_name().
+        assert_eq!(
+            AgentType::from_command(Some("/usr/local/bin/pi")),
+            Some(AgentType::Pi)
+        );
+        // Args after the binary are ignored.
+        assert_eq!(
+            AgentType::from_command(Some("pi --some-flag")),
+            Some(AgentType::Pi)
+        );
+        // No regression: claude/opencode still map to their own types.
+        assert_eq!(
+            AgentType::from_command(Some("claude")),
+            Some(AgentType::ClaudeCode)
+        );
+        assert_eq!(
+            AgentType::from_command(Some("opencode")),
             Some(AgentType::OpenCode)
         );
     }

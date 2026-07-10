@@ -66,6 +66,7 @@ impl fmt::Display for crate::event::AgentType {
         match self {
             crate::event::AgentType::ClaudeCode => write!(f, "ClaudeCode"),
             crate::event::AgentType::OpenCode => write!(f, "OpenCode"),
+            crate::event::AgentType::Pi => write!(f, "Pi"),
             crate::event::AgentType::None => write!(f, "No agent"),
         }
     }
