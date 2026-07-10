@@ -1,7 +1,7 @@
 ---
-name: tag-release
+name: dot-ai-tag-release
 description: Create a release tag based on accumulated changelog fragments. Run when ready to cut a release.
-disable-model-invocation: true
+user-invocable: true
 ---
 
 # Create Release Tag
@@ -21,7 +21,7 @@ Run this skill when:
 
 Run the analysis script bundled with this skill:
 ```bash
-bash analyze.sh
+bash .claude/skills/dot-ai-tag-release/analyze.sh
 ```
 
 If the script fails (non-zero exit) or the output contains `ERROR=true`, show the `MESSAGE` to the user and stop.
@@ -63,6 +63,7 @@ Show the user:
 
 - **Don't run during PR workflow**: This is a separate release activity
 - **Review fragments first**: Make sure all fragments are accurate before tagging
-- **Use semantic versioning**: Follow semver strictly based on fragment types. While the project is pre-1.0 (`v0.x`), the minor digit is the compatibility boundary, so `breaking` fragments bump the minor and `feature`/`bugfix` fragments are patch releases; from `1.0` onward, standard semver applies (`breaking`→major, `feature`→minor, `bugfix`→patch). The `analyze.sh` output already reflects this.
+- **Use semantic versioning**: Follow semver strictly based on fragment types. While the project is pre-1.0 (`v0.x`), the minor digit is the compatibility boundary, so `breaking` fragments bump the minor and `feature`/`bugfix` fragments are patch releases; from `1.0` onward, standard semver applies (`breaking`→major, `feature`→minor, `bugfix`→patch). The `.claude/skills/dot-ai-tag-release/analyze.sh` output already reflects this.
 - **Brief tag message**: Summarize the release in 1-2 sentences
 - **Never tag [skip ci] commits**: Always create a preparation commit first
+
