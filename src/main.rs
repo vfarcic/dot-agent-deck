@@ -112,6 +112,14 @@ enum Commands {
         #[arg(long = "type")]
         r#type: String,
     },
+    /// Set up the Pi orchestrator integration (PRD #201). Detects `pi` on
+    /// PATH, materializes the bundled orchestrator extension into Pi's global
+    /// extension dir, and enables it (Pi auto-discovers the dir). Prints the
+    /// one-line install hint and exits non-zero if `pi` is absent.
+    Orchestrator {
+        #[command(subcommand)]
+        cmd: OrchestratorCmd,
+    },
     /// Daemon-side subcommands. Used internally by remote transports — not
     /// part of the everyday user surface.
     Daemon {
@@ -227,6 +235,14 @@ enum ScheduleAction {
     },
     /// Ask the running daemon to re-read the global config.
     Reload,
+}
+
+#[derive(Subcommand)]
+enum OrchestratorCmd {
+    /// Detect `pi`, then materialize + enable the bundled orchestrator
+    /// extension in Pi's global extension dir. Idempotent (re-run to refresh a
+    /// stale copy). Exits non-zero with the install hint when `pi` is absent.
+    Setup,
 }
 
 #[derive(Subcommand)]
@@ -600,6 +616,33 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Some(Commands::Orchestrator { cmd }) => match cmd {
+            // PRD #201 M3.2: thin wrapper — wire real PATH-detection + the real
+            // `~/.pi/agent/extensions/dot-agent-deck` dir to the pure
+            // `run_setup` core, then render its report to stdout/stderr + exit.
+            OrchestratorCmd::Setup => {
+                use dot_agent_deck::orchestrator_ext;
+                let target_dir = orchestrator_ext::default_extension_dir();
+                let pi_present = orchestrator_ext::pi_on_path();
+                match orchestrator_ext::run_setup(pi_present, &target_dir) {
+                    Ok(report) if report.success => {
+                        println!("{}", report.message);
+                        ExitCode::SUCCESS
+                    }
+                    Ok(report) => {
+                        eprintln!("{}", report.message);
+                        ExitCode::FAILURE
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "orchestrator setup: failed to materialize the Pi extension into {}: {e}",
+                            target_dir.display()
+                        );
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+        },
         Some(Commands::Daemon { cmd }) => match cmd {
             DaemonCmd::Serve => {
                 // PRD #170 M1.2: capture the login-shell PATH and apply it to
