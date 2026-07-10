@@ -60,6 +60,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** absolute-time clocks (`Last:` is rendered against a fixed test clock).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/pane/007 — A Pi pane's card renders the Pi agent-type identity (PRD #201 M2.2).
+- **Layer:** L1 (ratatui `TestBackend` + `insta`-style buffer text assertion).
+- **Agent:** none (a fixture `SessionState` with `agent_type = AgentType::Pi` and no display name).
+- **Asserts:** a live Pi session with no friendly name renders its card title in the `<agent-type> · <session-id>` form showing the Pi identity (`Pi · orch-01`); the fixture's cwd basename and session id carry no capital `Pi`, so the match pins the agent-type Display specifically. The card must NOT show `ClaudeCode` / `OpenCode` / `No agent` — a plain `pi` pane is first-class, not "No agent".
+- **Does not assert:** the `experimental`-flag gating of Pi selectability (Phase 5 / M5.1); the status badge color (`status/badge/001`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/density
 
 ##### dashboard/density/001 — Spacious density shows up to 3 prompts and 3 tool calls per card.
@@ -366,6 +373,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Asserts:** each lifecycle state resolves through the seam (`running`→`Thinking`, `waiting`→`WaitingForInput`, `finished`→`Idle`) and, routed through `apply_event`, the derived `SessionStatus` (the badge source) moves `Thinking` → `WaitingForInput` → `Idle` in lock-step — with no hook and no `settings.json` mutation.
 - **Does not assert:** the TS extension's Pi-event-bus → state mapping (M2.2 TS tests); the rendered badge glyph/color (`status/badge/001`).
 - **Platform coverage:** mac+linux+windows.
+
+##### status/agent-event/003 — A Pi pane reports running/waiting/finished HEADLESS/UNATTENDED via `agent-event` against the real `daemon serve`, with NO hook installed and no `~/.claude/settings.json` mutation (PRD #201 M2.2).
+- **Layer:** L2 (headless `daemon serve` via the `DaemonProc` harness — no PTY, no attached TUI; spawns the real binary, so the `e2e` tier). The Pi extension is stood in for by the real `dot-agent-deck agent-event --type <state>` CLI subprocess; status is observed via an unattended `SubscribeEvents` consumer and the badge derived locally through `AppState::apply_event` (the same seam the production TUI subscriber uses). Hits no LLM.
+- **Agent:** synthetic (the `agent-event` CLI reporting `AgentType::Pi` from a pane carrying the daemon's injected `DOT_AGENT_DECK_PANE_ID` / `DOT_AGENT_DECK_AGENT_ID`).
+- **Asserts:** each `agent-event --type running|waiting|finished` exits 0 and is re-broadcast by the daemon as a bare `AgentEvent` carrying the Pi identity + injected ids + the mapped `EventType`; fed through `AppState::apply_event` the unattended badge moves `Thinking` → `WaitingForInput` → `Idle`; and a seeded sentinel `~/.claude/settings.json` (whose presence makes the hook-install guard pass) is byte-for-byte unchanged afterward and never gains a `dot-agent-deck` hook entry — proving the daemon/agent-event path installs no Claude hook.
+- **Does not assert:** the real `pi` runtime + bundled extension end to end (real-`pi` e2e, M4.1); the daemon's own internal derived status over the wire (`AgentRecord` carries no status field; the broadcast is the observable).
+- **Platform coverage:** linux (headless daemon-serve harness).
 
 ### Prompts
 
