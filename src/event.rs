@@ -53,6 +53,25 @@ impl AgentType {
     }
 }
 
+/// PRD #201 M1.2 (test-plan row 3): map a lifecycle **state** string an agent's
+/// extension reports via `dot-agent-deck agent-event --type <state>` to the
+/// [`EventType`] that drives the target pane's card status. This is the single
+/// production seam the CLI subcommand and the fast-tier status tests share.
+///
+/// The canonical `--type` vocabulary is exactly three states — `running`,
+/// `waiting`, `finished`. Anything else returns `None` so the subcommand can
+/// reject an unknown `--type` with a clear non-zero error instead of silently
+/// emitting a wrong (or default) status. The Phase 2 extension and the docs
+/// MUST use the same three strings.
+pub fn agent_event_type_from_state(state: &str) -> Option<EventType> {
+    match state {
+        "running" => Some(EventType::Thinking),
+        "waiting" => Some(EventType::WaitingForInput),
+        "finished" => Some(EventType::Idle),
+        _ => None,
+    }
+}
+
 /// `AgentEvent.metadata` key carrying a human-friendly card title (PRD #127
 /// finding #2). The daemon's live-surface path (`surface_spawned_pane`) sets
 /// this to the schedule's task name so an ALREADY-ATTACHED TUI titles the
@@ -479,6 +498,34 @@ mod tests {
         assert!(s.roles[0].is_start_role);
         assert_eq!(s.roles[1].pane_id, "sched-github-issues-0-r1");
         assert_eq!(s.roles[1].role_index, 1);
+    }
+
+    // PRD #201 M1.2 (test-plan row 3): pin the lifecycle-state → EventType
+    // mapping the `dot-agent-deck agent-event --type <state>` subcommand and
+    // the fast-tier status tests both consume. The three canonical states must
+    // map to the exact EventTypes that drive Thinking / WaitingForInput / Idle
+    // card statuses, and any other string must return None so the CLI rejects
+    // an unknown `--type` non-zero rather than emitting a wrong status.
+    #[test]
+    fn agent_event_type_from_state_maps_canonical_lifecycle_states() {
+        assert_eq!(
+            agent_event_type_from_state("running"),
+            Some(EventType::Thinking)
+        );
+        assert_eq!(
+            agent_event_type_from_state("waiting"),
+            Some(EventType::WaitingForInput)
+        );
+        assert_eq!(
+            agent_event_type_from_state("finished"),
+            Some(EventType::Idle)
+        );
+        // Unknown / malformed states map to None (the CLI turns this into a
+        // clear non-zero error). Includes casing and near-miss variants.
+        assert_eq!(agent_event_type_from_state("idle"), None);
+        assert_eq!(agent_event_type_from_state("Running"), None);
+        assert_eq!(agent_event_type_from_state("done"), None);
+        assert_eq!(agent_event_type_from_state(""), None);
     }
 
     #[test]

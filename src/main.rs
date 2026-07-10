@@ -5,7 +5,7 @@ use std::sync::Arc;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::sync::RwLock;
 
-use dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID;
+use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use dot_agent_deck::build_version_handshake;
 use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
@@ -102,6 +102,15 @@ enum Commands {
         /// Signal that the entire orchestration is complete (orchestrator only)
         #[arg(long)]
         done: bool,
+    },
+    /// Report an agent lifecycle state so the pane's card status updates
+    /// (PRD #201 M1.2). Used by an agent's extension (e.g. the bundled Pi
+    /// extension) to drive status with NO hook installed: it rides the
+    /// existing raw-`AgentEvent` socket path.
+    AgentEvent {
+        /// Lifecycle state: one of `running`, `waiting`, `finished`.
+        #[arg(long = "type")]
+        r#type: String,
     },
     /// Daemon-side subcommands. Used internally by remote transports — not
     /// part of the everyday user surface.
@@ -533,6 +542,60 @@ fn main() -> ExitCode {
             };
             if dot_agent_deck::hook::send_to_socket(&json).is_none() {
                 eprintln!("Failed to send work-done signal to daemon socket.");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Some(Commands::AgentEvent { r#type }) => {
+            let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
+                Ok(id) => id,
+                Err(_) => {
+                    eprintln!(
+                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            // Optional — the daemon injects this on spawn (same pattern as the
+            // hook path); a pane spawned before agent-id tagging has none.
+            let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID).ok();
+            let event_type = match dot_agent_deck::event::agent_event_type_from_state(&r#type) {
+                Some(et) => et,
+                None => {
+                    eprintln!(
+                        "Error: unknown agent-event --type {:?}. Expected one of: running, waiting, finished.",
+                        r#type
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            // Ride the EXISTING raw-`AgentEvent` socket path (zero new wire):
+            // a bare AgentEvent with no `message_type` envelope, keyed on a
+            // stable session id derived from the pane so repeated events update
+            // the same card. The daemon's `run_hook_loop` falls back to
+            // `AgentEvent` and `apply_event` drives the status.
+            let event = dot_agent_deck::event::AgentEvent {
+                session_id: format!("{pane_id}-session"),
+                agent_type: dot_agent_deck::event::AgentType::Pi,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some(pane_id),
+                agent_id,
+            };
+            let json = match serde_json::to_string(&event) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("Failed to serialize agent-event: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if dot_agent_deck::hook::send_to_socket(&json).is_none() {
+                eprintln!("Failed to send agent-event to daemon socket.");
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
