@@ -6276,6 +6276,15 @@ pub fn run_tui(
 ) -> std::io::Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // A panic inside a guarded vt100 feed (see
+        // `embedded_pane::guarded_parser_feed`) is caught by the caller and must
+        // NOT tear down the live terminal — doing so would yank the alternate
+        // screen out from under the render loop and exit the TUI, exactly the
+        // crash this guard exists to prevent. Leave the terminal untouched and
+        // let `catch_unwind` swallow it (the caller logs and drops the chunk).
+        if crate::embedded_pane::in_guarded_parser_feed() {
+            return;
+        }
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::DisableMouseCapture,
