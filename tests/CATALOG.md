@@ -351,6 +351,22 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the dot animation frame.
 - **Platform coverage:** mac+linux+windows.
 
+#### status/agent-event
+
+##### status/agent-event/001 — A `dot-agent-deck agent-event --type <state>` frame routes into the existing `AgentEvent` stream and drives the target pane's card status, with NO hook and no `settings.json` mutation (PRD #201 M1.2/M1.3).
+- **Layer:** L1 (in-process — resolve the lifecycle state via the production seam `dot_agent_deck::event::agent_event_type_from_state`, build the `AgentEvent` via the agent-agnostic synthetic-agent harness, drive `AppState::apply_event`; no daemon socket, no PTY, no hook).
+- **Agent:** none (synthetic — the harness at `AgentType::Pi` identity models the pane's injected `DOT_AGENT_DECK_PANE_ID` / `DOT_AGENT_DECK_AGENT_ID`).
+- **Asserts:** `agent-event --type running` maps to an `EventType` via the seam; the built frame carries the pane id, agent id, and the Pi agent type; it serializes as a bare `AgentEvent` with NO `message_type` envelope and does NOT parse as a `DaemonMessage` (it rides the existing raw-event wire, zero new surface); routed through `apply_event` on the registered pane it drives the card to a busy (`Thinking`) status.
+- **Does not assert:** the full CLI → daemon-socket → `run_hook_loop` path (real-`pi` e2e, M4); the exact `EventType` chosen for `running` beyond that it yields the `Thinking` badge.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/agent-event/002 — The Pi synthetic agent emits `running` → `waiting` → `finished` via `agent-event` and the card badge follows each transition (PRD #201 M1.3).
+- **Layer:** L1 (in-process — production state→EventType seam + `AppState::apply_event`, driven by the synthetic-agent harness).
+- **Agent:** none (synthetic — the harness at `AgentType::Pi` identity).
+- **Asserts:** each lifecycle state resolves through the seam (`running`→`Thinking`, `waiting`→`WaitingForInput`, `finished`→`Idle`) and, routed through `apply_event`, the derived `SessionStatus` (the badge source) moves `Thinking` → `WaitingForInput` → `Idle` in lock-step — with no hook and no `settings.json` mutation.
+- **Does not assert:** the TS extension's Pi-event-bus → state mapping (M2.2 TS tests); the rendered badge glyph/color (`status/badge/001`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Prompts
 
 #### prompt/permission
@@ -1344,6 +1360,20 @@ without depending on the config struct API.
 - **Agent:** none.
 - **Asserts:** worker's pane gains an error line; no task is delivered to any role.
 - **Does not assert:** the daemon-side log entry.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/005 — A Pi-identity orchestrator's `delegate` routes into the worker pane (the synthetic-agent harness proves the delegate contract holds for a Pi identity) (PRD #201 M1.3).
+- **Layer:** L1/fast (in-process — the daemon's real `handle_delegate` against a `cat`-stub worker pane; mirrors the fast-tier precedent `delegate_prompt_injection`, no daemon socket, no LLM).
+- **Agent:** none (synthetic — the harness at `AgentType::Pi` identity is the orchestrator; the `coder` worker is a `cat` stub whose PTY echoes injected bytes).
+- **Asserts:** with a Pi orchestrator (the `start = true` role) and a `coder` worker registered in the same orchestration, calling the harness's `delegate --to coder` routes the single-line task pointer into the worker pane's PTY. Additive Pi coverage of the `orchestration/delegate/001` contract; expected green-on-write because routing keys on pane role, not agent type.
+- **Does not assert:** the worker task-file footer / single-line-prompt shape (covered by `delegate_prompt_injection`); the real-agent response (no LLM).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/006 — A Pi-identity WORKER calling `delegate` is rejected by the pane-role guard; no task is delivered (PRD #201 M1.3).
+- **Layer:** L1/fast (in-process — the daemon's real `handle_delegate` against a `cat`-stub worker pane; no daemon socket, no LLM).
+- **Agent:** none (synthetic — the harness at `AgentType::Pi` identity is a non-orchestrator worker; a `coder` worker `cat` stub shares the orchestration so an orchestrator's delegate WOULD deliver).
+- **Asserts:** a Pi worker (registered in `pane_role_map` but deliberately absent from `orchestrator_pane_ids`) calling the harness's `delegate --to coder` is rejected — the `coder` stub's PTY never receives the task pointer within a bounded grace window (rejection is a synchronous early return before any dispatch task spawns). Additive Pi coverage of the `orchestration/delegate/004` guard; expected green-on-write.
+- **Does not assert:** the orchestrator pane's error-line rendering (L2 `orchestration/delegate/004`); the daemon-side log entry.
 - **Platform coverage:** mac+linux.
 
 #### orchestration/identity

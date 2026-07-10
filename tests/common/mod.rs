@@ -14,6 +14,12 @@
 
 #![allow(dead_code)]
 
+/// PRD #201 M1.3: the agent-agnostic synthetic-agent harness — a scripted
+/// stand-in that emits `delegate` / `work-done` / `agent-event` frames,
+/// parameterized by agent identity. Shared by the fast-tier contract tests
+/// (`tests/agent_event.rs`, `tests/orchestration_delegate.rs`).
+pub mod synthetic_agent;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
