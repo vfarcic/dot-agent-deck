@@ -1,6 +1,6 @@
 # PRD #201: Pi as a first-class agent — deterministic orchestrator + third agent type
 
-**Status**: Draft
+**Status**: Implemented — pre-PR (review resolved, e2e gate green; M5.3 manual cross-version test + M5.4 Greptile settle during `/prd-done`)
 **Priority**: Medium
 **Created**: 2026-07-10
 **GitHub Issue**: [#201](https://github.com/vfarcic/dot-agent-deck/issues/201)
@@ -123,35 +123,35 @@ It does not bundle or vendor the Pi/Node runtime, does not replace `claude`/`ope
 
 ### Phase 1 — Agent type & the synthetic harness
 
-- [ ] **M1.1** — `AgentType::Pi` in `crates/protocol` (`from_command`, status plumbing) with unit tests; a plain `pi` pane runs and is recognized (status wiring lands in M2).
-- [ ] **M1.2** — `dot-agent-deck agent-event --type <state>` subcommand: routes over the daemon socket via pane env vars into the existing `EventType`/`AgentEvent` stream. Rule-12 classification recorded.
-- [ ] **M1.3** — Agent-agnostic **synthetic-agent harness**: a scripted stand-in that calls `delegate`/`work-done`/`agent-event` on cue; deterministic contract tests for daemon routing, the pane-role guard, and status transitions (fast tier).
+- [x] **M1.1** — `AgentType::Pi` in `crates/protocol` (`from_command`, status plumbing) with unit tests; a plain `pi` pane runs and is recognized (status wiring lands in M2).
+- [x] **M1.2** — `dot-agent-deck agent-event --type <state>` subcommand: routes over the daemon socket via pane env vars into the existing `EventType`/`AgentEvent` stream. Rule-12 classification recorded.
+- [x] **M1.3** — Agent-agnostic **synthetic-agent harness**: a scripted stand-in that calls `delegate`/`work-done`/`agent-event` on cue; deterministic contract tests for daemon routing, the pane-role guard, and status transitions (fast tier).
 
 ### Phase 2 — The extension & clean status
 
-- [ ] **M2.1** — Orchestrator extension (TypeScript): native `delegate`/`work-done` tools shelling the CLI; TS unit tests for invocation-building and error paths. JS toolchain contained in the extension subdirectory.
-- [ ] **M2.2** — Extension event-bus → `agent-event` status mapping; a Pi pane reports running/waiting/finished with **no hook installed**. TS mapping tests + a synthetic-harness assertion, including **headless/unattended** (no client attached).
+- [x] **M2.1** — Orchestrator extension (TypeScript): native `delegate`/`work-done` tools shelling the CLI; TS unit tests for invocation-building and error paths. JS toolchain contained in the extension subdirectory.
+- [x] **M2.2** — Extension event-bus → `agent-event` status mapping; a Pi pane reports running/waiting/finished with **no hook installed**. TS mapping tests + a synthetic-harness assertion, including **headless/unattended** (no client attached).
 
 ### Phase 3 — Delivery & setup
 
-- [ ] **M3.1** — Bundle the extension as an in-binary asset (`include_str!`) and materialize it; test that materialization writes the expected files to a temp dir.
-- [ ] **M3.2** — `dot-agent-deck orchestrator setup`: pi detection + install hint + extension enablement; fast tests for present/absent pi.
+- [x] **M3.1** — Bundle the extension as an in-binary asset (`include_str!`) and materialize it; test that materialization writes the expected files to a temp dir.
+- [x] **M3.2** — `dot-agent-deck orchestrator setup`: pi detection + install hint + extension enablement; fast tests for present/absent pi.
 
 ### Phase 4 — Real-agent proof & scheduled/dashboard parity
 
-- [ ] **M4.1** — Real-`pi` e2e (`e2e_pi_orchestrator.rs`, `#[cfg(feature="e2e")]`): real orchestrator delegates to a real worker and receives `work-done`. Sized to confidence per Design Decision #7.
-- [ ] **M4.2** — Dashboard `pi` pane and **scheduled** `pi` job status-tracked end to end (the scheduler uses the same spawn primitive; assert unattended status).
+- [x] **M4.1** — Real-`pi` e2e (`e2e_pi_orchestrator.rs`, `#[cfg(feature="e2e")]`): real orchestrator delegates to a real worker and receives `work-done`. Sized to confidence per Design Decision #7.
+- [x] **M4.2** — Dashboard `pi` pane and **scheduled** `pi` job status-tracked end to end (the scheduler uses the same spawn primitive; assert unattended status).
 
 ### Phase 5 — Flag, docs, contract & release gate
 
-- [ ] **M5.1** — `experimental` gating: `features::show_pi_agent()` at the render/input seam; flag noted in PRD + changelog + `docs/develop/experimental-flag.md`; `graduate-pi-agent` follow-up filed.
-- [ ] **M5.2** — Docs: user enablement doc under `docs/` (+ `site/sidebars.js`); developer extension-contract doc under `docs/develop/` (+ `CONTRIBUTING.md`); changelog fragment.
+- [x] **M5.1** — `experimental` gating: `features::show_pi_agent()` at the render/input seam; flag noted in PRD + changelog + `docs/develop/experimental-flag.md`; `graduate-pi-agent` follow-up filed.
+- [x] **M5.2** — Docs: user enablement doc under `docs/` (+ `site/sidebars.js`); developer extension-contract doc under `docs/develop/` (+ `CONTRIBUTING.md`); changelog fragment.
 - [ ] **M5.3** — Rule-12 cross-version manual test (previous-release daemon + branch TUI + Pi orchestrator: delegate routes, status arrives); `PROTOCOL_VERSION`/`.breaking.md` finalized.
 - [ ] **M5.4** — Pre-PR gate: `cargo test-e2e` green; review (Greptile) settled per rule #8.
 
 ### Phase 6 — Existing-PRD cross-reference sweep
 
-- [ ] **M6.1** — Go through all existing PRDs under `prds/` (and `prds/done/`) and include `pi` wherever a PRD *specifically* mentions or enumerates the supported agent types (`claude`/`opencode`), so Pi's first-class status is reflected consistently across the PRD corpus. Skip generic "the agent" references; touch only explicit agent-type enumerations. This is the **final task**, run after all functional work in Phases 1–5 has landed, so the sweep reflects the shipped behavior.
+- [x] **M6.1** — Go through all existing PRDs under `prds/` (and `prds/done/`) and include `pi` wherever a PRD *specifically* mentions or enumerates the supported agent types (`claude`/`opencode`), so Pi's first-class status is reflected consistently across the PRD corpus. Skip generic "the agent" references; touch only explicit agent-type enumerations. This is the **final task**, run after all functional work in Phases 1–5 has landed, so the sweep reflects the shipped behavior.
 
 ## Risks & Mitigations
 
