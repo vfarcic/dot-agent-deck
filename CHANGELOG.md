@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.32.1] - 2026-07-11
+
+### Fixed
+
+- **TUI no longer crashes on a wide character in a short pane**
+  Attaching to a deck — most visibly over `connect` to a remote — no longer renders garbled and then exits when a dispatched orchestration surfaces many role panes stacked into one column. A pane that collapses to a single row could feed a wide character (CJK text, emoji) into the terminal emulator in a way that panicked the whole TUI on attach; the panic is now contained at the agent-output boundary. A malformed output chunk from an agent is dropped (that pane may render briefly stale) instead of taking the session down, so the deck stays up and the rest of the panes keep streaming.
+- **macOS: version-mismatch daemon restart no longer silently no-ops**
+  On macOS, attaching a new-build TUI to a still-running older-build daemon now actually restarts that daemon, as it always has on Linux. The build-version handshake re-resolved the daemon's PID over its socket to guard against PID reuse, and on macOS that lookup fails once the daemon closes its end of the handshake connection — which the code mistook for "the daemon already exited," so it skipped the restart and left you attached to the stale, incompatible daemon. The restart now falls back to the PID captured when the connection was live, so the old daemon is terminated and a fresh one at the current build takes over.
+
+
+
 ## [0.32.0] - 2026-06-25
 
 ### Changed
