@@ -147,14 +147,42 @@ pub fn pi_on_path() -> bool {
     }
 }
 
-/// Scan a `PATH`-shaped value for a regular file named `name`. Pure over its
-/// `path` argument (no environment read) so it is testable without mutating the
-/// process-global `PATH` — see the note on global-state races under CI's shared
-/// `cargo test` process. Follows symlinks (Pi's launcher is typically a symlink
-/// into its npm install) and requires a regular file, so a directory of that
-/// name in a `PATH` entry does not count.
+/// Scan a `PATH`-shaped value for a regular, *executable* file named `name`.
+/// Pure over its `path` argument (no environment read) so it is testable without
+/// mutating the process-global `PATH` — see the note on global-state races under
+/// CI's shared `cargo test` process. Follows symlinks (Pi's launcher is
+/// typically a symlink into its npm install) and requires a regular file, so a
+/// directory of that name in a `PATH` entry does not count.
 fn path_contains_binary(path: &std::ffi::OsStr, name: &str) -> bool {
-    std::env::split_paths(path).any(|dir| dir.join(name).is_file())
+    std::env::split_paths(path).any(|dir| is_executable_file(&dir.join(name)))
+}
+
+/// Whether `candidate` is a regular file that is *also* executable.
+///
+/// `is_file()` alone is not enough: a regular but non-executable file named `pi`
+/// on `PATH` would make `orchestrator setup` falsely report success, only for
+/// the Pi pane to fail to spawn later (Greptile #2). On Unix we additionally
+/// require at least one exec bit (`mode & 0o111 != 0`); a non-executable
+/// candidate is treated as "pi not usable", so the setup core takes the
+/// not-present branch (prints the install hint, exits non-zero). On non-Unix
+/// targets there is no cheap exec-bit check, so a regular file is accepted.
+/// `metadata()` follows symlinks, matching `is_file()`'s symlink behavior.
+fn is_executable_file(candidate: &Path) -> bool {
+    if !candidate.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(candidate) {
+            Ok(meta) => meta.permissions().mode() & 0o111 != 0,
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -309,7 +337,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bin_dir = tmp.path().join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
-        std::fs::write(bin_dir.join("faux-pi"), b"#!/bin/sh\n").unwrap();
+        let faux = bin_dir.join("faux-pi");
+        std::fs::write(&faux, b"#!/bin/sh\n").unwrap();
+        set_mode(&faux, 0o755);
         // A directory that shares the name must NOT count as the binary.
         std::fs::create_dir_all(bin_dir.join("faux-dir")).unwrap();
 
@@ -319,7 +349,7 @@ mod tests {
 
         assert!(
             path_contains_binary(&path, "faux-pi"),
-            "a regular file on PATH must be detected"
+            "a regular executable file on PATH must be detected"
         );
         assert!(
             !path_contains_binary(&path, "faux-dir"),
@@ -330,4 +360,57 @@ mod tests {
             "an absent name must not be detected"
         );
     }
+
+    /// Greptile #2 regression: a present-but-NON-EXECUTABLE `pi` on PATH must
+    /// NOT be treated as usable. `path_contains_binary` rejects it (it is a
+    /// regular file but has no exec bit), so the setup core takes the
+    /// not-present branch and does NOT report success — otherwise setup would
+    /// falsely succeed and the Pi pane would later fail to spawn.
+    #[cfg(unix)]
+    #[test]
+    fn setup_non_executable_pi_does_not_succeed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        // A regular file named `pi` with its exec bits explicitly cleared, so
+        // the outcome is deterministic regardless of the process umask.
+        let pi = bin_dir.join("pi");
+        std::fs::write(&pi, b"#!/bin/sh\necho pi\n").unwrap();
+        set_mode(&pi, 0o644);
+        assert!(pi.is_file(), "the candidate is a regular file");
+
+        let path = std::env::join_paths([bin_dir.as_path()]).unwrap();
+        let pi_present = path_contains_binary(&path, "pi");
+        assert!(
+            !pi_present,
+            "a non-executable `pi` must not count as present"
+        );
+
+        // Fed into the setup core, the not-present branch runs: no success, no
+        // writes, and the target dir is untouched.
+        let target = tmp.path().join(".pi/agent/extensions/dot-agent-deck");
+        let report = run_setup(pi_present, &target).unwrap();
+        assert!(
+            !report.success,
+            "a non-executable pi must not report setup success"
+        );
+        assert!(report.written.is_empty(), "nothing must be materialized");
+        assert!(!target.exists(), "the target dir must not be created");
+    }
+
+    /// Set the permission bits on `path` (Unix only). Used by the PATH-scan
+    /// tests to make a candidate executable or explicitly non-executable
+    /// independent of the process umask.
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(mode);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    /// No-op on non-Unix targets, where `is_executable_file` accepts any regular
+    /// file and exec bits are not consulted.
+    #[cfg(not(unix))]
+    fn set_mode(_path: &Path, _mode: u32) {}
 }
