@@ -1622,11 +1622,17 @@ fn process_agent_output_chunk(
                     }
                 }
                 Err(_) => {
+                    // The panic left the parser's cursor/screen partially
+                    // advanced, so cursor_position() for the REST of this chunk
+                    // is unreliable — computing link rows / scroll from it could
+                    // point hyperlinks at the wrong row. Stop feeding this chunk;
+                    // the next chunk starts a fresh (independently guarded) pass.
                     tracing::warn!(
-                        "vt100 parser panicked on an agent-output chunk; dropping it \
-                         (pane render may be briefly stale). Known vt100 0.16.2 edge \
-                         case with wide characters in a very short pane."
+                        "vt100 parser panicked on an agent-output chunk; dropping the \
+                         rest of it (pane render may be briefly stale). Known vt100 \
+                         0.16.2 edge case with wide characters in a very short pane."
                     );
+                    break;
                 }
             }
         }
