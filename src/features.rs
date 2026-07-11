@@ -98,6 +98,19 @@ pub fn show_issue_dispatch_authoring() -> bool {
     experimental_enabled()
 }
 
+/// Production wrapper for the Pi agent's first-class render identity/status
+/// (PRD #201 M5.1). One wrapper per feature (CLAUDE.md #9) so
+/// `grep show_pi_agent` finds the single gate at graduation
+/// (`graduate-pi-agent`). This is a *presentation* switch (rule-9-proper): it
+/// gates ONLY the Pi identity/status the dashboard card surfaces
+/// (`render_session_card` in `src/ui.rs`). It does NOT gate `from_command`,
+/// the daemon protocol, hooks, the Pi extension, or `agent-event` routing —
+/// a Pi pane still spawns, reports status, and is tracked with the flag OFF;
+/// it merely renders as the pre-feature unrecognized-agent placeholder.
+pub fn show_pi_agent() -> bool {
+    experimental_enabled()
+}
+
 /// Guards [`init_and_watch`] so the periodic watcher thread is spawned at
 /// most once per process (reviewer #4 / audit INFO-3): a second call is a
 /// no-op rather than leaking a duplicate poll thread.

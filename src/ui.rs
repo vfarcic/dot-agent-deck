@@ -11859,7 +11859,22 @@ fn render_session_card(
     density: CardDensity,
     idle_art: Option<&IdleArtEntry>,
 ) {
-    let is_placeholder = session.agent_type == crate::event::AgentType::None;
+    // PRD #201 M5.1: gate the Pi first-class identity/status behind the
+    // experimental flag at this single render seam (CLAUDE.md rule 9). With the
+    // flag OFF a Pi pane's card is byte-identical to the pre-feature
+    // `AgentType::None` placeholder (the unrecognized-agent baseline a
+    // `command = "pi"` pane showed before this PRD); ON, it shows `Pi · <id>`.
+    // This is a PRESENTATION switch only — `session.agent_type` is never
+    // mutated, so `from_command`, the daemon protocol, hooks, the extension,
+    // and agent-event routing are untouched, and gating never hides the pane.
+    // `grep show_pi_agent` finds this gate for the graduate-pi-agent cleanup.
+    let effective_agent =
+        if session.agent_type == crate::event::AgentType::Pi && !crate::features::show_pi_agent() {
+            crate::event::AgentType::None
+        } else {
+            session.agent_type.clone()
+        };
+    let is_placeholder = effective_agent == crate::event::AgentType::None;
     let (status_label, status_style) = if is_placeholder {
         ("No agent", text_primary())
     } else {
@@ -11883,7 +11898,7 @@ fn render_session_card(
     } else {
         format!(
             " {sel_prefix}{num_prefix}{} · {} ",
-            session.agent_type, id_display
+            effective_agent, id_display
         )
     };
 
