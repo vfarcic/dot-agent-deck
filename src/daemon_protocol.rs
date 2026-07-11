@@ -965,13 +965,7 @@ async fn handle_connection(
                 .iter()
                 .find(|(k, _)| k == DOT_AGENT_DECK_PANE_ID)
                 .map(|(_, v)| v.clone())
-                .and_then(|v| {
-                    if is_valid_pane_id_env(&v) {
-                        Some(v)
-                    } else {
-                        None
-                    }
-                });
+                .filter(|v| is_valid_pane_id_env(v));
             // Round-11 auditor #C: also pull `orchestration_cwd` out of
             // the membership so the daemon can use it (not StartAgent.cwd)
             // as the disambiguator in `pane_orchestration_map`. This keeps

@@ -346,6 +346,18 @@ async fn terminate_and_recover(
     // `peer_pid()` now fails the daemon has already exited on its own —
     // there's nothing to terminate, so short-circuit to success rather
     // than signalling an arbitrary same-UID PID.
+    // Re-resolve `peer_pid()` on the held-open stream as a PID-reuse
+    // mitigation. This is best-effort and MUST NOT be read as "daemon exited":
+    // macOS `LOCAL_PEERPID` returns `ENOTCONN` once the daemon closes its end
+    // of the one-shot Hello connection (which it always does after replying),
+    // whereas Linux `SO_PEERCRED` caches the creds at connect time and keeps
+    // reading after close. Treating that failure as "already gone" skipped the
+    // SIGTERM entirely on macOS, leaving the stale daemon running. So on any
+    // re-resolve failure, fall back to `probe.peer_pid` — the PID captured at
+    // connect time, when the socket was definitely connected — and still
+    // attempt the terminate. If the daemon really did exit on its own the
+    // SIGTERM lands as `ESRCH`, which `terminate_daemon_graceful` maps to a
+    // clean already-gone success.
     let resolved_pid = match peer_pid(&probe.stream) {
         Ok(p) => p,
         Err(e) => {
@@ -353,9 +365,10 @@ async fn terminate_and_recover(
                 target: "build_version_handshake",
                 error = %e,
                 original_pid = probe.peer_pid,
-                "re-resolved peer_pid failed before restart; treating daemon as already gone"
+                "re-resolved peer_pid failed (expected on macOS after peer close); \
+                 falling back to the connect-time peer_pid"
             );
-            return Ok(HandshakeOutcome::Recovered);
+            probe.peer_pid
         }
     };
     // Part A doesn't escalate to SIGKILL — the user can re-run
@@ -482,7 +495,15 @@ pub async fn terminate_daemon_graceful(
     // side effects beyond delivering the signal to the target PID.
     let rc = unsafe { libc::kill(signal_pid, libc::SIGTERM) };
     if rc != 0 {
-        return Err(HandshakeError::TerminateFailed(io::Error::last_os_error()));
+        let err = io::Error::last_os_error();
+        // ESRCH: no such process — the daemon already exited. There is nothing
+        // to terminate, so this is a clean already-gone success, not a failure.
+        // This matters for the re-resolve fallback above (a daemon that exited
+        // on its own) and for `daemon stop` racing a self-exiting daemon.
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(TerminateOutcome::Stopped);
+        }
+        return Err(HandshakeError::TerminateFailed(err));
     }
     if poll_daemon_gone(attach_path, grace_timeout).await {
         return Ok(TerminateOutcome::Stopped);
