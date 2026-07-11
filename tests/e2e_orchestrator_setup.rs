@@ -12,11 +12,12 @@
 //!   - `pi` PRESENT (a fake `pi` file on PATH) → exit 0 + the bundled extension
 //!     materialized into `$HOME/.pi/agent/extensions/dot-agent-deck/`.
 //!
-//! A *fake* `pi` (an empty file named `pi` on PATH) keeps the present-branch
-//! hermetic and deterministic whether or not real Pi is installed on the runner:
-//! detection only asks "is there a file named `pi` on PATH?" — it never executes
-//! it. Real-Pi behavior (does the materialized extension actually load and
-//! orchestrate) is M4.1's real-agent e2e, out of scope here.
+//! A *fake* `pi` (an empty but executable file named `pi` on PATH) keeps the
+//! present-branch hermetic and deterministic whether or not real Pi is installed
+//! on the runner: detection only asks "is there a regular *executable* file
+//! named `pi` on PATH?" (c8110eb) — it never executes it. Real-Pi behavior (does
+//! the materialized extension actually load and orchestrate) is M4.1's real-agent
+//! e2e, out of scope here.
 //!
 //! Gated behind the `e2e` feature so `cargo test-fast` never compiles it.
 
@@ -63,6 +64,22 @@ fn ext_dir(home: &Path) -> PathBuf {
     home.join(".pi/agent/extensions/dot-agent-deck")
 }
 
+/// Give a fixture file the exec bit so it passes `is_executable_file` (c8110eb):
+/// setup detection requires a regular *executable* file named `pi`, so a fake
+/// `pi` created via `fs::write` must be `chmod +x`'d or it takes the not-present
+/// branch. Unix-only; a no-op elsewhere, where the check accepts any regular
+/// file.
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) {}
+
 #[test]
 fn orchestrator_setup_pi_absent_prints_hint_and_fails() {
     let home = tempfile::tempdir().unwrap();
@@ -89,10 +106,15 @@ fn orchestrator_setup_pi_absent_prints_hint_and_fails() {
 #[test]
 fn orchestrator_setup_pi_present_materializes_and_succeeds() {
     let home = tempfile::tempdir().unwrap();
-    // A fake `pi` on PATH: detection only checks for a file named `pi`, so an
-    // empty file is enough to drive the present branch without a real Pi.
+    // A fake `pi` on PATH: detection checks for a regular *executable* file
+    // named `pi` (it never runs it), so an empty file with the exec bit set is
+    // enough to drive the present branch without a real Pi. The exec bit is
+    // required since c8110eb (`is_executable_file`) — a non-executable candidate
+    // takes the not-present branch.
     let bin_dir = tempfile::tempdir().unwrap();
-    std::fs::write(bin_dir.path().join("pi"), b"").unwrap();
+    let pi = bin_dir.path().join("pi");
+    std::fs::write(&pi, b"").unwrap();
+    make_executable(&pi);
 
     let (out, text) = run_setup(home.path(), &[bin_dir.path()]);
 
