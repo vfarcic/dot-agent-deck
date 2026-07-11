@@ -1,4 +1,6 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -629,7 +631,11 @@ impl EmbeddedPaneController {
         // A 24×80 parser receiving an already-correctly-sized frame would
         // clip it; resize-time keeps both sides in sync via the per-pane
         // resize worker + `resize_pane_pty`.
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(
+            rows,
+            cols,
+            PANE_SCROLLBACK_LINES,
+        )));
         let mouse_mode = Arc::new(AtomicBool::new(false));
         let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
 
@@ -1517,10 +1523,88 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// Scrollback depth (lines) for a pane's local vt100 parser. Used both when a
+/// pane is created and when a contained parser panic forces a rebuild.
+const PANE_SCROLLBACK_LINES: usize = 10_000;
+
+thread_local! {
+    /// Set while a `catch_unwind`-guarded vt100 feed is running on this thread
+    /// (see [`guarded_parser_feed`]). The `run_tui` panic hook (`src/ui.rs`)
+    /// reads it via [`in_guarded_parser_feed`] so a *contained* parser panic is
+    /// not treated like a genuine fatal panic — i.e. it does not restore/tear
+    /// down the live terminal and exit the TUI.
+    static IN_GUARDED_PARSER_FEED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// True while this thread is inside a guarded vt100 feed. The `run_tui` panic
+/// hook uses this to suppress terminal teardown for a contained pane-processing
+/// panic (a bug in the third-party `vt100` parser) rather than crashing the
+/// whole TUI.
+pub(crate) fn in_guarded_parser_feed() -> bool {
+    IN_GUARDED_PARSER_FEED.with(Cell::get)
+}
+
+/// Run `f` under [`catch_unwind`], flagging the thread for the duration so the
+/// `run_tui` panic hook treats any panic as *contained*. Used to isolate
+/// panics originating inside the `vt100` crate — notably the `col_wrap` row
+/// underflow / out-of-bounds cell `unwrap()` (grid.rs) that fires on wide
+/// characters in a very short (e.g. 1-row) pane. Callers MUST keep any held
+/// `MutexGuard` *outside* `f` so a caught panic does not drop a guard
+/// mid-unwind and poison the lock.
+///
+/// [`catch_unwind`]: std::panic::catch_unwind
+fn guarded_parser_feed<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
+    IN_GUARDED_PARSER_FEED.with(|flag| flag.set(true));
+    let result = std::panic::catch_unwind(AssertUnwindSafe(f));
+    IN_GUARDED_PARSER_FEED.with(|flag| flag.set(false));
+    result
+}
+
+/// Feed one OSC 8 segment into the vt100 parser, returning
+/// `(rows_scrolled_off, optional (row, url) link)`. Split out from
+/// [`process_agent_output_chunk`] so its whole body — every call that touches
+/// the third-party parser — runs inside [`guarded_parser_feed`]'s
+/// `catch_unwind`.
+fn feed_segment(p: &mut vt100::Parser, segment: &Osc8Segment) -> (u16, Option<(u16, String)>) {
+    // Recomputed per segment: only a resize changes it, and no resize happens
+    // within a single chunk, so this matches the previous once-per-chunk value.
+    let max_row = p.screen().size().0.saturating_sub(1);
+    match segment {
+        Osc8Segment::Text(bytes) => {
+            let rb = p.screen().cursor_position().0;
+            p.process(bytes);
+            let ra = p.screen().cursor_position().0;
+            let scrolled = if rb >= max_row && ra >= max_row {
+                bytes.iter().filter(|&&b| b == b'\n').count() as u16
+            } else {
+                0
+            };
+            (scrolled, None)
+        }
+        Osc8Segment::LinkedText { url, bytes } => {
+            let row = p.screen().cursor_position().0;
+            p.process(bytes);
+            let ra = p.screen().cursor_position().0;
+            let scrolled = if row >= max_row && ra >= max_row {
+                bytes.iter().filter(|&&b| b == b'\n').count() as u16
+            } else {
+                0
+            };
+            (scrolled, Some((row, url.clone())))
+        }
+    }
+}
+
 /// Feed a chunk of agent-output bytes through the OSC 8 filter, the vt100
 /// parser, and the hyperlink map. Shared between the local-PTY reader thread
 /// and the stream-backed I/O task so both backends produce identical render
 /// state from identical bytes.
+///
+/// The vt100 feed is wrapped in [`guarded_parser_feed`]: `vt100` 0.16.2 can
+/// panic on malformed/edge-case output (e.g. wide characters in a 1-row pane),
+/// and a panic on the stream-IO task must not crash the whole TUI. A panicking
+/// chunk is dropped (that pane may render briefly stale) and processing
+/// continues.
 fn process_agent_output_chunk(
     data: &[u8],
     osc8: &mut Osc8Filter,
@@ -1534,32 +1618,62 @@ fn process_agent_output_chunk(
     let mut new_links: Vec<(u16, String)> = Vec::new();
     let mut scroll_amount: u16 = 0;
 
+    let mut parser_reset = false;
     if let Ok(mut p) = parser.lock() {
-        let max_row = p.screen().size().0.saturating_sub(1);
+        // Captured while the parser is known-good so a contained panic can
+        // rebuild it at the same geometry.
+        let (rows, cols) = p.screen().size();
         for segment in &segments {
-            match segment {
-                Osc8Segment::Text(bytes) => {
-                    let rb = p.screen().cursor_position().0;
-                    p.process(bytes);
-                    let ra = p.screen().cursor_position().0;
-                    if rb >= max_row && ra >= max_row {
-                        let nl = bytes.iter().filter(|&&b| b == b'\n').count() as u16;
-                        scroll_amount += nl;
+            // The MutexGuard `p` is borrowed into the closure but lives in this
+            // scope, so a caught panic does not poison the lock.
+            match guarded_parser_feed(|| feed_segment(&mut p, segment)) {
+                Ok((scrolled, link)) => {
+                    scroll_amount += scrolled;
+                    if let Some(link) = link {
+                        new_links.push(link);
                     }
                 }
-                Osc8Segment::LinkedText { url, bytes } => {
-                    let row = p.screen().cursor_position().0;
-                    let rb = row;
-                    p.process(bytes);
-                    let ra = p.screen().cursor_position().0;
-                    new_links.push((row, url.clone()));
-                    if rb >= max_row && ra >= max_row {
-                        let nl = bytes.iter().filter(|&&b| b == b'\n').count() as u16;
-                        scroll_amount += nl;
-                    }
+                Err(_) => {
+                    // The panic left the parser's cursor/screen partially
+                    // advanced. Its state is now inconsistent, so link-row and
+                    // scroll reads — for the rest of THIS chunk AND for LATER
+                    // chunks that keep using this parser — could be wrong (e.g.
+                    // hyperlinks attached to the wrong row). Rebuild it at the
+                    // same geometry for a clean baseline. The pane loses its
+                    // current screen/scrollback, which is acceptable after a
+                    // contained crash and self-heals on the agent's next redraw;
+                    // drop this chunk's accumulated link/scroll work too.
+                    tracing::warn!(
+                        "vt100 parser panicked on an agent-output chunk; resetting the \
+                         pane parser to a clean state (screen/scrollback cleared). Known \
+                         vt100 0.16.2 edge case with wide characters in a very short pane."
+                    );
+                    *p = vt100::Parser::new(rows, cols, PANE_SCROLLBACK_LINES);
+                    new_links.clear();
+                    scroll_amount = 0;
+                    parser_reset = true;
+                    break;
                 }
             }
         }
+    }
+
+    // A reset cleared the screen, so state recorded against the old screen is
+    // stale and must be dropped alongside the rebuilt parser:
+    //   - the OSC 8 filter may hold an open link (`current_url`) or a partial
+    //     escape from the panicking chunk; left as-is it would wrap the next
+    //     chunk's plain text as a stale hyperlink, inserted at rows from the
+    //     fresh parser — Ctrl-click would open the wrong link. Rebuild it.
+    //   - hyperlink rows recorded against the old screen no longer map to
+    //     anything; clear the map.
+    // (The hyperlinks lock is taken after releasing the parser lock, preserving
+    // the existing parser-then-hyperlinks ordering.)
+    if parser_reset {
+        *osc8 = Osc8Filter::new();
+        if let Ok(mut hmap) = hyperlinks.lock() {
+            hmap.clear();
+        }
+        return;
     }
 
     if (!new_links.is_empty() || scroll_amount > 0)
@@ -1990,6 +2104,64 @@ impl PaneController for EmbeddedPaneController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: `vt100` 0.16.2 panics (`col_wrap` row-underflow / an
+    /// out-of-bounds cell `unwrap()` in grid.rs) when a wide character wraps in
+    /// a 1-row pane — the geometry a pane collapses to when many are stacked
+    /// into one column (the crash observed over `connect`). Feeding that chunk
+    /// must be contained by `process_agent_output_chunk` so a single malformed
+    /// chunk from any agent can never crash the whole TUI: the call returns
+    /// normally, the guard flag clears, the parser mutex is not poisoned, and a
+    /// later chunk still processes.
+    #[test]
+    fn wide_char_in_one_row_pane_does_not_crash_the_tui() {
+        // Suppress the *contained* panic's default report so test output stays
+        // clean; still surface any uncontained panic by delegating to the prior
+        // hook. Not restoring is harmless — it only alters behavior while
+        // `in_guarded_parser_feed()` is set, which only our guarded feed sets.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !in_guarded_parser_feed() {
+                prev(info);
+            }
+        }));
+
+        // Mirrors real agent output (CJK) landing in a 1-row pane.
+        let crasher = "hello 世界 world 世界 more 世界".as_bytes();
+
+        // Guard against bit-rot: prove the raw crate still panics on this input,
+        // so a future vt100 fix/upgrade doesn't turn this into a silent no-op.
+        let unguarded = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut p = vt100::Parser::new(1, 10, 1000);
+            p.process(crasher);
+        }));
+        assert!(
+            unguarded.is_err(),
+            "precondition: raw vt100 must still panic on this input; if the crate \
+             was fixed/upgraded, retarget or retire this regression test"
+        );
+
+        let parser = Mutex::new(vt100::Parser::new(1, 10, 1000));
+        let mut osc8 = Osc8Filter::new();
+        let mouse = AtomicBool::new(false);
+        let links = Mutex::new(HyperlinkMap::new());
+
+        // The real path must NOT panic on the crashing chunk.
+        process_agent_output_chunk(crasher, &mut osc8, &parser, &mouse, &links);
+
+        assert!(
+            !in_guarded_parser_feed(),
+            "guard flag must be cleared once the feed returns"
+        );
+        assert!(
+            parser.lock().is_ok(),
+            "parser mutex must not be poisoned by a contained panic"
+        );
+
+        // A subsequent chunk still flows through the same parser.
+        process_agent_output_chunk(b"plain ascii\r\n", &mut osc8, &parser, &mouse, &links);
+        assert!(parser.lock().is_ok());
+    }
 
     // PRD #104 M2: hydration sizes the local vt100 parser from the
     // daemon-reported dims. Pin the small helper so its three branches

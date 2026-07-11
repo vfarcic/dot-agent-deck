@@ -175,6 +175,50 @@ impl GhStub {
     fn ghstub_dir(&self) -> String {
         self.dir.to_string_lossy().into_owned()
     }
+
+    /// Write a fake login shell that re-adds the stub `gh` dir to `$PATH`, and
+    /// return its path (for `.with_env("SHELL", …)`).
+    ///
+    /// Why this is needed for the PTY/`TuiDeck` path but not the headless one:
+    /// the deck lazy-spawns its daemon DETACHED and pins `SHELL=/bin/sh`, so
+    /// PRD #170's `apply_login_shell_path` runs `$SHELL -ilc 'printf %s "$PATH"'`
+    /// at daemon startup and REPLACES the inherited PATH (which carries our stub
+    /// `gh`) with the login shell's own PATH — dropping the stub, so the dispatch
+    /// clone falls through to the real `gh` and fails on `gh auth login`. The
+    /// headless daemon sets no `SHELL`, so the capture no-ops and the stub PATH
+    /// survives. Pointing `$SHELL` at a login shell whose `-ilc` output prepends
+    /// the stub dir makes the captured PATH resolve the stub `gh` (real `git`
+    /// still comes from the inherited PATH), mirroring `tests/e2e_login_path.rs`.
+    fn login_shell(&self) -> PathBuf {
+        let base = self.bindir.parent().expect("stub bindir has a parent");
+        let shell = base.join("login-shell.sh");
+        std::fs::write(
+            &shell,
+            format!(
+                "#!/bin/sh\n\
+                 export PATH=\"{bindir}:$PATH\"\n\
+                 while [ \"$#\" -gt 0 ]; do\n\
+                 case \"$1\" in\n\
+                 -*) shift ;;\n\
+                 *) break ;;\n\
+                 esac\n\
+                 done\n\
+                 if [ \"$#\" -gt 0 ]; then\n\
+                 exec /bin/sh -c \"$1\"\n\
+                 fi\n\
+                 exec /bin/sh\n",
+                bindir = self.bindir.display()
+            ),
+        )
+        .expect("write ghstub login shell");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod ghstub login shell");
+        }
+        shell
+    }
 }
 
 /// Initialize a fixture remote: a real git repo with one commit (`README.md`,
@@ -295,6 +339,11 @@ fn dispatch_011_card_surfaces_live_in_tui() {
     let deck = TuiDeck::builder()
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
         .with_env("PATH", path)
+        // The deck's detached daemon re-derives PATH from `$SHELL -ilc` at
+        // startup (PRD #170), which would drop the stub `gh` off the inherited
+        // PATH. Point `$SHELL` at a login shell that re-adds the stub dir so the
+        // dispatch clone resolves the stub `gh` rather than the real one.
+        .with_env("SHELL", stub.login_shell().to_string_lossy())
         .with_env("GHSTUB_DIR", ghdir)
         .with_env("DOT_AGENT_DECK_CONFIG", cfg_str)
         .launch_with_fixture("minimal");
