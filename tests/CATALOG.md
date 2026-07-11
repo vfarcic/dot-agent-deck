@@ -63,8 +63,8 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 ##### dashboard/pane/007 — A Pi pane's card renders the Pi agent-type identity (PRD #201 M2.2).
 - **Layer:** L1 (ratatui `TestBackend` + `insta`-style buffer text assertion).
 - **Agent:** none (a fixture `SessionState` with `agent_type = AgentType::Pi` and no display name).
-- **Asserts:** a live Pi session with no friendly name renders its card title in the `<agent-type> · <session-id>` form showing the Pi identity (`Pi · orch-01`); the fixture's cwd basename and session id carry no capital `Pi`, so the match pins the agent-type Display specifically. The card must NOT show `ClaudeCode` / `OpenCode` / `No agent` — a plain `pi` pane is first-class, not "No agent".
-- **Does not assert:** the `experimental`-flag gating of Pi selectability (Phase 5 / M5.1); the status badge color (`status/badge/001`).
+- **Asserts:** with the experimental flag forced ON (`features::set_for_test(Features::test_with(true))` — the Pi identity is flag-gated at the render seam per M5.1), a live Pi session with no friendly name renders its card title in the `<agent-type> · <session-id>` form showing the Pi identity (`Pi · orch-01`); the fixture's cwd basename and session id carry no capital `Pi`, so the match pins the agent-type Display specifically. The card must NOT show `ClaudeCode` / `OpenCode` / `No agent` — a plain `pi` pane is first-class, not "No agent".
+- **Does not assert:** the flag-OFF (hidden) path of the Pi render gate (covered by `features/gating/004`); the status badge color (`status/badge/001`).
 - **Platform coverage:** mac+linux+windows.
 
 #### dashboard/density
@@ -2280,6 +2280,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Asserts:** with the env var set, the rendered grid shows the `experimental: on` footer once the dashboard is up; the control launch (no env var) never shows it once the dashboard is up and quiescent.
 - **Does not assert:** the TOML-file enable path or env-vs-file precedence (covered by `features/reload/001` and the unit suite); the footer's absolute grid coordinates.
 - **Platform coverage:** mac+linux.
+
+##### features/gating/004 — A Pi pane's card shows its first-class identity ONLY with the experimental flag ON; OFF hides the Pi identity while keeping the pane visible (PRD #201 M5.1).
+- **Layer:** L1 (ratatui `TestBackend` + buffer-text assertion). Renders the `dashboard/pane/007` Pi fixture via `render_card_to_buffer` and flips the process-global flag with `features::set_for_test(Features::test_with(..))` between renders (serialized with `features/reload/001` via a file-local `FLAG_LOCK`).
+- **Agent:** none (a fixture `SessionState` with `agent_type = AgentType::Pi`, no display name).
+- **Asserts:** with the flag OFF the rendered card contains no `Pi ·` identity (the pre-feature unrecognized-`pi` baseline) yet still renders the pane (its session id `orch-01` is present, so the flag never makes a running pane invisible); with the flag ON the same card shows `Pi · orch-01`. Pins the `features::show_pi_agent()` gate at the render seam (CLAUDE.md #9).
+- **Does not assert:** the CLI surfaces (`agent-event`, `orchestrator setup`), the extension, the daemon protocol, or `AgentType::from_command` inference — none are flag-gated (business logic / protocol stay flag-free); the exact OFF fallback styling.
+- **Platform coverage:** mac+linux+windows.
 
 #### features/reload
 

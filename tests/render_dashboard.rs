@@ -10,6 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
+use dot_agent_deck::features::{self, Features};
 use dot_agent_deck::state::{ActiveTool, DashboardStats, SessionState, SessionStatus};
 use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
@@ -355,14 +356,22 @@ fn guard_002_no_absolute_bg_in_source() {
 #[test]
 fn pane_007_pi_card_shows_pi_identity() {
     // PRD #201 M2.2 (test-plan row 2): a Pi pane's card renders the Pi identity.
-    // GREEN-ON-WRITE — the `AgentType` Display impl already prints "Pi" and
-    // `render_session_card`'s no-display-name branch titles the card
-    // `<agent_type> · <id>`. The cwd basename (`workspace`) and session id
-    // (`orch-01`) deliberately contain no capital `Pi`, so the assertion pins
-    // the agent-type identity specifically rather than an incidental substring.
+    // The `AgentType` Display impl prints "Pi" and `render_session_card`'s
+    // no-display-name branch titles the card `<agent_type> · <id>`. The cwd
+    // basename (`workspace`) and session id (`orch-01`) deliberately contain no
+    // capital `Pi`, so the assertion pins the agent-type identity specifically
+    // rather than an incidental substring.
+    //
+    // PRD #201 M5.1: the Pi first-class identity is gated behind
+    // `features::show_pi_agent()` at the render seam (CLAUDE.md #9), so this
+    // test forces the experimental flag ON as a precondition; the OFF (hidden)
+    // path is `features/gating/004`. nextest isolates this process, and within
+    // this binary only this test renders an `AgentType::Pi` card, so the flip
+    // needs no lock.
     //
     // `last_activity = now` keeps any rendered `Last: Xs ago` at `0s ago`
     // (mirrors `pane_004`).
+    features::set_for_test(Features::test_with(true));
     let now = chrono::Utc::now();
     let session = SessionState {
         session_id: "orch-01".to_string(),
