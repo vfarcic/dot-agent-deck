@@ -18,17 +18,16 @@ When `default_command` is empty, seed the new-agent Command field from the **las
 2. **Last executed command** — the most recent command a user spawned an agent with, if any.
 3. **Blank** — fresh install / never spawned an interactive agent: current behavior, unchanged.
 
-The value is **global** (one last-command value, not per-directory), **persisted** so it survives a deck restart, and it only ever **pre-fills the editable Command field** — it is never silently auto-run. The user still sees the field, can edit it, and can clear it; a wrong guess costs one clear. Commands that come from the **authoring-mode fallback** (schedule / issue-dispatch resolving to `claude` via `resolve_authoring_command`, `src/ui.rs:402`) are **not** recorded as "last command", so the value reflects only commands the user actually chose for an interactive agent.
+The value is **global** (one last-command value, not per-directory), **persisted** so it survives a deck restart, and it only ever **pre-fills the editable Command field** — it is never silently auto-run. The user still sees the field, can edit it, and can clear it; a wrong guess costs one clear. **Every** command submitted through the new-agent form is recorded as the last command, regardless of the selected mode (schedule / issue-dispatch authoring included) — there is no authoring-vs-interactive special-casing, since every pane launched from the form is the same kind of action. Orchestration role panes take their command from config (the form hides the Command field), so they never record, and empty commands are ignored.
 
 ## Scope
 
 ### In Scope
 
 - A single persisted, global `last_command` value (stored alongside the existing session/config persistence the deck already writes).
-- Recording `last_command` on each successful **interactive** agent spawn from the new-pane flow.
+- Recording `last_command` on each successful agent spawn submitted through the new-pane form, regardless of the selected mode (orchestration takes its command from config, not the form, and empty commands are ignored, so neither records).
 - Extending the form-seed logic at the `DirPickerIntent::NewPane` seam in `transition_after_dir_pick` (`src/ui.rs`) to resolve the fallback chain: `default_command` if non-empty, else `last_command` if present, else blank.
-- Excluding authoring-mode fallback commands (`resolve_authoring_command` results for schedule / issue-dispatch) from being recorded as `last_command`.
-- L1 widget/behavior coverage that the form seeds correctly for each branch of the fallback chain (config set; config empty + last present; config empty + no last), and that authoring-mode spawns do not overwrite `last_command`.
+- L1 widget/behavior coverage that the form seeds correctly for each branch of the fallback chain (config set; config empty + last present; config empty + no last), and that authoring-mode spawns also record `last_command` (no mode special-casing).
 - User docs: a short note that the new-agent command defaults to your last command when no `default_command` is configured.
 
 ### Out of Scope / Non-Goals
@@ -45,7 +44,7 @@ The value is **global** (one last-command value, not per-directory), **persisted
 2. **Pre-fill, never auto-run.** The Command field stays visible and editable; seeding it is non-destructive (one keystroke to clear). This matches the existing form behavior where `default_command` pre-fills the same field.
 3. **Dedicated `last_command` value, not derived from the pane list.** Although `SavedPane.command` already persists per pane, panes get removed and their ordering is not a reliable "most recent" signal. A single explicitly-tracked value written on each interactive spawn is unambiguous and cheap.
 4. **Global for v1.** One value is the simplest useful version and matches the stated intent ("the command I just typed"). Per-directory is deferred.
-5. **Exclude authoring-mode fallbacks.** Schedule / issue-dispatch authoring resolves to a default `claude` the user did not type; recording it would pollute the fallback and surprise users whose real last interactive command was something else.
+5. **Record every form-launched command; no mode special-casing.** *(Revised during implementation — the original plan excluded authoring-mode spawns.)* Every pane launched from the new-agent form — regular or schedule / issue-dispatch authoring — is the same kind of action: a user submitting a command. Recording only some was inconsistent, so all form-launched commands are recorded. Orchestration takes its command from config (the form hides the Command field) and empty commands are ignored, so neither records. Because the value only ever pre-fills an editable field, a stray or one-off command costs a single clear.
 6. **Persist across restarts.** The deck already writes session/config state to disk; persisting one extra string is trivial and the feature is most valuable on the first spawn of a session — exactly when an in-memory-only value would be empty.
 
 ## Success Criteria
@@ -54,7 +53,7 @@ The value is **global** (one last-command value, not per-directory), **persisted
 - With `default_command` set, the form pre-fills from `default_command` regardless of any last command (precedence preserved).
 - With `default_command` empty and no prior interactive spawn (fresh state), the Command field is blank (no regression).
 - The last command survives a full deck restart (persisted).
-- Spawning the schedule / issue-dispatch authoring helper does **not** change the recorded `last_command`.
+- Spawning via the schedule / issue-dispatch authoring option **records** its command as `last_command`, exactly like any other form spawn (no mode special-casing).
 - The field is only pre-filled; no command runs without the user submitting the form.
 - `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test-fast` pass; `cargo test-e2e` passes before the PR (CLAUDE.md rule 5).
 - User docs note the new fallback behavior.
@@ -64,12 +63,12 @@ The value is **global** (one last-command value, not per-directory), **persisted
 ### Phase 1 — Persisted last-command tracking
 
 - [ ] **M1.1** — Add a persisted, global `last_command` value to the existing config/session persistence; load it on startup, default to empty/absent.
-- [ ] **M1.2** — Record `last_command` on each successful interactive new-pane spawn; explicitly skip authoring-mode fallback spawns (`resolve_authoring_command`).
+- [ ] **M1.2** — Record `last_command` on each successful new-pane spawn submitted through the form, regardless of mode (orchestration excluded by construction — no form command; empty commands ignored).
 
 ### Phase 2 — Fallback-chain form seeding
 
 - [ ] **M2.1** — Extend the new-pane form seed (`DirPickerIntent::NewPane` seam in `transition_after_dir_pick`, `src/ui.rs`) to resolve `default_command` (if non-empty) → `last_command` (if present) → blank.
-- [ ] **M2.2** — Tests: L1/behavior coverage for all three seed branches and for authoring-mode spawns not overwriting `last_command`.
+- [ ] **M2.2** — Tests: L1/behavior coverage for all three seed branches and for authoring-mode spawns also recording `last_command`.
 
 ### Phase 3 — Docs & release gate
 
@@ -78,6 +77,6 @@ The value is **global** (one last-command value, not per-directory), **persisted
 
 ## Risks & Mitigations
 
-- **Polluting `last_command` with non-user commands.** Authoring-mode fallbacks are explicitly excluded; only interactive spawns the user submitted are recorded.
+- **A stale or one-off command lingering as the pre-fill.** Every recorded value is a command the user submitted through the form (orchestration and empty commands never record); because it only ever pre-fills an editable field, a wrong or one-off value costs a single clear, and an explicit `default_command` overrides it entirely.
 - **Surprise from a stale/one-off last command.** The field is pre-filled and editable, so the cost of a wrong guess is a single clear; explicit `default_command` still wins for users who want a fixed value.
 - **Persistence corruption / migration.** Reuse the deck's existing atomic-write persistence path; treat a missing/unreadable value as empty (fall through to blank), never a hard failure.
