@@ -151,7 +151,23 @@ pub const KIND_SHUTDOWN_ACK: u8 = 0x16;
 /// already-attached TUIs. An older client receiving the new tag would fail to
 /// deserialize the frame, so this is a non-forward-compatible payload-schema
 /// change.
-pub const PROTOCOL_VERSION: u32 = 4;
+///
+/// PRD #201 bumped 4 → 5: [`crate::event::AgentType`] gained a wire-serialized
+/// `Pi` variant that rides `AgentRecord.agent_type` (the `ListAgents`
+/// `KIND_RESP`) and `AgentEvent.agent_type` (the `KIND_EVENT` broadcast). A
+/// pre-Pi reader has neither the `Pi` variant NOR (before this PRD) a
+/// `#[serde(other)]` catch-all, so `agent_type = "pi"` fails its whole-response
+/// / whole-frame decode — a non-forward-compatible payload-schema change, the
+/// same class as #120's new enum variant. The bump makes the exact-match attach
+/// handshake ([`crate::connect::probe_remote_protocol`]) refuse the
+/// old-reader/new-daemon pairing at connect time (a clean `ProtocolMismatch`)
+/// instead of letting it reach a mid-session deserialize crash. `AgentType`
+/// now also carries `#[serde(other)]` so THIS build and every future one
+/// degrade an unknown agent type to the neutral `None` placeholder rather than
+/// erroring — future agent-type additions therefore need no further bump — but
+/// already-released pre-Pi binaries predate that fallback, which is exactly
+/// what this version bump guards.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.

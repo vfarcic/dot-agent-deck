@@ -25,6 +25,25 @@ pub enum AgentType {
     ClaudeCode,
     OpenCode,
     Pi,
+    /// "No recognized agent type." Produced by [`AgentType::from_command`] for
+    /// any unrecognized binary, mapped to `Option::None` by
+    /// [`crate::state::SessionState::live_snapshot`], and rendered as the "No
+    /// agent" dashboard placeholder.
+    ///
+    /// PRD #201 forward-compat catch-all: this variant also carries
+    /// `#[serde(other)]`, so any UNRECOGNIZED wire value (e.g. a `pi` record
+    /// reaching a pre-Pi reader, or a future agent type reaching today's
+    /// build) deserializes here instead of failing the whole `AgentEvent` /
+    /// `AgentRecord` decode. That mirrors [`crate::state::SessionStatus::Unknown`]
+    /// — but reuses the pre-existing neutral variant rather than adding a new
+    /// one: `None` already means "type not known", already maps to the "No
+    /// agent" placeholder, and is exactly what an unrecognized binary yields
+    /// via `from_command`, so an unknown wire value landing on `None` is the
+    /// consistent, non-active outcome (it never masquerades as a real agent).
+    /// `#[serde(other)]` is deserialize-only; `None` still serializes to
+    /// `"none"` (and `"none"` still deserializes back to `None` via this same
+    /// catch-all), so round-trips are unchanged.
+    #[serde(other)]
     None,
 }
 
@@ -376,6 +395,52 @@ mod tests {
         // Whitespace-only / empty input also stays None.
         assert!(AgentType::from_command(Some("")).is_none());
         assert!(AgentType::from_command(Some("   ")).is_none());
+    }
+
+    // PRD #201 (rule-12 wire safety): `AgentType` gained a wire-serialized `Pi`
+    // variant. Without a `#[serde(other)]` fallback, a NEWER daemon emitting
+    // `agent_type = "pi"` would break an OLDER reader's WHOLE-response decode
+    // (`list_agents` / the `KIND_EVENT` broadcast), stranding its agent list.
+    // The `#[serde(other)]` on `AgentType::None` makes any unrecognized value —
+    // a `pi` record at a pre-Pi reader, OR a future agent type at today's build
+    // — deserialize to the neutral `None` ("No agent") placeholder instead of
+    // erroring, so this class of break can never repeat for a future type.
+    #[test]
+    fn unknown_agent_type_deserializes_to_none_fallback() {
+        // The enum directly: an entirely unknown future value.
+        let ty: AgentType = serde_json::from_str("\"someunknownfuturetype\"").unwrap();
+        assert_eq!(ty, AgentType::None);
+
+        // The value carried in a full `AgentEvent` (the real wire shape a
+        // subscriber decodes over `KIND_EVENT`): the unknown `agent_type` must
+        // NOT fail the whole-event decode.
+        let json = r#"{
+            "session_id": "fwd-compat-1",
+            "agent_type": "someunknownfuturetype",
+            "event_type": "thinking",
+            "timestamp": "2026-03-22T10:00:00Z"
+        }"#;
+        let event: AgentEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.agent_type, AgentType::None);
+        assert_eq!(event.event_type, EventType::Thinking);
+
+        // `#[serde(other)]` is deserialize-only: `None` still round-trips
+        // through its own `"none"` name, so serialization is unaffected.
+        assert_eq!(serde_json::to_string(&AgentType::None).unwrap(), "\"none\"");
+        assert_eq!(
+            serde_json::from_str::<AgentType>("\"none\"").unwrap(),
+            AgentType::None
+        );
+        // And the recognized values still map to their own variants (regression
+        // guard: the catch-all must not swallow known types).
+        assert_eq!(
+            serde_json::from_str::<AgentType>("\"pi\"").unwrap(),
+            AgentType::Pi
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentType>("\"claude_code\"").unwrap(),
+            AgentType::ClaudeCode
+        );
     }
 
     #[test]

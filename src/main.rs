@@ -592,6 +592,11 @@ fn main() -> ExitCode {
             // `AgentEvent` and `apply_event` drives the status.
             let event = dot_agent_deck::event::AgentEvent {
                 session_id: format!("{pane_id}-session"),
+                // TODO(companion PRD): derive agent type from the pane instead
+                // of hard-coding Pi. Safe today because the daemon's
+                // `apply_event` only UPGRADES `None` → a concrete type (never
+                // downgrades), so a hard-coded `Pi` from the `agent-event`
+                // subcommand can't clobber an already-known type.
                 agent_type: dot_agent_deck::event::AgentType::Pi,
                 event_type,
                 tool_name: None,
