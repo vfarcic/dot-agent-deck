@@ -78,6 +78,7 @@ It does not bundle or vendor the Pi/Node runtime, does not replace `claude`/`ope
 - **Tests** across three layers (see Design Decision #7): synthetic-harness contract tests (fast tier), TS extension unit tests, and real-`pi` e2e (`e2e_*.rs`, `#[cfg(feature="e2e")]`), including **headless/unattended status reporting with no client attached**.
 - **`experimental`-flag gating** at the render/input seam (agent-type selectability, Pi status affordances) per rule #9; one `features::show_pi_agent()` wrapper.
 - The **rule-12 cross-version contract check** for the `agent-event` addition and any orchestration-event shape, with the `PROTOCOL_VERSION` / `.breaking.md` decision recorded.
+- **Existing-PRD cross-reference sweep**: review every PRD under `prds/` (and `prds/done/`) and, wherever a PRD *specifically enumerates or discusses the supported agent types* (today `claude`/`opencode`), add `pi` so the corpus reflects Pi as a first-class agent. Generic references to "the agent" are left alone; only explicit agent-type enumerations are updated. Done last, after all functional work has landed.
 - Docs and changelog as above.
 
 ### Out of Scope / Non-Goals
@@ -147,6 +148,10 @@ It does not bundle or vendor the Pi/Node runtime, does not replace `claude`/`ope
 - [ ] **M5.2** — Docs: user enablement doc under `docs/` (+ `site/sidebars.js`); developer extension-contract doc under `docs/develop/` (+ `CONTRIBUTING.md`); changelog fragment.
 - [ ] **M5.3** — Rule-12 cross-version manual test (previous-release daemon + branch TUI + Pi orchestrator: delegate routes, status arrives); `PROTOCOL_VERSION`/`.breaking.md` finalized.
 - [ ] **M5.4** — Pre-PR gate: `cargo test-e2e` green; review (Greptile) settled per rule #8.
+
+### Phase 6 — Existing-PRD cross-reference sweep
+
+- [ ] **M6.1** — Go through all existing PRDs under `prds/` (and `prds/done/`) and include `pi` wherever a PRD *specifically* mentions or enumerates the supported agent types (`claude`/`opencode`), so Pi's first-class status is reflected consistently across the PRD corpus. Skip generic "the agent" references; touch only explicit agent-type enumerations. This is the **final task**, run after all functional work in Phases 1–5 has landed, so the sweep reflects the shipped behavior.
 
 ## Risks & Mitigations
 
