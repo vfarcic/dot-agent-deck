@@ -4202,13 +4202,15 @@ fn resolve_seed_command(default_command: &str, last_command: Option<&str>) -> St
 
 /// PRD #196: decide whether a submitted new-pane command should be recorded as
 /// the global `last_command`. Pure so the decision is unit-testable without a UI.
-/// Records (returns `Some`) ONLY for a plain INTERACTIVE spawn with a non-empty
-/// command; returns `None` for an authoring-mode form (schedule / issue-dispatch,
-/// whose command is the `resolve_authoring_command` fallback the user did not
-/// type) and for an empty/whitespace command. The caller commits the returned
-/// value into `last_command` only after the spawn actually succeeds.
-fn record_candidate(is_authoring: bool, command: &str) -> Option<String> {
-    if is_authoring || command.trim().is_empty() {
+/// Records (returns `Some`) for ANY non-empty form-submitted command, regardless
+/// of the selected mode — a plain interactive spawn and an authoring-mode form
+/// (schedule / issue-dispatch) both record, since every pane launched from the
+/// form is the same kind of action. Returns `None` only for an empty/whitespace
+/// command. Orchestration never reaches here (it takes no form-typed command).
+/// The caller commits the returned value into `last_command` only after the
+/// spawn actually succeeds.
+fn record_candidate(command: &str) -> Option<String> {
+    if command.trim().is_empty() {
         None
     } else {
         Some(command.to_string())
@@ -4343,9 +4345,9 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
                 // the [Submit] button door apply it identically.
                 let req = build_new_pane_request(form, &default_command);
                 // PRD #196: capture the last-command candidate BEFORE dropping the
-                // form (the form carries whether it is authoring-mode). Committed
-                // into `last_command` only on a successful interactive spawn.
-                let candidate = record_candidate(form.is_authoring_selected(), &req.command);
+                // form. Any non-empty form-submitted command records (authoring
+                // included); committed into `last_command` only on a successful spawn.
+                let candidate = record_candidate(&req.command);
                 ui.new_pane_form = None;
                 ui.mode = UiMode::Normal;
                 ui.pending_last_command = candidate;
@@ -6040,10 +6042,9 @@ fn dispatch_action(
             if let Some(form) = ui.new_pane_form.take() {
                 ui.mode = UiMode::Normal;
                 let req = build_new_pane_request(&form, &ui.config.default_command);
-                // PRD #196: capture the last-command candidate (None for
-                // authoring-mode / empty); committed on a successful spawn below.
-                ui.pending_last_command =
-                    record_candidate(form.is_authoring_selected(), &req.command);
+                // PRD #196: capture the last-command candidate (None only for an
+                // empty command); committed on a successful spawn below.
+                ui.pending_last_command = record_candidate(&req.command);
                 return dispatch_action(
                     Action::SpawnPane(Box::new(req)),
                     ui,
@@ -13051,26 +13052,26 @@ mod tests {
         );
     }
 
-    /// PRD #196: the record decision is taken only for a plain INTERACTIVE spawn
-    /// with a non-empty command — an authoring-mode form (schedule /
-    /// issue-dispatch) and an empty/whitespace command both record nothing, so
-    /// the global last_command never picks up a command the user did not type.
+    /// PRD #196: the record decision fires for ANY non-empty form-submitted
+    /// command regardless of mode — a plain interactive spawn AND an authoring-mode
+    /// form (schedule / issue-dispatch) both record — and only an empty/whitespace
+    /// command records nothing.
     #[test]
-    fn record_candidate_only_records_interactive_nonempty() {
+    fn record_candidate_records_any_nonempty_command() {
         // Interactive + non-empty → records the command verbatim.
-        assert_eq!(record_candidate(false, "cat"), Some("cat".to_string()));
+        assert_eq!(record_candidate("cat"), Some("cat".to_string()));
         assert_eq!(
-            record_candidate(false, "devbox run agent-new"),
+            record_candidate("devbox run agent-new"),
             Some("devbox run agent-new".to_string())
         );
 
-        // Authoring-mode form → never records (the command is the
-        // resolve_authoring_command fallback, not a user-typed value).
-        assert_eq!(record_candidate(true, "claude"), None);
+        // Authoring-mode form now records too (the exclusion was dropped): every
+        // pane launched from the form is the same kind of action.
+        assert_eq!(record_candidate("claude"), Some("claude".to_string()));
 
         // Empty / whitespace-only command → records nothing.
-        assert_eq!(record_candidate(false, ""), None);
-        assert_eq!(record_candidate(false, "   "), None);
+        assert_eq!(record_candidate(""), None);
+        assert_eq!(record_candidate("   "), None);
     }
 
     // PRD #76 M2.15: pin the layout-math helpers so a future change to the
