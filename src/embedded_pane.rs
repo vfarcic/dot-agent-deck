@@ -631,7 +631,11 @@ impl EmbeddedPaneController {
         // A 24×80 parser receiving an already-correctly-sized frame would
         // clip it; resize-time keeps both sides in sync via the per-pane
         // resize worker + `resize_pane_pty`.
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(
+            rows,
+            cols,
+            PANE_SCROLLBACK_LINES,
+        )));
         let mouse_mode = Arc::new(AtomicBool::new(false));
         let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
 
@@ -1519,6 +1523,10 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// Scrollback depth (lines) for a pane's local vt100 parser. Used both when a
+/// pane is created and when a contained parser panic forces a rebuild.
+const PANE_SCROLLBACK_LINES: usize = 10_000;
+
 thread_local! {
     /// Set while a `catch_unwind`-guarded vt100 feed is running on this thread
     /// (see [`guarded_parser_feed`]). The `run_tui` panic hook (`src/ui.rs`)
@@ -1610,7 +1618,11 @@ fn process_agent_output_chunk(
     let mut new_links: Vec<(u16, String)> = Vec::new();
     let mut scroll_amount: u16 = 0;
 
+    let mut parser_reset = false;
     if let Ok(mut p) = parser.lock() {
+        // Captured while the parser is known-good so a contained panic can
+        // rebuild it at the same geometry.
+        let (rows, cols) = p.screen().size();
         for segment in &segments {
             // The MutexGuard `p` is borrowed into the closure but lives in this
             // scope, so a caught panic does not poison the lock.
@@ -1623,19 +1635,38 @@ fn process_agent_output_chunk(
                 }
                 Err(_) => {
                     // The panic left the parser's cursor/screen partially
-                    // advanced, so cursor_position() for the REST of this chunk
-                    // is unreliable — computing link rows / scroll from it could
-                    // point hyperlinks at the wrong row. Stop feeding this chunk;
-                    // the next chunk starts a fresh (independently guarded) pass.
+                    // advanced. Its state is now inconsistent, so link-row and
+                    // scroll reads — for the rest of THIS chunk AND for LATER
+                    // chunks that keep using this parser — could be wrong (e.g.
+                    // hyperlinks attached to the wrong row). Rebuild it at the
+                    // same geometry for a clean baseline. The pane loses its
+                    // current screen/scrollback, which is acceptable after a
+                    // contained crash and self-heals on the agent's next redraw;
+                    // drop this chunk's accumulated link/scroll work too.
                     tracing::warn!(
-                        "vt100 parser panicked on an agent-output chunk; dropping the \
-                         rest of it (pane render may be briefly stale). Known vt100 \
-                         0.16.2 edge case with wide characters in a very short pane."
+                        "vt100 parser panicked on an agent-output chunk; resetting the \
+                         pane parser to a clean state (screen/scrollback cleared). Known \
+                         vt100 0.16.2 edge case with wide characters in a very short pane."
                     );
+                    *p = vt100::Parser::new(rows, cols, PANE_SCROLLBACK_LINES);
+                    new_links.clear();
+                    scroll_amount = 0;
+                    parser_reset = true;
                     break;
                 }
             }
         }
+    }
+
+    // A reset cleared the screen, so hyperlink rows recorded against the old
+    // screen are stale — clear the map to keep it consistent with the freshly
+    // rebuilt parser. (Lock taken after releasing the parser lock, preserving
+    // the existing parser-then-hyperlinks ordering.)
+    if parser_reset {
+        if let Ok(mut hmap) = hyperlinks.lock() {
+            hmap.clear();
+        }
+        return;
     }
 
     if (!new_links.is_empty() || scroll_amount > 0)
