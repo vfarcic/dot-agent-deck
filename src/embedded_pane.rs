@@ -1658,11 +1658,18 @@ fn process_agent_output_chunk(
         }
     }
 
-    // A reset cleared the screen, so hyperlink rows recorded against the old
-    // screen are stale — clear the map to keep it consistent with the freshly
-    // rebuilt parser. (Lock taken after releasing the parser lock, preserving
+    // A reset cleared the screen, so state recorded against the old screen is
+    // stale and must be dropped alongside the rebuilt parser:
+    //   - the OSC 8 filter may hold an open link (`current_url`) or a partial
+    //     escape from the panicking chunk; left as-is it would wrap the next
+    //     chunk's plain text as a stale hyperlink, inserted at rows from the
+    //     fresh parser — Ctrl-click would open the wrong link. Rebuild it.
+    //   - hyperlink rows recorded against the old screen no longer map to
+    //     anything; clear the map.
+    // (The hyperlinks lock is taken after releasing the parser lock, preserving
     // the existing parser-then-hyperlinks ordering.)
     if parser_reset {
+        *osc8 = Osc8Filter::new();
         if let Ok(mut hmap) = hyperlinks.lock() {
             hmap.clear();
         }
