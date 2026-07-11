@@ -10,3 +10,10 @@ tmp/
 site/node_modules/
 site/build/
 site/.docusaurus/
+
+# Demo-reel build artifacts (regenerated each build; reel lives on YouTube)
+/reel.mp4
+/manifest.json
+
+# dot-ai skills lock (transient, like scheduled_tasks.lock above)
+.dot-ai.lock
