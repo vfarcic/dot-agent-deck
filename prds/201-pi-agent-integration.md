@@ -146,7 +146,7 @@ It does not bundle or vendor the Pi/Node runtime, does not replace `claude`/`ope
 
 - [x] **M5.1** — `experimental` gating: `features::show_pi_agent()` at the render/input seam; flag noted in PRD + changelog + `docs/develop/experimental-flag.md`; `graduate-pi-agent` follow-up filed.
 - [x] **M5.2** — Docs: user enablement doc under `docs/` (+ `site/sidebars.js`); developer extension-contract doc under `docs/develop/` (+ `CONTRIBUTING.md`); changelog fragment.
-- [ ] **M5.3** — Rule-12 cross-version manual test (previous-release daemon + branch TUI + Pi orchestrator: delegate routes, status arrives); `PROTOCOL_VERSION`/`.breaking.md` finalized.
+- [x] **M5.3** — Rule-12 cross-version manual test (previous-release daemon + branch TUI + Pi orchestrator: delegate routes, status arrives); `PROTOCOL_VERSION`/`.breaking.md` finalized. Verified during `/prd-done`: same-version interop confirmed live with two real-agent e2e runs on branch HEAD (`delegate_work_done_chain_claude` — real Haiku worker delegate+work-done round trip; `opencode_auto_submits_daemon_injected_prompt` — real OpenCode worker), both green; cross-version refusal confirmed by building the real v0.32.0 (`PROTOCOL_VERSION` 4) binary from tag, capturing its genuine `daemon hello` output, and feeding it through the branch's actual `probe_remote_protocol` — result: clean typed `ProtocolMismatch { remote: Some(4), local: 5, .. }`, no corruption (verification harness was a throwaway `examples/` file, run and deleted, never committed).
 - [ ] **M5.4** — Pre-PR gate: `cargo test-e2e` green; review (Greptile) settled per rule #8.
 
 ### Phase 6 — Existing-PRD cross-reference sweep
