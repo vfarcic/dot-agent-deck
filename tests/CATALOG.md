@@ -1682,6 +1682,16 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
 - **Cost note:** one cheap gpt-5-nano turn (orchestrator delegates) + one short Haiku turn (worker creates a file + work-done) — well under Decision 23's <$0.05/run bound.
 
+#### pi/live
+
+##### pi/live/001 — A REAL `pi` agent runs LIVE in a PTY-attached pane and its card renders the experimental-gated Pi identity plus a real, extension-driven status TRANSITION on the vt100 grid, with NO hook (PRD #201, CLAUDE.md rule 4 + PRD #180 reel-eligibility).
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness — records a `full-stream.cast`, so it is demo-reel-eligible per PRD #180, unlike the HEADLESS `chain-smoke/pi/001` + `scheduler/pi/001`). Mirrors `e2e_issue_dispatch_real.rs` / `e2e_chain_smoke_claude.rs` and the reference `scheduler/dispatch/013`. The bundled extension is materialized into the per-test HOME BEFORE launch (`TuiDeckBuilder::with_pi_extension`) so the deck's lazy-spawned daemon — and the pi child it spawns, which inherits that HOME — auto-discovers it at boot; `OPENROUTER_API_KEY` + the built-binary PATH are threaded into the deck via `with_env` (the key is never printed). Launched with `DOT_AGENT_DECK_EXPERIMENTAL=1`.
+- **Agent:** REAL `pi` (`--provider openrouter --model openai/gpt-5-nano --approve`, the cheapest GPT-5.x tier that reliably runs a directive turn) as a single interactive pane restored from a staged saved session. Flaky-tolerant pre-PR tier (real LLM) — run once, not looped (rule 4/5). Runtime-skipped (Decision 26) when `pi` / `OPENROUTER_API_KEY` is absent.
+- **Asserts (on the rendered vt100 grid):** after detaching to the dashboard, the Pi pane's card shows a REAL status TRANSITION driven ONLY by the extension's `agent-event` reports with NO hook installed — `Needs Input` (extension `session_start`→waiting) then `Thinking` (extension `agent_start`→running) — and the card title carries the experimental-flag-gated first-class Pi identity (`Pi ·`, the `AgentType` Display, which the lowercase `pi` command never produces). Scanned over the rolling byte history so a transient status frame still matches; generous 180s ceilings sized to confidence (Design Decision #7).
+- **Does not assert:** the orchestrator→worker delegation chain (a single live Pi pane fully satisfies rule 4; the delegate route is pinned headless by `chain-smoke/pi/001`); any specific text pi prints; the directed sentinel file (`pi_live_sentinel_4b1a.txt`) is a best-effort/logged secondary signal, not a gate, since the rendered status transition already proves the pi turn ran.
+- **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
+- **Cost note:** one cheap gpt-5-nano directive turn (create one file) — well under Decision 23's <$0.05/run bound.
+
 ### Mouse Parity (PRD #80)
 
 These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-only TUI action gains a clickable affordance carrying its shortcut inline, funneled through the single `dispatch_action` action layer.
