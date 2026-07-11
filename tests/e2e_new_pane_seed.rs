@@ -23,9 +23,10 @@
 //!   the recorded last command back.
 //! - `prompt/new-pane/012` — GREEN now AND after the feature lands: an explicit
 //!   `default_command` must keep winning over the recorded last command.
-//! - `prompt/new-pane/013` — regression guard: a spawn made through an
-//!   AUTHORING mode (the built-in `schedule` option) must NOT record a last
-//!   command, so a freshly reopened regular form stays blank.
+//! - `prompt/new-pane/013` — RED until the exclusion is dropped: a spawn made
+//!   through an AUTHORING mode (the built-in `schedule` option) now records a
+//!   last command like any other form-launched spawn, so a freshly reopened
+//!   regular form pre-fills with the authoring command.
 //! - `prompt/new-pane/014` — regression guard: the recorded last command must
 //!   survive a full deck RESTART (two launches sharing one HOME) — proving the
 //!   value round-trips through the persisted `session.toml`, not just in-process.
@@ -189,30 +190,32 @@ fn new_pane_012_default_command_precedence() {
 
 /// Scenario: Launch the deck with an EMPTY `default_command` in the
 /// `schedule-mode` fixture (so the regular form falls back to the recorded last
-/// command, making a stray recording observable). Open the new-pane form
+/// command, making the authoring recording observable). Open the new-pane form
 /// (Ctrl+n → Space), cycle the Mode field to the built-in `schedule` AUTHORING
-/// option, navigate to the Command field, type `cat`, and submit — dispatching
-/// an authoring-mode spawn. Then reopen a FRESH regular form (Ctrl+d → Ctrl+n →
-/// Space) WITHOUT cycling Mode and assert the Command field is BLANK — proving an
-/// authoring-mode spawn never records a last command (the submit gate excludes it
-/// regardless of the command typed), so the regular form has nothing to seed
-/// from. GREEN against the current implementation; a RED here means the
-/// authoring-exclusion gate regressed and the field would wrongly pre-fill `cat`.
+/// option, navigate to the Command field, CLEAR it so the submitted command is
+/// unambiguously `cat`, type `cat`, and submit — dispatching an authoring-mode
+/// spawn. Then reopen a FRESH regular form (Ctrl+d → Ctrl+n → Space) WITHOUT
+/// cycling Mode and assert the Command field is PRE-FILLED with `cat` — proving
+/// an authoring-mode spawn now records a last command like any other
+/// form-launched spawn (the exclusion was dropped for consistency), so the
+/// regular form seeds from it. RED against the current implementation, which
+/// still excludes authoring via `is_authoring_selected()`, so the reopened field
+/// renders blank.
 #[spec("prompt/new-pane/013")]
 #[test]
-fn new_pane_013_authoring_spawn_excluded_from_last_command() {
+fn new_pane_013_authoring_spawn_records_last_command() {
     // `default_command` is empty (the schedule-mode fixture sets no value and we
     // point DOT_AGENT_DECK_CONFIG nowhere), so the regular form's only possible
-    // seed is the last-command fallback — exactly the channel an authoring spawn
-    // must NOT pollute.
+    // seed is the last-command fallback — exactly the channel the authoring spawn
+    // now feeds.
     let deck = TuiDeck::launch_with_fixture("schedule-mode");
     deck.wait_for_string("No active sessions");
 
     // (1) Authoring spawn: open the form, cycle Mode to the built-in `schedule`
     // authoring option, type `cat`, and submit. `cat` is a real binary so the
-    // spawn deterministically succeeds and auto-focuses the card; the
-    // authoring-exclusion decision is gated on the SELECTED MODE (schedule), not
-    // the command, so spawning `cat` here still must NOT record a last command.
+    // spawn deterministically succeeds and auto-focuses the card. The
+    // exclusion is dropped, so this authoring spawn now records `cat` as the last
+    // command like any plain spawn.
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" "); // Space → confirm dir → new-pane form
@@ -221,30 +224,36 @@ fn new_pane_013_authoring_spawn_excluded_from_last_command() {
     deck.wait_for_string("schedule mode"); // selection landed on the schedule authoring mode
     deck.send_keys(b"\r"); // Mode → Name
     deck.send_keys(b"\r"); // Name → Command
+    // CLEAR the Command field first so the recorded value is unambiguously `cat`
+    // regardless of any pre-fill (the form has no clear-line key, so we pop with a
+    // run of Backspace (0x7f) bytes; extra pops on an empty field are no-ops —
+    // same technique as `012`).
+    deck.send_keys(&[0x7fu8; 32]); // Backspace ×32 → clear any pre-filled command
     deck.send_keys(b"cat");
     deck.send_keys(b"\r"); // submit the authoring spawn
     deck.wait_for_string("[Command Mode Ctrl+D]"); // authoring card spawned & auto-focused
 
     // (2) Reopen a FRESH regular form — do NOT cycle Mode, so it is the ordinary
     // "No mode" form whose Command field seeds from `default_command` (empty) →
-    // recorded last command → blank.
+    // recorded last command → `cat`.
     deck.send_keys(b"\x04"); // Ctrl+d → Normal mode
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" "); // Space → confirm dir → new-pane form
     deck.wait_for_string("Tab: switch"); // form fully painted
 
-    // (3) The Command field must be BLANK — NOT `cat`, NOT the authoring command.
-    // An authoring spawn does not record a last command, so the regular form has
-    // nothing to seed from.
+    // (3) The Command field must be PRE-FILLED with `cat` — the authoring spawn's
+    // command is now recorded and seeds the later regular form. RED against the
+    // current code, which still excludes authoring, so the field renders blank.
     let grid = deck.snapshot_grid();
     assert_eq!(
         command_field_value(&grid),
-        "",
-        "an authoring-mode (schedule) spawn must NOT record a last command: after spawning \
-         `cat` through the schedule authoring option, reopening a regular new-pane form must \
-         leave the Command field BLANK (not `cat`, not the authoring command), because \
-         `default_command` is empty and no last command was recorded.\nGrid:\n{grid}"
+        "cat",
+        "an authoring-mode (schedule) spawn must now RECORD its command as the last command: \
+         after spawning `cat` through the schedule authoring option, reopening a regular \
+         new-pane form must PRE-FILL the Command field with `cat` (`default_command` is empty, \
+         so the last command is the only seed). RED today: the authoring-exclusion gate still \
+         drops the recording, so the field renders blank.\nGrid:\n{grid}"
     );
 }
 
