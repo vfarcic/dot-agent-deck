@@ -206,7 +206,7 @@ fn path_with_binary_dir() -> String {
 /// with NO hook installed.
 #[spec("chain-smoke/pi/001")]
 #[test]
-fn pi_001_orchestrator_delegates_to_real_worker() {
+fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker() {
     skip_unless!(common::check_claude_available());
     skip_unless!(check_pi_available());
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -214,10 +214,10 @@ fn pi_001_orchestrator_delegates_to_real_worker() {
         .enable_all()
         .build()
         .expect("build multi-thread runtime");
-    rt.block_on(pi_001_orchestrator_delegates_to_real_worker_inner());
+    rt.block_on(chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner());
 }
 
-async fn pi_001_orchestrator_delegates_to_real_worker_inner() {
+async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
     let daemon = common::spawn_inprocess_daemon().await;
 
     // Shared orchestration cwd: the worker + orchestrator run here, and the
@@ -468,7 +468,7 @@ async fn pi_001_orchestrator_delegates_to_real_worker_inner() {
 /// value M4.2 adds over the synthetic `status/agent-event/003`).
 #[spec("scheduler/pi/001")]
 #[test]
-fn pi_001_scheduled_unattended_status_via_extension() {
+fn scheduler_pi_001_scheduled_unattended_status_via_extension() {
     skip_unless!(check_pi_available());
 
     let scratch = tempfile::tempdir().expect("scratch tempdir");

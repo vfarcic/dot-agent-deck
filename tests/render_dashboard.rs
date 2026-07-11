@@ -33,6 +33,31 @@ use spec::spec;
 /// a stale snapshot the next time the test runs).
 const RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH: u16 = 60;
 
+/// Serializes any test in this binary that mutates the *process-global*
+/// `Features` (only `dashboard/pane/007` today) so a concurrent flip can't
+/// bleed across another test's render/assert window under plain `cargo test`
+/// (CI's model — one process, tests on threads). `cargo test-fast`/nextest
+/// isolates each test in its own process, where this is belt-and-suspenders.
+/// Mirrors `FLAG_LOCK` in `tests/experimental_flag.rs`.
+static FLAG_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII guard: snapshots the process-global `Features` on construction and
+/// restores it on drop, so a test that flips the experimental flag cannot leak
+/// the mutated state to sibling tests in the same binary — even if an assertion
+/// panics between the flip and the end of the test. Hold it alongside the
+/// `FLAG_LOCK` guard for the full flip→render→assert window.
+struct FlagRestore(Features);
+impl FlagRestore {
+    fn new() -> Self {
+        Self(features::current())
+    }
+}
+impl Drop for FlagRestore {
+    fn drop(&mut self) {
+        features::set_for_test(self.0);
+    }
+}
+
 /// Stringify the rendered buffer — one line per row, with cells joined
 /// into the symbol layer. `insta` then captures this representation, so
 /// snapshot diffs read like the rendered card itself rather than as
@@ -365,12 +390,16 @@ fn pane_007_pi_card_shows_pi_identity() {
     // PRD #201 M5.1: the Pi first-class identity is gated behind
     // `features::show_pi_agent()` at the render seam (CLAUDE.md #9), so this
     // test forces the experimental flag ON as a precondition; the OFF (hidden)
-    // path is `features/gating/004`. nextest isolates this process, and within
-    // this binary only this test renders an `AgentType::Pi` card, so the flip
-    // needs no lock.
+    // path is `features/gating/004`. This mutates the process-global `Features`,
+    // so under plain `cargo test` (CI's shared-process/threaded model) the flip
+    // must not leak into sibling tests: serialize with `FLAG_LOCK` and snapshot
+    // + restore the prior flag via `FlagRestore` (restored on drop, even if an
+    // assertion below panics).
     //
     // `last_activity = now` keeps any rendered `Last: Xs ago` at `0s ago`
     // (mirrors `pane_004`).
+    let _flag_lock = FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _flag_restore = FlagRestore::new();
     features::set_for_test(Features::test_with(true));
     let now = chrono::Utc::now();
     let session = SessionState {
