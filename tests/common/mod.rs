@@ -2915,6 +2915,230 @@ pub fn process_running(pid: i32) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PRD #201 M4 — in-process daemon + real-agent polling helpers
+// ---------------------------------------------------------------------------
+//
+// The real-`pi` orchestrator e2e (`e2e_pi_orchestrator.rs`) needs the SAME
+// in-process daemon setup `e2e_delegate_work_done_chain.rs` uses (its hook loop
+// routes the extension's `delegate` / `work-done` / `agent-event` frames and
+// re-broadcasts `AgentEvent`s), plus a few `sleep`-based polls. Those polls live
+// HERE in `common` — not in an `e2e_*.rs` body — so linkage-check Decision 21
+// (no raw sleeps in e2e test bodies) is satisfied by construction, exactly as
+// the `DaemonProc` harness above does for the headless daemon-serve tests.
+
+/// Serializes the socket-bind window for [`spawn_inprocess_daemon`] (mirrors the
+/// bind lock in the daemon-spawning e2e tests).
+static INPROC_BIND_LOCK: Mutex<()> = Mutex::new(());
+
+/// An in-process `dot-agent-deck` daemon: its hook loop ingests `delegate` /
+/// `work-done` / `agent-event` frames over the hook socket and re-broadcasts
+/// `AgentEvent`s on [`event_tx`](Self::event_tx). Drop aborts the loop and shuts
+/// down every spawned PTY.
+#[allow(dead_code)]
+pub struct InProcDaemon {
+    _dir: tempfile::TempDir,
+    /// Shared app state — populate the orchestration maps the delegate /
+    /// work-done handlers read.
+    pub state: dot_agent_deck::state::SharedState,
+    /// The PTY registry — spawn real agent panes into it.
+    pub registry: std::sync::Arc<dot_agent_deck::agent_pty::AgentPtyRegistry>,
+    /// The daemon-wide broadcast — subscribe to observe re-broadcast events.
+    pub event_tx: tokio::sync::broadcast::Sender<dot_agent_deck::event::BroadcastMsg>,
+    /// Hand this to spawned agents as `DOT_AGENT_DECK_SOCKET`.
+    pub hook_path: PathBuf,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[allow(dead_code)]
+impl Drop for InProcDaemon {
+    fn drop(&mut self) {
+        self.handle.abort();
+        self.registry.shutdown_all();
+    }
+}
+
+/// Bring up an in-process daemon and block until its hook socket accepts
+/// connections (so an agent's first CLI call can't race startup). Mirrors
+/// `e2e_delegate_work_done_chain.rs::spawn_daemon`, centralized so the readiness
+/// poll lives in `common`.
+#[allow(dead_code)]
+pub async fn spawn_inprocess_daemon() -> InProcDaemon {
+    use dot_agent_deck::daemon::{Daemon, run_daemon_with};
+
+    init_test_env();
+    let (dir, hook_path, attach_path) = {
+        let _g = INPROC_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = race_safe_tempdir();
+        let hook = dir.path().join("hook.sock");
+        let attach = dir.path().join("attach.sock");
+        (dir, hook, attach)
+    };
+
+    let state: dot_agent_deck::state::SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
+        dot_agent_deck::state::AppState::default(),
+    ));
+    let daemon = Daemon::with_attach(state.clone(), attach_path.clone())
+        .with_idle_shutdown(None)
+        .with_lock_dir_override(lock_dir_path());
+    let registry = daemon.pty_registry.clone();
+    let event_tx = daemon.event_tx.clone();
+
+    let hook_for_daemon = hook_path.clone();
+    let handle = tokio::spawn(async move {
+        let _ = run_daemon_with(&hook_for_daemon, daemon).await;
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut ready = false;
+    while tokio::time::Instant::now() < deadline {
+        if hook_path.exists() && tokio::net::UnixStream::connect(&hook_path).await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        ready,
+        "in-process daemon hook socket was not accepting connections within 5s"
+    );
+
+    InProcDaemon {
+        _dir: dir,
+        state,
+        registry,
+        event_tx,
+        hook_path,
+        handle,
+    }
+}
+
+/// Poll a spawned agent's PTY snapshot until its byte length stops growing for
+/// `quiet` (with a minimum settle since first output), i.e. an interactive agent
+/// has finished rendering its boot UI and is input-ready. Delegating only after
+/// readiness keeps a daemon-injected prompt from being dropped mid-boot. Ported
+/// from `e2e_delegate_work_done_chain.rs::wait_until_worker_ready`.
+#[allow(dead_code)]
+pub async fn wait_until_agent_output_settled(
+    registry: &dot_agent_deck::agent_pty::AgentPtyRegistry,
+    agent_id: &str,
+    quiet: Duration,
+    timeout: Duration,
+) {
+    let start = tokio::time::Instant::now();
+    let deadline = start + timeout;
+    let min_since_first_output = Duration::from_secs(6);
+    let mut last_len = 0usize;
+    let mut first_output_at: Option<tokio::time::Instant> = None;
+    let mut stable_since = start;
+    loop {
+        let len = registry.snapshot(agent_id).map(|s| s.len()).unwrap_or(0);
+        if len > 0 && first_output_at.is_none() {
+            first_output_at = Some(tokio::time::Instant::now());
+        }
+        if len != last_len {
+            last_len = len;
+            stable_since = tokio::time::Instant::now();
+        } else if let Some(first) = first_output_at
+            && stable_since.elapsed() >= quiet
+            && first.elapsed() >= min_since_first_output
+        {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Async poll for `path` to exist, up to `timeout` (the async sibling of the
+/// sync [`wait_for_path`], for use inside an async e2e `_inner` body without
+/// blocking a runtime worker thread on a long wait).
+#[allow(dead_code)]
+pub async fn wait_for_path_async(path: &Path, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if path.exists() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// A background collector of an in-process daemon's re-broadcast `AgentEvent`s.
+/// Subscribe (via [`start`](Self::start)) BEFORE spawning the agent whose events
+/// you want, so its first status report can't be missed. Drop aborts the reader.
+/// The async [`wait_for`](Self::wait_for) poll lives here (Decision 21).
+#[allow(dead_code)]
+pub struct BroadcastEventLog {
+    events: std::sync::Arc<Mutex<Vec<dot_agent_deck::event::AgentEvent>>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[allow(dead_code)]
+impl Drop for BroadcastEventLog {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+#[allow(dead_code)]
+impl BroadcastEventLog {
+    /// Subscribe to `event_tx` and drain `AgentEvent`s into a shared buffer.
+    pub fn start(
+        event_tx: &tokio::sync::broadcast::Sender<dot_agent_deck::event::BroadcastMsg>,
+    ) -> Self {
+        use dot_agent_deck::event::BroadcastMsg;
+        use tokio::sync::broadcast::error::RecvError;
+
+        let mut rx = event_tx.subscribe();
+        let events =
+            std::sync::Arc::new(Mutex::new(Vec::<dot_agent_deck::event::AgentEvent>::new()));
+        let sink = std::sync::Arc::clone(&events);
+        let handle = tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(BroadcastMsg::Event(ev)) => sink.lock().unwrap().push(ev),
+                    Ok(_) => {}
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
+        Self { events, handle }
+    }
+
+    /// Block until a collected `AgentEvent` satisfies `pred`, returning a clone,
+    /// or `None` on timeout.
+    pub async fn wait_for(
+        &self,
+        pred: impl Fn(&dot_agent_deck::event::AgentEvent) -> bool,
+        timeout: Duration,
+    ) -> Option<dot_agent_deck::event::AgentEvent> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(ev) = self
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|e| pred(e))
+                .cloned()
+            {
+                return Some(ev);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod harness_unit_tests {
     use super::*;
