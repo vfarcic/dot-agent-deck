@@ -64,6 +64,10 @@ DOT_AGENT_DECK_EXPERIMENTAL=1 dot-agent-deck
 
 With the flag off, a `pi` pane still runs and functions, but its Pi-specific status identity is not shown (it renders like a generic pane). Turning the flag on surfaces the Pi identity and status affordances.
 
+## Security and sandboxing
+
+Pi runs with a **YOLO / no-permission model** — like Claude Code with full filesystem and shell access, it executes its tools without prompting. `orchestrator setup` and Pi's `--approve` flag trust the project so the `delegate`/`work-done` tools run without a permission dialog. This is the **same posture as the other agents** `dot-agent-deck` already spawns and does not change the deck's sandbox story: if you do not fully trust the workload, run `dot-agent-deck` (and therefore its agents) inside a container or other sandbox. See the security notes in [Getting Started](getting-started.md) — they apply to Pi exactly as they do to `claude` and `opencode`.
+
 ## What it deliberately does not do
 
 - It does **not** bundle or vendor the Pi or Node/Bun runtime — Pi is detected on PATH; only the extension ships inside the binary.
