@@ -752,6 +752,31 @@ impl TuiDeck {
         }
     }
 
+    /// Like [`wait_for_string`] (scans the RECONSTRUCTED vt100 grid, so
+    /// styled UI chrome — a bottom-bar affordance, a tab label, a card
+    /// field — whose glyphs are written as separate styled runs is matched
+    /// on its rendered text, not on the raw byte stream where the runs are
+    /// interleaved with cursor-move escapes) but with a caller-supplied
+    /// timeout instead of the fixed 10-second [`WAIT_TIMEOUT`]. Real-agent
+    /// L2 tests need a generous ceiling (minutes) the default cannot
+    /// express. Returns `true` once `needle` is on the rendered grid,
+    /// `false` if `timeout` elapses first (the caller decides whether a
+    /// miss is a hard failure or a soft observation). Use this for
+    /// persistent on-screen state; use [`wait_for_stream_string_within`]
+    /// for transient PLAIN-text agent output that may scroll off.
+    pub fn wait_for_grid_string_within(&self, needle: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.snapshot_grid().contains(needle) {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Wait for `needles` to appear, in order, in the cumulative
     /// byte stream the deck has emitted since this call started.
     ///

@@ -42,6 +42,11 @@ serial_test = "3"
 # harness/L2 tests need `libc` listed here to call `kill(2)` directly (process-
 # group cleanup on Drop; orphan-exit liveness polling).
 libc = "0.2"
+# PRD #201 `pi/live/002`: the injection-seeded orchestration e2e stages a
+# `session.toml` with an `OrchestrationSnapshot` by serializing a real
+# `config::SavedSession` — integration tests don't inherit the package deps, so
+# `toml` is listed here too (same version pin as the package dep).
+toml = "0.8"
 # PRD #77 Decision 22: insta pinned to a specific version, not `latest`,
 # so a future patch release cannot silently reshape snapshot diffs.
 insta = { version = "=1.47.2", features = ["yaml"] }
