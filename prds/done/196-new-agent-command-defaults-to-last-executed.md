@@ -1,8 +1,10 @@
 # PRD #196: New-agent command defaults to the last executed command
 
-**Status**: Not Started
+**Status**: Complete
+**Completed**: 2026-07-11
 **Priority**: Medium
 **Created**: 2026-06-25
+**Last updated**: 2026-07-11
 **GitHub Issue**: [#196](https://github.com/vfarcic/dot-agent-deck/issues/196)
 **Related**: PRD #170 (configurable agent command + `default_command` plumbing — this reuses the same config field and form seam), PRD #20 (multi-agent support — quality-of-life for switching between agent commands)
 
@@ -62,18 +64,18 @@ The value is **global** (one last-command value, not per-directory), **persisted
 
 ### Phase 1 — Persisted last-command tracking
 
-- [ ] **M1.1** — Add a persisted, global `last_command` value to the existing config/session persistence; load it on startup, default to empty/absent.
-- [ ] **M1.2** — Record `last_command` on each successful new-pane spawn submitted through the form, regardless of mode (orchestration excluded by construction — no form command; empty commands ignored).
+- [x] **M1.1** — Add a persisted, global `last_command` value to the existing config/session persistence; load it on startup, default to empty/absent.
+- [x] **M1.2** — Record `last_command` on each successful new-pane spawn submitted through the form, regardless of mode (orchestration excluded by construction — no form command; empty commands ignored).
 
 ### Phase 2 — Fallback-chain form seeding
 
-- [ ] **M2.1** — Extend the new-pane form seed (`DirPickerIntent::NewPane` seam in `transition_after_dir_pick`, `src/ui.rs`) to resolve `default_command` (if non-empty) → `last_command` (if present) → blank.
-- [ ] **M2.2** — Tests: L1/behavior coverage for all three seed branches and for authoring-mode spawns also recording `last_command`.
+- [x] **M2.1** — Extend the new-pane form seed (`DirPickerIntent::NewPane` seam in `transition_after_dir_pick`, `src/ui.rs`) to resolve `default_command` (if non-empty) → `last_command` (if present) → blank.
+- [x] **M2.2** — Tests: L1/behavior coverage for all three seed branches and for authoring-mode spawns also recording `last_command`.
 
 ### Phase 3 — Docs & release gate
 
-- [ ] **M3.1** — User docs note the fallback behavior; changelog fragment via `dot-ai-changelog-fragment`.
-- [ ] **M3.2** — Pre-PR gate: `cargo test-e2e` green; review (Greptile) settled per CLAUDE.md rule 8.
+- [x] **M3.1** — User docs note the fallback behavior; changelog fragment via `dot-ai-changelog-fragment`.
+- [x] **M3.2** — Pre-PR gate: `cargo test-e2e` green; review (Greptile) settled per CLAUDE.md rule 8.
 
 ## Risks & Mitigations
 
