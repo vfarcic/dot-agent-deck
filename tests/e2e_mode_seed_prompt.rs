@@ -59,7 +59,8 @@ fn write_agent_script(work: &std::path::Path, tag: &str) -> String {
 /// Drive the new-pane dialog to spawn `[[modes]]` entry at `mode_index`
 /// (1-based: index 1 = first mode) with the agent `command`. Sequence:
 /// Ctrl+n → dir-picker (Space confirms cwd) → form (Right ×mode_index selects
-/// the mode, Enter → Name, Enter → Command, type command, Enter submits).
+/// the mode, Enter → Name, Enter → Command, CLEAR the field, type command,
+/// Enter submits).
 fn spawn_mode(deck: &TuiDeck, mode_index: usize, command: &str) {
     // The deck repaints on a periodic tick, so it never goes fully quiescent —
     // sync on rendered dialog text instead. Keys are processed in order by the
@@ -74,6 +75,14 @@ fn spawn_mode(deck: &TuiDeck, mode_index: usize, command: &str) {
     deck.send_keys(&mode_keys);
     deck.send_keys(b"\r"); // Mode → Name
     deck.send_keys(b"\r"); // Name (default) → Command
+    // CLEAR the Command field before typing. PRD #196 pre-fills it with the last
+    // command spawned, so on a second (and later) spawn the field already holds
+    // the previous command; without clearing, the new command would be APPENDED
+    // (e.g. `./agent-seeded.sh./agent-plain.sh`) and fail to run. The form has no
+    // clear-line key, so the field is emptied with a run of Backspace (0x7f)
+    // bytes (same approach as `prompt/new-pane/012`); extra pops on an empty or
+    // blank field are harmless no-ops, so this is robust on the first spawn too.
+    deck.send_keys(&[0x7fu8; 64]); // Backspace ×64 → clear any pre-filled command
     deck.send_keys(command.as_bytes());
     deck.send_keys(b"\r"); // submit
 }

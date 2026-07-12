@@ -1129,6 +1129,36 @@ pub fn joined_rows(buffer: &ratatui::buffer::Buffer) -> String {
         .join("\n")
 }
 
+/// Poll `path` until its contents contain `needle`, or panic after the
+/// harness wait ceiling ([`WAIT_TIMEOUT`]). Lives in the harness (not an
+/// `e2e_*` test file) because it sleeps between reads — Decision 21 forbids
+/// `std::thread::sleep` inside e2e test bodies, but the harness's wait
+/// primitives are exempt, exactly like [`TuiDeck::wait_for_string`].
+///
+/// Restart tests use this to wait for the deck to flush a disk artifact (the
+/// persisted `session.toml`) before the NEXT launch reads it. The deck writes
+/// that file atomically (temp file + rename), so a read here always sees either
+/// the previous or the new complete file — never a half-written one.
+pub fn wait_for_file_contains(path: &Path, needle: &str) {
+    let deadline = Instant::now() + WAIT_TIMEOUT;
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path)
+            && contents.contains(needle)
+        {
+            return;
+        }
+        if Instant::now() > deadline {
+            let dump =
+                std::fs::read_to_string(path).unwrap_or_else(|e| format!("<unreadable: {e}>"));
+            panic!(
+                "file {} did not contain {needle:?} within {WAIT_TIMEOUT:?}.\nContents:\n{dump}",
+                path.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(QUIESCENT_IDLE_MS));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
