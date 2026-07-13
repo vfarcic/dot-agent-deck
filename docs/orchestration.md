@@ -176,8 +176,6 @@ The sidebar shows each role's status live (thinking, working, waiting, idle, err
 
 The orchestrator delegates a task to one or more workers. The deck delivers the task to each worker's pane automatically, including the worker's `prompt_template` as standing context. Each worker works independently, then signals completion. The deck notifies the orchestrator, which reads the summary and decides what to do next.
 
-> **Shell-safe task input.** When a task (or a `work-done` summary) contains characters the shell would mangle — backticks (`` `code` ``), quotes, `$VAR`, or newlines — pass it via `--task-file <path>` instead of `--task "…"`. The file is read verbatim, with no shell involved, so the payload survives unmangled; `--task-file -` reads from stdin. `--task` and `--task-file` are mutually exclusive. This applies to both `dot-agent-deck delegate` and `dot-agent-deck work-done`.
-
 ![Coder pane active and working after receiving a delegation from the orchestrator](./img/orchestration-coder.png)
 
 ### Parallel delegation
