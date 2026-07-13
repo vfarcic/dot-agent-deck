@@ -71,7 +71,6 @@ use tempfile::TempDir;
 
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 use dot_agent_deck::event::{AgentType, EventType};
-use dot_agent_deck::orchestrator_ext;
 
 mod common;
 
@@ -491,12 +490,13 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
 // M4.2 — scheduled real-pi, UNATTENDED status (test-plan ROW 14)
 // ---------------------------------------------------------------------------
 
-/// Scenario: Start the real `daemon serve` headlessly (no TUI client attached),
-/// materialize the bundled orchestrator extension into the daemon's HOME, and
-/// register one enabled schedule whose command is a REAL `pi` (cheap `-p`, cheap
-/// GPT-5.x). Propagate `OPENROUTER_API_KEY` + the built-binary PATH into the
-/// daemon (which the scheduler-spawned pi inherits, along with `HOME` +
-/// `DOT_AGENT_DECK_SOCKET`). Subscribe as an UNATTENDED `SubscribeEvents` consumer
+/// Scenario: Start the real `daemon serve` headlessly (no TUI client attached)
+/// with a CLEAN HOME and register one enabled schedule whose command is a REAL
+/// `pi` (cheap `-p`, cheap GPT-5.x). Propagate `OPENROUTER_API_KEY` + the
+/// built-binary PATH into the daemon (which the scheduler-spawned pi inherits,
+/// along with `HOME` + `DOT_AGENT_DECK_SOCKET`); the deck's spawn-time
+/// auto-materialize puts the bundled extension into that HOME as pi launches —
+/// no manual setup. Subscribe as an UNATTENDED `SubscribeEvents` consumer
 /// and fire the schedule via `RunNow`. Assert the scheduled pi boots and its real
 /// extension reports a `Pi`-typed `AgentEvent` that the daemon re-broadcasts on
 /// the event stream — the real-agent, unattended, no-client status path (the
@@ -529,15 +529,13 @@ fn scheduler_pi_001_scheduled_unattended_status_via_extension() {
         ],
     );
 
-    // Materialize the bundled extension into the daemon's HOME so the
-    // scheduler-spawned pi (which inherits that HOME) auto-discovers it.
-    let ext_dir = daemon
-        .home
-        .join(".pi")
-        .join("agent")
-        .join("extensions")
-        .join(orchestrator_ext::EXTENSION_DIR_NAME);
-    orchestrator_ext::materialize(&ext_dir).expect("materialize the bundled pi extension");
+    // No manual `orchestrator_ext::materialize` here: the deck's spawn-time
+    // auto-materialize (PRD #201, `spawn_agent` seam) fires when the scheduler
+    // launches the `pi` command, materializing the bundled extension into the
+    // HOME the pi child inherits (resolved from the spawn env → the daemon's
+    // process HOME, i.e. `daemon.home`) BEFORE pi boots. The daemon's HOME
+    // therefore starts CLEAN and this test exercises the production path, in
+    // parity with the other pi tests (chain-smoke/pi/001, pi/live/*).
 
     // Subscribe as an unattended consumer BEFORE firing, so the scheduled pi's
     // first status report can't be missed.
