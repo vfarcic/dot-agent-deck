@@ -4,7 +4,7 @@
 **Priority**: Medium
 **Created**: 2026-07-10
 **GitHub Issue**: [#201](https://github.com/vfarcic/dot-agent-deck/issues/201)
-**Related**: PRD #58 (multi-role agent orchestration — the delegate/work-done model this makes deterministic for one agent), PRD #82 (orchestrator-role reinforcement — the prompt-and-pray fragility this replaces with native tools), PRD #93 (always-external daemon — the daemon is the single source of truth the extension reports into), PRD #50 (auto-install hooks — the mechanism that becomes unnecessary for a Pi pane), PRD #176 (desktop GUI — its agents-communication graph consumes the same structured orchestration events this PRD's producer emits), PRD #139 (the `experimental` feature flag — gated here, see Design Decisions #8), and a **companion PRD (to be created): cross-agent orchestration test matrix + backfill**, which inherits this PRD's synthetic-agent harness and generalizes it across `{claude, opencode, pi}`.
+**Related**: PRD #58 (multi-role agent orchestration — the delegate/work-done model this makes deterministic for one agent), PRD #82 (orchestrator-role reinforcement — the prompt-and-pray fragility this replaces with native tools), PRD #93 (always-external daemon — the daemon is the single source of truth the extension reports into), PRD #50 (auto-install hooks — the mechanism that becomes unnecessary for a Pi pane), PRD #176 (desktop GUI — its agents-communication graph consumes the same structured orchestration events this PRD's producer emits), PRD #139 (the `experimental` feature flag — Pi was gated behind it during development, then un-gated before merge; see Design Decision #8), and a **companion PRD (to be created): cross-agent orchestration test matrix + backfill**, which inherits this PRD's synthetic-agent harness and generalizes it across `{claude, opencode, pi}`.
 
 ## Problem Statement
 
@@ -18,7 +18,7 @@ The workarounds do not get *ported* to Pi — for a Pi pane they *dissolve*, bec
 
 ## Solution Overview
 
-Add **Pi as a third, first-class, status-tracked agent type** alongside `claude`/`opencode`, and use its extension API to make the **orchestrator role deterministic**. Pi is not bundled as a runtime and does not replace anything; it is detected on PATH like the other agents, and it is opt-in behind the `experimental` flag until proven.
+Add **Pi as a third, first-class, status-tracked agent type** alongside `claude`/`opencode`, and use its extension API to make the **orchestrator role deterministic**. Pi is not bundled as a runtime and does not replace anything; it is detected on PATH like the other agents, and is opt-in by installing `pi` and pointing a role at `command = "pi"` (it was gated behind the `experimental` flag during development; that gate was removed before merge once the flagship was proven — see Design Decision #8).
 
 Six ideas carry the design:
 
@@ -61,9 +61,9 @@ It does not bundle or vendor the Pi/Node runtime, does not replace `claude`/`ope
 
 ### Docs
 
-- User doc: enabling Pi (install, `orchestrator setup`, `command = "pi"`, the `experimental` flag), added under `docs/` and `site/sidebars.js`.
+- User doc: enabling Pi (install, `orchestrator setup`, `command = "pi"`), added under `docs/` and `site/sidebars.js`.
 - Developer doc under `docs/develop/`: the extension's tool/event contract, how it maps Pi events to `agent-event` types, the embedded-asset materialization, and the JS toolchain (linked from `CONTRIBUTING.md`).
-- `docs/develop/experimental-flag.md` updated with the new flag.
+- `docs/develop/experimental-flag.md` — the Pi flag entry was added during development and removed when Pi was un-gated before merge; Pi is no longer listed there.
 - Changelog fragment via `dot-ai-changelog-fragment`.
 
 ## Scope
@@ -76,7 +76,7 @@ It does not bundle or vendor the Pi/Node runtime, does not replace `claude`/`ope
 - **`dot-agent-deck agent-event --type <state>`** (proposed, additive): the small CLI seam the extension uses to report status into the existing `EventType`/`AgentEvent` stream.
 - **A thin, agent-agnostic synthetic-agent test harness** — scripted stand-in that calls `delegate`/`work-done`/`agent-event` deterministically — built for Pi's own contract coverage but parameterized by agent identity from line one, so the companion PRD generalizes rather than rewrites it.
 - **Tests** across three layers (see Design Decision #7): synthetic-harness contract tests (fast tier), TS extension unit tests, and real-`pi` e2e (`e2e_*.rs`, `#[cfg(feature="e2e")]`), including **headless/unattended status reporting with no client attached**.
-- **`experimental`-flag gating** at the render/input seam (agent-type selectability, Pi status affordances) per rule #9; one `features::show_pi_agent()` wrapper.
+- **`experimental`-flag gating** at the render seam (Pi status affordances) via one `features::show_pi_agent()` wrapper per rule #9 — **implemented then removed before merge; Pi ships un-gated** (see Design Decision #8).
 - The **rule-12 cross-version contract check** for the `agent-event` addition and any orchestration-event shape, with the `PROTOCOL_VERSION` / `.breaking.md` decision recorded.
 - **Existing-PRD cross-reference sweep**: review every PRD under `prds/` (and `prds/done/`) and, wherever a PRD *specifically enumerates or discusses the supported agent types* (today `claude`/`opencode`), add `pi` so the corpus reflects Pi as a first-class agent. Generic references to "the agent" are left alone; only explicit agent-type enumerations are updated. Done last, after all functional work has landed.
 - Docs and changelog as above.
@@ -105,7 +105,7 @@ It does not bundle or vendor the Pi/Node runtime, does not replace `claude`/`ope
 
 7. **LLM use in tests is a quality decision, not a cost decision.** The synthetic harness exists because the plumbing under test — routing, protocol frames, status wiring — is genuinely more reliable asserted *deterministically*; it is **not** a token-saving dodge. Where the behavior under test is real agent behavior (does an orchestrator decide to delegate, call the tool correctly, react to `work-done`), a real agent is the higher-quality test and its coverage is **bounded by flakiness and wall-clock, not by token cost.** We will not shrink real-agent e2e to save money when the real agent gives better confidence. _This principle likely warrants revisiting the testing guidance in our skills/conventions (CLAUDE.md rules 4–6 lean toward minimizing the real-agent tier); flagged for follow-up, not resolved here._
 
-8. **Gate behind `experimental` (PRD #139).** Pi as a selectable agent, its status affordances, and the setup command are a new user-visible surface. Per rule #9, gate only the render/input seam via a single `features::show_pi_agent()` wrapper (not business logic, not the daemon protocol, not the extension), note the flag in this PRD + changelog + `docs/develop/experimental-flag.md`, and file a `graduate-pi-agent` follow-up at ship time.
+8. **Gate behind `experimental` (PRD #139).** Pi as a selectable agent, its status affordances, and the setup command are a new user-visible surface. Per rule #9, gate only the render/input seam via a single `features::show_pi_agent()` wrapper (not business logic, not the daemon protocol, not the extension), note the flag in this PRD + changelog + `docs/develop/experimental-flag.md`, and file a `graduate-pi-agent` follow-up at ship time. **Reversed before merge — Pi ships un-gated.** Once the flagship was proven end to end (real-`pi` orchestration + event-driven status), the gate was removed: it was cosmetic-only (it merely suppressed the Pi identity label on a card — it never guarded business logic, the protocol, or the deferred parity paths, none of which are flag-gated), it had no effect on existing users (`claude`/`opencode` panes are unaffected, and Pi is opt-in by install/config), and leaving it on showed adopters a confusing "No agent" label after they'd completed setup. So `show_pi_agent()` and the render-seam gate were deleted, the flag notes were stripped from the docs/changelog, and `graduate-pi-agent` is moot.
 
 ## Success Criteria
 
@@ -116,7 +116,7 @@ It does not bundle or vendor the Pi/Node runtime, does not replace `claude`/`ope
 - The synthetic-agent harness deterministically exercises delegate/work-done/status routing in the fast tier, and is written agent-agnostically (parameterized by agent identity) so the companion PRD can run it across `{claude, opencode, pi}`.
 - Real-`pi` e2e coverage is sized to confidence, not to token budget (Design Decision #7); it passes in `cargo test-e2e` before the PR.
 - The `agent-event` addition is classified per rule #12 (protocol bump or `.breaking.md` recorded), and the cross-version manual test passes: a previous-release daemon with a Pi orchestrator under the branch TUI still routes delegates and receives status.
-- The surface is gated behind `experimental`; a `graduate-pi-agent` issue is filed at ship.
+- The surface ships **un-gated** (visible by default): the `experimental` gate added during development was removed before merge (see Design Decision #8), so no `graduate-pi-agent` follow-up is needed.
 - `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test-fast` pass for the Rust crates; the extension's TS tests pass; `cargo test-e2e` passes before the PR (CLAUDE.md rules 2, 5, 8).
 
 ## Milestones
@@ -144,7 +144,7 @@ It does not bundle or vendor the Pi/Node runtime, does not replace `claude`/`ope
 
 ### Phase 5 — Flag, docs, contract & release gate
 
-- [x] **M5.1** — `experimental` gating: `features::show_pi_agent()` at the render/input seam; flag noted in PRD + changelog + `docs/develop/experimental-flag.md`; `graduate-pi-agent` follow-up filed.
+- [x] **M5.1** — `experimental` gating implemented (`features::show_pi_agent()` at the render seam) **then reversed before merge**: the gate was cosmetic-only, so Pi ships visible by default; the wrapper + flag notes were removed and `graduate-pi-agent` is moot (see Design Decision #8).
 - [x] **M5.2** — Docs: user enablement doc under `docs/` (+ `site/sidebars.js`); developer extension-contract doc under `docs/develop/` (+ `CONTRIBUTING.md`); changelog fragment.
 - [x] **M5.3** — Rule-12 cross-version manual test (previous-release daemon + branch TUI + Pi orchestrator: delegate routes, status arrives); `PROTOCOL_VERSION`/`.breaking.md` finalized. Verified during `/prd-done`: same-version interop confirmed live with two real-agent e2e runs on branch HEAD (`delegate_work_done_chain_claude` — real Haiku worker delegate+work-done round trip; `opencode_auto_submits_daemon_injected_prompt` — real OpenCode worker), both green; cross-version refusal confirmed by building the real v0.32.0 (`PROTOCOL_VERSION` 4) binary from tag, capturing its genuine `daemon hello` output, and feeding it through the branch's actual `probe_remote_protocol` — result: clean typed `ProtocolMismatch { remote: Some(4), local: 5, .. }`, no corruption (verification harness was a throwaway `examples/` file, run and deleted, never committed).
 - [ ] **M5.4** — Pre-PR gate: `cargo test-e2e` green; review (Greptile) settled per rule #8.
@@ -155,7 +155,7 @@ It does not bundle or vendor the Pi/Node runtime, does not replace `claude`/`ope
 
 ## Risks & Mitigations
 
-- **Coupling to a young, single-author project's extension API.** Pi moves fast and is one person's project. Mitigation: keep Pi optional (detected, `experimental`-gated), keep our surface to a small extension shelling stable CLI, and pin the tested Pi version in docs; never make Pi a required core dependency.
+- **Coupling to a young, single-author project's extension API.** Pi moves fast and is one person's project. Mitigation: keep Pi optional (detected on PATH, opt-in by config), keep our surface to a small extension shelling stable CLI, and pin the tested Pi version in docs; never make Pi a required core dependency.
 - **A second toolchain (Node/TS) in a Rust-centric repo and its gates.** Mitigation: contain all JS build tooling in the extension subdirectory; keep `cargo fmt`/`clippy`/`nextest` authoritative for the Rust crates; run TS tests off the Rust critical path.
 - **Two status paths (hook-based vs extension-based) drift apart.** Mitigation: both feed the *same* `EventType`/`AgentEvent` contract (Design Decision #2); the synthetic harness asserts the Pi path produces the identical event shapes the hook path does.
 - **Temptation to over-minimize real-agent tests for cost.** Directly counter to Design Decision #7. Mitigation: the principle is written into the PRD and success criteria; real-agent coverage is bounded by flakiness/time, and the maintainer-flagged skills revisit is tracked as follow-up.
