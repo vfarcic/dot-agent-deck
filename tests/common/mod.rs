@@ -843,13 +843,21 @@ impl TuiDeck {
     /// may render the placeholder) *before* the agent starts, so an
     /// early occurrence must not count — only a terminal state reached
     /// AFTER the working lifecycle does.
-    pub fn wait_for_strings_in_order_then_any(
+    ///
+    /// `timeout` is caller-supplied (rather than the shared
+    /// `WAIT_TIMEOUT`) so a real-agent test can grant a generous
+    /// settling budget for the terminal observation — the working
+    /// lifecycle is fast, but the terminal `Idle`/exit races real-agent
+    /// variance (Design Decision #7: real-agent tests use generous
+    /// timeouts).
+    pub fn wait_for_strings_in_order_then_any_within(
         &self,
         prefix: &[&str],
         terminal_alternatives: &[&str],
+        timeout: Duration,
     ) {
         let start_idx = self.byte_history.lock().unwrap().len();
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         loop {
             let snapshot: Vec<u8> = {
                 let hist = self.byte_history.lock().unwrap();
@@ -871,7 +879,7 @@ impl TuiDeck {
                     let next = prefix[matched];
                     panic!(
                         "did not see prefix needle `{next}` (#{} of {} — already \
-                         matched in order: [{so_far}]) within {WAIT_TIMEOUT:?}.\n\
+                         matched in order: [{so_far}]) within {timeout:?}.\n\
                          Final grid:\n{grid}",
                         matched + 1,
                         prefix.len(),
@@ -882,7 +890,7 @@ impl TuiDeck {
                     panic!(
                         "matched the full prefix [{pfx}] but saw none of the \
                          terminal alternatives [`{alts}`] after it within \
-                         {WAIT_TIMEOUT:?}.\nFinal grid:\n{grid}"
+                         {timeout:?}.\nFinal grid:\n{grid}"
                     );
                 }
             }
