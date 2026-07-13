@@ -1354,6 +1354,19 @@ struct UiState {
     /// PRD #89 M1.2 — monotonic reference the coalescer's `Duration` clock is
     /// measured from (`session_epoch.elapsed()`), set once at construction.
     session_epoch: std::time::Instant,
+    /// PRD #196 — the persisted, global "last command": the most recent command
+    /// the user spawned an INTERACTIVE agent with from the new-pane flow. Read by
+    /// the new-pane form seed (`resolve_seed_command`) when `default_command` is
+    /// empty, and persisted in the saved-session file so it survives a restart.
+    /// `None` on a fresh install / before any interactive spawn (form seeds
+    /// blank). Loaded at startup from [`config::SavedSession::last_command`].
+    last_command: Option<String>,
+    /// PRD #196 — the last-command candidate captured at form-submit time
+    /// (`record_candidate`), committed into `last_command` only on a SUCCESSFUL
+    /// interactive spawn. `None` for authoring-mode / empty-command submits, so
+    /// those never overwrite the recorded value. Always (re)set right before each
+    /// `Action::SpawnPane` dispatch, so a failed spawn never leaks a stale value.
+    pending_last_command: Option<String>,
 }
 
 /// PRD #80 review FIX 4: which click region produced a [`LastClick`]. Multi-
@@ -1483,6 +1496,10 @@ impl UiState {
             last_pane_keystroke_at: None,
             session_coalescer: config::SnapshotCoalescer::new(SNAPSHOT_COALESCE_INTERVAL),
             session_epoch: std::time::Instant::now(),
+            // PRD #196: restored from the persisted session in `run_tui` before
+            // the event loop; defaults to None so a fresh install seeds blank.
+            last_command: None,
+            pending_last_command: None,
             button_rects: Vec::new(),
             tab_close_rects: Vec::new(),
             tab_header_rects: Vec::new(),
@@ -1505,6 +1522,21 @@ impl UiState {
     /// collapses to one or two writes.
     fn mark_session_dirty(&mut self) {
         self.session_coalescer.mark_dirty();
+    }
+
+    /// PRD #196 — commit the candidate captured at form-submit
+    /// (`pending_last_command`) into the global `last_command`. The submit
+    /// door only records a candidate for a plain INTERACTIVE spawn with a
+    /// non-empty command (`None` for authoring-mode / empty-command submits),
+    /// so those never overwrite the recorded value. Must be called ONLY after
+    /// the spawn genuinely succeeds — a plain card was created, or a mode tab
+    /// opened (`open_mode_tab` Ok). It is deliberately NOT called on the
+    /// `open_mode_tab` Err arm, so a failed mode-spawn never pollutes
+    /// `last_command` (the PRD's record-only-on-success rule).
+    fn commit_pending_last_command(&mut self) {
+        if let Some(cmd) = self.pending_last_command.take() {
+            self.last_command = Some(cmd);
+        }
     }
 }
 
@@ -4123,7 +4155,10 @@ fn transition_after_dir_pick(ui: &mut UiState) {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let command = ui.config.default_command.clone();
+            // PRD #196: seed via the fallback chain — explicit `default_command`
+            // (unchanged precedence) → recorded `last_command` → blank.
+            let command =
+                resolve_seed_command(&ui.config.default_command, ui.last_command.as_deref());
             let (modes, orchestrations) = match load_project_config(&dir) {
                 Ok(Some(config)) => (config.modes, config.orchestrations),
                 _ => (vec![], vec![]),
@@ -4145,6 +4180,42 @@ fn transition_after_dir_pick(ui: &mut UiState) {
 
     ui.new_pane_form = Some(form);
     ui.mode = UiMode::NewPaneForm;
+}
+
+/// PRD #196: resolve the new-pane Command-field seed via the fallback chain —
+/// an explicit `default_command` always wins; otherwise the recorded
+/// `last_command` (when present and non-blank); otherwise blank. Pure so the
+/// branch logic is unit-testable without a UI. `default_command` semantics are
+/// UNCHANGED — its emptiness is checked verbatim (no added trimming), so this
+/// only affects the previously-blank case. The `last_command` branch checks
+/// `trim().is_empty()` to MATCH `record_candidate` (which never records a
+/// whitespace-only command): a whitespace-only value can't be recorded today,
+/// so this is defense-in-depth that removes the latent inconsistency.
+fn resolve_seed_command(default_command: &str, last_command: Option<&str>) -> String {
+    if !default_command.is_empty() {
+        default_command.to_string()
+    } else if let Some(last) = last_command.filter(|s| !s.trim().is_empty()) {
+        last.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// PRD #196: decide whether a submitted new-pane command should be recorded as
+/// the global `last_command`. Pure so the decision is unit-testable without a UI.
+/// Records (returns `Some`) for ANY non-empty form-submitted command, regardless
+/// of the selected mode — a plain interactive spawn and an authoring-mode form
+/// (schedule / issue-dispatch) both record, since every pane launched from the
+/// form is the same kind of action. Returns `None` only for an empty/whitespace
+/// command. Orchestration never reaches here (it takes no form-typed command).
+/// The caller commits the returned value into `last_command` only after the
+/// spawn actually succeeds.
+fn record_candidate(command: &str) -> Option<String> {
+    if command.trim().is_empty() {
+        None
+    } else {
+        Some(command.to_string())
+    }
 }
 
 /// PRD #80 M8: build the [`NewPaneRequest`] from the current form values.
@@ -4274,8 +4345,13 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
                 // lives in `build_new_pane_request`, so both this Enter door and
                 // the [Submit] button door apply it identically.
                 let req = build_new_pane_request(form, &default_command);
+                // PRD #196: capture the last-command candidate BEFORE dropping the
+                // form. Any non-empty form-submitted command records (authoring
+                // included); committed into `last_command` only on a successful spawn.
+                let candidate = record_candidate(&req.command);
                 ui.new_pane_form = None;
                 ui.mode = UiMode::Normal;
+                ui.pending_last_command = candidate;
                 return Action::SpawnPane(Box::new(req));
             }
         },
@@ -5332,6 +5408,15 @@ fn dispatch_action(
 
                 // Orchestration path — manage own panes, no agent pane.
                 if let Some(orch_config) = req.orchestration_config {
+                    // PRD #196: an orchestration spawn never records a
+                    // `last_command`; discard any candidate the submit door
+                    // captured so it can't leak into a later interactive
+                    // spawn. The interactive Ok-arm below still records via
+                    // `pending_last_command.take()`. Clearing it HERE makes the
+                    // "no stale orchestration command" invariant LOCAL to this
+                    // branch rather than relying on the doors re-setting it
+                    // before the next dispatch.
+                    ui.pending_last_command = None;
                     // PRD #107 regression fix: do NOT overwrite
                     // `orch_config.name` with the form name. That override
                     // corrupted the orchestration IDENTITY — the canonical
@@ -5639,6 +5724,18 @@ fn dispatch_action(
                                     orchestration: None,
                                 },
                             );
+                            // PRD #196: this is a successful INTERACTIVE spawn
+                            // (the orchestration path has its own branch above).
+                            // DEFER committing the submit candidate into
+                            // `last_command` until the spawn GENUINELY succeeds.
+                            // The plain-card path always creates its pane here, but
+                            // a mode spawn can still fail in `open_mode_tab` below —
+                            // so each genuine-success path calls
+                            // `commit_pending_last_command()`, and the
+                            // `open_mode_tab` Err arm deliberately does NOT, so a
+                            // failed mode-spawn never pollutes `last_command`.
+                            // `pending_last_command` is `None` for authoring-mode /
+                            // empty-command submits, so those never overwrite it.
                             // PRD #89 M1.2 — a new dashboard pane / mode tab is a
                             // meaningful state change; keep the snapshot fresh.
                             ui.mark_session_dirty();
@@ -5705,9 +5802,20 @@ fn dispatch_action(
                                             format!("Activated mode: {mode_name}"),
                                             std::time::Instant::now(),
                                         ));
+                                        // PRD #196: the mode tab genuinely opened —
+                                        // only now commit the submit candidate as
+                                        // the global last-command (the Err arm below
+                                        // must never reach this).
+                                        ui.commit_pending_last_command();
                                     }
                                     Err(e) => {
                                         let _ = pane.close_pane(&new_id);
+                                        // PRD #196: the mode-tab spawn FAILED — do
+                                        // NOT commit the submit candidate, so a
+                                        // failed mode-spawn never pollutes
+                                        // `last_command`. `pending_last_command`
+                                        // stays untouched and is (re)set before the
+                                        // next `Action::SpawnPane`.
                                         ui.status_message = Some((
                                             format!("Mode activation failed: {e}"),
                                             std::time::Instant::now(),
@@ -5760,6 +5868,10 @@ fn dispatch_action(
                                     format!("Created pane {new_id} in {dir_str}"),
                                     std::time::Instant::now(),
                                 ));
+                                // PRD #196: the plain card was genuinely created on
+                                // this path — commit the submit candidate as the
+                                // global last-command.
+                                ui.commit_pending_last_command();
                             }
                         }
                         Err(e) => {
@@ -5931,6 +6043,9 @@ fn dispatch_action(
             if let Some(form) = ui.new_pane_form.take() {
                 ui.mode = UiMode::Normal;
                 let req = build_new_pane_request(&form, &ui.config.default_command);
+                // PRD #196: capture the last-command candidate (None only for an
+                // empty command); committed on a successful spawn below.
+                ui.pending_last_command = record_candidate(&req.command);
                 return dispatch_action(
                     Action::SpawnPane(Box::new(req)),
                     ui,
@@ -6098,14 +6213,20 @@ fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
         return;
     }
     let live_panes = state.blocking_read().managed_pane_ids.clone();
-    let session =
+    let mut session =
         config::SavedSession::snapshot(&mut ui.pane_metadata, &ui.pane_display_names, &live_panes);
+    // PRD #196: overlay the runtime last-command onto the live-pane snapshot so
+    // it persists across restarts (the snapshot builder only knows panes).
+    session.last_command = ui.last_command.clone();
     // PRD #89 review-fix F10: only mark the write as done (clearing the dirty
     // flag via `record_write`) when the persist actually SUCCEEDED. On a
     // transient disk error we leave the coalescer dirty so the next loop
     // iteration retries, rather than dropping the pending snapshot until the
     // next unrelated state change re-dirties it.
-    let result = if session.panes.is_empty() {
+    // PRD #196: keep the file (don't clear) when there are no live panes but a
+    // last_command is set, so closing every pane doesn't discard the recorded
+    // command; clear only when BOTH are empty (today's no-state behavior).
+    let result = if session.panes.is_empty() && session.last_command.is_none() {
         config::SavedSession::clear().map_err(|e| format!("Warning: failed to clear session: {e}"))
     } else {
         session
@@ -6305,6 +6426,21 @@ pub fn run_tui(
     let mut terminal = ratatui::init();
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, keybindings);
+    // PRD #196: restore the persisted global last-command so the new-pane form
+    // can seed from it from the very first spawn of the session. Loaded
+    // UNCONDITIONALLY — independent of the snapshot-restore gate below (which only
+    // applies when daemon hydration produced zero panes) — because the value is
+    // global preference state, not tied to the live pane set. Missing/unreadable
+    // → None (the form then seeds blank); never a hard failure.
+    //
+    // This is a deliberately SEPARATE `load()` from the panes-restore one inside
+    // the `if apply_snapshot` block far below: the two have different gating
+    // (this read is unconditional; the panes restore is gated on hydration
+    // having produced zero panes). Sharing one load would require holding the
+    // whole `SavedSession` across the entire daemon-hydration block and threading
+    // it into the gated branch — entangling the restore path for a negligible
+    // startup disk read. Kept separate on purpose.
+    ui.last_command = config::SavedSession::load().last_command;
     let mut tab_manager = TabManager::new(Arc::clone(&pane));
 
     let mut star_state = config::StarPromptState::load();
@@ -6743,6 +6879,11 @@ pub fn run_tui(
         // default values because no draw() call has happened yet.
         let _ = terminal.autoresize();
 
+        // PRD #196: a SEPARATE `load()` from the unconditional last_command read
+        // near the top of `run_tui`. Different gating: this one is reached only
+        // when the restore gate (`apply_snapshot`) is true, so it can't be folded
+        // into the unconditional read without entangling the gate. Two loads by
+        // design; see the note at the top-of-function read.
         let saved = config::SavedSession::load();
         // Collect deferred mode pane restores — we need the terminal ready
         // before we can resize PTYs, so mode tabs are opened after the loop.
@@ -8633,12 +8774,15 @@ pub fn run_tui(
     {
         let live_panes = state.blocking_read().managed_pane_ids.clone();
 
-        let session = config::SavedSession::snapshot(
+        let mut session = config::SavedSession::snapshot(
             &mut ui.pane_metadata,
             &ui.pane_display_names,
             &live_panes,
         );
-        if session.panes.is_empty() {
+        // PRD #196: persist the global last-command alongside the panes so it
+        // survives a clean exit/restart; keep the file when only it is set.
+        session.last_command = ui.last_command.clone();
+        if session.panes.is_empty() && session.last_command.is_none() {
             if let Err(e) = config::SavedSession::clear() {
                 ui.session_warnings
                     .push(format!("Warning: failed to clear session: {e}"));
@@ -12901,6 +13045,65 @@ mod tests {
 
     fn default_ui() -> UiState {
         UiState::default()
+    }
+
+    /// PRD #196: the new-pane Command-field seed resolver honors the fallback
+    /// chain — an explicit `default_command` always wins; otherwise the recorded
+    /// `last_command` (when present and non-blank); otherwise blank. Also pins
+    /// that an empty/whitespace-only/`None` last command falls through to blank
+    /// (the whitespace case aligns with `record_candidate`'s `trim()` check).
+    #[test]
+    fn resolve_seed_command_fallback_chain() {
+        // (1) default_command set → wins regardless of last_command.
+        assert_eq!(
+            resolve_seed_command("opencode", Some("claude")),
+            "opencode",
+            "an explicit default_command must win over the recorded last command"
+        );
+        assert_eq!(resolve_seed_command("opencode", None), "opencode");
+
+        // (2) default_command empty + last present → seed from last.
+        assert_eq!(
+            resolve_seed_command("", Some("claude")),
+            "claude",
+            "an empty default_command must fall back to the recorded last command"
+        );
+
+        // (3) default_command empty + no/empty/whitespace last → blank.
+        assert_eq!(resolve_seed_command("", None), "");
+        assert_eq!(
+            resolve_seed_command("", Some("")),
+            "",
+            "an empty recorded last command must fall through to blank"
+        );
+        assert_eq!(
+            resolve_seed_command("", Some("   ")),
+            "",
+            "a whitespace-only recorded last command must fall through to blank \
+             (aligned with record_candidate's trim().is_empty() check)"
+        );
+    }
+
+    /// PRD #196: the record decision fires for ANY non-empty form-submitted
+    /// command regardless of mode — a plain interactive spawn AND an authoring-mode
+    /// form (schedule / issue-dispatch) both record — and only an empty/whitespace
+    /// command records nothing.
+    #[test]
+    fn record_candidate_records_any_nonempty_command() {
+        // Interactive + non-empty → records the command verbatim.
+        assert_eq!(record_candidate("cat"), Some("cat".to_string()));
+        assert_eq!(
+            record_candidate("devbox run agent-new"),
+            Some("devbox run agent-new".to_string())
+        );
+
+        // Authoring-mode form now records too (the exclusion was dropped): every
+        // pane launched from the form is the same kind of action.
+        assert_eq!(record_candidate("claude"), Some("claude".to_string()));
+
+        // Empty / whitespace-only command → records nothing.
+        assert_eq!(record_candidate(""), None);
+        assert_eq!(record_candidate("   "), None);
     }
 
     // PRD #76 M2.15: pin the layout-math helpers so a future change to the
@@ -20187,6 +20390,189 @@ mod tests {
             pc.focused.lock().unwrap().last().map(String::as_str),
             Some(new_card.as_str()),
             "the new card's pane must be focused after the spawn"
+        );
+    }
+
+    /// Pane controller that hands out unique ids but FAILS every `create_pane`
+    /// after the first. The first (successful) call backs the interactive AGENT
+    /// pane created by the `Action::SpawnPane` handler; the second call — the
+    /// mode side pane created inside `TabManager::open_mode_tab` →
+    /// `ModeManager::activate_mode` — returns `Err`, so `open_mode_tab` fails
+    /// and the handler takes its Err arm. This lets an in-process test drive the
+    /// failed-mode-spawn path without a real daemon/PTY.
+    struct FailSidePanePC {
+        calls: std::sync::Mutex<u32>,
+    }
+    impl FailSidePanePC {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+    }
+    impl crate::pane::PaneController for FailSidePanePC {
+        fn create_pane(
+            &self,
+            _cmd: Option<&str>,
+            _cwd: Option<&str>,
+        ) -> Result<String, crate::pane::PaneError> {
+            let mut n = self.calls.lock().unwrap();
+            let idx = *n;
+            *n += 1;
+            if idx == 0 {
+                Ok(format!("mock-pane-{idx}"))
+            } else {
+                Err(crate::pane::PaneError::CommandFailed(
+                    "side pane spawn failed".to_string(),
+                ))
+            }
+        }
+        fn write_to_pane(&self, _id: &str, _text: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn rename_pane(
+            &self,
+            _id: &str,
+            name: &str,
+        ) -> Result<crate::pane::RenameOutcome, crate::pane::PaneError> {
+            Ok(crate::pane::RenameOutcome::applied(name))
+        }
+        fn focus_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "fail-side-pane-mock"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn mode_card_request(dir: &str, command: &str, mode: ModeConfig) -> NewPaneRequest {
+        NewPaneRequest {
+            dir: std::path::PathBuf::from(dir),
+            name: "card".to_string(),
+            command: command.to_string(),
+            mode_config: Some(mode),
+            orchestration_config: None,
+            seed_prompt: None,
+        }
+    }
+
+    /// PRD #196 (Greptile P1 regression): a mode spawn whose `open_mode_tab`
+    /// FAILS must NOT persist the submit candidate into the global
+    /// `last_command`. Seed `pending_last_command`, dispatch a mode
+    /// `Action::SpawnPane` through the real handler against a controller that
+    /// fails the side-pane creation, and assert `last_command` is still `None`
+    /// afterward (record-only-on-success). Guards against the earlier bug where
+    /// the commit fired unconditionally before `open_mode_tab` was attempted.
+    #[test]
+    fn spawn_failed_mode_does_not_persist_last_command() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(FailSidePanePC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        // The submit door records the candidate right before dispatch.
+        ui.pending_last_command = Some("claude --model haiku".to_string());
+        assert_eq!(ui.last_command, None, "precondition: nothing recorded yet");
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(mode_card_request(
+                "/work/mode-card",
+                "claude --model haiku",
+                mode_config_local("m", 1),
+            ))),
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            None,
+            Rect::new(0, 0, 80, 24),
+        );
+
+        // The mode-tab creation failed, so the handler must have taken the Err
+        // arm (status reflects it) and must NOT have committed the candidate.
+        assert!(
+            ui.status_message
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("Mode activation failed")),
+            "precondition: the mode spawn actually failed (Err arm), got {:?}",
+            ui.status_message.as_ref().map(|(m, _)| m)
+        );
+        assert_eq!(
+            ui.last_command, None,
+            "a FAILED mode-spawn must not persist last_command"
+        );
+    }
+
+    /// PRD #196 companion: a mode spawn whose `open_mode_tab` SUCCEEDS DOES
+    /// commit the submit candidate into `last_command`. Locks the other
+    /// direction of the success-only rule so the Err-arm guard above can't be
+    /// satisfied by simply never committing on the mode path.
+    #[test]
+    fn spawn_successful_mode_persists_last_command() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        ui.pending_last_command = Some("claude --model haiku".to_string());
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(mode_card_request(
+                "/work/mode-card",
+                "claude --model haiku",
+                mode_config_local("m", 1),
+            ))),
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+            None,
+            Rect::new(0, 0, 80, 24),
+        );
+
+        assert_eq!(
+            ui.last_command.as_deref(),
+            Some("claude --model haiku"),
+            "a SUCCESSFUL mode-spawn must persist last_command"
         );
     }
 

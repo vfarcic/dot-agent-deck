@@ -404,6 +404,15 @@ pub struct OrchestrationSnapshot {
 pub struct SavedSession {
     #[serde(default)]
     pub panes: Vec<SavedPane>,
+    /// PRD #196: the global "last command" — the most recent command the user
+    /// spawned an INTERACTIVE agent with from the new-pane flow. Read back as the
+    /// new-pane Command-field seed when `default_command` is empty (the fallback
+    /// chain default → last → blank). `Option` + `#[serde(default)]` so an old
+    /// `session.toml` written before this field existed loads as `None` (PRD:
+    /// treat missing/unreadable as empty, never a hard failure). Authoring-mode
+    /// fallback spawns (schedule / issue-dispatch) are excluded from recording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_command: Option<String>,
 }
 
 impl SavedSession {
@@ -519,6 +528,10 @@ impl SavedSession {
                 .into_iter()
                 .filter_map(|id| pane_metadata.get(id).cloned())
                 .collect(),
+            // PRD #196: the snapshot is built from live panes only; the caller
+            // overlays the runtime `last_command` before persisting (it is global
+            // state, not derived from the pane list).
+            last_command: None,
         }
     }
 }
@@ -1418,6 +1431,7 @@ on_idle = true
                     orchestration: None,
                 },
             ],
+            last_command: None,
         };
         let toml_str = toml::to_string_pretty(&session).unwrap();
         let loaded: SavedSession = toml::from_str(&toml_str).unwrap();
@@ -1426,6 +1440,38 @@ on_idle = true
         assert_eq!(loaded.panes[0].name, "api");
         assert_eq!(loaded.panes[0].command, "claude");
         assert_eq!(loaded.panes[1].command, "");
+    }
+
+    /// PRD #196: the global `last_command` round-trips through serialize →
+    /// deserialize, AND a session TOML written before the field existed (no
+    /// `last_command` key) loads as `None` rather than failing — the
+    /// `#[serde(default)]` forward-compat guarantee the form-seed fallback relies
+    /// on (missing/unreadable → empty, never a hard failure).
+    #[test]
+    fn saved_session_last_command_round_trip_and_missing_key() {
+        // (a) A set last_command round-trips intact.
+        let session = SavedSession {
+            panes: Vec::new(),
+            last_command: Some("claude".to_string()),
+        };
+        let toml_str = toml::to_string_pretty(&session).unwrap();
+        let loaded: SavedSession = toml::from_str(&toml_str).unwrap();
+        assert_eq!(loaded.last_command.as_deref(), Some("claude"));
+
+        // (b) A legacy session.toml predating the field still parses, with
+        // last_command == None (the #[serde(default)] guarantee).
+        let legacy = r#"
+[[panes]]
+dir = "/repo/legacy"
+name = "old-pane"
+command = "vim"
+"#;
+        let legacy_loaded: SavedSession = toml::from_str(legacy).unwrap();
+        assert_eq!(legacy_loaded.panes.len(), 1);
+        assert!(
+            legacy_loaded.last_command.is_none(),
+            "a session.toml with no last_command key must load as None"
+        );
     }
 
     /// Scenario: Build a `SavedSession` whose single pane carries an
@@ -1461,6 +1507,7 @@ on_idle = true
                     display_title: Some("My TDD Run".to_string()),
                 }),
             }],
+            last_command: None,
         };
 
         let toml_str = toml::to_string_pretty(&session).unwrap();
@@ -1538,6 +1585,7 @@ command = "vim"
                 mode: None,
                 orchestration: None,
             }],
+            last_command: None,
         };
         session.save().unwrap();
         let loaded = SavedSession::load();
