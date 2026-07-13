@@ -12012,29 +12012,7 @@ fn render_session_card(
     density: CardDensity,
     idle_art: Option<&IdleArtEntry>,
 ) {
-    // PRD #201 M5.1: gate the Pi first-class IDENTITY behind the experimental
-    // flag at this single render seam (CLAUDE.md rule 9). With the flag OFF a
-    // Pi pane's identity is suppressed — the card falls back to the
-    // `AgentType::None` label/placeholder (title reads "No agent · <id>",
-    // placeholder border), exactly the unrecognized-agent baseline a
-    // `command = "pi"` pane showed before this PRD; ON, it shows `Pi · <id>`.
-    // Only the Pi IDENTITY is gated: the GENERIC status dot (`flash_dot` below,
-    // driven by `session.status`) is ungated and still renders, because status
-    // flows through the daemon/hook/`agent-event` path that rule 9 keeps
-    // flag-independent — so an OFF Pi card can differ from a bare `None`
-    // placeholder in that generic dot alone, which every pane shows and which
-    // carries no Pi-specific branding. This is a PRESENTATION switch only —
-    // `session.agent_type` is never mutated, so `from_command`, the daemon
-    // protocol, hooks, the extension, and agent-event routing are untouched,
-    // and gating never hides the pane.
-    // `grep show_pi_agent` finds this gate for the graduate-pi-agent cleanup.
-    let effective_agent =
-        if session.agent_type == crate::event::AgentType::Pi && !crate::features::show_pi_agent() {
-            crate::event::AgentType::None
-        } else {
-            session.agent_type.clone()
-        };
-    let is_placeholder = effective_agent == crate::event::AgentType::None;
+    let is_placeholder = session.agent_type == crate::event::AgentType::None;
     let (status_label, status_style) = if is_placeholder {
         ("No agent", text_primary())
     } else {
@@ -12058,7 +12036,7 @@ fn render_session_card(
     } else {
         format!(
             " {sel_prefix}{num_prefix}{} · {} ",
-            effective_agent, id_display
+            session.agent_type, id_display
         )
     };
 

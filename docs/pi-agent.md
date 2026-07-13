@@ -7,7 +7,7 @@ title: Pi Agent
 
 [Pi](https://github.com/earendil-works/pi) is a third, first-class agent alongside `claude` and `opencode`. Unlike those two — which `dot-agent-deck` observes from the outside — Pi exposes a TypeScript extension API, so `dot-agent-deck` ships a small extension that gives the Pi pane **native `delegate`/`work-done` tools** and **event-driven status**. The result is a more deterministic orchestrator: instead of relying on an agent remembering to type a CLI command, the Pi orchestrator calls a validated tool whose body runs that command for it.
 
-Pi is **detected on your PATH** like the other agents — `dot-agent-deck` does not bundle or vendor Pi (only the small extension is compiled into the binary). Pi is **opt-in behind the [`experimental` flag](#enable-the-experimental-flag)** until it graduates.
+Pi is **detected on your PATH** like the other agents — `dot-agent-deck` does not bundle or vendor Pi (only the small extension is compiled into the binary). Using it is opt-in only in the sense that you must install `pi` and point a role at `command = "pi"`; there is no feature flag to enable.
 
 > **Tested against Pi 0.80.6.** Pi is a young, fast-moving project. This integration is pinned to and tested against **Pi 0.80.6**; newer versions may change the extension API.
 
@@ -44,25 +44,6 @@ command = "pi --provider openrouter --model openai/gpt-5-nano"
 ```
 
 See [Orchestration](orchestration.md) for the full role/config shape. Everything else about running an orchestration is unchanged — only the orchestrator pane is now Pi.
-
-## Enable the experimental flag
-
-The Pi surface is gated behind the `experimental` flag and is **off by default**. Turn it on in either of two ways (the environment variable wins over the file):
-
-**Config file** — add to the `.dot-agent-deck.toml` where you launch the deck:
-
-```toml
-[features]
-experimental = true
-```
-
-**Environment variable:**
-
-```bash
-DOT_AGENT_DECK_EXPERIMENTAL=1 dot-agent-deck
-```
-
-With the flag off, a `pi` pane still runs and functions, but its Pi-specific status identity is not shown (it renders like a generic pane). Turning the flag on surfaces the Pi identity and status affordances.
 
 ## Security and sandboxing
 
