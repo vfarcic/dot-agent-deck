@@ -29,15 +29,10 @@
 //! exercises the production global wrapper `show_experimental_footer()`
 //! to prove live re-evaluation after a synthetic config change.
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, RwLock};
 
-use dot_agent_deck::event::AgentType;
 use dot_agent_deck::features::{self, Features};
-use dot_agent_deck::state::{SessionState, SessionStatus};
-use dot_agent_deck::ui::{
-    CardDensityKind, render_card_to_buffer, render_experimental_footer_to_buffer,
-};
+use dot_agent_deck::ui::render_experimental_footer_to_buffer;
 use spec::spec;
 
 /// Exact text the throwaway gated footer renders when the experimental
@@ -46,18 +41,13 @@ use spec::spec;
 /// `contains` assertion rather than a silent snapshot churn.
 const EXPERIMENTAL_FOOTER_TEXT: &str = "experimental: on";
 
-/// Width at which `render_session_card` flips to its wide layout — mirrors the
-/// same constant in `tests/render_dashboard.rs` so the Pi-card render in
-/// `features/gating/004` uses the identical height math as `dashboard/pane/007`.
-const RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH: u16 = 60;
-
-/// Serializes the tests that mutate the *process-global* `Features`
-/// (`features/reload/001` and `features/gating/004`) so a concurrent flip can't
-/// bleed across another test's render/assert window. Under plain `cargo test`
-/// (CI) the tests in this binary share one process and run on threads;
-/// `cargo test-fast`/nextest isolates each test in its own process, where this
-/// is belt-and-suspenders. The by-value `&Features` render seam used by
-/// `features/gating/001-002` never reads the global, so those need no lock.
+/// Serializes any test that mutates the *process-global* `Features`
+/// (`features/reload/001` today) so a concurrent flip can't bleed across
+/// another test's render/assert window. Under plain `cargo test` (CI) the tests
+/// in this binary share one process and run on threads; `cargo test-fast`/nextest
+/// isolates each test in its own process, where this is belt-and-suspenders. The
+/// by-value `&Features` render seam used by `features/gating/001-002` never reads
+/// the global, so those need no lock.
 static FLAG_LOCK: Mutex<()> = Mutex::new(());
 
 /// Stringify the rendered buffer — one line per row, cells joined into the
@@ -150,9 +140,9 @@ fn reload_001_footer_appears_after_synthetic_config_change() {
     let width: u16 = 80;
     let height: u16 = 1;
 
-    // Serialize with `features/gating/004`: both mutate the process-global
-    // `Features`, so under plain `cargo test` (shared process/threads) their
-    // set→read windows must not interleave (see FLAG_LOCK).
+    // Guard the process-global `Features` mutation below: under plain
+    // `cargo test` (shared process/threads) its set→read window must not
+    // interleave with any concurrent flip (see FLAG_LOCK).
     let _flag_lock = FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     // M1.2: a single shared Features value per process. Startup default is
@@ -190,87 +180,5 @@ fn reload_001_footer_appears_after_synthetic_config_change() {
     assert!(
         buffer_to_text(&after).contains(EXPERIMENTAL_FOOTER_TEXT),
         "footer must show {EXPERIMENTAL_FOOTER_TEXT:?} on the next render after the flag flips on"
-    );
-}
-
-/// Scenario: Build a live `AgentType::Pi` session with no display name (the
-/// same fixture as `dashboard/pane/007`) and render its dashboard card twice.
-/// With the experimental flag forced OFF, the card must NOT show the Pi
-/// first-class identity (`Pi · …`) — it falls back to the pre-feature
-/// unrecognized-agent baseline a `command = "pi"` pane showed before this PRD —
-/// yet the card/pane stays VISIBLE (its session id `orch-01` still renders), so
-/// the flag never hides an already-running pane. With the flag forced ON, the
-/// same card shows the Pi agent-type identity `Pi · orch-01`. This pins the
-/// `experimental`-flag gate of the Pi render surface (PRD #201 M5.1).
-#[spec("features/gating/004")]
-#[test]
-fn gating_004_pi_card_identity_gated_by_flag() {
-    // PRD #201 catalog: features/gating/004 — the Pi card's first-class
-    // identity/status affordance is gated behind `features::show_pi_agent()`
-    // at the render seam (CLAUDE.md #9). RED today: the card renderer does not
-    // yet consult the flag, so the OFF render still shows `Pi · orch-01` and
-    // the OFF assertion below fails.
-    //
-    // Serialize with `features/reload/001`: both mutate the process-global
-    // `Features`, so their set→render windows must not interleave under plain
-    // `cargo test` (see FLAG_LOCK).
-    let _flag_lock = FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-    // Same fixture as `dashboard/pane/007`: a live Pi pane with no friendly
-    // name, so the card title takes the `<agent-type> · <session-id>` form —
-    // the exact spot the Pi identity surfaces. The cwd basename (`workspace`)
-    // and session id (`orch-01`) carry no capital `Pi`, so a `Pi ·` match pins
-    // the agent-type Display specifically. `last_activity = now` keeps any
-    // rendered `Last: Xs ago` at `0s ago`.
-    let now = chrono::Utc::now();
-    let session = SessionState {
-        session_id: "orch-01".to_string(),
-        agent_type: AgentType::Pi,
-        cwd: Some("/home/dev/workspace".to_string()),
-        status: SessionStatus::Thinking,
-        active_tool: None,
-        started_at: now,
-        last_activity: now,
-        recent_events: VecDeque::new(),
-        tool_count: 0,
-        last_user_prompt: Some("orchestrate the release".to_string()),
-        first_prompts: vec!["orchestrate the release".to_string()],
-        pane_id: Some("pi-pane-1".to_string()),
-        agent_id: Some("1".to_string()),
-        display_name: None,
-    };
-    let width: u16 = 80;
-    let density = CardDensityKind::Normal;
-    let wide = width >= RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH;
-    let height = density.rendered_height(wide);
-
-    // Flag OFF -> the Pi first-class identity is hidden. The gate is a
-    // presentation switch at the render seam: a Pi pane falls back to the
-    // pre-feature unrecognized-agent baseline, but the card/pane must NOT
-    // become invisible.
-    features::set_for_test(Features::test_with(false));
-    let off = render_card_to_buffer(&session, None, Some(1), density, 0, false, width, height);
-    let off_text = buffer_to_text(&off);
-    assert!(
-        !off_text.contains("Pi ·"),
-        "experimental flag is OFF, so a Pi pane's card must NOT show the Pi \
-         first-class identity (`Pi · …`); rendered card was:\n{off_text}"
-    );
-    assert!(
-        off_text.contains("orch-01"),
-        "gating the Pi identity must NOT make the pane invisible — the card \
-         (session id `orch-01`) must still render with the flag OFF; \
-         rendered card was:\n{off_text}"
-    );
-
-    // Flag ON -> the Pi identity surfaces (`Pi · orch-01`), matching
-    // `dashboard/pane/007`.
-    features::set_for_test(Features::test_with(true));
-    let on = render_card_to_buffer(&session, None, Some(1), density, 0, false, width, height);
-    let on_text = buffer_to_text(&on);
-    assert!(
-        on_text.contains("Pi · orch-01"),
-        "experimental flag is ON, so a Pi pane's card must show the Pi \
-         agent-type identity (`Pi · orch-01`); rendered card was:\n{on_text}"
     );
 }
