@@ -4,13 +4,16 @@
 //!
 //! Thin real-binary spawn test (no PTY, no daemon, no LLM). It runs the real
 //! `dot-agent-deck orchestrator setup` subprocess against a per-call temp HOME
-//! and a fully-controlled PATH, so it deterministically exercises BOTH branches
+//! and a fully-controlled PATH, so it deterministically exercises every branch
 //! end to end through the actual clap wiring — which the pure-core unit tests in
 //! `src/orchestrator_ext.rs` (test-plan rows 11-12) cannot reach:
 //!
 //!   - `pi` ABSENT (PATH has no `pi`)   → non-zero exit + the exact install hint.
 //!   - `pi` PRESENT (a fake `pi` file on PATH) → exit 0 + the bundled extension
 //!     materialized into `$HOME/.pi/agent/extensions/dot-agent-deck/`.
+//!   - HOME UNSET / EMPTY (even with `pi` present) → non-zero exit + an error
+//!     naming HOME, and NO materialization (Greptile P1: the explicit path must
+//!     refuse rather than guess a `/tmp`/`./` location Pi never discovers).
 //!
 //! A *fake* `pi` (an empty but executable file named `pi` on PATH) keeps the
 //! present-branch hermetic and deterministic whether or not real Pi is installed
@@ -39,11 +42,21 @@ const PI_INSTALL_HINT: &str = "npm install -g @earendil-works/pi-coding-agent";
 /// `~/.pi` nor the developer's real PATH leaks in. Returns the captured output
 /// plus combined stdout+stderr text for assertions.
 fn run_setup(home: &Path, path_dirs: &[&Path]) -> (Output, String) {
+    run_setup_home(Some(home.as_os_str()), path_dirs)
+}
+
+/// Like [`run_setup`] but with explicit control over the child's `HOME`:
+/// `Some(value)` sets it (a real dir, or an empty string to exercise the
+/// empty-HOME refusal), `None` leaves it entirely UNSET after `env_clear`. The
+/// rest of the environment stays scrubbed so only HOME/PATH vary.
+fn run_setup_home(home: Option<&std::ffi::OsStr>, path_dirs: &[&Path]) -> (Output, String) {
     let path = std::env::join_paths(path_dirs).expect("join PATH dirs");
     let mut cmd = Command::new(bin());
     cmd.args(["orchestrator", "setup"]);
     cmd.env_clear();
-    cmd.env("HOME", home);
+    if let Some(home) = home {
+        cmd.env("HOME", home);
+    }
     cmd.env("PATH", path);
     cmd.env("TERM", "xterm-256color");
     cmd.stdin(Stdio::null());
@@ -137,5 +150,73 @@ fn orchestrator_setup_pi_present_materializes_and_succeeds() {
     assert!(
         text.contains("index.ts"),
         "success message should name what it wrote.\noutput:\n{text}"
+    );
+}
+
+/// Scenario: run the real `orchestrator setup` with a fake (present) `pi` on
+/// PATH but HOME entirely UNSET. It must REFUSE — exit non-zero with an error
+/// naming HOME — instead of guessing a `/tmp` location and falsely reporting
+/// success (Greptile P1). The present `pi` proves the ONLY reason to fail is the
+/// unset HOME, and the absence of the "Enabled" banner and the install hint
+/// confirms it neither materialized nor took the pi-absent branch.
+#[test]
+fn orchestrator_setup_home_unset_errors_without_materializing() {
+    // A fake *present* `pi`, so the only reason to fail is the unset HOME.
+    let bin_dir = tempfile::tempdir().unwrap();
+    let pi = bin_dir.path().join("pi");
+    std::fs::write(&pi, b"").unwrap();
+    make_executable(&pi);
+
+    let (out, text) = run_setup_home(None, &[bin_dir.path()]);
+
+    assert!(
+        !out.status.success(),
+        "unset HOME must exit non-zero, got {:?}.\noutput:\n{text}",
+        out.status.code()
+    );
+    assert!(
+        text.contains("HOME"),
+        "error must name HOME.\noutput:\n{text}"
+    );
+    assert!(
+        !text.contains("Enabled"),
+        "unset HOME must NOT report setup success.\noutput:\n{text}"
+    );
+    assert!(
+        !text.lines().any(|l| l == PI_INSTALL_HINT),
+        "unset HOME errors BEFORE the pi-presence check, so no install hint.\noutput:\n{text}"
+    );
+}
+
+/// Scenario: run the real `orchestrator setup` with a fake (present) `pi` on
+/// PATH but HOME set to the EMPTY string. Like the unset case it must refuse —
+/// exit non-zero naming HOME — never resolving to a relative `./.pi/...` base
+/// and never reporting success.
+#[test]
+fn orchestrator_setup_home_empty_errors_without_materializing() {
+    let bin_dir = tempfile::tempdir().unwrap();
+    let pi = bin_dir.path().join("pi");
+    std::fs::write(&pi, b"").unwrap();
+    make_executable(&pi);
+
+    let (out, text) = run_setup_home(Some(std::ffi::OsStr::new("")), &[bin_dir.path()]);
+
+    assert!(
+        !out.status.success(),
+        "empty HOME must exit non-zero, got {:?}.\noutput:\n{text}",
+        out.status.code()
+    );
+    assert!(
+        text.contains("HOME"),
+        "error must name HOME.\noutput:\n{text}"
+    );
+    assert!(
+        !text.contains("Enabled"),
+        "empty HOME must NOT report setup success.\noutput:\n{text}"
+    );
+    // A relative `.pi/...` base must never be created in the CWD.
+    assert!(
+        !Path::new(".pi/agent/extensions/dot-agent-deck").exists(),
+        "empty HOME must NOT materialize into a relative ./.pi base"
     );
 }

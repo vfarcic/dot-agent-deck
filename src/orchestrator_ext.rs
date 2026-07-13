@@ -45,8 +45,15 @@ pub const EXTENSION_FILES: &[(&str, &str)] = &[
     ),
 ];
 
-fn home_dir() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+/// Strict HOME resolver for the EXPLICIT `orchestrator setup` path: the process
+/// `HOME`, or `None` when it is unset OR empty. Unlike a lenient resolver it has
+/// NO `/tmp` (unset) or relative `./` (empty) fallback — an explicit user
+/// command must not silently materialize into a bogus location Pi will never
+/// discover, so the CLI errors instead. This mirrors the auto path's refusal to
+/// guess (see [`resolve_home_from_env`]); the two share the pure
+/// [`resolve_home_inner`] core.
+fn home_dir_strict() -> Option<PathBuf> {
+    resolve_home_inner(&[], std::env::var("HOME").ok().as_deref())
 }
 
 /// Build the extension target dir under a given HOME:
@@ -63,12 +70,15 @@ pub fn extension_dir_under(home: &Path) -> PathBuf {
 
 /// The global Pi extensions dir the bundled extension is materialized into:
 /// `~/.pi/agent/extensions/dot-agent-deck`. This is Pi's global auto-discovery
-/// location, so anything written here is loaded by every `pi` session. Uses
-/// [`home_dir`] (with its `/tmp` fallback) because this backs the EXPLICIT
-/// `orchestrator setup` path; the auto path deliberately avoids that fallback
-/// (see [`auto_materialize`]).
-pub fn default_extension_dir() -> PathBuf {
-    extension_dir_under(&home_dir())
+/// location, so anything written here is loaded by every `pi` session.
+///
+/// Returns `None` when HOME is unset OR empty: this backs the EXPLICIT
+/// `orchestrator setup` path, which must NOT guess a `/tmp` (unset) or relative
+/// `./` (empty) location Pi will never load — the CLI errors instead. That
+/// matches the auto path's HOME-unset SKIP (see [`auto_materialize`]); both
+/// refuse to guess.
+pub fn default_extension_dir() -> Option<PathBuf> {
+    home_dir_strict().map(|home| extension_dir_under(&home))
 }
 
 /// Materialize the bundled extension into `target_dir` in the layout Pi
@@ -122,9 +132,8 @@ fn resolve_home_inner(env: &[(String, String)], process_home: Option<&str>) -> O
 }
 
 /// Resolve the HOME the spawned pi child will use (env overlay → process
-/// `HOME`), or `None` when HOME is unset/empty. HOME-unset-safe: it has NO
-/// `/tmp` fallback (that is [`home_dir`]'s behavior, reserved for the explicit
-/// CLI path).
+/// `HOME`), or `None` when HOME is unset/empty. HOME-unset-safe: like the
+/// explicit CLI path's [`home_dir_strict`], it has NO `/tmp` fallback.
 fn resolve_home_from_env(env: &[(String, String)]) -> Option<PathBuf> {
     resolve_home_inner(env, std::env::var("HOME").ok().as_deref())
 }
@@ -574,9 +583,35 @@ mod tests {
     #[test]
     fn default_extension_dir_is_pi_global_layout() {
         // Pin the real target path shape without touching the real HOME's files.
-        let dir = default_extension_dir();
+        // With HOME set (the normal test env) the strict resolver yields the Pi
+        // global layout; if HOME were unset it would refuse (`None`), which the
+        // dedicated refusal test below covers.
+        let Some(dir) = default_extension_dir() else {
+            return;
+        };
         assert!(dir.ends_with("dot-agent-deck"));
         assert!(dir.to_string_lossy().contains(".pi/agent/extensions"));
+    }
+
+    /// The EXPLICIT setup path's HOME resolution refuses (yields no target dir)
+    /// when HOME is unset OR empty — it never guesses a `/tmp` (unset) or
+    /// relative `./` (empty) location Pi would never load. Exercised through the
+    /// shared pure [`resolve_home_inner`] core (which `home_dir_strict` calls
+    /// with the process `HOME`) so it needs no process-global env mutation. With
+    /// no target dir resolved, [`materialize`] is never reached and nothing is
+    /// written; the CLI turns this `None` into a non-zero error naming HOME (see
+    /// `src/main.rs`).
+    #[test]
+    fn explicit_setup_home_resolution_refuses_on_unset_or_empty() {
+        // Unset HOME → None (NO `/tmp` fallback for the explicit path).
+        assert_eq!(resolve_home_inner(&[], None), None);
+        // Empty HOME → None (NO relative `./` base).
+        assert_eq!(resolve_home_inner(&[], Some("")), None);
+        // Set HOME → the extension dir under it (the materialize target).
+        assert_eq!(
+            resolve_home_inner(&[], Some("/home/alice")).map(|h| extension_dir_under(&h)),
+            Some(extension_dir_under(Path::new("/home/alice")))
+        );
     }
 
     #[test]

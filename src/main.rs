@@ -761,23 +761,39 @@ fn main() -> ExitCode {
             // `run_setup` core, then render its report to stdout/stderr + exit.
             OrchestratorCmd::Setup => {
                 use dot_agent_deck::orchestrator_ext;
-                let target_dir = orchestrator_ext::default_extension_dir();
-                let pi_present = orchestrator_ext::pi_on_path();
-                match orchestrator_ext::run_setup(pi_present, &target_dir) {
-                    Ok(report) if report.success => {
-                        println!("{}", report.message);
-                        ExitCode::SUCCESS
-                    }
-                    Ok(report) => {
-                        eprintln!("{}", report.message);
-                        ExitCode::FAILURE
-                    }
-                    Err(e) => {
+                // HOME-unset-safe (matching the auto-materialize path): the
+                // strict resolver yields `None` when HOME is unset OR empty.
+                // Because this is an EXPLICIT user command it ERRORS (non-zero)
+                // rather than silently guessing a `/tmp`/`./` location Pi will
+                // never discover — do NOT materialize, do NOT report success.
+                match orchestrator_ext::default_extension_dir() {
+                    None => {
                         eprintln!(
-                            "orchestrator setup: failed to materialize the Pi extension into {}: {e}",
-                            target_dir.display()
+                            "orchestrator setup: HOME is not set — cannot locate Pi's extension \
+                             directory (~/.pi/agent/extensions/dot-agent-deck). Set HOME and \
+                             re-run `dot-agent-deck orchestrator setup`."
                         );
                         ExitCode::FAILURE
+                    }
+                    Some(target_dir) => {
+                        let pi_present = orchestrator_ext::pi_on_path();
+                        match orchestrator_ext::run_setup(pi_present, &target_dir) {
+                            Ok(report) if report.success => {
+                                println!("{}", report.message);
+                                ExitCode::SUCCESS
+                            }
+                            Ok(report) => {
+                                eprintln!("{}", report.message);
+                                ExitCode::FAILURE
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "orchestrator setup: failed to materialize the Pi extension into {}: {e}",
+                                    target_dir.display()
+                                );
+                                ExitCode::FAILURE
+                            }
+                        }
                     }
                 }
             }
