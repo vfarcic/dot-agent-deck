@@ -87,7 +87,6 @@ pub struct TuiDeckBuilder {
     credential_imports: Vec<CredentialImport>,
     keybindings_toml: Option<String>,
     claude_trust_paths: Vec<String>,
-    materialize_pi_extension: bool,
 }
 
 impl TuiDeckBuilder {
@@ -175,20 +174,12 @@ impl TuiDeckBuilder {
         self
     }
 
-    /// Materialize the bundled Pi orchestrator extension into the per-test HOME
-    /// (`$HOME/.pi/agent/extensions/dot-agent-deck/`) at launch, BEFORE the deck
-    /// (and the daemon + any agent it spawns) starts — so a Pi pane that boots
-    /// during startup restore finds the extension already on disk and loads it
-    /// (Pi discovers `<extensions>/<name>/index.ts` at boot; a copy landing a
-    /// beat later would be missed). The daemon inherits this HOME, so the pi
-    /// child it spawns auto-discovers the same extension — the daemon-side
-    /// equivalent of the headless `orchestrator_ext::materialize` call in
-    /// `e2e_pi_orchestrator.rs`. Used by the PTY-attached live-Pi e2e
-    /// (`pi/live/001`).
-    pub fn with_pi_extension(mut self) -> Self {
-        self.materialize_pi_extension = true;
-        self
-    }
+    // NOTE (PRD #201): a `with_pi_extension()` builder that pre-staged the
+    // bundled Pi extension into the per-test HOME was removed. The deck now
+    // AUTO-materializes the extension at spawn time (the `spawn_agent` seam
+    // detects the `pi` command and writes it into the HOME the pi child
+    // inherits, before pi boots), so the pi e2es exercise that production flow
+    // directly instead of a hand-staged shortcut.
 
     /// Stage a `keybindings.toml` in the per-test HOME's config dir
     /// (`$HOME/.config/dot-agent-deck/keybindings.toml`, mirroring the
@@ -278,7 +269,6 @@ impl TuiDeck {
             credential_imports: Vec::new(),
             keybindings_toml: None,
             claude_trust_paths: Vec::new(),
-            materialize_pi_extension: false,
         }
     }
 
@@ -336,21 +326,12 @@ impl TuiDeck {
         let home = work.join("home");
         std::fs::create_dir_all(&home).expect("create per-test HOME");
 
-        // PRD #201 `pi/live/001`: materialize the bundled Pi orchestrator
-        // extension into the per-test HOME before the binary spawns, so a
-        // startup-restored Pi pane (and the daemon-spawned pi child that
-        // inherits this HOME) auto-discovers it at boot. Mirrors the headless
-        // `orchestrator_ext::materialize` seeding in `e2e_pi_orchestrator.rs`,
-        // just staged pre-launch rather than into a per-agent tempdir.
-        if builder.materialize_pi_extension {
-            let ext_dir = home
-                .join(".pi")
-                .join("agent")
-                .join("extensions")
-                .join(dot_agent_deck::orchestrator_ext::EXTENSION_DIR_NAME);
-            dot_agent_deck::orchestrator_ext::materialize(&ext_dir)
-                .expect("materialize the bundled pi extension into the per-test HOME");
-        }
+        // PRD #201: the per-test HOME deliberately starts WITHOUT the bundled Pi
+        // extension. When a pi pane is spawned, the deck's spawn-time
+        // auto-materialize (the `spawn_agent` seam) detects the `pi` command and
+        // writes the extension into the HOME the pi child inherits (this per-test
+        // HOME) before pi boots — so the pi e2es exercise that production flow
+        // rather than a pre-staged shortcut.
 
         // PRD #40: stage the keybindings config the deck reads at
         // startup. Path mirrors `config_path()` in

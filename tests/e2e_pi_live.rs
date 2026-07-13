@@ -41,12 +41,13 @@
 //!   render seam (CLAUDE.md rule 9). With the flag ON the card title reads
 //!   `Pi · <id>`; without it the Pi identity would be suppressed and the reel
 //!   clip would show no Pi surface. The deck reads the flag from its env.
-//! - **Bundled extension materialized into the per-test HOME** (via
-//!   `TuiDeckBuilder::with_pi_extension`, before launch): the daemon the deck
-//!   lazy-spawns inherits that HOME, so the pi child it spawns auto-discovers
-//!   `~/.pi/agent/extensions/dot-agent-deck/` and loads it at boot — the same
-//!   seam `e2e_pi_orchestrator.rs` uses, staged pre-launch so a startup-restored
-//!   pane finds it in time.
+//! - **Bundled extension auto-materialized into the per-test HOME** (PRD #201):
+//!   the per-test HOME starts WITHOUT the extension; the deck's spawn-time
+//!   auto-materialize (the `spawn_agent` seam) detects the `pi` command and
+//!   writes the bundled extension into the HOME the pi child inherits BEFORE pi
+//!   boots, so pi auto-discovers `~/.pi/agent/extensions/dot-agent-deck/` and
+//!   loads it — the SAME production seam `e2e_pi_orchestrator.rs` exercises,
+//!   with no manual `with_pi_extension` staging.
 //! - **Status via `agent-event`, NO hook**: the Pi pane's card status is driven
 //!   ONLY by the extension shelling `dot-agent-deck agent-event` (mapped
 //!   `waiting`→Needs Input / `running`→Thinking). No `~/.claude/settings.json`
@@ -119,10 +120,12 @@ fn path_with_binary_dir() -> String {
     format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default())
 }
 
-/// Scenario: Materialize the bundled Pi orchestrator extension into the
-/// per-test HOME, then launch the REAL `dot-agent-deck` binary (via the vt100
-/// `TuiDeck` harness) with `DOT_AGENT_DECK_EXPERIMENTAL=1` and a restored saved
-/// session whose one pane runs a REAL interactive `pi`
+/// Scenario: Launch the REAL `dot-agent-deck` binary (via the vt100 `TuiDeck`
+/// harness) with `DOT_AGENT_DECK_EXPERIMENTAL=1` and a restored saved session
+/// whose one pane runs a REAL interactive `pi` — the per-test HOME starts
+/// WITHOUT the extension and the deck's spawn-time auto-materialize
+/// (`spawn_agent` seam) puts the bundled Pi orchestrator extension into that
+/// HOME before pi boots. The pane runs `pi`
 /// (`--provider openrouter --model openai/gpt-5-nano --approve`) with a
 /// directive initial prompt to create the uniquely-named sentinel
 /// `pi_live_sentinel_4b1a.txt`. The `OPENROUTER_API_KEY` + the built-binary PATH
@@ -171,11 +174,15 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
         )
         // Put the freshly-built binary's dir on PATH so the extension resolves
         // `dot-agent-deck agent-event`; preserves the host PATH so `pi` still
-        // resolves. Wins over the harness env scrub.
+        // resolves. Wins over the harness env scrub. (This PATH — inherited by
+        // the deck's lazy-spawned daemon — is also where the auto-materialize
+        // seam finds `pi`, so the detector fires; no manual `with_pi_extension`.)
         .with_env("PATH", path_with_binary_dir())
-        // Stage the bundled extension into the per-test HOME BEFORE launch so the
-        // startup-restored pi pane loads it at boot.
-        .with_pi_extension()
+        // NOTE: no `with_pi_extension()` — the per-test HOME starts WITHOUT the
+        // extension. The deck's spawn-time auto-materialize (PRD #201,
+        // `spawn_agent` seam) detects the `pi` command and materializes the
+        // bundled extension into that HOME (which the pi child inherits) before
+        // pi boots, so this exercises the real production flow.
         // Auto-open one pane running the real interactive pi against the fixture
         // cwd (the deck restores it on launch; PRD #89 no `--continue` flag). An
         // EMPTY pane name is deliberate: a user who opens a Pi pane without
@@ -355,9 +362,10 @@ fn orchestration_session_toml(project_dir: &str, pi_command: &str, directive: &s
 /// directive telling pi to call the native `delegate` tool once, handing the
 /// `coder` role a task to create the uniquely-named sentinel
 /// `pi_inject_orch_sentinel_5e8c.txt`. Launch the REAL `dot-agent-deck` binary
-/// through the vt100 `TuiDeck` harness with `DOT_AGENT_DECK_EXPERIMENTAL=1`, the
-/// bundled Pi extension materialized into the per-test HOME, imported Claude
-/// credentials + project-trust for the orchestration cwd, and
+/// through the vt100 `TuiDeck` harness with `DOT_AGENT_DECK_EXPERIMENTAL=1` (the
+/// per-test HOME starts WITHOUT the extension — the deck's spawn-time
+/// auto-materialize seam puts the bundled Pi extension there before pi boots),
+/// imported Claude credentials + project-trust for the orchestration cwd, and
 /// `OPENROUTER_API_KEY` + the built-binary PATH threaded in (the key is never
 /// printed). On the daemon-empty restore the deck spawns both role panes IDLE
 /// and REPLAYS the directive into the pi START role via the PRODUCTION
@@ -467,9 +475,11 @@ fn pi_live_002_injection_seeded_orchestration_delegates_live() {
         // claude clears its first-run onboarding + trust gates and auto-submits
         // the daemon-injected task pointer without a human keystroke.
         .with_claude_project_trust(project_str.clone())
-        // Stage the bundled Pi extension into the per-test HOME BEFORE launch so
-        // the startup-restored pi orchestrator pane loads it at boot.
-        .with_pi_extension()
+        // NOTE: no `with_pi_extension()` — the per-test HOME starts WITHOUT the
+        // extension. The deck's spawn-time auto-materialize (PRD #201,
+        // `spawn_agent` seam) detects the `pi` START-role command and
+        // materializes the bundled extension into that HOME (which the pi child
+        // inherits) before pi boots, so this exercises the real production flow.
         .launch_with_fixture("minimal");
 
     // The restored orchestration surfaces as its own tab: the tab strip shows

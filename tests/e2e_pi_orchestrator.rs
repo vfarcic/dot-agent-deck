@@ -24,8 +24,9 @@
 //! `delegate` / `work-done` / `agent-event` over the socket and re-broadcasts
 //! `AgentEvent`s), a REAL `claude` (Haiku) worker pane spawned + ready BEFORE the
 //! orchestrator delegates (so the daemon-injected pointer lands in a live input
-//! box), and a REAL `pi` orchestrator pane whose HOME carries the bundled
-//! extension (materialized via the Phase-3 `orchestrator_ext::materialize`). The
+//! box), and a REAL `pi` orchestrator pane whose HOME starts WITHOUT the
+//! extension — the deck's spawn-time auto-materialize (the `spawn_agent` seam,
+//! PRD #201) puts the bundled extension there before pi boots. The
 //! ORCHESTRATOR role is swapped to `pi`; the worker stays a black-box `claude`
 //! (its hooks/CLI are unchanged — the workaround-dissolution is Pi-only by
 //! construction, Design Decision #4).
@@ -192,9 +193,11 @@ fn path_with_binary_dir() -> String {
 
 /// Scenario: Bring up an in-process daemon, spawn a REAL Claude Code (Haiku)
 /// worker as a long-running interactive `coder`-role pane and wait until it is
-/// input-ready, then spawn a REAL `pi` orchestrator pane whose HOME carries the
-/// bundled orchestrator extension (materialized via `orchestrator_ext::materialize`)
-/// and whose env explicitly propagates `OPENROUTER_API_KEY` + `HOME`. Give pi a
+/// input-ready, then spawn a REAL `pi` orchestrator pane whose HOME starts
+/// WITHOUT the extension — the deck's spawn-time auto-materialize (the
+/// `spawn_agent` seam) detects the `pi` command and materializes the bundled
+/// orchestrator extension into that HOME before pi boots — and whose env
+/// explicitly propagates `OPENROUTER_API_KEY` + `HOME`. Give pi a
 /// directive initial prompt instructing it to call the native `delegate` tool
 /// once, delegating to the `coder` role a task that creates the uniquely-named
 /// sentinel `pi_orch_sentinel_7c3f.txt` (contents `PI_ORCH_SENTINEL_OK`). Assert
@@ -294,17 +297,14 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
     )
     .await;
 
-    // --- ORCHESTRATOR: real pi with the bundled extension materialized into its
-    // HOME (Phase-3 seam), so the real pi loads our `delegate` / `agent-event`
-    // tools + status reporting.
+    // --- ORCHESTRATOR: real pi whose HOME starts WITHOUT the extension. The
+    // deck's spawn-time auto-materialize (PRD #201, `spawn_agent` seam) detects
+    // the `pi` command and materializes the bundled extension into the HOME the
+    // pi child inherits (here `pi_home`, propagated via `opts.env` below) BEFORE
+    // pi boots — so this test exercises the real production flow, not a
+    // hand-set-up shortcut. `pi_home` therefore starts clean; no manual
+    // `orchestrator_ext::materialize` call.
     let pi_home = common::race_safe_tempdir();
-    let ext_dir = pi_home
-        .path()
-        .join(".pi")
-        .join("agent")
-        .join("extensions")
-        .join(orchestrator_ext::EXTENSION_DIR_NAME);
-    orchestrator_ext::materialize(&ext_dir).expect("materialize the bundled pi extension");
 
     // Collect the extension's `agent-event` broadcasts BEFORE spawning pi, so its
     // session_start (→ waiting) status report can't be missed.

@@ -49,15 +49,26 @@ fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
 }
 
-/// The global Pi extensions dir the bundled extension is materialized into:
-/// `~/.pi/agent/extensions/dot-agent-deck`. This is Pi's global auto-discovery
-/// location, so anything written here is loaded by every `pi` session.
-pub fn default_extension_dir() -> PathBuf {
-    home_dir()
-        .join(".pi")
+/// Build the extension target dir under a given HOME:
+/// `<home>/.pi/agent/extensions/dot-agent-deck`. Shared by
+/// [`default_extension_dir`] (the explicit CLI path, machine-global `~/.pi`) and
+/// the spawn-time auto-materialize path so the two can't compute divergent
+/// layouts.
+pub fn extension_dir_under(home: &Path) -> PathBuf {
+    home.join(".pi")
         .join("agent")
         .join("extensions")
         .join(EXTENSION_DIR_NAME)
+}
+
+/// The global Pi extensions dir the bundled extension is materialized into:
+/// `~/.pi/agent/extensions/dot-agent-deck`. This is Pi's global auto-discovery
+/// location, so anything written here is loaded by every `pi` session. Uses
+/// [`home_dir`] (with its `/tmp` fallback) because this backs the EXPLICIT
+/// `orchestrator setup` path; the auto path deliberately avoids that fallback
+/// (see [`auto_materialize`]).
+pub fn default_extension_dir() -> PathBuf {
+    extension_dir_under(&home_dir())
 }
 
 /// Materialize the bundled extension into `target_dir` in the layout Pi
@@ -77,6 +88,112 @@ pub fn materialize(target_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         written.push(path);
     }
     Ok(written)
+}
+
+// ---------------------------------------------------------------------------
+// PRD #201: spawn-time auto-materialize (reverses Design Decision #6)
+// ---------------------------------------------------------------------------
+//
+// Pi should need NO manual setup — parity with claude (hooks auto-install,
+// `hooks_manage::auto_install`) and opencode (plugin auto-install,
+// `opencode_manage::auto_install`). Rather than a machine-global startup seam,
+// the bundled extension is materialized at SPAWN TIME into the HOME the pi
+// child is about to run under, gated on the spawn command actually being `pi`.
+// That keeps the write hermetic to the agent being launched — in tests the
+// per-test temp HOME the deck sets, never the developer's real `~/.pi`.
+// Modeled on `hooks_manage::auto_install`: silent, guarded (only when pi is
+// present), idempotent (overwrite), and — unlike the explicit CLI path —
+// HOME-unset-safe (SKIP, never fall back to a `/tmp` guess; addresses
+// Greptile's `orchestrator_ext.rs:49` finding for the auto path).
+
+/// Env-free core of the HOME resolver: pick the HOME the child will actually
+/// use from the spawn env overlay first (the value that WINS in the child's
+/// environment), then the process `HOME`. `None` when neither yields a
+/// non-empty value — the auto path then SKIPS rather than writing to a
+/// predictable `/tmp` path. Pure over its inputs so the fallback logic is
+/// testable without mutating process-global `HOME`.
+fn resolve_home_inner(env: &[(String, String)], process_home: Option<&str>) -> Option<PathBuf> {
+    env.iter()
+        .find(|(k, _)| k == "HOME")
+        .map(|(_, v)| v.as_str())
+        .or(process_home)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Resolve the HOME the spawned pi child will use (env overlay → process
+/// `HOME`), or `None` when HOME is unset/empty. HOME-unset-safe: it has NO
+/// `/tmp` fallback (that is [`home_dir`]'s behavior, reserved for the explicit
+/// CLI path).
+fn resolve_home_from_env(env: &[(String, String)]) -> Option<PathBuf> {
+    resolve_home_inner(env, std::env::var("HOME").ok().as_deref())
+}
+
+/// Whether `pi` is discoverable on the PATH the spawned child will actually
+/// use: a `PATH` entry in the spawn env overlay if present, else the process
+/// `PATH`. The seam resolves pi-presence from the child's effective env (not
+/// merely the daemon's own PATH) so a caller that overrides `PATH` in
+/// `opts.env` — as the real-pi e2e tests do — is judged against the same PATH
+/// the child inherits.
+fn pi_present_for_env(env: &[(String, String)]) -> bool {
+    let path = env
+        .iter()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| std::ffi::OsString::from(v))
+        .or_else(|| std::env::var_os("PATH"));
+    match path {
+        Some(p) => path_contains_binary(&p, "pi"),
+        None => false,
+    }
+}
+
+/// Pure decision core for the spawn-time auto-materialize (mirrors
+/// [`run_setup`]'s testable shape). Given whether pi is present and the
+/// resolved target dir (`None` = HOME unset), returns the paths written, or
+/// `None` when it SKIPPED. No env / PATH reads, so the fast-tier test exercises
+/// every branch — present/absent, HOME-set/unset, idempotent re-run — without
+/// mutating process-global state.
+///
+///  - `!pi_present`        → SKIP (pi absent — nothing to enable).
+///  - `target_dir == None` → SKIP (HOME unset — do NOT write to a `/tmp` guess).
+///  - otherwise            → (over)write the bundled files into `target_dir`
+///    ([`materialize`] is idempotent), returning the paths written.
+pub fn auto_materialize_core(
+    pi_present: bool,
+    target_dir: Option<&Path>,
+) -> std::io::Result<Option<Vec<PathBuf>>> {
+    if !pi_present {
+        return Ok(None);
+    }
+    match target_dir {
+        Some(target) => Ok(Some(materialize(target)?)),
+        None => Ok(None),
+    }
+}
+
+/// Spawn-time seam entry: silently (over)materialize the bundled Pi orchestrator
+/// extension into the pi child's HOME just before it is launched, so
+/// `command = "pi"` needs ZERO manual setup. Called from
+/// [`crate::agent_pty::AgentPtyRegistry::spawn_agent`] only when the spawn
+/// command is detected as `pi`. `env` is the spawn env overlay, consulted for a
+/// `HOME` / `PATH` override before the process env. Guarded (pi present),
+/// idempotent (overwrite), and HOME-unset-safe (SKIP, no `/tmp` write).
+/// Best-effort — a write failure is logged, never fatal (the pane still spawns,
+/// matching `hooks_manage::auto_install`).
+pub fn auto_materialize(env: &[(String, String)]) {
+    let target = resolve_home_from_env(env).map(|home| extension_dir_under(&home));
+    match auto_materialize_core(pi_present_for_env(env), target.as_deref()) {
+        Ok(Some(written)) => tracing::info!(
+            count = written.len(),
+            "auto-materialized the Pi orchestrator extension into the pi agent's HOME"
+        ),
+        Ok(None) => {
+            tracing::debug!("auto-materialize: skipped the Pi extension (pi absent or HOME unset)")
+        }
+        Err(e) => {
+            tracing::warn!("auto-materialize: failed to write the Pi orchestrator extension: {e}")
+        }
+    }
 }
 
 /// The outcome of the pure `orchestrator setup` core, independent of the real
@@ -322,6 +439,136 @@ mod tests {
             "message must contain the exact install hint on its own line; got:\n{}",
             report.message
         );
+    }
+
+    // ---- PRD #201: spawn-time auto-materialize --------------------------
+
+    /// The auto path materializes into a CLEAN target HOME when pi is present:
+    /// starting from a directory with NO pre-existing extension, the two
+    /// bundled files land in the Pi discovery layout, byte-for-byte equal to
+    /// the compiled-in strings. The clean start is essential — otherwise a
+    /// materialize would be an indistinguishable no-op.
+    #[test]
+    fn auto_materialize_core_materializes_into_clean_home_when_pi_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = extension_dir_under(tmp.path());
+        // CLEAN: nothing there yet.
+        assert!(!target.exists(), "target must start without the extension");
+
+        let written = auto_materialize_core(true, Some(&target))
+            .unwrap()
+            .expect("pi present + HOME resolved must materialize");
+
+        assert_eq!(written.len(), EXTENSION_FILES.len());
+        assert!(target.join("index.ts").is_file());
+        assert!(target.join("orchestrator.ts").is_file());
+        for (name, contents) in EXTENSION_FILES {
+            let on_disk = std::fs::read_to_string(target.join(name)).unwrap();
+            assert_eq!(&on_disk, contents, "{name} must match the embedded source");
+        }
+    }
+
+    /// pi ABSENT → SKIP: nothing is written and the target dir is never even
+    /// created (the guard mirrors `hooks_manage::auto_install`'s
+    /// "only if the agent is detected").
+    #[test]
+    fn auto_materialize_core_skips_when_pi_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = extension_dir_under(tmp.path());
+
+        let result = auto_materialize_core(false, Some(&target)).unwrap();
+
+        assert!(result.is_none(), "pi absent must SKIP (return None)");
+        assert!(!target.exists(), "pi absent must not create the target dir");
+    }
+
+    /// HOME unset (`target_dir == None`) → SKIP with NO write anywhere — in
+    /// particular NOT to a predictable `/tmp` path. This is the auto-path
+    /// answer to Greptile's `orchestrator_ext.rs:49` `/tmp` fallback concern:
+    /// the resolver returns `None` (never a `/tmp` guess) and the core skips.
+    #[test]
+    fn auto_materialize_core_skips_and_writes_nothing_when_home_unset() {
+        // pi is "present", but the target could not be resolved (HOME unset), so
+        // the core takes NO `target` and therefore cannot write anywhere — in
+        // particular it never falls back to a `/tmp` path. The companion
+        // `resolve_home_inner_prefers_env_then_process_then_none` proves the
+        // resolver yields `None` (not a `/tmp` guess) when HOME is unset.
+        let result = auto_materialize_core(true, None).unwrap();
+        assert!(result.is_none(), "HOME unset must SKIP (return None)");
+    }
+
+    /// Re-running the auto path over an already-materialized (or stale) target
+    /// overwrites in place — idempotent refresh, never erroring on an existing
+    /// dir/file.
+    #[test]
+    fn auto_materialize_core_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = extension_dir_under(tmp.path());
+
+        auto_materialize_core(true, Some(&target)).unwrap();
+        // Corrupt a materialized file, then re-run: it must be restored.
+        std::fs::write(target.join("index.ts"), "STALE").unwrap();
+        let second = auto_materialize_core(true, Some(&target))
+            .unwrap()
+            .expect("second run must materialize");
+
+        assert_eq!(second.len(), EXTENSION_FILES.len());
+        let restored = std::fs::read_to_string(target.join("index.ts")).unwrap();
+        assert_ne!(restored, "STALE", "re-run must overwrite a stale file");
+        assert!(restored.contains("export default function"));
+    }
+
+    /// The HOME resolver prefers an explicit `HOME` in the spawn env overlay
+    /// (the value the child actually gets), then falls back to the process
+    /// `HOME`, and yields `None` when neither is set/non-empty — never a `/tmp`
+    /// guess.
+    #[test]
+    fn resolve_home_inner_prefers_env_then_process_then_none() {
+        let overlay = vec![("HOME".to_string(), "/override/home".to_string())];
+        // Env overlay wins over the process HOME.
+        assert_eq!(
+            resolve_home_inner(&overlay, Some("/proc/home")),
+            Some(PathBuf::from("/override/home"))
+        );
+        // No overlay HOME → fall back to the process HOME.
+        assert_eq!(
+            resolve_home_inner(&[], Some("/proc/home")),
+            Some(PathBuf::from("/proc/home"))
+        );
+        // Neither set → None (the HOME-unset SKIP path; NO `/tmp` fallback).
+        assert_eq!(resolve_home_inner(&[], None), None);
+        // Empty values are ignored (both overlay and process).
+        assert_eq!(
+            resolve_home_inner(&[("HOME".to_string(), String::new())], None),
+            None
+        );
+        assert_eq!(resolve_home_inner(&[], Some("")), None);
+    }
+
+    /// `pi_present_for_env` judges pi-presence against the PATH override in the
+    /// spawn env overlay when present (so a caller — like the real-pi e2e
+    /// tests — that puts pi on a PATH the daemon process itself lacks is
+    /// detected correctly).
+    #[cfg(unix)]
+    #[test]
+    fn pi_present_for_env_honors_env_path_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let pi = bin_dir.join("pi");
+        std::fs::write(&pi, b"#!/bin/sh\n").unwrap();
+        set_mode(&pi, 0o755);
+
+        // An overlay PATH pointing only at our temp bin dir detects pi even
+        // though the process PATH almost certainly does not contain THIS pi.
+        let overlay = vec![("PATH".to_string(), bin_dir.to_string_lossy().into_owned())];
+        assert!(pi_present_for_env(&overlay));
+
+        // An overlay PATH pointing at an empty dir does NOT detect pi.
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let overlay_empty = vec![("PATH".to_string(), empty.to_string_lossy().into_owned())];
+        assert!(!pi_present_for_env(&overlay_empty));
     }
 
     #[test]
