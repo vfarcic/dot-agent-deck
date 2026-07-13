@@ -6,7 +6,6 @@ const sidebars = {
     'session-management',
     'keyboard-shortcuts',
     'orchestration',
-    'pi-agent',
     'workspace-modes',
     'scheduled-tasks',
     'configuration',

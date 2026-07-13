@@ -59,7 +59,7 @@ The fastest way to get an orchestration config is to let an agent generate it fr
 
 1. Launch `dot-agent-deck` and open a pane on your project directory.
 2. Press `Ctrl+d` to enter command mode, then press `g` on the agent's dashboard card.
-3. Choose **Yes** in the prompt. The deck sends a structured prompt asking the agent to analyze your project, pick roles from the [built-in role library](#role-library), wire up the commands it finds (devbox scripts, Makefile targets, bare `claude`/`opencode`, etc.), and propose the config.
+3. Choose **Yes** in the prompt. The deck sends a structured prompt asking the agent to analyze your project, pick roles from the [built-in role library](#role-library), wire up the commands it finds (devbox scripts, Makefile targets, bare `claude`/`opencode`/`pi`, etc.), and propose the config.
 4. Review the proposal. The agent will list each role and explain why it chose it.
 5. Tell the agent what to drop or change — or confirm as-is — and it writes `.dot-agent-deck.toml` to your project root.
 
@@ -83,7 +83,7 @@ To write the config by hand, use the [configuration reference](#configuration-re
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `name` | string | yes | — | Role identifier. Shown on the role card in the deck so you can tell agents apart at a glance. Also used in `--to` arguments and in task/work-done file names. Must be unique within the orchestration. Must not contain `/`, `\`, or `..`. |
-| `command` | string | yes | — | Shell command that launches the agent for this role. Must result in a `claude` or `opencode` process (e.g. `claude`, `devbox run agent-big`, `opencode --model gpt-4o`). Other commands will run but won't get live status tracking on the role card. |
+| `command` | string | yes | — | Shell command that launches the agent for this role. Must result in a `claude`, `opencode`, or `pi` process (e.g. `claude`, `devbox run agent-big`, `opencode --model gpt-4o`, `pi --provider openrouter`). Other commands will run but won't get live status tracking on the role card. |
 | `start` | bool | no | `false` | `true` marks this role as the orchestrator. Exactly one role per orchestration must have `start = true`. |
 | `description` | string | no | — | Tells the orchestrator when to use this role and what it is for, so it can decide which worker to delegate to in a given situation. Also shown on the role card in the deck. |
 | `prompt_template` | string | no | — | Standing instructions the orchestrator prepends to every task it sends this role. When set, the orchestrator's `--task` content is appended under a `## Task` heading — the worker sees both the template and the task together. |
@@ -183,6 +183,34 @@ The orchestrator delegates a task to one or more workers. The deck delivers the 
 The orchestrator can delegate to multiple workers simultaneously — for example, sending a code change to both a reviewer and an auditor at the same time. Both workers start immediately and report back independently when done.
 
 ![Orchestrator delegating to reviewer and auditor in parallel — both cards light up simultaneously](./img/orchestration-delegation-parallel.png)
+
+## Using Pi as an agent
+
+[Pi](https://github.com/earendil-works/pi) is a third first-class agent alongside `claude` and `opencode`, and it makes a particularly good orchestrator. Where the deck observes `claude` and `opencode` from the outside, Pi exposes a TypeScript extension API — so `dot-agent-deck` ships a small bundled extension that gives a Pi pane **native `delegate`/`work-done` tools** and **event-driven status**. Instead of relying on the agent remembering to type a CLI command, the Pi orchestrator calls a validated tool whose body runs that command for it, and its status (running / waiting-for-input / finished) is reported straight from Pi's event bus — **with no Claude Code hook installed and no `~/.claude/settings.json` mutation**. The same applies to a plain `pi` pane and a scheduled `pi` job, including unattended, with no client attached.
+
+**Setup is one line.** Install `pi` the way you install any other agent — it needs a Node.js (or Bun) runtime, and you configure its model provider and credentials per [Pi's own documentation](https://github.com/earendil-works/pi):
+
+```bash
+npm install -g @earendil-works/pi-coding-agent
+```
+
+Then point a role at it in `.dot-agent-deck.toml` (adding whatever provider/model flags Pi needs) — that is the whole setup:
+
+```toml
+command = "pi --provider openrouter --model openai/gpt-5-nano"
+```
+
+The deck **auto-materializes** the bundled extension into Pi's extension directory (`~/.pi/agent/extensions/dot-agent-deck/`) the first time it spawns a Pi pane, so there is no separate install step. The pane also receives its task prompt natively — the extension delivers it through Pi's own message API rather than typing it into the terminal. (`dot-agent-deck orchestrator setup` remains an optional explicit path — for example to materialize the extension ahead of time, or to verify `pi` is on your `PATH` — but you do not need to run it.)
+
+> **Tested against Pi 0.80.6.** Pi is a young, fast-moving project. This integration is pinned to and tested against **Pi 0.80.6**; newer versions may change the extension API.
+
+> **Security and sandboxing.** Pi runs with a YOLO / no-permission model — like Claude Code with full filesystem and shell access, it executes its tools without prompting (Pi's `--approve` trusts the project so the `delegate`/`work-done` tools run without a permission dialog). This is the **same posture as the other agents** the deck already spawns and does not change the deck's sandbox story: if you do not fully trust the workload, run `dot-agent-deck` — and therefore its agents — inside a container or other sandbox. The security notes in [Getting Started](getting-started.md) apply to Pi exactly as they do to `claude` and `opencode`.
+
+**What the Pi integration deliberately does not do:**
+
+- It does **not** bundle or vendor Pi or the Node/Bun runtime — Pi is detected on `PATH`; only the extension ships inside the binary.
+- It does **not** replace `claude` or `opencode`, and does **not** remove hooks for those agents — the hook-free path is Pi-only.
+- It does **not** adopt Pi's own multi-agent orchestration (TEAM/CHAIN/PIPELINE). `dot-agent-deck`'s daemon remains the orchestrator of record; Pi is a better-behaved node inside it.
 
 ## Context handoff
 

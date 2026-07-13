@@ -68,7 +68,7 @@ The host must have:
 
 **AI agent runtime.** The deck launches AI agents but does not bundle them — the agent and its runtime must already be on the host, otherwise the deck has nothing to spawn. You need:
 
-- The agent CLI itself. Claude Code and OpenCode are the agents with first-class hook integration in the deck today (verified in `src/event.rs` and `src/hook.rs`); other agents may work if their CLI follows the same PTY pattern, but only those two have first-class event support.
+- The agent CLI itself. Claude Code, OpenCode, and Pi have first-class event/status support in the deck today — Claude Code and OpenCode via hook integration (verified in `src/event.rs` and `src/hook.rs`), and Pi via its bundled extension (no hook installed). Other agents may work if their CLI follows the same PTY pattern, but those three are the ones with first-class event support.
 - The runtime that agent depends on (e.g. Node.js for npm-distributed agents like Claude Code).
 - The agent's API credentials available in the user's environment (e.g. `ANTHROPIC_API_KEY` for Claude Code).
 

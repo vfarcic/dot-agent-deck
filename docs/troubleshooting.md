@@ -73,7 +73,7 @@ dot-agent-deck hooks uninstall --agent opencode   # OpenCode
 
 > **Note:** If you uninstall hooks manually, the next dashboard launch will re-install them automatically.
 
-## A bare command like `claude` or `opencode` fails to spawn
+## A bare command like `claude`, `opencode`, or `pi` fails to spawn
 
 If a pane comes up with an error such as *"Unable to spawn `claude` because it doesn't exist on the filesystem and was not found in PATH"*, the daemon couldn't resolve that bare command against its `PATH`.
 

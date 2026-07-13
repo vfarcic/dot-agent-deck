@@ -2,7 +2,7 @@
 
 > **Developer / maintainer reference.** This page documents the internal contract of the bundled Pi extension and is intentionally excluded from the published documentation site.
 
-[Pi](https://github.com/earendil-works/pi) is integrated as a first-class agent (PRD #201). The user-facing setup lives in the published [Pi Agent](../pi-agent.md) page; this page is the contract for maintainers.
+[Pi](https://github.com/earendil-works/pi) is integrated as a first-class agent (PRD #201). The user-facing setup lives in the published [Orchestration](../orchestration.md) page (the "Using Pi as an agent" section); this page is the contract for maintainers.
 
 The guiding split: **bundle the glue, detect the engine.** Shipping Pi itself would mean shipping a Node runtime and forfeiting the single-static-binary story, so Pi is detected on PATH like `claude`/`opencode`. The only thing compiled into the `dot-agent-deck` binary is the small TypeScript **extension** that gives a Pi pane native tools and event-driven status. Tested against **Pi 0.80.6**.
 
@@ -48,9 +48,21 @@ The extension subscribes with `pi.on(name, handler)` (note: `pi.events` is the *
 
 **This is zero new wire.** The `--type` vocabulary (`running`/`waiting`/`finished`) is the contract the extension's mapping and the docs must agree on.
 
+## Native prompt delivery
+
+A Pi pane receives its first task/seed prompt **natively**, through Pi's own message API, rather than by the daemon typing keystrokes into the PTY. Pi's `session_start` fires before the render-loop injection point, so the seed has to be ready at spawn time and the pane has to pull it. The pieces:
+
+- **`dot-agent-deck get-seed` — read-only verb (`src/main.rs`).** A pane pulls its pending seed by shelling `get-seed`, which sends a `DaemonMessage::GetSeed { pane_id }` request over the **same unversioned hook socket** that `delegate` / `work-done` / `agent-event` use, scoped by `DOT_AGENT_DECK_PANE_ID`, and reads back a single-line `GetSeedResponse` JSON reply. It is read-only — it never mutates daemon state — and prints an empty seed when the daemon has none. The request is tagged `message_type: "get_seed"` (`src/event.rs`) so an **older daemon that does not recognize it fails closed** rather than misinterpreting the frame; `get-seed` then reports an empty seed and the fallback delivers.
+- **`StartAgent.seed` — additive protocol field (`src/daemon_protocol.rs`).** A spawn-time seed the daemon stashes for the pane via `AgentPtyRegistry::set_pending_seed`, so it is available *before* pi boots and fires `session_start`. Only a Pi start-role (orchestrator) spawn — and a `clear = true` Pi worker respawn (`src/state.rs`) — carries a seed; every other spawn sends `seed: None`. The field is `skip_serializing_if` empty, so a no-seed `StartAgent` keeps the exact legacy wire shape (see the cross-version note below).
+- **Extension delivery (`pi-extension/src/index.ts`).** On `session_start` the extension shells `get-seed`, and if the result is a real (non-blank) seed it calls `pi.sendUserMessage(seed, { deliverAs: "followUp" })` (`SEED_DELIVER_AS` in `orchestrator.ts`). `followUp` on an idle agent both seeds and triggers a turn, so the orchestrator starts working with no keystroke and none of the injection path's timing fragility. Delivery is best-effort — any failure (no binary, no daemon, older daemon) just no-sends and lets the fallback cover it.
+- **Bounded exactly-once PTY-injection fallback.** Spawn arms a fallback (`agent_pty::arm_seed_fallback`, window = `seed_fallback_grace()`); the per-agent `seed_delivered_native` arbiter (`src/agent_pty.rs`) records whether the native path fired. Native delivery suppresses injection; if it does not arrive within the grace window the daemon injects the seed into the PTY **exactly once**. This also removes the old pi-worker ~10s `SessionStart` timeout (pi never emits `EventType::SessionStart`).
+- **Scope.** Covers the orchestrator seed and `clear = true` worker respawns (a respawn produces a fresh `session_start` for the pull to fire on). A **`clear = false`** re-delegation is mid-session with no respawn, so no native pull is armed and it **keeps the legacy PTY injection** (documented further enhancement). Pi's headless **RPC mode is explicitly rejected** — it has no live interactive session for `sendUserMessage`/`session_start` to work against, so the real-pi e2e reject it.
+
 ## Materialization (`src/orchestrator_ext.rs`)
 
-`index.ts` and `orchestrator.ts` are embedded with `include_str!` pointed at the **real** `pi-extension/src/` files (no fork — editing the extension flows into the binary on rebuild). `materialize(target_dir)` writes them into Pi's subdir discovery layout `<dir>/index.ts` + `<dir>/orchestrator.ts`; the real target is `~/.pi/agent/extensions/dot-agent-deck/`. `package.json` is intentionally not embedded — Pi's subdir `index.ts` discovery needs none, and TypeBox resolves from Pi's runtime. `orchestrator setup` (also in `src/main.rs` / `orchestrator_ext.rs`) wires `pi`-on-PATH detection + the default dir to `materialize`.
+`index.ts` and `orchestrator.ts` are embedded with `include_str!` pointed at the **real** `pi-extension/src/` files (no fork — editing the extension flows into the binary on rebuild). `materialize(target_dir)` writes them into Pi's subdir discovery layout `<dir>/index.ts` + `<dir>/orchestrator.ts`; the real target is `~/.pi/agent/extensions/dot-agent-deck/`. `package.json` is intentionally not embedded — Pi's subdir `index.ts` discovery needs none, and TypeBox resolves from Pi's runtime.
+
+**Auto-materialize at spawn time.** The bundled extension is materialized **automatically** just before a Pi pane is launched — `AgentPtyRegistry::spawn_agent` (`src/agent_pty.rs`) calls `orchestrator_ext::auto_materialize(&opts.env)` when `AgentType::from_command(opts.command) == Some(AgentType::Pi)`, so a user needs no manual step: install `pi` + `command = "pi"` is the whole setup. It writes into the **child's own HOME** (the `HOME`/`PATH` overlay in `opts.env` first, then the process `HOME`), is guarded on `pi` being present, and is idempotent (overwrite, refreshing a stale copy). It is **HOME-unset-safe**: `auto_materialize_core` returns `None` and **skips** when HOME is unset or empty — it never falls back to a `/tmp` guess (that `/tmp` fallback belongs only to `home_dir`, which backs the explicit CLI path). `orchestrator setup` (in `src/main.rs` / `orchestrator_ext.rs`) remains the **optional explicit path** — it wires `pi`-on-PATH detection + the default dir to `materialize` — but is no longer required for normal use.
 
 ## No hooks for a Pi pane
 
@@ -58,7 +70,13 @@ A Pi pane installs no Claude Code hook and mutates no `~/.claude/settings.json` 
 
 ## Cross-version contract (rule 12)
 
-The `agent-event` addition is an **additive CLI subcommand over the existing `AgentEvent` wire** — no wire shape or field-meaning change. Classification: **no `PROTOCOL_VERSION` bump, no `.breaking.md`.** See [versioning](versioning.md).
+Every PRD #201 addition rides existing wire without changing its shape or a field's meaning:
+
+- `agent-event` is an **additive CLI subcommand over the existing `AgentEvent` wire**.
+- `get-seed` rides the **unversioned hook socket** (request/response), and is tagged so an older daemon that does not know it fails closed to "no seed" rather than misparsing.
+- `StartAgent.seed` is an **additive, `skip_serializing_if`-empty field** — a no-seed `StartAgent` serializes to the exact legacy shape an older daemon parses.
+
+Classification: **no `PROTOCOL_VERSION` bump, no `.breaking.md`** — all additive, all degrade gracefully. See [versioning](versioning.md).
 
 ## Experimental gating
 
