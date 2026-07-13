@@ -215,19 +215,28 @@ fn main() -> ExitCode {
             ));
         }
 
-        // Check 4: function name carries `<sub>_<NNN>` prefix per
-        // Decision 17. M2.1 reviewer S1: hyphenated sub-areas
-        // (e.g. `prompt/pane-input/001`, `lifecycle/daemon-idle/001`)
-        // become snake_case in Rust identifiers — `sub_area_prefix`
-        // normalizes `-` → `_` on the sub-area before comparing.
+        // Check 4: function name carries a Decision-17 prefix derived
+        // from the catalog ID. We accept EITHER the short `<sub>_<NNN>`
+        // form OR the category-qualified `<area>_<sub>_<NNN>` full-ID
+        // form (both hyphen → underscore normalized for Rust idents,
+        // M2.1 reviewer S1). The qualified form is what lets tests whose
+        // short prefix collides across categories carry unambiguous
+        // names WITHOUT renaming — e.g. `chain-smoke/pi/001` and
+        // `scheduler/pi/001` both shorten to `pi_001`, so they use
+        // `chain_smoke_pi_001` / `scheduler_pi_001` (PRD #201). The short
+        // form stays valid so the many pre-existing short-named tests —
+        // including other colliding sub-areas that predate this rule
+        // (`help_001`, `form_001`, `live_001`, `spawn_001`,
+        // `selection_001`, `layout_001`, …) — keep passing. See
+        // `fn_name_matches_spec`.
         if let Some(fname) = &ann.fn_name {
-            let sub_nnn = sub_area_prefix(&ann.id).unwrap_or_default();
-            if !sub_nnn.is_empty() && !fname.starts_with(&sub_nnn) {
+            if !fn_name_matches_spec(&ann.id, fname) {
                 failures.push(format!(
-                    "[4] {} fn `{}` does not start with `{}` (Decision 17, derived from #[spec({:?})])",
+                    "[4] {} fn `{}` does not start with `{}` (short) or `{}` (category-qualified) (Decision 17, derived from #[spec({:?})])",
                     ann.file.display(),
                     fname,
-                    sub_nnn,
+                    sub_area_prefix(&ann.id).unwrap_or_default(),
+                    qualified_id_prefix(&ann.id).unwrap_or_default(),
                     ann.id
                 ));
             }
@@ -646,6 +655,49 @@ fn sub_area_prefix(id: &str) -> Option<String> {
     Some(format!("{}_{nnn}", sub.replace('-', "_")))
 }
 
+/// Derive the category-qualified Decision-17 prefix from a catalog ID:
+/// the FULL `<area>/<sub>/<NNN>` with `/` and `-` replaced by `_`
+/// (e.g. `chain-smoke/pi/001` → `chain_smoke_pi_001`). This is the
+/// unambiguous form used when a short `<sub>_<NNN>` prefix would collide
+/// across categories. Returns `None` for malformed IDs (same
+/// three-segment shape guard as [`sub_area_prefix`]).
+fn qualified_id_prefix(id: &str) -> Option<String> {
+    let (rest, nnn) = id.rsplit_once('/')?;
+    let (area, sub) = rest.rsplit_once('/')?;
+    Some(format!(
+        "{}_{}_{nnn}",
+        area.replace('-', "_"),
+        sub.replace('-', "_")
+    ))
+}
+
+/// Decision-17 acceptance: does `fname` carry a prefix traceable to
+/// catalog `id`? Accepts EITHER the short `<sub>_<NNN>` form
+/// ([`sub_area_prefix`]) OR the category-qualified `<area>_<sub>_<NNN>`
+/// form ([`qualified_id_prefix`]).
+///
+/// Accepting both is deliberate: the qualified form disambiguates
+/// cross-category same-sub-area IDs whose short prefixes collide
+/// (`chain-smoke/pi/001` and `scheduler/pi/001` both shorten to
+/// `pi_001`), while the short form keeps the many pre-existing
+/// short-named tests valid — including other colliding sub-areas
+/// (`help_001`, `form_001`, `live_001`, `spawn_001`, …) that predate
+/// this rule. We do NOT reject the short form on collision: that would
+/// force ~20 already-shipped tests to rename, which is out of scope and
+/// contrary to the "keep existing short-form names valid" contract.
+///
+/// A malformed ID with no derivable prefix is treated as vacuously OK —
+/// the ID-format check (check 3) already flags it.
+fn fn_name_matches_spec(id: &str, fname: &str) -> bool {
+    let short = sub_area_prefix(id).unwrap_or_default();
+    let qualified = qualified_id_prefix(id).unwrap_or_default();
+    if short.is_empty() && qualified.is_empty() {
+        return true;
+    }
+    (!short.is_empty() && fname.starts_with(&short))
+        || (!qualified.is_empty() && fname.starts_with(&qualified))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,6 +733,102 @@ mod tests {
     fn sub_area_prefix_rejects_malformed_id() {
         assert_eq!(sub_area_prefix("not-an-id"), None);
         assert_eq!(sub_area_prefix("only/two"), None);
+    }
+
+    #[test]
+    fn qualified_id_prefix_builds_full_id_form() {
+        // Full-ID form: `/` and `-` → `_` across all three segments.
+        assert_eq!(
+            qualified_id_prefix("chain-smoke/pi/001").as_deref(),
+            Some("chain_smoke_pi_001")
+        );
+        assert_eq!(
+            qualified_id_prefix("scheduler/pi/001").as_deref(),
+            Some("scheduler_pi_001")
+        );
+        assert_eq!(
+            qualified_id_prefix("pi/live/002").as_deref(),
+            Some("pi_live_002")
+        );
+        assert_eq!(
+            qualified_id_prefix("dashboard/pane/004").as_deref(),
+            Some("dashboard_pane_004")
+        );
+    }
+
+    #[test]
+    fn qualified_id_prefix_rejects_malformed_id() {
+        assert_eq!(qualified_id_prefix("not-an-id"), None);
+        assert_eq!(qualified_id_prefix("only/two"), None);
+    }
+
+    #[test]
+    fn fn_name_matches_spec_accepts_short_form() {
+        // Non-colliding sub-areas keep their short `<sub>_<NNN>` names.
+        assert!(fn_name_matches_spec(
+            "dashboard/pane/004",
+            "pane_004_card_renders"
+        ));
+        // Colliding short forms that predate the qualified rule stay
+        // valid via the short prefix (`help_001` is shared by three
+        // catalog IDs, `live_002` by three, etc.).
+        assert!(fn_name_matches_spec(
+            "keybindings/help/001",
+            "help_001_overlay"
+        ));
+        assert!(fn_name_matches_spec(
+            "scheduler/live/002",
+            "live_002_focusing_scheduled_card"
+        ));
+    }
+
+    #[test]
+    fn fn_name_matches_spec_accepts_category_qualified_form() {
+        // PRD #201: the pi tests' short forms collide across categories
+        // (`pi_001` from chain-smoke/pi + scheduler/pi), so they carry
+        // category-qualified names — which must now be accepted WITHOUT
+        // renaming them.
+        assert!(fn_name_matches_spec(
+            "chain-smoke/pi/001",
+            "chain_smoke_pi_001_orchestrator_delegates_to_real_worker"
+        ));
+        assert!(fn_name_matches_spec(
+            "scheduler/pi/001",
+            "scheduler_pi_001_scheduled_unattended_status_via_extension"
+        ));
+        assert!(fn_name_matches_spec(
+            "chain-smoke/pi/002",
+            "chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done"
+        ));
+        assert!(fn_name_matches_spec(
+            "pi/live/001",
+            "pi_live_001_live_pane_shows_identity_and_status"
+        ));
+        assert!(fn_name_matches_spec(
+            "pi/live/002",
+            "pi_live_002_native_seeded_orchestration_delegates_live"
+        ));
+    }
+
+    #[test]
+    fn fn_name_matches_spec_rejects_unrelated_prefix() {
+        // A name matching neither the short nor the qualified prefix is
+        // still flagged.
+        assert!(!fn_name_matches_spec(
+            "chain-smoke/pi/001",
+            "totally_unrelated_name"
+        ));
+        assert!(!fn_name_matches_spec(
+            "dashboard/pane/004",
+            "widget_004_something"
+        ));
+    }
+
+    #[test]
+    fn fn_name_matches_spec_vacuously_ok_for_malformed_id() {
+        // Malformed IDs have no derivable prefix; check 3 flags the
+        // format, so check 4 must not double-report.
+        assert!(fn_name_matches_spec("not-an-id", "whatever_name"));
     }
 
     #[test]
