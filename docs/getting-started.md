@@ -37,7 +37,7 @@ Native Windows is [coming soon](https://github.com/vfarcic/dot-agent-deck/issues
 
 Once the dashboard is running, press `?` inside the app to see all shortcuts. The dashboard is also fully mouse-clickable: a button bar along the bottom exposes the main commands (each labelled with its keyboard shortcut), and cards, tab headers, dialogs, the directory picker, and forms all respond to clicks. See [Keyboard Shortcuts → Mouse](keyboard-shortcuts.md#mouse).
 
-> On launch, dot-agent-deck installs Claude Code / OpenCode hooks automatically for whichever agents it detects. A `pi` pane is status-tracked through its bundled extension instead — no hook is installed for it. See [Troubleshooting](troubleshooting.md#hooks) if you need to manage them manually.
+> On launch, dot-agent-deck automatically sets up live status, tool, and prompt tracking for the agents it detects — [Claude Code](https://www.anthropic.com/claude-code), [OpenCode](https://opencode.ai), and [Pi](https://github.com/earendil-works/pi). No configuration is needed. See [Troubleshooting](troubleshooting.md#hooks) if you want to manage this manually.
 
 ## Launching
 
@@ -64,7 +64,7 @@ About 30 seconds after both the TUI and every managed agent are gone, the daemon
 4. To type into an agent, move keyboard focus into its pane: press `Ctrl+d` to enter command mode, then either `j`/`k` (or `Down`/`Up`) to cycle through cards or `1`–`9` to jump directly to a card
 5. To close the pane you're currently working in, press `Ctrl+w` — it closes the selected card and its pane, even while you're still typing in it. The dashboard tab itself can't be closed.
 
-> **Tip:** The command can be any shell command, but real-time status, tool, and prompt tracking on the dashboard only work for `claude`, `opencode`, and `pi` — `claude` and `opencode` via the hooks Agent Deck installs, and `pi` via its bundled extension (no hook installed).
+> **Tip:** The command can be any shell command, but real-time status, tool, and prompt tracking on the dashboard work for `claude`, `opencode`, and `pi`.
 
 > **Tip:** Press `Ctrl+d` from any pane to enter command / navigation mode.
 

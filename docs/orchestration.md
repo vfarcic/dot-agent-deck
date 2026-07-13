@@ -184,34 +184,6 @@ The orchestrator can delegate to multiple workers simultaneously — for example
 
 ![Orchestrator delegating to reviewer and auditor in parallel — both cards light up simultaneously](./img/orchestration-delegation-parallel.png)
 
-## Using Pi as an agent
-
-[Pi](https://github.com/earendil-works/pi) is a third first-class agent alongside `claude` and `opencode`, and it makes a particularly good orchestrator. Where the deck observes `claude` and `opencode` from the outside, Pi exposes a TypeScript extension API — so `dot-agent-deck` ships a small bundled extension that gives a Pi pane **native `delegate`/`work-done` tools** and **event-driven status**. Instead of relying on the agent remembering to type a CLI command, the Pi orchestrator calls a validated tool whose body runs that command for it, and its status (running / waiting-for-input / finished) is reported straight from Pi's event bus — **with no Claude Code hook installed and no `~/.claude/settings.json` mutation**. The same applies to a plain `pi` pane and a scheduled `pi` job, including unattended, with no client attached.
-
-**Setup is one line.** Install `pi` the way you install any other agent — it needs a Node.js (or Bun) runtime, and you configure its model provider and credentials per [Pi's own documentation](https://github.com/earendil-works/pi):
-
-```bash
-npm install -g @earendil-works/pi-coding-agent
-```
-
-Then point a role at it in `.dot-agent-deck.toml` (adding whatever provider/model flags Pi needs) — that is the whole setup:
-
-```toml
-command = "pi --provider openrouter --model openai/gpt-5-nano"
-```
-
-The deck **auto-materializes** the bundled extension into Pi's extension directory (`~/.pi/agent/extensions/dot-agent-deck/`) the first time it spawns a Pi pane, so there is no separate install step. The pane also receives its task prompt natively — the extension delivers it through Pi's own message API rather than typing it into the terminal. (`dot-agent-deck orchestrator setup` remains an optional explicit path — for example to materialize the extension ahead of time, or to verify `pi` is on your `PATH` — but you do not need to run it.)
-
-> **Tested against Pi 0.80.6.** Pi is a young, fast-moving project. This integration is pinned to and tested against **Pi 0.80.6**; newer versions may change the extension API.
-
-> **Security and sandboxing.** Pi runs with a YOLO / no-permission model — like Claude Code with full filesystem and shell access, it executes its tools without prompting (Pi's `--approve` trusts the project so the `delegate`/`work-done` tools run without a permission dialog). This is the **same posture as the other agents** the deck already spawns and does not change the deck's sandbox story: if you do not fully trust the workload, run `dot-agent-deck` — and therefore its agents — inside a container or other sandbox. The security notes in [Getting Started](getting-started.md) apply to Pi exactly as they do to `claude` and `opencode`.
-
-**What the Pi integration deliberately does not do:**
-
-- It does **not** bundle or vendor Pi or the Node/Bun runtime — Pi is detected on `PATH`; only the extension ships inside the binary.
-- It does **not** replace `claude` or `opencode`, and does **not** remove hooks for those agents — the hook-free path is Pi-only.
-- It does **not** adopt Pi's own multi-agent orchestration (TEAM/CHAIN/PIPELINE). `dot-agent-deck`'s daemon remains the orchestrator of record; Pi is a better-behaved node inside it.
-
 ## Context handoff
 
 Workers cold-start with no memory of prior conversation, no access to other workers' outputs, and no shared scratchpad. Whatever the orchestrator includes in a delegation is the **entire context the worker has** — plus the worker's `prompt_template`. The orchestrator's `prompt_template` is where you tell it how to delegate well: which files to reference, how to summarise prior findings when chaining workers, and what to include when retrying after a failure.
