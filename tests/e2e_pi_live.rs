@@ -339,6 +339,10 @@ fn orchestration_session_toml(project_dir: &str, pi_command: &str, directive: &s
                 display_title: None,
             }),
         }],
+        // PRD #196: `SavedSession` carries the global `last_command`; a restored
+        // session with no prior command persists `None` (matches every other
+        // `SavedSession` literal — src/config.rs).
+        last_command: None,
     };
     toml::to_string_pretty(&session).expect("serialize orchestration session.toml")
 }
