@@ -25,10 +25,13 @@ import { Type } from "typebox";
 import {
 	buildAgentEventArgv,
 	buildDelegateArgv,
+	buildGetSeedArgv,
 	buildWorkDoneArgv,
 	DECK_BIN,
 	execFailureMessage,
 	piEventToAgentState,
+	SEED_DELIVER_AS,
+	seedToDeliver,
 	spawnFailureMessage,
 } from "./orchestrator.ts";
 
@@ -127,8 +130,42 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 		}
 	};
 
+	// --- PRD #201: NATIVE prompt delivery on session_start ----------------
+	// Pull the seed/prompt the daemon prepared for this pane (`get-seed`) and,
+	// if there is one, deliver it via `pi.sendUserMessage` — which "always
+	// triggers a turn". This replaces the daemon typing the prompt into the
+	// pane's PTY (the last workaround): status, delegation, AND now prompt
+	// delivery are all native for a Pi pane. Best-effort like status — a
+	// failure here (no binary, no daemon, older daemon that doesn't answer)
+	// must never break the agent loop; the daemon's PTY-injection safety net
+	// still delivers, so we swallow errors and simply no-send.
+	const deliverPendingSeed = async (ctx: ExtensionContext): Promise<void> => {
+		const argv = buildGetSeedArgv();
+		let outcome: { code: number; stdout: string; stderr: string; killed: boolean };
+		try {
+			outcome = await pi.exec(DECK_BIN, argv, { signal: ctx.signal });
+		} catch {
+			// Spawn failure (missing binary / socket) — safety net covers it.
+			return;
+		}
+		// `get-seed` exits 0 even with no seed; a non-zero exit means the
+		// request failed, so treat it as "no seed" and let the fallback deliver.
+		if (execFailureMessage(argv, outcome)) {
+			return;
+		}
+		const seed = seedToDeliver(outcome.stdout);
+		if (!seed) {
+			return;
+		}
+		pi.sendUserMessage(seed, { deliverAs: SEED_DELIVER_AS });
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
+		// Report status first (Needs Input), then deliver the native seed —
+		// which triggers a turn (→ agent_start → Thinking), the same real
+		// waiting→running transition the live-pane e2e asserts.
 		await reportStatus("session_start", ctx);
+		await deliverPendingSeed(ctx);
 	});
 	pi.on("agent_start", async (_event, ctx) => {
 		await reportStatus("agent_start", ctx);

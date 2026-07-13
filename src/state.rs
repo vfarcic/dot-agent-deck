@@ -469,6 +469,27 @@ async fn dispatch_one_owned(
         );
         compose_worker_task_file(prompt_template, &task)
     };
+    // The single-line pointer the worker receives ("Read
+    // .dot-agent-deck/worker-task-<role>.md for your task."). Computed here so
+    // the PRD #201 pi-native path below can stash it as the pane's seed before
+    // the respawned pi boots.
+    let one_liner = compose_delegate_prompt(&task_body);
+
+    // PRD #201 native prompt delivery: a pi WORKER whose role is `clear = true`
+    // (respawn → a fresh `session_start`) receives its task NATIVELY — the
+    // daemon stashes the pointer as the pane's seed and pi's extension pulls it
+    // via `get-seed` → `pi.sendUserMessage`, no PTY keystroke injection. This
+    // ALSO dissolves the pi-specific fragility the old path had: pi never emits
+    // `EventType::SessionStart`, so `wait_for_session_start` always burned the
+    // full ~10s timeout before injecting into a maybe-not-yet-ready pane. A
+    // `clear = false` pi worker (no respawn → no `session_start`) keeps the
+    // legacy injection — the native pull needs a fresh session to fire on, so
+    // mid-session re-delegation is a documented further enhancement.
+    let is_pi_native = role_config
+        .as_ref()
+        .map(|r| r.clear && AgentType::from_command(Some(&r.command)) == Some(AgentType::Pi))
+        .unwrap_or(false);
+
     // Honor the per-role `clear` flag from `.dot-agent-deck.toml`.
     // `clear = true` terminates the existing worker child (SIGTERM
     // with grace, then SIGKILL via
@@ -496,6 +517,29 @@ async fn dispatch_one_owned(
             .await
         {
             Ok(new_agent_id) => {
+                if is_pi_native {
+                    // PRD #201: NATIVE delivery — stash the pointer as the
+                    // respawned pi's seed and arm the PTY-injection safety net.
+                    // Skip the `SessionStart` wait (pi never emits
+                    // `EventType::SessionStart`, so it would just burn the full
+                    // timeout) and skip the inline injection below (`return`):
+                    // pi's extension pulls the seed on `session_start` via
+                    // `get-seed` → `sendUserMessage`.
+                    tracing::debug!(
+                        role = %target_role,
+                        pane_id = %pane_id,
+                        new_agent_id = %new_agent_id,
+                        "delegate: pi worker respawned for clear=true; \
+                         stashing seed for native get-seed pull (no injection)"
+                    );
+                    registry.set_pending_seed(&pane_id, &one_liner);
+                    crate::agent_pty::arm_seed_fallback(
+                        registry.clone(),
+                        pane_id.clone(),
+                        crate::agent_pty::seed_fallback_grace(),
+                    );
+                    return;
+                }
                 tracing::debug!(
                     role = %target_role,
                     pane_id = %pane_id,
@@ -580,7 +624,10 @@ async fn dispatch_one_owned(
             }
         }
     }
-    let one_liner = compose_delegate_prompt(&task_body);
+    // Legacy PTY injection for every non-pi-native path: claude / opencode
+    // workers, and `clear = false` pi workers (which get no fresh
+    // `session_start` for the extension to pull on). The pi-native `clear =
+    // true` path returned early above after stashing the seed.
     if let Err(e) = registry
         .write_to_pane_and_submit(&pane_id, &one_liner)
         .await

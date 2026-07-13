@@ -125,6 +125,15 @@ enum Commands {
         #[arg(long = "type")]
         r#type: String,
     },
+    /// Print the seed/prompt the daemon prepared for this pane, then clear it
+    /// (PRD #201 native prompt delivery). READ-ONLY: it asks the daemon over
+    /// the hook socket for the pane's pending seed and prints it to stdout
+    /// (empty output = no seed). The bundled Pi extension shells this on
+    /// `session_start` and, if the output is non-empty, delivers it natively
+    /// via `pi.sendUserMessage` — so a Pi pane's first prompt no longer needs
+    /// PTY keystroke injection. Uses `DOT_AGENT_DECK_PANE_ID` to scope the
+    /// request, exactly like `agent-event`.
+    GetSeed,
     /// Set up the Pi orchestrator integration (PRD #201). Detects `pi` on
     /// PATH, materializes the bundled orchestrator extension into Pi's global
     /// extension dir, and enables it (Pi auto-discovers the dir). Prints the
@@ -697,6 +706,54 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
+        }
+        Some(Commands::GetSeed) => {
+            let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
+                Ok(id) => id,
+                Err(_) => {
+                    eprintln!(
+                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            // Ask the daemon (over the hook socket) for the seed it prepared
+            // for this pane. READ-ONLY request/response — the one hook-socket
+            // verb that reads a reply. A missing daemon / older daemon that
+            // doesn't answer → `None` → we print nothing and exit 0, so the
+            // extension no-sends and the daemon's PTY-injection safety net
+            // still delivers (graceful cross-version degradation, no
+            // PROTOCOL_VERSION dependency).
+            let req = dot_agent_deck::event::DaemonMessage::GetSeed(
+                dot_agent_deck::event::GetSeedRequest { pane_id },
+            );
+            let json = match serde_json::to_string(&req) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("Failed to serialize get-seed request: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match dot_agent_deck::hook::request_from_socket(&json) {
+                Some(line) if !line.trim().is_empty() => {
+                    match serde_json::from_str::<dot_agent_deck::event::GetSeedResponse>(&line) {
+                        Ok(resp) => {
+                            if let Some(seed) = resp.seed {
+                                // Print the seed verbatim (no trailing newline)
+                                // so the extension captures exactly the prepared
+                                // text. Empty seed → print nothing.
+                                print!("{seed}");
+                            }
+                            ExitCode::SUCCESS
+                        }
+                        // A reply we can't parse is treated as "no seed": print
+                        // nothing, exit 0 — the fallback still covers delivery.
+                        Err(_) => ExitCode::SUCCESS,
+                    }
+                }
+                // No reply (no daemon / older daemon / no seed) → no seed.
+                _ => ExitCode::SUCCESS,
+            }
         }
         Some(Commands::Orchestrator { cmd }) => match cmd {
             // PRD #201 M3.2: thin wrapper — wire real PATH-detection + the real

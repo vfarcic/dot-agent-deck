@@ -148,6 +148,39 @@ pub enum DaemonMessage {
     /// Worker (or orchestrator with `done`) reports task completion.
     #[serde(rename = "work_done")]
     WorkDone(WorkDoneSignal),
+    /// PRD #201 native prompt delivery: a READ-ONLY request for the seed the
+    /// daemon prepared for a pane, so the pane's extension can deliver it
+    /// NATIVELY (`pi.sendUserMessage`) instead of the daemon typing it into the
+    /// PTY. Unlike the two fire-and-forget signals above, this one gets a
+    /// reply: the daemon writes a [`GetSeedResponse`] JSON line back on the
+    /// same connection, then the seed is cleared (delivered exactly once). An
+    /// older daemon that doesn't know this variant fails to parse it and sends
+    /// no reply — the `get-seed` CLI then reports an empty seed, the extension
+    /// no-sends, and the daemon's PTY-injection safety net still delivers. So
+    /// this variant degrades gracefully across versions (see the rule-12 note
+    /// in `docs/develop/versioning.md`): it rides the unversioned hook socket
+    /// and does NOT move the attach `PROTOCOL_VERSION`.
+    #[serde(rename = "get_seed")]
+    GetSeed(GetSeedRequest),
+}
+
+/// PRD #201: payload of [`DaemonMessage::GetSeed`] — the pane whose pending
+/// seed the caller wants. Sourced from `DOT_AGENT_DECK_PANE_ID` by the
+/// `get-seed` CLI (same pane-scoping the delegate / work-done / agent-event
+/// verbs use).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetSeedRequest {
+    pub pane_id: String,
+}
+
+/// PRD #201: the daemon's reply to a [`DaemonMessage::GetSeed`], written as a
+/// single JSON line back on the hook-socket connection. `seed` is `None`
+/// (serialized as `null`) when no seed is pending for the pane — the pane is
+/// unknown, or the seed was already delivered (pulled or injected).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetSeedResponse {
+    #[serde(default)]
+    pub seed: Option<String>,
 }
 
 /// Signal sent by the orchestrator via `dot-agent-deck delegate`.
@@ -500,6 +533,47 @@ mod tests {
             }
             _ => panic!("expected WorkDone"),
         }
+    }
+
+    #[test]
+    fn serialize_deserialize_get_seed_request() {
+        // PRD #201: the get-seed request carries the pane id and tags itself
+        // `message_type: "get_seed"` so the daemon's hook loop can distinguish
+        // it from the fire-and-forget delegate / work-done signals.
+        let msg = DaemonMessage::GetSeed(GetSeedRequest {
+            pane_id: "pane-7".into(),
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            json.contains("\"message_type\":\"get_seed\""),
+            "get-seed must be tagged so an OLD daemon that doesn't know it fails \
+             to parse and simply doesn't reply (graceful degradation): {json}"
+        );
+        let parsed: DaemonMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonMessage::GetSeed(r) => assert_eq!(r.pane_id, "pane-7"),
+            _ => panic!("expected GetSeed"),
+        }
+    }
+
+    #[test]
+    fn serialize_deserialize_get_seed_response() {
+        // Some(seed) round-trips…
+        let resp = GetSeedResponse {
+            seed: Some("Read .dot-agent-deck/worker-task-coder.md for your task.".into()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: GetSeedResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.seed.as_deref(),
+            Some("Read .dot-agent-deck/worker-task-coder.md for your task.")
+        );
+        // …and "no seed" is a null the get-seed CLI reads as "print nothing".
+        let none = GetSeedResponse { seed: None };
+        let json = serde_json::to_string(&none).unwrap();
+        assert_eq!(json, "{\"seed\":null}");
+        let back: GetSeedResponse = serde_json::from_str(&json).unwrap();
+        assert!(back.seed.is_none());
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::{Notify, broadcast};
 use tracing::{error, info, warn};
@@ -900,7 +900,12 @@ async fn run_hook_loop(
                 let event_tx = event_tx.clone();
                 let pty_registry = pty_registry.clone();
                 tokio::spawn(async move {
-                    let reader = tokio::io::BufReader::new(stream);
+                    // PRD #201: split so the read-only `get-seed` verb can write
+                    // a reply back on the same connection. Every other message
+                    // on this socket is fire-and-forget, so the write half is
+                    // only ever used by the `GetSeed` arm below.
+                    let (read_half, mut write_half) = tokio::io::split(stream);
+                    let reader = tokio::io::BufReader::new(read_half);
                     let mut lines = reader.lines();
 
                     while let Ok(Some(line)) = lines.next_line().await {
@@ -939,6 +944,30 @@ async fn run_hook_loop(
                                         "Received work-done signal"
                                     );
                                     state.read().await.handle_work_done(signal, &pty_registry).await;
+                                }
+                                DaemonMessage::GetSeed(req) => {
+                                    // PRD #201 native prompt delivery: hand the
+                                    // pane's pending seed to the caller (the
+                                    // extension's `get-seed`) and CLEAR it, so
+                                    // the daemon's PTY-injection safety net
+                                    // won't also deliver it. `take_..._native`
+                                    // marks the delivery as native for the
+                                    // real-pi e2e proof. `None` → `{"seed":null}`.
+                                    let seed =
+                                        pty_registry.take_pending_seed_native(&req.pane_id);
+                                    info!(
+                                        pane_id = %req.pane_id,
+                                        has_seed = seed.is_some(),
+                                        "Received get-seed request"
+                                    );
+                                    let resp =
+                                        crate::event::GetSeedResponse { seed };
+                                    if let Ok(json) = serde_json::to_string(&resp) {
+                                        let line = format!("{json}\n");
+                                        let _ =
+                                            write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
                                 }
                             }
                         } else if let Ok(event) = serde_json::from_str::<AgentEvent>(&line) {
@@ -1129,6 +1158,93 @@ mod hook_ingestion_tests {
         // Await the aborted task so it drops its `registry` Arc clone before
         // we tear the registry down — strictly sequences cleanup instead of
         // racing `shutdown_all` against the still-live loop task.
+        let _ = handle.await;
+        registry.shutdown_all();
+    }
+
+    /// Scenario: PRD #201 native prompt delivery over the hook socket. Spawn a
+    /// shell agent tagged with a pane id, stash a seed for it via
+    /// `set_pending_seed`, run the real `run_hook_loop`, then send a `get_seed`
+    /// request line and read the reply. The daemon must reply with the exact
+    /// seed, mark it delivered-native, and clear it — a second request replies
+    /// `{"seed":null}`. This is the request/response path the pi extension's
+    /// `get-seed` verb rides (the one hook-socket message that reads a reply).
+    #[tokio::test]
+    async fn run_hook_loop_answers_get_seed_and_clears_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-gs".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell agent");
+        registry.set_pending_seed(
+            "pane-gs",
+            "Acknowledge your role and wait for instructions.",
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod tempdir");
+        let sock = dir.path().join("hook.sock");
+        let listener = UnixListener::bind(&sock).expect("bind hook socket");
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let shutdown = Arc::new(Notify::new());
+        let handle = tokio::spawn({
+            let registry = registry.clone();
+            async move { run_hook_loop(listener, state, event_tx, registry, shutdown).await }
+        });
+
+        // Helper: send one get_seed request line and read the single reply line.
+        async fn ask_get_seed(sock: &std::path::Path, pane_id: &str) -> String {
+            let req = crate::event::DaemonMessage::GetSeed(crate::event::GetSeedRequest {
+                pane_id: pane_id.to_string(),
+            });
+            let line = format!("{}\n", serde_json::to_string(&req).unwrap());
+            let mut stream = UnixStream::connect(sock).await.expect("connect");
+            stream.write_all(line.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut buf = String::new();
+            stream.read_to_string(&mut buf).await.unwrap();
+            buf
+        }
+
+        // First pull: the daemon returns the seed…
+        let reply = ask_get_seed(&sock, "pane-gs").await;
+        let resp: crate::event::GetSeedResponse =
+            serde_json::from_str(reply.trim()).expect("parse get-seed reply");
+        assert_eq!(
+            resp.seed.as_deref(),
+            Some("Acknowledge your role and wait for instructions.")
+        );
+        // …marks it delivered-native and clears it.
+        assert!(
+            registry.seed_delivered_native("pane-gs"),
+            "answering get-seed must mark the delivery native"
+        );
+
+        // Second pull: nothing left — the seed was delivered exactly once.
+        let reply2 = ask_get_seed(&sock, "pane-gs").await;
+        let resp2: crate::event::GetSeedResponse =
+            serde_json::from_str(reply2.trim()).expect("parse second get-seed reply");
+        assert!(
+            resp2.seed.is_none(),
+            "seed must be cleared after the first pull"
+        );
+
+        // Unknown pane → null, harmless.
+        let reply3 = ask_get_seed(&sock, "pane-unknown").await;
+        let resp3: crate::event::GetSeedResponse =
+            serde_json::from_str(reply3.trim()).expect("parse unknown-pane get-seed reply");
+        assert!(resp3.seed.is_none());
+
+        handle.abort();
         let _ = handle.await;
         registry.shutdown_all();
     }

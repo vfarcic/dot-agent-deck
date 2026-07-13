@@ -116,6 +116,7 @@ async fn start_agent(server: &Server, command: &str) -> String {
             env: vec![],
             tab_membership: None,
             agent_type: None,
+            seed: None,
         },
     )
     .await;
@@ -204,6 +205,7 @@ async fn start_agent_with_membership(server: &Server, membership: TabMembership)
             env: vec![],
             tab_membership: Some(membership),
             agent_type: None,
+            seed: None,
         },
     )
     .await;
@@ -265,6 +267,7 @@ async fn start_agent_rejects_orchestration_cwd_with_control_byte() {
                 display_title: None,
             }),
             agent_type: None,
+            seed: None,
         },
     )
     .await;
@@ -348,6 +351,7 @@ async fn start_agent_round_trips_explicit_rows_cols() {
         env: vec![],
         tab_membership: None,
         agent_type: None,
+        seed: None,
     };
 
     // Wire round-trip: encode + decode via the same serde path the daemon
@@ -458,6 +462,7 @@ fn start_agent_round_trips_explicit_agent_type() {
         env: vec![],
         tab_membership: None,
         agent_type: Some(AgentType::ClaudeCode),
+        seed: None,
     };
 
     let json = serde_json::to_string(&req).unwrap();
@@ -486,6 +491,7 @@ fn start_agent_round_trips_explicit_agent_type() {
         env: vec![],
         tab_membership: None,
         agent_type: Some(AgentType::OpenCode),
+        seed: None,
     };
     let json_oc = serde_json::to_string(&req_oc).unwrap();
     let back_oc: AttachRequest = serde_json::from_str(&json_oc).unwrap();
@@ -747,6 +753,7 @@ async fn start_agent_with_invalid_membership_name_is_rejected() {
                 env: vec![],
                 tab_membership: Some(TabMembership::Mode { name: name.clone() }),
                 agent_type: None,
+                seed: None,
             },
         )
         .await;
@@ -1015,6 +1022,7 @@ async fn start_agent_rejects_blank_command() {
             env: vec![],
             tab_membership: None,
             agent_type: None,
+            seed: None,
         },
     )
     .await;

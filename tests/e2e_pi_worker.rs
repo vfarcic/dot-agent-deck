@@ -3,17 +3,18 @@
 //! L2 REAL-`pi` WORKER proof (PRD #201 completeness — pi's second role).
 //!
 //! The existing pi e2es prove pi as an ORCHESTRATOR (`chain-smoke/pi/001`
-//! headless, `pi/live/002` live + injection-seeded). None prove pi as a
-//! **WORKER**: a real pi receiving the daemon-injected worker task, doing the
-//! work, and signalling `work-done` back. "Pi is a first-class agent" should mean
-//! BOTH roles work; this test pins the worker half.
+//! headless, `pi/live/002` live, both native-seeded). None prove pi as a
+//! **WORKER**: a real pi receiving its worker task NATIVELY, doing the work, and
+//! signalling `work-done` back. "Pi is a first-class agent" should mean BOTH
+//! roles work; this test pins the worker half.
 //!
-//! ## The worker chain under test (all three asserted)
-//! 1. The pi worker **receives the daemon-injected task** — the agent-agnostic
-//!    `worker-task-<role>.md` footer path: the daemon writes the task file and
-//!    injects the single-line pointer via `write_to_pane_and_submit`, and pi
-//!    AUTO-SUBMITS + acts on it (same injection primitive proven for the pi
-//!    ORCHESTRATOR by `pi/live/002`, here exercised for the pi WORKER role).
+//! ## The worker chain under test (all four asserted)
+//! 1. The pi worker **receives its task NATIVELY** (PRD #201) — on a `clear =
+//!    true` delegate the daemon RESPAWNS the worker, stashes the
+//!    `worker-task-<role>.md` pointer as the pane's seed, and the respawned pi's
+//!    extension pulls it on `session_start` via `dot-agent-deck get-seed` →
+//!    `pi.sendUserMessage` (NOT PTY keystroke injection). The daemon records the
+//!    delivery as native; the test asserts that flag.
 //! 2. The pi worker **does the task** — creates a uniquely-named sentinel file
 //!    with known contents.
 //! 3. The pi worker **signals `work-done`** — the daemon writes
@@ -21,6 +22,8 @@
 //!    `dot-agent-deck work-done` CLI or calls its extension's native `work_done`
 //!    tool, both route the same `WorkDone` signal over the hook socket, so the
 //!    file's appearance is a path-agnostic proof.
+//! 4. The delivery was **native, not the injection fallback** — the daemon's
+//!    per-pane `seed_delivered_native` flag is set only by the `get-seed` pull.
 //!
 //! ## Orchestrator side: the deterministic synthetic-delegate path (chosen)
 //! The thing under test is the pi WORKER. A real `claude`/`pi` orchestrator would
@@ -32,21 +35,26 @@
 //! pattern of `e2e_delegate_work_done_chain.rs`), routing the delegate into the
 //! real pi worker.
 //!
-//! ## Latency: `clear = false` sidesteps the 10s `SESSION_START_WAIT` fallback
-//! Workers default `clear = true`, so in a real orchestration each delegate
-//! RESPAWNS the worker and the daemon waits `SESSION_START_WAIT` (~10s) before
-//! injecting — and because pi maps `session_start → waiting` (it never emits
-//! `EventType::SessionStart`), that wait always burns the full fallback, so a slow
-//! pi boot could land the injected task before pi is input-ready. This test
-//! deliberately isolates the WORKER proof from that (separately-tracked) fragility
-//! by using the `clear = false` path: with NO `.dot-agent-deck.toml` role config
-//! in the worker cwd, `handle_delegate`'s role lookup returns `None`, so there is
-//! NO respawn — the pi worker is spawned ONCE, and the delegate injects only after
-//! we have polled it to genuine input-readiness (`wait_until_agent_output_settled`,
-//! sized generously for pi's Bun/Node boot + extension load). Per the brief,
-//! `clear = false` for the worker role is the sanctioned way to isolate this proof;
-//! the `clear = true`-respawn + 10s-fallback fragility is out of scope here (it is
-//! tracked for the companion PRD).
+//! ## `clear = true` + native delivery dissolves the old 10s-fallback fragility
+//! Workers default `clear = true`, so each delegate RESPAWNS the worker. The OLD
+//! injection path then waited `SESSION_START_WAIT` (~10s) before typing the task
+//! into the pane — and because pi maps `session_start → waiting` (it never emits
+//! `EventType::SessionStart`), that wait always burned the full fallback, so a
+//! slow pi boot could land the injected task before pi was input-ready. NATIVE
+//! delivery (PRD #201) removes that entirely: the daemon stashes the task as the
+//! respawned pane's seed and pi's extension pulls it on `session_start` via
+//! `get-seed` → `sendUserMessage` ("always triggers a turn") — deterministic, no
+//! keystroke timing. This test therefore exercises the real `clear = true`
+//! respawn path (a `.dot-agent-deck.toml` `coder` role whose command is `pi` and
+//! whose `clear` defaults to `true`) and proves the task arrives NATIVELY.
+//!
+//! The daemon's PTY-injection SAFETY NET (which delivers if the native pull never
+//! comes) is deferred out of the test window via `DOT_AGENT_DECK_SEED_FALLBACK_SECS`
+//! set high, so the ONLY route that can deliver in-window is the native pull —
+//! making the `seed_delivered_native` assertion a clean native-vs-fallback
+//! discriminator. A `clear = false` pi worker (no respawn → no `session_start`)
+//! still uses the legacy injection; that mid-session case is a documented further
+//! enhancement, out of scope here.
 //!
 //! ## Reuse of the real-pi machinery (from `e2e_pi_orchestrator.rs`)
 //! An in-process daemon (`common::spawn_inprocess_daemon`, whose hook loop ingests
@@ -140,31 +148,49 @@ fn path_with_binary_dir() -> String {
 // chain-smoke/pi/002 — real-pi WORKER receives a delegate → work-done
 // ---------------------------------------------------------------------------
 
-/// Scenario: Bring up an in-process daemon and spawn a REAL `pi` worker IDLE
-/// (no CLI-arg prompt — it boots to an interactive input box) as a `coder`-role
-/// worker pane whose env propagates `OPENROUTER_API_KEY` + `HOME` (+ the
-/// pane/socket/PATH vars). The worker's HOME starts WITHOUT the extension; the
-/// deck's spawn-time auto-materialize (the `spawn_agent` seam) detects the `pi`
-/// command and puts the bundled orchestrator extension into that HOME before pi
-/// boots. Register the orchestration maps (a synthetic, un-spawned orchestrator
-/// pane plus the real pi worker pane, sharing one orchestration + cwd) and wait
-/// until the pi worker is input-ready. Then, via the deterministic
+/// Scenario: Bring up an in-process daemon, write a `.dot-agent-deck.toml`
+/// declaring a `coder` role whose command is a REAL `pi` and whose `clear`
+/// defaults to `true`, and spawn a REAL `pi` worker pane (IDLE) as that role. The
+/// worker's HOME starts WITHOUT the extension; the deck's spawn-time
+/// auto-materialize (the `spawn_agent` seam) puts the bundled extension into that
+/// HOME before pi boots. Register the orchestration maps (a synthetic,
+/// un-spawned orchestrator pane plus the real pi worker pane, sharing the
+/// `pi-worker-orchestration` + cwd). Then, via the deterministic
 /// synthetic-delegate path, call `handle_delegate` with a `DelegateSignal` from
 /// the synthetic orchestrator delegating to the `coder` role a task to create the
 /// uniquely-named sentinel `pi_worker_sentinel_9d2e.txt` (contents
-/// `PI_WORKER_SENTINEL_OK`). Because no `.dot-agent-deck.toml` role config exists,
-/// the delegate takes the `clear = false` no-respawn path and injects the
-/// single-line worker-task pointer straight into the live pi pane. Assert the full
-/// WORKER chain: the pi worker auto-submitted the injected pointer, read its task
-/// file, created the sentinel with the expected contents (proves it received AND
-/// did the task), and the daemon wrote `.dot-agent-deck/work-done-coder.md`
-/// (proves it signalled work-done — via the footer CLI or the extension's native
-/// `work_done` tool). Generous per-step timeouts sized to confidence, not token
+/// `PI_WORKER_SENTINEL_OK`). Because the role config's `clear = true`, the daemon
+/// RESPAWNS the worker and delivers the task NATIVELY (PRD #201): it stashes the
+/// `worker-task-coder.md` pointer as the respawned pane's seed and pi's extension
+/// pulls it on `session_start` via `dot-agent-deck get-seed` →
+/// `pi.sendUserMessage` — NOT PTY keystroke injection (the injection safety net
+/// is deferred out of the window via `DOT_AGENT_DECK_SEED_FALLBACK_SECS`). Assert
+/// the full WORKER chain: the pi worker created the sentinel with the expected
+/// contents (received AND did the task), the daemon wrote
+/// `.dot-agent-deck/work-done-coder.md` (signalled work-done — footer CLI or the
+/// native `work_done` tool), AND the daemon recorded the seed was delivered
+/// NATIVELY (`seed_delivered_native`, proving the native pull ran, not the
+/// injection fallback). Generous per-step timeouts sized to confidence, not token
 /// cost (Design Decision #7). HEADLESS — a functional proof, not a reel clip.
 #[spec("chain-smoke/pi/002")]
 #[test]
 fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done() {
     skip_unless!(check_pi_available());
+    // PRD #201: defer the daemon's PTY-injection safety net far past the test
+    // window so the ONLY route that can deliver the task in-window is the native
+    // `get-seed` pull — making the `seed_delivered_native` assertion a clean
+    // native-vs-fallback discriminator (the fallback can't race in and win).
+    //
+    // SAFETY: set here, at the very top of the sync test entry point — BEFORE the
+    // tokio runtime (and therefore any daemon worker thread) is created below —
+    // so no concurrent `getenv` can race this `setenv`. nextest runs each test in
+    // its own process, so this never leaks to another test.
+    unsafe {
+        std::env::set_var(
+            dot_agent_deck::agent_pty::DOT_AGENT_DECK_SEED_FALLBACK_SECS,
+            "600",
+        );
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -178,8 +204,7 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
 
     // Shared orchestration cwd: the pi worker runs here, and the sentinel +
     // work-done file land here. A fresh tempdir → the sentinel name is unique by
-    // construction, and there is NO `.dot-agent-deck.toml`, so the delegate's role
-    // lookup returns `None` (⇒ `clear = false`, no respawn).
+    // construction.
     let cwd = common::race_safe_tempdir();
     let cwd_str = cwd
         .path()
@@ -187,6 +212,30 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         .expect("orchestration cwd is UTF-8")
         .to_string();
     let path_env = path_with_binary_dir();
+
+    // PRD #201: a `.dot-agent-deck.toml` whose `coder` role runs the REAL `pi`
+    // with `clear = true` (the default). `handle_delegate`'s role lookup finds
+    // it, so the delegate takes the `clear = true` RESPAWN path — the respawned
+    // pi's extension pulls the task NATIVELY via `get-seed`. The `orchestrator`
+    // start role's command is a no-op (`true`): it is never spawned here (the
+    // orchestrator pane is synthetic), it exists only so the config parses as a
+    // well-formed orchestration with a start role.
+    std::fs::write(
+        cwd.path().join(".dot-agent-deck.toml"),
+        format!(
+            "[[orchestrations]]\n\
+             name = \"pi-worker-orchestration\"\n\n\
+             [[orchestrations.roles]]\n\
+             name = \"orchestrator\"\n\
+             command = \"true\"\n\
+             start = true\n\n\
+             [[orchestrations.roles]]\n\
+             name = \"{WORKER_ROLE}\"\n\
+             command = \"pi --provider openrouter --model {PI_MODEL} --approve\"\n\
+             clear = true\n"
+        ),
+    )
+    .expect("write worker orchestration .dot-agent-deck.toml");
 
     // --- WORKER: real pi whose HOME starts WITHOUT the extension. The deck's
     // spawn-time auto-materialize (PRD #201, `spawn_agent` seam) detects the
@@ -221,21 +270,26 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         ("OPENROUTER_API_KEY".to_string(), openrouter_key),
     ];
 
-    // Spawn pi IDLE (no CLI-arg prompt) so it boots to an interactive input box —
-    // the daemon-injected worker-task pointer is what seeds it, exactly as a
-    // production worker pane is seeded.
-    let pi_command = format!("pi --provider openrouter --model {PI_MODEL} --approve");
-    let worker_agent_id = daemon
+    // Spawn a cheap placeholder (`cat`, blocks on stdin) as the worker pane, NOT
+    // pi. The `clear = true` delegate below RESPAWNS this pane into the REAL pi
+    // (the toml `coder` role's command), reusing THIS spawn's captured env
+    // (OPENROUTER_API_KEY + HOME etc.) — so the respawned pi is the one under
+    // test and we pay for exactly one pi boot. The placeholder exists only to
+    // give `respawn_agent_for_pane` a live target for `pane_id_env`.
+    // The returned agent id is intentionally unused: the `clear = true` respawn
+    // replaces this entry (and its id) with a fresh one, and the assertions
+    // resolve the CURRENT worker agent by its stable `pane_id_env`.
+    daemon
         .registry
         .spawn_agent(SpawnOptions {
-            command: Some(pi_command.as_str()),
+            command: Some("cat"),
             cwd: Some(cwd_str.as_str()),
             rows: 40,
             cols: 120,
             env: pi_env,
             ..SpawnOptions::default()
         })
-        .expect("spawn pi worker agent");
+        .expect("spawn placeholder worker agent");
 
     // Register the orchestration maps `handle_delegate` / `handle_work_done` read,
     // exactly as StartAgent would for a live orchestration tab. The synthetic
@@ -261,24 +315,21 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
             .insert(ORCH_PANE.to_string(), cwd_str.clone());
     }
 
-    // Let the real pi worker reach genuine input-readiness BEFORE delegating, so
-    // the daemon-injected pointer lands in a live input box (not mid-boot, where it
-    // would be dropped). Generous ceiling for pi's Bun/Node boot + extension load
-    // (Design Decision #7). This — not a fixed SESSION_START_WAIT — is what gates
-    // the injection, since the `clear = false` path does no respawn/wait.
-    common::wait_until_agent_output_settled(
-        &daemon.registry,
-        &worker_agent_id,
-        Duration::from_millis(1500),
-        Duration::from_secs(60),
-    )
-    .await;
+    // No readiness wait: the `cat` placeholder is a live registry entry the
+    // instant `spawn_agent` returns, which is all `respawn_agent_for_pane` needs
+    // as its target. Waiting for `cat` to "settle" would just burn the ceiling
+    // (it emits no output), and the pane it produces is discarded by the respawn
+    // anyway — the REAL pi boots fresh below, and only its `session_start` →
+    // `get-seed` pull is what the assertions turn on.
 
     // --- Deterministic orchestrator side: a synthetic `DelegateSignal` routed
     // through the real `handle_delegate`. Directive task with the literal sentinel
     // tokens the worker must reproduce (robust to LLM phrasing). The task body
     // becomes the contents of `worker-task-coder.md`; the daemon appends the
-    // work-done footer, and injects only the single-line pointer into the pi pane.
+    // work-done footer. Because the `coder` role is `clear = true`, the daemon
+    // RESPAWNS the pi worker and stashes the single-line pointer as the fresh
+    // pane's NATIVE seed (rather than typing it in) — pi's extension pulls it via
+    // `get-seed` → `sendUserMessage`.
     let task = format!(
         "Create a file named {SENTINEL_NAME} in the current working directory whose entire \
          contents are exactly the text {SENTINEL_CONTENT}. Use your shell tool to create it. \
@@ -299,33 +350,42 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
 
     // --- Assert the FULL worker chain. ---
 
-    // 1 + 2. The pi worker received the injected task and did it: the sentinel
-    //        exists with the expected contents (proves pi auto-submitted the
-    //        injected pointer, read its task file, and ran the work).
+    // After a `clear = true` respawn the worker's registry AGENT id changes
+    // (`worker_agent_id` above is now stale), so resolve the CURRENT agent for
+    // WORKER_PANE (by its stable `pane_id_env`) for the pane-snapshot diagnostics.
+    let current_worker_pane = || {
+        daemon
+            .registry
+            .agent_records()
+            .into_iter()
+            .find(|r| r.pane_id_env.as_deref() == Some(WORKER_PANE))
+            .and_then(|r| daemon.registry.snapshot(&r.id).ok())
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
+    };
+
+    // 1 + 2. The pi worker received the NATIVE task and did it: the sentinel
+    //        exists with the expected contents (proves pi pulled the seed via
+    //        get-seed, read its task file, and ran the work).
     let sentinel = cwd.path().join(SENTINEL_NAME);
     let sentinel_ok = common::wait_for_path_async(&sentinel, Duration::from_secs(240)).await;
 
-    let worker_pane = String::from_utf8_lossy(
-        &daemon
-            .registry
-            .snapshot(&worker_agent_id)
-            .unwrap_or_default(),
-    )
-    .into_owned();
+    let worker_pane = current_worker_pane();
 
-    // Self-diagnosing signals: did the injected pointer reach the pane, and did pi
-    // surface an API/account error? Distinguishes "the model/quota is the blocker"
-    // from "the pi-worker task-injection path is broken".
+    // Self-diagnosing signals: did the delegated task text reach the pane, and did
+    // pi surface an API/account error? Distinguishes "the model/quota is the
+    // blocker" from "the pi-worker native-delivery path is broken".
     let worker_lower = worker_pane.to_lowercase();
-    let pointer_reached = worker_pane.contains("worker-task-coder.md");
+    let task_reached = worker_pane.contains("worker-task-coder.md")
+        || worker_lower.contains(&SENTINEL_NAME.to_lowercase());
     let api_errored = ["quota", "exceeded", "billing", "unauthorized", "rate limit"]
         .iter()
         .any(|k| worker_lower.contains(k));
     assert!(
         sentinel_ok,
         "the pi WORKER never created the sentinel {SENTINEL_NAME:?} within 240s. \
-         injected_pointer_reached_pane={pointer_reached} (if false, the daemon-injected \
-         worker-task pointer never rendered — a task-injection failure, NOT the model). \
+         task_reached_pane={task_reached} (if false, the native seed never reached the \
+         respawned pi — a delivery failure, NOT the model). \
          api_error_in_pane={api_errored} (if true, an account/quota is the blocker, not the \
          pi-worker path).\n=== pi worker pane ===\n{worker_pane}\n=== end ==="
     );
@@ -352,11 +412,20 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
          the pi worker received AND did the task, but the work-done signal did not reach the \
          daemon (neither the footer `dot-agent-deck work-done` CLI nor the extension's `work_done` \
          tool).\n=== pi worker pane ===\n{}\n=== end ===",
-        String::from_utf8_lossy(
-            &daemon
-                .registry
-                .snapshot(&worker_agent_id)
-                .unwrap_or_default()
-        )
+        current_worker_pane()
+    );
+
+    // 4. NATIVE-PATH PROOF (PRD #201, GAP-#1 discipline): the task arrived via the
+    //    extension's `get-seed` pull → `pi.sendUserMessage`, NOT the PTY-injection
+    //    safety net. `get-seed`'s take marks the delivery native, and the fallback
+    //    was deferred 600s out of the window — so a completed chain can only mean
+    //    the native pull delivered the seed. Assert the registry flag to make that
+    //    explicit and bulletproof.
+    assert!(
+        daemon.registry.seed_delivered_native(WORKER_PANE),
+        "the pi worker's task must have been delivered NATIVELY via `get-seed` → \
+         `sendUserMessage` (the PTY-injection fallback was deferred out of the test \
+         window), but the daemon did not record a native seed delivery for \
+         {WORKER_PANE:?} — the respawned pi's session_start → get-seed pull did not run."
     );
 }

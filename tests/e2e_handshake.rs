@@ -100,6 +100,7 @@ fn start_live_agent(daemon: &DaemonProc) {
             display_name: Some(LIVE_AGENT_NAME.into()),
             tab_membership: None,
             agent_type: None,
+            seed: None,
         })
         .expect("StartAgent over the attach socket");
     assert!(

@@ -9,11 +9,12 @@
 //! * `pi/live/001` — a single live Pi pane whose card renders the first-class Pi
 //!   IDENTITY plus a REAL, extension-driven status TRANSITION on the vt100 grid,
 //!   with NO Claude-Code hook installed.
-//! * `pi/live/002` — GAP #1: proves a REAL `pi` orchestrator AUTO-SUBMITS a
-//!   daemon-INJECTED seed (the restore-path `write_and_submit_to_pane` replay,
-//!   NOT a CLI arg) and drives a full orchestration LIVE (pi → native `delegate`
-//!   → real `claude` Haiku worker → sentinel + work-done). See its own section
-//!   below.
+//! * `pi/live/002` — GAP #1 / PRD #201: proves a REAL `pi` orchestrator receives
+//!   its seed NATIVELY (the restore path stashes it via `StartAgent.seed`; pi's
+//!   extension pulls it with `get-seed` → `pi.sendUserMessage` — NOT a CLI arg,
+//!   NOT PTY injection) and drives a full orchestration LIVE (pi → native
+//!   `delegate` → real `claude` Haiku worker → sentinel + work-done). See its own
+//!   section below.
 //!
 //! ## Why this is separate from `e2e_pi_orchestrator.rs`
 //! The `chain-smoke/pi/001` + `scheduler/pi/001` tests are HEADLESS: an
@@ -322,12 +323,14 @@ fn orchestration_config_toml(pi_command: &str, worker_command: &str) -> String {
 /// Serialize a `session.toml` carrying an `OrchestrationSnapshot` for the
 /// two-role orchestration rooted at `project_dir`, with `directive` as the
 /// snapshot's `orchestrator_prompt`. On the daemon-empty restore path the deck
-/// re-resolves the config from `project_dir` + `config_name`, spawns both role
-/// panes IDLE, and REPLAYS `orchestrator_prompt` into the START role via
-/// `write_and_submit_to_pane` — the exact PRODUCTION injection primitive
-/// (single-line write, SUBMIT_DELAY, then a `\r`) whose auto-submit is under
-/// test. Built from the real `config` types (not hand-rolled TOML) so it can
-/// never drift from the struct the deck deserializes.
+/// re-resolves the config from `project_dir` + `config_name` and spawns both
+/// role panes IDLE. Because the START role is a Pi pane, the deck delivers
+/// `orchestrator_prompt` NATIVELY (PRD #201): it stashes it as the pane's seed at
+/// spawn (`StartAgent.seed` → daemon `set_pending_seed`) and DROPS the tab's
+/// `orchestrator_prompt`, so the render-loop `write_and_submit_to_pane` injection
+/// site is skipped for this pane. pi's extension pulls the seed on `session_start`
+/// via `get-seed` → `pi.sendUserMessage`. Built from the real `config` types (not
+/// hand-rolled TOML) so it can never drift from the struct the deck deserializes.
 fn orchestration_session_toml(project_dir: &str, pi_command: &str, directive: &str) -> String {
     let session = config::SavedSession {
         panes: vec![config::SavedPane {
@@ -365,24 +368,29 @@ fn orchestration_session_toml(project_dir: &str, pi_command: &str, directive: &s
 /// through the vt100 `TuiDeck` harness with `DOT_AGENT_DECK_EXPERIMENTAL=1` (the
 /// per-test HOME starts WITHOUT the extension — the deck's spawn-time
 /// auto-materialize seam puts the bundled Pi extension there before pi boots),
-/// imported Claude credentials + project-trust for the orchestration cwd, and
+/// imported Claude credentials + project-trust for the orchestration cwd,
 /// `OPENROUTER_API_KEY` + the built-binary PATH threaded in (the key is never
-/// printed). On the daemon-empty restore the deck spawns both role panes IDLE
-/// and REPLAYS the directive into the pi START role via the PRODUCTION
-/// `write_and_submit_to_pane` injection primitive — NOT a CLI arg. AUTO-SUBMIT
-/// CHECKPOINT (load-bearing): the daemon writes
-/// `.dot-agent-deck/worker-task-coder.md` only inside `handle_delegate`, so its
-/// appearance is the isolated proof that pi AUTO-SUBMITTED the daemon-INJECTED
-/// seed and called `delegate`. Then assert the user-visible reality on the
-/// rendered grid (the delegate pointer `worker-task-coder` rendered live in the
-/// worker pane) and confirm the full chain landed: the worker created the
-/// sentinel (contents `PI_INJECT_ORCH_OK`) and signalled work-done
-/// (`.dot-agent-deck/work-done-coder.md`). PTY-attached, so it records a
-/// `full-stream.cast` (reel-eligible, PRD #180); flaky-tolerant (real LLM) —
-/// run once, not looped.
+/// printed), and `DOT_AGENT_DECK_SEED_FALLBACK_SECS=600` so the daemon's
+/// PTY-injection safety net can't fire in-window. On the daemon-empty restore the
+/// deck spawns both role panes IDLE and delivers the directive to the pi START
+/// role NATIVELY (PRD #201): it stashes the directive as the pane's seed at spawn
+/// (`StartAgent.seed`) and SKIPS the render-loop `write_and_submit_to_pane`
+/// injection for the Pi pane; pi's extension pulls it on `session_start` via
+/// `get-seed` → `pi.sendUserMessage`. NOT a CLI arg, NOT PTY keystroke injection.
+/// AUTO-SUBMIT CHECKPOINT (load-bearing): the daemon writes
+/// `.dot-agent-deck/worker-task-coder.md` only inside `handle_delegate`, so —
+/// with the CLI arg absent, the TUI injection skipped for pi, and the daemon
+/// fallback deferred 600s — its appearance is the isolated proof that pi received
+/// its seed NATIVELY (`get-seed` → `sendUserMessage`) and called `delegate`. Then
+/// assert the user-visible reality on the rendered grid (the delegate pointer
+/// `worker-task-coder` rendered live in the worker pane) and confirm the full
+/// chain landed: the worker created the sentinel (contents `PI_INJECT_ORCH_OK`)
+/// and signalled work-done (`.dot-agent-deck/work-done-coder.md`). PTY-attached,
+/// so it records a `full-stream.cast` (reel-eligible, PRD #180); flaky-tolerant
+/// (real LLM) — run once, not looped.
 #[spec("pi/live/002")]
 #[test]
-fn pi_live_002_injection_seeded_orchestration_delegates_live() {
+fn pi_live_002_native_seeded_orchestration_delegates_live() {
     // Decision 26 runtime-skip: a missing CLI / credential is an environmental
     // condition, not a broken test. Needs BOTH a real pi (orchestrator) and a
     // real claude (worker).
@@ -457,10 +465,18 @@ fn pi_live_002_injection_seeded_orchestration_delegates_live() {
             std::env::var("OPENROUTER_API_KEY").expect("checked non-empty by check_pi_available"),
         )
         // Put the freshly-built binary's dir on PATH so the pi extension resolves
-        // `dot-agent-deck agent-event`/`delegate` and the claude worker resolves
-        // `dot-agent-deck work-done`; preserves the host PATH so `pi` / `claude`
-        // still resolve. Wins over the harness env scrub.
+        // `dot-agent-deck agent-event`/`delegate`/`get-seed` and the claude worker
+        // resolves `dot-agent-deck work-done`; preserves the host PATH so `pi` /
+        // `claude` still resolve. Wins over the harness env scrub.
         .with_env("PATH", path_with_binary_dir())
+        // PRD #201 native-path proof: defer the daemon's PTY-injection safety net
+        // far past the test window (inherited by the deck's lazy-spawned daemon),
+        // so the ONLY route the orchestrator seed can reach pi in-window is the
+        // native `get-seed` pull. Combined with the TUI-loop injection being
+        // SKIPPED for a Pi start role and NO CLI-arg prompt, a delegate can only
+        // happen if native delivery ran — making the AUTO-SUBMIT CHECKPOINT below
+        // a clean native-vs-injection discriminator.
+        .with_env("DOT_AGENT_DECK_SEED_FALLBACK_SECS", "600")
         // Point the deck's saved-session reader at our staged orchestration
         // snapshot so the daemon-empty restore rebuilds exactly this
         // orchestration (and nothing from the developer's real session.toml).
@@ -510,16 +526,18 @@ fn pi_live_002_injection_seeded_orchestration_delegates_live() {
         .join(".dot-agent-deck")
         .join(format!("worker-task-{ORCH_WORKER_ROLE}.md"));
 
-    // ===================== AUTO-SUBMIT CHECKPOINT (GAP #1) =====================
+    // ================== NATIVE-SEED CHECKPOINT (PRD #201 / GAP #1) ==================
     // The daemon writes `worker-task-coder.md` ONLY inside `handle_delegate` —
-    // i.e. only AFTER the pi orchestrator has AUTO-SUBMITTED the daemon-INJECTED
-    // seed (the restore-path `write_and_submit_to_pane` replay, NOT a CLI arg)
-    // and called the native `delegate` tool. So this file appearing is the
-    // isolated proof of GAP #1: pi auto-submits an injected seed and acts on it.
-    // If it never appears, pi did NOT auto-submit the injected seed (or did not
-    // delegate) — a production-flagship bug, NOT to be worked around with a CLI
-    // arg. Ceiling sized to confidence (Design Decision #7): pi boot + the
-    // restore readiness gate + a model round-trip + the delegate tool call.
+    // i.e. only AFTER the pi orchestrator RECEIVED its seed and called the native
+    // `delegate` tool. Here the seed can reach pi by exactly ONE route: the
+    // extension's `get-seed` pull → `pi.sendUserMessage`. There is NO CLI-arg
+    // prompt, the render-loop `write_and_submit_to_pane` injection is SKIPPED for
+    // a Pi start role, and the daemon's PTY-injection fallback is deferred 600s
+    // out of this window. So this file appearing is the isolated proof that pi
+    // received its seed NATIVELY and acted on it. If it never appears, native
+    // delivery did NOT run (or pi chose not to delegate). Ceiling sized to
+    // confidence (Design Decision #7): pi boot + extension load + get-seed pull +
+    // a model round-trip + the delegate tool call.
     let delegated = common::wait_for_path(&worker_task, Duration::from_secs(150));
     if !delegated {
         let grid = deck.snapshot_grid();
@@ -527,12 +545,12 @@ fn pi_live_002_injection_seeded_orchestration_delegates_live() {
             || grid.to_lowercase().contains("delegate")
             || grid.contains(ORCH_WORKER_ROLE);
         panic!(
-            "AUTO-SUBMIT CHECKPOINT FAILED (PRD #201 GAP #1): the daemon never wrote \
-             {worker_task:?} within 150s — the pi orchestrator did not AUTO-SUBMIT the \
-             daemon-INJECTED seed and delegate. injected_seed_visible_on_grid={seed_on_grid} (if \
-             true, the seed reached pi's pane but was not submitted — an auto-submit failure — or \
-             pi chose not to delegate). api_error_on_grid={} (if true, an account/quota is the \
-             blocker, not auto-submit).\nFinal grid:\n{grid}",
+            "NATIVE-SEED CHECKPOINT FAILED (PRD #201 GAP #1): the daemon never wrote \
+             {worker_task:?} within 150s — the pi orchestrator did not receive its seed \
+             NATIVELY (get-seed → sendUserMessage) and delegate. seed_visible_on_grid={seed_on_grid} \
+             (if true, the seed reached pi's pane but pi did not delegate). \
+             api_error_on_grid={} (if true, an account/quota is the blocker, not native \
+             delivery).\nFinal grid:\n{grid}",
             api_errored(&grid)
         );
     }

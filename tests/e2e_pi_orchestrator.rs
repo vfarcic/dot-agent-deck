@@ -193,20 +193,25 @@ fn path_with_binary_dir() -> String {
 
 /// Scenario: Bring up an in-process daemon, spawn a REAL Claude Code (Haiku)
 /// worker as a long-running interactive `coder`-role pane and wait until it is
-/// input-ready, then spawn a REAL `pi` orchestrator pane whose HOME starts
-/// WITHOUT the extension — the deck's spawn-time auto-materialize (the
-/// `spawn_agent` seam) detects the `pi` command and materializes the bundled
-/// orchestrator extension into that HOME before pi boots — and whose env
-/// explicitly propagates `OPENROUTER_API_KEY` + `HOME`. Give pi a
-/// directive initial prompt instructing it to call the native `delegate` tool
-/// once, delegating to the `coder` role a task that creates the uniquely-named
-/// sentinel `pi_orch_sentinel_7c3f.txt` (contents `PI_ORCH_SENTINEL_OK`). Assert
-/// the FULL chain: the sentinel file exists with the expected contents (the real
-/// worker ran the delegated task via the daemon route), the daemon wrote
-/// `.dot-agent-deck/work-done-coder.md` (work-done returned to the orchestrator),
-/// and a `Pi`-typed `AgentEvent` for the orchestrator pane was observed on the
-/// daemon's broadcast — status tracked through the extension's `agent-event` path
-/// with NO hook installed.
+/// input-ready, then spawn a REAL `pi` orchestrator pane IDLE (no CLI-arg
+/// prompt) whose HOME starts WITHOUT the extension — the deck's spawn-time
+/// auto-materialize (the `spawn_agent` seam) detects the `pi` command and
+/// materializes the bundled orchestrator extension into that HOME before pi
+/// boots — and whose env explicitly propagates `OPENROUTER_API_KEY` + `HOME`.
+/// Deliver pi's directive NATIVELY (PRD #201): stash it in the daemon seed store
+/// (`set_pending_seed`), and pi's extension pulls it on `session_start` via
+/// `dot-agent-deck get-seed` → `pi.sendUserMessage` (NOT a CLI arg, NOT PTY
+/// keystroke injection). The directive tells pi to call the native `delegate`
+/// tool once, delegating to the `coder` role a task that creates the
+/// uniquely-named sentinel `pi_orch_sentinel_7c3f.txt` (contents
+/// `PI_ORCH_SENTINEL_OK`). Assert the FULL chain: the sentinel file exists with
+/// the expected contents (the real worker ran the delegated task via the daemon
+/// route), the daemon wrote `.dot-agent-deck/work-done-coder.md` (work-done
+/// returned to the orchestrator), a `Pi`-typed `AgentEvent` for the orchestrator
+/// pane was observed on the daemon's broadcast (status via the extension's
+/// `agent-event` path, NO hook), AND the daemon recorded that the seed was
+/// delivered NATIVELY via the `get-seed` pull (proving the native path ran, not
+/// an injection fallback).
 #[spec("chain-smoke/pi/001")]
 #[test]
 fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker() {
@@ -335,7 +340,11 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
     // Directive prompt: instruct pi to call `delegate` ONCE with role `coder` and
     // a task that creates the distinctive sentinel. Robust to LLM phrasing — the
     // sentinel filename + content are literal tokens the worker must reproduce.
-    // Single-quoted in the shell-wrapped command; contains no apostrophes.
+    // PRD #201: this directive is delivered NATIVELY — NOT as a CLI arg. It is
+    // stashed in the daemon seed store (`set_pending_seed`) and the pi extension
+    // pulls it on `session_start` via `dot-agent-deck get-seed` →
+    // `pi.sendUserMessage`, which "always triggers a turn". No PTY keystroke
+    // injection, no CLI positional arg.
     let directive = format!(
         "You are the orchestrator in a dot-agent-deck orchestration. A worker role named \
          \"coder\" is available. Call the delegate tool EXACTLY ONCE with role \"coder\" and \
@@ -343,7 +352,11 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
          whose entire contents are exactly the text {SENTINEL_CONTENT}. Use the Bash tool to \
          create it. Do NOT do the work yourself — only call the delegate tool, then stop."
     );
-    let pi_command = format!("pi --provider openrouter --model {PI_MODEL} --approve '{directive}'");
+    // Spawn pi IDLE — NO CLI-arg prompt. The only route the directive can reach
+    // pi is the native `get-seed` pull, so a successful delegate PROVES native
+    // delivery (there is no injection fallback armed on this direct-registry
+    // spawn path).
+    let pi_command = format!("pi --provider openrouter --model {PI_MODEL} --approve");
 
     let orch_agent_id = daemon
         .registry
@@ -356,6 +369,12 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
             ..SpawnOptions::default()
         })
         .expect("spawn pi orchestrator agent");
+
+    // PRD #201 native prompt delivery: stash the directive as the orchestrator
+    // pane's seed (keyed by DOT_AGENT_DECK_PANE_ID = ORCH_PANE). pi's extension
+    // pulls it on `session_start` — well after this returns, since pi's Node/Bun
+    // boot + extension load takes seconds.
+    daemon.registry.set_pending_seed(ORCH_PANE, &directive);
 
     // --- Assert the FULL chain. ---
 
@@ -449,6 +468,22 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
          orchestrator pane {ORCH_PANE:?} — the extension's `agent-event` status path did not \
          report (expected it to shell `dot-agent-deck agent-event` on session_start/agent_start).\n\
          === pi orchestrator pane ===\n{orch_pane}\n=== end ==="
+    );
+
+    // 4. NATIVE-PATH PROOF (PRD #201, GAP-#1 discipline): the directive was
+    //    delivered by the extension's `get-seed` pull → `pi.sendUserMessage`,
+    //    NOT by a CLI arg and NOT by PTY keystroke injection. `get-seed`'s take
+    //    marks the delivery native, and there is no injection fallback on this
+    //    direct-registry spawn — so a delegate could only have happened if the
+    //    native pull delivered the seed. Asserting the registry flag makes that
+    //    explicit and bulletproof.
+    assert!(
+        daemon.registry.seed_delivered_native(ORCH_PANE),
+        "the pi orchestrator's directive must have been delivered NATIVELY via \
+         `get-seed` → `sendUserMessage` (the pane was spawned idle with no CLI-arg \
+         prompt and no PTY injection), but the daemon did not record a native seed \
+         delivery for {ORCH_PANE:?} — the extension's session_start → get-seed pull \
+         did not run."
     );
 }
 

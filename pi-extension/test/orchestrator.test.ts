@@ -20,11 +20,14 @@ import {
 	AGENT_STATES,
 	buildAgentEventArgv,
 	buildDelegateArgv,
+	buildGetSeedArgv,
 	buildWorkDoneArgv,
 	DECK_BIN,
 	execFailureMessage,
 	isAgentState,
 	piEventToAgentState,
+	SEED_DELIVER_AS,
+	seedToDeliver,
 	spawnFailureMessage,
 	STATUS_EVENTS,
 } from "../src/orchestrator.ts";
@@ -149,6 +152,48 @@ describe("row 8: exec error classification", () => {
 		assert.match(spawnFailureMessage(["work-done", "--task", "x"], new Error("EACCES")), /EACCES/);
 		assert.doesNotMatch(spawnFailureMessage(["work-done", "--task", "x"], new Error("EACCES")), /on PATH\?/);
 		assert.match(spawnFailureMessage(["work-done", "--task", "x"], "weird"), /weird/);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// PRD #201 native prompt delivery — get-seed argv + seed decision
+// ---------------------------------------------------------------------------
+
+describe("native seed delivery: get-seed argv", () => {
+	test("builds the read-only get-seed argv", () => {
+		assert.deepEqual(buildGetSeedArgv(), ["get-seed"]);
+	});
+});
+
+describe("native seed delivery: seedToDeliver", () => {
+	test("returns the trimmed seed when the CLI printed a real one", () => {
+		assert.equal(
+			seedToDeliver("Read .dot-agent-deck/worker-task-coder.md for your task."),
+			"Read .dot-agent-deck/worker-task-coder.md for your task.",
+		);
+	});
+
+	test("trims a trailing newline a shell layer might add", () => {
+		assert.equal(seedToDeliver("Acknowledge your role and wait.\n"), "Acknowledge your role and wait.");
+	});
+
+	test("returns null for an empty seed (no seed pending → no send)", () => {
+		assert.equal(seedToDeliver(""), null);
+	});
+
+	test("returns null for whitespace-only output", () => {
+		assert.equal(seedToDeliver("   \n\t "), null);
+	});
+
+	test("returns null for missing stdout (undefined / null)", () => {
+		assert.equal(seedToDeliver(undefined), null);
+		assert.equal(seedToDeliver(null), null);
+	});
+});
+
+describe("native seed delivery: deliverAs mode", () => {
+	test("delivers as followUp — triggers a turn, never steers an in-flight one", () => {
+		assert.equal(SEED_DELIVER_AS, "followUp");
 	});
 });
 

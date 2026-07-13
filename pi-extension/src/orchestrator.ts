@@ -98,6 +98,49 @@ export function buildAgentEventArgv(state: string): string[] {
 	return ["agent-event", "--type", state];
 }
 
+/**
+ * Build the argv for the read-only `dot-agent-deck get-seed` verb (PRD #201).
+ *
+ * `get-seed` asks the daemon (over the hook socket, scoped by
+ * `DOT_AGENT_DECK_PANE_ID`) for the seed/prompt it prepared for this pane and
+ * prints it to stdout (empty = nothing pending). The extension shells this on
+ * `session_start` and, if the output is a real seed, delivers it NATIVELY via
+ * `pi.sendUserMessage` — dissolving the last workaround (PTY keystroke
+ * injection) for a Pi pane's first prompt.
+ *
+ * @example buildGetSeedArgv() → ["get-seed"]
+ */
+export function buildGetSeedArgv(): string[] {
+	return ["get-seed"];
+}
+
+/**
+ * How the native seed is queued into Pi. `"followUp"` means "deliver the
+ * message and, if a turn is already streaming, queue it until the agent
+ * finishes" — and `sendUserMessage` "always triggers a turn", so on
+ * `session_start` (the agent is idle) this seeds AND runs the prompt
+ * deterministically, with none of the keystroke-timing fragility the PTY
+ * injection path had (no SUBMIT_DELAY, no readiness guess, no discarded early
+ * CR). `"steer"` would interrupt an in-flight turn — wrong for a first prompt.
+ */
+export const SEED_DELIVER_AS = "followUp" as const;
+
+/**
+ * Decide what to deliver from a `get-seed` result. Returns the trimmed seed
+ * when the CLI printed a non-blank one, or `null` when there is nothing to
+ * deliver (empty output, whitespace-only, or the CLI produced no stdout) — in
+ * which case the extension sends nothing and the daemon's PTY-injection safety
+ * net remains responsible for delivery. Trimming drops any trailing newline a
+ * shell layer might add without altering a single-line prompt's meaning.
+ */
+export function seedToDeliver(stdout: string | undefined | null): string | null {
+	if (typeof stdout !== "string") {
+		return null;
+	}
+	const seed = stdout.trim();
+	return seed.length > 0 ? seed : null;
+}
+
 /** The Pi lifecycle events the extension subscribes to for status reporting. */
 export const STATUS_EVENTS = [
 	"session_start",

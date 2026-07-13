@@ -48,6 +48,7 @@ fn delivery_007_hook_teaches_daemon_agent_type_for_reconnect() {
             display_name: None,
             tab_membership: None,
             agent_type: None,
+            seed: None,
         })
         .expect("StartAgent over the attach socket");
     assert!(
@@ -140,6 +141,7 @@ fn live_006_fresh_tui_renders_live_working_status_on_reconnect() {
             display_name: Some("recon-live-77".into()),
             tab_membership: None,
             agent_type: None,
+            seed: None,
         })
         .expect("StartAgent over the attach socket");
     assert!(

@@ -5684,6 +5684,9 @@ fn dispatch_action(
                             rows: spawn_rows,
                             cols: spawn_cols,
                             agent_type: spawn_agent_type,
+                            // PRD #201: single-pane spawn, not a Pi
+                            // orchestrator — no native seed.
+                            seed: None,
                         },
                     ) {
                         Ok((new_id, resolved_name)) => {
@@ -7098,6 +7101,8 @@ pub fn run_tui(
                     rows,
                     cols,
                     agent_type: AgentType::from_command(cmd),
+                    // PRD #201: single-pane spawn — no native seed.
+                    seed: None,
                 },
             ) {
                 Ok((new_id, _resolved)) => {
@@ -7182,6 +7187,8 @@ pub fn run_tui(
                     rows,
                     cols,
                     agent_type: mode_agent_type,
+                    // PRD #201: mode agent pane, not a Pi orchestrator — no seed.
+                    seed: None,
                 },
             ) {
                 Ok((new_id, _resolved)) => {
@@ -7260,6 +7267,8 @@ pub fn run_tui(
                                     rows: fb_rows,
                                     cols: fb_cols,
                                     agent_type: fb_agent_type.clone(),
+                                    // PRD #201: restore fallback spawn — no seed.
+                                    seed: None,
                                 },
                             ) {
                                 Ok((fb_id, _resolved)) => {
@@ -7326,6 +7335,8 @@ pub fn run_tui(
                             rows: fb_rows,
                             cols: fb_cols,
                             agent_type: fb_agent_type.clone(),
+                            // PRD #201: restore fallback spawn — no seed.
+                            seed: None,
                         },
                     ) {
                         Ok((fb_id, _resolved)) => {

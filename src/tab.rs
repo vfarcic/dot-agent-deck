@@ -489,6 +489,23 @@ impl TabManager {
         let mut role_pane_ids: Vec<String> = Vec::with_capacity(config.roles.len());
         let (spawn_rows, spawn_cols) = spawn_dims;
 
+        // PRD #201 native prompt delivery: when the START (orchestrator) role is
+        // a Pi pane, its first prompt is delivered NATIVELY — stashed daemon-side
+        // at spawn time (`AgentSpawnOptions.seed`) and pulled by the pane's
+        // extension via `get-seed` → `pi.sendUserMessage`, dissolving the last
+        // keystroke-injection workaround. For a Pi start role we therefore (a)
+        // attach the seed at spawn below, and (b) DROP the tab's
+        // `orchestrator_prompt` so the render-loop PTY-injection site
+        // (`ui.rs`) skips it — the daemon owns delivery (native pull + its own
+        // PTY-injection safety net). A non-Pi start role is unchanged: no seed,
+        // and the tab keeps `orchestrator_prompt` for the existing injection.
+        let start_role_is_pi = config
+            .roles
+            .iter()
+            .find(|r| r.start)
+            .map(|r| AgentType::from_command(Some(&r.command)) == Some(AgentType::Pi))
+            .unwrap_or(false);
+
         // CodeRabbit round-9 #7 / round-10 #1: `config.name` defaults
         // to an empty string when the user didn't name their
         // orchestration. We fall back to the cwd basename so the
@@ -552,6 +569,12 @@ impl TabManager {
                 // path can build the placeholder session with the right
                 // type instead of "No agent".
                 agent_type: AgentType::from_command(Some(&role.command)),
+                // PRD #201: seed only the Pi start-role pane for native pull.
+                seed: if role.start && start_role_is_pi {
+                    orchestrator_prompt.clone()
+                } else {
+                    None
+                },
             };
             let (pane_id, _resolved) = match self.pane_controller.create_pane_with_options(
                 Some(&role.command),
@@ -586,7 +609,13 @@ impl TabManager {
             cwd: cwd.to_string(),
             focused_role_pane_id: None,
             start_role_index,
-            orchestrator_prompt,
+            // PRD #201: a Pi start role is seeded natively at spawn, so drop the
+            // prompt here — the render-loop injection site skips a `None`.
+            orchestrator_prompt: if start_role_is_pi {
+                None
+            } else {
+                orchestrator_prompt
+            },
             config: config.clone(),
             status: OrchestrationStatus::WaitingForOrchestrator,
         });
