@@ -190,6 +190,22 @@ enum Commands {
         #[command(subcommand)]
         cmd: SnapshotCmd,
     },
+    /// Wrap an agent command, passing its stdio through transparently while
+    /// tee-ing output through pattern detection into `AgentEvent`s (PRD #20 M6
+    /// — the generic stdout-wrapper integration strategy). The child stays
+    /// fully interactive; recognised output lines drive the pane's card status,
+    /// and the child's exit code becomes the wrapper's exit code. Usage:
+    /// `dot-agent-deck wrap [--agent <name>] -- <command> <args...>`.
+    Wrap {
+        /// Optional agent identity override (a registry basename, e.g.
+        /// `claude`). When omitted, the type is inferred from the wrapped
+        /// command's binary.
+        #[arg(long)]
+        agent: Option<String>,
+        /// The agent command and its arguments, taken verbatim after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -983,6 +999,9 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        Some(Commands::Wrap { agent, command }) => {
+            dot_agent_deck::wrap::run_wrap(agent.as_deref(), &command)
         }
     }
 }
