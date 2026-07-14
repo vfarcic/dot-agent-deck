@@ -1,4 +1,5 @@
 pub mod agent_pty;
+pub mod agent_registry;
 pub mod ascii_art;
 pub mod build_id;
 pub mod build_version_handshake;

@@ -63,12 +63,10 @@ fn text_dim() -> Style {
 
 impl fmt::Display for crate::event::AgentType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            crate::event::AgentType::ClaudeCode => write!(f, "ClaudeCode"),
-            crate::event::AgentType::OpenCode => write!(f, "OpenCode"),
-            crate::event::AgentType::Pi => write!(f, "Pi"),
-            crate::event::AgentType::None => write!(f, "No agent"),
-        }
+        // PRD #20 M2: the human label is registry data now (single source of
+        // truth), not a per-variant `match` here. Labels are unchanged
+        // (ClaudeCode / OpenCode / Pi / "No agent").
+        write!(f, "{}", crate::agent_registry::spec(self).label)
     }
 }
 
@@ -400,20 +398,29 @@ const ISSUE_DISPATCH_MODE_NAME: &str = "schedule: issues";
 /// Command field is free-text (the clickable preset picker is gone), so only this
 /// blank-case default remains — `claude`, the simple default that launches a real
 /// conversational agent.
-const DEFAULT_AUTHORING_COMMAND: &str = "claude";
+///
+/// PRD #20 M2: sourced from the agent registry's Claude Code entry
+/// (`agent_registry::CLAUDE_CODE.default_command`) so the fallback lives in the
+/// single per-agent source of truth rather than a lone hardcoded string; the
+/// value is unchanged (`claude`).
+fn default_authoring_command() -> &'static str {
+    crate::agent_registry::CLAUDE_CODE
+        .default_command
+        .unwrap_or("claude")
+}
 
 /// PRD #170 round 2 (reviewer findings 1 & 3): resolve the authoring command
 /// for a scheduled-task authoring session. The authoring agent MUST be a real
 /// conversational agent that can act on the seed prompt and call the `schedule
 /// add` CLI — never a bare `$SHELL`. So a blank/whitespace `default_command`
 /// (the unconfigured-user case: `config.rs` defaults it to `String::new`) falls
-/// back to [`DEFAULT_AUTHORING_COMMAND`] (`claude`); a configured value is used
+/// back to [`default_authoring_command`] (`claude`); a configured value is used
 /// as-is (trimmed). Shared by both authoring spawn sites so the fallback is
 /// applied uniformly.
 fn resolve_authoring_command(default_command: &str) -> String {
     let trimmed = default_command.trim();
     if trimmed.is_empty() {
-        DEFAULT_AUTHORING_COMMAND.to_string()
+        default_authoring_command().to_string()
     } else {
         trimmed.to_string()
     }

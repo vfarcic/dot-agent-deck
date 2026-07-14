@@ -32,6 +32,19 @@ enum CliAgent {
     Opencode,
 }
 
+impl CliAgent {
+    /// Map the CLI-surface agent selector to the registry's typed identity, so
+    /// hook install/uninstall dispatch reads the integration STRATEGY from the
+    /// agent registry (PRD #20 M2) instead of hardcoding which per-agent module
+    /// to call for each variant.
+    fn agent_type(self) -> dot_agent_deck::event::AgentType {
+        match self {
+            CliAgent::ClaudeCode => dot_agent_deck::event::AgentType::ClaudeCode,
+            CliAgent::Opencode => dot_agent_deck::event::AgentType::OpenCode,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Handle an agent hook event (reads stdin, sends to socket)
@@ -487,25 +500,44 @@ fn main() -> ExitCode {
             handle_hook(agent_str)
         }
         Some(Commands::Hooks { action }) => {
+            // PRD #20 M2: dispatch on the agent's integration STRATEGY (looked
+            // up in the registry) rather than hardcoding a per-`CliAgent`
+            // module call. Behaviour is unchanged for the two CLI agents —
+            // ClaudeCode → NativeHooks (`hooks_manage`), Opencode → Plugin
+            // (`opencode_manage`) — but a future NativeHooks/Plugin agent would
+            // install correctly from just its registry entry + CLI variant.
+            use dot_agent_deck::agent_registry::{self, IntegrationStrategy};
             match action {
-                HooksAction::Install { agent } => match agent {
-                    CliAgent::Opencode => {
-                        if let Err(e) = dot_agent_deck::opencode_manage::install() {
-                            eprintln!("Failed to install OpenCode plugin: {e}");
+                HooksAction::Install { agent } => {
+                    match agent_registry::spec(&agent.agent_type()).strategy {
+                        Some(IntegrationStrategy::Plugin) => {
+                            if let Err(e) = dot_agent_deck::opencode_manage::install() {
+                                eprintln!("Failed to install OpenCode plugin: {e}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                        Some(IntegrationStrategy::NativeHooks) => hooks_manage::install(),
+                        other => {
+                            eprintln!("No hook installer for integration strategy {other:?}");
                             return ExitCode::FAILURE;
                         }
                     }
-                    CliAgent::ClaudeCode => hooks_manage::install(),
-                },
-                HooksAction::Uninstall { agent } => match agent {
-                    CliAgent::Opencode => {
-                        if let Err(e) = dot_agent_deck::opencode_manage::uninstall() {
-                            eprintln!("Failed to uninstall OpenCode plugin: {e}");
+                }
+                HooksAction::Uninstall { agent } => {
+                    match agent_registry::spec(&agent.agent_type()).strategy {
+                        Some(IntegrationStrategy::Plugin) => {
+                            if let Err(e) = dot_agent_deck::opencode_manage::uninstall() {
+                                eprintln!("Failed to uninstall OpenCode plugin: {e}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                        Some(IntegrationStrategy::NativeHooks) => hooks_manage::uninstall(),
+                        other => {
+                            eprintln!("No hook uninstaller for integration strategy {other:?}");
                             return ExitCode::FAILURE;
                         }
                     }
-                    CliAgent::ClaudeCode => hooks_manage::uninstall(),
-                },
+                }
             }
             ExitCode::SUCCESS
         }
@@ -1113,9 +1145,25 @@ async fn run_tui_session() -> ExitCode {
     // the alt-screen, so loading here keeps the warnings ahead of it.
     let keybindings = dot_agent_deck::keybindings::KeybindingConfig::load();
 
-    // Auto-install hooks for detected agents (silent, best-effort)
-    hooks_manage::auto_install();
-    dot_agent_deck::opencode_manage::auto_install();
+    // Auto-install hooks/plugins for detected agents (silent, best-effort).
+    // PRD #20 M2: driven from the agent registry — iterate the shipped agents
+    // and run the STARTUP installer for the strategies that have one. Order is
+    // stable (`ALL` order) and matches the prior hooks-then-plugin sequence.
+    // NativeHooks (Claude) and Plugin (OpenCode) install at startup; Extension
+    // (Pi) materializes at spawn-time (see `agent_pty`) and Wrapper has no
+    // install step, so those strategies are skipped here.
+    {
+        use dot_agent_deck::agent_registry::{ALL, IntegrationStrategy};
+        for spec in ALL {
+            match spec.strategy {
+                Some(IntegrationStrategy::NativeHooks) => hooks_manage::auto_install(),
+                Some(IntegrationStrategy::Plugin) => {
+                    dot_agent_deck::opencode_manage::auto_install()
+                }
+                _ => {}
+            }
+        }
+    }
 
     let pane_controller: Arc<dyn PaneController> = Arc::new(EmbeddedPaneController::new(
         attach_path.clone(),

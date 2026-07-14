@@ -1682,7 +1682,18 @@ impl AgentPtyRegistry {
         // HOME-unset-safe (skip, never a `/tmp` write) — see
         // `orchestrator_ext::auto_materialize`. Done before `spawn(opts)` so the
         // extension is on disk before Pi's boot-time discovery runs.
-        if AgentType::from_command(opts.command) == Some(AgentType::Pi) {
+        // PRD #20 M2: dispatch this spawn-time materialize through the agent
+        // registry's integration STRATEGY rather than hardcoding the `Pi`
+        // variant. Extension is the "bundled extension materialized into the
+        // agent's HOME" mechanism, and Pi (`orchestrator_ext`) is its sole user
+        // today — so this fires on exactly the same commands as before (`pi …`),
+        // but a future Extension-strategy agent slots in at this one seam.
+        // Detection still keys off the actual spawn COMMAND (registry-backed
+        // `from_command`), not the caller-supplied `agent_type`.
+        if let Some(agent_type) = AgentType::from_command(opts.command)
+            && crate::agent_registry::spec(&agent_type).strategy
+                == Some(crate::agent_registry::IntegrationStrategy::Extension)
+        {
             crate::orchestrator_ext::auto_materialize(&opts.env);
         }
 

@@ -59,16 +59,16 @@ impl AgentType {
     /// unknown commands and `None` input return `None` so the daemon stores
     /// "type not known yet" rather than misclassifying. Whitespace
     /// before the binary name is ignored to match shell-style invocations.
+    ///
+    /// PRD #20 M2: the per-agent basename→type mapping now lives in the agent
+    /// registry ([`crate::agent_registry`]); this fn keeps the command-parsing
+    /// (basename extraction, arg stripping) and delegates the lookup. The
+    /// recognized set and the "unknown → `None`" behaviour are unchanged.
     pub fn from_command(cmd: Option<&str>) -> Option<Self> {
         let cmd = cmd?;
         let bin = cmd.split_whitespace().next()?;
         let basename = std::path::Path::new(bin).file_name()?.to_str()?;
-        match basename {
-            "claude" => Some(AgentType::ClaudeCode),
-            "opencode" => Some(AgentType::OpenCode),
-            "pi" => Some(AgentType::Pi),
-            _ => None,
-        }
+        crate::agent_registry::detect_from_basename(basename)
     }
 }
 
