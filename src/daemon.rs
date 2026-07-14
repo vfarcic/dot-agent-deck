@@ -1006,7 +1006,11 @@ mod orphan_watchdog_tests {
     }
 }
 
-#[cfg(test)]
+// PRD #42 M2/review: these tests bind a real Unix socket, chmod it via
+// `PermissionsExt`, and spawn `/bin/sh` agents — none of which exist on
+// Windows. Gate the whole block to Unix so the Windows `cargo nextest run`
+// step compiles (mirrors `agent_pty::spawn_tests`). No Unix coverage is lost.
+#[cfg(all(test, unix))]
 mod hook_ingestion_tests {
     use super::*;
     use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
@@ -1051,7 +1055,11 @@ mod hook_ingestion_tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
             .expect("chmod tempdir");
         let sock = dir.path().join("hook.sock");
-        let listener = UnixListener::bind(&sock).expect("bind hook socket");
+        // Wrap the plain `UnixListener` as an `IpcListener` without going
+        // through `IpcListener::bind` (whose umask flip is what the comment
+        // above deliberately avoids). `run_hook_loop` takes an `IpcListener`.
+        let listener =
+            IpcListener::from_tokio_listener(UnixListener::bind(&sock).expect("bind hook socket"));
         let state: SharedState =
             Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
         let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
@@ -1134,7 +1142,8 @@ mod hook_ingestion_tests {
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
             .expect("chmod tempdir");
         let sock = dir.path().join("hook.sock");
-        let listener = UnixListener::bind(&sock).expect("bind hook socket");
+        let listener =
+            IpcListener::from_tokio_listener(UnixListener::bind(&sock).expect("bind hook socket"));
         let state: SharedState =
             Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
         let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);

@@ -118,6 +118,17 @@ impl IpcListener {
         let (stream, _addr) = self.0.accept().await?;
         Ok(IpcStream(stream))
     }
+
+    /// Test-only: adopt an already-bound [`tokio::net::UnixListener`] as an
+    /// `IpcListener` **without** the umask/permission dance [`bind`] performs.
+    /// The daemon hook-ingestion tests bind their socket with a plain
+    /// `UnixListener::bind` on purpose — [`bind`]'s process-global umask flip
+    /// races sibling tests under single-process `cargo test` — yet still need to
+    /// hand the listener to `run_hook_loop`, which takes an `IpcListener`.
+    #[cfg(test)]
+    pub(crate) fn from_tokio_listener(listener: UnixListener) -> Self {
+        Self(listener)
+    }
 }
 
 /// Blocking single-shot IPC client for the sync hook/ui paths. Unix backend:
@@ -138,6 +149,18 @@ impl IpcClient {
         self.0.set_read_timeout(Some(timeout))?;
         self.0.set_write_timeout(Some(timeout))?;
         Ok(())
+    }
+
+    /// Half-close the write side, leaving the read side open. Lift of the
+    /// `stream.shutdown(std::net::Shutdown::Write)` call in
+    /// `hook::request_from_socket`: after writing its single request line the
+    /// client half-closes so the daemon's line reader observes EOF and stops
+    /// waiting for more input — the daemon's per-connection task then drops its
+    /// write half, which is what lets the client's subsequent `read_to_string`
+    /// see EOF instead of blocking forever. Without this the get-seed
+    /// request/response deadlocks.
+    pub fn shutdown_write(&self) -> io::Result<()> {
+        self.0.shutdown(std::net::Shutdown::Write)
     }
 }
 

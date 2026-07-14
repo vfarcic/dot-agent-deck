@@ -186,13 +186,25 @@ fn checked_signal_pid(pid: u32) -> std::io::Result<libc::pid_t> {
 
 /// Send `SIGTERM` to `pid` (the daemon-stop graceful signal). Guards against
 /// pid 0 / overflow that would turn the signal into a process-group broadcast.
+///
+/// `ESRCH` (no such process) is **not** an error: it means the daemon already
+/// exited, which is a clean already-gone success for the caller (the
+/// `daemon stop` path racing a self-exiting daemon, and the re-resolve fallback
+/// in `build_version_handshake` that documents "SIGTERM lands as ESRCH").
+/// Returning `Ok(())` here lets the caller's `poll_daemon_gone` report
+/// `Stopped`, matching the pre-refactor `terminate_daemon_graceful` behavior on
+/// `main` — which special-cased ESRCH to `Ok(Stopped)` rather than a failure.
 pub fn terminate_pid(pid: u32) -> std::io::Result<()> {
     let signal_pid = checked_signal_pid(pid)?;
     // SAFETY: `libc::kill` is async-signal-safe and has no in-process side
     // effects beyond delivering the signal to the target PID.
     let rc = unsafe { libc::kill(signal_pid, libc::SIGTERM) };
     if rc != 0 {
-        return Err(std::io::Error::last_os_error());
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(err);
     }
     Ok(())
 }

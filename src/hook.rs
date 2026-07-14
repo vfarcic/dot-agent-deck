@@ -267,13 +267,13 @@ pub fn send_to_socket(json: &str) -> Option<()> {
 /// line is returned as `Some(String::new())`.
 pub fn request_from_socket(json: &str) -> Option<String> {
     let path = socket_path();
-    let mut stream = UnixStream::connect(path).ok()?;
+    let mut stream = crate::platform::ipc::IpcClient::connect(&path).ok()?;
     let msg = format!("{json}\n");
     stream.write_all(msg.as_bytes()).ok()?;
     stream.flush().ok()?;
     // Half-close our write side so the daemon's line reader sees EOF after our
     // single request and doesn't block waiting for more (it reads in a loop).
-    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.shutdown_write();
     let mut buf = String::new();
     stream.read_to_string(&mut buf).ok()?;
     // The daemon writes exactly one JSON line; take the first line and trim the

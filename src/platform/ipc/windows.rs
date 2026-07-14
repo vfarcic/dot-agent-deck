@@ -244,6 +244,16 @@ impl IpcClient {
     pub fn set_timeouts(&self, _timeout: std::time::Duration) -> io::Result<()> {
         Ok(())
     }
+
+    /// Half-close the write side (Unix `shutdown(Shutdown::Write)`). A named
+    /// pipe opened as a `std::fs::File` has no half-close primitive; the real
+    /// message-mode client (which does not need one) lands in PRD #163. Kept as
+    /// a signature-stable no-op so `hook::request_from_socket` compiles
+    /// unchanged. Unreachable in #42: the Windows daemon hard-fails at
+    /// `IpcListener::bind`, so no daemon ever answers the hook socket here.
+    pub fn shutdown_write(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl std::io::Read for IpcClient {
