@@ -65,12 +65,14 @@ watch = false
 pattern = "git (log|status|show|diff)"
 watch = false
 
+# Dogfood: mixed agents — orchestrator/auditor=pi (Opus, high thinking), reviewer/tester=opencode (gpt-5.6-pro), coder/release=claude. Flip any role back via the commented all-claude command under it.
 [[orchestrations]]
 name = "dot-agent-deck"
 
 [[orchestrations.roles]]
 name = "orchestrator"
-command = "devbox run agent-big"
+command = "devbox run pi-big"
+# command = "devbox run agent-big"   # all-claude default
 start = true
 prompt_template = """
 You coordinate the team. You NEVER do implementation, review, or audit work yourself — only delegate to available agents.
@@ -130,19 +132,22 @@ prompt_template = "Implement the requested change. If the task references a PRD 
 
 [[orchestrations.roles]]
 name = "reviewer"
-command = "devbox run agent-reviewer"
+command = "devbox run oc-big"
+# command = "devbox run agent-reviewer"   # all-claude default
 description = "Reviews code changes for correctness, style, and edge cases"
 prompt_template = "Review the change. Report findings only — do not modify code. Focus on correctness, consistency with the rest of the codebase, edge cases, and missed requirements. If the task references a PRD path, verify the implementation matches it. If critical context is missing (e.g. the diff or PRD path), surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."
 
 [[orchestrations.roles]]
 name = "auditor"
-command = "devbox run agent-auditor"
+command = "devbox run pi-big"
+# command = "devbox run agent-auditor"   # all-claude default
 description = "Audits code for security vulnerabilities and unsafe patterns"
 prompt_template = "Audit the change for security vulnerabilities, unsafe patterns, and OWASP top-10 class issues. Report findings only — do not modify code. If the task references a file or diff, read it before starting. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."
 
 [[orchestrations.roles]]
 name = "tester"
-command = "devbox run agent-tester"
+command = "devbox run oc-big"
+# command = "devbox run agent-tester"   # all-claude default
 description = "Writes failing synthetic L2 tests under the TUI test harness; verifies they pass after coder implements. Sweet spot is L2 synthetic flows (hooks, status transitions, prompts, focus, lifecycle, resize, error paths) and L1 widget redesigns. Skips pure refactors, pure-data fixes, and chain-smoke (all stay with coder). Prefers extending or modifying existing tests over creating new ones."
 prompt_template = """
 You author synthetic tests under the TUI test harness (`tests/render_*.rs` for L1, `tests/e2e_*.rs` for L2 synthetic). You operate in TDD mode: when the orchestrator delegates a behavior-changing task, write/extend/modify a failing test that pins the requested behavior, run it to confirm it fails for the right reason (RED), and report back with the failure signature so coder can implement. When the orchestrator re-delegates after coder finishes, re-run the test to confirm GREEN. Assert on the observable end-state (rendered output / behavior), not on internal routing or state, so your tests survive refactors.

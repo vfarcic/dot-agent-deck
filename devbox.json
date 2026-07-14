@@ -40,6 +40,8 @@
       "agent-auditor-oc":   ["opencode --model openai/gpt-5.5"],
       "agent-tester":       ["claude --model opus"],
       "agent-release":      ["claude --model sonnet"],
+      "pi-big":             ["pi --model anthropic/claude-opus-4-8 --thinking high --approve"],
+      "oc-big":             ["opencode --model openai/gpt-5.6-pro"],
       "oc-release":         ["opencode --model openai/gpt-5.4-mini"],
       "oc-kimi":            ["opencode --model openrouter/moonshotai/kimi-k2.6"]
     }
