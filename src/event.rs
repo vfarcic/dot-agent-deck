@@ -99,6 +99,82 @@ pub fn agent_event_type_from_state(state: &str) -> Option<EventType> {
 /// don't emit it; consumers treat its absence as "no friendly name known".
 pub const DISPLAY_NAME_METADATA_KEY: &str = "display_name";
 
+/// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
+///
+/// This versions the **payload shape of a single `AgentEvent` record** — the
+/// stable public JSON schema documented on [`AgentEvent`] below. It is
+/// DISTINCT from [`crate::daemon_protocol::PROTOCOL_VERSION`], which versions
+/// the **attach-socket handshake/framing** between a TUI and the daemon. The
+/// two move independently: adding an optional, serde-skipped field to
+/// `AgentEvent` (as M1 does) bumps neither, because old and new peers stay
+/// wire-compatible; a breaking change to the *attach handshake* bumps only
+/// `PROTOCOL_VERSION`; a breaking change to the *event record shape* would
+/// bump only this constant. Do not conflate them.
+///
+/// Producers MAY stamp [`AgentEvent::schema_version`] with this value to
+/// advertise which schema they wrote. It stays at `1` for the current shape;
+/// a future, non-additive change to the record's fields bumps it. Because the
+/// field is optional and skipped when `None`, existing producers that leave it
+/// unset emit byte-identical JSON to before, and a consumer treats a missing
+/// `schema_version` as the baseline (v1) schema.
+pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 1;
+
+/// Stable public JSON schema for a single agent event.
+///
+/// `AgentEvent` is the wire record every agent integration (Claude Code hooks,
+/// the OpenCode plugin, Pi's `agent-event` CLI, and future wrapper adapters)
+/// serializes to the daemon's hook socket, and that the daemon re-broadcasts to
+/// attached TUIs over `KIND_EVENT` (wrapped in [`BroadcastMsg::Event`]). Third
+/// parties author events against this schema, so it is a **stable public API**:
+/// fields are added additively (optional + serde-skipped so old and new
+/// payloads round-trip unchanged), never repurposed. The record's schema
+/// version is [`AGENT_EVENT_SCHEMA_VERSION`] (distinct from the attach-wire
+/// [`crate::daemon_protocol::PROTOCOL_VERSION`] — see that constant's docs).
+///
+/// ## JSON schema (field · type · optionality · meaning · producers)
+///
+/// - **`session_id`** · string · **required** · stable id that groups events
+///   into a single dashboard card. Set by every producer.
+/// - **`agent_type`** · enum ([`AgentType`], snake_case) · **required** · which
+///   agent produced the event. Claude hooks set `claude_code`, the OpenCode
+///   plugin sets `open_code`, Pi's `agent-event` CLI sets `pi`, the
+///   live-surface path derives it from the spawn command via
+///   [`AgentType::from_command`]. Unrecognized values decode to `none` (the
+///   `#[serde(other)]` catch-all), never failing the whole-record decode.
+/// - **`event_type`** · enum ([`EventType`], snake_case) · **required** · the
+///   lifecycle/tool event that drives the card's status. Set by every producer.
+/// - **`tool_name`** · string · optional (omitted/`null` ⇒ `None`) · the tool
+///   for `tool_start` / `tool_end` events. Set by the Claude/OpenCode hook
+///   builders; `None` for pure lifecycle events.
+/// - **`tool_detail`** · string · optional · short human-readable detail for a
+///   tool event (e.g. the file path or command). Set by the hook builders.
+/// - **`cwd`** · string · optional · working directory of the session. Set by
+///   hooks and the live-surface path; used for orchestration bucketing.
+/// - **`timestamp`** · string (RFC 3339 / ISO 8601 UTC) · **required** · when
+///   the event was produced. Set by every producer.
+/// - **`user_prompt`** · string · optional · truncated text of the user prompt
+///   that triggered the turn. Set by hooks when a prompt is present.
+/// - **`metadata`** · object (string→string) · optional (defaults to empty) ·
+///   free-form extra keys, e.g. [`DISPLAY_NAME_METADATA_KEY`], `bash_command`,
+///   `permission_state`. Consumers treat unknown keys as ignorable.
+/// - **`pane_id`** · string · optional · the `DOT_AGENT_DECK_PANE_ID` the event
+///   routes to. Populated from the env var the daemon injects at spawn; `None`
+///   for events not scoped to a known pane.
+/// - **`agent_id`** · string · optional · daemon-side registry id of the
+///   producing agent (from `DOT_AGENT_DECK_AGENT_ID`). Lets agent-id-scoped
+///   filters (e.g. post-respawn `SessionStart` waits) target the right agent;
+///   `None` payloads simply don't match those filters.
+/// - **`agent_version`** · string · optional (**PRD #20 M1**, added additively)
+///   · self-reported version of the agent binary/integration that produced the
+///   event (e.g. a Codex/Claude CLI version), for diagnostics and
+///   version-aware rendering. No current producer sets it; `None` (the default,
+///   omitted from the wire) means "version not reported".
+/// - **`schema_version`** · integer · optional (**PRD #20 M1**, added
+///   additively) · the [`AGENT_EVENT_SCHEMA_VERSION`] the producer wrote, for
+///   forward compatibility. No current producer sets it; `None` (the default,
+///   omitted from the wire) is read as the baseline (v1) schema. This is the
+///   **event-record** schema version, NOT the attach-wire
+///   [`crate::daemon_protocol::PROTOCOL_VERSION`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
     pub session_id: String,
@@ -131,6 +207,25 @@ pub struct AgentEvent {
     /// agent-id-scoped filters.
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// PRD #20 M1: self-reported version of the agent binary/integration that
+    /// produced this event (e.g. a wrapped Codex or Claude CLI version), for
+    /// diagnostics and version-aware rendering. Optional and additive:
+    /// `#[serde(default)]` lets older payloads that lack the field deserialize
+    /// to `None`, and `skip_serializing_if` omits it from the wire when unset —
+    /// so existing producers emit byte-identical JSON and old/new peers stay
+    /// compatible. No current producer sets it; `None` means "version not
+    /// reported".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_version: Option<String>,
+    /// PRD #20 M1: the [`AGENT_EVENT_SCHEMA_VERSION`] the producer wrote, for
+    /// forward compatibility of this record's JSON shape. This is the
+    /// **event-record** schema version and is DISTINCT from the attach-socket
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`] (see those docs). Optional
+    /// and additive for the same reasons as `agent_version`: a missing value
+    /// deserializes to `None` and is read as the baseline (v1) schema, and it
+    /// is omitted from the wire when unset. No current producer sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
 }
 
 /// Envelope for messages sent to the daemon over the Unix socket.
@@ -312,6 +407,96 @@ mod tests {
         assert!(event.tool_detail.is_none());
         assert!(event.cwd.is_none());
         assert!(event.metadata.is_empty());
+    }
+
+    // PRD #20 M1: an AgentEvent JSON written by an OLDER producer — one that
+    // predates the `agent_version` / `schema_version` fields — must still
+    // deserialize. This pins the backward-compatibility half of the "stable
+    // public JSON schema" contract: adding the two optional fields cannot break
+    // decoding of any previously-emitted payload.
+    #[test]
+    fn parse_event_without_new_version_fields_defaults_to_none() {
+        let json = r#"{
+            "session_id": "abc-123",
+            "agent_type": "claude_code",
+            "event_type": "idle",
+            "timestamp": "2026-03-22T10:00:00Z"
+        }"#;
+        let event: AgentEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            event.agent_version.is_none(),
+            "a payload lacking agent_version must decode it as None"
+        );
+        assert!(
+            event.schema_version.is_none(),
+            "a payload lacking schema_version must decode it as None (read as baseline v1)"
+        );
+    }
+
+    // PRD #20 M1: with the new fields SET, the event round-trips through JSON
+    // unchanged — the forward half of the schema contract (a newer producer's
+    // richer payload survives a serialize→deserialize cycle).
+    #[test]
+    fn round_trip_event_with_new_version_fields() {
+        let event = AgentEvent {
+            session_id: "rt-1".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-03-22T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+            agent_id: None,
+            agent_version: Some("codex-1.2.3".into()),
+            schema_version: Some(AGENT_EVENT_SCHEMA_VERSION),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        // Both fields must appear on the wire when set…
+        assert!(json.contains("\"agent_version\":\"codex-1.2.3\""), "{json}");
+        assert!(json.contains("\"schema_version\":1"), "{json}");
+        // …and survive the decode.
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.agent_version.as_deref(), Some("codex-1.2.3"));
+        assert_eq!(back.schema_version, Some(AGENT_EVENT_SCHEMA_VERSION));
+    }
+
+    // PRD #20 M1: `skip_serializing_if = "Option::is_none"` means an event that
+    // leaves the new fields unset emits BYTE-IDENTICAL JSON to before they
+    // existed — the keys are absent, not `null`. This is what keeps existing
+    // producers behaviour-preserving and old/new peers wire-compatible.
+    #[test]
+    fn none_version_fields_are_omitted_from_the_wire() {
+        let event = AgentEvent {
+            session_id: "min-1".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::Idle,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-03-22T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            !json.contains("agent_version"),
+            "None agent_version must be omitted from the wire, not serialized as null: {json}"
+        );
+        assert!(
+            !json.contains("schema_version"),
+            "None schema_version must be omitted from the wire, not serialized as null: {json}"
+        );
     }
 
     #[test]

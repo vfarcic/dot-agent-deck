@@ -725,6 +725,8 @@ fn main() -> ExitCode {
                 metadata: Default::default(),
                 pane_id: Some(pane_id),
                 agent_id,
+                agent_version: None,
+                schema_version: None,
             };
             let json = match serde_json::to_string(&event) {
                 Ok(j) => j,

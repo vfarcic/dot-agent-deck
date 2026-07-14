@@ -178,6 +178,8 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
         metadata,
         pane_id,
         agent_id,
+        agent_version: None,
+        schema_version: None,
     })
 }
 
@@ -246,6 +248,8 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
         metadata,
         pane_id,
         agent_id,
+        agent_version: None,
+        schema_version: None,
     })
 }
 

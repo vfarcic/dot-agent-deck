@@ -979,6 +979,8 @@ fn filled_session() -> SessionState {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
         });
     }
     for (name, detail) in [
@@ -998,6 +1000,8 @@ fn filled_session() -> SessionState {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
         });
     }
     SessionState {

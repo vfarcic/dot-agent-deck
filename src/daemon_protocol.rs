@@ -2152,6 +2152,8 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: Some("7".into()),
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
         };
         let payload = serde_json::to_vec(&BroadcastMsg::Event(event)).unwrap();
 

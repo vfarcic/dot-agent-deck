@@ -14873,6 +14873,8 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
         };
         state.apply_event(event1.clone());
 
@@ -14893,6 +14895,8 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
         };
         state.apply_event(event2);
 
@@ -14965,6 +14969,8 @@ mod tests {
                 metadata: HashMap::new(),
                 pane_id: None,
                 agent_id: None,
+                agent_version: None,
+                schema_version: None,
             });
         }
 
@@ -15016,6 +15022,8 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
         };
         state.apply_event(event.clone());
 
@@ -15258,6 +15266,8 @@ mod tests {
                 metadata: HashMap::new(),
                 pane_id: None,
                 agent_id: None,
+                agent_version: None,
+                schema_version: None,
             });
         }
 
@@ -15747,6 +15757,8 @@ mod tests {
                 metadata: HashMap::new(),
                 pane_id: None,
                 agent_id: None,
+                agent_version: None,
+                schema_version: None,
             });
         }
 
@@ -15771,6 +15783,8 @@ mod tests {
                 metadata: HashMap::new(),
                 pane_id: None,
                 agent_id: None,
+                agent_version: None,
+                schema_version: None,
             });
         }
 
@@ -15796,6 +15810,8 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -15809,6 +15825,8 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
         });
 
         let mut ui = default_ui();
@@ -15833,6 +15851,8 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -15846,6 +15866,8 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
         });
 
         let mut ui = default_ui();
@@ -15872,6 +15894,8 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
         });
 
         let mut ui = default_ui();
@@ -18083,6 +18107,8 @@ mod tests {
                 metadata: HashMap::new(),
                 pane_id: None,
                 agent_id: None,
+                agent_version: None,
+                schema_version: None,
             });
         }
 
@@ -19582,6 +19608,8 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
         });
         let output = build_art_output(&s);
         assert!(output.contains("Bash"));
