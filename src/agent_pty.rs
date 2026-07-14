@@ -70,6 +70,67 @@ pub const DOT_AGENT_DECK_EXIT_WHEN_ORPHANED: &str = "DOT_AGENT_DECK_EXIT_WHEN_OR
 /// orphan watchdog (e.g. a detached test daemon whose parent is already PID 1).
 pub const DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS: &str = "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS";
 
+/// PRD #201 native prompt delivery: how long the daemon waits for a Pi pane's
+/// extension to pull a stashed seed via `get-seed` (→ `pi.sendUserMessage`)
+/// before falling back to typing the seed into the PTY (the safety net that
+/// keeps the pane working if the extension failed to load or pull). Overridable
+/// via `DOT_AGENT_DECK_SEED_FALLBACK_SECS` (integer seconds); a real-pi e2e sets
+/// it high so it can prove the NATIVE pull path ran rather than the fallback.
+/// Default matches the legacy pi injection latency (`SESSION_START_WAIT_TIMEOUT`
+/// always timed out at 10s for pi), plus a small margin for Node/Bun boot.
+pub const DOT_AGENT_DECK_SEED_FALLBACK_SECS: &str = "DOT_AGENT_DECK_SEED_FALLBACK_SECS";
+
+/// Resolve the native-seed PTY-injection fallback grace (see
+/// [`DOT_AGENT_DECK_SEED_FALLBACK_SECS`]). Falls back to 15s when unset or
+/// unparseable.
+pub fn seed_fallback_grace() -> std::time::Duration {
+    std::env::var(DOT_AGENT_DECK_SEED_FALLBACK_SECS)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(15))
+}
+
+/// PRD #201: arm the PTY-injection SAFETY NET for a pane the daemon just
+/// stashed a native seed for. Spawns a background task that waits `grace` (see
+/// [`seed_fallback_grace`]) then — only if the seed was NOT already consumed by
+/// the native `get-seed` pull — types it into the PTY. The `take`/`set` on the
+/// registry is atomic, so the extension's pull and this fallback can never both
+/// deliver. A no-op delivery (native already won) is the common, expected case.
+pub fn arm_seed_fallback(
+    registry: Arc<AgentPtyRegistry>,
+    pane_id: String,
+    grace: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        match registry.take_pending_seed_fallback(&pane_id) {
+            Some(seed) => {
+                // Native pull did not happen within the grace window — deliver
+                // via the legacy PTY injection so the pane still works.
+                if let Err(e) = registry.write_to_pane_and_submit(&pane_id, &seed).await {
+                    tracing::warn!(
+                        pane_id = %pane_id,
+                        error = %e,
+                        "seed fallback: PTY injection failed"
+                    );
+                } else {
+                    tracing::debug!(
+                        pane_id = %pane_id,
+                        "seed fallback: delivered seed via PTY injection (native pull did not occur)"
+                    );
+                }
+            }
+            None => {
+                tracing::debug!(
+                    pane_id = %pane_id,
+                    "seed fallback: seed already delivered natively; no injection"
+                );
+            }
+        }
+    });
+}
+
 /// Hard upper bound on PTY rows/cols accepted by the daemon. Larger values
 /// are clamped down before reaching `MasterPty::resize`. The cap defends
 /// against a same-uid attach-socket peer perturbing an existing agent's
@@ -1142,6 +1203,21 @@ pub struct RunningAgent {
     /// `shutdown_all` still find the entry; only the idle gate filters it
     /// out. `Arc` because the reader thread holds an independent clone.
     pub exited: Arc<AtomicBool>,
+    /// PRD #201 native prompt delivery: a seed/prompt the daemon prepared for
+    /// this pane, awaiting a NATIVE pull by the agent's extension via
+    /// `dot-agent-deck get-seed` (which then calls `pi.sendUserMessage`).
+    /// `None` = nothing pending. Taken (cleared) on first read — whichever
+    /// path takes it first (the extension's `get-seed` pull, or the daemon's
+    /// PTY-injection safety net) is the SOLE delivery, so a seed is never
+    /// delivered twice. Runtime-only: it never crosses the wire (unlike the
+    /// `AgentRecord` fields), because `get-seed` reads it directly on the
+    /// daemon over the hook socket.
+    pub pending_seed: Option<String>,
+    /// PRD #201: set `true` when [`RunningAgent::pending_seed`] was consumed by
+    /// the native `get-seed` pull, as opposed to the PTY-injection fallback.
+    /// Lets a test prove the NATIVE delivery path ran rather than the safety
+    /// net (the whole point of dissolving the keystroke-injection workaround).
+    pub seed_delivered_native: bool,
 }
 
 /// Snapshot of one daemon-side agent that the M2.x rehydration path needs.
@@ -1594,6 +1670,22 @@ impl AgentPtyRegistry {
         let captured_rows = opts.rows.clamp(1, PTY_RESIZE_DIM_MAX);
         let captured_cols = opts.cols.clamp(1, PTY_RESIZE_DIM_MAX);
 
+        // PRD #201: auto-materialize the bundled Pi orchestrator extension into
+        // the pi child's HOME right before it is spawned, so `command = "pi"`
+        // works with ZERO manual setup — parity with claude
+        // (`hooks_manage::auto_install`) and opencode
+        // (`opencode_manage::auto_install`). Detect pi from the actual spawn
+        // COMMAND, not the caller-supplied `agent_type` (some callers, e.g. the
+        // headless real-pi e2e tests, leave `agent_type: None` while still
+        // running `pi …`), so the seam fires wherever a real pi is launched.
+        // The materialize is guarded (pi present), idempotent (overwrite), and
+        // HOME-unset-safe (skip, never a `/tmp` write) — see
+        // `orchestrator_ext::auto_materialize`. Done before `spawn(opts)` so the
+        // extension is on disk before Pi's boot-time discovery runs.
+        if AgentType::from_command(opts.command) == Some(AgentType::Pi) {
+            crate::orchestrator_ext::auto_materialize(&opts.env);
+        }
+
         // Defense in depth: `spawn` already protects the child internally
         // via its own `ChildGuard`, so any failure or panic *inside* spawn
         // cannot orphan the child. This outer `PtyGuard` covers the
@@ -1685,6 +1777,12 @@ impl AgentPtyRegistry {
             pty_rows: captured_rows,
             pty_cols: captured_cols,
             exited,
+            // PRD #201: a fresh agent starts with no pending seed; the seed
+            // path (StartAgent `seed` at spawn / a delegate respawn) sets it
+            // right after this spawn returns, before the agent's extension
+            // pulls it on `session_start`.
+            pending_seed: None,
+            seed_delivered_native: false,
         };
 
         // Use the id we pre-allocated above (before spawn) and injected
@@ -2004,6 +2102,11 @@ impl AgentPtyRegistry {
             pty_rows,
             pty_cols,
             exited: _,
+            // PRD #201: a respawn (`clear = true` delegate) drops any seed the
+            // old child left unconsumed; the caller re-arms the fresh child's
+            // seed via `set_pending_seed` right after this returns.
+            pending_seed: _,
+            seed_delivered_native: _,
         } = removed;
 
         // Drop this reference to the writer Arc; the slave half closes
@@ -2354,6 +2457,72 @@ impl AgentPtyRegistry {
         {
             agent.agent_type = Some(agent_type.clone());
         }
+    }
+
+    /// PRD #201 native prompt delivery: stash a seed/prompt for the pane whose
+    /// `DOT_AGENT_DECK_PANE_ID` matches `pane_id_env`, to be pulled NATIVELY by
+    /// the agent's extension via `dot-agent-deck get-seed` (→
+    /// `pi.sendUserMessage`). Overwrites any previous unconsumed seed (the
+    /// freshest seed wins) and resets the native-delivered flag. No-op when the
+    /// pane is unknown or the seed is blank. Keyed by `pane_id_env` (linear
+    /// scan) like [`AgentPtyRegistry::set_agent_type`].
+    pub fn set_pending_seed(&self, pane_id_env: &str, seed: &str) {
+        if pane_id_env.is_empty() || seed.trim().is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(agent) = inner
+            .agents
+            .values_mut()
+            .find(|a| a.pane_id_env.as_deref() == Some(pane_id_env))
+        {
+            agent.pending_seed = Some(seed.to_string());
+            agent.seed_delivered_native = false;
+        }
+    }
+
+    /// PRD #201: take (clear) the pending seed for `pane_id_env` on behalf of
+    /// the NATIVE `get-seed` pull. Marks the seed as delivered natively so a
+    /// test can prove the native path ran. Returns `None` when the pane is
+    /// unknown or has no pending seed (already delivered, or never set). The
+    /// take is atomic under the registry lock, so a race with the fallback
+    /// path can only let one of them win.
+    pub fn take_pending_seed_native(&self, pane_id_env: &str) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap();
+        let agent = inner
+            .agents
+            .values_mut()
+            .find(|a| a.pane_id_env.as_deref() == Some(pane_id_env))?;
+        let seed = agent.pending_seed.take()?;
+        agent.seed_delivered_native = true;
+        Some(seed)
+    }
+
+    /// PRD #201: take (clear) the pending seed for `pane_id_env` on behalf of
+    /// the daemon's PTY-injection SAFETY NET. Returns `Some` only if the seed
+    /// was NOT already consumed by the native pull — so the fallback injects
+    /// exactly when (and only when) native delivery did not happen.
+    pub fn take_pending_seed_fallback(&self, pane_id_env: &str) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap();
+        let agent = inner
+            .agents
+            .values_mut()
+            .find(|a| a.pane_id_env.as_deref() == Some(pane_id_env))?;
+        agent.pending_seed.take()
+    }
+
+    /// PRD #201: whether this pane's seed was delivered via the NATIVE
+    /// `get-seed` pull (vs. the PTY-injection fallback, or not yet delivered).
+    /// Test observable that distinguishes native delivery from the safety net.
+    pub fn seed_delivered_native(&self, pane_id_env: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .values()
+            .find(|a| a.pane_id_env.as_deref() == Some(pane_id_env))
+            .map(|a| a.seed_delivered_native)
+            .unwrap_or(false)
     }
 
     /// Number of agents currently owned by the registry.
@@ -3181,6 +3350,86 @@ mod tests {
         assert_eq!(registry.len(), 1);
 
         let _ = id;
+        registry.shutdown_all();
+    }
+
+    /// PRD #201 native prompt delivery: the daemon-side seed store. A seed set
+    /// for a pane is pullable exactly once; whichever taker (the native
+    /// `get-seed` pull or the PTY-injection fallback) runs first delivers, and
+    /// the native path is observably distinguished from the fallback.
+    #[test]
+    fn pending_seed_set_take_and_native_flag() {
+        let registry = AgentPtyRegistry::new();
+        let _id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-seed".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+
+        // No seed set yet → both takers return None, and native is false.
+        assert_eq!(registry.take_pending_seed_native("pane-seed"), None);
+        assert!(!registry.seed_delivered_native("pane-seed"));
+
+        // Set a seed, then the NATIVE pull takes it and marks it native.
+        registry.set_pending_seed(
+            "pane-seed",
+            "Read .dot-agent-deck/worker-task-coder.md for your task.",
+        );
+        assert!(
+            !registry.seed_delivered_native("pane-seed"),
+            "not delivered until pulled"
+        );
+        assert_eq!(
+            registry.take_pending_seed_native("pane-seed").as_deref(),
+            Some("Read .dot-agent-deck/worker-task-coder.md for your task."),
+        );
+        assert!(
+            registry.seed_delivered_native("pane-seed"),
+            "native pull marks the flag"
+        );
+        // Cleared after one take — a second pull (or the fallback) gets nothing.
+        assert_eq!(registry.take_pending_seed_native("pane-seed"), None);
+        assert_eq!(registry.take_pending_seed_fallback("pane-seed"), None);
+
+        // The FALLBACK take delivers when native did NOT run, and does NOT set
+        // the native flag (so a test can tell native from the safety net).
+        registry.set_pending_seed("pane-seed", "kickoff");
+        assert_eq!(
+            registry.take_pending_seed_fallback("pane-seed").as_deref(),
+            Some("kickoff")
+        );
+        assert!(
+            !registry.seed_delivered_native("pane-seed"),
+            "fallback delivery must NOT be reported as native"
+        );
+        assert_eq!(registry.take_pending_seed_native("pane-seed"), None);
+
+        // Exactly-once arbitration: once the fallback wins, the native pull
+        // gets nothing (and vice-versa) — the two can never both deliver.
+        registry.set_pending_seed("pane-seed", "second");
+        assert_eq!(
+            registry.take_pending_seed_fallback("pane-seed").as_deref(),
+            Some("second")
+        );
+        assert_eq!(registry.take_pending_seed_native("pane-seed"), None);
+
+        // Setting a fresh seed overwrites an unconsumed one and resets the flag.
+        registry.set_pending_seed("pane-seed", "first");
+        registry.set_pending_seed("pane-seed", "freshest");
+        assert_eq!(
+            registry.take_pending_seed_native("pane-seed").as_deref(),
+            Some("freshest")
+        );
+
+        // Blank seeds are ignored; unknown panes are harmless no-ops.
+        registry.set_pending_seed("pane-seed", "   ");
+        assert_eq!(registry.take_pending_seed_native("pane-seed"), None);
+        registry.set_pending_seed("pane-unknown", "orphan");
+        assert_eq!(registry.take_pending_seed_native("pane-unknown"), None);
+        assert!(!registry.seed_delivered_native("pane-unknown"));
+
         registry.shutdown_all();
     }
 

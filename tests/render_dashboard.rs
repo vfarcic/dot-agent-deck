@@ -343,6 +343,81 @@ fn guard_002_no_absolute_bg_in_source() {
     }
 }
 
+/// Scenario: Render a single dashboard card for a live `AgentType::Pi` session
+/// with NO display name (so the card title falls back to the
+/// `<agent-type> · <session-id>` form) into a `TestBackend` buffer, then assert
+/// the rendered card surface shows the Pi agent-type identity ("Pi") in its
+/// title — proving a plain `pi` pane (`command = "pi"`) is rendered as a
+/// first-class agent, not "No agent". The fixture's cwd basename and session id
+/// carry no capital-`Pi`, so the only way "Pi ·" reaches the grid is via the
+/// agent-type Display; the card must NOT show ClaudeCode / OpenCode / No agent.
+#[spec("dashboard/pane/007")]
+#[test]
+fn pane_007_pi_card_shows_pi_identity() {
+    // PRD #201 M2.2 (test-plan row 2): a Pi pane's card renders the Pi identity.
+    // The `AgentType` Display impl prints "Pi" and `render_session_card`'s
+    // no-display-name branch titles the card `<agent_type> · <id>`. The cwd
+    // basename (`workspace`) and session id (`orch-01`) deliberately contain no
+    // capital `Pi`, so the assertion pins the agent-type identity specifically
+    // rather than an incidental substring.
+    //
+    // PRD #201 (Design Decision #8 reversed): the Pi surface ships visible by
+    // default — it is NOT gated behind the experimental flag — so this test
+    // touches no flag and expects the Pi identity to render unconditionally.
+    //
+    // `last_activity = now` keeps any rendered `Last: Xs ago` at `0s ago`
+    // (mirrors `pane_004`).
+    let now = chrono::Utc::now();
+    let session = SessionState {
+        session_id: "orch-01".to_string(),
+        agent_type: AgentType::Pi,
+        cwd: Some("/home/dev/workspace".to_string()),
+        status: SessionStatus::Thinking,
+        active_tool: None,
+        started_at: now,
+        last_activity: now,
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: Some("orchestrate the release".to_string()),
+        first_prompts: vec!["orchestrate the release".to_string()],
+        pane_id: Some("pi-pane-1".to_string()),
+        agent_id: Some("1".to_string()),
+        // No friendly name → the title uses the `<agent_type> · <id>` form,
+        // which is where the Pi identity surfaces.
+        display_name: None,
+    };
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let wide = width >= RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH;
+    let height = density.rendered_height(wide);
+    let buffer = render_card_to_buffer(
+        &session,
+        None, // no display name
+        Some(1),
+        density,
+        0,     // animation tick
+        false, // not selected
+        width,
+        height,
+    );
+    let text = buffer_to_text(&buffer);
+
+    // The Pi agent-type identity surfaces in the card title (`Pi · orch-01`).
+    assert!(
+        text.contains("Pi · orch-01"),
+        "a Pi pane's card title must show the Pi agent-type identity \
+         (`Pi · orch-01`):\n{text}"
+    );
+    // ...and it must be Pi specifically — not another agent type or the
+    // placeholder.
+    for other in ["ClaudeCode", "OpenCode", "No agent"] {
+        assert!(
+            !text.contains(other),
+            "a Pi pane's card must not show `{other}`:\n{text}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PRD #155 — centralized color palette (Option A). Border encodes STATUS in
 // BOTH deck cards and embedded panes; the dedicated `selected` (Magenta) and

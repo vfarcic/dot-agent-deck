@@ -17,7 +17,8 @@
     "asciinema-agg@1.9.0",
     "ffmpeg@8.1",
     "jq@1.8.1",
-    "curl@8.17.0"
+    "curl@8.17.0",
+    "ripgrep@15.1.0"
   ],
   "shell": {
     "init_hook": [
@@ -26,21 +27,21 @@
       "[ -f .env ] && source .env || true"
     ],
     "scripts": {
-      "agent":                 ["claude --continue"],
-      "agent-new":             ["claude"],
-      "agent-plan":            ["claude --model opus --permission-mode plan"],
-      "agent-small":           ["claude --model haiku"],
-      "agent-big":             ["claude --model opus"],
-      "agent-orchestrator":    ["claude --model opus"],
-      "agent-coder":           ["claude --model opus"],
-      "agent-reviewer":        ["claude --model opus"],
-      "agent-reviewer-oc":     ["opencode --model openai/gpt-5.5"],
-      "agent-auditor":         ["claude --model opus"],
-      "agent-auditor-oc":      ["opencode --model openai/gpt-5.5"],
-      "agent-tester":          ["claude --model opus"],
-      "agent-release":         ["claude --model sonnet"],
-      "oc-release":            ["opencode --model openai/gpt-5.4-mini"],
-      "oc-kimi":               ["opencode --model openrouter/moonshotai/kimi-k2.6"]
+      "agent":              ["claude --continue"],
+      "agent-new":          ["claude"],
+      "agent-plan":         ["claude --model opus --permission-mode plan"],
+      "agent-small":        ["claude --model haiku"],
+      "agent-big":          ["claude --model opus"],
+      "agent-orchestrator": ["claude --model opus"],
+      "agent-coder":        ["claude --model opus"],
+      "agent-reviewer":     ["claude --model opus"],
+      "agent-reviewer-oc":  ["opencode --model openai/gpt-5.5"],
+      "agent-auditor":      ["claude --model opus"],
+      "agent-auditor-oc":   ["opencode --model openai/gpt-5.5"],
+      "agent-tester":       ["claude --model opus"],
+      "agent-release":      ["claude --model sonnet"],
+      "oc-release":         ["opencode --model openai/gpt-5.4-mini"],
+      "oc-kimi":            ["opencode --model openrouter/moonshotai/kimi-k2.6"]
     }
   }
 }

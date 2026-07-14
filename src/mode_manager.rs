@@ -218,6 +218,8 @@ impl ModeManager {
                             // (htop, npm, etc.) not AI agents, so M2.13
                             // agent_type stays `None`.
                             agent_type: None,
+                            // PRD #201: not a Pi orchestrator pane — no seed.
+                            seed: None,
                         },
                     )?;
                     created_pane_ids.push(pane_id.clone());
@@ -246,6 +248,8 @@ impl ModeManager {
                             // Reactive panes are mode side panes, not
                             // agents — same M2.13 rationale.
                             agent_type: None,
+                            // PRD #201: not a Pi orchestrator pane — no seed.
+                            seed: None,
                         },
                     )?;
                     created_pane_ids.push(pane_id.clone());
@@ -458,6 +462,8 @@ impl ModeManager {
                     // same M2.13 rationale as the initial reactive
                     // spawn above.
                     agent_type: None,
+                    // PRD #201: not a Pi orchestrator pane — no seed.
+                    seed: None,
                 },
             )?;
             mode.reactive_pool

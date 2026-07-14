@@ -14,6 +14,12 @@
 
 #![allow(dead_code)]
 
+/// PRD #201 M1.3: the agent-agnostic synthetic-agent harness — a scripted
+/// stand-in that emits `delegate` / `work-done` / `agent-event` frames,
+/// parameterized by agent identity. Shared by the fast-tier contract tests
+/// (`tests/agent_event.rs`, `tests/orchestration_delegate.rs`).
+pub mod synthetic_agent;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -168,6 +174,13 @@ impl TuiDeckBuilder {
         self
     }
 
+    // NOTE (PRD #201): a `with_pi_extension()` builder that pre-staged the
+    // bundled Pi extension into the per-test HOME was removed. The deck now
+    // AUTO-materializes the extension at spawn time (the `spawn_agent` seam
+    // detects the `pi` command and writes it into the HOME the pi child
+    // inherits, before pi boots), so the pi e2es exercise that production flow
+    // directly instead of a hand-staged shortcut.
+
     /// Stage a `keybindings.toml` in the per-test HOME's config dir
     /// (`$HOME/.config/dot-agent-deck/keybindings.toml`, mirroring the
     /// `config.toml` path resolved by `dot_agent_deck::config`) before
@@ -312,6 +325,13 @@ impl TuiDeck {
 
         let home = work.join("home");
         std::fs::create_dir_all(&home).expect("create per-test HOME");
+
+        // PRD #201: the per-test HOME deliberately starts WITHOUT the bundled Pi
+        // extension. When a pi pane is spawned, the deck's spawn-time
+        // auto-materialize (the `spawn_agent` seam) detects the `pi` command and
+        // writes the extension into the HOME the pi child inherits (this per-test
+        // HOME) before pi boots — so the pi e2es exercise that production flow
+        // rather than a pre-staged shortcut.
 
         // PRD #40: stage the keybindings config the deck reads at
         // startup. Path mirrors `config_path()` in
@@ -713,6 +733,31 @@ impl TuiDeck {
         }
     }
 
+    /// Like [`wait_for_string`] (scans the RECONSTRUCTED vt100 grid, so
+    /// styled UI chrome — a bottom-bar affordance, a tab label, a card
+    /// field — whose glyphs are written as separate styled runs is matched
+    /// on its rendered text, not on the raw byte stream where the runs are
+    /// interleaved with cursor-move escapes) but with a caller-supplied
+    /// timeout instead of the fixed 10-second [`WAIT_TIMEOUT`]. Real-agent
+    /// L2 tests need a generous ceiling (minutes) the default cannot
+    /// express. Returns `true` once `needle` is on the rendered grid,
+    /// `false` if `timeout` elapses first (the caller decides whether a
+    /// miss is a hard failure or a soft observation). Use this for
+    /// persistent on-screen state; use [`wait_for_stream_string_within`]
+    /// for transient PLAIN-text agent output that may scroll off.
+    pub fn wait_for_grid_string_within(&self, needle: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.snapshot_grid().contains(needle) {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Wait for `needles` to appear, in order, in the cumulative
     /// byte stream the deck has emitted since this call started.
     ///
@@ -798,13 +843,21 @@ impl TuiDeck {
     /// may render the placeholder) *before* the agent starts, so an
     /// early occurrence must not count — only a terminal state reached
     /// AFTER the working lifecycle does.
-    pub fn wait_for_strings_in_order_then_any(
+    ///
+    /// `timeout` is caller-supplied (rather than the shared
+    /// `WAIT_TIMEOUT`) so a real-agent test can grant a generous
+    /// settling budget for the terminal observation — the working
+    /// lifecycle is fast, but the terminal `Idle`/exit races real-agent
+    /// variance (Design Decision #7: real-agent tests use generous
+    /// timeouts).
+    pub fn wait_for_strings_in_order_then_any_within(
         &self,
         prefix: &[&str],
         terminal_alternatives: &[&str],
+        timeout: Duration,
     ) {
         let start_idx = self.byte_history.lock().unwrap().len();
-        let deadline = Instant::now() + WAIT_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         loop {
             let snapshot: Vec<u8> = {
                 let hist = self.byte_history.lock().unwrap();
@@ -826,7 +879,7 @@ impl TuiDeck {
                     let next = prefix[matched];
                     panic!(
                         "did not see prefix needle `{next}` (#{} of {} — already \
-                         matched in order: [{so_far}]) within {WAIT_TIMEOUT:?}.\n\
+                         matched in order: [{so_far}]) within {timeout:?}.\n\
                          Final grid:\n{grid}",
                         matched + 1,
                         prefix.len(),
@@ -837,7 +890,7 @@ impl TuiDeck {
                     panic!(
                         "matched the full prefix [{pfx}] but saw none of the \
                          terminal alternatives [`{alts}`] after it within \
-                         {WAIT_TIMEOUT:?}.\nFinal grid:\n{grid}"
+                         {timeout:?}.\nFinal grid:\n{grid}"
                     );
                 }
             }
@@ -2490,6 +2543,209 @@ impl DaemonProc {
         }
         false
     }
+
+    /// Run the real `dot-agent-deck agent-event --type <state>` CLI against this
+    /// daemon, standing in for a Pi extension's status report (PRD #201 M2.2).
+    /// Replays the daemon's env (so `HOME` + `DOT_AGENT_DECK_SOCKET` match) and
+    /// layers the pane-injected `DOT_AGENT_DECK_PANE_ID` / (optional)
+    /// `DOT_AGENT_DECK_AGENT_ID`. Returns the captured process output.
+    pub fn run_agent_event(
+        &self,
+        pane_id: &str,
+        agent_id: Option<&str>,
+        state: &str,
+    ) -> std::process::Output {
+        let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+        let mut cmd = std::process::Command::new(bin);
+        cmd.arg("agent-event").arg("--type").arg(state);
+        cmd.current_dir(&self.home);
+        cmd.env_clear();
+        for (k, v) in &self.env {
+            cmd.env(k, v);
+        }
+        cmd.env("DOT_AGENT_DECK_PANE_ID", pane_id);
+        if let Some(id) = agent_id {
+            cmd.env("DOT_AGENT_DECK_AGENT_ID", id);
+        }
+        cmd.output()
+            .expect("run `dot-agent-deck agent-event` subprocess")
+    }
+
+    /// Open a live `SubscribeEvents` stream against this daemon's attach socket,
+    /// draining the broadcast into a background buffer so a test can wait for a
+    /// specific `AgentEvent` UNATTENDED — the no-TUI equivalent of the
+    /// production event subscriber. Returns once the subscription is provably
+    /// live (the initial `KIND_RESP` was read), so no subsequent broadcast is
+    /// missed. All polling lives here in the harness (Decision 21).
+    pub fn subscribe_events(&self) -> EventSub {
+        EventSub::open(&self.attach_socket).expect("open SubscribeEvents stream")
+    }
+}
+
+/// A live `SubscribeEvents` subscription against a headless daemon: a background
+/// reader thread drains `KIND_EVENT` frames into a shared buffer so a test can
+/// wait for a specific broadcast `AgentEvent`. All sleeping/polling is contained
+/// here in `common` (Decision 21), not in the e2e test body.
+#[allow(dead_code)]
+pub struct EventSub {
+    events: Arc<Mutex<Vec<dot_agent_deck::event::AgentEvent>>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+#[allow(dead_code)]
+impl EventSub {
+    /// Send a `SubscribeEvents` request, read the `KIND_RESP` ack synchronously
+    /// (so the daemon's per-connection broadcast receiver exists before we
+    /// return — nothing broadcast afterward can be missed), then spawn a reader
+    /// thread collecting `BroadcastMsg::Event` frames.
+    fn open(attach_socket: &Path) -> std::io::Result<Self> {
+        use dot_agent_deck::daemon_protocol::{KIND_EVENT, KIND_REQ, KIND_RESP};
+        use dot_agent_deck::event::BroadcastMsg;
+
+        let mut stream = std::os::unix::net::UnixStream::connect(attach_socket)?;
+        stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+        let payload =
+            serde_json::to_vec(&dot_agent_deck::daemon_protocol::AttachRequest::SubscribeEvents)
+                .expect("serialize SubscribeEvents");
+        let mut header = [0u8; 5];
+        header[0] = KIND_REQ;
+        header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        stream.write_all(&header)?;
+        stream.write_all(&payload)?;
+        stream.flush()?;
+
+        // Block until the RESP ack arrives (retry past the read timeout).
+        read_framed(&mut stream, Some(KIND_RESP), Duration::from_secs(10))?;
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let events_for_reader = Arc::clone(&events);
+        let stop_for_reader = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !stop_for_reader.load(Ordering::Relaxed) {
+                match read_framed(&mut stream, None, Duration::from_millis(200)) {
+                    Ok(Some((KIND_EVENT, body))) => {
+                        if let Ok(BroadcastMsg::Event(ev)) =
+                            serde_json::from_slice::<BroadcastMsg>(&body)
+                        {
+                            events_for_reader.lock().unwrap().push(ev);
+                        }
+                    }
+                    // Other frame kinds (e.g. KIND_STREAM_END) — keep reading
+                    // until stopped or the socket closes.
+                    Ok(Some(_)) => {}
+                    // Timed out with no full frame this window — poll `stop`.
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Ok(EventSub {
+            events,
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    /// Block until a collected broadcast `AgentEvent` satisfies `pred`,
+    /// returning a clone of it, or panic after `timeout`.
+    pub fn wait_for(
+        &self,
+        pred: impl Fn(&dot_agent_deck::event::AgentEvent) -> bool,
+        timeout: Duration,
+    ) -> dot_agent_deck::event::AgentEvent {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(ev) = self.events.lock().unwrap().iter().find(|e| pred(e)) {
+                return ev.clone();
+            }
+            if Instant::now() >= deadline {
+                let seen: Vec<_> = self
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|e| (e.agent_type.clone(), e.event_type.clone()))
+                    .collect();
+                panic!(
+                    "no broadcast AgentEvent matched the predicate within {timeout:?}; \
+                     observed (agent_type, event_type): {seen:?}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl Drop for EventSub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Read one framed message (`[kind:u8][len:u32 BE][body]`) from `stream`,
+/// tolerating the socket read timeout by retrying until `timeout`. Returns
+/// `Ok(None)` if `timeout` elapses before a full frame arrives. When
+/// `want_kind` is `Some`, a mismatching kind is an error; when `None`, any kind
+/// is returned. Shared by [`EventSub`]'s handshake and reader loop.
+#[allow(dead_code)]
+fn read_framed(
+    stream: &mut std::os::unix::net::UnixStream,
+    want_kind: Option<u8>,
+    timeout: Duration,
+) -> std::io::Result<Option<(u8, Vec<u8>)>> {
+    let deadline = Instant::now() + timeout;
+    let mut header = [0u8; 5];
+    // Read the 5-byte header, retrying past WouldBlock/TimedOut until deadline.
+    let mut got = 0usize;
+    while got < header.len() {
+        match stream.read(&mut header[got..]) {
+            Ok(0) => return Err(std::io::Error::other("unexpected EOF reading frame header")),
+            Ok(n) => got += n,
+            Err(ref e)
+                if (e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut) =>
+            {
+                if got == 0 && Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::other("timed out mid-frame-header"));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let kind = header[0];
+    if let Some(want) = want_kind
+        && kind != want
+    {
+        return Err(std::io::Error::other(format!(
+            "expected frame kind 0x{want:02x}, got 0x{kind:02x}"
+        )));
+    }
+    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    let mut body = vec![0u8; len];
+    let mut filled = 0usize;
+    while filled < len {
+        match stream.read(&mut body[filled..]) {
+            Ok(0) => return Err(std::io::Error::other("unexpected EOF reading frame body")),
+            Ok(n) => filled += n,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some((kind, body)))
 }
 
 /// Count non-overlapping occurrences of `needle` in `hay`.
@@ -2733,6 +2989,230 @@ pub fn process_running(pid: i32) -> bool {
             }
         }
         Err(_) => true,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PRD #201 M4 — in-process daemon + real-agent polling helpers
+// ---------------------------------------------------------------------------
+//
+// The real-`pi` orchestrator e2e (`e2e_pi_orchestrator.rs`) needs the SAME
+// in-process daemon setup `e2e_delegate_work_done_chain.rs` uses (its hook loop
+// routes the extension's `delegate` / `work-done` / `agent-event` frames and
+// re-broadcasts `AgentEvent`s), plus a few `sleep`-based polls. Those polls live
+// HERE in `common` — not in an `e2e_*.rs` body — so linkage-check Decision 21
+// (no raw sleeps in e2e test bodies) is satisfied by construction, exactly as
+// the `DaemonProc` harness above does for the headless daemon-serve tests.
+
+/// Serializes the socket-bind window for [`spawn_inprocess_daemon`] (mirrors the
+/// bind lock in the daemon-spawning e2e tests).
+static INPROC_BIND_LOCK: Mutex<()> = Mutex::new(());
+
+/// An in-process `dot-agent-deck` daemon: its hook loop ingests `delegate` /
+/// `work-done` / `agent-event` frames over the hook socket and re-broadcasts
+/// `AgentEvent`s on [`event_tx`](Self::event_tx). Drop aborts the loop and shuts
+/// down every spawned PTY.
+#[allow(dead_code)]
+pub struct InProcDaemon {
+    _dir: tempfile::TempDir,
+    /// Shared app state — populate the orchestration maps the delegate /
+    /// work-done handlers read.
+    pub state: dot_agent_deck::state::SharedState,
+    /// The PTY registry — spawn real agent panes into it.
+    pub registry: std::sync::Arc<dot_agent_deck::agent_pty::AgentPtyRegistry>,
+    /// The daemon-wide broadcast — subscribe to observe re-broadcast events.
+    pub event_tx: tokio::sync::broadcast::Sender<dot_agent_deck::event::BroadcastMsg>,
+    /// Hand this to spawned agents as `DOT_AGENT_DECK_SOCKET`.
+    pub hook_path: PathBuf,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[allow(dead_code)]
+impl Drop for InProcDaemon {
+    fn drop(&mut self) {
+        self.handle.abort();
+        self.registry.shutdown_all();
+    }
+}
+
+/// Bring up an in-process daemon and block until its hook socket accepts
+/// connections (so an agent's first CLI call can't race startup). Mirrors
+/// `e2e_delegate_work_done_chain.rs::spawn_daemon`, centralized so the readiness
+/// poll lives in `common`.
+#[allow(dead_code)]
+pub async fn spawn_inprocess_daemon() -> InProcDaemon {
+    use dot_agent_deck::daemon::{Daemon, run_daemon_with};
+
+    init_test_env();
+    let (dir, hook_path, attach_path) = {
+        let _g = INPROC_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = race_safe_tempdir();
+        let hook = dir.path().join("hook.sock");
+        let attach = dir.path().join("attach.sock");
+        (dir, hook, attach)
+    };
+
+    let state: dot_agent_deck::state::SharedState = std::sync::Arc::new(tokio::sync::RwLock::new(
+        dot_agent_deck::state::AppState::default(),
+    ));
+    let daemon = Daemon::with_attach(state.clone(), attach_path.clone())
+        .with_idle_shutdown(None)
+        .with_lock_dir_override(lock_dir_path());
+    let registry = daemon.pty_registry.clone();
+    let event_tx = daemon.event_tx.clone();
+
+    let hook_for_daemon = hook_path.clone();
+    let handle = tokio::spawn(async move {
+        let _ = run_daemon_with(&hook_for_daemon, daemon).await;
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut ready = false;
+    while tokio::time::Instant::now() < deadline {
+        if hook_path.exists() && tokio::net::UnixStream::connect(&hook_path).await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        ready,
+        "in-process daemon hook socket was not accepting connections within 5s"
+    );
+
+    InProcDaemon {
+        _dir: dir,
+        state,
+        registry,
+        event_tx,
+        hook_path,
+        handle,
+    }
+}
+
+/// Poll a spawned agent's PTY snapshot until its byte length stops growing for
+/// `quiet` (with a minimum settle since first output), i.e. an interactive agent
+/// has finished rendering its boot UI and is input-ready. Delegating only after
+/// readiness keeps a daemon-injected prompt from being dropped mid-boot. Ported
+/// from `e2e_delegate_work_done_chain.rs::wait_until_worker_ready`.
+#[allow(dead_code)]
+pub async fn wait_until_agent_output_settled(
+    registry: &dot_agent_deck::agent_pty::AgentPtyRegistry,
+    agent_id: &str,
+    quiet: Duration,
+    timeout: Duration,
+) {
+    let start = tokio::time::Instant::now();
+    let deadline = start + timeout;
+    let min_since_first_output = Duration::from_secs(6);
+    let mut last_len = 0usize;
+    let mut first_output_at: Option<tokio::time::Instant> = None;
+    let mut stable_since = start;
+    loop {
+        let len = registry.snapshot(agent_id).map(|s| s.len()).unwrap_or(0);
+        if len > 0 && first_output_at.is_none() {
+            first_output_at = Some(tokio::time::Instant::now());
+        }
+        if len != last_len {
+            last_len = len;
+            stable_since = tokio::time::Instant::now();
+        } else if let Some(first) = first_output_at
+            && stable_since.elapsed() >= quiet
+            && first.elapsed() >= min_since_first_output
+        {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Async poll for `path` to exist, up to `timeout` (the async sibling of the
+/// sync [`wait_for_path`], for use inside an async e2e `_inner` body without
+/// blocking a runtime worker thread on a long wait).
+#[allow(dead_code)]
+pub async fn wait_for_path_async(path: &Path, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if path.exists() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// A background collector of an in-process daemon's re-broadcast `AgentEvent`s.
+/// Subscribe (via [`start`](Self::start)) BEFORE spawning the agent whose events
+/// you want, so its first status report can't be missed. Drop aborts the reader.
+/// The async [`wait_for`](Self::wait_for) poll lives here (Decision 21).
+#[allow(dead_code)]
+pub struct BroadcastEventLog {
+    events: std::sync::Arc<Mutex<Vec<dot_agent_deck::event::AgentEvent>>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[allow(dead_code)]
+impl Drop for BroadcastEventLog {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+#[allow(dead_code)]
+impl BroadcastEventLog {
+    /// Subscribe to `event_tx` and drain `AgentEvent`s into a shared buffer.
+    pub fn start(
+        event_tx: &tokio::sync::broadcast::Sender<dot_agent_deck::event::BroadcastMsg>,
+    ) -> Self {
+        use dot_agent_deck::event::BroadcastMsg;
+        use tokio::sync::broadcast::error::RecvError;
+
+        let mut rx = event_tx.subscribe();
+        let events =
+            std::sync::Arc::new(Mutex::new(Vec::<dot_agent_deck::event::AgentEvent>::new()));
+        let sink = std::sync::Arc::clone(&events);
+        let handle = tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(BroadcastMsg::Event(ev)) => sink.lock().unwrap().push(ev),
+                    Ok(_) => {}
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
+        Self { events, handle }
+    }
+
+    /// Block until a collected `AgentEvent` satisfies `pred`, returning a clone,
+    /// or `None` on timeout.
+    pub async fn wait_for(
+        &self,
+        pred: impl Fn(&dot_agent_deck::event::AgentEvent) -> bool,
+        timeout: Duration,
+    ) -> Option<dot_agent_deck::event::AgentEvent> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(ev) = self
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|e| pred(e))
+                .cloned()
+            {
+                return Some(ev);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 

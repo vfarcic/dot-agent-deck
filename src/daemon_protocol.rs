@@ -151,7 +151,23 @@ pub const KIND_SHUTDOWN_ACK: u8 = 0x16;
 /// already-attached TUIs. An older client receiving the new tag would fail to
 /// deserialize the frame, so this is a non-forward-compatible payload-schema
 /// change.
-pub const PROTOCOL_VERSION: u32 = 4;
+///
+/// PRD #201 bumped 4 → 5: [`crate::event::AgentType`] gained a wire-serialized
+/// `Pi` variant that rides `AgentRecord.agent_type` (the `ListAgents`
+/// `KIND_RESP`) and `AgentEvent.agent_type` (the `KIND_EVENT` broadcast). A
+/// pre-Pi reader has neither the `Pi` variant NOR (before this PRD) a
+/// `#[serde(other)]` catch-all, so `agent_type = "pi"` fails its whole-response
+/// / whole-frame decode — a non-forward-compatible payload-schema change, the
+/// same class as #120's new enum variant. The bump makes the exact-match attach
+/// handshake ([`crate::connect::probe_remote_protocol`]) refuse the
+/// old-reader/new-daemon pairing at connect time (a clean `ProtocolMismatch`)
+/// instead of letting it reach a mid-session deserialize crash. `AgentType`
+/// now also carries `#[serde(other)]` so THIS build and every future one
+/// degrade an unknown agent type to the neutral `None` placeholder rather than
+/// erroring — future agent-type additions therefore need no further bump — but
+/// already-released pre-Pi binaries predate that fallback, which is exactly
+/// what this version bump guards.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -292,6 +308,17 @@ pub enum AttachRequest {
         /// forward compat with daemons that don't know about it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_type: Option<AgentType>,
+        /// PRD #201 native prompt delivery: a seed/prompt the daemon stashes
+        /// for this pane at spawn time (`AgentPtyRegistry::set_pending_seed`),
+        /// pulled NATIVELY by the pane's extension via `dot-agent-deck get-seed`
+        /// (→ `pi.sendUserMessage`) instead of the daemon typing it into the
+        /// PTY. Set only for a Pi start-role (orchestrator) pane. Same
+        /// `skip_serializing_if` pattern as the M2.x fields above, so adding it
+        /// is forward + backward compatible and needs no `PROTOCOL_VERSION`
+        /// bump — an older daemon simply ignores the field and drives the
+        /// unchanged PTY-injection path (the fallback still delivers).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed: Option<String>,
     },
     StopAgent {
         id: String,
@@ -905,6 +932,7 @@ async fn handle_connection(
             display_name,
             tab_membership,
             agent_type,
+            seed,
         } => {
             // PRD #92 F1 followup hardening: refuse to start a new agent
             // while the registry's `shutting_down` latch is set. The
@@ -987,6 +1015,23 @@ async fn handle_connection(
             };
             match registry.spawn_agent(opts) {
                 Ok(id) => {
+                    // PRD #201 native prompt delivery: if the spawn carried a
+                    // seed (a Pi start-role orchestrator pane), stash it for the
+                    // pane's extension to pull natively via `get-seed`, and arm
+                    // the PTY-injection safety net in case the pull never comes.
+                    // Do this right after spawn so the seed is available before
+                    // pi boots + fires `session_start`. Non-seed spawns (every
+                    // other pane) skip this entirely and keep the legacy path.
+                    if let (Some(pane_id), Some(seed)) = (pane_id_env.as_deref(), seed.as_deref())
+                        && !seed.trim().is_empty()
+                    {
+                        registry.set_pending_seed(pane_id, seed);
+                        crate::agent_pty::arm_seed_fallback(
+                            registry.clone(),
+                            pane_id.to_string(),
+                            crate::agent_pty::seed_fallback_grace(),
+                        );
+                    }
                     // PRD #93 round-5: populate daemon-side role maps so
                     // `handle_delegate` / `handle_work_done` can resolve
                     // the worker pane and orchestrator pane purely from
@@ -1604,6 +1649,7 @@ mod tests {
             display_name: Some("auditor".into()),
             tab_membership: None,
             agent_type: None,
+            seed: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: AttachRequest = serde_json::from_str(&json).unwrap();
@@ -1638,6 +1684,7 @@ mod tests {
             display_name: None,
             tab_membership: None,
             agent_type: None,
+            seed: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
@@ -1652,6 +1699,13 @@ mod tests {
         assert!(
             !v.as_object().unwrap().contains_key("agent_type"),
             "agent_type=None should be omitted from the wire payload"
+        );
+        // PRD #201: the additive `seed` field is `skip_serializing_if`, so a
+        // no-seed StartAgent keeps the exact legacy wire shape an older daemon
+        // parses — the reason `get-seed`/`seed` need no `PROTOCOL_VERSION` bump.
+        assert!(
+            !v.as_object().unwrap().contains_key("seed"),
+            "seed=None should be omitted from the wire payload"
         );
     }
 
@@ -1670,6 +1724,7 @@ mod tests {
                 name: "k8s-ops".into(),
             }),
             agent_type: None,
+            seed: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1708,6 +1763,7 @@ mod tests {
                 display_title: None,
             }),
             agent_type: None,
+            seed: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

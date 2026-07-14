@@ -46,7 +46,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- configuration (env-overridable so the pure path is fixture-testable) ---
 RECORDINGS_DIR="${REEL_ADAPTER_RECORDINGS_DIR:-.dot-agent-deck/recordings}"
 CATALOG_FILE="${REEL_ADAPTER_CATALOG:-tests/CATALOG.md}"
-MAIN_REF="${REEL_ADAPTER_MAIN_REF:-main}"
+MAIN_REF="${REEL_ADAPTER_MAIN_REF:-origin/main}"
 ENGINE="${REEL_ADAPTER_ENGINE:-$SCRIPT_DIR/../demo-reel/reel.sh}"
 
 SKIP_MSG="skipped: no e2e tests changed on this branch"
@@ -76,7 +76,7 @@ Usage:
 Environment overrides:
   REEL_ADAPTER_RECORDINGS_DIR  (default: .dot-agent-deck/recordings)
   REEL_ADAPTER_CATALOG         (default: tests/CATALOG.md)
-  REEL_ADAPTER_MAIN_REF        (default: main)
+  REEL_ADAPTER_MAIN_REF        (default: origin/main)
   REEL_ADAPTER_ENGINE          (default: <skill>/../demo-reel/reel.sh)
 EOF
 }
@@ -213,6 +213,15 @@ assemble() {
 # --------------------------------------------------------------------------
 select_ids() {
   local changed base md id src
+  # The default ref is `origin/main`, so refresh the remote-tracking ref first —
+  # a local `main` can lag the true remote tip and over-select tests already
+  # merged upstream. Best-effort: offline / no remote just falls back to whatever
+  # ref exists (the merge-base below degrades to an empty diff). Attempted ONLY
+  # when MAIN_REF names an `origin/*` remote-tracking ref, so an overridden or
+  # local ref (as the acceptance test uses) never touches the network.
+  if [[ "$MAIN_REF" == origin/* ]]; then
+    git fetch --no-tags --quiet origin "${MAIN_REF#origin/}" 2>/dev/null || true
+  fi
   # Diff against the MERGE-BASE of MAIN_REF and HEAD, not the MAIN_REF tip: if
   # main advanced after this branch was cut, diffing the tip would report files
   # changed on main as "changed here" and over-select. The `-- '*.rs'` pathspec

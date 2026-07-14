@@ -24,6 +24,26 @@ pub enum EventType {
 pub enum AgentType {
     ClaudeCode,
     OpenCode,
+    Pi,
+    /// "No recognized agent type." Produced by [`AgentType::from_command`] for
+    /// any unrecognized binary, mapped to `Option::None` by
+    /// [`crate::state::SessionState::live_snapshot`], and rendered as the "No
+    /// agent" dashboard placeholder.
+    ///
+    /// PRD #201 forward-compat catch-all: this variant also carries
+    /// `#[serde(other)]`, so any UNRECOGNIZED wire value (e.g. a `pi` record
+    /// reaching a pre-Pi reader, or a future agent type reaching today's
+    /// build) deserializes here instead of failing the whole `AgentEvent` /
+    /// `AgentRecord` decode. That mirrors [`crate::state::SessionStatus::Unknown`]
+    /// — but reuses the pre-existing neutral variant rather than adding a new
+    /// one: `None` already means "type not known", already maps to the "No
+    /// agent" placeholder, and is exactly what an unrecognized binary yields
+    /// via `from_command`, so an unknown wire value landing on `None` is the
+    /// consistent, non-active outcome (it never masquerades as a real agent).
+    /// `#[serde(other)]` is deserialize-only; `None` still serializes to
+    /// `"none"` (and `"none"` still deserializes back to `None` via this same
+    /// catch-all), so round-trips are unchanged.
+    #[serde(other)]
     None,
 }
 
@@ -35,8 +55,8 @@ impl AgentType {
     /// sessions with the correct type instead of "No agent".
     ///
     /// Returns `Some(AgentType)` only for recognized agent binaries
-    /// (`claude` → `ClaudeCode`, `opencode` → `OpenCode`); unknown
-    /// commands and `None` input return `None` so the daemon stores
+    /// (`claude` → `ClaudeCode`, `opencode` → `OpenCode`, `pi` → `Pi`);
+    /// unknown commands and `None` input return `None` so the daemon stores
     /// "type not known yet" rather than misclassifying. Whitespace
     /// before the binary name is ignored to match shell-style invocations.
     pub fn from_command(cmd: Option<&str>) -> Option<Self> {
@@ -46,8 +66,28 @@ impl AgentType {
         match basename {
             "claude" => Some(AgentType::ClaudeCode),
             "opencode" => Some(AgentType::OpenCode),
+            "pi" => Some(AgentType::Pi),
             _ => None,
         }
+    }
+}
+
+/// PRD #201 M1.2 (test-plan row 3): map a lifecycle **state** string an agent's
+/// extension reports via `dot-agent-deck agent-event --type <state>` to the
+/// [`EventType`] that drives the target pane's card status. This is the single
+/// production seam the CLI subcommand and the fast-tier status tests share.
+///
+/// The canonical `--type` vocabulary is exactly three states — `running`,
+/// `waiting`, `finished`. Anything else returns `None` so the subcommand can
+/// reject an unknown `--type` with a clear non-zero error instead of silently
+/// emitting a wrong (or default) status. The Phase 2 extension and the docs
+/// MUST use the same three strings.
+pub fn agent_event_type_from_state(state: &str) -> Option<EventType> {
+    match state {
+        "running" => Some(EventType::Thinking),
+        "waiting" => Some(EventType::WaitingForInput),
+        "finished" => Some(EventType::Idle),
+        _ => None,
     }
 }
 
@@ -108,6 +148,39 @@ pub enum DaemonMessage {
     /// Worker (or orchestrator with `done`) reports task completion.
     #[serde(rename = "work_done")]
     WorkDone(WorkDoneSignal),
+    /// PRD #201 native prompt delivery: a READ-ONLY request for the seed the
+    /// daemon prepared for a pane, so the pane's extension can deliver it
+    /// NATIVELY (`pi.sendUserMessage`) instead of the daemon typing it into the
+    /// PTY. Unlike the two fire-and-forget signals above, this one gets a
+    /// reply: the daemon writes a [`GetSeedResponse`] JSON line back on the
+    /// same connection, then the seed is cleared (delivered exactly once). An
+    /// older daemon that doesn't know this variant fails to parse it and sends
+    /// no reply — the `get-seed` CLI then reports an empty seed, the extension
+    /// no-sends, and the daemon's PTY-injection safety net still delivers. So
+    /// this variant degrades gracefully across versions (see the rule-12 note
+    /// in `docs/develop/versioning.md`): it rides the unversioned hook socket
+    /// and does NOT move the attach `PROTOCOL_VERSION`.
+    #[serde(rename = "get_seed")]
+    GetSeed(GetSeedRequest),
+}
+
+/// PRD #201: payload of [`DaemonMessage::GetSeed`] — the pane whose pending
+/// seed the caller wants. Sourced from `DOT_AGENT_DECK_PANE_ID` by the
+/// `get-seed` CLI (same pane-scoping the delegate / work-done / agent-event
+/// verbs use).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetSeedRequest {
+    pub pane_id: String,
+}
+
+/// PRD #201: the daemon's reply to a [`DaemonMessage::GetSeed`], written as a
+/// single JSON line back on the hook-socket connection. `seed` is `None`
+/// (serialized as `null`) when no seed is pending for the pane — the pane is
+/// unknown, or the seed was already delivered (pulled or injected).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetSeedResponse {
+    #[serde(default)]
+    pub seed: Option<String>,
 }
 
 /// Signal sent by the orchestrator via `dot-agent-deck delegate`.
@@ -314,6 +387,35 @@ mod tests {
         );
     }
 
+    // PRD #201 M1.1 (test-plan row 1): pin the `pi` → AgentType::Pi mapping
+    // so a plain `pi` pane and a scheduled `pi` job are recognized as a
+    // first-class agent type, and reassert claude/opencode as a regression
+    // guard — the same detection path feeds all three. Mirrors the path/arg
+    // shapes covered for claude/opencode above.
+    #[test]
+    fn agent_type_from_command_recognizes_pi() {
+        assert_eq!(AgentType::from_command(Some("pi")), Some(AgentType::Pi));
+        // Full path also resolves via file_name().
+        assert_eq!(
+            AgentType::from_command(Some("/usr/local/bin/pi")),
+            Some(AgentType::Pi)
+        );
+        // Args after the binary are ignored.
+        assert_eq!(
+            AgentType::from_command(Some("pi --some-flag")),
+            Some(AgentType::Pi)
+        );
+        // No regression: claude/opencode still map to their own types.
+        assert_eq!(
+            AgentType::from_command(Some("claude")),
+            Some(AgentType::ClaudeCode)
+        );
+        assert_eq!(
+            AgentType::from_command(Some("opencode")),
+            Some(AgentType::OpenCode)
+        );
+    }
+
     #[test]
     fn agent_type_from_command_returns_none_for_unknown_or_empty() {
         // Non-agent commands must NOT misclassify — the daemon would
@@ -326,6 +428,52 @@ mod tests {
         // Whitespace-only / empty input also stays None.
         assert!(AgentType::from_command(Some("")).is_none());
         assert!(AgentType::from_command(Some("   ")).is_none());
+    }
+
+    // PRD #201 (rule-12 wire safety): `AgentType` gained a wire-serialized `Pi`
+    // variant. Without a `#[serde(other)]` fallback, a NEWER daemon emitting
+    // `agent_type = "pi"` would break an OLDER reader's WHOLE-response decode
+    // (`list_agents` / the `KIND_EVENT` broadcast), stranding its agent list.
+    // The `#[serde(other)]` on `AgentType::None` makes any unrecognized value —
+    // a `pi` record at a pre-Pi reader, OR a future agent type at today's build
+    // — deserialize to the neutral `None` ("No agent") placeholder instead of
+    // erroring, so this class of break can never repeat for a future type.
+    #[test]
+    fn unknown_agent_type_deserializes_to_none_fallback() {
+        // The enum directly: an entirely unknown future value.
+        let ty: AgentType = serde_json::from_str("\"someunknownfuturetype\"").unwrap();
+        assert_eq!(ty, AgentType::None);
+
+        // The value carried in a full `AgentEvent` (the real wire shape a
+        // subscriber decodes over `KIND_EVENT`): the unknown `agent_type` must
+        // NOT fail the whole-event decode.
+        let json = r#"{
+            "session_id": "fwd-compat-1",
+            "agent_type": "someunknownfuturetype",
+            "event_type": "thinking",
+            "timestamp": "2026-03-22T10:00:00Z"
+        }"#;
+        let event: AgentEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.agent_type, AgentType::None);
+        assert_eq!(event.event_type, EventType::Thinking);
+
+        // `#[serde(other)]` is deserialize-only: `None` still round-trips
+        // through its own `"none"` name, so serialization is unaffected.
+        assert_eq!(serde_json::to_string(&AgentType::None).unwrap(), "\"none\"");
+        assert_eq!(
+            serde_json::from_str::<AgentType>("\"none\"").unwrap(),
+            AgentType::None
+        );
+        // And the recognized values still map to their own variants (regression
+        // guard: the catch-all must not swallow known types).
+        assert_eq!(
+            serde_json::from_str::<AgentType>("\"pi\"").unwrap(),
+            AgentType::Pi
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentType>("\"claude_code\"").unwrap(),
+            AgentType::ClaudeCode
+        );
     }
 
     #[test]
@@ -385,6 +533,47 @@ mod tests {
             }
             _ => panic!("expected WorkDone"),
         }
+    }
+
+    #[test]
+    fn serialize_deserialize_get_seed_request() {
+        // PRD #201: the get-seed request carries the pane id and tags itself
+        // `message_type: "get_seed"` so the daemon's hook loop can distinguish
+        // it from the fire-and-forget delegate / work-done signals.
+        let msg = DaemonMessage::GetSeed(GetSeedRequest {
+            pane_id: "pane-7".into(),
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            json.contains("\"message_type\":\"get_seed\""),
+            "get-seed must be tagged so an OLD daemon that doesn't know it fails \
+             to parse and simply doesn't reply (graceful degradation): {json}"
+        );
+        let parsed: DaemonMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DaemonMessage::GetSeed(r) => assert_eq!(r.pane_id, "pane-7"),
+            _ => panic!("expected GetSeed"),
+        }
+    }
+
+    #[test]
+    fn serialize_deserialize_get_seed_response() {
+        // Some(seed) round-trips…
+        let resp = GetSeedResponse {
+            seed: Some("Read .dot-agent-deck/worker-task-coder.md for your task.".into()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: GetSeedResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.seed.as_deref(),
+            Some("Read .dot-agent-deck/worker-task-coder.md for your task.")
+        );
+        // …and "no seed" is a null the get-seed CLI reads as "print nothing".
+        let none = GetSeedResponse { seed: None };
+        let json = serde_json::to_string(&none).unwrap();
+        assert_eq!(json, "{\"seed\":null}");
+        let back: GetSeedResponse = serde_json::from_str(&json).unwrap();
+        assert!(back.seed.is_none());
     }
 
     #[test]
@@ -448,6 +637,34 @@ mod tests {
         assert!(s.roles[0].is_start_role);
         assert_eq!(s.roles[1].pane_id, "sched-github-issues-0-r1");
         assert_eq!(s.roles[1].role_index, 1);
+    }
+
+    // PRD #201 M1.2 (test-plan row 3): pin the lifecycle-state → EventType
+    // mapping the `dot-agent-deck agent-event --type <state>` subcommand and
+    // the fast-tier status tests both consume. The three canonical states must
+    // map to the exact EventTypes that drive Thinking / WaitingForInput / Idle
+    // card statuses, and any other string must return None so the CLI rejects
+    // an unknown `--type` non-zero rather than emitting a wrong status.
+    #[test]
+    fn agent_event_type_from_state_maps_canonical_lifecycle_states() {
+        assert_eq!(
+            agent_event_type_from_state("running"),
+            Some(EventType::Thinking)
+        );
+        assert_eq!(
+            agent_event_type_from_state("waiting"),
+            Some(EventType::WaitingForInput)
+        );
+        assert_eq!(
+            agent_event_type_from_state("finished"),
+            Some(EventType::Idle)
+        );
+        // Unknown / malformed states map to None (the CLI turns this into a
+        // clear non-zero error). Includes casing and near-miss variants.
+        assert_eq!(agent_event_type_from_state("idle"), None);
+        assert_eq!(agent_event_type_from_state("Running"), None);
+        assert_eq!(agent_event_type_from_state("done"), None);
+        assert_eq!(agent_event_type_from_state(""), None);
     }
 
     #[test]

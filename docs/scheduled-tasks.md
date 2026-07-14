@@ -146,7 +146,7 @@ enabled = true
 | `name` | string | yes | Unique id. Also the key that ties a task to its reused tab — see [Tab reuse](#tab-reuse). Renaming is forbidden (it would orphan an open reused tab); treat a rename as remove + add. |
 | `cron` | string | yes | A **5-field POSIX** cron expression (`min hour day-of-month month day-of-week`), e.g. `0 9 * * MON-FRI`. Evaluated in **local time**. 6/7-field forms (with a seconds field) are also accepted. |
 | `working_dir` | string | yes | Directory the fire spawns into. `~` and `$VAR` / `${VAR}` are expanded at load time; a relative path resolves against `$HOME` (never the authoring agent's cwd). Created with `mkdir -p` if missing. |
-| `command` | string | **yes** | The agent command for the **single-agent** card (e.g. `claude` or `opencode`), mirroring the new-deck dialog's command field. **Required**: `schedule add` errors without it and the loader **rejects (skips) a command-less entry** — there is **no `$SHELL` fallback**. Required **universally**, including orchestration-target schedules: it is still validated at load, but **ignored at fire** when the target dir defines an `[[orchestrations]]` block (the orchestration's role commands win). |
+| `command` | string | **yes** | The agent command for the **single-agent** card (e.g. `claude`, `opencode`, or `pi`), mirroring the new-deck dialog's command field. **Required**: `schedule add` errors without it and the loader **rejects (skips) a command-less entry** — there is **no `$SHELL` fallback**. Required **universally**, including orchestration-target schedules: it is still validated at load, but **ignored at fire** when the target dir defines an `[[orchestrations]]` block (the orchestration's role commands win). |
 | `prompt` | string | yes | The prompt delivered into the spawned agent (or the orchestrator role). |
 | `new_tab_per_fire` | bool | no (default `false`) | `false` reuses one tab per task; `true` opens a fresh tab every fire. See [Tab reuse](#tab-reuse). |
 | `enabled` | bool | no (default `true`) | `false` keeps the definition but stops it firing. |
@@ -286,7 +286,7 @@ Dispatched tabs/cards persist until **you** close them — you stay in control o
 name = "morning-digest"
 cron = "0 9 * * MON-FRI"          # 09:00 on weekdays, local time
 working_dir = "~/scheduled/morning-digest"
-command = "claude"                 # required — the single-agent card's command (claude or opencode)
+command = "claude"                 # required — the single-agent card's command (claude, opencode, or pi)
 prompt = """
 Generate a brief: Barcelona weather forecast for today, plus GitHub issues
 opened in the last 24h across vfarcic/dot-ai and vfarcic/dot-agent-deck.

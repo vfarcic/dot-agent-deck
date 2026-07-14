@@ -1,0 +1,19 @@
+{
+	"name": "dot-agent-deck-pi-extension",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"description": "dot-agent-deck orchestrator extension for Pi: native delegate/work-done tools + event-bus status reporting (PRD #201).",
+	"scripts": {
+		"test": "node --import tsx --test test/*.test.ts",
+		"typecheck": "tsc --noEmit"
+	},
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"devDependencies": {
+		"tsx": "^4.23.0"
+	}
+}

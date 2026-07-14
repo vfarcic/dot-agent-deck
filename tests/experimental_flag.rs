@@ -29,7 +29,7 @@
 //! exercises the production global wrapper `show_experimental_footer()`
 //! to prove live re-evaluation after a synthetic config change.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use dot_agent_deck::features::{self, Features};
 use dot_agent_deck::ui::render_experimental_footer_to_buffer;
@@ -40,6 +40,15 @@ use spec::spec;
 /// between the production label and the test surfaces as a failed
 /// `contains` assertion rather than a silent snapshot churn.
 const EXPERIMENTAL_FOOTER_TEXT: &str = "experimental: on";
+
+/// Serializes any test that mutates the *process-global* `Features`
+/// (`features/reload/001` today) so a concurrent flip can't bleed across
+/// another test's render/assert window. Under plain `cargo test` (CI) the tests
+/// in this binary share one process and run on threads; `cargo test-fast`/nextest
+/// isolates each test in its own process, where this is belt-and-suspenders. The
+/// by-value `&Features` render seam used by `features/gating/001-002` never reads
+/// the global, so those need no lock.
+static FLAG_LOCK: Mutex<()> = Mutex::new(());
 
 /// Stringify the rendered buffer — one line per row, cells joined into the
 /// symbol layer — so `insta` diffs read like the rendered widget itself.
@@ -130,6 +139,11 @@ fn reload_001_footer_appears_after_synthetic_config_change() {
     // gating tests above.
     let width: u16 = 80;
     let height: u16 = 1;
+
+    // Guard the process-global `Features` mutation below: under plain
+    // `cargo test` (shared process/threads) its set→read window must not
+    // interleave with any concurrent flip (see FLAG_LOCK).
+    let _flag_lock = FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     // M1.2: a single shared Features value per process. Startup default is
     // OFF (experimental = false). Install it as the process-global the

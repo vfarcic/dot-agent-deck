@@ -5,7 +5,7 @@ use std::sync::Arc;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::sync::RwLock;
 
-use dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID;
+use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use dot_agent_deck::build_version_handshake;
 use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
@@ -87,21 +87,60 @@ enum Commands {
     },
     /// Delegate work to one or more worker roles (orchestrator only)
     Delegate {
-        /// Task description with context, file paths, and constraints
-        #[arg(long)]
-        task: String,
+        /// Task description with context, file paths, and constraints.
+        /// Mutually exclusive with --task-file.
+        #[arg(long, conflicts_with = "task_file")]
+        task: Option<String>,
+        /// Read the task text verbatim from a file (or `-` for stdin). The
+        /// shell-safe way to pass a task containing backticks, quotes, `$VAR`,
+        /// or newlines, which --task would otherwise let the caller's shell
+        /// mangle. Mutually exclusive with --task.
+        #[arg(long = "task-file", value_name = "PATH")]
+        task_file: Option<String>,
         /// Role name(s) to delegate to (repeatable)
         #[arg(long)]
         to: Vec<String>,
     },
     /// Signal task completion back to the orchestrator
     WorkDone {
-        /// Summary of what was accomplished
-        #[arg(long)]
-        task: String,
+        /// Summary of what was accomplished. Mutually exclusive with
+        /// --task-file.
+        #[arg(long, conflicts_with = "task_file")]
+        task: Option<String>,
+        /// Read the summary text verbatim from a file (or `-` for stdin). The
+        /// shell-safe way to pass a summary containing backticks, quotes,
+        /// `$VAR`, or newlines. Mutually exclusive with --task.
+        #[arg(long = "task-file", value_name = "PATH")]
+        task_file: Option<String>,
         /// Signal that the entire orchestration is complete (orchestrator only)
         #[arg(long)]
         done: bool,
+    },
+    /// Report an agent lifecycle state so the pane's card status updates
+    /// (PRD #201 M1.2). Used by an agent's extension (e.g. the bundled Pi
+    /// extension) to drive status with NO hook installed: it rides the
+    /// existing raw-`AgentEvent` socket path.
+    AgentEvent {
+        /// Lifecycle state: one of `running`, `waiting`, `finished`.
+        #[arg(long = "type")]
+        r#type: String,
+    },
+    /// Print the seed/prompt the daemon prepared for this pane, then clear it
+    /// (PRD #201 native prompt delivery). READ-ONLY: it asks the daemon over
+    /// the hook socket for the pane's pending seed and prints it to stdout
+    /// (empty output = no seed). The bundled Pi extension shells this on
+    /// `session_start` and, if the output is non-empty, delivers it natively
+    /// via `pi.sendUserMessage` — so a Pi pane's first prompt no longer needs
+    /// PTY keystroke injection. Uses `DOT_AGENT_DECK_PANE_ID` to scope the
+    /// request, exactly like `agent-event`.
+    GetSeed,
+    /// Set up the Pi orchestrator integration (PRD #201). Detects `pi` on
+    /// PATH, materializes the bundled orchestrator extension into Pi's global
+    /// extension dir, and enables it (Pi auto-discovers the dir). Prints the
+    /// one-line install hint and exits non-zero if `pi` is absent.
+    Orchestrator {
+        #[command(subcommand)]
+        cmd: OrchestratorCmd,
     },
     /// Daemon-side subcommands. Used internally by remote transports — not
     /// part of the everyday user surface.
@@ -218,6 +257,14 @@ enum ScheduleAction {
     },
     /// Ask the running daemon to re-read the global config.
     Reload,
+}
+
+#[derive(Subcommand)]
+enum OrchestratorCmd {
+    /// Detect `pi`, then materialize + enable the bundled orchestrator
+    /// extension in Pi's global extension dir. Idempotent (re-run to refresh a
+    /// stale copy). Exits non-zero with the install hint when `pi` is absent.
+    Setup,
 }
 
 #[derive(Subcommand)]
@@ -358,6 +405,48 @@ enum ConfigAction {
     },
 }
 
+/// Resolve the task/summary text for `delegate` / `work-done` from the mutually
+/// exclusive `--task` / `--task-file` inputs.
+///
+/// `--task-file <path>` reads the text **verbatim** from a file — no shell is
+/// involved, so backticks, quotes, `$VAR`, and newlines survive unmangled
+/// (the whole point: `--task "…`code`…"` lets the caller's shell
+/// command-substitute the backticks before we ever run). `--task-file -` reads
+/// stdin instead. clap's `conflicts_with` already rejects passing *both*; this
+/// function rejects passing *neither* and surfaces file/stdin read errors.
+fn resolve_task(
+    task: Option<String>,
+    task_file: Option<String>,
+    stdin: impl std::io::Read,
+) -> Result<String, String> {
+    match (task, task_file) {
+        (Some(t), None) => Ok(t),
+        (None, Some(path)) => read_task_file(&path, stdin),
+        // clap `conflicts_with` normally prevents this; kept as a defensive
+        // guard so the invariant holds even if the two are ever resolved
+        // outside clap parsing.
+        (Some(_), Some(_)) => {
+            Err("--task and --task-file are mutually exclusive; pass exactly one".to_string())
+        }
+        (None, None) => Err(
+            "provide the task via --task <text> or --task-file <path> (use `-` for stdin)"
+                .to_string(),
+        ),
+    }
+}
+
+/// Read task text verbatim from `path`, or from `stdin` when `path` is `-`.
+fn read_task_file(path: &str, mut stdin: impl std::io::Read) -> Result<String, String> {
+    if path == "-" {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut stdin, &mut buf)
+            .map_err(|e| format!("failed to read task from stdin: {e}"))?;
+        Ok(buf)
+    } else {
+        std::fs::read_to_string(path).map_err(|e| format!("failed to read task file '{path}': {e}"))
+    }
+}
+
 fn main() -> ExitCode {
     // PRD #89 M3.4: the `--continue` flag was removed — auto-restore is now the
     // default. Intercept a stale invocation before clap parsing so the user
@@ -473,7 +562,11 @@ fn main() -> ExitCode {
         Some(Commands::Watch { interval, command }) => {
             dot_agent_deck::watch::run_watch(interval, &command)
         }
-        Some(Commands::Delegate { task, to }) => {
+        Some(Commands::Delegate {
+            task,
+            task_file,
+            to,
+        }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
                 Err(_) => {
@@ -487,6 +580,13 @@ fn main() -> ExitCode {
                 eprintln!("Error: at least one --to <role> is required.");
                 return ExitCode::FAILURE;
             }
+            let task = match resolve_task(task, task_file, std::io::stdin().lock()) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let signal = dot_agent_deck::event::DelegateSignal {
                 pane_id,
                 task,
@@ -507,13 +607,24 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Some(Commands::WorkDone { task, done }) => {
+        Some(Commands::WorkDone {
+            task,
+            task_file,
+            done,
+        }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
                 Ok(id) => id,
                 Err(_) => {
                     eprintln!(
                         "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
                     );
+                    return ExitCode::FAILURE;
+                }
+            };
+            let task = match resolve_task(task, task_file, std::io::stdin().lock()) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Error: {e}");
                     return ExitCode::FAILURE;
                 }
             };
@@ -537,6 +648,156 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Some(Commands::AgentEvent { r#type }) => {
+            let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
+                Ok(id) => id,
+                Err(_) => {
+                    eprintln!(
+                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            // Optional — the daemon injects this on spawn (same pattern as the
+            // hook path); a pane spawned before agent-id tagging has none.
+            let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID).ok();
+            let event_type = match dot_agent_deck::event::agent_event_type_from_state(&r#type) {
+                Some(et) => et,
+                None => {
+                    eprintln!(
+                        "Error: unknown agent-event --type {:?}. Expected one of: running, waiting, finished.",
+                        r#type
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            // Ride the EXISTING raw-`AgentEvent` socket path (zero new wire):
+            // a bare AgentEvent with no `message_type` envelope, keyed on a
+            // stable session id derived from the pane so repeated events update
+            // the same card. The daemon's `run_hook_loop` falls back to
+            // `AgentEvent` and `apply_event` drives the status.
+            let event = dot_agent_deck::event::AgentEvent {
+                session_id: format!("{pane_id}-session"),
+                // TODO(companion PRD): derive agent type from the pane instead
+                // of hard-coding Pi. Safe today because the daemon's
+                // `apply_event` only UPGRADES `None` → a concrete type (never
+                // downgrades), so a hard-coded `Pi` from the `agent-event`
+                // subcommand can't clobber an already-known type.
+                agent_type: dot_agent_deck::event::AgentType::Pi,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some(pane_id),
+                agent_id,
+            };
+            let json = match serde_json::to_string(&event) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("Failed to serialize agent-event: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if dot_agent_deck::hook::send_to_socket(&json).is_none() {
+                eprintln!("Failed to send agent-event to daemon socket.");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Some(Commands::GetSeed) => {
+            let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
+                Ok(id) => id,
+                Err(_) => {
+                    eprintln!(
+                        "Error: DOT_AGENT_DECK_PANE_ID environment variable not set.\nThis command should be run from within a dot-agent-deck managed pane."
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
+            // Ask the daemon (over the hook socket) for the seed it prepared
+            // for this pane. READ-ONLY request/response — the one hook-socket
+            // verb that reads a reply. A missing daemon / older daemon that
+            // doesn't answer → `None` → we print nothing and exit 0, so the
+            // extension no-sends and the daemon's PTY-injection safety net
+            // still delivers (graceful cross-version degradation, no
+            // PROTOCOL_VERSION dependency).
+            let req = dot_agent_deck::event::DaemonMessage::GetSeed(
+                dot_agent_deck::event::GetSeedRequest { pane_id },
+            );
+            let json = match serde_json::to_string(&req) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("Failed to serialize get-seed request: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match dot_agent_deck::hook::request_from_socket(&json) {
+                Some(line) if !line.trim().is_empty() => {
+                    match serde_json::from_str::<dot_agent_deck::event::GetSeedResponse>(&line) {
+                        Ok(resp) => {
+                            if let Some(seed) = resp.seed {
+                                // Print the seed verbatim (no trailing newline)
+                                // so the extension captures exactly the prepared
+                                // text. Empty seed → print nothing.
+                                print!("{seed}");
+                            }
+                            ExitCode::SUCCESS
+                        }
+                        // A reply we can't parse is treated as "no seed": print
+                        // nothing, exit 0 — the fallback still covers delivery.
+                        Err(_) => ExitCode::SUCCESS,
+                    }
+                }
+                // No reply (no daemon / older daemon / no seed) → no seed.
+                _ => ExitCode::SUCCESS,
+            }
+        }
+        Some(Commands::Orchestrator { cmd }) => match cmd {
+            // PRD #201 M3.2: thin wrapper — wire real PATH-detection + the real
+            // `~/.pi/agent/extensions/dot-agent-deck` dir to the pure
+            // `run_setup` core, then render its report to stdout/stderr + exit.
+            OrchestratorCmd::Setup => {
+                use dot_agent_deck::orchestrator_ext;
+                // HOME-unset-safe (matching the auto-materialize path): the
+                // strict resolver yields `None` when HOME is unset OR empty.
+                // Because this is an EXPLICIT user command it ERRORS (non-zero)
+                // rather than silently guessing a `/tmp`/`./` location Pi will
+                // never discover — do NOT materialize, do NOT report success.
+                match orchestrator_ext::default_extension_dir() {
+                    None => {
+                        eprintln!(
+                            "orchestrator setup: HOME is not set — cannot locate Pi's extension \
+                             directory (~/.pi/agent/extensions/dot-agent-deck). Set HOME and \
+                             re-run `dot-agent-deck orchestrator setup`."
+                        );
+                        ExitCode::FAILURE
+                    }
+                    Some(target_dir) => {
+                        let pi_present = orchestrator_ext::pi_on_path();
+                        match orchestrator_ext::run_setup(pi_present, &target_dir) {
+                            Ok(report) if report.success => {
+                                println!("{}", report.message);
+                                ExitCode::SUCCESS
+                            }
+                            Ok(report) => {
+                                eprintln!("{}", report.message);
+                                ExitCode::FAILURE
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "orchestrator setup: failed to materialize the Pi extension into {}: {e}",
+                                    target_dir.display()
+                                );
+                                ExitCode::FAILURE
+                            }
+                        }
+                    }
+                }
+            }
+        },
         Some(Commands::Daemon { cmd }) => match cmd {
             DaemonCmd::Serve => {
                 // PRD #170 M1.2: capture the login-shell PATH and apply it to
@@ -1382,5 +1643,177 @@ mod tests {
             }) => assert!(!new_tab_per_fire, "default must be false"),
             _ => panic!("expected `schedule add`"),
         }
+    }
+
+    // ---- PRD #201: shell-safe `--task-file` for delegate / work-done --------
+    //
+    // The task text may contain backticks, quotes, `$VAR`, and newlines. Passed
+    // as `--task "…"` those are mangled by the caller's shell *before*
+    // dot-agent-deck runs; `--task-file` reads the bytes verbatim off disk (or
+    // stdin) so they survive. `resolve_task` is the pure seam under both
+    // `delegate` and `work-done`, tested directly here.
+
+    // A payload that exercises every character class the shell would otherwise
+    // corrupt: backticks (command substitution), single/double quotes, a
+    // `$VAR`, an escaped `\`, and multiple lines.
+    const TRICKY_TASK: &str =
+        "Fix `compute()` in \"src/lib.rs\" for $USER\nsecond 'line' with $HOME & a \\ backslash\n";
+
+    #[test]
+    fn task_file_reads_task_verbatim_from_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("task.txt");
+        std::fs::write(&path, TRICKY_TASK).expect("write task file");
+
+        // Empty stdin — the file path branch must not touch it.
+        let got = resolve_task(
+            None,
+            Some(path.to_str().unwrap().to_string()),
+            std::io::empty(),
+        )
+        .expect("resolve_task should read the file");
+        assert_eq!(
+            got, TRICKY_TASK,
+            "a task with backticks/quotes/$VAR/newlines must round-trip VERBATIM via --task-file"
+        );
+    }
+
+    #[test]
+    fn task_file_dash_reads_task_verbatim_from_stdin() {
+        let got = resolve_task(None, Some("-".to_string()), TRICKY_TASK.as_bytes())
+            .expect("resolve_task should read stdin for `-`");
+        assert_eq!(
+            got, TRICKY_TASK,
+            "`--task-file -` must read the task VERBATIM from stdin"
+        );
+    }
+
+    #[test]
+    fn task_plain_string_passes_through() {
+        let got = resolve_task(Some("hello".to_string()), None, std::io::empty())
+            .expect("plain --task should pass through");
+        assert_eq!(got, "hello");
+    }
+
+    #[test]
+    fn task_file_missing_errors_clearly() {
+        let err = resolve_task(
+            None,
+            Some("/no/such/task-file.txt".to_string()),
+            std::io::empty(),
+        )
+        .expect_err("a missing --task-file must error");
+        assert!(
+            err.contains("failed to read task file") && err.contains("/no/such/task-file.txt"),
+            "missing-file error should name the path: {err}"
+        );
+    }
+
+    #[test]
+    fn task_and_task_file_both_set_is_rejected() {
+        // Defensive guard inside resolve_task (clap also rejects this at parse
+        // time — see the parse test below).
+        let err = resolve_task(
+            Some("x".to_string()),
+            Some("y".to_string()),
+            std::io::empty(),
+        )
+        .expect_err("--task + --task-file must conflict");
+        assert!(
+            err.contains("mutually exclusive"),
+            "conflict error should be clear: {err}"
+        );
+    }
+
+    #[test]
+    fn task_neither_set_is_rejected() {
+        let err = resolve_task(None, None, std::io::empty())
+            .expect_err("neither --task nor --task-file must error");
+        assert!(
+            err.contains("--task") && err.contains("--task-file"),
+            "neither-given error should mention both flags: {err}"
+        );
+    }
+
+    #[test]
+    fn delegate_parses_task_file_and_conflicts_with_task() {
+        // --task-file parses into `task_file` with `task` empty.
+        let cli = Cli::try_parse_from([
+            "dot-agent-deck",
+            "delegate",
+            "--task-file",
+            "/tmp/t.txt",
+            "--to",
+            "coder",
+        ])
+        .expect("delegate --task-file should parse");
+        match cli.command {
+            Some(Commands::Delegate {
+                task,
+                task_file,
+                to,
+            }) => {
+                assert_eq!(task, None);
+                assert_eq!(task_file.as_deref(), Some("/tmp/t.txt"));
+                assert_eq!(to, vec!["coder".to_string()]);
+            }
+            _ => panic!("expected `delegate`"),
+        }
+
+        // Passing both --task and --task-file is rejected at parse time.
+        // (`Cli` isn't `Debug`, so match rather than `expect_err`.)
+        let err = match Cli::try_parse_from([
+            "dot-agent-deck",
+            "delegate",
+            "--task",
+            "x",
+            "--task-file",
+            "/tmp/t.txt",
+            "--to",
+            "coder",
+        ]) {
+            Ok(_) => panic!("--task + --task-file must conflict at parse time"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "expected a clap ArgumentConflict, got: {err}"
+        );
+    }
+
+    #[test]
+    fn work_done_parses_task_file_and_conflicts_with_task() {
+        let cli = Cli::try_parse_from(["dot-agent-deck", "work-done", "--task-file", "-"])
+            .expect("work-done --task-file - should parse");
+        match cli.command {
+            Some(Commands::WorkDone {
+                task,
+                task_file,
+                done,
+            }) => {
+                assert_eq!(task, None);
+                assert_eq!(task_file.as_deref(), Some("-"));
+                assert!(!done);
+            }
+            _ => panic!("expected `work-done`"),
+        }
+
+        let err = match Cli::try_parse_from([
+            "dot-agent-deck",
+            "work-done",
+            "--task",
+            "x",
+            "--task-file",
+            "y",
+        ]) {
+            Ok(_) => panic!("--task + --task-file must conflict at parse time"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "expected a clap ArgumentConflict, got: {err}"
+        );
     }
 }

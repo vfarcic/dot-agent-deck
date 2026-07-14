@@ -199,6 +199,12 @@ pub struct AgentSpawnOptions<'a> {
     /// placeholder sessions with the correct type. `None` means
     /// "unknown / not an agent" — same default as the legacy path.
     pub agent_type: Option<AgentType>,
+    /// PRD #201 native prompt delivery: a seed/prompt to stash daemon-side for
+    /// this pane at spawn time, to be pulled NATIVELY by the pane's extension
+    /// via `dot-agent-deck get-seed` (→ `pi.sendUserMessage`) rather than typed
+    /// into the PTY. Set only for a Pi start-role (orchestrator) pane; `None`
+    /// for every other pane, which keeps the unchanged PTY-injection path.
+    pub seed: Option<String>,
 }
 
 impl Default for AgentSpawnOptions<'_> {
@@ -212,6 +218,7 @@ impl Default for AgentSpawnOptions<'_> {
             rows: 24,
             cols: 80,
             agent_type: None,
+            seed: None,
         }
     }
 }

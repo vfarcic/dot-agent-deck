@@ -26,6 +26,7 @@ pub mod llm;
 pub mod login_shell;
 pub mod mode_manager;
 pub mod opencode_manage;
+pub mod orchestrator_ext;
 pub mod palette;
 pub mod pane;
 pub mod pane_input;

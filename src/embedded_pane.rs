@@ -461,6 +461,9 @@ impl EmbeddedPaneController {
         agent_type: Option<AgentType>,
         rows: u16,
         cols: u16,
+        // PRD #201: seed/prompt to stash daemon-side for native pull (Pi
+        // orchestrator panes only); `None` keeps the unchanged inject path.
+        seed: Option<String>,
     ) -> Result<String, PaneError> {
         // Tag the spawned process so daemon-spawned agents see
         // DOT_AGENT_DECK_PANE_ID and can emit hook events back to this
@@ -490,6 +493,7 @@ impl EmbeddedPaneController {
             env,
             tab_membership,
             agent_type,
+            seed,
         };
 
         // Start-agent + attach happen on the daemon's runtime; we
@@ -1754,6 +1758,7 @@ impl PaneController for EmbeddedPaneController {
             opts.agent_type,
             opts.rows,
             opts.cols,
+            opts.seed,
         );
         result.map(|id| (id, resolved))
     }

@@ -60,13 +60,27 @@ Composition degrades gracefully — a missing repo/PRD/PR drops only its own seg
    subset). Casts are local-only (PRD #77) and only written on failure or under
    `DOT_AGENT_DECK_RECORD=1`, so the reel step runs the e2e suite with that flag
    first; without casts, every dir fails this check and the step clean-skips.
-2. **Its source file changed on this branch vs `main`.** Each `test.md` carries a
-   `**Source:** `<dir>/<file>::<fn>`` line. The file is matched **by basename**
-   against `git diff --name-only main` restricted to `*.rs`. Basename matching
+2. **Its source file changed on this branch vs `origin/main`.** Each `test.md`
+   carries a `**Source:** `<dir>/<file>::<fn>`` line. The file is matched **by
+   basename** against `git diff --name-only origin/main` restricted to `*.rs`.
+   `select` first does a best-effort `git fetch origin main` so the diff is
+   against the true remote tip, not a stale local `main`. Basename matching
    sidesteps the `test.md` `<immediate-parent>/<file>` path quirk and is robust
    for the flat `tests/*.rs` (and `src/*.rs`) layout this repo uses.
 
 > The recording dir is named after the test **function** (e.g. `mytest`), while the **catalog id** (e.g. `mouse/button/001`) lives in the test.md H1 — the two are not the same string, which is why ids for ordering are read from the H1, not the dir name.
+
+## Reel-eligibility contract: real user-facing usage only
+
+The mechanical selection above (has a cast + source changed) decides *which* tests are candidates. On top of it is a **hard authoring rule**: a test is a legitimate reel clip only if it exercises the feature **the way a user actually runs it**. A clip exists so a human can *watch and validate real behavior* — so a test that drives the feature under a **test-only artifice** must **not** become a clip, because the viewer would be validating a fiction. A reel-eligible PTY-attached test must not rely on:
+
+- non-representative CLI flags a user would never pass (e.g. `pi --no-builtin-tools`, or tool allow/deny-lists that force a particular code path);
+- stand-in binaries (`cat`, echo scripts) standing in for a real agent;
+- delivering a prompt as a command-line argument when production delivers it by **injection** — the pane must be seeded the way the daemon does it (`write_to_pane_and_submit`), not `agent … '<prompt>'`.
+
+If a feature can only be *proven* under such an artifice, split it: a **real-usage** test for the reel plus a separate **headless** (non-recorded) test for the forensic proof. This applies CLAUDE.md rule 4's "validate it AS A USER ACTUALLY USES AND SEES IT" bar at the clip-selection boundary.
+
+> **Today this is an authoring convention, not enforced.** One robustness follow-up is tracked: an explicit opt-in marker so an artifice test can never be *auto*-selected as a clip. Until it ships, authors are responsible for not letting an artifice test become a clip.
 
 ## Assembly rule (concern b)
 
@@ -97,7 +111,7 @@ All paths default to this repo's layout and are overridable (the test uses this 
 | --- | --- |
 | `REEL_ADAPTER_RECORDINGS_DIR` | `.dot-agent-deck/recordings` |
 | `REEL_ADAPTER_CATALOG` | `tests/CATALOG.md` |
-| `REEL_ADAPTER_MAIN_REF` | `main` |
+| `REEL_ADAPTER_MAIN_REF` | `origin/main` |
 | `REEL_ADAPTER_ENGINE` | `<skill>/../demo-reel/reel.sh` |
 
 ## Acceptance test

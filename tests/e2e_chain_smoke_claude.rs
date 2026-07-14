@@ -10,6 +10,8 @@
 
 mod common;
 
+use std::time::Duration;
+
 use common::TuiDeck;
 use spec::spec;
 
@@ -90,8 +92,16 @@ fn claude_001_thinking_working_idle() {
     // ~20 ms poll. Either a captured `Idle` OR that clean-exit
     // placeholder (observed AFTER the working lifecycle) satisfies the
     // terminal condition — both mean the agent ran to completion.
-    deck.wait_for_strings_in_order_then_any(
+    //
+    // Terminal-state budget is a generous 30s (not the shared 10s
+    // `WAIT_TIMEOUT`): the working lifecycle is fast, but the terminal
+    // observation races real-agent variance — an 11.5s run once reached
+    // [Thinking, Working, Bash] with the terminal `Idle` still pending
+    // at the old ~10s bound (an immediate re-run settled in 6.5s). Per
+    // Design Decision #7, real-agent tests use generous timeouts.
+    deck.wait_for_strings_in_order_then_any_within(
         &["Thinking", "Working", "Bash"],
         &["Idle", "Launch an agent to get started"],
+        Duration::from_secs(30),
     );
 }

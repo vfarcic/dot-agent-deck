@@ -258,6 +258,30 @@ pub fn send_to_socket(json: &str) -> Option<()> {
     Some(())
 }
 
+/// PRD #201: send a line to the daemon hook socket and read ONE line of reply
+/// back on the same connection. Used by the read-only `get-seed` verb, the one
+/// hook-socket message that expects a response (the delegate / work-done /
+/// agent-event senders are fire-and-forget). Returns `None` if the socket is
+/// absent/unreadable — the caller (get-seed) treats that as "no seed", so an
+/// older daemon that never replies, or no daemon at all, degrades to the
+/// PTY-injection safety net rather than hanging or erroring. A blank reply
+/// line is returned as `Some(String::new())`.
+pub fn request_from_socket(json: &str) -> Option<String> {
+    let path = socket_path();
+    let mut stream = UnixStream::connect(path).ok()?;
+    let msg = format!("{json}\n");
+    stream.write_all(msg.as_bytes()).ok()?;
+    stream.flush().ok()?;
+    // Half-close our write side so the daemon's line reader sees EOF after our
+    // single request and doesn't block waiting for more (it reads in a loop).
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf).ok()?;
+    // The daemon writes exactly one JSON line; take the first line and trim the
+    // trailing newline.
+    Some(buf.lines().next().unwrap_or("").to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
