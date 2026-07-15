@@ -157,6 +157,7 @@ fn drive_session_to_working(state: &mut AppState, session_id: &str, pane_id: &st
         agent_id: Some(agent_id.to_string()),
         agent_version: None,
         schema_version: None,
+        live_target: None,
     };
     state.apply_event(mk(EventType::SessionStart, None, None, None));
     state.apply_event(mk(
@@ -1919,6 +1920,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         agent_id: Some(agent_id.to_string()),
         agent_version: None,
         schema_version: None,
+        live_target: None,
     });
 
     let sessions: Vec<&SessionState> = state

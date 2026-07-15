@@ -180,6 +180,7 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
         agent_id,
         agent_version: None,
         schema_version: None,
+        live_target: None,
     })
 }
 
@@ -250,6 +251,7 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
         agent_id,
         agent_version: None,
         schema_version: None,
+        live_target: None,
     })
 }
 

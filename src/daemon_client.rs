@@ -26,7 +26,7 @@ use crate::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_DETACH, KIND_EVENT, KIND_REQ, KIND_RESP, KIND_SHUTDOWN,
     KIND_SHUTDOWN_ACK, KIND_STREAM_END, KIND_STREAM_OUT, read_frame, write_frame,
 };
-use crate::event::{AgentType, BroadcastMsg};
+use crate::event::{AgentType, BroadcastMsg, SendResult};
 
 /// Errors returned by the client. Server-side error responses are surfaced
 /// as [`ClientError::Server`] with the daemon's message; transport problems
@@ -398,7 +398,18 @@ impl DaemonClient {
     /// per-agent writer mutex across `payload → SUBMIT_DELAY → CR`, so a
     /// concurrent daemon-initiated write (work-done feedback, respawn
     /// notice) cannot interleave between the payload and the submit CR.
-    pub async fn write_and_submit(&self, pane_id: &str, text: &str) -> Result<(), ClientError> {
+    ///
+    /// PRD #20 M3: returns the daemon's honest [`SendResult`] rather than a bare
+    /// `()`. A newer daemon reports `applied` for a live target and
+    /// `history-only` / `no-live-target` when the session can't accept live
+    /// input; a pre-PRD-20 daemon omits the field, which we read as
+    /// [`SendResult::Applied`] (the legacy fire-and-forget assumption). A
+    /// transport/`ok=false` failure still surfaces as `Err`.
+    pub async fn write_and_submit(
+        &self,
+        pane_id: &str,
+        text: &str,
+    ) -> Result<SendResult, ClientError> {
         let stream = self.connect().await?;
         let (mut rd, mut wr) = stream.into_split();
         let resp = issue_command(
@@ -416,7 +427,7 @@ impl DaemonClient {
                     .unwrap_or_else(|| "write-and-submit failed".into()),
             ));
         }
-        Ok(())
+        Ok(resp.send_result.unwrap_or(SendResult::Applied))
     }
 
     /// Push a TUI pane resize through to the daemon's PTY. Idempotent on the

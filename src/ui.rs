@@ -3278,6 +3278,21 @@ fn truncate_styled_segments(
     out
 }
 
+/// PRD #20 M4: the feedback shown when a user tries to enter (type into) a
+/// non-live card. Input can't reach a history-only / view-only session, so the
+/// dashboard surfaces this and stays on the dashboard rather than entering
+/// PaneInput and silently dropping keystrokes. `None` for a live session, where
+/// entry proceeds normally.
+fn non_live_input_feedback(writable: crate::event::Writable) -> Option<&'static str> {
+    match writable {
+        crate::event::Writable::Live => None,
+        crate::event::Writable::HistoryOnly => {
+            Some("History-only session cannot accept live input")
+        }
+        crate::event::Writable::None => Some("View-only session cannot accept live input"),
+    }
+}
+
 /// Select deck at `idx` and focus its pane. Returns `true` if idx was valid.
 fn focus_deck(
     idx: usize,
@@ -3295,6 +3310,14 @@ fn focus_deck(
     if let Some((sid, _)) = filtered.get(idx)
         && let Some(session) = snapshot.sessions.get(*sid)
     {
+        // PRD #20 M4: refuse to enter a non-live (history-only / view-only)
+        // card — the session can't accept live input, so surface honest
+        // feedback and stay on the dashboard instead of dropping keystrokes.
+        // The card stays selected (highlight set above) so it remains visible.
+        if let Some(msg) = non_live_input_feedback(session.writable()) {
+            ui.status_message = Some((msg.to_string(), std::time::Instant::now()));
+            return true;
+        }
         if let Some(ref pane_id) = session.pane_id {
             // PRD #127 finding #2: a card backed by a LIVE daemon agent but not
             // yet wired to a local pane (e.g. a scheduler-spawned agent that
@@ -5353,7 +5376,13 @@ fn dispatch_action(
             if let Some(sid) = selected_id
                 && let Some(session) = snapshot.sessions.get(sid)
             {
-                if let Some(ref pane_id) = session.pane_id {
+                // PRD #20 M4: Enter on a non-live (history-only / view-only)
+                // card surfaces honest feedback and stays on the dashboard,
+                // mirroring the digit-jump gate in `focus_deck` — the session
+                // can't accept live input, so don't enter PaneInput.
+                if let Some(msg) = non_live_input_feedback(session.writable()) {
+                    ui.status_message = Some((msg.to_string(), std::time::Instant::now()));
+                } else if let Some(ref pane_id) = session.pane_id {
                     if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
                         // PRD #83: snapshot the SOURCE tab's focus before
                         // leaving it, mirroring `switch_tab_with_focus`
@@ -12095,23 +12124,60 @@ fn render_session_card(
     };
     let sel_prefix = if is_selected { "▸ " } else { "" };
     let title_bold = text_primary().add_modifier(Modifier::BOLD);
+    // PRD #20 M4: a session whose live_target is not `Live` (e.g. a wrapped
+    // Codex pane surfaced history-only) can't accept live input. Render it
+    // distinctly — dim the numeric input shortcut and show a `history` /
+    // `view-only` marker next to the type badge — so a view-only card announces
+    // both what it is and that typing into it won't reach the agent. `Live`
+    // sessions (every native PTY pane, and any fixture that declared no
+    // live_target) render exactly as before.
+    let writable = session.writable();
+    let is_live = writable == crate::event::Writable::Live;
+    let shortcut_style = if is_live {
+        title_bold
+    } else {
+        title_bold.add_modifier(Modifier::DIM)
+    };
+    let liveness_marker = match writable {
+        crate::event::Writable::Live => "",
+        crate::event::Writable::HistoryOnly => " history ",
+        crate::event::Writable::None => " view-only ",
+    };
     // PRD #20 M5: the agent-type label carries its registry badge colour so the
     // card exposes a coloured type badge (cross-agent: Claude / OpenCode / Pi /
     // Codex each get their registry colour). The rest of the title stays primary
-    // text. A friendly `display_name` replaces the `<type> · <id>` form, so it
-    // shows no coloured type label. Segment concatenation is character-identical
-    // to the prior single-string title, so text-only snapshots are unchanged.
+    // text. A friendly `display_name` replaces the `<type> · <id>` form for a
+    // live card, so it shows no coloured type label; a non-live card keeps the
+    // badge + marker even with a name so the view-only status stays visible.
+    // For a live card the segment concatenation is character-identical to the
+    // prior single-string title, so existing text-only snapshots are unchanged.
+    let badge_style = Style::default()
+        .fg(crate::agent_registry::spec(&session.agent_type).badge_color)
+        .add_modifier(Modifier::BOLD);
+    // The marker is appended AFTER the `<type> · <id>` (or name) so the
+    // `<type> · <id>` shape callers match on (e.g. `Codex ·`, `Pi · orch-01`)
+    // stays intact — only a trailing view-only annotation is added.
     let title_segments: Vec<(String, Style)> = if let Some(name) = display_name {
-        vec![(format!(" {sel_prefix}{num_prefix}{name} "), title_bold)]
+        if is_live {
+            vec![(format!(" {sel_prefix}{num_prefix}{name} "), title_bold)]
+        } else {
+            vec![
+                (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
+                (format!("{}", session.agent_type), badge_style),
+                (format!(" · {name} "), title_bold),
+                (liveness_marker.to_string(), text_dim()),
+            ]
+        }
     } else {
-        let badge_style = Style::default()
-            .fg(crate::agent_registry::spec(&session.agent_type).badge_color)
-            .add_modifier(Modifier::BOLD);
-        vec![
-            (format!(" {sel_prefix}{num_prefix}"), title_bold),
+        let mut segs = vec![
+            (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
             (format!("{}", session.agent_type), badge_style),
             (format!(" · {id_display} "), title_bold),
-        ]
+        ];
+        if !is_live {
+            segs.push((liveness_marker.to_string(), text_dim()));
+        }
+        segs
     };
 
     let dot = flash_dot(&session.status, tick);
@@ -14928,6 +14994,7 @@ mod tests {
             agent_id: None,
             agent_version: None,
             schema_version: None,
+            live_target: None,
         };
         state.apply_event(event1.clone());
 
@@ -14950,6 +15017,7 @@ mod tests {
             agent_id: None,
             agent_version: None,
             schema_version: None,
+            live_target: None,
         };
         state.apply_event(event2);
 
@@ -15024,6 +15092,7 @@ mod tests {
                 agent_id: None,
                 agent_version: None,
                 schema_version: None,
+                live_target: None,
             });
         }
 
@@ -15077,6 +15146,7 @@ mod tests {
             agent_id: None,
             agent_version: None,
             schema_version: None,
+            live_target: None,
         };
         state.apply_event(event.clone());
 
@@ -15321,6 +15391,7 @@ mod tests {
                 agent_id: None,
                 agent_version: None,
                 schema_version: None,
+                live_target: None,
             });
         }
 
@@ -15812,6 +15883,7 @@ mod tests {
                 agent_id: None,
                 agent_version: None,
                 schema_version: None,
+                live_target: None,
             });
         }
 
@@ -15838,6 +15910,7 @@ mod tests {
                 agent_id: None,
                 agent_version: None,
                 schema_version: None,
+                live_target: None,
             });
         }
 
@@ -15865,6 +15938,7 @@ mod tests {
             agent_id: None,
             agent_version: None,
             schema_version: None,
+            live_target: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -15880,6 +15954,7 @@ mod tests {
             agent_id: None,
             agent_version: None,
             schema_version: None,
+            live_target: None,
         });
 
         let mut ui = default_ui();
@@ -15906,6 +15981,7 @@ mod tests {
             agent_id: None,
             agent_version: None,
             schema_version: None,
+            live_target: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -15921,6 +15997,7 @@ mod tests {
             agent_id: None,
             agent_version: None,
             schema_version: None,
+            live_target: None,
         });
 
         let mut ui = default_ui();
@@ -15949,6 +16026,7 @@ mod tests {
             agent_id: None,
             agent_version: None,
             schema_version: None,
+            live_target: None,
         });
 
         let mut ui = default_ui();
@@ -18162,6 +18240,7 @@ mod tests {
                 agent_id: None,
                 agent_version: None,
                 schema_version: None,
+                live_target: None,
             });
         }
 
@@ -19663,6 +19742,7 @@ mod tests {
             agent_id: None,
             agent_version: None,
             schema_version: None,
+            live_target: None,
         });
         let output = build_art_output(&s);
         assert!(output.contains("Bash"));

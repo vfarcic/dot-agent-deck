@@ -32,7 +32,9 @@ use std::sync::{Arc, Mutex};
 use chrono::Utc;
 
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
-use crate::event::{AGENT_EVENT_SCHEMA_VERSION, AgentEvent, AgentType, EventType};
+use crate::event::{
+    AGENT_EVENT_SCHEMA_VERSION, AgentEvent, AgentType, EventType, LiveTarget, TargetKind, Writable,
+};
 
 /// A coarse activity state detected from a single line of wrapped output.
 ///
@@ -200,6 +202,13 @@ struct Emitter {
     pane_id: Option<String>,
     agent_id: Option<String>,
     cwd: Option<String>,
+    /// PRD #20 M3: the live-target descriptor every event this wrapper emits
+    /// carries. A wrapped session is the first place the live/history-only
+    /// distinction bites: the child's stdin is the user's inherited terminal,
+    /// not a daemon-controlled PTY, so the *dashboard* has no live write target
+    /// — the session is `history-only`. Stamped on the card so a wrapped Codex
+    /// pane renders view-only and refuses live input (M4).
+    live_target: LiveTarget,
 }
 
 impl Emitter {
@@ -223,6 +232,9 @@ impl Emitter {
             agent_version: None,
             // PRD #20 M6: stamp the schema version the wrapper writes.
             schema_version: Some(AGENT_EVENT_SCHEMA_VERSION),
+            // PRD #20 M3: a wrapped session is history-only from the dashboard's
+            // perspective (see `Emitter::live_target`).
+            live_target: Some(self.live_target),
         };
         if let Ok(json) = serde_json::to_string(&event) {
             let _ = crate::hook::send_to_socket(&json);
@@ -344,6 +356,13 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
         pane_id,
         agent_id,
         cwd,
+        // The wrapper strategy delivers to a child process it owns, but the
+        // dashboard cannot inject live input (stdin is the inherited terminal),
+        // so every wrapped session — Codex included — is history-only.
+        live_target: LiveTarget {
+            kind: TargetKind::Process,
+            writable: Writable::HistoryOnly,
+        },
     });
 
     let mut child = match Command::new(program)

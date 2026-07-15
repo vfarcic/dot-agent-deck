@@ -79,6 +79,89 @@ impl AgentType {
     }
 }
 
+/// PRD #20 M3: the concrete handle, if any, through which a session's input is
+/// delivered — the `kind` half of a [`LiveTarget`] descriptor. Serializes
+/// kebab-case (`process`, `pty`, `tmux`, `sdk`, `none`). Purely descriptive: it
+/// tells the UI what *kind* of thing (if any) backs the session; whether it can
+/// actually be written to *now* is the separate [`Writable`] axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TargetKind {
+    /// A child process the producer owns (e.g. a `dot-agent-deck wrap` child).
+    Process,
+    /// A pseudo-terminal the daemon controls — the live, writable Claude
+    /// Code / OpenCode / Pi pane case.
+    Pty,
+    /// A `tmux` pane/window.
+    Tmux,
+    /// An in-process SDK/agent handle.
+    Sdk,
+    /// No concrete handle — the session is known only from history/logs.
+    None,
+}
+
+/// PRD #20 M3: whether the dashboard can deliver input to a session right now —
+/// the `writable` half of a [`LiveTarget`] descriptor. Serializes kebab-case
+/// (`live`, `history-only`, `none`).
+///
+/// A dashboard-visible session is not necessarily a live, writable target:
+/// today's Claude/OpenCode/Pi panes are `Live` (a PTY the daemon drives), but a
+/// wrapped Codex session surfaced via [`crate::wrap`] is `HistoryOnly` — the
+/// user's keystrokes reach the child through the inherited terminal, not a
+/// daemon-controlled handle, so the *dashboard* cannot inject live input. The UI
+/// reads this to render non-`Live` sessions distinctly and to refuse (with
+/// honest feedback) an attempt to type into a card that can't accept input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Writable {
+    /// Input can be delivered to the running session now.
+    Live,
+    /// The session can only be resumed/replayed from history — no live write.
+    HistoryOnly,
+    /// Neither live write nor history resume — view-only.
+    None,
+}
+
+/// PRD #20 M3: a per-session descriptor of whether/how a session can receive
+/// input. Carried on [`AgentEvent::live_target`] (optional + additive) so an
+/// adapter can declare that the session it surfaces is a live PTY target, a
+/// history-only wrapper session, or view-only — and the UI never invites users
+/// to type into a card that can't accept input.
+///
+/// See the "Liveness & Write Semantics" section of PRD #20: the `kind`
+/// ([`TargetKind`]) names the concrete handle and `writable` ([`Writable`])
+/// names what can be done with it now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveTarget {
+    pub kind: TargetKind,
+    pub writable: Writable,
+}
+
+/// PRD #20 M3: the honest outcome of delivering input to a session, returned
+/// instead of a fire-and-forget `Result<(), _>`. Serializes kebab-case; every
+/// variant keeps a distinct public wire value so a caller can tell accepted
+/// input apart from a stale, wrong, or unwritable target.
+///
+/// Rides the daemon wire on [`crate::daemon_protocol::AttachResponse::send_result`]
+/// as an additive, optional field (a missing value decodes to `None`), so it is
+/// forward-compatible and needs no `PROTOCOL_VERSION` bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SendResult {
+    /// Delivered to the live target.
+    Applied,
+    /// Accepted, not yet confirmed applied.
+    Queued,
+    /// Target moved on / our view was behind.
+    Stale,
+    /// The handle no longer maps to the session we meant.
+    WrongSession,
+    /// No live target — only history resume is possible.
+    HistoryOnly,
+    /// Nothing to write to.
+    NoLiveTarget,
+}
+
 /// PRD #201 M1.2 (test-plan row 3): map a lifecycle **state** string an agent's
 /// extension reports via `dot-agent-deck agent-event --type <state>` to the
 /// [`EventType`] that drives the target pane's card status. This is the single
@@ -233,6 +316,16 @@ pub struct AgentEvent {
     /// is omitted from the wire when unset. No current producer sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<u32>,
+    /// PRD #20 M3: per-session live-target descriptor declaring whether/how the
+    /// session can receive input (see [`LiveTarget`]). Optional and additive:
+    /// `#[serde(default)]` lets legacy payloads that predate the field
+    /// deserialize to `None`, and `skip_serializing_if` omits it from the wire
+    /// when unset — so existing producers emit byte-identical JSON and old/new
+    /// peers stay compatible. A wrapped-Codex adapter ([`crate::wrap`]) stamps
+    /// `history-only`; native PTY panes leave it `None`, which the UI reads as
+    /// the historical live/writable default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_target: Option<LiveTarget>,
 }
 
 /// Envelope for messages sent to the daemon over the Unix socket.
@@ -461,6 +554,7 @@ mod tests {
             agent_id: None,
             agent_version: Some("codex-1.2.3".into()),
             schema_version: Some(AGENT_EVENT_SCHEMA_VERSION),
+            live_target: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         // Both fields must appear on the wire when set…
@@ -494,6 +588,7 @@ mod tests {
             agent_id: None,
             agent_version: None,
             schema_version: None,
+            live_target: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(

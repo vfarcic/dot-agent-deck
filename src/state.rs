@@ -9,7 +9,7 @@ use crate::agent_pty::AgentPtyRegistry;
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
     AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
-    OrchestrationSurface, WorkDoneSignal,
+    OrchestrationSurface, WorkDoneSignal, Writable,
 };
 use crate::project_config::{OrchestrationRoleConfig, load_project_config};
 
@@ -170,6 +170,25 @@ impl SessionState {
             first_prompts: self.first_prompts.clone(),
             last_user_prompt: self.last_user_prompt.clone(),
         }
+    }
+
+    /// PRD #20 M3: the write-semantics of this session's live target, derived
+    /// from the most recent event that declared a [`crate::event::LiveTarget`].
+    ///
+    /// The descriptor rides `AgentEvent.live_target` and is retained in
+    /// `recent_events`, so a `SessionState` carries no dedicated field for it —
+    /// this reads the latest declaration back out. A session whose events never
+    /// declared a live_target (every native Claude/OpenCode/Pi PTY pane, and any
+    /// directly-constructed fixture) is treated as [`Writable::Live`]: the
+    /// historical default where the pane the dashboard shows is the pane it
+    /// writes to. A wrapped Codex session declares `history-only` on every event
+    /// (see [`crate::wrap`]), so it reports non-live here.
+    pub fn writable(&self) -> Writable {
+        self.recent_events
+            .iter()
+            .rev()
+            .find_map(|e| e.live_target.map(|lt| lt.writable))
+            .unwrap_or(Writable::Live)
     }
 }
 
@@ -663,6 +682,25 @@ impl AppState {
             stats.total_tools += session.tool_count as u64;
         }
         stats
+    }
+
+    /// PRD #20 M3: the write-semantics of the live session bound to `pane_id`.
+    ///
+    /// The daemon's [`crate::daemon_protocol::AttachRequest::WriteAndSubmit`]
+    /// handler calls this to decide whether input should actually be delivered
+    /// or reported as history-only / no-live-target. Resolves the session on the
+    /// pane (newest by `last_activity` if a `/clear` restart left more than one)
+    /// and reads its [`SessionState::writable`]. A pane with no live session
+    /// defaults to [`Writable::Live`] so the historical PTY write path is
+    /// unaffected — only a session that explicitly declared a non-live
+    /// live_target (a wrapped Codex pane) reports otherwise.
+    pub fn pane_writable(&self, pane_id: &str) -> Writable {
+        self.sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some(pane_id))
+            .max_by_key(|s| s.last_activity)
+            .map(|s| s.writable())
+            .unwrap_or(Writable::Live)
     }
 
     /// Register a pane ID as managed by our app.

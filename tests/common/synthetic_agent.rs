@@ -99,6 +99,7 @@ impl SyntheticAgent {
             agent_id: self.agent_id.clone(),
             agent_version: None,
             schema_version: None,
+            live_target: None,
         }
     }
 

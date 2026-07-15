@@ -743,6 +743,7 @@ fn main() -> ExitCode {
                 agent_id,
                 agent_version: None,
                 schema_version: None,
+                live_target: None,
             };
             let json = match serde_json::to_string(&event) {
                 Ok(j) => j,

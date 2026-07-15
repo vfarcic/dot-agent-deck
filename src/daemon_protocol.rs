@@ -515,6 +515,18 @@ pub struct AttachResponse {
     /// daemon omits it (`None`), and `PROTOCOL_VERSION` is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_version: Option<String>,
+    /// PRD #20 M3: the honest outcome of an input-delivery request
+    /// ([`AttachRequest::WriteAndSubmit`]). `applied`/`queued` mean the input
+    /// reached (or was accepted for) a live target; `history-only` /
+    /// `no-live-target` / `stale` / `wrong-session` mean it was deliberately
+    /// NOT delivered and the client should surface feedback rather than assume
+    /// success. Additive + optional (`#[serde(default, skip_serializing_if]`):
+    /// a pre-PRD-20 daemon omits it (decodes to `None`, read as "assume
+    /// applied" by a newer client), and an older client ignores the extra
+    /// field — so it is forward-compatible and needs no `PROTOCOL_VERSION` bump.
+    /// `None` on every non-`WriteAndSubmit` response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_result: Option<crate::event::SendResult>,
 }
 
 impl AttachResponse {
@@ -556,6 +568,18 @@ impl AttachResponse {
         Self {
             ok: true,
             id: Some(id),
+            ..Default::default()
+        }
+    }
+    /// PRD #20 M3: an OK reply to [`AttachRequest::WriteAndSubmit`] that carries
+    /// the honest [`crate::event::SendResult`]. `ok = true` because the RPC
+    /// itself succeeded (the daemon evaluated the target and reports what
+    /// happened); the `send_result` variant tells the client whether the input
+    /// was actually delivered.
+    pub fn with_send_result(result: crate::event::SendResult) -> Self {
+        Self {
+            ok: true,
+            send_result: Some(result),
             ..Default::default()
         }
     }
@@ -1195,9 +1219,45 @@ async fn handle_connection(
             Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
         },
         AttachRequest::WriteAndSubmit { pane_id, text } => {
-            match registry.write_to_pane_and_submit(&pane_id, &text).await {
-                Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
-                Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
+            // PRD #20 M3: deliver input honestly. A dashboard-visible session is
+            // not necessarily a live, writable target (a wrapped Codex session
+            // is history-only), so consult the live session state for the pane
+            // and return an honest `SendResult` instead of a fire-and-forget
+            // ok(). Only a `Live` target is actually written; a non-live target
+            // is reported (`history-only` / `no-live-target`) WITHOUT writing,
+            // so the TUI surfaces feedback rather than silently dropping input.
+            let writable = state.read().await.pane_writable(&pane_id);
+            match writable {
+                crate::event::Writable::Live => {
+                    match registry.write_to_pane_and_submit(&pane_id, &text).await {
+                        Ok(()) => {
+                            write_resp(
+                                &mut stream,
+                                &AttachResponse::with_send_result(
+                                    crate::event::SendResult::Applied,
+                                ),
+                            )
+                            .await?
+                        }
+                        Err(e) => {
+                            write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?
+                        }
+                    }
+                }
+                crate::event::Writable::HistoryOnly => {
+                    write_resp(
+                        &mut stream,
+                        &AttachResponse::with_send_result(crate::event::SendResult::HistoryOnly),
+                    )
+                    .await?
+                }
+                crate::event::Writable::None => {
+                    write_resp(
+                        &mut stream,
+                        &AttachResponse::with_send_result(crate::event::SendResult::NoLiveTarget),
+                    )
+                    .await?
+                }
             }
         }
         AttachRequest::SubscribeEvents => {
@@ -2154,6 +2214,7 @@ mod tests {
             agent_id: None,
             agent_version: None,
             schema_version: None,
+            live_target: None,
         };
         let payload = serde_json::to_vec(&BroadcastMsg::Event(event)).unwrap();
 

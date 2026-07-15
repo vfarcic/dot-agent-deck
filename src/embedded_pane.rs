@@ -2084,7 +2084,11 @@ impl PaneController for EmbeddedPaneController {
     /// work-done feedback for a sibling worker) could otherwise
     /// interleave into the legacy two-frame path's mid-sequence gap and
     /// submit the user's prompt with daemon bytes fused in.
-    fn write_and_submit_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
+    fn write_and_submit_to_pane(
+        &self,
+        pane_id: &str,
+        text: &str,
+    ) -> Result<crate::event::SendResult, PaneError> {
         let client = self.client.clone();
         let pane_id = pane_id.to_string();
         let text = text.to_string();

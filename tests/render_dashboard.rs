@@ -1095,6 +1095,7 @@ fn filled_session() -> SessionState {
             agent_id: None,
             agent_version: None,
             schema_version: None,
+            live_target: None,
         });
     }
     for (name, detail) in [
@@ -1116,6 +1117,7 @@ fn filled_session() -> SessionState {
             agent_id: None,
             agent_version: None,
             schema_version: None,
+            live_target: None,
         });
     }
     SessionState {

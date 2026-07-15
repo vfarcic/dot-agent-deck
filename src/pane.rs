@@ -364,8 +364,22 @@ pub trait PaneController: Send + Sync {
     /// `WriteAndSubmit` RPC; the orchestrator spawn-time role-prompt
     /// injection in `ui.rs` uses the override because it shares its
     /// pane with daemon-initiated writes.
-    fn write_and_submit_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
+    ///
+    /// PRD #20 M3: returns the honest [`crate::event::SendResult`] the atomic
+    /// submit path produced, so a caller can surface feedback when input was
+    /// NOT delivered to a live target (a history-only / view-only session)
+    /// instead of assuming a fire-and-forget success. The default impl forwards
+    /// to [`Self::write_to_pane`] (the raw keystroke path, which has no
+    /// send-result of its own) and reports [`crate::event::SendResult::Applied`]
+    /// on success — correct for the local-PTY mocks that use the default, since
+    /// they always target a live pane.
+    fn write_and_submit_to_pane(
+        &self,
+        pane_id: &str,
+        text: &str,
+    ) -> Result<crate::event::SendResult, PaneError> {
         self.write_to_pane(pane_id, text)
+            .map(|()| crate::event::SendResult::Applied)
     }
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;
