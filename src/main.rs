@@ -812,6 +812,17 @@ fn main() -> ExitCode {
                 // therefore no longer initializes it.
                 init_logging_from_env();
                 dot_agent_deck::login_shell::apply_login_shell_path();
+                // PRD #201: materialize the bundled Pi orchestrator extension ONCE
+                // at daemon startup — parity with claude/opencode installing their
+                // hooks/plugin at startup. This covers both the lazy-spawned daemon
+                // and a headless `daemon serve`, and is command-agnostic (works for
+                // `pi`, an absolute path, or a wrapper like `devbox run pi-big`),
+                // since it does not look at any spawn command. Runs AFTER the
+                // login-shell PATH is applied so pi-presence is detected against the
+                // daemon's real PATH. Self-guards on pi being installed; a no-op
+                // otherwise. It honors `PI_CODING_AGENT_DIR` (else `~/.pi/agent`),
+                // so it lands where pi will look — see `orchestrator_ext`.
+                dot_agent_deck::orchestrator_ext::auto_materialize(&[]);
                 run_daemon_serve_cli()
             }
             DaemonCmd::Hello => run_daemon_hello_cli(),

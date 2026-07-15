@@ -24,6 +24,17 @@ pub const PI_INSTALL_HINT: &str = "npm install -g @earendil-works/pi-coding-agen
 /// dir is what *enables* the extension — there is no separate enable step.
 pub const EXTENSION_DIR_NAME: &str = "dot-agent-deck";
 
+/// Pi's own env var (`PI_CODING_AGENT_DIR`) that relocates its agent directory —
+/// the dir that holds `extensions/`. Pi resolves it in `getAgentDir()`:
+/// `$PI_CODING_AGENT_DIR` (tilde-expanded) if set, else `~/.pi/agent`.
+/// dot-agent-deck mirrors that EXACT precedence so the bundled extension is
+/// always materialized where pi will actually look for it:
+///   - **production correctness** — a user who relocates pi via this var still
+///     gets a status-tracked pane (materializing into `~/.pi` would miss); and
+///   - **test isolation** — tests set it to a throwaway dir, so the suite never
+///     writes the developer's real `~/.pi`.
+pub const ENV_PI_AGENT_DIR: &str = "PI_CODING_AGENT_DIR";
+
 /// The embedded extension files, as `(filename, contents)` pairs.
 ///
 /// Only the two files Pi needs to load the extension are embedded:
@@ -45,40 +56,76 @@ pub const EXTENSION_FILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Strict HOME resolver for the EXPLICIT `orchestrator setup` path: the process
-/// `HOME`, or `None` when it is unset OR empty. Unlike a lenient resolver it has
-/// NO `/tmp` (unset) or relative `./` (empty) fallback — an explicit user
-/// command must not silently materialize into a bogus location Pi will never
-/// discover, so the CLI errors instead. This mirrors the auto path's refusal to
-/// guess (see [`resolve_home_from_env`]); the two share the pure
-/// [`resolve_home_inner`] core.
-fn home_dir_strict() -> Option<PathBuf> {
-    resolve_home_inner(&[], std::env::var("HOME").ok().as_deref())
+/// Pi's agent directory under a given HOME: `<home>/.pi/agent` (the default
+/// branch of pi's `getAgentDir()`, used when [`ENV_PI_AGENT_DIR`] is unset).
+fn agent_dir_under_home(home: &Path) -> PathBuf {
+    home.join(".pi").join("agent")
+}
+
+/// The `extensions/dot-agent-deck` subpath pi discovers inside an agent dir. The
+/// single place the `<agent-dir>/extensions/<name>` layout is encoded, so the
+/// HOME-based and `PI_CODING_AGENT_DIR`-based paths can't diverge.
+fn extension_dir_in(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("extensions").join(EXTENSION_DIR_NAME)
 }
 
 /// Build the extension target dir under a given HOME:
-/// `<home>/.pi/agent/extensions/dot-agent-deck`. Shared by
-/// [`default_extension_dir`] (the explicit CLI path, machine-global `~/.pi`) and
-/// the spawn-time auto-materialize path so the two can't compute divergent
-/// layouts.
+/// `<home>/.pi/agent/extensions/dot-agent-deck`. The `PI_CODING_AGENT_DIR`-unset
+/// layout; kept for the HOME-based resolvers and tests.
 pub fn extension_dir_under(home: &Path) -> PathBuf {
-    home.join(".pi")
-        .join("agent")
-        .join("extensions")
-        .join(EXTENSION_DIR_NAME)
+    extension_dir_in(&agent_dir_under_home(home))
 }
 
-/// The global Pi extensions dir the bundled extension is materialized into:
-/// `~/.pi/agent/extensions/dot-agent-deck`. This is Pi's global auto-discovery
-/// location, so anything written here is loaded by every `pi` session.
+/// Expand a leading `~` / `~/` in a `PI_CODING_AGENT_DIR` value against `home`,
+/// matching pi's `expandTildePath`. A bare `~` becomes `home`; `~/x` becomes
+/// `home/x`; everything else (absolute or relative) passes through unchanged.
+/// With no HOME to expand against, a `~`-prefixed value is returned verbatim
+/// (pi would do the same fallback).
+fn expand_tilde(value: &str, home: Option<&str>) -> PathBuf {
+    match (value, home) {
+        ("~", Some(h)) => PathBuf::from(h),
+        (v, Some(h)) if v.starts_with("~/") => Path::new(h).join(&v[2..]),
+        _ => PathBuf::from(value),
+    }
+}
+
+/// Pure core mirroring pi's `getAgentDir()`: `$PI_CODING_AGENT_DIR`
+/// (tilde-expanded against `home`) if set & non-empty, else `<home>/.pi/agent`.
+/// `None` only when NEITHER the override nor `home` yields a non-empty value.
+/// Pure over its inputs so every branch is testable without mutating
+/// process-global env.
+fn resolve_agent_dir_inner(
+    agent_dir_override: Option<&str>,
+    home: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(dir) = agent_dir_override.filter(|v| !v.is_empty()) {
+        return Some(expand_tilde(dir, home));
+    }
+    home.filter(|v| !v.is_empty())
+        .map(|h| agent_dir_under_home(Path::new(h)))
+}
+
+/// The Pi agent dir the EXPLICIT `orchestrator setup` path targets, resolved from
+/// the process env: `$PI_CODING_AGENT_DIR` if set & non-empty, else
+/// `<HOME>/.pi/agent`. `None` only when neither yields a non-empty value — the
+/// CLI then errors rather than guess a location pi will never load.
+fn agent_dir_strict() -> Option<PathBuf> {
+    resolve_agent_dir_inner(
+        std::env::var(ENV_PI_AGENT_DIR).ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// The Pi extensions dir the bundled extension is materialized into by the
+/// EXPLICIT `orchestrator setup` path: `<agent-dir>/extensions/dot-agent-deck`,
+/// where the agent dir is `$PI_CODING_AGENT_DIR` if set else `~/.pi/agent`.
 ///
-/// Returns `None` when HOME is unset OR empty: this backs the EXPLICIT
-/// `orchestrator setup` path, which must NOT guess a `/tmp` (unset) or relative
-/// `./` (empty) location Pi will never load — the CLI errors instead. That
-/// matches the auto path's HOME-unset SKIP (see [`auto_materialize`]); both
-/// refuse to guess.
+/// Returns `None` when neither `PI_CODING_AGENT_DIR` nor HOME is set/non-empty:
+/// the CLI must NOT guess a `/tmp` (unset) or relative (`./`, empty) location Pi
+/// will never load — it errors instead. Matches the auto path's SKIP
+/// (see [`auto_materialize`]); both refuse to guess.
 pub fn default_extension_dir() -> Option<PathBuf> {
-    home_dir_strict().map(|home| extension_dir_under(&home))
+    agent_dir_strict().map(|dir| extension_dir_in(&dir))
 }
 
 /// Materialize the bundled extension into `target_dir` in the layout Pi
@@ -101,41 +148,48 @@ pub fn materialize(target_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 }
 
 // ---------------------------------------------------------------------------
-// PRD #201: spawn-time auto-materialize (reverses Design Decision #6)
+// PRD #201: daemon-startup auto-materialize
 // ---------------------------------------------------------------------------
 //
 // Pi should need NO manual setup — parity with claude (hooks auto-install,
 // `hooks_manage::auto_install`) and opencode (plugin auto-install,
-// `opencode_manage::auto_install`). Rather than a machine-global startup seam,
-// the bundled extension is materialized at SPAWN TIME into the HOME the pi
-// child is about to run under, gated on the spawn command actually being `pi`.
-// That keeps the write hermetic to the agent being launched — in tests the
-// per-test temp HOME the deck sets, never the developer's real `~/.pi`.
-// Modeled on `hooks_manage::auto_install`: silent, guarded (only when pi is
-// present), idempotent (overwrite), and — unlike the explicit CLI path —
-// HOME-unset-safe (SKIP, never fall back to a `/tmp` guess; addresses
-// Greptile's `orchestrator_ext.rs:49` finding for the auto path).
+// `opencode_manage::auto_install`), which install ONCE at startup. The bundled
+// extension is materialized once when the daemon starts serving (the
+// `dot-agent-deck daemon serve` entry, which both the lazy-spawned daemon and a
+// headless serve go through), NOT on every agent spawn.
+//
+// Why not per-spawn: the deck must not care HOW pi is launched, so we cannot key
+// off the spawn command's basename (a wrapper like `devbox run pi-big` would be
+// missed). Materializing per-spawn regardless of command instead meant every
+// unrelated agent start (claude, a shell, a fast test) rewrote `~/.pi` whenever
+// pi happened to be on PATH. Doing it once at daemon startup is command-agnostic
+// AND touches Pi's dir only once per daemon.
+//
+// Location mirrors pi's own `getAgentDir()`: `$PI_CODING_AGENT_DIR` if set, else
+// `<HOME>/.pi/agent`, + `/extensions/dot-agent-deck` (see [`ENV_PI_AGENT_DIR`]).
+// Guarded (only when pi is present), idempotent (overwrite), and unset-safe
+// (SKIP, never a `/tmp` guess).
 
-/// Env-free core of the HOME resolver: pick the HOME the child will actually
-/// use from the spawn env overlay first (the value that WINS in the child's
-/// environment), then the process `HOME`. `None` when neither yields a
-/// non-empty value — the auto path then SKIPS rather than writing to a
-/// predictable `/tmp` path. Pure over its inputs so the fallback logic is
-/// testable without mutating process-global `HOME`.
-fn resolve_home_inner(env: &[(String, String)], process_home: Option<&str>) -> Option<PathBuf> {
+/// Look up `key` in the env overlay first (the value that wins in the child's
+/// environment), then the process env. `None` if absent in both.
+fn lookup_env(env: &[(String, String)], key: &str) -> Option<String> {
     env.iter()
-        .find(|(k, _)| k == "HOME")
-        .map(|(_, v)| v.as_str())
-        .or(process_home)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var(key).ok())
 }
 
-/// Resolve the HOME the spawned pi child will use (env overlay → process
-/// `HOME`), or `None` when HOME is unset/empty. HOME-unset-safe: like the
-/// explicit CLI path's [`home_dir_strict`], it has NO `/tmp` fallback.
-fn resolve_home_from_env(env: &[(String, String)]) -> Option<PathBuf> {
-    resolve_home_inner(env, std::env::var("HOME").ok().as_deref())
+/// Resolve the Pi agent dir the daemon should materialize the extension into,
+/// mirroring pi's `getAgentDir()`: `$PI_CODING_AGENT_DIR` (tilde-expanded) if set
+/// & non-empty, else `<HOME>/.pi/agent`. `None` only when neither the override
+/// nor HOME yields a non-empty value (then auto-materialize SKIPs rather than
+/// guess). Consults the env overlay before the process env for both keys so a
+/// daemon/test that overrides them is judged on the effective environment.
+fn resolve_agent_dir_from_env(env: &[(String, String)]) -> Option<PathBuf> {
+    resolve_agent_dir_inner(
+        lookup_env(env, ENV_PI_AGENT_DIR).as_deref(),
+        lookup_env(env, "HOME").as_deref(),
+    )
 }
 
 /// Whether `pi` is discoverable on the PATH the spawned child will actually
@@ -180,27 +234,27 @@ pub fn auto_materialize_core(
     }
 }
 
-/// Spawn-time seam entry: silently (over)materialize the bundled Pi orchestrator
-/// extension into the child's HOME just before it is launched, so a pi agent
-/// needs ZERO manual setup. Called UNCONDITIONALLY from
-/// [`crate::agent_pty::AgentPtyRegistry::spawn_agent`] — NOT gated on the spawn
-/// command's basename, so it works whether pi is launched as `pi`, an absolute
-/// path, or a wrapper (`devbox run …`, `run_agent.sh`). `env` is the spawn env
-/// overlay, consulted for a `HOME` / `PATH` override before the process env. The
-/// self-guard here is pi-presence: [`pi_present_for_env`] means a spawn on a
-/// machine without pi is a cheap no-op. Idempotent (overwrite) and HOME-unset-safe
-/// (SKIP, no `/tmp` write). Best-effort — a write failure is logged, never fatal
-/// (the pane still spawns, matching `hooks_manage::auto_install`).
+/// Daemon-startup entry: silently (over)materialize the bundled Pi orchestrator
+/// extension so a pi agent needs ZERO manual setup. Called ONCE from the
+/// `dot-agent-deck daemon serve` entry (covering both the lazy-spawned daemon and
+/// a headless serve) — NOT per spawn and NOT gated on any command, so it works
+/// whether pi is launched as `pi`, an absolute path, or a wrapper (`devbox run …`,
+/// `run_agent.sh`). `env` is an optional overlay consulted before the process env
+/// for `PI_CODING_AGENT_DIR` / `HOME` / `PATH`; the daemon passes `&[]` to use its
+/// own environment. The self-guard is pi-presence ([`pi_present_for_env`]), so a
+/// daemon on a machine without pi is a cheap no-op. Idempotent (overwrite) and
+/// unset-safe (SKIP, no `/tmp` write). Best-effort — a write failure is logged,
+/// never fatal (matching `hooks_manage::auto_install`).
 pub fn auto_materialize(env: &[(String, String)]) {
-    let target = resolve_home_from_env(env).map(|home| extension_dir_under(&home));
+    let target = resolve_agent_dir_from_env(env).map(|dir| extension_dir_in(&dir));
     match auto_materialize_core(pi_present_for_env(env), target.as_deref()) {
         Ok(Some(written)) => tracing::info!(
             count = written.len(),
-            "auto-materialized the Pi orchestrator extension into the pi agent's HOME"
+            "auto-materialized the Pi orchestrator extension into the Pi agent dir"
         ),
-        Ok(None) => {
-            tracing::debug!("auto-materialize: skipped the Pi extension (pi absent or HOME unset)")
-        }
+        Ok(None) => tracing::debug!(
+            "auto-materialize: skipped the Pi extension (pi absent, or PI_CODING_AGENT_DIR/HOME unset)"
+        ),
         Err(e) => {
             tracing::warn!("auto-materialize: failed to write the Pi orchestrator extension: {e}")
         }
@@ -502,8 +556,8 @@ mod tests {
         // pi is "present", but the target could not be resolved (HOME unset), so
         // the core takes NO `target` and therefore cannot write anywhere — in
         // particular it never falls back to a `/tmp` path. The companion
-        // `resolve_home_inner_prefers_env_then_process_then_none` proves the
-        // resolver yields `None` (not a `/tmp` guess) when HOME is unset.
+        // `resolve_agent_dir_inner_override_and_home_precedence` proves the
+        // resolver yields `None` (not a `/tmp` guess) when neither is set.
         let result = auto_materialize_core(true, None).unwrap();
         assert!(result.is_none(), "HOME unset must SKIP (return None)");
     }
@@ -529,31 +583,68 @@ mod tests {
         assert!(restored.contains("export default function"));
     }
 
-    /// The HOME resolver prefers an explicit `HOME` in the spawn env overlay
-    /// (the value the child actually gets), then falls back to the process
-    /// `HOME`, and yields `None` when neither is set/non-empty — never a `/tmp`
-    /// guess.
+    /// The pure agent-dir core mirrors pi's `getAgentDir()`: the
+    /// `PI_CODING_AGENT_DIR` override wins over HOME (tilde-expanded against it);
+    /// with no override it is `<HOME>/.pi/agent`; with neither it is `None`
+    /// (never a `/tmp` guess); empty values are ignored on both.
     #[test]
-    fn resolve_home_inner_prefers_env_then_process_then_none() {
-        let overlay = vec![("HOME".to_string(), "/override/home".to_string())];
-        // Env overlay wins over the process HOME.
+    fn resolve_agent_dir_inner_override_and_home_precedence() {
+        // Override wins over HOME (absolute passes through).
         assert_eq!(
-            resolve_home_inner(&overlay, Some("/proc/home")),
-            Some(PathBuf::from("/override/home"))
+            resolve_agent_dir_inner(Some("/custom/agent"), Some("/home/alice")),
+            Some(PathBuf::from("/custom/agent"))
         );
-        // No overlay HOME → fall back to the process HOME.
+        // Override is tilde-expanded against HOME.
         assert_eq!(
-            resolve_home_inner(&[], Some("/proc/home")),
-            Some(PathBuf::from("/proc/home"))
+            resolve_agent_dir_inner(Some("~/pi-agent"), Some("/home/alice")),
+            Some(PathBuf::from("/home/alice/pi-agent"))
         );
-        // Neither set → None (the HOME-unset SKIP path; NO `/tmp` fallback).
-        assert_eq!(resolve_home_inner(&[], None), None);
-        // Empty values are ignored (both overlay and process).
+        // No override → <HOME>/.pi/agent.
         assert_eq!(
-            resolve_home_inner(&[("HOME".to_string(), String::new())], None),
-            None
+            resolve_agent_dir_inner(None, Some("/home/alice")),
+            Some(PathBuf::from("/home/alice/.pi/agent"))
         );
-        assert_eq!(resolve_home_inner(&[], Some("")), None);
+        // Neither set → None (the SKIP path; NO `/tmp` fallback).
+        assert_eq!(resolve_agent_dir_inner(None, None), None);
+        // Empty override is ignored → falls back to <HOME>/.pi/agent.
+        assert_eq!(
+            resolve_agent_dir_inner(Some(""), Some("/home/alice")),
+            Some(PathBuf::from("/home/alice/.pi/agent"))
+        );
+        // Empty HOME with no override → None.
+        assert_eq!(resolve_agent_dir_inner(None, Some("")), None);
+    }
+
+    /// `expand_tilde` expands ONLY a leading `~` / `~/` against HOME (matching
+    /// pi's `expandTildePath`); absolute and relative paths, a mid-path `~`, and
+    /// (with no HOME) a `~`-prefixed value all pass through unchanged.
+    #[test]
+    fn expand_tilde_expands_leading_home_only() {
+        assert_eq!(expand_tilde("~", Some("/h")), PathBuf::from("/h"));
+        assert_eq!(expand_tilde("~/a/b", Some("/h")), PathBuf::from("/h/a/b"));
+        assert_eq!(expand_tilde("/abs/x", Some("/h")), PathBuf::from("/abs/x"));
+        assert_eq!(expand_tilde("rel/x", Some("/h")), PathBuf::from("rel/x"));
+        assert_eq!(expand_tilde("/x/~/y", Some("/h")), PathBuf::from("/x/~/y"));
+        // No HOME → a `~` value is returned verbatim (pi's fallback).
+        assert_eq!(expand_tilde("~/a", None), PathBuf::from("~/a"));
+    }
+
+    /// The env-based resolver honors `PI_CODING_AGENT_DIR` from the overlay (the
+    /// value the child gets), winning over HOME, and maps to
+    /// `<agent-dir>/extensions/dot-agent-deck`. Hermetic: the override is in the
+    /// overlay, so the process env is never consulted.
+    #[test]
+    fn resolve_agent_dir_from_env_honors_pi_agent_dir_override() {
+        let overlay = vec![
+            (ENV_PI_AGENT_DIR.to_string(), "/iso/agent".to_string()),
+            ("HOME".to_string(), "/should/not/win".to_string()),
+        ];
+        let dir = resolve_agent_dir_from_env(&overlay).expect("override yields a dir");
+        assert_eq!(dir, PathBuf::from("/iso/agent"));
+        assert_eq!(
+            extension_dir_in(&dir),
+            PathBuf::from("/iso/agent/extensions/dot-agent-deck")
+        );
     }
 
     /// `pi_present_for_env` judges pi-presence against the PATH override in the
@@ -595,23 +686,22 @@ mod tests {
         assert!(dir.to_string_lossy().contains(".pi/agent/extensions"));
     }
 
-    /// The EXPLICIT setup path's HOME resolution refuses (yields no target dir)
-    /// when HOME is unset OR empty — it never guesses a `/tmp` (unset) or
-    /// relative `./` (empty) location Pi would never load. Exercised through the
-    /// shared pure [`resolve_home_inner`] core (which `home_dir_strict` calls
-    /// with the process `HOME`) so it needs no process-global env mutation. With
-    /// no target dir resolved, [`materialize`] is never reached and nothing is
-    /// written; the CLI turns this `None` into a non-zero error naming HOME (see
-    /// `src/main.rs`).
+    /// The EXPLICIT setup path refuses (yields no target dir) when NEITHER
+    /// `PI_CODING_AGENT_DIR` nor HOME is set/non-empty — it never guesses a `/tmp`
+    /// (unset) or relative `./` (empty) location Pi would never load. Exercised
+    /// through the pure [`resolve_agent_dir_inner`] core (which `agent_dir_strict`
+    /// feeds the process env) so it needs no process-global env mutation. With no
+    /// dir resolved, [`materialize`] is never reached and nothing is written; the
+    /// CLI turns the `None` into a non-zero error (see `src/main.rs`).
     #[test]
-    fn explicit_setup_home_resolution_refuses_on_unset_or_empty() {
-        // Unset HOME → None (NO `/tmp` fallback for the explicit path).
-        assert_eq!(resolve_home_inner(&[], None), None);
-        // Empty HOME → None (NO relative `./` base).
-        assert_eq!(resolve_home_inner(&[], Some("")), None);
-        // Set HOME → the extension dir under it (the materialize target).
+    fn explicit_setup_refuses_when_agent_dir_and_home_unset_or_empty() {
+        // Neither override nor HOME → None (NO `/tmp` fallback).
+        assert_eq!(resolve_agent_dir_inner(None, None), None);
+        // Empty HOME, no override → None (NO relative `./` base).
+        assert_eq!(resolve_agent_dir_inner(None, Some("")), None);
+        // HOME set, no override → the extension dir under `<HOME>/.pi/agent`.
         assert_eq!(
-            resolve_home_inner(&[], Some("/home/alice")).map(|h| extension_dir_under(&h)),
+            resolve_agent_dir_inner(None, Some("/home/alice")).map(|d| extension_dir_in(&d)),
             Some(extension_dir_under(Path::new("/home/alice")))
         );
     }

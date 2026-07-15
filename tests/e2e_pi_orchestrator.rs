@@ -24,9 +24,10 @@
 //! `delegate` / `work-done` / `agent-event` over the socket and re-broadcasts
 //! `AgentEvent`s), a REAL `claude` (Haiku) worker pane spawned + ready BEFORE the
 //! orchestrator delegates (so the daemon-injected pointer lands in a live input
-//! box), and a REAL `pi` orchestrator pane whose HOME starts WITHOUT the
-//! extension — the deck's spawn-time auto-materialize (the `spawn_agent` seam,
-//! PRD #201) puts the bundled extension there before pi boots. The
+//! box), and a REAL `pi` orchestrator pane whose HOME carries the bundled
+//! extension, staged into the location pi resolves from that HOME (production
+//! materializes it at daemon startup; this in-process daemon bypasses that entry,
+//! so the test stages it, PRD #201). The
 //! ORCHESTRATOR role is swapped to `pi`; the worker stays a black-box `claude`
 //! (its hooks/CLI are unchanged — the workaround-dissolution is Pi-only by
 //! construction, Design Decision #4).
@@ -193,10 +194,9 @@ fn path_with_binary_dir() -> String {
 /// Scenario: Bring up an in-process daemon, spawn a REAL Claude Code (Haiku)
 /// worker as a long-running interactive `coder`-role pane and wait until it is
 /// input-ready, then spawn a REAL `pi` orchestrator pane IDLE (no CLI-arg
-/// prompt) whose HOME starts WITHOUT the extension — the deck's spawn-time
-/// auto-materialize (the `spawn_agent` seam) detects the `pi` command and
-/// materializes the bundled orchestrator extension into that HOME before pi
-/// boots — and whose env explicitly propagates `OPENROUTER_API_KEY` + `HOME`.
+/// prompt) whose HOME carries the bundled extension, staged (as the
+/// daemon-startup seam would) into the location pi resolves from that HOME before
+/// pi boots — and whose env explicitly propagates `OPENROUTER_API_KEY` + `HOME`.
 /// Deliver pi's directive NATIVELY (PRD #201): stash it in the daemon seed store
 /// (`set_pending_seed`), and pi's extension pulls it on `session_start` via
 /// `dot-agent-deck get-seed` → `pi.sendUserMessage` (NOT a CLI arg, NOT PTY
@@ -301,14 +301,18 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
     )
     .await;
 
-    // --- ORCHESTRATOR: real pi whose HOME starts WITHOUT the extension. The
-    // deck's spawn-time auto-materialize (PRD #201, `spawn_agent` seam) detects
-    // the `pi` command and materializes the bundled extension into the HOME the
-    // pi child inherits (here `pi_home`, propagated via `opts.env` below) BEFORE
-    // pi boots — so this test exercises the real production flow, not a
-    // hand-set-up shortcut. `pi_home` therefore starts clean; no manual
-    // `orchestrator_ext::materialize` call.
+    // --- ORCHESTRATOR: real pi whose HOME carries the bundled extension. In
+    // production the extension is materialized ONCE at daemon startup
+    // (`orchestrator_ext::auto_materialize`, from the `daemon serve` entry); this
+    // in-process test daemon bypasses that entry, so we stage the extension here —
+    // into the SAME location pi resolves from `pi_home` — mirroring the
+    // daemon-startup seam. `pi_home` is propagated as the pi child's HOME via
+    // `opts.env` below.
     let pi_home = common::race_safe_tempdir();
+    dot_agent_deck::orchestrator_ext::materialize(
+        &dot_agent_deck::orchestrator_ext::extension_dir_under(pi_home.path()),
+    )
+    .expect("stage the bundled pi extension into the orchestrator HOME");
 
     // Collect the extension's `agent-event` broadcasts BEFORE spawning pi, so its
     // session_start (→ waiting) status report can't be missed.
@@ -494,9 +498,9 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
 /// with a CLEAN HOME and register one enabled schedule whose command is a REAL
 /// `pi` (cheap `-p`, cheap GPT-5.x). Propagate `OPENROUTER_API_KEY` + the
 /// built-binary PATH into the daemon (which the scheduler-spawned pi inherits,
-/// along with `HOME` + `DOT_AGENT_DECK_SOCKET`); the deck's spawn-time
-/// auto-materialize puts the bundled extension into that HOME as pi launches —
-/// no manual setup. Subscribe as an UNATTENDED `SubscribeEvents` consumer
+/// along with `HOME` + `DOT_AGENT_DECK_SOCKET`); the daemon-startup
+/// auto-materialize puts the bundled extension into that HOME as the daemon
+/// boots — no manual setup. Subscribe as an UNATTENDED `SubscribeEvents` consumer
 /// and fire the schedule via `RunNow`. Assert the scheduled pi boots and its real
 /// extension reports a `Pi`-typed `AgentEvent` that the daemon re-broadcasts on
 /// the event stream — the real-agent, unattended, no-client status path (the
@@ -529,13 +533,15 @@ fn scheduler_pi_001_scheduled_unattended_status_via_extension() {
         ],
     );
 
-    // No manual `orchestrator_ext::materialize` here: the deck's spawn-time
-    // auto-materialize (PRD #201, `spawn_agent` seam) fires when the scheduler
-    // launches the `pi` command, materializing the bundled extension into the
-    // HOME the pi child inherits (resolved from the spawn env → the daemon's
-    // process HOME, i.e. `daemon.home`) BEFORE pi boots. The daemon's HOME
+    // No manual `orchestrator_ext::materialize` here: this is a REAL
+    // `daemon serve`, so the daemon-startup auto-materialize (PRD #201, the
+    // `daemon serve` entry) fires as the daemon boots, materializing the bundled
+    // extension into the daemon's HOME (`daemon.home`) — which the
+    // scheduler-spawned pi inherits — BEFORE pi launches. The daemon's HOME
     // therefore starts CLEAN and this test exercises the production path, in
-    // parity with the other pi tests (chain-smoke/pi/001, pi/live/*).
+    // parity with the other real-daemon pi tests (pi/live/*). (The in-process
+    // daemon tests — chain-smoke/pi/00{1,2} — bypass that entry, so they stage
+    // the extension explicitly.)
 
     // Subscribe as an unattended consumer BEFORE firing, so the scheduled pi's
     // first status report can't be missed.
