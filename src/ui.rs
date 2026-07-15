@@ -13441,6 +13441,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use spec::spec;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
     fn default_ui() -> UiState {
@@ -21367,6 +21368,7 @@ mod tests {
 
     struct SendResultPaneController {
         outcome: InjectedSendOutcome,
+        attempts: Arc<AtomicUsize>,
     }
 
     impl PaneController for SendResultPaneController {
@@ -21409,6 +21411,7 @@ mod tests {
             _pane_id: &str,
             _text: &str,
         ) -> Result<crate::event::SendResult, PaneError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
             match self.outcome {
                 InjectedSendOutcome::Error => Err(PaneError::CommandFailed(
                     "injected transport failure".into(),
@@ -21432,8 +21435,8 @@ mod tests {
 
     /// Scenario: Queue a real mode seed prompt at the UI's readiness gate, then
     /// inject each transport error and non-applied `SendResult` through a
-    /// controllable PaneController. Every failed delivery must retain the seed
-    /// for retry and surface visible status feedback instead of dropping it.
+    /// controllable PaneController. Every failed delivery must retain the seed,
+    /// surface visible feedback, and avoid retrying on every render frame.
     #[spec("prompt/pane-input/006")]
     #[test]
     fn pane_input_006_seed_prompt_result_controls_retention_and_feedback() {
@@ -21465,7 +21468,10 @@ mod tests {
                 Some(AgentType::Codex),
                 Some("seed-agent".into()),
             );
-            let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController { outcome });
+            let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController {
+                outcome,
+                attempts: Arc::new(AtomicUsize::new(0)),
+            });
 
             process_pending_seed_prompts(&mut ui, &pane, &snapshot);
 
@@ -21483,5 +21489,40 @@ mod tests {
                 ui.status_message.as_ref().map(|(message, _)| message)
             );
         }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController {
+            outcome: InjectedSendOutcome::HistoryOnly,
+            attempts: attempts.clone(),
+        });
+        let mut ui = default_ui();
+        ui.pending_seed_prompts.push(PendingSeedPrompt {
+            pane_id: "backoff-pane".into(),
+            prompt: "retry with backoff".into(),
+            created_at: std::time::Instant::now(),
+            ready_since: Some(
+                std::time::Instant::now()
+                    .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                    .expect("readiness timestamp"),
+            ),
+        });
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("backoff-pane".into());
+        snapshot.insert_placeholder_session(
+            "backoff-pane".into(),
+            None,
+            Some(AgentType::Codex),
+            Some("backoff-agent".into()),
+        );
+
+        for _ in 0..8 {
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        }
+
+        assert!(
+            attempts.load(Ordering::SeqCst) <= 1,
+            "a permanent HistoryOnly result must be throttled across immediate render frames; attempts={}",
+            attempts.load(Ordering::SeqCst)
+        );
     }
 }

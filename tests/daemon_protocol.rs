@@ -18,7 +18,9 @@ use dot_agent_deck::daemon_protocol::{
     KIND_STREAM_IN, KIND_STREAM_OUT, RunningAgentsSummary, TabMembership, bind_attach_listener,
     serve_attach_with_counter, write_resp,
 };
-use dot_agent_deck::event::{AgentEvent, AgentType, EventType, LiveTarget, TargetKind, Writable};
+use dot_agent_deck::event::{
+    AgentEvent, AgentType, EventType, LiveTarget, SendResult, TargetKind, Writable,
+};
 use dot_agent_deck::state::{AppState, SharedState};
 use spec::spec;
 
@@ -114,6 +116,13 @@ async fn write_request(s: &mut UnixStream, req: &AttachRequest) {
     write_frame(s, KIND_REQ, &payload).await;
 }
 
+async fn issue_json_request(server: &Server, request: serde_json::Value) -> AttachResponse {
+    let mut stream = UnixStream::connect(&server.path).await.unwrap();
+    let payload = serde_json::to_vec(&request).unwrap();
+    write_frame(&mut stream, KIND_REQ, &payload).await;
+    read_response(&mut stream).await
+}
+
 async fn read_response(s: &mut UnixStream) -> AttachResponse {
     let (kind, payload) = read_frame(s).await.expect("expected RESP frame");
     assert_eq!(kind, KIND_RESP, "expected RESP, got 0x{kind:02x}");
@@ -162,6 +171,28 @@ async fn start_agent_for_pane(server: &Server, command: &str, pane_id: &str) -> 
     let resp = read_response(&mut s).await;
     assert!(resp.ok, "start-agent failed: {:?}", resp.error);
     resp.id.expect("start-agent response missing id")
+}
+
+async fn start_plain_agent_for_pane(server: &Server, command: &str, pane_id: &str) -> String {
+    let mut stream = UnixStream::connect(&server.path).await.unwrap();
+    write_request(
+        &mut stream,
+        &AttachRequest::StartAgent {
+            command: Some(command.into()),
+            cwd: None,
+            display_name: None,
+            rows: 24,
+            cols: 80,
+            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), pane_id.into())],
+            tab_membership: None,
+            agent_type: None,
+            seed: None,
+        },
+    )
+    .await;
+    let response = read_response(&mut stream).await;
+    assert!(response.ok, "start-agent failed: {:?}", response.error);
+    response.id.expect("start-agent response missing id")
 }
 
 async fn connect_attach(server: &Server, id: &str) -> UnixStream {
@@ -934,6 +965,189 @@ fn pane_input_005_stream_rejects_key_and_paste_after_live_transition() {
         .build()
         .expect("build pane-input runtime");
     runtime.block_on(pane_input_005_stream_rejects_key_and_paste_after_live_transition_inner());
+}
+
+/// Scenario: Queue a prompt for one live agent identity, replace that agent on
+/// the same pane before delivery, and send the identity-bearing request. The
+/// daemon must reject it as stale/wrong-session without writing to the replacement.
+#[spec("prompt/pane-input/009")]
+#[test]
+fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build stale-delivery runtime");
+    runtime.block_on(async {
+        let server = start_server().await;
+        let pane_id = "pane-rebound-before-delivery";
+        let original_id = start_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        server.registry.close_agent(&original_id).unwrap();
+        let replacement_id = start_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let mut replacement = connect_attach(&server, &replacement_id).await;
+        let marker = b"STALE-PROMPT-REACHED-REPLACEMENT";
+
+        let response = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'STALE-PROMPT-REACHED-REPLACEMENT\\n'",
+                "expected_agent_id": original_id,
+                "expected_session_id": "original-session",
+                "delivery_id": "stale-delivery-009"
+            }),
+        )
+        .await;
+        let reached_replacement =
+            stream_contains_within(&mut replacement, marker, Duration::from_millis(750)).await;
+
+        assert!(
+            matches!(
+                response.send_result,
+                Some(SendResult::WrongSession | SendResult::Stale)
+            ) && !reached_replacement,
+            "identity-bearing stale delivery must return WrongSession/Stale and write no bytes to the replacement; result={:?}, reached_replacement={reached_replacement}",
+            response.send_result
+        );
+
+        server.registry.close_agent(&replacement_id).unwrap();
+    });
+}
+
+/// Scenario: Send one identity-bearing prompt, model its successful response as
+/// lost, and retry with the same stable delivery ID. The target command must be
+/// submitted exactly once even though both request connections reach the daemon.
+#[spec("prompt/pane-input/010")]
+#[test]
+fn pane_input_010_retry_after_lost_response_is_idempotent() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build idempotency runtime");
+    runtime.block_on(async {
+        let server = start_server().await;
+        let pane_id = "pane-idempotent-delivery";
+        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let counter_path = server._dir.path().join("delivery-count");
+        let request = serde_json::json!({
+            "op": "write-and-submit",
+            "pane_id": pane_id,
+            "text": format!("printf x >> {}", counter_path.display()),
+            "expected_agent_id": agent_id,
+            "expected_session_id": "idempotent-session",
+            "delivery_id": "stable-delivery-010"
+        });
+
+        let first = issue_json_request(&server, request.clone()).await;
+        // The consumer loses `first` and retries the exact same delivery ID.
+        let retry = issue_json_request(&server, request).await;
+        let writes = std::fs::read_to_string(&counter_path).unwrap_or_default();
+
+        assert_eq!(
+            writes,
+            "x",
+            "retrying one applied delivery must not submit twice; first={:?}, retry={:?}, file={writes:?}",
+            first.send_result,
+            retry.send_result
+        );
+
+        server.registry.close_agent(&agent_id).unwrap();
+    });
+}
+
+/// Scenario: Hold a live pane's PTY writer, begin an atomic prompt delivery so
+/// authorization completes and the write blocks, then make the session
+/// history-only before releasing the writer. No bytes may pass that stale check.
+#[spec("prompt/pane-input/013")]
+#[test]
+fn pane_input_013_liveness_is_rechecked_after_writer_lock() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build liveness barrier runtime");
+    runtime.block_on(async {
+        let server = start_server().await;
+        let pane_id = "pane-liveness-barrier";
+        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let now = chrono::Utc::now();
+        let event = |event_type, writable| AgentEvent {
+            session_id: "liveness-barrier-session".to_string(),
+            agent_type: AgentType::Codex,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: now,
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(agent_id.clone()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(LiveTarget {
+                kind: TargetKind::Pty,
+                writable,
+            }),
+        };
+        {
+            let mut state = server.state.write().await;
+            state.register_pane(pane_id.to_string());
+            state.apply_event(event(EventType::SessionStart, Writable::Live));
+        }
+
+        let mut attached = connect_attach(&server, &agent_id).await;
+        let writer = server.registry.subscribe(&agent_id).unwrap().writer;
+        let writer_guard = writer.lock().await;
+        let path = server.path.clone();
+        let request_agent_id = agent_id.clone();
+        let mut request_task = tokio::spawn(async move {
+            let mut stream = UnixStream::connect(path).await.unwrap();
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'STALE-LIVENESS-WRITE\\n'",
+                "expected_agent_id": request_agent_id,
+                "expected_session_id": "liveness-barrier-session",
+                "delivery_id": "liveness-barrier-013"
+            }))
+            .unwrap();
+            write_frame(&mut stream, KIND_REQ, &payload).await;
+            read_response(&mut stream).await
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut request_task)
+                .await
+                .is_err(),
+            "precondition: delivery must be waiting on the held PTY writer"
+        );
+        {
+            let mut state = server.state.write().await;
+            state.apply_event(event(EventType::Thinking, Writable::HistoryOnly));
+        }
+        drop(writer_guard);
+
+        let response = request_task.await.unwrap();
+        let stale_bytes_reached_target = stream_contains_within(
+            &mut attached,
+            b"STALE-LIVENESS-WRITE",
+            Duration::from_millis(750),
+        )
+        .await;
+        assert!(
+            !matches!(
+                response.send_result,
+                Some(SendResult::Applied | SendResult::Queued)
+            ) && !stale_bytes_reached_target,
+            "a target that became history-only while waiting for its writer must reject delivery; result={:?}, bytes_reached_target={stale_bytes_reached_target}",
+            response.send_result
+        );
+
+        server.registry.close_agent(&agent_id).unwrap();
+    });
 }
 
 async fn pane_input_005_stream_rejects_key_and_paste_after_live_transition_inner() {

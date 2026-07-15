@@ -91,6 +91,67 @@ fn pane_input_004_history_only_send_reports_result_and_feedback() {
     );
 }
 
+/// Scenario: Keep a real dashboard focused in PaneInput while its attached
+/// session transitions from live to history-only, then send a key and a paste
+/// in separate runs. Each rejection must show feedback and leave PaneInput.
+#[spec("prompt/pane-input/008")]
+#[test]
+fn pane_input_008_stream_rejection_surfaces_feedback_and_exits_input_mode() {
+    let mut observations = Vec::new();
+    for (input_kind, input) in [
+        ("key", b"rejected-key".as_slice()),
+        ("paste", b"\x1b[200~rejected-paste\x1b[201~".as_slice()),
+    ] {
+        let deck = TuiDeck::builder()
+            .with_continue_session(format!("stream-rejection-{input_kind}"), "cat")
+            .launch_with_fixture("minimal");
+        deck.wait_for_string("[Command Mode Ctrl+D]");
+
+        let record = common::agent_records_on(deck.attach_socket_path())
+            .into_iter()
+            .next()
+            .expect("restored synthetic pane must have a daemon record");
+        let pane_id = record
+            .pane_id_env
+            .expect("restored synthetic pane must have a daemon pane id");
+        let event = json!({
+            "session_id": format!("stream-rejection-{input_kind}-session"),
+            "agent_type": "codex",
+            "event_type": "session_start",
+            "timestamp": "2026-07-15T12:00:00Z",
+            "pane_id": pane_id,
+            "agent_id": record.id,
+            "live_target": {
+                "kind": "process",
+                "writable": "history-only"
+            }
+        });
+        common::write_hook_line(deck.hook_socket_path(), &event.to_string())
+            .expect("make focused synthetic session history-only");
+        deck.wait_for_absence("No agent");
+
+        deck.send_keys(input);
+        let feedback = deck.wait_for_grid_string_within(
+            "History-only session cannot accept live input",
+            Duration::from_secs(2),
+        );
+        let grid = deck.snapshot_grid();
+        observations.push((
+            input_kind,
+            feedback,
+            !grid.contains("[Command Mode Ctrl+D]"),
+            grid,
+        ));
+    }
+
+    assert!(
+        observations
+            .iter()
+            .all(|(_, feedback, exited, _)| *feedback && *exited),
+        "key and paste rejection must both show feedback and exit PaneInput; observations={observations:#?}"
+    );
+}
+
 /// Scenario: Open an orchestration whose start role declares itself
 /// history-only, let the real spawn-time prompt action receive that non-applied
 /// result, then transition the same role to live. The UI must show feedback,

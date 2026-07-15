@@ -528,6 +528,48 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the other result variants (covered at the seed consumer by `prompt/pane-input/006`).
 - **Platform coverage:** mac+linux.
 
+##### prompt/pane-input/008 — Stream-input rejection visibly exits PaneInput for both keys and paste (PRD #20 R20-007).
+- **Layer:** L2 PTY-attached real dashboard with a synthetic pane and hook liveness transition.
+- **Agent:** synthetic Codex session backed by `cat`; no LLM.
+- **Asserts:** after a focused live pane becomes history-only, a rejected key and rejected bracketed paste each render feedback and leave PaneInput mode.
+- **Does not assert:** the daemon's byte-level stream gate (covered by `prompt/pane-input/005`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/009 — A queued prompt cannot cross a same-pane agent rebind (PRD #20 R20-003).
+- **Layer:** L1 protocol integration with an in-process daemon and real PTY-backed shells.
+- **Agent:** synthetic Codex identities bound sequentially to the same pane.
+- **Asserts:** an identity-bearing request queued for the original agent returns `wrong-session`/`stale` and no marker reaches its replacement.
+- **Does not assert:** UI feedback for the returned result (covered by `prompt/pane-input/006`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/010 — Retrying an ambiguously applied delivery ID does not submit twice (PRD #20 R20-004).
+- **Layer:** L1 protocol integration with an in-process daemon and real PTY-backed shell.
+- **Agent:** synthetic Codex identity backed by `/bin/sh`.
+- **Asserts:** two requests with one stable delivery ID produce exactly one observable file append.
+- **Does not assert:** retry scheduling or visible feedback.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/011 — Unknown send-result variants decode as safe non-delivery (PRD #20 R20-011).
+- **Layer:** L1 fast wire-decoding unit test.
+- **Agent:** none.
+- **Asserts:** a future `send_result` value does not reject the whole response and is not classified as delivered.
+- **Does not assert:** live daemon version skew.
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/pane-input/012 — `ok=false` overrides a contradictory applied send result (PRD #20 R20-011).
+- **Layer:** L1 fast client test with a synthetic Unix-socket daemon.
+- **Agent:** none.
+- **Asserts:** the client does not report delivery for `{ok:false, send_result:"applied"}`.
+- **Does not assert:** server-side response construction.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/013 — Liveness is revalidated after acquiring the exact target writer (PRD #20 R20-006).
+- **Layer:** L1 protocol integration with an in-process daemon, held writer mutex, and real PTY-backed shell.
+- **Agent:** synthetic Codex identity backed by `/bin/sh`.
+- **Asserts:** a request authorized while live but blocked on the writer writes no bytes after the session becomes history-only.
+- **Does not assert:** the attach-handle removal race in R20-008, which has no deterministic harness barrier.
+- **Platform coverage:** mac+linux.
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.

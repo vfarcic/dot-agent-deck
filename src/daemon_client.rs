@@ -750,6 +750,7 @@ impl AttachConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
@@ -867,6 +868,72 @@ mod tests {
         );
 
         registry.close_agent(&id).unwrap();
+    }
+
+    /// Scenario: Decode a future daemon response carrying a send-result value
+    /// this client does not know. The response must remain decodable and the
+    /// unknown value must not be interpreted as delivered.
+    #[spec("prompt/pane-input/011")]
+    #[test]
+    fn pane_input_011_unknown_send_result_decodes_as_safe_non_delivery() {
+        let decoded = serde_json::from_value::<AttachResponse>(serde_json::json!({
+            "ok": false,
+            "send_result": "future-delivery-outcome"
+        }));
+
+        assert!(
+            decoded.is_ok(),
+            "an unknown send_result must not reject the whole AttachResponse: {decoded:?}"
+        );
+        let response = decoded.unwrap();
+        assert!(
+            !matches!(
+                response.send_result,
+                Some(SendResult::Applied | SendResult::Queued)
+            ),
+            "an unknown send_result must degrade to safe non-delivery: {:?}",
+            response.send_result
+        );
+    }
+
+    /// Scenario: Have a synthetic daemon return the inconsistent combination
+    /// `ok=false` with `send_result=applied`. The client must let the failure
+    /// bit win and must not report successful delivery.
+    #[spec("prompt/pane-input/012")]
+    #[tokio::test]
+    async fn pane_input_012_ok_false_overrides_applied_send_result() {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("inconsistent-response.sock");
+            let listener = bind_attach_listener(&path).expect("bind synthetic daemon");
+            (dir, path, listener)
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept client");
+            let _request = read_frame(&mut stream).await.expect("read request frame");
+            let response = AttachResponse {
+                ok: false,
+                error: Some("delivery was not accepted".into()),
+                send_result: Some(SendResult::Applied),
+                ..Default::default()
+            };
+            crate::daemon_protocol::write_resp(&mut stream, &response)
+                .await
+                .expect("write inconsistent response");
+        });
+        let client = DaemonClient::new(path);
+
+        let result = client
+            .write_and_submit("pane-inconsistent", "must not report success")
+            .await;
+        server.await.unwrap();
+        drop(dir);
+
+        assert!(
+            !matches!(result, Ok(SendResult::Applied | SendResult::Queued)),
+            "ok=false must win over a contradictory delivered result; got {result:?}"
+        );
     }
 
     #[test]
