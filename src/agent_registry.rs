@@ -165,6 +165,33 @@ pub fn detect_from_basename(basename: &str) -> Option<AgentType> {
         .map(|spec| spec.agent_type.clone())
 }
 
+/// PRD #20 M9: resolve a `type:<alias>` dashboard-filter token to an agent
+/// type, matching case-insensitively against either the agent's human [`label`]
+/// (e.g. `type:codex`, `type:ClaudeCode`) or any of its detection basenames
+/// (e.g. `type:claude`). Returns `None` for an unrecognized or empty alias so
+/// the `/` filter (`src/ui.rs`) can treat `type:bogus` as "matches nothing".
+///
+/// Driven by [`ALL`] so every shipped agent is filterable and a future agent
+/// needs no new filter code — the neutral [`NONE`] placeholder is excluded (it
+/// is not a real, filterable agent).
+///
+/// [`label`]: AgentSpec::label
+pub fn resolve_type_alias(alias: &str) -> Option<AgentType> {
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return None;
+    }
+    ALL.iter()
+        .find(|spec| {
+            spec.label.eq_ignore_ascii_case(alias)
+                || spec
+                    .detect_basenames
+                    .iter()
+                    .any(|basename| basename.eq_ignore_ascii_case(alias))
+        })
+        .map(|spec| spec.agent_type.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

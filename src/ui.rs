@@ -1763,23 +1763,53 @@ fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'
         return sessions;
     }
 
-    let query = ui.filter_text.to_lowercase();
+    // PRD #20 M9: split the query into `type:<agent>` tokens and ordinary text.
+    // Each `type:` token resolves through the agent registry (label/basename,
+    // case-insensitive) so all agent identities are filterable and a future
+    // agent needs no new filter code. The remaining text keeps matching
+    // id/cwd/status/display-name exactly as before, and the two compose with
+    // AND semantics (`type:codex wrapped-worker` = Codex AND "wrapped-worker").
+    let mut type_filters: Vec<crate::event::AgentType> = Vec::new();
+    let mut unknown_type = false;
+    let mut text_terms: Vec<&str> = Vec::new();
+    for token in ui.filter_text.split_whitespace() {
+        let lowered = token.to_lowercase();
+        if let Some(alias) = lowered.strip_prefix("type:") {
+            match crate::agent_registry::resolve_type_alias(alias) {
+                Some(agent_type) => type_filters.push(agent_type),
+                None => unknown_type = true,
+            }
+        } else {
+            text_terms.push(token);
+        }
+    }
+
+    // An unrecognized `type:` token (e.g. `type:bogus`) matches nothing.
+    if unknown_type {
+        return Vec::new();
+    }
+
+    let text_query = text_terms.join(" ").to_lowercase();
     sessions.retain(|(id, s)| {
-        let id_match = id.to_lowercase().contains(&query);
-        let cwd_match = s
-            .cwd
-            .as_deref()
-            .unwrap_or("")
-            .to_lowercase()
-            .contains(&query);
-        let status_str = format!("{:?}", s.status).to_lowercase();
-        let status_match = status_str.contains(&query);
-        let name_match = ui
-            .display_names
-            .get(*id)
-            .map(|n| n.to_lowercase().contains(&query))
-            .unwrap_or(false);
-        id_match || cwd_match || status_match || name_match
+        let type_match = type_filters.is_empty() || type_filters.contains(&s.agent_type);
+        let text_match = text_query.is_empty() || {
+            let id_match = id.to_lowercase().contains(&text_query);
+            let cwd_match = s
+                .cwd
+                .as_deref()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains(&text_query);
+            let status_str = format!("{:?}", s.status).to_lowercase();
+            let status_match = status_str.contains(&text_query);
+            let name_match = ui
+                .display_names
+                .get(*id)
+                .map(|n| n.to_lowercase().contains(&text_query))
+                .unwrap_or(false);
+            id_match || cwd_match || status_match || name_match
+        };
+        type_match && text_match
     });
     sessions
 }
