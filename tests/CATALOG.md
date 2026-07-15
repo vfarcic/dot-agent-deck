@@ -679,6 +679,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the in-process read-back within one launch (covered by `prompt/new-pane/011`); the `default_command` precedence (covered by `prompt/new-pane/012`); the authoring-mode recording (covered by `prompt/new-pane/013`).
 - **Platform coverage:** mac+linux.
 
+##### prompt/new-pane/015 — Registry defaults seed each agent type and Codex launches through the wrapper (PRD #20 M8).
+- **Layer:** L2 synthetic (the private new-pane form is driven through the real binary via PTY; PATH recorder stubs capture the process command selected at submit without invoking an LLM).
+- **Agent:** synthetic registry-default rows for Claude Code, OpenCode, Pi, and Codex; the submitted Codex process is a recorder stand-in.
+- **Asserts:** the existing Command field displays each shipped agent's `AgentSpec.default_command`, preserving command-derived agent selection without adding a picker; submitting the Codex seed launches `dot-agent-deck wrap --agent codex -- codex`, not bare `codex`.
+- **Does not assert:** real Codex output/event classification (covered by `codex/wrap/001` and `codex/live/001`); custom command arguments; a new agent-type picker (none is specified).
+- **Platform coverage:** mac+linux (executable PATH stubs).
+
 ### Focus / navigation
 
 #### focus/dashboard

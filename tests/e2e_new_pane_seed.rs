@@ -30,11 +30,17 @@
 //! - `prompt/new-pane/014` — regression guard: the recorded last command must
 //!   survive a full deck RESTART (two launches sharing one HOME) — proving the
 //!   value round-trips through the persisted `session.toml`, not just in-process.
+//! - `prompt/new-pane/015` — RED until PRD #20 M8: each recognized command seed
+//!   matches that agent's registry default, and submitting Codex launches it
+//!   through `dot-agent-deck wrap --agent codex -- codex` rather than bare.
 
 mod common;
 
 use common::TuiDeck;
+use dot_agent_deck::agent_registry;
+use dot_agent_deck::event::AgentType;
 use spec::spec;
+use std::time::Duration;
 
 /// Read the new-pane form's Command-field text from a rendered vt100 grid.
 ///
@@ -60,6 +66,45 @@ fn command_field_value(grid: &str) -> String {
         .map(|(head, _)| head)
         .unwrap_or(after);
     value.trim().to_string()
+}
+
+fn open_new_pane_form(deck: &TuiDeck) -> String {
+    deck.wait_for_string("No active sessions");
+    deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" "); // Space → confirm dir → new-pane form
+    deck.wait_for_string("Tab: switch"); // footer is the last line → form fully painted
+    deck.snapshot_grid()
+}
+
+fn assert_registry_default_is_seeded(agent_type: AgentType) {
+    let expected = agent_registry::spec(&agent_type)
+        .default_command
+        .expect("a shipped agent has a registry default command");
+    let cfg_dir = tempfile::tempdir().expect("config tempdir");
+    let cfg_path = cfg_dir.path().join("config.toml");
+    std::fs::write(&cfg_path, format!("default_command = {expected:?}\n"))
+        .expect("write config.toml");
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_CONFIG", cfg_path.to_string_lossy())
+        .launch_with_fixture("minimal");
+    let grid = open_new_pane_form(&deck);
+    assert_eq!(
+        command_field_value(&grid),
+        expected,
+        "the new-pane Command seed for {agent_type} must match its registry default_command.\n\
+         Grid:\n{grid}"
+    );
+}
+
+#[cfg(unix)]
+fn write_executable(path: &std::path::Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(path, contents).expect("write executable stub");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod executable stub");
 }
 
 /// Scenario: Launch the deck with an EMPTY `default_command`, open the new-pane
@@ -341,4 +386,71 @@ fn new_pane_014_last_command_survives_restart() {
     );
 
     drop(shared_home);
+}
+
+/// Scenario: Open the existing new-agent form with each shipped agent's
+/// registry default and assert the Command field offers that exact per-agent
+/// seed. Submit the Codex seed against recorder stubs and assert the command
+/// actually launched is `dot-agent-deck wrap --agent codex -- codex`, never a
+/// bare `codex` process.
+#[spec("prompt/new-pane/015")]
+#[test]
+#[cfg(unix)]
+fn new_pane_015_registry_defaults_and_codex_launches_wrapped() {
+    for agent_type in [AgentType::ClaudeCode, AgentType::OpenCode, AgentType::Pi] {
+        assert_registry_default_is_seeded(agent_type);
+    }
+
+    let codex_default = agent_registry::spec(&AgentType::Codex)
+        .default_command
+        .expect("Codex has a registry default command");
+    let fixture = tempfile::tempdir().expect("Codex launch fixture");
+    let cfg_path = fixture.path().join("config.toml");
+    let bin_dir = fixture.path().join("bin");
+    let launch_record = fixture.path().join("launch.txt");
+    std::fs::create_dir(&bin_dir).expect("create stub bin dir");
+    std::fs::write(&cfg_path, format!("default_command = {codex_default:?}\n"))
+        .expect("write Codex config.toml");
+
+    write_executable(
+        &bin_dir.join("dot-agent-deck"),
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$M8_LAUNCH_RECORD\"\nexec cat\n",
+    );
+    write_executable(
+        &bin_dir.join("codex"),
+        "#!/bin/sh\nprintf 'BARE codex %s\\n' \"$*\" > \"$M8_LAUNCH_RECORD\"\nexec cat\n",
+    );
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").expect("test runner PATH")
+    );
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_CONFIG", cfg_path.to_string_lossy())
+        .with_env("M8_LAUNCH_RECORD", launch_record.to_string_lossy())
+        .with_env("PATH", path)
+        .launch_with_fixture("minimal");
+    let grid = open_new_pane_form(&deck);
+    assert_eq!(
+        command_field_value(&grid),
+        codex_default,
+        "the new-pane Command seed for Codex must match its registry default_command.\n\
+         Grid:\n{grid}"
+    );
+
+    deck.send_keys(b"\r"); // Mode → Name
+    deck.send_keys(b"\r"); // Name → Command
+    deck.send_keys(b"\r"); // submit the pre-seeded Codex command
+    assert!(
+        common::wait_for_path(&launch_record, Duration::from_secs(10)),
+        "submitting the Codex seed did not launch either recorder stub"
+    );
+    let launched = std::fs::read_to_string(&launch_record).expect("read launch record");
+    assert_eq!(
+        launched.trim(),
+        "wrap --agent codex -- codex",
+        "creating a Codex agent must launch `dot-agent-deck wrap --agent codex -- codex`; \
+         a `BARE codex` record means the new-agent seam bypassed the wrapper"
+    );
 }
