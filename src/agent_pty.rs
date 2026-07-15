@@ -1670,21 +1670,13 @@ impl AgentPtyRegistry {
         let captured_rows = opts.rows.clamp(1, PTY_RESIZE_DIM_MAX);
         let captured_cols = opts.cols.clamp(1, PTY_RESIZE_DIM_MAX);
 
-        // PRD #201: auto-materialize the bundled Pi orchestrator extension into
-        // the pi child's HOME right before it is spawned, so `command = "pi"`
-        // works with ZERO manual setup — parity with claude
-        // (`hooks_manage::auto_install`) and opencode
-        // (`opencode_manage::auto_install`). Detect pi from the actual spawn
-        // COMMAND, not the caller-supplied `agent_type` (some callers, e.g. the
-        // headless real-pi e2e tests, leave `agent_type: None` while still
-        // running `pi …`), so the seam fires wherever a real pi is launched.
-        // The materialize is guarded (pi present), idempotent (overwrite), and
-        // HOME-unset-safe (skip, never a `/tmp` write) — see
-        // `orchestrator_ext::auto_materialize`. Done before `spawn(opts)` so the
-        // extension is on disk before Pi's boot-time discovery runs.
-        if AgentType::from_command(opts.command) == Some(AgentType::Pi) {
-            crate::orchestrator_ext::auto_materialize(&opts.env);
-        }
+        // PRD #201: the bundled Pi orchestrator extension is materialized ONCE at
+        // daemon startup (`orchestrator_ext::auto_materialize`, called from the
+        // `daemon serve` entry), NOT here per spawn. Doing it per spawn meant an
+        // unrelated agent start (claude, a shell, a test) rewrote `~/.pi` whenever
+        // pi was on PATH; the daemon-startup seam is command-agnostic and touches
+        // Pi's dir only once. So there is deliberately no materialize call in the
+        // spawn path.
 
         // Defense in depth: `spawn` already protects the child internally
         // via its own `ChildGuard`, so any failure or panic *inside* spawn

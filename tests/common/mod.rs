@@ -175,11 +175,13 @@ impl TuiDeckBuilder {
     }
 
     // NOTE (PRD #201): a `with_pi_extension()` builder that pre-staged the
-    // bundled Pi extension into the per-test HOME was removed. The deck now
-    // AUTO-materializes the extension at spawn time (the `spawn_agent` seam
-    // detects the `pi` command and writes it into the HOME the pi child
-    // inherits, before pi boots), so the pi e2es exercise that production flow
-    // directly instead of a hand-staged shortcut.
+    // bundled Pi extension into the per-test HOME was removed. Because `TuiDeck`
+    // drives the REAL binary, its lazy-spawned daemon runs the `daemon serve`
+    // entry, whose daemon-startup auto-materialize writes the extension into the
+    // daemon's HOME (this per-test HOME, which the pi child inherits) before pi
+    // boots — so the TuiDeck pi e2es exercise that production flow directly. (The
+    // in-process-daemon pi e2es bypass that entry and stage the extension
+    // themselves via `orchestrator_ext::materialize`.)
 
     /// Stage a `keybindings.toml` in the per-test HOME's config dir
     /// (`$HOME/.config/dot-agent-deck/keybindings.toml`, mirroring the
@@ -327,11 +329,12 @@ impl TuiDeck {
         std::fs::create_dir_all(&home).expect("create per-test HOME");
 
         // PRD #201: the per-test HOME deliberately starts WITHOUT the bundled Pi
-        // extension. When a pi pane is spawned, the deck's spawn-time
-        // auto-materialize (the `spawn_agent` seam) detects the `pi` command and
-        // writes the extension into the HOME the pi child inherits (this per-test
-        // HOME) before pi boots — so the pi e2es exercise that production flow
-        // rather than a pre-staged shortcut.
+        // extension. Because `TuiDeck` drives the REAL binary, its lazy-spawned
+        // daemon runs the `daemon serve` entry, whose daemon-startup
+        // auto-materialize writes the extension into the daemon's HOME (this
+        // per-test HOME, which the pi child inherits) before pi boots — so the
+        // TuiDeck pi e2es exercise that production flow rather than a pre-staged
+        // shortcut.
 
         // PRD #40: stage the keybindings config the deck reads at
         // startup. Path mirrors `config_path()` in
