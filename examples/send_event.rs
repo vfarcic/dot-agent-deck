@@ -1,14 +1,24 @@
+// This example drives the daemon over its Unix domain socket, so its body is
+// gated to `cfg(unix)`. On Windows (and any non-Unix target) it builds as a
+// binary with a stub `main` that explains the limitation, keeping the
+// `examples` build green on `x86_64-pc-windows-msvc`. A native named-pipe
+// client is tracked in PRD #163.
+#[cfg(unix)]
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
+#[cfg(unix)]
 use dot_agent_deck::config::socket_path;
 
+#[cfg(unix)]
 fn send(stream: &mut UnixStream, json: &str) {
     writeln!(stream, "{json}").unwrap();
     println!("Sent: {json}");
     std::thread::sleep(std::time::Duration::from_secs(2));
 }
 
+#[cfg(unix)]
 fn main() {
     let path = socket_path();
     println!("Connecting to {}...", path.display());
@@ -96,4 +106,9 @@ fn main() {
     );
 
     println!("Done! Sessions have ended.");
+}
+
+#[cfg(not(unix))]
+fn main() {
+    println!("send_event example is Unix-only (named-pipe client tracked in PRD #163)");
 }

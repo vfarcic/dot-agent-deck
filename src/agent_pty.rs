@@ -166,14 +166,12 @@ pub fn is_valid_pane_id_env(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// Whether a `command` must be run through `$SHELL -c` rather than exec'd
-/// directly. A command with whitespace is a shell command line (pipes,
-/// `;`, redirections, multiple words); a single bare word is exec'd directly.
-/// Centralized so the spawn path's shell-override decision (PRD #127 C2) and
-/// the actual wrap in [`spawn`] can't drift apart.
-pub fn command_needs_shell_wrap(command: &str) -> bool {
-    command.contains(char::is_whitespace)
-}
+// PRD #42 M1: the shell-wrap policy (which commands need wrapping, and the
+// `$SHELL`/`/bin/sh -c` vs `%COMSPEC%`/`cmd /C` shell selection) moved to
+// `crate::platform::shell`. Re-exported here so existing
+// `agent_pty::command_needs_shell_wrap` callers (e.g. `spawn.rs`) keep
+// resolving without churn.
+pub use crate::platform::shell::command_needs_shell_wrap;
 
 /// Maximum byte length the daemon will accept for a per-agent display name
 /// (M2.11). Anything longer is rejected and the agent's display_name is
@@ -601,192 +599,24 @@ pub struct AgentPty {
     pub reader: Box<dyn std::io::Read + Send>,
 }
 
-/// PRD #92 F1 followup (defensive): convert a portable-pty `process_id()`
-/// (a `u32`) into a positive `libc::pid_t` suitable for `killpg`, or
-/// `None` if the raw value can't legally name a process group.
-///
-/// `killpg(pgid, sig)` has two dangerous degenerate cases for non-positive
-/// `pgid`:
-///   - `pgid == 0` is documented as "signal every process in *the caller's*
-///     process group" — which for the daemon would mean signalling the
-///     daemon itself plus every connected attach-client.
-///   - `pgid < 0` is undefined behavior in POSIX and a likely overflow
-///     indicator (a `u32` PID that didn't fit in `i32`).
-///
-/// Both should be impossible from a well-behaved `portable-pty` spawn
-/// (Linux PIDs are positive `i32` values up to `i32::MAX`), but
-/// defensively checking is one `if` and one unit test, which is much
-/// cheaper than the unbounded blast radius of getting it wrong. On
-/// `None` the caller falls back to `child.kill()` (single-PID).
-pub(crate) fn pid_to_pgid(pid: u32) -> Option<libc::pid_t> {
-    let signed = pid as i64;
-    if signed > 0 && signed <= libc::pid_t::MAX as i64 {
-        Some(signed as libc::pid_t)
-    } else {
-        None
-    }
-}
-
 /// PRD #92 F8: hardcoded grace window between SIGTERM and the SIGKILL
 /// fallback used by the single-pane Ctrl+W path
-/// ([`terminate_child_with_grace_and_wait`]) and as the poll budget in
-/// the daemon-wide [`AgentPtyRegistry::shutdown_all_graceful`].
+/// ([`crate::platform::proc::terminate_child_with_grace_and_wait`]) and as the
+/// poll budget in the daemon-wide [`AgentPtyRegistry::shutdown_all_graceful`].
 /// 3 s matches the F1 graceful-shutdown grace, which is the natural
 /// sibling. Hardcoded as a constant for now (one symbol to find) rather
 /// than lifted to `DashboardConfig` until a real user need surfaces.
 pub(crate) const AGENT_TERMINATE_GRACE: Duration = Duration::from_secs(3);
 
-/// PRD #92 F8: low-level shared helper. Send `signal` to the child's
-/// process group, falling back to `portable_pty::Child::kill` when
-/// `pid_to_pgid` rejects the raw pid (F1-followup defensive boundary
-/// check). `phase` is included in `tracing::warn!` payloads so a wedged
-/// child can be traced back to whichever phase issued the kill.
-/// Returns `true` if the `killpg` syscall actually fired (or the
-/// `child.kill` fallback was used), `false` if the syscall reported an
-/// error other than ESRCH.
-///
-/// Used by both [`force_kill_child_and_wait`] (single-shot SIGKILL,
-/// for Drop / RAII / shutdown_all paths) and
-/// [`terminate_child_with_grace_and_wait`] (single-pane Ctrl+W, SIGTERM
-/// then SIGKILL), as well as by the SIGTERM phase inside
-/// [`AgentPtyRegistry::shutdown_all_graceful`] (daemon-wide Stop).
-/// Centralising the killpg + fallback logic prevents the three call
-/// sites from drifting.
-fn signal_child_pgroup_or_fallback(
-    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
-    signal: libc::c_int,
-    phase: &'static str,
-) -> bool {
-    let raw_pid = child.process_id();
-    let pgid = raw_pid.and_then(pid_to_pgid);
-    let Some(pgid) = pgid else {
-        // PRD #92 F8 followup (auditor #2 — option b documented):
-        // pid_to_pgid rejected the raw pid (either `process_id()`
-        // returned `None` or the pid was outside the safe `(0, i32::MAX]`
-        // range). The portable-pty `Child` trait allows `None` here,
-        // but the Unix backend used by this codebase (the only backend
-        // we ship — PRD #93 is Unix-only and Windows support is
-        // PRD #42's territory) always returns `Some` in practice. The
-        // `(0, i32::MAX]` boundary check is defense-in-depth against a
-        // future portable-pty bug; on real Linux/macOS PIDs it never
-        // fails. The fallback below uses `portable_pty::Child::kill`,
-        // which sends SIGHUP — strictly weaker than the requested
-        // `signal` (typically SIGTERM or SIGKILL) and limited to the
-        // direct child (no process-group semantics, so descendants
-        // leak). The caller's subsequent `child.wait()` is unbounded
-        // — that's acceptable for the same "this branch is practically
-        // unreachable" reason; if it ever fires, we'd rather see the
-        // log and accept a hang than complicate every call site with a
-        // bounded-wait wrapper for a path that doesn't exist in
-        // practice.
-        //
-        // Auditor #5: emit a warn-level event so a descendant leak
-        // surfaced via this fallback is at least observable.
-        tracing::warn!(
-            ?raw_pid,
-            signal,
-            phase = %phase,
-            reason = if raw_pid.is_none() { "process_id-returned-none" } else { "pid_to_pgid-rejected" },
-            "signal_child_pgroup_or_fallback: pgid unavailable — falling back to portable_pty::Child::kill (SIGHUP, single-PID; descendants will leak)"
-        );
-        let _ = child.kill();
-        return true;
-    };
-    // SAFETY: `killpg(2)` is async-signal-safe; the pgid we just
-    // validated via `pid_to_pgid` is the child's own PID (portable-pty
-    // `setsid`'d it, making it the group leader), so this cannot
-    // affect any other agent's group.
-    let rc = unsafe { libc::killpg(pgid, signal) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        let benign = err.raw_os_error() == Some(libc::ESRCH);
-        if !benign {
-            tracing::warn!(pgid, signal, phase = %phase, error = %err, "killpg failed");
-        }
-        return benign;
-    }
-    true
-}
-
-/// Forcefully terminate the child *and every descendant in its process
-/// group* with SIGKILL and reap it. SIGKILL is preferred over
-/// `portable_pty::Child::kill()` (which sends SIGHUP) because a shell can
-/// ignore SIGHUP — some distros' bash/zsh configurations do exactly that —
-/// leaving the subsequent `wait()` to block forever. SIGKILL cannot be
-/// caught or ignored, so the kernel tears the process down and `wait()`
-/// returns promptly. Callers should drop the master/writer/reader handles
-/// before invoking this so any I/O blocked on the PTY unblocks first.
-///
-/// PRD #92 F5: switched from `kill(pid)` to `killpg(pgid)` so descendants
-/// of shell-wrapped commands are reaped together with the shell. PRD #92 F1
-/// followup: the raw `pid as i32` cast went through a `pid_to_pgid` guard.
-/// Both behaviours now live in the shared
-/// [`signal_child_pgroup_or_fallback`] helper.
-///
-/// PRD #92 F8: callers that want the user's agent to have a catchable
-/// signal (single-pane Ctrl+W) now use
-/// [`terminate_child_with_grace_and_wait`] instead. This function
-/// retains the SIGKILL-only semantics for the contexts where a grace
-/// window is wrong or unnecessary: the registry's `Drop` impl, the
-/// `PtyGuard` / `AgentPty` cleanup paths, and the third phase of
-/// `shutdown_all_graceful` (after the SIGTERM phase has already run
-/// daemon-wide).
-fn force_kill_child_and_wait(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
-    signal_child_pgroup_or_fallback(child, libc::SIGKILL, "force-kill");
-    let _ = child.wait();
-}
-
-/// PRD #92 F8: SIGTERM-then-SIGKILL escalation used by the single-pane
-/// Ctrl+W path. Sends `SIGTERM` to the child's process group, polls
-/// `try_wait` until the child exits or `grace` elapses, then sends
-/// `SIGKILL` as the backstop and reaps the child.
-///
-/// Why this lives separately from [`force_kill_child_and_wait`]: the
-/// daemon-wide `shutdown_all_graceful` path issues SIGTERM to every
-/// agent in parallel and polls them all together, so a per-agent
-/// graceful helper would serialise the grace windows and slow daemon
-/// shutdown to `O(grace × N)`. The single-pane Ctrl+W path closes one
-/// agent at a time, so the simpler per-agent shape is appropriate
-/// here. Both paths share [`signal_child_pgroup_or_fallback`] for the
-/// low-level killpg behaviour.
-///
-/// Why F8 exists at all: pre-F8, Ctrl+W sent SIGKILL directly, which
-/// is uncatchable. Even a well-behaved agent that wanted to clean up
-/// its descendants — Claude Code's internal `setsid`'d sub-shells that
-/// the F5 manual-test pass surfaced — had no opportunity to do so.
-/// The graceful escalation gives the agent a 3-second window during
-/// which a SIGTERM trap can run.
-fn terminate_child_with_grace_and_wait(
-    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
-    grace: Duration,
-) {
-    // Phase 1: SIGTERM the process group.
-    signal_child_pgroup_or_fallback(child, libc::SIGTERM, "graceful-close-sigterm");
-
-    // Phase 2: poll `try_wait` until the child exits or the grace
-    // elapses. Polling avoids the obvious "sleep for grace then
-    // SIGKILL" alternative — a child that exits promptly after
-    // SIGTERM doesn't have to wait around for the deadline. 50 ms
-    // polling cadence is small enough to feel responsive in the UI
-    // and large enough to keep CPU cost negligible (~60 polls over 3 s).
-    let deadline = std::time::Instant::now() + grace;
-    while std::time::Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => {}
-            Err(_) => break,
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    // Phase 3: SIGKILL backstop. Reaches survivors regardless of
-    // SIGTERM-trapping state.
-    signal_child_pgroup_or_fallback(child, libc::SIGKILL, "graceful-close-sigkill");
-    let _ = child.wait();
-}
+// PRD #42 M1: the process-group teardown helpers (`pid_to_pgid`,
+// `signal_child_pgroup_or_fallback`, `force_kill_child_and_wait`,
+// `terminate_child_with_grace_and_wait`) moved to `crate::platform::proc`,
+// where the Unix `killpg`/SIGTERM→SIGKILL logic lives behind the platform seam
+// and a Windows Job-Object backend lands in PRD #163. Call sites below use
+// `crate::platform::proc::*`.
 
 fn force_kill_and_wait(pty: &mut AgentPty) {
-    force_kill_child_and_wait(&mut pty.child);
+    crate::platform::proc::force_kill_child_and_wait(&mut pty.child);
 }
 
 /// RAII guard that owns a freshly-spawned child between the `spawn_command`
@@ -812,7 +642,7 @@ impl ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            force_kill_child_and_wait(&mut child);
+            crate::platform::proc::force_kill_child_and_wait(&mut child);
         }
     }
 }
@@ -890,14 +720,12 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
         .iter()
         .find(|(k, _)| k == "SHELL")
         .map(|(_, v)| v.clone());
-    let default_shell = shell_override
-        .clone()
-        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
+    let default_shell = crate::platform::shell::default_shell(shell_override.as_deref());
 
     let mut cmd = match opts.command {
         Some(c) if command_needs_shell_wrap(c) => {
             let mut cb = CommandBuilder::new(&default_shell);
-            cb.arg("-c");
+            cb.arg(crate::platform::shell::shell_command_flag());
             cb.arg(c);
             cb
         }
@@ -1991,7 +1819,10 @@ impl AgentPtyRegistry {
                 .remove(id)
                 .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?
         };
-        terminate_child_with_grace_and_wait(&mut agent.child, AGENT_TERMINATE_GRACE);
+        crate::platform::proc::terminate_child_with_grace_and_wait(
+            &mut agent.child,
+            AGENT_TERMINATE_GRACE,
+        );
         // Notify the idle monitor so it observes the registry shrink
         // immediately. The pump_reader thread will *also* signal once it
         // sees EOF from the kill, but doing it here makes the
@@ -2123,7 +1954,10 @@ impl AgentPtyRegistry {
         // `close_agent`.
         let mut child = child;
         let join = tokio::task::spawn_blocking(move || {
-            terminate_child_with_grace_and_wait(&mut child, AGENT_TERMINATE_GRACE);
+            crate::platform::proc::terminate_child_with_grace_and_wait(
+                &mut child,
+                AGENT_TERMINATE_GRACE,
+            );
         })
         .await;
         if let Err(join_err) = join {
@@ -2560,7 +2394,7 @@ impl AgentPtyRegistry {
             inner.agents.drain().map(|(_, a)| a).collect()
         };
         for mut agent in agents {
-            force_kill_child_and_wait(&mut agent.child);
+            crate::platform::proc::force_kill_child_and_wait(&mut agent.child);
         }
         // Wake the idle monitor if it's parked on `change_notify` — the
         // registry just emptied, so the next gate check should see
@@ -2601,13 +2435,12 @@ impl AgentPtyRegistry {
         //
         // PRD #92 F8: the killpg logic + `pid_to_pgid` boundary check is
         // shared with the single-pane Ctrl+W path via
-        // `signal_child_pgroup_or_fallback`, so the two paths can't
+        // `crate::platform::proc` (PRD #42 M1), so the two paths can't
         // drift on what counts as a valid pgid or how a failed killpg
         // is logged.
         for agent in &mut agents {
-            signal_child_pgroup_or_fallback(
+            crate::platform::proc::send_sigterm_to_child_group(
                 &mut agent.child,
-                libc::SIGTERM,
                 "shutdown-all-graceful-sigterm",
             );
         }
@@ -2635,7 +2468,7 @@ impl AgentPtyRegistry {
         // ignored and `wait` returns the cached status), so this loop is
         // safe to run unconditionally.
         for mut agent in agents {
-            force_kill_child_and_wait(&mut agent.child);
+            crate::platform::proc::force_kill_child_and_wait(&mut agent.child);
         }
 
         self.change_notify.notify_one();
@@ -2651,48 +2484,9 @@ impl Drop for AgentPtyRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::OrchestrationSurfaceRole;
-    use std::time::Duration;
 
-    // PRD #92 F1 followup (auditor #3) — defensive boundary check on the
-    // `u32` PID → `libc::pid_t` PGID conversion used by the `killpg`
-    // call sites. The pre-followup code did `pid as i32` directly, which
-    // silently wrapped overflowing `u32` values into negative `i32`s
-    // (undefined behavior for `killpg`) and never guarded against
-    // `pgid == 0` (which `killpg(2)` documents as "signal every process
-    // in the *caller's* process group" — for the daemon that would
-    // signal itself plus every attach client). Real-world Linux PIDs
-    // are positive `i32` values, so this is defense-in-depth; the unit
-    // test pins the boundary semantics.
-
-    #[test]
-    fn pid_to_pgid_accepts_positive_normal_pid() {
-        assert_eq!(pid_to_pgid(1), Some(1));
-        assert_eq!(pid_to_pgid(12345), Some(12345));
-    }
-
-    #[test]
-    fn pid_to_pgid_rejects_zero_pid() {
-        // `killpg(0, ...)` would signal the caller's own group — for
-        // the daemon that's a fatal self-target. Must be filtered out.
-        assert_eq!(pid_to_pgid(0), None);
-    }
-
-    #[test]
-    fn pid_to_pgid_accepts_max_i32_pid() {
-        let max = i32::MAX as u32;
-        assert_eq!(pid_to_pgid(max), Some(i32::MAX));
-    }
-
-    #[test]
-    fn pid_to_pgid_rejects_overflowing_u32_pid() {
-        // Anything above i32::MAX would overflow the `as i32` cast in
-        // the pre-followup code into a negative pgid. The guard
-        // converts those to `None` so the kill path falls back to the
-        // single-PID `child.kill()` path.
-        assert_eq!(pid_to_pgid(i32::MAX as u32 + 1), None);
-        assert_eq!(pid_to_pgid(u32::MAX), None);
-    }
+    // PRD #42 M1: the `pid_to_pgid` boundary-check unit tests moved with the
+    // function to `crate::platform::proc` (see `src/platform/proc/unix.rs`).
 
     // PRD #76 M2.11 fixup 4 — pin the canonical name resolver so the UI
     // helper, the controller's new-pane path, and the rename path all
@@ -2965,6 +2759,19 @@ mod tests {
         };
         assert!(validate_tab_membership(tm).is_some());
     }
+}
+
+// PRD #42 M8/review B1: these tests spawn real PTYs running `/bin/sh` / `sh -c`
+// (and kill agents via `libc`), none of which exist on Windows. Gate the whole
+// block to Unix so the Windows `cargo nextest run` step compiles and does not
+// panic. The pure-logic tests above (`resolve_display_name_*`,
+// `validate_tab_membership_*`) stay cross-platform. No Unix coverage is lost —
+// every test here still runs on Unix.
+#[cfg(all(test, unix))]
+mod spawn_tests {
+    use super::*;
+    use crate::event::OrchestrationSurfaceRole;
+    use std::time::Duration;
 
     // ---------------------------------------------------------------------
     // PRD #120 — validate_orchestration_surface (the live-surface wire path
@@ -3915,6 +3722,12 @@ mod tests {
 
     /// Returns true if `kill(pid, 0)` reports the process is gone (ESRCH).
     /// `kill(pid, 0)` performs an existence check without actually signalling.
+    ///
+    /// PRD #42 M2: `kill(pid, 0)` is POSIX (no Windows analogue), so this
+    /// liveness helper and the three Drop/shutdown tests that use it are gated
+    /// to Unix. The same teardown logic on Windows is exercised via Job-Object
+    /// reaping under PRD #163.
+    #[cfg(unix)]
     fn pid_is_dead(pid: u32) -> bool {
         let r = unsafe { libc::kill(pid as i32, 0) };
         if r == 0 {
@@ -3924,6 +3737,7 @@ mod tests {
         errno == Some(libc::ESRCH)
     }
 
+    #[cfg(unix)]
     #[test]
     fn registry_shutdown_all_clears_state() {
         let registry = AgentPtyRegistry::new();
@@ -4051,6 +3865,7 @@ mod tests {
             .expect("agent exit must signal change_notify");
     }
 
+    #[cfg(unix)]
     #[test]
     fn registry_drop_kills_agents() {
         // Constructing-and-dropping a registry with a live agent must not
@@ -4074,6 +3889,7 @@ mod tests {
         assert!(pid_is_dead(pid), "pid {pid} should be dead after Drop");
     }
 
+    #[cfg(unix)]
     #[test]
     fn child_guard_drop_kills_orphan_child() {
         // Models the leak scenario the in-`spawn()` ChildGuard now covers:
