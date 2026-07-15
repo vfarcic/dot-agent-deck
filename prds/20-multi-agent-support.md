@@ -155,10 +155,10 @@ Captured here only so the follow-up PRDs have a starting point; **not in this PR
 - [ ] Codex CLI adapter working end-to-end via wrapper, with new L2 e2e coverage
 - [ ] `--agent` flag on `pane new` command with per-type default commands from the registry
 - [ ] Agent type filter support in `/` search (`src/ui.rs`)
-- [ ] Documentation: adapter authoring guide for third-party agents
+- [x] Documentation: adapter authoring guide for third-party agents (`docs/develop/agent-adapters.md`, linked from `CONTRIBUTING.md`)
 - [ ] All existing tests passing unchanged; new tests for the registry, wrapper, and Codex
-- [ ] **Follow-up PRD: Gemini adapter** — create a PRD for the Gemini CLI adapter (wrapper strategy; reuses `dot-agent-deck wrap` from this PRD)
-- [ ] **Follow-up PRD: Aider adapter** — create a PRD for the Aider adapter (introduces the log-watcher strategy + `watch --agent`)
+- [x] **Follow-up PRD: Gemini adapter** — [PRD #211](211-gemini-adapter.md) (wrapper strategy; reuses `dot-agent-deck wrap` from this PRD)
+- [x] **Follow-up PRD: Aider adapter** — [PRD #212](212-aider-adapter.md) (introduces the log-watcher strategy + `watch --agent`)
 
 ## Key Files
 
