@@ -581,6 +581,13 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     for arg in args {
         cmd.arg(arg);
     }
+    // Pin the child's cwd to the wrapper's own working directory. Unlike
+    // `std::process::Command`, `portable_pty`'s `CommandBuilder` does NOT
+    // resolve a relative program (e.g. `./tty-probe.sh`) against the process
+    // cwd when none is set — it would fail to find it — so set it explicitly.
+    if let Ok(dir) = std::env::current_dir() {
+        cmd.cwd(dir);
+    }
 
     let mut child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,
