@@ -25,6 +25,12 @@ pub enum AgentType {
     ClaudeCode,
     OpenCode,
     Pi,
+    /// OpenAI Codex CLI (PRD #20 M7) — the first wrapper-strategy agent. Wired
+    /// in via `dot-agent-deck wrap -- codex …`; its events are synthesized from
+    /// stdout by [`crate::wrap`] and ride the existing raw-`AgentEvent` socket.
+    /// Serializes to `"codex"` (snake_case); resolved from the `codex` binary
+    /// basename through the registry ([`crate::agent_registry`]).
+    Codex,
     /// "No recognized agent type." Produced by [`AgentType::from_command`] for
     /// any unrecognized binary, mapped to `Option::None` by
     /// [`crate::state::SessionState::live_snapshot`], and rendered as the "No
@@ -55,7 +61,8 @@ impl AgentType {
     /// sessions with the correct type instead of "No agent".
     ///
     /// Returns `Some(AgentType)` only for recognized agent binaries
-    /// (`claude` → `ClaudeCode`, `opencode` → `OpenCode`, `pi` → `Pi`);
+    /// (`claude` → `ClaudeCode`, `opencode` → `OpenCode`, `pi` → `Pi`,
+    /// `codex` → `Codex`);
     /// unknown commands and `None` input return `None` so the daemon stores
     /// "type not known yet" rather than misclassifying. Whitespace
     /// before the binary name is ignored to match shell-style invocations.

@@ -11,19 +11,18 @@
 //! CLI verb and native hooks use — so there is **no new wire** and no protocol
 //! change (rule 12): the wrapper is just another `AgentEvent` producer.
 //!
-//! This module ships the GENERIC strategy only. The pattern-detection seam is a
-//! small, data-driven [`RuleSet`] consulted by the pure [`classify_line`]
-//! function, and a [`Detector`] state machine that debounces repeated
-//! classifications into one event per state change. A later milestone (M7) adds
-//! Codex-specific rules as **data** — a new [`RuleSet`] keyed off the detected
-//! agent type / registry strategy — without rewriting the wrapper runtime. This
-//! is the PRD's "open design dial": how far pattern data lives in config vs.
-//! code is decided incrementally, and the seam here is deliberately just enough
-//! to make the generic case work and the Codex case a data add.
+//! The pattern-detection seam is a small, data-driven [`RuleSet`] consulted by
+//! the pure [`classify_line`] function, and a [`Detector`] state machine that
+//! debounces repeated classifications into one event per state change. PRD #20
+//! M7 proves the seam: Codex plugs in purely as **data** — the [`CODEX`]
+//! [`RuleSet`], selected by [`ruleset_for`] off the resolved agent type —
+//! without rewriting the wrapper runtime. This is the PRD's "open design dial":
+//! how far pattern data lives in config vs. code is decided incrementally, and
+//! the seam is deliberately just enough to make the generic case work and the
+//! Codex case a data add.
 //!
 //! The [`IntegrationStrategy::Wrapper`](crate::agent_registry::IntegrationStrategy::Wrapper)
-//! registry variant names this mechanism; no shipped agent uses it yet (Codex
-//! plugs in at M7).
+//! registry variant names this mechanism; Codex is its first consumer (M7).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -67,9 +66,9 @@ impl DetectedEvent {
 ///
 /// The rules are plain data (case-insensitive substrings) so a new agent's
 /// patterns are added as a new `RuleSet` value, not new control flow. The
-/// generic wrapper ships [`GENERIC`]; M7 adds a Codex `RuleSet` alongside it and
-/// selects between them by agent type, without touching [`classify_line_with`]
-/// or the wrapper runtime.
+/// generic wrapper ships [`GENERIC`]; the [`CODEX`] set lives alongside it and
+/// [`ruleset_for`] selects between them by agent type, without touching
+/// [`classify_line_with`] or the wrapper runtime.
 pub struct RuleSet {
     /// Case-insensitive substrings that mark a line as an error/failure.
     /// Checked first, so an error line is never misread as generic activity.
@@ -89,6 +88,35 @@ pub static GENERIC: RuleSet = RuleSet {
     error_markers: &["error", "panic", "traceback", "exception", "fatal"],
     idle_markers: &[],
 };
+
+/// PRD #20 M7 — the Codex (`codex exec --json`) rule set.
+///
+/// Codex emits one compact JSON object per line on stdout (JSONL). Rather than
+/// wait for process-exit quiescence like the generic set, we key card state off
+/// the record's `type` discriminator: a `turn.completed` record ends the turn
+/// (Idle) while the process is still alive, an `error` record is a failure, and
+/// every other record (`turn.started`, `item.started` reasoning /
+/// `command_execution`, …) is active work via the generic non-blank fallback.
+/// Markers match the compact `"type":"…"` discriminator specifically so
+/// incidental occurrences of the word "error" inside reasoning/command text
+/// never flip the card. Selected by [`ruleset_for`] when the resolved agent is
+/// [`AgentType::Codex`]; no change to [`classify_line_with`] or the runtime.
+pub static CODEX: RuleSet = RuleSet {
+    error_markers: &["\"type\":\"error\""],
+    idle_markers: &["\"type\":\"turn.completed\""],
+};
+
+/// Select the line-classification [`RuleSet`] for a resolved agent type. Codex
+/// gets its JSONL-aware [`CODEX`] rules; every other (or unknown) agent falls
+/// back to the agent-agnostic [`GENERIC`] rules. This is the M7 seam that keeps
+/// per-agent patterns as data — a new agent adds a `RuleSet` and an arm here,
+/// not new runtime control flow.
+fn ruleset_for(agent_type: &AgentType) -> &'static RuleSet {
+    match agent_type {
+        AgentType::Codex => &CODEX,
+        _ => &GENERIC,
+    }
+}
 
 /// Classify a single line of wrapped agent output using the [`GENERIC`] rules.
 ///
@@ -250,9 +278,9 @@ fn tee<R: Read, W: Write>(mut reader: R, mut writer: W, mut on_line: impl FnMut(
 /// a name the registry doesn't know yet becomes the neutral
 /// [`AgentType::None`] rather than a guess. Otherwise the type is inferred from
 /// the wrapped binary exactly like the TUI spawn sites
-/// ([`AgentType::from_command`]). Either way, once M7 adds Codex to the
-/// registry, `wrap -- codex` (or `--agent codex`) resolves to it with no change
-/// here.
+/// ([`AgentType::from_command`]). Either way, with Codex in the registry (M7),
+/// `wrap -- codex` (or `--agent codex`) resolves to it and [`ruleset_for`]
+/// selects the [`CODEX`] rules — with no change here.
 fn resolve_agent_type(agent_override: Option<&str>, program: &str) -> AgentType {
     if let Some(name) = agent_override {
         return crate::agent_registry::detect_from_basename(name).unwrap_or(AgentType::None);
@@ -336,8 +364,12 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     emitter.emit(EventType::SessionStart);
 
     // One shared detector so stdout and stderr contribute to a single,
-    // coherent session state (see `Detector`).
-    let detector = Arc::new(Mutex::new(Detector::new()));
+    // coherent session state (see `Detector`). PRD #20 M7: the rule set is
+    // keyed off the resolved agent type so `wrap --agent codex` classifies
+    // Codex JSONL, while any other command keeps the generic fallback.
+    let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
+        &emitter.agent_type,
+    ))));
 
     let stdout_thread = child.stdout.take().map(|out| {
         let emitter = Arc::clone(&emitter);

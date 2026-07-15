@@ -3233,6 +3233,51 @@ fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
     out
 }
 
+/// Truncate a sequence of styled title segments to `max_chars` total characters,
+/// appending a single `…` (in the last surviving segment's style) when they
+/// don't all fit. Produces the SAME character sequence as
+/// [`truncate_with_ellipsis`] on the concatenated text — so text-only snapshots
+/// are unchanged — but preserves each segment's style, letting the coloured
+/// agent-type badge (PRD #20 M5) keep its registry colour even on a narrow card.
+fn truncate_styled_segments(
+    segments: Vec<(String, Style)>,
+    max_chars: usize,
+) -> Vec<Span<'static>> {
+    if max_chars == 0 {
+        return Vec::new();
+    }
+    let total: usize = segments.iter().map(|(t, _)| t.chars().count()).sum();
+    if total <= max_chars {
+        return segments
+            .into_iter()
+            .map(|(t, s)| Span::styled(t, s))
+            .collect();
+    }
+    // Overflow: keep the first (max_chars - 1) chars, then a trailing ellipsis.
+    let keep = max_chars - 1;
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let mut last_style = text_primary();
+    for (text, style) in segments {
+        if used >= keep {
+            break;
+        }
+        let remaining = keep - used;
+        let cnt = text.chars().count();
+        last_style = style;
+        if cnt <= remaining {
+            used += cnt;
+            out.push(Span::styled(text, style));
+        } else {
+            let piece: String = text.chars().take(remaining).collect();
+            out.push(Span::styled(piece, style));
+            break;
+        }
+    }
+    out.push(Span::styled("…".to_string(), last_style));
+    out
+}
+
 /// Select deck at `idx` and focus its pane. Returns `true` if idx was valid.
 fn focus_deck(
     idx: usize,
@@ -12049,20 +12094,31 @@ fn render_session_card(
         None => String::new(),
     };
     let sel_prefix = if is_selected { "▸ " } else { "" };
-    let mut title_left = if let Some(name) = display_name {
-        format!(" {sel_prefix}{num_prefix}{} ", name)
+    let title_bold = text_primary().add_modifier(Modifier::BOLD);
+    // PRD #20 M5: the agent-type label carries its registry badge colour so the
+    // card exposes a coloured type badge (cross-agent: Claude / OpenCode / Pi /
+    // Codex each get their registry colour). The rest of the title stays primary
+    // text. A friendly `display_name` replaces the `<type> · <id>` form, so it
+    // shows no coloured type label. Segment concatenation is character-identical
+    // to the prior single-string title, so text-only snapshots are unchanged.
+    let title_segments: Vec<(String, Style)> = if let Some(name) = display_name {
+        vec![(format!(" {sel_prefix}{num_prefix}{name} "), title_bold)]
     } else {
-        format!(
-            " {sel_prefix}{num_prefix}{} · {} ",
-            session.agent_type, id_display
-        )
+        let badge_style = Style::default()
+            .fg(crate::agent_registry::spec(&session.agent_type).badge_color)
+            .add_modifier(Modifier::BOLD);
+        vec![
+            (format!(" {sel_prefix}{num_prefix}"), title_bold),
+            (format!("{}", session.agent_type), badge_style),
+            (format!(" · {id_display} "), title_bold),
+        ]
     };
 
     let dot = flash_dot(&session.status, tick);
     let status_text = format!(" {} {} ", dot, status_label);
     // area.width includes left+right borders (2 chars)
     let max_title = (area.width as usize).saturating_sub(status_text.chars().count() + 2);
-    title_left = truncate_with_ellipsis(&title_left, max_title);
+    let title_spans = truncate_styled_segments(title_segments, max_title);
 
     let border_style = if is_selected {
         // PRD #155 Option A: selection uses the dedicated `selected` accent role
@@ -12083,10 +12139,7 @@ fn render_session_card(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .title(Span::styled(
-            title_left,
-            text_primary().add_modifier(Modifier::BOLD),
-        ))
+        .title(Line::from(title_spans))
         .title_alignment(ratatui::layout::Alignment::Left)
         .title(
             Line::from(Span::styled(status_text, status_style))

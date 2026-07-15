@@ -108,6 +108,21 @@ pub static PI: AgentSpec = AgentSpec {
     badge_color: Color::LightCyan,
 };
 
+/// Codex — stdout-wrapper strategy (PRD #20 M7). The first agent to use the
+/// [`IntegrationStrategy::Wrapper`] mechanism: `dot-agent-deck wrap -- codex …`
+/// tees Codex's stdout through pattern detection into `AgentEvent`s. Its badge
+/// colour is a distinct named ANSI colour (LightYellow) — not reused by Claude
+/// (LightMagenta), OpenCode (LightGreen), or Pi (LightCyan), and never the
+/// neutral [`NONE`] DarkGray.
+pub static CODEX: AgentSpec = AgentSpec {
+    agent_type: AgentType::Codex,
+    label: "Codex",
+    detect_basenames: &["codex"],
+    default_command: Some("codex"),
+    strategy: Some(IntegrationStrategy::Wrapper),
+    badge_color: Color::LightYellow,
+};
+
 /// Neutral entry for the "no recognized agent" placeholder. Not a real agent:
 /// it has no detection basenames, no default command, and no integration
 /// strategy. It exists so registry lookups ([`spec`]) are total — the `Display`
@@ -125,7 +140,7 @@ pub static NONE: AgentSpec = AgentSpec {
 /// All SHIPPED, detectable agents, in a stable order. Excludes the neutral
 /// [`NONE`] placeholder — it is not a detectable agent and has no strategy to
 /// dispatch. Detection and startup auto-install iterate this slice.
-pub static ALL: &[&AgentSpec] = &[&CLAUDE_CODE, &OPEN_CODE, &PI];
+pub static ALL: &[&AgentSpec] = &[&CLAUDE_CODE, &OPEN_CODE, &PI, &CODEX];
 
 /// The registry entry for a given agent type. Total: every [`AgentType`]
 /// variant — including the neutral [`AgentType::None`] — maps to an entry, so
@@ -135,6 +150,7 @@ pub fn spec(agent_type: &AgentType) -> &'static AgentSpec {
         AgentType::ClaudeCode => &CLAUDE_CODE,
         AgentType::OpenCode => &OPEN_CODE,
         AgentType::Pi => &PI,
+        AgentType::Codex => &CODEX,
         AgentType::None => &NONE,
     }
 }
@@ -235,26 +251,41 @@ mod tests {
         assert_eq!(spec(&AgentType::None).strategy, None);
     }
 
-    /// `Wrapper` is defined but reserved for the coming Codex/Gemini work — no
-    /// shipped agent uses it yet. This guards against a stray registry edit
-    /// wiring a shipped agent to the not-yet-implemented wrapper mechanism.
+    /// PRD #20 M7: Codex is the wrapper-strategy agent. It is the ONLY shipped
+    /// agent that uses [`IntegrationStrategy::Wrapper`]; the others keep their
+    /// own mechanisms (native hooks / plugin / bundled extension). This guards
+    /// against a stray registry edit wiring another agent to the wrapper.
     #[test]
-    fn wrapper_strategy_is_reserved_and_unused() {
-        assert!(
-            ALL.iter()
-                .all(|spec| spec.strategy != Some(IntegrationStrategy::Wrapper)),
-            "no shipped agent should use the reserved Wrapper strategy yet"
+    fn only_codex_uses_wrapper_strategy() {
+        assert_eq!(
+            spec(&AgentType::Codex).strategy,
+            Some(IntegrationStrategy::Wrapper)
         );
+        for spec in ALL {
+            if spec.agent_type == AgentType::Codex {
+                continue;
+            }
+            assert_ne!(
+                spec.strategy,
+                Some(IntegrationStrategy::Wrapper),
+                "only Codex should use the Wrapper strategy"
+            );
+        }
     }
 
-    /// `ALL` holds exactly the three shipped, detectable agents (the neutral
+    /// `ALL` holds exactly the shipped, detectable agents (the neutral
     /// placeholder is excluded), and each entry round-trips through detection.
     #[test]
     fn all_holds_shipped_agents_and_round_trips() {
         let types: Vec<&AgentType> = ALL.iter().map(|spec| &spec.agent_type).collect();
         assert_eq!(
             types,
-            vec![&AgentType::ClaudeCode, &AgentType::OpenCode, &AgentType::Pi]
+            vec![
+                &AgentType::ClaudeCode,
+                &AgentType::OpenCode,
+                &AgentType::Pi,
+                &AgentType::Codex
+            ]
         );
         assert!(!ALL.iter().any(|spec| spec.agent_type == AgentType::None));
 
