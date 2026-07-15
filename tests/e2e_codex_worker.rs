@@ -53,8 +53,8 @@ async fn codex_worker_001_inner() {
         .expect("worker cwd is UTF-8")
         .to_string();
     let command = format!(
-        "codex --model {} --sandbox workspace-write --ask-for-approval never -c 'model_reasoning_effort=\"low\"'",
-        common::CODEX_TEST_MODEL
+        "codex --model {} --sandbox workspace-write --ask-for-approval never -c 'sandbox_workspace_write.network_access=true' -c 'model_reasoning_effort=\"low\"'",
+        common::CODEX_TEST_MODEL,
     );
 
     std::fs::write(
