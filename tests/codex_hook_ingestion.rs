@@ -101,12 +101,12 @@ fn codex_hooks_001_native_payloads_emit_rich_codex_events() {
                 "session_id": "codex-hooks-session",
                 "hook_event_name": "PreToolUse",
                 "cwd": "/tmp/codex-hooks",
-                "tool_name": "shell",
+                "tool_name": "Bash",
                 "tool_use_id": "shell-1",
-                "tool_input": {"command": ["/bin/sh", "-lc", "touch codex_hook_sentinel.txt"]}
+                "tool_input": {"command": "touch codex_hook_sentinel.txt"}
             }),
             EventType::ToolStart,
-            Some("shell"),
+            Some("Bash"),
             Some("touch codex_hook_sentinel.txt"),
             None,
         ),
@@ -115,13 +115,13 @@ fn codex_hooks_001_native_payloads_emit_rich_codex_events() {
                 "session_id": "codex-hooks-session",
                 "hook_event_name": "PostToolUse",
                 "cwd": "/tmp/codex-hooks",
-                "tool_name": "shell",
+                "tool_name": "Bash",
                 "tool_use_id": "shell-1",
-                "tool_input": {"command": ["/bin/sh", "-lc", "touch codex_hook_sentinel.txt"]},
-                "tool_response": {"exit_code": 0}
+                "tool_input": {"command": "touch codex_hook_sentinel.txt"},
+                "tool_response": ""
             }),
             EventType::ToolEnd,
-            Some("shell"),
+            Some("Bash"),
             Some("touch codex_hook_sentinel.txt"),
             None,
         ),
@@ -171,11 +171,11 @@ fn codex_hooks_001_native_payloads_emit_rich_codex_events() {
                 "session_id": "codex-hooks-session",
                 "hook_event_name": "PermissionRequest",
                 "cwd": "/tmp/codex-hooks",
-                "tool_name": "shell",
-                "tool_input": {"command": ["rm", "codex_hook_sentinel.txt"]}
+                "tool_name": "Bash",
+                "tool_input": {"command": "rm codex_hook_sentinel.txt"}
             }),
             EventType::PermissionRequest,
-            Some("shell"),
+            Some("Bash"),
             Some("codex_hook_sentinel.txt"),
             None,
         ),

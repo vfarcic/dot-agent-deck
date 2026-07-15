@@ -2822,16 +2822,10 @@ impl EventSub {
                 return ev.clone();
             }
             if Instant::now() >= deadline {
-                let seen: Vec<_> = self
-                    .events
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .map(|e| (e.agent_type.clone(), e.event_type.clone()))
-                    .collect();
+                let seen = self.events.lock().unwrap().clone();
                 panic!(
                     "no broadcast AgentEvent matched the predicate within {timeout:?}; \
-                     observed (agent_type, event_type): {seen:?}"
+                     observed events: {seen:#?}"
                 );
             }
             std::thread::sleep(Duration::from_millis(20));

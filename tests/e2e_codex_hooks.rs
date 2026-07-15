@@ -82,10 +82,7 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
         |event| {
             event.agent_type == AgentType::Codex
                 && event.event_type == EventType::Thinking
-                && event
-                    .user_prompt
-                    .as_deref()
-                    .is_some_and(|value| value.contains(HOOK_SENTINEL_NAME))
+                && event.user_prompt.as_deref() == Some(prompt.as_str())
         },
         Duration::from_secs(120),
     );
@@ -100,7 +97,7 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
         |event| {
             event.agent_type == AgentType::Codex
                 && event.event_type == EventType::ToolStart
-                && event.tool_name.as_deref() == Some("shell")
+                && event.tool_name.as_deref() == Some("Bash")
                 && event
                     .tool_detail
                     .as_deref()
@@ -108,11 +105,11 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
         },
         Duration::from_secs(120),
     );
-    assert_eq!(tool_start.tool_name.as_deref(), Some("shell"));
+    assert_eq!(tool_start.tool_name.as_deref(), Some("Bash"));
     assert!(
-        deck.wait_for_grid_string_within("shell", Duration::from_secs(30))
+        deck.wait_for_grid_string_within("Bash", Duration::from_secs(30))
             && deck.wait_for_grid_string_within(HOOK_SENTINEL_NAME, Duration::from_secs(30)),
-        "the Codex shell tool name and command detail never appeared on the dashboard card:\n{}",
+        "the Codex Bash tool name and command detail never appeared on the dashboard card:\n{}",
         deck.snapshot_grid()
     );
 
@@ -120,7 +117,7 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
         |event| {
             event.agent_type == AgentType::Codex
                 && event.event_type == EventType::ToolEnd
-                && event.tool_name.as_deref() == Some("shell")
+                && event.tool_name.as_deref() == Some("Bash")
         },
         Duration::from_secs(120),
     );
@@ -129,7 +126,7 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
             .tool_detail
             .as_deref()
             .is_some_and(|value| value.contains(HOOK_SENTINEL_NAME)),
-        "Codex PostToolUse lost the shell command detail: {tool_end:?}"
+        "Codex PostToolUse lost the Bash command detail: {tool_end:?}"
     );
 
     let idle = events.wait_for(
