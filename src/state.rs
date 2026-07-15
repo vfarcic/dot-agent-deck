@@ -263,6 +263,19 @@ pub struct AppState {
     /// Empty in the common case; bounded by `MAX_PENDING_ORCHESTRATION_SURFACES`
     /// (L1) so a flood can't grow it unbounded.
     pub pending_orchestration_surfaces: Vec<OrchestrationSurface>,
+    /// PRD #20 R20-003 (finding #4): the DAEMON-AUTHORITATIVE hook session id
+    /// (the "generation") currently bound to each pane, keyed by `pane_id`.
+    /// Captured from every event's ORIGINAL `session_id` BEFORE the same-agent
+    /// reuse guard in [`Self::apply_event`] remaps that id onto the stable card
+    /// id. Without this separate track, a same-agent `/clear` / thread restart
+    /// (which mints a NEW hook session under the SAME `agent_id`) is remapped
+    /// back onto the OLD card id, so the card's `session_id` — and thus
+    /// [`Self::pane_session_id`] — keeps reporting the OLD generation, and an old
+    /// queued prompt bound to it is wrongly accepted in the NEW conversation.
+    /// The atomic write-and-submit guard compares the caller's expected session
+    /// against [`Self::pane_hook_session_id`] (this map) instead, so a stale
+    /// generation is refused with no bytes. Cleared on `SessionEnd`.
+    pane_hook_session: HashMap<String, String>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -788,6 +801,23 @@ impl AppState {
             .map(|s| s.session_id.clone())
     }
 
+    /// PRD #20 R20-003 (finding #4): the DAEMON-AUTHORITATIVE hook session id
+    /// (generation) currently bound to `pane_id`, or `None` when the pane has no
+    /// live hook session (only a placeholder, or the agent ended).
+    ///
+    /// Unlike [`Self::pane_session_id`] — which returns the *card* id that the
+    /// same-agent reuse guard deliberately keeps STABLE across a `/clear` for UI
+    /// continuity — this reflects the LATEST hook `session_id` the pane's agent
+    /// actually reported (see [`AppState::pane_hook_session`]). The atomic
+    /// write-and-submit guard compares a caller's `expected_session_id` against
+    /// THIS value and requires an EXACT match: a same-agent `/clear` / thread
+    /// restart rolls the generation over, so an old queued prompt is refused.
+    /// A `None` here with an expected session supplied is a REJECTION, not a
+    /// silent accept — the queued generation no longer exists.
+    pub fn pane_hook_session_id(&self, pane_id: &str) -> Option<String> {
+        self.pane_hook_session.get(pane_id).cloned()
+    }
+
     /// Register a pane ID as managed by our app.
     pub fn register_pane(&mut self, pane_id: String) {
         self.managed_pane_ids.insert(pane_id);
@@ -1151,6 +1181,11 @@ impl AppState {
     }
 
     pub fn apply_event(&mut self, mut event: AgentEvent) {
+        // PRD #20 R20-003 (finding #4): the ORIGINAL hook `session_id` on the
+        // wire, captured BEFORE the same-agent reuse guard below remaps it onto
+        // the stable card id. This is the generation the daemon's send guard
+        // compares against — see [`Self::pane_hook_session`].
+        let incoming_session_id = event.session_id.clone();
         // Only accept events from panes managed by our app.
         // Events without a pane_id (external agents) are rejected when we have
         // managed panes. Events with an unknown pane_id are rejected unless it
@@ -1268,6 +1303,14 @@ impl AppState {
         }
 
         if event.event_type == EventType::SessionEnd {
+            // PRD #20 R20-003 (finding #4): the agent ended, so drop the pane's
+            // hook-session generation. A prompt queued for the now-dead session
+            // then hits a `None` current-session in the send guard and is
+            // refused (a `None` with an expected session is a rejection, never a
+            // silent accept).
+            if let Some(ref pane_id) = event.pane_id {
+                self.pane_hook_session.remove(pane_id);
+            }
             // Preserve started_at for the pane so a restarted session keeps its position.
             //
             // PRD #110 followup: also capture the dying session's `agent_id`
@@ -1298,6 +1341,17 @@ impl AppState {
                 self.insert_placeholder_session(pane_id, cwd, None, agent_id);
             }
             return;
+        }
+
+        // PRD #20 R20-003 (finding #4): record the LATEST hook-session generation
+        // for this pane using the ORIGINAL (pre-remap) session id. A same-agent
+        // `/clear` mints a new hook session under the SAME agent_id — the reuse
+        // guard above remapped `event.session_id` back to the old card id for UI
+        // continuity, but the generation tracked here rolls forward, so the send
+        // guard refuses an old queued prompt against the new conversation.
+        if let Some(ref pane_id) = event.pane_id {
+            self.pane_hook_session
+                .insert(pane_id.clone(), incoming_session_id.clone());
         }
 
         let pane_started = event

@@ -355,6 +355,16 @@ pub enum SendResult {
     HistoryOnly,
     /// Nothing to write to.
     NoLiveTarget,
+    /// PRD #20 R20-004 (finding #3): a write STARTED reaching the target but the
+    /// full payload+submit sequence did not complete (a partial write followed
+    /// by a writer error). Some bytes MAY already have been delivered, so this is
+    /// neither a clean success nor a safely-retryable failure: the daemon caches
+    /// it against the `delivery_id` so a retry REPLAYS this (does not blind-submit
+    /// again, which could duplicate the partial input), and the UI surfaces it as
+    /// a terminal non-delivery rather than looping a retry. Older clients decode
+    /// the unknown `"ambiguous"` value to [`SendResult::Unknown`] (also treated as
+    /// a non-delivered, conservative outcome), so it stays forward-compatible.
+    Ambiguous,
     /// PRD #20 R20-011: forward-compat catch-all. A future daemon may report an
     /// honest outcome this build does not know; a pre-`serde(other)` reader would
     /// reject the whole [`crate::daemon_protocol::AttachResponse`] as malformed

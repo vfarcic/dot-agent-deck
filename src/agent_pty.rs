@@ -1013,12 +1013,14 @@ const SCROLLBACK_CAP_BYTES: usize = 1024 * 1024;
 /// the protocol layer (the client can reattach and replay the snapshot).
 const BROADCAST_CAPACITY: usize = 4096;
 
-/// PRD #20 R20-004: cap on the atomic-send idempotency cache
-/// ([`AgentPtyRegistry::delivery_results`]). Far above any plausible number of
-/// distinct in-flight deliveries; on overflow the cache is cleared wholesale
-/// (bounding memory) — a delivery id evicted this way would re-submit only on a
-/// retry arriving after that many other deliveries, which never happens inside a
-/// real (seconds-long) retry window.
+/// PRD #20 R20-004 (finding #3): cap on the atomic-send idempotency ledger
+/// ([`AgentPtyRegistry::delivery_ledger`]). Far above any plausible number of
+/// distinct in-flight deliveries. On overflow the ledger evicts the OLDEST
+/// entries one at a time (LRU) rather than clearing wholesale — the old
+/// wholesale clear could wipe a delivery id that was STILL retrying, re-enabling
+/// a duplicate submit; LRU eviction only ever drops the least-recently-touched
+/// ids, which are the ones a real (seconds-long) retry window has long since
+/// abandoned.
 const MAX_DELIVERY_RESULTS: usize = 8192;
 
 /// Per-agent broadcast bus. Producers (the reader thread) atomically append
@@ -1196,6 +1198,12 @@ pub enum GuardedSend {
     Stale,
     /// No live registry entry owns the pane. No bytes written.
     NoLiveTarget,
+    /// PRD #20 R20-004 (finding #3): the write to the authorized target STARTED
+    /// but the full payload+submit sequence did not complete (a partial write
+    /// then a writer error). Some bytes may already have reached the PTY, so the
+    /// delivery is AMBIGUOUS — it must be recorded (not blindly retried into a
+    /// duplicate). Maps to [`crate::event::SendResult::Ambiguous`].
+    Ambiguous,
 }
 
 /// PRD #20 R20-003/R20-006: the live target that currently owns a pane, resolved
@@ -1205,6 +1213,172 @@ struct PaneWriterTarget {
     writer: Arc<AsyncMutex<Box<dyn std::io::Write + Send>>>,
     agent_id: String,
     exited: Arc<AtomicBool>,
+}
+
+/// PRD #20 R20-004 (finding #3): one ledger record per seen `delivery_id`.
+struct DeliveryRecord {
+    /// Fingerprint of (target agent identity + pane + text). A reuse of the id
+    /// with a DIFFERENT fingerprint is a conflict, never a replay.
+    fingerprint: u64,
+    /// Single-flight lock: the FIRST attempt for this id holds it while it
+    /// computes the outcome; a concurrent duplicate awaits it, then re-reads
+    /// `result` — so two in-flight duplicates never both submit.
+    lock: Arc<AsyncMutex<()>>,
+    /// The cached outcome once a DELIVERED (`applied`/`queued`) or `ambiguous`
+    /// attempt completes. Stays `None` while the first attempt is in flight AND
+    /// after a NON-delivered outcome (history-only / stale / wrong-session /
+    /// no-live-target), so a later retry re-attempts — a role that becomes live
+    /// still gets its prompt, while a real delivery is never repeated.
+    result: Option<crate::event::SendResult>,
+}
+
+/// PRD #20 R20-004 (finding #3): atomic, fingerprint-bound idempotency ledger.
+/// See [`AgentPtyRegistry::delivery_ledger`].
+#[derive(Default)]
+struct DeliveryLedger {
+    records: HashMap<String, DeliveryRecord>,
+    /// LRU order — front = least-recently-used, back = most-recent. A touched or
+    /// inserted id moves to the back; eviction drops from the front.
+    order: VecDeque<String>,
+}
+
+impl DeliveryLedger {
+    /// Move `id` to the most-recently-used position.
+    fn touch(&mut self, id: &str) {
+        if let Some(pos) = self.order.iter().position(|k| k == id) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(id.to_string());
+    }
+
+    /// Drop the record entirely (a non-delivered outcome stays retryable).
+    fn forget(&mut self, id: &str) {
+        self.records.remove(id);
+        if let Some(pos) = self.order.iter().position(|k| k == id) {
+            self.order.remove(pos);
+        }
+    }
+
+    /// Evict least-recently-used records until at most [`MAX_DELIVERY_RESULTS`]
+    /// remain. Unlike the old wholesale clear, this never drops a
+    /// recently-touched (still-retrying) id.
+    fn evict_to_cap(&mut self) {
+        while self.records.len() > MAX_DELIVERY_RESULTS {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.records.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// PRD #20 R20-004 (finding #3): the outcome of admitting a `delivery_id` into
+/// the ledger before a guarded send runs.
+pub enum DeliveryAdmission {
+    /// This id already completed with a MATCHING fingerprint — replay verbatim,
+    /// do NOT write again.
+    Replay(crate::event::SendResult),
+    /// This id was reused with a DIFFERENT fingerprint (payload/target changed) —
+    /// refuse; never replay a false success onto conflicting content.
+    Conflict,
+    /// First attempt (or a retry of a still-retryable non-delivered outcome):
+    /// the caller should compute and then record via
+    /// [`AgentPtyRegistry::record_delivery_outcome`]. The permit holds the
+    /// single-flight guard so concurrent duplicates wait behind it.
+    Proceed(DeliveryPermit),
+}
+
+/// PRD #20 R20-004 (finding #3): RAII-ish permit returned by
+/// [`AgentPtyRegistry::admit_delivery`]. Holds the single-flight guard for the
+/// admitted `delivery_id` until dropped; carry it to
+/// [`AgentPtyRegistry::record_delivery_outcome`] to publish the result.
+pub struct DeliveryPermit {
+    delivery_id: String,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// PRD #20 R20-004 (finding #3): the outcome of physically writing a payload +
+/// submit CR to a PTY writer, classifying WHERE a write error struck.
+#[derive(Debug, PartialEq, Eq)]
+enum PayloadDelivery {
+    /// Payload and submit CR both fully written.
+    Applied,
+    /// Some bytes were written but the sequence did not complete — a partial
+    /// write. The bytes may already have reached the target; the caller must NOT
+    /// blind-retry (that could duplicate the partial input).
+    Ambiguous,
+    /// The very first byte could not be written — nothing reached the target, so
+    /// a retry is safe. Carries the error text for surfacing.
+    CleanFailure(String),
+}
+
+/// How far a single `write_all`-style loop got before an error.
+enum WriteProgress {
+    Complete,
+    /// >0 bytes written, then an error / write-zero.
+    Partial,
+    /// 0 bytes written — the first write failed (nothing reached the target).
+    NothingWritten(String),
+}
+
+/// Write all of `buf`, tracking whether any bytes reached the writer so a
+/// partial write can be told apart from a clean first-write failure. Retries on
+/// `Interrupted` like `write_all`.
+fn write_all_tracked(w: &mut (dyn std::io::Write + Send), buf: &[u8]) -> WriteProgress {
+    let mut written = 0usize;
+    while written < buf.len() {
+        match w.write(&buf[written..]) {
+            Ok(0) => {
+                return if written == 0 {
+                    WriteProgress::NothingWritten("writer accepted zero bytes".to_string())
+                } else {
+                    WriteProgress::Partial
+                };
+            }
+            Ok(n) => written += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return if written == 0 {
+                    WriteProgress::NothingWritten(e.to_string())
+                } else {
+                    WriteProgress::Partial
+                };
+            }
+        }
+    }
+    WriteProgress::Complete
+}
+
+/// PRD #20 R20-004 (finding #3): write `payload`, wait `SUBMIT_DELAY`, then write
+/// a submit CR — reporting a partial write as [`PayloadDelivery::Ambiguous`]
+/// rather than a clean failure. Extracted from
+/// [`AgentPtyRegistry::write_and_submit_guarded`] so the ambiguity classification
+/// is unit-testable against a fault-injecting writer.
+async fn deliver_payload_and_submit(
+    w: &mut (dyn std::io::Write + Send),
+    payload: &[u8],
+) -> PayloadDelivery {
+    match write_all_tracked(w, payload) {
+        WriteProgress::Complete => {}
+        // Payload partially written — bytes may have reached the PTY.
+        WriteProgress::Partial => return PayloadDelivery::Ambiguous,
+        // Nothing written — safe to retry.
+        WriteProgress::NothingWritten(e) => return PayloadDelivery::CleanFailure(e),
+    }
+    let _ = w.flush();
+    tokio::time::sleep(SUBMIT_DELAY).await;
+    // The payload already landed; ANY failure writing the submit CR now leaves
+    // the target holding un-submitted payload bytes — ambiguous, not clean.
+    match write_all_tracked(w, b"\r") {
+        WriteProgress::Complete => {}
+        WriteProgress::Partial | WriteProgress::NothingWritten(_) => {
+            return PayloadDelivery::Ambiguous;
+        }
+    }
+    let _ = w.flush();
+    PayloadDelivery::Applied
 }
 
 /// One agent owned by the registry: child + master + shared writer + bus.
@@ -1448,16 +1622,16 @@ pub struct AgentPtyRegistry {
     /// so a scheduled delivery never resets its own debounce clock. In-memory,
     /// monotonically growing by `pane_id_env` seen (negligible).
     user_input_at: Mutex<HashMap<String, Instant>>,
-    /// PRD #20 R20-004: idempotency cache for atomic write-and-submit. Keyed by
-    /// the caller's stable `delivery_id`, holding the first honest
-    /// [`crate::event::SendResult`] produced for it. A retry after a lost
-    /// response (an ambiguous transport failure re-sent with the SAME id)
-    /// replays the cached result instead of writing again, so a destructive
-    /// prompt is never submitted twice. Bounded — see
-    /// [`MAX_DELIVERY_RESULTS`]; a delivery id evicted after that many distinct
-    /// deliveries could re-submit on a very late retry, which is implausible
-    /// within any real retry window.
-    delivery_results: Mutex<HashMap<String, crate::event::SendResult>>,
+    /// PRD #20 R20-004 (finding #3): atomic, fingerprint-bound idempotency ledger
+    /// for guarded write-and-submit. Keyed by the caller's stable `delivery_id`;
+    /// each record binds the id to a fingerprint of the target agent identity,
+    /// pane, and text, and carries a single-flight async lock. Concurrent
+    /// duplicates of one id serialize on that lock and REPLAY the leader's result
+    /// instead of both submitting; a retry after a lost response replays the
+    /// cached delivered (or ambiguous) result; reusing an id with a DIFFERENT
+    /// fingerprint is a CONFLICT (never a false replay). Bounded by LRU eviction —
+    /// see [`MAX_DELIVERY_RESULTS`].
+    delivery_ledger: Mutex<DeliveryLedger>,
 }
 
 struct RegistryInner {
@@ -1495,7 +1669,7 @@ impl AgentPtyRegistry {
             change_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
             user_input_at: Mutex::new(HashMap::new()),
-            delivery_results: Mutex::new(HashMap::new()),
+            delivery_ledger: Mutex::new(DeliveryLedger::default()),
         }
     }
 
@@ -1959,26 +2133,116 @@ impl AgentPtyRegistry {
             .await
     }
 
-    /// PRD #20 R20-004: replay the cached honest result for a previously-seen
-    /// `delivery_id`, or `None` if this is the first time. See
-    /// [`Self::delivery_results`].
-    pub fn cached_delivery_result(&self, delivery_id: &str) -> Option<crate::event::SendResult> {
-        self.delivery_results
-            .lock()
-            .unwrap()
-            .get(delivery_id)
-            .copied()
+    /// PRD #20 R20-004 (finding #3): a stable fingerprint of a delivery's
+    /// identity — the (expected) target agent id, the pane, and the exact text.
+    /// A `delivery_id` is bound to its fingerprint at first admission; a later
+    /// request that reuses the id with a DIFFERENT fingerprint is refused as a
+    /// conflict rather than replaying the first (unrelated) result. Process-local
+    /// (the ledger never crosses the wire), so `DefaultHasher` is sufficient.
+    pub fn delivery_fingerprint(expected_agent_id: Option<&str>, pane_id: &str, text: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        expected_agent_id.hash(&mut h);
+        pane_id.hash(&mut h);
+        text.hash(&mut h);
+        h.finish()
     }
 
-    /// PRD #20 R20-004: record the honest result produced for `delivery_id` so a
-    /// later retry with the same id replays it instead of writing again. Bounded
-    /// by [`MAX_DELIVERY_RESULTS`] (cleared wholesale on overflow).
-    pub fn record_delivery_result(&self, delivery_id: &str, result: crate::event::SendResult) {
-        let mut map = self.delivery_results.lock().unwrap();
-        if map.len() >= MAX_DELIVERY_RESULTS && !map.contains_key(delivery_id) {
-            map.clear();
+    /// PRD #20 R20-004 (finding #3): admit a `delivery_id` + `fingerprint` into
+    /// the idempotency ledger before a guarded send. Atomic and single-flight:
+    ///
+    /// * an id already completed with a MATCHING fingerprint → [`DeliveryAdmission::Replay`];
+    /// * an id reused with a DIFFERENT fingerprint → [`DeliveryAdmission::Conflict`];
+    /// * otherwise → [`DeliveryAdmission::Proceed`] holding the single-flight
+    ///   guard, so a concurrent duplicate blocks and replays this attempt's
+    ///   result instead of double-submitting.
+    pub async fn admit_delivery(&self, delivery_id: &str, fingerprint: u64) -> DeliveryAdmission {
+        // Phase 1 (sync): immediate replay/conflict check + get-or-create the
+        // per-id single-flight lock.
+        let lock = {
+            let mut ledger = self.delivery_ledger.lock().unwrap();
+            if let Some(rec) = ledger.records.get(delivery_id) {
+                if rec.fingerprint != fingerprint {
+                    return DeliveryAdmission::Conflict;
+                }
+                if let Some(result) = rec.result {
+                    ledger.touch(delivery_id);
+                    return DeliveryAdmission::Replay(result);
+                }
+                rec.lock.clone()
+            } else {
+                let lock = Arc::new(AsyncMutex::new(()));
+                ledger.records.insert(
+                    delivery_id.to_string(),
+                    DeliveryRecord {
+                        fingerprint,
+                        lock: lock.clone(),
+                        result: None,
+                    },
+                );
+                ledger.touch(delivery_id);
+                lock
+            }
+        };
+        // Phase 2 (async): serialize concurrent duplicates of this id.
+        let guard = lock.lock_owned().await;
+        // Phase 3 (sync): double-check — another attempt may have completed (or a
+        // conflicting reuse landed) while we waited for the single-flight lock.
+        {
+            let mut ledger = self.delivery_ledger.lock().unwrap();
+            if let Some(rec) = ledger.records.get(delivery_id) {
+                if rec.fingerprint != fingerprint {
+                    return DeliveryAdmission::Conflict;
+                }
+                if let Some(result) = rec.result {
+                    ledger.touch(delivery_id);
+                    return DeliveryAdmission::Replay(result);
+                }
+            }
         }
-        map.insert(delivery_id.to_string(), result);
+        DeliveryAdmission::Proceed(DeliveryPermit {
+            delivery_id: delivery_id.to_string(),
+            _guard: guard,
+        })
+    }
+
+    /// PRD #20 R20-004 (finding #3): publish the honest `outcome` produced for a
+    /// [`DeliveryPermit`]. A DELIVERED (`applied`/`queued`) or `ambiguous`
+    /// outcome is CACHED so a retry (or a concurrent duplicate still awaiting the
+    /// single-flight lock) replays it instead of writing again. Every other
+    /// (non-delivered) outcome is FORGOTTEN so a later retry re-attempts — a
+    /// history-only role that becomes live must still receive its prompt.
+    pub fn record_delivery_outcome(
+        &self,
+        permit: &DeliveryPermit,
+        outcome: crate::event::SendResult,
+    ) {
+        use crate::event::SendResult;
+        let cache = matches!(
+            outcome,
+            SendResult::Applied | SendResult::Queued | SendResult::Ambiguous
+        );
+        let mut ledger = self.delivery_ledger.lock().unwrap();
+        if cache {
+            if let Some(rec) = ledger.records.get_mut(&permit.delivery_id) {
+                rec.result = Some(outcome);
+            }
+            ledger.touch(&permit.delivery_id);
+            ledger.evict_to_cap();
+        } else {
+            ledger.forget(&permit.delivery_id);
+        }
+    }
+
+    /// PRD #20 R20-004 (finding #3): forget an in-flight delivery whose attempt
+    /// failed CLEANLY (a transport error before any byte reached the target), so
+    /// a retry re-attempts rather than being pinned to a stale in-flight record.
+    /// The single-flight guard releases when the caller drops the permit.
+    pub fn forget_delivery(&self, permit: &DeliveryPermit) {
+        self.delivery_ledger
+            .lock()
+            .unwrap()
+            .forget(&permit.delivery_id);
     }
 
     /// PRD #20 R20-003/R20-006: the live target that currently owns `pane_id`,
@@ -1986,6 +2250,42 @@ impl AgentPtyRegistry {
     /// registry id, and its `exited` liveness token so the caller can bind
     /// authorization to the EXACT identity and re-check it after acquiring the
     /// writer. Skips exited entries (mirrors [`Self::write_to_pane_internal`]).
+    /// PRD #20 R20-006 (finding #7): the registry id of the live (non-exited)
+    /// agent that CURRENTLY owns `pane_id`, or `None` if no live entry does. The
+    /// attach input path calls this AFTER acquiring the target writer to
+    /// re-authorize a stream write against the current owner: a close/respawn
+    /// that landed while the frame waited for the writer flips the owner (a
+    /// different id) or removes it (`None`), so no bytes reach a stale/removed
+    /// target. Mirrors the exited-entry skip of [`Self::writer_target_for_pane`].
+    pub fn pane_current_agent_id(&self, pane_id: &str) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .agents
+            .iter()
+            .find(|(_, a)| {
+                a.pane_id_env.as_deref() == Some(pane_id) && !a.exited.load(Ordering::SeqCst)
+            })
+            .map(|(id, _)| id.clone())
+    }
+
+    /// PRD #20 R20-003 (finding #4): whether a deck client is CURRENTLY attached
+    /// to (driving) `pane_id` — i.e. its agent's PTY stream has ≥1 live
+    /// subscriber. The write-and-submit session guard uses this to scope its
+    /// strictest check: a stale prompt that would surface in a LIVE INTERACTIVE
+    /// conversation (an attached pane the user is watching — finding #4's actual
+    /// threat) is refused even when the pane reports NO current hook session,
+    /// whereas a headless, unattached delivery with a confirmed agent identity
+    /// proceeds. In the real deck the TUI is always attached to a pane it drives,
+    /// so the strict guard applies to every real automatic-prompt delivery.
+    pub fn pane_has_live_attach(&self, pane_id: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.agents.values().any(|a| {
+            a.pane_id_env.as_deref() == Some(pane_id)
+                && !a.exited.load(Ordering::SeqCst)
+                && a.bus.receiver_count() > 0
+        })
+    }
+
     fn writer_target_for_pane(&self, pane_id: &str) -> Option<PaneWriterTarget> {
         let inner = self.inner.lock().unwrap();
         inner
@@ -2027,7 +2327,6 @@ impl AgentPtyRegistry {
     where
         Fut: std::future::Future<Output = bool>,
     {
-        use std::io::Write as _;
         let Some(target) = self.writer_target_for_pane(pane_id) else {
             return Ok(GuardedSend::NoLiveTarget);
         };
@@ -2059,14 +2358,15 @@ impl AgentPtyRegistry {
         }
         // Authorized — write + submit, holding the writer across the whole
         // sequence (mirrors `write_to_pane_internal`'s atomic submit contract).
-        w.write_all(&payload)
-            .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
-        let _ = w.flush();
-        tokio::time::sleep(SUBMIT_DELAY).await;
-        w.write_all(b"\r")
-            .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
-        let _ = w.flush();
-        Ok(GuardedSend::Applied)
+        // PRD #20 R20-004 (finding #3): classify WHERE a writer error struck. A
+        // failure before any byte reached the PTY is a clean, retryable transport
+        // error; a partial write (payload started, or the submit CR failed after
+        // the payload landed) is AMBIGUOUS and must not be blind-retried.
+        match deliver_payload_and_submit(&mut **w, &payload).await {
+            PayloadDelivery::Applied => Ok(GuardedSend::Applied),
+            PayloadDelivery::Ambiguous => Ok(GuardedSend::Ambiguous),
+            PayloadDelivery::CleanFailure(e) => Err(AgentPtyError::Writer(e)),
+        }
     }
 
     /// Writes bytes to the pane's PTY without triggering submission semantics
@@ -4849,5 +5149,246 @@ mod tests {
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back.rows, 0);
         assert_eq!(back.cols, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #20 R20-004 (finding #3): delivery-ledger idempotency + partial-write
+    // ambiguity. Coder-authored targeted coverage for the W3-Pass-1 items the
+    // tester left (redtests.md "Harness Gaps": partial-write fault injection).
+    // -----------------------------------------------------------------------
+
+    /// A `std::io::Write` that accepts at most `budget` bytes total, then errors —
+    /// the fault seam the tester noted the registry lacked. Lets us drive
+    /// `deliver_payload_and_submit` through the "nothing written / partial /
+    /// complete" branches without a real (unfaultable) PTY writer.
+    struct FaultyWriter {
+        budget: usize,
+        written: usize,
+    }
+
+    impl std::io::Write for FaultyWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.written >= self.budget {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "faulty writer budget exhausted",
+                ));
+            }
+            let n = buf.len().min(self.budget - self.written);
+            self.written += n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_payload_classifies_partial_write_as_ambiguous() {
+        // Payload fully written AND submit CR written → Applied.
+        let mut w = FaultyWriter {
+            budget: b"hello".len() + 1,
+            written: 0,
+        };
+        assert_eq!(
+            deliver_payload_and_submit(&mut w, b"hello").await,
+            PayloadDelivery::Applied
+        );
+
+        // First byte can't be written (0 bytes reached the target) → a clean,
+        // retryable transport failure, NOT ambiguous.
+        let mut w = FaultyWriter {
+            budget: 0,
+            written: 0,
+        };
+        assert!(matches!(
+            deliver_payload_and_submit(&mut w, b"hello").await,
+            PayloadDelivery::CleanFailure(_)
+        ));
+
+        // Some payload bytes reached the target, then the writer errored →
+        // AMBIGUOUS (must not be blind-retried into a duplicate).
+        let mut w = FaultyWriter {
+            budget: 2,
+            written: 0,
+        };
+        assert_eq!(
+            deliver_payload_and_submit(&mut w, b"hello").await,
+            PayloadDelivery::Ambiguous
+        );
+
+        // Payload fully written but the submit CR fails → still AMBIGUOUS (the
+        // target holds un-submitted payload bytes).
+        let mut w = FaultyWriter {
+            budget: b"hello".len(),
+            written: 0,
+        };
+        assert_eq!(
+            deliver_payload_and_submit(&mut w, b"hello").await,
+            PayloadDelivery::Ambiguous
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_ledger_replays_delivered_and_ambiguous_but_retries_non_delivery() {
+        use crate::event::SendResult;
+        let reg = AgentPtyRegistry::new();
+        let fp = AgentPtyRegistry::delivery_fingerprint(Some("agent-1"), "pane", "text");
+
+        // First admission proceeds; record a DELIVERED outcome.
+        let permit = match reg.admit_delivery("did-applied", fp).await {
+            DeliveryAdmission::Proceed(p) => p,
+            DeliveryAdmission::Replay(_) => panic!("first admission must Proceed, got Replay"),
+            DeliveryAdmission::Conflict => panic!("first admission must Proceed, got Conflict"),
+        };
+        reg.record_delivery_outcome(&permit, SendResult::Applied);
+        drop(permit);
+        // A retry with the SAME id+fingerprint REPLAYS (no re-submit).
+        assert!(matches!(
+            reg.admit_delivery("did-applied", fp).await,
+            DeliveryAdmission::Replay(SendResult::Applied)
+        ));
+
+        // AMBIGUOUS is cached too — a partial write must not be blind-retried.
+        let permit = match reg.admit_delivery("did-ambiguous", fp).await {
+            DeliveryAdmission::Proceed(p) => p,
+            _ => panic!("expected Proceed"),
+        };
+        reg.record_delivery_outcome(&permit, SendResult::Ambiguous);
+        drop(permit);
+        assert!(matches!(
+            reg.admit_delivery("did-ambiguous", fp).await,
+            DeliveryAdmission::Replay(SendResult::Ambiguous)
+        ));
+
+        // A NON-delivered outcome is FORGOTTEN — a later retry re-attempts (a
+        // history-only role that becomes live must still get its prompt).
+        let permit = match reg.admit_delivery("did-history", fp).await {
+            DeliveryAdmission::Proceed(p) => p,
+            _ => panic!("expected Proceed"),
+        };
+        reg.record_delivery_outcome(&permit, SendResult::HistoryOnly);
+        drop(permit);
+        assert!(matches!(
+            reg.admit_delivery("did-history", fp).await,
+            DeliveryAdmission::Proceed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn delivery_ledger_conflicting_fingerprint_reuse_is_refused() {
+        use crate::event::SendResult;
+        let reg = AgentPtyRegistry::new();
+        let fp_a = AgentPtyRegistry::delivery_fingerprint(Some("agent-1"), "pane", "payload-a");
+        let fp_b = AgentPtyRegistry::delivery_fingerprint(Some("agent-1"), "pane", "payload-b");
+        assert_ne!(fp_a, fp_b, "distinct payloads must fingerprint differently");
+
+        let permit = match reg.admit_delivery("shared-id", fp_a).await {
+            DeliveryAdmission::Proceed(p) => p,
+            _ => panic!("expected Proceed"),
+        };
+        reg.record_delivery_outcome(&permit, SendResult::Applied);
+        drop(permit);
+
+        // Reusing the SAME id with a DIFFERENT fingerprint must be a Conflict,
+        // never a false replay of the first (unrelated) result.
+        assert!(matches!(
+            reg.admit_delivery("shared-id", fp_b).await,
+            DeliveryAdmission::Conflict
+        ));
+    }
+
+    /// PRD #20 R20-006 (finding #7): removal-after-authorization barrier. Hold
+    /// the target writer externally so a guarded send blocks AFTER its pre-lock
+    /// identity gate but BEFORE the write; remove the agent (registry entry gone)
+    /// while it waits; then release. The post-writer-lock re-resolution must find
+    /// NO current owner for the pane and return `Stale` with NO bytes written —
+    /// closing the window where a close/respawn lands after authorization.
+    #[tokio::test]
+    async fn guarded_send_rejects_agent_removal_after_writer_lock() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let id = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "pane-removal-barrier".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn agent");
+
+        // Acquire the EXACT writer the guarded send will contend for, and hold it.
+        let target = reg
+            .writer_target_for_pane("pane-removal-barrier")
+            .expect("live target for pane");
+        let guard = target.writer.lock().await;
+
+        let reg_for_task = reg.clone();
+        let mut task = tokio::spawn(async move {
+            reg_for_task
+                .write_and_submit_guarded(
+                    "pane-removal-barrier",
+                    "printf 'REMOVED-AFTER-AUTH'",
+                    None,
+                    // Liveness always "ok" — the ONLY thing that must reject is
+                    // the removal re-resolution under the held writer.
+                    || async { true },
+                )
+                .await
+        });
+
+        // Precondition: the send is parked on the held writer (authorized, not
+        // yet written).
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut task)
+                .await
+                .is_err(),
+            "precondition: guarded send must block on the held writer"
+        );
+
+        // Remove the agent WHILE the send holds authorization but waits for the
+        // writer.
+        reg.close_agent(&id).expect("close agent");
+        drop(guard);
+
+        let result = task.await.unwrap().expect("guarded send result");
+        assert_eq!(
+            result,
+            GuardedSend::Stale,
+            "a target removed while the send waited for its writer must be refused as Stale (no bytes)"
+        );
+
+        reg.shutdown_all();
+    }
+
+    #[test]
+    fn delivery_ledger_lru_touch_and_forget() {
+        let mut ledger = DeliveryLedger::default();
+        let mk = |fp| DeliveryRecord {
+            fingerprint: fp,
+            lock: Arc::new(AsyncMutex::new(())),
+            result: None,
+        };
+        ledger.records.insert("a".into(), mk(1));
+        ledger.touch("a");
+        ledger.records.insert("b".into(), mk(2));
+        ledger.touch("b");
+        ledger.records.insert("c".into(), mk(3));
+        ledger.touch("c");
+        // Touch "a" → it becomes most-recent, so the LRU front is now "b".
+        ledger.touch("a");
+        assert_eq!(
+            ledger.order.iter().cloned().collect::<Vec<_>>(),
+            vec!["b".to_string(), "c".to_string(), "a".to_string()],
+            "touch must move an id to the most-recent (back) position"
+        );
+        // forget drops from both maps.
+        ledger.forget("c");
+        assert!(!ledger.records.contains_key("c"));
+        assert_eq!(
+            ledger.order.iter().cloned().collect::<Vec<_>>(),
+            vec!["b".to_string(), "a".to_string()]
+        );
     }
 }

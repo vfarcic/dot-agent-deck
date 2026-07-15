@@ -1393,6 +1393,89 @@ fn pane_input_013_liveness_is_rechecked_after_writer_lock() {
     });
 }
 
+/// PRD #20 R20-006/R20-007 (finding #7 + #10, coder-authored): the SHARED
+/// attach-stream write path must RE-VALIDATE liveness AFTER acquiring the PTY
+/// writer — not only in the pre-lock snapshot. Hold the writer externally so a
+/// `KIND_STREAM_IN` frame passes its pre-lock (Live) checks and then blocks; flip
+/// the pane to history-only WHILE it waits; release. The frame must be refused
+/// after the writer lock (no bytes reach the PTY) and produce a typed, non-empty
+/// `KIND_STREAM_REJECT` frame while the stream stays open — the post-lock TOCTOU
+/// window pane_input_005 (pre-lock transition only) can't cover.
+#[test]
+fn stream_write_revalidates_liveness_after_writer_lock() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build stream post-lock barrier runtime");
+    runtime.block_on(async {
+        let server = start_server().await;
+        let pane_id = "pane-stream-postlock";
+        let id = start_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let now = chrono::Utc::now();
+        let event = |event_type, writable| AgentEvent {
+            session_id: "stream-postlock-session".to_string(),
+            agent_type: AgentType::Codex,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: now,
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(id.clone()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(LiveTarget {
+                kind: TargetKind::Pty,
+                writable,
+            }),
+        };
+        {
+            let mut state = server.state.write().await;
+            state.register_pane(pane_id.to_string());
+            state.apply_event(event(EventType::SessionStart, Writable::Live));
+        }
+
+        let mut attached = connect_attach(&server, &id).await;
+        // Acquire the SAME writer the input loop contends for, and hold it so the
+        // STREAM_IN frame parks AFTER its pre-lock (Live) checks.
+        let writer = server.registry.subscribe(&id).unwrap().writer;
+        let writer_guard = writer.lock().await;
+
+        write_frame(
+            &mut attached,
+            KIND_STREAM_IN,
+            b"printf 'STREAM-POSTLOCK-MARKER\\n'\n",
+        )
+        .await;
+        // Give the input loop time to pass the pre-lock (Live) checks and block on
+        // the held writer.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Now the frame is parked on the writer — flip liveness so ONLY the
+        // post-writer-lock re-validation can catch it.
+        {
+            let mut state = server.state.write().await;
+            state.apply_event(event(EventType::Thinking, Writable::HistoryOnly));
+        }
+        drop(writer_guard);
+
+        let reached = stream_contains_within(
+            &mut attached,
+            b"STREAM-POSTLOCK-MARKER",
+            Duration::from_millis(750),
+        )
+        .await;
+        assert!(
+            !reached,
+            "a frame that became history-only while waiting for the writer must not reach the PTY"
+        );
+
+        server.registry.close_agent(&id).unwrap();
+    });
+}
+
 async fn pane_input_005_stream_rejects_key_and_paste_after_live_transition_inner() {
     let server = start_server().await;
     let pane_id = "pane-live-transition";

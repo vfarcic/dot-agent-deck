@@ -1255,6 +1255,40 @@ fn send_retry_delay(attempts: u32) -> std::time::Duration {
     std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << shift)).min(CAP)
 }
 
+/// PRD #20 R20-004 (finding #3): hard cap on how long an automatic prompt (a
+/// mode seed or an orchestrator role prompt) is retried before it is abandoned.
+/// The deadline is checked BEFORE the readiness/backoff/delivery branches so it
+/// is actually reachable — the previous code checked it only after the delivery
+/// branch, which always returned first, so a permanent non-delivery
+/// (`wrong-session`, a never-live role) retried one RPC every ~2s forever.
+const AUTOMATIC_PROMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// PRD #20 R20-004 (finding #3): mint a GLOBALLY-UNIQUE delivery id for an
+/// automatic prompt. The old `seed-<pane>-<seq>` restarted its counter at 1 in
+/// EVERY TUI process while the daemon's dedup ledger persists — so a reconnecting
+/// (restarted) TUI could reuse an id the daemon still had cached and have a
+/// genuinely-new prompt silently suppressed (or replayed against conflicting
+/// content). This combines a per-PROCESS nonce (two processes never collide)
+/// with a global monotonic counter (two ids within one process never collide),
+/// keyed by pane for log readability.
+fn mint_delivery_id(pane_id: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nonce = *NONCE.get_or_init(|| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::process::id().hash(&mut h);
+        // Nanos since the epoch disambiguate a pid reused across restarts.
+        if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            dur.as_nanos().hash(&mut h);
+        }
+        h.finish()
+    });
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("send-{nonce:016x}-{pane_id}-{seq}")
+}
+
 struct UiState {
     mode: UiMode,
     /// PRD #113: the Dashboard's selection is active/inactive. `Some(i)` paints
@@ -1452,9 +1486,6 @@ struct UiState {
     /// so every (re)delivery carries the same agent identity + stable delivery
     /// id. Keyed by pane id; cleared when the prompt is delivered or abandoned.
     prompt_delivery: HashMap<String, PromptDelivery>,
-    /// PRD #20 R20-004: monotonic counter backing the per-prompt `delivery_id`,
-    /// so each queued automatic prompt gets a distinct, stable idempotency key.
-    next_delivery_seq: u64,
     /// PRD #127 M3.3: schedules listed in the "Scheduled Tasks" manager dialog,
     /// loaded from the global config when the dialog opens.
     scheduled_tasks: Vec<config::ScheduledTask>,
@@ -1619,7 +1650,8 @@ impl UiState {
             pending_seed_prompts: Vec::new(),
             send_retry_backoff: HashMap::new(),
             prompt_delivery: HashMap::new(),
-            next_delivery_seq: 0,
+            // next_delivery_seq removed (PRD #20 finding #3): delivery ids are now
+            // minted globally unique via `mint_delivery_id`.
             scheduled_tasks: Vec::new(),
             scheduled_selected: 0,
             scheduled_delete_confirm: false,
@@ -2493,8 +2525,19 @@ fn process_pending_seed_prompts(
     let mut prompts = std::mem::take(&mut ui.pending_seed_prompts);
     let mut backoff = std::mem::take(&mut ui.send_retry_backoff);
     let mut deliveries = std::mem::take(&mut ui.prompt_delivery);
-    let mut next_seq = ui.next_delivery_seq;
     prompts.retain_mut(|sp| {
+        // PRD #20 R20-005 (finding #13): the hard timeout is checked FIRST, before
+        // the readiness/backoff/delivery branches — so it is actually reachable.
+        // The old code checked it only AFTER the delivery branch (which always
+        // returned first), making the 60s deadline unreachable: a permanent
+        // non-delivery re-attempted one RPC every ~2s forever. An expired seed is
+        // abandoned here with NO further delivery attempt.
+        if sp.created_at.elapsed() > AUTOMATIC_PROMPT_DEADLINE {
+            tracing::warn!(pane_id = %sp.pane_id, "seed prompt: timed out; abandoning");
+            backoff.remove(&sp.pane_id);
+            deliveries.remove(&sp.pane_id);
+            return false;
+        }
         // Fast path: agent fired SessionStart (agent_type resolved).
         let agent_ready = snapshot.sessions.values().any(|s| {
             s.pane_id.as_deref() == Some(sp.pane_id.as_str()) && s.agent_type != AgentType::None
@@ -2524,14 +2567,19 @@ fn process_pending_seed_prompts(
             // this pane. Captured once and reused across retries so the daemon
             // dedups on a stable `delivery_id` and validates the queued-for agent.
             let delivery = deliveries.entry(sp.pane_id.clone()).or_insert_with(|| {
-                next_seq = next_seq.wrapping_add(1);
                 PromptDelivery {
-                    // See `capture_prompt_delivery`: agent id is the reliable
-                    // cross-boundary identity; session id is intentionally not
-                    // captured from the UI's (placeholder-bearing) session view.
+                    // Agent id is the reliable cross-boundary identity. PRD #20
+                    // finding #4: ALSO capture the daemon-authoritative hook
+                    // session generation (`None` for a placeholder-only pane, so
+                    // the daemon applies no session check there) so a same-agent
+                    // `/clear` between enqueue and delivery is refused by the
+                    // daemon rather than delivering the old prompt into the new
+                    // conversation.
                     expected_agent_id: pane.pane_agent_id(&sp.pane_id),
-                    expected_session_id: None,
-                    delivery_id: format!("seed-{}-{next_seq}", sp.pane_id),
+                    expected_session_id: snapshot.pane_hook_session_id(&sp.pane_id),
+                    // PRD #20 finding #3: globally-unique id (process nonce +
+                    // global counter), not a per-process `seed-<pane>-N`.
+                    delivery_id: mint_delivery_id(&sp.pane_id),
                 }
             });
             let expected_agent_id = delivery.expected_agent_id.clone();
@@ -2550,7 +2598,9 @@ fn process_pending_seed_prompts(
                     deliveries.remove(&sp.pane_id);
                     return false;
                 }
-                // Explicit non-delivery: retain for retry, back off, surface feedback.
+                // Explicit non-delivery: retain for retry, back off, surface
+                // feedback. Bounded by the deadline checked at the top of this
+                // closure (finding #13) — never a forever loop.
                 Ok(other) => {
                     schedule_send_retry(&mut backoff, &sp.pane_id, now);
                     feedback = Some(format!(
@@ -2567,19 +2617,11 @@ fn process_pending_seed_prompts(
                 }
             }
         }
-        // Hard timeout after 60s — give up.
-        if sp.created_at.elapsed() > std::time::Duration::from_secs(60) {
-            tracing::warn!(pane_id = %sp.pane_id, "seed prompt: timed out waiting for agent");
-            backoff.remove(&sp.pane_id);
-            deliveries.remove(&sp.pane_id);
-            return false;
-        }
         true
     });
     ui.pending_seed_prompts = prompts;
     ui.send_retry_backoff = backoff;
     ui.prompt_delivery = deliveries;
-    ui.next_delivery_seq = next_seq;
     if let Some(message) = feedback {
         ui.status_message = Some((message, now));
     }
@@ -2608,8 +2650,6 @@ fn schedule_send_retry(
 /// if one exists, and a fresh stable `delivery_id` for idempotent retries.
 /// Overwrites any prior entry: a re-enqueue starts a fresh delivery.
 fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneController) {
-    ui.next_delivery_seq = ui.next_delivery_seq.wrapping_add(1);
-    let seq = ui.next_delivery_seq;
     // The daemon-side agent id currently bound to this pane (the registry key,
     // == the client's stream-backend `agent_id`). This is the reliable identity:
     // a respawn/rebind rolls it over, so the daemon's guard catches a stale
@@ -2625,9 +2665,188 @@ fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneContr
         PromptDelivery {
             expected_agent_id,
             expected_session_id: None,
-            delivery_id: format!("seed-{pane_id}-{seq}"),
+            // PRD #20 finding #3: globally-unique id (process nonce + global
+            // counter) so a TUI restart can't collide with the daemon's still-live
+            // dedup ledger.
+            delivery_id: mint_delivery_id(pane_id),
         },
     );
+}
+
+/// PRD #20 R20-005 (finding #13): whether a non-delivered [`SendResult`] is
+/// TERMINAL — retrying it can never succeed (or, for `Ambiguous`, must not be
+/// retried at all) — versus a RETRYABLE liveness transition that may become
+/// deliverable once the target settles. Terminal outcomes are abandoned with
+/// feedback rather than looped every ~2s until the deadline; retryable ones are
+/// retried (still bounded by [`AUTOMATIC_PROMPT_DEADLINE`]).
+///
+/// * TERMINAL: `WrongSession` (the queued identity is permanently wrong),
+///   `Unknown` (a future outcome this build can't act on), `Ambiguous` (a
+///   partial write — a retry could duplicate the input).
+/// * RETRYABLE: `HistoryOnly` / `Stale` / `NoLiveTarget` (the target may become
+///   live / re-settle). `Applied` / `Queued` never reach this helper.
+fn is_terminal_send_result(result: SendResult) -> bool {
+    matches!(
+        result,
+        SendResult::WrongSession | SendResult::Unknown | SendResult::Ambiguous
+    )
+}
+
+/// PRD #20 R20-005 (finding #13): abandon an orchestrator role prompt — clear
+/// its prompt (so the render-loop gate stops re-entering), drop its retry/
+/// delivery/ready-since state, and surface `msg`. Used on the deadline and on a
+/// terminal send outcome.
+fn abandon_orchestrator_prompt(
+    ui: &mut UiState,
+    tab_id: TabId,
+    start_pane_id: &str,
+    orchestrator_prompt: &mut Option<String>,
+    now: std::time::Instant,
+    msg: String,
+) {
+    *orchestrator_prompt = None;
+    ui.send_retry_backoff.remove(start_pane_id);
+    ui.prompt_delivery.remove(start_pane_id);
+    ui.orchestration_ready_since.remove(&tab_id);
+    ui.status_message = Some((msg, now));
+}
+
+/// PRD #20 R20-003/004/005 (findings #5, #13): deliver (or retry, or abandon) an
+/// orchestrator start-role prompt for ONE orchestration tab. Extracted from the
+/// render loop with an INJECTED `now` so the deadline / terminal-outcome policy
+/// is unit-testable with a controlled clock (the render loop passes
+/// `Instant::now()`).
+///
+/// Preconditions (the caller's gate): `orchestrator_prompt.is_some()` and the
+/// tab is not already prompted.
+#[allow(clippy::too_many_arguments)]
+fn deliver_orchestrator_prompt(
+    ui: &mut UiState,
+    pane: &dyn PaneController,
+    snapshot: &AppState,
+    now: std::time::Instant,
+    tab_id: TabId,
+    role_pane_ids: &[String],
+    start_role_index: usize,
+    role_statuses: &mut [OrchestrationRoleStatus],
+    orchestrator_prompt: &mut Option<String>,
+) {
+    let start_pane_id = role_pane_ids[start_role_index].clone();
+
+    // PRD #20 R20-005 (finding #13): DEADLINE FIRST — before the readiness /
+    // backoff / delivery branches — so the hard timeout is actually reachable.
+    // The old block had no orchestrator deadline at all, so a permanent
+    // non-delivery retried one RPC every ~2s forever.
+    if ui
+        .orchestration_created_at
+        .get(&tab_id)
+        .is_some_and(|t| now.duration_since(*t) > AUTOMATIC_PROMPT_DEADLINE)
+    {
+        tracing::warn!(pane_id = %start_pane_id, "orchestrator prompt: timed out; abandoning");
+        abandon_orchestrator_prompt(
+            ui,
+            tab_id,
+            &start_pane_id,
+            orchestrator_prompt,
+            now,
+            "Orchestrator prompt not delivered (timed out); abandoned".to_string(),
+        );
+        return;
+    }
+
+    let agent_ready = snapshot.sessions.values().any(|s| {
+        s.pane_id.as_deref() == Some(start_pane_id.as_str()) && s.agent_type != AgentType::None
+    });
+    let timeout_ready = !agent_ready
+        && ui
+            .orchestration_created_at
+            .get(&tab_id)
+            .is_some_and(|t| now.duration_since(*t) > std::time::Duration::from_secs(10));
+    if agent_ready {
+        ui.orchestration_ready_since.entry(tab_id).or_insert(now);
+    }
+    let buffer_elapsed = if timeout_ready {
+        true
+    } else {
+        should_inject_spawn_time_prompt(ui.orchestration_ready_since.get(&tab_id).copied(), now)
+    };
+    let backed_off = ui
+        .send_retry_backoff
+        .get(start_pane_id.as_str())
+        .is_some_and(|s| now < s.next_attempt_at);
+    if !((agent_ready || timeout_ready) && buffer_elapsed && !backed_off) {
+        return;
+    }
+
+    // PRD #20 R20-003/004 (finding #5 fallback): normally the identity was
+    // captured at tab creation; capture lazily here only if that didn't happen.
+    if !ui.prompt_delivery.contains_key(start_pane_id.as_str()) {
+        capture_prompt_delivery(ui, &start_pane_id, pane);
+    }
+    let (expected_agent_id, expected_session_id, delivery_id) =
+        match ui.prompt_delivery.get(start_pane_id.as_str()) {
+            Some(d) => (
+                d.expected_agent_id.clone(),
+                d.expected_session_id.clone(),
+                Some(d.delivery_id.clone()),
+            ),
+            None => (None, None, None),
+        };
+    let prompt_text = orchestrator_prompt
+        .as_deref()
+        .unwrap_or_default()
+        .to_string();
+    match pane.write_and_submit_to_pane_with_identity(
+        &start_pane_id,
+        &prompt_text,
+        expected_agent_id.as_deref(),
+        expected_session_id.as_deref(),
+        delivery_id.as_deref(),
+    ) {
+        Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
+            *orchestrator_prompt = None;
+            role_statuses[start_role_index] = OrchestrationRoleStatus::Working;
+            ui.orchestration_prompted.insert(tab_id);
+            ui.send_retry_backoff.remove(start_pane_id.as_str());
+            ui.prompt_delivery.remove(start_pane_id.as_str());
+            ui.orchestration_ready_since.remove(&tab_id);
+        }
+        // PRD #20 finding #13: a TERMINAL outcome is abandoned (no forever
+        // retry); a RETRYABLE liveness transition is retried under backoff,
+        // bounded by the deadline checked at the top of this function.
+        Ok(other) if is_terminal_send_result(other) => {
+            abandon_orchestrator_prompt(
+                ui,
+                tab_id,
+                &start_pane_id,
+                orchestrator_prompt,
+                now,
+                format!(
+                    "Orchestrator prompt not delivered ({}); abandoned",
+                    describe_send_result(other)
+                ),
+            );
+        }
+        Ok(other) => {
+            schedule_send_retry(&mut ui.send_retry_backoff, &start_pane_id, now);
+            let msg = if other == SendResult::HistoryOnly {
+                "History-only session cannot accept live input".to_string()
+            } else {
+                format!(
+                    "Orchestrator prompt not delivered ({}); will retry",
+                    describe_send_result(other)
+                )
+            };
+            ui.status_message = Some((msg, now));
+        }
+        Err(e) => {
+            schedule_send_retry(&mut ui.send_retry_backoff, &start_pane_id, now);
+            ui.status_message = Some((
+                format!("Orchestrator prompt not delivered ({e}); will retry"),
+                now,
+            ));
+        }
+    }
 }
 
 /// PRD #20 blocker-3: wrap a bare, about-to-be-TYPED launch command for a
@@ -2655,6 +2874,9 @@ fn describe_send_result(result: SendResult) -> &'static str {
         SendResult::NoLiveTarget => "no live target",
         SendResult::Stale => "stale target",
         SendResult::WrongSession => "wrong session",
+        // PRD #20 R20-004 (finding #3): a partial write — bytes may have reached
+        // the target, so retrying is unsafe. Terminal, not retried.
+        SendResult::Ambiguous => "ambiguous partial write",
         // PRD #20 R20-011: a forward-compat outcome this build doesn't know —
         // describe it as an undelivered outcome (it is never a delivered success).
         SendResult::Unknown => "unknown outcome",
@@ -3603,6 +3825,40 @@ fn non_live_input_feedback(writable: crate::event::Writable) -> Option<&'static 
         }
         crate::event::Writable::None => Some("View-only session cannot accept live input"),
     }
+}
+
+/// PRD #20 R20-007 (finding #10): human-readable feedback for a typed daemon
+/// stream-rejection `reason` (a `KIND_STREAM_REJECT` frame's payload).
+fn stream_reject_message(reason: &str) -> String {
+    match reason {
+        "history-only" => "Input not delivered: session is history-only".to_string(),
+        "exited" => "Input not delivered: the agent has exited".to_string(),
+        "stale" | "wrong-session" => "Input not delivered: the pane's session changed".to_string(),
+        other => format!("Input not delivered ({other})"),
+    }
+}
+
+/// PRD #20 R20-007 (finding #10): consume a daemon stream-rejection for
+/// `rejected_pane_id` (reason `reason`) that arrived asynchronously on the
+/// attach stream. When it targets the focused pane AND the UI is in PaneInput,
+/// surface honest feedback and LEAVE PaneInput — for BOTH key and paste, since
+/// the daemon rejects them identically. This closes the server/UI race the
+/// pre-forward liveness snapshot (`non_live_input_feedback`) can't: the snapshot
+/// may still read `Live` when the daemon has already gone non-live. Returns
+/// `true` if it acted (test seam).
+fn apply_stream_rejection_feedback(
+    ui: &mut UiState,
+    focused_pane_id: Option<&str>,
+    rejected_pane_id: &str,
+    reason: &str,
+    now: std::time::Instant,
+) -> bool {
+    if focused_pane_id != Some(rejected_pane_id) || ui.mode != UiMode::PaneInput {
+        return false;
+    }
+    ui.status_message = Some((stream_reject_message(reason), now));
+    ui.mode = UiMode::Normal;
+    true
 }
 
 /// Select deck at `idx` and focus its pane. Returns `true` if idx was valid.
@@ -5926,6 +6182,21 @@ fn dispatch_action(
                             }
                             let start_idx =
                                 orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
+                            // PRD #20 R20-003 (finding #5): capture the START
+                            // role's delivery IDENTITY *now* — immediately after
+                            // `open_orchestration_tab` created the role panes —
+                            // not lazily at the first delivery attempt. If the
+                            // start pane is rebound while we wait for SessionStart
+                            // / the readiness buffer / the 10s fallback, a lazy
+                            // capture would bind the OLD orchestrator prompt to the
+                            // REPLACEMENT agent and deliver it there. Capturing
+                            // here freezes the identity to the agent that owns the
+                            // pane at creation, so the daemon refuses a stale
+                            // delivery to a replacement. Only when the role
+                            // actually carries a prompt to deliver.
+                            if !captured_prompt.is_empty() {
+                                capture_prompt_delivery(ui, &role_pane_ids[start_idx], pane);
+                            }
                             // PRD #89 M2b.2 — capture the orchestration metadata
                             // onto the START (orchestrator) role pane so the
                             // daemon-empty restore path can rebuild the whole tab
@@ -7466,6 +7737,17 @@ pub fn run_tui(
                                     ui.orchestration_created_at
                                         .insert(*id, std::time::Instant::now());
                                 }
+                                // PRD #20 R20-003 (finding #5): capture the start
+                                // role's delivery identity NOW (restore path too),
+                                // so a rebind before the replayed prompt fires
+                                // can't redirect it to a replacement agent.
+                                if !orch_snap.orchestrator_prompt.is_empty() {
+                                    capture_prompt_delivery(
+                                        &mut ui,
+                                        &role_pane_ids[saved_start_idx],
+                                        pane.as_ref(),
+                                    );
+                                }
                                 if first_restored_orch_tab.is_none() {
                                     first_restored_orch_tab = Some(tab_idx);
                                 }
@@ -8179,6 +8461,11 @@ pub fn run_tui(
         // Inject orchestrator prompt when start role agent becomes ready.
         // Fast path: Claude Code fires SessionStart immediately (agent_type != None).
         // Slow path: agents like opencode don't signal — fall back after 10 seconds.
+        // PRD #20 R20-005 (finding #13): the per-tab delivery / retry / abandon
+        // policy (including the reachable hard deadline and terminal-outcome
+        // handling) lives in `deliver_orchestrator_prompt`, which takes an
+        // injected `now` so it is unit-testable with a controlled clock.
+        let orch_now = std::time::Instant::now();
         for tab in tab_manager.tabs_mut() {
             if let Tab::Orchestration {
                 id,
@@ -8191,128 +8478,17 @@ pub fn run_tui(
                 && orchestrator_prompt.is_some()
                 && !ui.orchestration_prompted.contains(id)
             {
-                let start_pane_id = &role_pane_ids[*start_role_index];
-                let agent_ready = snapshot.sessions.values().any(|s| {
-                    s.pane_id.as_deref() == Some(start_pane_id) && s.agent_type != AgentType::None
-                });
-                let timeout_ready = !agent_ready
-                    && ui
-                        .orchestration_created_at
-                        .get(id)
-                        .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(10));
-                // PRD #128 Direction B-1 — record the moment SessionStart
-                // was first observed for this orchestration so the
-                // readiness buffer can be measured from it. The timeout
-                // path bypasses the buffer because by then Claude Code
-                // either fired SessionStart far earlier or never will, so
-                // any further wait would just deepen the user-visible
-                // hang.
-                if agent_ready {
-                    ui.orchestration_ready_since
-                        .entry(*id)
-                        .or_insert_with(std::time::Instant::now);
-                }
-                let buffer_elapsed = if timeout_ready {
-                    true
-                } else {
-                    should_inject_spawn_time_prompt(
-                        ui.orchestration_ready_since.get(id).copied(),
-                        std::time::Instant::now(),
-                    )
-                };
-                // PRD #20 R20-005: hold off a retry until the backoff window
-                // elapses, so a permanent non-delivery (history-only role,
-                // wrong-session, daemon error) doesn't re-attempt every frame.
-                let now = std::time::Instant::now();
-                let backed_off = ui
-                    .send_retry_backoff
-                    .get(start_pane_id.as_str())
-                    .is_some_and(|s| now < s.next_attempt_at);
-                if (agent_ready || timeout_ready) && buffer_elapsed && !backed_off {
-                    // PRD #128 audit S2: emit a one-shot operator-visible
-                    // log right before the write fires. Distinct target
-                    // from `pane_write` so an operator can flip on the
-                    // buffer trail without also enabling the per-byte
-                    // trace. `debug!` (not `trace!`) because this is an
-                    // operational, once-per-spawn event.
-                    if let Some(rs) = ui.orchestration_ready_since.get(id) {
-                        tracing::debug!(
-                            target: "spawn_time_buffer",
-                            elapsed_ms = rs.elapsed().as_millis() as u64,
-                            pane_id = %start_pane_id,
-                            "spawn-time readiness buffer elapsed; proceeding with role prompt write"
-                        );
-                    }
-                    // PRD #20 R20-003/004: capture (once) the delivery identity
-                    // for this role pane so a rebind before delivery is caught
-                    // daemon-side and retries share a stable idempotency key.
-                    if !ui.prompt_delivery.contains_key(start_pane_id.as_str()) {
-                        capture_prompt_delivery(&mut ui, start_pane_id, &*pane);
-                    }
-                    let (expected_agent_id, expected_session_id, delivery_id) =
-                        match ui.prompt_delivery.get(start_pane_id.as_str()) {
-                            Some(d) => (
-                                d.expected_agent_id.clone(),
-                                d.expected_session_id.clone(),
-                                Some(d.delivery_id.clone()),
-                            ),
-                            None => (None, None, None),
-                        };
-                    // PRD #20 blocker-5: the send OUTCOME controls retention +
-                    // role state. Do NOT take the prompt or mark the role
-                    // Working until delivery is confirmed — a role that
-                    // declared history-only must RETAIN its prompt for a retry
-                    // once it becomes live, and must show honest feedback
-                    // instead of a false Working. Only `Applied`/`Queued`
-                    // consume the prompt and advance the role; every other
-                    // outcome leaves the prompt in place (retried after backoff)
-                    // and surfaces feedback.
-                    let prompt_text = orchestrator_prompt
-                        .as_deref()
-                        .unwrap_or_default()
-                        .to_string();
-                    match pane.write_and_submit_to_pane_with_identity(
-                        start_pane_id,
-                        &prompt_text,
-                        expected_agent_id.as_deref(),
-                        expected_session_id.as_deref(),
-                        delivery_id.as_deref(),
-                    ) {
-                        Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
-                            *orchestrator_prompt = None;
-                            role_statuses[*start_role_index] = OrchestrationRoleStatus::Working;
-                            ui.orchestration_prompted.insert(*id);
-                            ui.send_retry_backoff.remove(start_pane_id.as_str());
-                            ui.prompt_delivery.remove(start_pane_id.as_str());
-                            // PRD #128 audit N1: the ready-since timestamp is
-                            // load-bearing only between SessionStart and the
-                            // buffered write. Once the write fires this entry
-                            // is dead state — drop it so the map size matches
-                            // the count of pending orchestration spawns rather
-                            // than accumulating over the session.
-                            ui.orchestration_ready_since.remove(id);
-                        }
-                        Ok(other) => {
-                            schedule_send_retry(&mut ui.send_retry_backoff, start_pane_id, now);
-                            let msg = if other == SendResult::HistoryOnly {
-                                "History-only session cannot accept live input".to_string()
-                            } else {
-                                format!(
-                                    "Orchestrator prompt not delivered ({}); will retry",
-                                    describe_send_result(other)
-                                )
-                            };
-                            ui.status_message = Some((msg, std::time::Instant::now()));
-                        }
-                        Err(e) => {
-                            schedule_send_retry(&mut ui.send_retry_backoff, start_pane_id, now);
-                            ui.status_message = Some((
-                                format!("Orchestrator prompt not delivered ({e}); will retry"),
-                                std::time::Instant::now(),
-                            ));
-                        }
-                    }
-                }
+                deliver_orchestrator_prompt(
+                    &mut ui,
+                    &*pane,
+                    &snapshot,
+                    orch_now,
+                    *id,
+                    role_pane_ids.as_slice(),
+                    *start_role_index,
+                    role_statuses.as_mut_slice(),
+                    orchestrator_prompt,
+                );
             }
         }
 
@@ -8328,6 +8504,28 @@ pub fn run_tui(
         // PRD #127 M3.1: deliver any mode `seed_prompt`s whose agent pane has
         // become ready (gated, like orchestrations).
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+
+        // PRD #20 R20-007 (finding #10): consume any typed stream rejections the
+        // daemon pushed asynchronously (a key/paste refused because the focused
+        // target went non-live / exited / rebound). Surface honest feedback and
+        // leave PaneInput — closing the server/UI race the pre-forward snapshot
+        // can't. Drained each frame from the embedded controller's queue.
+        if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+            let rejections = embedded.take_stream_rejections();
+            if !rejections.is_empty() {
+                let focused = embedded.focused_pane_id();
+                let now = std::time::Instant::now();
+                for (rejected_pane, reason) in rejections {
+                    apply_stream_rejection_feedback(
+                        &mut ui,
+                        focused.as_deref(),
+                        &rejected_pane,
+                        &reason,
+                        now,
+                    );
+                }
+            }
+        }
 
         // Drain all pending events before re-rendering. This avoids a full
         // render cycle between each keystroke, which eliminates perceived typing
@@ -21980,5 +22178,166 @@ mod tests {
             ui.pending_seed_prompts.len(),
             deadline_attempts.load(Ordering::SeqCst)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #20 R20-005 (finding #13, coder-authored): the ORCHESTRATOR prompt
+    // path is bounded by a reachable deadline and abandons terminal outcomes,
+    // via the clock-controlled `deliver_orchestrator_prompt` seam (the tester
+    // pinned only the seed path in pane_input_006 and left this to the coder).
+    // -----------------------------------------------------------------------
+
+    /// Scenario: drive `deliver_orchestrator_prompt` with an injected clock. (1)
+    /// A prompt whose tab was created past the deadline is abandoned BEFORE any
+    /// delivery attempt. (2) A within-deadline delivery that returns a TERMINAL
+    /// outcome (WrongSession) is abandoned after that one attempt — not retried
+    /// every ~2s forever.
+    #[test]
+    fn deliver_orchestrator_prompt_bounds_deadline_and_terminal_outcomes() {
+        // (1) Deadline reached → abandon with NO delivery attempt.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::WrongSession,
+            attempts.clone(),
+        ));
+        let mut ui = default_ui();
+        let tab_id: TabId = 7;
+        let created = std::time::Instant::now();
+        ui.orchestration_created_at.insert(tab_id, created);
+        let now_past_deadline = created
+            .checked_add(AUTOMATIC_PROMPT_DEADLINE + std::time::Duration::from_secs(1))
+            .expect("future instant");
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("orch-pane".into());
+        snapshot.insert_placeholder_session(
+            "orch-pane".into(),
+            None,
+            Some(AgentType::Codex),
+            Some("orch-agent".into()),
+        );
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some("orchestrator prompt".to_string());
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            now_past_deadline,
+            tab_id,
+            &["orch-pane".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert!(prompt.is_none(), "past-deadline prompt must be abandoned");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "a past-deadline prompt must NOT attempt delivery"
+        );
+
+        // (2) Terminal outcome within the deadline → abandon after one attempt.
+        let attempts2 = Arc::new(AtomicUsize::new(0));
+        let pane2: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::WrongSession,
+            attempts2.clone(),
+        ));
+        let mut ui2 = default_ui();
+        let tab2: TabId = 8;
+        ui2.orchestration_created_at
+            .insert(tab2, std::time::Instant::now());
+        ui2.orchestration_ready_since.insert(
+            tab2,
+            std::time::Instant::now()
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut snapshot2 = AppState::default();
+        snapshot2.register_pane("orch-pane-2".into());
+        snapshot2.insert_placeholder_session(
+            "orch-pane-2".into(),
+            None,
+            Some(AgentType::Codex),
+            Some("orch-agent-2".into()),
+        );
+        let mut role_statuses2 = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt2 = Some("orchestrator prompt".to_string());
+        deliver_orchestrator_prompt(
+            &mut ui2,
+            pane2.as_ref(),
+            &snapshot2,
+            std::time::Instant::now(),
+            tab2,
+            &["orch-pane-2".to_string()],
+            0,
+            &mut role_statuses2,
+            &mut prompt2,
+        );
+        assert!(
+            prompt2.is_none(),
+            "a TERMINAL WrongSession outcome must abandon the orchestrator prompt"
+        );
+        assert_eq!(
+            attempts2.load(Ordering::SeqCst),
+            1,
+            "terminal abandon happens after exactly one delivery attempt"
+        );
+        assert!(
+            ui2.status_message
+                .as_ref()
+                .is_some_and(|(m, _)| m.to_ascii_lowercase().contains("abandoned")),
+            "abandonment must surface visible feedback, got {:?}",
+            ui2.status_message.as_ref().map(|(m, _)| m)
+        );
+    }
+
+    /// Scenario: a daemon `KIND_STREAM_REJECT` for the FOCUSED pane while in
+    /// PaneInput must surface honest feedback and leave PaneInput — for both a
+    /// key- and a paste-triggered rejection (the daemon rejects them
+    /// identically). A rejection for a NON-focused pane, or when not in
+    /// PaneInput, is ignored. Covers finding #10's client (UI) half.
+    #[test]
+    fn stream_rejection_leaves_pane_input_with_feedback() {
+        let now = std::time::Instant::now();
+
+        // Focused + PaneInput → feedback + leave PaneInput (both key & paste map
+        // to the same daemon reason, so one reason covers both).
+        for reason in ["history-only", "exited"] {
+            let mut ui = default_ui();
+            ui.mode = UiMode::PaneInput;
+            let acted =
+                apply_stream_rejection_feedback(&mut ui, Some("focused"), "focused", reason, now);
+            assert!(acted, "rejection for the focused pane must act ({reason})");
+            assert_eq!(
+                ui.mode,
+                UiMode::Normal,
+                "a stream rejection must leave PaneInput ({reason})"
+            );
+            assert!(
+                ui.status_message
+                    .as_ref()
+                    .is_some_and(|(m, _)| m.to_ascii_lowercase().contains("not delivered")),
+                "a stream rejection must surface visible feedback ({reason}), got {:?}",
+                ui.status_message.as_ref().map(|(m, _)| m)
+            );
+        }
+
+        // Rejection for a DIFFERENT (non-focused) pane must not disturb input.
+        let mut ui = default_ui();
+        ui.mode = UiMode::PaneInput;
+        let acted =
+            apply_stream_rejection_feedback(&mut ui, Some("focused"), "other-pane", "exited", now);
+        assert!(!acted, "a rejection for a non-focused pane must be ignored");
+        assert_eq!(
+            ui.mode,
+            UiMode::PaneInput,
+            "non-focused rejection keeps mode"
+        );
+
+        // Not in PaneInput → nothing to leave.
+        let mut ui = default_ui();
+        ui.mode = UiMode::Normal;
+        let acted =
+            apply_stream_rejection_feedback(&mut ui, Some("focused"), "focused", "exited", now);
+        assert!(!acted, "a rejection while not in PaneInput must be ignored");
     }
 }

@@ -468,6 +468,25 @@ impl DaemonClient {
         expected_session_id: Option<&str>,
         delivery_id: Option<&str>,
     ) -> Result<SendResult, ClientError> {
+        // PRD #20 R20-006 (finding #6): an identity-bearing send DEPENDS on the
+        // daemon's guarded-send guarantees (exact agent+session match, atomic
+        // delivery-id dedup). If the daemon doesn't advertise that capability —
+        // an older build that silently IGNORES the identity/idempotency fields
+        // and just returns `ok=true` — FAIL SAFE and do NOT submit. Trusting that
+        // unguarded `ok=true` would (a) let a lost-response retry double-submit
+        // (no dedup), and (b) let a rebind receive the old prompt (no identity
+        // check). Refusing preserves pre-PRD-20 fire-once semantics against an
+        // old daemon. The plain (non-identity) `write_and_submit` path skips this
+        // and stays legacy-compatible.
+        let identity_bearing =
+            expected_agent_id.is_some() || expected_session_id.is_some() || delivery_id.is_some();
+        if identity_bearing && !self.daemon_advertises_guarded_send().await? {
+            return Err(ClientError::Server(
+                "daemon does not advertise guarded-send support; refusing to submit an \
+                 identity-bearing prompt unguarded (would risk double-submit / mis-deliver)"
+                    .into(),
+            ));
+        }
         let mut request = serde_json::json!({
             "op": "write-and-submit",
             "pane_id": pane_id,
@@ -499,6 +518,27 @@ impl DaemonClient {
             .map_err(|e| ClientError::Malformed(format!("request JSON: {e}")))?;
         write_frame(&mut wr, KIND_REQ, &payload).await?;
         read_response(&mut rd).await
+    }
+
+    /// PRD #20 R20-006 (finding #6): probe whether the daemon advertises the
+    /// guarded-send capability on its `Hello` reply. `Ok(true)` only when the
+    /// reply carries `guarded_send = Some(true)` — i.e. a daemon that enforces
+    /// the identity/idempotency guards. `Ok(false)` for any older daemon that
+    /// omits the field (so the caller fails a guarded send safe). A transport
+    /// error surfaces as `Err` (also fail-safe: the caller does not submit).
+    async fn daemon_advertises_guarded_send(&self) -> Result<bool, ClientError> {
+        let stream = self.connect().await?;
+        let (mut rd, mut wr) = stream.into_split();
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::Hello {
+                client_version: crate::daemon_protocol::PROTOCOL_VERSION,
+                client_build_version: None,
+            },
+        )
+        .await?;
+        Ok(resp.guarded_send == Some(true))
     }
 
     /// Push a TUI pane resize through to the daemon's PTY. Idempotent on the
