@@ -15865,6 +15865,65 @@ mod tests {
     // Filter tests
     // ---------------------------------------------------------------------------
 
+    fn typed_filter_fixture() -> (AppState, UiState) {
+        let mut state = AppState::default();
+        for (session_id, agent_type, cwd, pane_id) in [
+            (
+                "claude-session",
+                AgentType::ClaudeCode,
+                "/work/claude-project",
+                "1",
+            ),
+            (
+                "opencode-session",
+                AgentType::OpenCode,
+                "/work/open-worktree",
+                "2",
+            ),
+            ("pi-session", AgentType::Pi, "/work/pi-project", "3"),
+            (
+                "codex-session",
+                AgentType::Codex,
+                "/work/codex-project",
+                "4",
+            ),
+        ] {
+            state.apply_event(AgentEvent {
+                session_id: session_id.to_string(),
+                agent_type,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: Some(cwd.to_string()),
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: Some(pane_id.to_string()),
+                agent_id: Some(format!("agent-{pane_id}")),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            });
+        }
+        state
+            .sessions
+            .get_mut("pi-session")
+            .expect("Pi fixture session exists")
+            .status = SessionStatus::Thinking;
+
+        let mut ui = default_ui();
+        for (session_id, display_name) in [
+            ("claude-session", "planner"),
+            ("opencode-session", "frontend"),
+            ("pi-session", "test-runner"),
+            ("codex-session", "wrapped-worker"),
+        ] {
+            ui.display_names
+                .insert(session_id.to_string(), display_name.to_string());
+        }
+        (state, ui)
+    }
+
     #[test]
     fn test_filter_sessions_no_filter() {
         let mut state = AppState::default();
@@ -16033,6 +16092,119 @@ mod tests {
         ui.filter_text = "mysess".to_string();
         let filtered = filter_sessions(&state, &ui);
         assert_eq!(filtered.len(), 1);
+    }
+
+    /// Scenario: Filter a mixed Claude Code, OpenCode, Pi, and Codex session set
+    /// with `type:` tokens and ordinary text. Every registry identity must match
+    /// case-insensitively, compose with text using AND semantics, and reject an
+    /// unknown type while the existing id/cwd/status/display-name searches work.
+    #[spec("dashboard/filter/003")]
+    #[test]
+    fn filter_003_agent_type_tokens_compose_with_text() {
+        let (state, mut ui) = typed_filter_fixture();
+        let mut matching_ids = |query: &str| {
+            ui.filter_text = query.to_string();
+            filter_sessions(&state, &ui)
+                .into_iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>()
+        };
+
+        for (query, expected) in [
+            ("type:claude", "claude-session"),
+            ("type:ClaudeCode", "claude-session"),
+            ("type:opencode", "opencode-session"),
+            ("type:pi", "pi-session"),
+            ("type:codex", "codex-session"),
+            ("TYPE:CODEX", "codex-session"),
+        ] {
+            assert_eq!(
+                matching_ids(query),
+                vec![expected],
+                "{query:?} must select only its registry agent type"
+            );
+        }
+
+        for (query, expected) in [
+            ("claude-session", "claude-session"),
+            ("open-worktree", "opencode-session"),
+            ("thinking", "pi-session"),
+            ("wrapped-worker", "codex-session"),
+        ] {
+            assert_eq!(
+                matching_ids(query),
+                vec![expected],
+                "plain query {query:?} must preserve existing filter semantics"
+            );
+        }
+
+        assert_eq!(
+            matching_ids("type:codex wrapped-worker"),
+            vec!["codex-session"],
+            "type and text terms must both match"
+        );
+        assert!(
+            matching_ids("type:codex planner").is_empty(),
+            "a matching type must not bypass a non-matching text term"
+        );
+        assert!(
+            matching_ids("type:bogus").is_empty(),
+            "an unknown agent type must match no sessions"
+        );
+    }
+
+    /// Scenario: From the dashboard, press `/` and type `type:codex` through the
+    /// normal filter-input handlers, then render the resulting card list. The
+    /// visible dashboard must contain the Codex card and hide the Claude Code,
+    /// OpenCode, and Pi cards.
+    #[spec("dashboard/filter/004")]
+    #[test]
+    fn filter_004_slash_type_filter_narrows_rendered_cards() {
+        let (state, mut ui) = typed_filter_fixture();
+        let action = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut ui,
+            state.sessions.len(),
+            None,
+            &KeybindingConfig::default(),
+        );
+        assert!(matches!(action, Action::EnterFilter));
+        ui.mode = UiMode::Filter;
+        for c in "type:codex".chars() {
+            handle_filter_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &mut ui);
+        }
+
+        let filtered = filter_sessions(&state, &ui);
+        let cards: Vec<(&SessionState, Option<&str>)> = filtered
+            .iter()
+            .map(|(id, session)| (*session, ui.display_names.get(*id).map(String::as_str)))
+            .collect();
+        let buffer = render_dashboard_cards_to_buffer(
+            &cards,
+            ui.selected_index,
+            CardDensityKind::Normal,
+            0,
+            100,
+        );
+        let visible: String = (0..buffer.area().height)
+            .map(|y| {
+                (0..buffer.area().width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            visible.contains("wrapped-worker"),
+            "typing type:codex must leave the Codex card visible:\n{visible}"
+        );
+        for hidden in ["planner", "frontend", "test-runner"] {
+            assert!(
+                !visible.contains(hidden),
+                "typing type:codex must hide the {hidden} card:\n{visible}"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------------

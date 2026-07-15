@@ -262,6 +262,20 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** subsequent re-open behavior of the filter dialog with prior input restored — not yet specified.
 - **Platform coverage:** mac+linux.
 
+##### dashboard/filter/003 — `type:<agent>` filters mixed sessions by registry identity and composes with ordinary text (PRD #20 M9).
+- **Layer:** L1 (in-process `filter_sessions` pure-data matrix).
+- **Agent:** none (synthetic Claude Code, OpenCode, Pi, and Codex session states).
+- **Asserts:** `type:claude`, `type:claudecode`, `type:opencode`, `type:pi`, and `type:codex` each select only that agent; type matching is case-insensitive; a remaining text term is ANDed with the type; an unknown type yields no matches; plain id/cwd/status/display-name matching is unchanged.
+- **Does not assert:** the rendered dashboard result (covered by `dashboard/filter/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/filter/004 — Typing `type:codex` in the `/` search visibly narrows the dashboard to Codex cards (PRD #20 M9).
+- **Layer:** L1 (in-process keyboard handlers + ratatui `TestBackend` dashboard render).
+- **Agent:** none (synthetic Claude Code, OpenCode, Pi, and Codex session states).
+- **Asserts:** `/` enters filter mode; typing `type:codex` through the filter input leaves the Codex card visible and hides every non-Codex card in the rendered buffer.
+- **Does not assert:** accepting or clearing the filter (covered by `dashboard/filter/002` and `dashboard/selection/004`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/rename
 
 ##### dashboard/rename/001 — `r` on the selected card opens a rename input pre-filled with the current name.
