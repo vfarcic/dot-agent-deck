@@ -20839,6 +20839,7 @@ mod tests {
     struct CapturingPaneController {
         next: std::sync::Mutex<u32>,
         memberships: std::sync::Mutex<Vec<Option<TabMembership>>>,
+        agent_generation: std::sync::Mutex<String>,
     }
 
     impl CapturingPaneController {
@@ -20846,6 +20847,7 @@ mod tests {
             Self {
                 next: std::sync::Mutex::new(0),
                 memberships: std::sync::Mutex::new(Vec::new()),
+                agent_generation: std::sync::Mutex::new("original".to_string()),
             }
         }
 
@@ -20861,6 +20863,10 @@ mod tests {
                     _ => None,
                 })
                 .collect()
+        }
+
+        fn rebind_agents(&self) {
+            *self.agent_generation.lock().unwrap() = "replacement".to_string();
         }
     }
 
@@ -20883,6 +20889,12 @@ mod tests {
         }
         fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
             Ok(())
+        }
+        fn pane_agent_id(&self, pane_id: &str) -> Option<String> {
+            Some(format!(
+                "{}-{pane_id}",
+                self.agent_generation.lock().unwrap()
+            ))
         }
         fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
             Ok(())
@@ -21024,6 +21036,74 @@ mod tests {
             ),
             _ => panic!("expected an Orchestration tab to be active after SpawnPane"),
         }
+    }
+
+    /// Scenario: Open an orchestration with an initial start-role agent, then
+    /// rebind that pane before readiness. The queued prompt must remain bound to
+    /// the original agent identity captured when the tab was created.
+    #[spec("prompt/pane-input/016")]
+    #[test]
+    fn pane_input_016_orchestrator_prompt_captures_identity_at_tab_creation() {
+        let tmp = tempdir().expect("tempdir");
+        let config = OrchestrationConfig {
+            name: "capture-at-creation".to_string(),
+            roles: vec![OrchestrationRoleConfig {
+                name: "orchestrator".to_string(),
+                command: "cat".to_string(),
+                start: true,
+                description: None,
+                prompt_template: Some("old orchestration prompt".to_string()),
+                clear: false,
+            }],
+        };
+        let req = NewPaneRequest {
+            dir: tmp.path().to_path_buf(),
+            name: "capture-at-creation".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config),
+            seed_prompt: None,
+        };
+        let controller = Arc::new(CapturingPaneController::new());
+        let mut tab_manager = TabManager::new(controller.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            controller.as_ref(),
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 120, 40),
+        );
+        let start_pane_id = match tab_manager.active_tab() {
+            Tab::Orchestration {
+                role_pane_ids,
+                start_role_index,
+                ..
+            } => role_pane_ids[*start_role_index].clone(),
+            _ => panic!("expected orchestration tab"),
+        };
+        let original_agent_id = format!("original-{start_pane_id}");
+        controller.rebind_agents();
+        let replacement_agent_id = controller
+            .pane_agent_id(&start_pane_id)
+            .expect("replacement agent identity");
+        let captured_agent_id = ui
+            .prompt_delivery
+            .get(&start_pane_id)
+            .and_then(|delivery| delivery.expected_agent_id.clone());
+
+        assert_eq!(
+            captured_agent_id,
+            Some(original_agent_id),
+            "the old orchestration prompt must stay bound to the tab-creation identity, not replacement {replacement_agent_id:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -21595,6 +21675,19 @@ mod tests {
     struct SendResultPaneController {
         outcome: InjectedSendOutcome,
         attempts: Arc<AtomicUsize>,
+        delivery_ids: Arc<std::sync::Mutex<Vec<String>>>,
+        expected_sessions: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    impl SendResultPaneController {
+        fn new(outcome: InjectedSendOutcome, attempts: Arc<AtomicUsize>) -> Self {
+            Self {
+                outcome,
+                attempts,
+                delivery_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+                expected_sessions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
     }
 
     impl PaneController for SendResultPaneController {
@@ -21648,6 +21741,26 @@ mod tests {
                 InjectedSendOutcome::WrongSession => Ok(crate::event::SendResult::WrongSession),
             }
         }
+        fn write_and_submit_to_pane_with_identity(
+            &self,
+            pane_id: &str,
+            text: &str,
+            _expected_agent_id: Option<&str>,
+            expected_session_id: Option<&str>,
+            delivery_id: Option<&str>,
+        ) -> Result<crate::event::SendResult, PaneError> {
+            if let Some(delivery_id) = delivery_id {
+                self.delivery_ids
+                    .lock()
+                    .unwrap()
+                    .push(delivery_id.to_string());
+            }
+            self.expected_sessions
+                .lock()
+                .unwrap()
+                .push(expected_session_id.map(str::to_string));
+            self.write_and_submit_to_pane(pane_id, text)
+        }
         fn name(&self) -> &str {
             "send-result-injector"
         }
@@ -21659,10 +21772,9 @@ mod tests {
         }
     }
 
-    /// Scenario: Queue a real mode seed prompt at the UI's readiness gate, then
-    /// inject each transport error and non-applied `SendResult` through a
-    /// controllable PaneController. Every failed delivery must retain the seed,
-    /// surface visible feedback, and avoid retrying on every render frame.
+    /// Scenario: Queue mode seed prompts and inject permanent non-delivery through
+    /// a controllable PaneController. Failed sends must retain feedback briefly,
+    /// use restart-safe/session-bound identities, then stop after the deadline.
     #[spec("prompt/pane-input/006")]
     #[test]
     fn pane_input_006_seed_prompt_result_controls_retention_and_feedback() {
@@ -21694,10 +21806,10 @@ mod tests {
                 Some(AgentType::Codex),
                 Some("seed-agent".into()),
             );
-            let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController {
+            let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
                 outcome,
-                attempts: Arc::new(AtomicUsize::new(0)),
-            });
+                Arc::new(AtomicUsize::new(0)),
+            ));
 
             process_pending_seed_prompts(&mut ui, &pane, &snapshot);
 
@@ -21717,10 +21829,10 @@ mod tests {
         }
 
         let attempts = Arc::new(AtomicUsize::new(0));
-        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController {
-            outcome: InjectedSendOutcome::HistoryOnly,
-            attempts: attempts.clone(),
-        });
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::HistoryOnly,
+            attempts.clone(),
+        ));
         let mut ui = default_ui();
         ui.pending_seed_prompts.push(PendingSeedPrompt {
             pane_id: "backoff-pane".into(),
@@ -21749,6 +21861,124 @@ mod tests {
             attempts.load(Ordering::SeqCst) <= 1,
             "a permanent HistoryOnly result must be throttled across immediate render frames; attempts={}",
             attempts.load(Ordering::SeqCst)
+        );
+
+        let restart_delivery_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for _ in 0..2 {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let controller =
+                SendResultPaneController::new(InjectedSendOutcome::WrongSession, attempts);
+            let recorded = controller.delivery_ids.clone();
+            let pane: Arc<dyn PaneController> = Arc::new(controller);
+            let mut ui = default_ui();
+            ui.pending_seed_prompts.push(PendingSeedPrompt {
+                pane_id: "restart-collision-pane".into(),
+                prompt: "genuinely new prompt after TUI restart".into(),
+                created_at: std::time::Instant::now(),
+                ready_since: Some(
+                    std::time::Instant::now()
+                        .checked_sub(
+                            SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1),
+                        )
+                        .expect("readiness timestamp"),
+                ),
+            });
+            let mut snapshot = AppState::default();
+            snapshot.register_pane("restart-collision-pane".into());
+            snapshot.insert_placeholder_session(
+                "restart-collision-pane".into(),
+                None,
+                Some(AgentType::Codex),
+                Some("restart-agent".into()),
+            );
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+            restart_delivery_ids
+                .lock()
+                .unwrap()
+                .extend(recorded.lock().unwrap().iter().cloned());
+        }
+        let restart_delivery_ids = restart_delivery_ids.lock().unwrap().clone();
+        let restart_ids_are_unique =
+            restart_delivery_ids.len() == 2 && restart_delivery_ids[0] != restart_delivery_ids[1];
+
+        let controller = SendResultPaneController::new(
+            InjectedSendOutcome::WrongSession,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let expected_sessions = controller.expected_sessions.clone();
+        let pane: Arc<dyn PaneController> = Arc::new(controller);
+        let mut ui = default_ui();
+        ui.pending_seed_prompts.push(PendingSeedPrompt {
+            pane_id: "logical-session-pane".into(),
+            prompt: "prompt bound to the old conversation".into(),
+            created_at: std::time::Instant::now(),
+            ready_since: Some(
+                std::time::Instant::now()
+                    .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                    .expect("readiness timestamp"),
+            ),
+        });
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("logical-session-pane".into());
+        snapshot.apply_event(AgentEvent {
+            session_id: "logical-session-before-clear".into(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("logical-session-pane".into()),
+            agent_id: Some("logical-session-agent".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        let captured_sessions = expected_sessions.lock().unwrap().clone();
+        let logical_session_was_captured =
+            captured_sessions.as_slice() == [Some("logical-session-before-clear".to_string())];
+
+        let deadline_attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::WrongSession,
+            deadline_attempts.clone(),
+        ));
+        let mut ui = default_ui();
+        ui.pending_seed_prompts.push(PendingSeedPrompt {
+            pane_id: "expired-seed-pane".into(),
+            prompt: "must be abandoned".into(),
+            created_at: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(61))
+                .expect("expired creation timestamp"),
+            ready_since: Some(
+                std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(61))
+                    .expect("expired readiness timestamp"),
+            ),
+        });
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("expired-seed-pane".into());
+        snapshot.insert_placeholder_session(
+            "expired-seed-pane".into(),
+            None,
+            Some(AgentType::Codex),
+            Some("expired-seed-agent".into()),
+        );
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        let expired_seed_was_abandoned =
+            ui.pending_seed_prompts.is_empty() && deadline_attempts.load(Ordering::SeqCst) == 0;
+
+        assert!(
+            restart_ids_are_unique && logical_session_was_captured && expired_seed_was_abandoned,
+            "seed delivery must be restart-safe, session-bound, and deadline-bounded; restart_ids={restart_delivery_ids:?}, expected_sessions={captured_sessions:?}, expired=(pending={}, attempts={})",
+            ui.pending_seed_prompts.len(),
+            deadline_attempts.load(Ordering::SeqCst)
         );
     }
 }

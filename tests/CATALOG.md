@@ -514,10 +514,10 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** UI mode exit or card feedback; this pins the authoritative daemon stream-input gate.
 - **Platform coverage:** mac+linux.
 
-##### prompt/pane-input/006 — Seed-prompt delivery retains the prompt and surfaces feedback for every non-applied result (PRD #20, blocker 5 / finding 17).
+##### prompt/pane-input/006 — Seed-prompt delivery is retained safely and abandoned after its deadline (PRD #20 findings #3/#4/#13).
 - **Layer:** L1 (in-process seed-prompt readiness consumer with a controllable `PaneController`).
 - **Agent:** none.
-- **Asserts:** injected transport error, `history-only`, `no-live-target`, `stale`, and `wrong-session` outcomes each keep the pending seed for retry and set a visible status message instead of silently consuming it.
+- **Asserts:** injected transport error and non-applied outcomes retain the seed with feedback and backoff; two fresh TUI states generate distinct IDs; delivery captures its logical session; an expired permanent failure is abandoned without another RPC.
 - **Does not assert:** daemon production of stale/wrong-session or orchestration-role status; those require identity-bearing daemon requests and the orchestration render loop.
 - **Platform coverage:** mac+linux+windows.
 
@@ -535,17 +535,17 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the daemon's byte-level stream gate (covered by `prompt/pane-input/005`).
 - **Platform coverage:** mac+linux.
 
-##### prompt/pane-input/009 — A queued prompt cannot cross a same-pane agent rebind (PRD #20 R20-003).
+##### prompt/pane-input/009 — A queued prompt cannot cross an agent or logical-session generation (PRD #20 finding #4).
 - **Layer:** L1 protocol integration with an in-process daemon and real PTY-backed shells.
 - **Agent:** synthetic Codex identities bound sequentially to the same pane.
-- **Asserts:** an identity-bearing request queued for the original agent returns `wrong-session`/`stale` and no marker reaches its replacement.
+- **Asserts:** requests queued for an original agent, a same-agent pre-`/clear` session, or a session missing on the target return `wrong-session`/`stale` and write no marker.
 - **Does not assert:** UI feedback for the returned result (covered by `prompt/pane-input/006`).
 - **Platform coverage:** mac+linux.
 
-##### prompt/pane-input/010 — Retrying an ambiguously applied delivery ID does not submit twice (PRD #20 R20-004).
+##### prompt/pane-input/010 — Delivery IDs are atomic and bound to a request fingerprint (PRD #20 finding #3).
 - **Layer:** L1 protocol integration with an in-process daemon and real PTY-backed shell.
 - **Agent:** synthetic Codex identity backed by `/bin/sh`.
-- **Asserts:** two requests with one stable delivery ID produce exactly one observable file append.
+- **Asserts:** sequential and writer-barrier concurrent duplicates produce one append; reusing an ID with a different payload or target cannot replay a false successful result.
 - **Does not assert:** retry scheduling or visible feedback.
 - **Platform coverage:** mac+linux.
 
@@ -569,6 +569,27 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Asserts:** a request authorized while live but blocked on the writer writes no bytes after the session becomes history-only.
 - **Does not assert:** the attach-handle removal race in R20-008, which has no deterministic harness barrier.
 - **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/014 — Post-snapshot stream rejection returns a typed reason (PRD #20 finding #10).
+- **Layer:** L1 protocol integration with an in-process daemon and live state handle.
+- **Agent:** synthetic Codex identity backed by `/bin/sh`.
+- **Asserts:** after the client observes `Live` but daemon state changes before `KIND_STREAM_IN`, both key and paste frames receive a non-empty typed rejection frame.
+- **Does not assert:** the TUI's visible feedback/mode exit after consuming that frame; no injectable UI/server barrier currently spans those processes.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/015 — Guarded send fails safe against a daemon without the capability (PRD #20 finding #6).
+- **Layer:** L1 client protocol test with a synthetic previous-shape Unix-socket daemon.
+- **Agent:** none.
+- **Asserts:** an identity-bearing send returns an error and submits zero requests when the daemon handshake lacks guarded-send capability.
+- **Does not assert:** the release-step manual test against the actual previous-release daemon.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/016 — Orchestrator prompt identity is captured at tab creation (PRD #20 finding #5).
+- **Layer:** L1 orchestration action with a controllable pane-controller rebind.
+- **Agent:** none.
+- **Asserts:** replacing the start pane's agent after tab creation cannot change the queued prompt's captured target identity.
+- **Does not assert:** daemon-side stale rejection, covered by `prompt/pane-input/009`.
+- **Platform coverage:** mac+linux+windows.
 
 #### prompt/quit
 

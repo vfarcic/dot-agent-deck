@@ -809,6 +809,7 @@ impl AttachConnection {
 mod tests {
     use super::*;
     use spec::spec;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
@@ -991,6 +992,66 @@ mod tests {
         assert!(
             !matches!(result, Ok(SendResult::Applied | SendResult::Queued)),
             "ok=false must win over a contradictory delivered result; got {result:?}"
+        );
+    }
+
+    /// Scenario: Point a new identity-bearing send client at a synthetic older
+    /// daemon whose handshake does not advertise guarded-send support. The client
+    /// must fail before submitting rather than trust an unsafe legacy `ok=true`.
+    #[spec("prompt/pane-input/015")]
+    #[tokio::test]
+    async fn pane_input_015_guarded_send_fails_safe_without_daemon_capability() {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("legacy-unguarded-send.sock");
+            let listener = bind_attach_listener(&path).expect("bind legacy daemon");
+            (dir, path, listener)
+        };
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let server_submissions = submissions.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                let Some((KIND_REQ, payload)) = read_frame(&mut stream)
+                    .await
+                    .expect("read legacy request frame")
+                else {
+                    continue;
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("decode legacy request");
+                let response = if request.get("op").and_then(|op| op.as_str()) == Some("hello") {
+                    // Previous daemon shape: protocol version only, no guarded-send capability.
+                    AttachResponse::hello(crate::daemon_protocol::PROTOCOL_VERSION)
+                } else {
+                    server_submissions.fetch_add(1, Ordering::SeqCst);
+                    AttachResponse::with_send_result(SendResult::Applied)
+                };
+                crate::daemon_protocol::write_resp(&mut stream, &response)
+                    .await
+                    .expect("write legacy response");
+            }
+        });
+        let client = DaemonClient::new(path);
+
+        let result = client
+            .write_and_submit_with_identity(
+                "guarded-pane",
+                "must not reach an unguarded daemon",
+                Some("expected-agent"),
+                Some("expected-session"),
+                Some("guarded-delivery-015"),
+            )
+            .await;
+        server.await.unwrap();
+        drop(dir);
+
+        assert!(
+            result.is_err() && submissions.load(Ordering::SeqCst) == 0,
+            "guarded send must fail safe before submission when capability is absent; result={result:?}, submissions={}",
+            submissions.load(Ordering::SeqCst)
         );
     }
 

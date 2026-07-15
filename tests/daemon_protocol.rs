@@ -262,6 +262,22 @@ async fn stream_contains_within(s: &mut UnixStream, marker: &[u8], timeout: Dura
     false
 }
 
+async fn read_non_output_frame_within(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Option<(u8, Vec<u8>)> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        match tokio::time::timeout(remaining, read_frame(stream)).await {
+            Ok(Some((KIND_STREAM_OUT, _))) => {}
+            Ok(Some(frame)) => return Some(frame),
+            Ok(None) | Err(_) => return None,
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -967,9 +983,9 @@ fn pane_input_005_stream_rejects_key_and_paste_after_live_transition() {
     runtime.block_on(pane_input_005_stream_rejects_key_and_paste_after_live_transition_inner());
 }
 
-/// Scenario: Queue a prompt for one live agent identity, replace that agent on
-/// the same pane before delivery, and send the identity-bearing request. The
-/// daemon must reject it as stale/wrong-session without writing to the replacement.
+/// Scenario: Queue prompts for an agent and logical session, then replace either
+/// the agent or the same agent's conversation before delivery. The daemon must
+/// reject stale generations, including an expected session with no current match.
 #[spec("prompt/pane-input/009")]
 #[test]
 fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
@@ -1012,12 +1028,108 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
         );
 
         server.registry.close_agent(&replacement_id).unwrap();
+
+        let server = start_server().await;
+        let pane_id = "pane-same-agent-new-session";
+        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let event = |session_id: &str, timestamp| AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp,
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(agent_id.clone()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(LiveTarget {
+                kind: TargetKind::Pty,
+                writable: Writable::Live,
+            }),
+        };
+        {
+            let mut state = server.state.write().await;
+            state.register_pane(pane_id.to_string());
+            state.apply_event(event("old-logical-session", chrono::Utc::now()));
+        }
+        let mut attached = connect_attach(&server, &agent_id).await;
+        {
+            let mut state = server.state.write().await;
+            state.apply_event(event(
+                "new-logical-session",
+                chrono::Utc::now() + chrono::Duration::seconds(1),
+            ));
+        }
+        let response = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'OLD-SESSION-PROMPT-LEAKED\\n'",
+                "expected_agent_id": agent_id,
+                "expected_session_id": "old-logical-session",
+                "delivery_id": "same-agent-session-restart-009"
+            }),
+        )
+        .await;
+        let old_prompt_reached_new_session = stream_contains_within(
+            &mut attached,
+            b"OLD-SESSION-PROMPT-LEAKED",
+            Duration::from_millis(750),
+        )
+        .await;
+        let same_agent_restart_rejected = matches!(
+            response.send_result,
+            Some(SendResult::WrongSession | SendResult::Stale)
+        ) && !old_prompt_reached_new_session;
+        let same_agent_result = response.send_result;
+        server.registry.close_agent(&agent_id).unwrap();
+
+        let server = start_server().await;
+        let pane_id = "pane-missing-current-session";
+        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let mut attached = connect_attach(&server, &agent_id).await;
+        let response = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'MISSING-SESSION-PROMPT-LEAKED\\n'",
+                "expected_agent_id": agent_id,
+                "expected_session_id": "required-session",
+                "delivery_id": "missing-current-session-009"
+            }),
+        )
+        .await;
+        let prompt_reached_sessionless_target = stream_contains_within(
+            &mut attached,
+            b"MISSING-SESSION-PROMPT-LEAKED",
+            Duration::from_millis(750),
+        )
+        .await;
+        let missing_session_rejected = matches!(
+            response.send_result,
+            Some(SendResult::WrongSession | SendResult::Stale)
+        ) && !prompt_reached_sessionless_target;
+        let missing_session_result = response.send_result;
+        server.registry.close_agent(&agent_id).unwrap();
+
+        assert!(
+            same_agent_restart_rejected && missing_session_rejected,
+            "logical-session authorization must require an exact match; same_agent_restart=(result={:?}, leaked={old_prompt_reached_new_session}), missing_current=(result={:?}, leaked={prompt_reached_sessionless_target})",
+            same_agent_result,
+            missing_session_result
+        );
     });
 }
 
-/// Scenario: Send one identity-bearing prompt, model its successful response as
-/// lost, and retry with the same stable delivery ID. The target command must be
-/// submitted exactly once even though both request connections reach the daemon.
+/// Scenario: Retry identical deliveries sequentially and concurrently, then reuse
+/// an ID with a different payload or target. Identical work must submit once,
+/// while conflicting fingerprints must never replay a false successful result.
 #[spec("prompt/pane-input/010")]
 #[test]
 fn pane_input_010_retry_after_lost_response_is_idempotent() {
@@ -1054,6 +1166,137 @@ fn pane_input_010_retry_after_lost_response_is_idempotent() {
         );
 
         server.registry.close_agent(&agent_id).unwrap();
+
+        let server = start_server().await;
+        let pane_id = "pane-concurrent-idempotent-delivery";
+        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let counter_path = server._dir.path().join("concurrent-delivery-count");
+        let request = serde_json::json!({
+            "op": "write-and-submit",
+            "pane_id": pane_id,
+            "text": format!("printf x >> {}", counter_path.display()),
+            "expected_agent_id": agent_id,
+            "delivery_id": "concurrent-delivery-010"
+        });
+        let writer = server.registry.subscribe(&agent_id).unwrap().writer;
+        let writer_guard = writer.lock().await;
+        let path = server.path.clone();
+        let first_request = request.clone();
+        let mut first_task = tokio::spawn(async move {
+            let mut stream = UnixStream::connect(path).await.unwrap();
+            let payload = serde_json::to_vec(&first_request).unwrap();
+            write_frame(&mut stream, KIND_REQ, &payload).await;
+            read_response(&mut stream).await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut first_task)
+                .await
+                .is_err(),
+            "precondition: first delivery must be waiting on the held writer"
+        );
+        let path = server.path.clone();
+        let mut second_task = tokio::spawn(async move {
+            let mut stream = UnixStream::connect(path).await.unwrap();
+            let payload = serde_json::to_vec(&request).unwrap();
+            write_frame(&mut stream, KIND_REQ, &payload).await;
+            read_response(&mut stream).await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut second_task)
+                .await
+                .is_err(),
+            "precondition: concurrent duplicate must also be waiting on the held writer"
+        );
+        drop(writer_guard);
+        let concurrent_first = first_task.await.unwrap();
+        let concurrent_second = second_task.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let concurrent_writes = std::fs::read_to_string(&counter_path).unwrap_or_default();
+        server.registry.close_agent(&agent_id).unwrap();
+
+        let server = start_server().await;
+        let pane_id = "pane-payload-fingerprint";
+        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let fingerprint_path = server._dir.path().join("payload-fingerprint");
+        let first = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": format!("printf a >> {}", fingerprint_path.display()),
+                "expected_agent_id": agent_id,
+                "delivery_id": "fingerprint-delivery-010"
+            }),
+        )
+        .await;
+        let conflicting_payload = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": format!("printf b >> {}", fingerprint_path.display()),
+                "expected_agent_id": agent_id,
+                "delivery_id": "fingerprint-delivery-010"
+            }),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let payload_writes = std::fs::read_to_string(&fingerprint_path).unwrap_or_default();
+        let payload_conflict_not_replayed = !matches!(
+            conflicting_payload.send_result,
+            Some(SendResult::Applied | SendResult::Queued)
+        ) || payload_writes == "ab";
+        server.registry.close_agent(&agent_id).unwrap();
+
+        let server = start_server().await;
+        let first_pane = "pane-target-fingerprint-a";
+        let second_pane = "pane-target-fingerprint-b";
+        let first_agent = start_plain_agent_for_pane(&server, "/bin/sh", first_pane).await;
+        let second_agent = start_plain_agent_for_pane(&server, "/bin/sh", second_pane).await;
+        let first_path = server._dir.path().join("target-a");
+        let second_path = server._dir.path().join("target-b");
+        let _ = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": first_pane,
+                "text": format!("printf a >> {}", first_path.display()),
+                "expected_agent_id": first_agent,
+                "delivery_id": "target-fingerprint-delivery-010"
+            }),
+        )
+        .await;
+        let conflicting_target = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": second_pane,
+                "text": format!("printf b >> {}", second_path.display()),
+                "expected_agent_id": second_agent,
+                "delivery_id": "target-fingerprint-delivery-010"
+            }),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let target_writes = std::fs::read_to_string(&second_path).unwrap_or_default();
+        let target_conflict_not_replayed = !matches!(
+            conflicting_target.send_result,
+            Some(SendResult::Applied | SendResult::Queued)
+        ) || target_writes == "b";
+        server.registry.close_agent(&first_agent).unwrap();
+        server.registry.close_agent(&second_agent).unwrap();
+
+        assert!(
+            concurrent_writes == "x"
+                && payload_conflict_not_replayed
+                && target_conflict_not_replayed,
+            "delivery IDs must be atomic and fingerprint-bound; concurrent=(first={:?}, second={:?}, writes={concurrent_writes:?}), payload=(first={:?}, conflict={:?}, writes={payload_writes:?}), target=(conflict={:?}, writes={target_writes:?})",
+            concurrent_first.send_result,
+            concurrent_second.send_result,
+            first.send_result,
+            conflicting_payload.send_result,
+            conflicting_target.send_result
+        );
     });
 }
 
@@ -1236,6 +1479,76 @@ async fn pane_input_005_stream_rejects_key_and_paste_after_live_transition_inner
     );
 
     server.registry.close_agent(&id).unwrap();
+}
+
+/// Scenario: Let a client observe a live pane, change daemon liveness before its
+/// key or paste reaches `KIND_STREAM_IN`, and keep the attach stream open. Each
+/// refused frame must return a typed, non-empty rejection instead of disappearing.
+#[spec("prompt/pane-input/014")]
+#[test]
+fn pane_input_014_stream_liveness_race_returns_typed_rejection() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build typed stream-rejection runtime");
+    runtime.block_on(async {
+        let mut observations = Vec::new();
+        for (input_kind, input) in [
+            ("key", b"rejected-key".as_slice()),
+            ("paste", b"\x1b[200~rejected-paste\x1b[201~".as_slice()),
+        ] {
+            let server = start_server().await;
+            let pane_id = format!("pane-typed-stream-rejection-{input_kind}");
+            let id = start_agent_for_pane(&server, "/bin/sh", &pane_id).await;
+            let event = |writable| AgentEvent {
+                session_id: format!("typed-stream-rejection-{input_kind}"),
+                agent_type: AgentType::Codex,
+                event_type: EventType::Thinking,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some(pane_id.clone()),
+                agent_id: Some(id.clone()),
+                agent_version: None,
+                schema_version: None,
+                live_target: Some(LiveTarget {
+                    kind: TargetKind::Pty,
+                    writable,
+                }),
+            };
+            {
+                let mut state = server.state.write().await;
+                state.register_pane(pane_id.clone());
+                state.apply_event(event(Writable::Live));
+            }
+            let mut attached = connect_attach(&server, &id).await;
+
+            let client_snapshot = server.state.read().await.pane_writable(&pane_id);
+            {
+                let mut state = server.state.write().await;
+                state.apply_event(event(Writable::HistoryOnly));
+            }
+            write_frame(&mut attached, KIND_STREAM_IN, input).await;
+            let rejection =
+                read_non_output_frame_within(&mut attached, Duration::from_millis(750)).await;
+            observations.push((input_kind, client_snapshot, rejection));
+            server.registry.close_agent(&id).unwrap();
+        }
+
+        assert!(
+            observations.iter().all(|(_, snapshot, rejection)| {
+                *snapshot == Writable::Live
+                    && rejection
+                        .as_ref()
+                        .is_some_and(|(_, payload)| !payload.is_empty())
+            }),
+            "a post-snapshot liveness rejection must return a typed frame with a reason for key and paste input; observations={observations:?}"
+        );
+    });
 }
 
 #[tokio::test]
