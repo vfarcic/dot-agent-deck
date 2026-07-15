@@ -181,14 +181,16 @@ pub fn auto_materialize_core(
 }
 
 /// Spawn-time seam entry: silently (over)materialize the bundled Pi orchestrator
-/// extension into the pi child's HOME just before it is launched, so
-/// `command = "pi"` needs ZERO manual setup. Called from
-/// [`crate::agent_pty::AgentPtyRegistry::spawn_agent`] only when the spawn
-/// command is detected as `pi`. `env` is the spawn env overlay, consulted for a
-/// `HOME` / `PATH` override before the process env. Guarded (pi present),
-/// idempotent (overwrite), and HOME-unset-safe (SKIP, no `/tmp` write).
-/// Best-effort — a write failure is logged, never fatal (the pane still spawns,
-/// matching `hooks_manage::auto_install`).
+/// extension into the child's HOME just before it is launched, so a pi agent
+/// needs ZERO manual setup. Called UNCONDITIONALLY from
+/// [`crate::agent_pty::AgentPtyRegistry::spawn_agent`] — NOT gated on the spawn
+/// command's basename, so it works whether pi is launched as `pi`, an absolute
+/// path, or a wrapper (`devbox run …`, `run_agent.sh`). `env` is the spawn env
+/// overlay, consulted for a `HOME` / `PATH` override before the process env. The
+/// self-guard here is pi-presence: [`pi_present_for_env`] means a spawn on a
+/// machine without pi is a cheap no-op. Idempotent (overwrite) and HOME-unset-safe
+/// (SKIP, no `/tmp` write). Best-effort — a write failure is logged, never fatal
+/// (the pane still spawns, matching `hooks_manage::auto_install`).
 pub fn auto_materialize(env: &[(String, String)]) {
     let target = resolve_home_from_env(env).map(|home| extension_dir_under(&home));
     match auto_materialize_core(pi_present_for_env(env), target.as_deref()) {

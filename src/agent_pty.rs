@@ -1671,20 +1671,22 @@ impl AgentPtyRegistry {
         let captured_cols = opts.cols.clamp(1, PTY_RESIZE_DIM_MAX);
 
         // PRD #201: auto-materialize the bundled Pi orchestrator extension into
-        // the pi child's HOME right before it is spawned, so `command = "pi"`
-        // works with ZERO manual setup — parity with claude
-        // (`hooks_manage::auto_install`) and opencode
-        // (`opencode_manage::auto_install`). Detect pi from the actual spawn
-        // COMMAND, not the caller-supplied `agent_type` (some callers, e.g. the
-        // headless real-pi e2e tests, leave `agent_type: None` while still
-        // running `pi …`), so the seam fires wherever a real pi is launched.
-        // The materialize is guarded (pi present), idempotent (overwrite), and
-        // HOME-unset-safe (skip, never a `/tmp` write) — see
-        // `orchestrator_ext::auto_materialize`. Done before `spawn(opts)` so the
-        // extension is on disk before Pi's boot-time discovery runs.
-        if AgentType::from_command(opts.command) == Some(AgentType::Pi) {
-            crate::orchestrator_ext::auto_materialize(&opts.env);
-        }
+        // the child's HOME right before spawn, so a pi agent reports status with
+        // ZERO manual setup — parity with claude (`hooks_manage::auto_install`)
+        // and opencode (`opencode_manage::auto_install`).
+        //
+        // We do NOT gate on the spawn command's basename. The deck must not care
+        // HOW an agent is launched — `pi`, an absolute path, or a wrapper like
+        // `devbox run pi-big` / `run_agent.sh` — and `AgentType::from_command`
+        // only recognizes a bare `pi` first token, so a command-basename gate
+        // silently skipped every wrapper-launched pi (the "No agent" bug). Like
+        // claude/opencode's unconditional installers, we always call the
+        // materializer; it self-guards on pi actually being on PATH
+        // (`pi_present_for_env`), is idempotent (overwrite), and HOME-unset-safe
+        // (skip, never a `/tmp` write) — see `orchestrator_ext::auto_materialize`.
+        // Done before `spawn(opts)` so the extension is on disk before Pi's
+        // boot-time discovery runs; a no-op when pi is not installed.
+        crate::orchestrator_ext::auto_materialize(&opts.env);
 
         // Defense in depth: `spawn` already protects the child internally
         // via its own `ChildGuard`, so any failure or panic *inside* spawn
@@ -3240,6 +3242,55 @@ mod tests {
 
         registry.close_agent(&id).expect("close should succeed");
         assert!(registry.is_empty());
+    }
+
+    /// Regression (PRD #201, the "Pi shows No agent under a wrapper command" bug):
+    /// the deck must materialize the Pi orchestrator extension regardless of HOW
+    /// the agent is started. Spawn a NON-`pi` command (basename `sh`, standing in
+    /// for a wrapper like `devbox run pi-big`) with a fake, executable `pi` on the
+    /// env PATH and a temp HOME, then assert the bundled extension was written
+    /// under that HOME. Before the fix the spawn seam gated materialization on the
+    /// command basename being literally `pi`, so every wrapper-launched pi agent
+    /// silently got no extension and stayed "No agent".
+    #[test]
+    fn spawn_materializes_pi_extension_regardless_of_command_basename() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        // A fake, *executable* `pi` so `pi_present_for_env` sees pi on PATH.
+        let fake_pi = bin.path().join("pi");
+        std::fs::write(&fake_pi, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_pi, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let registry = AgentPtyRegistry::new();
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                // Absolute path so it spawns independent of PATH; basename `sh`,
+                // NOT `pi` — the wrapper/stand-in case.
+                command: Some("/bin/sh"),
+                env: vec![
+                    ("HOME".to_string(), home.path().display().to_string()),
+                    ("PATH".to_string(), bin.path().display().to_string()),
+                ],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+
+        // The bundled extension must be materialized into the child's HOME even
+        // though the command basename is not `pi`.
+        let ext = home
+            .path()
+            .join(".pi/agent/extensions/dot-agent-deck/index.ts");
+        assert!(
+            ext.is_file(),
+            "spawn via a non-`pi` command must still materialize the Pi extension at {}",
+            ext.display()
+        );
+
+        registry.close_agent(&id).expect("close should succeed");
     }
 
     #[test]
