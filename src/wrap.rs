@@ -284,6 +284,54 @@ fn tee<R: Read, W: Write>(mut reader: R, mut writer: W, mut on_line: impl FnMut(
     }
 }
 
+/// PRD #20 M8 — rewrite a bare launch command into its `dot-agent-deck wrap`
+/// invocation when the resolved agent uses the
+/// [`IntegrationStrategy::Wrapper`](crate::agent_registry::IntegrationStrategy::Wrapper)
+/// mechanism, so the agent's stdout is monitored transparently.
+///
+/// Called at the TUI new-agent spawn site: a Wrapper-strategy agent (Codex now;
+/// Gemini later) launches as
+/// `dot-agent-deck wrap --agent <registry-basename> -- <command>` while its
+/// Command field, `last_command`, and persisted metadata keep the bare base
+/// command. `--agent <basename>` pins the identity through the registry
+/// ([`resolve_agent_type`]) so events attribute to the right agent even when the
+/// wrapped binary is a path or alias.
+///
+/// Idempotent: a command that is already a `dot-agent-deck wrap` invocation is
+/// returned unchanged (never double-wrapped), so restoring an already-bare saved
+/// command re-wraps exactly once. Non-Wrapper agents (and the neutral unknown
+/// type) are returned unchanged.
+pub fn wrap_launch_command(command: &str, agent_type: &AgentType) -> String {
+    let spec = crate::agent_registry::spec(agent_type);
+    if spec.strategy != Some(crate::agent_registry::IntegrationStrategy::Wrapper)
+        || is_wrap_invocation(command)
+    {
+        return command.to_string();
+    }
+    // Prefer the registry detection basename (the stable `--agent` alias the
+    // wrapper resolves back through `detect_from_basename`); fall back to the
+    // label only if an entry somehow ships without one.
+    let name = spec.detect_basenames.first().copied().unwrap_or(spec.label);
+    format!("dot-agent-deck wrap --agent {name} -- {command}")
+}
+
+/// Whether `command` is already a `dot-agent-deck wrap …` invocation — the
+/// idempotency guard for [`wrap_launch_command`]. Tolerant of a leading path on
+/// the binary (`/usr/local/bin/dot-agent-deck wrap …`).
+fn is_wrap_invocation(command: &str) -> bool {
+    let mut tokens = command.split_whitespace();
+    match (tokens.next(), tokens.next()) {
+        (Some(program), Some(subcommand)) => {
+            std::path::Path::new(program)
+                .file_name()
+                .and_then(|s| s.to_str())
+                == Some("dot-agent-deck")
+                && subcommand == "wrap"
+        }
+        _ => false,
+    }
+}
+
 /// Resolve the agent identity emitted events should carry.
 ///
 /// An explicit `--agent` override wins and is resolved through the registry, so
@@ -597,5 +645,66 @@ mod tests {
     fn session_id_derivation() {
         assert_eq!(session_id_for(Some("pane-7"), "codex"), "pane-7-session");
         assert_eq!(session_id_for(None, "/usr/bin/codex"), "wrap-codex");
+    }
+
+    /// PRD #20 M8: a Wrapper-strategy agent's bare command is rewritten to its
+    /// `dot-agent-deck wrap --agent <basename> -- <command>` invocation, using
+    /// the registry detection basename as the `--agent` alias.
+    #[test]
+    fn wrap_launch_command_wraps_wrapper_strategy() {
+        assert_eq!(
+            wrap_launch_command("codex", &AgentType::Codex),
+            "dot-agent-deck wrap --agent codex -- codex"
+        );
+    }
+
+    /// Non-Wrapper agents (and the neutral unknown type) launch bare — the
+    /// transform only fires for the Wrapper strategy.
+    #[test]
+    fn wrap_launch_command_leaves_non_wrapper_agents_bare() {
+        assert_eq!(
+            wrap_launch_command("claude", &AgentType::ClaudeCode),
+            "claude"
+        );
+        assert_eq!(
+            wrap_launch_command("opencode", &AgentType::OpenCode),
+            "opencode"
+        );
+        assert_eq!(wrap_launch_command("pi", &AgentType::Pi), "pi");
+        assert_eq!(wrap_launch_command("cat", &AgentType::None), "cat");
+    }
+
+    /// Idempotent: a command that is already a `dot-agent-deck wrap …`
+    /// invocation is returned unchanged, even with a leading binary path, so a
+    /// restore never double-wraps.
+    #[test]
+    fn wrap_launch_command_is_idempotent() {
+        assert_eq!(
+            wrap_launch_command(
+                "dot-agent-deck wrap --agent codex -- codex",
+                &AgentType::Codex
+            ),
+            "dot-agent-deck wrap --agent codex -- codex"
+        );
+        assert_eq!(
+            wrap_launch_command(
+                "/usr/local/bin/dot-agent-deck wrap --agent codex -- codex",
+                &AgentType::Codex
+            ),
+            "/usr/local/bin/dot-agent-deck wrap --agent codex -- codex"
+        );
+    }
+
+    /// The idempotency guard recognises a `dot-agent-deck wrap` invocation (with
+    /// or without a leading path) and rejects anything else.
+    #[test]
+    fn is_wrap_invocation_matches_only_wrap() {
+        assert!(is_wrap_invocation(
+            "dot-agent-deck wrap --agent codex -- codex"
+        ));
+        assert!(is_wrap_invocation("/opt/bin/dot-agent-deck wrap -- codex"));
+        assert!(!is_wrap_invocation("codex"));
+        assert!(!is_wrap_invocation("dot-agent-deck daemon serve"));
+        assert!(!is_wrap_invocation(""));
     }
 }

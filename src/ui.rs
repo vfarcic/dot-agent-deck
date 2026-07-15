@@ -5719,10 +5719,37 @@ fn dispatch_action(
                     // dimensions before the command starts.  This avoids
                     // the process seeing the default 80×24 size.
                     let is_mode = req.mode_config.is_some();
+                    // PRD #76 M2.13: infer agent_type from the form's command
+                    // (the canonical "what runs in this pane" hint) — use
+                    // `req.command` directly so it covers both the plain-card
+                    // flow and mode panes (which spawn empty and run the command
+                    // later via `write_to_pane`). The inferred type goes into the
+                    // daemon-bound spawn options so a remote reconnect's
+                    // hydration carries it; the local placeholder stays at `None`
+                    // until the first `SessionStart` hook fires (pre-M2.13
+                    // contract).
+                    let spawn_agent_type = if req.command.is_empty() {
+                        None
+                    } else {
+                        AgentType::from_command(Some(req.command.as_str()))
+                    };
+                    // PRD #20 M8: launch Wrapper-strategy agents (Codex now;
+                    // Gemini later) WRAPPED so their stdout is monitored
+                    // transparently — whether the command came from the registry
+                    // seed or was typed by the user. Only the LAUNCHED process is
+                    // rewritten to `dot-agent-deck wrap --agent <name> -- <base>`;
+                    // the Command field, `last_command`, and the persisted
+                    // `SavedPane.command` all keep the bare base command (so the
+                    // seed round-trips), and the transform is idempotent so a
+                    // restore re-wraps exactly once, never double-wraps.
+                    let launch_command = match &spawn_agent_type {
+                        Some(at) => crate::wrap::wrap_launch_command(&req.command, at),
+                        None => req.command.clone(),
+                    };
                     let cmd = if req.command.is_empty() || is_mode {
                         None
                     } else {
-                        Some(req.command.as_str())
+                        Some(launch_command.as_str())
                     };
                     // Thread the form's Name through to `StartAgent.display_name`
                     // so a disconnect or crash between create and rename can't
@@ -5770,22 +5797,8 @@ fn dispatch_action(
                             tab_manager.show_tab_bar(),
                         )
                     };
-                    // PRD #76 M2.13: infer agent_type from the
-                    // form's command (the canonical "what runs in
-                    // this pane" hint) — `cmd` is `None` for mode
-                    // panes (which spawn empty and run the
-                    // command later via `write_to_pane`), so use
-                    // `req.command` directly to cover both flows.
-                    // The inferred type goes ONLY into the daemon-
-                    // bound spawn options so a remote reconnect's
-                    // hydration carries it; the local placeholder
-                    // stays at `None` until the first `SessionStart`
-                    // hook fires (pre-M2.13 contract).
-                    let spawn_agent_type = if req.command.is_empty() {
-                        None
-                    } else {
-                        AgentType::from_command(Some(req.command.as_str()))
-                    };
+                    // `spawn_agent_type` and the wrapped `launch_command` (used
+                    // for `cmd` above) were both resolved before the dims block.
                     match pane.create_pane_with_options(
                         cmd,
                         Some(&dir_str),
