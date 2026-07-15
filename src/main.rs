@@ -30,6 +30,10 @@ enum CliAgent {
     #[default]
     ClaudeCode,
     Opencode,
+    /// PRD #20 W1: Codex ships a Claude-Code-compatible hooks engine, so its
+    /// native command hooks shell `dot-agent-deck hook --agent codex`. Ingested
+    /// by the [`dot_agent_deck::hook`] `"codex"` arm.
+    Codex,
 }
 
 impl CliAgent {
@@ -41,6 +45,7 @@ impl CliAgent {
         match self {
             CliAgent::ClaudeCode => dot_agent_deck::event::AgentType::ClaudeCode,
             CliAgent::Opencode => dot_agent_deck::event::AgentType::OpenCode,
+            CliAgent::Codex => dot_agent_deck::event::AgentType::Codex,
         }
     }
 }
@@ -512,6 +517,7 @@ fn main() -> ExitCode {
             let agent_str = match agent {
                 CliAgent::ClaudeCode => "claude-code",
                 CliAgent::Opencode => "opencode",
+                CliAgent::Codex => "codex",
             };
             handle_hook(agent_str)
         }

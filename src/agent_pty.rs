@@ -1639,7 +1639,20 @@ impl AgentPtyRegistry {
         // OpenCode / None) so there's no equivalent of the display_name /
         // tab_membership validation gate — serde already rejected anything
         // outside the variant set at deserialization.
-        let agent_type = opts.agent_type.take();
+        //
+        // R20-009: resolve ONE effective agent identity and PRESERVE the explicit
+        // caller identity in `opts` so the common `spawn` seam's Wrapper transform
+        // wraps it. Previously this `take()` DROPPED the identity before `spawn`,
+        // so an explicitly-Codex spawn whose launcher basename is not `codex`
+        // (an alias / launcher / custom path) was recorded as Codex but launched
+        // UNWRAPPED. Registry metadata keeps the caller-supplied identity (the
+        // learn-from-event upgrade still fills it in for a bare shell spawn); the
+        // effective identity (explicit-or-inferred) also drives the spec
+        // materializer so a non-inferable launcher can't skip it.
+        let agent_type = opts.agent_type.clone();
+        let effective_agent = agent_type
+            .clone()
+            .or_else(|| AgentType::from_command(opts.command));
 
         // PRD #92 F9 followup-7: pre-allocate the registry id *before*
         // `spawn` so we can inject `DOT_AGENT_DECK_AGENT_ID = <id>` into
@@ -1711,10 +1724,14 @@ impl AgentPtyRegistry {
         // sets it, so this fires on exactly the same commands as before (`pi …`),
         // but a future agent provides its own materialize here — a second
         // Extension-strategy agent would never run Pi's implementation.
-        // Detection still keys off the actual spawn COMMAND (registry-backed
-        // `from_command`), not the caller-supplied `agent_type`.
-        if let Some(agent_type) = AgentType::from_command(opts.command)
-            && let Some(materialize) = crate::agent_registry::spec(&agent_type).materialize
+        // R20-009: dispatch off the EFFECTIVE identity (explicit caller type,
+        // else command inference) rather than the command alone, so an explicit
+        // identity behind a non-inferable launcher still reaches its
+        // materializer. For every current caller this resolves identically to
+        // the old command-only detection (Pi is spawned as `pi …` or with an
+        // explicit `Pi` type), so the seam still fires on exactly the same spawns.
+        if let Some(effective) = effective_agent.clone()
+            && let Some(materialize) = crate::agent_registry::spec(&effective).materialize
         {
             materialize(&opts.env);
         }

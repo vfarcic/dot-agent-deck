@@ -3,6 +3,7 @@ pub mod agent_registry;
 pub mod ascii_art;
 pub mod build_id;
 pub mod build_version_handshake;
+pub mod codex_hooks_manage;
 pub mod config;
 pub mod config_gen;
 pub mod config_validation;

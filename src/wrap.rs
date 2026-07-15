@@ -27,9 +27,10 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::io::RawFd;
-use std::process::ExitCode;
+use std::process::{Command as StdCommand, ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
@@ -309,6 +310,10 @@ fn tee<R: Read, W: Write>(mut reader: R, mut writer: W, mut on_line: impl FnMut(
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
+            // R20-002: with catchable-signal handlers installed (no SA_RESTART),
+            // a blocked read can return `Interrupted`; retry rather than treat it
+            // as end-of-stream.
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Ok(n) => {
                 let chunk = &buf[..n];
                 // Transparent passthrough first — the user must see output with
@@ -499,16 +504,122 @@ impl Drop for RawModeGuard {
     }
 }
 
+/// The `--dangerously-bypass-hook-trust` flag the deck passes when it launches a
+/// wrapped `codex`. Codex requires command hooks to be trusted before they run;
+/// the deck authors its OWN hook definition (see [`crate::codex_hooks_manage`]),
+/// so it vets the source — itself — and bypasses the interactive trust prompt for
+/// this vetted spawn (PRD #20 W1 design).
+const CODEX_BYPASS_HOOK_TRUST_FLAG: &str = "--dangerously-bypass-hook-trust";
+
+/// Whether the wrapped program's basename is `codex`. PRD #20 W1 keys the
+/// trust-flag injection off the ACTUAL program, not the resolved agent identity:
+/// `wrap --agent codex -- /bin/sh` (the non-interactive I/O test) carries Codex
+/// identity but launches a shell, which must NOT receive a codex-only flag; and
+/// a launcher/script (`devbox run …`, `run_codex_agent.sh`) is not `codex`, so
+/// the flag can't be auto-injected into its eventual codex call (documented in
+/// `docs/develop/agent-adapters.md`).
+fn program_is_codex(program: &str) -> bool {
+    std::path::Path::new(program)
+        .file_name()
+        .and_then(|s| s.to_str())
+        == Some("codex")
+}
+
+/// PRD #20 W1 spawn wiring. Decides, for this wrap invocation, whether to
+/// install the deck's native Codex hooks and whether to inject the hook-trust
+/// bypass flag.
+///
+/// - **Hooks install** fires whenever a Codex-identity agent will actually run
+///   under this wrapper: a direct `codex` program, OR a deck-spawned pane
+///   (`pane_id` present) whose declared identity is Codex. The latter covers a
+///   launcher/wrapper SCRIPT the deck spawned but whose argv we can't reach
+///   into — the hooks are `CODEX_HOME`-scoped, so they apply however codex is
+///   ultimately launched. It deliberately does NOT fire for a standalone
+///   `wrap --agent codex -- /bin/sh` (no pane, non-codex program), so a
+///   non-interactive I/O wrap never writes to the user's `~/.codex`.
+/// - **The trust-bypass flag** is injected ONLY for a direct `codex` program —
+///   the one case where the wrapper controls codex's argv. A launcher/script
+///   must add the flag to its own `codex …` line (see the module docs and
+///   `docs/develop/agent-adapters.md`).
+///
+/// Returns `true` when the caller should add [`CODEX_BYPASS_HOOK_TRUST_FLAG`].
+fn codex_spawn_prep(program: &str, agent_type: &AgentType, pane_id: Option<&str>) -> bool {
+    let program_codex = program_is_codex(program);
+    if *agent_type == AgentType::Codex && (program_codex || pane_id.is_some()) {
+        crate::codex_hooks_manage::auto_install();
+    }
+    program_codex
+}
+
+/// PRD #20 R20-002: the last catchable termination signal delivered to the
+/// wrapper (0 = none). Set by [`handle_wrap_signal`] (async-signal-safe: a lone
+/// atomic store) and observed by the interactive PTY main loop, which forwards
+/// it to the child's process group, escalates after a grace window, and returns
+/// through normal cleanup so [`RawModeGuard`] restores the terminal — no
+/// raw-mode-left-on-signal, no unreaped child.
+static WRAP_PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn handle_wrap_signal(sig: libc::c_int) {
+    WRAP_PENDING_SIGNAL.store(sig, Ordering::SeqCst);
+}
+
+/// Install async handlers for `SIGTERM` / `SIGHUP` / `SIGINT` on the interactive
+/// wrap path. `SA_RESTART` is intentionally NOT set so a blocked read returns
+/// `EINTR` and the loop reacts promptly; the pump read loops treat `Interrupted`
+/// as retry, not end-of-stream.
+fn install_wrap_signal_handlers() {
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = handle_wrap_signal as *const () as libc::sighandler_t;
+    unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+    }
+    action.sa_flags = 0;
+    for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        unsafe {
+            libc::sigaction(sig, &action, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Send `signal` to the wrapped child's entire process group (so descendants
+/// that inherited the slave PTY are torn down too), falling back to the direct
+/// child when the pid can't be resolved to a group id.
+fn kill_child_group(child: &mut Box<dyn portable_pty::Child + Send + Sync>, signal: libc::c_int) {
+    if let Some(pgid) = child.process_id().and_then(crate::agent_pty::pid_to_pgid) {
+        // SAFETY: `killpg(2)` is async-signal-safe; the pgid is the child's own
+        // pid (portable-pty `setsid`'d it), so this can't hit another group.
+        unsafe {
+            libc::killpg(pgid, signal);
+        }
+    } else {
+        let _ = child.kill();
+    }
+}
+
+/// Bounded wait for `flag` to become `true`, polling briefly. Returns whether it
+/// was observed within `timeout` — used for the post-exit output drain (R20-001)
+/// so a wrapper never blocks forever on an unbounded `join`.
+fn wait_flag(flag: &AtomicBool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !flag.load(Ordering::SeqCst) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    true
+}
+
 /// Entry point for `dot-agent-deck wrap [--agent <name>] -- <command> <args...>`.
 ///
-/// PRD #20 blocker-1: spawns `command` on a fresh INNER pseudo-terminal and
-/// proxies all three streams, so the child sees `isatty(0/1/2) == true` and an
-/// interactive agent (bare `codex`) keeps its full TUI. The inner PTY's master
-/// output is tee'd through pattern detection into `AgentEvent`s (the child's
-/// terminal is never replaced with pipes), the outer terminal is put in raw
-/// mode so keystrokes / `Ctrl+C` pass through, and outer resizes are forwarded
-/// to the inner PTY (so the child receives `SIGWINCH`). Returns the child's
-/// exit code as the wrapper's exit code.
+/// PRD #20 blocker-1: for an INTERACTIVE outer terminal, spawns `command` on a
+/// fresh inner pseudo-terminal and proxies all three streams so the child sees
+/// `isatty(0/1/2) == true` and an interactive agent (bare `codex`) keeps its
+/// full TUI. R20-012: for a NON-INTERACTIVE outer terminal (piped/redirected),
+/// uses a pipe-based path with SEPARATE stdout/stderr and byte-exact raw stdin
+/// (no PTY line discipline), so `2>file`, stdout-only pipes, and binary/EOF
+/// stdin are preserved. Both paths tee the child's output through pattern
+/// detection into `AgentEvent`s and return the child's exit code.
 pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     let Some((program, args)) = command.split_first() else {
         eprintln!(
@@ -554,9 +665,39 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
         live_target,
     });
 
+    // PRD #20 W1: install the deck's native Codex hooks into the active
+    // CODEX_HOME (for a direct `codex` OR a deck-spawned Codex-identity launcher)
+    // and, for a direct `codex`, bypass Codex's hook-trust prompt for this
+    // deck-vetted spawn via the returned flag. Done once, before either path
+    // spawns. A launcher/script must add the flag to its own codex line.
+    let add_trust_flag = codex_spawn_prep(program, &emitter.agent_type, emitter.pane_id.as_deref());
+
+    // R20-012: PTY proxying only for an interactive outer terminal (both stdin
+    // and stdout are TTYs). A piped / redirected outer stream uses the
+    // pipe-based path so stdout/stderr stay separate and stdin is byte-exact.
+    let interactive =
+        unsafe { libc::isatty(libc::STDIN_FILENO) == 1 && libc::isatty(libc::STDOUT_FILENO) == 1 };
+
+    if interactive {
+        run_wrap_pty(program, args, &emitter, add_trust_flag)
+    } else {
+        run_wrap_pipe(program, args, &emitter, add_trust_flag)
+    }
+}
+
+/// Interactive path: spawn the child on a fresh inner PTY and proxy all three
+/// streams (raw outer terminal, resize forwarding, tee'd output). Implements the
+/// R20-001/R20-002 robustness contract: cancellable output pump, owned child
+/// process group, catchable-signal forwarding + escalation, bounded post-exit
+/// drain, and an always-run reap so the terminal is restored on every exit path.
+fn run_wrap_pty(
+    program: &str,
+    args: &[String],
+    emitter: &Arc<Emitter>,
+    add_trust_flag: bool,
+) -> ExitCode {
     // Open the inner PTY at the outer terminal's current size so the child's
-    // first frame paints at the right geometry (falls back to 24×80 when the
-    // outer stream isn't a terminal).
+    // first frame paints at the right geometry (falls back to 24×80).
     let (rows, cols) = terminal_size(libc::STDIN_FILENO)
         .or_else(|| terminal_size(libc::STDOUT_FILENO))
         .unwrap_or((24, 80));
@@ -578,6 +719,9 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     // carries `DOT_AGENT_DECK_PANE_ID` / `_AGENT_ID` injected by the daemon), so
     // the child's own hooks and this wrapper's events attribute to the same pane.
     let mut cmd = CommandBuilder::new(program);
+    if add_trust_flag {
+        cmd.arg(CODEX_BYPASS_HOOK_TRUST_FLAG);
+    }
     for arg in args {
         cmd.arg(arg);
     }
@@ -620,21 +764,34 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     // The session has begun — surface the card immediately.
     emitter.emit(EventType::SessionStart);
 
+    // R20-002: forward catchable termination signals to the child group and
+    // return through normal cleanup (terminal restored) rather than dying with
+    // raw mode left on. Installed BEFORE raw mode so a signal in the tiny window
+    // still routes through the handler.
+    install_wrap_signal_handlers();
+
     // Raw-mode the outer terminal so keystrokes (incl. Ctrl+C and CR) pass
-    // through to the inner PTY unmodified; restored on drop.
+    // through to the inner PTY unmodified; restored on drop (incl. on the signal
+    // paths, which break to this function's normal return).
     let _raw_guard = RawModeGuard::enable(libc::STDIN_FILENO);
 
     // Output pump (inner master → outer stdout, tee'd through classification).
     // PRD #20 M7: the rule set is keyed off the resolved agent type; Codex uses
     // JSON-aware classification, any other command keeps the generic fallback.
     // Auditor: recover from a poisoned detector mutex instead of panicking.
+    // R20-001: `output_done` reports pump termination to the main loop so a tee
+    // that stops on a downstream write failure (outer stdout closed) makes the
+    // loop terminate the child rather than poll forever while the child blocks
+    // on a full, undrained inner PTY.
     let is_codex = emitter.agent_type == AgentType::Codex;
     let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
         &emitter.agent_type,
     ))));
+    let output_done = Arc::new(AtomicBool::new(false));
     let output_thread = {
-        let emitter = Arc::clone(&emitter);
+        let emitter = Arc::clone(emitter);
         let detector = Arc::clone(&detector);
+        let output_done = Arc::clone(&output_done);
         std::thread::spawn(move || {
             tee(reader, FdWriter(libc::STDOUT_FILENO), |line| {
                 let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
@@ -648,6 +805,7 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
                     emitter.emit(ev.event_type());
                 }
             });
+            output_done.store(true, Ordering::SeqCst);
         })
     };
 
@@ -665,7 +823,15 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
                         buf.len(),
                     )
                 };
-                if n <= 0 {
+                if n < 0 {
+                    // R20-002: a handler-delivered signal interrupts the read;
+                    // retry rather than tear down stdin forwarding.
+                    if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    break;
+                }
+                if n == 0 {
                     break;
                 }
                 if writer.write_all(&buf[..n as usize]).is_err() || writer.flush().is_err() {
@@ -676,10 +842,11 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     }
 
     // Main loop: forward outer resizes to the inner PTY (so the child receives
-    // SIGWINCH) and poll for child exit. Keeping `master` here avoids sharing a
-    // non-Send/Sync handle across threads. `try_wait` reaps the child once it
-    // returns `Some`, so its status is captured and reused (no second wait).
+    // SIGWINCH), react to a catchable signal, notice a dead output pump, and poll
+    // for child exit. `try_wait` reaps the child once it returns `Some`.
     let mut last_size = (rows, cols);
+    let mut escalate_deadline: Option<Instant> = None;
+    let mut output_gone_at: Option<Instant> = None;
     let status = loop {
         if let Some(size) = terminal_size(libc::STDIN_FILENO)
             && size != last_size
@@ -692,20 +859,62 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
             });
             last_size = size;
         }
+
+        // R20-002: a catchable termination signal — forward it to the child's
+        // process group once, then arm a grace window after which we escalate.
+        let sig = WRAP_PENDING_SIGNAL.swap(0, Ordering::SeqCst);
+        if sig != 0 && escalate_deadline.is_none() {
+            kill_child_group(&mut child, sig);
+            escalate_deadline = Some(Instant::now() + crate::agent_pty::AGENT_TERMINATE_GRACE);
+        }
+
+        // R20-001: the output pump ended. On a PTY the master reader only EOFs
+        // once the child fully exits (a clean exit is caught by `try_wait`
+        // below), so an output pump that ends while the child is still alive
+        // means the DOWNSTREAM consumer closed — the child would then block on a
+        // full inner PTY. Give a short settle window, then terminate the group.
+        if output_done.load(Ordering::SeqCst) {
+            let since = output_gone_at.get_or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_millis(200) && escalate_deadline.is_none() {
+                kill_child_group(&mut child, libc::SIGTERM);
+                escalate_deadline = Some(Instant::now() + crate::agent_pty::AGENT_TERMINATE_GRACE);
+            }
+        }
+
+        if let Some(deadline) = escalate_deadline
+            && Instant::now() >= deadline
+        {
+            kill_child_group(&mut child, libc::SIGKILL);
+        }
+
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {}
             Err(e) => {
                 eprintln!("Error: failed to wait on wrapped `{program}`: {e}");
-                let _ = child.kill();
+                kill_child_group(&mut child, libc::SIGKILL);
                 break None;
             }
         }
         std::thread::sleep(Duration::from_millis(50));
     };
 
-    // Drain the output tee so no trailing output is lost before the final event.
-    let _ = output_thread.join();
+    // R20-001 cleanup: the direct child exited (or was killed). Drain the output
+    // tee with a BOUNDED wait instead of an unbounded join — a background
+    // descendant that retained the slave PTY keeps the reader blocked, so if the
+    // drain times out force the whole group down (which releases the slave and
+    // EOFs the reader), then reap. Never `join()` the pump: process exit reaps a
+    // still-blocked reader thread.
+    drop(master);
+    if !wait_flag(&output_done, Duration::from_millis(300)) {
+        kill_child_group(&mut child, libc::SIGTERM);
+        if !wait_flag(&output_done, crate::agent_pty::AGENT_TERMINATE_GRACE) {
+            kill_child_group(&mut child, libc::SIGKILL);
+            let _ = wait_flag(&output_done, Duration::from_millis(500));
+        }
+    }
+    let _ = child.wait();
+    drop(output_thread);
 
     // PRD #20 finding #14: emit Idle only after a SUCCESSFUL exit; a nonzero /
     // signalled failure (or a wait error) ends as a visible Error rather than a
@@ -721,6 +930,146 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
         EventType::Error
     });
     ExitCode::from(code)
+}
+
+/// Non-interactive path (R20-012): the outer stream is piped/redirected, so
+/// there is no TTY to proxy and no line discipline to honor. Spawn the child
+/// with SEPARATE stdout/stderr pipes and a raw stdin pipe, copy each stream
+/// verbatim to the matching outer fd (tee'd through classification), and forward
+/// the outer stdin byte-for-byte — closing the child's stdin on EOF so an
+/// EOF-sensitive child (`cat`) terminates. This preserves `2>file`, stdout-only
+/// pipes, and binary/partial stdin that the merged-PTY path would mangle.
+fn run_wrap_pipe(
+    program: &str,
+    args: &[String],
+    emitter: &Arc<Emitter>,
+    add_trust_flag: bool,
+) -> ExitCode {
+    let mut cmd = StdCommand::new(program);
+    if add_trust_flag {
+        cmd.arg(CODEX_BYPASS_HOOK_TRUST_FLAG);
+    }
+    cmd.args(args);
+    if let Ok(dir) = std::env::current_dir() {
+        cmd.current_dir(dir);
+    }
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: failed to spawn `{program}`: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    emitter.emit(EventType::SessionStart);
+
+    let child_stdout = child.stdout.take().expect("piped child stdout");
+    let child_stderr = child.stderr.take().expect("piped child stderr");
+    let child_stdin = child.stdin.take().expect("piped child stdin");
+
+    // One shared detector across both output streams so the card reflects a
+    // single coherent state (mirrors the PTY path).
+    let is_codex = emitter.agent_type == AgentType::Codex;
+    let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
+        &emitter.agent_type,
+    ))));
+
+    let out_thread = spawn_pipe_tee(
+        child_stdout,
+        libc::STDOUT_FILENO,
+        emitter,
+        &detector,
+        is_codex,
+    );
+    let err_thread = spawn_pipe_tee(
+        child_stderr,
+        libc::STDERR_FILENO,
+        emitter,
+        &detector,
+        is_codex,
+    );
+
+    // Input pump (outer stdin → child stdin, verbatim). On EOF/close of our
+    // stdin, dropping `child_stdin` closes it so an EOF-sensitive child finishes.
+    let in_thread = std::thread::spawn(move || {
+        let mut child_stdin = child_stdin;
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = unsafe {
+                libc::read(
+                    libc::STDIN_FILENO,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            if n < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if n == 0 {
+                break;
+            }
+            if child_stdin.write_all(&buf[..n as usize]).is_err() || child_stdin.flush().is_err() {
+                break;
+            }
+        }
+        drop(child_stdin);
+    });
+
+    let status = child.wait();
+    // The child exited → its stdout/stderr pipe write ends close → the tees see
+    // EOF and finish. Join them so all output is flushed before the final event.
+    let _ = out_thread.join();
+    let _ = err_thread.join();
+    // The stdin pump may still block on our stdin; detach it (process exit reaps
+    // it). Dropping the handle does not wait.
+    drop(in_thread);
+
+    let (success, code) = match status {
+        Ok(s) => (s.success(), s.code().unwrap_or(1) as u8),
+        Err(_) => (false, 1),
+    };
+    emitter.emit(if success {
+        EventType::Idle
+    } else {
+        EventType::Error
+    });
+    ExitCode::from(code)
+}
+
+/// Spawn a tee thread copying `reader` verbatim to the raw fd `out_fd` while
+/// feeding completed lines through the shared classification `detector`. Used by
+/// the non-interactive pipe path for both stdout and stderr so the streams stay
+/// separate on their own outer fds.
+fn spawn_pipe_tee<R: Read + Send + 'static>(
+    reader: R,
+    out_fd: RawFd,
+    emitter: &Arc<Emitter>,
+    detector: &Arc<Mutex<Detector>>,
+    is_codex: bool,
+) -> std::thread::JoinHandle<()> {
+    let emitter = Arc::clone(emitter);
+    let detector = Arc::clone(detector);
+    std::thread::spawn(move || {
+        tee(reader, FdWriter(out_fd), |line| {
+            let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
+            let ev = if is_codex {
+                det.observe_detected(classify_codex_line(line))
+            } else {
+                det.observe(line)
+            };
+            drop(det);
+            if let Some(ev) = ev {
+                emitter.emit(ev.event_type());
+            }
+        });
+    })
 }
 
 #[cfg(test)]

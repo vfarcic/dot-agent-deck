@@ -109,6 +109,33 @@ fn ruleset_for(agent_type: &AgentType) -> &'static RuleSet {
 
 The wrapper runtime (`run_wrap`, `tee`, `Detector`) does not change — the `Detector` debounces a stream of classifications into one event per state change, and it is driven by whichever `RuleSet` `ruleset_for` returns. The `GENERIC` fallback (any non-blank line is activity, a handful of substrings flip to error, idleness comes from process-exit quiescence) already makes `wrap -- <arbitrary-command>` do something useful, so a per-agent rule set is an *upgrade*, not a prerequisite.
 
+#### Codex is a **hybrid**: native hooks under the wrapper (PRD #20 W1)
+
+Stdout scraping cannot reach full parity for *interactive* Codex — bare `codex` paints an ANSI TUI on stdout with no JSON, so the coarse `CODEX` `RuleSet` above can only ever see a wall of redraw text (it never reliably reaches `Idle`/`Error` mid-session and emits no tool/prompt detail). Codex 0.144.4, however, ships a **Claude-Code-compatible native hooks engine**. So Codex keeps `IntegrationStrategy::Wrapper` as its **PTY host + hook injector**, but its rich events come from **native hooks**, not the classifier — the `CODEX` `RuleSet` above is retained only as a coarse fallback.
+
+Concretely, when the wrapper launches a real `codex`:
+
+1. It installs a `hooks.json` into the active `CODEX_HOME` ([`src/codex_hooks_manage.rs`](../../src/codex_hooks_manage.rs)) whose every command hook shells `dot-agent-deck hook --agent codex`. Those hook payloads are the **same shape Claude posts**, so they are ingested by the existing [`src/hook.rs`](../../src/hook.rs) `handle_hook` `"codex"` arm (stamping `AgentType::Codex`) — no new wire, no `PROTOCOL_VERSION` bump. The installer is idempotent, merges (it never clobbers a user's own hooks or `config.toml`), and resolves `CODEX_HOME` the way Codex does (`$CODEX_HOME`, else `$HOME/.codex` — the user's REAL home in production, never a throwaway).
+2. It launches `codex` with `--dangerously-bypass-hook-trust`. Codex requires command hooks to be *trusted* before they run (an interactive `/hooks` review otherwise); because the deck **authors its own hook definition**, it vets the source — itself — and bypasses that prompt for this deck-controlled spawn.
+
+##### Trust flag and launcher/wrapper scripts (important)
+
+The `--dangerously-bypass-hook-trust` flag can only be auto-injected when the wrapper's **direct program is `codex`** — e.g. `dot-agent-deck wrap --agent codex -- codex --model …`. The wrapper appends the flag to codex's own argv, so it works for the common case (and the deck's default `codex` command).
+
+**If you launch Codex through a launcher or wrapper script** — `devbox run …`, a `run_codex_agent.sh`, an alias, a custom absolute path whose basename is not `codex` — the wrapper sees the *launcher* as the program and **cannot** reach inside it to append the flag to the eventual `codex …` invocation. In that case:
+
+- The deck still **auto-installs the hooks** into `CODEX_HOME` whenever it spawns a Codex-identity pane (i.e. `DOT_AGENT_DECK_PANE_ID` is set), so `hooks.json` is present however codex is ultimately launched — you do **not** need to install hooks in your script.
+- You **must add the trust flag yourself** inside the script, on the codex command line:
+
+  ```sh
+  #!/bin/sh
+  # run_codex_agent.sh — a launcher the deck wraps as
+  #   dot-agent-deck wrap --agent codex -- ./run_codex_agent.sh
+  exec codex --dangerously-bypass-hook-trust "$@"
+  ```
+
+  (Alternatively, pre-trust the deck's hooks once via Codex's interactive `/hooks` review; the persisted trust then applies to subsequent runs without the flag.) Without one of these, Codex will refuse to run the deck's hooks and the dashboard card will fall back to the coarse stdout classifier — reliable status is degraded and no tool/prompt detail appears.
+
 **If you need a genuinely new mechanism (e.g. Aider's log-watcher):** implement a new [`IntegrationStrategy`] variant **once** — a new module that produces `AgentEvent`s (e.g. `dot-agent-deck watch --agent aider --log <path>` tailing a structured log and parsing entries) plus its dispatch. Note that today's `Commands::Watch` is an **unrelated generic interval-runner**, not a log watcher; a log-watcher strategy is a separate command. After the strategy exists once, the *second* agent that uses it is back on the cheap path (a registry entry naming the strategy).
 
 ### 4. Declare `live_target` / writability — `src/event.rs`, and your producer

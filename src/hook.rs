@@ -52,12 +52,24 @@ pub fn handle_hook(agent: &str) -> ExitCode {
             };
             build_opencode_event(hook_input)
         }
+        // PRD #20 W1: Codex ships a Claude-Code-compatible hooks engine, so its
+        // command hooks POST the SAME stdin JSON shape as Claude
+        // ([`ClaudeCodeHookInput`]). We reuse the whole ingestion path, only
+        // stamping [`AgentType::Codex`] and letting the Codex-aware
+        // `extract_tool_detail` arms (`shell`, `apply_patch`) sharpen the detail.
+        "codex" => {
+            let hook_input: ClaudeCodeHookInput = match serde_json::from_str(&input) {
+                Ok(v) => v,
+                Err(_) => return ExitCode::SUCCESS,
+            };
+            build_event_typed(hook_input, AgentType::Codex)
+        }
         _ => {
             let hook_input: ClaudeCodeHookInput = match serde_json::from_str(&input) {
                 Ok(v) => v,
                 Err(_) => return ExitCode::SUCCESS,
             };
-            build_event(hook_input)
+            build_event_typed(hook_input, AgentType::ClaudeCode)
         }
     };
 
@@ -111,6 +123,21 @@ fn extract_tool_detail(tool_name: Option<&str>, tool_input: Option<&Value>) -> O
         "Read" | "Edit" | "Write" => input.get("file_path")?.as_str()?.to_string(),
         "Grep" | "Glob" => input.get("pattern")?.as_str()?.to_string(),
         "Agent" => input.get("description")?.as_str()?.to_string(),
+        // PRD #20 W1 — Codex-specific tool shapes. Codex's `shell` tool carries
+        // its `command` as an ARGV ARRAY (e.g. `["/bin/sh","-lc","touch x"]`),
+        // not a Claude-style command STRING; join it so the human detail still
+        // shows the real command. `apply_patch` carries a `*** … File: <path>`
+        // patch envelope; surface the file path.
+        "shell" => {
+            let joined = codex_shell_command(input.get("command")?)?;
+            let first_line = joined.lines().next().unwrap_or(&joined).to_string();
+            truncate(&first_line, 120)
+        }
+        "apply_patch" => {
+            let patch = input.get("patch").and_then(|v| v.as_str())?;
+            codex_patch_path(patch)
+                .unwrap_or_else(|| truncate(patch.lines().next().unwrap_or(patch), 120))
+        }
         _ => {
             // First string-valued key
             let val = input.values().find_map(|v| v.as_str())?;
@@ -128,7 +155,63 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// PRD #20 W1: normalize a Codex `shell` tool's `command` value into a single
+/// human-readable command string. Codex passes an ARGV array
+/// (`["/bin/sh","-lc","touch x"]`); we join with spaces. A plain string is used
+/// verbatim (tolerant of a future shape change). Returns `None` for any other
+/// JSON type so classification degrades gracefully.
+fn codex_shell_command(command: &Value) -> Option<String> {
+    match command {
+        Value::Array(parts) => {
+            let joined = parts
+                .iter()
+                .filter_map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined)
+            }
+        }
+        Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// PRD #20 W1: extract the target file path from a Codex `apply_patch` patch
+/// envelope. Codex uses the `*** Add File: <path>` / `*** Update File: <path>` /
+/// `*** Delete File: <path>` marker lines; return the first such path. `None`
+/// when no marker is present (the caller then falls back to the first line).
+fn codex_patch_path(patch: &str) -> Option<String> {
+    for line in patch.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("***")
+            && let Some((_, path)) = rest.split_once("File:")
+        {
+            let path = path.trim();
+            if !path.is_empty() {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Claude-Code hook builder — the [`AgentType::ClaudeCode`] specialization of
+/// [`build_event_typed`]. Kept as a thin wrapper so the existing Claude unit
+/// tests (and any Claude caller) stay unchanged.
+#[cfg(test)]
 fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
+    build_event_typed(input, AgentType::ClaudeCode)
+}
+
+/// Build an [`AgentEvent`] from a Claude-compatible hook payload, stamping the
+/// given `agent_type`. PRD #20 W1 parameterized this over the agent type so the
+/// Codex hook path (which posts the SAME payload shape) reuses the whole
+/// builder, differing only in the stamped identity and the Codex-aware
+/// `extract_tool_detail` arms.
+fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Option<AgentEvent> {
     let ClaudeCodeHookInput {
         session_id,
         hook_event_name,
@@ -168,7 +251,7 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
 
     Some(AgentEvent {
         session_id,
-        agent_type: AgentType::ClaudeCode,
+        agent_type,
         event_type,
         tool_name,
         tool_detail,

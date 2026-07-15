@@ -87,7 +87,44 @@ impl AgentType {
     /// non-agent command is never misclassified.
     pub fn from_command(cmd: Option<&str>) -> Option<Self> {
         let tokens = tokenize_command(cmd?);
-        detect_from_tokens(&tokens)
+        detect_from_tokens(&tokens, DETECT_RECURSION_BUDGET)
+    }
+}
+
+/// PRD #20 finding R20-016: hard cap on shell-launcher recursion, decremented
+/// across [`detect_from_tokens`] calls (NOT reset per call). A deeply nested
+/// `sh -c "sh -c \"sh -c …\""` can otherwise recurse until stack exhaustion;
+/// with an explicit budget each `-c` level costs one unit and the chain
+/// terminates safely at `None`.
+const DETECT_RECURSION_BUDGET: usize = 8;
+
+/// Short options (matched WITH their leading dash) that consume the FOLLOWING
+/// token as their argument for a given launcher, so command detection skips both
+/// the option and its argument to reach the real binary (`sudo -u root codex`,
+/// `env -u FOO codex`). Conservative allow-list: only these consume the next
+/// token; every other flag is treated as self-contained.
+fn launcher_option_takes_arg(launcher: &str, opt: &str) -> bool {
+    match launcher {
+        "sudo" => matches!(
+            opt,
+            "-u" | "-g" | "-h" | "-p" | "-C" | "-D" | "-R" | "-T" | "-U" | "-r" | "-t"
+        ),
+        "env" => matches!(opt, "-u" | "-C" | "-S"),
+        _ => false,
+    }
+}
+
+/// Whether `arg` is a shell SHORT-option cluster that selects command mode
+/// (`-c`) — e.g. `-c`, `-lc`, `-ic`. Only a single-dash cluster of ASCII-letter
+/// options containing `c` counts; a LONG option like `--rcfile` (which merely
+/// happens to contain the letter `c`) is deliberately NOT command mode, so a
+/// startup-file path is never mistaken for a `-c` script.
+fn is_shell_command_flag(arg: &str) -> bool {
+    match arg.strip_prefix('-') {
+        Some(rest) if !rest.is_empty() && !rest.starts_with('-') => {
+            rest.chars().all(|c| c.is_ascii_alphabetic()) && rest.contains('c')
+        }
+        _ => false,
     }
 }
 
@@ -108,9 +145,15 @@ fn is_env_assignment(token: &str) -> bool {
 
 /// Resolve the agent type from an already-tokenized command, looking through
 /// `env`/`sudo`/shell-launcher prefixes. See [`AgentType::from_command`].
-fn detect_from_tokens(tokens: &[String]) -> Option<AgentType> {
+fn detect_from_tokens(tokens: &[String], budget: usize) -> Option<AgentType> {
+    // R20-016: the recursion budget is decremented across calls (a `-c` script
+    // recurse below spends one unit), so a deeply nested `sh -c "sh -c …"` can no
+    // longer recurse until stack exhaustion — it terminates at `None`.
+    if budget == 0 {
+        return None;
+    }
     let mut idx = 0;
-    // Guard against a pathological deeply-nested `sh -c "sh -c ..."`.
+    // Bound the number of prefix hops (`env`/`sudo` chains) within one frame.
     for _ in 0..8 {
         // Skip a run of leading environment assignments (`FOO=1 codex`).
         while tokens.get(idx).is_some_and(|t| is_env_assignment(t)) {
@@ -122,13 +165,29 @@ fn detect_from_tokens(tokens: &[String]) -> Option<AgentType> {
             .and_then(|s| s.to_str())
             .unwrap_or(token.as_str());
 
-        // `env` / `sudo` prefix: skip the launcher and any of its own flags or
-        // `VAR=VALUE` assignments, then re-resolve from the next real token.
+        // `env` / `sudo` prefix: skip the launcher and any of its own flags,
+        // `VAR=VALUE` assignments, and — R20-016 — the ARGUMENT of an
+        // option that consumes one (`sudo -u root`, `env -u FOO`), then
+        // re-resolve from the next real token. `--` ends option parsing.
         if basename == "env" || basename == "sudo" {
             idx += 1;
             while let Some(next) = tokens.get(idx) {
-                if next.starts_with('-') || is_env_assignment(next) {
+                if next == "--" {
                     idx += 1;
+                    break;
+                } else if is_env_assignment(next) {
+                    idx += 1;
+                } else if next.starts_with('-') {
+                    // A single-dash short option may consume the following
+                    // token as its argument (e.g. `-u root`); a `--long` option
+                    // either bundles its value (`--unset=FOO`) or is a flag, so
+                    // never over-consume for those.
+                    let consumes =
+                        !next.starts_with("--") && launcher_option_takes_arg(basename, next);
+                    idx += 1;
+                    if consumes && tokens.get(idx).is_some_and(|t| !t.starts_with('-')) {
+                        idx += 1;
+                    }
                 } else {
                     break;
                 }
@@ -136,18 +195,19 @@ fn detect_from_tokens(tokens: &[String]) -> Option<AgentType> {
             continue;
         }
 
-        // Shell launcher: `sh -c '<script>'`, `bash -lc "<script>"`. Find the
-        // `-…c` flag and recurse into the following script argument's first
-        // word; a shell with no `-c` stays an unrecognized binary.
+        // Shell launcher: `sh -c '<script>'`, `bash -lc "<script>"`. Recurse into
+        // the script argument that follows a valid command-mode short-option
+        // cluster ([`is_shell_command_flag`]); a shell with no `-c` (or one given
+        // only a `--rcfile`-style long option) stays an unrecognized binary.
         if matches!(basename, "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash") {
             let mut j = idx + 1;
             while let Some(arg) = tokens.get(j) {
                 if arg.starts_with('-') {
-                    if arg.contains('c')
+                    if is_shell_command_flag(arg)
                         && let Some(script) = tokens.get(j + 1)
                     {
                         let inner = tokenize_command(script);
-                        return detect_from_tokens(&inner);
+                        return detect_from_tokens(&inner, budget - 1);
                     }
                     j += 1;
                 } else {
