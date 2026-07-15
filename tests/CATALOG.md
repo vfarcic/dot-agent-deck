@@ -67,6 +67,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the status badge color (`status/badge/001`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/pane/008 — A Codex pane's card renders the first-class Codex identity in its registry badge color (PRD #20 M7).
+- **Layer:** L1 (ratatui `TestBackend` + color-aware `insta` snapshot).
+- **Agent:** none (a fixture `SessionState` with `agent_type = AgentType::Codex` and no display name).
+- **Asserts:** the rendered card contains the `Codex` identity; every label cell uses the Codex registry entry's `badge_color`; the complete color-aware card buffer matches its snapshot.
+- **Does not assert:** wrapper event delivery or real Codex execution (covered by `codex/wrap/001` and `codex/live/001`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/density
 
 ##### dashboard/density/001 — Spacious density shows up to 3 prompts and 3 tool calls per card.
@@ -380,6 +387,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Asserts:** each `agent-event --type running|waiting|finished` exits 0 and is re-broadcast by the daemon as a bare `AgentEvent` carrying the Pi identity + injected ids + the mapped `EventType`; fed through `AppState::apply_event` the unattended badge moves `Thinking` → `WaitingForInput` → `Idle`; and a seeded sentinel `~/.claude/settings.json` (whose presence makes the hook-install guard pass) is byte-for-byte unchanged afterward and never gains a `dot-agent-deck` hook entry — proving the daemon/agent-event path installs no Claude hook.
 - **Does not assert:** the real `pi` runtime + bundled extension end to end (real-`pi` e2e, M4.1); the daemon's own internal derived status over the wire (`AgentRecord` carries no status field; the broadcast is the observable).
 - **Platform coverage:** linux (headless daemon-serve harness).
+
+##### status/agent-event/004 — A typed synthetic Codex wrapper lifecycle updates one dashboard card through active, error, recovery, and idle states (PRD #20 M7).
+- **Layer:** L1 (in-process `SyntheticAgent<AgentType::Codex>` events applied through `AppState::apply_event`).
+- **Agent:** synthetic Codex wrapper identity.
+- **Asserts:** the same Codex session remains one card and its observable status follows Thinking → Error → Thinking → Idle while retaining `AgentType::Codex`.
+- **Does not assert:** stdout classification or socket transport (covered by `codex/wrap/001`).
+- **Platform coverage:** mac+linux+windows.
 
 ### Prompts
 
@@ -1679,6 +1693,25 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux.
 
 ### Chain-smoke (real-agent) coverage
+
+#### codex/wrap
+
+##### codex/wrap/001 — A synthetic Codex JSONL stream runs through the real wrapper, daemon event stream, and PTY-attached dashboard (PRD #20 M7).
+- **Layer:** L2 PTY-attached (`TuiDeck`, real binary + daemon, deterministic shell stand-in, no authentication or LLM).
+- **Agent:** synthetic stand-in wrapped with `dot-agent-deck wrap --agent codex`.
+- **Asserts:** realistic turn-start and turn-completed lines become typed Codex `AgentEvent`s carrying `AGENT_EVENT_SCHEMA_VERSION`; the rendered card visibly shows the Codex identity and transitions Thinking → Idle.
+- **Does not assert:** model authentication or Codex CLI behavior (covered by `codex/live/001`).
+- **Platform coverage:** mac+linux.
+
+#### codex/live
+
+##### codex/live/001 — A real cheap-model Codex run is visible as a wrapped Codex card and reports a unique fixture sentinel (PRD #20 M7, rule 4).
+- **Layer:** L2 PTY-attached (`TuiDeck`, reel-eligible); runtime-skipped unless `check_codex_available` verifies the binary, persisted auth, and a live model request.
+- **Agent:** real `codex exec` using `gpt-5.1-codex-mini`, isolated copied credentials, read-only sandbox, and low reasoning effort.
+- **Asserts:** the visible dashboard renders `Codex` and transitions Thinking → Idle; Codex reaches the model, uses the shell to list the fixture, and writes a final response containing `codex_sentinel_a7c91f.txt`.
+- **Does not assert:** exact model phrasing or token usage.
+- **Platform coverage:** mac+linux (real-agent tier is local-only).
+- **Cost note:** one minimal mini-model availability probe plus one short read-only directory-listing turn.
 
 #### chain-smoke/claude
 

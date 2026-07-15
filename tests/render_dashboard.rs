@@ -418,6 +418,58 @@ fn pane_007_pi_card_shows_pi_identity() {
     }
 }
 
+/// Scenario: Render a live Codex session with no friendly display name into a
+/// color-aware card buffer. The title must expose the first-class `Codex`
+/// identity and every cell in that label must use Codex's registry badge color.
+#[spec("dashboard/pane/008")]
+#[test]
+fn pane_008_codex_card_shows_colored_identity_badge() {
+    let now = chrono::Utc::now();
+    let session = SessionState {
+        session_id: "wrapped-01".to_string(),
+        agent_type: AgentType::Codex,
+        cwd: Some("/home/dev/workspace".to_string()),
+        status: SessionStatus::Thinking,
+        active_tool: None,
+        started_at: now,
+        last_activity: now,
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: Some("inspect the repository".to_string()),
+        first_prompts: vec!["inspect the repository".to_string()],
+        pane_id: Some("codex-pane-1".to_string()),
+        agent_id: Some("1".to_string()),
+        display_name: None,
+    };
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let height = density.rendered_height(width >= RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH);
+    let buffer = render_card_to_buffer(&session, None, Some(1), density, 0, false, width, height);
+    let text = buffer_to_text(&buffer);
+    assert!(
+        text.contains("Codex"),
+        "a wrapped Codex pane must render the Codex identity:\n{text}"
+    );
+
+    let expected = dot_agent_deck::agent_registry::spec(&AgentType::Codex).badge_color;
+    let mut colored_label_found = false;
+    for y in 0..buffer.area().height {
+        for x in 0..=buffer.area().width.saturating_sub(5) {
+            let symbols: String = (x..x + 5).map(|cx| buffer[(cx, y)].symbol()).collect();
+            if symbols == "Codex" {
+                colored_label_found |= (x..x + 5).all(|cx| buffer[(cx, y)].fg == expected);
+            }
+        }
+    }
+    assert!(
+        colored_label_found,
+        "the rendered Codex identity must use registry badge color {expected:?}:\n{}",
+        buffer_to_color_text(&buffer)
+    );
+
+    insta::assert_snapshot!(buffer_to_color_text(&buffer));
+}
+
 // ---------------------------------------------------------------------------
 // PRD #155 — centralized color palette (Option A). Border encodes STATUS in
 // BOTH deck cards and embedded panes; the dedicated `selected` (Magenta) and

@@ -148,3 +148,35 @@ fn agent_event_002_status_badge_follows_running_waiting_finished_sequence() {
         );
     }
 }
+
+/// Scenario: A synthetic Codex wrapper emits the same observable lifecycle its
+/// stdout detector produces: session start, active work, an error, recovery,
+/// and turn completion. Applying those typed events must keep one Codex card
+/// and move its badge Thinking → Error → Thinking → Idle.
+#[spec("status/agent-event/004")]
+#[test]
+fn agent_event_004_codex_wrapper_lifecycle_drives_one_card() {
+    let codex = SyntheticAgent::new(AgentType::Codex, "codex-wrapper-pane")
+        .with_agent_id("codex-wrapper-agent");
+    let mut state = AppState::default();
+    state.register_pane(codex.pane_id.clone());
+
+    for (event_type, expected) in [
+        (EventType::Thinking, SessionStatus::Thinking),
+        (EventType::Error, SessionStatus::Error),
+        (EventType::Thinking, SessionStatus::Thinking),
+        (EventType::Idle, SessionStatus::Idle),
+    ] {
+        state.apply_event(codex.agent_event(event_type));
+        assert_eq!(status_of(&state, codex.session_id()), expected);
+        assert_eq!(
+            state.sessions[codex.session_id()].agent_type,
+            AgentType::Codex
+        );
+        assert_eq!(
+            state.sessions.len(),
+            1,
+            "one wrapped run must update one card"
+        );
+    }
+}

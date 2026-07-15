@@ -75,6 +75,7 @@ struct ContinueSession {
 enum CredentialImport {
     ClaudeCode,
     OpenCode,
+    Codex,
 }
 
 /// Builder for [`TuiDeck`]. Use the test surface
@@ -150,6 +151,14 @@ impl TuiDeckBuilder {
     /// `~/.opencode/plugin/` directory on the host is NOT copied.
     pub fn with_imported_opencode_credentials(mut self) -> Self {
         self.credential_imports.push(CredentialImport::OpenCode);
+        self
+    }
+
+    /// Import the host user's Codex `auth.json` into the isolated per-test HOME.
+    /// Pair with [`check_codex_available`] so missing or rejected credentials
+    /// cleanly skip a real-Codex test instead of failing during TUI launch.
+    pub fn with_imported_codex_credentials(mut self) -> Self {
+        self.credential_imports.push(CredentialImport::Codex);
         self
     }
 
@@ -358,6 +367,9 @@ impl TuiDeck {
                 }
                 CredentialImport::OpenCode => {
                     import_opencode_credentials(&home).map_err(|e| e.to_string())?;
+                }
+                CredentialImport::Codex => {
+                    import_codex_credentials(&home).map_err(|e| e.to_string())?;
                 }
             }
         }
@@ -913,6 +925,13 @@ impl TuiDeck {
         writer.flush().expect("flush keys to PTY master");
     }
 
+    /// Subscribe to the daemon's broadcast event stream used by this attached
+    /// deck. Wrapper e2es use it to inspect the typed event and schema version
+    /// while separately asserting the same transition on the rendered grid.
+    pub fn subscribe_events(&self) -> EventSub {
+        EventSub::open(&self.attach_socket).expect("open SubscribeEvents stream")
+    }
+
     /// Returns the deck's per-test hook socket path. Synthetic-event
     /// L2 tests connect to this directly to inject hook payloads.
     pub fn hook_socket_path(&self) -> &Path {
@@ -1443,6 +1462,90 @@ pub fn check_opencode_available() -> Result<(), String> {
     )
 }
 
+/// Cheap model used by Codex availability probes and real-agent e2e coverage.
+pub const CODEX_TEST_MODEL: &str = "gpt-5.1-codex-mini";
+
+/// Runtime-skip helper for real Codex coverage. A version check alone is not
+/// enough: this verifies persisted auth and performs one minimal model request,
+/// so expired credentials, 401 responses, and unreachable accounts skip cleanly
+/// before the PTY scenario starts.
+pub fn check_codex_available() -> Result<(), String> {
+    if !cli_invocable("codex") {
+        return Err("Codex CLI not installed (could not invoke `codex --version`)".into());
+    }
+
+    let auth_path = host_home().join(".codex").join("auth.json");
+    let auth_is_regular = std::fs::symlink_metadata(&auth_path)
+        .map(|meta| meta.file_type().is_file())
+        .unwrap_or(false);
+    if !auth_is_regular {
+        return Err(
+            "Codex credentials not found at ~/.codex/auth.json — log in with `codex login`".into(),
+        );
+    }
+
+    let login = std::process::Command::new("codex")
+        .args(["login", "status"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("could not check Codex login status: {e}"))?;
+    let login_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&login.stdout),
+        String::from_utf8_lossy(&login.stderr)
+    );
+    if !login.status.success() || login_text.to_ascii_lowercase().contains("not logged") {
+        return Err("Codex is not authenticated — log in with `codex login`".into());
+    }
+
+    let final_message = tempfile::NamedTempFile::new()
+        .map_err(|e| format!("could not create Codex probe output file: {e}"))?;
+    let probe = std::process::Command::new("codex")
+        .args([
+            "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "--model",
+            CODEX_TEST_MODEL,
+            "-c",
+            "model_reasoning_effort=\"low\"",
+            "--color",
+            "never",
+        ])
+        .arg("--output-last-message")
+        .arg(final_message.path())
+        .arg("Reply with exactly CODEX_AUTH_OK and do not use tools.")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run Codex model probe: {e}"))?;
+    let probe_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    let lower = probe_text.to_ascii_lowercase();
+    let model_reply = std::fs::read_to_string(final_message.path()).unwrap_or_default();
+    if !probe.status.success()
+        || !model_reply.contains("CODEX_AUTH_OK")
+        || [
+            "401",
+            "unauthorized",
+            "not logged in",
+            "authentication required",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return Err(format!(
+            "Codex could not reach model {CODEX_TEST_MODEL} with the current authentication"
+        ));
+    }
+    Ok(())
+}
+
 /// Helper: returns true when `bin --version` exits 0, false otherwise
 /// (binary missing, returns non-zero, etc.). Used by the
 /// `check_*_available()` helpers — extracted so the BoolNot trait
@@ -1870,6 +1973,21 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Copy only Codex's authentication state into the isolated test HOME. User
+/// configuration is deliberately not imported; real-agent tests pin their model
+/// and pass `--ignore-user-config` for deterministic behavior.
+fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
+    let src = host_home().join(".codex").join("auth.json");
+    let bytes = read_credential_file_no_symlink(
+        &src,
+        "Codex credentials not found at ~/.codex/auth.json — log in with `codex login`",
+        "~/.codex/auth.json",
+    )?;
+    let dst = test_home.join(".codex");
+    std::fs::create_dir_all(&dst)?;
+    write_credential_file_atomic_0o600(&dst.join("auth.json"), &bytes)
 }
 
 /// Like `copy_dir_recursively` but skips any top-level `plugin/`
