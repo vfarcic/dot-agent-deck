@@ -980,10 +980,22 @@ mod tests {
 
     #[test]
     fn canonical_workspace_requires_absolute() {
+        // Relative roots are rejected on every platform (bare/`.`-prefixed are
+        // relative everywhere), so these assertions need no cfg gate.
         assert!(canonical_workspace("relative/dir").is_err());
         assert!(canonical_workspace("./also/relative").is_err());
-        let abs = canonical_workspace("/work/space").expect("absolute path accepted");
+
+        // The accepted-absolute fixture must be a *genuinely* absolute path on
+        // the host: on Windows a POSIX-style "/work/space" is NOT absolute
+        // (Path::is_absolute wants a drive/prefix like `C:\`), so pick the
+        // literal by platform. Precedent: commit 8796fc3 made the config-path
+        // tests platform-aware for the same build-windows CI job.
+        #[cfg(windows)]
+        let abs_root = r"C:\work\space";
+        #[cfg(not(windows))]
+        let abs_root = "/work/space";
+        let abs = canonical_workspace(abs_root).expect("absolute path accepted");
         assert!(abs.is_absolute());
-        assert_eq!(abs, PathBuf::from("/work/space"));
+        assert_eq!(abs, PathBuf::from(abs_root));
     }
 }
