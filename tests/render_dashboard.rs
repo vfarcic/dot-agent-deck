@@ -173,6 +173,7 @@ fn overlay_buffers() -> Vec<(&'static str, ratatui::buffer::Buffer)> {
         idle: 1,
         compacting: 1,
         total_tools: 42,
+        ..Default::default()
     };
     vec![
         (

@@ -1881,6 +1881,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         tool_count: 2,
         first_prompts: vec!["build the feature".into()],
         last_user_prompt: Some("build the feature".into()),
+        live_target: None,
     };
 
     // Hydration seeds the card from the snapshot; agent_id is minted on it so
@@ -2012,6 +2013,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         last_user_prompt: Some(format!(
                             "run \x1b[31mhostile\x07 \x00prompt {over_long}"
                         )),
+                        live_target: None,
                     }),
                 };
                 let resp = AttachResponse {

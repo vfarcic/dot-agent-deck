@@ -421,13 +421,26 @@ impl DaemonClient {
             },
         )
         .await?;
+        // PRD #20 blocker-7: a NEW client reads the typed `send_result` BEFORE
+        // treating a non-ok response as a transport error. A newer daemon
+        // returns `ok=false` for non-delivery (history-only / no-live-target /
+        // stale / wrong-session) so an OLD client that ignores `send_result`
+        // still treats non-delivery as failure — but this new client must
+        // surface the precise outcome so callers can retain/retry the input.
+        // Only a response with NO `send_result` and `ok=false` is a genuine
+        // transport/server failure.
+        if let Some(result) = resp.send_result {
+            return Ok(result);
+        }
         if !resp.ok {
             return Err(ClientError::Server(
                 resp.error
                     .unwrap_or_else(|| "write-and-submit failed".into()),
             ));
         }
-        Ok(resp.send_result.unwrap_or(SendResult::Applied))
+        // A pre-PRD-20 daemon omits `send_result`; ok=true is the legacy
+        // fire-and-forget "assume applied" case.
+        Ok(SendResult::Applied)
     }
 
     /// Push a TUI pane resize through to the daemon's PTY. Idempotent on the

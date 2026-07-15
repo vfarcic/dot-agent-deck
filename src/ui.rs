@@ -19,7 +19,7 @@ use crate::ascii_art::{AsciiArtResult, generate_ascii_art};
 use crate::config;
 use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
 use crate::embedded_pane::{EmbeddedPaneController, HydratedPane};
-use crate::event::{AgentType, EventType, OrchestrationSurface};
+use crate::event::{AgentType, EventType, OrchestrationSurface, SendResult};
 use crate::features::Features;
 // PRD #80 introduced a UI-dispatch `Action` enum in this module (the renamed
 // `KeyResult`), which collides with the keybinding-action enum. Import the
@@ -1763,12 +1763,18 @@ fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'
         return sessions;
     }
 
-    // PRD #20 M9: split the query into `type:<agent>` tokens and ordinary text.
-    // Each `type:` token resolves through the agent registry (label/basename,
-    // case-insensitive) so all agent identities are filterable and a future
-    // agent needs no new filter code. The remaining text keeps matching
-    // id/cwd/status/display-name exactly as before, and the two compose with
-    // AND semantics (`type:codex wrapped-worker` = Codex AND "wrapped-worker").
+    // PRD #20 M9 / finding #20: split the query into `type:<agent>` tokens and
+    // ordinary text. Each `type:` token resolves through the agent registry
+    // (label/basename, case-insensitive) so all agent identities are filterable
+    // and a future agent needs no new filter code. The remaining text keeps
+    // matching id/cwd/status/display-name exactly as before.
+    //
+    // Grammar (all conjunctive — AND): a session matches iff it satisfies EVERY
+    // `type:` token AND the joined text query. Because a session has exactly one
+    // agent type, MULTIPLE DISTINCT `type:` tokens can never all hold — so
+    // `type:codex type:claude` matches nothing (a session cannot be both Codex
+    // and Claude Code). A repeated same-type token is a harmless no-op, and
+    // `type:codex wrapped-worker` = Codex AND text "wrapped-worker".
     let mut type_filters: Vec<crate::event::AgentType> = Vec::new();
     let mut unknown_type = false;
     let mut text_terms: Vec<&str> = Vec::new();
@@ -1791,7 +1797,7 @@ fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'
 
     let text_query = text_terms.join(" ").to_lowercase();
     sessions.retain(|(id, s)| {
-        let type_match = type_filters.is_empty() || type_filters.contains(&s.agent_type);
+        let type_match = type_filters.is_empty() || type_filters.iter().all(|t| *t == s.agent_type);
         let text_match = text_query.is_empty() || {
             let id_match = id.to_lowercase().contains(&text_query);
             let cwd_match = s
@@ -2348,6 +2354,12 @@ fn process_pending_seed_prompts(
     snapshot: &AppState,
 ) {
     let now = std::time::Instant::now();
+    // PRD #20 blocker-5: the send outcome CONTROLS retention. A non-delivered
+    // seed must be retained for a later retry (e.g. after a pane transitions
+    // from history-only to live) and must surface visible feedback — never be
+    // silently dropped. Collected here and applied to `ui.status_message` after
+    // the `retain_mut` borrow ends (the closure can't touch `ui` directly).
+    let mut feedback: Option<String> = None;
     ui.pending_seed_prompts.retain_mut(|sp| {
         // Fast path: agent fired SessionStart (agent_type resolved).
         let agent_ready = snapshot.sessions.values().any(|s| {
@@ -2367,8 +2379,23 @@ fn process_pending_seed_prompts(
             should_inject_spawn_time_prompt(sp.ready_since, now)
         };
         if (agent_ready || timeout_ready) && buffer_elapsed {
-            let _ = pane.write_and_submit_to_pane(&sp.pane_id, &sp.prompt);
-            return false;
+            match pane.write_and_submit_to_pane(&sp.pane_id, &sp.prompt) {
+                // Delivered (or accepted for delivery): drop the seed.
+                Ok(SendResult::Applied) | Ok(SendResult::Queued) => return false,
+                // Explicit non-delivery: retain for retry, surface feedback.
+                Ok(other) => {
+                    feedback = Some(format!(
+                        "Seed prompt not delivered ({}); will retry",
+                        describe_send_result(other)
+                    ));
+                    return true;
+                }
+                // Transport failure: retain for retry, surface feedback.
+                Err(e) => {
+                    feedback = Some(format!("Seed prompt not delivered ({e}); will retry"));
+                    return true;
+                }
+            }
         }
         // Hard timeout after 60s — give up.
         if sp.created_at.elapsed() > std::time::Duration::from_secs(60) {
@@ -2377,6 +2404,37 @@ fn process_pending_seed_prompts(
         }
         true
     });
+    if let Some(message) = feedback {
+        ui.status_message = Some((message, now));
+    }
+}
+
+/// PRD #20 blocker-3: wrap a bare, about-to-be-TYPED launch command for a
+/// mode/restore agent shell (the one launch class that doesn't pass its command
+/// through the common `agent_pty::spawn` boundary — it spawns a shell and
+/// injects the command as keystrokes). Resolves the Wrapper-strategy identity
+/// from the command and returns `dot-agent-deck wrap --agent <name> -- <cmd>`
+/// for a Wrapper agent (Codex); returns the command unchanged for native agents.
+/// Idempotent, so a re-typed already-wrapped command is never double-wrapped.
+fn wrap_agent_command(command: &str) -> String {
+    match AgentType::from_command(Some(command)) {
+        Some(agent_type) => crate::wrap::wrap_launch_command(command, &agent_type),
+        None => command.to_string(),
+    }
+}
+
+/// PRD #20 blocker-5: a short human-readable reason a [`SendResult`] was not
+/// delivered, for the status-bar feedback shown when a seed / orchestrator
+/// prompt could not reach a live target.
+fn describe_send_result(result: SendResult) -> &'static str {
+    match result {
+        SendResult::Applied => "applied",
+        SendResult::Queued => "queued",
+        SendResult::HistoryOnly => "history-only session",
+        SendResult::NoLiveTarget => "no live target",
+        SendResult::Stale => "stale target",
+        SendResult::WrongSession => "wrong session",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5922,7 +5980,16 @@ fn dispatch_action(
                                         if let Some(saved) = ui.pane_metadata.get(&new_id) {
                                             let agent_cmd = saved.command.clone();
                                             if !agent_cmd.is_empty() {
-                                                let _ = pane.write_to_pane(&new_id, &agent_cmd);
+                                                // PRD #20 blocker-3: this mode path
+                                                // spawns a bare shell then TYPES the
+                                                // command in, so it bypasses the
+                                                // common spawn-boundary wrap — apply
+                                                // the Wrapper strategy to the typed
+                                                // launch line here. The persisted
+                                                // `saved.command` stays bare (only
+                                                // the injected line is transformed).
+                                                let launch = wrap_agent_command(&agent_cmd);
+                                                let _ = pane.write_to_pane(&new_id, &launch);
                                             }
                                         }
                                         ui.status_message = Some((
@@ -7351,7 +7418,14 @@ pub fn run_tui(
                                 let _ = pane.write_to_pane(&new_id, init_cmd);
                             }
                             if !saved_pane.command.is_empty() {
-                                let _ = pane.write_to_pane(&new_id, &saved_pane.command);
+                                // PRD #20 blocker-3: mode RESTORE also spawns a
+                                // bare shell then types the saved command — wrap
+                                // a Wrapper-strategy command at this type site
+                                // (the persisted `saved_pane.command` stays bare).
+                                let _ = pane.write_to_pane(
+                                    &new_id,
+                                    &wrap_agent_command(&saved_pane.command),
+                                );
                             }
                         }
                         Err(e) => {
@@ -7894,32 +7968,64 @@ pub fn run_tui(
                     )
                 };
                 if (agent_ready || timeout_ready) && buffer_elapsed {
-                    if let Some(prompt) = orchestrator_prompt.take() {
-                        // PRD #128 audit S2: emit a one-shot operator-visible
-                        // log right before the write fires. Distinct target
-                        // from `pane_write` so an operator can flip on the
-                        // buffer trail without also enabling the per-byte
-                        // trace. `debug!` (not `trace!`) because this is an
-                        // operational, once-per-spawn event.
-                        if let Some(rs) = ui.orchestration_ready_since.get(id) {
-                            tracing::debug!(
-                                target: "spawn_time_buffer",
-                                elapsed_ms = rs.elapsed().as_millis() as u64,
-                                pane_id = %start_pane_id,
-                                "spawn-time readiness buffer elapsed; proceeding with role prompt write"
-                            );
-                        }
-                        let _ = pane.write_and_submit_to_pane(start_pane_id, &prompt);
+                    // PRD #128 audit S2: emit a one-shot operator-visible
+                    // log right before the write fires. Distinct target
+                    // from `pane_write` so an operator can flip on the
+                    // buffer trail without also enabling the per-byte
+                    // trace. `debug!` (not `trace!`) because this is an
+                    // operational, once-per-spawn event.
+                    if let Some(rs) = ui.orchestration_ready_since.get(id) {
+                        tracing::debug!(
+                            target: "spawn_time_buffer",
+                            elapsed_ms = rs.elapsed().as_millis() as u64,
+                            pane_id = %start_pane_id,
+                            "spawn-time readiness buffer elapsed; proceeding with role prompt write"
+                        );
                     }
-                    role_statuses[*start_role_index] = OrchestrationRoleStatus::Working;
-                    ui.orchestration_prompted.insert(*id);
-                    // PRD #128 audit N1: the ready-since timestamp is
-                    // load-bearing only between SessionStart and the
-                    // buffered write. Once the write fires this entry is
-                    // dead state — drop it so the map size matches the
-                    // count of pending orchestration spawns rather than
-                    // accumulating over the session.
-                    ui.orchestration_ready_since.remove(id);
+                    // PRD #20 blocker-5: the send OUTCOME controls retention +
+                    // role state. Do NOT take the prompt or mark the role
+                    // Working until delivery is confirmed — a role that
+                    // declared history-only must RETAIN its prompt for a retry
+                    // once it becomes live, and must show honest feedback
+                    // instead of a false Working. Only `Applied`/`Queued`
+                    // consume the prompt and advance the role; every other
+                    // outcome leaves the prompt in place (retried next frame)
+                    // and surfaces feedback.
+                    let prompt_text = orchestrator_prompt
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_string();
+                    match pane.write_and_submit_to_pane(start_pane_id, &prompt_text) {
+                        Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
+                            *orchestrator_prompt = None;
+                            role_statuses[*start_role_index] = OrchestrationRoleStatus::Working;
+                            ui.orchestration_prompted.insert(*id);
+                            // PRD #128 audit N1: the ready-since timestamp is
+                            // load-bearing only between SessionStart and the
+                            // buffered write. Once the write fires this entry
+                            // is dead state — drop it so the map size matches
+                            // the count of pending orchestration spawns rather
+                            // than accumulating over the session.
+                            ui.orchestration_ready_since.remove(id);
+                        }
+                        Ok(other) => {
+                            let msg = if other == SendResult::HistoryOnly {
+                                "History-only session cannot accept live input".to_string()
+                            } else {
+                                format!(
+                                    "Orchestrator prompt not delivered ({}); will retry",
+                                    describe_send_result(other)
+                                )
+                            };
+                            ui.status_message = Some((msg, std::time::Instant::now()));
+                        }
+                        Err(e) => {
+                            ui.status_message = Some((
+                                format!("Orchestrator prompt not delivered ({e}); will retry"),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -10194,6 +10300,21 @@ fn render_stats_bar(
         }
     }
 
+    // PRD #20 finding #10: when more than one real agent type is active, show a
+    // compact per-agent-type breakdown (e.g. `1 ClaudeCode │ 1 Codex`), each in
+    // its registry badge color. A single-agent deck shows nothing extra — the
+    // breakdown would just restate the `active` count.
+    if stats.by_agent_type.len() > 1 {
+        for (agent_type, count) in &stats.by_agent_type {
+            let spec = crate::agent_registry::spec(agent_type);
+            spans.push(Span::styled("  \u{2502}  ", text_dim()));
+            spans.push(Span::styled(
+                format!("{count} {}", spec.label),
+                Style::default().fg(spec.badge_color),
+            ));
+        }
+    }
+
     // Always show total tools
     spans.push(Span::styled("  \u{2502}  ", text_dim()));
     spans.push(Span::styled(
@@ -12186,36 +12307,28 @@ fn render_session_card(
         crate::event::Writable::HistoryOnly => " history ",
         crate::event::Writable::None => " view-only ",
     };
-    // PRD #20 M5: the agent-type label carries its registry badge colour so the
-    // card exposes a coloured type badge (cross-agent: Claude / OpenCode / Pi /
-    // Codex each get their registry colour). The rest of the title stays primary
-    // text. A friendly `display_name` replaces the `<type> · <id>` form for a
-    // live card, so it shows no coloured type label; a non-live card keeps the
-    // badge + marker even with a name so the view-only status stays visible.
-    // For a live card the segment concatenation is character-identical to the
-    // prior single-string title, so existing text-only snapshots are unchanged.
+    // PRD #20 M5 / finding #9: the agent-type label carries its registry badge
+    // colour so EVERY card exposes a coloured type badge (cross-agent: Claude /
+    // OpenCode / Pi / Codex each get their registry colour). The rest of the
+    // title stays primary text. A friendly `display_name` now renders ALONGSIDE
+    // the badge (`<type> · <name>`) rather than replacing it — most real panes
+    // have a display name, so dropping the badge there hid the type in the
+    // common case. A non-live card additionally shows a trailing
+    // `history` / `view-only` marker.
     let badge_style = Style::default()
         .fg(crate::agent_registry::spec(&session.agent_type).badge_color)
         .add_modifier(Modifier::BOLD);
-    // The marker is appended AFTER the `<type> · <id>` (or name) so the
-    // `<type> · <id>` shape callers match on (e.g. `Codex ·`, `Pi · orch-01`)
+    // The marker is appended AFTER the `<type> · <id-or-name>` so the
+    // `<type> · …` shape callers match on (e.g. `Codex ·`, `Pi · orch-01`)
     // stays intact — only a trailing view-only annotation is added.
-    let title_segments: Vec<(String, Style)> = if let Some(name) = display_name {
-        if is_live {
-            vec![(format!(" {sel_prefix}{num_prefix}{name} "), title_bold)]
-        } else {
-            vec![
-                (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
-                (format!("{}", session.agent_type), badge_style),
-                (format!(" · {name} "), title_bold),
-                (liveness_marker.to_string(), text_dim()),
-            ]
-        }
-    } else {
+    let label_after_badge = display_name
+        .map(|name| format!(" · {name} "))
+        .unwrap_or_else(|| format!(" · {id_display} "));
+    let title_segments: Vec<(String, Style)> = {
         let mut segs = vec![
             (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
             (format!("{}", session.agent_type), badge_style),
-            (format!(" · {id_display} "), title_bold),
+            (label_after_badge, title_bold),
         ];
         if !is_live {
             segs.push((liveness_marker.to_string(), text_dim()));

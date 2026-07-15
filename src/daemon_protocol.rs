@@ -571,14 +571,24 @@ impl AttachResponse {
             ..Default::default()
         }
     }
-    /// PRD #20 M3: an OK reply to [`AttachRequest::WriteAndSubmit`] that carries
-    /// the honest [`crate::event::SendResult`]. `ok = true` because the RPC
-    /// itself succeeded (the daemon evaluated the target and reports what
-    /// happened); the `send_result` variant tells the client whether the input
-    /// was actually delivered.
+    /// PRD #20 M3 / blocker-7: a reply to [`AttachRequest::WriteAndSubmit`] that
+    /// carries the honest [`crate::event::SendResult`]. `ok` MIRRORS delivery —
+    /// `true` only for `applied`/`queued`, `false` for every non-delivery
+    /// (`history-only` / `no-live-target` / `stale` / `wrong-session`). This is
+    /// the cross-version safety choice for Rule 12: an OLD client that ignores
+    /// the unknown `send_result` field reads `ok=false` and correctly treats
+    /// non-delivery as a failure (never a false success), while a NEW client
+    /// reads the typed `send_result` BEFORE converting a non-ok response to an
+    /// error (see [`crate::daemon_client::DaemonClient::write_and_submit`]). The
+    /// request/response wire SHAPE is unchanged (additive optional field), so
+    /// `PROTOCOL_VERSION` is not bumped.
     pub fn with_send_result(result: crate::event::SendResult) -> Self {
+        let delivered = matches!(
+            result,
+            crate::event::SendResult::Applied | crate::event::SendResult::Queued
+        );
         Self {
-            ok: true,
+            ok: delivered,
             send_result: Some(result),
             ..Default::default()
         }
@@ -1212,7 +1222,7 @@ async fn handle_connection(
             Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
         },
         AttachRequest::AttachStream { id } => {
-            handle_attach_stream(stream, registry, id).await?;
+            handle_attach_stream(stream, registry, id, state.clone()).await?;
         }
         AttachRequest::Resize { id, rows, cols } => match registry.resize(&id, rows, cols) {
             Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
@@ -1466,6 +1476,7 @@ async fn handle_attach_stream(
     stream: UnixStream,
     registry: Arc<AgentPtyRegistry>,
     id: String,
+    state: SharedState,
 ) -> io::Result<()> {
     let handle = match registry.subscribe(&id) {
         Ok(h) => h,
@@ -1561,6 +1572,27 @@ async fn handle_attach_stream(
         match read_frame(&mut rd).await {
             Ok(Some((KIND_STREAM_IN, bytes))) => {
                 use std::io::Write;
+                // PRD #20 blocker-6: enforce liveness AUTHORITATIVELY here, not
+                // just in the UI. If the focused session became non-live (a
+                // wrapped Codex pane that declared `history-only`, or a
+                // view-only target), REJECT the key / bracketed-paste frame
+                // rather than forwarding it to the PTY — a UI-only gate can't
+                // close the race where a pane goes non-live while a stream is
+                // already open, nor protect an older/stale client. A pane with
+                // no non-live declaration stays `Live` (the historical default),
+                // so native PTY panes are unaffected. The connection stays open
+                // (the client remains attached, seeing output) — only the write
+                // is dropped.
+                if state.read().await.pane_writable(&pane_id) != crate::event::Writable::Live {
+                    tracing::debug!(
+                        target: "pane_write",
+                        agent_id = %id,
+                        pane_id = %pane_id,
+                        payload_len = bytes.len(),
+                        "STREAM_IN rejected — target is not live (history-only / view-only)"
+                    );
+                    continue;
+                }
                 let mut w = writer.lock().await;
                 // PRD #128 (cherry-picked from PR #122): byte-level trace
                 // of STREAM_IN frames forwarded to the per-agent PTY
@@ -2015,6 +2047,7 @@ mod tests {
                 tool_count: 3,
                 first_prompts: vec!["build the feature".into()],
                 last_user_prompt: Some("build the feature".into()),
+                live_target: None,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
             let back: SessionSnapshot =
@@ -2048,6 +2081,7 @@ mod tests {
                 tool_count: 0,
                 first_prompts: Vec::new(),
                 last_user_prompt: None,
+                live_target: None,
             }),
         };
         let json = serde_json::to_string(&rec).expect("AgentRecord serializes");

@@ -9,7 +9,7 @@ use crate::agent_pty::AgentPtyRegistry;
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
     AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
-    OrchestrationSurface, WorkDoneSignal, Writable,
+    LiveTarget, OrchestrationSurface, WorkDoneSignal, Writable,
 };
 use crate::project_config::{OrchestrationRoleConfig, load_project_config};
 
@@ -73,6 +73,13 @@ pub struct DashboardStats {
     pub idle: usize,
     pub compacting: usize,
     pub total_tools: u64,
+    /// PRD #20 finding #10: per-agent-type active counts, in registry
+    /// (`agent_registry::ALL`) order, including only real agent types that have
+    /// at least one active session. The stats bar renders a compact breakdown
+    /// (`1 ClaudeCode │ 1 Codex`) from this ONLY when more than one distinct
+    /// agent type is active, so a single-agent dashboard is unchanged. Defaults
+    /// to empty (a hand-built `DashboardStats` carries no breakdown).
+    pub by_agent_type: Vec<(AgentType, usize)>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -114,6 +121,15 @@ pub struct SessionSnapshot {
     /// The most recent user prompt, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_user_prompt: Option<String>,
+    /// PRD #20 blocker-4: the session's durable live-target descriptor, so a
+    /// history-only / view-only card keeps its input-refusal across a
+    /// detach/reconnect instead of falling back to the legacy live default.
+    /// Additive optional (`#[serde(default)]` + `skip_serializing_if`): an
+    /// older daemon or a native PTY pane that never declared one yields `None`,
+    /// which the TUI reads as `Live`. Restored by
+    /// [`AppState::seed_hydrated_session`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_target: Option<LiveTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,25 +185,38 @@ impl SessionState {
             tool_count: self.tool_count,
             first_prompts: self.first_prompts.clone(),
             last_user_prompt: self.last_user_prompt.clone(),
+            // PRD #20 blocker-4: carry the durable live-target so a reconnect
+            // restores the card's write-semantics (history-only / view-only).
+            live_target: self.live_target(),
         }
     }
 
-    /// PRD #20 M3: the write-semantics of this session's live target, derived
-    /// from the most recent event that declared a [`crate::event::LiveTarget`].
+    /// PRD #20 M3/blocker-2: the current live-target descriptor of this session,
+    /// or `None` when no event ever declared one.
     ///
-    /// The descriptor rides `AgentEvent.live_target` and is retained in
-    /// `recent_events`, so a `SessionState` carries no dedicated field for it —
-    /// this reads the latest declaration back out. A session whose events never
-    /// declared a live_target (every native Claude/OpenCode/Pi PTY pane, and any
-    /// directly-constructed fixture) is treated as [`Writable::Live`]: the
-    /// historical default where the pane the dashboard shows is the pane it
-    /// writes to. A wrapped Codex session declares `history-only` on every event
-    /// (see [`crate::wrap`]), so it reports non-live here.
+    /// The value is DURABLE, not a property that disappears when the declaring
+    /// event ages out of the bounded `recent_events` journal: `apply_event`
+    /// forward-stamps the last-declared `live_target` onto every subsequent
+    /// event that omits one (see [`AppState::apply_event`]), and
+    /// [`AppState::seed_hydrated_session`] restamps it from the reconnect
+    /// snapshot. So reading the newest declaration back out of `recent_events`
+    /// always reflects the explicit session state, even after >`MAX_RECENT_EVENTS`
+    /// undeclared events have evicted the original declaration. A
+    /// `SessionState` carries no dedicated field for it because uneditable
+    /// fixtures construct the struct by exhaustive literal.
+    pub fn live_target(&self) -> Option<LiveTarget> {
+        self.recent_events.iter().rev().find_map(|e| e.live_target)
+    }
+
+    /// PRD #20 M3: the write-semantics of this session's live target. A session
+    /// that never declared a live_target (every native Claude/OpenCode/Pi PTY
+    /// pane, and any directly-constructed fixture) is treated as
+    /// [`Writable::Live`]: the historical default where the pane the dashboard
+    /// shows is the pane it writes to. A wrapped Codex session that declared
+    /// `history-only` (see [`crate::wrap`]) reports non-live here durably.
     pub fn writable(&self) -> Writable {
-        self.recent_events
-            .iter()
-            .rev()
-            .find_map(|e| e.live_target.map(|lt| lt.writable))
+        self.live_target()
+            .map(|lt| lt.writable)
             .unwrap_or(Writable::Live)
     }
 }
@@ -660,6 +689,30 @@ async fn dispatch_one_owned(
     }
 }
 
+/// PRD #20 blocker-4: build an inert [`AgentEvent`] that carries only a
+/// `live_target`, used to re-seed a reconnected session's durable write-
+/// semantics into `recent_events`. Its `Idle` type and empty tool/prompt fields
+/// mean the card's activity renderers (`collect_recent_prompts`,
+/// `recent_tool_lines`) ignore it; only [`SessionState::live_target`] reads it.
+fn live_target_carrier_event(session: &SessionState, live_target: LiveTarget) -> AgentEvent {
+    AgentEvent {
+        session_id: session.session_id.clone(),
+        agent_type: session.agent_type.clone(),
+        event_type: EventType::Idle,
+        tool_name: None,
+        tool_detail: None,
+        cwd: session.cwd.clone(),
+        timestamp: session.last_activity,
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: session.pane_id.clone(),
+        agent_id: session.agent_id.clone(),
+        agent_version: None,
+        schema_version: None,
+        live_target: Some(live_target),
+    }
+}
+
 impl AppState {
     pub fn aggregate_stats(&self) -> DashboardStats {
         let mut stats = DashboardStats::default();
@@ -681,6 +734,20 @@ impl AppState {
             }
             stats.total_tools += session.tool_count as u64;
         }
+        // PRD #20 finding #10: per-agent-type active counts in stable registry
+        // (`ALL`) order, so the rendered bar / snapshot is deterministic. Only
+        // types with at least one active session are included.
+        stats.by_agent_type = crate::agent_registry::ALL
+            .iter()
+            .filter_map(|spec| {
+                let count = self
+                    .sessions
+                    .values()
+                    .filter(|s| s.agent_type == spec.agent_type)
+                    .count();
+                (count > 0).then(|| (spec.agent_type.clone(), count))
+            })
+            .collect();
         stats
     }
 
@@ -834,6 +901,19 @@ impl AppState {
                 session.tool_count = snap.tool_count;
                 session.first_prompts = snap.first_prompts.clone();
                 session.last_user_prompt = snap.last_user_prompt.clone();
+                // PRD #20 blocker-4: restore the durable live-target so a
+                // history-only / view-only card keeps refusing input right
+                // after reconnect, before any new event re-declares it. The
+                // descriptor lives in `recent_events` (no dedicated field —
+                // uneditable fixtures build `SessionState` by exhaustive
+                // literal), so re-seed it as a single inert carrier event. It
+                // sets no prompt/tool, so the card's activity renderers ignore
+                // it; `apply_event`'s forward-stamping then keeps it durable.
+                if let Some(live_target) = snap.live_target {
+                    session
+                        .recent_events
+                        .push_back(live_target_carrier_event(session, live_target));
+                }
             }
         }
     }
@@ -1310,6 +1390,19 @@ impl AppState {
                 session.status = SessionStatus::Error;
             }
             EventType::SessionEnd => unreachable!(),
+        }
+
+        // PRD #20 blocker-2: keep the live-target durable across the bounded
+        // journal. An event that omits `live_target` inherits the session's
+        // last-declared one, so the descriptor is never lost when the original
+        // declaring event ages out of `recent_events` (>MAX_RECENT_EVENTS later).
+        // A new declaration on the event itself always wins.
+        if event.live_target.is_none() {
+            event.live_target = session
+                .recent_events
+                .iter()
+                .rev()
+                .find_map(|e| e.live_target);
         }
 
         session.recent_events.push_back(event);

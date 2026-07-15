@@ -71,12 +71,135 @@ impl AgentType {
     /// registry ([`crate::agent_registry`]); this fn keeps the command-parsing
     /// (basename extraction, arg stripping) and delegates the lookup. The
     /// recognized set and the "unknown → `None`" behaviour are unchanged.
+    ///
+    /// PRD #20 finding #19: the parser is no longer limited to the first
+    /// whitespace token. It tokenizes the command with quote awareness and
+    /// conservatively looks through common launch forms so a Wrapper-strategy
+    /// agent behind a launcher is still detected and wrapped:
+    /// - leading `VAR=VALUE` assignments and an `env`/`sudo` prefix (with their
+    ///   own option flags/assignments) are skipped to reach the real binary;
+    /// - a quoted executable path (`"/opt/OpenAI Codex/codex"`) resolves by its
+    ///   basename;
+    /// - a shell launcher (`sh -c '<script>'`, `bash -lc "<script>"`) is
+    ///   recursed into via its `-c` script argument.
+    ///
+    /// Everything still degrades to `None` for an unrecognized binary, so a
+    /// non-agent command is never misclassified.
     pub fn from_command(cmd: Option<&str>) -> Option<Self> {
-        let cmd = cmd?;
-        let bin = cmd.split_whitespace().next()?;
-        let basename = std::path::Path::new(bin).file_name()?.to_str()?;
-        crate::agent_registry::detect_from_basename(basename)
+        let tokens = tokenize_command(cmd?);
+        detect_from_tokens(&tokens)
     }
+}
+
+/// Whether `token` looks like a leading `NAME=VALUE` environment assignment
+/// (e.g. `FOO=1`) rather than a program or path. Conservative: `NAME` must be a
+/// shell-identifier-shaped run before the first `=`, so a path that merely
+/// contains `=` isn't misread as an assignment.
+fn is_env_assignment(token: &str) -> bool {
+    match token.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && name.chars().next().is_some_and(|c| !c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// Resolve the agent type from an already-tokenized command, looking through
+/// `env`/`sudo`/shell-launcher prefixes. See [`AgentType::from_command`].
+fn detect_from_tokens(tokens: &[String]) -> Option<AgentType> {
+    let mut idx = 0;
+    // Guard against a pathological deeply-nested `sh -c "sh -c ..."`.
+    for _ in 0..8 {
+        // Skip a run of leading environment assignments (`FOO=1 codex`).
+        while tokens.get(idx).is_some_and(|t| is_env_assignment(t)) {
+            idx += 1;
+        }
+        let token = tokens.get(idx)?;
+        let basename = std::path::Path::new(token)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(token.as_str());
+
+        // `env` / `sudo` prefix: skip the launcher and any of its own flags or
+        // `VAR=VALUE` assignments, then re-resolve from the next real token.
+        if basename == "env" || basename == "sudo" {
+            idx += 1;
+            while let Some(next) = tokens.get(idx) {
+                if next.starts_with('-') || is_env_assignment(next) {
+                    idx += 1;
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // Shell launcher: `sh -c '<script>'`, `bash -lc "<script>"`. Find the
+        // `-…c` flag and recurse into the following script argument's first
+        // word; a shell with no `-c` stays an unrecognized binary.
+        if matches!(basename, "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash") {
+            let mut j = idx + 1;
+            while let Some(arg) = tokens.get(j) {
+                if arg.starts_with('-') {
+                    if arg.contains('c')
+                        && let Some(script) = tokens.get(j + 1)
+                    {
+                        let inner = tokenize_command(script);
+                        return detect_from_tokens(&inner);
+                    }
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            return crate::agent_registry::detect_from_basename(basename);
+        }
+
+        // An ordinary binary token — resolve it directly.
+        return crate::agent_registry::detect_from_basename(basename);
+    }
+    None
+}
+
+/// Split a command string into whitespace-separated tokens, honoring single and
+/// double quotes (the quote characters are stripped, and whitespace inside a
+/// quoted run is preserved so a quoted executable path stays one token). This is
+/// a deliberately small shell-word splitter — enough for agent detection
+/// ([`AgentType::from_command`]), not a full POSIX parser.
+fn tokenize_command(cmd: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    for c in cmd.chars() {
+        match c {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                started = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                started = true;
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if started {
+                    tokens.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        tokens.push(cur);
+    }
+    tokens
 }
 
 /// PRD #20 M3: the concrete handle, if any, through which a session's input is
@@ -97,6 +220,12 @@ pub enum TargetKind {
     /// An in-process SDK/agent handle.
     Sdk,
     /// No concrete handle — the session is known only from history/logs.
+    ///
+    /// Forward-compat catch-all (matches [`AgentType::None`]): a future/unknown
+    /// `kind` on the wire deserializes here via `#[serde(other)]` instead of
+    /// failing the whole `LiveTarget`/`AgentEvent` decode. Deserialize-only —
+    /// `None` still serializes to `"none"`.
+    #[serde(other)]
     None,
 }
 
@@ -119,6 +248,12 @@ pub enum Writable {
     /// The session can only be resumed/replayed from history — no live write.
     HistoryOnly,
     /// Neither live write nor history resume — view-only.
+    ///
+    /// Forward-compat catch-all (matches [`AgentType::None`]): a future/unknown
+    /// `writable` on the wire deserializes here via `#[serde(other)]` — the
+    /// safe, non-writable outcome — instead of failing the decode.
+    /// Deserialize-only; `None` still serializes to `"none"`.
+    #[serde(other)]
     None,
 }
 
@@ -261,10 +396,20 @@ pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 1;
 ///   omitted from the wire) means "version not reported".
 /// - **`schema_version`** · integer · optional (**PRD #20 M1**, added
 ///   additively) · the [`AGENT_EVENT_SCHEMA_VERSION`] the producer wrote, for
-///   forward compatibility. No current producer sets it; `None` (the default,
+///   forward compatibility. The wrapper adapter ([`crate::wrap`]) stamps it on
+///   every event it emits; native hooks currently omit it. `None` (the default,
 ///   omitted from the wire) is read as the baseline (v1) schema. This is the
 ///   **event-record** schema version, NOT the attach-wire
 ///   [`crate::daemon_protocol::PROTOCOL_VERSION`].
+/// - **`live_target`** · object (`{ "kind": <TargetKind>, "writable":
+///   <Writable> }`, both kebab-case) · optional (**PRD #20 M3**, added
+///   additively; omitted/`null` ⇒ `None`) · declares whether/how the session
+///   can receive dashboard input (see [`LiveTarget`]). Producers: the wrapper
+///   adapter ([`crate::wrap`]) stamps it on every event — `pty`/`live` when it
+///   runs inside a daemon-managed pane (its child is reachable through that
+///   live PTY), else `process`/`history-only` for a standalone wrap. Native
+///   PTY panes (Claude/OpenCode/Pi) omit it, which the UI reads as the
+///   historical `live`/writable default. Absence never fails the decode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
     pub session_id: String,
@@ -313,7 +458,9 @@ pub struct AgentEvent {
     /// [`crate::daemon_protocol::PROTOCOL_VERSION`] (see those docs). Optional
     /// and additive for the same reasons as `agent_version`: a missing value
     /// deserializes to `None` and is read as the baseline (v1) schema, and it
-    /// is omitted from the wire when unset. No current producer sets it.
+    /// is omitted from the wire when unset. The wrapper adapter
+    /// ([`crate::wrap`]) stamps it on every event it emits; native hooks
+    /// currently leave it unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<u32>,
     /// PRD #20 M3: per-session live-target descriptor declaring whether/how the
@@ -321,9 +468,10 @@ pub struct AgentEvent {
     /// `#[serde(default)]` lets legacy payloads that predate the field
     /// deserialize to `None`, and `skip_serializing_if` omits it from the wire
     /// when unset — so existing producers emit byte-identical JSON and old/new
-    /// peers stay compatible. A wrapped-Codex adapter ([`crate::wrap`]) stamps
-    /// `history-only`; native PTY panes leave it `None`, which the UI reads as
-    /// the historical live/writable default.
+    /// peers stay compatible. The wrapper adapter ([`crate::wrap`]) stamps
+    /// `pty`/`live` when it runs inside a daemon-managed pane and
+    /// `process`/`history-only` for a standalone wrap; native PTY panes leave
+    /// it `None`, which the UI reads as the historical live/writable default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_target: Option<LiveTarget>,
 }

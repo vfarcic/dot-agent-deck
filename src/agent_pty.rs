@@ -894,7 +894,30 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
         .clone()
         .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
 
-    let mut cmd = match opts.command {
+    // PRD #20 blocker-3: apply the Wrapper integration strategy at the COMMON
+    // spawn boundary. Every launch path that reaches a real child — fresh/plain
+    // new-pane, plain/mode RESTORE, orchestration role, scheduler single/role,
+    // issue-dispatch single/role, and respawn — funnels through here, so a
+    // Wrapper-strategy agent (Codex) is wrapped into
+    // `dot-agent-deck wrap --agent <name> -- <command>` exactly once regardless
+    // of which path created it. Prefer the caller's resolved identity (finding
+    // #19), falling back to parsing the command. `wrap_launch_command` is
+    // idempotent (never double-wraps an already-`wrap` command) and a no-op for
+    // non-Wrapper agents, so native agents and pre-wrapped commands are
+    // untouched. The BARE command remains the persisted/user-facing metadata
+    // upstream (Command field, last_command, SavedPane.command) — only the
+    // actual exec here is transformed. Mode panes type their command into a
+    // shell rather than passing it here; those seams wrap at the type site.
+    let resolved_agent = opts
+        .agent_type
+        .clone()
+        .or_else(|| AgentType::from_command(opts.command))
+        .unwrap_or(AgentType::None);
+    let launch_command: Option<String> = opts
+        .command
+        .map(|c| crate::wrap::wrap_launch_command(c, &resolved_agent));
+
+    let mut cmd = match launch_command.as_deref() {
         Some(c) if command_needs_shell_wrap(c) => {
             let mut cb = CommandBuilder::new(&default_shell);
             cb.arg("-c");

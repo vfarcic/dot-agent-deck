@@ -1,8 +1,9 @@
 ---
 source: tests/render_dashboard.rs
+assertion_line: 1159
 expression: buffer_to_text(&buffer)
 ---
-┌ 1 example-alpha ────────────────────────────────────────────────── ● Working ┐
+┌ 1 ClaudeCode · example-alpha ───────────────────────────────────── ● Working ┐
 │Dir:  alpha                                             Last: 0s ago  Tools: 3│
 │Prmt: do the thing                                                            │
 │                                                                              │
@@ -10,7 +11,7 @@ expression: buffer_to_text(&buffer)
 │                                                                              │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
-┌ ▸ 2 example-beta ───────────────────────────────────────────────── ● Working ┐
+┌ ▸ 2 ClaudeCode · example-beta ──────────────────────────────────── ● Working ┐
 │Dir:  beta                                              Last: 0s ago  Tools: 3│
 │Prmt: do the thing                                                            │
 │                                                                              │
@@ -18,7 +19,7 @@ expression: buffer_to_text(&buffer)
 │                                                                              │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
-┌ 3 example-gamma ────────────────────────────────────────────────── ● Working ┐
+┌ 3 ClaudeCode · example-gamma ───────────────────────────────────── ● Working ┐
 │Dir:  gamma                                             Last: 0s ago  Tools: 3│
 │Prmt: do the thing                                                            │
 │                                                                              │
