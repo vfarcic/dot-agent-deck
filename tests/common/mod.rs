@@ -172,9 +172,10 @@ impl TuiDeckBuilder {
         self
     }
 
-    /// Import the host user's Codex `auth.json` into the isolated per-test HOME.
-    /// Pair with [`check_codex_available`] so missing or rejected credentials
-    /// cleanly skip a real-Codex test instead of failing during TUI launch.
+    /// Import the host user's Codex `auth.json` into the isolated per-test HOME
+    /// and trust the fixture working directory in Codex's project config. Pair
+    /// with [`check_codex_available`] so missing or rejected credentials cleanly
+    /// skip a real-Codex test instead of failing during TUI launch.
     pub fn with_imported_codex_credentials(mut self) -> Self {
         self.credential_imports.push(CredentialImport::Codex);
         self
@@ -1999,9 +2000,9 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Copy only Codex's authentication state into the isolated test HOME. User
-/// configuration is deliberately not imported; real-agent tests pin their model
-/// and pass `--ignore-user-config` for deterministic behavior.
+/// Copy only Codex's authentication state into the isolated test HOME and seed
+/// the fixture working directory as trusted. User configuration is deliberately
+/// not imported; real-agent tests pin their model for deterministic behavior.
 fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
     let src = host_home().join(".codex").join("auth.json");
     let bytes = read_credential_file_no_symlink(
@@ -2011,7 +2012,18 @@ fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
     )?;
     let dst = test_home.join(".codex");
     std::fs::create_dir_all(&dst)?;
-    write_credential_file_atomic_0o600(&dst.join("auth.json"), &bytes)
+    write_credential_file_atomic_0o600(&dst.join("auth.json"), &bytes)?;
+
+    let project = test_home.parent().ok_or_else(|| {
+        std::io::Error::other("isolated Codex HOME has no fixture working directory")
+    })?;
+    let config = format!(
+        "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+        toml_escape(project.to_str().ok_or_else(|| {
+            std::io::Error::other("isolated Codex fixture path is not UTF-8")
+        })?)
+    );
+    write_credential_file_atomic_0o600(&dst.join("config.toml"), config.as_bytes())
 }
 
 /// Like `copy_dir_recursively` but skips any top-level `plugin/`

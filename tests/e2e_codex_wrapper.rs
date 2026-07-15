@@ -125,7 +125,7 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
         "Use the shell to list the current directory and confirm {SENTINEL_NAME} exists. Then write exactly {SENTINEL_NAME} followed by a newline to {INTERACTIVE_PROOF_NAME}. Do not modify any other file."
     );
     let command = format!(
-        "codex --model {} --sandbox workspace-write -c 'model_reasoning_effort=\"low\"'",
+        "codex --model {} --sandbox workspace-write --ask-for-approval never -c 'model_reasoning_effort=\"low\"'",
         common::CODEX_TEST_MODEL,
     );
     let config_dir = tempfile::tempdir().expect("Codex new-pane config");
@@ -140,6 +140,7 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
         .launch_with_fixture("codex-live");
 
     deck.wait_for_string("No active sessions");
+    let events = deck.subscribe_events();
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
@@ -153,8 +154,8 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
         "the bare interactive Codex UI never became ready in the new pane:\n{}",
         deck.snapshot_grid()
     );
-    let events = deck.subscribe_events();
     deck.send_keys(prompt.as_bytes());
+    deck.wait_for_string(SENTINEL_NAME);
     deck.send_keys(b"\r");
 
     let thinking = events.wait_for(
@@ -170,6 +171,9 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
     );
     let proof = std::fs::read_to_string(&proof_path).expect("read interactive Codex proof");
     assert_eq!(proof.trim(), SENTINEL_NAME);
+    deck.send_keys(b"/exit");
+    deck.wait_for_string("/exit");
+    deck.send_keys(b"\r");
     let idle = events.wait_for(
         |event| event.agent_type == AgentType::Codex && event.event_type == EventType::Idle,
         Duration::from_secs(120),

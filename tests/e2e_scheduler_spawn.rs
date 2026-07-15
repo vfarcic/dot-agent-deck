@@ -400,14 +400,14 @@ fn spawn_006_single_and_role_codex_commands_are_wrapped() {
         .run_now("single-codex")
         .expect("run single Codex schedule");
     assert!(
-        common::wait_for_file_substr_count(&record, "codex", 1, Duration::from_secs(10)),
+        common::wait_for_file_substr_count(&record, "WRAPPED", 1, Duration::from_secs(10)),
         "scheduled single-agent Codex command never launched"
     );
     daemon
         .run_now("role-codex")
         .expect("run role Codex schedule");
     assert!(
-        common::wait_for_file_substr_count(&record, "codex", 2, Duration::from_secs(10)),
+        common::wait_for_file_substr_count(&record, "WRAPPED", 2, Duration::from_secs(10)),
         "scheduled orchestration Codex role never launched"
     );
     let launches = std::fs::read_to_string(&record).expect("read scheduler launch record");

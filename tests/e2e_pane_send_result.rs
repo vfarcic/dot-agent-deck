@@ -100,6 +100,7 @@ fn pane_input_004_history_only_send_reports_result_and_feedback() {
 #[cfg(unix)]
 fn pane_input_007_orchestrator_prompt_retries_after_non_applied_result() {
     const MARKER: &str = "ORCHESTRATORRESULTMARKER20";
+    const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context.md";
     let deck = TuiDeck::launch_with_fixture("send-result-orchestration");
     deck.wait_for_string("No active sessions");
     let script = deck.workdir().join("orchestrator-send-result.sh");
@@ -158,10 +159,15 @@ while IFS= read -r line; do printf '%s\n' "$line" >> orchestrator-prompt.log; do
         .expect("allow synthetic role to become live");
     let delivered = common::wait_for_file_substr_count(
         &deck.workdir().join("orchestrator-prompt.log"),
-        MARKER,
+        DELIVERED_POINTER,
         1,
         Duration::from_secs(10),
     );
+    let context = std::fs::read_to_string(
+        deck.workdir()
+            .join(".dot-agent-deck/orchestrator-context.md"),
+    )
+    .expect("read generated orchestrator context");
     let grid = deck.snapshot_grid();
 
     assert!(
@@ -175,5 +181,9 @@ while IFS= read -r line; do printf '%s\n' "$line" >> orchestrator-prompt.log; do
     assert!(
         delivered,
         "the non-delivered orchestrator prompt must be retained and retried after the role becomes live\nFinal grid:\n{grid}"
+    );
+    assert!(
+        context.contains(MARKER),
+        "the delivered context pointer must reference the generated context containing the role prompt"
     );
 }
