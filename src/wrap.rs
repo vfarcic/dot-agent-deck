@@ -26,10 +26,13 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::process::{Command, ExitCode, ExitStatus, Stdio};
+use std::os::unix::io::RawFd;
+use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::Utc;
+use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use crate::event::{
@@ -177,7 +180,16 @@ impl Detector {
     /// Feed one line; return the event to emit, or `None` when the line is
     /// blank (no classification) or does not change the detected state.
     pub fn observe(&mut self, line: &str) -> Option<DetectedEvent> {
-        let detected = classify_line_with(line, self.rules)?;
+        self.observe_detected(classify_line_with(line, self.rules))
+    }
+
+    /// Debounce an already-classified event. The JSON-aware Codex path
+    /// ([`classify_codex_line`]) classifies the line itself and feeds the
+    /// result here so it shares the same one-event-per-state-change debouncing
+    /// as the generic substring path. `None` (blank / unclassifiable line)
+    /// never changes state.
+    pub fn observe_detected(&mut self, detected: Option<DetectedEvent>) -> Option<DetectedEvent> {
+        let detected = detected?;
         if self.last == Some(detected) {
             None
         } else {
@@ -185,6 +197,33 @@ impl Detector {
             Some(detected)
         }
     }
+}
+
+/// PRD #20 finding #11: classify one line of Codex output. Codex emits JSONL
+/// (`codex exec --json` writes one compact JSON object per line) and the
+/// interactive `codex` TUI mixes JSON events with plain redraw text. Parse the
+/// top-level `type` discriminator with `serde_json` (robust to insignificant
+/// whitespace and field reordering, unlike a raw substring match), mapping:
+/// `turn.completed` → `Idle`, `turn.failed` / `error` → `Error`, and every
+/// other record (`turn.started`, `item.started` reasoning / command execution,
+/// …) → `Working`. A non-JSON line (the interactive channel's plain text)
+/// falls back to the substring [`CODEX`] rules, so bare `codex` still surfaces
+/// activity instead of staying stuck until process exit.
+pub fn classify_codex_line(line: &str) -> Option<DetectedEvent> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Some(kind) = value.get("type").and_then(|t| t.as_str())
+    {
+        return Some(match kind {
+            "turn.completed" | "task.completed" => DetectedEvent::Idle,
+            "turn.failed" | "task.failed" | "error" => DetectedEvent::Error,
+            _ => DetectedEvent::Working,
+        });
+    }
+    classify_line_with(trimmed, &CODEX)
 }
 
 impl Default for Detector {
@@ -242,15 +281,28 @@ impl Emitter {
     }
 }
 
+/// PRD #20 finding #13: cap the retained classification buffer. A newline-free
+/// stream (or a CR-only progress redraw an arbitrary producer emits) must not
+/// grow memory without bound — beyond this the accumulated bytes are classified
+/// and flushed as one line. 64 KiB is far above any real single output line.
+const MAX_CLASSIFY_LINE: usize = 64 * 1024;
+
 /// Pump bytes from `reader` to `writer` **verbatim** (transparent passthrough),
 /// while feeding each completed line to `on_line` for classification.
 ///
 /// Reads in chunks and writes+flushes immediately, so a prompt printed without
 /// a trailing newline (e.g. `Enter your name: `) still reaches the user at once
 /// — line-oriented buffering would stall interactivity. Line accumulation for
-/// classification happens on `\n`; a trailing partial line is classified when
-/// the stream ends. Bytes that don't form valid UTF-8 are passed through but
-/// skipped for classification.
+/// classification happens on `\n` OR `\r` (a PTY child's cooked output arrives
+/// as `\r\n`, and TUIs redraw with a bare `\r`; empty segments between the two
+/// are skipped so `\r\n` yields one clean line). A trailing partial line is
+/// classified when the stream ends. Bytes that don't form valid UTF-8 are
+/// passed through but skipped for classification.
+///
+/// PRD #20 finding #13: the retained line buffer is BOUNDED
+/// ([`MAX_CLASSIFY_LINE`]), and a parent-output write/flush error (e.g. `EPIPE`
+/// from an early-closing consumer) STOPS the tee so the caller can terminate
+/// the child side rather than draining forever.
 fn tee<R: Read, W: Write>(mut reader: R, mut writer: W, mut on_line: impl FnMut(&str)) {
     let mut buf = [0u8; 8192];
     let mut line: Vec<u8> = Vec::new();
@@ -260,17 +312,27 @@ fn tee<R: Read, W: Write>(mut reader: R, mut writer: W, mut on_line: impl FnMut(
             Ok(n) => {
                 let chunk = &buf[..n];
                 // Transparent passthrough first — the user must see output with
-                // minimal latency regardless of classification.
-                let _ = writer.write_all(chunk);
-                let _ = writer.flush();
+                // minimal latency regardless of classification. On a write/flush
+                // failure (broken pipe), stop: the downstream is gone.
+                if writer.write_all(chunk).is_err() || writer.flush().is_err() {
+                    break;
+                }
                 for &b in chunk {
-                    if b == b'\n' {
-                        if let Ok(s) = std::str::from_utf8(&line) {
-                            on_line(s);
+                    if b == b'\n' || b == b'\r' {
+                        if !line.is_empty() {
+                            if let Ok(s) = std::str::from_utf8(&line) {
+                                on_line(s);
+                            }
+                            line.clear();
                         }
-                        line.clear();
                     } else {
                         line.push(b);
+                        if line.len() >= MAX_CLASSIFY_LINE {
+                            if let Ok(s) = std::str::from_utf8(&line) {
+                                on_line(s);
+                            }
+                            line.clear();
+                        }
                     }
                 }
             }
@@ -365,21 +427,88 @@ fn session_id_for(pane_id: Option<&str>, program: &str) -> String {
     }
 }
 
-/// Translate a finished child's [`ExitStatus`] into the wrapper's own
-/// [`ExitCode`], preserving the child's numeric code (truncated to a byte, as
-/// shells do). A child killed by a signal has no code → `FAILURE`.
-fn exit_code_from(status: ExitStatus) -> ExitCode {
-    match status.code() {
-        Some(code) => ExitCode::from(code as u8),
-        None => ExitCode::FAILURE,
+/// A `Write` that writes UNBUFFERED to a raw fd (the outer stdout), so the
+/// child's output passes through with minimal latency and no line buffering.
+struct FdWriter(RawFd);
+
+impl Write for FdWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = unsafe { libc::write(self.0, buf.as_ptr() as *const libc::c_void, buf.len()) };
+        if n < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Read the current window size of the terminal on `fd` via `TIOCGWINSZ`.
+/// `None` when `fd` isn't a terminal or the ioctl fails / reports a zero size.
+fn terminal_size(fd: RawFd) -> Option<(u16, u16)> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+    if rc == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
+        Some((ws.ws_row, ws.ws_col))
+    } else {
+        None
+    }
+}
+
+/// RAII guard that puts the outer terminal (`fd`) into raw mode for the wrap
+/// session and restores the original attributes on drop. Raw mode is required
+/// so keystrokes — including `Ctrl+C` (INTR) and `\r` — reach the wrapper as
+/// bytes and are forwarded to the INNER PTY, whose own line discipline turns
+/// `Ctrl+C` into `SIGINT` for the child and maps `\r`→`\n` for canonical reads.
+/// A no-op (and harmless) when `fd` is not a terminal (e.g. piped stdin).
+struct RawModeGuard {
+    fd: RawFd,
+    original: Option<libc::termios>,
+}
+
+impl RawModeGuard {
+    fn enable(fd: RawFd) -> Self {
+        if unsafe { libc::isatty(fd) } != 1 {
+            return Self { fd, original: None };
+        }
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
+            return Self { fd, original: None };
+        }
+        let original = termios;
+        unsafe {
+            libc::cfmakeraw(&mut termios);
+            libc::tcsetattr(fd, libc::TCSANOW, &termios);
+        }
+        Self {
+            fd,
+            original: Some(original),
+        }
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if let Some(orig) = self.original {
+            unsafe {
+                libc::tcsetattr(self.fd, libc::TCSANOW, &orig);
+            }
+        }
     }
 }
 
 /// Entry point for `dot-agent-deck wrap [--agent <name>] -- <command> <args...>`.
 ///
-/// Spawns `command`, tees its stdout/stderr through pattern detection into
-/// `AgentEvent`s while passing all stdio through transparently, and returns the
-/// child's exit code as the wrapper's exit code.
+/// PRD #20 blocker-1: spawns `command` on a fresh INNER pseudo-terminal and
+/// proxies all three streams, so the child sees `isatty(0/1/2) == true` and an
+/// interactive agent (bare `codex`) keeps its full TUI. The inner PTY's master
+/// output is tee'd through pattern detection into `AgentEvent`s (the child's
+/// terminal is never replaced with pipes), the outer terminal is put in raw
+/// mode so keystrokes / `Ctrl+C` pass through, and outer resizes are forwarded
+/// to the inner PTY (so the child receives `SIGWINCH`). Returns the child's
+/// exit code as the wrapper's exit code.
 pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     let Some((program, args)) = command.split_first() else {
         eprintln!(
@@ -398,31 +527,85 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
         .and_then(|p| p.to_str().map(String::from));
     let session_id = session_id_for(pane_id.as_deref(), program);
 
+    // PRD #20 blocker-2: a wrapper running INSIDE a daemon-managed pane
+    // (`DOT_AGENT_DECK_PANE_ID` set) is backed by that live PTY — the daemon's
+    // dashboard writes reach the child through the pane PTY → this wrapper's
+    // stdin → the inner PTY — so it declares `Pty`/`Live`. A STANDALONE wrap has
+    // no deck-controlled target (the child's terminal is the user's own), so it
+    // stays history-only.
+    let live_target = if pane_id.is_some() {
+        LiveTarget {
+            kind: TargetKind::Pty,
+            writable: Writable::Live,
+        }
+    } else {
+        LiveTarget {
+            kind: TargetKind::Process,
+            writable: Writable::HistoryOnly,
+        }
+    };
+
     let emitter = Arc::new(Emitter {
         agent_type,
         session_id,
         pane_id,
         agent_id,
         cwd,
-        // The wrapper strategy delivers to a child process it owns, but the
-        // dashboard cannot inject live input (stdin is the inherited terminal),
-        // so every wrapped session — Codex included — is history-only.
-        live_target: LiveTarget {
-            kind: TargetKind::Process,
-            writable: Writable::HistoryOnly,
-        },
+        live_target,
     });
 
-    let mut child = match Command::new(program)
-        .args(args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+    // Open the inner PTY at the outer terminal's current size so the child's
+    // first frame paints at the right geometry (falls back to 24×80 when the
+    // outer stream isn't a terminal).
+    let (rows, cols) = terminal_size(libc::STDIN_FILENO)
+        .or_else(|| terminal_size(libc::STDOUT_FILENO))
+        .unwrap_or((24, 80));
+    let pty_system = NativePtySystem::default();
+    let pair = match pty_system.openpty(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error: failed to open a pseudo-terminal for `{program}`: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Build the child command. `CommandBuilder` inherits the wrapper's env (which
+    // carries `DOT_AGENT_DECK_PANE_ID` / `_AGENT_ID` injected by the daemon), so
+    // the child's own hooks and this wrapper's events attribute to the same pane.
+    let mut cmd = CommandBuilder::new(program);
+    for arg in args {
+        cmd.arg(arg);
+    }
+
+    let mut child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error: failed to spawn `{program}`: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Interact through the master side only; the child holds its own slave fds.
+    drop(pair.slave);
+
+    let master = pair.master;
+    let reader = match master.try_clone_reader() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: failed to read the wrapped `{program}` terminal: {e}");
+            let _ = child.kill();
+            return ExitCode::FAILURE;
+        }
+    };
+    let writer = match master.take_writer() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("Error: failed to write the wrapped `{program}` terminal: {e}");
+            let _ = child.kill();
             return ExitCode::FAILURE;
         }
     };
@@ -430,58 +613,107 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     // The session has begun — surface the card immediately.
     emitter.emit(EventType::SessionStart);
 
-    // One shared detector so stdout and stderr contribute to a single,
-    // coherent session state (see `Detector`). PRD #20 M7: the rule set is
-    // keyed off the resolved agent type so `wrap --agent codex` classifies
-    // Codex JSONL, while any other command keeps the generic fallback.
+    // Raw-mode the outer terminal so keystrokes (incl. Ctrl+C and CR) pass
+    // through to the inner PTY unmodified; restored on drop.
+    let _raw_guard = RawModeGuard::enable(libc::STDIN_FILENO);
+
+    // Output pump (inner master → outer stdout, tee'd through classification).
+    // PRD #20 M7: the rule set is keyed off the resolved agent type; Codex uses
+    // JSON-aware classification, any other command keeps the generic fallback.
+    // Auditor: recover from a poisoned detector mutex instead of panicking.
+    let is_codex = emitter.agent_type == AgentType::Codex;
     let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
         &emitter.agent_type,
     ))));
-
-    let stdout_thread = child.stdout.take().map(|out| {
+    let output_thread = {
         let emitter = Arc::clone(&emitter);
         let detector = Arc::clone(&detector);
         std::thread::spawn(move || {
-            tee(out, std::io::stdout(), |line| {
-                if let Some(ev) = detector.lock().unwrap().observe(line) {
+            tee(reader, FdWriter(libc::STDOUT_FILENO), |line| {
+                let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
+                let ev = if is_codex {
+                    det.observe_detected(classify_codex_line(line))
+                } else {
+                    det.observe(line)
+                };
+                drop(det);
+                if let Some(ev) = ev {
                     emitter.emit(ev.event_type());
                 }
             });
         })
-    });
+    };
 
-    let stderr_thread = child.stderr.take().map(|err| {
-        let emitter = Arc::clone(&emitter);
-        let detector = Arc::clone(&detector);
+    // Input pump (outer stdin → inner master). Detached: on child exit the main
+    // loop below returns and the process exits, reaping this blocked reader.
+    {
+        let mut writer = writer;
         std::thread::spawn(move || {
-            tee(err, std::io::stderr(), |line| {
-                if let Some(ev) = detector.lock().unwrap().observe(line) {
-                    emitter.emit(ev.event_type());
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = unsafe {
+                    libc::read(
+                        libc::STDIN_FILENO,
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
+                };
+                if n <= 0 {
+                    break;
                 }
+                if writer.write_all(&buf[..n as usize]).is_err() || writer.flush().is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    // Main loop: forward outer resizes to the inner PTY (so the child receives
+    // SIGWINCH) and poll for child exit. Keeping `master` here avoids sharing a
+    // non-Send/Sync handle across threads. `try_wait` reaps the child once it
+    // returns `Some`, so its status is captured and reused (no second wait).
+    let mut last_size = (rows, cols);
+    let status = loop {
+        if let Some(size) = terminal_size(libc::STDIN_FILENO)
+            && size != last_size
+        {
+            let _ = master.resize(PtySize {
+                rows: size.0,
+                cols: size.1,
+                pixel_width: 0,
+                pixel_height: 0,
             });
-        })
-    });
-
-    let status = child.wait();
-
-    // Drain both tees so no trailing output is lost before we report Idle.
-    if let Some(t) = stdout_thread {
-        let _ = t.join();
-    }
-    if let Some(t) = stderr_thread {
-        let _ = t.join();
-    }
-
-    // Process-exit quiescence: the wrapped session is done → idle.
-    emitter.emit(EventType::Idle);
-
-    match status {
-        Ok(s) => exit_code_from(s),
-        Err(e) => {
-            eprintln!("Error: failed to wait on wrapped `{program}`: {e}");
-            ExitCode::FAILURE
+            last_size = size;
         }
-    }
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("Error: failed to wait on wrapped `{program}`: {e}");
+                let _ = child.kill();
+                break None;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // Drain the output tee so no trailing output is lost before the final event.
+    let _ = output_thread.join();
+
+    // PRD #20 finding #14: emit Idle only after a SUCCESSFUL exit; a nonzero /
+    // signalled failure (or a wait error) ends as a visible Error rather than a
+    // false idle card. Preserve the child's numeric exit code as the wrapper's
+    // own (truncated to a byte, as shells do); a wait failure maps to 1.
+    let (success, code) = match status {
+        Some(s) => (s.success(), s.exit_code() as u8),
+        None => (false, 1),
+    };
+    emitter.emit(if success {
+        EventType::Idle
+    } else {
+        EventType::Error
+    });
+    ExitCode::from(code)
 }
 
 #[cfg(test)]
