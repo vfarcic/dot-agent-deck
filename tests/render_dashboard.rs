@@ -10,7 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
-use dot_agent_deck::state::{ActiveTool, DashboardStats, SessionState, SessionStatus};
+use dot_agent_deck::state::{ActiveTool, AppState, DashboardStats, SessionState, SessionStatus};
 use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
@@ -468,6 +468,68 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
     );
 
     insta::assert_snapshot!(buffer_to_color_text(&buffer));
+}
+
+/// Scenario: Apply otherwise-identical live and history-only Codex session
+/// events, then render their cards together through the dashboard `TestBackend`
+/// seam. The history-only card must show a history marker and dim its numeric
+/// input shortcut, while the live card keeps the normal writable affordance.
+#[spec("dashboard/pane/009")]
+#[test]
+fn pane_009_history_only_card_marks_and_dims_input_affordance() {
+    let session_from_event = |session_id: &str, pane_id: &str, writable: &str| {
+        let event: AgentEvent = serde_json::from_value(serde_json::json!({
+            "session_id": session_id,
+            "agent_type": "codex",
+            "event_type": "session_start",
+            "timestamp": "2026-07-15T12:00:00Z",
+            "pane_id": pane_id,
+            "cwd": "/home/dev/workspace",
+            "live_target": {
+                "kind": if writable == "live" { "pty" } else { "process" },
+                "writable": writable,
+            }
+        }))
+        .expect("deserialize AgentEvent fixture");
+        let mut state = AppState::default();
+        state.apply_event(event);
+        state
+            .sessions
+            .remove(session_id)
+            .expect("SessionStart must create a dashboard session")
+    };
+
+    let live = session_from_event("live-01", "live-pane", "live");
+    let history = session_from_event("resume-01", "resume-pane", "history-only");
+    let width = 80;
+    let density = CardDensityKind::Normal;
+    let card_height = density.rendered_height((width as usize).saturating_sub(2) >= 60);
+    let buffer = render_dashboard_cards_to_buffer(
+        &[(&live, None), (&history, None)],
+        None,
+        density,
+        0,
+        width,
+    );
+    let text = buffer_to_text(&buffer);
+    let lines: Vec<&str> = text.lines().collect();
+    let live_card = lines[..card_height as usize].join("\n").to_lowercase();
+    let history_card = lines[card_height as usize..].join("\n").to_lowercase();
+    let live_shortcut_dimmed = buffer[(2, 0)].modifier.contains(Modifier::DIM);
+    let history_shortcut_dimmed = buffer[(2, card_height)].modifier.contains(Modifier::DIM);
+
+    insta::assert_snapshot!(
+        format!(
+            "live_has_history_marker: {}\nhistory_has_history_marker: {}\nlive_shortcut_dimmed: {live_shortcut_dimmed}\nhistory_shortcut_dimmed: {history_shortcut_dimmed}",
+            live_card.contains("history"),
+            history_card.contains("history"),
+        ),
+        @r"
+    live_has_history_marker: false
+    history_has_history_marker: true
+    live_shortcut_dimmed: false
+    history_shortcut_dimmed: true"
+    );
 }
 
 // ---------------------------------------------------------------------------

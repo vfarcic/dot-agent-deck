@@ -74,6 +74,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** wrapper event delivery or real Codex execution (covered by `codex/wrap/001` and `codex/live/001`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/pane/009 — A history-only session is visibly distinct from a live writable session (PRD #20 M4).
+- **Layer:** L1 (ratatui `TestBackend` + inline `insta` snapshot).
+- **Agent:** synthetic Codex `AgentEvent` fixtures, one live and one history-only.
+- **Asserts:** the history-only card visibly contains a history marker and its numeric input shortcut carries `Modifier::DIM`; the live contrast card has neither treatment.
+- **Does not assert:** delivery feedback or daemon send results (covered by `prompt/pane-input/004`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/density
 
 ##### dashboard/density/001 — Spacious density shows up to 3 prompts and 3 tool calls per card.
@@ -395,6 +402,26 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** stdout classification or socket transport (covered by `codex/wrap/001`).
 - **Platform coverage:** mac+linux+windows.
 
+### Agent protocol
+
+#### protocol/live-target
+
+##### protocol/live-target/001 — `AgentEvent.live_target` preserves every target-kind and writability value while remaining optional for legacy events (PRD #20 M3).
+- **Layer:** L1 (pure serde wire contract).
+- **Agent:** none (JSON fixtures).
+- **Asserts:** every Cartesian combination of `process|pty|tmux|sdk|none` and `live|history-only|none` survives an `AgentEvent` deserialize/serialize round trip; a legacy event without the field still deserializes and reserializes with the optional field omitted.
+- **Does not assert:** state propagation or rendering (covered by `dashboard/pane/009`).
+- **Platform coverage:** mac+linux+windows.
+
+#### protocol/send-result
+
+##### protocol/send-result/001 — Every input-delivery result retains its distinct public wire value (PRD #20 M3).
+- **Layer:** L1 (pure serde wire contract).
+- **Agent:** none (JSON fixtures).
+- **Asserts:** `applied`, `queued`, `stale`, `wrong-session`, `history-only`, and `no-live-target` each survive an `AttachResponse` deserialize/serialize round trip.
+- **Does not assert:** actual pane delivery or rendered feedback (covered by `prompt/pane-input/004`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Prompts
 
 #### prompt/permission
@@ -441,6 +468,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Agent:** none (fixture: `sh -c 'trap "echo INT" INT; sleep 5'`).
 - **Asserts:** the pane PTY shows `INT` after the keystroke, confirming the signal was delivered.
 - **Does not assert:** signal handling in the dashboard tab itself (covered by `dashboard/quit/*`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/004 — A history-only send returns an honest result and surfaces feedback instead of silently dropping input (PRD #20 M3/M4).
+- **Layer:** L2 (real spawned TUI + daemon in the PTY/vt100 harness; synthetic pane and hook event, no LLM).
+- **Agent:** synthetic wrapped Codex session backed by `cat`, declared `writable = history-only` through `AgentEvent.live_target`.
+- **Asserts:** `WriteAndSubmit` returns `send_result = history-only`; attempting to enter the card renders `History-only session cannot accept live input`; the rejected send does not remove the Codex card.
+- **Does not assert:** real Codex execution or wrapper stdout classification (covered by `codex/live/001` and `codex/wrap/001`).
 - **Platform coverage:** mac+linux.
 
 #### prompt/quit
