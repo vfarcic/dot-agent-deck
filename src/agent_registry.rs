@@ -53,6 +53,14 @@ pub enum IntegrationStrategy {
     Wrapper,
 }
 
+/// PRD #20 finding #15: an integration-hook handler (install / uninstall) —
+/// `Ok(())` on success, `Err(message)` on a reported failure.
+pub type HookFn = fn() -> Result<(), String>;
+
+/// PRD #20 finding #15: a spawn-time materialize handler (the `Extension`
+/// strategy). Receives the spawn env so it can honor `HOME` / deck env vars.
+pub type MaterializeFn = fn(&[(String, String)]);
+
 /// One cohesive registry entry per agent — the single place per-agent data
 /// lives (PRD #20 success criteria).
 #[derive(Debug)]
@@ -76,6 +84,42 @@ pub struct AgentSpec {
     /// A named ANSI colour only (no absolute `Color::Rgb`), matching the
     /// palette policy (`src/palette.rs`) so terminal themes can remap it.
     pub badge_color: Color,
+    /// PRD #20 finding #15: this agent's OWN integration handlers, so strategy
+    /// dispatch resolves from the SPEC rather than a hardcoded incumbent module
+    /// keyed by the [`IntegrationStrategy`] enum. Before this, every `NativeHooks`
+    /// entry ran Claude's installer, every `Plugin` ran OpenCode's, and every
+    /// `Extension` materialized Pi's — so a FUTURE agent reusing one of those
+    /// strategies would run another agent's implementation. With the handler on
+    /// the spec, `main.rs` / `agent_pty.rs` call `spec(x).hook_install` etc. and
+    /// a new agent slots in its own handlers here. `None` where the agent's
+    /// strategy has no such action (a Wrapper agent has no hook installer or
+    /// extension materialize; the neutral placeholder has none at all).
+    pub hook_install: Option<HookFn>,
+    pub hook_uninstall: Option<HookFn>,
+    /// Materialize a bundled artifact into the agent's HOME just before spawn
+    /// (the `Extension` strategy).
+    pub materialize: Option<MaterializeFn>,
+}
+
+// PRD #20 finding #15: per-agent adapters that normalize each incumbent
+// module's signature to the spec's handler shape. Keeping them here (as the
+// values the statics point at) is what makes dispatch spec-resolved.
+fn claude_install() -> Result<(), String> {
+    crate::hooks_manage::install();
+    Ok(())
+}
+fn claude_uninstall() -> Result<(), String> {
+    crate::hooks_manage::uninstall();
+    Ok(())
+}
+fn opencode_install() -> Result<(), String> {
+    crate::opencode_manage::install().map_err(|e| e.to_string())
+}
+fn opencode_uninstall() -> Result<(), String> {
+    crate::opencode_manage::uninstall().map_err(|e| e.to_string())
+}
+fn pi_materialize(env: &[(String, String)]) {
+    crate::orchestrator_ext::auto_materialize(env);
 }
 
 /// Claude Code — native-hooks strategy (shipped).
@@ -86,6 +130,9 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
     default_command: Some("claude"),
     strategy: Some(IntegrationStrategy::NativeHooks),
     badge_color: Color::LightMagenta,
+    hook_install: Some(claude_install),
+    hook_uninstall: Some(claude_uninstall),
+    materialize: None,
 };
 
 /// OpenCode — plugin strategy (shipped).
@@ -96,6 +143,9 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
     default_command: Some("opencode"),
     strategy: Some(IntegrationStrategy::Plugin),
     badge_color: Color::LightGreen,
+    hook_install: Some(opencode_install),
+    hook_uninstall: Some(opencode_uninstall),
+    materialize: None,
 };
 
 /// Pi — bundled-extension strategy (shipped, PRD #201).
@@ -106,6 +156,9 @@ pub static PI: AgentSpec = AgentSpec {
     default_command: Some("pi"),
     strategy: Some(IntegrationStrategy::Extension),
     badge_color: Color::LightCyan,
+    hook_install: None,
+    hook_uninstall: None,
+    materialize: Some(pi_materialize),
 };
 
 /// Codex — stdout-wrapper strategy (PRD #20 M7). The first agent to use the
@@ -121,6 +174,11 @@ pub static CODEX: AgentSpec = AgentSpec {
     default_command: Some("codex"),
     strategy: Some(IntegrationStrategy::Wrapper),
     badge_color: Color::LightYellow,
+    // Wrapper agents synthesize events from stdout — no hook install, no
+    // extension materialize (the `dot-agent-deck wrap` seam does the work).
+    hook_install: None,
+    hook_uninstall: None,
+    materialize: None,
 };
 
 /// Neutral entry for the "no recognized agent" placeholder. Not a real agent:
@@ -135,6 +193,9 @@ pub static NONE: AgentSpec = AgentSpec {
     default_command: None,
     strategy: None,
     badge_color: Color::DarkGray,
+    hook_install: None,
+    hook_uninstall: None,
+    materialize: None,
 };
 
 /// All SHIPPED, detectable agents, in a stable order. Excludes the neutral
@@ -328,6 +389,47 @@ mod tests {
                 Some(spec.agent_type.clone())
             );
         }
+    }
+
+    /// PRD #20 finding #15: strategy dispatch resolves from the SPEC's own
+    /// handler, not a hardcoded incumbent keyed by the strategy enum. Each
+    /// shipped agent carries exactly the handlers its strategy needs, a Wrapper
+    /// agent and the neutral placeholder carry none, and two agents that share a
+    /// hook-install shape resolve to DIFFERENT handlers — so a future agent
+    /// reusing an existing strategy runs its own implementation, never another
+    /// agent's module.
+    #[test]
+    fn strategy_handlers_resolve_from_spec_not_incumbent() {
+        assert!(spec(&AgentType::ClaudeCode).hook_install.is_some());
+        assert!(spec(&AgentType::ClaudeCode).hook_uninstall.is_some());
+        assert!(spec(&AgentType::ClaudeCode).materialize.is_none());
+
+        assert!(spec(&AgentType::OpenCode).hook_install.is_some());
+        assert!(spec(&AgentType::OpenCode).hook_uninstall.is_some());
+        assert!(spec(&AgentType::OpenCode).materialize.is_none());
+
+        assert!(spec(&AgentType::Pi).materialize.is_some());
+        assert!(spec(&AgentType::Pi).hook_install.is_none());
+
+        // A Wrapper agent (Codex) and the neutral placeholder carry no
+        // hook-install / materialize handlers.
+        assert!(spec(&AgentType::Codex).hook_install.is_none());
+        assert!(spec(&AgentType::Codex).materialize.is_none());
+        assert!(spec(&AgentType::None).hook_install.is_none());
+        assert!(spec(&AgentType::None).materialize.is_none());
+
+        // Claude and OpenCode install through DIFFERENT handlers — proof the
+        // handler is sourced per-spec, not from one per-strategy incumbent.
+        let claude = spec(&AgentType::ClaudeCode)
+            .hook_install
+            .expect("Claude has an installer");
+        let opencode = spec(&AgentType::OpenCode)
+            .hook_install
+            .expect("OpenCode has an installer");
+        assert!(
+            !std::ptr::fn_addr_eq(claude, opencode),
+            "each agent must resolve to its OWN installer, not a shared incumbent"
+        );
     }
 
     /// The badge colour field is populated for every entry (single source of

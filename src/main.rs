@@ -516,40 +516,40 @@ fn main() -> ExitCode {
             handle_hook(agent_str)
         }
         Some(Commands::Hooks { action }) => {
-            // PRD #20 M2: dispatch on the agent's integration STRATEGY (looked
-            // up in the registry) rather than hardcoding a per-`CliAgent`
-            // module call. Behaviour is unchanged for the two CLI agents —
-            // ClaudeCode → NativeHooks (`hooks_manage`), Opencode → Plugin
-            // (`opencode_manage`) — but a future NativeHooks/Plugin agent would
-            // install correctly from just its registry entry + CLI variant.
-            use dot_agent_deck::agent_registry::{self, IntegrationStrategy};
+            // PRD #20 finding #15: dispatch through the SPEC's own handler rather
+            // than a strategy-keyed hardcoded incumbent. Behaviour is unchanged
+            // for the two CLI agents — ClaudeCode installs its native hooks,
+            // Opencode its plugin — but a FUTURE agent (even one reusing an
+            // existing strategy) installs correctly from just its own registry
+            // handler, never another agent's module.
+            use dot_agent_deck::agent_registry;
             match action {
                 HooksAction::Install { agent } => {
-                    match agent_registry::spec(&agent.agent_type()).strategy {
-                        Some(IntegrationStrategy::Plugin) => {
-                            if let Err(e) = dot_agent_deck::opencode_manage::install() {
-                                eprintln!("Failed to install OpenCode plugin: {e}");
+                    let spec = agent_registry::spec(&agent.agent_type());
+                    match spec.hook_install {
+                        Some(install) => {
+                            if let Err(e) = install() {
+                                eprintln!("Failed to install {} hooks: {e}", spec.label);
                                 return ExitCode::FAILURE;
                             }
                         }
-                        Some(IntegrationStrategy::NativeHooks) => hooks_manage::install(),
-                        other => {
-                            eprintln!("No hook installer for integration strategy {other:?}");
+                        None => {
+                            eprintln!("No hook installer for agent {}", spec.label);
                             return ExitCode::FAILURE;
                         }
                     }
                 }
                 HooksAction::Uninstall { agent } => {
-                    match agent_registry::spec(&agent.agent_type()).strategy {
-                        Some(IntegrationStrategy::Plugin) => {
-                            if let Err(e) = dot_agent_deck::opencode_manage::uninstall() {
-                                eprintln!("Failed to uninstall OpenCode plugin: {e}");
+                    let spec = agent_registry::spec(&agent.agent_type());
+                    match spec.hook_uninstall {
+                        Some(uninstall) => {
+                            if let Err(e) = uninstall() {
+                                eprintln!("Failed to uninstall {} hooks: {e}", spec.label);
                                 return ExitCode::FAILURE;
                             }
                         }
-                        Some(IntegrationStrategy::NativeHooks) => hooks_manage::uninstall(),
-                        other => {
-                            eprintln!("No hook uninstaller for integration strategy {other:?}");
+                        None => {
+                            eprintln!("No hook uninstaller for agent {}", spec.label);
                             return ExitCode::FAILURE;
                         }
                     }
