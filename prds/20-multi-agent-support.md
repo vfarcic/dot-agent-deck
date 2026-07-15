@@ -1,6 +1,6 @@
 # PRD #20: Multi-agent machinery + Codex adapter
 
-**Status**: Draft (rescoped 2026-06-22 — machinery + Codex only; Gemini/Aider split to follow-up PRDs)
+**Status**: Complete (implemented 2026-07-15; rescoped 2026-06-22 — machinery + Codex only; Gemini/Aider split to follow-up PRDs). See [Implementation notes](#implementation-notes-2026-07-15).
 **Priority**: Low
 **Created**: 2026-03-31
 **GitHub Issue**: [#20](https://github.com/vfarcic/dot-agent-deck/issues/20)
@@ -146,17 +146,17 @@ Captured here only so the follow-up PRDs have a starting point; **not in this PR
 
 ## Milestones
 
-- [ ] AgentEvent protocol documented with version field and stable JSON schema (`src/event.rs`)
-- [ ] Agent registry + strategy seam: move Claude Code and OpenCode per-agent data into registry entries, behaviour-preserving (existing tests pass unchanged) (`src/event.rs`, `src/config.rs`, `src/ui.rs`)
-- [ ] `live_target` descriptor (`kind` + `writable`) on the protocol and `send_result` status returned on input delivery (`src/event.rs`, `src/pane_input.rs`)
-- [ ] UI renders view-only / history-only sessions distinctly and surfaces failed/stale sends (`src/ui.rs`)
-- [ ] Agent type badge rendering on cards, colour from the registry (`src/ui.rs`)
-- [ ] `dot-agent-deck wrap` CLI subcommand with stdout/stderr pattern detection (`src/wrap.rs`)
-- [ ] Codex CLI adapter working end-to-end via wrapper, with new L2 e2e coverage
-- [ ] `--agent` flag on `pane new` command with per-type default commands from the registry
-- [ ] Agent type filter support in `/` search (`src/ui.rs`)
+- [x] AgentEvent protocol documented with version field and stable JSON schema (`src/event.rs`)
+- [x] Agent registry + strategy seam: move Claude Code and OpenCode per-agent data into registry entries, behaviour-preserving (existing tests pass unchanged) (`src/agent_registry.rs`, `src/event.rs`, `src/ui.rs`)
+- [x] `live_target` descriptor (`kind` + `writable`) on the protocol and `send_result` status returned on input delivery (`src/event.rs`, `src/daemon_client.rs`, `src/pane_input.rs`)
+- [x] UI renders view-only / history-only sessions distinctly and surfaces failed/stale sends (`src/ui.rs`)
+- [x] Agent type badge rendering on cards, colour from the registry (`src/ui.rs`)
+- [x] `dot-agent-deck wrap` CLI subcommand with stdout/stderr pattern detection (`src/wrap.rs`)
+- [x] Codex CLI adapter working end-to-end via wrapper + native hooks, with new L2 e2e coverage (`src/wrap.rs`, `src/codex_hooks_manage.rs`, `src/hook.rs`)
+- [x] ~~`--agent` flag on `pane new` command~~ **SUPERSEDED** — there is no `pane new` CLI for any agent; the `--agent` intent shipped as the **TUI new-pane Agent selector**, which seeds the Command field from the selected registry entry's `default_command`, and the spawn seam auto-wraps Wrapper-strategy commands (`src/ui.rs`, `src/wrap.rs::wrap_launch_command`). See Implementation notes (b).
+- [x] Agent type filter support in `/` search (`type:codex`) (`src/ui.rs`, `src/agent_registry.rs::resolve_type_alias`)
 - [x] Documentation: adapter authoring guide for third-party agents (`docs/develop/agent-adapters.md`, linked from `CONTRIBUTING.md`)
-- [ ] All existing tests passing unchanged; new tests for the registry, wrapper, and Codex
+- [x] All existing tests passing unchanged; new tests for the registry, wrapper, and Codex (`tests/codex_adapter.rs`, `tests/codex_hook_ingestion.rs`, `tests/e2e_codex_*.rs`)
 - [x] **Follow-up PRD: Gemini adapter** — [PRD #211](211-gemini-adapter.md) (wrapper strategy; reuses `dot-agent-deck wrap` from this PRD)
 - [x] **Follow-up PRD: Aider adapter** — [PRD #212](212-aider-adapter.md) (introduces the log-watcher strategy + `watch --agent`)
 
@@ -176,3 +176,30 @@ Captured here only so the follow-up PRDs have a starting point; **not in this PR
 - **Agent tool availability**: Each agent has its own installation, auth, and API key requirements. We don't manage these — we just monitor.
 - **Feature disparity**: Different agents expose very different levels of information. Cards for wrapper-based agents will be sparser than Claude Code cards. This is acceptable — basic status is still valuable.
 - **Registry refactor scope creep**: centralising the scattered `match AgentType` arms could grow into a larger rework of `src/ui.rs`/`src/event.rs`. Mitigated by the behaviour-preserving constraint — existing tests must pass unchanged, which bounds the refactor to a move, not a redesign.
+
+## Implementation notes (2026-07-15)
+
+All milestones shipped. Two places where the delivered implementation evolved past the original draft's premise are recorded here so the doc matches the code.
+
+### (a) Codex reached FULL tool + prompt event parity via NATIVE HOOKS, not the wrapper alone
+
+The draft assumed Codex would be a pure **stdout-wrapper** agent: `dot-agent-deck wrap -- codex` teeing stdout through pattern detection into coarse Working/Idle/Error states. That premise turned out to be insufficient for *interactive* Codex — bare `codex` paints an ANSI TUI on stdout with no machine-readable JSON, so a classifier can only ever see redraw noise (no reliable Idle/Error, no tool or prompt detail).
+
+Codex 0.144.4 ships a **Claude-Code-compatible native hooks engine**, so the shipped design is a **hybrid**: Codex keeps `IntegrationStrategy::Wrapper` as its **PTY host + hook injector**, but its rich events (prompt / tool / turn-Idle) come from **native hooks**, not the classifier. The wrapper (`src/wrap.rs`) installs a `hooks.json` into the active `CODEX_HOME` (`src/codex_hooks_manage.rs`) whose every command hook shells `dot-agent-deck hook --agent codex`, and launches `codex` with `--dangerously-bypass-hook-trust` (the deck authors — and thus vets — its own hook definition). Those payloads are the **same shape Claude posts** and are ingested by the existing `src/hook.rs` `handle_hook` `"codex"` arm (stamping `AgentType::Codex`) — no new wire, no `PROTOCOL_VERSION` bump. Verified against a live interactive turn, a shell tool call arrives as `tool_name: "Bash"` with a **plain-string `command`** (not the argv-array `shell` shape assumed early on); `hook.rs` retains defensive `shell`/`apply_patch` arms as fallbacks for the `codex exec --json` stream. The coarse stdout classifier (`wrap.rs`'s `CODEX` `RuleSet`, keyed off `codex exec --json` JSONL `type` discriminators) remains as the **fallback** when hooks can't fire (e.g. a launcher/script that never trusts the deck's hooks). Full detail is in [`docs/develop/agent-adapters.md`](../docs/develop/agent-adapters.md); the launch/network caveats are in [`docs/troubleshooting.md`](../docs/troubleshooting.md).
+
+### (b) The `pane new --agent` CLI milestone was SUPERSEDED by the TUI new-pane Agent selector
+
+The draft's Pane Integration section proposed a `dot-agent-deck pane new --agent <type>` CLI flag. **There is no `pane new` CLI for any agent** — the deck creates panes from the TUI, not a scriptable pane-creation subcommand. The `--agent` *intent* shipped instead as the **TUI new-pane Agent selector**: a click-activated chip (◀▶ cycles agents) that seeds the Command field from the selected registry entry's `default_command`. The spawn seam then rewrites a Wrapper-strategy command into `dot-agent-deck wrap --agent <basename> -- <command>` automatically (`src/wrap.rs::wrap_launch_command`, idempotent), so selecting Codex launches it under the wrapper with no user ceremony. A scriptable pane-creation CLI is filed as an optional follow-up ([#214](https://github.com/vfarcic/dot-agent-deck/issues/214)).
+
+### (c) Everything else shipped as specified
+
+`live_target` (`kind` + `writable`) and the honest `send_result` status both landed (`src/event.rs`, `src/daemon_client.rs`): a wrapper session declares `Pty`/`Live` when it runs inside a deck-managed pane and `Process`/`HistoryOnly` when standalone, and input delivery returns `applied`/`queued`/`stale`/`wrong-session`/`history-only`/`no-live-target` instead of fire-and-forget. Per-agent coloured **badges** (from the registry `badge_color`), the `type:codex` **filter** (`resolve_type_alias`), and the stats-bar breakdown by agent type all shipped, driven entirely off the registry.
+
+### Follow-up issues
+
+Filed as optional/additive work on top of this PRD (none block shipping):
+
+- [#213](https://github.com/vfarcic/dot-agent-deck/issues/213) — Make project `.claude/skills` discoverable by Codex (seed/symlink project skills into `~/.codex/skills` at spawn; Codex only reads its own skills dir).
+- [#214](https://github.com/vfarcic/dot-agent-deck/issues/214) — Scriptable pane-creation CLI (the superseded `pane new --agent` milestone — optional convenience; no pane-creation CLI exists for any agent).
+- [#215](https://github.com/vfarcic/dot-agent-deck/issues/215) — Enrich the `codex exec --json` wrapper mapping to `ToolStart`/`ToolEnd` (additive; the interactive native-hook path already has parity).
+- [#216](https://github.com/vfarcic/dot-agent-deck/issues/216) — Optional: migrate Codex to a pure `NativeHooks` strategy and retire the wrapper for it (cleanup; the hybrid ships now).

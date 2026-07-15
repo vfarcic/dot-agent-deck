@@ -72,6 +72,19 @@ exec codex --dangerously-bypass-hook-trust "$@"
 
 (Alternatively, run Codex once and approve the deck's hooks via its interactive `/hooks` review — Codex then remembers the trust and you can drop the flag.) Without one of these, Codex refuses to run the deck's hooks and the card falls back to coarse status only — no live tool or prompt detail.
 
+### Codex as a role or worker: allow sandbox network access
+
+Codex is usable as an orchestrator **role** or a delegated **worker**. In those flows the Codex agent has to reach the dashboard daemon — it runs `dot-agent-deck delegate …` to hand work to another pane and `dot-agent-deck work-done …` to report completion, both of which connect to the daemon over its local socket. Codex's `workspace-write` sandbox blocks that connection by default, so those commands silently fail and the orchestration pipeline never moves.
+
+Launch Codex with `workspace-write`, non-interactive approvals, **and** sandbox network access so the deck's CLI can reach the daemon:
+
+```bash
+codex --sandbox workspace-write --ask-for-approval never \
+  -c "sandbox_workspace_write.network_access=true"
+```
+
+The `-c "sandbox_workspace_write.network_access=true"` override is the important part — without it, `delegate` / `work-done` can't reach the daemon even though the pane itself looks healthy. Point a role at Codex by setting that full command as the role's `command` in `.dot-agent-deck.toml`.
+
 ### Manual Management
 
 The `hooks install` and `hooks uninstall` commands are available when you need to debug or temporarily remove hooks:

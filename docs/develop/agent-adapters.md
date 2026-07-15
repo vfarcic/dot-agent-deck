@@ -115,8 +115,25 @@ Stdout scraping cannot reach full parity for *interactive* Codex — bare `codex
 
 Concretely, when the wrapper launches a real `codex`:
 
-1. It installs a `hooks.json` into the active `CODEX_HOME` ([`src/codex_hooks_manage.rs`](../../src/codex_hooks_manage.rs)) whose every command hook shells `dot-agent-deck hook --agent codex`. Those hook payloads are the **same shape Claude posts**, so they are ingested by the existing [`src/hook.rs`](../../src/hook.rs) `handle_hook` `"codex"` arm (stamping `AgentType::Codex`) — no new wire, no `PROTOCOL_VERSION` bump. The installer is idempotent, merges (it never clobbers a user's own hooks or `config.toml`), and resolves `CODEX_HOME` the way Codex does (`$CODEX_HOME`, else `$HOME/.codex` — the user's REAL home in production, never a throwaway).
+1. It installs a `hooks.json` into the active `CODEX_HOME` ([`src/codex_hooks_manage.rs`](../../src/codex_hooks_manage.rs)) whose every command hook shells `dot-agent-deck hook --agent codex`. Those hook payloads are the **same shape Claude posts**, so they are ingested by the existing [`src/hook.rs`](../../src/hook.rs) `handle_hook` `"codex"` arm (stamping `AgentType::Codex`) — no new wire, no `PROTOCOL_VERSION` bump. The installed rule set covers the lifecycle (`SessionStart`/`Stop`), the prompt (`UserPromptSubmit`), tools (`PreToolUse`/`PostToolUse`), permission, compaction, and subagent boundaries — the same class Claude delivers. The installer is idempotent, merges (it never clobbers a user's own hooks or `config.toml`), and resolves `CODEX_HOME` the way Codex does (`$CODEX_HOME`, else `$HOME/.codex` — the user's REAL home in production, never a throwaway).
 2. It launches `codex` with `--dangerously-bypass-hook-trust`. Codex requires command hooks to be *trusted* before they run (an interactive `/hooks` review otherwise); because the deck **authors its own hook definition**, it vets the source — itself — and bypasses that prompt for this deck-controlled spawn.
+
+##### The live hook payload shape (what interactive Codex actually posts)
+
+Codex 0.144.4's native hooks post the **Claude-Code JSON shape**, and — verified against a live interactive turn (the `tests/e2e_codex_hooks.rs` real-agent test, aligned to the live payload) — a shell tool call arrives with **`tool_name: "Bash"`** and a **plain-string `command`**, exactly like Claude:
+
+```json
+{
+  "session_id": "…",
+  "hook_event_name": "PreToolUse",
+  "cwd": "/path/to/project",
+  "tool_name": "Bash",
+  "tool_use_id": "…",
+  "tool_input": { "command": "touch sentinel.txt" }
+}
+```
+
+So the `UserPromptSubmit` prompt text, the `Bash` tool name, and the command detail all reach the card through the *same* `extract_tool_detail` `"Bash"` arm the Claude path uses — no Codex-specific parsing required for the common case. `hook.rs` **also** carries defensive `"shell"` (argv-array `command`) and `"apply_patch"` (patch-envelope file path) arms; these tolerate the alternative shape that the `codex exec --json` stream / older Codex builds can emit, but the shipped interactive hook path does not exercise them. Treat `Bash` + string as the canonical shape and the argv/patch arms as graceful fallbacks.
 
 ##### Trust flag and launcher/wrapper scripts (important)
 
@@ -140,12 +157,17 @@ The `--dangerously-bypass-hook-trust` flag can only be auto-injected when the wr
 
 ### 4. Declare `live_target` / writability — `src/event.rs`, and your producer
 
-A dashboard-visible session is **not** necessarily a live, writable target. Native PTY panes (Claude / OpenCode / Pi) are `Live`: the daemon owns the PTY and can inject input. A **wrapper** session is different — the child's stdin is the user's inherited terminal, not a daemon-controlled handle — so the *dashboard* has no live write target. Each producer therefore declares a per-session [`LiveTarget`] descriptor with two axes:
+A dashboard-visible session is **not** necessarily a live, writable target. Native PTY panes (Claude / OpenCode / Pi) are `Live`: the daemon owns the PTY and can inject input. A **wrapper** session's writability depends on *how* it was launched, so each producer declares a per-session [`LiveTarget`] descriptor with two axes:
 
 - `kind` ([`TargetKind`]): the concrete handle — `process | pty | tmux | sdk | none`.
 - `writable` ([`Writable`]): what can be done with it now — `live` | `history-only` | `none`.
 
-The Codex wrapper stamps every event it emits with `{ kind: Process, writable: HistoryOnly }`. Native PTY panes leave `live_target` unset (`None`), which the UI reads as the historical live/writable default. Wrapper sessions are **typically history-only** — declare that honestly so the UI renders the card view-only and refuses to invite input it can't deliver.
+The Codex wrapper decides this **per invocation** (see `run_wrap` in [`src/wrap.rs`](../../src/wrap.rs)):
+
+- **Inside a deck-managed pane** (`DOT_AGENT_DECK_PANE_ID` set) — the common case for a deck-spawned Codex pane — the child runs on a daemon-backed PTY, so the wrapper stamps `{ kind: Pty, writable: Live }`: the daemon's dashboard writes reach the child through the pane PTY → the wrapper's stdin → the inner PTY.
+- **A standalone `wrap`** (no pane) has no deck-controlled write handle — the child's terminal is the user's own — so it stamps `{ kind: Process, writable: HistoryOnly }`, and the UI renders the card view-only rather than inviting input it can't deliver.
+
+Native PTY panes leave `live_target` unset (`None`), which the UI reads as the historical live/writable default. Declare the descriptor honestly so a session that *can't* take input never presents a live input affordance.
 
 When the dashboard *does* deliver input, the send path returns an honest [`SendResult`] instead of fire-and-forget: `applied`, `queued`, `stale`, `wrong-session`, `history-only`, or `no-live-target`. A `history-only` / `stale` / `wrong-session` result surfaces feedback rather than silently dropping the keystroke. (Proving *consumption* of a specific input — generation counters, output-cursor diffing — is explicitly out of scope; the lightweight `live_target` + `send_result` model is enough.)
 

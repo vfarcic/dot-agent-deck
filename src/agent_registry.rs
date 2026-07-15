@@ -45,11 +45,15 @@ pub enum IntegrationStrategy {
     /// A bundled extension materialized into the agent's HOME
     /// (Pi — `src/orchestrator_ext.rs`).
     Extension,
-    /// A stdout wrapper (`dot-agent-deck wrap`) that intercepts the agent's
-    /// stdio to synthesize events. **Reserved** for the coming Codex/Gemini
-    /// work (later PRD #20 milestones): the variant is defined now so the
-    /// registry shape is stable, but no shipped agent uses it yet and nothing
-    /// dispatches on it.
+    /// A stdout wrapper (`dot-agent-deck wrap`) that spawns the agent, passes
+    /// stdio through transparently, and tees its output through pattern
+    /// detection into events. Shipped and dispatched-on: Codex uses it (PRD
+    /// #20), and the new-agent spawn seam rewrites a Wrapper-strategy command
+    /// into `dot-agent-deck wrap …` (`crate::wrap::wrap_launch_command`). For
+    /// Codex the wrapper is also the PTY host + native-hook injector — its rich
+    /// prompt/tool/turn events come from Codex's Claude-Code-compatible native
+    /// hooks, with the coarse stdout classifier only as a fallback (see
+    /// `docs/develop/agent-adapters.md`).
     Wrapper,
 }
 
