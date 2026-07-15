@@ -608,11 +608,11 @@ impl DaemonClient {
 pub struct EventSubscription {
     rd: IpcReadHalf,
     /// Held purely as a lifetime signal: dropping the subscription drops
-    /// both halves, which closes the stream and trips the daemon's read-side
-    /// disconnect detector (EOF) promptly. Never written to after the request.
-    /// (Both halves come from [`tokio::io::split`], so the underlying stream
-    /// stays open until this *and* `rd` drop — which is exactly when the
-    /// subscription ends.)
+    /// `_wr`, which — on the Unix backend, whose [`IpcWriteHalf`] is
+    /// `tokio::net::unix::OwnedWriteHalf` — half-closes the socket via
+    /// `SHUT_WR`, tripping the daemon's read-side disconnect detector and
+    /// tearing the per-connection receiver down promptly. Never written to
+    /// after the request.
     _wr: IpcWriteHalf,
 }
 

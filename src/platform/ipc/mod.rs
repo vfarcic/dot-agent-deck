@@ -13,12 +13,19 @@
 //!   Replaces the hook listener in `daemon.rs` and the attach listener in
 //!   `daemon_protocol.rs`.
 //! - [`IpcStream`] — `AsyncRead + AsyncWrite + Unpin + Send`, with async
-//!   `connect(endpoint)` and `into_split()`. Per PRD #42's *Trait-shape note*
-//!   the halves come from [`tokio::io::split`] over the stream, so the same
-//!   half types ([`IpcReadHalf`] / [`IpcWriteHalf`]) work for both
-//!   `UnixStream` and named pipes — `daemon_client.rs`'s protocol helpers were
+//!   `connect(endpoint)` and `into_split()`. Callers only ever name the halves
+//!   through the [`IpcReadHalf`] / [`IpcWriteHalf`] aliases, so each backend is
+//!   free to choose the concrete half type that matches its transport. The
+//!   **Unix** backend uses `tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf}`
+//!   (via [`tokio::net::UnixStream::into_split`]) so that dropping the write
+//!   half alone performs `shutdown(SHUT_WR)` — the native half-close the attach
+//!   protocol depends on and that `main` had. (An earlier draft used
+//!   [`tokio::io::split`] here, but its generic write half does *not* `SHUT_WR`
+//!   on drop, silently regressing the attach half-close on Linux/macOS.) The
+//!   **Windows** named-pipe backend has no per-half half-close primitive, so it
+//!   keeps [`tokio::io::split`]. `daemon_client.rs`'s protocol helpers were
 //!   written against `tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf}` and
-//!   are ported to these.
+//!   stay compatible with both.
 //! - [`IpcClient`] — a blocking, single-shot connect handle (`std::io::Read +
 //!   Write`) for `hook::send_to_socket` and `ui::send_daemon_request_blocking`.
 //!

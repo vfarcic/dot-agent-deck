@@ -191,10 +191,14 @@ fn checked_signal_pid(pid: u32) -> std::io::Result<libc::pid_t> {
 /// exited, which is a clean already-gone success for the caller (the
 /// `daemon stop` path racing a self-exiting daemon, and the re-resolve fallback
 /// in `build_version_handshake` that documents "SIGTERM lands as ESRCH").
-/// Returning `Ok(())` here lets the caller's `poll_daemon_gone` report
-/// `Stopped`, matching the pre-refactor `terminate_daemon_graceful` behavior on
-/// `main` — which special-cased ESRCH to `Ok(Stopped)` rather than a failure.
-pub fn terminate_pid(pid: u32) -> std::io::Result<()> {
+/// Rather than collapsing that case into an indistinguishable `Ok(())` — which
+/// would force `terminate_daemon_graceful` into the same poll/escalate loop it
+/// runs for a signal that *was* delivered — ESRCH surfaces as the distinct
+/// [`TerminateSignal::AlreadyGone`] so the caller can short-circuit straight to
+/// `Stopped`, exactly matching the pre-refactor `terminate_daemon_graceful` on
+/// `main` (which special-cased ESRCH to an immediate `Ok(Stopped)`). Any other
+/// errno is a genuine failure and is **not** swallowed.
+pub fn terminate_pid(pid: u32) -> std::io::Result<super::TerminateSignal> {
     let signal_pid = checked_signal_pid(pid)?;
     // SAFETY: `libc::kill` is async-signal-safe and has no in-process side
     // effects beyond delivering the signal to the target PID.
@@ -202,11 +206,11 @@ pub fn terminate_pid(pid: u32) -> std::io::Result<()> {
     if rc != 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(());
+            return Ok(super::TerminateSignal::AlreadyGone);
         }
         return Err(err);
     }
-    Ok(())
+    Ok(super::TerminateSignal::Delivered)
 }
 
 /// Send `SIGKILL` to `pid` (the daemon-stop `--force` escalation). Same guards

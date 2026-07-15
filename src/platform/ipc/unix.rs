@@ -18,12 +18,19 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
 
-/// Owned read half of an [`IpcStream`]. Per the PRD #42 Trait-shape note this
-/// is [`tokio::io::ReadHalf`] over the stream (not `tokio::net::unix`'s owned
-/// half) so the type is identical across the Unix and Windows backends.
-pub type IpcReadHalf = tokio::io::ReadHalf<IpcStream>;
-/// Owned write half of an [`IpcStream`] — see [`IpcReadHalf`].
-pub type IpcWriteHalf = tokio::io::WriteHalf<IpcStream>;
+/// Owned read half of an [`IpcStream`]. This is `tokio::net::unix`'s native
+/// [`OwnedReadHalf`](tokio::net::unix::OwnedReadHalf) — **not**
+/// [`tokio::io::split`]'s generic half — so that dropping the paired
+/// [`IpcWriteHalf`] performs a real `SHUT_WR` on the socket (see
+/// [`IpcStream::into_split`]). The Windows named-pipe backend keeps the generic
+/// `tokio::io::split` halves; callers reference these types only through the
+/// `IpcReadHalf` / `IpcWriteHalf` aliases, so the per-backend divergence is
+/// invisible above the seam.
+pub type IpcReadHalf = tokio::net::unix::OwnedReadHalf;
+/// Owned write half of an [`IpcStream`] — see [`IpcReadHalf`]. Its `Drop`
+/// half-closes the socket for writing (`shutdown(SHUT_WR)`), which the attach
+/// protocol relies on to signal the peer independently of the read half.
+pub type IpcWriteHalf = tokio::net::unix::OwnedWriteHalf;
 
 /// Async bidirectional IPC stream. Unix backend: a thin newtype over
 /// [`tokio::net::UnixStream`]. `AsyncRead`/`AsyncWrite` delegate to the inner
@@ -40,13 +47,24 @@ impl IpcStream {
         Ok(Self(UnixStream::connect(endpoint).await?))
     }
 
-    /// Split into owned read/write halves via [`tokio::io::split`]. Both halves
-    /// keep the underlying socket alive until *both* are dropped, at which
-    /// point the socket closes and the peer observes EOF — matching the
-    /// disconnect semantics the `daemon_client` subscription/attach paths rely
-    /// on.
+    /// Split into owned read/write halves via
+    /// [`UnixStream::into_split`](tokio::net::UnixStream::into_split), which
+    /// yields `tokio::net::unix`'s native [`OwnedReadHalf`] /
+    /// [`OwnedWriteHalf`]. Crucially — unlike [`tokio::io::split`] — dropping
+    /// the write half alone performs a `shutdown(SHUT_WR)` on the socket, so
+    /// the peer observes a write-side EOF the moment the write half drops, even
+    /// while the read half is still live. The attach server
+    /// (`daemon_protocol::handle_attach_stream`) moves its write half into a
+    /// spawned output task that can end — dropping the write half — *before*
+    /// the input loop that owns the read half; that independent SHUT_WR is the
+    /// behavior this preserves byte-for-byte from `main` (which split a
+    /// `UnixStream` directly). The Windows named-pipe backend keeps
+    /// `tokio::io::split` (no per-half half-close primitive there).
+    ///
+    /// [`OwnedReadHalf`]: tokio::net::unix::OwnedReadHalf
+    /// [`OwnedWriteHalf`]: tokio::net::unix::OwnedWriteHalf
     pub fn into_split(self) -> (IpcReadHalf, IpcWriteHalf) {
-        tokio::io::split(self)
+        self.0.into_split()
     }
 }
 

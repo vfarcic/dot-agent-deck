@@ -83,8 +83,11 @@ impl IpcStream {
         }
     }
 
-    /// Split into owned read/write halves via [`tokio::io::split`] — see the
-    /// Unix backend for the disconnect-on-double-drop semantics this preserves.
+    /// Split into owned read/write halves via [`tokio::io::split`]. A named
+    /// pipe has no per-half half-close primitive (the Unix `shutdown(SHUT_WR)`
+    /// the Unix backend gets from `UnixStream::into_split` has no analogue
+    /// here), so both halves keep the pipe alive until *both* drop, at which
+    /// point the peer observes EOF.
     pub fn into_split(self) -> (IpcReadHalf, IpcWriteHalf) {
         tokio::io::split(self)
     }

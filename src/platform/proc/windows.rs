@@ -40,7 +40,10 @@ pub fn send_sigterm_to_child_group(
 }
 
 /// Daemon-stop graceful signal by PID — `TerminateProcess` skeleton (#163).
-pub fn terminate_pid(_pid: u32) -> std::io::Result<()> {
+/// The real implementation will distinguish a delivered termination from an
+/// already-exited target (the Windows analogue of `ESRCH`) via
+/// [`super::TerminateSignal`]; the stub only ever errors.
+pub fn terminate_pid(_pid: u32) -> std::io::Result<super::TerminateSignal> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "daemon termination by PID is not yet implemented on Windows (PRD #163)",

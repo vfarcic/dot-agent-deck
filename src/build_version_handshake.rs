@@ -494,7 +494,18 @@ pub async fn terminate_daemon_graceful(
     // `crate::platform::proc::{terminate_pid, force_kill_pid}` (Unix `kill`;
     // Windows `TerminateProcess` lands in #163). Guard failures (pid 0 /
     // overflow) and `kill` errors both surface as `TerminateFailed`.
-    crate::platform::proc::terminate_pid(pid).map_err(HandshakeError::TerminateFailed)?;
+    //
+    // The `AlreadyGone` (Unix `ESRCH`) arm is a clean already-gone success:
+    // there is no live process to wait on, so — exactly like `main` — we
+    // short-circuit straight to `Stopped` without entering the poll/escalate
+    // loop below. `Delivered` means the signal reached a live process that may
+    // still be shutting down, so we fall through and poll for it to vanish.
+    match crate::platform::proc::terminate_pid(pid).map_err(HandshakeError::TerminateFailed)? {
+        crate::platform::proc::TerminateSignal::AlreadyGone => {
+            return Ok(TerminateOutcome::Stopped);
+        }
+        crate::platform::proc::TerminateSignal::Delivered => {}
+    }
     if poll_daemon_gone(attach_path, grace_timeout).await {
         return Ok(TerminateOutcome::Stopped);
     }
