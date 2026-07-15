@@ -392,7 +392,6 @@ impl SavedSession {
 
     pub fn save(&self) -> Result<(), String> {
         use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         let path = session_path();
         let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
@@ -416,11 +415,13 @@ impl SavedSession {
             .unwrap_or_else(|| "session.toml".to_string());
         let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
 
-        let mut tmp_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
+        // PRD #42 M1: owner-only (0o600) creation mode comes from the platform
+        // seam — `.mode(0o600)` on Unix, a no-op-under-`%LOCALAPPDATA%`-ACL on
+        // Windows (#163).
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.create(true).write(true).truncate(true);
+        crate::platform::fsperm::set_create_mode_owner_only(&mut open_opts);
+        let mut tmp_file = open_opts
             .open(&tmp_path)
             .map_err(|e| format!("Failed to open temp session at {}: {e}", tmp_path.display()))?;
 
@@ -432,9 +433,10 @@ impl SavedSession {
             ));
         }
         // Defense in depth: a stale temp file from a crashed previous save would
-        // keep its old mode (OpenOptions::mode only applies on create), so
-        // re-assert 0o600 explicitly before the rename.
-        if let Err(e) = tmp_file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        // keep its old mode (the create-mode only applies on create), so
+        // re-assert owner-only permissions explicitly before the rename (PRD #42
+        // M1: via the platform seam — set 0o600 on Unix, no-op on Windows).
+        if let Err(e) = crate::platform::fsperm::set_file_owner_only(&tmp_file) {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(format!(
                 "Failed to set permissions on temp session at {}: {e}",
