@@ -2003,7 +2003,7 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<()> {
 /// Copy only Codex's authentication state into the isolated test HOME and seed
 /// the fixture working directory as trusted. User configuration is deliberately
 /// not imported; real-agent tests pin their model for deterministic behavior.
-fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
+pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
     let src = host_home().join(".codex").join("auth.json");
     let bytes = read_credential_file_no_symlink(
         &src,

@@ -1856,6 +1856,16 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 - **Cost note:** one minimal mini-model availability probe plus one short interactive directory-listing/file-write turn.
 
+#### codex/worker
+
+##### codex/worker/001 — A real wrapped Codex orchestration worker receives a delegated task, does the work, and signals work-done (PRD #20 parity gap #12).
+- **Layer:** L2 headless in-process daemon plus a real interactive Codex PTY; runtime-skipped unless `check_codex_available` verifies the CLI, persisted auth, and model access.
+- **Agent:** real `gpt-5.1-codex-mini` Codex configured as the `coder` role with workspace-write sandboxing, approval disabled, low reasoning effort, isolated copied credentials, and project trust; the common spawn seam automatically launches it through `dot-agent-deck wrap`.
+- **Asserts:** Codex auto-submits the daemon-injected single-line `worker-task-coder.md` pointer, reads the delegated task, creates `codex_worker_sentinel_c81f2a.txt` with exact known contents, and runs the task footer's `dot-agent-deck work-done` command so the daemon writes `.dot-agent-deck/work-done-coder.md`.
+- **Does not assert:** exact model phrasing, token usage, or dashboard rendering (covered by `codex/live/001`).
+- **Platform coverage:** mac+linux (real-agent tier is local-only).
+- **Cost note:** one minimal mini-model availability probe plus one short worker turn.
+
 #### chain-smoke/claude
 
 ##### chain-smoke/claude/001 — A real Claude Code agent run end-to-end emits hook events that drive the card through Thinking → Working → Idle.
