@@ -415,6 +415,35 @@ fn default_cols() -> u16 {
     80
 }
 
+/// PRD #20 R20-003/R20-004: additive identity + idempotency fields that ride
+/// alongside a [`AttachRequest::WriteAndSubmit`] request as extra JSON keys.
+///
+/// They are deliberately NOT declared on the `WriteAndSubmit` enum variant: its
+/// `{ pane_id, text }` shape is constructed as a 2-field literal at existing
+/// call sites (older tests, the Codex-wrapper path), and widening the variant
+/// would break those literals. Instead the handler re-parses the SAME request
+/// payload into this struct — every field `#[serde(default)]`, so an older
+/// client that omits them decodes to all-`None` and the daemon degrades to
+/// pane-only authorization (current behavior). Unknown keys on the base variant
+/// are ignored by serde, so the two parses of one payload never conflict.
+#[derive(Debug, Default, Deserialize)]
+struct WriteAndSubmitExtras {
+    /// The registry id of the agent the prompt was queued for. On a mismatch
+    /// with the live target that currently owns the pane, the daemon returns
+    /// `wrong-session` WITHOUT writing (R20-003).
+    #[serde(default)]
+    expected_agent_id: Option<String>,
+    /// The session id the prompt was queued for. If a DIFFERENT live session now
+    /// owns the pane, the daemon returns `stale` WITHOUT writing (R20-003).
+    #[serde(default)]
+    expected_session_id: Option<String>,
+    /// A stable idempotency key. The daemon caches the first result for a
+    /// delivery id and replays it on a retry, so a re-sent ambiguous transport
+    /// failure never double-submits (R20-004).
+    #[serde(default)]
+    delivery_id: Option<String>,
+}
+
 /// PRD #161 M1.1: a snapshot of the agents the daemon is currently managing,
 /// carried additively on the [`AttachResponse`] reply to an
 /// [`AttachRequest::Hello`]. The shared TUI↔daemon restart prompt (Part A)
@@ -1236,37 +1265,103 @@ async fn handle_connection(
             // ok(). Only a `Live` target is actually written; a non-live target
             // is reported (`history-only` / `no-live-target`) WITHOUT writing,
             // so the TUI surfaces feedback rather than silently dropping input.
-            let writable = state.read().await.pane_writable(&pane_id);
-            match writable {
-                crate::event::Writable::Live => {
-                    match registry.write_to_pane_and_submit(&pane_id, &text).await {
-                        Ok(()) => {
-                            write_resp(
-                                &mut stream,
-                                &AttachResponse::with_send_result(
-                                    crate::event::SendResult::Applied,
-                                ),
+            //
+            // PRD #20 R20-003/004/006: the request MAY additionally carry the
+            // agent identity + session the prompt was queued for and a stable
+            // delivery id. These ride as extra JSON keys alongside the base
+            // `WriteAndSubmit { pane_id, text }` shape (the enum stays 2-field so
+            // existing literals compile), parsed here from the raw payload. When
+            // present the daemon (a) dedups on `delivery_id` so a retry replays
+            // the first result instead of re-submitting, (b) binds delivery to
+            // the EXACT live registry target and refuses (WrongSession/Stale, no
+            // write) on a rebind, and (c) re-validates liveness AFTER acquiring
+            // the target's writer, closing the TOCTOU where a pane goes
+            // history-only / rebinds while the send waits for the writer.
+            let extras: WriteAndSubmitExtras = serde_json::from_slice(&frame.1).unwrap_or_default();
+
+            // (a) Idempotency: replay the cached result for a repeated delivery id.
+            if let Some(cached) = extras
+                .delivery_id
+                .as_deref()
+                .and_then(|did| registry.cached_delivery_result(did))
+            {
+                write_resp(&mut stream, &AttachResponse::with_send_result(cached)).await?;
+            } else {
+                let writable = state.read().await.pane_writable(&pane_id);
+                let result: Result<crate::event::SendResult, String> = match writable {
+                    crate::event::Writable::HistoryOnly => {
+                        Ok(crate::event::SendResult::HistoryOnly)
+                    }
+                    crate::event::Writable::None => Ok(crate::event::SendResult::NoLiveTarget),
+                    crate::event::Writable::Live => {
+                        // The re-validation closure runs UNDER the held target
+                        // writer (inside `write_and_submit_guarded`), immediately
+                        // before the write, against the authoritative session
+                        // state: the pane must still be `Live` and — if the caller
+                        // named a session — still be that same session.
+                        let st = state.clone();
+                        let pane_for_check = pane_id.clone();
+                        let expected_session = extras.expected_session_id.clone();
+                        let guarded = registry
+                            .write_and_submit_guarded(
+                                &pane_id,
+                                &text,
+                                extras.expected_agent_id.as_deref(),
+                                move || async move {
+                                    let guard = st.read().await;
+                                    if guard.pane_writable(&pane_for_check)
+                                        != crate::event::Writable::Live
+                                    {
+                                        return false;
+                                    }
+                                    if let Some(expected) = expected_session.as_deref()
+                                        && let Some(current) =
+                                            guard.pane_session_id(&pane_for_check)
+                                        && current != expected
+                                    {
+                                        return false;
+                                    }
+                                    true
+                                },
                             )
-                            .await?
-                        }
-                        Err(e) => {
-                            write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?
+                            .await;
+                        match guarded {
+                            Ok(crate::agent_pty::GuardedSend::Applied) => {
+                                Ok(crate::event::SendResult::Applied)
+                            }
+                            Ok(crate::agent_pty::GuardedSend::WrongSession) => {
+                                Ok(crate::event::SendResult::WrongSession)
+                            }
+                            Ok(crate::agent_pty::GuardedSend::Stale) => {
+                                Ok(crate::event::SendResult::Stale)
+                            }
+                            Ok(crate::agent_pty::GuardedSend::NoLiveTarget) => {
+                                Ok(crate::event::SendResult::NoLiveTarget)
+                            }
+                            Err(e) => Err(e.to_string()),
                         }
                     }
-                }
-                crate::event::Writable::HistoryOnly => {
-                    write_resp(
-                        &mut stream,
-                        &AttachResponse::with_send_result(crate::event::SendResult::HistoryOnly),
-                    )
-                    .await?
-                }
-                crate::event::Writable::None => {
-                    write_resp(
-                        &mut stream,
-                        &AttachResponse::with_send_result(crate::event::SendResult::NoLiveTarget),
-                    )
-                    .await?
+                };
+                match result {
+                    Ok(outcome) => {
+                        // Cache ONLY a DELIVERED outcome (a write that actually
+                        // happened) so a retry with the same delivery id replays
+                        // it instead of writing again (R20-004). A non-delivery
+                        // (history-only / stale / wrong-session / no-live-target)
+                        // wrote nothing, so it MUST stay retryable — caching it
+                        // would pin the pane to that outcome and defeat the
+                        // retry-once-live path (a history-only role that later
+                        // becomes live would never receive its prompt).
+                        if matches!(
+                            outcome,
+                            crate::event::SendResult::Applied | crate::event::SendResult::Queued
+                        ) && let Some(did) = extras.delivery_id.as_deref()
+                        {
+                            registry.record_delivery_result(did, outcome);
+                        }
+                        write_resp(&mut stream, &AttachResponse::with_send_result(outcome)).await?
+                    }
+                    Err(e) => write_resp(&mut stream, &AttachResponse::err(e)).await?,
                 }
             }
         }
@@ -1509,20 +1604,28 @@ async fn handle_attach_stream(
 
     let mut rx = handle.rx;
     let writer = handle.writer;
+    // PRD #20 R20-008: the target's liveness token, captured ATOMICALLY with the
+    // writer at `subscribe` time. The input path re-checks it before every write
+    // so a frame arriving during teardown can't reach a dead writer.
+    let exited = handle.exited;
 
-    // PRD #128 trace-field-symmetry: cache the agent's `pane_id_env`
-    // once per attach so the per-frame STREAM_IN trace can emit
-    // `pane_id` alongside `agent_id` without re-locking the registry on
-    // every frame. `pane_id_env` is fixed for an agent's lifetime, so
-    // one lookup is enough. Three states are distinguished — the M1.4
-    // cross-path diff needs to tell them apart, not just see an empty
-    // string. Angle-bracket sentinels (`<agent-gone>` / `<no-pane>`)
-    // can never collide with a real `pane_id_env` value because
+    // PRD #128 trace-field-symmetry: the agent's `pane_id_env`, used to enrich
+    // the per-frame STREAM_IN trace with `pane_id` and — more importantly — to
+    // authorize the write via `pane_writable(pane_id)`.
+    //
+    // PRD #20 R20-008: this is now the value CAPTURED ON THE HANDLE under the
+    // same registry lock as the writer, NOT a separate post-lock
+    // `pane_id_env_for_agent` lookup. The old lookup could race a concurrent
+    // removal and return the `<agent-gone>` sentinel, and
+    // `pane_writable("<agent-gone>")` defaults to `Live` — so a teardown-time
+    // frame authorized against `<agent-gone>` could still be written to the
+    // cached writer. Using the captured pane id closes that race: it always
+    // reflects the exact target the writer belongs to. `<no-pane>` (a daemon-side
+    // agent that carried no pane id) can never collide with a real value because
     // `is_valid_pane_id_env` rejects `<` and `>`.
-    let pane_id: String = match registry.pane_id_env_for_agent(&id) {
-        Some(Some(s)) => s,
-        Some(None) => "<no-pane>".to_string(),
-        None => "<agent-gone>".to_string(),
+    let pane_id: String = match &handle.pane_id_env {
+        Some(s) => s.clone(),
+        None => "<no-pane>".to_string(),
     };
 
     // Output task: forward broadcast bytes → STREAM_OUT frames. Owns `wr`
@@ -1583,6 +1686,19 @@ async fn handle_attach_stream(
                 // so native PTY panes are unaffected. The connection stays open
                 // (the client remains attached, seeing output) — only the write
                 // is dropped.
+                // PRD #20 R20-008: reject frames to a target that has exited
+                // (its reader thread saw EOF) even if the registry entry hasn't
+                // been reaped yet — the cached writer points at a dead PTY.
+                if exited.load(std::sync::atomic::Ordering::SeqCst) {
+                    tracing::debug!(
+                        target: "pane_write",
+                        agent_id = %id,
+                        pane_id = %pane_id,
+                        payload_len = bytes.len(),
+                        "STREAM_IN rejected — target agent has exited"
+                    );
+                    continue;
+                }
                 if state.read().await.pane_writable(&pane_id) != crate::event::Writable::Live {
                     tracing::debug!(
                         target: "pane_write",

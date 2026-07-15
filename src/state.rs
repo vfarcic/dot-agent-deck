@@ -770,6 +770,24 @@ impl AppState {
             .unwrap_or(Writable::Live)
     }
 
+    /// PRD #20 R20-003: the `session_id` of the newest live session bound to
+    /// `pane_id` (same newest-by-`last_activity` resolution as
+    /// [`Self::pane_writable`]), or `None` when the pane carries no session.
+    ///
+    /// The daemon's atomic write-and-submit guard compares this against the
+    /// session id the prompt was queued for: if a DIFFERENT session now owns the
+    /// pane (a `/clear` restart or respawn replaced it), the prompt is stale and
+    /// must not be delivered to the replacement. `None` means "no session
+    /// declared" — the guard treats that as a match (the legacy native-PTY
+    /// default, consistent with `pane_writable` defaulting to `Live`).
+    pub fn pane_session_id(&self, pane_id: &str) -> Option<String> {
+        self.sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some(pane_id))
+            .max_by_key(|s| s.last_activity)
+            .map(|s| s.session_id.clone())
+    }
+
     /// Register a pane ID as managed by our app.
     pub fn register_pane(&mut self, pane_id: String) {
         self.managed_pane_ids.insert(pane_id);

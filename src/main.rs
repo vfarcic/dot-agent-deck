@@ -13,7 +13,6 @@ use dot_agent_deck::daemon_attach::ensure_external_daemon_or_die;
 use dot_agent_deck::daemon_client::DaemonClient;
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::hook::handle_hook;
-use dot_agent_deck::hooks_manage;
 use dot_agent_deck::pane::PaneController;
 use dot_agent_deck::state::AppState;
 use dot_agent_deck::ui::run_tui;
@@ -1174,21 +1173,20 @@ async fn run_tui_session() -> ExitCode {
     let keybindings = dot_agent_deck::keybindings::KeybindingConfig::load();
 
     // Auto-install hooks/plugins for detected agents (silent, best-effort).
-    // PRD #20 M2: driven from the agent registry — iterate the shipped agents
-    // and run the STARTUP installer for the strategies that have one. Order is
-    // stable (`ALL` order) and matches the prior hooks-then-plugin sequence.
-    // NativeHooks (Claude) and Plugin (OpenCode) install at startup; Extension
-    // (Pi) materializes at spawn-time (see `agent_pty`) and Wrapper has no
-    // install step, so those strategies are skipped here.
+    // PRD #20 M2 / R20-010: driven from the agent registry — iterate the shipped
+    // agents and run each spec's OWN startup auto-install action. Order is stable
+    // (`ALL` order). Dispatching per-spec (rather than mapping the reusable
+    // `IntegrationStrategy` enum to a hardcoded incumbent) means a future agent
+    // reusing `NativeHooks`/`Plugin` runs ITS OWN installer, not Claude's or
+    // OpenCode's. Claude installs native hooks and OpenCode its plugin at
+    // startup; Pi (`Extension`) materializes at spawn-time (see `agent_pty`) and
+    // Codex (`Wrapper`) has no install step, so their `startup_auto_install` is
+    // `None` and they are skipped.
     {
-        use dot_agent_deck::agent_registry::{ALL, IntegrationStrategy};
+        use dot_agent_deck::agent_registry::ALL;
         for spec in ALL {
-            match spec.strategy {
-                Some(IntegrationStrategy::NativeHooks) => hooks_manage::auto_install(),
-                Some(IntegrationStrategy::Plugin) => {
-                    dot_agent_deck::opencode_manage::auto_install()
-                }
-                _ => {}
+            if let Some(install) = spec.startup_auto_install {
+                install();
             }
         }
     }

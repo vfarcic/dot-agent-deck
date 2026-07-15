@@ -155,6 +155,38 @@ pub async fn read_response<R: AsyncRead + Unpin>(
     }
 }
 
+/// PRD #20 R20-011: translate a `WriteAndSubmit` [`AttachResponse`] into the
+/// honest [`SendResult`] a caller acts on, enforcing that `ok` AGREES with the
+/// delivered-vs-non-delivered outcome. Three cases:
+///
+/// * A typed `send_result` present → return it, EXCEPT when it claims delivery
+///   (`applied`/`queued`) while `ok = false`. That contradiction (a
+///   forward-compat/hostile daemon, or a bug) must NEVER be reported as success:
+///   `ok = false` wins and we surface a server error. An unknown future variant
+///   decodes to [`SendResult::Unknown`] and is returned verbatim (a non-delivery
+///   the UI matches handle conservatively).
+/// * No `send_result` and `ok = false` → a genuine transport/server failure.
+/// * No `send_result` and `ok = true` → a pre-PRD-20 daemon; legacy
+///   fire-and-forget "assume applied".
+fn interpret_send_response(resp: AttachResponse) -> Result<SendResult, ClientError> {
+    if let Some(result) = resp.send_result {
+        let claims_delivered = matches!(result, SendResult::Applied | SendResult::Queued);
+        if claims_delivered && !resp.ok {
+            return Err(ClientError::Server(resp.error.unwrap_or_else(|| {
+                "daemon reported ok=false with a delivered send_result".into()
+            })));
+        }
+        return Ok(result);
+    }
+    if !resp.ok {
+        return Err(ClientError::Server(
+            resp.error
+                .unwrap_or_else(|| "write-and-submit failed".into()),
+        ));
+    }
+    Ok(SendResult::Applied)
+}
+
 /// One-shot request/response: send `req`, read one RESP, return it. Used for
 /// non-streaming operations (`list-agents`, `start-agent`, `stop-agent`).
 pub async fn issue_command<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
@@ -410,37 +442,63 @@ impl DaemonClient {
         pane_id: &str,
         text: &str,
     ) -> Result<SendResult, ClientError> {
+        self.write_and_submit_with_identity(pane_id, text, None, None, None)
+            .await
+    }
+
+    /// PRD #20 R20-003/R20-004: identity-bearing, idempotent counterpart of
+    /// [`Self::write_and_submit`]. Carries the agent identity + session the
+    /// prompt was queued for (`expected_agent_id` / `expected_session_id`) and a
+    /// stable `delivery_id`. The daemon compares the identity against the exact
+    /// live registry target BEFORE writing and returns `stale` / `wrong-session`
+    /// (without writing) on a rebind, and dedups on `delivery_id` so a retry
+    /// after a lost response replays the first result instead of double-submitting.
+    ///
+    /// The additive fields ride ALONGSIDE the base `WriteAndSubmit` shape as JSON
+    /// rather than widening the [`AttachRequest`] enum — its 2-field
+    /// `WriteAndSubmit { pane_id, text }` literal is depended on by existing call
+    /// sites, and a pre-PRD-20 daemon simply ignores the extra keys (degrading to
+    /// pane-only authorization), so the wire stays forward + backward compatible
+    /// and needs no `PROTOCOL_VERSION` bump.
+    pub async fn write_and_submit_with_identity(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: Option<&str>,
+        expected_session_id: Option<&str>,
+        delivery_id: Option<&str>,
+    ) -> Result<SendResult, ClientError> {
+        let mut request = serde_json::json!({
+            "op": "write-and-submit",
+            "pane_id": pane_id,
+            "text": text,
+        });
+        if let Some(v) = expected_agent_id {
+            request["expected_agent_id"] = serde_json::Value::String(v.to_string());
+        }
+        if let Some(v) = expected_session_id {
+            request["expected_session_id"] = serde_json::Value::String(v.to_string());
+        }
+        if let Some(v) = delivery_id {
+            request["delivery_id"] = serde_json::Value::String(v.to_string());
+        }
+        let resp = self.issue_json_command(&request).await?;
+        interpret_send_response(resp)
+    }
+
+    /// One-shot request/response for a hand-built JSON request. Used by
+    /// [`Self::write_and_submit_with_identity`] to carry additive fields the
+    /// [`AttachRequest`] enum doesn't declare, without widening the enum.
+    async fn issue_json_command(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<AttachResponse, ClientError> {
         let stream = self.connect().await?;
         let (mut rd, mut wr) = stream.into_split();
-        let resp = issue_command(
-            &mut rd,
-            &mut wr,
-            &AttachRequest::WriteAndSubmit {
-                pane_id: pane_id.to_string(),
-                text: text.to_string(),
-            },
-        )
-        .await?;
-        // PRD #20 blocker-7: a NEW client reads the typed `send_result` BEFORE
-        // treating a non-ok response as a transport error. A newer daemon
-        // returns `ok=false` for non-delivery (history-only / no-live-target /
-        // stale / wrong-session) so an OLD client that ignores `send_result`
-        // still treats non-delivery as failure — but this new client must
-        // surface the precise outcome so callers can retain/retry the input.
-        // Only a response with NO `send_result` and `ok=false` is a genuine
-        // transport/server failure.
-        if let Some(result) = resp.send_result {
-            return Ok(result);
-        }
-        if !resp.ok {
-            return Err(ClientError::Server(
-                resp.error
-                    .unwrap_or_else(|| "write-and-submit failed".into()),
-            ));
-        }
-        // A pre-PRD-20 daemon omits `send_result`; ok=true is the legacy
-        // fire-and-forget "assume applied" case.
-        Ok(SendResult::Applied)
+        let payload = serde_json::to_vec(request)
+            .map_err(|e| ClientError::Malformed(format!("request JSON: {e}")))?;
+        write_frame(&mut wr, KIND_REQ, &payload).await?;
+        read_response(&mut rd).await
     }
 
     /// Push a TUI pane resize through to the daemon's PTY. Idempotent on the

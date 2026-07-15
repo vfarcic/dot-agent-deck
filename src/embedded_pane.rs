@@ -2097,6 +2097,40 @@ impl PaneController for EmbeddedPaneController {
             .map_err(|e| PaneError::CommandFailed(format!("write_and_submit: {e}")))
     }
 
+    /// PRD #20 R20-003/R20-004: carry the queued-for agent identity + session and
+    /// a stable delivery id to the daemon's atomic write-and-submit RPC, so a
+    /// respawn/rebind between enqueue and delivery yields `stale`/`wrong-session`
+    /// (no write) and a retry after a lost response replays the first result
+    /// instead of double-submitting.
+    fn write_and_submit_to_pane_with_identity(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: Option<&str>,
+        expected_session_id: Option<&str>,
+        delivery_id: Option<&str>,
+    ) -> Result<crate::event::SendResult, PaneError> {
+        let client = self.client.clone();
+        let pane_id = pane_id.to_string();
+        let text = text.to_string();
+        let expected_agent_id = expected_agent_id.map(str::to_string);
+        let expected_session_id = expected_session_id.map(str::to_string);
+        let delivery_id = delivery_id.map(str::to_string);
+        self.runtime
+            .block_on(async move {
+                client
+                    .write_and_submit_with_identity(
+                        &pane_id,
+                        &text,
+                        expected_agent_id.as_deref(),
+                        expected_session_id.as_deref(),
+                        delivery_id.as_deref(),
+                    )
+                    .await
+            })
+            .map_err(|e| PaneError::CommandFailed(format!("write_and_submit: {e}")))
+    }
+
     fn name(&self) -> &str {
         "embedded"
     }

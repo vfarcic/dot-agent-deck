@@ -355,6 +355,16 @@ pub enum SendResult {
     HistoryOnly,
     /// Nothing to write to.
     NoLiveTarget,
+    /// PRD #20 R20-011: forward-compat catch-all. A future daemon may report an
+    /// honest outcome this build does not know; a pre-`serde(other)` reader would
+    /// reject the whole [`crate::daemon_protocol::AttachResponse`] as malformed
+    /// (`unknown variant`) rather than degrade gracefully. Deserializing an
+    /// unknown value here — the SAFE, non-delivered outcome — keeps the response
+    /// decodable and forces every UI match to treat it conservatively (never as a
+    /// delivered success). Deserialize-only in practice: this build never
+    /// constructs `Unknown`, so it is never sent on the wire.
+    #[serde(other)]
+    Unknown,
 }
 
 /// PRD #201 M1.2 (test-plan row 3): map a lifecycle **state** string an agent's

@@ -1215,6 +1215,46 @@ struct PendingSeedPrompt {
     ready_since: Option<std::time::Instant>,
 }
 
+/// PRD #20 R20-005: per-target retry-backoff state for an automatic prompt
+/// (a mode `seed_prompt` or an orchestrator role prompt), keyed by pane id.
+/// Without this, a permanent non-delivery (a `history-only` role, a
+/// `wrong-session`, or a daemon error) was re-attempted on EVERY render frame —
+/// an unbounded RPC storm that also thrashed the visible status timestamp. The
+/// gate holds the next attempt until `next_attempt_at`, applying bounded
+/// exponential backoff (see [`send_retry_delay`]).
+#[derive(Clone)]
+struct SendRetryState {
+    next_attempt_at: std::time::Instant,
+    attempts: u32,
+}
+
+/// PRD #20 R20-003/R20-004: the target identity + idempotency key an automatic
+/// prompt was queued for, captured at ENQUEUE and carried in every (re)delivery
+/// so the daemon can (a) refuse a stale delivery to a replacement agent
+/// (`wrong-session`/`stale`, no write) after a respawn/rebind and (b) dedup a
+/// retry after a lost response. Keyed by pane id.
+#[derive(Clone)]
+struct PromptDelivery {
+    expected_agent_id: Option<String>,
+    expected_session_id: Option<String>,
+    delivery_id: String,
+}
+
+/// PRD #20 R20-005: bounded exponential backoff for a retried automatic prompt.
+/// `attempts` is the number of failed attempts so far (≥ 1). Schedule: 500 ms,
+/// 1 s, then capped at 2 s — so a permanent non-delivery settles into an
+/// occasional retry (≤ one RPC / 2 s, not a per-frame storm) yet a retryable
+/// outcome (a `history-only` role that later becomes live) is still re-attempted
+/// PROMPTLY once the target transitions, rather than languishing behind a
+/// minutes-long exponential delay. The cap is the "wait for a matching target
+/// transition" bound from the finding: it keeps the catch-up latency small.
+fn send_retry_delay(attempts: u32) -> std::time::Duration {
+    const BASE_MS: u64 = 500;
+    const CAP: std::time::Duration = std::time::Duration::from_secs(2);
+    let shift = attempts.saturating_sub(1).min(6);
+    std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << shift)).min(CAP)
+}
+
 struct UiState {
     mode: UiMode,
     /// PRD #113: the Dashboard's selection is active/inactive. `Some(i)` paints
@@ -1400,6 +1440,21 @@ struct UiState {
     /// ready before the gated atomic submit. Parallel to `pending_dispatches`
     /// but uses the spawn-time readiness buffer + `write_and_submit_to_pane`.
     pending_seed_prompts: Vec<PendingSeedPrompt>,
+    /// PRD #20 R20-005: per-pane retry-backoff for automatic prompts (seed +
+    /// orchestrator role prompts). Keyed by pane id; entry present ⇒ a prior
+    /// attempt was non-delivered and the next attempt is held until
+    /// `next_attempt_at`. Cleared on a successful delivery or when the prompt is
+    /// abandoned. Kept OUTSIDE `PendingSeedPrompt` so the struct's construction
+    /// shape is unchanged.
+    send_retry_backoff: HashMap<String, SendRetryState>,
+    /// PRD #20 R20-003/R20-004: per-pane captured delivery identity for automatic
+    /// prompts. Populated at ENQUEUE (and lazily at first delivery as a fallback)
+    /// so every (re)delivery carries the same agent identity + stable delivery
+    /// id. Keyed by pane id; cleared when the prompt is delivered or abandoned.
+    prompt_delivery: HashMap<String, PromptDelivery>,
+    /// PRD #20 R20-004: monotonic counter backing the per-prompt `delivery_id`,
+    /// so each queued automatic prompt gets a distinct, stable idempotency key.
+    next_delivery_seq: u64,
     /// PRD #127 M3.3: schedules listed in the "Scheduled Tasks" manager dialog,
     /// loaded from the global config when the dialog opens.
     scheduled_tasks: Vec<config::ScheduledTask>,
@@ -1562,6 +1617,9 @@ impl UiState {
             orchestration_ready_since: HashMap::new(),
             pending_dispatches: Vec::new(),
             pending_seed_prompts: Vec::new(),
+            send_retry_backoff: HashMap::new(),
+            prompt_delivery: HashMap::new(),
+            next_delivery_seq: 0,
             scheduled_tasks: Vec::new(),
             scheduled_selected: 0,
             scheduled_delete_confirm: false,
@@ -2425,8 +2483,18 @@ fn process_pending_seed_prompts(
     // from history-only to live) and must surface visible feedback — never be
     // silently dropped. Collected here and applied to `ui.status_message` after
     // the `retain_mut` borrow ends (the closure can't touch `ui` directly).
+    //
+    // PRD #20 R20-003/004/005: take the backoff + delivery-identity maps out of
+    // `ui` so the retain closure can read/update them (it can't touch `ui`
+    // directly). Each seed carries a stable delivery identity (captured at
+    // enqueue, or lazily here) and honors a bounded retry backoff so a permanent
+    // non-delivery doesn't re-attempt every frame.
     let mut feedback: Option<String> = None;
-    ui.pending_seed_prompts.retain_mut(|sp| {
+    let mut prompts = std::mem::take(&mut ui.pending_seed_prompts);
+    let mut backoff = std::mem::take(&mut ui.send_retry_backoff);
+    let mut deliveries = std::mem::take(&mut ui.prompt_delivery);
+    let mut next_seq = ui.next_delivery_seq;
+    prompts.retain_mut(|sp| {
         // Fast path: agent fired SessionStart (agent_type resolved).
         let agent_ready = snapshot.sessions.values().any(|s| {
             s.pane_id.as_deref() == Some(sp.pane_id.as_str()) && s.agent_type != AgentType::None
@@ -2445,19 +2513,55 @@ fn process_pending_seed_prompts(
             should_inject_spawn_time_prompt(sp.ready_since, now)
         };
         if (agent_ready || timeout_ready) && buffer_elapsed {
-            match pane.write_and_submit_to_pane(&sp.pane_id, &sp.prompt) {
-                // Delivered (or accepted for delivery): drop the seed.
-                Ok(SendResult::Applied) | Ok(SendResult::Queued) => return false,
-                // Explicit non-delivery: retain for retry, surface feedback.
+            // R20-005: don't re-attempt until the backoff window elapses.
+            if backoff
+                .get(&sp.pane_id)
+                .is_some_and(|s| now < s.next_attempt_at)
+            {
+                return true;
+            }
+            // R20-003/004: resolve (or lazily capture) the delivery identity for
+            // this pane. Captured once and reused across retries so the daemon
+            // dedups on a stable `delivery_id` and validates the queued-for agent.
+            let delivery = deliveries.entry(sp.pane_id.clone()).or_insert_with(|| {
+                next_seq = next_seq.wrapping_add(1);
+                PromptDelivery {
+                    // See `capture_prompt_delivery`: agent id is the reliable
+                    // cross-boundary identity; session id is intentionally not
+                    // captured from the UI's (placeholder-bearing) session view.
+                    expected_agent_id: pane.pane_agent_id(&sp.pane_id),
+                    expected_session_id: None,
+                    delivery_id: format!("seed-{}-{next_seq}", sp.pane_id),
+                }
+            });
+            let expected_agent_id = delivery.expected_agent_id.clone();
+            let expected_session_id = delivery.expected_session_id.clone();
+            let delivery_id = delivery.delivery_id.clone();
+            match pane.write_and_submit_to_pane_with_identity(
+                &sp.pane_id,
+                &sp.prompt,
+                expected_agent_id.as_deref(),
+                expected_session_id.as_deref(),
+                Some(&delivery_id),
+            ) {
+                // Delivered (or accepted for delivery): drop the seed + its state.
+                Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
+                    backoff.remove(&sp.pane_id);
+                    deliveries.remove(&sp.pane_id);
+                    return false;
+                }
+                // Explicit non-delivery: retain for retry, back off, surface feedback.
                 Ok(other) => {
+                    schedule_send_retry(&mut backoff, &sp.pane_id, now);
                     feedback = Some(format!(
                         "Seed prompt not delivered ({}); will retry",
                         describe_send_result(other)
                     ));
                     return true;
                 }
-                // Transport failure: retain for retry, surface feedback.
+                // Transport failure: retain for retry, back off, surface feedback.
                 Err(e) => {
+                    schedule_send_retry(&mut backoff, &sp.pane_id, now);
                     feedback = Some(format!("Seed prompt not delivered ({e}); will retry"));
                     return true;
                 }
@@ -2466,13 +2570,64 @@ fn process_pending_seed_prompts(
         // Hard timeout after 60s — give up.
         if sp.created_at.elapsed() > std::time::Duration::from_secs(60) {
             tracing::warn!(pane_id = %sp.pane_id, "seed prompt: timed out waiting for agent");
+            backoff.remove(&sp.pane_id);
+            deliveries.remove(&sp.pane_id);
             return false;
         }
         true
     });
+    ui.pending_seed_prompts = prompts;
+    ui.send_retry_backoff = backoff;
+    ui.prompt_delivery = deliveries;
+    ui.next_delivery_seq = next_seq;
     if let Some(message) = feedback {
         ui.status_message = Some((message, now));
     }
+}
+
+/// PRD #20 R20-005: record that an automatic-prompt delivery to `pane_id` was
+/// NOT delivered, arming the next retry after a bounded exponential backoff.
+fn schedule_send_retry(
+    backoff: &mut HashMap<String, SendRetryState>,
+    pane_id: &str,
+    now: std::time::Instant,
+) {
+    let entry = backoff
+        .entry(pane_id.to_string())
+        .or_insert(SendRetryState {
+            next_attempt_at: now,
+            attempts: 0,
+        });
+    entry.attempts = entry.attempts.saturating_add(1);
+    entry.next_attempt_at = now + send_retry_delay(entry.attempts);
+}
+
+/// PRD #20 R20-003/R20-004: capture the delivery identity for an automatic
+/// prompt just queued for `pane_id` — the daemon agent id currently bound to the
+/// pane (so a later respawn/rebind is caught daemon-side), the current session id
+/// if one exists, and a fresh stable `delivery_id` for idempotent retries.
+/// Overwrites any prior entry: a re-enqueue starts a fresh delivery.
+fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneController) {
+    ui.next_delivery_seq = ui.next_delivery_seq.wrapping_add(1);
+    let seq = ui.next_delivery_seq;
+    // The daemon-side agent id currently bound to this pane (the registry key,
+    // == the client's stream-backend `agent_id`). This is the reliable identity:
+    // a respawn/rebind rolls it over, so the daemon's guard catches a stale
+    // delivery to a replacement. We deliberately do NOT capture a session id:
+    // the UI's session view carries placeholder sessions with UI-minted ids that
+    // don't match the daemon's hook-derived session state, so comparing them
+    // daemon-side would spuriously reject EVERY delivery. The agent-id guard
+    // already covers the respawn case; the session axis stays daemon-internal
+    // (exercised by the protocol tests that set up daemon state directly).
+    let expected_agent_id = pane.pane_agent_id(pane_id);
+    ui.prompt_delivery.insert(
+        pane_id.to_string(),
+        PromptDelivery {
+            expected_agent_id,
+            expected_session_id: None,
+            delivery_id: format!("seed-{pane_id}-{seq}"),
+        },
+    );
 }
 
 /// PRD #20 blocker-3: wrap a bare, about-to-be-TYPED launch command for a
@@ -2500,6 +2655,9 @@ fn describe_send_result(result: SendResult) -> &'static str {
         SendResult::NoLiveTarget => "no live target",
         SendResult::Stale => "stale target",
         SendResult::WrongSession => "wrong session",
+        // PRD #20 R20-011: a forward-compat outcome this build doesn't know —
+        // describe it as an undelivered outcome (it is never a delivered success).
+        SendResult::Unknown => "unknown outcome",
     }
 }
 
@@ -6056,6 +6214,12 @@ fn dispatch_action(
                                                 created_at: std::time::Instant::now(),
                                                 ready_since: None,
                                             });
+                                            // PRD #20 R20-003/004: capture the
+                                            // queued-for agent identity NOW so a
+                                            // respawn/rebind before delivery is
+                                            // caught daemon-side, and stamp a stable
+                                            // delivery id for idempotent retries.
+                                            capture_prompt_delivery(ui, &new_id, pane);
                                         }
                                         if let Some(saved) = ui.pane_metadata.get(&new_id) {
                                             let agent_cmd = saved.command.clone();
@@ -6137,6 +6301,9 @@ fn dispatch_action(
                                         created_at: std::time::Instant::now(),
                                         ready_since: None,
                                     });
+                                    // PRD #20 R20-003/004: capture the queued-for
+                                    // agent identity + a stable delivery id now.
+                                    capture_prompt_delivery(ui, &new_id, pane);
                                 }
                                 ui.status_message = Some((
                                     format!("Created pane {new_id} in {dir_str}"),
@@ -8053,7 +8220,15 @@ pub fn run_tui(
                         std::time::Instant::now(),
                     )
                 };
-                if (agent_ready || timeout_ready) && buffer_elapsed {
+                // PRD #20 R20-005: hold off a retry until the backoff window
+                // elapses, so a permanent non-delivery (history-only role,
+                // wrong-session, daemon error) doesn't re-attempt every frame.
+                let now = std::time::Instant::now();
+                let backed_off = ui
+                    .send_retry_backoff
+                    .get(start_pane_id.as_str())
+                    .is_some_and(|s| now < s.next_attempt_at);
+                if (agent_ready || timeout_ready) && buffer_elapsed && !backed_off {
                     // PRD #128 audit S2: emit a one-shot operator-visible
                     // log right before the write fires. Distinct target
                     // from `pane_write` so an operator can flip on the
@@ -8068,6 +8243,21 @@ pub fn run_tui(
                             "spawn-time readiness buffer elapsed; proceeding with role prompt write"
                         );
                     }
+                    // PRD #20 R20-003/004: capture (once) the delivery identity
+                    // for this role pane so a rebind before delivery is caught
+                    // daemon-side and retries share a stable idempotency key.
+                    if !ui.prompt_delivery.contains_key(start_pane_id.as_str()) {
+                        capture_prompt_delivery(&mut ui, start_pane_id, &*pane);
+                    }
+                    let (expected_agent_id, expected_session_id, delivery_id) =
+                        match ui.prompt_delivery.get(start_pane_id.as_str()) {
+                            Some(d) => (
+                                d.expected_agent_id.clone(),
+                                d.expected_session_id.clone(),
+                                Some(d.delivery_id.clone()),
+                            ),
+                            None => (None, None, None),
+                        };
                     // PRD #20 blocker-5: the send OUTCOME controls retention +
                     // role state. Do NOT take the prompt or mark the role
                     // Working until delivery is confirmed — a role that
@@ -8075,17 +8265,25 @@ pub fn run_tui(
                     // once it becomes live, and must show honest feedback
                     // instead of a false Working. Only `Applied`/`Queued`
                     // consume the prompt and advance the role; every other
-                    // outcome leaves the prompt in place (retried next frame)
+                    // outcome leaves the prompt in place (retried after backoff)
                     // and surfaces feedback.
                     let prompt_text = orchestrator_prompt
                         .as_deref()
                         .unwrap_or_default()
                         .to_string();
-                    match pane.write_and_submit_to_pane(start_pane_id, &prompt_text) {
+                    match pane.write_and_submit_to_pane_with_identity(
+                        start_pane_id,
+                        &prompt_text,
+                        expected_agent_id.as_deref(),
+                        expected_session_id.as_deref(),
+                        delivery_id.as_deref(),
+                    ) {
                         Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
                             *orchestrator_prompt = None;
                             role_statuses[*start_role_index] = OrchestrationRoleStatus::Working;
                             ui.orchestration_prompted.insert(*id);
+                            ui.send_retry_backoff.remove(start_pane_id.as_str());
+                            ui.prompt_delivery.remove(start_pane_id.as_str());
                             // PRD #128 audit N1: the ready-since timestamp is
                             // load-bearing only between SessionStart and the
                             // buffered write. Once the write fires this entry
@@ -8095,6 +8293,7 @@ pub fn run_tui(
                             ui.orchestration_ready_since.remove(id);
                         }
                         Ok(other) => {
+                            schedule_send_retry(&mut ui.send_retry_backoff, start_pane_id, now);
                             let msg = if other == SendResult::HistoryOnly {
                                 "History-only session cannot accept live input".to_string()
                             } else {
@@ -8106,6 +8305,7 @@ pub fn run_tui(
                             ui.status_message = Some((msg, std::time::Instant::now()));
                         }
                         Err(e) => {
+                            schedule_send_retry(&mut ui.send_retry_backoff, start_pane_id, now);
                             ui.status_message = Some((
                                 format!("Orchestrator prompt not delivered ({e}); will retry"),
                                 std::time::Instant::now(),
@@ -8146,6 +8346,32 @@ pub fn run_tui(
             // the new PTY sizes — no PTY work happens in the event handler.
             if let Event::Resize(_w, _h) = ev {
                 break; // re-render; layout-driven resize handles PTY sizing
+            }
+
+            // PRD #20 R20-007: input rejection with VISIBLE feedback. A focused
+            // pane can go non-live (a wrapped Codex session that declared
+            // history-only, or a view-only target) WHILE the user is in
+            // PaneInput. The daemon's authoritative stream gate already refuses
+            // the bytes, but a UI that keeps forwarding them shows nothing and
+            // leaves the user stuck typing into a dead pane (keys AND paste
+            // silently dropped). When the focused pane is no longer writable,
+            // refuse the key/paste here with honest feedback and LEAVE PaneInput,
+            // and drain the rest of this input burst so its tail can neither
+            // clobber the feedback nor leak into command mode.
+            let is_input_event = matches!(&ev, Event::Paste(_))
+                || matches!(&ev, Event::Key(k) if k.kind == crossterm::event::KeyEventKind::Press);
+            if ui.mode == UiMode::PaneInput
+                && is_input_event
+                && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                && let Some(focused_id) = embedded.focused_pane_id()
+                && let Some(msg) = non_live_input_feedback(snapshot.pane_writable(&focused_id))
+            {
+                ui.status_message = Some((msg.to_string(), std::time::Instant::now()));
+                ui.mode = UiMode::Normal;
+                while crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                    let _ = event::read()?;
+                }
+                break;
             }
 
             // Handle mouse events: scroll, text selection, and copy.

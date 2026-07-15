@@ -99,6 +99,18 @@ pub struct AgentSpec {
     /// Materialize a bundled artifact into the agent's HOME just before spawn
     /// (the `Extension` strategy).
     pub materialize: Option<MaterializeFn>,
+    /// PRD #20 R20-010: this agent's OWN startup auto-install action — the
+    /// silent, best-effort install the TUI runs at launch for every shipped
+    /// agent. Before this, startup dispatched by matching the reusable
+    /// [`IntegrationStrategy`] enum to a hardcoded incumbent
+    /// (`NativeHooks` → Claude's installer, `Plugin` → OpenCode's), so a FUTURE
+    /// agent reusing one of those strategies would run another agent's
+    /// installer. With the action on the spec, `main.rs` iterates [`ALL`] and
+    /// calls `spec.startup_auto_install` directly, and a new agent slots in its
+    /// own installer here. `None` where the agent has no startup install step —
+    /// a spawn-time `Extension` (Pi materializes at spawn), a `Wrapper` (Codex
+    /// synthesizes events from stdout), or the neutral placeholder.
+    pub startup_auto_install: Option<fn()>,
 }
 
 // PRD #20 finding #15: per-agent adapters that normalize each incumbent
@@ -133,6 +145,7 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
     hook_install: Some(claude_install),
     hook_uninstall: Some(claude_uninstall),
     materialize: None,
+    startup_auto_install: Some(crate::hooks_manage::auto_install),
 };
 
 /// OpenCode — plugin strategy (shipped).
@@ -146,6 +159,7 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
     hook_install: Some(opencode_install),
     hook_uninstall: Some(opencode_uninstall),
     materialize: None,
+    startup_auto_install: Some(crate::opencode_manage::auto_install),
 };
 
 /// Pi — bundled-extension strategy (shipped, PRD #201).
@@ -159,6 +173,8 @@ pub static PI: AgentSpec = AgentSpec {
     hook_install: None,
     hook_uninstall: None,
     materialize: Some(pi_materialize),
+    // Pi materializes its extension at SPAWN time, not startup.
+    startup_auto_install: None,
 };
 
 /// Codex — stdout-wrapper strategy (PRD #20 M7). The first agent to use the
@@ -179,6 +195,8 @@ pub static CODEX: AgentSpec = AgentSpec {
     hook_install: None,
     hook_uninstall: None,
     materialize: None,
+    // Wrapper agents have no startup install step.
+    startup_auto_install: None,
 };
 
 /// Neutral entry for the "no recognized agent" placeholder. Not a real agent:
@@ -196,6 +214,7 @@ pub static NONE: AgentSpec = AgentSpec {
     hook_install: None,
     hook_uninstall: None,
     materialize: None,
+    startup_auto_install: None,
 };
 
 /// All SHIPPED, detectable agents, in a stable order. Excludes the neutral
@@ -307,6 +326,37 @@ mod tests {
             Some(AgentType::Pi)
         );
         assert_eq!(AgentType::from_command(Some("bash")), None);
+    }
+
+    /// PRD #20 R20-010: startup auto-install is resolved PER SPEC, not by
+    /// mapping the reusable `IntegrationStrategy` enum to a hardcoded incumbent.
+    /// The two agents with a startup install step (Claude native hooks, OpenCode
+    /// plugin) carry an action; the spawn-time `Extension` (Pi), the `Wrapper`
+    /// (Codex), and the neutral placeholder carry `None` — so a future agent
+    /// reusing `NativeHooks`/`Plugin` runs ITS OWN installer, never another
+    /// agent's.
+    #[test]
+    fn startup_auto_install_is_resolved_per_spec() {
+        assert!(
+            spec(&AgentType::ClaudeCode).startup_auto_install.is_some(),
+            "Claude installs its native hooks at startup"
+        );
+        assert!(
+            spec(&AgentType::OpenCode).startup_auto_install.is_some(),
+            "OpenCode installs its plugin at startup"
+        );
+        assert!(
+            spec(&AgentType::Pi).startup_auto_install.is_none(),
+            "Pi materializes its extension at spawn time, not startup"
+        );
+        assert!(
+            spec(&AgentType::Codex).startup_auto_install.is_none(),
+            "Codex is a stdout wrapper — no startup install step"
+        );
+        assert!(
+            spec(&AgentType::None).startup_auto_install.is_none(),
+            "the neutral placeholder has no startup install step"
+        );
     }
 
     /// Default commands match the prior per-agent launch commands; the neutral

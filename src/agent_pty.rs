@@ -1013,6 +1013,14 @@ const SCROLLBACK_CAP_BYTES: usize = 1024 * 1024;
 /// the protocol layer (the client can reattach and replay the snapshot).
 const BROADCAST_CAPACITY: usize = 4096;
 
+/// PRD #20 R20-004: cap on the atomic-send idempotency cache
+/// ([`AgentPtyRegistry::delivery_results`]). Far above any plausible number of
+/// distinct in-flight deliveries; on overflow the cache is cleared wholesale
+/// (bounding memory) — a delivery id evicted this way would re-submit only on a
+/// retry arriving after that many other deliveries, which never happens inside a
+/// real (seconds-long) retry window.
+const MAX_DELIVERY_RESULTS: usize = 8192;
+
 /// Per-agent broadcast bus. Producers (the reader thread) atomically append
 /// to scrollback and publish to subscribers under the same lock so a fresh
 /// subscriber's `(snapshot, receiver)` is always consistent: the snapshot
@@ -1145,10 +1153,58 @@ fn pump_reader(
 
 /// Snapshot of the writer + bus needed to attach a streaming client.
 /// Returned by [`AgentPtyRegistry::subscribe`].
+///
+/// PRD #20 R20-008: the handle now CAPTURES the target's immutable identity
+/// (`agent_id`, `pane_id_env`) and its liveness token (`exited`) ATOMICALLY with
+/// the writer, under the single registry lock. Before this, `handle_attach_stream`
+/// looked the pane up separately AFTER the lock was released; if the entry was
+/// removed in between, the handler kept the cached writer but resolved the pane
+/// to the `<agent-gone>` sentinel — and `pane_writable("<agent-gone>")` defaults
+/// to `Live`, so a teardown-time frame could still be written to the dead
+/// writer. Carrying the identity on the handle removes that racy second lookup
+/// and lets the input path reject writes to an exited target.
 pub struct AttachHandle {
     pub snapshot: Vec<u8>,
     pub rx: broadcast::Receiver<Arc<Vec<u8>>>,
     pub writer: Arc<AsyncMutex<Box<dyn std::io::Write + Send>>>,
+    /// The registry id of the agent this handle attached to, captured under the
+    /// same lock as `writer`.
+    pub agent_id: String,
+    /// The agent's spawn-time `DOT_AGENT_DECK_PANE_ID`, captured atomically with
+    /// `writer`. `None` for a daemon-side agent that carried no pane id. The
+    /// attach handler uses this instead of a post-lock lookup that could return
+    /// the `<agent-gone>` sentinel.
+    pub pane_id_env: Option<String>,
+    /// Liveness token shared with the agent's reader thread: set `true` once the
+    /// PTY returns EOF (the child died / was killed). The input path re-checks
+    /// this before every write so bytes never reach a dead writer.
+    pub exited: Arc<AtomicBool>,
+}
+
+/// PRD #20 R20-003/R20-006: the outcome of an identity-guarded atomic
+/// write-and-submit ([`AgentPtyRegistry::write_and_submit_guarded`]). The
+/// daemon-protocol handler maps these onto the wire [`crate::event::SendResult`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardedSend {
+    /// Bytes were written and submitted to the exact authorized live target.
+    Applied,
+    /// The live target that currently owns the pane is NOT the one the caller
+    /// expected (a respawn/rebind between enqueue and delivery). No bytes written.
+    WrongSession,
+    /// The target changed liveness/session (or the writer's target rebound)
+    /// WHILE the caller waited for the writer lock. No bytes written.
+    Stale,
+    /// No live registry entry owns the pane. No bytes written.
+    NoLiveTarget,
+}
+
+/// PRD #20 R20-003/R20-006: the live target that currently owns a pane, resolved
+/// atomically for the identity-guarded send path. Bundles the shared writer with
+/// the identity/liveness needed to re-validate after the writer lock is acquired.
+struct PaneWriterTarget {
+    writer: Arc<AsyncMutex<Box<dyn std::io::Write + Send>>>,
+    agent_id: String,
+    exited: Arc<AtomicBool>,
 }
 
 /// One agent owned by the registry: child + master + shared writer + bus.
@@ -1392,6 +1448,16 @@ pub struct AgentPtyRegistry {
     /// so a scheduled delivery never resets its own debounce clock. In-memory,
     /// monotonically growing by `pane_id_env` seen (negligible).
     user_input_at: Mutex<HashMap<String, Instant>>,
+    /// PRD #20 R20-004: idempotency cache for atomic write-and-submit. Keyed by
+    /// the caller's stable `delivery_id`, holding the first honest
+    /// [`crate::event::SendResult`] produced for it. A retry after a lost
+    /// response (an ambiguous transport failure re-sent with the SAME id)
+    /// replays the cached result instead of writing again, so a destructive
+    /// prompt is never submitted twice. Bounded — see
+    /// [`MAX_DELIVERY_RESULTS`]; a delivery id evicted after that many distinct
+    /// deliveries could re-submit on a very late retry, which is implausible
+    /// within any real retry window.
+    delivery_results: Mutex<HashMap<String, crate::event::SendResult>>,
 }
 
 struct RegistryInner {
@@ -1429,6 +1495,7 @@ impl AgentPtyRegistry {
             change_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
             user_input_at: Mutex::new(HashMap::new()),
+            delivery_results: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1892,6 +1959,116 @@ impl AgentPtyRegistry {
             .await
     }
 
+    /// PRD #20 R20-004: replay the cached honest result for a previously-seen
+    /// `delivery_id`, or `None` if this is the first time. See
+    /// [`Self::delivery_results`].
+    pub fn cached_delivery_result(&self, delivery_id: &str) -> Option<crate::event::SendResult> {
+        self.delivery_results
+            .lock()
+            .unwrap()
+            .get(delivery_id)
+            .copied()
+    }
+
+    /// PRD #20 R20-004: record the honest result produced for `delivery_id` so a
+    /// later retry with the same id replays it instead of writing again. Bounded
+    /// by [`MAX_DELIVERY_RESULTS`] (cleared wholesale on overflow).
+    pub fn record_delivery_result(&self, delivery_id: &str, result: crate::event::SendResult) {
+        let mut map = self.delivery_results.lock().unwrap();
+        if map.len() >= MAX_DELIVERY_RESULTS && !map.contains_key(delivery_id) {
+            map.clear();
+        }
+        map.insert(delivery_id.to_string(), result);
+    }
+
+    /// PRD #20 R20-003/R20-006: the live target that currently owns `pane_id`,
+    /// resolved under the registry lock. Returns the shared writer, the target's
+    /// registry id, and its `exited` liveness token so the caller can bind
+    /// authorization to the EXACT identity and re-check it after acquiring the
+    /// writer. Skips exited entries (mirrors [`Self::write_to_pane_internal`]).
+    fn writer_target_for_pane(&self, pane_id: &str) -> Option<PaneWriterTarget> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .agents
+            .iter()
+            .find(|(_, a)| {
+                a.pane_id_env.as_deref() == Some(pane_id) && !a.exited.load(Ordering::SeqCst)
+            })
+            .map(|(id, a)| PaneWriterTarget {
+                writer: a.writer.clone(),
+                agent_id: id.clone(),
+                exited: a.exited.clone(),
+            })
+    }
+
+    /// PRD #20 R20-003/R20-006: atomic write-and-submit that binds delivery to an
+    /// EXACT target identity and RE-VALIDATES it after acquiring that target's
+    /// writer, immediately before writing — closing the liveness/rebind TOCTOU
+    /// that the plain [`Self::write_to_pane_and_submit`] leaves open (it checks
+    /// liveness, releases the state lock, then awaits a separate writer lookup).
+    ///
+    /// Flow:
+    /// 1. Resolve the live target for `pane_id`; `None` → [`GuardedSend::NoLiveTarget`].
+    /// 2. If `expected_agent_id` names a different agent than currently owns the
+    ///    pane → [`GuardedSend::WrongSession`] (no write).
+    /// 3. Acquire that target's writer (may block behind an in-flight write).
+    /// 4. RE-VALIDATE under the held writer: the pane must still resolve to the
+    ///    SAME live, non-exited agent, and `revalidate()` (the caller's
+    ///    liveness/session recheck against `AppState`) must still hold — else
+    ///    [`GuardedSend::Stale`]/[`GuardedSend::WrongSession`] with NO bytes written.
+    /// 5. Write payload → `SUBMIT_DELAY` → CR, all under the held writer.
+    pub async fn write_and_submit_guarded<Fut>(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: Option<&str>,
+        revalidate: impl FnOnce() -> Fut,
+    ) -> Result<GuardedSend, AgentPtyError>
+    where
+        Fut: std::future::Future<Output = bool>,
+    {
+        use std::io::Write as _;
+        let Some(target) = self.writer_target_for_pane(pane_id) else {
+            return Ok(GuardedSend::NoLiveTarget);
+        };
+        // Pre-lock identity gate: refuse a prompt queued for a different agent
+        // than the one that now owns the pane (respawn/rebind before delivery).
+        if let Some(expected) = expected_agent_id
+            && expected != target.agent_id
+        {
+            return Ok(GuardedSend::WrongSession);
+        }
+        // Encode before locking so a bad payload doesn't pin the writer.
+        let payload = encode_pane_payload(text)?;
+        // Acquire the EXACT target writer, THEN re-validate — this is the
+        // barrier the TOCTOU test holds open by locking the writer externally.
+        let mut w = target.writer.lock().await;
+        // Re-resolve identity: the pane may have rebound to a new agent, or the
+        // target may have exited, while we waited for the writer.
+        match self.writer_target_for_pane(pane_id) {
+            Some(current) if current.agent_id == target.agent_id => {}
+            Some(_) => return Ok(GuardedSend::WrongSession),
+            None => return Ok(GuardedSend::Stale),
+        }
+        if target.exited.load(Ordering::SeqCst) {
+            return Ok(GuardedSend::Stale);
+        }
+        // Liveness/session recheck against the authoritative session state.
+        if !revalidate().await {
+            return Ok(GuardedSend::Stale);
+        }
+        // Authorized — write + submit, holding the writer across the whole
+        // sequence (mirrors `write_to_pane_internal`'s atomic submit contract).
+        w.write_all(&payload)
+            .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
+        let _ = w.flush();
+        tokio::time::sleep(SUBMIT_DELAY).await;
+        w.write_all(b"\r")
+            .map_err(|e| AgentPtyError::Writer(e.to_string()))?;
+        let _ = w.flush();
+        Ok(GuardedSend::Applied)
+    }
+
     /// Writes bytes to the pane's PTY without triggering submission semantics
     /// (no SUBMIT_DELAY, no CR). Used for visible status notices (e.g., respawn
     /// failures) that must appear in the orchestrator pane's scrollback but
@@ -2234,10 +2411,17 @@ impl AgentPtyRegistry {
             .get(id)
             .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
         let (snapshot, rx) = agent.bus.subscribe();
+        // PRD #20 R20-008: capture the writer AND the target's identity/liveness
+        // under this single lock, so the attach handler never needs the racy
+        // post-lock `pane_id_env_for_agent` lookup that could resolve to
+        // `<agent-gone>` (which `pane_writable` treats as `Live`).
         Ok(AttachHandle {
             snapshot,
             rx,
             writer: agent.writer.clone(),
+            agent_id: id.to_string(),
+            pane_id_env: agent.pane_id_env.clone(),
+            exited: agent.exited.clone(),
         })
     }
 
@@ -2366,25 +2550,6 @@ impl AgentPtyRegistry {
     pub fn child_pid(&self, id: &str) -> Option<u32> {
         let inner = self.inner.lock().unwrap();
         inner.agents.get(id).and_then(|a| a.child.process_id())
-    }
-
-    /// `pane_id_env` recorded for a given agent_id. Three states are
-    /// distinguished — the M1.4 cross-path byte-trace diff needs to
-    /// tell them apart, not just "is there a string or not":
-    ///
-    /// * `None` — the agent is not in the registry (gone / never
-    ///   registered under this id).
-    /// * `Some(None)` — the agent is registered but never carried a
-    ///   `pane_id_env` (rare; daemon-side test agents).
-    /// * `Some(Some(s))` — the agent is registered and `s` is its
-    ///   `pane_id_env`.
-    ///
-    /// Used by `handle_attach_stream` to enrich the STREAM_IN trace
-    /// with the same `pane_id` field daemon-initiated writes log, so
-    /// the trace audit can be diffed on a common key.
-    pub(crate) fn pane_id_env_for_agent(&self, agent_id: &str) -> Option<Option<String>> {
-        let inner = self.inner.lock().unwrap();
-        inner.agents.get(agent_id).map(|a| a.pane_id_env.clone())
     }
 
     /// All currently-owned agent ids, sorted ascending.
@@ -3567,6 +3732,79 @@ mod tests {
         assert!(
             registry.agent_records().is_empty(),
             "agent_records must drop exited entries so hydration doesn't materialize ghost panes"
+        );
+
+        registry.shutdown_all();
+    }
+
+    /// PRD #20 R20-008: `subscribe` captures the target's identity
+    /// (`agent_id`, `pane_id_env`) and liveness token (`exited`) ATOMICALLY with
+    /// the writer, under the single registry lock. This is what lets the attach
+    /// handler stop using the racy post-lock `pane_id_env_for_agent` lookup that
+    /// could resolve to the `<agent-gone>` sentinel after a concurrent removal —
+    /// and `pane_writable("<agent-gone>")` defaults to `Live`, so a teardown-time
+    /// frame could still reach the dead writer.
+    ///
+    /// Proves the fix deterministically: the captured `pane_id_env` is a REAL
+    /// value that is unaffected by removing the entry afterward (no post-removal
+    /// lookup is needed), and the shared `exited` token the handler now checks
+    /// before every write flips `true` once the killed child's PTY EOFs.
+    #[tokio::test]
+    async fn subscribe_captures_target_identity_atomically() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "pane-attach-handle".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+
+        let handle = registry.subscribe(&id).expect("subscribe to live agent");
+        assert_eq!(handle.agent_id, id, "handle carries the exact agent id");
+        assert_eq!(
+            handle.pane_id_env.as_deref(),
+            Some("pane-attach-handle"),
+            "handle captures the real pane_id_env — never the <agent-gone> sentinel"
+        );
+        assert!(
+            !handle.exited.load(Ordering::SeqCst),
+            "a freshly-attached live agent is not exited"
+        );
+
+        // Remove the entry (kills + reaps the child) — the crux race window.
+        registry.close_agent(&id).expect("close the agent");
+
+        // The captured identity is IMMUNE to the removal: the handler no longer
+        // needs a post-removal lookup that would default the pane to
+        // `<agent-gone>` (and thus `pane_writable` → Live).
+        assert_eq!(
+            handle.pane_id_env.as_deref(),
+            Some("pane-attach-handle"),
+            "captured pane_id_env must survive removal, not degrade to a sentinel"
+        );
+        assert!(
+            registry.subscribe(&id).is_err(),
+            "the entry is gone after close, so a fresh subscribe fails"
+        );
+
+        // The shared `exited` token the input path now checks before every write
+        // flips to true once the killed child's PTY EOFs — so a teardown-time
+        // frame arriving on the cached writer is rejected.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if handle.exited.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            handle.exited.load(Ordering::SeqCst),
+            "the captured exited token must flip true once the target dies, so the \
+             input path rejects a frame to the dead writer"
         );
 
         registry.shutdown_all();

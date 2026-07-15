@@ -381,6 +381,27 @@ pub trait PaneController: Send + Sync {
         self.write_to_pane(pane_id, text)
             .map(|()| crate::event::SendResult::Applied)
     }
+    /// PRD #20 R20-003/R20-004: identity-bearing, idempotent counterpart of
+    /// [`Self::write_and_submit_to_pane`]. Carries the agent identity + session
+    /// the automatic prompt was queued for and a stable delivery id so the daemon
+    /// can (a) refuse delivery to a replacement agent on a rebind
+    /// (`stale`/`wrong-session`) and (b) dedup a retry after a lost response.
+    ///
+    /// The default impl DROPS the identity and forwards to
+    /// [`Self::write_and_submit_to_pane`] — correct for local-PTY test mocks
+    /// (which always target a live pane and don't talk to a daemon). The
+    /// daemon-backed `EmbeddedPaneController` overrides it to carry the identity
+    /// over the wire via `DaemonClient::write_and_submit_with_identity`.
+    fn write_and_submit_to_pane_with_identity(
+        &self,
+        pane_id: &str,
+        text: &str,
+        _expected_agent_id: Option<&str>,
+        _expected_session_id: Option<&str>,
+        _delivery_id: Option<&str>,
+    ) -> Result<crate::event::SendResult, PaneError> {
+        self.write_and_submit_to_pane(pane_id, text)
+    }
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;
     fn as_any(&self) -> &dyn Any;
