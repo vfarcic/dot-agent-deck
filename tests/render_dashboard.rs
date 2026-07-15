@@ -468,6 +468,98 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
     );
 
     insta::assert_snapshot!(buffer_to_color_text(&buffer));
+
+    let mut named_badges = String::new();
+    for (agent_type, friendly_name) in [
+        (AgentType::ClaudeCode, "friendly-claude"),
+        (AgentType::OpenCode, "friendly-opencode"),
+        (AgentType::Pi, "friendly-pi"),
+        (AgentType::Codex, "friendly-codex"),
+    ] {
+        let mut named = session.clone();
+        named.agent_type = agent_type.clone();
+        named.display_name = Some(friendly_name.to_string());
+        let named_buffer = render_card_to_buffer(
+            &named,
+            Some(friendly_name),
+            Some(1),
+            density,
+            0,
+            false,
+            width,
+            height,
+        );
+        let label = dot_agent_deck::agent_registry::spec(&agent_type).label;
+        let expected_color = dot_agent_deck::agent_registry::spec(&agent_type).badge_color;
+        let text = buffer_to_text(&named_buffer);
+        assert!(
+            text.contains(label),
+            "a named {agent_type:?} card must retain its registry agent-type badge alongside {friendly_name:?}:\n{text}"
+        );
+        let colored = (0..named_buffer.area().height).any(|y| {
+            (0..=named_buffer
+                .area()
+                .width
+                .saturating_sub(label.chars().count() as u16))
+                .any(|x| {
+                    let symbols: String = (x..x + label.chars().count() as u16)
+                        .map(|cx| named_buffer[(cx, y)].symbol())
+                        .collect();
+                    symbols == label
+                        && (x..x + label.chars().count() as u16)
+                            .all(|cx| named_buffer[(cx, y)].fg == expected_color)
+                })
+        });
+        assert!(
+            colored,
+            "the named {agent_type:?} card's `{label}` badge must use registry color {expected_color:?}:\n{}",
+            buffer_to_color_text(&named_buffer)
+        );
+        named_badges.push_str(&format!(
+            "== {agent_type:?} / {friendly_name} ==\n{}",
+            buffer_to_color_text(&named_buffer)
+        ));
+    }
+    insta::assert_snapshot!("pane_008_named_agent_badges", named_badges);
+}
+
+/// Scenario: Aggregate a dashboard containing one Claude Code session and one
+/// Codex session, then render its stats bar. Because multiple real agent types
+/// are active, the visible bar must include a compact per-type count breakdown.
+#[spec("dashboard/stats/001")]
+#[test]
+fn stats_001_mixed_agents_render_per_type_breakdown() {
+    let mut state = AppState::default();
+    for (session_id, pane_id, agent_type) in [
+        ("mixed-claude", "pane-claude", AgentType::ClaudeCode),
+        ("mixed-codex", "pane-codex", AgentType::Codex),
+    ] {
+        state.register_pane(pane_id.to_string());
+        state.apply_event(AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(format!("agent-{pane_id}")),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+    }
+
+    let stats = state.aggregate_stats();
+    let buffer = render_stats_bar_to_buffer(&stats, None, 160, 1);
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("1 ClaudeCode") && rendered.contains("1 Codex"),
+        "a mixed-agent dashboard must show per-agent-type counts in its stats bar:\n{rendered}"
+    );
 }
 
 /// Scenario: Apply otherwise-identical live and history-only Codex session

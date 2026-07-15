@@ -42,6 +42,15 @@ fn task_block(name: &str, working_dir: &str, command: Option<&str>) -> String {
     s
 }
 
+#[cfg(unix)]
+fn write_executable(path: &std::path::Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(path, contents).expect("write scheduler recorder executable");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod scheduler recorder executable");
+}
+
 /// Scenario: Register one task whose `working_dir` does not exist, one whose
 /// `working_dir` is uncreatable (its parent is a regular file), and one control
 /// task with a valid dir. Fire the missing-dir task via run-now and assert the
@@ -330,5 +339,84 @@ fn spawn_005_delivery_gated_on_session_start() {
     assert!(
         daemon.attach_and_wait_for_output(&agent_id, PROMPT_MARKER, Duration::from_secs(10)),
         "after the agent's SessionStart is observed, the gated prompt must be delivered"
+    );
+}
+
+/// Scenario: Fire one scheduled single-agent task whose command is bare Codex
+/// and one scheduled orchestration whose start-role command is bare Codex, with
+/// recorder binaries ahead of PATH. Both scheduler paths must launch through
+/// `dot-agent-deck wrap --agent codex -- codex`, never bare Codex.
+#[spec("scheduler/spawn/006")]
+#[test]
+#[cfg(unix)]
+fn spawn_006_single_and_role_codex_commands_are_wrapped() {
+    let scratch = tempfile::tempdir().expect("scheduler wrapper scratch");
+    let bin_dir = scratch.path().join("bin");
+    let single_dir = scratch.path().join("single");
+    let orch_dir = scratch.path().join("orchestration");
+    let record = scratch.path().join("launch.log");
+    std::fs::create_dir_all(&bin_dir).expect("create recorder bin dir");
+    std::fs::create_dir_all(&single_dir).expect("create single-agent dir");
+    std::fs::create_dir_all(&orch_dir).expect("create orchestration dir");
+    write_executable(
+        &bin_dir.join("dot-agent-deck"),
+        "#!/bin/sh\nprintf 'WRAPPED %s\\n' \"$*\" >> \"$CODEX_SCHED_RECORD\"\nexec cat\n",
+    );
+    write_executable(
+        &bin_dir.join("codex"),
+        "#!/bin/sh\nprintf 'BARE codex %s\\n' \"$*\" >> \"$CODEX_SCHED_RECORD\"\nexec cat\n",
+    );
+    std::fs::write(
+        orch_dir.join(".dot-agent-deck.toml"),
+        "[[orchestrations]]\nname = \"wrapped\"\n\n\
+         [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"codex\"\nstart = true\n",
+    )
+    .expect("write scheduler orchestration config");
+
+    let mut schedules = task_block("single-codex", &single_dir.to_string_lossy(), Some("codex"));
+    schedules.push_str(&task_block(
+        "role-codex",
+        &orch_dir.to_string_lossy(),
+        Some("codex"),
+    ));
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").expect("test runner PATH")
+    );
+    let daemon = common::spawn_daemon_serve_with_env(
+        Some(&schedules),
+        "0",
+        &[
+            ("PATH", path.as_str()),
+            (
+                "CODEX_SCHED_RECORD",
+                record.to_str().expect("record path UTF-8"),
+            ),
+        ],
+    );
+
+    daemon
+        .run_now("single-codex")
+        .expect("run single Codex schedule");
+    assert!(
+        common::wait_for_file_substr_count(&record, "codex", 1, Duration::from_secs(10)),
+        "scheduled single-agent Codex command never launched"
+    );
+    daemon
+        .run_now("role-codex")
+        .expect("run role Codex schedule");
+    assert!(
+        common::wait_for_file_substr_count(&record, "codex", 2, Duration::from_secs(10)),
+        "scheduled orchestration Codex role never launched"
+    );
+    let launches = std::fs::read_to_string(&record).expect("read scheduler launch record");
+    assert_eq!(
+        launches.lines().collect::<Vec<_>>(),
+        vec![
+            "WRAPPED wrap --agent codex -- codex",
+            "WRAPPED wrap --agent codex -- codex",
+        ],
+        "scheduled single-agent and role spawns must both cross the Wrapper strategy exactly once; observed:\n{launches}"
     );
 }

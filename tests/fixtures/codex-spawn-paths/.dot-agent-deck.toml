@@ -1,0 +1,12 @@
+default_command = "codex"
+
+[[modes]]
+name = "wrapped-mode"
+
+[[orchestrations]]
+name = "wrapped-orchestration"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "codex"
+start = true

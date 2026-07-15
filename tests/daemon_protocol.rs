@@ -16,9 +16,11 @@ use dot_agent_deck::agent_pty::{AgentPtyRegistry, AgentRecord};
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_DETACH, KIND_REQ, KIND_RESP, KIND_STREAM_END,
     KIND_STREAM_IN, KIND_STREAM_OUT, RunningAgentsSummary, TabMembership, bind_attach_listener,
-    serve_attach, write_resp,
+    serve_attach_with_counter, write_resp,
 };
-use dot_agent_deck::event::AgentType;
+use dot_agent_deck::event::{AgentEvent, AgentType, EventType, LiveTarget, TargetKind, Writable};
+use dot_agent_deck::state::{AppState, SharedState};
+use spec::spec;
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -28,6 +30,7 @@ struct Server {
     _dir: TempDir,
     path: PathBuf,
     registry: Arc<AgentPtyRegistry>,
+    state: SharedState,
     handle: JoinHandle<()>,
 }
 
@@ -48,6 +51,7 @@ static HARNESS_BIND_LOCK: Mutex<()> = Mutex::new(());
 
 async fn start_server() -> Server {
     let registry = Arc::new(AgentPtyRegistry::new());
+    let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
 
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -58,15 +62,28 @@ async fn start_server() -> Server {
     };
 
     let registry_for_task = registry.clone();
+    let state_for_task = state.clone();
     let (event_tx, _) = tokio::sync::broadcast::channel(16);
     let handle = tokio::spawn(async move {
-        let _ = serve_attach(listener, registry_for_task, event_tx).await;
+        let _ = serve_attach_with_counter(
+            listener,
+            registry_for_task,
+            event_tx,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            state_for_task,
+            None,
+            Arc::new(dot_agent_deck::scheduler::Scheduler::with_stderr_notifier()),
+            dot_agent_deck::spawn::new_reuse_registry(),
+            dot_agent_deck::issue_dispatch_run::new_worktree_registry(),
+        )
+        .await;
     });
 
     Server {
         _dir: dir,
         path,
         registry,
+        state,
         handle,
     }
 }
@@ -125,6 +142,28 @@ async fn start_agent(server: &Server, command: &str) -> String {
     resp.id.expect("start-agent response missing id")
 }
 
+async fn start_agent_for_pane(server: &Server, command: &str, pane_id: &str) -> String {
+    let mut s = UnixStream::connect(&server.path).await.unwrap();
+    write_request(
+        &mut s,
+        &AttachRequest::StartAgent {
+            command: Some(command.into()),
+            cwd: None,
+            display_name: None,
+            rows: 24,
+            cols: 80,
+            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), pane_id.into())],
+            tab_membership: None,
+            agent_type: Some(AgentType::Codex),
+            seed: None,
+        },
+    )
+    .await;
+    let resp = read_response(&mut s).await;
+    assert!(resp.ok, "start-agent failed: {:?}", resp.error);
+    resp.id.expect("start-agent response missing id")
+}
+
 async fn connect_attach(server: &Server, id: &str) -> UnixStream {
     let mut s = UnixStream::connect(&server.path).await.unwrap();
     write_request(&mut s, &AttachRequest::AttachStream { id: id.into() }).await;
@@ -171,6 +210,25 @@ async fn read_until_contains(s: &mut UnixStream, marker: &[u8]) -> Vec<u8> {
         String::from_utf8_lossy(marker),
         String::from_utf8_lossy(&acc)
     );
+}
+
+async fn stream_contains_within(s: &mut UnixStream, marker: &[u8], timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut acc = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        match tokio::time::timeout(remaining, read_frame(s)).await {
+            Ok(Some((KIND_STREAM_OUT, bytes))) => {
+                acc.extend_from_slice(&bytes);
+                if acc.windows(marker.len()).any(|window| window == marker) {
+                    return true;
+                }
+            }
+            Ok(Some((KIND_STREAM_END, _))) | Ok(None) | Err(_) => return false,
+            Ok(Some(_)) => {}
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -860,6 +918,109 @@ async fn attach_stream_forwards_keystrokes_and_output() {
     read_until_contains(&mut a, b"HELLO-MARKER").await;
 
     // Cleanup: kill the agent.
+    server.registry.close_agent(&id).unwrap();
+}
+
+/// Scenario: Attach to a focused live Codex pane, prove a baseline key reaches
+/// its PTY, then transition that same session to history-only while the stream
+/// stays open. Subsequent key and bracketed-paste frames must be rejected by the
+/// daemon and must not appear in the child output.
+#[spec("prompt/pane-input/005")]
+#[test]
+fn pane_input_005_stream_rejects_key_and_paste_after_live_transition() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build pane-input runtime");
+    runtime.block_on(pane_input_005_stream_rejects_key_and_paste_after_live_transition_inner());
+}
+
+async fn pane_input_005_stream_rejects_key_and_paste_after_live_transition_inner() {
+    let server = start_server().await;
+    let pane_id = "pane-live-transition";
+    let id = start_agent_for_pane(&server, "/bin/sh", pane_id).await;
+    let now = chrono::Utc::now();
+    let event = |event_type, live_target| AgentEvent {
+        session_id: "stream-live-session".to_string(),
+        agent_type: AgentType::Codex,
+        event_type,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: now,
+        user_prompt: None,
+        metadata: Default::default(),
+        pane_id: Some(pane_id.to_string()),
+        agent_id: Some(id.clone()),
+        agent_version: None,
+        schema_version: None,
+        live_target: Some(live_target),
+    };
+    {
+        let mut state = server.state.write().await;
+        state.register_pane(pane_id.to_string());
+        state.apply_event(event(
+            EventType::SessionStart,
+            LiveTarget {
+                kind: TargetKind::Pty,
+                writable: Writable::Live,
+            },
+        ));
+    }
+
+    let mut attached = connect_attach(&server, &id).await;
+    write_frame(
+        &mut attached,
+        KIND_STREAM_IN,
+        b"printf 'LIVE-KEY-ACCEPTED\\n'\n",
+    )
+    .await;
+    read_until_contains(&mut attached, b"LIVE-KEY-ACCEPTED").await;
+
+    {
+        let mut state = server.state.write().await;
+        state.apply_event(event(
+            EventType::Thinking,
+            LiveTarget {
+                kind: TargetKind::Process,
+                writable: Writable::HistoryOnly,
+            },
+        ));
+    }
+
+    write_frame(
+        &mut attached,
+        KIND_STREAM_IN,
+        b"printf 'REJECTED-KEY-MARKER\\n'\n",
+    )
+    .await;
+    write_frame(
+        &mut attached,
+        KIND_STREAM_IN,
+        b"\x1b[200~printf 'REJECTED-PASTE-MARKER\\n'\x1b[201~\n",
+    )
+    .await;
+
+    assert!(
+        !stream_contains_within(
+            &mut attached,
+            b"REJECTED-KEY-MARKER",
+            Duration::from_millis(500),
+        )
+        .await,
+        "the daemon forwarded a key frame after the focused session became history-only"
+    );
+    assert!(
+        !stream_contains_within(
+            &mut attached,
+            b"REJECTED-PASTE-MARKER",
+            Duration::from_millis(500),
+        )
+        .await,
+        "the daemon forwarded a paste frame after the focused session became history-only"
+    );
+
     server.registry.close_agent(&id).unwrap();
 }
 

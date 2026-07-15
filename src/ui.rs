@@ -16141,6 +16141,8 @@ mod tests {
     /// with `type:` tokens and ordinary text. Every registry identity must match
     /// case-insensitively, compose with text using AND semantics, and reject an
     /// unknown type while the existing id/cwd/status/display-name searches work.
+    /// Multiple type constraints compose with true AND semantics, so conflicting
+    /// identities such as `type:codex type:claude` match no session.
     #[spec("dashboard/filter/003")]
     #[test]
     fn filter_003_agent_type_tokens_compose_with_text() {
@@ -16193,6 +16195,10 @@ mod tests {
         assert!(
             matching_ids("type:bogus").is_empty(),
             "an unknown agent type must match no sessions"
+        );
+        assert!(
+            matching_ids("type:codex type:claude").is_empty(),
+            "multiple type constraints use AND semantics, so no session can be both Codex and Claude Code"
         );
     }
 
@@ -21106,5 +21112,134 @@ mod tests {
              mode tab's focused_pane_id was never captured, so restore falls back \
              to the agent pane (`agent-m`) and the user's prior focus is lost"
         );
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum InjectedSendOutcome {
+        Error,
+        HistoryOnly,
+        NoLiveTarget,
+        Stale,
+        WrongSession,
+    }
+
+    struct SendResultPaneController {
+        outcome: InjectedSendOutcome,
+    }
+
+    impl PaneController for SendResultPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::NotAvailable)
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_and_submit_to_pane(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+        ) -> Result<crate::event::SendResult, PaneError> {
+            match self.outcome {
+                InjectedSendOutcome::Error => Err(PaneError::CommandFailed(
+                    "injected transport failure".into(),
+                )),
+                InjectedSendOutcome::HistoryOnly => Ok(crate::event::SendResult::HistoryOnly),
+                InjectedSendOutcome::NoLiveTarget => Ok(crate::event::SendResult::NoLiveTarget),
+                InjectedSendOutcome::Stale => Ok(crate::event::SendResult::Stale),
+                InjectedSendOutcome::WrongSession => Ok(crate::event::SendResult::WrongSession),
+            }
+        }
+        fn name(&self) -> &str {
+            "send-result-injector"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Scenario: Queue a real mode seed prompt at the UI's readiness gate, then
+    /// inject each transport error and non-applied `SendResult` through a
+    /// controllable PaneController. Every failed delivery must retain the seed
+    /// for retry and surface visible status feedback instead of dropping it.
+    #[spec("prompt/pane-input/006")]
+    #[test]
+    fn pane_input_006_seed_prompt_result_controls_retention_and_feedback() {
+        for outcome in [
+            InjectedSendOutcome::Error,
+            InjectedSendOutcome::HistoryOnly,
+            InjectedSendOutcome::NoLiveTarget,
+            InjectedSendOutcome::Stale,
+            InjectedSendOutcome::WrongSession,
+        ] {
+            let mut ui = default_ui();
+            ui.pending_seed_prompts.push(PendingSeedPrompt {
+                pane_id: "seed-pane".into(),
+                prompt: "retained seed prompt".into(),
+                created_at: std::time::Instant::now(),
+                ready_since: Some(
+                    std::time::Instant::now()
+                        .checked_sub(
+                            SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1),
+                        )
+                        .expect("readiness timestamp"),
+                ),
+            });
+            let mut snapshot = AppState::default();
+            snapshot.register_pane("seed-pane".into());
+            snapshot.insert_placeholder_session(
+                "seed-pane".into(),
+                None,
+                Some(AgentType::Codex),
+                Some("seed-agent".into()),
+            );
+            let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController { outcome });
+
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+
+            assert_eq!(
+                ui.pending_seed_prompts.len(),
+                1,
+                "non-applied result {outcome:?} must retain the seed prompt for retry"
+            );
+            assert!(
+                ui.status_message.as_ref().is_some_and(|(message, _)| {
+                    let lower = message.to_ascii_lowercase();
+                    lower.contains("not delivered") || lower.contains("retry")
+                }),
+                "non-applied result {outcome:?} must produce visible delivery feedback, got {:?}",
+                ui.status_message.as_ref().map(|(message, _)| message)
+            );
+        }
     }
 }

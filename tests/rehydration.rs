@@ -38,7 +38,7 @@ use dot_agent_deck::daemon_protocol::{
     serve_attach, serve_attach_with_counter, write_frame,
 };
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
-use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
+use dot_agent_deck::event::{AgentEvent, AgentType, EventType, Writable};
 use dot_agent_deck::state::{
     ActiveTool, AppState, SessionSnapshot, SessionState, SessionStatus, SharedState,
 };
@@ -2213,4 +2213,52 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         "event-derived AgentType::None must fall back to the spawn-time ClaudeCode, not \
          seed the card as 'No agent'"
     );
+}
+
+/// Scenario: Rehydrate one history-only Codex card and one view-only Codex card
+/// from daemon `SessionSnapshot` JSON after a detach/reconnect. Each rebuilt
+/// session must retain its non-live writability so input remains refused rather
+/// than silently reverting to the legacy live default.
+#[spec("session/live/010")]
+#[test]
+fn live_010_rehydrate_preserves_history_and_view_only_writability() {
+    for (pane_id, writable, expected) in [
+        ("pane-history", "history-only", Writable::HistoryOnly),
+        ("pane-view", "none", Writable::None),
+    ] {
+        let snapshot_json = serde_json::json!({
+            "status": "idle",
+            "agent_type": "codex",
+            "active_tool": null,
+            "tool_count": 0,
+            "first_prompts": [],
+            "last_user_prompt": null,
+            "live_target": {
+                "kind": if writable == "history-only" { "process" } else { "none" },
+                "writable": writable,
+            }
+        });
+        let snapshot: SessionSnapshot = serde_json::from_value(snapshot_json)
+            .expect("a reconnect snapshot with live_target must deserialize");
+        let mut state = AppState::default();
+        state.register_pane(pane_id.to_string());
+        state.seed_hydrated_session(
+            pane_id.to_string(),
+            None,
+            Some(AgentType::Codex),
+            Some(format!("agent-{pane_id}")),
+            Some(&snapshot),
+        );
+
+        let session = state
+            .sessions
+            .values()
+            .find(|session| session.pane_id.as_deref() == Some(pane_id))
+            .expect("rehydration creates one card for the pane");
+        assert_eq!(
+            session.writable(),
+            expected,
+            "reconnecting {writable} pane {pane_id} must preserve its input refusal"
+        );
+    }
 }

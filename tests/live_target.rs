@@ -1,7 +1,11 @@
 //! Fast wire-contract tests for PRD #20 live-target and send-result semantics.
 
 use dot_agent_deck::daemon_protocol::AttachResponse;
-use dot_agent_deck::event::AgentEvent;
+use std::collections::HashMap;
+
+use chrono::{Duration, Utc};
+use dot_agent_deck::event::{AgentEvent, AgentType, EventType, Writable};
+use dot_agent_deck::state::AppState;
 use serde_json::{Value, json};
 use spec::spec;
 
@@ -75,4 +79,64 @@ fn send_result_001_all_variants_round_trip() {
             "AttachResponse must preserve SendResult::{result}"
         );
     }
+}
+
+/// Scenario: Declare a Codex session history-only, then apply more than the
+/// bounded activity journal's capacity of events that omit `live_target`. The
+/// session must remain history-only because writability is durable state, not a
+/// property that disappears when the declaring event ages out of recent history.
+#[spec("protocol/live-target/002")]
+#[test]
+fn live_target_002_writability_survives_recent_event_eviction() {
+    let mut state = AppState::default();
+    state.register_pane("pane-durable".to_string());
+    let started = Utc::now();
+    state.apply_event(AgentEvent {
+        session_id: "durable-codex".to_string(),
+        agent_type: AgentType::Codex,
+        event_type: EventType::SessionStart,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: started,
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: Some("pane-durable".to_string()),
+        agent_id: Some("agent-durable".to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: Some(dot_agent_deck::event::LiveTarget {
+            kind: dot_agent_deck::event::TargetKind::Process,
+            writable: Writable::HistoryOnly,
+        }),
+    });
+
+    for offset in 1..=51 {
+        state.apply_event(AgentEvent {
+            session_id: "durable-codex".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: started + Duration::seconds(offset),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some("pane-durable".to_string()),
+            agent_id: Some("agent-durable".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+    }
+
+    let session = state
+        .sessions
+        .get("durable-codex")
+        .expect("the durable Codex session remains present");
+    assert_eq!(
+        session.writable(),
+        Writable::HistoryOnly,
+        "evicting the declaring event from the 50-entry recent-events journal must not promote a history-only session to Live"
+    );
 }
