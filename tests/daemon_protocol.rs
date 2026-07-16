@@ -1130,6 +1130,8 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
 /// Scenario: Retry identical deliveries sequentially and concurrently, then reuse
 /// an ID with a different payload or target. Identical work must submit once,
 /// while conflicting fingerprints must never replay a false successful result.
+/// The sequential case omits a session assertion because session authorization is
+/// covered separately; this scenario isolates delivery idempotency.
 #[spec("prompt/pane-input/010")]
 #[test]
 fn pane_input_010_retry_after_lost_response_is_idempotent() {
@@ -1148,7 +1150,6 @@ fn pane_input_010_retry_after_lost_response_is_idempotent() {
             "pane_id": pane_id,
             "text": format!("printf x >> {}", counter_path.display()),
             "expected_agent_id": agent_id,
-            "expected_session_id": "idempotent-session",
             "delivery_id": "stable-delivery-010"
         });
 

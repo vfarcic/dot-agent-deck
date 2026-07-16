@@ -118,6 +118,10 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
             event.agent_type == AgentType::Codex
                 && event.event_type == EventType::ToolEnd
                 && event.tool_name.as_deref() == Some("Bash")
+                && event
+                    .tool_detail
+                    .as_deref()
+                    .is_some_and(|value| value.contains(HOOK_SENTINEL_NAME))
         },
         Duration::from_secs(120),
     );
