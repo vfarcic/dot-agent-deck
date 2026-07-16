@@ -999,8 +999,17 @@ mod tests {
     /// `ok=false` with `send_result=applied`. The client must let the failure
     /// bit win and must not report successful delivery.
     #[spec("prompt/pane-input/012")]
-    #[tokio::test]
-    async fn pane_input_012_ok_false_overrides_applied_send_result() {
+    #[test]
+    fn pane_input_012_ok_false_overrides_applied_send_result() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build send-result consistency runtime");
+        runtime.block_on(pane_input_012_ok_false_overrides_applied_send_result_inner());
+    }
+
+    async fn pane_input_012_ok_false_overrides_applied_send_result_inner() {
         let (dir, path, listener) = {
             let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let dir = tempfile::tempdir().unwrap();
@@ -1039,8 +1048,17 @@ mod tests {
     /// daemon whose handshake does not advertise guarded-send support. The client
     /// must fail before submitting rather than trust an unsafe legacy `ok=true`.
     #[spec("prompt/pane-input/015")]
-    #[tokio::test]
-    async fn pane_input_015_guarded_send_fails_safe_without_daemon_capability() {
+    #[test]
+    fn pane_input_015_guarded_send_fails_safe_without_daemon_capability() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build guarded-send runtime");
+        runtime.block_on(pane_input_015_guarded_send_fails_safe_without_daemon_capability_inner());
+    }
+
+    async fn pane_input_015_guarded_send_fails_safe_without_daemon_capability_inner() {
         let (dir, path, listener) = {
             let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let dir = tempfile::tempdir().unwrap();
