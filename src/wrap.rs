@@ -505,10 +505,17 @@ impl Drop for RawModeGuard {
 }
 
 /// The `--dangerously-bypass-hook-trust` flag the deck passes when it launches a
-/// wrapped `codex`. Codex requires command hooks to be trusted before they run;
-/// the deck authors its OWN hook definition (see [`crate::codex_hooks_manage`]),
-/// so it vets the source — itself — and bypasses the interactive trust prompt for
-/// this vetted spawn (PRD #20 W1 design).
+/// wrapped `codex`. Codex requires non-managed command hooks to be trusted before
+/// they run; the deck authors its OWN hook definition (see
+/// [`crate::codex_hooks_manage`]), so it vets the source — itself.
+///
+/// PRD #20 W3-Pass-2 (finding #2 / M-1): this flag is INVOCATION-GLOBAL — it
+/// trusts EVERY enabled hook in the active `CODEX_HOME`, not only the deck's. So
+/// the deck injects it ONLY when the target `CODEX_HOME` contains no non-deck
+/// command hooks (see [`crate::codex_hooks_manage::foreign_command_hooks_present`]),
+/// i.e. when the only thing the bypass would trust is the deck's own vetted entry.
+/// If a third-party hook is present the deck does NOT bypass, so a user's
+/// unreviewed hook is never silently trusted.
 const CODEX_BYPASS_HOOK_TRUST_FLAG: &str = "--dangerously-bypass-hook-trust";
 
 /// Whether the wrapped program's basename is `codex`. PRD #20 W1 keys the
@@ -537,18 +544,50 @@ fn program_is_codex(program: &str) -> bool {
 ///   ultimately launched. It deliberately does NOT fire for a standalone
 ///   `wrap --agent codex -- /bin/sh` (no pane, non-codex program), so a
 ///   non-interactive I/O wrap never writes to the user's `~/.codex`.
-/// - **The trust-bypass flag** is injected ONLY for a direct `codex` program —
-///   the one case where the wrapper controls codex's argv. A launcher/script
-///   must add the flag to its own `codex …` line (see the module docs and
-///   `docs/develop/agent-adapters.md`).
+/// - **The trust-bypass flag** is injected ONLY when ALL of the following hold,
+///   so it can never silently trust something the deck didn't author:
+///   1. the program is a direct `codex` (the one case where the wrapper controls
+///      codex's argv — a launcher/script must add the flag to its own `codex …`
+///      line, see the module docs and `docs/develop/agent-adapters.md`), AND
+///   2. the resolved identity is [`AgentType::Codex`] — so
+///      `wrap --agent claude -- codex` neither installs Codex hooks nor bypasses
+///      trust (finding #2), AND
+///   3. the active `CODEX_HOME` contains no non-deck command hooks
+///      ([`crate::codex_hooks_manage::foreign_command_hooks_present`]) — because
+///      the bypass is invocation-global, so with a third-party hook present it
+///      would trust the user's unreviewed hook too (finding #2 / M-1). When a
+///      foreign hook is present the deck skips the bypass and warns; its own
+///      events then degrade to stdout classification.
 ///
 /// Returns `true` when the caller should add [`CODEX_BYPASS_HOOK_TRUST_FLAG`].
 fn codex_spawn_prep(program: &str, agent_type: &AgentType, pane_id: Option<&str>) -> bool {
     let program_codex = program_is_codex(program);
-    if *agent_type == AgentType::Codex && (program_codex || pane_id.is_some()) {
+    let codex_identity = *agent_type == AgentType::Codex;
+    if codex_identity && (program_codex || pane_id.is_some()) {
         crate::codex_hooks_manage::auto_install();
     }
-    program_codex
+    // Both a direct `codex` program AND Codex identity are required before the
+    // wrapper will even consider the invocation-global bypass.
+    if !(program_codex && codex_identity) {
+        return false;
+    }
+    // Only bypass when nothing but the deck's own vetted hook would be trusted.
+    match crate::codex_hooks_manage::foreign_command_hooks_present() {
+        Ok(false) => true,
+        Ok(true) => {
+            tracing::warn!(
+                "codex: third-party command hooks present in CODEX_HOME; not bypassing hook \
+                 trust (deck events degrade to stdout classification)"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(
+                "codex: could not inspect CODEX_HOME hooks ({e}); not bypassing hook trust"
+            );
+            false
+        }
+    }
 }
 
 /// PRD #20 R20-002: the last catchable termination signal delivered to the

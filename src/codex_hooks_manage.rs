@@ -10,23 +10,61 @@
 //! `PROTOCOL_VERSION` bump — rule 12).
 //!
 //! It is the Codex analog of [`crate::hooks_manage::auto_install`] (Claude):
-//! **idempotent-overwrite, guarded, silent**. Two deliberate choices vs. Claude:
+//! **guarded, silent, and SAFE for the user's real `~/.codex`**. Deliberate
+//! choices vs. Claude:
 //!
 //! - We write a SEPARATE `hooks.json` — Codex's highest-precedence,
 //!   auto-discovered hook source (`$CODEX_HOME/hooks.json`) — rather than
 //!   editing `config.toml`, so the user's real `~/.codex/config.toml` (auth
 //!   references, model, project trust, skills, history) is never touched.
-//! - We MERGE: any pre-existing user hooks are preserved; only prior
-//!   deck-authored (`dot-agent-deck …`) entries are refreshed, so re-installs
-//!   never accumulate duplicates.
+//! - We MERGE, never clobber: pre-existing user hooks are preserved; only prior
+//!   deck-authored entries (identified by the EXACT command signature
+//!   [`HOOK_COMMAND_SUFFIX`], not a loose `dot-agent-deck` substring) are
+//!   refreshed, so re-installs never accumulate duplicates and a user hook that
+//!   merely mentions `dot-agent-deck` is never deleted (finding #14).
+//! - The write is ATOMIC (temp file in the same dir + `rename(2)`) and guarded
+//!   by an in-process mutex, so a crash mid-write can't truncate the file and two
+//!   panes launching Codex concurrently can't clobber each other (finding #1/M-2).
+//! - We treat ONLY `NotFound` as an empty config. Unreadable, malformed, or
+//!   structurally-incompatible existing content is NEVER silently discarded:
+//!   malformed JSON is backed up to `hooks.json.bak` and the install errors;
+//!   a structurally-incompatible shape errors WITHOUT touching the file
+//!   (findings #1, L-2).
 //!
-//! Trust: Codex requires command hooks to be trusted before they run. The deck
-//! authors its OWN hook definition (it vets the source — itself), so the wrapper
-//! launches `codex` with `--dangerously-bypass-hook-trust` (see [`crate::wrap`]).
+//! Trust (finding #2 / M-1): Codex requires non-managed command hooks to be
+//! trusted before they run. `--dangerously-bypass-hook-trust` exists, but it is
+//! INVOCATION-GLOBAL — it trusts every enabled hook in the active `CODEX_HOME`,
+//! including the user's own untrusted third-party hooks. Codex 0.144.4 exposes
+//! no user-space *scoped* pre-trust the deck can safely use (managed/pre-trusted
+//! hooks require a root-owned `/etc/codex/{managed_config,requirements}.toml` or
+//! MDM/cloud source; per-hook trust is a SHA-256 over the exact definition that
+//! only Codex itself should record). So the wrapper injects the global bypass
+//! ONLY when the active `CODEX_HOME` contains no non-deck command hooks — i.e.
+//! when the only thing the bypass would trust is the deck's own vetted entry
+//! (see [`foreign_command_hooks_present`] and [`crate::wrap::codex_spawn_prep`]).
+//! When a third-party hook is present the deck does NOT bypass, and its events
+//! degrade to the coarse stdout classification rather than silently trusting an
+//! unreviewed hook.
 
+use std::io::{self, ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde_json::{Value, json};
+
+/// The fixed command signature that identifies a deck-authored Codex hook. Every
+/// deck hook command is `<binary_path> hook --agent codex`, so a command ending
+/// in this exact suffix is deck-owned. Matching the full verb (rather than the
+/// `dot-agent-deck` substring) means a user hook that merely mentions
+/// `dot-agent-deck` in an argument is never mistaken for a deck entry
+/// (finding #14).
+const HOOK_COMMAND_SUFFIX: &str = "hook --agent codex";
+
+/// Serializes the read-modify-write of `hooks.json` across concurrent in-process
+/// Codex spawns (two panes launching `codex` at once). Combined with the atomic
+/// temp-file+rename publish, this closes the concurrent-clobber / partial-write
+/// window on the user's real `~/.codex/hooks.json` (finding #1/M-2).
+static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 
 /// Codex hook events we install a command handler for. Every name maps to an
 /// [`crate::event::EventType`] via [`crate::hook`]'s `map_event_type`, and Codex
@@ -62,10 +100,18 @@ fn codex_home() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".codex"))
 }
 
+/// Whether a command string is a deck-authored hook, by EXACT signature: it ends
+/// with [`HOOK_COMMAND_SUFFIX`] (`… hook --agent codex`). A user command that
+/// merely contains `dot-agent-deck` (e.g. `audit-wrapper --watch dot-agent-deck`)
+/// is NOT deck-owned and is preserved (finding #14).
+fn command_is_deck_owned(command: &str) -> bool {
+    command.trim_end().ends_with(HOOK_COMMAND_SUFFIX)
+}
+
 /// Whether a hooks.json rule was authored by the deck — i.e. one of its command
-/// handlers shells `dot-agent-deck`. Used to strip stale deck entries before
-/// re-adding fresh ones, so re-installs are idempotent and never touch a user's
-/// own hooks.
+/// handlers is a deck hook by [`command_is_deck_owned`]. Used to strip stale deck
+/// entries before re-adding fresh ones, so re-installs are idempotent and never
+/// touch a user's own hooks.
 fn rule_is_dot_agent_deck(rule: &Value) -> bool {
     rule.get("hooks")
         .and_then(|h| h.as_array())
@@ -73,9 +119,39 @@ fn rule_is_dot_agent_deck(rule: &Value) -> bool {
             hooks.iter().any(|hook| {
                 hook.get("command")
                     .and_then(|c| c.as_str())
-                    .is_some_and(|cmd| cmd.contains("dot-agent-deck"))
+                    .is_some_and(command_is_deck_owned)
             })
         })
+}
+
+/// Build the deck's hook command for `binary_path`, robustly quoting the
+/// executable path so a path containing whitespace or shell metacharacters still
+/// produces a valid command that Codex parses to the intended argv (finding #14 /
+/// L-1). A "safe" path (only path-typical characters) is emitted verbatim so the
+/// common case stays human-readable and stable; anything else is single-quoted
+/// with embedded single quotes escaped.
+fn build_command(binary_path: &str) -> String {
+    format!(
+        "{} {HOOK_COMMAND_SUFFIX}",
+        shell_quote_if_needed(binary_path)
+    )
+}
+
+/// Single-quote `path` for a POSIX shell only when it contains a character
+/// outside a conservative safe set; otherwise return it unchanged.
+fn shell_quote_if_needed(path: &str) -> String {
+    fn is_safe(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'/' | b'.' | b'_' | b'-' | b'+' | b'=' | b':' | b'@' | b'%' | b','
+            )
+    }
+    if !path.is_empty() && path.bytes().all(is_safe) {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', r"'\''"))
+    }
 }
 
 /// Merge the deck's command hooks for `command` into an existing `hooks.json`
@@ -117,20 +193,161 @@ fn install_impl(root: &mut Value, command: &str) {
     }
 }
 
+/// Reject a structurally-incompatible existing `hooks.json` shape without
+/// mutating it. Accepts a missing `hooks` key (created on install) and an empty
+/// object, but rejects a non-object root, a non-object `hooks`, or any event
+/// value that is not an array — so a merge never silently replaces user content
+/// it doesn't understand (finding #1).
+fn validate_structure(root: &Value) -> io::Result<()> {
+    let incompatible = |what: &str| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("existing hooks.json is structurally incompatible: {what}"),
+        )
+    };
+    if !root.is_object() {
+        return Err(incompatible("root is not a JSON object"));
+    }
+    let Some(hooks) = root.get("hooks") else {
+        return Ok(()); // missing `hooks` is fine — install creates it
+    };
+    let Some(hooks) = hooks.as_object() else {
+        return Err(incompatible("`hooks` is not a JSON object"));
+    };
+    for (event, value) in hooks {
+        if !value.is_array() {
+            return Err(incompatible(&format!(
+                "hook event `{event}` is not an array"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Atomically publish `bytes` to `dest` by writing a temp file in the SAME
+/// directory (so `rename(2)` stays on one filesystem and is atomic) and renaming
+/// over `dest`. A crash mid-write leaves either the old file or the temp file
+/// intact — never a truncated `dest` (finding #1/M-2).
+fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = dir.join(format!(".hooks.json.tmp.{}", std::process::id()));
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    match std::fs::rename(&tmp, dest) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 /// Testable core: merge the deck's hooks into `<codex_home>/hooks.json`, writing
-/// the file (creating the home dir if needed). `binary_path` is the absolute
-/// `dot-agent-deck` path the hook command should invoke.
+/// the file atomically (creating the home dir if needed). `binary_path` is the
+/// absolute `dot-agent-deck` path the hook command should invoke.
+///
+/// Safety contract (findings #1, #14, L-2, M-2): the read-modify-write is
+/// serialized by [`INSTALL_LOCK`] and published atomically. Only a missing file
+/// is treated as empty. Malformed JSON is backed up to `hooks.json.bak` and the
+/// call errors (never discarded); a structurally-incompatible shape errors
+/// WITHOUT touching the file; unreadable content propagates its error unwritten.
 pub fn install_to(codex_home: &Path, binary_path: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(codex_home)?;
     let path = codex_home.join("hooks.json");
-    let mut root = match std::fs::read_to_string(&path) {
-        Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|_| json!({})),
-        Err(_) => json!({}),
+
+    let _guard = INSTALL_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let mut root = match std::fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) => value,
+            Err(parse_err) => {
+                // Preserve the user's bytes (best-effort backup) and refuse to
+                // overwrite — never discard content we couldn't parse.
+                let backup = codex_home.join("hooks.json.bak");
+                let _ = std::fs::write(&backup, &bytes);
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "existing hooks.json is not valid JSON (preserved at {}): {parse_err}",
+                        backup.display()
+                    ),
+                ));
+            }
+        },
+        Err(e) if e.kind() == ErrorKind::NotFound => json!({}),
+        // Unreadable (permissions, etc.): propagate rather than overwrite.
+        Err(e) => return Err(e),
     };
-    let command = format!("{binary_path} hook --agent codex");
+
+    validate_structure(&root)?;
+
+    let command = build_command(binary_path);
     install_impl(&mut root, &command);
     let contents = serde_json::to_string_pretty(&root)?;
-    std::fs::write(&path, contents)
+    write_atomic(codex_home, &path, contents.as_bytes())
+}
+
+/// Whether the active `CODEX_HOME`'s `hooks.json` declares any command hook NOT
+/// authored by the deck. The wrapper consults this before injecting the
+/// invocation-global `--dangerously-bypass-hook-trust`: the bypass is only safe
+/// when every command hook it would trust is deck-owned. Returns:
+/// - `Ok(false)` when the file is absent or contains only deck-owned command
+///   hooks (bypass is safe);
+/// - `Ok(true)` when a non-deck command hook is present (do NOT bypass — it would
+///   silently trust the user's unreviewed third-party hook, finding #2/M-1), or
+///   when no `CODEX_HOME` resolves (conservative default);
+/// - `Err` when the file exists but is unreadable/malformed (caller treats any
+///   error as "do not bypass").
+///
+/// It inspects `CODEX_HOME/hooks.json` only. Project-local (`<repo>/.codex`),
+/// plugin, and `config.toml`-defined hooks are NOT inspected here; the residual
+/// is documented in `docs/develop/agent-adapters.md`.
+pub fn foreign_command_hooks_present() -> std::io::Result<bool> {
+    let Some(home) = codex_home() else {
+        return Ok(true);
+    };
+    let path = home.join("hooks.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let root: Value =
+        serde_json::from_slice(&bytes).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    Ok(any_foreign_command_hook(&root))
+}
+
+/// Walk `root.hooks.<event>[].hooks[]` and report whether any `type == "command"`
+/// handler's command is NOT deck-owned (per [`command_is_deck_owned`]).
+fn any_foreign_command_hook(root: &Value) -> bool {
+    let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
+        return false;
+    };
+    for rules in hooks.values() {
+        let Some(rules) = rules.as_array() else {
+            continue;
+        };
+        for rule in rules {
+            let Some(handlers) = rule.get("hooks").and_then(Value::as_array) else {
+                continue;
+            };
+            for handler in handlers {
+                if handler.get("type").and_then(Value::as_str) != Some("command") {
+                    continue;
+                }
+                let foreign = handler
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|command| !command_is_deck_owned(command));
+                if foreign {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Silently install the Codex hooks into the active `CODEX_HOME`. Guarded
