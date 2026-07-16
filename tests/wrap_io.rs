@@ -7,9 +7,11 @@ mod common;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::os::fd::FromRawFd as _;
+use std::os::unix::net::UnixListener;
 use std::process::{Child, Command, Output, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use dot_agent_deck::event::AgentEvent;
 use spec::spec;
 
 fn run_wrap(script: &str, stdin: &[u8]) -> Output {
@@ -130,6 +132,32 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+fn collect_wrapper_events(listener: &UnixListener, expected: usize) -> Vec<AgentEvent> {
+    listener
+        .set_nonblocking(true)
+        .expect("make wrapper event listener nonblocking");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut events = Vec::new();
+    while events.len() < expected && Instant::now() < deadline {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let mut json = String::new();
+                stream
+                    .read_to_string(&mut json)
+                    .expect("read standalone wrapper event");
+                events.push(
+                    serde_json::from_str(json.trim()).expect("parse standalone wrapper event"),
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("accept standalone wrapper event: {error}"),
+        }
+    }
+    events
+}
+
 /// Scenario: Run `dot-agent-deck wrap` with redirected non-interactive streams.
 /// Wholly non-interactive streams remain separate and byte-exact, while stderr-only
 /// and stdout-only redirects preserve each unaffected descriptor's TTY identity.
@@ -230,6 +258,55 @@ fn codex_wrap_003_each_descriptor_preserves_its_original_semantics() {
             b"stdin=tty stderr=tty\n".to_vec(),
         ),
         "wrapping must preserve every descriptor independently: non-interactive streams stay separate and byte-exact, stderr-only redirection reaches only stderr, and stdout-only redirection leaves stdin/stderr attached to their TTY"
+    );
+}
+
+/// Scenario: Start two overlapping standalone wrappers with the same Codex identity and no pane environment ID. Their emitted lifecycle events must carry two distinct session IDs so one terminal cannot overwrite the other's card or status.
+#[spec("codex/wrap/005")]
+#[test]
+fn codex_wrap_005_standalone_sessions_have_unique_ids() {
+    let fixture = tempfile::tempdir().expect("create standalone wrapper fixture");
+    let socket = fixture.path().join("hook.sock");
+    let start = fixture.path().join("start");
+    let listener = UnixListener::bind(&socket).expect("bind standalone wrapper event socket");
+    let spawn_wrapper = || {
+        Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+            .args([
+                "wrap",
+                "--agent",
+                "codex",
+                "--",
+                "/bin/sh",
+                "-c",
+                "while [ ! -e \"$WRAP_START\" ]; do sleep 0.01; done; printf 'working\\n'; sleep 0.1",
+            ])
+            .env("DOT_AGENT_DECK_SOCKET", &socket)
+            .env("WRAP_START", &start)
+            .env_remove("DOT_AGENT_DECK_PANE_ID")
+            .env_remove("DOT_AGENT_DECK_AGENT_ID")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn standalone wrapper")
+    };
+    let first = spawn_wrapper();
+    let second = spawn_wrapper();
+    std::fs::write(&start, b"go").expect("release standalone wrappers");
+    let first_output = first.wait_with_output().expect("wait for first wrapper");
+    let second_output = second.wait_with_output().expect("wait for second wrapper");
+    assert!(first_output.status.success(), "first wrapper failed");
+    assert!(second_output.status.success(), "second wrapper failed");
+
+    let events = collect_wrapper_events(&listener, 6);
+    let session_ids: std::collections::HashSet<&str> = events
+        .iter()
+        .map(|event| event.session_id.as_str())
+        .collect();
+    assert_eq!(
+        session_ids.len(),
+        2,
+        "two concurrent standalone wrappers must emit distinct session IDs; events={events:?}"
     );
 }
 

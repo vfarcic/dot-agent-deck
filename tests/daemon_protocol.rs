@@ -21,8 +21,8 @@ use tokio::task::JoinHandle;
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, AgentRecord};
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_DETACH, KIND_REQ, KIND_RESP, KIND_STREAM_END,
-    KIND_STREAM_IN, KIND_STREAM_OUT, RunningAgentsSummary, TabMembership, bind_attach_listener,
-    serve_attach_with_counter, write_resp,
+    KIND_STREAM_IN, KIND_STREAM_OUT, KIND_STREAM_REJECT, RunningAgentsSummary, TabMembership,
+    bind_attach_listener, serve_attach_with_counter, write_resp,
 };
 use dot_agent_deck::event::{
     AgentEvent, AgentType, EventType, LiveTarget, SendResult, TargetKind, Writable,
@@ -282,6 +282,31 @@ async fn read_non_output_frame_within(
         }
     }
     None
+}
+
+async fn observe_stream_input_outcome(
+    stream: &mut UnixStream,
+    marker: &[u8],
+    timeout: Duration,
+) -> (bool, Option<(u8, Vec<u8>)>) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut output = Vec::new();
+    let mut non_output = None;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        match tokio::time::timeout(remaining, read_frame(stream)).await {
+            Ok(Some((KIND_STREAM_OUT, bytes))) => output.extend_from_slice(&bytes),
+            Ok(Some((KIND_STREAM_END, _))) | Ok(None) | Err(_) => break,
+            Ok(Some(frame)) => non_output = Some(frame),
+        }
+        if output.windows(marker.len()).any(|window| window == marker) && non_output.is_some() {
+            break;
+        }
+    }
+    (
+        output.windows(marker.len()).any(|window| window == marker),
+        non_output,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,6 +1154,280 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
             "logical-session authorization must require an exact match; same_agent_restart=(result={:?}, leaked={old_prompt_reached_new_session}), missing_current=(result={:?}, leaked={prompt_reached_sessionless_target})",
             same_agent_result,
             missing_session_result
+        );
+    });
+}
+
+/// Scenario: Send guarded write requests whose agent, session, or delivery identity has the wrong JSON type. Every malformed request must be rejected and no submitted marker may reach the pane PTY.
+#[spec("prompt/pane-input/017")]
+#[test]
+fn pane_input_017_malformed_guard_identity_fails_closed() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build malformed-guard runtime");
+    runtime.block_on(async {
+        let malformed_fields = [
+            ("expected_agent_id", serde_json::json!(123)),
+            ("expected_session_id", serde_json::json!(["wrong-type"])),
+            ("delivery_id", serde_json::json!({"wrong": "type"})),
+        ];
+        let mut observations = Vec::new();
+
+        for (field, malformed_value) in malformed_fields {
+            let server = start_server().await;
+            let pane_id = format!("pane-malformed-{field}");
+            let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", &pane_id).await;
+            let mut attached = connect_attach(&server, &agent_id).await;
+            let marker = format!("MALFORMED-{}-LEAKED", field.to_ascii_uppercase());
+            let mut request = serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": format!("printf '{marker}\\n'")
+            });
+            request[field] = malformed_value;
+
+            let response = issue_json_request(&server, request).await;
+            let (leaked, _) = observe_stream_input_outcome(
+                &mut attached,
+                marker.as_bytes(),
+                Duration::from_millis(750),
+            )
+            .await;
+            observations.push((field, response.ok, response.send_result, leaked));
+            server.registry.close_agent(&agent_id).unwrap();
+        }
+
+        assert!(
+            observations.iter().all(|(_, ok, result, leaked)| {
+                (!ok
+                    || !matches!(
+                        result,
+                        Some(SendResult::Applied | SendResult::Queued)
+                    )) && !leaked
+            }),
+            "present-but-malformed guarded-send identity must fail closed and write no bytes; observations={observations:?}"
+        );
+    });
+}
+
+/// Scenario: Attach to a history-only agent that has no pane environment identity, then send stream input. The daemon must return a typed rejection and must not write the submitted marker to the agent PTY.
+#[spec("prompt/pane-input/018")]
+#[test]
+fn pane_input_018_paneless_history_target_rejects_stream_input() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build pane-less stream runtime");
+    runtime.block_on(async {
+        let server = start_server().await;
+        let agent_id = start_agent(&server, "/bin/sh").await;
+        server.state.write().await.apply_event(AgentEvent {
+            session_id: "paneless-history-session".to_string(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: None,
+            agent_id: Some(agent_id.clone()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(LiveTarget {
+                kind: TargetKind::Process,
+                writable: Writable::HistoryOnly,
+            }),
+        });
+        let mut attached = connect_attach(&server, &agent_id).await;
+        let marker = b"PANELESS-HISTORY-INPUT-LEAKED";
+
+        write_frame(
+            &mut attached,
+            KIND_STREAM_IN,
+            b"printf 'PANELESS-HISTORY-INPUT-LEAKED\\n'\n",
+        )
+        .await;
+        let (leaked, rejection) =
+            observe_stream_input_outcome(&mut attached, marker, Duration::from_millis(750)).await;
+
+        assert!(
+            !leaked
+                && rejection
+                    .as_ref()
+                    .is_some_and(|(kind, reason)| *kind == KIND_STREAM_REJECT && !reason.is_empty()),
+            "a pane-less history-only target must reject stream input without writing it; leaked={leaked}, rejection={rejection:?}"
+        );
+        server.registry.close_agent(&agent_id).unwrap();
+    });
+}
+
+/// Scenario: Start a newer logical session on a live pane, then deliver a delayed activity or end event from its prior generation. Stale prompts must remain rejected while prompts for the current generation still reach the PTY.
+#[spec("prompt/pane-input/019")]
+#[test]
+fn pane_input_019_late_events_cannot_regress_or_clear_generation() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build monotonic-generation runtime");
+    runtime.block_on(async {
+        let server = start_server().await;
+        let pane_id = "pane-late-prior-activity";
+        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let now = chrono::Utc::now();
+        let event = |session_id: &str, event_type, timestamp| AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::Codex,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp,
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(agent_id.clone()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(LiveTarget {
+                kind: TargetKind::Pty,
+                writable: Writable::Live,
+            }),
+        };
+        {
+            let mut state = server.state.write().await;
+            state.register_pane(pane_id.to_string());
+            state.apply_event(event("prior-generation", EventType::SessionStart, now));
+            state.apply_event(event(
+                "current-generation",
+                EventType::SessionStart,
+                now + chrono::Duration::seconds(2),
+            ));
+            state.apply_event(event(
+                "prior-generation",
+                EventType::Thinking,
+                now + chrono::Duration::seconds(1),
+            ));
+        }
+        let mut attached = connect_attach(&server, &agent_id).await;
+        let stale = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'REGRESSED-STALE-PROMPT\\n'",
+                "expected_agent_id": agent_id,
+                "expected_session_id": "prior-generation",
+                "delivery_id": "late-prior-activity-stale"
+            }),
+        )
+        .await;
+        let (stale_leaked, _) = observe_stream_input_outcome(
+            &mut attached,
+            b"REGRESSED-STALE-PROMPT",
+            Duration::from_millis(500),
+        )
+        .await;
+        let current = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'CURRENT-PROMPT-AFTER-LATE-ACTIVITY\\n'",
+                "expected_agent_id": agent_id,
+                "expected_session_id": "current-generation",
+                "delivery_id": "late-prior-activity-current"
+            }),
+        )
+        .await;
+        let (current_reached, _) = observe_stream_input_outcome(
+            &mut attached,
+            b"CURRENT-PROMPT-AFTER-LATE-ACTIVITY",
+            Duration::from_millis(750),
+        )
+        .await;
+        let activity_observation = (
+            stale.send_result,
+            stale_leaked,
+            current.send_result,
+            current_reached,
+        );
+        server.registry.close_agent(&agent_id).unwrap();
+
+        let server = start_server().await;
+        let pane_id = "pane-late-prior-end";
+        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        let event = |session_id: &str, event_type, timestamp| AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::Codex,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp,
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(agent_id.clone()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(LiveTarget {
+                kind: TargetKind::Pty,
+                writable: Writable::Live,
+            }),
+        };
+        {
+            let mut state = server.state.write().await;
+            state.register_pane(pane_id.to_string());
+            state.apply_event(event("prior-generation", EventType::SessionStart, now));
+            state.apply_event(event(
+                "current-generation",
+                EventType::SessionStart,
+                now + chrono::Duration::seconds(2),
+            ));
+            state.apply_event(event(
+                "prior-generation",
+                EventType::SessionEnd,
+                now + chrono::Duration::seconds(1),
+            ));
+        }
+        let mut attached = connect_attach(&server, &agent_id).await;
+        let current_after_end = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'CURRENT-PROMPT-AFTER-LATE-END\\n'",
+                "expected_agent_id": agent_id,
+                "expected_session_id": "current-generation",
+                "delivery_id": "late-prior-end-current"
+            }),
+        )
+        .await;
+        let (current_after_end_reached, _) = observe_stream_input_outcome(
+            &mut attached,
+            b"CURRENT-PROMPT-AFTER-LATE-END",
+            Duration::from_millis(750),
+        )
+        .await;
+        let end_observation = (current_after_end.send_result, current_after_end_reached);
+        server.registry.close_agent(&agent_id).unwrap();
+
+        assert!(
+            !matches!(
+                activity_observation.0,
+                Some(SendResult::Applied | SendResult::Queued)
+            ) && !activity_observation.1
+                && activity_observation.2 == Some(SendResult::Applied)
+                && activity_observation.3
+                && end_observation.0 == Some(SendResult::Applied)
+                && end_observation.1,
+            "late prior-generation events must not restore or clear the current guarded-send generation; activity={activity_observation:?}, end={end_observation:?}"
         );
     });
 }

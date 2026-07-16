@@ -591,6 +591,27 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** daemon-side stale rejection, covered by `prompt/pane-input/009`.
 - **Platform coverage:** mac+linux+windows.
 
+##### prompt/pane-input/017 — Malformed guarded-send identity fails closed (PRD #20 Greptile finding #1).
+- **Layer:** L1 protocol integration with an in-process daemon and real PTY-backed shells.
+- **Agent:** synthetic pane targets backed by `/bin/sh`.
+- **Asserts:** a wrong JSON type for `expected_agent_id`, `expected_session_id`, or `delivery_id` is rejected and submits no marker bytes.
+- **Does not assert:** malformed base `WriteAndSubmit` fields, covered by the protocol's general malformed-request tests.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/018 — A pane-less history-only target rejects stream input (PRD #20 Greptile finding #2).
+- **Layer:** L1 protocol integration with an in-process daemon and a real PTY-backed shell carrying no pane environment ID.
+- **Agent:** synthetic Codex history-only event attached to a pane-less `/bin/sh` target.
+- **Asserts:** `KIND_STREAM_IN` returns a typed non-empty rejection and writes no marker bytes when the attach handle resolves to the no-pane sentinel.
+- **Does not assert:** visible TUI feedback after consuming the rejection, covered by `prompt/pane-input/008`.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/019 — Guarded-send generation remains monotonic under delayed prior-session events (PRD #20 Greptile finding #3).
+- **Layer:** L1 protocol integration with an in-process daemon and real PTY-backed shells.
+- **Agent:** synthetic Codex lifecycle generations sharing one pane and agent identity.
+- **Asserts:** delayed activity cannot restore an old generation, delayed `SessionEnd` cannot clear the current generation, stale prompts remain rejected, and current prompts remain deliverable.
+- **Does not assert:** transport-level event reordering before `AppState::apply_event`.
+- **Platform coverage:** mac+linux.
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.
@@ -1884,6 +1905,22 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Agent:** deterministic lingering shell child wrapped as Codex.
 - **Asserts:** after SIGTERM and SIGHUP are delivered to the wrapper, both interactive PTY and non-interactive pipe wrappers exit and their recorded child process is no longer running.
 - **Does not assert:** the pre-spawn signal race or termios restoration during a signal arriving inside setup; those timing edges are not deterministic at this subprocess seam.
+- **Platform coverage:** mac+linux.
+
+##### codex/wrap/005 — Concurrent standalone wrappers emit unique session IDs (PRD #20 Greptile finding #4).
+- **Layer:** L1/fast real-binary subprocess integration with a synthetic hook socket; no TUI or LLM.
+- **Agent:** two overlapping deterministic shell probes wrapped with Codex identity and no pane environment ID.
+- **Asserts:** the two wrapper lifecycles produce two distinct session IDs instead of reconciling onto one synthetic `wrap-<program>` ID.
+- **Does not assert:** managed-pane session IDs, which intentionally remain pane-derived and are covered by `codex/wrap/001`.
+- **Platform coverage:** mac+linux.
+
+#### codex/trust
+
+##### codex/trust/001 — The hook-trust bypass cannot cross to an uninspected CODEX_HOME (PRD #20 Greptile finding #6).
+- **Layer:** L1/fast real-binary subprocess integration with controlled Codex homes and a launcher named `codex`.
+- **Agent:** deterministic launcher that redirects `CODEX_HOME` before recording its effective home and argv.
+- **Asserts:** a foreign hook set in a home other than the one vetted by the deck never receives `--dangerously-bypass-hook-trust`.
+- **Does not assert:** real Codex hook execution or native event ingestion.
 - **Platform coverage:** mac+linux.
 
 #### codex/spawn

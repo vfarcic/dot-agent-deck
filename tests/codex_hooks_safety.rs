@@ -7,6 +7,7 @@ use std::process::{Command, Output, Stdio};
 
 use dot_agent_deck::codex_hooks_manage::install_to;
 use serde_json::{Value, json};
+use spec::spec;
 
 const DECK_BINARY: &str = "/opt/dot-agent-deck/bin/dot-agent-deck";
 const TRUST_BYPASS_FLAG: &str = "--dangerously-bypass-hook-trust";
@@ -240,5 +241,60 @@ fn codex_hooks_trust_002_third_party_hooks_are_not_globally_trusted() {
     assert!(
         !args.iter().any(|arg| arg == TRUST_BYPASS_FLAG),
         "invocation-global trust bypass would trust the third-party hook too: args={args:?}"
+    );
+}
+
+/// Scenario: Launch an executable named codex that redirects CODEX_HOME to an uninspected home containing a foreign hook before invoking Codex. The deck must not let the redirected hook set receive its invocation-global trust bypass.
+#[spec("codex/trust/001")]
+#[test]
+fn codex_trust_001_vetted_home_cannot_be_swapped_under_bypass() {
+    let fixture = tempfile::tempdir().expect("create Codex launcher fixture");
+    let vetted_home = tempfile::tempdir().expect("create vetted Codex home");
+    let swapped_home = tempfile::tempdir().expect("create swapped Codex home");
+    write_hooks(
+        swapped_home.path(),
+        &json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "hooks": [{"type": "command", "command": "/uninspected/foreign-hook"}]
+                }]
+            }
+        }),
+    );
+    let launcher = fixture.path().join("codex");
+    let launch_record = fixture.path().join("launch.txt");
+    std::fs::write(
+        &launcher,
+        "#!/bin/sh\nexport CODEX_HOME=\"$SWAPPED_CODEX_HOME\"\nprintf 'home=%s\\n' \"$CODEX_HOME\" > \"$CODEX_LAUNCH_RECORD\"\nprintf 'arg=%s\\n' \"$@\" >> \"$CODEX_LAUNCH_RECORD\"\n",
+    )
+    .expect("write CODEX_HOME-swapping launcher");
+    let mut permissions = std::fs::metadata(&launcher)
+        .expect("stat CODEX_HOME-swapping launcher")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&launcher, permissions)
+        .expect("make CODEX_HOME-swapping launcher executable");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["wrap", "--agent", "codex", "--"])
+        .arg(&launcher)
+        .env("CODEX_HOME", vetted_home.path())
+        .env("SWAPPED_CODEX_HOME", swapped_home.path())
+        .env("CODEX_LAUNCH_RECORD", &launch_record)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run CODEX_HOME-swapping launcher");
+    let observed = std::fs::read_to_string(&launch_record).expect("read Codex launch record");
+    let bypass_reached_swapped_home = observed
+        .lines()
+        .any(|line| line == format!("arg={TRUST_BYPASS_FLAG}"))
+        && observed.contains(&format!("home={}", swapped_home.path().display()));
+
+    assert!(output.status.success(), "wrapper failed: {output:?}");
+    assert!(
+        !bypass_reached_swapped_home,
+        "an uninspected CODEX_HOME must never receive the global trust bypass; launch={observed:?}"
     );
 }
