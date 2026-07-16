@@ -1872,6 +1872,20 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** Codex output parsing or model behavior (`codex/live/001`).
 - **Platform coverage:** mac+linux.
 
+##### codex/wrap/003 — Wrapped commands preserve each standard descriptor's independent TTY or redirection semantics (PRD #20, final review finding 11).
+- **Layer:** L1/fast real-binary subprocess integration with controlled pseudo-terminals and files; no TUI or LLM.
+- **Agent:** deterministic shell probes wrapped as Codex.
+- **Asserts:** wholly non-interactive stdout/stderr remain separate and binary stdin remains byte-exact through EOF; redirecting only stderr sends child stderr to that file rather than merged PTY stdout; redirecting only stdout leaves child stdin and stderr attached to TTYs.
+- **Does not assert:** interactive resize, ordinary input, or Ctrl+C behavior (`codex/wrap/002`).
+- **Platform coverage:** mac+linux.
+
+##### codex/wrap/004 — Catchable termination signals tear down and reap wrapped children on PTY and pipe paths (PRD #20, final review finding 12).
+- **Layer:** L1/fast real-binary subprocess integration with a controlled pseudo-terminal for the interactive path and null descriptors for the pipe path; no TUI or LLM.
+- **Agent:** deterministic lingering shell child wrapped as Codex.
+- **Asserts:** after SIGTERM and SIGHUP are delivered to the wrapper, both interactive PTY and non-interactive pipe wrappers exit and their recorded child process is no longer running.
+- **Does not assert:** the pre-spawn signal race or termios restoration during a signal arriving inside setup; those timing edges are not deterministic at this subprocess seam.
+- **Platform coverage:** mac+linux.
+
 #### codex/spawn
 
 ##### codex/spawn/001 — Plain restored Codex panes launch through the Wrapper strategy (PRD #20, blocker 3).
