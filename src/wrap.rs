@@ -25,15 +25,16 @@
 //! registry variant names this mechanism; Codex is its first consumer (M7).
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::{Read, Write};
-use std::os::unix::io::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::process::CommandExt;
 use std::process::{Command as StdCommand, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use crate::event::{
@@ -592,46 +593,213 @@ fn codex_spawn_prep(program: &str, agent_type: &AgentType, pane_id: Option<&str>
 
 /// PRD #20 R20-002: the last catchable termination signal delivered to the
 /// wrapper (0 = none). Set by [`handle_wrap_signal`] (async-signal-safe: a lone
-/// atomic store) and observed by the interactive PTY main loop, which forwards
-/// it to the child's process group, escalates after a grace window, and returns
-/// through normal cleanup so [`RawModeGuard`] restores the terminal — no
-/// raw-mode-left-on-signal, no unreaped child.
+/// atomic store) and observed by BOTH wrap reap loops (PTY and pipe), which
+/// forward it to the child's process group, escalate after a grace window, and
+/// return through normal cleanup so [`RawModeGuard`] restores the terminal and
+/// the child is always reaped — no raw-mode-left-on-signal, no orphaned child.
 static WRAP_PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn handle_wrap_signal(sig: libc::c_int) {
     WRAP_PENDING_SIGNAL.store(sig, Ordering::SeqCst);
 }
 
-/// Install async handlers for `SIGTERM` / `SIGHUP` / `SIGINT` on the interactive
-/// wrap path. `SA_RESTART` is intentionally NOT set so a blocked read returns
-/// `EINTR` and the loop reacts promptly; the pump read loops treat `Interrupted`
-/// as retry, not end-of-stream.
-fn install_wrap_signal_handlers() {
-    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-    action.sa_sigaction = handle_wrap_signal as *const () as libc::sighandler_t;
-    unsafe {
-        libc::sigemptyset(&mut action.sa_mask);
-    }
-    action.sa_flags = 0;
-    for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+/// PRD #20 finding #12: a RESTORABLE guard that installs async handlers for
+/// `SIGTERM` / `SIGHUP` / `SIGINT` and restores the previous dispositions on
+/// drop. It is installed BEFORE the child is spawned so a signal arriving in the
+/// spawn/setup window is still recorded (and forwarded by the reap loop) instead
+/// of terminating the wrapper outright and orphaning the child. `SA_RESTART` is
+/// intentionally NOT set so a blocked read returns `EINTR` and the loops react
+/// promptly; the pump read loops treat `Interrupted` as retry, not end-of-stream.
+struct SignalGuard {
+    previous: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+impl SignalGuard {
+    fn install() -> Self {
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = handle_wrap_signal as *const () as libc::sighandler_t;
         unsafe {
-            libc::sigaction(sig, &action, std::ptr::null_mut());
+            libc::sigemptyset(&mut action.sa_mask);
+        }
+        action.sa_flags = 0;
+        let mut previous = Vec::new();
+        for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+            let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::sigaction(sig, &action, &mut old);
+            }
+            previous.push((sig, old));
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for SignalGuard {
+    fn drop(&mut self) {
+        for (sig, old) in &self.previous {
+            // SAFETY: `old` is the disposition this guard captured at install.
+            unsafe {
+                libc::sigaction(*sig, old, std::ptr::null_mut());
+            }
         }
     }
 }
 
 /// Send `signal` to the wrapped child's entire process group (so descendants
-/// that inherited the slave PTY are torn down too), falling back to the direct
-/// child when the pid can't be resolved to a group id.
-fn kill_child_group(child: &mut Box<dyn portable_pty::Child + Send + Sync>, signal: libc::c_int) {
-    if let Some(pgid) = child.process_id().and_then(crate::agent_pty::pid_to_pgid) {
-        // SAFETY: `killpg(2)` is async-signal-safe; the pgid is the child's own
-        // pid (portable-pty `setsid`'d it), so this can't hit another group.
+/// that inherited its session are torn down too), falling back to the direct
+/// child pid if the group send fails. The child is `setsid`'d in its pre-exec
+/// (see [`child_pre_exec`]) so its process-group id equals its pid.
+fn kill_pid_group(pid: libc::pid_t, signal: libc::c_int) {
+    if pid <= 0 {
+        return;
+    }
+    // SAFETY: `killpg`/`kill` are async-signal-safe; `pid` is this wrapper's own
+    // child, made a session/group leader via `setsid`, so this targets only its
+    // group (or, on fallback, the child itself).
+    let sent = unsafe { libc::killpg(pid, signal) };
+    if sent != 0 {
         unsafe {
-            libc::killpg(pgid, signal);
+            libc::kill(pid, signal);
         }
+    }
+}
+
+/// Per-loop signal forwarding + escalation shared by the PTY and pipe reap loops
+/// (PRD #20 finding #12). Forwards the first catchable termination signal to the
+/// child's process group, arms a grace window, and escalates to `SIGKILL` once
+/// it elapses — so a signalled wrapper never orphans a long-running child.
+struct SignalForwarder {
+    pid: libc::pid_t,
+    escalate_deadline: Option<Instant>,
+}
+
+impl SignalForwarder {
+    fn new(pid: libc::pid_t) -> Self {
+        Self {
+            pid,
+            escalate_deadline: None,
+        }
+    }
+
+    /// Forward a pending signal (if any) to the child group and escalate to
+    /// `SIGKILL` once the grace window elapses. Call once per reap-loop iteration.
+    fn tick(&mut self) {
+        let sig = WRAP_PENDING_SIGNAL.swap(0, Ordering::SeqCst);
+        if sig != 0 {
+            self.terminate_with(sig);
+        }
+        if let Some(deadline) = self.escalate_deadline
+            && Instant::now() >= deadline
+        {
+            kill_pid_group(self.pid, libc::SIGKILL);
+        }
+    }
+
+    /// Begin termination with `signal`, arming the escalation grace window once.
+    /// Also used by the PTY path's downstream-closed teardown (R20-001).
+    fn terminate_with(&mut self, signal: libc::c_int) {
+        if self.escalate_deadline.is_none() {
+            kill_pid_group(self.pid, signal);
+            self.escalate_deadline = Some(Instant::now() + crate::agent_pty::AGENT_TERMINATE_GRACE);
+        }
+    }
+}
+
+/// Child pre-exec setup, run in the forked child before `exec` on both wrap
+/// paths (PRD #20 finding #12). Resets inherited signal dispositions to their
+/// defaults, starts a new session so the child owns its process group (the
+/// [`kill_pid_group`] forwarding target), and — when `ctty_fd >= 0` — acquires
+/// the inner PTY as the controlling terminal so line discipline (Ctrl+C→SIGINT),
+/// job control, and SIGWINCH work for an interactive child. Only async-signal-
+/// safe libc calls are used, as required between `fork` and `exec`.
+fn child_pre_exec(ctty_fd: RawFd) -> std::io::Result<()> {
+    for signo in [
+        libc::SIGTERM,
+        libc::SIGHUP,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGCHLD,
+        libc::SIGALRM,
+    ] {
+        // SAFETY: async-signal-safe; resets any inherited handler/ignore.
+        unsafe {
+            libc::signal(signo, libc::SIG_DFL);
+        }
+    }
+    // SAFETY: async-signal-safe; new session → own process group.
+    if unsafe { libc::setsid() } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: async-signal-safe; `ctty_fd` is one of the child's std fds backed
+    // by the inner PTY slave. Acquire it as the controlling terminal.
+    if ctty_fd >= 0 && unsafe { libc::ioctl(ctty_fd, libc::TIOCSCTTY, 0) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Open a fresh inner pseudo-terminal sized to `(rows, cols)`, returning the
+/// owned master and slave descriptors.
+fn open_inner_pty(rows: u16, cols: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut master: RawFd = -1;
+    let mut slave: RawFd = -1;
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `openpty` fills both descriptors on success; each is turned into an
+    // `OwnedFd` exactly once so ownership (and close-on-drop) is unambiguous.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &ws,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) })
+}
+
+/// Resize an open PTY master, which sends `SIGWINCH` to its foreground process
+/// group (the wrapped child).
+fn set_pty_size(fd: RawFd, rows: u16, cols: u16) {
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `TIOCSWINSZ` reads exactly one `winsize` through the pointer.
+    unsafe {
+        libc::ioctl(fd, libc::TIOCSWINSZ, &ws);
+    }
+}
+
+/// Classify one tee'd output `line` through the shared `detector` and emit the
+/// resulting card event, if the state changed. Shared by every wrap tee (the PTY
+/// master pump and the redirected-descriptor pipe pumps) so one coherent session
+/// state drives the card.
+fn classify_and_emit(
+    line: &str,
+    detector: &Arc<Mutex<Detector>>,
+    emitter: &Emitter,
+    is_codex: bool,
+) {
+    let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
+    let ev = if is_codex {
+        det.observe_detected(classify_codex_line(line))
     } else {
-        let _ = child.kill();
+        det.observe(line)
+    };
+    drop(det);
+    if let Some(ev) = ev {
+        emitter.emit(ev.event_type());
     }
 }
 
@@ -711,147 +879,214 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     // spawns. A launcher/script must add the flag to its own codex line.
     let add_trust_flag = codex_spawn_prep(program, &emitter.agent_type, emitter.pane_id.as_deref());
 
-    // R20-012: PTY proxying only for an interactive outer terminal (both stdin
-    // and stdout are TTYs). A piped / redirected outer stream uses the
-    // pipe-based path so stdout/stderr stay separate and stdin is byte-exact.
-    let interactive =
-        unsafe { libc::isatty(libc::STDIN_FILENO) == 1 && libc::isatty(libc::STDOUT_FILENO) == 1 };
+    // R20-012 / finding #11: genuine per-descriptor routing. Detect the
+    // tty-or-redirected nature of EACH standard descriptor independently. If any
+    // descriptor is a real terminal the child needs an inner PTY (so its
+    // terminal descriptors see `isatty == true`); each redirected descriptor is
+    // threaded to the wrapper's matching real fd rather than merged into the PTY.
+    // When NONE is a terminal the wholly non-interactive pipe path runs
+    // (separate stdout/stderr, byte-exact stdin).
+    let tty = [
+        unsafe { libc::isatty(libc::STDIN_FILENO) == 1 },
+        unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 },
+        unsafe { libc::isatty(libc::STDERR_FILENO) == 1 },
+    ];
 
-    if interactive {
-        run_wrap_pty(program, args, &emitter, add_trust_flag)
+    if tty.iter().any(|&t| t) {
+        run_wrap_pty(program, args, &emitter, add_trust_flag, tty)
     } else {
         run_wrap_pipe(program, args, &emitter, add_trust_flag)
     }
 }
 
-/// Interactive path: spawn the child on a fresh inner PTY and proxy all three
-/// streams (raw outer terminal, resize forwarding, tee'd output). Implements the
-/// R20-001/R20-002 robustness contract: cancellable output pump, owned child
-/// process group, catchable-signal forwarding + escalation, bounded post-exit
-/// drain, and an always-run reap so the terminal is restored on every exit path.
+/// Interactive path: spawn the child on a fresh inner PTY with GENUINE
+/// per-descriptor routing (PRD #20 finding #11). Each of stdin/stdout/stderr is
+/// wired to the inner PTY slave when the matching outer descriptor is a terminal
+/// (so the child sees `isatty == true` there) or to a pipe teed to the wrapper's
+/// matching real fd when it is redirected — so `2>error.log` reaches only the
+/// file and `>out.log` leaves stdin/stderr on their terminals, instead of
+/// merging everything onto one PTY. Implements the R20-001 / finding #12
+/// robustness contract: cancellable output pump, owned child process group,
+/// catchable-signal forwarding + escalation, bounded post-exit drain, and an
+/// always-run reap so the terminal is restored on every exit path.
 fn run_wrap_pty(
     program: &str,
     args: &[String],
     emitter: &Arc<Emitter>,
     add_trust_flag: bool,
+    tty: [bool; 3],
 ) -> ExitCode {
-    // Open the inner PTY at the outer terminal's current size so the child's
-    // first frame paints at the right geometry (falls back to 24×80).
+    let [stdin_tty, stdout_tty, stderr_tty] = tty;
+
+    // Size the inner PTY from whichever descriptor is a real terminal so the
+    // child's first frame paints at the right geometry (falls back to 24×80).
     let (rows, cols) = terminal_size(libc::STDIN_FILENO)
         .or_else(|| terminal_size(libc::STDOUT_FILENO))
+        .or_else(|| terminal_size(libc::STDERR_FILENO))
         .unwrap_or((24, 80));
-    let pty_system = NativePtySystem::default();
-    let pair = match pty_system.openpty(PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    }) {
-        Ok(p) => p,
+
+    let (master, slave) = match open_inner_pty(rows, cols) {
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!("Error: failed to open a pseudo-terminal for `{program}`: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    // Build the child command. `CommandBuilder` inherits the wrapper's env (which
+    // Build the child. `std::process::Command` inherits the wrapper's env (which
     // carries `DOT_AGENT_DECK_PANE_ID` / `_AGENT_ID` injected by the daemon), so
     // the child's own hooks and this wrapper's events attribute to the same pane.
-    let mut cmd = CommandBuilder::new(program);
+    let mut cmd = StdCommand::new(program);
     if add_trust_flag {
         cmd.arg(CODEX_BYPASS_HOOK_TRUST_FLAG);
     }
-    for arg in args {
-        cmd.arg(arg);
-    }
-    // Pin the child's cwd to the wrapper's own working directory. Unlike
-    // `std::process::Command`, `portable_pty`'s `CommandBuilder` does NOT
-    // resolve a relative program (e.g. `./tty-probe.sh`) against the process
-    // cwd when none is set — it would fail to find it — so set it explicitly.
+    cmd.args(args);
     if let Ok(dir) = std::env::current_dir() {
-        cmd.cwd(dir);
+        cmd.current_dir(dir);
     }
 
-    let mut child = match pair.slave.spawn_command(cmd) {
+    // Per-descriptor routing: a terminal descriptor is backed by the inner PTY
+    // slave (child sees a tty); a redirected descriptor is a pipe we tee to the
+    // wrapper's own matching fd (child sees its real redirection).
+    let route = |is_tty: bool, slave: &OwnedFd| -> std::io::Result<Stdio> {
+        if is_tty {
+            Ok(Stdio::from(File::from(slave.try_clone()?)))
+        } else {
+            Ok(Stdio::piped())
+        }
+    };
+    let (child_stdin, child_stdout, child_stderr) = match (
+        route(stdin_tty, &slave),
+        route(stdout_tty, &slave),
+        route(stderr_tty, &slave),
+    ) {
+        (Ok(i), Ok(o), Ok(e)) => (i, o, e),
+        _ => {
+            eprintln!("Error: failed to set up the wrapped `{program}` terminal descriptors");
+            return ExitCode::FAILURE;
+        }
+    };
+    cmd.stdin(child_stdin);
+    cmd.stdout(child_stdout);
+    cmd.stderr(child_stderr);
+
+    // The first slave-backed std fd becomes the child's controlling terminal.
+    let ctty_fd: RawFd = if stdin_tty {
+        libc::STDIN_FILENO
+    } else if stdout_tty {
+        libc::STDOUT_FILENO
+    } else {
+        libc::STDERR_FILENO
+    };
+    // SAFETY: `child_pre_exec` performs only async-signal-safe libc calls.
+    unsafe {
+        cmd.pre_exec(move || child_pre_exec(ctty_fd));
+    }
+
+    // finding #12: record catchable signals BEFORE the child exists so a signal
+    // in the spawn/setup window is forwarded through normal cleanup rather than
+    // killing the wrapper and orphaning the child. Restored on drop.
+    let _signal_guard = SignalGuard::install();
+
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error: failed to spawn `{program}`: {e}");
             return ExitCode::FAILURE;
         }
     };
-    // Interact through the master side only; the child holds its own slave fds.
-    drop(pair.slave);
+    // The parent keeps only the master; drop every slave copy so the master
+    // reader EOFs once the child (and its descendants) release the slave.
+    drop(slave);
 
-    let master = pair.master;
-    let reader = match master.try_clone_reader() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Error: failed to read the wrapped `{program}` terminal: {e}");
-            let _ = child.kill();
-            return ExitCode::FAILURE;
-        }
+    let child_pid = child.id() as libc::pid_t;
+
+    // Take the pipe ends for any redirected descriptor.
+    let pipe_in = if stdin_tty { None } else { child.stdin.take() };
+    let pipe_out = if stdout_tty {
+        None
+    } else {
+        child.stdout.take()
     };
-    let writer = match master.take_writer() {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("Error: failed to write the wrapped `{program}` terminal: {e}");
-            let _ = child.kill();
-            return ExitCode::FAILURE;
-        }
+    let pipe_err = if stderr_tty {
+        None
+    } else {
+        child.stderr.take()
     };
 
     // The session has begun — surface the card immediately.
     emitter.emit(EventType::SessionStart);
 
-    // R20-002: forward catchable termination signals to the child group and
-    // return through normal cleanup (terminal restored) rather than dying with
-    // raw mode left on. Installed BEFORE raw mode so a signal in the tiny window
-    // still routes through the handler.
-    install_wrap_signal_handlers();
+    // Raw-mode the outer terminal ONLY when stdin is itself a terminal, so
+    // keystrokes (incl. Ctrl+C and CR) reach the inner PTY unmodified; restored
+    // on drop on every return path.
+    let _raw_guard = stdin_tty.then(|| RawModeGuard::enable(libc::STDIN_FILENO));
 
-    // Raw-mode the outer terminal so keystrokes (incl. Ctrl+C and CR) pass
-    // through to the inner PTY unmodified; restored on drop (incl. on the signal
-    // paths, which break to this function's normal return).
-    let _raw_guard = RawModeGuard::enable(libc::STDIN_FILENO);
-
-    // Output pump (inner master → outer stdout, tee'd through classification).
-    // PRD #20 M7: the rule set is keyed off the resolved agent type; Codex uses
-    // JSON-aware classification, any other command keeps the generic fallback.
-    // Auditor: recover from a poisoned detector mutex instead of panicking.
-    // R20-001: `output_done` reports pump termination to the main loop so a tee
-    // that stops on a downstream write failure (outer stdout closed) makes the
-    // loop terminate the child rather than poll forever while the child blocks
-    // on a full, undrained inner PTY.
+    // One shared detector across every tee so the card reflects a single
+    // coherent session state. PRD #20 M7: the rule set is keyed off the resolved
+    // agent type; Codex uses JSON-aware classification, any other command keeps
+    // the generic fallback. Recover from a poisoned mutex instead of panicking.
     let is_codex = emitter.agent_type == AgentType::Codex;
     let detector = Arc::new(Mutex::new(Detector::with_rules(ruleset_for(
         &emitter.agent_type,
     ))));
+
+    // Terminal-output pump: the inner master carries whatever the child wrote to
+    // the slave. Copy it to the real terminal fd (prefer stdout, else stderr),
+    // tee'd through classification. R20-001: `output_done` reports pump
+    // termination so a tee that stops on a downstream write failure (the outer
+    // terminal closed) makes the main loop terminate the child rather than poll
+    // forever while the child blocks on a full inner PTY. Only meaningful when a
+    // terminal output descriptor exists; otherwise the master carries nothing.
+    let has_tty_output = stdout_tty || stderr_tty;
     let output_done = Arc::new(AtomicBool::new(false));
-    let output_thread = {
+    let output_thread = if has_tty_output {
+        let out_fd = if stdout_tty {
+            libc::STDOUT_FILENO
+        } else {
+            libc::STDERR_FILENO
+        };
+        let reader = match master.try_clone() {
+            Ok(fd) => File::from(fd),
+            Err(e) => {
+                eprintln!("Error: failed to read the wrapped `{program}` terminal: {e}");
+                kill_pid_group(child_pid, libc::SIGKILL);
+                let _ = child.wait();
+                return ExitCode::FAILURE;
+            }
+        };
         let emitter = Arc::clone(emitter);
         let detector = Arc::clone(&detector);
         let output_done = Arc::clone(&output_done);
-        std::thread::spawn(move || {
-            tee(reader, FdWriter(libc::STDOUT_FILENO), |line| {
-                let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
-                let ev = if is_codex {
-                    det.observe_detected(classify_codex_line(line))
-                } else {
-                    det.observe(line)
-                };
-                drop(det);
-                if let Some(ev) = ev {
-                    emitter.emit(ev.event_type());
-                }
+        Some(std::thread::spawn(move || {
+            tee(reader, FdWriter(out_fd), |line| {
+                classify_and_emit(line, &detector, &emitter, is_codex);
             });
             output_done.store(true, Ordering::SeqCst);
-        })
+        }))
+    } else {
+        None
     };
 
-    // Input pump (outer stdin → inner master). Detached: on child exit the main
-    // loop below returns and the process exits, reaping this blocked reader.
-    {
-        let mut writer = writer;
+    // Redirected output descriptors: tee each pipe to the matching real fd.
+    let out_pipe_thread =
+        pipe_out.map(|r| spawn_pipe_tee(r, libc::STDOUT_FILENO, emitter, &detector, is_codex));
+    let err_pipe_thread =
+        pipe_err.map(|r| spawn_pipe_tee(r, libc::STDERR_FILENO, emitter, &detector, is_codex));
+
+    // Input pump (outer stdin → inner master when stdin is a terminal, else →
+    // the child's stdin pipe). Detached: on child exit the main loop returns and
+    // process exit reaps this possibly-blocked reader. Dropping the writer on EOF
+    // closes the child's stdin so an EOF-sensitive child finishes.
+    let input_writer: Option<Box<dyn Write + Send>> = if stdin_tty {
+        match master.try_clone() {
+            Ok(fd) => Some(Box::new(File::from(fd))),
+            Err(_) => None,
+        }
+    } else {
+        pipe_in.map(|p| Box::new(p) as Box<dyn Write + Send>)
+    };
+    if let Some(mut writer) = input_writer {
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -863,8 +1098,8 @@ fn run_wrap_pty(
                     )
                 };
                 if n < 0 {
-                    // R20-002: a handler-delivered signal interrupts the read;
-                    // retry rather than tear down stdin forwarding.
+                    // finding #12: a handler-delivered signal interrupts the
+                    // read; retry rather than tear down stdin forwarding.
                     if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                         continue;
                     }
@@ -881,49 +1116,33 @@ fn run_wrap_pty(
     }
 
     // Main loop: forward outer resizes to the inner PTY (so the child receives
-    // SIGWINCH), react to a catchable signal, notice a dead output pump, and poll
-    // for child exit. `try_wait` reaps the child once it returns `Some`.
+    // SIGWINCH), forward + escalate catchable signals, notice a dead output pump,
+    // and poll for child exit. `try_wait` reaps the child once it returns `Some`.
+    let master_fd = master.as_raw_fd();
     let mut last_size = (rows, cols);
-    let mut escalate_deadline: Option<Instant> = None;
     let mut output_gone_at: Option<Instant> = None;
+    let mut fwd = SignalForwarder::new(child_pid);
     let status = loop {
         if let Some(size) = terminal_size(libc::STDIN_FILENO)
+            .or_else(|| terminal_size(libc::STDOUT_FILENO))
+            .or_else(|| terminal_size(libc::STDERR_FILENO))
             && size != last_size
         {
-            let _ = master.resize(PtySize {
-                rows: size.0,
-                cols: size.1,
-                pixel_width: 0,
-                pixel_height: 0,
-            });
+            set_pty_size(master_fd, size.0, size.1);
             last_size = size;
         }
 
-        // R20-002: a catchable termination signal — forward it to the child's
-        // process group once, then arm a grace window after which we escalate.
-        let sig = WRAP_PENDING_SIGNAL.swap(0, Ordering::SeqCst);
-        if sig != 0 && escalate_deadline.is_none() {
-            kill_child_group(&mut child, sig);
-            escalate_deadline = Some(Instant::now() + crate::agent_pty::AGENT_TERMINATE_GRACE);
-        }
+        // finding #12: forward a pending signal to the child group and escalate.
+        fwd.tick();
 
-        // R20-001: the output pump ended. On a PTY the master reader only EOFs
-        // once the child fully exits (a clean exit is caught by `try_wait`
-        // below), so an output pump that ends while the child is still alive
-        // means the DOWNSTREAM consumer closed — the child would then block on a
-        // full inner PTY. Give a short settle window, then terminate the group.
-        if output_done.load(Ordering::SeqCst) {
+        // R20-001: the terminal output pump ended while the child is still alive
+        // → the downstream terminal consumer closed; after a short settle window
+        // terminate the group so the child can't block on a full inner PTY.
+        if has_tty_output && output_done.load(Ordering::SeqCst) {
             let since = output_gone_at.get_or_insert_with(Instant::now);
-            if since.elapsed() >= Duration::from_millis(200) && escalate_deadline.is_none() {
-                kill_child_group(&mut child, libc::SIGTERM);
-                escalate_deadline = Some(Instant::now() + crate::agent_pty::AGENT_TERMINATE_GRACE);
+            if since.elapsed() >= Duration::from_millis(200) {
+                fwd.terminate_with(libc::SIGTERM);
             }
-        }
-
-        if let Some(deadline) = escalate_deadline
-            && Instant::now() >= deadline
-        {
-            kill_child_group(&mut child, libc::SIGKILL);
         }
 
         match child.try_wait() {
@@ -931,36 +1150,45 @@ fn run_wrap_pty(
             Ok(None) => {}
             Err(e) => {
                 eprintln!("Error: failed to wait on wrapped `{program}`: {e}");
-                kill_child_group(&mut child, libc::SIGKILL);
+                kill_pid_group(child_pid, libc::SIGKILL);
                 break None;
             }
         }
         std::thread::sleep(Duration::from_millis(50));
     };
 
-    // R20-001 cleanup: the direct child exited (or was killed). Drain the output
-    // tee with a BOUNDED wait instead of an unbounded join — a background
-    // descendant that retained the slave PTY keeps the reader blocked, so if the
-    // drain times out force the whole group down (which releases the slave and
-    // EOFs the reader), then reap. Never `join()` the pump: process exit reaps a
-    // still-blocked reader thread.
+    // R20-001 cleanup: the direct child exited (or was killed). Drain the
+    // terminal-output tee with a BOUNDED wait instead of an unbounded join — a
+    // background descendant that retained the slave PTY keeps the reader blocked,
+    // so if the drain times out force the whole group down (releasing the slave
+    // and EOFing the reader), then reap. Never `join()` that pump: process exit
+    // reaps a still-blocked reader thread.
     drop(master);
-    if !wait_flag(&output_done, Duration::from_millis(300)) {
-        kill_child_group(&mut child, libc::SIGTERM);
+    if has_tty_output && !wait_flag(&output_done, Duration::from_millis(300)) {
+        kill_pid_group(child_pid, libc::SIGTERM);
         if !wait_flag(&output_done, crate::agent_pty::AGENT_TERMINATE_GRACE) {
-            kill_child_group(&mut child, libc::SIGKILL);
+            kill_pid_group(child_pid, libc::SIGKILL);
             let _ = wait_flag(&output_done, Duration::from_millis(500));
         }
     }
     let _ = child.wait();
+    // The redirected-output tees see EOF once the child's pipe ends close (the
+    // child is reaped, or the group was killed above); join them so all output
+    // reaches the file/pipe before the final event.
+    if let Some(t) = out_pipe_thread {
+        let _ = t.join();
+    }
+    if let Some(t) = err_pipe_thread {
+        let _ = t.join();
+    }
     drop(output_thread);
 
     // PRD #20 finding #14: emit Idle only after a SUCCESSFUL exit; a nonzero /
     // signalled failure (or a wait error) ends as a visible Error rather than a
     // false idle card. Preserve the child's numeric exit code as the wrapper's
-    // own (truncated to a byte, as shells do); a wait failure maps to 1.
+    // own (truncated to a byte, as shells do); a signalled/wait failure maps to 1.
     let (success, code) = match status {
-        Some(s) => (s.success(), s.exit_code() as u8),
+        Some(s) => (s.success(), s.code().unwrap_or(1) as u8),
         None => (false, 1),
     };
     emitter.emit(if success {
@@ -996,6 +1224,18 @@ fn run_wrap_pipe(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
+    // finding #12: own the child's process group (no controlling terminal on
+    // this non-interactive path) and reset inherited signal dispositions, so a
+    // signal delivered to the wrapper is forwarded to and reaps the child.
+    // SAFETY: `child_pre_exec` performs only async-signal-safe libc calls.
+    unsafe {
+        cmd.pre_exec(|| child_pre_exec(-1));
+    }
+
+    // finding #12: install the restorable signal guard BEFORE spawning so a
+    // signal in the spawn window is recorded and forwarded, not fatal.
+    let _signal_guard = SignalGuard::install();
+
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -1003,6 +1243,7 @@ fn run_wrap_pipe(
             return ExitCode::FAILURE;
         }
     };
+    let child_pid = child.id() as libc::pid_t;
 
     emitter.emit(EventType::SessionStart);
 
@@ -1061,9 +1302,23 @@ fn run_wrap_pipe(
         drop(child_stdin);
     });
 
-    let status = child.wait();
-    // The child exited → its stdout/stderr pipe write ends close → the tees see
-    // EOF and finish. Join them so all output is flushed before the final event.
+    // finding #12: reap through a NON-blocking loop (never a bare blocking
+    // `child.wait`) so a catchable termination signal delivered to the wrapper
+    // is forwarded to the child group and escalated, guaranteeing the child is
+    // reaped rather than orphaned when the wrapper is signalled.
+    let mut fwd = SignalForwarder::new(child_pid);
+    let status = loop {
+        fwd.tick();
+        match child.try_wait() {
+            Ok(Some(s)) => break Ok(s),
+            Ok(None) => {}
+            Err(e) => break Err(e),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // The child exited (or was killed) → its stdout/stderr pipe write ends close
+    // → the tees see EOF and finish. Join them so all output is flushed before
+    // the final event.
     let _ = out_thread.join();
     let _ = err_thread.join();
     // The stdin pump may still block on our stdin; detach it (process exit reaps
@@ -1083,9 +1338,10 @@ fn run_wrap_pipe(
 }
 
 /// Spawn a tee thread copying `reader` verbatim to the raw fd `out_fd` while
-/// feeding completed lines through the shared classification `detector`. Used by
-/// the non-interactive pipe path for both stdout and stderr so the streams stay
-/// separate on their own outer fds.
+/// feeding completed lines through the shared classification `detector`. Used
+/// for every REDIRECTED descriptor on both wrap paths (the non-interactive pipe
+/// path's stdout/stderr, and a PTY-path descriptor that was redirected) so each
+/// stays separate on its own outer fd.
 fn spawn_pipe_tee<R: Read + Send + 'static>(
     reader: R,
     out_fd: RawFd,
@@ -1097,16 +1353,7 @@ fn spawn_pipe_tee<R: Read + Send + 'static>(
     let detector = Arc::clone(detector);
     std::thread::spawn(move || {
         tee(reader, FdWriter(out_fd), |line| {
-            let mut det = detector.lock().unwrap_or_else(|p| p.into_inner());
-            let ev = if is_codex {
-                det.observe_detected(classify_codex_line(line))
-            } else {
-                det.observe(line)
-            };
-            drop(det);
-            if let Some(ev) = ev {
-                emitter.emit(ev.event_type());
-            }
+            classify_and_emit(line, &detector, &emitter, is_codex);
         });
     })
 }
@@ -1333,5 +1580,70 @@ mod tests {
         assert!(!is_wrap_invocation("codex"));
         assert!(!is_wrap_invocation("dot-agent-deck daemon serve"));
         assert!(!is_wrap_invocation(""));
+    }
+
+    // PRD #20 finding #12 targeted coverage for the edges the subprocess harness
+    // (`tests/wrap_io.rs`, `codex/wrap/004`) left to the coder: the restorable
+    // pre-spawn signal guard and terminal-state restoration. Both mutate
+    // process-global disposition/termios but RESTORE it, and each `#[spec]`-free
+    // unit test runs isolated under nextest, so they cannot leak into siblings.
+
+    fn query_sigaction(sig: libc::c_int) -> libc::sigaction {
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: a null new-action only queries the current disposition.
+        unsafe {
+            libc::sigaction(sig, std::ptr::null(), &mut current);
+        }
+        current
+    }
+
+    /// The signal guard installs the wrap handler for SIGTERM/SIGHUP/SIGINT the
+    /// moment it is constructed — the pre-spawn window finding #12 requires — and
+    /// restores the previous disposition on drop so a returning wrapper leaves
+    /// the process's signal state as it found it.
+    #[test]
+    fn signal_guard_installs_before_spawn_and_restores_on_drop() {
+        let handler = handle_wrap_signal as *const () as libc::sighandler_t;
+        let before = query_sigaction(libc::SIGHUP).sa_sigaction;
+        {
+            let _guard = SignalGuard::install();
+            assert_eq!(query_sigaction(libc::SIGTERM).sa_sigaction, handler);
+            assert_eq!(query_sigaction(libc::SIGHUP).sa_sigaction, handler);
+            assert_eq!(query_sigaction(libc::SIGINT).sa_sigaction, handler);
+        }
+        assert_eq!(
+            query_sigaction(libc::SIGHUP).sa_sigaction,
+            before,
+            "dropping the guard restores the previous SIGHUP disposition"
+        );
+    }
+
+    /// The raw-mode guard puts a terminal into raw mode (clearing the canonical
+    /// line-discipline flags) and restores the ORIGINAL termios on drop, so a
+    /// signalled or normally-exiting wrapper never leaves the terminal in raw
+    /// mode.
+    #[test]
+    fn raw_mode_guard_restores_termios_on_drop() {
+        let (_master, slave) = open_inner_pty(24, 80).expect("open inner pty");
+        let fd = slave.as_raw_fd();
+        let read_lflag = || {
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(fd, &mut t) }, 0, "tcgetattr");
+            t.c_lflag
+        };
+        let before = read_lflag();
+        {
+            let _guard = RawModeGuard::enable(fd);
+            assert_ne!(
+                read_lflag(),
+                before,
+                "raw mode clears canonical/echo/signal line-discipline flags"
+            );
+        }
+        assert_eq!(
+            read_lflag(),
+            before,
+            "termios restored to the original on drop"
+        );
     }
 }
