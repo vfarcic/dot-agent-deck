@@ -65,10 +65,7 @@ fn invoke_codex_hook(payload: &serde_json::Value) -> AgentEvent {
     }
 }
 
-/// Scenario: Send Codex-native SessionStart, prompt, shell/apply_patch tool,
-/// Stop, and permission hook JSON through the real `hook --agent codex` CLI.
-/// Every emitted event must retain Codex identity and expose the corresponding
-/// lifecycle type, prompt text, tool name, and useful tool detail.
+/// Scenario: Send Codex-native SessionStart, prompt, shell/apply_patch tool, Stop, and permission hook JSON through the real `hook --agent codex` CLI. Every emitted event must retain Codex identity and expose the corresponding lifecycle type, prompt text, tool name, and useful tool detail.
 #[test]
 fn codex_hooks_001_native_payloads_emit_rich_codex_events() {
     let cases = [
@@ -132,7 +129,7 @@ fn codex_hooks_001_native_payloads_emit_rich_codex_events() {
                 "cwd": "/tmp/codex-hooks",
                 "tool_name": "apply_patch",
                 "tool_use_id": "patch-1",
-                "tool_input": {"patch": "*** Add File: codex_hook_patch.txt\n+hook parity"}
+                "tool_input": {"command": "*** Add File: codex_hook_patch.txt\n+hook parity"}
             }),
             EventType::ToolStart,
             Some("apply_patch"),
@@ -146,7 +143,7 @@ fn codex_hooks_001_native_payloads_emit_rich_codex_events() {
                 "cwd": "/tmp/codex-hooks",
                 "tool_name": "apply_patch",
                 "tool_use_id": "patch-1",
-                "tool_input": {"patch": "*** Add File: codex_hook_patch.txt\n+hook parity"},
+                "tool_input": {"command": "*** Add File: codex_hook_patch.txt\n+hook parity"},
                 "tool_response": {"status": "completed"}
             }),
             EventType::ToolEnd,
@@ -199,4 +196,30 @@ fn codex_hooks_001_native_payloads_emit_rich_codex_events() {
         assert_eq!(event.pane_id.as_deref(), Some("codex-hook-pane"));
         assert_eq!(event.agent_id.as_deref(), Some("codex-hook-agent"));
     }
+}
+
+/// Scenario: Send a schema-accurate Codex PostToolUse payload whose string tool response reports a non-zero exit while the session remains active. The hook command must emit an Error event immediately instead of reporting an ordinary ToolEnd.
+#[test]
+fn codex_hooks_002_failed_tool_emits_error_before_session_exit() {
+    let payload = serde_json::json!({
+        "session_id": "codex-hooks-session",
+        "turn_id": "codex-hooks-turn",
+        "hook_event_name": "PostToolUse",
+        "cwd": "/tmp/codex-hooks",
+        "model": "gpt-5.1-codex-mini",
+        "permission_mode": "default",
+        "transcript_path": null,
+        "tool_name": "Bash",
+        "tool_use_id": "shell-failed-1",
+        "tool_input": {"command": "sh -c 'exit 7'"},
+        "tool_response": "Exit code: 7\nWall time: 0 seconds\nOutput:\ncommand failed"
+    });
+
+    let event = invoke_codex_hook(&payload);
+    assert_eq!(event.agent_type, AgentType::Codex);
+    assert_eq!(
+        event.event_type,
+        EventType::Error,
+        "a failed Codex PostToolUse must surface Error before process exit; event={event:?} payload={payload}"
+    );
 }
