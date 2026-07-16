@@ -23,11 +23,25 @@
 //!
 //! The [`IntegrationStrategy::Wrapper`](crate::agent_registry::IntegrationStrategy::Wrapper)
 //! registry variant names this mechanism; Codex is its first consumer (M7).
+//!
+//! PRD #42 M8 (merge with #20): the wrapper RUNTIME (inner PTY via `openpty`,
+//! raw-mode termios, POSIX signal forwarding, `killpg`, `setsid`/`TIOCSCTTY`
+//! pre-exec) is Unix-only and carries a per-item `#[cfg(unix)]` gate; on Windows
+//! `run_wrap` is a compiling stub (a ConPTY port is #163/#164, matching the
+//! daemon/attach story). The PURE detection layer ([`classify_line`],
+//! [`Detector`], [`RuleSet`], [`CODEX`]) and the pure command rewrite
+//! ([`wrap_launch_command`], called by the cross-platform `agent_pty`/`ui` spawn
+//! seams) stay cross-platform. On non-Unix the Unix-only helpers compile out, so
+//! the pure helpers they alone consume are dead there — hence the conditional
+//! `allow` below (Unix keeps full linting).
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Command as StdCommand, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -435,8 +449,10 @@ fn session_id_for(pane_id: Option<&str>, program: &str) -> String {
 
 /// A `Write` that writes UNBUFFERED to a raw fd (the outer stdout), so the
 /// child's output passes through with minimal latency and no line buffering.
+#[cfg(unix)]
 struct FdWriter(RawFd);
 
+#[cfg(unix)]
 impl Write for FdWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let n = unsafe { libc::write(self.0, buf.as_ptr() as *const libc::c_void, buf.len()) };
@@ -453,6 +469,7 @@ impl Write for FdWriter {
 
 /// Read the current window size of the terminal on `fd` via `TIOCGWINSZ`.
 /// `None` when `fd` isn't a terminal or the ioctl fails / reports a zero size.
+#[cfg(unix)]
 fn terminal_size(fd: RawFd) -> Option<(u16, u16)> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
@@ -469,11 +486,13 @@ fn terminal_size(fd: RawFd) -> Option<(u16, u16)> {
 /// bytes and are forwarded to the INNER PTY, whose own line discipline turns
 /// `Ctrl+C` into `SIGINT` for the child and maps `\r`→`\n` for canonical reads.
 /// A no-op (and harmless) when `fd` is not a terminal (e.g. piped stdin).
+#[cfg(unix)]
 struct RawModeGuard {
     fd: RawFd,
     original: Option<libc::termios>,
 }
 
+#[cfg(unix)]
 impl RawModeGuard {
     fn enable(fd: RawFd) -> Self {
         if unsafe { libc::isatty(fd) } != 1 {
@@ -495,6 +514,7 @@ impl RawModeGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         if let Some(orig) = self.original {
@@ -599,6 +619,7 @@ fn codex_spawn_prep(program: &str, agent_type: &AgentType, pane_id: Option<&str>
 /// the child is always reaped — no raw-mode-left-on-signal, no orphaned child.
 static WRAP_PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
+#[cfg(unix)]
 extern "C" fn handle_wrap_signal(sig: libc::c_int) {
     WRAP_PENDING_SIGNAL.store(sig, Ordering::SeqCst);
 }
@@ -610,10 +631,12 @@ extern "C" fn handle_wrap_signal(sig: libc::c_int) {
 /// of terminating the wrapper outright and orphaning the child. `SA_RESTART` is
 /// intentionally NOT set so a blocked read returns `EINTR` and the loops react
 /// promptly; the pump read loops treat `Interrupted` as retry, not end-of-stream.
+#[cfg(unix)]
 struct SignalGuard {
     previous: Vec<(libc::c_int, libc::sigaction)>,
 }
 
+#[cfg(unix)]
 impl SignalGuard {
     fn install() -> Self {
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -634,6 +657,7 @@ impl SignalGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for SignalGuard {
     fn drop(&mut self) {
         for (sig, old) in &self.previous {
@@ -649,6 +673,7 @@ impl Drop for SignalGuard {
 /// that inherited its session are torn down too), falling back to the direct
 /// child pid if the group send fails. The child is `setsid`'d in its pre-exec
 /// (see [`child_pre_exec`]) so its process-group id equals its pid.
+#[cfg(unix)]
 fn kill_pid_group(pid: libc::pid_t, signal: libc::c_int) {
     if pid <= 0 {
         return;
@@ -668,11 +693,13 @@ fn kill_pid_group(pid: libc::pid_t, signal: libc::c_int) {
 /// (PRD #20 finding #12). Forwards the first catchable termination signal to the
 /// child's process group, arms a grace window, and escalates to `SIGKILL` once
 /// it elapses — so a signalled wrapper never orphans a long-running child.
+#[cfg(unix)]
 struct SignalForwarder {
     pid: libc::pid_t,
     escalate_deadline: Option<Instant>,
 }
 
+#[cfg(unix)]
 impl SignalForwarder {
     fn new(pid: libc::pid_t) -> Self {
         Self {
@@ -712,6 +739,7 @@ impl SignalForwarder {
 /// the inner PTY as the controlling terminal so line discipline (Ctrl+C→SIGINT),
 /// job control, and SIGWINCH work for an interactive child. Only async-signal-
 /// safe libc calls are used, as required between `fork` and `exec`.
+#[cfg(unix)]
 fn child_pre_exec(ctty_fd: RawFd) -> std::io::Result<()> {
     for signo in [
         libc::SIGTERM,
@@ -740,6 +768,7 @@ fn child_pre_exec(ctty_fd: RawFd) -> std::io::Result<()> {
 
 /// Open a fresh inner pseudo-terminal sized to `(rows, cols)`, returning the
 /// owned master and slave descriptors.
+#[cfg(unix)]
 fn open_inner_pty(rows: u16, cols: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
     let mut master: RawFd = -1;
     let mut slave: RawFd = -1;
@@ -768,6 +797,7 @@ fn open_inner_pty(rows: u16, cols: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
 
 /// Resize an open PTY master, which sends `SIGWINCH` to its foreground process
 /// group (the wrapped child).
+#[cfg(unix)]
 fn set_pty_size(fd: RawFd, rows: u16, cols: u16) {
     let ws = libc::winsize {
         ws_row: rows,
@@ -827,6 +857,19 @@ fn wait_flag(flag: &AtomicBool, timeout: Duration) -> bool {
 /// (no PTY line discipline), so `2>file`, stdout-only pipes, and binary/EOF
 /// stdin are preserved. Both paths tee the child's output through pattern
 /// detection into `AgentEvent`s and return the child's exit code.
+///
+/// PRD #42 M8: Windows compiling stub — the interactive wrapper runtime needs a
+/// ConPTY + Job-Object port (tracked by #163/#164), so on non-Unix this returns
+/// a failure rather than silently pretending to wrap. The pure
+/// [`wrap_launch_command`] rewrite and the detection layer remain available
+/// cross-platform.
+#[cfg(not(unix))]
+pub fn run_wrap(_agent_override: Option<&str>, _command: &[String]) -> ExitCode {
+    eprintln!("Error: `dot-agent-deck wrap` is not supported on this platform yet.");
+    ExitCode::FAILURE
+}
+
+#[cfg(unix)]
 pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     let Some((program, args)) = command.split_first() else {
         eprintln!(
@@ -909,6 +952,7 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
 /// robustness contract: cancellable output pump, owned child process group,
 /// catchable-signal forwarding + escalation, bounded post-exit drain, and an
 /// always-run reap so the terminal is restored on every exit path.
+#[cfg(unix)]
 fn run_wrap_pty(
     program: &str,
     args: &[String],
@@ -1206,6 +1250,7 @@ fn run_wrap_pty(
 /// the outer stdin byte-for-byte — closing the child's stdin on EOF so an
 /// EOF-sensitive child (`cat`) terminates. This preserves `2>file`, stdout-only
 /// pipes, and binary/partial stdin that the merged-PTY path would mangle.
+#[cfg(unix)]
 fn run_wrap_pipe(
     program: &str,
     args: &[String],
@@ -1342,6 +1387,7 @@ fn run_wrap_pipe(
 /// for every REDIRECTED descriptor on both wrap paths (the non-interactive pipe
 /// path's stdout/stderr, and a PTY-path descriptor that was redirected) so each
 /// stays separate on its own outer fd.
+#[cfg(unix)]
 fn spawn_pipe_tee<R: Read + Send + 'static>(
     reader: R,
     out_fd: RawFd,
@@ -1588,6 +1634,7 @@ mod tests {
     // process-global disposition/termios but RESTORE it, and each `#[spec]`-free
     // unit test runs isolated under nextest, so they cannot leak into siblings.
 
+    #[cfg(unix)]
     fn query_sigaction(sig: libc::c_int) -> libc::sigaction {
         let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
         // SAFETY: a null new-action only queries the current disposition.
@@ -1601,6 +1648,7 @@ mod tests {
     /// moment it is constructed — the pre-spawn window finding #12 requires — and
     /// restores the previous disposition on drop so a returning wrapper leaves
     /// the process's signal state as it found it.
+    #[cfg(unix)]
     #[test]
     fn signal_guard_installs_before_spawn_and_restores_on_drop() {
         let handler = handle_wrap_signal as *const () as libc::sighandler_t;
@@ -1622,6 +1670,7 @@ mod tests {
     /// line-discipline flags) and restores the ORIGINAL termios on drop, so a
     /// signalled or normally-exiting wrapper never leaves the terminal in raw
     /// mode.
+    #[cfg(unix)]
     #[test]
     fn raw_mode_guard_restores_termios_on_drop() {
         let (_master, slave) = open_inner_pty(24, 80).expect("open inner pty");

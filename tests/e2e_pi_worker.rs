@@ -59,9 +59,9 @@
 //! ## Reuse of the real-pi machinery (from `e2e_pi_orchestrator.rs`)
 //! An in-process daemon (`common::spawn_inprocess_daemon`, whose hook loop ingests
 //! `work-done` over the socket and re-broadcasts), and a REAL `pi` worker PTY whose
-//! HOME starts WITHOUT the extension — the deck's spawn-time auto-materialize
-//! (the `spawn_agent` seam, PRD #201) puts the bundled extension into that HOME
-//! before pi boots — spawned with `--provider openrouter --model
+//! HOME carries the bundled extension, staged into the location pi resolves from
+//! that HOME (production materializes it at daemon startup; this in-process daemon
+//! bypasses that entry, so the test stages it) — spawned with `--provider openrouter --model
 //! openai/gpt-5-nano --approve`. `OPENROUTER_API_KEY` + `HOME` (+ the pane/socket/
 //! PATH vars) are explicitly propagated into the pi child's `opts.env`; the key is
 //! NEVER printed (only checked non-empty for the runtime-skip). HEADLESS — a
@@ -151,9 +151,9 @@ fn path_with_binary_dir() -> String {
 /// Scenario: Bring up an in-process daemon, write a `.dot-agent-deck.toml`
 /// declaring a `coder` role whose command is a REAL `pi` and whose `clear`
 /// defaults to `true`, and spawn a REAL `pi` worker pane (IDLE) as that role. The
-/// worker's HOME starts WITHOUT the extension; the deck's spawn-time
-/// auto-materialize (the `spawn_agent` seam) puts the bundled extension into that
-/// HOME before pi boots. Register the orchestration maps (a synthetic,
+/// worker's HOME carries the bundled extension, staged (as the daemon-startup
+/// seam would) into the location pi resolves from that HOME before pi boots.
+/// Register the orchestration maps (a synthetic,
 /// un-spawned orchestrator pane plus the real pi worker pane, sharing the
 /// `pi-worker-orchestration` + cwd). Then, via the deterministic
 /// synthetic-delegate path, call `handle_delegate` with a `DelegateSignal` from
@@ -237,15 +237,20 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
     )
     .expect("write worker orchestration .dot-agent-deck.toml");
 
-    // --- WORKER: real pi whose HOME starts WITHOUT the extension. The deck's
-    // spawn-time auto-materialize (PRD #201, `spawn_agent` seam) detects the
-    // `pi` command and materializes the bundled extension into the HOME the pi
-    // child inherits (here `pi_home`, propagated via `opts.env` below) BEFORE pi
-    // boots — so the pi worker loads our tools (incl. the native `work_done`) +
-    // status reporting exactly like a production pi pane, via the real
-    // production flow rather than a hand-set-up shortcut. `pi_home` starts
-    // clean; no manual `orchestrator_ext::materialize` call.
+    // --- WORKER: real pi whose HOME carries the bundled extension. In production
+    // the extension is materialized ONCE at daemon startup
+    // (`orchestrator_ext::auto_materialize`, from the `daemon serve` entry); this
+    // in-process test daemon bypasses that entry, so we stage the extension here —
+    // into the SAME location pi resolves from `pi_home` (`<home>/.pi/agent/
+    // extensions/dot-agent-deck`) — mirroring the daemon-startup seam. `pi_home`
+    // is propagated as the pi child's HOME via `opts.env` below, so the worker
+    // loads our tools (incl. the native `work_done`) + status reporting exactly
+    // like a production pi pane.
     let pi_home = common::race_safe_tempdir();
+    dot_agent_deck::orchestrator_ext::materialize(
+        &dot_agent_deck::orchestrator_ext::extension_dir_under(pi_home.path()),
+    )
+    .expect("stage the bundled pi extension into the worker HOME");
 
     // CRITICAL (harness caveat): explicitly propagate OPENROUTER_API_KEY + HOME
     // (+ pane/socket/PATH) into the pi child. Never print the key. The pi worker

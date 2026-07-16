@@ -1,3 +1,9 @@
+// PRD #42 M8: this suite drives the attach protocol over a Unix-domain socket
+// (tokio::net::UnixStream) and is Unix-only at the source level. `#![cfg(unix)]`
+// makes the crate empty on Windows so the cross-platform test build compiles; on
+// Unix every test still runs exactly as before. A named-pipe port of this
+// harness for Windows is tracked by #164 (M10 — e2e on a Windows VM).
+#![cfg(unix)]
 //! Round-trip tests for the M1.2 streaming attach protocol. Each test spins
 //! up an in-process attach server bound to a tempdir socket, drives it with
 //! a UnixStream client, and verifies every message kind round-trips

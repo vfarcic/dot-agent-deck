@@ -1,3 +1,15 @@
+// PRD #42 M8: most of this harness (PTY spawning, Unix-domain sockets, libc
+// process-group signalling, mode-bit chmod) is Unix-only at the source level, so
+// those items carry a per-item `#[cfg(unix)]` gate. The genuinely cross-platform
+// helpers — the L1 vt100/render helpers (`nonblank_rows`, `joined_rows`), the
+// synthetic-agent submodule, and the legacy lock-dir helpers (`init_test_env`,
+// `race_safe_tempdir`, `lock_dir_path`) — are left ungated so the fast-tier test
+// files that use them (`render_button_bar.rs`, `render_layout.rs`,
+// `agent_event.rs`, `orchestration_delegate.rs`, `delegate_prompt_injection.rs`)
+// compile on the `x86_64-pc-windows-msvc` build-windows CI target too. A
+// wholesale module-level `#![cfg(unix)]` would drop those files' Windows
+// coverage. The Windows (ConPTY + named-pipe) port of the Unix-only harness is
+// tracked by #164 (M10).
 //! PRD #77 — TUI testing harness (L2 slice).
 //!
 //! Spawns the production `dot-agent-deck` binary inside a `portable-pty`
@@ -7,10 +19,11 @@
 //! deterministic; Decisions 12 + 21 + 28 govern per-test isolation,
 //! quiescence-based waits, and failure recordings.
 //!
-//! Intentionally compiled unconditionally so this single module can be
-//! shared by every L2 test under the `e2e` feature. The harness uses
-//! production deps only (`portable-pty`, `vt100`, `tempfile`, `libc`,
-//! `serde_json`), all already in `Cargo.toml`.
+//! The Unix-only harness items carry a per-item `#[cfg(unix)]` gate (see the
+//! file header) so this single module can be shared by every L2 test under the
+//! `e2e` feature while the cross-platform helpers still compile on Windows. The
+//! harness uses production deps only (`portable-pty`, `vt100`, `tempfile`,
+//! `libc`, `serde_json`), all already in `Cargo.toml`.
 
 #![allow(dead_code)]
 
@@ -203,11 +216,13 @@ impl TuiDeckBuilder {
     }
 
     // NOTE (PRD #201): a `with_pi_extension()` builder that pre-staged the
-    // bundled Pi extension into the per-test HOME was removed. The deck now
-    // AUTO-materializes the extension at spawn time (the `spawn_agent` seam
-    // detects the `pi` command and writes it into the HOME the pi child
-    // inherits, before pi boots), so the pi e2es exercise that production flow
-    // directly instead of a hand-staged shortcut.
+    // bundled Pi extension into the per-test HOME was removed. Because `TuiDeck`
+    // drives the REAL binary, its lazy-spawned daemon runs the `daemon serve`
+    // entry, whose daemon-startup auto-materialize writes the extension into the
+    // daemon's HOME (this per-test HOME, which the pi child inherits) before pi
+    // boots — so the TuiDeck pi e2es exercise that production flow directly. (The
+    // in-process-daemon pi e2es bypass that entry and stage the extension
+    // themselves via `orchestrator_ext::materialize`.)
 
     /// Stage a `keybindings.toml` in the per-test HOME's config dir
     /// (`$HOME/.config/dot-agent-deck/keybindings.toml`, mirroring the
@@ -355,11 +370,12 @@ impl TuiDeck {
         std::fs::create_dir_all(&home).expect("create per-test HOME");
 
         // PRD #201: the per-test HOME deliberately starts WITHOUT the bundled Pi
-        // extension. When a pi pane is spawned, the deck's spawn-time
-        // auto-materialize (the `spawn_agent` seam) detects the `pi` command and
-        // writes the extension into the HOME the pi child inherits (this per-test
-        // HOME) before pi boots — so the pi e2es exercise that production flow
-        // rather than a pre-staged shortcut.
+        // extension. Because `TuiDeck` drives the REAL binary, its lazy-spawned
+        // daemon runs the `daemon serve` entry, whose daemon-startup
+        // auto-materialize writes the extension into the daemon's HOME (this
+        // per-test HOME, which the pi child inherits) before pi boots — so the
+        // TuiDeck pi e2es exercise that production flow rather than a pre-staged
+        // shortcut.
 
         // PRD #40: stage the keybindings config the deck reads at
         // startup. Path mirrors `config_path()` in
@@ -953,6 +969,10 @@ impl TuiDeck {
     /// Subscribe to the daemon's broadcast event stream used by this attached
     /// deck. Wrapper e2es use it to inspect the typed event and schema version
     /// while separately asserting the same transition on the rendered grid.
+    ///
+    /// PRD #42 M8: returns the Unix-only `EventSub` (attach stream over a UDS),
+    /// so this accessor is Unix-gated like the harness it exposes.
+    #[cfg(unix)]
     pub fn subscribe_events(&self) -> EventSub {
         EventSub::open(&self.attach_socket).expect("open SubscribeEvents stream")
     }
@@ -1053,6 +1073,7 @@ impl Drop for TuiDeck {
         // as the fallback. (The deck's own lazy-spawned daemon setsid's into a
         // separate session and escapes this group — its
         // `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` cap is the net for that.)
+        #[cfg(unix)]
         if let Some(pid) = self.child.process_id() {
             // SAFETY: kill(2) with a negative pid signals the process group;
             // SIGKILL has no failure mode beyond ESRCH/EPERM, which we ignore.
@@ -2112,6 +2133,7 @@ fn toml_escape(s: &str) -> String {
 /// socket. Connects, writes the line + newline, and drops the
 /// connection. Synthetic-event tests use this to inject events
 /// without going through the `hook` subcommand.
+#[cfg(unix)]
 pub fn write_hook_line(socket: &Path, json_line: &str) -> std::io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     // The daemon binds the hook socket asynchronously after the TUI
@@ -2156,7 +2178,6 @@ pub fn write_hook_line(socket: &Path, json_line: &str) -> std::io::Result<()> {
 // `tmp/legacy-tests/tests/common/mod.rs`; only the surface those tests
 // import is reproduced here.
 
-use std::os::unix::fs::PermissionsExt as _LegacyPermissionsExt;
 use std::sync::OnceLock;
 
 #[allow(dead_code)]
@@ -2189,11 +2210,20 @@ pub fn lock_dir_path() -> Option<PathBuf> {
 /// `bind_socket` umask flip. Mirrors `src/daemon_attach.rs`'s
 /// same-named helper; promoted here so every legacy daemon-spawning
 /// test binary gets the fix without duplicating the workaround.
+///
+/// Cross-platform: the 0o700 chmod is Unix-only (mode bits). On Windows there
+/// are no POSIX mode bits and no umask race to close, so the chmod is skipped
+/// (the ACL-based equivalent is deferred to #163/#164). Unix behavior is
+/// unchanged.
 #[allow(dead_code)]
 pub fn race_safe_tempdir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("create tempdir");
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
-        .expect("chmod tempdir to 0o700");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod tempdir to 0o700");
+    }
     dir
 }
 
@@ -2217,6 +2247,7 @@ pub fn race_safe_tempdir() -> tempfile::TempDir {
 /// A spawned headless `dot-agent-deck daemon serve` process plus the per-test
 /// tempdir paths it was pointed at. Drop kills the child so a hung daemon
 /// never leaks past the test.
+#[cfg(unix)]
 #[allow(dead_code)]
 pub struct DaemonProc {
     child: std::process::Child,
@@ -2238,6 +2269,7 @@ pub struct DaemonProc {
     _tempdir: tempfile::TempDir,
 }
 
+#[cfg(unix)]
 #[allow(dead_code)]
 impl Drop for DaemonProc {
     fn drop(&mut self) {
@@ -2262,6 +2294,7 @@ impl Drop for DaemonProc {
 /// `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS` ("0" disables idle shutdown; a small
 /// number arms a fast idle window for the carve-out test). Blocks until the
 /// attach socket appears so callers can immediately drive the control protocol.
+#[cfg(unix)]
 #[allow(dead_code)]
 pub fn spawn_daemon_serve(
     initial_schedules_toml: Option<&str>,
@@ -2273,6 +2306,7 @@ pub fn spawn_daemon_serve(
 /// Like [`spawn_daemon_serve`] but layers `extra_env` onto the daemon's
 /// environment (and onto every `schedule` CLI subprocess). Used by the spawn
 /// tests to pin `SHELL` for the `$SHELL`-fallback case.
+#[cfg(unix)]
 #[allow(dead_code)]
 pub fn spawn_daemon_serve_with_env(
     initial_schedules_toml: Option<&str>,
@@ -2378,6 +2412,7 @@ pub fn spawn_daemon_serve_with_env(
     proc
 }
 
+#[cfg(unix)]
 #[allow(dead_code)]
 impl DaemonProc {
     /// Block until the attach socket file exists (the daemon finished
@@ -2744,6 +2779,7 @@ impl DaemonProc {
 /// reader thread drains `KIND_EVENT` frames into a shared buffer so a test can
 /// wait for a specific broadcast `AgentEvent`. All sleeping/polling is contained
 /// here in `common` (Decision 21), not in the e2e test body.
+#[cfg(unix)]
 #[allow(dead_code)]
 pub struct EventSub {
     events: Arc<Mutex<Vec<dot_agent_deck::event::AgentEvent>>>,
@@ -2751,6 +2787,7 @@ pub struct EventSub {
     handle: Option<JoinHandle<()>>,
 }
 
+#[cfg(unix)]
 #[allow(dead_code)]
 impl EventSub {
     /// Send a `SubscribeEvents` request, read the `KIND_RESP` ack synchronously
@@ -2833,6 +2870,7 @@ impl EventSub {
     }
 }
 
+#[cfg(unix)]
 #[allow(dead_code)]
 impl Drop for EventSub {
     fn drop(&mut self) {
@@ -2848,6 +2886,7 @@ impl Drop for EventSub {
 /// `Ok(None)` if `timeout` elapses before a full frame arrives. When
 /// `want_kind` is `Some`, a mismatching kind is an error; when `None`, any kind
 /// is returned. Shared by [`EventSub`]'s handshake and reader loop.
+#[cfg(unix)]
 #[allow(dead_code)]
 fn read_framed(
     stream: &mut std::os::unix::net::UnixStream,
@@ -2922,6 +2961,7 @@ fn count_occurrences(hay: &[u8], needle: &[u8]) -> usize {
 /// Send one `AttachRequest` over a daemon attach socket and read back the
 /// single `AttachResponse`. Blocking; shared by `DaemonProc` and the
 /// `TuiDeck`-driven tests (which pass `deck.attach_socket_path()`).
+#[cfg(unix)]
 #[allow(dead_code)]
 pub fn attach_request_on(
     socket: &Path,
@@ -2962,6 +3002,7 @@ pub fn attach_request_on(
 }
 
 /// Snapshot a daemon's live agent registry via `ListAgents` over `socket`.
+#[cfg(unix)]
 #[allow(dead_code)]
 pub fn agent_records_on(socket: &Path) -> Vec<dot_agent_deck::agent_pty::AgentRecord> {
     match attach_request_on(
@@ -2976,6 +3017,7 @@ pub fn agent_records_on(socket: &Path) -> Vec<dot_agent_deck::agent_pty::AgentRe
 /// Poll `ListAgents` until an agent whose `display_name` equals `name` is
 /// present (`want_present = true`) or absent (`want_present = false`), or the
 /// timeout elapses. Returns whether the desired condition held.
+#[cfg(unix)]
 #[allow(dead_code)]
 pub fn wait_for_agent_display_name(
     socket: &Path,
@@ -3068,6 +3110,7 @@ pub fn wait_for_path(path: &Path, timeout: Duration) -> bool {
 /// Blocking `read_exact` bounded by a wall-clock `deadline`, tolerating the
 /// per-read timeout set on the stream. Returns `Err` on EOF / hard error / the
 /// deadline passing before the buffer fills.
+#[cfg(unix)]
 #[allow(dead_code)]
 fn read_exact_with_deadline(
     stream: &mut std::os::unix::net::UnixStream,
@@ -3122,6 +3165,7 @@ pub fn wait_until<F: Fn() -> bool>(timeout: Duration, cond: F) -> bool {
 /// reparented-then-exited pid may briefly be a zombie — treat state `Z` as
 /// exited so the check isn't fooled by an unreaped zombie under a sub-reaper.
 /// Uses `/proc` on Linux and falls back to a `kill(pid, 0)` probe elsewhere.
+#[cfg(unix)]
 #[allow(dead_code)]
 pub fn process_running(pid: i32) -> bool {
     let stat_path = format!("/proc/{pid}/stat");
@@ -3191,6 +3235,7 @@ impl Drop for InProcDaemon {
 /// connections (so an agent's first CLI call can't race startup). Mirrors
 /// `e2e_delegate_work_done_chain.rs::spawn_daemon`, centralized so the readiness
 /// poll lives in `common`.
+#[cfg(unix)]
 #[allow(dead_code)]
 pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     use dot_agent_deck::daemon::{Daemon, run_daemon_with};

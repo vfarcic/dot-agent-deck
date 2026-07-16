@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.33.0] - 2026-07-14
+
+### Changed
+
+- **Attach-protocol bump: first-class `Pi` agent type (`PROTOCOL_VERSION` 4 → 5)**
+  Pi is now a first-class, status-tracked agent type, so `AgentType` gained a wire-serialized `pi` value. That value rides `AgentRecord.agent_type` (in the `ListAgents` response) and `AgentEvent.agent_type` (in the daemon→TUI `KIND_EVENT` broadcast) — both payloads a peer decodes as a whole. A build that predates this variant and lacks a catch-all fallback fails the entire response/frame decode when it sees `agent_type = "pi"`, breaking its agent list and live status stream. That is a non-forward-compatible payload-schema change (the same class as PRD #120's new `BroadcastMsg` variant), so this is classified `breaking` per rule 12 and `PROTOCOL_VERSION` bumped from 4 to 5, which the attach handshake refuses across.
+  Classification: this is a cross-version compatibility break for **pre-Pi readers** (an older TUI attached to a newer daemon that runs a Pi pane), not generic user-facing breakage. It supersedes the earlier "no `.breaking.md` needed" note, which was correct only for the purely additive `dot-agent-deck agent-event` subcommand — not for the enum addition.
+  Mitigation: `AgentType` now also carries a `#[serde(other)]` fallback that decodes any unrecognized value (a `pi` record at an old reader, or a future agent type at today's build) to the neutral `None` ("No agent") placeholder instead of erroring, so this build and every future one degrade gracefully — future agent-type additions need no further bump. Already-released pre-Pi binaries predate that fallback; for them the `PROTOCOL_VERSION` bump is the actual guard: the exact-match handshake turns an old-reader/new-daemon pairing into a clean connect-time `ProtocolMismatch` (recover by upgrading the reader) rather than a mid-session deserialize crash. On the local socket the same skew is already forced to a daemon restart by the build-version (`DAD_BUILD_ID`) handshake, which fires on any in-place binary upgrade. While the major version is `0`, a `breaking` fragment bumps the **minor** digit.
+
+### Added
+
+- **New-agent command defaults to the last executed command**
+  The new-agent form's Command field now pre-fills from the last command you launched when no `default_command` is configured, eliminating the need to retype the same command on every spawn.
+  The seed follows a strict fallback chain: if `default_command` is set in your config it wins unconditionally (no change for existing users); otherwise the field pre-fills from the most recent command you launched from the new-agent form; if no prior command exists (fresh install or cleared state) the field remains blank, preserving the current behavior. The value is global, persisted across deck restarts, and reflects the last command you launched from the form in any mode (schedule / issue-dispatch authoring included). The field remains editable; a wrong pre-fill costs a single clear.
+  See the [Configuration reference](https://agent-deck.devopstoolkit.ai/docs/configuration) for details on `default_command` and the fallback behavior.
+  Demo reel for PRD #196: https://youtu.be/I6A-uOEirEo
+- **Pi as a First-Class Agent**
+  [Pi](https://github.com/earendil-works/pi) is now a third, first-class, status-tracked agent type alongside `claude` and `opencode` — and its TypeScript extension API makes the orchestrator role deterministic instead of prompt-and-pray. `dot-agent-deck` does not bundle or vendor Pi itself (only a small extension is compiled into the binary); Pi is detected on `PATH` exactly like the other two agents.
+  For a Pi orchestrator, `delegate(role, task)` and `work-done(summary)` are now native, schema-validated tools instead of a CLI string the model has to remember to type correctly — calling the tool shells the existing `dot-agent-deck delegate` / `work-done` commands and the daemon routes to the worker pane exactly as it does today. Status reporting is event-driven: the bundled extension subscribes to Pi's own event bus and reports lifecycle/status through a new `dot-agent-deck agent-event --type <state>` subcommand, so a Pi pane shows running / waiting-for-input / finished in the TUI **with no Claude-Code-style hook installed and no `settings.json` mutation** — including headless, unattended panes with no client attached. Prompt delivery is native too: the extension pulls the pane's seed (a read-only `dot-agent-deck get-seed`) on `session_start` and delivers it through Pi's own `sendUserMessage`, so the orchestrator starts working without the deck typing into the terminal (PTY injection remains only as a bounded fallback). Because status plumbing lives at the `AgentType` level, a plain `pi` pane opened from the dashboard or a scheduled `pi` job are status-tracked the same way; the orchestrator flow is the flagship use case, not the only one.
+  Setup is zero-step: install `pi` (`npm install -g @earendil-works/pi-coding-agent`) and point a role at it with `command = "pi"` in `.dot-agent-deck.toml`. The deck **auto-materializes** the bundled extension into Pi's extension directory the first time it spawns a Pi pane — there is no manual install command to run. (`dot-agent-deck orchestrator setup` remains as an optional explicit path that detects `pi` on `PATH`, printing the install command if it's missing, and materializes the extension ahead of time.)
+  Pi ships visible by default — no feature flag to enable. It deliberately does not replace `claude`/`opencode`, remove hooks for non-Pi agents, or adopt Pi's own multi-agent orchestration — `dot-agent-deck`'s daemon remains the orchestrator-of-record.
+  See [Orchestration](https://agent-deck.devopstoolkit.ai/docs/orchestration) for setup and usage, and the [Pi extension developer guide](https://github.com/vfarcic/dot-agent-deck/blob/main/docs/develop/pi-extension.md) for the tool/event contract.
+  Demo reel for PRD #201: https://youtu.be/gSw9zc0Y54E
+
+
+
 ## [0.32.1] - 2026-07-11
 
 ### Fixed

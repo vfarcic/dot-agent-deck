@@ -1,6 +1,24 @@
 use std::path::{Path, PathBuf};
 
-fn plugin_subpath(root: &Path) -> PathBuf {
+/// The FLAT plugin file dot-agent-deck installs under an OpenCode config root:
+/// `<root>/plugin/dot-agent-deck.js`.
+///
+/// OpenCode discovers local plugins with a **one-level** glob
+/// (`{plugin,plugins}/*.{ts,js}` — no `**`), so the plugin must be a file
+/// directly under `plugin/`. The pre-existing nested layout
+/// (`<root>/plugin/dot-agent-deck/index.js`, see [`stale_plugin_dir`]) sat a
+/// directory too deep and was therefore never scanned — it silently never
+/// loaded, so the agent's card stayed "No agent". This flat path is what the
+/// glob actually matches.
+fn plugin_file(root: &Path) -> PathBuf {
+    root.join("plugin").join("dot-agent-deck.js")
+}
+
+/// The obsolete nested plugin directory (`<root>/plugin/dot-agent-deck/`) from
+/// before the flat-file layout. OpenCode never loaded it, but existing users
+/// still have it on disk; [`write_plugin`] deletes it when it installs the flat
+/// file so every user converges to the discoverable layout with no manual step.
+fn stale_plugin_dir(root: &Path) -> PathBuf {
     root.join("plugin").join("dot-agent-deck")
 }
 
@@ -14,21 +32,20 @@ fn xdg_config_root(home: &Path) -> PathBuf {
         .unwrap_or_else(|_| home.join(".config"))
 }
 
-/// The XDG-default plugin dir (`$XDG_CONFIG_HOME/opencode/plugin/dot-agent-deck`,
-/// defaulting to `$HOME/.config/opencode/...`). Used as the explicit-install fallback
-/// when no existing layout is found. Deliberately performs **no** existence checks:
-/// it is only ever evaluated after the caller has already determined that none of the
+/// The XDG-default OpenCode config root (`$XDG_CONFIG_HOME/opencode`, defaulting
+/// to `$HOME/.config/opencode`). Used as the explicit-install fallback root when
+/// no existing layout is found. Deliberately performs **no** existence checks: it
+/// is only ever evaluated after the caller has already determined that none of the
 /// candidate roots exist, so re-detecting them would be dead work.
-fn xdg_default_plugin_dir() -> PathBuf {
+fn xdg_default_root() -> PathBuf {
     let home = home_dir();
-    let xdg_default = xdg_config_root(&home).join("opencode");
-    plugin_subpath(&xdg_default)
+    xdg_config_root(&home).join("opencode")
 }
 
 /// All candidate OpenCode config roots, XDG first then legacy, **without** checking
 /// existence — that is the caller's job. This is the single source of truth for which
-/// layouts we touch, shared by `existing_plugin_dirs` (uninstall), `auto_install`, and
-/// `install`. Adding a future layout is a one-line change here.
+/// layouts we touch, shared by `existing_plugin_artifacts` (uninstall), `auto_install`,
+/// and `install`. Adding a future layout is a one-line change here.
 fn candidate_roots() -> Vec<PathBuf> {
     let home = home_dir();
     vec![
@@ -37,13 +54,23 @@ fn candidate_roots() -> Vec<PathBuf> {
     ]
 }
 
-/// All plugin dirs that currently exist on disk (XDG and legacy). For uninstall.
-fn existing_plugin_dirs() -> Vec<PathBuf> {
-    candidate_roots()
-        .iter()
-        .map(|r| plugin_subpath(r))
-        .filter(|p| p.exists())
-        .collect()
+/// All plugin artifacts that currently exist on disk across candidate roots (XDG
+/// and legacy): the flat `dot-agent-deck.js` file AND any obsolete nested
+/// `dot-agent-deck/` directory. For uninstall — so it clears both the current
+/// layout and the stale one an upgrade may have left behind.
+fn existing_plugin_artifacts() -> Vec<PathBuf> {
+    let mut artifacts = Vec::new();
+    for root in candidate_roots() {
+        let file = plugin_file(&root);
+        if file.exists() {
+            artifacts.push(file);
+        }
+        let stale = stale_plugin_dir(&root);
+        if stale.is_dir() {
+            artifacts.push(stale);
+        }
+    }
+    artifacts
 }
 
 fn plugin_template(binary_path: &str) -> String {
@@ -344,52 +371,70 @@ export default DotAgentDeckPlugin;
     )
 }
 
-/// Ensure `dir` exists and (over)write `index.js` with a plugin pinned to `binary_path`.
-/// Returns the path written. Shared by every install path (auto + explicit + test seam).
-fn write_plugin(dir: &Path, binary_path: &str) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
+/// Ensure `<root>/plugin/` exists and (over)write the flat `dot-agent-deck.js`
+/// pinned to `binary_path`, returning the file path written. Also removes any
+/// obsolete nested `dot-agent-deck/` directory (see [`stale_plugin_dir`]) so an
+/// upgrade migrates the layout in place. Shared by every install path
+/// (auto + explicit + test seam).
+fn write_plugin(root: &Path, binary_path: &str) -> std::io::Result<PathBuf> {
+    let plugin_dir = root.join("plugin");
+    std::fs::create_dir_all(&plugin_dir)?;
 
-    let path = dir.join("index.js");
+    // Migrate away from the pre-flat nested layout OpenCode never scanned.
+    // Best-effort: a failure to remove the dead dir must not abort the install
+    // of the working flat file.
+    let stale = stale_plugin_dir(root);
+    if stale.is_dir() {
+        let _ = std::fs::remove_dir_all(&stale);
+    }
+
+    let path = plugin_file(root);
     let content = plugin_template(binary_path);
     std::fs::write(&path, content)?;
 
     Ok(path)
 }
 
-fn uninstall_impl(dir: &PathBuf) -> std::io::Result<()> {
-    if !dir.exists() {
+/// Remove one plugin artifact — a flat file or an obsolete nested dir — and print
+/// a line naming what was removed. A missing path is reported, not an error.
+fn uninstall_impl(path: &PathBuf) -> std::io::Result<()> {
+    if !path.exists() {
         println!("No OpenCode plugin found to remove.");
         return Ok(());
     }
 
-    std::fs::remove_dir_all(dir)?;
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
 
-    println!("Removed OpenCode plugin: {}", dir.display());
+    println!("Removed OpenCode plugin: {}", path.display());
     Ok(())
 }
 
 /// Fan-out core for auto-install: for every candidate root that exists, refresh the
-/// plugin under `plugin/dot-agent-deck/`. Roots that don't exist are skipped — no
-/// speculative directory creation. Per-target failures are logged via `tracing::warn!`
-/// and never abort the remaining targets. Silent on stdout (dashboard startup path).
+/// flat `plugin/dot-agent-deck.js` (migrating away from any stale nested layout).
+/// Roots that don't exist are skipped — no speculative directory creation. Per-target
+/// failures are logged via `tracing::warn!` and never abort the remaining targets.
+/// Silent on stdout (dashboard startup path).
 fn auto_install_to(roots: &[PathBuf], binary_path: &str) {
     for root in roots {
         if !root.exists() {
             continue;
         }
-        let dir = plugin_subpath(root);
-        match write_plugin(&dir, binary_path) {
+        match write_plugin(root, binary_path) {
             Ok(path) => tracing::info!("auto-installed OpenCode plugin: {}", path.display()),
             Err(e) => tracing::warn!(
-                "auto-install: failed to write OpenCode plugin to {}: {e}",
-                dir.display()
+                "auto-install: failed to write OpenCode plugin under {}: {e}",
+                root.display()
             ),
         }
     }
 }
 
 /// Fan-out core for explicit install: write the plugin into every candidate root that
-/// exists; if none exist, fall back to `fallback_dir()` (the XDG-default plugin dir),
+/// exists; if none exist, fall back to `fallback_root()` (the XDG-default config root),
 /// creating it — the first-time-install behavior. The fallback closure is evaluated
 /// lazily, only when no layout exists, so the common path avoids the extra filesystem
 /// probe. Each successful write emits one `Installed OpenCode plugin: <path>` line to
@@ -397,30 +442,30 @@ fn auto_install_to(roots: &[PathBuf], binary_path: &str) {
 /// any) is returned so the caller surfaces it.
 fn install_to_roots(
     roots: &[PathBuf],
-    fallback_dir: impl FnOnce() -> PathBuf,
+    fallback_root: impl FnOnce() -> PathBuf,
     binary_path: &str,
     out: &mut impl std::io::Write,
 ) -> std::io::Result<()> {
     let mut targets: Vec<PathBuf> = Vec::new();
     for root in roots {
         if root.exists() {
-            targets.push(plugin_subpath(root));
+            targets.push(root.clone());
         }
     }
     if targets.is_empty() {
-        targets.push(fallback_dir());
+        targets.push(fallback_root());
     }
 
     let mut first_err: Option<std::io::Error> = None;
-    for dir in &targets {
-        match write_plugin(dir, binary_path) {
+    for root in &targets {
+        match write_plugin(root, binary_path) {
             Ok(path) => {
                 let _ = writeln!(out, "Installed OpenCode plugin: {}", path.display());
             }
             Err(e) => {
                 tracing::warn!(
-                    "install: failed to write OpenCode plugin to {}: {e}",
-                    dir.display()
+                    "install: failed to write OpenCode plugin under {}: {e}",
+                    root.display()
                 );
                 if first_err.is_none() {
                     first_err = Some(e);
@@ -452,28 +497,28 @@ pub fn install() -> std::io::Result<()> {
 
     install_to_roots(
         &candidate_roots(),
-        xdg_default_plugin_dir,
+        xdg_default_root,
         &binary_path,
         &mut std::io::stdout(),
     )
 }
 
 pub fn uninstall() -> std::io::Result<()> {
-    let dirs = existing_plugin_dirs();
-    if dirs.is_empty() {
+    let artifacts = existing_plugin_artifacts();
+    if artifacts.is_empty() {
         println!("No OpenCode plugin found to remove.");
         return Ok(());
     }
-    for dir in &dirs {
-        uninstall_impl(dir)?;
+    for artifact in &artifacts {
+        uninstall_impl(artifact)?;
     }
     Ok(())
 }
 
 // --- Testable versions that accept a custom path ---
 
-pub fn uninstall_from(dir: &PathBuf) -> std::io::Result<()> {
-    uninstall_impl(dir)
+pub fn uninstall_from(path: &PathBuf) -> std::io::Result<()> {
+    uninstall_impl(path)
 }
 
 #[cfg(test)]
@@ -497,24 +542,31 @@ mod tests {
         assert!(content.contains("\"permission.asked\""));
     }
 
+    /// The plugin must be a FLAT `.js` file directly under `plugin/` — that is the
+    /// only layout OpenCode's one-level `{plugin,plugins}/*.{ts,js}` glob discovers.
+    /// The obsolete nested dir sits a level deeper and is never scanned.
     #[test]
-    fn plugin_subpath_appends_plugin_and_name() {
+    fn plugin_file_is_flat_under_plugin_dir() {
         let root = PathBuf::from("/some/opencode");
         assert_eq!(
-            plugin_subpath(&root),
+            plugin_file(&root),
+            PathBuf::from("/some/opencode/plugin/dot-agent-deck.js")
+        );
+        assert_eq!(
+            stale_plugin_dir(&root),
             PathBuf::from("/some/opencode/plugin/dot-agent-deck")
         );
     }
 
     /// Read the installed plugin under `root` and assert its `BINARY_PATH` matches.
     fn assert_plugin_binary(root: &Path, binary_path: &str) {
-        let index = plugin_subpath(root).join("index.js");
-        let content = std::fs::read_to_string(&index)
-            .unwrap_or_else(|e| panic!("expected plugin at {}: {e}", index.display()));
+        let file = plugin_file(root);
+        let content = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("expected plugin at {}: {e}", file.display()));
         assert!(
             content.contains(&format!(r#"BINARY_PATH = "{binary_path}""#)),
             "plugin at {} should pin BINARY_PATH = {binary_path:?}",
-            index.display()
+            file.display()
         );
     }
 
@@ -543,7 +595,7 @@ mod tests {
 
         assert_plugin_binary(&legacy_root, "/bin/deck-legacy");
         assert!(!xdg_root.exists(), "absent XDG root must not be created");
-        assert!(!plugin_subpath(&xdg_root).exists());
+        assert!(!plugin_file(&xdg_root).exists());
     }
 
     #[test]
@@ -560,7 +612,7 @@ mod tests {
             !legacy_root.exists(),
             "absent legacy root must not be created"
         );
-        assert!(!plugin_subpath(&legacy_root).exists());
+        assert!(!plugin_file(&legacy_root).exists());
     }
 
     #[test]
@@ -574,8 +626,8 @@ mod tests {
 
         assert!(!xdg_root.exists());
         assert!(!legacy_root.exists());
-        assert!(!plugin_subpath(&xdg_root).exists());
-        assert!(!plugin_subpath(&legacy_root).exists());
+        assert!(!plugin_file(&xdg_root).exists());
+        assert!(!plugin_file(&legacy_root).exists());
     }
 
     #[test]
@@ -591,7 +643,7 @@ mod tests {
         auto_install_to(&roots, "/bin/deck-new");
 
         for root in [&xdg_root, &legacy_root] {
-            let content = std::fs::read_to_string(plugin_subpath(root).join("index.js")).unwrap();
+            let content = std::fs::read_to_string(plugin_file(root)).unwrap();
             assert!(content.contains(r#"BINARY_PATH = "/bin/deck-new""#));
             assert!(!content.contains(r#"BINARY_PATH = "/bin/deck-old""#));
         }
@@ -611,7 +663,7 @@ mod tests {
         auto_install_to(&[xdg_root.clone(), legacy_root.clone()], "/bin/deck-resil");
 
         assert_plugin_binary(&legacy_root, "/bin/deck-resil");
-        assert!(!plugin_subpath(&xdg_root).join("index.js").exists());
+        assert!(!plugin_file(&xdg_root).exists());
     }
 
     #[test]
@@ -621,12 +673,12 @@ mod tests {
         let legacy_root = tmp.path().join(".opencode");
         std::fs::create_dir_all(&xdg_root).unwrap();
         std::fs::create_dir_all(&legacy_root).unwrap();
-        let fallback = plugin_subpath(&tmp.path().join("fallback").join("opencode"));
+        let fallback_root = tmp.path().join("fallback").join("opencode");
 
         let mut out = Vec::new();
         install_to_roots(
             &[xdg_root.clone(), legacy_root.clone()],
-            || fallback.clone(),
+            || fallback_root.clone(),
             "/bin/deck-install",
             &mut out,
         )
@@ -635,7 +687,7 @@ mod tests {
         assert_plugin_binary(&xdg_root, "/bin/deck-install");
         assert_plugin_binary(&legacy_root, "/bin/deck-install");
         // Fallback NOT used because at least one layout existed.
-        assert!(!fallback.join("index.js").exists());
+        assert!(!plugin_file(&fallback_root).exists());
 
         // Stdout names every written path, one line per layout.
         let stdout = String::from_utf8(out).unwrap();
@@ -644,14 +696,8 @@ mod tests {
             .filter(|l| l.starts_with("Installed OpenCode plugin:"))
             .count();
         assert_eq!(lines, 2, "one line per written layout, got: {stdout:?}");
-        let xdg_index = plugin_subpath(&xdg_root)
-            .join("index.js")
-            .display()
-            .to_string();
-        let legacy_index = plugin_subpath(&legacy_root)
-            .join("index.js")
-            .display()
-            .to_string();
+        let xdg_index = plugin_file(&xdg_root).display().to_string();
+        let legacy_index = plugin_file(&legacy_root).display().to_string();
         assert!(stdout.contains(xdg_index.as_str()));
         assert!(stdout.contains(legacy_index.as_str()));
     }
@@ -661,18 +707,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let xdg_root = tmp.path().join(".config").join("opencode"); // absent
         let legacy_root = tmp.path().join(".opencode"); // absent
-        let fallback = plugin_subpath(&tmp.path().join(".config").join("opencode"));
+        let fallback_root = tmp.path().join(".config").join("opencode");
 
         let mut out = Vec::new();
         install_to_roots(
             &[xdg_root.clone(), legacy_root.clone()],
-            || fallback.clone(),
+            || fallback_root.clone(),
             "/bin/deck-fallback",
             &mut out,
         )
         .unwrap();
 
-        let content = std::fs::read_to_string(fallback.join("index.js")).unwrap();
+        let content = std::fs::read_to_string(plugin_file(&fallback_root)).unwrap();
         assert!(content.contains(r#"BINARY_PATH = "/bin/deck-fallback""#));
 
         let stdout = String::from_utf8(out).unwrap();
@@ -681,7 +727,7 @@ mod tests {
             .filter(|l| l.starts_with("Installed OpenCode plugin:"))
             .count();
         assert_eq!(lines, 1);
-        let fallback_index = fallback.join("index.js").display().to_string();
+        let fallback_index = plugin_file(&fallback_root).display().to_string();
         assert!(stdout.contains(fallback_index.as_str()));
     }
 
@@ -694,11 +740,11 @@ mod tests {
         std::fs::create_dir_all(&legacy_root).unwrap();
         std::fs::write(xdg_root.join("plugin"), b"not a dir").unwrap(); // block XDG
 
-        let fallback = plugin_subpath(&tmp.path().join("fallback"));
+        let fallback_root = tmp.path().join("fallback");
         let mut out = Vec::new();
         let result = install_to_roots(
             &[xdg_root.clone(), legacy_root.clone()],
-            || fallback.clone(),
+            || fallback_root.clone(),
             "/bin/deck-resil2",
             &mut out,
         );
@@ -711,5 +757,61 @@ mod tests {
         assert_plugin_binary(&legacy_root, "/bin/deck-resil2");
         let stdout = String::from_utf8(out).unwrap();
         assert!(stdout.contains("Installed OpenCode plugin:"));
+    }
+
+    /// Regression (the "OpenCode shows No agent" bug): a user upgrading from the
+    /// old nested layout has `plugin/dot-agent-deck/index.js` on disk, which
+    /// OpenCode's one-level glob never scanned. Installing must (a) write the flat
+    /// `plugin/dot-agent-deck.js` OpenCode DOES discover, and (b) delete the dead
+    /// nested dir so no stale copy lingers — converging every user with no manual
+    /// step.
+    #[test]
+    fn install_migrates_stale_nested_layout_to_flat_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".config").join("opencode");
+        // Seed the obsolete nested layout as an upgrade would leave it.
+        let stale_dir = stale_plugin_dir(&root);
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        std::fs::write(stale_dir.join("index.js"), b"// old nested plugin").unwrap();
+
+        auto_install_to(std::slice::from_ref(&root), "/bin/deck-migrated");
+
+        // Flat, discoverable file is present and current.
+        assert_plugin_binary(&root, "/bin/deck-migrated");
+        assert!(
+            plugin_file(&root).is_file(),
+            "flat plugin/dot-agent-deck.js must exist after install"
+        );
+        // The dead nested dir is gone.
+        assert!(
+            !stale_dir.exists(),
+            "stale nested plugin/dot-agent-deck/ dir must be removed on install"
+        );
+    }
+
+    /// Uninstall must clear BOTH the current flat file and any leftover nested dir,
+    /// so a machine that was never re-installed after the migration still ends up
+    /// clean.
+    #[test]
+    fn uninstall_impl_removes_flat_file_and_nested_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".config").join("opencode");
+
+        // A flat file...
+        let file = plugin_file(&root);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"// flat plugin").unwrap();
+        uninstall_impl(&file).unwrap();
+        assert!(!file.exists(), "flat plugin file must be removed");
+
+        // ...and, independently, a stale nested dir.
+        let stale_dir = stale_plugin_dir(&root);
+        std::fs::create_dir_all(&stale_dir).unwrap();
+        std::fs::write(stale_dir.join("index.js"), b"// old").unwrap();
+        uninstall_impl(&stale_dir).unwrap();
+        assert!(
+            !stale_dir.exists(),
+            "stale nested plugin dir must be removed"
+        );
     }
 }

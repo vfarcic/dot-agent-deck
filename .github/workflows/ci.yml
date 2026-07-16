@@ -27,6 +27,39 @@ jobs:
       - run: cargo build --release
       - run: cargo test
 
+  # PRD #42 M8 — native Windows (x86_64-pc-windows-msvc) compile + clippy +
+  # unit-test gate, running parallel to the Linux `build` job so a Windows-only
+  # break is visible independently. Uses rustup via dtolnay/rust-toolchain (the
+  # devbox/nix toolchain used locally is Linux-only) and the runner's native
+  # MSVC toolchain — no cross-compile lib.exe→ar shim (that was a Linux-only
+  # cross-check artifact; windows-latest archives natively).
+  #
+  # SCOPE: foundation gate only. The Unix-domain-socket daemon/attach/hook
+  # integration suites and the L2 PTY e2e suite are gated to Unix at the source
+  # level (#![cfg(unix)]), so they compile to empty crates here. Porting that
+  # harness to Windows named pipes + ConPTY and running full integration/e2e on
+  # a Windows VM is tracked by #164 (M10). aarch64-pc-windows-msvc is #164 (M9),
+  # not M8.
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo build
+      # Match the Linux `build` job's clippy invocation (no --all-targets) so a
+      # test-only lint can't fail Windows-only and be unreproducible on the
+      # Linux pre-push gate (PRD #42 review S1).
+      - run: cargo clippy -- -D warnings
+      # test-fast tier only (CLAUDE.md #5): protocol/state + L1 render tests.
+      # No `e2e` feature (needs real agents + LLM APIs) and no linkage-check /
+      # `cargo xtask docs` steps — those stay on the Linux job.
+      - run: cargo nextest run
+
   security:
     runs-on: ubuntu-latest
     steps:

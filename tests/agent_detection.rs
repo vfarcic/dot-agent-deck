@@ -1,6 +1,9 @@
 //! Fast command-detection coverage for wrapper-strategy launch forms.
 
 use dot_agent_deck::event::{AgentType, AgentType::Codex};
+// PRD #42 M8: the `#[spec]` tests below are Unix-gated (they drive the socket
+// harness), so the macro import is too — otherwise it is unused on Windows.
+#[cfg(unix)]
 use spec::spec;
 
 /// Scenario: Infer Codex from common shell command forms rather than only when

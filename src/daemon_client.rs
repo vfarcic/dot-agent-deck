@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::UnixStream;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+
+use crate::platform::ipc::{IpcReadHalf, IpcStream, IpcWriteHalf};
 
 pub use crate::agent_pty::{
     AgentRecord, TabMembership, validate_orchestration_surface, validate_tab_membership,
@@ -279,7 +279,7 @@ fn sanitize_record_tab_membership(rec: &mut AgentRecord) {
 // ---------------------------------------------------------------------------
 
 /// Thin handle around the daemon's attach socket path. Cheap to clone — every
-/// operation opens its own short-lived `UnixStream` (matching the daemon's
+/// operation opens its own short-lived [`IpcStream`] (matching the daemon's
 /// per-connection state machine in [`crate::daemon_protocol`]).
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
@@ -305,8 +305,8 @@ impl DaemonClient {
         Ok(())
     }
 
-    async fn connect(&self) -> io::Result<UnixStream> {
-        UnixStream::connect(&self.socket_path).await
+    async fn connect(&self) -> io::Result<IpcStream> {
+        IpcStream::connect(&self.socket_path).await
     }
 
     /// List daemon-side agents. Returns one [`AgentRecord`] per agent,
@@ -728,12 +728,14 @@ impl DaemonClient {
 /// receiver fell behind) or the socket drops. Callers reconnect via
 /// [`DaemonClient::subscribe_events`].
 pub struct EventSubscription {
-    rd: OwnedReadHalf,
+    rd: IpcReadHalf,
     /// Held purely as a lifetime signal: dropping the subscription drops
-    /// `_wr`, which half-closes the socket via `SHUT_WR`, which trips the
-    /// daemon's read-side disconnect detector and tears the per-connection
-    /// receiver down promptly. Never written to after the request.
-    _wr: OwnedWriteHalf,
+    /// `_wr`, which — on the Unix backend, whose [`IpcWriteHalf`] is
+    /// `tokio::net::unix::OwnedWriteHalf` — half-closes the socket via
+    /// `SHUT_WR`, tripping the daemon's read-side disconnect detector and
+    /// tearing the per-connection receiver down promptly. Never written to
+    /// after the request.
+    _wr: IpcWriteHalf,
 }
 
 impl EventSubscription {
@@ -804,8 +806,8 @@ impl EventSubscription {
 /// the next read returns the daemon-supplied scrollback snapshot, then live
 /// STREAM_OUT frames until the agent exits or the client detaches.
 pub struct AttachConnection {
-    rd: OwnedReadHalf,
-    wr: OwnedWriteHalf,
+    rd: IpcReadHalf,
+    wr: IpcWriteHalf,
 }
 
 impl AttachConnection {
@@ -840,7 +842,7 @@ impl AttachConnection {
 
     /// Split into owned halves for callers that drive read and write tasks
     /// concurrently (the typical pane wiring).
-    pub fn into_split(self) -> (OwnedReadHalf, OwnedWriteHalf) {
+    pub fn into_split(self) -> (IpcReadHalf, IpcWriteHalf) {
         (self.rd, self.wr)
     }
 }
@@ -848,21 +850,41 @@ impl AttachConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `spec::spec` is needed cross-platform by `pane_input_011` (a pure serde
+    // decode test that stays cross-platform below).
     use spec::spec;
+    // PRD #42 M8/review B1: the attach-server harness below binds a real
+    // listener at a filesystem tempdir path and spawns `/bin/sh`, neither of
+    // which exists on Windows (`IpcListener::bind` on a non-`\\.\pipe\` path
+    // → `ERROR_INVALID_NAME`; no `/bin/sh`). Gate the harness + the tests that
+    // use it to Unix so the Windows `cargo nextest run` step compiles and does
+    // not panic. The pure tests below (`ensure_socket_exists_reports_missing`,
+    // `sanitize_record_tab_membership_*`, `run_now_outcome_*`,
+    // `pane_input_011`) stay cross-platform. No Unix coverage is lost — all of
+    // these still run on Unix. (PRD #20's `pane_input_012`/`015` drive the
+    // socket harness, so they join the Unix-gated set.)
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(unix)]
     use std::sync::{Arc, Mutex};
+    #[cfg(unix)]
     use tempfile::TempDir;
 
+    #[cfg(unix)]
     use crate::agent_pty::AgentPtyRegistry;
+    #[cfg(unix)]
     use crate::daemon_protocol::{bind_attach_listener, serve_attach};
+    #[cfg(unix)]
     use tokio::sync::broadcast;
 
     /// Mirror the harness lock from `tests/daemon_protocol.rs`: `bind_socket`
     /// flips the process-global umask while binding, and a tempdir created
     /// inside that window inherits 0o600, breaking later binds. Hold this
     /// across tempdir+bind for any in-process attach server.
+    #[cfg(unix)]
     static BIND_LOCK: Mutex<()> = Mutex::new(());
 
+    #[cfg(unix)]
     async fn spawn_test_server() -> (TempDir, PathBuf, Arc<AgentPtyRegistry>) {
         let registry = Arc::new(AgentPtyRegistry::new());
         let (dir, path, listener) = {
@@ -889,6 +911,7 @@ mod tests {
         assert!(matches!(err, ClientError::SocketMissing(p) if p == missing));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn start_list_stop_round_trip() {
         let (_dir, path, registry) = spawn_test_server().await;
@@ -910,6 +933,7 @@ mod tests {
         assert!(registry.is_empty());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn start_agent_blank_command_returns_server_error() {
         let (_dir, path, _registry) = spawn_test_server().await;
@@ -924,6 +948,7 @@ mod tests {
         assert!(matches!(err, ClientError::Server(_)));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn attach_streams_output_and_input() {
         let (_dir, path, registry) = spawn_test_server().await;
@@ -998,6 +1023,9 @@ mod tests {
     /// Scenario: Have a synthetic daemon return the inconsistent combination
     /// `ok=false` with `send_result=applied`. The client must let the failure
     /// bit win and must not report successful delivery.
+    // PRD #42 M8: drives the Unix-domain-socket attach harness (`BIND_LOCK`,
+    // `bind_attach_listener`), so it is Unix-gated like the other harness tests.
+    #[cfg(unix)]
     #[spec("prompt/pane-input/012")]
     #[test]
     fn pane_input_012_ok_false_overrides_applied_send_result() {
@@ -1009,6 +1037,7 @@ mod tests {
         runtime.block_on(pane_input_012_ok_false_overrides_applied_send_result_inner());
     }
 
+    #[cfg(unix)]
     async fn pane_input_012_ok_false_overrides_applied_send_result_inner() {
         let (dir, path, listener) = {
             let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1018,7 +1047,9 @@ mod tests {
             (dir, path, listener)
         };
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept client");
+            // PRD #42 M2: `IpcListener::accept()` yields the stream directly (no
+            // `(stream, addr)` tuple like the raw `UnixListener`).
+            let mut stream = listener.accept().await.expect("accept client");
             let _request = read_frame(&mut stream).await.expect("read request frame");
             let response = AttachResponse {
                 ok: false,
@@ -1047,6 +1078,10 @@ mod tests {
     /// Scenario: Point a new identity-bearing send client at a synthetic older
     /// daemon whose handshake does not advertise guarded-send support. The client
     /// must fail before submitting rather than trust an unsafe legacy `ok=true`.
+    // PRD #42 M8: drives the Unix-domain-socket attach harness (`BIND_LOCK`,
+    // `bind_attach_listener`, `Arc`/`AtomicUsize`), so it is Unix-gated like the
+    // other harness tests.
+    #[cfg(unix)]
     #[spec("prompt/pane-input/015")]
     #[test]
     fn pane_input_015_guarded_send_fails_safe_without_daemon_capability() {
@@ -1058,6 +1093,7 @@ mod tests {
         runtime.block_on(pane_input_015_guarded_send_fails_safe_without_daemon_capability_inner());
     }
 
+    #[cfg(unix)]
     async fn pane_input_015_guarded_send_fails_safe_without_daemon_capability_inner() {
         let (dir, path, listener) = {
             let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1069,7 +1105,8 @@ mod tests {
         let submissions = Arc::new(AtomicUsize::new(0));
         let server_submissions = submissions.clone();
         let server = tokio::spawn(async move {
-            while let Ok(Ok((mut stream, _))) =
+            // PRD #42 M2: `IpcListener::accept()` yields the stream directly.
+            while let Ok(Ok(mut stream)) =
                 tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
             {
                 let Some((KIND_REQ, payload)) = read_frame(&mut stream)
