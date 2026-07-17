@@ -1531,6 +1531,13 @@ without depending on the config struct API.
 - **Does not assert:** the live-path title plumbing (already covered by the new-pane orchestration flow); the serde round-trip of the new field in isolation (a unit test the coder adds with the field).
 - **Platform coverage:** mac+linux.
 
+##### session/restore/014 — A restored pane whose command identifies a supported agent immediately shows that agent as Idle.
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
+- **Agent:** none (a test-owned executable named `opencode` runs `sleep 600`; no LLM or OpenCode hook event).
+- **Asserts:** restoring a saved plain pane whose command basename is `opencode` immediately renders an `Idle` card and never requires a hook event to replace the `No agent` placeholder identity.
+- **Does not assert:** OpenCode plugin delivery or later working/waiting transitions; restore fallback paths after a mode-tab failure.
+- **Platform coverage:** mac+linux.
+
 ### Live session status on reconnect (PRD #162)
 
 These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must attach the live, event-derived session state (a `SessionSnapshot` on each `AgentRecord`) so reconnected cards show real status instead of `Idle`/"No agent". The data already exists in `AppState.sessions` (built by `apply_event`, unchanged); this PRD only exposes it. The wire field `live: Option<SessionSnapshot>` is additive/optional — no `PROTOCOL_VERSION` bump.

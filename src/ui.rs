@@ -7087,10 +7087,9 @@ pub fn run_tui(
             // rounding once every restored pane is in the layout.
             let (rows, cols) =
                 dashboard_restore_pane_dims(&*pane, &tab_manager, terminal.get_frame().area());
-            // PRD #76 M2.13: infer agent_type from the restored command so
-            // the daemon's registry echo on reconnect carries the right
-            // type. Local-mode session card pick-up still happens via the
-            // next `SessionStart` hook.
+            // Infer the agent type once so both the daemon registry and the
+            // local placeholder identify a recognized command immediately.
+            let agent_type = AgentType::from_command(cmd);
             match pane.create_pane_with_options(
                 cmd,
                 Some(&saved_pane.dir),
@@ -7099,7 +7098,7 @@ pub fn run_tui(
                     tab_membership: None,
                     rows,
                     cols,
-                    agent_type: AgentType::from_command(cmd),
+                    agent_type: agent_type.clone(),
                     // PRD #201: single-pane spawn — no native seed.
                     seed: None,
                 },
@@ -7116,15 +7115,10 @@ pub fn run_tui(
                     {
                         let mut st = state.blocking_write();
                         st.register_pane(new_id.clone());
-                        // PRD #76 M2.13: the daemon-bound spawn above tags
-                        // the registry entry with the inferred agent type so
-                        // a later reconnect's hydration knows it; the local
-                        // placeholder stays at `None` until the next
-                        // `SessionStart` hook fires (pre-M2.13 contract).
                         st.insert_placeholder_session(
                             new_id.clone(),
                             Some(saved_pane.dir.clone()),
-                            None,
+                            agent_type,
                             new_agent_id,
                         );
                     }
@@ -7281,7 +7275,7 @@ pub fn run_tui(
                                         st.insert_placeholder_session(
                                             fb_id.clone(),
                                             Some(saved_pane.dir.clone()),
-                                            None,
+                                            fb_agent_type,
                                             fb_agent_id,
                                         );
                                     }
@@ -7348,7 +7342,7 @@ pub fn run_tui(
                                 st.insert_placeholder_session(
                                     fb_id.clone(),
                                     Some(saved_pane.dir.clone()),
-                                    None,
+                                    fb_agent_type,
                                     fb_agent_id,
                                 );
                             }
