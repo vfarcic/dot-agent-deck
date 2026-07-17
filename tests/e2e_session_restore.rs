@@ -855,7 +855,11 @@ fn restore_014_recognized_agent_is_idle_before_first_hook() {
     deck.wait_for_string("restored-opencode");
     let idle = common::wait_until(Duration::from_secs(10), || {
         let grid = deck.snapshot_grid();
-        grid.contains("Idle") && !grid.contains("No agent")
+        grid.lines().any(|line| {
+            line.contains("restored-opencode")
+                && line.contains("Idle")
+                && !line.contains("No agent")
+        })
     });
     assert!(
         idle,
