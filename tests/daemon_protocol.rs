@@ -1432,6 +1432,172 @@ fn pane_input_019_late_events_cannot_regress_or_clear_generation() {
     });
 }
 
+/// Scenario: Send guarded prompts to pane-less agents through the no-pane sentinel. A declared history-only target must reject both before and after the writer lock without receiving bytes, while a declared live target must still receive its prompt.
+#[spec("prompt/pane-input/020")]
+#[test]
+fn pane_input_020_paneless_guarded_send_resolves_writability_by_agent() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build pane-less guarded-send runtime");
+    runtime.block_on(async {
+        let paneless_event = |agent_id: &str,
+                               session_id: &str,
+                               event_type,
+                               timestamp,
+                               writable| AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::Codex,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp,
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: None,
+            agent_id: Some(agent_id.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(LiveTarget {
+                kind: TargetKind::Process,
+                writable,
+            }),
+        };
+
+        let server = start_server().await;
+        let agent_id = start_agent(&server, "/bin/sh").await;
+        server.state.write().await.apply_event(paneless_event(
+            &agent_id,
+            "paneless-pre-lock-history",
+            EventType::SessionStart,
+            chrono::Utc::now(),
+            Writable::HistoryOnly,
+        ));
+        let mut attached = connect_attach(&server, &agent_id).await;
+        let history_response = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": "<no-pane>",
+                "text": "printf 'PANELESS-PRELOCK-HISTORY-LEAKED\\n'",
+                "expected_agent_id": agent_id,
+                "delivery_id": "paneless-pre-lock-history-020"
+            }),
+        )
+        .await;
+        let history_leaked = stream_contains_within(
+            &mut attached,
+            b"PANELESS-PRELOCK-HISTORY-LEAKED",
+            Duration::from_millis(500),
+        )
+        .await;
+        let history_observation = (history_response.send_result, history_leaked);
+        server.registry.close_agent(&agent_id).unwrap();
+
+        let server = start_server().await;
+        let agent_id = start_agent(&server, "/bin/sh").await;
+        let now = chrono::Utc::now();
+        server.state.write().await.apply_event(paneless_event(
+            &agent_id,
+            "paneless-post-lock-history",
+            EventType::SessionStart,
+            now,
+            Writable::Live,
+        ));
+        let mut attached = connect_attach(&server, &agent_id).await;
+        let writer = server.registry.subscribe(&agent_id).unwrap().writer;
+        let writer_guard = writer.lock().await;
+        let path = server.path.clone();
+        let request_agent_id = agent_id.clone();
+        let mut request_task = tokio::spawn(async move {
+            let mut stream = UnixStream::connect(path).await.unwrap();
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": "<no-pane>",
+                "text": "printf 'PANELESS-POSTLOCK-HISTORY-LEAKED\\n'",
+                "expected_agent_id": request_agent_id,
+                "delivery_id": "paneless-post-lock-history-020"
+            }))
+            .unwrap();
+            write_frame(&mut stream, KIND_REQ, &payload).await;
+            read_response(&mut stream).await
+        });
+        let early_response = tokio::time::timeout(Duration::from_millis(250), &mut request_task)
+            .await
+            .ok()
+            .map(|result| result.unwrap());
+        let waited_for_writer = early_response.is_none();
+        server.state.write().await.apply_event(paneless_event(
+            &agent_id,
+            "paneless-post-lock-history",
+            EventType::Thinking,
+            now + chrono::Duration::seconds(1),
+            Writable::HistoryOnly,
+        ));
+        drop(writer_guard);
+        let post_lock_response = match early_response {
+            Some(response) => response,
+            None => request_task.await.unwrap(),
+        };
+        let post_lock_leaked = stream_contains_within(
+            &mut attached,
+            b"PANELESS-POSTLOCK-HISTORY-LEAKED",
+            Duration::from_millis(500),
+        )
+        .await;
+        let post_lock_observation = (
+            waited_for_writer,
+            post_lock_response.send_result,
+            post_lock_leaked,
+        );
+        server.registry.close_agent(&agent_id).unwrap();
+
+        let server = start_server().await;
+        let agent_id = start_agent(&server, "/bin/sh").await;
+        server.state.write().await.apply_event(paneless_event(
+            &agent_id,
+            "paneless-live",
+            EventType::SessionStart,
+            chrono::Utc::now(),
+            Writable::Live,
+        ));
+        let mut attached = connect_attach(&server, &agent_id).await;
+        let live_response = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": "<no-pane>",
+                "text": "printf 'PANELESS-LIVE-DELIVERED\\n'",
+                "expected_agent_id": agent_id,
+                "delivery_id": "paneless-live-020"
+            }),
+        )
+        .await;
+        let live_reached = stream_contains_within(
+            &mut attached,
+            b"PANELESS-LIVE-DELIVERED",
+            Duration::from_millis(750),
+        )
+        .await;
+        let live_observation = (live_response.send_result, live_reached);
+        server.registry.close_agent(&agent_id).unwrap();
+
+        assert!(
+            history_observation == (Some(SendResult::HistoryOnly), false)
+                && post_lock_observation.0
+                && !matches!(
+                    post_lock_observation.1,
+                    Some(SendResult::Applied | SendResult::Queued)
+                )
+                && !post_lock_observation.2
+                && live_observation == (Some(SendResult::Applied), true),
+            "guarded sends must resolve pane-less writability and routing by agent identity; pre_lock={history_observation:?}, post_lock={post_lock_observation:?}, live={live_observation:?}"
+        );
+    });
+}
+
 /// Scenario: Retry identical deliveries sequentially and concurrently, then reuse
 /// an ID with a different payload or target. Identical work must submit once,
 /// while conflicting fingerprints must never replay a false successful result.

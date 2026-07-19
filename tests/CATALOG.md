@@ -612,6 +612,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** transport-level event reordering before `AppState::apply_event`.
 - **Platform coverage:** mac+linux.
 
+##### prompt/pane-input/020 — Guarded sends resolve pane-less writability and routing by agent identity (PRD #20 Greptile P1).
+- **Layer:** L1 protocol integration with an in-process Unix-domain socket daemon, held writer mutex, and real PTY-backed shells.
+- **Agent:** synthetic Codex live and history-only events bound by agent identity to pane-less `/bin/sh` targets.
+- **Asserts:** pre-lock history-only sends return `history-only` without bytes, a live-to-history transition while waiting for the writer is rejected after the lock, and a live pane-less target still receives its guarded prompt.
+- **Does not assert:** visible TUI feedback for the returned result.
+- **Platform coverage:** mac+linux.
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.
