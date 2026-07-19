@@ -1402,7 +1402,32 @@ async fn handle_connection(
             // write) on a rebind, and (c) re-validates liveness AFTER acquiring
             // the target's writer, closing the TOCTOU where a pane goes
             // history-only / rebinds while the send waits for the writer.
-            let extras: WriteAndSubmitExtras = serde_json::from_slice(&frame.1).unwrap_or_default();
+            // PRD #20 Greptile finding #1 (fail closed on malformed guards): the
+            // base `WriteAndSubmit { pane_id, text }` shape already decoded, so
+            // the ONLY way this strict re-parse of the SAME payload can fail is a
+            // guarded-send identity key (`expected_agent_id` / `expected_session_id`
+            // / `delivery_id`) that is PRESENT but has the wrong JSON type (every
+            // field is `Option<String>` with `#[serde(default)]`, and unknown keys
+            // are ignored). An ABSENT guard set (a legacy / non-guarded client)
+            // still decodes cleanly to all-`None` and degrades to pane-only
+            // authorization — the cross-version fail-safe is preserved. A
+            // present-but-malformed guard must REJECT and write nothing, rather
+            // than silently dropping every identity check via `unwrap_or_default`
+            // and proceeding UNGUARDED (which could reach a rebound pane or
+            // double-submit).
+            let extras: WriteAndSubmitExtras = match serde_json::from_slice(&frame.1) {
+                Ok(extras) => extras,
+                Err(e) => {
+                    write_resp(
+                        &mut stream,
+                        &AttachResponse::err(format!(
+                            "malformed guarded-send identity — refusing unguarded write: {e}"
+                        )),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
 
             match extras.delivery_id.as_deref() {
                 // No idempotency key (legacy / non-guarded caller): compute once,
@@ -1679,6 +1704,28 @@ async fn handle_subscribe_events(
     Ok(())
 }
 
+/// PRD #20 Greptile finding #6: capacity of the per-attach `KIND_STREAM_IN`
+/// rejection channel. Bounded so a client that keeps typing into a history-only
+/// / view-only target during sustained PTY output — where the output task biases
+/// toward `KIND_STREAM_OUT` and drains rejections slowly — cannot grow the
+/// daemon's memory without limit. Rejections are coalesceable (the client only
+/// needs to learn its input was refused so it can leave its input mode), so a
+/// full queue drops the newest reason rather than blocking the input loop.
+const REJECT_QUEUE_CAP: usize = 64;
+
+/// Best-effort, NON-BLOCKING enqueue of a typed `KIND_STREAM_IN` rejection reason
+/// onto the bounded reject channel (finding #6). On a full queue the reason is
+/// dropped and logged — never awaited — so a flooding client can neither
+/// back-pressure the input loop nor grow the queue past [`REJECT_QUEUE_CAP`].
+fn enqueue_reject(tx: &tokio::sync::mpsc::Sender<Vec<u8>>, reason: &'static [u8]) {
+    if tx.try_send(reason.to_vec()).is_err() {
+        tracing::debug!(
+            target: "pane_write",
+            "STREAM_IN rejection dropped — reject queue full (bounded) or closed"
+        );
+    }
+}
+
 async fn handle_attach_stream(
     stream: IpcStream,
     registry: Arc<AgentPtyRegistry>,
@@ -1739,14 +1786,28 @@ async fn handle_attach_stream(
         Some(s) => s.clone(),
         None => "<no-pane>".to_string(),
     };
+    // PRD #20 Greptile finding #3: a daemon-side agent that carried no pane id.
+    // `pane_writable("<no-pane>")` can never find its session (that session is
+    // stored with `pane_id == None`) and would fall through to the `Live`
+    // default — so a history-only / view-only paneless target would still accept
+    // `KIND_STREAM_IN`. For such a target the input loop resolves writability by
+    // AGENT identity (`agent_writable`) instead, failing closed on a declared
+    // non-live session while a paneless target with no declared session keeps the
+    // historical `Live` default.
+    let is_paneless = pane_id == "<no-pane>";
 
     // PRD #20 R20-007 (finding #10): the input loop rejects a key/paste frame
     // when the target went non-live/exited/rebound, but `wr` is owned by the
     // output task below — so it hands the typed reason to the output task over
     // this channel, which serializes it onto the wire as a non-terminal
-    // `KIND_STREAM_REJECT` frame. Unbounded is fine: rejections are rare and
-    // small, and the receiver drains promptly.
-    let (reject_tx, mut reject_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    // `KIND_STREAM_REJECT` frame.
+    //
+    // PRD #20 Greptile finding #6: the channel is BOUNDED (was unbounded). A
+    // client flooding a history-only target with keystrokes while the output task
+    // biases toward PTY output would otherwise grow this queue until the daemon
+    // exhausts memory. Rejections are coalesceable, so [`enqueue_reject`] drops
+    // the newest reason on a full queue instead of awaiting or growing it.
+    let (reject_tx, mut reject_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(REJECT_QUEUE_CAP);
 
     // Output task: forward broadcast bytes → STREAM_OUT frames, and input-loop
     // rejection reasons → STREAM_REJECT frames. Owns `wr` for the duration of
@@ -1844,10 +1905,22 @@ async fn handle_attach_stream(
                         payload_len = bytes.len(),
                         "STREAM_IN rejected — target agent has exited"
                     );
-                    let _ = reject_tx.send(b"exited".to_vec());
+                    enqueue_reject(&reject_tx, b"exited");
                     continue;
                 }
-                if state.read().await.pane_writable(&pane_id) != crate::event::Writable::Live {
+                // Finding #3: resolve by agent identity for a paneless target, by
+                // pane otherwise. Both default to `Live` when nothing is declared,
+                // so an ordinary shell is unaffected; a declared non-live target
+                // (paneless or paned) fails closed.
+                let pre_lock_writable = {
+                    let guard = state.read().await;
+                    if is_paneless {
+                        guard.agent_writable(&id)
+                    } else {
+                        guard.pane_writable(&pane_id)
+                    }
+                };
+                if pre_lock_writable != crate::event::Writable::Live {
                     tracing::debug!(
                         target: "pane_write",
                         agent_id = %id,
@@ -1855,7 +1928,7 @@ async fn handle_attach_stream(
                         payload_len = bytes.len(),
                         "STREAM_IN rejected — target is not live (history-only / view-only)"
                     );
-                    let _ = reject_tx.send(b"history-only".to_vec());
+                    enqueue_reject(&reject_tx, b"history-only");
                     continue;
                 }
                 let mut w = writer.lock().await;
@@ -1870,7 +1943,7 @@ async fn handle_attach_stream(
                 // typed frame and keep the stream open.
                 if exited.load(std::sync::atomic::Ordering::SeqCst) {
                     drop(w);
-                    let _ = reject_tx.send(b"exited".to_vec());
+                    enqueue_reject(&reject_tx, b"exited");
                     continue;
                 }
                 // The pane→agent ownership re-check only applies to an agent
@@ -1878,24 +1951,34 @@ async fn handle_attach_stream(
                 // pane (`<no-pane>`) has no pane→agent mapping to re-resolve, and
                 // its stream is bound directly to the agent's own writer, so skip
                 // the check (it would spuriously find no owner and reject).
-                if pane_id != "<no-pane>" {
+                if !is_paneless {
                     match registry.pane_current_agent_id(&pane_id) {
                         Some(current) if current == id => {}
                         Some(_) => {
                             drop(w);
-                            let _ = reject_tx.send(b"wrong-session".to_vec());
+                            enqueue_reject(&reject_tx, b"wrong-session");
                             continue;
                         }
                         None => {
                             drop(w);
-                            let _ = reject_tx.send(b"stale".to_vec());
+                            enqueue_reject(&reject_tx, b"stale");
                             continue;
                         }
                     }
                 }
-                if state.read().await.pane_writable(&pane_id) != crate::event::Writable::Live {
+                // Finding #3: re-validate writability under the held writer, by
+                // agent identity for a paneless target and by pane otherwise.
+                let post_lock_writable = {
+                    let guard = state.read().await;
+                    if is_paneless {
+                        guard.agent_writable(&id)
+                    } else {
+                        guard.pane_writable(&pane_id)
+                    }
+                };
+                if post_lock_writable != crate::event::Writable::Live {
                     drop(w);
-                    let _ = reject_tx.send(b"history-only".to_vec());
+                    enqueue_reject(&reject_tx, b"history-only");
                     continue;
                 }
                 // PRD #128 (cherry-picked from PR #122): byte-level trace
@@ -1959,6 +2042,42 @@ async fn handle_attach_stream(
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// PRD #20 Greptile finding #6 (coder-authored): the per-attach STREAM_IN
+    /// rejection channel must be BOUNDED so a client flooding a history-only /
+    /// view-only target with keystrokes — while the output task biases toward PTY
+    /// output and drains rejections slowly — cannot grow the daemon's memory
+    /// without limit. Flood the channel far past its capacity WITHOUT draining
+    /// (modeling exactly that backlog) and prove: every enqueue returns without
+    /// blocking, and the queue never holds more than [`REJECT_QUEUE_CAP`] items —
+    /// the flood is dropped/coalesced, not buffered. Before the fix the channel
+    /// was `unbounded_channel`, so this backlog would hold all
+    /// `REJECT_QUEUE_CAP * 100` items instead of the cap.
+    #[tokio::test]
+    async fn reject_queue_is_bounded_under_flood() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(REJECT_QUEUE_CAP);
+        // A flooding client keeps typing into a non-live target; the receiver
+        // (output task) is busy with PTY output and never drains here.
+        let flood = REJECT_QUEUE_CAP * 100;
+        for _ in 0..flood {
+            // `enqueue_reject` must be strictly non-blocking; if it ever awaited
+            // or panicked on a full queue, this loop would hang or fail.
+            enqueue_reject(&tx, b"history-only");
+        }
+        let mut buffered = 0usize;
+        while rx.try_recv().is_ok() {
+            buffered += 1;
+        }
+        assert!(
+            buffered <= REJECT_QUEUE_CAP,
+            "reject queue grew past its bound: buffered {buffered} > cap {REJECT_QUEUE_CAP} \
+             (a flood of {flood} rejections must be coalesced/dropped, not buffered)"
+        );
+        assert_eq!(
+            buffered, REJECT_QUEUE_CAP,
+            "an undrained flood should fill the bounded queue exactly to its cap"
+        );
+    }
 
     #[tokio::test]
     async fn frame_round_trip() {

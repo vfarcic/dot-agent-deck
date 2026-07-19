@@ -275,7 +275,15 @@ pub struct AppState {
     /// The atomic write-and-submit guard compares the caller's expected session
     /// against [`Self::pane_hook_session_id`] (this map) instead, so a stale
     /// generation is refused with no bytes. Cleared on `SessionEnd`.
-    pane_hook_session: HashMap<String, String>,
+    ///
+    /// PRD #20 Greptile finding #4 (monotonic generation): the value is a
+    /// `(session_id, established_at)` pair, NOT just the id. The generation only
+    /// advances on a genuinely newer session (an incoming id different from the
+    /// current one whose event timestamp is `>=` the established one); an
+    /// out-of-order / older-generation event is IGNORED so a delayed prior-event
+    /// can neither restore a stale id nor clear a newer one, and a delayed
+    /// prior-generation `SessionEnd` cannot wipe the current generation.
+    pane_hook_session: HashMap<String, (String, DateTime<Utc>)>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -815,7 +823,29 @@ impl AppState {
     /// A `None` here with an expected session supplied is a REJECTION, not a
     /// silent accept — the queued generation no longer exists.
     pub fn pane_hook_session_id(&self, pane_id: &str) -> Option<String> {
-        self.pane_hook_session.get(pane_id).cloned()
+        self.pane_hook_session
+            .get(pane_id)
+            .map(|(id, _)| id.clone())
+    }
+
+    /// PRD #20 Greptile finding #3: the write-semantics of the newest live
+    /// session produced by `agent_id`, resolved by agent identity rather than by
+    /// pane. A daemon-side agent with no `pane_id_env` maps to the `<no-pane>`
+    /// sentinel, so [`Self::pane_writable`] can never find its session (which is
+    /// keyed with `pane_id == None`) and would fall through to the `Live`
+    /// default — letting a history-only/view-only paneless target still receive
+    /// `KIND_STREAM_IN`. The attach-stream input loop consults THIS for a
+    /// paneless target so a declared non-live session fails closed. A paneless
+    /// agent with no declared session still defaults to [`Writable::Live`] (the
+    /// historical native-PTY behavior), so an ordinary paneless shell is
+    /// unaffected.
+    pub fn agent_writable(&self, agent_id: &str) -> Writable {
+        self.sessions
+            .values()
+            .filter(|s| s.agent_id.as_deref() == Some(agent_id))
+            .max_by_key(|s| s.last_activity)
+            .map(|s| s.writable())
+            .unwrap_or(Writable::Live)
     }
 
     /// Register a pane ID as managed by our app.
@@ -1308,7 +1338,19 @@ impl AppState {
             // then hits a `None` current-session in the send guard and is
             // refused (a `None` with an expected session is a rejection, never a
             // silent accept).
-            if let Some(ref pane_id) = event.pane_id {
+            //
+            // Greptile finding #4 (monotonic): only the CURRENT generation's end
+            // clears the entry. A DELAYED `SessionEnd` from a PRIOR generation
+            // (its `session_id` no longer matches the pane's current generation)
+            // must NOT wipe a newer generation that already superseded it —
+            // otherwise a current prompt would be wrongly refused against a
+            // cleared entry.
+            if let Some(ref pane_id) = event.pane_id
+                && self
+                    .pane_hook_session
+                    .get(pane_id)
+                    .is_some_and(|(current, _)| *current == incoming_session_id)
+            {
                 self.pane_hook_session.remove(pane_id);
             }
             // Preserve started_at for the pane so a restarted session keeps its position.
@@ -1349,9 +1391,33 @@ impl AppState {
         // guard above remapped `event.session_id` back to the old card id for UI
         // continuity, but the generation tracked here rolls forward, so the send
         // guard refuses an old queued prompt against the new conversation.
+        //
+        // Greptile finding #4 (monotonic): the generation only ADVANCES; it never
+        // regresses. Advance to the incoming id when it is a genuinely newer
+        // generation — a different id whose event timestamp is at least the
+        // established one (or a fresher timestamp for the same id). A delayed
+        // event from a PRIOR generation (older timestamp, different id) is
+        // IGNORED, so it can neither restore a stale generation nor overwrite the
+        // current one.
         if let Some(ref pane_id) = event.pane_id {
-            self.pane_hook_session
-                .insert(pane_id.clone(), incoming_session_id.clone());
+            let incoming_ts = event.timestamp;
+            let advance = match self.pane_hook_session.get(pane_id) {
+                None => true,
+                Some((current_id, current_ts)) => {
+                    if *current_id == incoming_session_id {
+                        // Same generation: keep the id, bump the established
+                        // timestamp so subsequent older events stay rejected.
+                        incoming_ts > *current_ts
+                    } else {
+                        // Different generation: only a not-older event wins.
+                        incoming_ts >= *current_ts
+                    }
+                }
+            };
+            if advance {
+                self.pane_hook_session
+                    .insert(pane_id.clone(), (incoming_session_id.clone(), incoming_ts));
+            }
         }
 
         let pane_started = event

@@ -432,9 +432,16 @@ fn resolve_agent_type(agent_override: Option<&str>, program: &str) -> AgentType 
 
 /// Derive the session id events are grouped under. When run inside a managed
 /// pane it mirrors the `agent-event` verb's `{pane_id}-session` convention so
-/// events land on the pane's card; standalone (no pane) it derives a stable id
-/// from the wrapped binary's basename.
-fn session_id_for(pane_id: Option<&str>, program: &str) -> String {
+/// events land on the pane's card.
+///
+/// PRD #20 Greptile finding #4/#5 (standalone uniqueness): a STANDALONE wrap (no
+/// `DOT_AGENT_DECK_PANE_ID`) previously derived a FIXED id from the binary's
+/// basename (e.g. `wrap-codex`), so two concurrent standalone Codex terminals
+/// collided on one session id and their events/card-status overwrote each other.
+/// The standalone id now folds in a per-session `nonce` (the wrapper pid) so
+/// concurrent standalone sessions stay distinct. The managed-pane id is
+/// intentionally left pane-derived (stable across a `/clear` for card continuity).
+fn session_id_for(pane_id: Option<&str>, program: &str, standalone_nonce: &str) -> String {
     match pane_id {
         Some(p) => format!("{p}-session"),
         None => {
@@ -442,7 +449,7 @@ fn session_id_for(pane_id: Option<&str>, program: &str) -> String {
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or(program);
-            format!("wrap-{base}")
+            format!("wrap-{base}-{standalone_nonce}")
         }
     }
 }
@@ -553,61 +560,115 @@ fn program_is_codex(program: &str) -> bool {
         == Some("codex")
 }
 
+/// Whether the wrapped program is a BARE `codex` command (no path component) —
+/// the codex the deck itself resolves through `PATH`. PRD #20 Greptile finding
+/// #2: the basename check alone (`program_is_codex`) also matches an EXPLICIT
+/// path to a `codex`-named launcher/wrapper script — and such a launcher can
+/// re-home `CODEX_HOME` at runtime and forward the injected invocation-global
+/// bypass to a Codex running under a DIFFERENT, uninspected hook set. The deck
+/// therefore auto-injects the bypass only for the bare `codex` it resolves
+/// itself; an explicit path is treated as a user launcher that must add the flag
+/// to its own `codex …` line (see the module docs / `docs/develop/agent-adapters.md`).
+fn program_is_bare_codex(program: &str) -> bool {
+    !program.contains('/') && program_is_codex(program)
+}
+
+/// The outcome of [`codex_spawn_prep`]: whether to inject the hook-trust bypass,
+/// and the vetted `CODEX_HOME` (resolved ONCE) to PIN on the spawned child so the
+/// home the deck vetted/installed into is exactly the home Codex loads.
+struct CodexSpawnPrep {
+    /// Add [`CODEX_BYPASS_HOOK_TRUST_FLAG`] to the child's argv.
+    add_trust_flag: bool,
+    /// `CODEX_HOME` to set explicitly on the spawned child's environment (finding
+    /// #2). `None` when this invocation installs no Codex hooks / resolves no home.
+    pinned_home: Option<std::path::PathBuf>,
+}
+
 /// PRD #20 W1 spawn wiring. Decides, for this wrap invocation, whether to
-/// install the deck's native Codex hooks and whether to inject the hook-trust
-/// bypass flag.
+/// install the deck's native Codex hooks, which `CODEX_HOME` to pin, and whether
+/// to inject the hook-trust bypass flag.
 ///
 /// - **Hooks install** fires whenever a Codex-identity agent will actually run
-///   under this wrapper: a direct `codex` program, OR a deck-spawned pane
+///   under this wrapper: a `codex` program (bare or path), OR a deck-spawned pane
 ///   (`pane_id` present) whose declared identity is Codex. The latter covers a
 ///   launcher/wrapper SCRIPT the deck spawned but whose argv we can't reach
 ///   into — the hooks are `CODEX_HOME`-scoped, so they apply however codex is
 ///   ultimately launched. It deliberately does NOT fire for a standalone
 ///   `wrap --agent codex -- /bin/sh` (no pane, non-codex program), so a
 ///   non-interactive I/O wrap never writes to the user's `~/.codex`.
+/// - **`CODEX_HOME` pin** (finding #2): the vetted home is resolved ONCE and
+///   returned so the caller can set it EXPLICITLY on the child, keeping vet and
+///   launch on the same deck-controlled home instead of a value that could drift.
 /// - **The trust-bypass flag** is injected ONLY when ALL of the following hold,
 ///   so it can never silently trust something the deck didn't author:
-///   1. the program is a direct `codex` (the one case where the wrapper controls
-///      codex's argv — a launcher/script must add the flag to its own `codex …`
-///      line, see the module docs and `docs/develop/agent-adapters.md`), AND
+///   1. the program is a BARE `codex` — the codex the deck resolves through
+///      `PATH` and whose home it pins. An explicit path to a `codex`-named file
+///      is a launcher/wrapper (which can re-home `CODEX_HOME` and forward the
+///      invocation-global bypass to an uninspected hook set, finding #2), so it
+///      must add the flag to its own `codex …` line, AND
 ///   2. the resolved identity is [`AgentType::Codex`] — so
 ///      `wrap --agent claude -- codex` neither installs Codex hooks nor bypasses
-///      trust (finding #2), AND
-///   3. the active `CODEX_HOME` contains no non-deck command hooks
-///      ([`crate::codex_hooks_manage::foreign_command_hooks_present`]) — because
+///      trust, AND
+///   3. the vetted `CODEX_HOME` contains no non-deck command hooks
+///      ([`crate::codex_hooks_manage::foreign_command_hooks_present_in`]) — because
 ///      the bypass is invocation-global, so with a third-party hook present it
 ///      would trust the user's unreviewed hook too (finding #2 / M-1). When a
 ///      foreign hook is present the deck skips the bypass and warns; its own
 ///      events then degrade to stdout classification.
-///
-/// Returns `true` when the caller should add [`CODEX_BYPASS_HOOK_TRUST_FLAG`].
-fn codex_spawn_prep(program: &str, agent_type: &AgentType, pane_id: Option<&str>) -> bool {
+fn codex_spawn_prep(
+    program: &str,
+    agent_type: &AgentType,
+    pane_id: Option<&str>,
+) -> CodexSpawnPrep {
     let program_codex = program_is_codex(program);
     let codex_identity = *agent_type == AgentType::Codex;
-    if codex_identity && (program_codex || pane_id.is_some()) {
+    let installs_hooks = codex_identity && (program_codex || pane_id.is_some());
+    // Resolve the vetted home ONCE, so the SAME path is installed into, vetted,
+    // and pinned on the child — vet and launch can't drift apart (finding #2).
+    let pinned_home = if installs_hooks {
         crate::codex_hooks_manage::auto_install();
-    }
-    // Both a direct `codex` program AND Codex identity are required before the
-    // wrapper will even consider the invocation-global bypass.
-    if !(program_codex && codex_identity) {
-        return false;
-    }
-    // Only bypass when nothing but the deck's own vetted hook would be trusted.
-    match crate::codex_hooks_manage::foreign_command_hooks_present() {
-        Ok(false) => true,
-        Ok(true) => {
-            tracing::warn!(
-                "codex: third-party command hooks present in CODEX_HOME; not bypassing hook \
-                 trust (deck events degrade to stdout classification)"
-            );
-            false
+        crate::codex_hooks_manage::active_codex_home()
+    } else {
+        None
+    };
+
+    // The invocation-global bypass is auto-injected only for a BARE `codex` the
+    // deck resolves itself; an explicit path is a user launcher (finding #2).
+    let add_trust_flag = if program_is_bare_codex(program) && codex_identity {
+        match pinned_home.as_deref() {
+            // Only bypass when there is a resolvable home to vet AND pin — never
+            // trust an unknown home globally.
+            None => {
+                tracing::warn!(
+                    "codex: no resolvable CODEX_HOME to vet/pin; not bypassing hook trust"
+                );
+                false
+            }
+            Some(home) => match crate::codex_hooks_manage::foreign_command_hooks_present_in(home) {
+                // Nothing but the deck's own vetted hook would be trusted.
+                Ok(false) => true,
+                Ok(true) => {
+                    tracing::warn!(
+                        "codex: third-party command hooks present in CODEX_HOME; not bypassing \
+                         hook trust (deck events degrade to stdout classification)"
+                    );
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "codex: could not inspect CODEX_HOME hooks ({e}); not bypassing hook trust"
+                    );
+                    false
+                }
+            },
         }
-        Err(e) => {
-            tracing::warn!(
-                "codex: could not inspect CODEX_HOME hooks ({e}); not bypassing hook trust"
-            );
-            false
-        }
+    } else {
+        false
+    };
+
+    CodexSpawnPrep {
+        add_trust_flag,
+        pinned_home,
     }
 }
 
@@ -886,7 +947,11 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(String::from));
-    let session_id = session_id_for(pane_id.as_deref(), program);
+    // The standalone nonce is the wrapper's own pid: unique across concurrent
+    // standalone `wrap` invocations, so two overlapping standalone sessions no
+    // longer collide on a fixed `wrap-<program>` id (finding #4/#5). A managed
+    // pane ignores the nonce and stays pane-derived.
+    let session_id = session_id_for(pane_id.as_deref(), program, &std::process::id().to_string());
 
     // PRD #20 blocker-2: a wrapper running INSIDE a daemon-managed pane
     // (`DOT_AGENT_DECK_PANE_ID` set) is backed by that live PTY — the daemon's
@@ -916,11 +981,17 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     });
 
     // PRD #20 W1: install the deck's native Codex hooks into the active
-    // CODEX_HOME (for a direct `codex` OR a deck-spawned Codex-identity launcher)
-    // and, for a direct `codex`, bypass Codex's hook-trust prompt for this
+    // CODEX_HOME (for a `codex` program OR a deck-spawned Codex-identity launcher)
+    // and, for a bare `codex`, bypass Codex's hook-trust prompt for this
     // deck-vetted spawn via the returned flag. Done once, before either path
     // spawns. A launcher/script must add the flag to its own codex line.
-    let add_trust_flag = codex_spawn_prep(program, &emitter.agent_type, emitter.pane_id.as_deref());
+    // PRD #20 Greptile finding #2: the returned `pinned_home` is set explicitly
+    // on the spawned child so the home the deck vetted is exactly the home Codex
+    // loads (vet and launch use the same, deck-controlled home).
+    let CodexSpawnPrep {
+        add_trust_flag,
+        pinned_home,
+    } = codex_spawn_prep(program, &emitter.agent_type, emitter.pane_id.as_deref());
 
     // R20-012 / finding #11: genuine per-descriptor routing. Detect the
     // tty-or-redirected nature of EACH standard descriptor independently. If any
@@ -936,9 +1007,22 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     ];
 
     if tty.iter().any(|&t| t) {
-        run_wrap_pty(program, args, &emitter, add_trust_flag, tty)
+        run_wrap_pty(
+            program,
+            args,
+            &emitter,
+            add_trust_flag,
+            pinned_home.as_deref(),
+            tty,
+        )
     } else {
-        run_wrap_pipe(program, args, &emitter, add_trust_flag)
+        run_wrap_pipe(
+            program,
+            args,
+            &emitter,
+            add_trust_flag,
+            pinned_home.as_deref(),
+        )
     }
 }
 
@@ -958,6 +1042,7 @@ fn run_wrap_pty(
     args: &[String],
     emitter: &Arc<Emitter>,
     add_trust_flag: bool,
+    pinned_codex_home: Option<&std::path::Path>,
     tty: [bool; 3],
 ) -> ExitCode {
     let [stdin_tty, stdout_tty, stderr_tty] = tty;
@@ -985,6 +1070,11 @@ fn run_wrap_pty(
         cmd.arg(CODEX_BYPASS_HOOK_TRUST_FLAG);
     }
     cmd.args(args);
+    // Finding #2: pin the vetted CODEX_HOME on the child so the home the deck
+    // inspected/installed into is exactly the home Codex loads.
+    if let Some(home) = pinned_codex_home {
+        cmd.env("CODEX_HOME", home);
+    }
     if let Ok(dir) = std::env::current_dir() {
         cmd.current_dir(dir);
     }
@@ -1256,12 +1346,18 @@ fn run_wrap_pipe(
     args: &[String],
     emitter: &Arc<Emitter>,
     add_trust_flag: bool,
+    pinned_codex_home: Option<&std::path::Path>,
 ) -> ExitCode {
     let mut cmd = StdCommand::new(program);
     if add_trust_flag {
         cmd.arg(CODEX_BYPASS_HOOK_TRUST_FLAG);
     }
     cmd.args(args);
+    // Finding #2: pin the vetted CODEX_HOME on the child so the home the deck
+    // inspected/installed into is exactly the home Codex loads.
+    if let Some(home) = pinned_codex_home {
+        cmd.env("CODEX_HOME", home);
+    }
     if let Ok(dir) = std::env::current_dir() {
         cmd.current_dir(dir);
     }
@@ -1560,11 +1656,26 @@ mod tests {
     }
 
     /// Session id mirrors the `agent-event` `{pane_id}-session` convention in a
-    /// managed pane, and derives a stable basename id when standalone.
+    /// managed pane (nonce ignored, stable for card continuity), and folds the
+    /// per-session nonce into the standalone id so concurrent standalone wrappers
+    /// stay distinct (PRD #20 Greptile finding #4/#5).
     #[test]
     fn session_id_derivation() {
-        assert_eq!(session_id_for(Some("pane-7"), "codex"), "pane-7-session");
-        assert_eq!(session_id_for(None, "/usr/bin/codex"), "wrap-codex");
+        // Managed pane: pane-derived, nonce ignored.
+        assert_eq!(
+            session_id_for(Some("pane-7"), "codex", "4242"),
+            "pane-7-session"
+        );
+        // Standalone: basename plus the per-session nonce.
+        assert_eq!(
+            session_id_for(None, "/usr/bin/codex", "4242"),
+            "wrap-codex-4242"
+        );
+        // Distinct nonces (concurrent wrappers) yield distinct standalone ids.
+        assert_ne!(
+            session_id_for(None, "/bin/sh", "111"),
+            session_id_for(None, "/bin/sh", "222"),
+        );
     }
 
     /// PRD #20 M8: a Wrapper-strategy agent's bare command is rewritten to its

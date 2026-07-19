@@ -308,6 +308,23 @@ pub fn foreign_command_hooks_present() -> std::io::Result<bool> {
     let Some(home) = codex_home() else {
         return Ok(true);
     };
+    foreign_command_hooks_present_in(&home)
+}
+
+/// The resolved active Codex home the way Codex itself would (`$CODEX_HOME`, else
+/// `$HOME/.codex`), or `None` when neither resolves. PRD #20 Greptile finding #2:
+/// the wrapper resolves this ONCE and PINS it on the spawned Codex child's
+/// environment so the home the deck vetted and installed into is exactly the home
+/// Codex loads — vet and launch use the same, deck-controlled home instead of a
+/// value a launcher could drift between the two.
+pub fn active_codex_home() -> Option<PathBuf> {
+    codex_home()
+}
+
+/// Like [`foreign_command_hooks_present`] but against an EXPLICIT `home`, so a
+/// caller can resolve the home once and vet the SAME path it will pin on the
+/// child (finding #2). Returns `Ok(false)` when the file is absent.
+pub fn foreign_command_hooks_present_in(home: &Path) -> std::io::Result<bool> {
     let path = home.join("hooks.json");
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
