@@ -927,8 +927,29 @@ async fn compute_write_and_submit_outcome(
     text: &str,
     extras: &WriteAndSubmitExtras,
 ) -> Result<crate::event::SendResult, String> {
+    use crate::agent_pty::GuardedSend;
     use crate::event::{SendResult, Writable};
-    let writable = state.read().await.pane_writable(pane_id);
+    // PRD #20 Greptile (paneless guarded send): a daemon-side agent that carries
+    // no pane maps to the `<no-pane>` sentinel. `pane_writable` filters sessions
+    // by `pane_id` and can never find such a session (it is stored with
+    // `pane_id == None`), so it falls through to the `Live` default — letting a
+    // history-only / view-only paneless target pass the liveness gate. Resolve a
+    // paneless target's writability by AGENT identity instead, mirroring the
+    // attach STREAM_IN input loop. A paneless request that carries no agent
+    // identity cannot be routed by identity, so it fails closed (`None` → no
+    // delivery attempted). Paned targets keep the pane-keyed resolution.
+    let is_paneless = pane_id == "<no-pane>";
+    let writable = {
+        let guard = state.read().await;
+        if is_paneless {
+            match extras.expected_agent_id.as_deref() {
+                Some(agent_id) => guard.agent_writable(agent_id),
+                None => Writable::None,
+            }
+        } else {
+            guard.pane_writable(pane_id)
+        }
+    };
     match writable {
         Writable::HistoryOnly => Ok(SendResult::HistoryOnly),
         Writable::None => Ok(SendResult::NoLiveTarget),
@@ -937,51 +958,71 @@ async fn compute_write_and_submit_outcome(
             // `write_and_submit_guarded`), immediately before the write, against
             // the authoritative session state.
             let st = state.clone();
-            let pane_for_check = pane_id.to_string();
-            let expected_session = extras.expected_session_id.clone();
-            // PRD #20 R20-003 (finding #4): is a deck client actively driving this
-            // pane? The strict "reject a None current-session" rule applies to a
-            // LIVE INTERACTIVE (attached) pane — finding #4's threat is a stale
-            // prompt surfacing in the conversation the user is watching. A
-            // headless (unattached) delivery whose agent identity is confirmed
-            // proceeds. In the real deck the TUI is always attached to a pane it
-            // drives, so this is the strict guard for every real delivery.
-            let has_live_attach = registry.pane_has_live_attach(pane_id);
-            let guarded = registry
-                .write_and_submit_guarded(
-                    pane_id,
-                    text,
-                    extras.expected_agent_id.as_deref(),
-                    move || async move {
-                        let guard = st.read().await;
-                        if guard.pane_writable(&pane_for_check) != Writable::Live {
-                            return false;
-                        }
-                        // When the caller named a session, require an EXACT match
-                        // against the pane's CURRENT daemon-authoritative
-                        // hook-session generation. A same-agent `/clear` / thread
-                        // restart rolls the generation over → mismatch → reject
-                        // (always). A `None` current-session (the session ended,
-                        // or none was recorded) is refused too on an attached,
-                        // live-interactive pane — never a silent accept.
-                        if let Some(expected) = expected_session.as_deref() {
-                            match guard.pane_hook_session_id(&pane_for_check) {
-                                Some(current) if current != expected => return false,
-                                Some(_) => {}
-                                None if has_live_attach => return false,
-                                None => {}
+            let guarded = if is_paneless {
+                // A paneless target is re-validated by agent identity (mirroring
+                // STREAM_IN). `<no-pane>` has no pane→hook-session mapping, so the
+                // pane-keyed session-generation guard (finding #4) does not apply
+                // — STREAM_IN likewise performs no session check on a paneless
+                // target. `Live` above implies `expected_agent_id` is `Some`.
+                let agent_id = extras
+                    .expected_agent_id
+                    .clone()
+                    .expect("paneless Live target implies an expected agent id");
+                let agent_for_check = agent_id.clone();
+                registry
+                    .write_and_submit_guarded(pane_id, text, Some(&agent_id), move || async move {
+                        st.read().await.agent_writable(&agent_for_check) == Writable::Live
+                    })
+                    .await
+            } else {
+                let pane_for_check = pane_id.to_string();
+                let expected_session = extras.expected_session_id.clone();
+                // PRD #20 R20-003 (finding #4): is a deck client actively driving
+                // this pane? The strict "reject a None current-session" rule
+                // applies to a LIVE INTERACTIVE (attached) pane — finding #4's
+                // threat is a stale prompt surfacing in the conversation the user
+                // is watching. A headless (unattached) delivery whose agent
+                // identity is confirmed proceeds. In the real deck the TUI is
+                // always attached to a pane it drives, so this is the strict guard
+                // for every real delivery.
+                let has_live_attach = registry.pane_has_live_attach(pane_id);
+                registry
+                    .write_and_submit_guarded(
+                        pane_id,
+                        text,
+                        extras.expected_agent_id.as_deref(),
+                        move || async move {
+                            let guard = st.read().await;
+                            if guard.pane_writable(&pane_for_check) != Writable::Live {
+                                return false;
                             }
-                        }
-                        true
-                    },
-                )
-                .await;
+                            // When the caller named a session, require an EXACT
+                            // match against the pane's CURRENT daemon-authoritative
+                            // hook-session generation. A same-agent `/clear` /
+                            // thread restart rolls the generation over → mismatch →
+                            // reject (always). A `None` current-session (the session
+                            // ended, or none was recorded) is refused too on an
+                            // attached, live-interactive pane — never a silent
+                            // accept.
+                            if let Some(expected) = expected_session.as_deref() {
+                                match guard.pane_hook_session_id(&pane_for_check) {
+                                    Some(current) if current != expected => return false,
+                                    Some(_) => {}
+                                    None if has_live_attach => return false,
+                                    None => {}
+                                }
+                            }
+                            true
+                        },
+                    )
+                    .await
+            };
             match guarded {
-                Ok(crate::agent_pty::GuardedSend::Applied) => Ok(SendResult::Applied),
-                Ok(crate::agent_pty::GuardedSend::WrongSession) => Ok(SendResult::WrongSession),
-                Ok(crate::agent_pty::GuardedSend::Stale) => Ok(SendResult::Stale),
-                Ok(crate::agent_pty::GuardedSend::NoLiveTarget) => Ok(SendResult::NoLiveTarget),
-                Ok(crate::agent_pty::GuardedSend::Ambiguous) => Ok(SendResult::Ambiguous),
+                Ok(GuardedSend::Applied) => Ok(SendResult::Applied),
+                Ok(GuardedSend::WrongSession) => Ok(SendResult::WrongSession),
+                Ok(GuardedSend::Stale) => Ok(SendResult::Stale),
+                Ok(GuardedSend::NoLiveTarget) => Ok(SendResult::NoLiveTarget),
+                Ok(GuardedSend::Ambiguous) => Ok(SendResult::Ambiguous),
                 Err(e) => Err(e.to_string()),
             }
         }

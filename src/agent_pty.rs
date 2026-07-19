@@ -2110,6 +2110,28 @@ impl AgentPtyRegistry {
             })
     }
 
+    /// PRD #20 Greptile (paneless guarded send): resolve the live (non-exited)
+    /// writer target for an AGENT id rather than for a pane. A daemon-side agent
+    /// that carries no `pane_id_env` maps to the `<no-pane>` sentinel, so
+    /// [`Self::writer_target_for_pane`] can never find it (it matches on
+    /// `pane_id_env`, which is `None` for such an agent). The identity-guarded
+    /// write-and-submit path resolves a paneless target by agent identity instead
+    /// — mirroring the attach STREAM_IN input loop, which routes a paneless
+    /// target's writer and writability check by agent id. Skips exited entries,
+    /// like [`Self::writer_target_for_pane`].
+    fn writer_target_for_agent(&self, agent_id: &str) -> Option<PaneWriterTarget> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .agents
+            .get(agent_id)
+            .filter(|a| !a.exited.load(Ordering::SeqCst))
+            .map(|a| PaneWriterTarget {
+                writer: a.writer.clone(),
+                agent_id: agent_id.to_string(),
+                exited: a.exited.clone(),
+            })
+    }
+
     /// PRD #20 R20-003/R20-006: atomic write-and-submit that binds delivery to an
     /// EXACT target identity and RE-VALIDATES it after acquiring that target's
     /// writer, immediately before writing — closing the liveness/rebind TOCTOU
@@ -2126,6 +2148,14 @@ impl AgentPtyRegistry {
     ///    liveness/session recheck against `AppState`) must still hold — else
     ///    [`GuardedSend::Stale`]/[`GuardedSend::WrongSession`] with NO bytes written.
     /// 5. Write payload → `SUBMIT_DELAY` → CR, all under the held writer.
+    ///
+    /// PRD #20 Greptile (paneless guarded send): a daemon-side agent that carries
+    /// no pane maps to the `<no-pane>` sentinel and can never be resolved by pane
+    /// (`writer_target_for_pane` matches on `pane_id_env`). For that sentinel the
+    /// target is resolved by AGENT identity (`expected_agent_id`) instead, and the
+    /// pane→agent rebind re-check is replaced by an agent-still-present re-check —
+    /// mirroring the attach STREAM_IN input loop, which resolves a paneless
+    /// target's writer/writability by agent id and skips the pane-owner re-check.
     pub async fn write_and_submit_guarded<Fut>(
         &self,
         pane_id: &str,
@@ -2136,12 +2166,25 @@ impl AgentPtyRegistry {
     where
         Fut: std::future::Future<Output = bool>,
     {
-        let Some(target) = self.writer_target_for_pane(pane_id) else {
-            return Ok(GuardedSend::NoLiveTarget);
+        let is_paneless = pane_id == "<no-pane>";
+        let target = if is_paneless {
+            // Resolve BY agent identity; no identity → nothing to route to.
+            match expected_agent_id.and_then(|id| self.writer_target_for_agent(id)) {
+                Some(target) => target,
+                None => return Ok(GuardedSend::NoLiveTarget),
+            }
+        } else {
+            let Some(target) = self.writer_target_for_pane(pane_id) else {
+                return Ok(GuardedSend::NoLiveTarget);
+            };
+            target
         };
         // Pre-lock identity gate: refuse a prompt queued for a different agent
         // than the one that now owns the pane (respawn/rebind before delivery).
-        if let Some(expected) = expected_agent_id
+        // A paneless target was resolved BY `expected_agent_id`, so it can never
+        // mismatch here — skip the gate.
+        if !is_paneless
+            && let Some(expected) = expected_agent_id
             && expected != target.agent_id
         {
             return Ok(GuardedSend::WrongSession);
@@ -2152,11 +2195,19 @@ impl AgentPtyRegistry {
         // barrier the TOCTOU test holds open by locking the writer externally.
         let mut w = target.writer.lock().await;
         // Re-resolve identity: the pane may have rebound to a new agent, or the
-        // target may have exited, while we waited for the writer.
-        match self.writer_target_for_pane(pane_id) {
-            Some(current) if current.agent_id == target.agent_id => {}
-            Some(_) => return Ok(GuardedSend::WrongSession),
-            None => return Ok(GuardedSend::Stale),
+        // target may have exited, while we waited for the writer. A paneless
+        // agent has no pane→agent mapping to rebind, so the meaningful re-check
+        // is that the agent still exists — a removal (`None`) is `Stale`.
+        if is_paneless {
+            if self.writer_target_for_agent(&target.agent_id).is_none() {
+                return Ok(GuardedSend::Stale);
+            }
+        } else {
+            match self.writer_target_for_pane(pane_id) {
+                Some(current) if current.agent_id == target.agent_id => {}
+                Some(_) => return Ok(GuardedSend::WrongSession),
+                None => return Ok(GuardedSend::Stale),
+            }
         }
         if target.exited.load(Ordering::SeqCst) {
             return Ok(GuardedSend::Stale);
