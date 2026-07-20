@@ -45,7 +45,7 @@ use dot_agent_deck::daemon_protocol::{
     serve_attach, serve_attach_with_counter, write_frame,
 };
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
-use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
+use dot_agent_deck::event::{AgentEvent, AgentType, EventType, Writable};
 use dot_agent_deck::state::{
     ActiveTool, AppState, SessionSnapshot, SessionState, SessionStatus, SharedState,
 };
@@ -162,6 +162,9 @@ fn drive_session_to_working(state: &mut AppState, session_id: &str, pane_id: &st
         metadata: HashMap::new(),
         pane_id: Some(pane_id.to_string()),
         agent_id: Some(agent_id.to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
     };
     state.apply_event(mk(EventType::SessionStart, None, None, None));
     state.apply_event(mk(
@@ -1885,6 +1888,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         tool_count: 2,
         first_prompts: vec!["build the feature".into()],
         last_user_prompt: Some("build the feature".into()),
+        live_target: None,
     };
 
     // Hydration seeds the card from the snapshot; agent_id is minted on it so
@@ -1922,6 +1926,9 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         metadata: HashMap::new(),
         pane_id: Some(pane.to_string()),
         agent_id: Some(agent_id.to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
     });
 
     let sessions: Vec<&SessionState> = state
@@ -2013,6 +2020,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         last_user_prompt: Some(format!(
                             "run \x1b[31mhostile\x07 \x00prompt {over_long}"
                         )),
+                        live_target: None,
                     }),
                 };
                 let resp = AttachResponse {
@@ -2214,4 +2222,52 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         "event-derived AgentType::None must fall back to the spawn-time ClaudeCode, not \
          seed the card as 'No agent'"
     );
+}
+
+/// Scenario: Rehydrate one history-only Codex card and one view-only Codex card
+/// from daemon `SessionSnapshot` JSON after a detach/reconnect. Each rebuilt
+/// session must retain its non-live writability so input remains refused rather
+/// than silently reverting to the legacy live default.
+#[spec("session/live/010")]
+#[test]
+fn live_010_rehydrate_preserves_history_and_view_only_writability() {
+    for (pane_id, writable, expected) in [
+        ("pane-history", "history-only", Writable::HistoryOnly),
+        ("pane-view", "none", Writable::None),
+    ] {
+        let snapshot_json = serde_json::json!({
+            "status": "idle",
+            "agent_type": "codex",
+            "active_tool": null,
+            "tool_count": 0,
+            "first_prompts": [],
+            "last_user_prompt": null,
+            "live_target": {
+                "kind": if writable == "history-only" { "process" } else { "none" },
+                "writable": writable,
+            }
+        });
+        let snapshot: SessionSnapshot = serde_json::from_value(snapshot_json)
+            .expect("a reconnect snapshot with live_target must deserialize");
+        let mut state = AppState::default();
+        state.register_pane(pane_id.to_string());
+        state.seed_hydrated_session(
+            pane_id.to_string(),
+            None,
+            Some(AgentType::Codex),
+            Some(format!("agent-{pane_id}")),
+            Some(&snapshot),
+        );
+
+        let session = state
+            .sessions
+            .values()
+            .find(|session| session.pane_id.as_deref() == Some(pane_id))
+            .expect("rehydration creates one card for the pane");
+        assert_eq!(
+            session.writable(),
+            expected,
+            "reconnecting {writable} pane {pane_id} must preserve its input refusal"
+        );
+    }
 }

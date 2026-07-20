@@ -1,0 +1,41 @@
+---
+source: tests/render_dashboard.rs
+assertion_line: 524
+expression: named_badges
+---
+== ClaudeCode / friendly-claude ==
+[Blue/Reset]"┌" [Reset/Reset]" 1 " [LightMagenta/Reset]"ClaudeCode" [Reset/Reset]" · friendly-claude " [Blue/Reset]"────────────────────────────────── ● Thinking ┐"
+[Blue/Reset]"│" [Reset/Reset]"Dir:  workspace                                         Last: 0s ago  Tools: 0" [Blue/Reset]"│"
+[Blue/Reset]"│" [Reset/Reset]"Prmt: inspect the repository                                                  " [Blue/Reset]"│"
+[Blue/Reset]"│" [Blue/Reset]"│"
+[Blue/Reset]"│" [Blue/Reset]"│"
+[Blue/Reset]"│" [Blue/Reset]"│"
+[Blue/Reset]"│" [Blue/Reset]"│"
+[Blue/Reset]"└──────────────────────────────────────────────────────────────────────────────┘"
+== OpenCode / friendly-opencode ==
+[Blue/Reset]"┌" [Reset/Reset]" 1 " [LightGreen/Reset]"OpenCode" [Reset/Reset]" · friendly-opencode " [Blue/Reset]"────────────────────────────────── ● Thinking ┐"
+[Blue/Reset]"│" [Reset/Reset]"Dir:  workspace                                         Last: 0s ago  Tools: 0" [Blue/Reset]"│"
+[Blue/Reset]"│" [Reset/Reset]"Prmt: inspect the repository                                                  " [Blue/Reset]"│"
+[Blue/Reset]"│" [Blue/Reset]"│"
+[Blue/Reset]"│" [Blue/Reset]"│"
+[Blue/Reset]"│" [Blue/Reset]"│"
+[Blue/Reset]"│" [Blue/Reset]"│"
+[Blue/Reset]"└──────────────────────────────────────────────────────────────────────────────┘"
+== Pi / friendly-pi ==
+[Blue/Reset]"┌" [Reset/Reset]" 1 " [LightCyan/Reset]"Pi" [Reset/Reset]" · friendly-pi " [Blue/Reset]"────────────────────────────────────────────── ● Thinking ┐"
+[Blue/Reset]"│" [Reset/Reset]"Dir:  workspace                                         Last: 0s ago  Tools: 0" [Blue/Reset]"│"
+[Blue/Reset]"│" [Reset/Reset]"Prmt: inspect the repository                                                  " [Blue/Reset]"│"
+[Blue/Reset]"│" [Blue/Reset]"│"
+[Blue/Reset]"│" [Blue/Reset]"│"
+[Blue/Reset]"│" [Blue/Reset]"│"
+[Blue/Reset]"│" [Blue/Reset]"│"
+[Blue/Reset]"└──────────────────────────────────────────────────────────────────────────────┘"
+== Codex / friendly-codex ==
+[Blue/Reset]"┌" [Reset/Reset]" 1 " [LightYellow/Reset]"Codex" [Reset/Reset]" · friendly-codex " [Blue/Reset]"──────────────────────────────────────── ● Thinking ┐"
+[Blue/Reset]"│" [Reset/Reset]"Dir:  workspace                                         Last: 0s ago  Tools: 0" [Blue/Reset]"│"
+[Blue/Reset]"│" [Reset/Reset]"Prmt: inspect the repository                                                  " [Blue/Reset]"│"
+[Blue/Reset]"│" [Blue/Reset]"│"
+[Blue/Reset]"│" [Blue/Reset]"│"
+[Blue/Reset]"│" [Blue/Reset]"│"
+[Blue/Reset]"│" [Blue/Reset]"│"
+[Blue/Reset]"└──────────────────────────────────────────────────────────────────────────────┘"

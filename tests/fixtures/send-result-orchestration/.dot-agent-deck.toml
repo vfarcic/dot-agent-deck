@@ -1,0 +1,8 @@
+[[orchestrations]]
+name = "send-result"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "./orchestrator-send-result.sh"
+start = true
+prompt_template = "ORCHESTRATORRESULTMARKER20"

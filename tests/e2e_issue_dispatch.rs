@@ -594,19 +594,25 @@ fn dispatch_003_skip_open_pr() {
     );
 }
 
-/// Scenario: Fire two `issue_dispatch` tasks — one whose cloned repo carries an
-/// orchestration `.dot-agent-deck.toml`, one whose clone has none (single-agent,
-/// `default_command = cat`). Assert the orchestration clone opens an orchestrator
-/// tab in its worktree with the substituted prompt delivered, while the plain
-/// clone opens a non-orchestration single-agent card in its worktree with the
-/// substituted prompt delivered.
+/// Scenario: Fire two `issue_dispatch` tasks whose resolved commands are bare
+/// Codex — one from a cloned orchestration role and one from the single-agent
+/// registry default. Both prompts must reach their panes, and PATH recorders must
+/// prove both dispatch paths launched through the Codex Wrapper strategy.
 #[spec("scheduler/dispatch/004")]
 #[test]
 fn dispatch_004_orchestration_vs_single_agent() {
     let stub = GhStub::new();
     let orch_repo = "acme/orch";
     let plain_repo = "acme/plain";
-    stub.add_repo(orch_repo, true);
+    let orch_fixture = stub.repo_dir(orch_repo);
+    std::fs::create_dir_all(&orch_fixture).expect("create Codex orchestration fixture");
+    init_remote_with_orch_toml(
+        &orch_fixture.join("remote"),
+        Some(
+            "[[orchestrations]]\nname = \"dispatch-orch\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"codex\"\nstart = true\n",
+        ),
+    );
     stub.add_repo(plain_repo, false);
     stub.set_issues(orch_repo, &[11]);
     stub.set_issues(plain_repo, &[22]);
@@ -619,7 +625,28 @@ fn dispatch_004_orchestration_vs_single_agent() {
     // A single-agent dispatch resolves its command from `default_command`.
     let cfg_td = tempfile::tempdir().expect("config tempdir");
     let cfg = cfg_td.path().join("config.toml");
-    std::fs::write(&cfg, "default_command = \"cat\"\n").expect("write config.toml");
+    std::fs::write(&cfg, "default_command = \"codex\"\n").expect("write config.toml");
+    let launch_record = cfg_td.path().join("dispatch-launch.log");
+    let wrapper_stub = stub.bindir.join("dot-agent-deck");
+    let codex_stub = stub.bindir.join("codex");
+    std::fs::write(
+        &wrapper_stub,
+        "#!/bin/sh\nprintf 'WRAPPED %s\\n' \"$*\" >> \"$CODEX_DISPATCH_RECORD\"\nexec cat\n",
+    )
+    .expect("write dispatch wrapper recorder");
+    std::fs::write(
+        &codex_stub,
+        "#!/bin/sh\nprintf 'BARE codex %s\\n' \"$*\" >> \"$CODEX_DISPATCH_RECORD\"\nexec cat\n",
+    )
+    .expect("write dispatch bare recorder");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for executable in [&wrapper_stub, &codex_stub] {
+            std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod dispatch recorder");
+        }
+    }
 
     let mut toml = dispatch_task(
         "task-orch",
@@ -639,10 +666,12 @@ fn dispatch_004_orchestration_vs_single_agent() {
     let path = stub.path_env();
     let ghdir = stub.ghstub_dir();
     let cfg_str = cfg.to_string_lossy().into_owned();
+    let record_str = launch_record.to_string_lossy().into_owned();
     let env: Vec<(&str, &str)> = vec![
         ("PATH", path.as_str()),
         ("GHSTUB_DIR", ghdir.as_str()),
         ("DOT_AGENT_DECK_CONFIG", cfg_str.as_str()),
+        ("CODEX_DISPATCH_RECORD", record_str.as_str()),
     ];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
 
@@ -676,6 +705,19 @@ fn dispatch_004_orchestration_vs_single_agent() {
     assert!(
         daemon.attach_and_wait_for_output(&plain_agent.id, "PLAINDISP-22", W),
         "the prompt must reach the single-agent card of the plain dispatch"
+    );
+    assert!(
+        common::wait_for_file_substr_count(&launch_record, "codex", 2, W),
+        "both issue-dispatch Codex paths must reach a launch recorder"
+    );
+    let launches = std::fs::read_to_string(&launch_record).expect("read dispatch launch record");
+    assert_eq!(
+        launches.lines().collect::<Vec<_>>(),
+        vec![
+            "WRAPPED wrap --agent codex -- codex",
+            "WRAPPED wrap --agent codex -- codex",
+        ],
+        "issue-dispatch single-agent and role spawns must both cross the Wrapper strategy; observed:\n{launches}"
     );
 }
 

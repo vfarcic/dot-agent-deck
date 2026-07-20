@@ -563,6 +563,9 @@ fn surface_spawned_pane(
         metadata,
         pane_id: Some(pane_id.to_string()),
         agent_id: None,
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
     };
     let _ = event_tx.send(BroadcastMsg::Event(event));
 }

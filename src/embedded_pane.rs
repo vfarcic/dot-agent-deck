@@ -252,6 +252,14 @@ pub struct EmbeddedPaneController {
     /// from the TUI's blocking render thread, plus the long-lived
     /// per-pane I/O and resize worker tasks.
     runtime: tokio::runtime::Handle,
+    /// PRD #20 R20-007 (finding #10): typed stream rejections the daemon pushed
+    /// on the attach stream (a `KIND_STREAM_REJECT` frame). Each per-pane I/O
+    /// task appends `(pane_id, reason)` here when the daemon refuses a key/paste
+    /// frame because the target went non-live / exited / rebound. The render loop
+    /// drains this each frame via [`Self::take_stream_rejections`] and surfaces
+    /// honest feedback + leaves PaneInput — closing the server/UI race where the
+    /// UI's pre-forward liveness snapshot was stale.
+    stream_rejections: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl EmbeddedPaneController {
@@ -265,7 +273,16 @@ impl EmbeddedPaneController {
             next_id: Arc::new(Mutex::new(1)),
             client: DaemonClient::new(socket_path),
             runtime,
+            stream_rejections: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// PRD #20 R20-007 (finding #10): drain and return the typed stream
+    /// rejections the daemon has pushed since the last call — `(pane_id, reason)`
+    /// pairs. The render loop consumes these each frame to surface honest input
+    /// feedback and leave PaneInput.
+    pub fn take_stream_rejections(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut *self.stream_rejections.lock().unwrap())
     }
 
     /// Test-only constructor for code paths that need a `PaneController`
@@ -671,6 +688,7 @@ impl EmbeddedPaneController {
         let agent_id_for_task = Arc::clone(&shared_agent_id);
         let client_for_task = self.client.clone();
         let pane_id_for_task = pane_id.clone();
+        let rejections_for_task = Arc::clone(&self.stream_rejections);
 
         let io_task = runtime.spawn(run_pane_io_task(
             pane_id_for_task,
@@ -681,6 +699,7 @@ impl EmbeddedPaneController {
             parser_for_task,
             mouse_mode_for_task,
             hyperlinks_for_task,
+            rejections_for_task,
         ));
 
         let pane = Pane {
@@ -1246,6 +1265,7 @@ async fn run_pane_io_task(
     parser: Arc<Mutex<vt100::Parser>>,
     mouse_mode: Arc<AtomicBool>,
     hyperlinks: Arc<Mutex<HyperlinkMap>>,
+    stream_rejections: Arc<Mutex<Vec<(String, String)>>>,
 ) {
     let mut conn_opt: Option<AttachConnection> = Some(initial_conn);
     let mut consecutive_empty_sessions: u32 = 0;
@@ -1280,6 +1300,19 @@ async fn run_pane_io_task(
                                 );
                             }
                             crate::daemon_protocol::KIND_STREAM_END => break,
+                            // PRD #20 R20-007 (finding #10): a typed, NON-terminal
+                            // input rejection — the daemon refused a key/paste
+                            // frame because the target went non-live / exited /
+                            // rebound. Record `(pane_id, reason)` for the render
+                            // loop to surface + leave PaneInput; DO NOT break, the
+                            // stream stays open (output keeps flowing).
+                            crate::daemon_protocol::KIND_STREAM_REJECT => {
+                                let reason = String::from_utf8_lossy(&bytes).into_owned();
+                                stream_rejections
+                                    .lock()
+                                    .unwrap()
+                                    .push((pane_id.clone(), reason));
+                            }
                             _ => break,
                         },
                         Err(_) => break,
@@ -2084,12 +2117,50 @@ impl PaneController for EmbeddedPaneController {
     /// work-done feedback for a sibling worker) could otherwise
     /// interleave into the legacy two-frame path's mid-sequence gap and
     /// submit the user's prompt with daemon bytes fused in.
-    fn write_and_submit_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
+    fn write_and_submit_to_pane(
+        &self,
+        pane_id: &str,
+        text: &str,
+    ) -> Result<crate::event::SendResult, PaneError> {
         let client = self.client.clone();
         let pane_id = pane_id.to_string();
         let text = text.to_string();
         self.runtime
             .block_on(async move { client.write_and_submit(&pane_id, &text).await })
+            .map_err(|e| PaneError::CommandFailed(format!("write_and_submit: {e}")))
+    }
+
+    /// PRD #20 R20-003/R20-004: carry the queued-for agent identity + session and
+    /// a stable delivery id to the daemon's atomic write-and-submit RPC, so a
+    /// respawn/rebind between enqueue and delivery yields `stale`/`wrong-session`
+    /// (no write) and a retry after a lost response replays the first result
+    /// instead of double-submitting.
+    fn write_and_submit_to_pane_with_identity(
+        &self,
+        pane_id: &str,
+        text: &str,
+        expected_agent_id: Option<&str>,
+        expected_session_id: Option<&str>,
+        delivery_id: Option<&str>,
+    ) -> Result<crate::event::SendResult, PaneError> {
+        let client = self.client.clone();
+        let pane_id = pane_id.to_string();
+        let text = text.to_string();
+        let expected_agent_id = expected_agent_id.map(str::to_string);
+        let expected_session_id = expected_session_id.map(str::to_string);
+        let delivery_id = delivery_id.map(str::to_string);
+        self.runtime
+            .block_on(async move {
+                client
+                    .write_and_submit_with_identity(
+                        &pane_id,
+                        &text,
+                        expected_agent_id.as_deref(),
+                        expected_session_id.as_deref(),
+                        delivery_id.as_deref(),
+                    )
+                    .await
+            })
             .map_err(|e| PaneError::CommandFailed(format!("write_and_submit: {e}")))
     }
 

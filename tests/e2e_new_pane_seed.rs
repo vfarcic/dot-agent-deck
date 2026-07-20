@@ -30,10 +30,15 @@
 //! - `prompt/new-pane/014` — regression guard: the recorded last command must
 //!   survive a full deck RESTART (two launches sharing one HOME) — proving the
 //!   value round-trips through the persisted `session.toml`, not just in-process.
+//! - `prompt/new-pane/015` — RED until PRD #20 M8: each recognized command seed
+//!   matches that agent's registry default, and submitting Codex launches it
+//!   through `dot-agent-deck wrap --agent codex -- codex` rather than bare.
 
 mod common;
 
 use common::TuiDeck;
+use dot_agent_deck::agent_registry;
+use dot_agent_deck::event::AgentType;
 use spec::spec;
 
 /// Read the new-pane form's Command-field text from a rendered vt100 grid.
@@ -60,6 +65,32 @@ fn command_field_value(grid: &str) -> String {
         .map(|(head, _)| head)
         .unwrap_or(after);
     value.trim().to_string()
+}
+
+fn agent_field_value(grid: &str) -> String {
+    let line = grid
+        .lines()
+        .find(|line| line.contains("Agent:"))
+        .unwrap_or_else(|| {
+            panic!("the new-pane form must render an `Agent:` selector.\nGrid:\n{grid}")
+        });
+    let after = line.split("Agent:").nth(1).unwrap_or("");
+    after
+        .split_once('\u{2502}')
+        .map(|(value, _)| value)
+        .unwrap_or(after)
+        .trim()
+        .trim_matches(['[', ']'])
+        .to_string()
+}
+
+fn open_new_pane_form(deck: &TuiDeck) -> String {
+    deck.wait_for_string("No active sessions");
+    deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" "); // Space → confirm dir → new-pane form
+    deck.wait_for_string("Tab: switch"); // footer is the last line → form fully painted
+    deck.snapshot_grid()
 }
 
 /// Scenario: Launch the deck with an EMPTY `default_command`, open the new-pane
@@ -341,4 +372,50 @@ fn new_pane_014_last_command_survives_restart() {
     );
 
     drop(shared_home);
+}
+
+/// Scenario: Open the new-pane form with no global default command, click its
+/// agent selector, and cycle through Claude Code, OpenCode, Pi, and Codex. Each
+/// real UI selection must immediately seed Command from that selected registry
+/// entry, without the test copying the expected value into global config first.
+#[spec("prompt/new-pane/015")]
+#[test]
+fn new_pane_015_registry_defaults_and_codex_launches_wrapped() {
+    let deck = TuiDeck::launch_with_fixture("minimal");
+    let initial = open_new_pane_form(&deck);
+    let (agent_x, agent_y) = deck.find_in_grid("Agent:").unwrap_or_else(|| {
+        panic!("the actual new-pane UI must expose an Agent selector.\nGrid:\n{initial}")
+    });
+    deck.click(agent_x, agent_y);
+
+    for (index, agent_type) in [
+        AgentType::ClaudeCode,
+        AgentType::OpenCode,
+        AgentType::Pi,
+        AgentType::Codex,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index > 0 {
+            deck.send_keys(b"\x1b[C");
+        }
+        let expected = agent_registry::spec(&agent_type)
+            .default_command
+            .expect("every selectable shipped agent has a default command");
+        deck.wait_until_grid("selected agent updates its command seed", |grid| {
+            agent_field_value(grid) == agent_registry::spec(&agent_type).label
+                && command_field_value(grid) == expected
+        });
+        let grid = deck.snapshot_grid();
+        assert_eq!(
+            agent_field_value(&grid),
+            agent_registry::spec(&agent_type).label
+        );
+        assert_eq!(
+            command_field_value(&grid),
+            expected,
+            "selecting {agent_type} in the real form must seed its registry default without a global default_command override\nGrid:\n{grid}"
+        );
+    }
 }

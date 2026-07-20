@@ -76,6 +76,7 @@ struct CastEvent {
 struct ContinueSession {
     pane_name: String,
     command: String,
+    mode: Option<String>,
 }
 
 /// Which agent's credential set the test wants imported from the
@@ -88,6 +89,7 @@ struct ContinueSession {
 enum CredentialImport {
     ClaudeCode,
     OpenCode,
+    Codex,
 }
 
 /// Builder for [`TuiDeck`]. Use the test surface
@@ -132,6 +134,23 @@ impl TuiDeckBuilder {
         self.continue_session = Some(ContinueSession {
             pane_name: pane_name.into(),
             command: command.into(),
+            mode: None,
+        });
+        self
+    }
+
+    /// Stage a saved pane carrying mode membership so restore exercises the
+    /// mode-tab rebuild path rather than the plain-pane fallback.
+    pub fn with_continue_mode_session(
+        mut self,
+        pane_name: impl Into<String>,
+        command: impl Into<String>,
+        mode: impl Into<String>,
+    ) -> Self {
+        self.continue_session = Some(ContinueSession {
+            pane_name: pane_name.into(),
+            command: command.into(),
+            mode: Some(mode.into()),
         });
         self
     }
@@ -163,6 +182,15 @@ impl TuiDeckBuilder {
     /// `~/.opencode/plugin/` directory on the host is NOT copied.
     pub fn with_imported_opencode_credentials(mut self) -> Self {
         self.credential_imports.push(CredentialImport::OpenCode);
+        self
+    }
+
+    /// Import the host user's Codex `auth.json` into the isolated per-test HOME
+    /// and trust the fixture working directory in Codex's project config. Pair
+    /// with [`check_codex_available`] so missing or rejected credentials cleanly
+    /// skip a real-Codex test instead of failing during TUI launch.
+    pub fn with_imported_codex_credentials(mut self) -> Self {
+        self.credential_imports.push(CredentialImport::Codex);
         self
     }
 
@@ -375,6 +403,9 @@ impl TuiDeck {
                 CredentialImport::OpenCode => {
                     import_opencode_credentials(&home).map_err(|e| e.to_string())?;
                 }
+                CredentialImport::Codex => {
+                    import_codex_credentials(&home).map_err(|e| e.to_string())?;
+                }
             }
         }
 
@@ -394,8 +425,14 @@ impl TuiDeck {
         // skips panes whose `dir` doesn't exist on disk).
         let session_toml_path = work.join("session.toml");
         if let Some(cs) = &builder.continue_session {
-            write_continue_session_file(&session_toml_path, &work, &cs.pane_name, &cs.command)
-                .expect("write continue session.toml");
+            write_continue_session_file(
+                &session_toml_path,
+                &work,
+                &cs.pane_name,
+                &cs.command,
+                cs.mode.as_deref(),
+            )
+            .expect("write continue session.toml");
         }
 
         let hook_socket = work.join("hook.sock");
@@ -929,6 +966,17 @@ impl TuiDeck {
         writer.flush().expect("flush keys to PTY master");
     }
 
+    /// Subscribe to the daemon's broadcast event stream used by this attached
+    /// deck. Wrapper e2es use it to inspect the typed event and schema version
+    /// while separately asserting the same transition on the rendered grid.
+    ///
+    /// PRD #42 M8: returns the Unix-only `EventSub` (attach stream over a UDS),
+    /// so this accessor is Unix-gated like the harness it exposes.
+    #[cfg(unix)]
+    pub fn subscribe_events(&self) -> EventSub {
+        EventSub::open(&self.attach_socket).expect("open SubscribeEvents stream")
+    }
+
     /// Returns the deck's per-test hook socket path. Synthetic-event
     /// L2 tests connect to this directly to inject hook payloads.
     pub fn hook_socket_path(&self) -> &Path {
@@ -1460,6 +1508,90 @@ pub fn check_opencode_available() -> Result<(), String> {
     )
 }
 
+/// Cheap model used by Codex availability probes and real-agent e2e coverage.
+pub const CODEX_TEST_MODEL: &str = "gpt-5.1-codex-mini";
+
+/// Runtime-skip helper for real Codex coverage. A version check alone is not
+/// enough: this verifies persisted auth and performs one minimal model request,
+/// so expired credentials, 401 responses, and unreachable accounts skip cleanly
+/// before the PTY scenario starts.
+pub fn check_codex_available() -> Result<(), String> {
+    if !cli_invocable("codex") {
+        return Err("Codex CLI not installed (could not invoke `codex --version`)".into());
+    }
+
+    let auth_path = host_home().join(".codex").join("auth.json");
+    let auth_is_regular = std::fs::symlink_metadata(&auth_path)
+        .map(|meta| meta.file_type().is_file())
+        .unwrap_or(false);
+    if !auth_is_regular {
+        return Err(
+            "Codex credentials not found at ~/.codex/auth.json — log in with `codex login`".into(),
+        );
+    }
+
+    let login = std::process::Command::new("codex")
+        .args(["login", "status"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("could not check Codex login status: {e}"))?;
+    let login_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&login.stdout),
+        String::from_utf8_lossy(&login.stderr)
+    );
+    if !login.status.success() || login_text.to_ascii_lowercase().contains("not logged") {
+        return Err("Codex is not authenticated — log in with `codex login`".into());
+    }
+
+    let final_message = tempfile::NamedTempFile::new()
+        .map_err(|e| format!("could not create Codex probe output file: {e}"))?;
+    let probe = std::process::Command::new("codex")
+        .args([
+            "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "--model",
+            CODEX_TEST_MODEL,
+            "-c",
+            "model_reasoning_effort=\"low\"",
+            "--color",
+            "never",
+        ])
+        .arg("--output-last-message")
+        .arg(final_message.path())
+        .arg("Reply with exactly CODEX_AUTH_OK and do not use tools.")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("could not run Codex model probe: {e}"))?;
+    let probe_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    let lower = probe_text.to_ascii_lowercase();
+    let model_reply = std::fs::read_to_string(final_message.path()).unwrap_or_default();
+    if !probe.status.success()
+        || !model_reply.contains("CODEX_AUTH_OK")
+        || [
+            "401",
+            "unauthorized",
+            "not logged in",
+            "authentication required",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return Err(format!(
+            "Codex could not reach model {CODEX_TEST_MODEL} with the current authentication"
+        ));
+    }
+    Ok(())
+}
+
 /// Helper: returns true when `bin --version` exits 0, false otherwise
 /// (binary missing, returns non-zero, etc.). Used by the
 /// `check_*_available()` helpers — extracted so the BoolNot trait
@@ -1889,6 +2021,32 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Copy only Codex's authentication state into the isolated test HOME and seed
+/// the fixture working directory as trusted. User configuration is deliberately
+/// not imported; real-agent tests pin their model for deterministic behavior.
+pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
+    let src = host_home().join(".codex").join("auth.json");
+    let bytes = read_credential_file_no_symlink(
+        &src,
+        "Codex credentials not found at ~/.codex/auth.json — log in with `codex login`",
+        "~/.codex/auth.json",
+    )?;
+    let dst = test_home.join(".codex");
+    std::fs::create_dir_all(&dst)?;
+    write_credential_file_atomic_0o600(&dst.join("auth.json"), &bytes)?;
+
+    let project = test_home.parent().ok_or_else(|| {
+        std::io::Error::other("isolated Codex HOME has no fixture working directory")
+    })?;
+    let config = format!(
+        "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+        toml_escape(project.to_str().ok_or_else(|| {
+            std::io::Error::other("isolated Codex fixture path is not UTF-8")
+        })?)
+    );
+    write_credential_file_atomic_0o600(&dst.join("config.toml"), config.as_bytes())
+}
+
 /// Like `copy_dir_recursively` but skips any top-level `plugin/`
 /// child — the deck auto-installs its own OpenCode plugin into the
 /// tempdir HOME and we do NOT want the host's plugin firing too.
@@ -1925,6 +2083,7 @@ fn write_continue_session_file(
     work_dir: &Path,
     pane_name: &str,
     command: &str,
+    mode: Option<&str>,
 ) -> std::io::Result<()> {
     // Hand-rolled TOML so we don't need a runtime dep on toml in the
     // harness module. Field names match `dot_agent_deck::config::SavedPane`.
@@ -1936,6 +2095,9 @@ fn write_continue_session_file(
     ));
     s.push_str(&format!("name = \"{}\"\n", toml_escape(pane_name)));
     s.push_str(&format!("command = \"{}\"\n", toml_escape(command)));
+    if let Some(mode) = mode {
+        s.push_str(&format!("mode = \"{}\"\n", toml_escape(mode)));
+    }
     std::fs::write(session_toml_path, s)
 }
 
@@ -2697,16 +2859,10 @@ impl EventSub {
                 return ev.clone();
             }
             if Instant::now() >= deadline {
-                let seen: Vec<_> = self
-                    .events
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .map(|e| (e.agent_type.clone(), e.event_type.clone()))
-                    .collect();
+                let seen = self.events.lock().unwrap().clone();
                 panic!(
                     "no broadcast AgentEvent matched the predicate within {timeout:?}; \
-                     observed (agent_type, event_type): {seen:?}"
+                     observed events: {seen:#?}"
                 );
             }
             std::thread::sleep(Duration::from_millis(20));

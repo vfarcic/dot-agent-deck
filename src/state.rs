@@ -9,7 +9,7 @@ use crate::agent_pty::AgentPtyRegistry;
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
     AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
-    OrchestrationSurface, WorkDoneSignal,
+    LiveTarget, OrchestrationSurface, WorkDoneSignal, Writable,
 };
 use crate::project_config::{OrchestrationRoleConfig, load_project_config};
 
@@ -73,6 +73,13 @@ pub struct DashboardStats {
     pub idle: usize,
     pub compacting: usize,
     pub total_tools: u64,
+    /// PRD #20 finding #10: per-agent-type active counts, in registry
+    /// (`agent_registry::ALL`) order, including only real agent types that have
+    /// at least one active session. The stats bar renders a compact breakdown
+    /// (`1 ClaudeCode │ 1 Codex`) from this ONLY when more than one distinct
+    /// agent type is active, so a single-agent dashboard is unchanged. Defaults
+    /// to empty (a hand-built `DashboardStats` carries no breakdown).
+    pub by_agent_type: Vec<(AgentType, usize)>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -114,6 +121,15 @@ pub struct SessionSnapshot {
     /// The most recent user prompt, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_user_prompt: Option<String>,
+    /// PRD #20 blocker-4: the session's durable live-target descriptor, so a
+    /// history-only / view-only card keeps its input-refusal across a
+    /// detach/reconnect instead of falling back to the legacy live default.
+    /// Additive optional (`#[serde(default)]` + `skip_serializing_if`): an
+    /// older daemon or a native PTY pane that never declared one yields `None`,
+    /// which the TUI reads as `Live`. Restored by
+    /// [`AppState::seed_hydrated_session`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_target: Option<LiveTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,7 +185,39 @@ impl SessionState {
             tool_count: self.tool_count,
             first_prompts: self.first_prompts.clone(),
             last_user_prompt: self.last_user_prompt.clone(),
+            // PRD #20 blocker-4: carry the durable live-target so a reconnect
+            // restores the card's write-semantics (history-only / view-only).
+            live_target: self.live_target(),
         }
+    }
+
+    /// PRD #20 M3/blocker-2: the current live-target descriptor of this session,
+    /// or `None` when no event ever declared one.
+    ///
+    /// The value is DURABLE, not a property that disappears when the declaring
+    /// event ages out of the bounded `recent_events` journal: `apply_event`
+    /// forward-stamps the last-declared `live_target` onto every subsequent
+    /// event that omits one (see [`AppState::apply_event`]), and
+    /// [`AppState::seed_hydrated_session`] restamps it from the reconnect
+    /// snapshot. So reading the newest declaration back out of `recent_events`
+    /// always reflects the explicit session state, even after >`MAX_RECENT_EVENTS`
+    /// undeclared events have evicted the original declaration. A
+    /// `SessionState` carries no dedicated field for it because uneditable
+    /// fixtures construct the struct by exhaustive literal.
+    pub fn live_target(&self) -> Option<LiveTarget> {
+        self.recent_events.iter().rev().find_map(|e| e.live_target)
+    }
+
+    /// PRD #20 M3: the write-semantics of this session's live target. A session
+    /// that never declared a live_target (every native Claude/OpenCode/Pi PTY
+    /// pane, and any directly-constructed fixture) is treated as
+    /// [`Writable::Live`]: the historical default where the pane the dashboard
+    /// shows is the pane it writes to. A wrapped Codex session that declared
+    /// `history-only` (see [`crate::wrap`]) reports non-live here durably.
+    pub fn writable(&self) -> Writable {
+        self.live_target()
+            .map(|lt| lt.writable)
+            .unwrap_or(Writable::Live)
     }
 }
 
@@ -215,6 +263,27 @@ pub struct AppState {
     /// Empty in the common case; bounded by `MAX_PENDING_ORCHESTRATION_SURFACES`
     /// (L1) so a flood can't grow it unbounded.
     pub pending_orchestration_surfaces: Vec<OrchestrationSurface>,
+    /// PRD #20 R20-003 (finding #4): the DAEMON-AUTHORITATIVE hook session id
+    /// (the "generation") currently bound to each pane, keyed by `pane_id`.
+    /// Captured from every event's ORIGINAL `session_id` BEFORE the same-agent
+    /// reuse guard in [`Self::apply_event`] remaps that id onto the stable card
+    /// id. Without this separate track, a same-agent `/clear` / thread restart
+    /// (which mints a NEW hook session under the SAME `agent_id`) is remapped
+    /// back onto the OLD card id, so the card's `session_id` — and thus
+    /// [`Self::pane_session_id`] — keeps reporting the OLD generation, and an old
+    /// queued prompt bound to it is wrongly accepted in the NEW conversation.
+    /// The atomic write-and-submit guard compares the caller's expected session
+    /// against [`Self::pane_hook_session_id`] (this map) instead, so a stale
+    /// generation is refused with no bytes. Cleared on `SessionEnd`.
+    ///
+    /// PRD #20 Greptile finding #4 (monotonic generation): the value is a
+    /// `(session_id, established_at)` pair, NOT just the id. The generation only
+    /// advances on a genuinely newer session (an incoming id different from the
+    /// current one whose event timestamp is `>=` the established one); an
+    /// out-of-order / older-generation event is IGNORED so a delayed prior-event
+    /// can neither restore a stale id nor clear a newer one, and a delayed
+    /// prior-generation `SessionEnd` cannot wipe the current generation.
+    pane_hook_session: HashMap<String, (String, DateTime<Utc>)>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -641,6 +710,30 @@ async fn dispatch_one_owned(
     }
 }
 
+/// PRD #20 blocker-4: build an inert [`AgentEvent`] that carries only a
+/// `live_target`, used to re-seed a reconnected session's durable write-
+/// semantics into `recent_events`. Its `Idle` type and empty tool/prompt fields
+/// mean the card's activity renderers (`collect_recent_prompts`,
+/// `recent_tool_lines`) ignore it; only [`SessionState::live_target`] reads it.
+fn live_target_carrier_event(session: &SessionState, live_target: LiveTarget) -> AgentEvent {
+    AgentEvent {
+        session_id: session.session_id.clone(),
+        agent_type: session.agent_type.clone(),
+        event_type: EventType::Idle,
+        tool_name: None,
+        tool_detail: None,
+        cwd: session.cwd.clone(),
+        timestamp: session.last_activity,
+        user_prompt: None,
+        metadata: HashMap::new(),
+        pane_id: session.pane_id.clone(),
+        agent_id: session.agent_id.clone(),
+        agent_version: None,
+        schema_version: None,
+        live_target: Some(live_target),
+    }
+}
+
 impl AppState {
     pub fn aggregate_stats(&self) -> DashboardStats {
         let mut stats = DashboardStats::default();
@@ -662,7 +755,97 @@ impl AppState {
             }
             stats.total_tools += session.tool_count as u64;
         }
+        // PRD #20 finding #10: per-agent-type active counts in stable registry
+        // (`ALL`) order, so the rendered bar / snapshot is deterministic. Only
+        // types with at least one active session are included.
+        stats.by_agent_type = crate::agent_registry::ALL
+            .iter()
+            .filter_map(|spec| {
+                let count = self
+                    .sessions
+                    .values()
+                    .filter(|s| s.agent_type == spec.agent_type)
+                    .count();
+                (count > 0).then(|| (spec.agent_type.clone(), count))
+            })
+            .collect();
         stats
+    }
+
+    /// PRD #20 M3: the write-semantics of the live session bound to `pane_id`.
+    ///
+    /// The daemon's [`crate::daemon_protocol::AttachRequest::WriteAndSubmit`]
+    /// handler calls this to decide whether input should actually be delivered
+    /// or reported as history-only / no-live-target. Resolves the session on the
+    /// pane (newest by `last_activity` if a `/clear` restart left more than one)
+    /// and reads its [`SessionState::writable`]. A pane with no live session
+    /// defaults to [`Writable::Live`] so the historical PTY write path is
+    /// unaffected — only a session that explicitly declared a non-live
+    /// live_target (a wrapped Codex pane) reports otherwise.
+    pub fn pane_writable(&self, pane_id: &str) -> Writable {
+        self.sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some(pane_id))
+            .max_by_key(|s| s.last_activity)
+            .map(|s| s.writable())
+            .unwrap_or(Writable::Live)
+    }
+
+    /// PRD #20 R20-003: the `session_id` of the newest live session bound to
+    /// `pane_id` (same newest-by-`last_activity` resolution as
+    /// [`Self::pane_writable`]), or `None` when the pane carries no session.
+    ///
+    /// The daemon's atomic write-and-submit guard compares this against the
+    /// session id the prompt was queued for: if a DIFFERENT session now owns the
+    /// pane (a `/clear` restart or respawn replaced it), the prompt is stale and
+    /// must not be delivered to the replacement. `None` means "no session
+    /// declared" — the guard treats that as a match (the legacy native-PTY
+    /// default, consistent with `pane_writable` defaulting to `Live`).
+    pub fn pane_session_id(&self, pane_id: &str) -> Option<String> {
+        self.sessions
+            .values()
+            .filter(|s| s.pane_id.as_deref() == Some(pane_id))
+            .max_by_key(|s| s.last_activity)
+            .map(|s| s.session_id.clone())
+    }
+
+    /// PRD #20 R20-003 (finding #4): the DAEMON-AUTHORITATIVE hook session id
+    /// (generation) currently bound to `pane_id`, or `None` when the pane has no
+    /// live hook session (only a placeholder, or the agent ended).
+    ///
+    /// Unlike [`Self::pane_session_id`] — which returns the *card* id that the
+    /// same-agent reuse guard deliberately keeps STABLE across a `/clear` for UI
+    /// continuity — this reflects the LATEST hook `session_id` the pane's agent
+    /// actually reported (see [`AppState::pane_hook_session`]). The atomic
+    /// write-and-submit guard compares a caller's `expected_session_id` against
+    /// THIS value and requires an EXACT match: a same-agent `/clear` / thread
+    /// restart rolls the generation over, so an old queued prompt is refused.
+    /// A `None` here with an expected session supplied is a REJECTION, not a
+    /// silent accept — the queued generation no longer exists.
+    pub fn pane_hook_session_id(&self, pane_id: &str) -> Option<String> {
+        self.pane_hook_session
+            .get(pane_id)
+            .map(|(id, _)| id.clone())
+    }
+
+    /// PRD #20 Greptile finding #3: the write-semantics of the newest live
+    /// session produced by `agent_id`, resolved by agent identity rather than by
+    /// pane. A daemon-side agent with no `pane_id_env` maps to the `<no-pane>`
+    /// sentinel, so [`Self::pane_writable`] can never find its session (which is
+    /// keyed with `pane_id == None`) and would fall through to the `Live`
+    /// default — letting a history-only/view-only paneless target still receive
+    /// `KIND_STREAM_IN`. The attach-stream input loop consults THIS for a
+    /// paneless target so a declared non-live session fails closed. A paneless
+    /// agent with no declared session still defaults to [`Writable::Live`] (the
+    /// historical native-PTY behavior), so an ordinary paneless shell is
+    /// unaffected.
+    pub fn agent_writable(&self, agent_id: &str) -> Writable {
+        self.sessions
+            .values()
+            .filter(|s| s.agent_id.as_deref() == Some(agent_id))
+            .max_by_key(|s| s.last_activity)
+            .map(|s| s.writable())
+            .unwrap_or(Writable::Live)
     }
 
     /// Register a pane ID as managed by our app.
@@ -796,6 +979,19 @@ impl AppState {
                 session.tool_count = snap.tool_count;
                 session.first_prompts = snap.first_prompts.clone();
                 session.last_user_prompt = snap.last_user_prompt.clone();
+                // PRD #20 blocker-4: restore the durable live-target so a
+                // history-only / view-only card keeps refusing input right
+                // after reconnect, before any new event re-declares it. The
+                // descriptor lives in `recent_events` (no dedicated field —
+                // uneditable fixtures build `SessionState` by exhaustive
+                // literal), so re-seed it as a single inert carrier event. It
+                // sets no prompt/tool, so the card's activity renderers ignore
+                // it; `apply_event`'s forward-stamping then keeps it durable.
+                if let Some(live_target) = snap.live_target {
+                    session
+                        .recent_events
+                        .push_back(live_target_carrier_event(session, live_target));
+                }
             }
         }
     }
@@ -1015,6 +1211,11 @@ impl AppState {
     }
 
     pub fn apply_event(&mut self, mut event: AgentEvent) {
+        // PRD #20 R20-003 (finding #4): the ORIGINAL hook `session_id` on the
+        // wire, captured BEFORE the same-agent reuse guard below remaps it onto
+        // the stable card id. This is the generation the daemon's send guard
+        // compares against — see [`Self::pane_hook_session`].
+        let incoming_session_id = event.session_id.clone();
         // Only accept events from panes managed by our app.
         // Events without a pane_id (external agents) are rejected when we have
         // managed panes. Events with an unknown pane_id are rejected unless it
@@ -1132,6 +1333,26 @@ impl AppState {
         }
 
         if event.event_type == EventType::SessionEnd {
+            // PRD #20 R20-003 (finding #4): the agent ended, so drop the pane's
+            // hook-session generation. A prompt queued for the now-dead session
+            // then hits a `None` current-session in the send guard and is
+            // refused (a `None` with an expected session is a rejection, never a
+            // silent accept).
+            //
+            // Greptile finding #4 (monotonic): only the CURRENT generation's end
+            // clears the entry. A DELAYED `SessionEnd` from a PRIOR generation
+            // (its `session_id` no longer matches the pane's current generation)
+            // must NOT wipe a newer generation that already superseded it —
+            // otherwise a current prompt would be wrongly refused against a
+            // cleared entry.
+            if let Some(ref pane_id) = event.pane_id
+                && self
+                    .pane_hook_session
+                    .get(pane_id)
+                    .is_some_and(|(current, _)| *current == incoming_session_id)
+            {
+                self.pane_hook_session.remove(pane_id);
+            }
             // Preserve started_at for the pane so a restarted session keeps its position.
             //
             // PRD #110 followup: also capture the dying session's `agent_id`
@@ -1162,6 +1383,41 @@ impl AppState {
                 self.insert_placeholder_session(pane_id, cwd, None, agent_id);
             }
             return;
+        }
+
+        // PRD #20 R20-003 (finding #4): record the LATEST hook-session generation
+        // for this pane using the ORIGINAL (pre-remap) session id. A same-agent
+        // `/clear` mints a new hook session under the SAME agent_id — the reuse
+        // guard above remapped `event.session_id` back to the old card id for UI
+        // continuity, but the generation tracked here rolls forward, so the send
+        // guard refuses an old queued prompt against the new conversation.
+        //
+        // Greptile finding #4 (monotonic): the generation only ADVANCES; it never
+        // regresses. Advance to the incoming id when it is a genuinely newer
+        // generation — a different id whose event timestamp is at least the
+        // established one (or a fresher timestamp for the same id). A delayed
+        // event from a PRIOR generation (older timestamp, different id) is
+        // IGNORED, so it can neither restore a stale generation nor overwrite the
+        // current one.
+        if let Some(ref pane_id) = event.pane_id {
+            let incoming_ts = event.timestamp;
+            let advance = match self.pane_hook_session.get(pane_id) {
+                None => true,
+                Some((current_id, current_ts)) => {
+                    if *current_id == incoming_session_id {
+                        // Same generation: keep the id, bump the established
+                        // timestamp so subsequent older events stay rejected.
+                        incoming_ts > *current_ts
+                    } else {
+                        // Different generation: only a not-older event wins.
+                        incoming_ts >= *current_ts
+                    }
+                }
+            };
+            if advance {
+                self.pane_hook_session
+                    .insert(pane_id.clone(), (incoming_session_id.clone(), incoming_ts));
+            }
         }
 
         let pane_started = event
@@ -1272,6 +1528,19 @@ impl AppState {
                 session.status = SessionStatus::Error;
             }
             EventType::SessionEnd => unreachable!(),
+        }
+
+        // PRD #20 blocker-2: keep the live-target durable across the bounded
+        // journal. An event that omits `live_target` inherits the session's
+        // last-declared one, so the descriptor is never lost when the original
+        // declaring event ages out of `recent_events` (>MAX_RECENT_EVENTS later).
+        // A new declaration on the event itself always wins.
+        if event.live_target.is_none() {
+            event.live_target = session
+                .recent_events
+                .iter()
+                .rev()
+                .find_map(|e| e.live_target);
         }
 
         session.recent_events.push_back(event);

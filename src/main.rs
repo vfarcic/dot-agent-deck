@@ -13,7 +13,6 @@ use dot_agent_deck::daemon_attach::ensure_external_daemon_or_die;
 use dot_agent_deck::daemon_client::DaemonClient;
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::hook::handle_hook;
-use dot_agent_deck::hooks_manage;
 use dot_agent_deck::pane::PaneController;
 use dot_agent_deck::state::AppState;
 use dot_agent_deck::ui::run_tui;
@@ -30,6 +29,24 @@ enum CliAgent {
     #[default]
     ClaudeCode,
     Opencode,
+    /// PRD #20 W1: Codex ships a Claude-Code-compatible hooks engine, so its
+    /// native command hooks shell `dot-agent-deck hook --agent codex`. Ingested
+    /// by the [`dot_agent_deck::hook`] `"codex"` arm.
+    Codex,
+}
+
+impl CliAgent {
+    /// Map the CLI-surface agent selector to the registry's typed identity, so
+    /// hook install/uninstall dispatch reads the integration STRATEGY from the
+    /// agent registry (PRD #20 M2) instead of hardcoding which per-agent module
+    /// to call for each variant.
+    fn agent_type(self) -> dot_agent_deck::event::AgentType {
+        match self {
+            CliAgent::ClaudeCode => dot_agent_deck::event::AgentType::ClaudeCode,
+            CliAgent::Opencode => dot_agent_deck::event::AgentType::OpenCode,
+            CliAgent::Codex => dot_agent_deck::event::AgentType::Codex,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -176,6 +193,22 @@ enum Commands {
     Snapshot {
         #[command(subcommand)]
         cmd: SnapshotCmd,
+    },
+    /// Wrap an agent command, passing its stdio through transparently while
+    /// tee-ing output through pattern detection into `AgentEvent`s (PRD #20 M6
+    /// — the generic stdout-wrapper integration strategy). The child stays
+    /// fully interactive; recognised output lines drive the pane's card status,
+    /// and the child's exit code becomes the wrapper's exit code. Usage:
+    /// `dot-agent-deck wrap [--agent <name>] -- <command> <args...>`.
+    Wrap {
+        /// Optional agent identity override (a registry basename, e.g.
+        /// `claude`). When omitted, the type is inferred from the wrapped
+        /// command's binary.
+        #[arg(long)]
+        agent: Option<String>,
+        /// The agent command and its arguments, taken verbatim after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
     },
 }
 
@@ -483,29 +516,49 @@ fn main() -> ExitCode {
             let agent_str = match agent {
                 CliAgent::ClaudeCode => "claude-code",
                 CliAgent::Opencode => "opencode",
+                CliAgent::Codex => "codex",
             };
             handle_hook(agent_str)
         }
         Some(Commands::Hooks { action }) => {
+            // PRD #20 finding #15: dispatch through the SPEC's own handler rather
+            // than a strategy-keyed hardcoded incumbent. Behaviour is unchanged
+            // for the two CLI agents — ClaudeCode installs its native hooks,
+            // Opencode its plugin — but a FUTURE agent (even one reusing an
+            // existing strategy) installs correctly from just its own registry
+            // handler, never another agent's module.
+            use dot_agent_deck::agent_registry;
             match action {
-                HooksAction::Install { agent } => match agent {
-                    CliAgent::Opencode => {
-                        if let Err(e) = dot_agent_deck::opencode_manage::install() {
-                            eprintln!("Failed to install OpenCode plugin: {e}");
+                HooksAction::Install { agent } => {
+                    let spec = agent_registry::spec(&agent.agent_type());
+                    match spec.hook_install {
+                        Some(install) => {
+                            if let Err(e) = install() {
+                                eprintln!("Failed to install {} hooks: {e}", spec.label);
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                        None => {
+                            eprintln!("No hook installer for agent {}", spec.label);
                             return ExitCode::FAILURE;
                         }
                     }
-                    CliAgent::ClaudeCode => hooks_manage::install(),
-                },
-                HooksAction::Uninstall { agent } => match agent {
-                    CliAgent::Opencode => {
-                        if let Err(e) = dot_agent_deck::opencode_manage::uninstall() {
-                            eprintln!("Failed to uninstall OpenCode plugin: {e}");
+                }
+                HooksAction::Uninstall { agent } => {
+                    let spec = agent_registry::spec(&agent.agent_type());
+                    match spec.hook_uninstall {
+                        Some(uninstall) => {
+                            if let Err(e) = uninstall() {
+                                eprintln!("Failed to uninstall {} hooks: {e}", spec.label);
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                        None => {
+                            eprintln!("No hook uninstaller for agent {}", spec.label);
                             return ExitCode::FAILURE;
                         }
                     }
-                    CliAgent::ClaudeCode => hooks_manage::uninstall(),
-                },
+                }
             }
             ExitCode::SUCCESS
         }
@@ -693,6 +746,9 @@ fn main() -> ExitCode {
                 metadata: Default::default(),
                 pane_id: Some(pane_id),
                 agent_id,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
             };
             let json = match serde_json::to_string(&event) {
                 Ok(j) => j,
@@ -961,6 +1017,9 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some(Commands::Wrap { agent, command }) => {
+            dot_agent_deck::wrap::run_wrap(agent.as_deref(), &command)
+        }
     }
 }
 
@@ -1124,9 +1183,24 @@ async fn run_tui_session() -> ExitCode {
     // the alt-screen, so loading here keeps the warnings ahead of it.
     let keybindings = dot_agent_deck::keybindings::KeybindingConfig::load();
 
-    // Auto-install hooks for detected agents (silent, best-effort)
-    hooks_manage::auto_install();
-    dot_agent_deck::opencode_manage::auto_install();
+    // Auto-install hooks/plugins for detected agents (silent, best-effort).
+    // PRD #20 M2 / R20-010: driven from the agent registry — iterate the shipped
+    // agents and run each spec's OWN startup auto-install action. Order is stable
+    // (`ALL` order). Dispatching per-spec (rather than mapping the reusable
+    // `IntegrationStrategy` enum to a hardcoded incumbent) means a future agent
+    // reusing `NativeHooks`/`Plugin` runs ITS OWN installer, not Claude's or
+    // OpenCode's. Claude installs native hooks and OpenCode its plugin at
+    // startup; Pi (`Extension`) materializes at spawn-time (see `agent_pty`) and
+    // Codex (`Wrapper`) has no install step, so their `startup_auto_install` is
+    // `None` and they are skipped.
+    {
+        use dot_agent_deck::agent_registry::ALL;
+        for spec in ALL {
+            if let Some(install) = spec.startup_auto_install {
+                install();
+            }
+        }
+    }
 
     let pane_controller: Arc<dyn PaneController> = Arc::new(EmbeddedPaneController::new(
         attach_path.clone(),

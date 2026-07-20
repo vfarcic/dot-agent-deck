@@ -67,6 +67,29 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the status badge color (`status/badge/001`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/pane/008 — Agent cards retain their registry-colored type badges even when they have friendly display names (PRD #20 M7, review finding 9).
+- **Layer:** L1 (ratatui `TestBackend` + color-aware `insta` snapshot).
+- **Agent:** none (synthetic Claude Code, OpenCode, Pi, and Codex `SessionState` fixtures, including friendly display names).
+- **Asserts:** the unnamed Codex card and named cards for all four shipped agents contain their registry identity; every badge cell uses that registry entry's `badge_color`; complete color-aware buffers are snapshotted.
+- **Does not assert:** wrapper event delivery or real Codex execution (covered by `codex/wrap/001` and `codex/live/001`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/pane/009 — A history-only session is visibly distinct from a live writable session (PRD #20 M4).
+- **Layer:** L1 (ratatui `TestBackend` + inline `insta` snapshot).
+- **Agent:** synthetic Codex `AgentEvent` fixtures, one live and one history-only.
+- **Asserts:** the history-only card visibly contains a history marker and its numeric input shortcut carries `Modifier::DIM`; the live contrast card has neither treatment.
+- **Does not assert:** delivery feedback or daemon send results (covered by `prompt/pane-input/004`).
+- **Platform coverage:** mac+linux+windows.
+
+#### dashboard/stats
+
+##### dashboard/stats/001 — Mixed-agent dashboards show a per-agent-type count breakdown in the stats bar (PRD #20, review finding 10).
+- **Layer:** L1 (in-process `AppState::aggregate_stats` + ratatui `TestBackend` stats render).
+- **Agent:** none (one synthetic Claude Code session and one synthetic Codex session).
+- **Asserts:** when more than one real agent type is active, the rendered stats bar visibly contains `1 ClaudeCode` and `1 Codex` alongside the aggregate status totals.
+- **Does not assert:** single-agent-type suppression or exact badge colors.
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/density
 
 ##### dashboard/density/001 — Spacious density shows up to 3 prompts and 3 tool calls per card.
@@ -248,6 +271,20 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** subsequent re-open behavior of the filter dialog with prior input restored — not yet specified.
 - **Platform coverage:** mac+linux.
 
+##### dashboard/filter/003 — `type:<agent>` filters mixed sessions by registry identity and composes with ordinary text (PRD #20 M9).
+- **Layer:** L1 (in-process `filter_sessions` pure-data matrix).
+- **Agent:** none (synthetic Claude Code, OpenCode, Pi, and Codex session states).
+- **Asserts:** `type:claude`, `type:claudecode`, `type:opencode`, `type:pi`, and `type:codex` each select only that agent; type matching is case-insensitive; a remaining text term is ANDed with the type; conflicting `type:codex type:claude` constraints use true AND semantics and yield no matches; an unknown type yields no matches; plain id/cwd/status/display-name matching is unchanged.
+- **Does not assert:** the rendered dashboard result (covered by `dashboard/filter/004`).
+- **Platform coverage:** mac+linux+windows.
+
+##### dashboard/filter/004 — Typing `type:codex` in the `/` search visibly narrows the dashboard to Codex cards (PRD #20 M9).
+- **Layer:** L1 (in-process keyboard handlers + ratatui `TestBackend` dashboard render).
+- **Agent:** none (synthetic Claude Code, OpenCode, Pi, and Codex session states).
+- **Asserts:** `/` enters filter mode; typing `type:codex` through the filter input leaves the Codex card visible and hides every non-Codex card in the rendered buffer.
+- **Does not assert:** accepting or clearing the filter (covered by `dashboard/filter/002` and `dashboard/selection/004`).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/rename
 
 ##### dashboard/rename/001 — `r` on the selected card opens a rename input pre-filled with the current name.
@@ -381,6 +418,40 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** the real `pi` runtime + bundled extension end to end (real-`pi` e2e, M4.1); the daemon's own internal derived status over the wire (`AgentRecord` carries no status field; the broadcast is the observable).
 - **Platform coverage:** linux (headless daemon-serve harness).
 
+##### status/agent-event/004 — A typed synthetic Codex wrapper lifecycle updates one dashboard card through active, error, recovery, and idle states (PRD #20 M7).
+- **Layer:** L1 (in-process `SyntheticAgent<AgentType::Codex>` events applied through `AppState::apply_event`).
+- **Agent:** synthetic Codex wrapper identity.
+- **Asserts:** the same Codex session remains one card and its observable status follows Thinking → Error → Thinking → Idle while retaining `AgentType::Codex`.
+- **Does not assert:** stdout classification or socket transport (covered by `codex/wrap/001`).
+- **Platform coverage:** mac+linux+windows.
+
+### Agent protocol
+
+#### protocol/live-target
+
+##### protocol/live-target/001 — `AgentEvent.live_target` preserves every target-kind and writability value while remaining optional for legacy events (PRD #20 M3).
+- **Layer:** L1 (pure serde wire contract).
+- **Agent:** none (JSON fixtures).
+- **Asserts:** every Cartesian combination of `process|pty|tmux|sdk|none` and `live|history-only|none` survives an `AgentEvent` deserialize/serialize round trip; a legacy event without the field still deserializes and reserializes with the optional field omitted.
+- **Does not assert:** state propagation or rendering (covered by `dashboard/pane/009`).
+- **Platform coverage:** mac+linux+windows.
+
+##### protocol/live-target/002 — A declared non-live capability survives eviction of its declaring event from bounded recent history (PRD #20, blocker 2).
+- **Layer:** L1 (in-process `AppState::apply_event` state transition).
+- **Agent:** synthetic Codex events.
+- **Asserts:** after a history-only `SessionStart` and 51 later events omitting `live_target`, the session remains `Writable::HistoryOnly` rather than falling back to Live when the first event leaves the 50-entry journal.
+- **Does not assert:** reconnect serialization (covered by `session/live/010`) or card rendering (`dashboard/pane/009`).
+- **Platform coverage:** mac+linux+windows.
+
+#### protocol/send-result
+
+##### protocol/send-result/001 — Every input-delivery result retains its distinct public wire value (PRD #20 M3).
+- **Layer:** L1 (pure serde wire contract).
+- **Agent:** none (JSON fixtures).
+- **Asserts:** `applied`, `queued`, `stale`, `wrong-session`, `history-only`, and `no-live-target` each survive an `AttachResponse` deserialize/serialize round trip.
+- **Does not assert:** actual pane delivery or rendered feedback (covered by `prompt/pane-input/004`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Prompts
 
 #### prompt/permission
@@ -427,6 +498,125 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Agent:** none (fixture: `sh -c 'trap "echo INT" INT; sleep 5'`).
 - **Asserts:** the pane PTY shows `INT` after the keystroke, confirming the signal was delivered.
 - **Does not assert:** signal handling in the dashboard tab itself (covered by `dashboard/quit/*`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/004 — A history-only send returns an honest result and surfaces feedback instead of silently dropping input (PRD #20 M3/M4).
+- **Layer:** L2 (real spawned TUI + daemon in the PTY/vt100 harness; synthetic pane and hook event, no LLM).
+- **Agent:** synthetic wrapped Codex session backed by `cat`, declared `writable = history-only` through `AgentEvent.live_target`.
+- **Asserts:** `WriteAndSubmit` returns `send_result = history-only`; attempting to enter the card renders `History-only session cannot accept live input`; the rejected send does not remove the Codex card.
+- **Does not assert:** real Codex execution or wrapper stdout classification (covered by `codex/live/001` and `codex/wrap/001`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/005 — An open attach stream rejects key and paste input after its focused session becomes non-live (PRD #20, blocker 6).
+- **Layer:** L1 protocol integration (in-process daemon attach server + real PTY-backed shell; fast tier).
+- **Agent:** synthetic Codex session bound to the shell pane.
+- **Asserts:** a baseline live key reaches the child; after the same session declares history-only, subsequent key and bracketed-paste `KIND_STREAM_IN` frames produce no child output.
+- **Does not assert:** UI mode exit or card feedback; this pins the authoritative daemon stream-input gate.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/006 — Seed-prompt delivery is retained safely and abandoned after its deadline (PRD #20 findings #3/#4/#13).
+- **Layer:** L1 (in-process seed-prompt readiness consumer with a controllable `PaneController`).
+- **Agent:** none.
+- **Asserts:** injected transport error and non-applied outcomes retain the seed with feedback and backoff; two fresh TUI states generate distinct IDs; delivery captures its logical session; an expired permanent failure is abandoned without another RPC.
+- **Does not assert:** daemon production of stale/wrong-session or orchestration-role status; those require identity-bearing daemon requests and the orchestration render loop.
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/pane-input/007 — An orchestrator prompt is retained and the role stays non-working after a non-applied result (PRD #20, blocker 5 / finding 17).
+- **Layer:** L2 PTY-attached real orchestration flow with a synthetic role that changes from history-only to live.
+- **Agent:** synthetic Codex role emitting raw `AgentEvent` liveness transitions; no LLM.
+- **Asserts:** the real spawn-time orchestrator-prompt action surfaces HistoryOnly feedback, does not mark the role Working, retains the prompt, and retries it successfully once the same role declares a live PTY target.
+- **Does not assert:** the other result variants (covered at the seed consumer by `prompt/pane-input/006`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/008 — Stream-input rejection visibly exits PaneInput for both keys and paste (PRD #20 R20-007).
+- **Layer:** L2 PTY-attached real dashboard with a synthetic pane and hook liveness transition.
+- **Agent:** synthetic Codex session backed by `cat`; no LLM.
+- **Asserts:** after a focused live pane becomes history-only, a rejected key and rejected bracketed paste each render feedback and leave PaneInput mode.
+- **Does not assert:** the daemon's byte-level stream gate (covered by `prompt/pane-input/005`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/009 — A queued prompt cannot cross an agent or logical-session generation (PRD #20 finding #4).
+- **Layer:** L1 protocol integration with an in-process daemon and real PTY-backed shells.
+- **Agent:** synthetic Codex identities bound sequentially to the same pane.
+- **Asserts:** requests queued for an original agent, a same-agent pre-`/clear` session, or a session missing on the target return `wrong-session`/`stale` and write no marker.
+- **Does not assert:** UI feedback for the returned result (covered by `prompt/pane-input/006`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/010 — Delivery IDs are atomic and bound to a request fingerprint (PRD #20 finding #3).
+- **Layer:** L1 protocol integration with an in-process daemon and real PTY-backed shell.
+- **Agent:** synthetic Codex identity backed by `/bin/sh`.
+- **Asserts:** sequential and writer-barrier concurrent duplicates produce one append; reusing an ID with a different payload or target cannot replay a false successful result.
+- **Does not assert:** retry scheduling or visible feedback.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/011 — Unknown send-result variants decode as safe non-delivery (PRD #20 R20-011).
+- **Layer:** L1 fast wire-decoding unit test.
+- **Agent:** none.
+- **Asserts:** a future `send_result` value does not reject the whole response and is not classified as delivered.
+- **Does not assert:** live daemon version skew.
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/pane-input/012 — `ok=false` overrides a contradictory applied send result (PRD #20 R20-011).
+- **Layer:** L1 fast client test with a synthetic Unix-socket daemon.
+- **Agent:** none.
+- **Asserts:** the client does not report delivery for `{ok:false, send_result:"applied"}`.
+- **Does not assert:** server-side response construction.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/013 — Liveness is revalidated after acquiring the exact target writer (PRD #20 R20-006).
+- **Layer:** L1 protocol integration with an in-process daemon, held writer mutex, and real PTY-backed shell.
+- **Agent:** synthetic Codex identity backed by `/bin/sh`.
+- **Asserts:** a request authorized while live but blocked on the writer writes no bytes after the session becomes history-only.
+- **Does not assert:** the attach-handle removal race in R20-008, which has no deterministic harness barrier.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/014 — Post-snapshot stream rejection returns a typed reason (PRD #20 finding #10).
+- **Layer:** L1 protocol integration with an in-process daemon and live state handle.
+- **Agent:** synthetic Codex identity backed by `/bin/sh`.
+- **Asserts:** after the client observes `Live` but daemon state changes before `KIND_STREAM_IN`, both key and paste frames receive a non-empty typed rejection frame.
+- **Does not assert:** the TUI's visible feedback/mode exit after consuming that frame; no injectable UI/server barrier currently spans those processes.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/015 — Guarded send fails safe against a daemon without the capability (PRD #20 finding #6).
+- **Layer:** L1 client protocol test with a synthetic previous-shape Unix-socket daemon.
+- **Agent:** none.
+- **Asserts:** an identity-bearing send returns an error and submits zero requests when the daemon handshake lacks guarded-send capability.
+- **Does not assert:** the release-step manual test against the actual previous-release daemon.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/016 — Orchestrator prompt identity is captured at tab creation (PRD #20 finding #5).
+- **Layer:** L1 orchestration action with a controllable pane-controller rebind.
+- **Agent:** none.
+- **Asserts:** replacing the start pane's agent after tab creation cannot change the queued prompt's captured target identity.
+- **Does not assert:** daemon-side stale rejection, covered by `prompt/pane-input/009`.
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/pane-input/017 — Malformed guarded-send identity fails closed (PRD #20 Greptile finding #1).
+- **Layer:** L1 protocol integration with an in-process daemon and real PTY-backed shells.
+- **Agent:** synthetic pane targets backed by `/bin/sh`.
+- **Asserts:** a wrong JSON type for `expected_agent_id`, `expected_session_id`, or `delivery_id` is rejected and submits no marker bytes.
+- **Does not assert:** malformed base `WriteAndSubmit` fields, covered by the protocol's general malformed-request tests.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/018 — A pane-less history-only target rejects stream input (PRD #20 Greptile finding #2).
+- **Layer:** L1 protocol integration with an in-process daemon and a real PTY-backed shell carrying no pane environment ID.
+- **Agent:** synthetic Codex history-only event attached to a pane-less `/bin/sh` target.
+- **Asserts:** `KIND_STREAM_IN` returns a typed non-empty rejection and writes no marker bytes when the attach handle resolves to the no-pane sentinel.
+- **Does not assert:** visible TUI feedback after consuming the rejection, covered by `prompt/pane-input/008`.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/019 — Guarded-send generation remains monotonic under delayed prior-session events (PRD #20 Greptile finding #3).
+- **Layer:** L1 protocol integration with an in-process daemon and real PTY-backed shells.
+- **Agent:** synthetic Codex lifecycle generations sharing one pane and agent identity.
+- **Asserts:** delayed activity cannot restore an old generation, delayed `SessionEnd` cannot clear the current generation, stale prompts remain rejected, and current prompts remain deliverable.
+- **Does not assert:** transport-level event reordering before `AppState::apply_event`.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/020 — Guarded sends resolve pane-less writability and routing by agent identity (PRD #20 Greptile P1).
+- **Layer:** L1 protocol integration with an in-process Unix-domain socket daemon, held writer mutex, and real PTY-backed shells.
+- **Agent:** synthetic Codex live and history-only events bound by agent identity to pane-less `/bin/sh` targets.
+- **Asserts:** pre-lock history-only sends return `history-only` without bytes, a live-to-history transition while waiting for the writer is rejected after the lock, and a live pane-less target still receives its guarded prompt.
+- **Does not assert:** visible TUI feedback for the returned result.
 - **Platform coverage:** mac+linux.
 
 #### prompt/quit
@@ -615,6 +805,13 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Agent:** none (`cat` is a real runnable stand-in command — the spawn succeeds and records a last command, and `cat` blocks on stdin so the pane stays alive; no LLM tokens).
 - **Asserts:** with an empty `default_command`, launch 1 spawns `cat` and quits cleanly so the session flushes to disk; launch 2 (sharing the same HOME) then PRE-FILLS the new-pane Command field with `cat`, read back from the persisted `session.toml` launch 1 wrote — proving the recorded last command round-trips through persist → reload → seed, not just in-process state. GREEN against the current implementation — a regression guard.
 - **Does not assert:** the in-process read-back within one launch (covered by `prompt/new-pane/011`); the `default_command` precedence (covered by `prompt/new-pane/012`); the authoring-mode recording (covered by `prompt/new-pane/013`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/new-pane/015 — Selecting an agent in the real new-pane form seeds its registry default without a global-config copy (PRD #20, finding 8).
+- **Layer:** L2 PTY-attached (the private new-pane form is driven through the real binary and its visible selector is clicked/cycled).
+- **Agent:** none (selection rows for Claude Code, OpenCode, Pi, and Codex; no agent process is submitted).
+- **Asserts:** with no global `default_command`, the form exposes an `Agent:` selector; selecting each shipped type visibly updates Command to exactly that type's `AgentSpec.default_command`.
+- **Does not assert:** launch wrapping (covered by `codex/spawn/*` and `codex/live/001`) or custom command arguments.
 - **Platform coverage:** mac+linux.
 
 ### Focus / navigation
@@ -1600,6 +1797,13 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Does not assert:** which degrade mechanism is chosen (`#[serde(other)]` vs lenient `live -> None`); the older-shape back-compat (`live` absent -> `None`, session/live/001); the wire-boundary scrub/clamp (session/live/007).
 - **Platform coverage:** mac+linux+windows.
 
+##### session/live/010 — Rehydration preserves history-only and view-only writability across detach/reconnect (PRD #20, blocker 4).
+- **Layer:** L1 state/wire integration (`SessionSnapshot` JSON deserialize + `AppState::seed_hydrated_session`).
+- **Agent:** synthetic Codex snapshots.
+- **Asserts:** reconnect snapshots carrying `history-only` and `none` live targets rebuild sessions with `Writable::HistoryOnly` and `Writable::None`, rather than reverting to Live.
+- **Does not assert:** real socket reconnect rendering; the snapshot-to-state seam is the capability-loss boundary.
+- **Platform coverage:** mac+linux+windows.
+
 ### Session save (snapshot freshness, PRD #89 Phase 1)
 
 These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept continuously fresh — written on meaningful TUI state changes and on detach — not only at clean teardown/quit.
@@ -1679,6 +1883,126 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux.
 
 ### Chain-smoke (real-agent) coverage
+
+#### codex/wrap
+
+##### codex/wrap/001 — A synthetic Codex JSONL stream runs through the real wrapper, daemon event stream, and PTY-attached dashboard (PRD #20 M7).
+- **Layer:** L2 PTY-attached (`TuiDeck`, real binary + daemon, deterministic shell stand-in, no authentication or LLM).
+- **Agent:** synthetic stand-in wrapped with `dot-agent-deck wrap --agent codex`.
+- **Asserts:** realistic turn-start and turn-completed lines become typed Codex `AgentEvent`s carrying `AGENT_EVENT_SCHEMA_VERSION`; because the wrapper is inside a daemon-managed pane, events declare `Pty/Live`; `WriteAndSubmit` returns Applied and the child records the submitted line; the rendered card visibly shows the Codex identity and transitions Thinking → Idle.
+- **Does not assert:** model authentication or Codex CLI behavior (covered by `codex/live/001`).
+- **Platform coverage:** mac+linux.
+
+##### codex/wrap/002 — Wrapped children retain TTY identity, resize delivery, input, and Ctrl+C behavior (PRD #20, blocker 1 / finding 16).
+- **Layer:** L2 PTY-attached (`TuiDeck` + deterministic shell probe under the real wrapper; no LLM).
+- **Agent:** synthetic terminal probe wrapped as Codex.
+- **Asserts:** the child observes `isatty(0/1/2) == true`, receives SIGWINCH after resize, records ordinary input, and handles Ctrl+C as SIGINT.
+- **Does not assert:** Codex output parsing or model behavior (`codex/live/001`).
+- **Platform coverage:** mac+linux.
+
+##### codex/wrap/003 — Wrapped commands preserve each standard descriptor's independent TTY or redirection semantics (PRD #20, final review finding 11).
+- **Layer:** L1/fast real-binary subprocess integration with controlled pseudo-terminals and files; no TUI or LLM.
+- **Agent:** deterministic shell probes wrapped as Codex.
+- **Asserts:** wholly non-interactive stdout/stderr remain separate and binary stdin remains byte-exact through EOF; redirecting only stderr sends child stderr to that file rather than merged PTY stdout; redirecting only stdout leaves child stdin and stderr attached to TTYs.
+- **Does not assert:** interactive resize, ordinary input, or Ctrl+C behavior (`codex/wrap/002`).
+- **Platform coverage:** mac+linux.
+
+##### codex/wrap/004 — Catchable termination signals tear down and reap wrapped children on PTY and pipe paths (PRD #20, final review finding 12).
+- **Layer:** L1/fast real-binary subprocess integration with a controlled pseudo-terminal for the interactive path and null descriptors for the pipe path; no TUI or LLM.
+- **Agent:** deterministic lingering shell child wrapped as Codex.
+- **Asserts:** after SIGTERM and SIGHUP are delivered to the wrapper, both interactive PTY and non-interactive pipe wrappers exit and their recorded child process is no longer running.
+- **Does not assert:** the pre-spawn signal race or termios restoration during a signal arriving inside setup; those timing edges are not deterministic at this subprocess seam.
+- **Platform coverage:** mac+linux.
+
+##### codex/wrap/005 — Concurrent standalone wrappers emit unique session IDs (PRD #20 Greptile finding #4).
+- **Layer:** L1/fast real-binary subprocess integration with a synthetic hook socket; no TUI or LLM.
+- **Agent:** two overlapping deterministic shell probes wrapped with Codex identity and no pane environment ID.
+- **Asserts:** the two wrapper lifecycles produce two distinct session IDs instead of reconciling onto one synthetic `wrap-<program>` ID.
+- **Does not assert:** managed-pane session IDs, which intentionally remain pane-derived and are covered by `codex/wrap/001`.
+- **Platform coverage:** mac+linux.
+
+#### codex/trust
+
+##### codex/trust/001 — The hook-trust bypass cannot cross to an uninspected CODEX_HOME (PRD #20 Greptile finding #6).
+- **Layer:** L1/fast real-binary subprocess integration with controlled Codex homes and a launcher named `codex`.
+- **Agent:** deterministic launcher that redirects `CODEX_HOME` before recording its effective home and argv.
+- **Asserts:** a foreign hook set in a home other than the one vetted by the deck never receives `--dangerously-bypass-hook-trust`.
+- **Does not assert:** real Codex hook execution or native event ingestion.
+- **Platform coverage:** mac+linux.
+
+#### codex/spawn
+
+##### codex/spawn/001 — Plain restored Codex panes launch through the Wrapper strategy (PRD #20, blocker 3).
+- **Layer:** L2 synthetic PTY-attached restore with PATH recorder stubs.
+- **Agent:** synthetic Codex recorder.
+- **Asserts:** restoring persisted bare `codex` executes exactly `dot-agent-deck wrap --agent codex -- codex` and never the bare recorder.
+- **Does not assert:** mode or orchestration paths (002–003).
+- **Platform coverage:** mac+linux.
+
+##### codex/spawn/002 — Mode-pane Codex commands launch through the Wrapper strategy (PRD #20, blocker 3).
+- **Layer:** L2 synthetic PTY-attached new-pane mode flow with PATH recorder stubs.
+- **Agent:** synthetic Codex recorder.
+- **Asserts:** selecting a workload mode while Command is bare `codex` injects the wrapped command into the mode pane, never bare Codex.
+- **Does not assert:** restore or orchestration paths.
+- **Platform coverage:** mac+linux.
+
+##### codex/spawn/003 — Orchestration role Codex commands launch through the Wrapper strategy (PRD #20, blocker 3).
+- **Layer:** L2 synthetic PTY-attached new-pane orchestration flow with PATH recorder stubs.
+- **Agent:** synthetic Codex recorder as the start role.
+- **Asserts:** selecting an orchestration whose start-role command is bare `codex` launches the role through the wrapper exactly once.
+- **Does not assert:** scheduler role spawning (`scheduler/spawn/006`) or respawn.
+- **Platform coverage:** mac+linux.
+
+##### codex/spawn/004 — Restored mode-pane Codex commands launch through the Wrapper strategy (PRD #20, blocker 3).
+- **Layer:** L2 synthetic PTY-attached saved-session mode restore with PATH recorder stubs.
+- **Agent:** synthetic Codex recorder.
+- **Asserts:** a saved pane carrying `mode = "wrapped-mode"` and bare command `codex` rebuilds the mode tab and injects the wrapper command, never bare Codex.
+- **Does not assert:** fresh mode creation (`codex/spawn/002`) or plain restore (`codex/spawn/001`).
+- **Platform coverage:** mac+linux.
+
+##### codex/spawn/005 — Respawning an existing pane as Codex launches through the Wrapper strategy (PRD #20, blocker 3).
+- **Layer:** fast PTY registry integration (`AgentPtyRegistry::respawn_agent_for_pane` with PATH recorder stubs).
+- **Agent:** synthetic Codex recorder.
+- **Asserts:** replacing an existing pane process with bare command `codex` executes exactly `dot-agent-deck wrap --agent codex -- codex`.
+- **Does not assert:** delegate routing that chooses respawn; it pins the respawn spawn boundary itself.
+- **Platform coverage:** mac+linux.
+
+##### codex/spawn/006 — An explicit Codex identity wraps a non-inferable custom launcher and remains the pane identity (PRD #20, R20-009).
+- **Layer:** fast PTY registry integration (`AgentPtyRegistry::spawn_agent` with PATH recorder stubs).
+- **Agent:** synthetic custom launcher explicitly declared as Codex.
+- **Asserts:** a command whose basename is not `codex` still executes exactly through `dot-agent-deck wrap --agent codex -- ...` when the caller supplies `AgentType::Codex`, and the live registry records that pane as Codex.
+- **Does not assert:** command-string inference (covered by the detection matrix) or real Codex behavior.
+- **Platform coverage:** mac+linux.
+
+#### codex/hooks
+
+##### codex/hooks/001 — A real wrapped interactive Codex turn reports native prompt/tool detail and becomes Idle without process exit (PRD #20 W1, R20-013/R20-014).
+- **Layer:** L2 PTY-attached (`TuiDeck`, reel-eligible); runtime-skipped unless `check_codex_available` verifies the binary, persisted auth, and a live model request.
+- **Agent:** real interactive Codex on the cheap test model, isolated credentials and Codex home, workspace-write sandbox, no approvals, network-enabled sandbox configuration, and low reasoning effort; launch passes through the normal Wrapper strategy seam.
+- **Asserts:** the deck-installed Codex native hooks emit a prompt-bearing Thinking event, shell ToolStart/ToolEnd events with the sentinel command as detail, and Stop-hook Idle; the dashboard visibly retains prompt/tool detail and shows Idle, the requested sentinel contains exact known content, and the Codex pane is still alive because the test never sends `/exit`.
+- **Does not assert:** stdout JSONL classification (covered by `codex/wrap/001`) or exact model prose.
+- **Platform coverage:** mac+linux (real-agent tier is local-only).
+- **Cost note:** one minimal mini-model availability probe plus one short interactive shell-tool turn.
+
+#### codex/live
+
+##### codex/live/001 — A real interactive cheap-model Codex run launched through the normal new-pane flow works visibly and reports live status (PRD #20, rule 4 / finding 16).
+- **Layer:** L2 PTY-attached (`TuiDeck`, reel-eligible); runtime-skipped unless `check_codex_available` verifies the binary, persisted auth, and a live model request.
+- **Agent:** real interactive bare `codex` using `gpt-5.1-codex-mini`, isolated copied credentials, workspace-write sandbox, and low reasoning effort; automatic wrapping occurs at the normal pane spawn seam.
+- **Asserts:** the interactive pane becomes ready, accepts a typed prompt, uses the shell to list the fixture and writes a proof file naming `codex_sentinel_a7c91f.txt`; after detach, the visible Codex card has traversed Thinking → Idle.
+- **Does not assert:** exact model phrasing or token usage.
+- **Platform coverage:** mac+linux (real-agent tier is local-only).
+- **Cost note:** one minimal mini-model availability probe plus one short interactive directory-listing/file-write turn.
+
+#### codex/worker
+
+##### codex/worker/001 — A real wrapped Codex orchestration worker receives a delegated task, does the work, and signals work-done (PRD #20 parity gap #12).
+- **Layer:** L2 headless in-process daemon plus a real interactive Codex PTY; runtime-skipped unless `check_codex_available` verifies the CLI, persisted auth, and model access.
+- **Agent:** real `gpt-5.1-codex-mini` Codex configured as the `coder` role with workspace-write sandboxing, approval disabled, low reasoning effort, isolated copied credentials, and project trust; the common spawn seam automatically launches it through `dot-agent-deck wrap`.
+- **Asserts:** Codex auto-submits the daemon-injected single-line `worker-task-coder.md` pointer, reads the delegated task, creates `codex_worker_sentinel_c81f2a.txt` with exact known contents, and runs the task footer's `dot-agent-deck work-done` command so the daemon writes `.dot-agent-deck/work-done-coder.md`.
+- **Does not assert:** exact model phrasing, token usage, or dashboard rendering (covered by `codex/live/001`).
+- **Platform coverage:** mac+linux (real-agent tier is local-only).
+- **Cost note:** one minimal mini-model availability probe plus one short worker turn.
 
 #### chain-smoke/claude
 
@@ -2049,6 +2373,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the 10s fallback-on-timeout delivery path (a separate readiness facet); orchestration-tab delivery gating (covered structurally by spawn/002).
 - **Platform coverage:** mac+linux.
 
+##### scheduler/spawn/006 — Scheduled single-agent and orchestration-role Codex commands both launch through the Wrapper strategy (PRD #20, blocker 3).
+- **Layer:** L2 headless daemon `RunNow` with PATH recorder stubs.
+- **Agent:** synthetic Codex recorders for one plain scheduled task and one scheduled orchestration start role.
+- **Asserts:** both bare `codex` commands execute exactly as `dot-agent-deck wrap --agent codex -- codex`; neither path launches the bare recorder.
+- **Does not assert:** issue-dispatch worktree creation or prompt delivery content.
+- **Platform coverage:** mac+linux.
+
 #### scheduler/dispatch
 
 ##### scheduler/dispatch/001 — Firing an `issue_dispatch` task clones the repo, creates a per-issue worktree on `agent/issue-<n>`, and spawns an agent into it with the substituted prompt (PRD #120 M2.1–M2.3).
@@ -2073,10 +2404,10 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Note:** a control issue (8, no PR) is included so "the flow ran AND issue 7 was skipped" is observable from end-state alone.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/dispatch/004 — A clone with an `[[orchestrations]]` block opens an orchestration tab (prompt to the `orchestrator` role); a clone without one opens a single-agent card (prompt delivered) — reached through the dispatch path (PRD #120 M2.3).
-- **Layer:** L2 (as `scheduler/dispatch/001`; two `issue_dispatch` tasks, one fixture remote with a committed `.dot-agent-deck.toml`, one without; `default_command = cat` via `DOT_AGENT_DECK_CONFIG` so the single-agent card runs `cat`).
-- **Agent:** none (run-now; observes `ListAgents` tab_membership + spawn cwd + PTY prompt echo).
-- **Asserts:** the orchestration clone spawns an `orchestrator`-role agent in its worktree and the substituted prompt (`ORCHDISP-11`) reaches it; the plain clone spawns a non-orchestration single-agent card whose cwd is its worktree and the substituted prompt (`PLAINDISP-22`) reaches it.
+##### scheduler/dispatch/004 — Issue-dispatch orchestration-role and single-agent Codex spawns both use the Wrapper strategy (PRD #120 M2.3, PRD #20 blocker 3).
+- **Layer:** L2 (as `scheduler/dispatch/001`; two `issue_dispatch` tasks, one fixture remote with a committed Codex orchestration and one without; `default_command = codex`; PATH recorders execute `cat` after recording argv so prompt delivery remains observable).
+- **Agent:** synthetic Codex recorders (run-now; observes `ListAgents` tab_membership + spawn cwd + PTY prompt echo + launch argv).
+- **Asserts:** the orchestration clone spawns an `orchestrator`-role agent in its worktree and receives `ORCHDISP-11`; the plain clone spawns a non-orchestration card in its worktree and receives `PLAINDISP-22`; both launch records are exactly `dot-agent-deck wrap --agent codex -- codex`, never bare Codex.
 - **Does not assert:** the clone/worktree/branch derivation (covered by `scheduler/dispatch/001`); the orchestration-vs-card branch outside the dispatch path (covered by `scheduler/spawn/002`).
 - **Platform coverage:** mac+linux.
 

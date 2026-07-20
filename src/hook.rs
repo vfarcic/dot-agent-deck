@@ -51,12 +51,24 @@ pub fn handle_hook(agent: &str) -> ExitCode {
             };
             build_opencode_event(hook_input)
         }
+        // PRD #20 W1: Codex ships a Claude-Code-compatible hooks engine, so its
+        // command hooks POST the SAME stdin JSON shape as Claude
+        // ([`ClaudeCodeHookInput`]). We reuse the whole ingestion path, only
+        // stamping [`AgentType::Codex`] and letting the Codex-aware
+        // `extract_tool_detail` arms (`shell`, `apply_patch`) sharpen the detail.
+        "codex" => {
+            let hook_input: ClaudeCodeHookInput = match serde_json::from_str(&input) {
+                Ok(v) => v,
+                Err(_) => return ExitCode::SUCCESS,
+            };
+            build_event_typed(hook_input, AgentType::Codex)
+        }
         _ => {
             let hook_input: ClaudeCodeHookInput = match serde_json::from_str(&input) {
                 Ok(v) => v,
                 Err(_) => return ExitCode::SUCCESS,
             };
-            build_event(hook_input)
+            build_event_typed(hook_input, AgentType::ClaudeCode)
         }
     };
 
@@ -90,13 +102,65 @@ fn map_event_type(hook_event_name: &str) -> Option<EventType> {
         "Notification" => Some(EventType::WaitingForInput),
         "PermissionRequest" => Some(EventType::PermissionRequest),
         "Stop" => Some(EventType::Idle),
-        "StopFailure" => Some(EventType::Error),
+        // NOTE: there is no `StopFailure` hook event in Claude Code or Codex
+        // 0.144.4 (Codex's installed events are enumerated in
+        // [`crate::codex_hooks_manage`]). A mid-session failure surfaces instead
+        // through a FAILED `PostToolUse` (`tool_response` reports a non-zero
+        // exit / error), which [`build_event_typed`] promotes to
+        // [`EventType::Error`] — see [`tool_response_is_failure`].
         "PreCompact" => Some(EventType::Compacting),
         "PostCompact" => Some(EventType::Thinking),
         "SubagentStart" => Some(EventType::SubagentStart),
         "SubagentStop" => Some(EventType::SubagentStop),
         _ => None,
     }
+}
+
+/// PRD #20 W3-Pass-2 (finding #9): whether a `PostToolUse` `tool_response`
+/// reports a FAILED tool call, so the native-hook path can surface a mid-session
+/// [`EventType::Error`] instead of a plain `ToolEnd`. Uses Codex's REAL response
+/// shapes: shell/`Bash` returns a STRING beginning with a `Exit code: <n>` line
+/// (n != 0 is a failure; a success returns an empty string or `Exit code: 0`),
+/// while structured tools return an OBJECT (a `completed`/`success` status is OK;
+/// an explicit `failed`/`error` status or a non-zero `exit_code` is a failure).
+/// Anything without a clear failure signal is treated as success, so an ordinary
+/// completed tool never false-positives into Error.
+fn tool_response_is_failure(response: &Value) -> bool {
+    match response {
+        Value::String(text) => exit_code_from_text(text).is_some_and(|code| code != 0),
+        Value::Object(map) => {
+            if let Some(status) = map.get("status").and_then(Value::as_str) {
+                let status = status.to_ascii_lowercase();
+                if status == "failed" || status == "error" {
+                    return true;
+                }
+            }
+            if let Some(code) = map.get("exit_code").and_then(Value::as_i64)
+                && code != 0
+            {
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Parse the integer from a leading `Exit code: <n>` line in a Codex shell
+/// `tool_response` string (case-insensitive on the label). Returns `None` when no
+/// such line is present so a response without an exit marker is not treated as a
+/// failure.
+fn exit_code_from_text(text: &str) -> Option<i64> {
+    for line in text.lines() {
+        let line = line.trim();
+        let lower = line.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("exit code:")
+            && let Ok(code) = rest.trim().parse::<i64>()
+        {
+            return Some(code);
+        }
+    }
+    None
 }
 
 fn extract_tool_detail(tool_name: Option<&str>, tool_input: Option<&Value>) -> Option<String> {
@@ -110,6 +174,29 @@ fn extract_tool_detail(tool_name: Option<&str>, tool_input: Option<&Value>) -> O
         "Read" | "Edit" | "Write" => input.get("file_path")?.as_str()?.to_string(),
         "Grep" | "Glob" => input.get("pattern")?.as_str()?.to_string(),
         "Agent" => input.get("description")?.as_str()?.to_string(),
+        // PRD #20 W1 — Codex-specific tool shapes. Codex's `shell` tool carries
+        // its `command` as an ARGV ARRAY (e.g. `["/bin/sh","-lc","touch x"]`),
+        // not a Claude-style command STRING; join it so the human detail still
+        // shows the real command. `apply_patch` carries a `*** … File: <path>`
+        // patch envelope; surface the file path.
+        "shell" => {
+            let joined = codex_shell_command(input.get("command")?)?;
+            let first_line = joined.lines().next().unwrap_or(&joined).to_string();
+            truncate(&first_line, 120)
+        }
+        // PRD #20 W3-Pass-2 (finding #8): Codex's real `apply_patch` hook input
+        // carries the patch envelope in `tool_input.command` (the string Codex
+        // actually sends), NOT `patch`. Read `command` first and keep `patch` as
+        // a defensive fallback so both the live shape and any older/synthetic
+        // shape yield a non-empty detail (the target file path).
+        "apply_patch" => {
+            let patch = input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .or_else(|| input.get("patch").and_then(|v| v.as_str()))?;
+            codex_patch_path(patch)
+                .unwrap_or_else(|| truncate(patch.lines().next().unwrap_or(patch), 120))
+        }
         _ => {
             // First string-valued key
             let val = input.values().find_map(|v| v.as_str())?;
@@ -127,7 +214,63 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// PRD #20 W1: normalize a Codex `shell` tool's `command` value into a single
+/// human-readable command string. Codex passes an ARGV array
+/// (`["/bin/sh","-lc","touch x"]`); we join with spaces. A plain string is used
+/// verbatim (tolerant of a future shape change). Returns `None` for any other
+/// JSON type so classification degrades gracefully.
+fn codex_shell_command(command: &Value) -> Option<String> {
+    match command {
+        Value::Array(parts) => {
+            let joined = parts
+                .iter()
+                .filter_map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined)
+            }
+        }
+        Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// PRD #20 W1: extract the target file path from a Codex `apply_patch` patch
+/// envelope. Codex uses the `*** Add File: <path>` / `*** Update File: <path>` /
+/// `*** Delete File: <path>` marker lines; return the first such path. `None`
+/// when no marker is present (the caller then falls back to the first line).
+fn codex_patch_path(patch: &str) -> Option<String> {
+    for line in patch.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("***")
+            && let Some((_, path)) = rest.split_once("File:")
+        {
+            let path = path.trim();
+            if !path.is_empty() {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Claude-Code hook builder — the [`AgentType::ClaudeCode`] specialization of
+/// [`build_event_typed`]. Kept as a thin wrapper so the existing Claude unit
+/// tests (and any Claude caller) stay unchanged.
+#[cfg(test)]
 fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
+    build_event_typed(input, AgentType::ClaudeCode)
+}
+
+/// Build an [`AgentEvent`] from a Claude-compatible hook payload, stamping the
+/// given `agent_type`. PRD #20 W1 parameterized this over the agent type so the
+/// Codex hook path (which posts the SAME payload shape) reuses the whole
+/// builder, differing only in the stamped identity and the Codex-aware
+/// `extract_tool_detail` arms.
+fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Option<AgentEvent> {
     let ClaudeCodeHookInput {
         session_id,
         hook_event_name,
@@ -136,10 +279,24 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
         tool_input,
         tool_use_id,
         prompt,
-        _extra: _,
+        _extra: extra,
     } = input;
 
-    let event_type = map_event_type(&hook_event_name)?;
+    let mut event_type = map_event_type(&hook_event_name)?;
+    // PRD #20 W3-Pass-2 (finding #9): a FAILED tool call arrives as an ordinary
+    // `PostToolUse` (→ `ToolEnd`) whose `tool_response` reports the failure.
+    // Promote it to a mid-session `Error` (emitted before the process exits) so
+    // the card surfaces the failure with Working/Idle/Error parity, rather than
+    // discarding `tool_response` and showing a benign `ToolEnd`. `tool_response`
+    // rides the flattened `_extra` (it is not a first-class field), keeping the
+    // existing input/struct shape unchanged.
+    if event_type == EventType::ToolEnd
+        && extra
+            .get("tool_response")
+            .is_some_and(tool_response_is_failure)
+    {
+        event_type = EventType::Error;
+    }
     let tool_detail = extract_tool_detail(tool_name.as_deref(), tool_input.as_ref());
 
     let user_prompt = prompt.map(|p| truncate(&p, 200));
@@ -167,7 +324,7 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
 
     Some(AgentEvent {
         session_id,
-        agent_type: AgentType::ClaudeCode,
+        agent_type,
         event_type,
         tool_name,
         tool_detail,
@@ -177,6 +334,9 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
         metadata,
         pane_id,
         agent_id,
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
     })
 }
 
@@ -245,6 +405,9 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
         metadata,
         pane_id,
         agent_id,
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
     })
 }
 

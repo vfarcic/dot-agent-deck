@@ -10,7 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
-use dot_agent_deck::state::{ActiveTool, DashboardStats, SessionState, SessionStatus};
+use dot_agent_deck::state::{ActiveTool, AppState, DashboardStats, SessionState, SessionStatus};
 use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
@@ -173,6 +173,7 @@ fn overlay_buffers() -> Vec<(&'static str, ratatui::buffer::Buffer)> {
         idle: 1,
         compacting: 1,
         total_tools: 42,
+        ..Default::default()
     };
     vec![
         (
@@ -416,6 +417,212 @@ fn pane_007_pi_card_shows_pi_identity() {
             "a Pi pane's card must not show `{other}`:\n{text}"
         );
     }
+}
+
+/// Scenario: Render a live Codex session with no friendly display name into a
+/// color-aware card buffer. The title must expose the first-class `Codex`
+/// identity and every cell in that label must use Codex's registry badge color.
+#[spec("dashboard/pane/008")]
+#[test]
+fn pane_008_codex_card_shows_colored_identity_badge() {
+    let now = chrono::Utc::now();
+    let session = SessionState {
+        session_id: "wrapped-01".to_string(),
+        agent_type: AgentType::Codex,
+        cwd: Some("/home/dev/workspace".to_string()),
+        status: SessionStatus::Thinking,
+        active_tool: None,
+        started_at: now,
+        last_activity: now,
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: Some("inspect the repository".to_string()),
+        first_prompts: vec!["inspect the repository".to_string()],
+        pane_id: Some("codex-pane-1".to_string()),
+        agent_id: Some("1".to_string()),
+        display_name: None,
+    };
+    let width: u16 = 80;
+    let density = CardDensityKind::Normal;
+    let height = density.rendered_height(width >= RENDER_CARD_WIDE_LAYOUT_MIN_WIDTH);
+    let buffer = render_card_to_buffer(&session, None, Some(1), density, 0, false, width, height);
+    let text = buffer_to_text(&buffer);
+    assert!(
+        text.contains("Codex"),
+        "a wrapped Codex pane must render the Codex identity:\n{text}"
+    );
+
+    let expected = dot_agent_deck::agent_registry::spec(&AgentType::Codex).badge_color;
+    let mut colored_label_found = false;
+    for y in 0..buffer.area().height {
+        for x in 0..=buffer.area().width.saturating_sub(5) {
+            let symbols: String = (x..x + 5).map(|cx| buffer[(cx, y)].symbol()).collect();
+            if symbols == "Codex" {
+                colored_label_found |= (x..x + 5).all(|cx| buffer[(cx, y)].fg == expected);
+            }
+        }
+    }
+    assert!(
+        colored_label_found,
+        "the rendered Codex identity must use registry badge color {expected:?}:\n{}",
+        buffer_to_color_text(&buffer)
+    );
+
+    insta::assert_snapshot!(buffer_to_color_text(&buffer));
+
+    let mut named_badges = String::new();
+    for (agent_type, friendly_name) in [
+        (AgentType::ClaudeCode, "friendly-claude"),
+        (AgentType::OpenCode, "friendly-opencode"),
+        (AgentType::Pi, "friendly-pi"),
+        (AgentType::Codex, "friendly-codex"),
+    ] {
+        let mut named = session.clone();
+        named.agent_type = agent_type.clone();
+        named.display_name = Some(friendly_name.to_string());
+        let named_buffer = render_card_to_buffer(
+            &named,
+            Some(friendly_name),
+            Some(1),
+            density,
+            0,
+            false,
+            width,
+            height,
+        );
+        let label = dot_agent_deck::agent_registry::spec(&agent_type).label;
+        let expected_color = dot_agent_deck::agent_registry::spec(&agent_type).badge_color;
+        let text = buffer_to_text(&named_buffer);
+        assert!(
+            text.contains(label),
+            "a named {agent_type:?} card must retain its registry agent-type badge alongside {friendly_name:?}:\n{text}"
+        );
+        let colored = (0..named_buffer.area().height).any(|y| {
+            (0..=named_buffer
+                .area()
+                .width
+                .saturating_sub(label.chars().count() as u16))
+                .any(|x| {
+                    let symbols: String = (x..x + label.chars().count() as u16)
+                        .map(|cx| named_buffer[(cx, y)].symbol())
+                        .collect();
+                    symbols == label
+                        && (x..x + label.chars().count() as u16)
+                            .all(|cx| named_buffer[(cx, y)].fg == expected_color)
+                })
+        });
+        assert!(
+            colored,
+            "the named {agent_type:?} card's `{label}` badge must use registry color {expected_color:?}:\n{}",
+            buffer_to_color_text(&named_buffer)
+        );
+        named_badges.push_str(&format!(
+            "== {agent_type:?} / {friendly_name} ==\n{}",
+            buffer_to_color_text(&named_buffer)
+        ));
+    }
+    insta::assert_snapshot!("pane_008_named_agent_badges", named_badges);
+}
+
+/// Scenario: Aggregate a dashboard containing one Claude Code session and one
+/// Codex session, then render its stats bar. Because multiple real agent types
+/// are active, the visible bar must include a compact per-type count breakdown.
+#[spec("dashboard/stats/001")]
+#[test]
+fn stats_001_mixed_agents_render_per_type_breakdown() {
+    let mut state = AppState::default();
+    for (session_id, pane_id, agent_type) in [
+        ("mixed-claude", "pane-claude", AgentType::ClaudeCode),
+        ("mixed-codex", "pane-codex", AgentType::Codex),
+    ] {
+        state.register_pane(pane_id.to_string());
+        state.apply_event(AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(format!("agent-{pane_id}")),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+    }
+
+    let stats = state.aggregate_stats();
+    let buffer = render_stats_bar_to_buffer(&stats, None, 160, 1);
+    let rendered = buffer_to_text(&buffer);
+    assert!(
+        rendered.contains("1 ClaudeCode") && rendered.contains("1 Codex"),
+        "a mixed-agent dashboard must show per-agent-type counts in its stats bar:\n{rendered}"
+    );
+}
+
+/// Scenario: Apply otherwise-identical live and history-only Codex session
+/// events, then render their cards together through the dashboard `TestBackend`
+/// seam. The history-only card must show a history marker and dim its numeric
+/// input shortcut, while the live card keeps the normal writable affordance.
+#[spec("dashboard/pane/009")]
+#[test]
+fn pane_009_history_only_card_marks_and_dims_input_affordance() {
+    let session_from_event = |session_id: &str, pane_id: &str, writable: &str| {
+        let event: AgentEvent = serde_json::from_value(serde_json::json!({
+            "session_id": session_id,
+            "agent_type": "codex",
+            "event_type": "session_start",
+            "timestamp": "2026-07-15T12:00:00Z",
+            "pane_id": pane_id,
+            "cwd": "/home/dev/workspace",
+            "live_target": {
+                "kind": if writable == "live" { "pty" } else { "process" },
+                "writable": writable,
+            }
+        }))
+        .expect("deserialize AgentEvent fixture");
+        let mut state = AppState::default();
+        state.apply_event(event);
+        state
+            .sessions
+            .remove(session_id)
+            .expect("SessionStart must create a dashboard session")
+    };
+
+    let live = session_from_event("live-01", "live-pane", "live");
+    let history = session_from_event("resume-01", "resume-pane", "history-only");
+    let width = 80;
+    let density = CardDensityKind::Normal;
+    let card_height = density.rendered_height((width as usize).saturating_sub(2) >= 60);
+    let buffer = render_dashboard_cards_to_buffer(
+        &[(&live, None), (&history, None)],
+        None,
+        density,
+        0,
+        width,
+    );
+    let text = buffer_to_text(&buffer);
+    let lines: Vec<&str> = text.lines().collect();
+    let live_card = lines[..card_height as usize].join("\n").to_lowercase();
+    let history_card = lines[card_height as usize..].join("\n").to_lowercase();
+    let live_shortcut_dimmed = buffer[(2, 0)].modifier.contains(Modifier::DIM);
+    let history_shortcut_dimmed = buffer[(2, card_height)].modifier.contains(Modifier::DIM);
+
+    insta::assert_snapshot!(
+        format!(
+            "live_has_history_marker: {}\nhistory_has_history_marker: {}\nlive_shortcut_dimmed: {live_shortcut_dimmed}\nhistory_shortcut_dimmed: {history_shortcut_dimmed}",
+            live_card.contains("history"),
+            history_card.contains("history"),
+        ),
+        @r"
+    live_has_history_marker: false
+    history_has_history_marker: true
+    live_shortcut_dimmed: false
+    history_shortcut_dimmed: true"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -979,6 +1186,9 @@ fn filled_session() -> SessionState {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
         });
     }
     for (name, detail) in [
@@ -998,6 +1208,9 @@ fn filled_session() -> SessionState {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
         });
     }
     SessionState {

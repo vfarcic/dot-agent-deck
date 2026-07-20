@@ -130,6 +130,16 @@ pub const KIND_SHUTDOWN: u8 = 0x15;
 /// not exit the TUI — the user can retry, Detach, or `pkill` from a
 /// shell.
 pub const KIND_SHUTDOWN_ACK: u8 = 0x16;
+/// PRD #20 R20-007 (finding #10): server → client frame emitted on the attach
+/// stream when a `KIND_STREAM_IN` key/paste frame is REFUSED because the target
+/// became non-live (history-only / view-only), exited, or rebound while the
+/// stream stayed open. Carries a short UTF-8 reason (e.g. `history-only`) as its
+/// payload. UNLIKE [`KIND_STREAM_END`] it does NOT end the stream — the client
+/// stays attached (still sees output) and can surface honest feedback + leave
+/// its input mode, and subsequent frames to a still-non-live target are each
+/// rejected the same way. Adding this server→client frame changes the attach
+/// stream wire shape, so it rides the `PROTOCOL_VERSION` 5 → 6 bump (see below).
+pub const KIND_STREAM_REJECT: u8 = 0x17;
 
 /// PRD #76 M2.21: wire-format version for the attach socket. Bump every time
 /// the on-the-wire shape changes in a way an older client/daemon would
@@ -167,7 +177,22 @@ pub const KIND_SHUTDOWN_ACK: u8 = 0x16;
 /// erroring — future agent-type additions therefore need no further bump — but
 /// already-released pre-Pi binaries predate that fallback, which is exactly
 /// what this version bump guards.
-pub const PROTOCOL_VERSION: u32 = 5;
+///
+/// PRD #20 bumped 5 → 6 (findings #6 + #10 — one coherent Rule 12 decision):
+/// finding #10 adds a new server→client attach-stream frame kind
+/// ([`KIND_STREAM_REJECT`]) so the daemon can report a typed input rejection
+/// instead of silently dropping bytes. A new frame kind changes the stream wire
+/// shape (an older client would see an unrecognised kind), so per the task's
+/// Rule 12 rule this is a hard bump, not an additive-field change. Finding #6's
+/// guarded-send capability rides ALONGSIDE this as an additive, optional field
+/// on the `Hello` reply ([`AttachResponse::guarded_send`]) — a NEW client checks
+/// that explicit capability (NOT the version number) before an identity-bearing
+/// send, and fails safe when it is absent, so the two concerns are decoupled: an
+/// old daemon that happens to share a version can never be mistaken for one that
+/// enforces the identity/idempotency guards. Documented as a semantic
+/// cross-version consideration in `changelog.d/20.breaking.md`; a
+/// previous-release-daemon manual test is required at release.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -415,6 +440,35 @@ fn default_cols() -> u16 {
     80
 }
 
+/// PRD #20 R20-003/R20-004: additive identity + idempotency fields that ride
+/// alongside a [`AttachRequest::WriteAndSubmit`] request as extra JSON keys.
+///
+/// They are deliberately NOT declared on the `WriteAndSubmit` enum variant: its
+/// `{ pane_id, text }` shape is constructed as a 2-field literal at existing
+/// call sites (older tests, the Codex-wrapper path), and widening the variant
+/// would break those literals. Instead the handler re-parses the SAME request
+/// payload into this struct — every field `#[serde(default)]`, so an older
+/// client that omits them decodes to all-`None` and the daemon degrades to
+/// pane-only authorization (current behavior). Unknown keys on the base variant
+/// are ignored by serde, so the two parses of one payload never conflict.
+#[derive(Debug, Default, Deserialize)]
+struct WriteAndSubmitExtras {
+    /// The registry id of the agent the prompt was queued for. On a mismatch
+    /// with the live target that currently owns the pane, the daemon returns
+    /// `wrong-session` WITHOUT writing (R20-003).
+    #[serde(default)]
+    expected_agent_id: Option<String>,
+    /// The session id the prompt was queued for. If a DIFFERENT live session now
+    /// owns the pane, the daemon returns `stale` WITHOUT writing (R20-003).
+    #[serde(default)]
+    expected_session_id: Option<String>,
+    /// A stable idempotency key. The daemon caches the first result for a
+    /// delivery id and replays it on a retry, so a re-sent ambiguous transport
+    /// failure never double-submits (R20-004).
+    #[serde(default)]
+    delivery_id: Option<String>,
+}
+
 /// PRD #161 M1.1: a snapshot of the agents the daemon is currently managing,
 /// carried additively on the [`AttachResponse`] reply to an
 /// [`AttachRequest::Hello`]. The shared TUI↔daemon restart prompt (Part A)
@@ -515,6 +569,31 @@ pub struct AttachResponse {
     /// daemon omits it (`None`), and `PROTOCOL_VERSION` is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_version: Option<String>,
+    /// PRD #20 M3: the honest outcome of an input-delivery request
+    /// ([`AttachRequest::WriteAndSubmit`]). `applied`/`queued` mean the input
+    /// reached (or was accepted for) a live target; `history-only` /
+    /// `no-live-target` / `stale` / `wrong-session` mean it was deliberately
+    /// NOT delivered and the client should surface feedback rather than assume
+    /// success. Additive + optional (`#[serde(default, skip_serializing_if]`):
+    /// a pre-PRD-20 daemon omits it (decodes to `None`, read as "assume
+    /// applied" by a newer client), and an older client ignores the extra
+    /// field — so it is forward-compatible and needs no `PROTOCOL_VERSION` bump.
+    /// `None` on every non-`WriteAndSubmit` response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_result: Option<crate::event::SendResult>,
+    /// PRD #20 R20-003/004/006 (finding #6): guarded-send capability advertised
+    /// on the `Hello` reply. `Some(true)` means this daemon enforces the
+    /// identity/idempotency guards on `write-and-submit` (exact agent + session
+    /// match, atomic delivery-id dedup). A NEW client checks THIS field — not the
+    /// version number — before an identity-bearing send: when it is absent
+    /// (`None`, an OLD daemon that never sets it), the client FAILS SAFE and does
+    /// NOT submit, preserving pre-PRD-20 fire-once semantics rather than trusting
+    /// an unguarded `ok=true` that could double-submit or mis-deliver on a rebind.
+    /// Additive + optional: a pre-PRD-20 daemon omits it, and the plain
+    /// [`AttachResponse::hello`] constructor leaves it `None` (only the live
+    /// daemon's `Hello` handler sets it via [`AttachResponse::with_guarded_send`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guarded_send: Option<bool>,
 }
 
 impl AttachResponse {
@@ -559,6 +638,28 @@ impl AttachResponse {
             ..Default::default()
         }
     }
+    /// PRD #20 M3 / blocker-7: a reply to [`AttachRequest::WriteAndSubmit`] that
+    /// carries the honest [`crate::event::SendResult`]. `ok` MIRRORS delivery —
+    /// `true` only for `applied`/`queued`, `false` for every non-delivery
+    /// (`history-only` / `no-live-target` / `stale` / `wrong-session`). This is
+    /// the cross-version safety choice for Rule 12: an OLD client that ignores
+    /// the unknown `send_result` field reads `ok=false` and correctly treats
+    /// non-delivery as a failure (never a false success), while a NEW client
+    /// reads the typed `send_result` BEFORE converting a non-ok response to an
+    /// error (see [`crate::daemon_client::DaemonClient::write_and_submit`]). The
+    /// request/response wire SHAPE is unchanged (additive optional field), so
+    /// `PROTOCOL_VERSION` is not bumped.
+    pub fn with_send_result(result: crate::event::SendResult) -> Self {
+        let delivered = matches!(
+            result,
+            crate::event::SendResult::Applied | crate::event::SendResult::Queued
+        );
+        Self {
+            ok: delivered,
+            send_result: Some(result),
+            ..Default::default()
+        }
+    }
     /// PRD #76 M2.21: protocol-version handshake reply. `version` is the
     /// daemon's [`PROTOCOL_VERSION`]; the client compares it against its own.
     ///
@@ -594,6 +695,17 @@ impl AttachResponse {
     /// no registry (the `daemon hello` CLI) leave `running_agents` as `None`.
     pub fn with_running_agents(mut self, summary: RunningAgentsSummary) -> Self {
         self.running_agents = Some(summary);
+        self
+    }
+
+    /// PRD #20 R20-003/004/006 (finding #6): advertise that this daemon enforces
+    /// the guarded-send identity/idempotency contract. The live daemon's `Hello`
+    /// handler calls this; a client uses the resulting `guarded_send = Some(true)`
+    /// to decide it is SAFE to issue an identity-bearing `write-and-submit`. Its
+    /// ABSENCE (any daemon that never calls this, including every pre-PRD-20
+    /// build) makes a guarded send FAIL SAFE — see [`Self::guarded_send`].
+    pub fn with_guarded_send(mut self) -> Self {
+        self.guarded_send = Some(true);
         self
     }
 }
@@ -795,6 +907,126 @@ pub async fn run_attach_server_with_counter(
         dummy_worktrees,
     )
     .await
+}
+
+/// PRD #20 M3 / R20-003/006 (findings #3, #4, #7): compute the honest
+/// [`crate::event::SendResult`] for a `write-and-submit` request. Shared by the
+/// idempotent (delivery-id) and legacy paths.
+///
+/// A dashboard-visible session is not necessarily a live, writable target: a
+/// `history-only` / `none` pane is reported WITHOUT writing so the TUI surfaces
+/// feedback. A `Live` pane goes through [`AgentPtyRegistry::write_and_submit_guarded`],
+/// which binds delivery to the EXACT target agent and RE-VALIDATES liveness +
+/// (finding #4) the daemon-authoritative hook-session generation AFTER acquiring
+/// the writer, immediately before the write. `Err` is a clean transport failure
+/// (nothing written); `Ok(Ambiguous)` a partial write.
+async fn compute_write_and_submit_outcome(
+    registry: &AgentPtyRegistry,
+    state: &SharedState,
+    pane_id: &str,
+    text: &str,
+    extras: &WriteAndSubmitExtras,
+) -> Result<crate::event::SendResult, String> {
+    use crate::agent_pty::GuardedSend;
+    use crate::event::{SendResult, Writable};
+    // PRD #20 Greptile (paneless guarded send): a daemon-side agent that carries
+    // no pane maps to the `<no-pane>` sentinel. `pane_writable` filters sessions
+    // by `pane_id` and can never find such a session (it is stored with
+    // `pane_id == None`), so it falls through to the `Live` default — letting a
+    // history-only / view-only paneless target pass the liveness gate. Resolve a
+    // paneless target's writability by AGENT identity instead, mirroring the
+    // attach STREAM_IN input loop. A paneless request that carries no agent
+    // identity cannot be routed by identity, so it fails closed (`None` → no
+    // delivery attempted). Paned targets keep the pane-keyed resolution.
+    let is_paneless = pane_id == "<no-pane>";
+    let writable = {
+        let guard = state.read().await;
+        if is_paneless {
+            match extras.expected_agent_id.as_deref() {
+                Some(agent_id) => guard.agent_writable(agent_id),
+                None => Writable::None,
+            }
+        } else {
+            guard.pane_writable(pane_id)
+        }
+    };
+    match writable {
+        Writable::HistoryOnly => Ok(SendResult::HistoryOnly),
+        Writable::None => Ok(SendResult::NoLiveTarget),
+        Writable::Live => {
+            // The re-validation closure runs UNDER the held target writer (inside
+            // `write_and_submit_guarded`), immediately before the write, against
+            // the authoritative session state.
+            let st = state.clone();
+            let guarded = if is_paneless {
+                // A paneless target is re-validated by agent identity (mirroring
+                // STREAM_IN). `<no-pane>` has no pane→hook-session mapping, so the
+                // pane-keyed session-generation guard (finding #4) does not apply
+                // — STREAM_IN likewise performs no session check on a paneless
+                // target. `Live` above implies `expected_agent_id` is `Some`.
+                let agent_id = extras
+                    .expected_agent_id
+                    .clone()
+                    .expect("paneless Live target implies an expected agent id");
+                let agent_for_check = agent_id.clone();
+                registry
+                    .write_and_submit_guarded(pane_id, text, Some(&agent_id), move || async move {
+                        st.read().await.agent_writable(&agent_for_check) == Writable::Live
+                    })
+                    .await
+            } else {
+                let pane_for_check = pane_id.to_string();
+                let expected_session = extras.expected_session_id.clone();
+                // PRD #20 R20-003 (finding #4): is a deck client actively driving
+                // this pane? The strict "reject a None current-session" rule
+                // applies to a LIVE INTERACTIVE (attached) pane — finding #4's
+                // threat is a stale prompt surfacing in the conversation the user
+                // is watching. A headless (unattached) delivery whose agent
+                // identity is confirmed proceeds. In the real deck the TUI is
+                // always attached to a pane it drives, so this is the strict guard
+                // for every real delivery.
+                let has_live_attach = registry.pane_has_live_attach(pane_id);
+                registry
+                    .write_and_submit_guarded(
+                        pane_id,
+                        text,
+                        extras.expected_agent_id.as_deref(),
+                        move || async move {
+                            let guard = st.read().await;
+                            if guard.pane_writable(&pane_for_check) != Writable::Live {
+                                return false;
+                            }
+                            // When the caller named a session, require an EXACT
+                            // match against the pane's CURRENT daemon-authoritative
+                            // hook-session generation. A same-agent `/clear` /
+                            // thread restart rolls the generation over → mismatch →
+                            // reject (always). A `None` current-session (the session
+                            // ended, or none was recorded) is refused too on an
+                            // attached, live-interactive pane — never a silent
+                            // accept.
+                            if let Some(expected) = expected_session.as_deref() {
+                                match guard.pane_hook_session_id(&pane_for_check) {
+                                    Some(current) if current != expected => return false,
+                                    Some(_) => {}
+                                    None if has_live_attach => return false,
+                                    None => {}
+                                }
+                            }
+                            true
+                        },
+                    )
+                    .await
+            };
+            match guarded {
+                Ok(GuardedSend::Applied) => Ok(SendResult::Applied),
+                Ok(GuardedSend::WrongSession) => Ok(SendResult::WrongSession),
+                Ok(GuardedSend::Stale) => Ok(SendResult::Stale),
+                Ok(GuardedSend::NoLiveTarget) => Ok(SendResult::NoLiveTarget),
+                Ok(GuardedSend::Ambiguous) => Ok(SendResult::Ambiguous),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1185,16 +1417,126 @@ async fn handle_connection(
             Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
         },
         AttachRequest::AttachStream { id } => {
-            handle_attach_stream(stream, registry, id).await?;
+            handle_attach_stream(stream, registry, id, state.clone()).await?;
         }
         AttachRequest::Resize { id, rows, cols } => match registry.resize(&id, rows, cols) {
             Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
             Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
         },
         AttachRequest::WriteAndSubmit { pane_id, text } => {
-            match registry.write_to_pane_and_submit(&pane_id, &text).await {
-                Ok(()) => write_resp(&mut stream, &AttachResponse::ok()).await?,
-                Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
+            // PRD #20 M3: deliver input honestly. A dashboard-visible session is
+            // not necessarily a live, writable target (a wrapped Codex session
+            // is history-only), so consult the live session state for the pane
+            // and return an honest `SendResult` instead of a fire-and-forget
+            // ok(). Only a `Live` target is actually written; a non-live target
+            // is reported (`history-only` / `no-live-target`) WITHOUT writing,
+            // so the TUI surfaces feedback rather than silently dropping input.
+            //
+            // PRD #20 R20-003/004/006: the request MAY additionally carry the
+            // agent identity + session the prompt was queued for and a stable
+            // delivery id. These ride as extra JSON keys alongside the base
+            // `WriteAndSubmit { pane_id, text }` shape (the enum stays 2-field so
+            // existing literals compile), parsed here from the raw payload. When
+            // present the daemon (a) dedups on `delivery_id` so a retry replays
+            // the first result instead of re-submitting, (b) binds delivery to
+            // the EXACT live registry target and refuses (WrongSession/Stale, no
+            // write) on a rebind, and (c) re-validates liveness AFTER acquiring
+            // the target's writer, closing the TOCTOU where a pane goes
+            // history-only / rebinds while the send waits for the writer.
+            // PRD #20 Greptile finding #1 (fail closed on malformed guards): the
+            // base `WriteAndSubmit { pane_id, text }` shape already decoded, so
+            // the ONLY way this strict re-parse of the SAME payload can fail is a
+            // guarded-send identity key (`expected_agent_id` / `expected_session_id`
+            // / `delivery_id`) that is PRESENT but has the wrong JSON type (every
+            // field is `Option<String>` with `#[serde(default)]`, and unknown keys
+            // are ignored). An ABSENT guard set (a legacy / non-guarded client)
+            // still decodes cleanly to all-`None` and degrades to pane-only
+            // authorization — the cross-version fail-safe is preserved. A
+            // present-but-malformed guard must REJECT and write nothing, rather
+            // than silently dropping every identity check via `unwrap_or_default`
+            // and proceeding UNGUARDED (which could reach a rebound pane or
+            // double-submit).
+            let extras: WriteAndSubmitExtras = match serde_json::from_slice(&frame.1) {
+                Ok(extras) => extras,
+                Err(e) => {
+                    write_resp(
+                        &mut stream,
+                        &AttachResponse::err(format!(
+                            "malformed guarded-send identity — refusing unguarded write: {e}"
+                        )),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+
+            match extras.delivery_id.as_deref() {
+                // No idempotency key (legacy / non-guarded caller): compute once,
+                // no dedup ledger involvement.
+                None => match compute_write_and_submit_outcome(
+                    &registry, &state, &pane_id, &text, &extras,
+                )
+                .await
+                {
+                    Ok(outcome) => {
+                        write_resp(&mut stream, &AttachResponse::with_send_result(outcome)).await?
+                    }
+                    Err(e) => write_resp(&mut stream, &AttachResponse::err(e)).await?,
+                },
+                // PRD #20 R20-004 (finding #3): atomic, fingerprint-bound
+                // idempotency. Admit the id BEFORE computing so concurrent
+                // duplicates serialize on the single-flight lock and replay one
+                // result; a retry after a lost response replays the cached
+                // delivered/ambiguous result; and reusing the id with a different
+                // payload/target is a conflict (never a false success replay).
+                Some(did) => {
+                    let fingerprint = crate::agent_pty::AgentPtyRegistry::delivery_fingerprint(
+                        extras.expected_agent_id.as_deref(),
+                        &pane_id,
+                        &text,
+                    );
+                    match registry.admit_delivery(did, fingerprint).await {
+                        crate::agent_pty::DeliveryAdmission::Replay(result) => {
+                            write_resp(&mut stream, &AttachResponse::with_send_result(result))
+                                .await?
+                        }
+                        crate::agent_pty::DeliveryAdmission::Conflict => {
+                            write_resp(
+                                &mut stream,
+                                &AttachResponse::err(
+                                    "delivery id reused with a conflicting payload/target",
+                                ),
+                            )
+                            .await?
+                        }
+                        crate::agent_pty::DeliveryAdmission::Proceed(permit) => {
+                            match compute_write_and_submit_outcome(
+                                &registry, &state, &pane_id, &text, &extras,
+                            )
+                            .await
+                            {
+                                Ok(outcome) => {
+                                    // Cache a DELIVERED (`applied`/`queued`) or
+                                    // AMBIGUOUS outcome; a non-delivery stays
+                                    // retryable (see `record_delivery_outcome`).
+                                    registry.record_delivery_outcome(&permit, outcome);
+                                    write_resp(
+                                        &mut stream,
+                                        &AttachResponse::with_send_result(outcome),
+                                    )
+                                    .await?
+                                }
+                                Err(e) => {
+                                    // Clean transport failure (nothing written):
+                                    // forget the in-flight record so a retry
+                                    // re-attempts, then surface the error.
+                                    registry.forget_delivery(&permit);
+                                    write_resp(&mut stream, &AttachResponse::err(e)).await?
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         AttachRequest::SubscribeEvents => {
@@ -1253,7 +1595,11 @@ async fn handle_connection(
                 std::env::var_os("DOT_AGENT_DECK_TEST_OMIT_RUNNING_AGENTS").is_some();
             #[cfg(not(any(test, debug_assertions)))]
             let omit_running_agents = false;
-            let mut resp = AttachResponse::hello(PROTOCOL_VERSION);
+            // PRD #20 finding #6: advertise the guarded-send capability so a new
+            // client knows this daemon enforces the identity/idempotency guards
+            // and may safely issue an identity-bearing write-and-submit. Its
+            // absence (an older daemon) makes the client fail such a send safe.
+            let mut resp = AttachResponse::hello(PROTOCOL_VERSION).with_guarded_send();
             if !omit_running_agents {
                 let summary = RunningAgentsSummary::from_records(&registry.agent_records());
                 resp = resp.with_running_agents(summary);
@@ -1399,10 +1745,33 @@ async fn handle_subscribe_events(
     Ok(())
 }
 
+/// PRD #20 Greptile finding #6: capacity of the per-attach `KIND_STREAM_IN`
+/// rejection channel. Bounded so a client that keeps typing into a history-only
+/// / view-only target during sustained PTY output — where the output task biases
+/// toward `KIND_STREAM_OUT` and drains rejections slowly — cannot grow the
+/// daemon's memory without limit. Rejections are coalesceable (the client only
+/// needs to learn its input was refused so it can leave its input mode), so a
+/// full queue drops the newest reason rather than blocking the input loop.
+const REJECT_QUEUE_CAP: usize = 64;
+
+/// Best-effort, NON-BLOCKING enqueue of a typed `KIND_STREAM_IN` rejection reason
+/// onto the bounded reject channel (finding #6). On a full queue the reason is
+/// dropped and logged — never awaited — so a flooding client can neither
+/// back-pressure the input loop nor grow the queue past [`REJECT_QUEUE_CAP`].
+fn enqueue_reject(tx: &tokio::sync::mpsc::Sender<Vec<u8>>, reason: &'static [u8]) {
+    if tx.try_send(reason.to_vec()).is_err() {
+        tracing::debug!(
+            target: "pane_write",
+            "STREAM_IN rejection dropped — reject queue full (bounded) or closed"
+        );
+    }
+}
+
 async fn handle_attach_stream(
     stream: IpcStream,
     registry: Arc<AgentPtyRegistry>,
     id: String,
+    state: SharedState,
 ) -> io::Result<()> {
     let handle = match registry.subscribe(&id) {
         Ok(h) => h,
@@ -1435,24 +1804,55 @@ async fn handle_attach_stream(
 
     let mut rx = handle.rx;
     let writer = handle.writer;
+    // PRD #20 R20-008: the target's liveness token, captured ATOMICALLY with the
+    // writer at `subscribe` time. The input path re-checks it before every write
+    // so a frame arriving during teardown can't reach a dead writer.
+    let exited = handle.exited;
 
-    // PRD #128 trace-field-symmetry: cache the agent's `pane_id_env`
-    // once per attach so the per-frame STREAM_IN trace can emit
-    // `pane_id` alongside `agent_id` without re-locking the registry on
-    // every frame. `pane_id_env` is fixed for an agent's lifetime, so
-    // one lookup is enough. Three states are distinguished — the M1.4
-    // cross-path diff needs to tell them apart, not just see an empty
-    // string. Angle-bracket sentinels (`<agent-gone>` / `<no-pane>`)
-    // can never collide with a real `pane_id_env` value because
+    // PRD #128 trace-field-symmetry: the agent's `pane_id_env`, used to enrich
+    // the per-frame STREAM_IN trace with `pane_id` and — more importantly — to
+    // authorize the write via `pane_writable(pane_id)`.
+    //
+    // PRD #20 R20-008: this is now the value CAPTURED ON THE HANDLE under the
+    // same registry lock as the writer, NOT a separate post-lock
+    // `pane_id_env_for_agent` lookup. The old lookup could race a concurrent
+    // removal and return the `<agent-gone>` sentinel, and
+    // `pane_writable("<agent-gone>")` defaults to `Live` — so a teardown-time
+    // frame authorized against `<agent-gone>` could still be written to the
+    // cached writer. Using the captured pane id closes that race: it always
+    // reflects the exact target the writer belongs to. `<no-pane>` (a daemon-side
+    // agent that carried no pane id) can never collide with a real value because
     // `is_valid_pane_id_env` rejects `<` and `>`.
-    let pane_id: String = match registry.pane_id_env_for_agent(&id) {
-        Some(Some(s)) => s,
-        Some(None) => "<no-pane>".to_string(),
-        None => "<agent-gone>".to_string(),
+    let pane_id: String = match &handle.pane_id_env {
+        Some(s) => s.clone(),
+        None => "<no-pane>".to_string(),
     };
+    // PRD #20 Greptile finding #3: a daemon-side agent that carried no pane id.
+    // `pane_writable("<no-pane>")` can never find its session (that session is
+    // stored with `pane_id == None`) and would fall through to the `Live`
+    // default — so a history-only / view-only paneless target would still accept
+    // `KIND_STREAM_IN`. For such a target the input loop resolves writability by
+    // AGENT identity (`agent_writable`) instead, failing closed on a declared
+    // non-live session while a paneless target with no declared session keeps the
+    // historical `Live` default.
+    let is_paneless = pane_id == "<no-pane>";
 
-    // Output task: forward broadcast bytes → STREAM_OUT frames. Owns `wr`
-    // for the duration of streaming.
+    // PRD #20 R20-007 (finding #10): the input loop rejects a key/paste frame
+    // when the target went non-live/exited/rebound, but `wr` is owned by the
+    // output task below — so it hands the typed reason to the output task over
+    // this channel, which serializes it onto the wire as a non-terminal
+    // `KIND_STREAM_REJECT` frame.
+    //
+    // PRD #20 Greptile finding #6: the channel is BOUNDED (was unbounded). A
+    // client flooding a history-only target with keystrokes while the output task
+    // biases toward PTY output would otherwise grow this queue until the daemon
+    // exhausts memory. Rejections are coalesceable, so [`enqueue_reject`] drops
+    // the newest reason on a full queue instead of awaiting or growing it.
+    let (reject_tx, mut reject_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(REJECT_QUEUE_CAP);
+
+    // Output task: forward broadcast bytes → STREAM_OUT frames, and input-loop
+    // rejection reasons → STREAM_REJECT frames. Owns `wr` for the duration of
+    // streaming.
     //
     // Every write goes through `CLIENT_WRITE_TIMEOUT`. Without it, a client
     // that stops draining its socket pins this task on `write_all` (the
@@ -1462,32 +1862,52 @@ async fn handle_attach_stream(
     // detected within bounded time and the connection is dropped.
     let output_task = tokio::spawn(async move {
         loop {
-            match rx.recv().await {
-                Ok(bytes) => {
-                    if !write_or_timeout(&mut wr, KIND_STREAM_OUT, &bytes).await {
-                        // Client wedged or socket error: try one bounded
-                        // STREAM_END, then give up. If even STREAM_END
-                        // can't get through, dropping `wr` here closes the
-                        // socket — the client observes EOF either way.
-                        let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"timeout").await;
+            tokio::select! {
+                // Bias toward output so heavy PTY traffic isn't starved by
+                // the (rare) reject path; both are still serviced.
+                biased;
+                out = rx.recv() => match out {
+                    Ok(bytes) => {
+                        if !write_or_timeout(&mut wr, KIND_STREAM_OUT, &bytes).await {
+                            // Client wedged or socket error: try one bounded
+                            // STREAM_END, then give up. If even STREAM_END
+                            // can't get through, dropping `wr` here closes the
+                            // socket — the client observes EOF either way.
+                            let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"timeout").await;
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Agent terminated (reader thread saw EOF).
+                        let _ = write_or_timeout(&mut wr, KIND_STREAM_END, &[]).await;
                         break;
                     }
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    // Agent terminated (reader thread saw EOF).
-                    let _ = write_or_timeout(&mut wr, KIND_STREAM_END, &[]).await;
-                    break;
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    // This subscriber fell behind beyond BROADCAST_CAPACITY.
-                    // Better to disconnect than to deliver corrupted ANSI;
-                    // the client can reattach and replay scrollback. The
-                    // bounded write timeout matters here too: if the client
-                    // also wedged its socket, we still need to drop within
-                    // a known time rather than block on STREAM_END.
-                    let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"lagged").await;
-                    break;
-                }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // This subscriber fell behind beyond BROADCAST_CAPACITY.
+                        // Better to disconnect than to deliver corrupted ANSI;
+                        // the client can reattach and replay scrollback. The
+                        // bounded write timeout matters here too: if the client
+                        // also wedged its socket, we still need to drop within
+                        // a known time rather than block on STREAM_END.
+                        let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"lagged").await;
+                        break;
+                    }
+                },
+                reason = reject_rx.recv() => match reason {
+                    // PRD #20 finding #10: a typed, NON-terminal rejection — the
+                    // client stays attached (keeps seeing output) but now has an
+                    // honest reason to surface and leave its input mode.
+                    Some(reason) => {
+                        if !write_or_timeout(&mut wr, KIND_STREAM_REJECT, &reason).await {
+                            let _ = write_or_timeout(&mut wr, KIND_STREAM_END, b"timeout").await;
+                            break;
+                        }
+                    }
+                    // `reject_tx` dropped (only at teardown, AFTER this task is
+                    // aborted — so unreachable in practice). Break rather than
+                    // busy-spin on a permanently-ready closed channel.
+                    None => break,
+                },
             }
         }
     });
@@ -1498,7 +1918,110 @@ async fn handle_attach_stream(
         match read_frame(&mut rd).await {
             Ok(Some((KIND_STREAM_IN, bytes))) => {
                 use std::io::Write;
+                // PRD #20 blocker-6: enforce liveness AUTHORITATIVELY here, not
+                // just in the UI. If the focused session became non-live (a
+                // wrapped Codex pane that declared `history-only`, or a
+                // view-only target), REJECT the key / bracketed-paste frame
+                // rather than forwarding it to the PTY — a UI-only gate can't
+                // close the race where a pane goes non-live while a stream is
+                // already open, nor protect an older/stale client. A pane with
+                // no non-live declaration stays `Live` (the historical default),
+                // so native PTY panes are unaffected. The connection stays open
+                // (the client remains attached, seeing output) — only the write
+                // is dropped.
+                // PRD #20 R20-008: reject frames to a target that has exited
+                // (its reader thread saw EOF) even if the registry entry hasn't
+                // been reaped yet — the cached writer points at a dead PTY.
+                //
+                // PRD #20 R20-007 (finding #10): a rejection is no longer a
+                // silent debug-only drop. Send a TYPED, NON-terminal
+                // `KIND_STREAM_REJECT` frame (via the output task) so the client
+                // can surface honest feedback and leave its input mode for BOTH
+                // key and paste, while the stream stays open.
+                if exited.load(std::sync::atomic::Ordering::SeqCst) {
+                    tracing::debug!(
+                        target: "pane_write",
+                        agent_id = %id,
+                        pane_id = %pane_id,
+                        payload_len = bytes.len(),
+                        "STREAM_IN rejected — target agent has exited"
+                    );
+                    enqueue_reject(&reject_tx, b"exited");
+                    continue;
+                }
+                // Finding #3: resolve by agent identity for a paneless target, by
+                // pane otherwise. Both default to `Live` when nothing is declared,
+                // so an ordinary shell is unaffected; a declared non-live target
+                // (paneless or paned) fails closed.
+                let pre_lock_writable = {
+                    let guard = state.read().await;
+                    if is_paneless {
+                        guard.agent_writable(&id)
+                    } else {
+                        guard.pane_writable(&pane_id)
+                    }
+                };
+                if pre_lock_writable != crate::event::Writable::Live {
+                    tracing::debug!(
+                        target: "pane_write",
+                        agent_id = %id,
+                        pane_id = %pane_id,
+                        payload_len = bytes.len(),
+                        "STREAM_IN rejected — target is not live (history-only / view-only)"
+                    );
+                    enqueue_reject(&reject_tx, b"history-only");
+                    continue;
+                }
                 let mut w = writer.lock().await;
+                // PRD #20 R20-006 (finding #7): RE-VALIDATE under the held writer,
+                // immediately before writing. A close/respawn (registry removal),
+                // a liveness transition, or a rebind can land WHILE this frame
+                // waited for the writer lock — the pre-lock checks above cannot
+                // see that. Re-check exit, the pane's CURRENT live owner (it must
+                // still be THIS agent), and writability, holding the writer
+                // through the completed write, so no bytes reach a target already
+                // declared stale/removed/non-live. All rejections send the same
+                // typed frame and keep the stream open.
+                if exited.load(std::sync::atomic::Ordering::SeqCst) {
+                    drop(w);
+                    enqueue_reject(&reject_tx, b"exited");
+                    continue;
+                }
+                // The pane→agent ownership re-check only applies to an agent
+                // that actually carries a pane id: a daemon-side agent with no
+                // pane (`<no-pane>`) has no pane→agent mapping to re-resolve, and
+                // its stream is bound directly to the agent's own writer, so skip
+                // the check (it would spuriously find no owner and reject).
+                if !is_paneless {
+                    match registry.pane_current_agent_id(&pane_id) {
+                        Some(current) if current == id => {}
+                        Some(_) => {
+                            drop(w);
+                            enqueue_reject(&reject_tx, b"wrong-session");
+                            continue;
+                        }
+                        None => {
+                            drop(w);
+                            enqueue_reject(&reject_tx, b"stale");
+                            continue;
+                        }
+                    }
+                }
+                // Finding #3: re-validate writability under the held writer, by
+                // agent identity for a paneless target and by pane otherwise.
+                let post_lock_writable = {
+                    let guard = state.read().await;
+                    if is_paneless {
+                        guard.agent_writable(&id)
+                    } else {
+                        guard.pane_writable(&pane_id)
+                    }
+                };
+                if post_lock_writable != crate::event::Writable::Live {
+                    drop(w);
+                    enqueue_reject(&reject_tx, b"history-only");
+                    continue;
+                }
                 // PRD #128 (cherry-picked from PR #122): byte-level trace
                 // of STREAM_IN frames forwarded to the per-agent PTY
                 // writer. Useful for confirming that bytes the TUI
@@ -1560,6 +2083,42 @@ async fn handle_attach_stream(
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// PRD #20 Greptile finding #6 (coder-authored): the per-attach STREAM_IN
+    /// rejection channel must be BOUNDED so a client flooding a history-only /
+    /// view-only target with keystrokes — while the output task biases toward PTY
+    /// output and drains rejections slowly — cannot grow the daemon's memory
+    /// without limit. Flood the channel far past its capacity WITHOUT draining
+    /// (modeling exactly that backlog) and prove: every enqueue returns without
+    /// blocking, and the queue never holds more than [`REJECT_QUEUE_CAP`] items —
+    /// the flood is dropped/coalesced, not buffered. Before the fix the channel
+    /// was `unbounded_channel`, so this backlog would hold all
+    /// `REJECT_QUEUE_CAP * 100` items instead of the cap.
+    #[tokio::test]
+    async fn reject_queue_is_bounded_under_flood() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(REJECT_QUEUE_CAP);
+        // A flooding client keeps typing into a non-live target; the receiver
+        // (output task) is busy with PTY output and never drains here.
+        let flood = REJECT_QUEUE_CAP * 100;
+        for _ in 0..flood {
+            // `enqueue_reject` must be strictly non-blocking; if it ever awaited
+            // or panicked on a full queue, this loop would hang or fail.
+            enqueue_reject(&tx, b"history-only");
+        }
+        let mut buffered = 0usize;
+        while rx.try_recv().is_ok() {
+            buffered += 1;
+        }
+        assert!(
+            buffered <= REJECT_QUEUE_CAP,
+            "reject queue grew past its bound: buffered {buffered} > cap {REJECT_QUEUE_CAP} \
+             (a flood of {flood} rejections must be coalesced/dropped, not buffered)"
+        );
+        assert_eq!(
+            buffered, REJECT_QUEUE_CAP,
+            "an undrained flood should fill the bounded queue exactly to its cap"
+        );
+    }
 
     #[tokio::test]
     async fn frame_round_trip() {
@@ -1952,6 +2511,7 @@ mod tests {
                 tool_count: 3,
                 first_prompts: vec!["build the feature".into()],
                 last_user_prompt: Some("build the feature".into()),
+                live_target: None,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
             let back: SessionSnapshot =
@@ -1985,6 +2545,7 @@ mod tests {
                 tool_count: 0,
                 first_prompts: Vec::new(),
                 last_user_prompt: None,
+                live_target: None,
             }),
         };
         let json = serde_json::to_string(&rec).expect("AgentRecord serializes");
@@ -2149,6 +2710,9 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: Some("7".into()),
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
         };
         let payload = serde_json::to_vec(&BroadcastMsg::Event(event)).unwrap();
 

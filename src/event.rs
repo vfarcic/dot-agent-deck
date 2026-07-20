@@ -25,6 +25,12 @@ pub enum AgentType {
     ClaudeCode,
     OpenCode,
     Pi,
+    /// OpenAI Codex CLI (PRD #20 M7) — the first wrapper-strategy agent. Wired
+    /// in via `dot-agent-deck wrap -- codex …`; its events are synthesized from
+    /// stdout by [`crate::wrap`] and ride the existing raw-`AgentEvent` socket.
+    /// Serializes to `"codex"` (snake_case); resolved from the `codex` binary
+    /// basename through the registry ([`crate::agent_registry`]).
+    Codex,
     /// "No recognized agent type." Produced by [`AgentType::from_command`] for
     /// any unrecognized binary, mapped to `Option::None` by
     /// [`crate::state::SessionState::live_snapshot`], and rendered as the "No
@@ -55,21 +61,320 @@ impl AgentType {
     /// sessions with the correct type instead of "No agent".
     ///
     /// Returns `Some(AgentType)` only for recognized agent binaries
-    /// (`claude` → `ClaudeCode`, `opencode` → `OpenCode`, `pi` → `Pi`);
+    /// (`claude` → `ClaudeCode`, `opencode` → `OpenCode`, `pi` → `Pi`,
+    /// `codex` → `Codex`);
     /// unknown commands and `None` input return `None` so the daemon stores
     /// "type not known yet" rather than misclassifying. Whitespace
     /// before the binary name is ignored to match shell-style invocations.
+    ///
+    /// PRD #20 M2: the per-agent basename→type mapping now lives in the agent
+    /// registry ([`crate::agent_registry`]); this fn keeps the command-parsing
+    /// (basename extraction, arg stripping) and delegates the lookup. The
+    /// recognized set and the "unknown → `None`" behaviour are unchanged.
+    ///
+    /// PRD #20 finding #19: the parser is no longer limited to the first
+    /// whitespace token. It tokenizes the command with quote awareness and
+    /// conservatively looks through common launch forms so a Wrapper-strategy
+    /// agent behind a launcher is still detected and wrapped:
+    /// - leading `VAR=VALUE` assignments and an `env`/`sudo` prefix (with their
+    ///   own option flags/assignments) are skipped to reach the real binary;
+    /// - a quoted executable path (`"/opt/OpenAI Codex/codex"`) resolves by its
+    ///   basename;
+    /// - a shell launcher (`sh -c '<script>'`, `bash -lc "<script>"`) is
+    ///   recursed into via its `-c` script argument.
+    ///
+    /// Everything still degrades to `None` for an unrecognized binary, so a
+    /// non-agent command is never misclassified.
     pub fn from_command(cmd: Option<&str>) -> Option<Self> {
-        let cmd = cmd?;
-        let bin = cmd.split_whitespace().next()?;
-        let basename = std::path::Path::new(bin).file_name()?.to_str()?;
-        match basename {
-            "claude" => Some(AgentType::ClaudeCode),
-            "opencode" => Some(AgentType::OpenCode),
-            "pi" => Some(AgentType::Pi),
-            _ => None,
+        let tokens = tokenize_command(cmd?);
+        detect_from_tokens(&tokens, DETECT_RECURSION_BUDGET)
+    }
+}
+
+/// PRD #20 finding R20-016: hard cap on shell-launcher recursion, decremented
+/// across [`detect_from_tokens`] calls (NOT reset per call). A deeply nested
+/// `sh -c "sh -c \"sh -c …\""` can otherwise recurse until stack exhaustion;
+/// with an explicit budget each `-c` level costs one unit and the chain
+/// terminates safely at `None`.
+const DETECT_RECURSION_BUDGET: usize = 8;
+
+/// Short options (matched WITH their leading dash) that consume the FOLLOWING
+/// token as their argument for a given launcher, so command detection skips both
+/// the option and its argument to reach the real binary (`sudo -u root codex`,
+/// `env -u FOO codex`). Conservative allow-list: only these consume the next
+/// token; every other flag is treated as self-contained.
+fn launcher_option_takes_arg(launcher: &str, opt: &str) -> bool {
+    match launcher {
+        "sudo" => matches!(
+            opt,
+            "-u" | "-g" | "-h" | "-p" | "-C" | "-D" | "-R" | "-T" | "-U" | "-r" | "-t"
+        ),
+        "env" => matches!(opt, "-u" | "-C" | "-S"),
+        _ => false,
+    }
+}
+
+/// Whether `arg` is a shell SHORT-option cluster that selects command mode
+/// (`-c`) — e.g. `-c`, `-lc`, `-ic`. Only a single-dash cluster of ASCII-letter
+/// options containing `c` counts; a LONG option like `--rcfile` (which merely
+/// happens to contain the letter `c`) is deliberately NOT command mode, so a
+/// startup-file path is never mistaken for a `-c` script.
+fn is_shell_command_flag(arg: &str) -> bool {
+    match arg.strip_prefix('-') {
+        Some(rest) if !rest.is_empty() && !rest.starts_with('-') => {
+            rest.chars().all(|c| c.is_ascii_alphabetic()) && rest.contains('c')
+        }
+        _ => false,
+    }
+}
+
+/// Whether `token` looks like a leading `NAME=VALUE` environment assignment
+/// (e.g. `FOO=1`) rather than a program or path. Conservative: `NAME` must be a
+/// shell-identifier-shaped run before the first `=`, so a path that merely
+/// contains `=` isn't misread as an assignment.
+fn is_env_assignment(token: &str) -> bool {
+    match token.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && name.chars().next().is_some_and(|c| !c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// Resolve the agent type from an already-tokenized command, looking through
+/// `env`/`sudo`/shell-launcher prefixes. See [`AgentType::from_command`].
+fn detect_from_tokens(tokens: &[String], budget: usize) -> Option<AgentType> {
+    // R20-016: the recursion budget is decremented across calls (a `-c` script
+    // recurse below spends one unit), so a deeply nested `sh -c "sh -c …"` can no
+    // longer recurse until stack exhaustion — it terminates at `None`.
+    if budget == 0 {
+        return None;
+    }
+    let mut idx = 0;
+    // Bound the number of prefix hops (`env`/`sudo` chains) within one frame.
+    for _ in 0..8 {
+        // Skip a run of leading environment assignments (`FOO=1 codex`).
+        while tokens.get(idx).is_some_and(|t| is_env_assignment(t)) {
+            idx += 1;
+        }
+        let token = tokens.get(idx)?;
+        let basename = std::path::Path::new(token)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(token.as_str());
+
+        // `env` / `sudo` prefix: skip the launcher and any of its own flags,
+        // `VAR=VALUE` assignments, and — R20-016 — the ARGUMENT of an
+        // option that consumes one (`sudo -u root`, `env -u FOO`), then
+        // re-resolve from the next real token. `--` ends option parsing.
+        if basename == "env" || basename == "sudo" {
+            idx += 1;
+            while let Some(next) = tokens.get(idx) {
+                if next == "--" {
+                    idx += 1;
+                    break;
+                } else if is_env_assignment(next) {
+                    idx += 1;
+                } else if next.starts_with('-') {
+                    // A single-dash short option may consume the following
+                    // token as its argument (e.g. `-u root`); a `--long` option
+                    // either bundles its value (`--unset=FOO`) or is a flag, so
+                    // never over-consume for those.
+                    let consumes =
+                        !next.starts_with("--") && launcher_option_takes_arg(basename, next);
+                    idx += 1;
+                    if consumes && tokens.get(idx).is_some_and(|t| !t.starts_with('-')) {
+                        idx += 1;
+                    }
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // Shell launcher: `sh -c '<script>'`, `bash -lc "<script>"`. Recurse into
+        // the script argument that follows a valid command-mode short-option
+        // cluster ([`is_shell_command_flag`]); a shell with no `-c` (or one given
+        // only a `--rcfile`-style long option) stays an unrecognized binary.
+        if matches!(basename, "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash") {
+            let mut j = idx + 1;
+            while let Some(arg) = tokens.get(j) {
+                if arg.starts_with('-') {
+                    if is_shell_command_flag(arg)
+                        && let Some(script) = tokens.get(j + 1)
+                    {
+                        let inner = tokenize_command(script);
+                        return detect_from_tokens(&inner, budget - 1);
+                    }
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            return crate::agent_registry::detect_from_basename(basename);
+        }
+
+        // An ordinary binary token — resolve it directly.
+        return crate::agent_registry::detect_from_basename(basename);
+    }
+    None
+}
+
+/// Split a command string into whitespace-separated tokens, honoring single and
+/// double quotes (the quote characters are stripped, and whitespace inside a
+/// quoted run is preserved so a quoted executable path stays one token). This is
+/// a deliberately small shell-word splitter — enough for agent detection
+/// ([`AgentType::from_command`]), not a full POSIX parser.
+fn tokenize_command(cmd: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    for c in cmd.chars() {
+        match c {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                started = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                started = true;
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if started {
+                    tokens.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                started = true;
+            }
         }
     }
+    if started {
+        tokens.push(cur);
+    }
+    tokens
+}
+
+/// PRD #20 M3: the concrete handle, if any, through which a session's input is
+/// delivered — the `kind` half of a [`LiveTarget`] descriptor. Serializes
+/// kebab-case (`process`, `pty`, `tmux`, `sdk`, `none`). Purely descriptive: it
+/// tells the UI what *kind* of thing (if any) backs the session; whether it can
+/// actually be written to *now* is the separate [`Writable`] axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TargetKind {
+    /// A child process the producer owns (e.g. a `dot-agent-deck wrap` child).
+    Process,
+    /// A pseudo-terminal the daemon controls — the live, writable Claude
+    /// Code / OpenCode / Pi pane case.
+    Pty,
+    /// A `tmux` pane/window.
+    Tmux,
+    /// An in-process SDK/agent handle.
+    Sdk,
+    /// No concrete handle — the session is known only from history/logs.
+    ///
+    /// Forward-compat catch-all (matches [`AgentType::None`]): a future/unknown
+    /// `kind` on the wire deserializes here via `#[serde(other)]` instead of
+    /// failing the whole `LiveTarget`/`AgentEvent` decode. Deserialize-only —
+    /// `None` still serializes to `"none"`.
+    #[serde(other)]
+    None,
+}
+
+/// PRD #20 M3: whether the dashboard can deliver input to a session right now —
+/// the `writable` half of a [`LiveTarget`] descriptor. Serializes kebab-case
+/// (`live`, `history-only`, `none`).
+///
+/// A dashboard-visible session is not necessarily a live, writable target:
+/// today's Claude/OpenCode/Pi panes are `Live` (a PTY the daemon drives), but a
+/// wrapped Codex session surfaced via [`crate::wrap`] is `HistoryOnly` — the
+/// user's keystrokes reach the child through the inherited terminal, not a
+/// daemon-controlled handle, so the *dashboard* cannot inject live input. The UI
+/// reads this to render non-`Live` sessions distinctly and to refuse (with
+/// honest feedback) an attempt to type into a card that can't accept input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Writable {
+    /// Input can be delivered to the running session now.
+    Live,
+    /// The session can only be resumed/replayed from history — no live write.
+    HistoryOnly,
+    /// Neither live write nor history resume — view-only.
+    ///
+    /// Forward-compat catch-all (matches [`AgentType::None`]): a future/unknown
+    /// `writable` on the wire deserializes here via `#[serde(other)]` — the
+    /// safe, non-writable outcome — instead of failing the decode.
+    /// Deserialize-only; `None` still serializes to `"none"`.
+    #[serde(other)]
+    None,
+}
+
+/// PRD #20 M3: a per-session descriptor of whether/how a session can receive
+/// input. Carried on [`AgentEvent::live_target`] (optional + additive) so an
+/// adapter can declare that the session it surfaces is a live PTY target, a
+/// history-only wrapper session, or view-only — and the UI never invites users
+/// to type into a card that can't accept input.
+///
+/// See the "Liveness & Write Semantics" section of PRD #20: the `kind`
+/// ([`TargetKind`]) names the concrete handle and `writable` ([`Writable`])
+/// names what can be done with it now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveTarget {
+    pub kind: TargetKind,
+    pub writable: Writable,
+}
+
+/// PRD #20 M3: the honest outcome of delivering input to a session, returned
+/// instead of a fire-and-forget `Result<(), _>`. Serializes kebab-case; every
+/// variant keeps a distinct public wire value so a caller can tell accepted
+/// input apart from a stale, wrong, or unwritable target.
+///
+/// Rides the daemon wire on [`crate::daemon_protocol::AttachResponse::send_result`]
+/// as an additive, optional field (a missing value decodes to `None`), so it is
+/// forward-compatible and needs no `PROTOCOL_VERSION` bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SendResult {
+    /// Delivered to the live target.
+    Applied,
+    /// Accepted, not yet confirmed applied.
+    Queued,
+    /// Target moved on / our view was behind.
+    Stale,
+    /// The handle no longer maps to the session we meant.
+    WrongSession,
+    /// No live target — only history resume is possible.
+    HistoryOnly,
+    /// Nothing to write to.
+    NoLiveTarget,
+    /// PRD #20 R20-004 (finding #3): a write STARTED reaching the target but the
+    /// full payload+submit sequence did not complete (a partial write followed
+    /// by a writer error). Some bytes MAY already have been delivered, so this is
+    /// neither a clean success nor a safely-retryable failure: the daemon caches
+    /// it against the `delivery_id` so a retry REPLAYS this (does not blind-submit
+    /// again, which could duplicate the partial input), and the UI surfaces it as
+    /// a terminal non-delivery rather than looping a retry. Older clients decode
+    /// the unknown `"ambiguous"` value to [`SendResult::Unknown`] (also treated as
+    /// a non-delivered, conservative outcome), so it stays forward-compatible.
+    Ambiguous,
+    /// PRD #20 R20-011: forward-compat catch-all. A future daemon may report an
+    /// honest outcome this build does not know; a pre-`serde(other)` reader would
+    /// reject the whole [`crate::daemon_protocol::AttachResponse`] as malformed
+    /// (`unknown variant`) rather than degrade gracefully. Deserializing an
+    /// unknown value here — the SAFE, non-delivered outcome — keeps the response
+    /// decodable and forces every UI match to treat it conservatively (never as a
+    /// delivered success). Deserialize-only in practice: this build never
+    /// constructs `Unknown`, so it is never sent on the wire.
+    #[serde(other)]
+    Unknown,
 }
 
 /// PRD #201 M1.2 (test-plan row 3): map a lifecycle **state** string an agent's
@@ -99,6 +404,92 @@ pub fn agent_event_type_from_state(state: &str) -> Option<EventType> {
 /// don't emit it; consumers treat its absence as "no friendly name known".
 pub const DISPLAY_NAME_METADATA_KEY: &str = "display_name";
 
+/// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
+///
+/// This versions the **payload shape of a single `AgentEvent` record** — the
+/// stable public JSON schema documented on [`AgentEvent`] below. It is
+/// DISTINCT from [`crate::daemon_protocol::PROTOCOL_VERSION`], which versions
+/// the **attach-socket handshake/framing** between a TUI and the daemon. The
+/// two move independently: adding an optional, serde-skipped field to
+/// `AgentEvent` (as M1 does) bumps neither, because old and new peers stay
+/// wire-compatible; a breaking change to the *attach handshake* bumps only
+/// `PROTOCOL_VERSION`; a breaking change to the *event record shape* would
+/// bump only this constant. Do not conflate them.
+///
+/// Producers MAY stamp [`AgentEvent::schema_version`] with this value to
+/// advertise which schema they wrote. It stays at `1` for the current shape;
+/// a future, non-additive change to the record's fields bumps it. Because the
+/// field is optional and skipped when `None`, existing producers that leave it
+/// unset emit byte-identical JSON to before, and a consumer treats a missing
+/// `schema_version` as the baseline (v1) schema.
+pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 1;
+
+/// Stable public JSON schema for a single agent event.
+///
+/// `AgentEvent` is the wire record every agent integration (Claude Code hooks,
+/// the OpenCode plugin, Pi's `agent-event` CLI, and future wrapper adapters)
+/// serializes to the daemon's hook socket, and that the daemon re-broadcasts to
+/// attached TUIs over `KIND_EVENT` (wrapped in [`BroadcastMsg::Event`]). Third
+/// parties author events against this schema, so it is a **stable public API**:
+/// fields are added additively (optional + serde-skipped so old and new
+/// payloads round-trip unchanged), never repurposed. The record's schema
+/// version is [`AGENT_EVENT_SCHEMA_VERSION`] (distinct from the attach-wire
+/// [`crate::daemon_protocol::PROTOCOL_VERSION`] — see that constant's docs).
+///
+/// ## JSON schema (field · type · optionality · meaning · producers)
+///
+/// - **`session_id`** · string · **required** · stable id that groups events
+///   into a single dashboard card. Set by every producer.
+/// - **`agent_type`** · enum ([`AgentType`], snake_case) · **required** · which
+///   agent produced the event. Claude hooks set `claude_code`, the OpenCode
+///   plugin sets `open_code`, Pi's `agent-event` CLI sets `pi`, the
+///   live-surface path derives it from the spawn command via
+///   [`AgentType::from_command`]. Unrecognized values decode to `none` (the
+///   `#[serde(other)]` catch-all), never failing the whole-record decode.
+/// - **`event_type`** · enum ([`EventType`], snake_case) · **required** · the
+///   lifecycle/tool event that drives the card's status. Set by every producer.
+/// - **`tool_name`** · string · optional (omitted/`null` ⇒ `None`) · the tool
+///   for `tool_start` / `tool_end` events. Set by the Claude/OpenCode hook
+///   builders; `None` for pure lifecycle events.
+/// - **`tool_detail`** · string · optional · short human-readable detail for a
+///   tool event (e.g. the file path or command). Set by the hook builders.
+/// - **`cwd`** · string · optional · working directory of the session. Set by
+///   hooks and the live-surface path; used for orchestration bucketing.
+/// - **`timestamp`** · string (RFC 3339 / ISO 8601 UTC) · **required** · when
+///   the event was produced. Set by every producer.
+/// - **`user_prompt`** · string · optional · truncated text of the user prompt
+///   that triggered the turn. Set by hooks when a prompt is present.
+/// - **`metadata`** · object (string→string) · optional (defaults to empty) ·
+///   free-form extra keys, e.g. [`DISPLAY_NAME_METADATA_KEY`], `bash_command`,
+///   `permission_state`. Consumers treat unknown keys as ignorable.
+/// - **`pane_id`** · string · optional · the `DOT_AGENT_DECK_PANE_ID` the event
+///   routes to. Populated from the env var the daemon injects at spawn; `None`
+///   for events not scoped to a known pane.
+/// - **`agent_id`** · string · optional · daemon-side registry id of the
+///   producing agent (from `DOT_AGENT_DECK_AGENT_ID`). Lets agent-id-scoped
+///   filters (e.g. post-respawn `SessionStart` waits) target the right agent;
+///   `None` payloads simply don't match those filters.
+/// - **`agent_version`** · string · optional (**PRD #20 M1**, added additively)
+///   · self-reported version of the agent binary/integration that produced the
+///   event (e.g. a Codex/Claude CLI version), for diagnostics and
+///   version-aware rendering. No current producer sets it; `None` (the default,
+///   omitted from the wire) means "version not reported".
+/// - **`schema_version`** · integer · optional (**PRD #20 M1**, added
+///   additively) · the [`AGENT_EVENT_SCHEMA_VERSION`] the producer wrote, for
+///   forward compatibility. The wrapper adapter ([`crate::wrap`]) stamps it on
+///   every event it emits; native hooks currently omit it. `None` (the default,
+///   omitted from the wire) is read as the baseline (v1) schema. This is the
+///   **event-record** schema version, NOT the attach-wire
+///   [`crate::daemon_protocol::PROTOCOL_VERSION`].
+/// - **`live_target`** · object (`{ "kind": <TargetKind>, "writable":
+///   <Writable> }`, both kebab-case) · optional (**PRD #20 M3**, added
+///   additively; omitted/`null` ⇒ `None`) · declares whether/how the session
+///   can receive dashboard input (see [`LiveTarget`]). Producers: the wrapper
+///   adapter ([`crate::wrap`]) stamps it on every event — `pty`/`live` when it
+///   runs inside a daemon-managed pane (its child is reachable through that
+///   live PTY), else `process`/`history-only` for a standalone wrap. Native
+///   PTY panes (Claude/OpenCode/Pi) omit it, which the UI reads as the
+///   historical `live`/writable default. Absence never fails the decode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
     pub session_id: String,
@@ -131,6 +522,38 @@ pub struct AgentEvent {
     /// agent-id-scoped filters.
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// PRD #20 M1: self-reported version of the agent binary/integration that
+    /// produced this event (e.g. a wrapped Codex or Claude CLI version), for
+    /// diagnostics and version-aware rendering. Optional and additive:
+    /// `#[serde(default)]` lets older payloads that lack the field deserialize
+    /// to `None`, and `skip_serializing_if` omits it from the wire when unset —
+    /// so existing producers emit byte-identical JSON and old/new peers stay
+    /// compatible. No current producer sets it; `None` means "version not
+    /// reported".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_version: Option<String>,
+    /// PRD #20 M1: the [`AGENT_EVENT_SCHEMA_VERSION`] the producer wrote, for
+    /// forward compatibility of this record's JSON shape. This is the
+    /// **event-record** schema version and is DISTINCT from the attach-socket
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`] (see those docs). Optional
+    /// and additive for the same reasons as `agent_version`: a missing value
+    /// deserializes to `None` and is read as the baseline (v1) schema, and it
+    /// is omitted from the wire when unset. The wrapper adapter
+    /// ([`crate::wrap`]) stamps it on every event it emits; native hooks
+    /// currently leave it unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
+    /// PRD #20 M3: per-session live-target descriptor declaring whether/how the
+    /// session can receive input (see [`LiveTarget`]). Optional and additive:
+    /// `#[serde(default)]` lets legacy payloads that predate the field
+    /// deserialize to `None`, and `skip_serializing_if` omits it from the wire
+    /// when unset — so existing producers emit byte-identical JSON and old/new
+    /// peers stay compatible. The wrapper adapter ([`crate::wrap`]) stamps
+    /// `pty`/`live` when it runs inside a daemon-managed pane and
+    /// `process`/`history-only` for a standalone wrap; native PTY panes leave
+    /// it `None`, which the UI reads as the historical live/writable default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_target: Option<LiveTarget>,
 }
 
 /// Envelope for messages sent to the daemon over the Unix socket.
@@ -312,6 +735,98 @@ mod tests {
         assert!(event.tool_detail.is_none());
         assert!(event.cwd.is_none());
         assert!(event.metadata.is_empty());
+    }
+
+    // PRD #20 M1: an AgentEvent JSON written by an OLDER producer — one that
+    // predates the `agent_version` / `schema_version` fields — must still
+    // deserialize. This pins the backward-compatibility half of the "stable
+    // public JSON schema" contract: adding the two optional fields cannot break
+    // decoding of any previously-emitted payload.
+    #[test]
+    fn parse_event_without_new_version_fields_defaults_to_none() {
+        let json = r#"{
+            "session_id": "abc-123",
+            "agent_type": "claude_code",
+            "event_type": "idle",
+            "timestamp": "2026-03-22T10:00:00Z"
+        }"#;
+        let event: AgentEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            event.agent_version.is_none(),
+            "a payload lacking agent_version must decode it as None"
+        );
+        assert!(
+            event.schema_version.is_none(),
+            "a payload lacking schema_version must decode it as None (read as baseline v1)"
+        );
+    }
+
+    // PRD #20 M1: with the new fields SET, the event round-trips through JSON
+    // unchanged — the forward half of the schema contract (a newer producer's
+    // richer payload survives a serialize→deserialize cycle).
+    #[test]
+    fn round_trip_event_with_new_version_fields() {
+        let event = AgentEvent {
+            session_id: "rt-1".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-03-22T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+            agent_id: None,
+            agent_version: Some("codex-1.2.3".into()),
+            schema_version: Some(AGENT_EVENT_SCHEMA_VERSION),
+            live_target: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        // Both fields must appear on the wire when set…
+        assert!(json.contains("\"agent_version\":\"codex-1.2.3\""), "{json}");
+        assert!(json.contains("\"schema_version\":1"), "{json}");
+        // …and survive the decode.
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.agent_version.as_deref(), Some("codex-1.2.3"));
+        assert_eq!(back.schema_version, Some(AGENT_EVENT_SCHEMA_VERSION));
+    }
+
+    // PRD #20 M1: `skip_serializing_if = "Option::is_none"` means an event that
+    // leaves the new fields unset emits BYTE-IDENTICAL JSON to before they
+    // existed — the keys are absent, not `null`. This is what keeps existing
+    // producers behaviour-preserving and old/new peers wire-compatible.
+    #[test]
+    fn none_version_fields_are_omitted_from_the_wire() {
+        let event = AgentEvent {
+            session_id: "min-1".into(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::Idle,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-03-22T10:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: None,
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            !json.contains("agent_version"),
+            "None agent_version must be omitted from the wire, not serialized as null: {json}"
+        );
+        assert!(
+            !json.contains("schema_version"),
+            "None schema_version must be omitted from the wire, not serialized as null: {json}"
+        );
     }
 
     #[test]

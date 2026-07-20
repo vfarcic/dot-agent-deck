@@ -19,7 +19,7 @@ use crate::ascii_art::{AsciiArtResult, generate_ascii_art};
 use crate::config;
 use crate::config::{BellConfig, DashboardConfig, IdleArtConfig};
 use crate::embedded_pane::{EmbeddedPaneController, HydratedPane};
-use crate::event::{AgentType, EventType, OrchestrationSurface};
+use crate::event::{AgentType, EventType, OrchestrationSurface, SendResult};
 use crate::features::Features;
 // PRD #80 introduced a UI-dispatch `Action` enum in this module (the renamed
 // `KeyResult`), which collides with the keybinding-action enum. Import the
@@ -63,12 +63,10 @@ fn text_dim() -> Style {
 
 impl fmt::Display for crate::event::AgentType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            crate::event::AgentType::ClaudeCode => write!(f, "ClaudeCode"),
-            crate::event::AgentType::OpenCode => write!(f, "OpenCode"),
-            crate::event::AgentType::Pi => write!(f, "Pi"),
-            crate::event::AgentType::None => write!(f, "No agent"),
-        }
+        // PRD #20 M2: the human label is registry data now (single source of
+        // truth), not a per-variant `match` here. Labels are unchanged
+        // (ClaudeCode / OpenCode / Pi / "No agent").
+        write!(f, "{}", crate::agent_registry::spec(self).label)
     }
 }
 
@@ -400,20 +398,29 @@ const ISSUE_DISPATCH_MODE_NAME: &str = "schedule: issues";
 /// Command field is free-text (the clickable preset picker is gone), so only this
 /// blank-case default remains — `claude`, the simple default that launches a real
 /// conversational agent.
-const DEFAULT_AUTHORING_COMMAND: &str = "claude";
+///
+/// PRD #20 M2: sourced from the agent registry's Claude Code entry
+/// (`agent_registry::CLAUDE_CODE.default_command`) so the fallback lives in the
+/// single per-agent source of truth rather than a lone hardcoded string; the
+/// value is unchanged (`claude`).
+fn default_authoring_command() -> &'static str {
+    crate::agent_registry::CLAUDE_CODE
+        .default_command
+        .unwrap_or("claude")
+}
 
 /// PRD #170 round 2 (reviewer findings 1 & 3): resolve the authoring command
 /// for a scheduled-task authoring session. The authoring agent MUST be a real
 /// conversational agent that can act on the seed prompt and call the `schedule
 /// add` CLI — never a bare `$SHELL`. So a blank/whitespace `default_command`
 /// (the unconfigured-user case: `config.rs` defaults it to `String::new`) falls
-/// back to [`DEFAULT_AUTHORING_COMMAND`] (`claude`); a configured value is used
+/// back to [`default_authoring_command`] (`claude`); a configured value is used
 /// as-is (trimmed). Shared by both authoring spawn sites so the fallback is
 /// applied uniformly.
 fn resolve_authoring_command(default_command: &str) -> String {
     let trimmed = default_command.trim();
     if trimmed.is_empty() {
-        DEFAULT_AUTHORING_COMMAND.to_string()
+        default_authoring_command().to_string()
     } else {
         trimmed.to_string()
     }
@@ -671,6 +678,11 @@ fn live_schedule_names() -> HashSet<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormField {
     Mode,
+    /// PRD #20 finding #8: the per-agent selector. A CLICK-activated chip (not
+    /// part of the Tab/Enter Mode→Name→Command cycle, so existing key-driven
+    /// flows are unchanged); focusing it or cycling it with ◀▶ seeds the
+    /// Command from the selected registry entry's `default_command`.
+    Agent,
     Name,
     Command,
 }
@@ -715,6 +727,11 @@ struct NewPaneFormState {
     /// hidden and the cycler shape is byte-for-byte the pre-feature baseline.
     show_issue_dispatch: bool,
     selection_index: usize, // 0 = "No mode", 1..M = modes, M+1..M+O = orchestrations, then "schedule" [, "schedule: issues"]
+    /// PRD #20 finding #8: the selected agent's index into
+    /// [`crate::agent_registry::ALL`], or `None` when the user hasn't picked one
+    /// (the Command then comes from the global default / typed text). Selecting
+    /// an agent seeds the Command from that entry's `default_command`.
+    agent_selection: Option<usize>,
     has_mode_field: bool,
     focused: FormField,
     /// PRD #170 (unify): when `true` the form is MODE-LOCKED to schedule
@@ -801,6 +818,7 @@ impl NewPaneFormState {
             // all observe one consistent value.
             show_issue_dispatch: crate::features::show_issue_dispatch_authoring(),
             selection_index: 0,
+            agent_selection: None,
             has_mode_field,
             focused: FormField::Mode,
             // PRD #170: the ordinary `Ctrl+n` form is never locked.
@@ -856,6 +874,7 @@ impl NewPaneFormState {
             // the locked form hides the cycler entirely, so it never appears here.
             show_issue_dispatch: false,
             selection_index: 0,
+            agent_selection: None,
             has_mode_field: true,
             focused: FormField::Command,
             schedule_locked: true,
@@ -981,6 +1000,54 @@ impl NewPaneFormState {
         self.selected_orchestration().is_none()
     }
 
+    /// PRD #20 finding #8: the label shown in the Agent chip — the selected
+    /// registry entry's label, or `auto` when no agent is picked (Command comes
+    /// from the global default / typed text).
+    fn agent_label(&self) -> String {
+        match self.agent_selection {
+            Some(idx) => crate::agent_registry::ALL
+                .get(idx)
+                .map(|spec| spec.label.to_string())
+                .unwrap_or_else(|| "auto".to_string()),
+            None => "auto".to_string(),
+        }
+    }
+
+    /// PRD #20 finding #8: select the agent at `idx` and SEED the Command field
+    /// from its registry `default_command`. This is the whole point of the
+    /// selector — picking an agent fills in how to launch it — so the seed
+    /// consults the registry, not any global config value.
+    fn select_agent(&mut self, idx: usize) {
+        if let Some(spec) = crate::agent_registry::ALL.get(idx) {
+            self.agent_selection = Some(idx);
+            self.command = spec.default_command.unwrap_or_default().to_string();
+        }
+    }
+
+    /// Advance the Agent selection to the next shipped agent (wrapping), seeding
+    /// the Command. An unselected field starts at the first agent.
+    fn cycle_agent_next(&mut self) {
+        let n = crate::agent_registry::ALL.len();
+        if n == 0 {
+            return;
+        }
+        let next = self.agent_selection.map(|i| (i + 1) % n).unwrap_or(0);
+        self.select_agent(next);
+    }
+
+    /// Reverse of [`Self::cycle_agent_next`].
+    fn cycle_agent_prev(&mut self) {
+        let n = crate::agent_registry::ALL.len();
+        if n == 0 {
+            return;
+        }
+        let prev = self
+            .agent_selection
+            .map(|i| (i + n - 1) % n)
+            .unwrap_or(n - 1);
+        self.select_agent(prev);
+    }
+
     fn next_field(&self) -> FormField {
         // PRD #170: the locked schedule form has a single navigable field
         // (Command) — Mode + Name are hidden, so Tab is a no-op.
@@ -990,6 +1057,9 @@ impl NewPaneFormState {
         let cmd_visible = self.command_visible();
         match self.focused {
             FormField::Mode => FormField::Name,
+            // PRD #20 finding #8: the Agent chip is off the Tab cycle (only
+            // reachable by click); leaving it advances to Name.
+            FormField::Agent => FormField::Name,
             FormField::Name => {
                 if cmd_visible {
                     FormField::Command
@@ -1024,6 +1094,9 @@ impl NewPaneFormState {
                     FormField::Name
                 }
             }
+            // PRD #20 finding #8: the Agent chip is off the Tab cycle; stepping
+            // back from it lands on Mode.
+            FormField::Agent => FormField::Mode,
             FormField::Name => {
                 if self.has_mode_field {
                     FormField::Mode
@@ -1139,6 +1212,80 @@ struct PendingSeedPrompt {
     prompt: String,
     created_at: std::time::Instant,
     ready_since: Option<std::time::Instant>,
+}
+
+/// PRD #20 R20-005: per-target retry-backoff state for an automatic prompt
+/// (a mode `seed_prompt` or an orchestrator role prompt), keyed by pane id.
+/// Without this, a permanent non-delivery (a `history-only` role, a
+/// `wrong-session`, or a daemon error) was re-attempted on EVERY render frame —
+/// an unbounded RPC storm that also thrashed the visible status timestamp. The
+/// gate holds the next attempt until `next_attempt_at`, applying bounded
+/// exponential backoff (see [`send_retry_delay`]).
+#[derive(Clone)]
+struct SendRetryState {
+    next_attempt_at: std::time::Instant,
+    attempts: u32,
+}
+
+/// PRD #20 R20-003/R20-004: the target identity + idempotency key an automatic
+/// prompt was queued for, captured at ENQUEUE and carried in every (re)delivery
+/// so the daemon can (a) refuse a stale delivery to a replacement agent
+/// (`wrong-session`/`stale`, no write) after a respawn/rebind and (b) dedup a
+/// retry after a lost response. Keyed by pane id.
+#[derive(Clone)]
+struct PromptDelivery {
+    expected_agent_id: Option<String>,
+    expected_session_id: Option<String>,
+    delivery_id: String,
+}
+
+/// PRD #20 R20-005: bounded exponential backoff for a retried automatic prompt.
+/// `attempts` is the number of failed attempts so far (≥ 1). Schedule: 500 ms,
+/// 1 s, then capped at 2 s — so a permanent non-delivery settles into an
+/// occasional retry (≤ one RPC / 2 s, not a per-frame storm) yet a retryable
+/// outcome (a `history-only` role that later becomes live) is still re-attempted
+/// PROMPTLY once the target transitions, rather than languishing behind a
+/// minutes-long exponential delay. The cap is the "wait for a matching target
+/// transition" bound from the finding: it keeps the catch-up latency small.
+fn send_retry_delay(attempts: u32) -> std::time::Duration {
+    const BASE_MS: u64 = 500;
+    const CAP: std::time::Duration = std::time::Duration::from_secs(2);
+    let shift = attempts.saturating_sub(1).min(6);
+    std::time::Duration::from_millis(BASE_MS.saturating_mul(1u64 << shift)).min(CAP)
+}
+
+/// PRD #20 R20-004 (finding #3): hard cap on how long an automatic prompt (a
+/// mode seed or an orchestrator role prompt) is retried before it is abandoned.
+/// The deadline is checked BEFORE the readiness/backoff/delivery branches so it
+/// is actually reachable — the previous code checked it only after the delivery
+/// branch, which always returned first, so a permanent non-delivery
+/// (`wrong-session`, a never-live role) retried one RPC every ~2s forever.
+const AUTOMATIC_PROMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// PRD #20 R20-004 (finding #3): mint a GLOBALLY-UNIQUE delivery id for an
+/// automatic prompt. The old `seed-<pane>-<seq>` restarted its counter at 1 in
+/// EVERY TUI process while the daemon's dedup ledger persists — so a reconnecting
+/// (restarted) TUI could reuse an id the daemon still had cached and have a
+/// genuinely-new prompt silently suppressed (or replayed against conflicting
+/// content). This combines a per-PROCESS nonce (two processes never collide)
+/// with a global monotonic counter (two ids within one process never collide),
+/// keyed by pane for log readability.
+fn mint_delivery_id(pane_id: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nonce = *NONCE.get_or_init(|| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::process::id().hash(&mut h);
+        // Nanos since the epoch disambiguate a pid reused across restarts.
+        if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            dur.as_nanos().hash(&mut h);
+        }
+        h.finish()
+    });
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("send-{nonce:016x}-{pane_id}-{seq}")
 }
 
 struct UiState {
@@ -1326,6 +1473,18 @@ struct UiState {
     /// ready before the gated atomic submit. Parallel to `pending_dispatches`
     /// but uses the spawn-time readiness buffer + `write_and_submit_to_pane`.
     pending_seed_prompts: Vec<PendingSeedPrompt>,
+    /// PRD #20 R20-005: per-pane retry-backoff for automatic prompts (seed +
+    /// orchestrator role prompts). Keyed by pane id; entry present ⇒ a prior
+    /// attempt was non-delivered and the next attempt is held until
+    /// `next_attempt_at`. Cleared on a successful delivery or when the prompt is
+    /// abandoned. Kept OUTSIDE `PendingSeedPrompt` so the struct's construction
+    /// shape is unchanged.
+    send_retry_backoff: HashMap<String, SendRetryState>,
+    /// PRD #20 R20-003/R20-004: per-pane captured delivery identity for automatic
+    /// prompts. Populated at ENQUEUE (and lazily at first delivery as a fallback)
+    /// so every (re)delivery carries the same agent identity + stable delivery
+    /// id. Keyed by pane id; cleared when the prompt is delivered or abandoned.
+    prompt_delivery: HashMap<String, PromptDelivery>,
     /// PRD #127 M3.3: schedules listed in the "Scheduled Tasks" manager dialog,
     /// loaded from the global config when the dialog opens.
     scheduled_tasks: Vec<config::ScheduledTask>,
@@ -1488,6 +1647,10 @@ impl UiState {
             orchestration_ready_since: HashMap::new(),
             pending_dispatches: Vec::new(),
             pending_seed_prompts: Vec::new(),
+            send_retry_backoff: HashMap::new(),
+            prompt_delivery: HashMap::new(),
+            // next_delivery_seq removed (PRD #20 finding #3): delivery ids are now
+            // minted globally unique via `mint_delivery_id`.
             scheduled_tasks: Vec::new(),
             scheduled_selected: 0,
             scheduled_delete_confirm: false,
@@ -1755,23 +1918,59 @@ fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'
         return sessions;
     }
 
-    let query = ui.filter_text.to_lowercase();
+    // PRD #20 M9 / finding #20: split the query into `type:<agent>` tokens and
+    // ordinary text. Each `type:` token resolves through the agent registry
+    // (label/basename, case-insensitive) so all agent identities are filterable
+    // and a future agent needs no new filter code. The remaining text keeps
+    // matching id/cwd/status/display-name exactly as before.
+    //
+    // Grammar (all conjunctive — AND): a session matches iff it satisfies EVERY
+    // `type:` token AND the joined text query. Because a session has exactly one
+    // agent type, MULTIPLE DISTINCT `type:` tokens can never all hold — so
+    // `type:codex type:claude` matches nothing (a session cannot be both Codex
+    // and Claude Code). A repeated same-type token is a harmless no-op, and
+    // `type:codex wrapped-worker` = Codex AND text "wrapped-worker".
+    let mut type_filters: Vec<crate::event::AgentType> = Vec::new();
+    let mut unknown_type = false;
+    let mut text_terms: Vec<&str> = Vec::new();
+    for token in ui.filter_text.split_whitespace() {
+        let lowered = token.to_lowercase();
+        if let Some(alias) = lowered.strip_prefix("type:") {
+            match crate::agent_registry::resolve_type_alias(alias) {
+                Some(agent_type) => type_filters.push(agent_type),
+                None => unknown_type = true,
+            }
+        } else {
+            text_terms.push(token);
+        }
+    }
+
+    // An unrecognized `type:` token (e.g. `type:bogus`) matches nothing.
+    if unknown_type {
+        return Vec::new();
+    }
+
+    let text_query = text_terms.join(" ").to_lowercase();
     sessions.retain(|(id, s)| {
-        let id_match = id.to_lowercase().contains(&query);
-        let cwd_match = s
-            .cwd
-            .as_deref()
-            .unwrap_or("")
-            .to_lowercase()
-            .contains(&query);
-        let status_str = format!("{:?}", s.status).to_lowercase();
-        let status_match = status_str.contains(&query);
-        let name_match = ui
-            .display_names
-            .get(*id)
-            .map(|n| n.to_lowercase().contains(&query))
-            .unwrap_or(false);
-        id_match || cwd_match || status_match || name_match
+        let type_match = type_filters.is_empty() || type_filters.iter().all(|t| *t == s.agent_type);
+        let text_match = text_query.is_empty() || {
+            let id_match = id.to_lowercase().contains(&text_query);
+            let cwd_match = s
+                .cwd
+                .as_deref()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains(&text_query);
+            let status_str = format!("{:?}", s.status).to_lowercase();
+            let status_match = status_str.contains(&text_query);
+            let name_match = ui
+                .display_names
+                .get(*id)
+                .map(|n| n.to_lowercase().contains(&text_query))
+                .unwrap_or(false);
+            id_match || cwd_match || status_match || name_match
+        };
+        type_match && text_match
     });
     sessions
 }
@@ -2310,7 +2509,34 @@ fn process_pending_seed_prompts(
     snapshot: &AppState,
 ) {
     let now = std::time::Instant::now();
-    ui.pending_seed_prompts.retain_mut(|sp| {
+    // PRD #20 blocker-5: the send outcome CONTROLS retention. A non-delivered
+    // seed must be retained for a later retry (e.g. after a pane transitions
+    // from history-only to live) and must surface visible feedback — never be
+    // silently dropped. Collected here and applied to `ui.status_message` after
+    // the `retain_mut` borrow ends (the closure can't touch `ui` directly).
+    //
+    // PRD #20 R20-003/004/005: take the backoff + delivery-identity maps out of
+    // `ui` so the retain closure can read/update them (it can't touch `ui`
+    // directly). Each seed carries a stable delivery identity (captured at
+    // enqueue, or lazily here) and honors a bounded retry backoff so a permanent
+    // non-delivery doesn't re-attempt every frame.
+    let mut feedback: Option<String> = None;
+    let mut prompts = std::mem::take(&mut ui.pending_seed_prompts);
+    let mut backoff = std::mem::take(&mut ui.send_retry_backoff);
+    let mut deliveries = std::mem::take(&mut ui.prompt_delivery);
+    prompts.retain_mut(|sp| {
+        // PRD #20 R20-005 (finding #13): the hard timeout is checked FIRST, before
+        // the readiness/backoff/delivery branches — so it is actually reachable.
+        // The old code checked it only AFTER the delivery branch (which always
+        // returned first), making the 60s deadline unreachable: a permanent
+        // non-delivery re-attempted one RPC every ~2s forever. An expired seed is
+        // abandoned here with NO further delivery attempt.
+        if sp.created_at.elapsed() > AUTOMATIC_PROMPT_DEADLINE {
+            tracing::warn!(pane_id = %sp.pane_id, "seed prompt: timed out; abandoning");
+            backoff.remove(&sp.pane_id);
+            deliveries.remove(&sp.pane_id);
+            return false;
+        }
         // Fast path: agent fired SessionStart (agent_type resolved).
         let agent_ready = snapshot.sessions.values().any(|s| {
             s.pane_id.as_deref() == Some(sp.pane_id.as_str()) && s.agent_type != AgentType::None
@@ -2329,16 +2555,331 @@ fn process_pending_seed_prompts(
             should_inject_spawn_time_prompt(sp.ready_since, now)
         };
         if (agent_ready || timeout_ready) && buffer_elapsed {
-            let _ = pane.write_and_submit_to_pane(&sp.pane_id, &sp.prompt);
-            return false;
-        }
-        // Hard timeout after 60s — give up.
-        if sp.created_at.elapsed() > std::time::Duration::from_secs(60) {
-            tracing::warn!(pane_id = %sp.pane_id, "seed prompt: timed out waiting for agent");
-            return false;
+            // R20-005: don't re-attempt until the backoff window elapses.
+            if backoff
+                .get(&sp.pane_id)
+                .is_some_and(|s| now < s.next_attempt_at)
+            {
+                return true;
+            }
+            // R20-003/004: resolve (or lazily capture) the delivery identity for
+            // this pane. Captured once and reused across retries so the daemon
+            // dedups on a stable `delivery_id` and validates the queued-for agent.
+            let delivery = deliveries.entry(sp.pane_id.clone()).or_insert_with(|| {
+                PromptDelivery {
+                    // Agent id is the reliable cross-boundary identity. PRD #20
+                    // finding #4: ALSO capture the daemon-authoritative hook
+                    // session generation (`None` for a placeholder-only pane, so
+                    // the daemon applies no session check there) so a same-agent
+                    // `/clear` between enqueue and delivery is refused by the
+                    // daemon rather than delivering the old prompt into the new
+                    // conversation.
+                    expected_agent_id: pane.pane_agent_id(&sp.pane_id),
+                    expected_session_id: snapshot.pane_hook_session_id(&sp.pane_id),
+                    // PRD #20 finding #3: globally-unique id (process nonce +
+                    // global counter), not a per-process `seed-<pane>-N`.
+                    delivery_id: mint_delivery_id(&sp.pane_id),
+                }
+            });
+            let expected_agent_id = delivery.expected_agent_id.clone();
+            let expected_session_id = delivery.expected_session_id.clone();
+            let delivery_id = delivery.delivery_id.clone();
+            match pane.write_and_submit_to_pane_with_identity(
+                &sp.pane_id,
+                &sp.prompt,
+                expected_agent_id.as_deref(),
+                expected_session_id.as_deref(),
+                Some(&delivery_id),
+            ) {
+                // Delivered (or accepted for delivery): drop the seed + its state.
+                Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
+                    backoff.remove(&sp.pane_id);
+                    deliveries.remove(&sp.pane_id);
+                    return false;
+                }
+                // Explicit non-delivery: retain for retry, back off, surface
+                // feedback. Bounded by the deadline checked at the top of this
+                // closure (finding #13) — never a forever loop.
+                Ok(other) => {
+                    schedule_send_retry(&mut backoff, &sp.pane_id, now);
+                    feedback = Some(format!(
+                        "Seed prompt not delivered ({}); will retry",
+                        describe_send_result(other)
+                    ));
+                    return true;
+                }
+                // Transport failure: retain for retry, back off, surface feedback.
+                Err(e) => {
+                    schedule_send_retry(&mut backoff, &sp.pane_id, now);
+                    feedback = Some(format!("Seed prompt not delivered ({e}); will retry"));
+                    return true;
+                }
+            }
         }
         true
     });
+    ui.pending_seed_prompts = prompts;
+    ui.send_retry_backoff = backoff;
+    ui.prompt_delivery = deliveries;
+    if let Some(message) = feedback {
+        ui.status_message = Some((message, now));
+    }
+}
+
+/// PRD #20 R20-005: record that an automatic-prompt delivery to `pane_id` was
+/// NOT delivered, arming the next retry after a bounded exponential backoff.
+fn schedule_send_retry(
+    backoff: &mut HashMap<String, SendRetryState>,
+    pane_id: &str,
+    now: std::time::Instant,
+) {
+    let entry = backoff
+        .entry(pane_id.to_string())
+        .or_insert(SendRetryState {
+            next_attempt_at: now,
+            attempts: 0,
+        });
+    entry.attempts = entry.attempts.saturating_add(1);
+    entry.next_attempt_at = now + send_retry_delay(entry.attempts);
+}
+
+/// PRD #20 R20-003/R20-004: capture the delivery identity for an automatic
+/// prompt just queued for `pane_id` — the daemon agent id currently bound to the
+/// pane (so a later respawn/rebind is caught daemon-side), the current session id
+/// if one exists, and a fresh stable `delivery_id` for idempotent retries.
+/// Overwrites any prior entry: a re-enqueue starts a fresh delivery.
+fn capture_prompt_delivery(ui: &mut UiState, pane_id: &str, pane: &dyn PaneController) {
+    // The daemon-side agent id currently bound to this pane (the registry key,
+    // == the client's stream-backend `agent_id`). This is the reliable identity:
+    // a respawn/rebind rolls it over, so the daemon's guard catches a stale
+    // delivery to a replacement. We deliberately do NOT capture a session id:
+    // the UI's session view carries placeholder sessions with UI-minted ids that
+    // don't match the daemon's hook-derived session state, so comparing them
+    // daemon-side would spuriously reject EVERY delivery. The agent-id guard
+    // already covers the respawn case; the session axis stays daemon-internal
+    // (exercised by the protocol tests that set up daemon state directly).
+    let expected_agent_id = pane.pane_agent_id(pane_id);
+    ui.prompt_delivery.insert(
+        pane_id.to_string(),
+        PromptDelivery {
+            expected_agent_id,
+            expected_session_id: None,
+            // PRD #20 finding #3: globally-unique id (process nonce + global
+            // counter) so a TUI restart can't collide with the daemon's still-live
+            // dedup ledger.
+            delivery_id: mint_delivery_id(pane_id),
+        },
+    );
+}
+
+/// PRD #20 R20-005 (finding #13): whether a non-delivered [`SendResult`] is
+/// TERMINAL — retrying it can never succeed (or, for `Ambiguous`, must not be
+/// retried at all) — versus a RETRYABLE liveness transition that may become
+/// deliverable once the target settles. Terminal outcomes are abandoned with
+/// feedback rather than looped every ~2s until the deadline; retryable ones are
+/// retried (still bounded by [`AUTOMATIC_PROMPT_DEADLINE`]).
+///
+/// * TERMINAL: `WrongSession` (the queued identity is permanently wrong),
+///   `Unknown` (a future outcome this build can't act on), `Ambiguous` (a
+///   partial write — a retry could duplicate the input).
+/// * RETRYABLE: `HistoryOnly` / `Stale` / `NoLiveTarget` (the target may become
+///   live / re-settle). `Applied` / `Queued` never reach this helper.
+fn is_terminal_send_result(result: SendResult) -> bool {
+    matches!(
+        result,
+        SendResult::WrongSession | SendResult::Unknown | SendResult::Ambiguous
+    )
+}
+
+/// PRD #20 R20-005 (finding #13): abandon an orchestrator role prompt — clear
+/// its prompt (so the render-loop gate stops re-entering), drop its retry/
+/// delivery/ready-since state, and surface `msg`. Used on the deadline and on a
+/// terminal send outcome.
+fn abandon_orchestrator_prompt(
+    ui: &mut UiState,
+    tab_id: TabId,
+    start_pane_id: &str,
+    orchestrator_prompt: &mut Option<String>,
+    now: std::time::Instant,
+    msg: String,
+) {
+    *orchestrator_prompt = None;
+    ui.send_retry_backoff.remove(start_pane_id);
+    ui.prompt_delivery.remove(start_pane_id);
+    ui.orchestration_ready_since.remove(&tab_id);
+    ui.status_message = Some((msg, now));
+}
+
+/// PRD #20 R20-003/004/005 (findings #5, #13): deliver (or retry, or abandon) an
+/// orchestrator start-role prompt for ONE orchestration tab. Extracted from the
+/// render loop with an INJECTED `now` so the deadline / terminal-outcome policy
+/// is unit-testable with a controlled clock (the render loop passes
+/// `Instant::now()`).
+///
+/// Preconditions (the caller's gate): `orchestrator_prompt.is_some()` and the
+/// tab is not already prompted.
+#[allow(clippy::too_many_arguments)]
+fn deliver_orchestrator_prompt(
+    ui: &mut UiState,
+    pane: &dyn PaneController,
+    snapshot: &AppState,
+    now: std::time::Instant,
+    tab_id: TabId,
+    role_pane_ids: &[String],
+    start_role_index: usize,
+    role_statuses: &mut [OrchestrationRoleStatus],
+    orchestrator_prompt: &mut Option<String>,
+) {
+    let start_pane_id = role_pane_ids[start_role_index].clone();
+
+    // PRD #20 R20-005 (finding #13): DEADLINE FIRST — before the readiness /
+    // backoff / delivery branches — so the hard timeout is actually reachable.
+    // The old block had no orchestrator deadline at all, so a permanent
+    // non-delivery retried one RPC every ~2s forever.
+    if ui
+        .orchestration_created_at
+        .get(&tab_id)
+        .is_some_and(|t| now.duration_since(*t) > AUTOMATIC_PROMPT_DEADLINE)
+    {
+        tracing::warn!(pane_id = %start_pane_id, "orchestrator prompt: timed out; abandoning");
+        abandon_orchestrator_prompt(
+            ui,
+            tab_id,
+            &start_pane_id,
+            orchestrator_prompt,
+            now,
+            "Orchestrator prompt not delivered (timed out); abandoned".to_string(),
+        );
+        return;
+    }
+
+    let agent_ready = snapshot.sessions.values().any(|s| {
+        s.pane_id.as_deref() == Some(start_pane_id.as_str()) && s.agent_type != AgentType::None
+    });
+    let timeout_ready = !agent_ready
+        && ui
+            .orchestration_created_at
+            .get(&tab_id)
+            .is_some_and(|t| now.duration_since(*t) > std::time::Duration::from_secs(10));
+    if agent_ready {
+        ui.orchestration_ready_since.entry(tab_id).or_insert(now);
+    }
+    let buffer_elapsed = if timeout_ready {
+        true
+    } else {
+        should_inject_spawn_time_prompt(ui.orchestration_ready_since.get(&tab_id).copied(), now)
+    };
+    let backed_off = ui
+        .send_retry_backoff
+        .get(start_pane_id.as_str())
+        .is_some_and(|s| now < s.next_attempt_at);
+    if !((agent_ready || timeout_ready) && buffer_elapsed && !backed_off) {
+        return;
+    }
+
+    // PRD #20 R20-003/004 (finding #5 fallback): normally the identity was
+    // captured at tab creation; capture lazily here only if that didn't happen.
+    if !ui.prompt_delivery.contains_key(start_pane_id.as_str()) {
+        capture_prompt_delivery(ui, &start_pane_id, pane);
+    }
+    let (expected_agent_id, expected_session_id, delivery_id) =
+        match ui.prompt_delivery.get(start_pane_id.as_str()) {
+            Some(d) => (
+                d.expected_agent_id.clone(),
+                d.expected_session_id.clone(),
+                Some(d.delivery_id.clone()),
+            ),
+            None => (None, None, None),
+        };
+    let prompt_text = orchestrator_prompt
+        .as_deref()
+        .unwrap_or_default()
+        .to_string();
+    match pane.write_and_submit_to_pane_with_identity(
+        &start_pane_id,
+        &prompt_text,
+        expected_agent_id.as_deref(),
+        expected_session_id.as_deref(),
+        delivery_id.as_deref(),
+    ) {
+        Ok(SendResult::Applied) | Ok(SendResult::Queued) => {
+            *orchestrator_prompt = None;
+            role_statuses[start_role_index] = OrchestrationRoleStatus::Working;
+            ui.orchestration_prompted.insert(tab_id);
+            ui.send_retry_backoff.remove(start_pane_id.as_str());
+            ui.prompt_delivery.remove(start_pane_id.as_str());
+            ui.orchestration_ready_since.remove(&tab_id);
+        }
+        // PRD #20 finding #13: a TERMINAL outcome is abandoned (no forever
+        // retry); a RETRYABLE liveness transition is retried under backoff,
+        // bounded by the deadline checked at the top of this function.
+        Ok(other) if is_terminal_send_result(other) => {
+            abandon_orchestrator_prompt(
+                ui,
+                tab_id,
+                &start_pane_id,
+                orchestrator_prompt,
+                now,
+                format!(
+                    "Orchestrator prompt not delivered ({}); abandoned",
+                    describe_send_result(other)
+                ),
+            );
+        }
+        Ok(other) => {
+            schedule_send_retry(&mut ui.send_retry_backoff, &start_pane_id, now);
+            let msg = if other == SendResult::HistoryOnly {
+                "History-only session cannot accept live input".to_string()
+            } else {
+                format!(
+                    "Orchestrator prompt not delivered ({}); will retry",
+                    describe_send_result(other)
+                )
+            };
+            ui.status_message = Some((msg, now));
+        }
+        Err(e) => {
+            schedule_send_retry(&mut ui.send_retry_backoff, &start_pane_id, now);
+            ui.status_message = Some((
+                format!("Orchestrator prompt not delivered ({e}); will retry"),
+                now,
+            ));
+        }
+    }
+}
+
+/// PRD #20 blocker-3: wrap a bare, about-to-be-TYPED launch command for a
+/// mode/restore agent shell (the one launch class that doesn't pass its command
+/// through the common `agent_pty::spawn` boundary — it spawns a shell and
+/// injects the command as keystrokes). Resolves the Wrapper-strategy identity
+/// from the command and returns `dot-agent-deck wrap --agent <name> -- <cmd>`
+/// for a Wrapper agent (Codex); returns the command unchanged for native agents.
+/// Idempotent, so a re-typed already-wrapped command is never double-wrapped.
+fn wrap_agent_command(command: &str) -> String {
+    match AgentType::from_command(Some(command)) {
+        Some(agent_type) => crate::wrap::wrap_launch_command(command, &agent_type),
+        None => command.to_string(),
+    }
+}
+
+/// PRD #20 blocker-5: a short human-readable reason a [`SendResult`] was not
+/// delivered, for the status-bar feedback shown when a seed / orchestrator
+/// prompt could not reach a live target.
+fn describe_send_result(result: SendResult) -> &'static str {
+    match result {
+        SendResult::Applied => "applied",
+        SendResult::Queued => "queued",
+        SendResult::HistoryOnly => "history-only session",
+        SendResult::NoLiveTarget => "no live target",
+        SendResult::Stale => "stale target",
+        SendResult::WrongSession => "wrong session",
+        // PRD #20 R20-004 (finding #3): a partial write — bytes may have reached
+        // the target, so retrying is unsafe. Terminal, not retried.
+        SendResult::Ambiguous => "ambiguous partial write",
+        // PRD #20 R20-011: a forward-compat outcome this build doesn't know —
+        // describe it as an undelivered outcome (it is never a delivered success).
+        SendResult::Unknown => "unknown outcome",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3225,6 +3766,100 @@ fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
     out
 }
 
+/// Truncate a sequence of styled title segments to `max_chars` total characters,
+/// appending a single `…` (in the last surviving segment's style) when they
+/// don't all fit. Produces the SAME character sequence as
+/// [`truncate_with_ellipsis`] on the concatenated text — so text-only snapshots
+/// are unchanged — but preserves each segment's style, letting the coloured
+/// agent-type badge (PRD #20 M5) keep its registry colour even on a narrow card.
+fn truncate_styled_segments(
+    segments: Vec<(String, Style)>,
+    max_chars: usize,
+) -> Vec<Span<'static>> {
+    if max_chars == 0 {
+        return Vec::new();
+    }
+    let total: usize = segments.iter().map(|(t, _)| t.chars().count()).sum();
+    if total <= max_chars {
+        return segments
+            .into_iter()
+            .map(|(t, s)| Span::styled(t, s))
+            .collect();
+    }
+    // Overflow: keep the first (max_chars - 1) chars, then a trailing ellipsis.
+    let keep = max_chars - 1;
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let mut last_style = text_primary();
+    for (text, style) in segments {
+        if used >= keep {
+            break;
+        }
+        let remaining = keep - used;
+        let cnt = text.chars().count();
+        last_style = style;
+        if cnt <= remaining {
+            used += cnt;
+            out.push(Span::styled(text, style));
+        } else {
+            let piece: String = text.chars().take(remaining).collect();
+            out.push(Span::styled(piece, style));
+            break;
+        }
+    }
+    out.push(Span::styled("…".to_string(), last_style));
+    out
+}
+
+/// PRD #20 M4: the feedback shown when a user tries to enter (type into) a
+/// non-live card. Input can't reach a history-only / view-only session, so the
+/// dashboard surfaces this and stays on the dashboard rather than entering
+/// PaneInput and silently dropping keystrokes. `None` for a live session, where
+/// entry proceeds normally.
+fn non_live_input_feedback(writable: crate::event::Writable) -> Option<&'static str> {
+    match writable {
+        crate::event::Writable::Live => None,
+        crate::event::Writable::HistoryOnly => {
+            Some("History-only session cannot accept live input")
+        }
+        crate::event::Writable::None => Some("View-only session cannot accept live input"),
+    }
+}
+
+/// PRD #20 R20-007 (finding #10): human-readable feedback for a typed daemon
+/// stream-rejection `reason` (a `KIND_STREAM_REJECT` frame's payload).
+fn stream_reject_message(reason: &str) -> String {
+    match reason {
+        "history-only" => "Input not delivered: session is history-only".to_string(),
+        "exited" => "Input not delivered: the agent has exited".to_string(),
+        "stale" | "wrong-session" => "Input not delivered: the pane's session changed".to_string(),
+        other => format!("Input not delivered ({other})"),
+    }
+}
+
+/// PRD #20 R20-007 (finding #10): consume a daemon stream-rejection for
+/// `rejected_pane_id` (reason `reason`) that arrived asynchronously on the
+/// attach stream. When it targets the focused pane AND the UI is in PaneInput,
+/// surface honest feedback and LEAVE PaneInput — for BOTH key and paste, since
+/// the daemon rejects them identically. This closes the server/UI race the
+/// pre-forward liveness snapshot (`non_live_input_feedback`) can't: the snapshot
+/// may still read `Live` when the daemon has already gone non-live. Returns
+/// `true` if it acted (test seam).
+fn apply_stream_rejection_feedback(
+    ui: &mut UiState,
+    focused_pane_id: Option<&str>,
+    rejected_pane_id: &str,
+    reason: &str,
+    now: std::time::Instant,
+) -> bool {
+    if focused_pane_id != Some(rejected_pane_id) || ui.mode != UiMode::PaneInput {
+        return false;
+    }
+    ui.status_message = Some((stream_reject_message(reason), now));
+    ui.mode = UiMode::Normal;
+    true
+}
+
 /// Select deck at `idx` and focus its pane. Returns `true` if idx was valid.
 fn focus_deck(
     idx: usize,
@@ -3242,6 +3877,14 @@ fn focus_deck(
     if let Some((sid, _)) = filtered.get(idx)
         && let Some(session) = snapshot.sessions.get(*sid)
     {
+        // PRD #20 M4: refuse to enter a non-live (history-only / view-only)
+        // card — the session can't accept live input, so surface honest
+        // feedback and stay on the dashboard instead of dropping keystrokes.
+        // The card stays selected (highlight set above) so it remains visible.
+        if let Some(msg) = non_live_input_feedback(session.writable()) {
+            ui.status_message = Some((msg.to_string(), std::time::Instant::now()));
+            return true;
+        }
         if let Some(ref pane_id) = session.pane_id {
             // PRD #127 finding #2: a card backed by a LIVE daemon agent but not
             // yet wired to a local pane (e.g. a scheduler-spawned agent that
@@ -4329,8 +4972,22 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
         KeyCode::Right | KeyCode::Char('l') if form.focused == FormField::Mode => {
             form.select_next_mode();
         }
+        // PRD #20 finding #8: Left/Right cycle the Agent selector when it is
+        // focused (via click), seeding the Command from the picked registry
+        // entry's default_command.
+        KeyCode::Left | KeyCode::Char('h') if form.focused == FormField::Agent => {
+            form.cycle_agent_prev();
+        }
+        KeyCode::Right | KeyCode::Char('l') if form.focused == FormField::Agent => {
+            form.cycle_agent_next();
+        }
         KeyCode::Enter => match form.focused {
             FormField::Mode => {
+                form.focused = FormField::Name;
+            }
+            // PRD #20 finding #8: Enter from the click-focused Agent chip
+            // advances to Name (it is off the Tab cycle).
+            FormField::Agent => {
                 form.focused = FormField::Name;
             }
             FormField::Name if form.command_visible() => {
@@ -4354,19 +5011,19 @@ fn handle_new_pane_form_key(key: KeyEvent, ui: &mut UiState) -> Action {
                 return Action::SpawnPane(Box::new(req));
             }
         },
-        KeyCode::Backspace if form.focused != FormField::Mode => {
+        KeyCode::Backspace if matches!(form.focused, FormField::Name | FormField::Command) => {
             let field = match form.focused {
                 FormField::Name => &mut form.name,
                 FormField::Command => &mut form.command,
-                FormField::Mode => unreachable!(),
+                FormField::Mode | FormField::Agent => unreachable!(),
             };
             field.pop();
         }
-        KeyCode::Char(c) if form.focused != FormField::Mode => {
+        KeyCode::Char(c) if matches!(form.focused, FormField::Name | FormField::Command) => {
             let field = match form.focused {
                 FormField::Name => &mut form.name,
                 FormField::Command => &mut form.command,
-                FormField::Mode => unreachable!(),
+                FormField::Mode | FormField::Agent => unreachable!(),
             };
             field.push(c);
         }
@@ -5300,7 +5957,13 @@ fn dispatch_action(
             if let Some(sid) = selected_id
                 && let Some(session) = snapshot.sessions.get(sid)
             {
-                if let Some(ref pane_id) = session.pane_id {
+                // PRD #20 M4: Enter on a non-live (history-only / view-only)
+                // card surfaces honest feedback and stays on the dashboard,
+                // mirroring the digit-jump gate in `focus_deck` — the session
+                // can't accept live input, so don't enter PaneInput.
+                if let Some(msg) = non_live_input_feedback(session.writable()) {
+                    ui.status_message = Some((msg.to_string(), std::time::Instant::now()));
+                } else if let Some(ref pane_id) = session.pane_id {
                     if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
                         // PRD #83: snapshot the SOURCE tab's focus before
                         // leaving it, mirroring `switch_tab_with_focus`
@@ -5518,6 +6181,21 @@ fn dispatch_action(
                             }
                             let start_idx =
                                 orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
+                            // PRD #20 R20-003 (finding #5): capture the START
+                            // role's delivery IDENTITY *now* — immediately after
+                            // `open_orchestration_tab` created the role panes —
+                            // not lazily at the first delivery attempt. If the
+                            // start pane is rebound while we wait for SessionStart
+                            // / the readiness buffer / the 10s fallback, a lazy
+                            // capture would bind the OLD orchestrator prompt to the
+                            // REPLACEMENT agent and deliver it there. Capturing
+                            // here freezes the identity to the agent that owns the
+                            // pane at creation, so the daemon refuses a stale
+                            // delivery to a replacement. Only when the role
+                            // actually carries a prompt to deliver.
+                            if !captured_prompt.is_empty() {
+                                capture_prompt_delivery(ui, &role_pane_ids[start_idx], pane);
+                            }
                             // PRD #89 M2b.2 — capture the orchestration metadata
                             // onto the START (orchestrator) role pane so the
                             // daemon-empty restore path can rebuild the whole tab
@@ -5607,10 +6285,37 @@ fn dispatch_action(
                     // dimensions before the command starts.  This avoids
                     // the process seeing the default 80×24 size.
                     let is_mode = req.mode_config.is_some();
+                    // PRD #76 M2.13: infer agent_type from the form's command
+                    // (the canonical "what runs in this pane" hint) — use
+                    // `req.command` directly so it covers both the plain-card
+                    // flow and mode panes (which spawn empty and run the command
+                    // later via `write_to_pane`). The inferred type goes into the
+                    // daemon-bound spawn options so a remote reconnect's
+                    // hydration carries it; the local placeholder stays at `None`
+                    // until the first `SessionStart` hook fires (pre-M2.13
+                    // contract).
+                    let spawn_agent_type = if req.command.is_empty() {
+                        None
+                    } else {
+                        AgentType::from_command(Some(req.command.as_str()))
+                    };
+                    // PRD #20 M8: launch Wrapper-strategy agents (Codex now;
+                    // Gemini later) WRAPPED so their stdout is monitored
+                    // transparently — whether the command came from the registry
+                    // seed or was typed by the user. Only the LAUNCHED process is
+                    // rewritten to `dot-agent-deck wrap --agent <name> -- <base>`;
+                    // the Command field, `last_command`, and the persisted
+                    // `SavedPane.command` all keep the bare base command (so the
+                    // seed round-trips), and the transform is idempotent so a
+                    // restore re-wraps exactly once, never double-wraps.
+                    let launch_command = match &spawn_agent_type {
+                        Some(at) => crate::wrap::wrap_launch_command(&req.command, at),
+                        None => req.command.clone(),
+                    };
                     let cmd = if req.command.is_empty() || is_mode {
                         None
                     } else {
-                        Some(req.command.as_str())
+                        Some(launch_command.as_str())
                     };
                     // Thread the form's Name through to `StartAgent.display_name`
                     // so a disconnect or crash between create and rename can't
@@ -5658,22 +6363,8 @@ fn dispatch_action(
                             tab_manager.show_tab_bar(),
                         )
                     };
-                    // PRD #76 M2.13: infer agent_type from the
-                    // form's command (the canonical "what runs in
-                    // this pane" hint) — `cmd` is `None` for mode
-                    // panes (which spawn empty and run the
-                    // command later via `write_to_pane`), so use
-                    // `req.command` directly to cover both flows.
-                    // The inferred type goes ONLY into the daemon-
-                    // bound spawn options so a remote reconnect's
-                    // hydration carries it; the local placeholder
-                    // stays at `None` until the first `SessionStart`
-                    // hook fires (pre-M2.13 contract).
-                    let spawn_agent_type = if req.command.is_empty() {
-                        None
-                    } else {
-                        AgentType::from_command(Some(req.command.as_str()))
-                    };
+                    // `spawn_agent_type` and the wrapped `launch_command` (used
+                    // for `cmd` above) were both resolved before the dims block.
                     match pane.create_pane_with_options(
                         cmd,
                         Some(&dir_str),
@@ -5793,11 +6484,26 @@ fn dispatch_action(
                                                 created_at: std::time::Instant::now(),
                                                 ready_since: None,
                                             });
+                                            // PRD #20 R20-003/004: capture the
+                                            // queued-for agent identity NOW so a
+                                            // respawn/rebind before delivery is
+                                            // caught daemon-side, and stamp a stable
+                                            // delivery id for idempotent retries.
+                                            capture_prompt_delivery(ui, &new_id, pane);
                                         }
                                         if let Some(saved) = ui.pane_metadata.get(&new_id) {
                                             let agent_cmd = saved.command.clone();
                                             if !agent_cmd.is_empty() {
-                                                let _ = pane.write_to_pane(&new_id, &agent_cmd);
+                                                // PRD #20 blocker-3: this mode path
+                                                // spawns a bare shell then TYPES the
+                                                // command in, so it bypasses the
+                                                // common spawn-boundary wrap — apply
+                                                // the Wrapper strategy to the typed
+                                                // launch line here. The persisted
+                                                // `saved.command` stays bare (only
+                                                // the injected line is transformed).
+                                                let launch = wrap_agent_command(&agent_cmd);
+                                                let _ = pane.write_to_pane(&new_id, &launch);
                                             }
                                         }
                                         ui.status_message = Some((
@@ -5865,6 +6571,9 @@ fn dispatch_action(
                                         created_at: std::time::Instant::now(),
                                         ready_since: None,
                                     });
+                                    // PRD #20 R20-003/004: capture the queued-for
+                                    // agent identity + a stable delivery id now.
+                                    capture_prompt_delivery(ui, &new_id, pane);
                                 }
                                 ui.status_message = Some((
                                     format!("Created pane {new_id} in {dir_str}"),
@@ -6028,6 +6737,12 @@ fn dispatch_action(
         Action::FormFocusField(field) => {
             if let Some(form) = ui.new_pane_form.as_mut() {
                 form.focused = field;
+                // PRD #20 finding #8: clicking the Agent chip picks an agent
+                // (the first one if none was selected yet) and seeds the
+                // Command from its registry default_command.
+                if field == FormField::Agent {
+                    form.select_agent(form.agent_selection.unwrap_or(0));
+                }
             }
         }
         // click a mode chip → select that option (== Left/Right/h/l cycler).
@@ -7021,6 +7736,17 @@ pub fn run_tui(
                                     ui.orchestration_created_at
                                         .insert(*id, std::time::Instant::now());
                                 }
+                                // PRD #20 R20-003 (finding #5): capture the start
+                                // role's delivery identity NOW (restore path too),
+                                // so a rebind before the replayed prompt fires
+                                // can't redirect it to a replacement agent.
+                                if !orch_snap.orchestrator_prompt.is_empty() {
+                                    capture_prompt_delivery(
+                                        &mut ui,
+                                        &role_pane_ids[saved_start_idx],
+                                        pane.as_ref(),
+                                    );
+                                }
                                 if first_restored_orch_tab.is_none() {
                                     first_restored_orch_tab = Some(tab_idx);
                                 }
@@ -7226,7 +7952,14 @@ pub fn run_tui(
                                 let _ = pane.write_to_pane(&new_id, init_cmd);
                             }
                             if !saved_pane.command.is_empty() {
-                                let _ = pane.write_to_pane(&new_id, &saved_pane.command);
+                                // PRD #20 blocker-3: mode RESTORE also spawns a
+                                // bare shell then types the saved command — wrap
+                                // a Wrapper-strategy command at this type site
+                                // (the persisted `saved_pane.command` stays bare).
+                                let _ = pane.write_to_pane(
+                                    &new_id,
+                                    &wrap_agent_command(&saved_pane.command),
+                                );
                             }
                         }
                         Err(e) => {
@@ -7727,6 +8460,11 @@ pub fn run_tui(
         // Inject orchestrator prompt when start role agent becomes ready.
         // Fast path: Claude Code fires SessionStart immediately (agent_type != None).
         // Slow path: agents like opencode don't signal — fall back after 10 seconds.
+        // PRD #20 R20-005 (finding #13): the per-tab delivery / retry / abandon
+        // policy (including the reachable hard deadline and terminal-outcome
+        // handling) lives in `deliver_orchestrator_prompt`, which takes an
+        // injected `now` so it is unit-testable with a controlled clock.
+        let orch_now = std::time::Instant::now();
         for tab in tab_manager.tabs_mut() {
             if let Tab::Orchestration {
                 id,
@@ -7739,63 +8477,17 @@ pub fn run_tui(
                 && orchestrator_prompt.is_some()
                 && !ui.orchestration_prompted.contains(id)
             {
-                let start_pane_id = &role_pane_ids[*start_role_index];
-                let agent_ready = snapshot.sessions.values().any(|s| {
-                    s.pane_id.as_deref() == Some(start_pane_id) && s.agent_type != AgentType::None
-                });
-                let timeout_ready = !agent_ready
-                    && ui
-                        .orchestration_created_at
-                        .get(id)
-                        .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(10));
-                // PRD #128 Direction B-1 — record the moment SessionStart
-                // was first observed for this orchestration so the
-                // readiness buffer can be measured from it. The timeout
-                // path bypasses the buffer because by then Claude Code
-                // either fired SessionStart far earlier or never will, so
-                // any further wait would just deepen the user-visible
-                // hang.
-                if agent_ready {
-                    ui.orchestration_ready_since
-                        .entry(*id)
-                        .or_insert_with(std::time::Instant::now);
-                }
-                let buffer_elapsed = if timeout_ready {
-                    true
-                } else {
-                    should_inject_spawn_time_prompt(
-                        ui.orchestration_ready_since.get(id).copied(),
-                        std::time::Instant::now(),
-                    )
-                };
-                if (agent_ready || timeout_ready) && buffer_elapsed {
-                    if let Some(prompt) = orchestrator_prompt.take() {
-                        // PRD #128 audit S2: emit a one-shot operator-visible
-                        // log right before the write fires. Distinct target
-                        // from `pane_write` so an operator can flip on the
-                        // buffer trail without also enabling the per-byte
-                        // trace. `debug!` (not `trace!`) because this is an
-                        // operational, once-per-spawn event.
-                        if let Some(rs) = ui.orchestration_ready_since.get(id) {
-                            tracing::debug!(
-                                target: "spawn_time_buffer",
-                                elapsed_ms = rs.elapsed().as_millis() as u64,
-                                pane_id = %start_pane_id,
-                                "spawn-time readiness buffer elapsed; proceeding with role prompt write"
-                            );
-                        }
-                        let _ = pane.write_and_submit_to_pane(start_pane_id, &prompt);
-                    }
-                    role_statuses[*start_role_index] = OrchestrationRoleStatus::Working;
-                    ui.orchestration_prompted.insert(*id);
-                    // PRD #128 audit N1: the ready-since timestamp is
-                    // load-bearing only between SessionStart and the
-                    // buffered write. Once the write fires this entry is
-                    // dead state — drop it so the map size matches the
-                    // count of pending orchestration spawns rather than
-                    // accumulating over the session.
-                    ui.orchestration_ready_since.remove(id);
-                }
+                deliver_orchestrator_prompt(
+                    &mut ui,
+                    &*pane,
+                    &snapshot,
+                    orch_now,
+                    *id,
+                    role_pane_ids.as_slice(),
+                    *start_role_index,
+                    role_statuses.as_mut_slice(),
+                    orchestrator_prompt,
+                );
             }
         }
 
@@ -7811,6 +8503,28 @@ pub fn run_tui(
         // PRD #127 M3.1: deliver any mode `seed_prompt`s whose agent pane has
         // become ready (gated, like orchestrations).
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+
+        // PRD #20 R20-007 (finding #10): consume any typed stream rejections the
+        // daemon pushed asynchronously (a key/paste refused because the focused
+        // target went non-live / exited / rebound). Surface honest feedback and
+        // leave PaneInput — closing the server/UI race the pre-forward snapshot
+        // can't. Drained each frame from the embedded controller's queue.
+        if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+            let rejections = embedded.take_stream_rejections();
+            if !rejections.is_empty() {
+                let focused = embedded.focused_pane_id();
+                let now = std::time::Instant::now();
+                for (rejected_pane, reason) in rejections {
+                    apply_stream_rejection_feedback(
+                        &mut ui,
+                        focused.as_deref(),
+                        &rejected_pane,
+                        &reason,
+                        now,
+                    );
+                }
+            }
+        }
 
         // Drain all pending events before re-rendering. This avoids a full
         // render cycle between each keystroke, which eliminates perceived typing
@@ -7829,6 +8543,32 @@ pub fn run_tui(
             // the new PTY sizes — no PTY work happens in the event handler.
             if let Event::Resize(_w, _h) = ev {
                 break; // re-render; layout-driven resize handles PTY sizing
+            }
+
+            // PRD #20 R20-007: input rejection with VISIBLE feedback. A focused
+            // pane can go non-live (a wrapped Codex session that declared
+            // history-only, or a view-only target) WHILE the user is in
+            // PaneInput. The daemon's authoritative stream gate already refuses
+            // the bytes, but a UI that keeps forwarding them shows nothing and
+            // leaves the user stuck typing into a dead pane (keys AND paste
+            // silently dropped). When the focused pane is no longer writable,
+            // refuse the key/paste here with honest feedback and LEAVE PaneInput,
+            // and drain the rest of this input burst so its tail can neither
+            // clobber the feedback nor leak into command mode.
+            let is_input_event = matches!(&ev, Event::Paste(_))
+                || matches!(&ev, Event::Key(k) if k.kind == crossterm::event::KeyEventKind::Press);
+            if ui.mode == UiMode::PaneInput
+                && is_input_event
+                && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                && let Some(focused_id) = embedded.focused_pane_id()
+                && let Some(msg) = non_live_input_feedback(snapshot.pane_writable(&focused_id))
+            {
+                ui.status_message = Some((msg.to_string(), std::time::Instant::now()));
+                ui.mode = UiMode::Normal;
+                while crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                    let _ = event::read()?;
+                }
+                break;
             }
 
             // Handle mouse events: scroll, text selection, and copy.
@@ -10069,6 +10809,21 @@ fn render_stats_bar(
         }
     }
 
+    // PRD #20 finding #10: when more than one real agent type is active, show a
+    // compact per-agent-type breakdown (e.g. `1 ClaudeCode │ 1 Codex`), each in
+    // its registry badge color. A single-agent deck shows nothing extra — the
+    // breakdown would just restate the `active` count.
+    if stats.by_agent_type.len() > 1 {
+        for (agent_type, count) in &stats.by_agent_type {
+            let spec = crate::agent_registry::spec(agent_type);
+            spans.push(Span::styled("  \u{2502}  ", text_dim()));
+            spans.push(Span::styled(
+                format!("{count} {}", spec.label),
+                Style::default().fg(spec.badge_color),
+            ));
+        }
+    }
+
     // Always show total tools
     spans.push(Span::styled("  \u{2502}  ", text_dim()));
     spans.push(Span::styled(
@@ -11681,6 +12436,10 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     };
     // PRD #170: the locked schedule form also drops the Name row.
     let name_rows: u16 = if show_name { 1 } else { 0 };
+    // PRD #20 finding #8: the Agent selector row shows in the ordinary form
+    // (same condition as Name); the locked schedule form omits it.
+    let show_agent = show_name;
+    let agent_rows: u16 = if show_agent { 1 } else { 0 };
     // PRD #106: when the Command field is hidden (orchestration selected) the
     // form is two rows shorter — Command's label row plus its spacing row.
     let cmd_visible = form.command_visible();
@@ -11700,7 +12459,7 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // terminal. The `9 + name_rows` base reproduces the prior `10` when the Name
     // row is shown (unlocked) and trims a row when it is hidden (locked).
     let desired_w = chip_row_w.saturating_add(4).max(56);
-    let desired_h = 9 + name_rows + mode_extra + cmd_rows + schedule_rows;
+    let desired_h = 9 + name_rows + agent_rows + mode_extra + cmd_rows + schedule_rows;
     let popup_area = modal_rect(desired_w, desired_h, area, 56, 10);
     let popup_width = popup_area.width;
 
@@ -11719,6 +12478,11 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
         unfocused_label
     };
     let cmd_style = if form.focused == FormField::Command {
+        focused_label
+    } else {
+        unfocused_label
+    };
+    let agent_style = if form.focused == FormField::Agent {
         focused_label
     } else {
         unfocused_label
@@ -11769,6 +12533,26 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::ITALIC),
         ));
+    }
+
+    // PRD #20 finding #8: the Agent selector chip. Rendered as a `[label]` chip
+    // (`auto` when unpicked) so its value is machine-readable next to the
+    // `Agent:` label. Off the Tab/Enter cycle — clicking it (or ◀▶ once focused)
+    // picks an agent and seeds the Command from its registry default_command.
+    let mut agent_line_idx: Option<usize> = None;
+    if show_agent {
+        agent_line_idx = Some(lines.len());
+        lines.push(Line::from(vec![
+            Span::styled("  Agent:   ", agent_style),
+            Span::styled(
+                format!("[{}]", form.agent_label()),
+                if form.focused == FormField::Agent {
+                    text_primary()
+                } else {
+                    unfocused_label
+                },
+            ),
+        ]));
     }
 
     // PRD #170: the locked schedule form hides the Name field — the card's name
@@ -11865,6 +12649,20 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     let inner_end = row_x + row_width;
 
     let mut field_rects: Vec<(FormField, Rect)> = Vec::new();
+    // PRD #20 finding #8: clicking the Agent row focuses it (and picks/seeds).
+    if let Some(ai) = agent_line_idx
+        && line_y(ai) < popup_bottom
+    {
+        field_rects.push((
+            FormField::Agent,
+            Rect {
+                x: row_x,
+                y: line_y(ai),
+                width: row_width,
+                height: 1,
+            },
+        ));
+    }
     if let Some(ni) = name_line_idx {
         field_rects.push((
             FormField::Name,
@@ -12041,20 +12839,60 @@ fn render_session_card(
         None => String::new(),
     };
     let sel_prefix = if is_selected { "▸ " } else { "" };
-    let mut title_left = if let Some(name) = display_name {
-        format!(" {sel_prefix}{num_prefix}{} ", name)
+    let title_bold = text_primary().add_modifier(Modifier::BOLD);
+    // PRD #20 M4: a session whose live_target is not `Live` (e.g. a wrapped
+    // Codex pane surfaced history-only) can't accept live input. Render it
+    // distinctly — dim the numeric input shortcut and show a `history` /
+    // `view-only` marker next to the type badge — so a view-only card announces
+    // both what it is and that typing into it won't reach the agent. `Live`
+    // sessions (every native PTY pane, and any fixture that declared no
+    // live_target) render exactly as before.
+    let writable = session.writable();
+    let is_live = writable == crate::event::Writable::Live;
+    let shortcut_style = if is_live {
+        title_bold
     } else {
-        format!(
-            " {sel_prefix}{num_prefix}{} · {} ",
-            session.agent_type, id_display
-        )
+        title_bold.add_modifier(Modifier::DIM)
+    };
+    let liveness_marker = match writable {
+        crate::event::Writable::Live => "",
+        crate::event::Writable::HistoryOnly => " history ",
+        crate::event::Writable::None => " view-only ",
+    };
+    // PRD #20 M5 / finding #9: the agent-type label carries its registry badge
+    // colour so EVERY card exposes a coloured type badge (cross-agent: Claude /
+    // OpenCode / Pi / Codex each get their registry colour). The rest of the
+    // title stays primary text. A friendly `display_name` now renders ALONGSIDE
+    // the badge (`<type> · <name>`) rather than replacing it — most real panes
+    // have a display name, so dropping the badge there hid the type in the
+    // common case. A non-live card additionally shows a trailing
+    // `history` / `view-only` marker.
+    let badge_style = Style::default()
+        .fg(crate::agent_registry::spec(&session.agent_type).badge_color)
+        .add_modifier(Modifier::BOLD);
+    // The marker is appended AFTER the `<type> · <id-or-name>` so the
+    // `<type> · …` shape callers match on (e.g. `Codex ·`, `Pi · orch-01`)
+    // stays intact — only a trailing view-only annotation is added.
+    let label_after_badge = display_name
+        .map(|name| format!(" · {name} "))
+        .unwrap_or_else(|| format!(" · {id_display} "));
+    let title_segments: Vec<(String, Style)> = {
+        let mut segs = vec![
+            (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
+            (format!("{}", session.agent_type), badge_style),
+            (label_after_badge, title_bold),
+        ];
+        if !is_live {
+            segs.push((liveness_marker.to_string(), text_dim()));
+        }
+        segs
     };
 
     let dot = flash_dot(&session.status, tick);
     let status_text = format!(" {} {} ", dot, status_label);
     // area.width includes left+right borders (2 chars)
     let max_title = (area.width as usize).saturating_sub(status_text.chars().count() + 2);
-    title_left = truncate_with_ellipsis(&title_left, max_title);
+    let title_spans = truncate_styled_segments(title_segments, max_title);
 
     let border_style = if is_selected {
         // PRD #155 Option A: selection uses the dedicated `selected` accent role
@@ -12075,10 +12913,7 @@ fn render_session_card(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .title(Span::styled(
-            title_left,
-            text_primary().add_modifier(Modifier::BOLD),
-        ))
+        .title(Line::from(title_spans))
         .title_alignment(ratatui::layout::Alignment::Left)
         .title(
             Line::from(Span::styled(status_text, status_style))
@@ -13029,6 +13864,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use spec::spec;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
     fn default_ui() -> UiState {
@@ -14865,6 +15701,9 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
         };
         state.apply_event(event1.clone());
 
@@ -14885,6 +15724,9 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
         };
         state.apply_event(event2);
 
@@ -14957,6 +15799,9 @@ mod tests {
                 metadata: HashMap::new(),
                 pane_id: None,
                 agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
             });
         }
 
@@ -15008,6 +15853,9 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
         };
         state.apply_event(event.clone());
 
@@ -15250,6 +16098,9 @@ mod tests {
                 metadata: HashMap::new(),
                 pane_id: None,
                 agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
             });
         }
 
@@ -15723,6 +16574,65 @@ mod tests {
     // Filter tests
     // ---------------------------------------------------------------------------
 
+    fn typed_filter_fixture() -> (AppState, UiState) {
+        let mut state = AppState::default();
+        for (session_id, agent_type, cwd, pane_id) in [
+            (
+                "claude-session",
+                AgentType::ClaudeCode,
+                "/work/claude-project",
+                "1",
+            ),
+            (
+                "opencode-session",
+                AgentType::OpenCode,
+                "/work/open-worktree",
+                "2",
+            ),
+            ("pi-session", AgentType::Pi, "/work/pi-project", "3"),
+            (
+                "codex-session",
+                AgentType::Codex,
+                "/work/codex-project",
+                "4",
+            ),
+        ] {
+            state.apply_event(AgentEvent {
+                session_id: session_id.to_string(),
+                agent_type,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: Some(cwd.to_string()),
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: Some(pane_id.to_string()),
+                agent_id: Some(format!("agent-{pane_id}")),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            });
+        }
+        state
+            .sessions
+            .get_mut("pi-session")
+            .expect("Pi fixture session exists")
+            .status = SessionStatus::Thinking;
+
+        let mut ui = default_ui();
+        for (session_id, display_name) in [
+            ("claude-session", "planner"),
+            ("opencode-session", "frontend"),
+            ("pi-session", "test-runner"),
+            ("codex-session", "wrapped-worker"),
+        ] {
+            ui.display_names
+                .insert(session_id.to_string(), display_name.to_string());
+        }
+        (state, ui)
+    }
+
     #[test]
     fn test_filter_sessions_no_filter() {
         let mut state = AppState::default();
@@ -15739,6 +16649,9 @@ mod tests {
                 metadata: HashMap::new(),
                 pane_id: None,
                 agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
             });
         }
 
@@ -15763,6 +16676,9 @@ mod tests {
                 metadata: HashMap::new(),
                 pane_id: None,
                 agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
             });
         }
 
@@ -15788,6 +16704,9 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -15801,6 +16720,9 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
         });
 
         let mut ui = default_ui();
@@ -15825,6 +16747,9 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -15838,6 +16763,9 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
         });
 
         let mut ui = default_ui();
@@ -15864,12 +16792,134 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
         });
 
         let mut ui = default_ui();
         ui.filter_text = "mysess".to_string();
         let filtered = filter_sessions(&state, &ui);
         assert_eq!(filtered.len(), 1);
+    }
+
+    /// Scenario: Filter a mixed Claude Code, OpenCode, Pi, and Codex session set
+    /// with `type:` tokens and ordinary text. Every registry identity must match
+    /// case-insensitively, compose with text using AND semantics, and reject an
+    /// unknown type while the existing id/cwd/status/display-name searches work.
+    /// Multiple type constraints compose with true AND semantics, so conflicting
+    /// identities such as `type:codex type:claude` match no session.
+    #[spec("dashboard/filter/003")]
+    #[test]
+    fn filter_003_agent_type_tokens_compose_with_text() {
+        let (state, mut ui) = typed_filter_fixture();
+        let mut matching_ids = |query: &str| {
+            ui.filter_text = query.to_string();
+            filter_sessions(&state, &ui)
+                .into_iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>()
+        };
+
+        for (query, expected) in [
+            ("type:claude", "claude-session"),
+            ("type:ClaudeCode", "claude-session"),
+            ("type:opencode", "opencode-session"),
+            ("type:pi", "pi-session"),
+            ("type:codex", "codex-session"),
+            ("TYPE:CODEX", "codex-session"),
+        ] {
+            assert_eq!(
+                matching_ids(query),
+                vec![expected],
+                "{query:?} must select only its registry agent type"
+            );
+        }
+
+        for (query, expected) in [
+            ("claude-session", "claude-session"),
+            ("open-worktree", "opencode-session"),
+            ("thinking", "pi-session"),
+            ("wrapped-worker", "codex-session"),
+        ] {
+            assert_eq!(
+                matching_ids(query),
+                vec![expected],
+                "plain query {query:?} must preserve existing filter semantics"
+            );
+        }
+
+        assert_eq!(
+            matching_ids("type:codex wrapped-worker"),
+            vec!["codex-session"],
+            "type and text terms must both match"
+        );
+        assert!(
+            matching_ids("type:codex planner").is_empty(),
+            "a matching type must not bypass a non-matching text term"
+        );
+        assert!(
+            matching_ids("type:bogus").is_empty(),
+            "an unknown agent type must match no sessions"
+        );
+        assert!(
+            matching_ids("type:codex type:claude").is_empty(),
+            "multiple type constraints use AND semantics, so no session can be both Codex and Claude Code"
+        );
+    }
+
+    /// Scenario: From the dashboard, press `/` and type `type:codex` through the
+    /// normal filter-input handlers, then render the resulting card list. The
+    /// visible dashboard must contain the Codex card and hide the Claude Code,
+    /// OpenCode, and Pi cards.
+    #[spec("dashboard/filter/004")]
+    #[test]
+    fn filter_004_slash_type_filter_narrows_rendered_cards() {
+        let (state, mut ui) = typed_filter_fixture();
+        let action = handle_normal_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut ui,
+            state.sessions.len(),
+            None,
+            &KeybindingConfig::default(),
+        );
+        assert!(matches!(action, Action::EnterFilter));
+        ui.mode = UiMode::Filter;
+        for c in "type:codex".chars() {
+            handle_filter_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &mut ui);
+        }
+
+        let filtered = filter_sessions(&state, &ui);
+        let cards: Vec<(&SessionState, Option<&str>)> = filtered
+            .iter()
+            .map(|(id, session)| (*session, ui.display_names.get(*id).map(String::as_str)))
+            .collect();
+        let buffer = render_dashboard_cards_to_buffer(
+            &cards,
+            ui.selected_index,
+            CardDensityKind::Normal,
+            0,
+            100,
+        );
+        let visible: String = (0..buffer.area().height)
+            .map(|y| {
+                (0..buffer.area().width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            visible.contains("wrapped-worker"),
+            "typing type:codex must leave the Codex card visible:\n{visible}"
+        );
+        for hidden in ["planner", "frontend", "test-runner"] {
+            assert!(
+                !visible.contains(hidden),
+                "typing type:codex must hide the {hidden} card:\n{visible}"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -18075,6 +19125,9 @@ mod tests {
                 metadata: HashMap::new(),
                 pane_id: None,
                 agent_id: None,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
             });
         }
 
@@ -19574,6 +20627,9 @@ mod tests {
             metadata: HashMap::new(),
             pane_id: None,
             agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
         });
         let output = build_art_output(&s);
         assert!(output.contains("Bash"));
@@ -19980,6 +21036,7 @@ mod tests {
     struct CapturingPaneController {
         next: std::sync::Mutex<u32>,
         memberships: std::sync::Mutex<Vec<Option<TabMembership>>>,
+        agent_generation: std::sync::Mutex<String>,
     }
 
     impl CapturingPaneController {
@@ -19987,6 +21044,7 @@ mod tests {
             Self {
                 next: std::sync::Mutex::new(0),
                 memberships: std::sync::Mutex::new(Vec::new()),
+                agent_generation: std::sync::Mutex::new("original".to_string()),
             }
         }
 
@@ -20002,6 +21060,10 @@ mod tests {
                     _ => None,
                 })
                 .collect()
+        }
+
+        fn rebind_agents(&self) {
+            *self.agent_generation.lock().unwrap() = "replacement".to_string();
         }
     }
 
@@ -20024,6 +21086,12 @@ mod tests {
         }
         fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
             Ok(())
+        }
+        fn pane_agent_id(&self, pane_id: &str) -> Option<String> {
+            Some(format!(
+                "{}-{pane_id}",
+                self.agent_generation.lock().unwrap()
+            ))
         }
         fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
             Ok(())
@@ -20165,6 +21233,74 @@ mod tests {
             ),
             _ => panic!("expected an Orchestration tab to be active after SpawnPane"),
         }
+    }
+
+    /// Scenario: Open an orchestration with an initial start-role agent, then
+    /// rebind that pane before readiness. The queued prompt must remain bound to
+    /// the original agent identity captured when the tab was created.
+    #[spec("prompt/pane-input/016")]
+    #[test]
+    fn pane_input_016_orchestrator_prompt_captures_identity_at_tab_creation() {
+        let tmp = tempdir().expect("tempdir");
+        let config = OrchestrationConfig {
+            name: "capture-at-creation".to_string(),
+            roles: vec![OrchestrationRoleConfig {
+                name: "orchestrator".to_string(),
+                command: "cat".to_string(),
+                start: true,
+                description: None,
+                prompt_template: Some("old orchestration prompt".to_string()),
+                clear: false,
+            }],
+        };
+        let req = NewPaneRequest {
+            dir: tmp.path().to_path_buf(),
+            name: "capture-at-creation".to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(config),
+            seed_prompt: None,
+        };
+        let controller = Arc::new(CapturingPaneController::new());
+        let mut tab_manager = TabManager::new(controller.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            controller.as_ref(),
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 120, 40),
+        );
+        let start_pane_id = match tab_manager.active_tab() {
+            Tab::Orchestration {
+                role_pane_ids,
+                start_role_index,
+                ..
+            } => role_pane_ids[*start_role_index].clone(),
+            _ => panic!("expected orchestration tab"),
+        };
+        let original_agent_id = format!("original-{start_pane_id}");
+        controller.rebind_agents();
+        let replacement_agent_id = controller
+            .pane_agent_id(&start_pane_id)
+            .expect("replacement agent identity");
+        let captured_agent_id = ui
+            .prompt_delivery
+            .get(&start_pane_id)
+            .and_then(|delivery| delivery.expected_agent_id.clone());
+
+        assert_eq!(
+            captured_agent_id,
+            Some(original_agent_id),
+            "the old orchestration prompt must stay bound to the tab-creation identity, not replacement {replacement_agent_id:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -20722,5 +21858,485 @@ mod tests {
              mode tab's focused_pane_id was never captured, so restore falls back \
              to the agent pane (`agent-m`) and the user's prior focus is lost"
         );
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum InjectedSendOutcome {
+        Error,
+        HistoryOnly,
+        NoLiveTarget,
+        Stale,
+        WrongSession,
+    }
+
+    struct SendResultPaneController {
+        outcome: InjectedSendOutcome,
+        attempts: Arc<AtomicUsize>,
+        delivery_ids: Arc<std::sync::Mutex<Vec<String>>>,
+        expected_sessions: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    impl SendResultPaneController {
+        fn new(outcome: InjectedSendOutcome, attempts: Arc<AtomicUsize>) -> Self {
+            Self {
+                outcome,
+                attempts,
+                delivery_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+                expected_sessions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl PaneController for SendResultPaneController {
+        fn create_pane_with_options(
+            &self,
+            _command: Option<&str>,
+            _cwd: Option<&str>,
+            _opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            Err(PaneError::NotAvailable)
+        }
+        fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _pane_id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            Ok(RenameOutcome::applied(name))
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+            Ok(())
+        }
+        fn write_and_submit_to_pane(
+            &self,
+            _pane_id: &str,
+            _text: &str,
+        ) -> Result<crate::event::SendResult, PaneError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            match self.outcome {
+                InjectedSendOutcome::Error => Err(PaneError::CommandFailed(
+                    "injected transport failure".into(),
+                )),
+                InjectedSendOutcome::HistoryOnly => Ok(crate::event::SendResult::HistoryOnly),
+                InjectedSendOutcome::NoLiveTarget => Ok(crate::event::SendResult::NoLiveTarget),
+                InjectedSendOutcome::Stale => Ok(crate::event::SendResult::Stale),
+                InjectedSendOutcome::WrongSession => Ok(crate::event::SendResult::WrongSession),
+            }
+        }
+        fn write_and_submit_to_pane_with_identity(
+            &self,
+            pane_id: &str,
+            text: &str,
+            _expected_agent_id: Option<&str>,
+            expected_session_id: Option<&str>,
+            delivery_id: Option<&str>,
+        ) -> Result<crate::event::SendResult, PaneError> {
+            if let Some(delivery_id) = delivery_id {
+                self.delivery_ids
+                    .lock()
+                    .unwrap()
+                    .push(delivery_id.to_string());
+            }
+            self.expected_sessions
+                .lock()
+                .unwrap()
+                .push(expected_session_id.map(str::to_string));
+            self.write_and_submit_to_pane(pane_id, text)
+        }
+        fn name(&self) -> &str {
+            "send-result-injector"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Scenario: Queue mode seed prompts and inject permanent non-delivery through
+    /// a controllable PaneController. Failed sends must retain feedback briefly,
+    /// use restart-safe/session-bound identities, then stop after the deadline.
+    #[spec("prompt/pane-input/006")]
+    #[test]
+    fn pane_input_006_seed_prompt_result_controls_retention_and_feedback() {
+        for outcome in [
+            InjectedSendOutcome::Error,
+            InjectedSendOutcome::HistoryOnly,
+            InjectedSendOutcome::NoLiveTarget,
+            InjectedSendOutcome::Stale,
+            InjectedSendOutcome::WrongSession,
+        ] {
+            let mut ui = default_ui();
+            ui.pending_seed_prompts.push(PendingSeedPrompt {
+                pane_id: "seed-pane".into(),
+                prompt: "retained seed prompt".into(),
+                created_at: std::time::Instant::now(),
+                ready_since: Some(
+                    std::time::Instant::now()
+                        .checked_sub(
+                            SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1),
+                        )
+                        .expect("readiness timestamp"),
+                ),
+            });
+            let mut snapshot = AppState::default();
+            snapshot.register_pane("seed-pane".into());
+            snapshot.insert_placeholder_session(
+                "seed-pane".into(),
+                None,
+                Some(AgentType::Codex),
+                Some("seed-agent".into()),
+            );
+            let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+                outcome,
+                Arc::new(AtomicUsize::new(0)),
+            ));
+
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+
+            assert_eq!(
+                ui.pending_seed_prompts.len(),
+                1,
+                "non-applied result {outcome:?} must retain the seed prompt for retry"
+            );
+            assert!(
+                ui.status_message.as_ref().is_some_and(|(message, _)| {
+                    let lower = message.to_ascii_lowercase();
+                    lower.contains("not delivered") || lower.contains("retry")
+                }),
+                "non-applied result {outcome:?} must produce visible delivery feedback, got {:?}",
+                ui.status_message.as_ref().map(|(message, _)| message)
+            );
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::HistoryOnly,
+            attempts.clone(),
+        ));
+        let mut ui = default_ui();
+        ui.pending_seed_prompts.push(PendingSeedPrompt {
+            pane_id: "backoff-pane".into(),
+            prompt: "retry with backoff".into(),
+            created_at: std::time::Instant::now(),
+            ready_since: Some(
+                std::time::Instant::now()
+                    .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                    .expect("readiness timestamp"),
+            ),
+        });
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("backoff-pane".into());
+        snapshot.insert_placeholder_session(
+            "backoff-pane".into(),
+            None,
+            Some(AgentType::Codex),
+            Some("backoff-agent".into()),
+        );
+
+        for _ in 0..8 {
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        }
+
+        assert!(
+            attempts.load(Ordering::SeqCst) <= 1,
+            "a permanent HistoryOnly result must be throttled across immediate render frames; attempts={}",
+            attempts.load(Ordering::SeqCst)
+        );
+
+        let restart_delivery_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for _ in 0..2 {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let controller =
+                SendResultPaneController::new(InjectedSendOutcome::WrongSession, attempts);
+            let recorded = controller.delivery_ids.clone();
+            let pane: Arc<dyn PaneController> = Arc::new(controller);
+            let mut ui = default_ui();
+            ui.pending_seed_prompts.push(PendingSeedPrompt {
+                pane_id: "restart-collision-pane".into(),
+                prompt: "genuinely new prompt after TUI restart".into(),
+                created_at: std::time::Instant::now(),
+                ready_since: Some(
+                    std::time::Instant::now()
+                        .checked_sub(
+                            SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1),
+                        )
+                        .expect("readiness timestamp"),
+                ),
+            });
+            let mut snapshot = AppState::default();
+            snapshot.register_pane("restart-collision-pane".into());
+            snapshot.insert_placeholder_session(
+                "restart-collision-pane".into(),
+                None,
+                Some(AgentType::Codex),
+                Some("restart-agent".into()),
+            );
+            process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+            restart_delivery_ids
+                .lock()
+                .unwrap()
+                .extend(recorded.lock().unwrap().iter().cloned());
+        }
+        let restart_delivery_ids = restart_delivery_ids.lock().unwrap().clone();
+        let restart_ids_are_unique =
+            restart_delivery_ids.len() == 2 && restart_delivery_ids[0] != restart_delivery_ids[1];
+
+        let controller = SendResultPaneController::new(
+            InjectedSendOutcome::WrongSession,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let expected_sessions = controller.expected_sessions.clone();
+        let pane: Arc<dyn PaneController> = Arc::new(controller);
+        let mut ui = default_ui();
+        ui.pending_seed_prompts.push(PendingSeedPrompt {
+            pane_id: "logical-session-pane".into(),
+            prompt: "prompt bound to the old conversation".into(),
+            created_at: std::time::Instant::now(),
+            ready_since: Some(
+                std::time::Instant::now()
+                    .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                    .expect("readiness timestamp"),
+            ),
+        });
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("logical-session-pane".into());
+        snapshot.apply_event(AgentEvent {
+            session_id: "logical-session-before-clear".into(),
+            agent_type: AgentType::Codex,
+            event_type: EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some("logical-session-pane".into()),
+            agent_id: Some("logical-session-agent".into()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(crate::event::LiveTarget {
+                kind: crate::event::TargetKind::Pty,
+                writable: crate::event::Writable::Live,
+            }),
+        });
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        let captured_sessions = expected_sessions.lock().unwrap().clone();
+        let logical_session_was_captured =
+            captured_sessions.as_slice() == [Some("logical-session-before-clear".to_string())];
+
+        let deadline_attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::WrongSession,
+            deadline_attempts.clone(),
+        ));
+        let mut ui = default_ui();
+        ui.pending_seed_prompts.push(PendingSeedPrompt {
+            pane_id: "expired-seed-pane".into(),
+            prompt: "must be abandoned".into(),
+            created_at: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(61))
+                .expect("expired creation timestamp"),
+            ready_since: Some(
+                std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(61))
+                    .expect("expired readiness timestamp"),
+            ),
+        });
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("expired-seed-pane".into());
+        snapshot.insert_placeholder_session(
+            "expired-seed-pane".into(),
+            None,
+            Some(AgentType::Codex),
+            Some("expired-seed-agent".into()),
+        );
+        process_pending_seed_prompts(&mut ui, &pane, &snapshot);
+        let expired_seed_was_abandoned =
+            ui.pending_seed_prompts.is_empty() && deadline_attempts.load(Ordering::SeqCst) == 0;
+
+        assert!(
+            restart_ids_are_unique && logical_session_was_captured && expired_seed_was_abandoned,
+            "seed delivery must be restart-safe, session-bound, and deadline-bounded; restart_ids={restart_delivery_ids:?}, expected_sessions={captured_sessions:?}, expired=(pending={}, attempts={})",
+            ui.pending_seed_prompts.len(),
+            deadline_attempts.load(Ordering::SeqCst)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #20 R20-005 (finding #13, coder-authored): the ORCHESTRATOR prompt
+    // path is bounded by a reachable deadline and abandons terminal outcomes,
+    // via the clock-controlled `deliver_orchestrator_prompt` seam (the tester
+    // pinned only the seed path in pane_input_006 and left this to the coder).
+    // -----------------------------------------------------------------------
+
+    /// Scenario: drive `deliver_orchestrator_prompt` with an injected clock. (1)
+    /// A prompt whose tab was created past the deadline is abandoned BEFORE any
+    /// delivery attempt. (2) A within-deadline delivery that returns a TERMINAL
+    /// outcome (WrongSession) is abandoned after that one attempt — not retried
+    /// every ~2s forever.
+    #[test]
+    fn deliver_orchestrator_prompt_bounds_deadline_and_terminal_outcomes() {
+        // (1) Deadline reached → abandon with NO delivery attempt.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let pane: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::WrongSession,
+            attempts.clone(),
+        ));
+        let mut ui = default_ui();
+        let tab_id: TabId = 7;
+        let created = std::time::Instant::now();
+        ui.orchestration_created_at.insert(tab_id, created);
+        let now_past_deadline = created
+            .checked_add(AUTOMATIC_PROMPT_DEADLINE + std::time::Duration::from_secs(1))
+            .expect("future instant");
+        let mut snapshot = AppState::default();
+        snapshot.register_pane("orch-pane".into());
+        snapshot.insert_placeholder_session(
+            "orch-pane".into(),
+            None,
+            Some(AgentType::Codex),
+            Some("orch-agent".into()),
+        );
+        let mut role_statuses = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt = Some("orchestrator prompt".to_string());
+        deliver_orchestrator_prompt(
+            &mut ui,
+            pane.as_ref(),
+            &snapshot,
+            now_past_deadline,
+            tab_id,
+            &["orch-pane".to_string()],
+            0,
+            &mut role_statuses,
+            &mut prompt,
+        );
+        assert!(prompt.is_none(), "past-deadline prompt must be abandoned");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "a past-deadline prompt must NOT attempt delivery"
+        );
+
+        // (2) Terminal outcome within the deadline → abandon after one attempt.
+        let attempts2 = Arc::new(AtomicUsize::new(0));
+        let pane2: Arc<dyn PaneController> = Arc::new(SendResultPaneController::new(
+            InjectedSendOutcome::WrongSession,
+            attempts2.clone(),
+        ));
+        let mut ui2 = default_ui();
+        let tab2: TabId = 8;
+        ui2.orchestration_created_at
+            .insert(tab2, std::time::Instant::now());
+        ui2.orchestration_ready_since.insert(
+            tab2,
+            std::time::Instant::now()
+                .checked_sub(SPAWN_TIME_READINESS_BUFFER + std::time::Duration::from_millis(1))
+                .expect("ready timestamp"),
+        );
+        let mut snapshot2 = AppState::default();
+        snapshot2.register_pane("orch-pane-2".into());
+        snapshot2.insert_placeholder_session(
+            "orch-pane-2".into(),
+            None,
+            Some(AgentType::Codex),
+            Some("orch-agent-2".into()),
+        );
+        let mut role_statuses2 = vec![OrchestrationRoleStatus::Waiting];
+        let mut prompt2 = Some("orchestrator prompt".to_string());
+        deliver_orchestrator_prompt(
+            &mut ui2,
+            pane2.as_ref(),
+            &snapshot2,
+            std::time::Instant::now(),
+            tab2,
+            &["orch-pane-2".to_string()],
+            0,
+            &mut role_statuses2,
+            &mut prompt2,
+        );
+        assert!(
+            prompt2.is_none(),
+            "a TERMINAL WrongSession outcome must abandon the orchestrator prompt"
+        );
+        assert_eq!(
+            attempts2.load(Ordering::SeqCst),
+            1,
+            "terminal abandon happens after exactly one delivery attempt"
+        );
+        assert!(
+            ui2.status_message
+                .as_ref()
+                .is_some_and(|(m, _)| m.to_ascii_lowercase().contains("abandoned")),
+            "abandonment must surface visible feedback, got {:?}",
+            ui2.status_message.as_ref().map(|(m, _)| m)
+        );
+    }
+
+    /// Scenario: a daemon `KIND_STREAM_REJECT` for the FOCUSED pane while in
+    /// PaneInput must surface honest feedback and leave PaneInput — for both a
+    /// key- and a paste-triggered rejection (the daemon rejects them
+    /// identically). A rejection for a NON-focused pane, or when not in
+    /// PaneInput, is ignored. Covers finding #10's client (UI) half.
+    #[test]
+    fn stream_rejection_leaves_pane_input_with_feedback() {
+        let now = std::time::Instant::now();
+
+        // Focused + PaneInput → feedback + leave PaneInput (both key & paste map
+        // to the same daemon reason, so one reason covers both).
+        for reason in ["history-only", "exited"] {
+            let mut ui = default_ui();
+            ui.mode = UiMode::PaneInput;
+            let acted =
+                apply_stream_rejection_feedback(&mut ui, Some("focused"), "focused", reason, now);
+            assert!(acted, "rejection for the focused pane must act ({reason})");
+            assert_eq!(
+                ui.mode,
+                UiMode::Normal,
+                "a stream rejection must leave PaneInput ({reason})"
+            );
+            assert!(
+                ui.status_message
+                    .as_ref()
+                    .is_some_and(|(m, _)| m.to_ascii_lowercase().contains("not delivered")),
+                "a stream rejection must surface visible feedback ({reason}), got {:?}",
+                ui.status_message.as_ref().map(|(m, _)| m)
+            );
+        }
+
+        // Rejection for a DIFFERENT (non-focused) pane must not disturb input.
+        let mut ui = default_ui();
+        ui.mode = UiMode::PaneInput;
+        let acted =
+            apply_stream_rejection_feedback(&mut ui, Some("focused"), "other-pane", "exited", now);
+        assert!(!acted, "a rejection for a non-focused pane must be ignored");
+        assert_eq!(
+            ui.mode,
+            UiMode::PaneInput,
+            "non-focused rejection keeps mode"
+        );
+
+        // Not in PaneInput → nothing to leave.
+        let mut ui = default_ui();
+        ui.mode = UiMode::Normal;
+        let acted =
+            apply_stream_rejection_feedback(&mut ui, Some("focused"), "focused", "exited", now);
+        assert!(!acted, "a rejection while not in PaneInput must be ignored");
     }
 }
