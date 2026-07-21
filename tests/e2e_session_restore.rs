@@ -816,3 +816,55 @@ fn restore_013_custom_orchestration_tab_title_is_preserved_on_restore() {
         deck.snapshot_grid()
     );
 }
+
+/// Scenario: Stage a saved plain pane whose test-owned command is an executable
+/// named `opencode`, then launch against an empty daemon without emitting any
+/// hook event. The restored card must immediately identify the agent and render
+/// `Idle`, rather than showing `No agent` until the first prompt.
+#[spec("session/restore/014")]
+#[test]
+fn restore_014_recognized_agent_is_idle_before_first_hook() {
+    let session_dir = common::race_safe_tempdir();
+    let fake_opencode = session_dir.path().join("opencode");
+    std::fs::write(&fake_opencode, "#!/bin/sh\nsleep 600\n")
+        .expect("write fake opencode executable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_opencode, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake opencode executable");
+    }
+
+    let session_file = session_dir.path().join("session.toml");
+    stage_session_snapshot(
+        &session_file,
+        session_dir.path(),
+        &[(
+            "restored-opencode",
+            fake_opencode.to_str().expect("command path is UTF-8"),
+        )],
+    );
+
+    let deck = TuiDeck::builder()
+        .with_env(
+            "DOT_AGENT_DECK_SESSION",
+            session_file.to_str().expect("session path is UTF-8"),
+        )
+        .launch_with_fixture("minimal");
+
+    deck.wait_for_string("restored-opencode");
+    let idle = common::wait_until(Duration::from_secs(10), || {
+        let grid = deck.snapshot_grid();
+        grid.lines().any(|line| {
+            line.contains("restored-opencode")
+                && line.contains("Idle")
+                && !line.contains("No agent")
+        })
+    });
+    assert!(
+        idle,
+        "a restored command already recognized as OpenCode must render Idle before any hook \
+         event, not No agent.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+}
