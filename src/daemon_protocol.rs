@@ -2166,6 +2166,15 @@ mod tests {
     /// new conversation. It pins the pre-lock reading as `false` and the post-lock
     /// reading as `true`, so the closure is provably the single source of truth:
     /// had the stale pre-lock value been trusted, the outcome would be `Applied`.
+    ///
+    /// PRD #42 build-windows: this test spawns a real PTY running `/bin/sh`,
+    /// which does not exist on Windows, so — like its sibling
+    /// `guarded_send_rejects_agent_removal_after_writer_lock` (whole
+    /// `agent_pty::spawn_tests` module is `#[cfg(all(test, unix))]`) — it is
+    /// gated to Unix. The module here is mixed cross-platform, so the gate is
+    /// on the function itself (already inside `#[cfg(test)]`). No Unix coverage
+    /// is lost: the fast tier still exercises it green on Unix.
+    #[cfg(unix)]
     #[tokio::test]
     async fn guarded_send_rechecks_live_attach_after_writer_lock() {
         let reg = Arc::new(AgentPtyRegistry::new());
