@@ -25,11 +25,26 @@
 #   A recording dir `<RECORDINGS_DIR>/<id>/` is IN SCOPE iff
 #     1. it contains a `full-stream.cast` — the e2e proxy. L1 render tests emit a
 #        `test.md` but NO cast, so they are excluded by construction; and
-#     2. the source file named in its `test.md` `**Source:**` line was changed on
+#     2. its catalog id carries the OPT-IN `[reel]` eligibility MARKER (see below); and
+#     3. the source file named in its `test.md` `**Source:**` line was changed on
 #        this branch vs `<MAIN_REF>`. Matching is by FILE BASENAME against
 #        `git diff --name-only <MAIN_REF>` restricted to `*.rs` — basename match
 #        sidesteps the test.md "<immediate-parent>/<file>" path quirk and is
 #        robust for the flat `tests/*.rs` (and `src/*.rs`) layout this repo uses.
+#
+# Reel-eligibility MARKER (opt-in, committed, explicit — PRD #20):
+#   Having a cast just means a test is PTY-attached; it does NOT mean it belongs
+#   in the reel. A clip exists so a human can watch and validate REAL behavior, so
+#   only tests that genuinely spin up a real agent (spawn -> agent -> work) should
+#   ship. Eligibility is therefore OPT-IN: an author marks a test by appending a
+#   trailing ` [reel]` tag to its `##### <id> — …` line in CATALOG.md. The DEFAULT
+#   (no tag, or an id absent from the catalog) is NOT eligible, so synthetic /
+#   stand-in tests (cat, scripted echo, recorder stubs, terminal-probe, synthesized
+#   hook events) never auto-select as clips even when they have a cast and their
+#   source changed. The marker lives on the catalog line the adapter ALREADY parses
+#   for ordering — no gitignored artifact, no Rust macro change. Both `select`
+#   (concern a) and `assemble` (concern b) enforce it, so an injected id list can
+#   no more smuggle an unmarked test in than a cast-less one.
 #
 # Card text is lifted from test.md only (no test-body parsing):
 #   title       <- the H1 line, minus the leading "# " (e.g. "mouse/button/001 — …")
@@ -70,8 +85,9 @@ Usage:
       Print the in-scope recording-dir IDs (one per line). Uses git.
   build.sh assemble [ID...] [--manifest PATH]
       Build manifest.json from the given recording-dir IDs (pure: no git, no
-      network). Excludes any ID without a full-stream.cast; orders by catalog id.
-      Clean-skips when no ID resolves to an e2e clip.
+      network). Excludes any ID without a full-stream.cast, or whose catalog id
+      lacks the trailing [reel] eligibility marker; orders by catalog id.
+      Clean-skips when no ID resolves to a reel-eligible e2e clip.
 
 Environment overrides:
   REEL_ADAPTER_RECORDINGS_DIR  (default: .dot-agent-deck/recordings)
@@ -85,11 +101,16 @@ EOF
 # Pure helpers (no git, no network) — drive concern (b).
 # --------------------------------------------------------------------------
 
-# Title = the test.md H1, minus the leading "# ".
+# Title = the test.md H1, minus the leading "# ". A trailing ` [reel]`
+# eligibility marker is stripped: the `cargo xtask docs` generator copies the
+# catalog headline (marker and all) verbatim into the H1, but the marker is an
+# internal selection signal — it must never appear on the card. Quoting the
+# pattern makes bash strip it literally rather than as a `[...]` glob class.
 extract_title() {
   local md="$1" line
   line="$(grep -m1 '^# ' "$md" 2>/dev/null || true)"
-  printf '%s' "${line#"# "}"
+  line="${line#"# "}"
+  printf '%s' "${line%" [reel]"}"
 }
 
 # Catalog id = the part of the H1 before the first " — " (em dash separator).
@@ -147,6 +168,21 @@ catalog_ord() {
   printf '999999'
 }
 
+# Reel-eligible? True iff the id's `##### <id> — …` line in CATALOG.md ends with
+# the trailing ` [reel]` marker. Opt-in: the default (no marker, or the id absent
+# from the catalog) returns false, so only explicitly-marked tests are published.
+# The ` [reel]` on the RHS of `==` is QUOTED, so bash matches it literally rather
+# than as a `[...]` glob character class.
+catalog_reel_eligible() {
+  local want="$1" line
+  line="$(awk -v want="$want" '
+    /^##### / {
+      l=$0; sub(/^##### /,"",l); id=l; sub(/ —.*/,"",id)
+      if (id==want) { print; exit }
+    }' "$CATALOG_FILE")"
+  [[ "$line" == *" [reel]" ]]
+}
+
 # --------------------------------------------------------------------------
 # Concern (b): assemble manifest.json from an explicit list of recording IDs.
 # Pure — reads test.md + CATALOG.md only. Excludes cast-less (L1) IDs. Orders by
@@ -182,6 +218,13 @@ assemble() {
     # catid is matched against CATALOG.md ids, so derive it from the RAW title
     # (ids are plain ASCII — no entities); only the card-bound text is decoded.
     catid="$(extract_catalog_id "$title")"
+    # Opt-in eligibility: an id without the ` [reel]` marker is a candidate cast
+    # (PTY-attached) but NOT a reel clip. Excluded at assembly too, so an injected
+    # id list can't smuggle an unmarked test past selection's own marker check.
+    if ! catalog_reel_eligible "$catid"; then
+      echo "demo-reel-adapter: excluding '$id' (catalog id '$catid' has no [reel] marker — not reel-eligible)" >&2
+      continue
+    fi
     desc="$(extract_description "$md")"
     ord="$(catalog_ord "$catid")"
     title_dec="$(printf '%s' "$title" | html_decode)"
@@ -234,9 +277,11 @@ select_ids() {
     [[ -f "$md" ]] || continue
     id="$(basename "$(dirname "$md")")"
     [[ -f "$RECORDINGS_DIR/$id/full-stream.cast" ]] || continue   # (1) e2e proxy
+    catalog_reel_eligible "$(extract_catalog_id "$(extract_title "$md")")" \
+      || continue                                                 # (2) [reel] marker
     src="$(extract_source_basename "$md")"
     [[ -n "$src" ]] || continue
-    if printf '%s\n' "$changed" | grep -Fxq "$src"; then          # (2) changed vs main
+    if printf '%s\n' "$changed" | grep -Fxq "$src"; then          # (3) changed vs main
       printf '%s\n' "$id"
     fi
   done

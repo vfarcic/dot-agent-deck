@@ -7,17 +7,21 @@
 # adapter's deterministic concern (b) — `build.sh assemble` — against a tiny
 # fixture and asserts:
 #
-#   (i)  given a list of IDs, the emitted manifest has the right
-#        titles/descriptions/clip paths IN CATALOG ORDER and EXCLUDES the
-#        cast-less L1 entry;
-#   (ii) given an empty in-scope list, it CLEAN-SKIPS — no manifest, exit 0, and
-#        the skip message.
+#   (i)   given a list of IDs, the emitted manifest has the right
+#         titles/descriptions/clip paths IN CATALOG ORDER, EXCLUDES the cast-less
+#         L1 entry, and EXCLUDES a cast-bearing entry that is NOT reel-marked;
+#   (ii)  given an empty in-scope list, it CLEAN-SKIPS — no manifest, exit 0, and
+#         the skip message;
+#   (ii-b/c) an L1-only list AND an unmarked-cast-only list each CLEAN-SKIP too.
 #
-# The fixture under tests/fixtures/recordings/ has two e2e dirs (alpha, beta;
-# each has a full-stream.cast) and one L1 dir (gamma; test.md but NO cast). The
-# CATALOG.md fixture orders them 001=beta, 002=alpha, 003=gamma, so feeding
-# `alpha beta gamma` and getting back `[beta, alpha]` proves both ordering and
-# the L1 exclusion at once.
+# The fixture under tests/fixtures/recordings/ has FOUR dirs:
+#   * alpha, beta — e2e dirs WITH a cast whose catalog entry carries ` [reel]`;
+#   * gamma       — an L1 dir (test.md but NO cast), so excluded by construction;
+#   * delta       — an e2e dir WITH a cast but whose catalog entry is UNMARKED,
+#                   so excluded by the opt-in reel-eligibility marker.
+# The CATALOG.md fixture orders them 001=beta, 002=alpha, 003=gamma, 004=delta, so
+# feeding `alpha beta gamma delta` and getting back exactly `[beta, alpha]` proves
+# ordering, the L1 exclusion, AND the unmarked-cast exclusion at once.
 #
 # Run via: task reel-adapter-test
 #   (or directly: .claude/skills/demo-reel-adapter/tests/adapter_test.sh)
@@ -35,14 +39,15 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 fail() { echo "ADAPTER TEST FAIL: $*" >&2; exit 1; }
 
-# --- (i) assemble alpha beta gamma -> [beta(001), alpha(002)]; gamma excluded --
+# --- (i) assemble alpha beta gamma delta -> [beta(001), alpha(002)];
+#         gamma excluded (no cast), delta excluded (cast but NOT [reel]-marked) --
 MAN="$TMP/manifest.json"
-"$BUILD" assemble --manifest "$MAN" alpha beta gamma >/dev/null
+"$BUILD" assemble --manifest "$MAN" alpha beta gamma delta >/dev/null
 
 [[ -s "$MAN" ]] || fail "(i) manifest not written"
 
 len="$(jq 'length' "$MAN")"
-[[ "$len" -eq 2 ]] || fail "(i) expected 2 entries, got $len (L1 gamma must be excluded)"
+[[ "$len" -eq 2 ]] || fail "(i) expected 2 entries, got $len (L1 gamma AND unmarked delta must be excluded)"
 
 # Beta's fixture title/description carry HTML entities (&#91;label&#93;, &amp;) —
 # the adapter must HTML-decode them to literal characters on the card while
@@ -65,7 +70,10 @@ c1="$(jq -r '.[1].clip' "$MAN")"
 if jq -e '[.[].clip] | any(. | test("gamma"))' "$MAN" >/dev/null; then
   fail "(i) cast-less L1 'gamma' leaked into the manifest"
 fi
-echo "PASS (i): 2 entries in catalog order (beta, alpha), L1 gamma excluded, fields correct"
+if jq -e '[.[].clip] | any(. | test("delta"))' "$MAN" >/dev/null; then
+  fail "(i) unmarked cast-bearing 'delta' leaked into the manifest (missing [reel] marker must exclude it)"
+fi
+echo "PASS (i): 2 entries in catalog order (beta, alpha); L1 gamma AND unmarked delta excluded; fields correct"
 
 # --- (ii) empty in-scope list -> clean skip (no manifest, exit 0, skip message) --
 MAN2="$TMP/skip.json"
@@ -82,5 +90,15 @@ out3="$("$BUILD" assemble --manifest "$MAN3" gamma)"
 printf '%s\n' "$out3" | grep -qF "skipped: no e2e tests changed on this branch" \
   || fail "(ii-b) missing skip message for L1-only list; got: '$out3'"
 echo "PASS (ii-b): L1-only list clean-skips"
+
+# --- (ii-c) a list of only UNMARKED cast-bearing ids also clean-skips -----------
+# delta has a full-stream.cast but its catalog entry lacks the ` [reel]` marker,
+# so an all-unmarked list resolves to zero reel-eligible clips and clean-skips.
+MAN4="$TMP/skip3.json"
+out4="$("$BUILD" assemble --manifest "$MAN4" delta)"
+[[ ! -e "$MAN4" ]] || fail "(ii-c) manifest must NOT be written when only unmarked cast ids are given"
+printf '%s\n' "$out4" | grep -qF "skipped: no e2e tests changed on this branch" \
+  || fail "(ii-c) missing skip message for unmarked-cast-only list; got: '$out4'"
+echo "PASS (ii-c): unmarked-cast-only list clean-skips"
 
 echo "ADAPTER TEST PASS"

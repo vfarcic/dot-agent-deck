@@ -14,6 +14,8 @@ This is the authoritative list of test cases the harness must cover. IDs are sta
 
 Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows once the harness's Windows path is ready per Decision 4); **mac+linux+windows** = portable from day one.
 
+Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> — <headline>` line opts that test into the PRD #180 demo reel (`.claude/skills/demo-reel-adapter`). Eligibility is **opt-in** — the default (no marker) is *not* eligible even for a PTY-attached test that records a cast. Mark a test only if it validates the feature **as a user actually runs and sees it** — a real agent genuinely spinning up (spawn → agent → work) — never a synthetic/stand-in test (`cat`, scripted echo, recorder stubs, terminal-probe, or synthesized hook events). The adapter includes a marked test in the reel only when it *also* has a cast and its source changed on the branch.
+
 ### Dashboard panes
 
 #### dashboard/pane
@@ -1976,7 +1978,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 #### codex/hooks
 
-##### codex/hooks/001 — A real wrapped interactive Codex turn reports native prompt/tool detail and becomes Idle without process exit (PRD #20 W1, R20-013/R20-014).
+##### codex/hooks/001 — A real wrapped interactive Codex turn reports native prompt/tool detail and becomes Idle without process exit (PRD #20 W1, R20-013/R20-014). [reel]
 - **Layer:** L2 PTY-attached (`TuiDeck`, reel-eligible); runtime-skipped unless `check_codex_available` verifies the binary, persisted auth, and a live model request.
 - **Agent:** real interactive Codex on the cheap test model, isolated credentials and Codex home, workspace-write sandbox, no approvals, network-enabled sandbox configuration, and low reasoning effort; launch passes through the normal Wrapper strategy seam.
 - **Asserts:** the deck-installed Codex native hooks emit a prompt-bearing Thinking event, shell ToolStart/ToolEnd events with the sentinel command as detail, and Stop-hook Idle; the dashboard visibly retains prompt/tool detail and shows Idle, the requested sentinel contains exact known content, and the Codex pane is still alive because the test never sends `/exit`.
@@ -1986,7 +1988,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 #### codex/live
 
-##### codex/live/001 — A real interactive cheap-model Codex run launched through the normal new-pane flow works visibly and reports live status (PRD #20, rule 4 / finding 16).
+##### codex/live/001 — A real interactive cheap-model Codex run launched through the normal new-pane flow works visibly and reports live status (PRD #20, rule 4 / finding 16). [reel]
 - **Layer:** L2 PTY-attached (`TuiDeck`, reel-eligible); runtime-skipped unless `check_codex_available` verifies the binary, persisted auth, and a live model request.
 - **Agent:** real interactive bare `codex` using `gpt-5.1-codex-mini`, isolated copied credentials, workspace-write sandbox, and low reasoning effort; automatic wrapping occurs at the normal pane spawn seam.
 - **Asserts:** the interactive pane becomes ready, accepts a typed prompt, uses the shell to list the fixture and writes a proof file naming `codex_sentinel_a7c91f.txt`; after detach, the visible Codex card has traversed Thinking → Idle.
