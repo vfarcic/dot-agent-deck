@@ -1345,11 +1345,24 @@ impl AppState {
             // must NOT wipe a newer generation that already superseded it —
             // otherwise a current prompt would be wrongly refused against a
             // cleared entry.
+            //
+            // Greptile P1 (stale same-session end): the session-id match alone is
+            // not enough. An OLDER, delayed `SessionEnd` can carry the SAME
+            // `session_id` as a generation whose stored timestamp a NEWER event
+            // (e.g. `Thinking`) already advanced. Removing on id-match alone would
+            // drop that current generation and let a stale/misrouted guarded send
+            // fall through the missing-session path. So mirror EXACTLY the
+            // non-terminal update path's comparison: clear only when the terminal
+            // event's timestamp is not older than the stored generation's
+            // (`incoming_ts >= current_ts`). A current/matching end still clears; a
+            // superseded end is ignored, preserving the newer generation.
             if let Some(ref pane_id) = event.pane_id
                 && self
                     .pane_hook_session
                     .get(pane_id)
-                    .is_some_and(|(current, _)| *current == incoming_session_id)
+                    .is_some_and(|(current, current_ts)| {
+                        *current == incoming_session_id && event.timestamp >= *current_ts
+                    })
             {
                 self.pane_hook_session.remove(pane_id);
             }
