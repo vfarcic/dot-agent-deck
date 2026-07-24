@@ -605,10 +605,10 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 - **Does not assert:** visible TUI feedback after consuming the rejection, covered by `prompt/pane-input/008`.
 - **Platform coverage:** mac+linux.
 
-##### prompt/pane-input/019 — Guarded-send generation remains monotonic under delayed prior-session events (PRD #20 Greptile finding #3).
+##### prompt/pane-input/019 — Guarded-send generation remains monotonic under delayed prior-session and same-session events (PRD #20 Greptile findings #3/P1).
 - **Layer:** L1 protocol integration with an in-process daemon and real PTY-backed shells.
 - **Agent:** synthetic Codex lifecycle generations sharing one pane and agent identity.
-- **Asserts:** delayed activity cannot restore an old generation, delayed `SessionEnd` cannot clear the current generation, stale prompts remain rejected, and current prompts remain deliverable.
+- **Asserts:** delayed activity cannot restore an old generation, a delayed `SessionEnd` from either a prior session or an older timestamp cannot clear the current generation, a current `SessionEnd` does clear it, stale prompts remain rejected, and current prompts remain deliverable.
 - **Does not assert:** transport-level event reordering before `AppState::apply_event`.
 - **Platform coverage:** mac+linux.
 

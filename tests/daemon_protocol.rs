@@ -1266,7 +1266,7 @@ fn pane_input_018_paneless_history_target_rejects_stream_input() {
     });
 }
 
-/// Scenario: Start a newer logical session on a live pane, then deliver a delayed activity or end event from its prior generation. Stale prompts must remain rejected while prompts for the current generation still reach the PTY.
+/// Scenario: Start a newer logical session on a live pane, then deliver delayed activity and end events from an older generation or timestamp. Stale terminal events must preserve the current generation, while a current terminal event clears it and guarded prompts retain the correct routing behavior.
 #[spec("prompt/pane-input/019")]
 #[test]
 fn pane_input_019_late_events_cannot_regress_or_clear_generation() {
@@ -1417,6 +1417,53 @@ fn pane_input_019_late_events_cannot_regress_or_clear_generation() {
         .await;
         let end_observation = (current_after_end.send_result, current_after_end_reached);
         server.registry.close_agent(&agent_id).unwrap();
+
+        let pane_id = "pane-stale-same-session-end";
+        let session_id = "same-session-generation";
+        let mut state = AppState::default();
+        state.register_pane(pane_id.to_string());
+        let event = |event_type, timestamp| AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::Codex,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp,
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some("same-session-agent".to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: Some(LiveTarget {
+                kind: TargetKind::Pty,
+                writable: Writable::Live,
+            }),
+        };
+        state.apply_event(event(EventType::SessionStart, now));
+        state.apply_event(event(
+            EventType::Thinking,
+            now + chrono::Duration::seconds(2),
+        ));
+        state.apply_event(event(
+            EventType::SessionEnd,
+            now + chrono::Duration::seconds(1),
+        ));
+        assert_eq!(
+            state.pane_hook_session_id(pane_id).as_deref(),
+            Some(session_id),
+            "an older SessionEnd for the same session must not clear its newer generation"
+        );
+        state.apply_event(event(
+            EventType::SessionEnd,
+            now + chrono::Duration::seconds(2),
+        ));
+        assert_eq!(
+            state.pane_hook_session_id(pane_id),
+            None,
+            "a SessionEnd matching the stored generation timestamp must clear it"
+        );
 
         assert!(
             !matches!(
