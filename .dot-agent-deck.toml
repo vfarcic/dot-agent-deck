@@ -65,7 +65,7 @@ watch = false
 pattern = "git (log|status|show|diff)"
 watch = false
 
-# Dogfood: mixed agents — orchestrator/auditor=pi (Opus, high thinking), reviewer/tester=opencode (gpt-5.6-pro), coder/release=claude. Flip any role back via the commented all-claude command under it.
+# Dogfood: mixed agents — orchestrator/auditor=pi (Opus, high thinking), reviewer=opencode (gpt-5.6-pro), tester=codex (gpt-5.6-sol, high reasoning), coder/release=claude. Flip any role back via the commented all-claude command under it.
 [[orchestrations]]
 name = "dot-agent-deck"
 
@@ -146,7 +146,7 @@ prompt_template = "Audit the change for security vulnerabilities, unsafe pattern
 
 [[orchestrations.roles]]
 name = "tester"
-command = "devbox run oc-big"
+command = "devbox run codex-big"
 # command = "devbox run agent-tester"   # all-claude default
 description = "Writes failing synthetic L2 tests under the TUI test harness; verifies they pass after coder implements. Sweet spot is L2 synthetic flows (hooks, status transitions, prompts, focus, lifecycle, resize, error paths) and L1 widget redesigns. Skips pure refactors, pure-data fixes, and chain-smoke (all stay with coder). Prefers extending or modifying existing tests over creating new ones."
 prompt_template = """

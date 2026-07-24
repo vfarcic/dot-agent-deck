@@ -46,3 +46,15 @@ Maintainer-facing references that are intentionally **not** published to the doc
 - [Agent adapters — adding a new agent](docs/develop/agent-adapters.md) — the contract for adding a new agent (PRD #20): the curated-registry design philosophy (runtime extensibility is a non-goal), the four shipped integration strategies (native-hooks/Claude, plugin/OpenCode, extension/Pi, wrapper/Codex), and a step-by-step "add an agent" checklist keyed to the real seams (`AgentType`, the `AgentSpec` registry entry, the wrapper `RuleSet`, `live_target`/`send_result`, badge colour, and the test ladder), worked end to end with Codex.
 - [Pi orchestrator extension](docs/develop/pi-extension.md) — the bundled TypeScript extension that makes Pi a first-class agent (PRD #201): its native `delegate`/`work-done` tools, the Pi-event → status mapping, the additive `agent-event` CLI seam, `include_str!` materialization into Pi's extension dir, the hook-free-by-construction property, the rule-12 classification, and the `experimental` gating.
 - [Config-gen baseline regeneration](docs/develop/config-gen-regeneration.md) — the repeatable PRD #116 workflow for regenerating what the AI config generator would produce for a project and diffing it against that project's live `.dot-agent-deck.toml`: where the tooling lives (`examples/render_config_gen_prompt.rs`, `examples/diff_config.rs`), the engine (deck-default model, agent run against the real repo with tools enabled), and the date-gate methodology. The real config files are the corpus — no captured baselines are stored in-repo.
+
+## Dogfooding: Codex skills
+
+When you dogfood a Codex agent as an orchestration role or worker (e.g. `devbox run codex-big` as the `tester`), Codex only loads skills from its own skills dir (`$CODEX_HOME/skills`, default `~/.codex/skills`) — it does **not** read this repo's `.claude/skills/`. To give a dogfooded Codex the same skills the Claude agents get, symlink each project skill into Codex's skills dir. This is a one-time local machine setup step, not a committed repo artifact. Run this from the repo root; it skips any name that already exists (so it never clobbers Codex's `.system` builtins or your own skills):
+
+```bash
+mkdir -p ~/.codex/skills
+for d in .claude/skills/*/; do
+  n=$(basename "$d")
+  [ -e ~/.codex/skills/"$n" ] || ln -s "$PWD/.claude/skills/$n" ~/.codex/skills/"$n"
+done
+```
