@@ -920,6 +920,16 @@ pub async fn run_attach_server_with_counter(
 /// (finding #4) the daemon-authoritative hook-session generation AFTER acquiring
 /// the writer, immediately before the write. `Err` is a clean transport failure
 /// (nothing written); `Ok(Ambiguous)` a partial write.
+///
+/// PRD #20 Greptile P1 class-close (stale pre-lock snapshot): every
+/// authorization input the guard consults — writability, the hook-session
+/// generation, AND live-attachment — is sampled INSIDE the post-lock
+/// re-validation closure, so a state change that lands while the send waits for
+/// the writer lock (a pane becoming attached, a `/clear`, a liveness flip)
+/// cannot be masked by a value snapshotted before the lock. The pre-lock
+/// `pane_writable` read below is routing-only (it picks the HistoryOnly / None /
+/// Live branch) and fails closed; the Live branch never trusts it — the closure
+/// re-checks writability post-lock.
 async fn compute_write_and_submit_outcome(
     registry: &AgentPtyRegistry,
     state: &SharedState,
@@ -977,33 +987,50 @@ async fn compute_write_and_submit_outcome(
             } else {
                 let pane_for_check = pane_id.to_string();
                 let expected_session = extras.expected_session_id.clone();
-                // PRD #20 R20-003 (finding #4): is a deck client actively driving
-                // this pane? The strict "reject a None current-session" rule
-                // applies to a LIVE INTERACTIVE (attached) pane — finding #4's
-                // threat is a stale prompt surfacing in the conversation the user
-                // is watching. A headless (unattached) delivery whose agent
-                // identity is confirmed proceeds. In the real deck the TUI is
-                // always attached to a pane it drives, so this is the strict guard
-                // for every real delivery.
-                let has_live_attach = registry.pane_has_live_attach(pane_id);
                 registry
                     .write_and_submit_guarded(
                         pane_id,
                         text,
                         extras.expected_agent_id.as_deref(),
                         move || async move {
+                            // PRD #20 Greptile P1 (daemon_protocol.rs:988) + the
+                            // stale-pre-lock-snapshot CLASS close: this closure is
+                            // the SINGLE delivery-time authorization snapshot. It
+                            // runs UNDER the held target writer, immediately before
+                            // the write, so EVERY authorization input it consults is
+                            // sampled HERE, post-lock — no value captured before the
+                            // writer lock is trusted after it. `has_live_attach` used
+                            // to be read BEFORE `write_and_submit_guarded` acquired
+                            // the writer and consulted here (stale): a pane that
+                            // became attached WHILE the send waited for the writer
+                            // was still seen as unattached, letting a stale prompt
+                            // slip into the freshly-attached conversation. Reading it
+                            // here (and `pane_writable` / `pane_hook_session_id`
+                            // alongside it under one snapshot) samples attachment at
+                            // DELIVERY time. Sampled before taking the state read
+                            // lock so no lock is held across the `inner` mutex.
+                            let has_live_attach = registry.pane_has_live_attach(&pane_for_check);
                             let guard = st.read().await;
                             if guard.pane_writable(&pane_for_check) != Writable::Live {
                                 return false;
                             }
-                            // When the caller named a session, require an EXACT
-                            // match against the pane's CURRENT daemon-authoritative
-                            // hook-session generation. A same-agent `/clear` /
-                            // thread restart rolls the generation over → mismatch →
-                            // reject (always). A `None` current-session (the session
-                            // ended, or none was recorded) is refused too on an
-                            // attached, live-interactive pane — never a silent
-                            // accept.
+                            // PRD #20 R20-003 (finding #4): is a deck client actively
+                            // driving this pane? The strict "reject a None
+                            // current-session" rule applies to a LIVE INTERACTIVE
+                            // (attached) pane — finding #4's threat is a stale prompt
+                            // surfacing in the conversation the user is watching. A
+                            // headless (unattached) delivery whose agent identity is
+                            // confirmed proceeds. In the real deck the TUI is always
+                            // attached to a pane it drives, so this is the strict
+                            // guard for every real delivery.
+                            //
+                            // When the caller named a session, require an EXACT match
+                            // against the pane's CURRENT daemon-authoritative
+                            // hook-session generation. A same-agent `/clear` / thread
+                            // restart rolls the generation over → mismatch → reject
+                            // (always). A `None` current-session (the session ended,
+                            // or none was recorded) is refused too on an attached,
+                            // live-interactive pane — never a silent accept.
                             if let Some(expected) = expected_session.as_deref() {
                                 match guard.pane_hook_session_id(&pane_for_check) {
                                     Some(current) if current != expected => return false,
@@ -2118,6 +2145,109 @@ mod tests {
             buffered, REJECT_QUEUE_CAP,
             "an undrained flood should fill the bounded queue exactly to its cap"
         );
+    }
+
+    /// PRD #20 Greptile P1 (daemon_protocol.rs:988) — attach-after-check
+    /// barrier, closing the stale-pre-lock-snapshot class for `has_live_attach`.
+    /// The attach flag used to be sampled BEFORE `write_and_submit_guarded`
+    /// acquired the target writer, then consulted in the post-lock re-validation
+    /// closure. If the pane became attached WHILE the send waited for that
+    /// writer, the closure saw the stale (pre-lock) "unattached" value and let a
+    /// stale prompt — whose named session no longer exists (`pane_hook_session_id`
+    /// is `None`) — slip into the freshly-attached conversation instead of
+    /// rejecting it.
+    ///
+    /// This mirrors `guarded_send_rejects_agent_removal_after_writer_lock`: it
+    /// holds the EXACT target writer so a guarded send parks AFTER its pre-lock
+    /// checks but BEFORE the write, makes the pane become attached during that
+    /// window, then releases the writer. Because the fix samples attachment
+    /// INSIDE the post-lock closure (one delivery-time snapshot), the send must
+    /// observe the NEW attached state and reject with `Stale` — no bytes into the
+    /// new conversation. It pins the pre-lock reading as `false` and the post-lock
+    /// reading as `true`, so the closure is provably the single source of truth:
+    /// had the stale pre-lock value been trusted, the outcome would be `Applied`.
+    #[tokio::test]
+    async fn guarded_send_rechecks_live_attach_after_writer_lock() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let pane_id = "pane-attach-after-check-barrier";
+        let id = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn agent");
+
+        // State: the pane is registered but carries NO session, so `pane_writable`
+        // defaults to `Live` (the send enters the guarded path) while
+        // `pane_hook_session_id` is `None` (the named generation is gone). With an
+        // `expected_session_id` supplied, delivery then hinges ENTIRELY on whether
+        // the pane is attached at DELIVERY time — isolating the attach re-check.
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(pane_id.to_string());
+
+        // Grab the EXACT writer the guarded send will contend for WITHOUT staying
+        // subscribed: `subscribe` bumps `receiver_count`, so keep only `.writer`
+        // and let the rest of the handle (its receiver) drop — returning the pane
+        // to UNATTACHED for the pre-lock reading.
+        let writer = reg.subscribe(&id).expect("subscribe for writer").writer;
+        assert!(
+            !reg.pane_has_live_attach(pane_id),
+            "precondition: pane must be UNATTACHED before the send parks (pre-lock reading)"
+        );
+        let guard = writer.lock().await;
+
+        let reg_task = reg.clone();
+        let state_task = state.clone();
+        let pane = pane_id.to_string();
+        let extras = WriteAndSubmitExtras {
+            expected_agent_id: Some(id.clone()),
+            expected_session_id: Some("queued-generation".to_string()),
+            ..Default::default()
+        };
+        let mut task = tokio::spawn(async move {
+            compute_write_and_submit_outcome(
+                &reg_task,
+                &state_task,
+                &pane,
+                "printf 'ATTACHED-AFTER-CHECK\\n'",
+                &extras,
+            )
+            .await
+        });
+
+        // Precondition: the send is parked on the held writer — past its pre-lock
+        // checks, not yet written.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut task)
+                .await
+                .is_err(),
+            "precondition: guarded send must block on the held writer"
+        );
+
+        // The pane becomes ATTACHED while the send waits for the writer. Keep the
+        // handle alive so `receiver_count > 0` for the post-lock reading.
+        let _attach = reg.subscribe(&id).expect("attach during writer wait");
+        assert!(
+            reg.pane_has_live_attach(pane_id),
+            "the pane must now read as ATTACHED (post-lock reading differs from pre-lock)"
+        );
+
+        // Release the writer; the guarded send now runs its post-lock closure.
+        drop(guard);
+
+        let result = task.await.expect("join guarded-send task");
+        assert_eq!(
+            result,
+            Ok(crate::event::SendResult::Stale),
+            "a pane attached after the pre-lock check must be re-evaluated post-lock: with \
+             its named session gone the stale prompt is refused as Stale (had the pre-lock \
+             'unattached' value been trusted, it would have been Applied)"
+        );
+
+        drop(_attach);
+        reg.shutdown_all();
     }
 
     #[tokio::test]
