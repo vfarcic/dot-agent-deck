@@ -49,12 +49,4 @@ Maintainer-facing references that are intentionally **not** published to the doc
 
 ## Dogfooding: Codex skills
 
-When you dogfood a Codex agent as an orchestration role or worker (e.g. `devbox run codex-big` as the `tester`), Codex only loads skills from its own skills dir (`$CODEX_HOME/skills`, default `~/.codex/skills`) — it does **not** read this repo's `.claude/skills/`. To give a dogfooded Codex the same skills the Claude agents get, symlink each project skill into Codex's skills dir. This is a one-time local machine setup step, not a committed repo artifact. Run this from the repo root; it skips any name that already exists (so it never clobbers Codex's `.system` builtins or your own skills):
-
-```bash
-mkdir -p ~/.codex/skills
-for d in .claude/skills/*/; do
-  n=$(basename "$d")
-  [ -e ~/.codex/skills/"$n" ] || ln -s "$PWD/.claude/skills/$n" ~/.codex/skills/"$n"
-done
-```
+A dogfooded Codex agent loads skills only from `$CODEX_HOME/skills` and does **not** read this repo's `.claude/skills/`; giving it project skills is tracked in issue #213 (deck auto-provisions them into a per-project `CODEX_HOME`) — symlinking them into the global `~/.codex/skills` is intentionally **not** recommended, since that leaks this repo's skills into every project you run Codex on.
