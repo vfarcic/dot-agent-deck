@@ -27,7 +27,7 @@ Implement the Windows backend (`windows.rs`) for each `platform/` submodule intr
 | `paths` | `dirs` crate → `%LOCALAPPDATA%`/`%APPDATA%`/`%USERPROFILE%`; per-user pipe-name suffix; `DOT_AGENT_DECK_*` env overrides stay authoritative. |
 | `shell` | `%COMSPEC%`/`cmd /C`. |
 | `detach` | `creation_flags(DETACHED_PROCESS \| CREATE_NEW_PROCESS_GROUP)` + `NUL` stdin; handle `CREATE_BREAKAWAY_FROM_JOB` if launched inside a kill-on-job-close Job Object. |
-| `lock` | named mutex `Global\dot-agent-deck-spawn-{user}` (RAII shape preserved); treat `WAIT_ABANDONED` as acquired-after-crash. Doubles as the singleton-daemon guard. |
+| `lock` | named mutex `Global\dot-agent-deck-spawn-{user}-{lock-path}` (RAII shape preserved); treat `WAIT_ABANDONED` as acquired-after-crash. Doubles as the singleton-daemon guard. **M2 refinement:** the name carries a per-lock-**path** segment, not just `{user}`. `flock(2)` serializes per lock file and the two callers use two different files — `ensure_daemon_running` holds `<state_dir>/spawn.lock` across spawn *and* its poll-for-endpoint loop while the daemon it spawns needs `lock_path_for(endpoint)` for its own probe→bind — so one per-user name would deadlock every lazy-spawn. Keying on the path reproduces flock's granularity (and keeps `DOT_AGENT_DECK_LOCK_DIR` test isolation); the singleton-daemon doubling still holds because `lock_path_for` is a pure function of the endpoint. Created with a protected current-user-only DACL, the counterpart of the Unix 0o600-in-0o700-dir lock file. |
 | `peercred` | `GetNamedPipeServerProcessId` / `GetNamedPipeClientProcessId` (`windows-sys`). |
 | `proc` | `daemon stop` routes through the existing `KIND_SHUTDOWN`/ACK protocol then escalates to `TerminateProcess`; agent teardown assigns each agent to a Job Object and `TerminateJobObject` reaps descendants; best-effort `CTRL_BREAK_EVENT` grace window. |
 | `fsperm` | current-user-only pipe security descriptor (replaces socket `0o600` + `verify_socket_trusted`); per-user `%LOCALAPPDATA%` ACL for dirs (optional explicit `SetNamedSecurityInfo`); audit each `cfg(unix)` permission site individually. |
@@ -54,7 +54,7 @@ The #42 Foundation review (auditor + reviewer) confirmed no Unix regression but 
 These map to #42's M3–M7. Unix halves are behavior-preserving moves (Linux-testable, prove no regression); Windows behavior requires the `windows-latest` CI job (from #42) plus the e2e VM pass (in #164).
 
 - [x] **paths + shell** (#42 M3) — platform-dispatch home/runtime/state/lock resolution and the shell-wrap; Unix unchanged; add Windows branches. Linux-testable + `cargo check --target`.
-- [ ] **detach + lock** (#42 M4) — Windows `DETACHED_PROCESS`/Job-breakaway + named mutex; confirm on a runner the daemon survives parent exit and concurrent spawns serialize.
+- [x] **detach + lock** (#42 M4) — Windows `DETACHED_PROCESS`/Job-breakaway + named mutex; confirm on a runner the daemon survives parent exit and concurrent spawns serialize. Code + Linux-runnable naming tests + `cargo check`/`clippy --target x86_64-pc-windows-msvc` done; the on-a-runner confirmation lands with #164's e2e pass.
 - [ ] **peer-PID + lifecycle** (#42 M5) — `GetNamedPipeServerProcessId`; `daemon stop` graceful→force; Job-Object agent teardown.
 - [ ] **filesystem security** (#42 M6) — pipe security descriptors + dir ACLs; verify foreign-user denial on a runner.
 - [ ] **clipboard `CONOUT$`** (#42 M7) — `cfg` clipboard write; visual confirm in Windows Terminal (done in #164's e2e).
