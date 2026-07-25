@@ -207,16 +207,34 @@ fn codex_hooks_003_non_codex_launcher_gets_startup_integration() {
     );
 }
 
-/// Scenario: Launch a real cheap-model Codex through the normal wrapped pane
-/// seam, submit a directive that runs one shell command and creates a unique
-/// sentinel, then detach without exiting Codex. Native hooks installed in the
-/// isolated Codex home must make the dashboard show the prompt, shell tool name
-/// and command detail, and finally Idle while the Codex pane remains alive.
+/// Scenario: Launch a real cheap-model Codex through a PATH launcher script and
+/// the normal wrapped pane seam, then submit a directive that runs one shell
+/// command. With no global trust bypass or manual review, deck-installed hooks in
+/// the isolated home must show prompt/tool detail and Idle while Codex stays live.
 #[spec("codex/hooks/001")]
 #[test]
+#[cfg(unix)]
 fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
     skip_unless!(common::check_codex_available());
 
+    let real_codex = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("codex"))
+                .find(|candidate| candidate.is_file())
+        })
+        .expect("available Codex binary resolves on PATH");
+    let launcher_dir = tempfile::tempdir().expect("real Codex launcher directory");
+    let launch_record = launcher_dir.path().join("codex-launches.txt");
+    write_executable(
+        &launcher_dir.path().join("codex"),
+        "#!/bin/sh\nprintf 'home=%s args=%s\\n' \"$CODEX_HOME\" \"$*\" >> \"$CODEX_LAUNCH_RECORD\"\nexec \"$REAL_CODEX_BIN\" \"$@\"\n",
+    );
+    let path = format!(
+        "{}:{}",
+        launcher_dir.path().display(),
+        path_with_binary_dir()
+    );
     let prompt = format!(
         "Run this exact command with the shell tool: printf {HOOK_SENTINEL_CONTENT} > {HOOK_SENTINEL_NAME}. Do not use apply_patch. After reporting completion, stay open and wait for another prompt."
     );
@@ -230,7 +248,9 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
         .expect("write bare Codex hooks command");
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)
-        .with_env("PATH", path_with_binary_dir())
+        .with_env("PATH", path)
+        .with_env("CODEX_LAUNCH_RECORD", launch_record.to_string_lossy())
+        .with_env("REAL_CODEX_BIN", real_codex.to_string_lossy())
         .with_env("DOT_AGENT_DECK_CONFIG", config_path.to_string_lossy())
         .with_imported_codex_credentials()
         .launch_with_fixture("codex-live");
@@ -340,5 +360,41 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
             .iter()
             .any(|record| record.agent_type == Some(AgentType::Codex)),
         "Stop-hook Idle was observed only after Codex exited; the pane must still be live"
+    );
+
+    let launches = std::fs::read_to_string(&launch_record)
+        .expect("the PATH launcher did not record real Codex invocations");
+    assert!(
+        launches
+            .lines()
+            .any(|line| line.contains(" args=app-server"))
+            && launches
+                .lines()
+                .any(|line| line.contains(&format!("--model {}", common::CODEX_TEST_MODEL))),
+        "both the trust probe and interactive agent must run through the launcher script:\n{launches}"
+    );
+    assert!(
+        !launches.contains(TRUST_BYPASS_FLAG),
+        "the real launcher received the forbidden global trust bypass:\n{launches}"
+    );
+    let codex_home = launches
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("home=")
+                .and_then(|rest| rest.split_once(" args="))
+                .map(|(home, _args)| Path::new(home))
+        })
+        .expect("launcher record contains CODEX_HOME");
+    let trusted_keys = trust_state_keys(codex_home);
+    assert_eq!(
+        trusted_keys.len(),
+        DECK_HOOK_EVENTS.len(),
+        "the deck must trust all and only its native hooks in the fresh Codex home"
+    );
+    assert!(
+        trusted_keys
+            .iter()
+            .all(|key| key.starts_with(&format!("{}/hooks.json:", codex_home.display()))),
+        "scoped trust escaped the launcher-inherited Codex home: {trusted_keys:?}"
     );
 }
