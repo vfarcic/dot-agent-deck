@@ -51,7 +51,7 @@ fn write_fake_codex(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("codex");
     std::fs::write(
         &path,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CODEX_ARGS_RECORD\"\n",
+        "#!/bin/sh\nif [ \"${1:-}\" = app-server ]; then\n    IFS= read -r _initialize\n    printf '%s\\n' '{\"id\":1,\"result\":{\"userAgent\":\"trust-test\",\"codexHome\":\"test\",\"platformFamily\":\"unix\",\"platformOs\":\"linux\"}}'\n    IFS= read -r _list\n    printf '%s\\n' \"$CODEX_HOOK_LIST_RESPONSE\" | sed \"s|__CODEX_HOME__|$CODEX_HOME|g\"\n    exit 0\nfi\nprintf '%s\\n' \"$@\" > \"$CODEX_ARGS_RECORD\"\nprintf '%s\\n' \"$CODEX_HOME\" > \"$CODEX_HOME_RECORD\"\n",
     )
     .expect("write fake codex");
     let mut permissions = std::fs::metadata(&path)
@@ -60,6 +60,117 @@ fn write_fake_codex(dir: &std::path::Path) -> std::path::PathBuf {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&path, permissions).expect("make fake codex executable");
     path
+}
+
+fn write_fake_program(path: &std::path::Path) {
+    std::fs::copy(path.parent().expect("program parent").join("codex"), path)
+        .expect("copy fake program");
+    let mut permissions = std::fs::metadata(path)
+        .expect("stat fake program")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).expect("make fake program executable");
+}
+
+fn hook_entry(
+    key: &str,
+    command: &str,
+    source_path: &str,
+    current_hash: &str,
+    is_managed: bool,
+) -> Value {
+    json!({
+        "key": key,
+        "eventName": "preToolUse",
+        "handlerType": "command",
+        "matcher": null,
+        "command": command,
+        "timeoutSec": 600,
+        "statusMessage": null,
+        "sourcePath": source_path,
+        "source": "user",
+        "pluginId": null,
+        "displayOrder": 0,
+        "enabled": true,
+        "isManaged": is_managed,
+        "currentHash": current_hash,
+        "trustStatus": "untrusted"
+    })
+}
+
+fn hook_list_response(entries: Vec<Value>) -> String {
+    json!({
+        "id": 2,
+        "result": {
+            "data": [{
+                "cwd": "/workspace",
+                "hooks": entries,
+                "warnings": [],
+                "errors": []
+            }]
+        }
+    })
+    .to_string()
+}
+
+fn run_wrapped_program(
+    program: &std::path::Path,
+    codex_home: &std::path::Path,
+    fixture_dir: &std::path::Path,
+    hook_response: &str,
+) -> (Output, Vec<String>, String) {
+    let args_record = fixture_dir.join("args.txt");
+    let home_record = fixture_dir.join("home.txt");
+    let path = format!(
+        "{}:{}",
+        fixture_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["wrap", "--agent", "codex", "--"])
+        .arg(program)
+        .env("PATH", path)
+        .env("CODEX_HOME", codex_home)
+        .env("CODEX_ARGS_RECORD", &args_record)
+        .env("CODEX_HOME_RECORD", &home_record)
+        .env("CODEX_HOOK_LIST_RESPONSE", hook_response)
+        .env("DOT_AGENT_DECK_PANE_ID", "codex-trust-test-pane")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run wrapper with fake Codex program");
+    let args = std::fs::read_to_string(args_record)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let observed_home = std::fs::read_to_string(home_record)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    (output, args, observed_home)
+}
+
+fn trust_state_keys(home: &std::path::Path) -> Vec<String> {
+    let path = home.join("config.toml");
+    let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "scoped trust config was not written at {}: {e}",
+            path.display()
+        )
+    });
+    let root: toml::Value = toml::from_str(&contents).expect("parse Codex config.toml");
+    let mut keys = root
+        .get("hooks")
+        .and_then(|value| value.get("state"))
+        .and_then(toml::Value::as_table)
+        .expect("config.toml has [hooks.state] entries")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys
 }
 
 fn run_fake_codex(
@@ -74,6 +185,8 @@ fn run_fake_codex(
         .arg(fake_codex)
         .env("CODEX_HOME", codex_home)
         .env("CODEX_ARGS_RECORD", &args_record)
+        .env("CODEX_HOME_RECORD", fixture_dir.join("home.txt"))
+        .env("CODEX_HOOK_LIST_RESPONSE", hook_list_response(Vec::new()))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -209,92 +322,234 @@ fn codex_hooks_trust_001_direct_codex_requires_codex_identity() {
     );
 }
 
-/// Scenario: Launch a deck-managed Codex with an unrelated third-party hook already present in CODEX_HOME. The wrapper may install its own hook, but must not use an invocation-global flag that also trusts the third-party hook.
+/// Scenario: Launch a bare Codex stand-in and a launcher with a mixed hooks/list response from the pinned home. Only the unmanaged deck command from that home's hooks.json may receive a scoped trust record; foreign, differently sourced, managed, and merely name-mentioning commands must remain untrusted.
+#[spec("codex/trust/002")]
 #[test]
-fn codex_hooks_trust_002_third_party_hooks_are_not_globally_trusted() {
+fn codex_trust_002_only_pinned_unmanaged_deck_entries_are_trusted() {
+    for launcher in [false, true] {
+        let fixture = tempfile::tempdir().expect("create wrapper fixture");
+        let home = tempfile::tempdir().expect("create Codex home");
+        let fake_codex = write_fake_codex(fixture.path());
+        write_hooks(
+            home.path(),
+            &json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": "/usr/local/bin/foreign-hook"
+                        }]
+                    }]
+                }
+            }),
+        );
+        let program = if launcher {
+            let path = fixture.path().join("launcher.sh");
+            write_fake_program(&path);
+            path
+        } else {
+            std::path::PathBuf::from("codex")
+        };
+        let good_key = "__CODEX_HOME__/hooks.json:pre_tool_use:0:0";
+        let response = hook_list_response(vec![
+            hook_entry(
+                good_key,
+                "/opt/dot-agent-deck hook --agent codex",
+                "__CODEX_HOME__/hooks.json",
+                "sha256:deck",
+                false,
+            ),
+            hook_entry(
+                "__CODEX_HOME__/hooks.json:pre_tool_use:0:1",
+                "/usr/local/bin/foreign-hook",
+                "__CODEX_HOME__/hooks.json",
+                "sha256:foreign",
+                false,
+            ),
+            hook_entry(
+                "/different/home/hooks.json:pre_tool_use:0:0",
+                "/opt/dot-agent-deck hook --agent codex",
+                "/different/home/hooks.json",
+                "sha256:different-home",
+                false,
+            ),
+            hook_entry(
+                "__CODEX_HOME__/hooks.json:pre_tool_use:0:2",
+                "/opt/dot-agent-deck hook --agent codex",
+                "__CODEX_HOME__/hooks.json",
+                "sha256:managed",
+                true,
+            ),
+            hook_entry(
+                "__CODEX_HOME__/hooks.json:pre_tool_use:0:3",
+                "/usr/local/bin/audit --watch dot-agent-deck",
+                "__CODEX_HOME__/hooks.json",
+                "sha256:mention",
+                false,
+            ),
+        ]);
+
+        let (output, args, _) =
+            run_wrapped_program(&program, home.path(), fixture.path(), &response);
+
+        assert!(output.status.success(), "wrapper failed: {output:?}");
+        assert!(
+            !args.iter().any(|arg| arg == TRUST_BYPASS_FLAG),
+            "the invocation-global bypass must never appear: args={args:?}"
+        );
+        assert_eq!(
+            trust_state_keys(home.path()),
+            vec![good_key.replace("__CODEX_HOME__", &home.path().display().to_string())],
+            "only the pinned home's unmanaged deck-owned entry may be trusted (launcher={launcher})"
+        );
+        drop(fake_codex);
+    }
+}
+
+/// Scenario: Launch Codex identity through bare codex, an absolute codex path, a launcher script, and devbox. Every child must inherit the pinned home and no program form may receive the deleted invocation-global hook-trust bypass.
+#[spec("codex/trust/001")]
+#[test]
+fn codex_trust_001_no_program_form_receives_global_bypass() {
+    for program_name in ["codex", "absolute-codex", "launcher.sh", "devbox"] {
+        let fixture = tempfile::tempdir().expect("create Codex launcher fixture");
+        let home = tempfile::tempdir().expect("create pinned Codex home");
+        let fake_codex = write_fake_codex(fixture.path());
+        let program = match program_name {
+            "codex" => std::path::PathBuf::from("codex"),
+            "absolute-codex" => fake_codex.clone(),
+            name => {
+                let path = fixture.path().join(name);
+                write_fake_program(&path);
+                if name == "devbox" {
+                    std::path::PathBuf::from(name)
+                } else {
+                    path
+                }
+            }
+        };
+
+        let (output, args, observed_home) = run_wrapped_program(
+            &program,
+            home.path(),
+            fixture.path(),
+            &hook_list_response(Vec::new()),
+        );
+
+        assert!(
+            output.status.success(),
+            "wrapper failed for {program_name}: {output:?}"
+        );
+        assert_eq!(
+            observed_home,
+            home.path().display().to_string(),
+            "{program_name} did not inherit the pinned CODEX_HOME"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == TRUST_BYPASS_FLAG),
+            "{program_name} received the deleted invocation-global trust bypass: args={args:?}"
+        );
+    }
+}
+
+/// Scenario: Trust one deck hook in a Codex home with an existing commented config and a foreign trust record, repeat the write, then uninstall Codex hooks. Unrelated bytes and the foreign record must survive, the deck table must not duplicate, and uninstall must remove only the deck key.
+#[spec("codex/trust/003")]
+#[test]
+fn codex_trust_003_config_edits_are_preserving_idempotent_and_scoped() {
     let fixture = tempfile::tempdir().expect("create wrapper fixture");
     let home = tempfile::tempdir().expect("create Codex home");
-    let third_party_command = "/usr/local/bin/untrusted-third-party-hook";
-    write_hooks(
-        home.path(),
-        &json!({
-            "hooks": {
-                "PreToolUse": [{
-                    "hooks": [{"type": "command", "command": third_party_command}]
-                }]
-            }
-        }),
+    write_fake_codex(fixture.path());
+    let original = "# user comment must survive\nmodel = \"gpt-user-choice\"\n\n[hooks.state.\"foreign-key\"]\nenabled = true\ntrusted_hash = \"sha256:foreign\"\n";
+    std::fs::write(home.path().join("config.toml"), original).expect("seed Codex config");
+    let deck_key_template = "__CODEX_HOME__/hooks.json:pre_tool_use:0:0";
+    let deck_key = deck_key_template.replace("__CODEX_HOME__", &home.path().display().to_string());
+    let response = hook_list_response(vec![hook_entry(
+        deck_key_template,
+        "/opt/dot-agent-deck hook --agent codex",
+        "__CODEX_HOME__/hooks.json",
+        "sha256:deck",
+        false,
+    )]);
+
+    for _ in 0..2 {
+        let (output, _, _) = run_wrapped_program(
+            std::path::Path::new("codex"),
+            home.path(),
+            fixture.path(),
+            &response,
+        );
+        assert!(output.status.success(), "wrapper failed: {output:?}");
+    }
+
+    let trusted = std::fs::read_to_string(home.path().join("config.toml"))
+        .expect("read trusted Codex config");
+    assert!(
+        trusted.starts_with(original),
+        "existing config bytes, comments, and model selection must remain verbatim:\n{trusted}"
+    );
+    assert_eq!(
+        trusted
+            .matches(&format!("[hooks.state.\"{deck_key}\"]"))
+            .count(),
+        1,
+        "repeated trust writes must not duplicate the deck table:\n{trusted}"
+    );
+    assert_eq!(
+        trust_state_keys(home.path()),
+        vec![deck_key.clone(), "foreign-key".to_string()],
     );
 
-    let (output, args) = run_fake_codex("codex", home.path(), fixture.path());
-
-    assert!(output.status.success(), "wrapper failed: {output:?}");
-    let installed = read_hooks(home.path());
-    assert!(
-        installed["hooks"]["PreToolUse"]
-            .as_array()
-            .is_some_and(|rules| rules
-                .iter()
-                .any(|rule| rule["hooks"][0]["command"] == third_party_command)),
-        "third-party hook must remain user-controlled: {installed}"
+    let path = format!(
+        "{}:{}",
+        fixture.path().display(),
+        std::env::var("PATH").unwrap_or_default()
     );
+    let uninstall = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["hooks", "uninstall", "--agent", "codex"])
+        .env("PATH", path)
+        .env("CODEX_HOME", home.path())
+        .env("CODEX_HOOK_LIST_RESPONSE", &response)
+        .output()
+        .expect("uninstall Codex hooks");
     assert!(
-        !args.iter().any(|arg| arg == TRUST_BYPASS_FLAG),
-        "invocation-global trust bypass would trust the third-party hook too: args={args:?}"
+        uninstall.status.success(),
+        "Codex hook uninstall failed: {}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    assert_eq!(
+        trust_state_keys(home.path()),
+        vec!["foreign-key".to_string()],
+        "untrust must remove only the deck-owned key"
     );
 }
 
-/// Scenario: Launch an executable named codex that redirects CODEX_HOME to an uninspected home containing a foreign hook before invoking Codex. The deck must not let the redirected hook set receive its invocation-global trust bypass.
-#[spec("codex/trust/001")]
+/// Scenario: Run the documented Codex hook installation command against an isolated home and deterministic app-server stand-in. The command must succeed and materialize Codex hook definitions instead of reporting that no installer exists.
+#[spec("codex/hooks/004")]
 #[test]
-fn codex_trust_001_vetted_home_cannot_be_swapped_under_bypass() {
-    let fixture = tempfile::tempdir().expect("create Codex launcher fixture");
-    let vetted_home = tempfile::tempdir().expect("create vetted Codex home");
-    let swapped_home = tempfile::tempdir().expect("create swapped Codex home");
-    write_hooks(
-        swapped_home.path(),
-        &json!({
-            "hooks": {
-                "PreToolUse": [{
-                    "hooks": [{"type": "command", "command": "/uninspected/foreign-hook"}]
-                }]
-            }
-        }),
+fn codex_hooks_004_cli_install_succeeds() {
+    let fixture = tempfile::tempdir().expect("create CLI fixture");
+    let home = tempfile::tempdir().expect("create Codex home");
+    write_fake_codex(fixture.path());
+    let path = format!(
+        "{}:{}",
+        fixture.path().display(),
+        std::env::var("PATH").unwrap_or_default()
     );
-    let launcher = fixture.path().join("codex");
-    let launch_record = fixture.path().join("launch.txt");
-    std::fs::write(
-        &launcher,
-        "#!/bin/sh\nexport CODEX_HOME=\"$SWAPPED_CODEX_HOME\"\nprintf 'home=%s\\n' \"$CODEX_HOME\" > \"$CODEX_LAUNCH_RECORD\"\nprintf 'arg=%s\\n' \"$@\" >> \"$CODEX_LAUNCH_RECORD\"\n",
-    )
-    .expect("write CODEX_HOME-swapping launcher");
-    let mut permissions = std::fs::metadata(&launcher)
-        .expect("stat CODEX_HOME-swapping launcher")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&launcher, permissions)
-        .expect("make CODEX_HOME-swapping launcher executable");
 
     let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
-        .args(["wrap", "--agent", "codex", "--"])
-        .arg(&launcher)
-        .env("CODEX_HOME", vetted_home.path())
-        .env("SWAPPED_CODEX_HOME", swapped_home.path())
-        .env("CODEX_LAUNCH_RECORD", &launch_record)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .args(["hooks", "install", "--agent", "codex"])
+        .env("PATH", path)
+        .env("CODEX_HOME", home.path())
+        .env("CODEX_HOOK_LIST_RESPONSE", hook_list_response(Vec::new()))
         .output()
-        .expect("run CODEX_HOME-swapping launcher");
-    let observed = std::fs::read_to_string(&launch_record).expect("read Codex launch record");
-    let bypass_reached_swapped_home = observed
-        .lines()
-        .any(|line| line == format!("arg={TRUST_BYPASS_FLAG}"))
-        && observed.contains(&format!("home={}", swapped_home.path().display()));
+        .expect("install Codex hooks from CLI");
 
-    assert!(output.status.success(), "wrapper failed: {output:?}");
     assert!(
-        !bypass_reached_swapped_home,
-        "an uninspected CODEX_HOME must never receive the global trust bypass; launch={observed:?}"
+        output.status.success(),
+        "documented Codex hook install must succeed; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        hooks_path(home.path()).exists(),
+        "successful Codex hook install did not create hooks.json"
     );
 }

@@ -1925,11 +1925,25 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 #### codex/trust
 
-##### codex/trust/001 — The hook-trust bypass cannot cross to an uninspected CODEX_HOME (PRD #20 Greptile finding #6).
-- **Layer:** L1/fast real-binary subprocess integration with controlled Codex homes and a launcher named `codex`.
-- **Agent:** deterministic launcher that redirects `CODEX_HOME` before recording its effective home and argv.
-- **Asserts:** a foreign hook set in a home other than the one vetted by the deck never receives `--dangerously-bypass-hook-trust`.
-- **Does not assert:** real Codex hook execution or native event ingestion.
+##### codex/trust/001 — No Codex launch form receives an invocation-global hook-trust bypass (PRD #20 Greptile P1 close-by-deletion).
+- **Layer:** L1/fast real-binary subprocess integration with controlled Codex homes and executable stand-ins.
+- **Agent:** deterministic bare `codex`, absolute `/path/codex`, launcher script, and `devbox` stand-ins.
+- **Asserts:** every launch form inherits the pinned `CODEX_HOME`, and none receives `--dangerously-bypass-hook-trust`; the hazardous global mechanism is absent rather than launcher-identity-gated.
+- **Does not assert:** scoped trust records (covered by `codex/trust/002`–`003`) or real Codex hook execution.
+- **Platform coverage:** mac+linux.
+
+##### codex/trust/002 — Scoped trust selects only pinned-home, unmanaged, deck-owned hook entries (PRD #20 §4.3.1/§4.3.6).
+- **Layer:** L1/fast real-binary subprocess integration with a deterministic `codex app-server` JSON-RPC stand-in, exercised through both bare Codex and a launcher script.
+- **Agent:** synthetic Codex hooks/list response containing one eligible deck hook plus a foreign command, a deck command from a different home, a managed entry, and a user command that merely mentions `dot-agent-deck`.
+- **Asserts:** `[hooks.state]` contains only the eligible entry whose `sourcePath` is the pinned home's `hooks.json`, command ends in `hook --agent codex`, and `isManaged` is false; the global bypass never appears for either launch method.
+- **Does not assert:** byte-preserving config edits or untrust behavior (covered by `codex/trust/003`).
+- **Platform coverage:** mac+linux.
+
+##### codex/trust/003 — Scoped trust config edits preserve user bytes, remain idempotent, and untrust only deck keys (PRD #20 §4.3.2).
+- **Layer:** L1/fast real-binary subprocess integration with an isolated Codex home and deterministic app-server stand-in.
+- **Agent:** synthetic deck hook identity plus a pre-existing user `config.toml` containing a comment, model selection, and foreign trust record.
+- **Asserts:** trust appends exactly one hash-pinned deck table while preserving the existing config bytes verbatim; a second write creates no duplicate; Codex hook uninstall removes the deck key and retains the foreign key.
+- **Does not assert:** Codex's runtime trust-status interpretation (covered by the real-agent green-confirm scenario).
 - **Platform coverage:** mac+linux.
 
 #### codex/spawn
@@ -1985,6 +1999,27 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** stdout JSONL classification (covered by `codex/wrap/001`) or exact model prose.
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 - **Cost note:** one minimal mini-model availability probe plus one short interactive shell-tool turn.
+
+##### codex/hooks/002 — A script-launched Codex inherits its pinned home and exactly the deck's scoped trust records (PRD #20 §4.3.5).
+- **Layer:** L2 synthetic real-binary subprocess under the `e2e` feature; deterministic launcher and `codex app-server` stand-ins, no LLM.
+- **Agent:** launcher script executing a Codex stand-in with all ten deck hook identities returned by hooks/list.
+- **Asserts:** `hooks.json` is installed, the child inherits the pinned `CODEX_HOME`, child argv has no global bypass, and `[hooks.state]` names exactly the ten deck keys.
+- **Does not assert:** rendered dashboard behavior or real Codex hook execution.
+- **Platform coverage:** mac+linux.
+
+##### codex/hooks/003 — Command-agnostic startup integration delivers Codex events from a non-Codex-basename launcher (PRD #20 §4.2.1/§4.3.6).
+- **Layer:** L2 PTY-attached (`TuiDeck`, real binary + daemon, deterministic launcher and app-server stand-ins, no LLM).
+- **Agent:** restored `/bin/sh startup-parity-launcher.sh` pane whose command cannot infer Codex identity; the launcher emits a Codex hook event only after startup scoped trust exists.
+- **Asserts:** daemon/TUI startup installs and trusts Codex hooks independently of the pane command basename, then the emitted prompt visibly creates a Codex card showing Thinking and the prompt sentinel.
+- **Does not assert:** wrapper classification, explicit role `agent = "codex"`, or real Codex execution.
+- **Platform coverage:** mac+linux.
+
+##### codex/hooks/004 — The documented Codex hook-install CLI succeeds (PRD #20 §4.2.1).
+- **Layer:** L1/fast real-binary subprocess integration with an isolated home and deterministic Codex app-server stand-in.
+- **Agent:** synthetic Codex installation environment.
+- **Asserts:** `dot-agent-deck hooks install --agent codex` exits successfully and creates `hooks.json` instead of reporting `No hook installer for agent Codex`.
+- **Does not assert:** uninstall scoping (covered by `codex/trust/003`) or dashboard rendering.
+- **Platform coverage:** mac+linux.
 
 #### codex/live
 

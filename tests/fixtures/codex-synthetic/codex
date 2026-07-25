@@ -1,0 +1,7 @@
+#!/bin/sh
+if [ "${1:-}" = app-server ]; then
+    IFS= read -r _initialize
+    printf '%s\n' '{"id":1,"result":{"userAgent":"startup-parity-test","codexHome":"test","platformFamily":"unix","platformOs":"linux"}}'
+    IFS= read -r _list
+    printf '%s\n' "$CODEX_HOOK_LIST_RESPONSE" | sed "s|__CODEX_HOME__|$CODEX_HOME|g"
+fi
