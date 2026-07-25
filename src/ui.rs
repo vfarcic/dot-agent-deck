@@ -2273,6 +2273,12 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
                 is_start_role,
                 orchestration_cwd,
                 display_title,
+                // PRD #140: the per-tab instance token is not part of the
+                // hydration bucket key yet — M3.0 folds it in so two
+                // same-`(name, cwd)` tabs rebuild as two tabs instead of
+                // merging. Bound explicitly (not via `..`) so that milestone
+                // is a compiler-visible edit here rather than a silent miss.
+                orchestration_id: _,
             }) => {
                 // Round-12 reviewer #1: bucket by `(orchestration_cwd,
                 // name)` — the same identity tuple the daemon uses for
@@ -14444,6 +14450,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
             hydrated(
@@ -14457,6 +14464,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
             hydrated(
@@ -14470,6 +14478,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
         ];
@@ -14505,6 +14514,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: None, // leading slot omits the title
+                    orchestration_id: None,
                 }),
             ),
             hydrated(
@@ -14518,6 +14528,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some(orch_cwd.clone()),
                     display_title: Some("My Custom Run".into()),
+                    orchestration_id: None,
                 }),
             ),
         ];
@@ -14548,6 +14559,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/home/u/project-a".into()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
             hydrated(
@@ -14561,6 +14573,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/home/u/project-b".into()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
         ];
@@ -14589,6 +14602,7 @@ mod tests {
                 is_start_role: true,
                 orchestration_cwd: None,
                 display_title: None,
+                orchestration_id: None,
             }),
         )];
         let p = partition_hydrated_panes(&panes);
@@ -14610,6 +14624,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
             hydrated(
@@ -14623,6 +14638,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
         ];
@@ -15095,6 +15111,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
             hydrated(
@@ -15108,6 +15125,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
         ];
@@ -15137,6 +15155,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: None,
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
         ];
@@ -15174,6 +15193,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
             hydrated(
@@ -15187,6 +15207,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
         ];
@@ -15232,6 +15253,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
             hydrated(
@@ -15245,6 +15267,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
         ];
@@ -15374,6 +15397,7 @@ mod tests {
                     is_start_role: true,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
             hydrated(
@@ -15387,6 +15411,7 @@ mod tests {
                     is_start_role: false,
                     orchestration_cwd: Some("/remote/proj".into()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             ),
         ];

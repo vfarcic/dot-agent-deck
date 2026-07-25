@@ -401,6 +401,7 @@ async fn start_agent_rejects_orchestration_cwd_with_control_byte() {
                 is_start_role: false,
                 orchestration_cwd: Some("/proj/\x1b[31m".into()),
                 display_title: None,
+                orchestration_id: None,
             }),
             agent_type: None,
             seed: None,
@@ -438,6 +439,7 @@ async fn start_agent_with_orchestration_membership_round_trip() {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         },
     )
     .await;
@@ -456,6 +458,7 @@ async fn start_agent_with_orchestration_membership_round_trip() {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         })
     );
     server.registry.shutdown_all();

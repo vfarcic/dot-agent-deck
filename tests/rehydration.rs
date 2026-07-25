@@ -1116,6 +1116,7 @@ async fn dead_role_stays_visible_on_reconnect_as_placeholder_card() {
                     is_start_role: role_index == 0,
                     orchestration_cwd: Some(cwd.clone()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
                 ..Default::default()
             })
@@ -1357,6 +1358,7 @@ async fn restore_007_warm_daemon_hydrates_orchestration_roles_in_order_inner() {
                     is_start_role: role_index == 0,
                     orchestration_cwd: Some(cwd.clone()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
                 ..Default::default()
             })

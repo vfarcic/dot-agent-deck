@@ -318,7 +318,61 @@ pub enum TabMembership {
         /// older clients) means the title falls back to the canonical name.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_title: Option<String>,
+        /// PRD #140 M1.0: a per-TAB instance token, minted once when the
+        /// orchestration tab is created and stamped on every role pane in
+        /// that tab. Opaque to the daemon — it never parses or interprets
+        /// the value, it only compares it for equality when deciding which
+        /// panes belong to the same routing group
+        /// ([`crate::state::OrchestrationIdentity`]).
+        ///
+        /// Distinct from the other three identity-ish fields: `name` is the
+        /// CONFIG identity (which orchestration this is), `orchestration_cwd`
+        /// is the DIRECTORY disambiguator (round-11 auditor #C), and
+        /// `display_title` is presentation-only. Neither `name` nor
+        /// `orchestration_cwd` distinguishes two tabs of the SAME
+        /// orchestration opened from the SAME directory — that pair produces
+        /// byte-identical `(name, cwd)` identities and the daemon
+        /// cross-delivers delegate/work-done between them (issue #140). The
+        /// instance token is what makes each tab its own routing group.
+        ///
+        /// `Option<String>` with `#[serde(default, skip_serializing_if)]` so
+        /// older peers round-trip cleanly: a client predating this field
+        /// sends nothing and the daemon falls back to the `(name, cwd)`
+        /// identity, exactly the pre-#140 behaviour.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orchestration_id: Option<String>,
     },
+}
+
+/// PRD #140 M1.2/M1.3: mint a fresh per-tab orchestration instance token.
+///
+/// Called ONCE per orchestration tab (before the `for role in config.roles`
+/// loop) and stamped on every role pane's
+/// [`TabMembership::Orchestration::orchestration_id`], so all roles of one tab
+/// share a token and no two tabs ever do. The value is opaque — only equality
+/// matters — but it must satisfy [`is_valid_display_name`] so it survives
+/// [`validate_tab_membership`] at the wire boundary.
+///
+/// Uniqueness follows the same recipe as `ui::mint_delivery_id`: a per-PROCESS
+/// nonce (pid hashed with the epoch nanos at first use, so two processes — and
+/// a pid reused across restarts — never collide) combined with a global
+/// monotonic counter (so two tabs within one process never collide). The token
+/// deliberately does NOT need to be reproducible across restarts: a live tab
+/// re-hydrates its id from the daemon echo, it is never regenerated.
+pub fn mint_orchestration_id() -> String {
+    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nonce = *NONCE.get_or_init(|| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::process::id().hash(&mut h);
+        if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            dur.as_nanos().hash(&mut h);
+        }
+        h.finish()
+    });
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("orch-{nonce:016x}-{seq}")
 }
 
 impl TabMembership {
@@ -377,6 +431,7 @@ pub fn validate_tab_membership(mut tm: TabMembership) -> Option<TabMembership> {
         role_name,
         orchestration_cwd,
         display_title,
+        orchestration_id,
         ..
     } = &mut tm
     {
@@ -392,6 +447,22 @@ pub fn validate_tab_membership(mut tm: TabMembership) -> Option<TabMembership> {
         }
         if let Some(c) = orchestration_cwd.as_deref()
             && !is_valid_orchestration_cwd(c)
+        {
+            return None;
+        }
+        // PRD #140 M1.1: the instance token gets the same control-byte /
+        // size discipline as role_name and orchestration_cwd — it is echoed
+        // back through `list_agents` and logged, so a hostile same-user peer
+        // could otherwise smuggle escape sequences through it.
+        //
+        // An invalid token REJECTS the whole membership rather than being
+        // nulled out the way `display_title` is. `display_title` is cosmetic
+        // with a defined fallback; the instance token is a ROUTING key, and
+        // silently dropping it would merge two same-`(name, cwd)` tabs back
+        // into one routing group — reintroducing exactly the cross-delivery
+        // this PRD fixes, invisibly.
+        if let Some(id) = orchestration_id.as_deref()
+            && !is_valid_display_name(id)
         {
             return None;
         }
@@ -3116,6 +3187,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: Some("/proj/\0evil".into()),
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3129,6 +3201,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: Some("/proj/\x1b[31m".into()),
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3146,6 +3219,7 @@ mod tests {
             // cwd happens to match.
             orchestration_cwd: Some("relative/proj".into()),
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3160,6 +3234,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: Some(oversized),
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3173,6 +3248,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: Some("/home/user/project-a".into()),
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_some());
     }
@@ -3190,6 +3266,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3203,6 +3280,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_some());
     }
@@ -3220,6 +3298,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3233,6 +3312,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3251,6 +3331,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: Some("\x1b[31mpwn".into()),
+            orchestration_id: None,
         };
         let validated = validate_tab_membership(tm).expect("membership preserved");
         match validated {
@@ -3270,6 +3351,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: Some("My\0Run".into()),
+            orchestration_id: None,
         };
         let validated = validate_tab_membership(tm).expect("membership preserved");
         match validated {
@@ -3289,6 +3371,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: Some("My Custom Run".into()),
+            orchestration_id: None,
         };
         let validated = validate_tab_membership(tm).expect("membership preserved");
         match validated {
@@ -3311,8 +3394,162 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_some());
+    }
+
+    // -----------------------------------------------------------------
+    // PRD #140 M1.0 / M1.1 — the per-tab orchestration instance token.
+    // -----------------------------------------------------------------
+
+    /// M1.0: the token survives a serialize → deserialize round-trip. It is
+    /// the daemon's routing key, so losing it on the wire would silently
+    /// merge two tabs back into one routing group.
+    #[test]
+    fn tab_membership_orchestration_id_survives_serde_round_trip() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 1,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: Some("/home/user/project-a".into()),
+            display_title: Some("My Custom Run".into()),
+            orchestration_id: Some("abc".into()),
+        };
+        let json = serde_json::to_string(&tm).expect("serialize");
+        assert!(
+            json.contains("\"orchestration_id\":\"abc\""),
+            "token must be on the wire, got {json}"
+        );
+        let back: TabMembership = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, tm);
+    }
+
+    /// M1.0: `skip_serializing_if` keeps the field off the wire when absent,
+    /// so a NEWER client talking to an OLDER daemon sends the pre-#140 frame
+    /// shape byte for byte.
+    #[test]
+    fn tab_membership_omits_absent_orchestration_id_from_the_wire() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: true,
+            orchestration_cwd: None,
+            display_title: None,
+            orchestration_id: None,
+        };
+        let json = serde_json::to_string(&tm).expect("serialize");
+        assert!(
+            !json.contains("orchestration_id"),
+            "absent token must be skipped, got {json}"
+        );
+    }
+
+    /// M1.0: the older wire shape (no `orchestration_id` key at all — what an
+    /// OLDER client sends to a NEWER daemon) deserializes to `None`, which is
+    /// the daemon's cue to fall back to the `(name, cwd)` identity.
+    #[test]
+    fn tab_membership_without_orchestration_id_deserializes_to_none() {
+        let legacy = r#"{
+            "kind": "orchestration",
+            "name": "tdd-cycle",
+            "role_index": 2,
+            "role_name": "coder",
+            "is_start_role": false,
+            "orchestration_cwd": "/home/user/project-a"
+        }"#;
+        let tm: TabMembership = serde_json::from_str(legacy).expect("legacy shape parses");
+        match tm {
+            TabMembership::Orchestration {
+                orchestration_id,
+                orchestration_cwd,
+                ..
+            } => {
+                assert_eq!(orchestration_id, None);
+                assert_eq!(orchestration_cwd.as_deref(), Some("/home/user/project-a"));
+            }
+            _ => panic!("expected Orchestration variant"),
+        }
+    }
+
+    /// M1.1: a control-byte token is rejected outright. Unlike `display_title`
+    /// (nulled out, cosmetic), dropping a routing key silently would merge two
+    /// same-`(name, cwd)` tabs into one group — the very bug #140 fixes.
+    #[test]
+    fn validate_tab_membership_rejects_orchestration_id_with_ansi_escape() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: None,
+            display_title: None,
+            orchestration_id: Some("\x1b[31mpwn".into()),
+        };
+        assert!(validate_tab_membership(tm).is_none());
+    }
+
+    #[test]
+    fn validate_tab_membership_rejects_orchestration_id_with_nul_byte() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: None,
+            display_title: None,
+            orchestration_id: Some("orch\0-1".into()),
+        };
+        assert!(validate_tab_membership(tm).is_none());
+    }
+
+    #[test]
+    fn validate_tab_membership_rejects_oversized_orchestration_id() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: None,
+            display_title: None,
+            orchestration_id: Some("a".repeat(DISPLAY_NAME_MAX_LEN + 1)),
+        };
+        assert!(validate_tab_membership(tm).is_none());
+    }
+
+    #[test]
+    fn validate_tab_membership_accepts_well_formed_orchestration_id() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: Some("/home/user/project-a".into()),
+            display_title: None,
+            orchestration_id: Some(mint_orchestration_id()),
+        };
+        let validated = validate_tab_membership(tm).expect("membership preserved");
+        match validated {
+            TabMembership::Orchestration {
+                orchestration_id, ..
+            } => assert!(orchestration_id.is_some(), "token preserved verbatim"),
+            _ => panic!("expected Orchestration variant"),
+        }
+    }
+
+    /// M1.2/M1.3: two tabs created in the same process must never collide,
+    /// and every minted token must survive the wire-boundary validation
+    /// (otherwise the whole membership would be dropped at spawn).
+    #[test]
+    fn mint_orchestration_id_is_unique_and_wire_valid() {
+        let ids: std::collections::HashSet<String> =
+            (0..1000).map(|_| mint_orchestration_id()).collect();
+        assert_eq!(ids.len(), 1000, "minted tokens must not collide");
+        for id in &ids {
+            assert!(is_valid_display_name(id), "token {id} must pass validation");
+        }
     }
 }
 

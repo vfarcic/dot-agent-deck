@@ -282,7 +282,10 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
         st.pane_role_map
             .insert(WORKER_PANE.to_string(), WORKER_ROLE.to_string());
         st.orchestrator_pane_ids.insert(ORCH_PANE.to_string());
-        let orch = ("pi-orchestration".to_string(), cwd_str.clone());
+        let orch = dot_agent_deck::state::OrchestrationIdentity::NameCwd {
+            name: "pi-orchestration".to_string(),
+            cwd: cwd_str.clone(),
+        };
         st.pane_orchestration_map
             .insert(ORCH_PANE.to_string(), orch.clone());
         st.pane_orchestration_map
