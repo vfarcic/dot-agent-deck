@@ -80,6 +80,10 @@ windows-sys = { version = "0.59", features = [
     # Also where `SetNamedSecurityInfo` lives for the M4 dir ACLs.
     "Win32_Security_Authorization",
     "Win32_System_JobObjects",
+    # PRD #163 M3: `GenerateConsoleCtrlEvent`/`CTRL_BREAK_EVENT`, the best-effort
+    # `killpg(SIGTERM)` stand-in `platform::proc` sends an agent's process group
+    # before the `TerminateJobObject` backstop.
+    "Win32_System_Console",
 ] }
 # `%USERPROFILE%` / `%LOCALAPPDATA%` resolution for `src/platform/paths.rs`.
 dirs = "6"

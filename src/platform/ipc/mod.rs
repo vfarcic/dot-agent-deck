@@ -43,3 +43,19 @@ mod windows;
 pub use unix::{IpcClient, IpcListener, IpcReadHalf, IpcStream, IpcWriteHalf};
 #[cfg(windows)]
 pub use windows::{IpcClient, IpcListener, IpcReadHalf, IpcStream, IpcWriteHalf};
+
+/// Whether an endpoint's *presence* can be observed on the filesystem.
+///
+/// `true` on Unix: the endpoint is a socket file, so `Path::exists()` is a
+/// meaningful (if not authoritative) liveness hint — the daemon does not unlink
+/// its socket on exit, but a missing file definitely means no daemon.
+///
+/// `false` on Windows: a `\\.\pipe\…` name has no filesystem presence at all
+/// (`GetFileAttributesW` answers `ERROR_BAD_PATHNAME`), so `exists()` is
+/// permanently `false` whether or not a daemon is serving. Any code that treats
+/// "path missing" as "daemon gone" must therefore consult this first and fall
+/// back to an actual connect attempt — see
+/// [`crate::build_version_handshake`]'s `poll_daemon_gone`, where an
+/// unconditional `exists()` check would declare *every* live Windows daemon gone
+/// on the first poll (PRD #163: "`poll_daemon_gone` path-existence check").
+pub const ENDPOINT_IS_FILESYSTEM_PATH: bool = cfg!(unix);

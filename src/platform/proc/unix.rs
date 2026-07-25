@@ -9,6 +9,32 @@ use std::time::Duration;
 // Agent process-group teardown (lifted from agent_pty.rs).
 // ---------------------------------------------------------------------------
 
+/// PRD #163 M3 — Unix has nothing to hold here.
+///
+/// An agent's descendant tree is already addressable on Unix: `portable-pty`
+/// `setsid`s the child, which makes it a process-group leader, so `killpg(pid,
+/// …)` reaches the agent *and* everything it spawned with no bookkeeping at all.
+/// This zero-sized type exists only so the spawn/teardown seam has the same
+/// shape on both platforms — Windows has no implicit grouping and must own a Job
+/// Object handle for the agent's whole lifetime (see the windows backend), which
+/// is why the handle has to be created at spawn and carried on
+/// [`crate::agent_pty::RunningAgent`].
+///
+/// Being a ZST, it is `Send`/`Sync`/`Default` for free and costs nothing in
+/// `AgentPty`/`RunningAgent`; the Unix teardown paths ignore it entirely and
+/// keep using `killpg`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AgentProcessGroup;
+
+impl AgentProcessGroup {
+    /// No-op on Unix: the process group the kill paths use is the one
+    /// `portable-pty`'s `setsid` already established, so there is nothing to
+    /// create and nothing that can fail.
+    pub fn adopt(_pid: Option<u32>) -> Self {
+        Self
+    }
+}
+
 /// PRD #92 F1 followup (defensive): convert a portable-pty `process_id()`
 /// (a `u32`) into a positive `libc::pid_t` suitable for `killpg`, or `None` if
 /// the raw value can't legally name a process group.
@@ -98,7 +124,14 @@ fn signal_child_pgroup_or_fallback(
 /// cannot be caught or ignored, so the kernel tears the process down and
 /// `wait()` returns promptly. Callers should drop the master/writer/reader
 /// handles before invoking this so any I/O blocked on the PTY unblocks first.
-pub fn force_kill_child_and_wait(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
+///
+/// `_group` is the cross-platform teardown handle (PRD #163 M3) and is unused on
+/// Unix — see [`AgentProcessGroup`]; the process group `killpg` addresses is
+/// implicit in the child's own pid.
+pub fn force_kill_child_and_wait(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    _group: &AgentProcessGroup,
+) {
     signal_child_pgroup_or_fallback(child, libc::SIGKILL, "force-kill");
     let _ = child.wait();
 }
@@ -107,9 +140,12 @@ pub fn force_kill_child_and_wait(child: &mut Box<dyn portable_pty::Child + Send 
 /// `SIGTERM` to the child's process group, polls `try_wait` until the child
 /// exits or `grace` elapses, then sends `SIGKILL` as the backstop and reaps the
 /// child.
+///
+/// `_group` is unused on Unix (see [`force_kill_child_and_wait`]).
 pub fn terminate_child_with_grace_and_wait(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     grace: Duration,
+    _group: &AgentProcessGroup,
 ) {
     // Phase 1: SIGTERM the process group.
     signal_child_pgroup_or_fallback(child, libc::SIGTERM, "graceful-close-sigterm");

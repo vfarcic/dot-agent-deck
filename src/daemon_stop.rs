@@ -11,10 +11,14 @@
 //!    every change in this PRD, so a stale daemon answers normally.
 //!    Refuse without `--force` when ≥1 agent is alive (data-loss
 //!    guard).
-//! 3. **SIGTERM + poll + optional SIGKILL escalation** —
+//! 3. **Graceful + poll + optional force escalation** —
 //!    [`crate::build_version_handshake::terminate_daemon_graceful`]
 //!    handles both stages; this module just decides whether to pass
-//!    `force_kill_after = Some(...)` based on the `--force` flag.
+//!    `force_kill_after = Some(...)` based on the `--force` flag. Which
+//!    mechanism each stage uses is the platform's business (PRD #163 M3,
+//!    [`crate::platform::proc::GRACEFUL_STOP_DELIVERY`]): `SIGTERM` then
+//!    `SIGKILL` on Unix; the shared `KIND_SHUTDOWN`/ACK frame then
+//!    `TerminateProcess` on Windows, which has no signals.
 //!
 //! `restart` is implemented as a thin wrapper: it runs `stop` and
 //! returns. The next TUI invocation lazy-spawns a fresh daemon per
@@ -66,8 +70,9 @@ pub enum StopError {
     /// SIGTERM (and SIGKILL if `--force`) failed to take the daemon
     /// down within the configured timeouts.
     TimedOut { pid: u32 },
-    /// `libc::kill` itself failed (typically ESRCH if the daemon already
-    /// exited between probe and signal).
+    /// The termination call itself failed — `libc::kill` on Unix (typically
+    /// ESRCH if the daemon already exited between probe and signal),
+    /// `OpenProcess`/`TerminateProcess` on Windows.
     KillFailed(io::Error),
 }
 
