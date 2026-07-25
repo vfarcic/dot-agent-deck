@@ -672,6 +672,70 @@ fn live_schedule_names() -> HashSet<String> {
     }
 }
 
+/// PRD #140 M4.0: the non-blocking warning shown in the new-pane form when the
+/// picked directory ALREADY hosts a live orchestration. Two orchestrations in
+/// one directory are legal — the daemon routes them as separate groups since
+/// M2.0 — but they still share the two resources the daemon can't partition:
+/// the `.dot-agent-deck/*-{role}.md` coordination files (one file per role, so a
+/// second orchestration's orchestrator writes over the first's brief) and the
+/// working tree itself (both sets of workers edit the same checkout).
+/// `/worktree-prd` is the isolated alternative.
+///
+/// Every line is kept inside the form's 52-column base inner width so the copy
+/// survives un-clipped even on a narrow terminal; the render also grows the
+/// modal to fit it (see [`render_new_pane_form`]).
+const SAME_CWD_ORCHESTRATION_WARNING: [&str; 3] = [
+    "  ! This directory already runs an orchestration.",
+    "    Both share .dot-agent-deck/*-{role}.md files",
+    "    and one working tree; /worktree-prd isolates.",
+];
+
+/// PRD #140 M4.0: the shared warning DECISION — does `form_cwd` collide with
+/// any directory the daemon reports as hosting a live orchestration? The single
+/// code path behind both the L1 seam
+/// ([`render_new_pane_orchestration_guard_to_buffer`]) and the interactive
+/// `Ctrl+n` flow, so the test and the real form can't drift apart.
+///
+/// Compared as [`Path`]s rather than strings so a trailing separator
+/// (`/work/proj/` vs `/work/proj`) doesn't read as a fresh directory; both sides
+/// are absolute paths minted by the same TUI (the form's picked dir and the
+/// daemon's echoed `orchestration_cwd`), so no canonicalisation (which would hit
+/// the filesystem from a render path) is attempted.
+fn live_orchestration_in_same_cwd(form_cwd: &Path, live_orchestration_cwds: &[String]) -> bool {
+    live_orchestration_cwds
+        .iter()
+        .any(|c| Path::new(c) == form_cwd)
+}
+
+/// PRD #140 M4.0: directories that currently host a live orchestration, derived
+/// from the daemon's `ListAgents` — the same one-shot socket query
+/// [`live_schedule_names`] uses at dialog-open time, and the same records the
+/// hydration path buckets. A down daemon degrades to "no live orchestrations"
+/// (no warning), which is the right failure direction for an informational hint.
+///
+/// Only `TabMembership::Orchestration` panes contribute, and only via the
+/// tab-wide `orchestration_cwd` (never the per-pane cwd, which round-9 #2 let
+/// diverge into sub-directories). Duplicates are dropped so N role panes of one
+/// orchestration don't inflate the list.
+fn live_orchestration_cwds() -> Vec<String> {
+    let Ok(resp) = send_daemon_request_blocking(&crate::daemon_protocol::AttachRequest::ListAgents)
+    else {
+        return Vec::new();
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    resp.agent_records
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| match r.tab_membership {
+            Some(TabMembership::Orchestration {
+                orchestration_cwd, ..
+            }) => orchestration_cwd,
+            _ => None,
+        })
+        .filter(|cwd| seen.insert(cwd.clone()))
+        .collect()
+}
+
 /// PRD #80 M8: which new-pane-form field is focused. Public because it rides
 /// in [`Action::FormFocusField`] (a click on a field's row focuses it, the
 /// same as Tab landing there).
@@ -746,6 +810,13 @@ struct NewPaneFormState {
     /// row's values and calls `schedule update`) and the ` Edit Schedule ` title.
     /// Only ever `Some` when `schedule_locked` is `true`.
     schedule_existing: Option<config::ScheduledTask>,
+    /// PRD #140 M4.0: directories the daemon reported as hosting a live
+    /// orchestration, snapshotted once when the form opens (see
+    /// [`live_orchestration_cwds`]). Drives the non-blocking same-cwd warning
+    /// via [`NewPaneFormState::same_cwd_orchestration_warning`]. Empty (the
+    /// default) means "nothing known" → no warning, so every other form
+    /// construction site renders byte-for-byte as before.
+    live_orchestration_cwds: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -824,7 +895,31 @@ impl NewPaneFormState {
             // PRD #170: the ordinary `Ctrl+n` form is never locked.
             schedule_locked: false,
             schedule_existing: None,
+            // PRD #140 M4.0: the caller attaches the daemon's live-orchestration
+            // cwds via `with_live_orchestration_cwds`; unattached means no
+            // warning.
+            live_orchestration_cwds: Vec::new(),
         }
+    }
+
+    /// PRD #140 M4.0: attach the daemon's live-orchestration directories to the
+    /// form so a same-cwd selection renders the non-blocking shared-resource
+    /// warning. Kept a separate builder step (rather than a 6th `new` parameter)
+    /// so the many existing construction sites — and the daemon-free L1 seams —
+    /// stay untouched.
+    fn with_live_orchestration_cwds(mut self, cwds: Vec<String>) -> Self {
+        self.live_orchestration_cwds = cwds;
+        self
+    }
+
+    /// PRD #140 M4.0: whether the form should render
+    /// [`SAME_CWD_ORCHESTRATION_WARNING`] — an orchestration is selected AND its
+    /// directory already hosts a live one. Selecting "No mode", a plain mode, or
+    /// either authoring option never warns: the shared-resource risk is specific
+    /// to a second orchestration's role files and workers.
+    fn same_cwd_orchestration_warning(&self) -> bool {
+        self.selected_orchestration().is_some()
+            && live_orchestration_in_same_cwd(&self.dir, &self.live_orchestration_cwds)
     }
 
     /// PRD #170 (unify): build the new-pane form MODE-LOCKED to schedule
@@ -879,6 +974,9 @@ impl NewPaneFormState {
             focused: FormField::Command,
             schedule_locked: true,
             schedule_existing: existing,
+            // PRD #140 M4.0: the locked schedule form can't select an
+            // orchestration, so the same-cwd warning never applies to it.
+            live_orchestration_cwds: Vec::new(),
         };
         // Lock the selection onto the built-in schedule option (index 1 with no
         // modes/orchestrations) so the existing schedule spawn branch fires.
@@ -2218,10 +2316,13 @@ pub(crate) struct HydrationPartition {
 ///   duplicates from the same pairing are logged and dropped to the
 ///   dashboard so a buggy daemon can't double-build a single mode tab.
 /// - `Some(Orchestration { name, role_index })` → orchestration bucket
-///   keyed by `(cwd, orch_name)`, collecting `(role_index, pane_id)`.
-///   The bucket may be sparse (a role can be missing if its agent died
-///   before the TUI reattached); the dispatcher expands this to a
-///   `Vec<Option<String>>` of full role-count length.
+///   keyed by the same [`crate::state::OrchestrationIdentity`] the daemon
+///   routes on (PRD #140 M3.0): a per-tab `orchestration_id` token keys
+///   `Instance { id, name }`, and its absence falls back to the legacy
+///   `NameCwd { name, cwd }` tuple. Each bucket collects
+///   `(role_index, pane_id)` and may be sparse (a role can be missing if
+///   its agent died before the TUI reattached); the dispatcher expands
+///   this to a `Vec<Option<String>>` of full role-count length.
 ///
 /// Ordering is stable: dashboard panes preserve input order, mode and
 /// orchestration buckets preserve the order in which their (cwd, name)
@@ -2235,7 +2336,10 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
     // this partition pass. Index into `out.mode_buckets` /
     // `out.orchestration_buckets` keyed by `(cwd, name)`.
     let mut mode_keys: HashSet<(String, String)> = HashSet::new();
-    let mut orch_index: std::collections::HashMap<(String, String), usize> =
+    // PRD #140 M3.0: orchestration buckets are keyed by the SAME identity the
+    // daemon routes delegate / work-done on, so a reattach reconstructs exactly
+    // the tabs the daemon considers distinct routing groups.
+    let mut orch_index: std::collections::HashMap<crate::state::OrchestrationIdentity, usize> =
         std::collections::HashMap::new();
 
     for h in hydrated {
@@ -2273,12 +2377,11 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
                 is_start_role,
                 orchestration_cwd,
                 display_title,
-                // PRD #140: the per-tab instance token is not part of the
-                // hydration bucket key yet — M3.0 folds it in so two
+                // PRD #140 M3.0: the per-tab instance token IS part of the
+                // hydration bucket key (see `key` below) so two
                 // same-`(name, cwd)` tabs rebuild as two tabs instead of
-                // merging. Bound explicitly (not via `..`) so that milestone
-                // is a compiler-visible edit here rather than a silent miss.
-                orchestration_id: _,
+                // merging into one and orphaning half the panes.
+                orchestration_id,
             }) => {
                 // Round-12 reviewer #1: bucket by `(orchestration_cwd,
                 // name)` — the same identity tuple the daemon uses for
@@ -2308,7 +2411,27 @@ pub(crate) fn partition_hydrated_panes(hydrated: &[HydratedPane]) -> HydrationPa
                         cwd.clone()
                     }
                 };
-                let key = (bucket_cwd.clone(), name.clone());
+                // PRD #140 M3.0: mirror the daemon's `pane_orchestration_map`
+                // construct site (`daemon_protocol.rs` StartAgent) exactly — a
+                // stamped `orchestration_id` keys the tab by INSTANCE, and only
+                // its absence falls back to the legacy `(name, cwd)` tuple. Two
+                // tabs of the same orchestration in the same directory carry
+                // byte-identical `(name, cwd)` pairs, so without the token they
+                // merged into one bucket on reattach and half the role panes were
+                // orphaned to the dashboard. Mixed variants are never equal
+                // (derived `PartialEq`), which is the right answer here too: a
+                // tokened and a token-less pane came from different clients and
+                // there is no evidence they shared a tab.
+                let key = match orchestration_id {
+                    Some(id) => crate::state::OrchestrationIdentity::Instance {
+                        id: id.clone(),
+                        name: name.clone(),
+                    },
+                    None => crate::state::OrchestrationIdentity::NameCwd {
+                        name: name.clone(),
+                        cwd: bucket_cwd.clone(),
+                    },
+                };
                 let idx = match orch_index.get(&key) {
                     Some(i) => *i,
                     None => {
@@ -4811,7 +4934,21 @@ fn transition_after_dir_pick(ui: &mut UiState) {
                 Ok(Some(config)) => (config.modes, config.orchestrations),
                 _ => (vec![], vec![]),
             };
+            // PRD #140 M4.0: snapshot the daemon's live-orchestration
+            // directories now — before any orchestration can be opened from this
+            // form — so selecting an orchestration whose cwd already hosts one
+            // renders the non-blocking shared-resource warning above `[Submit]`.
+            // One-shot `ListAgents`, exactly like `live_schedule_names` at
+            // manager-open time; a down daemon just yields no warning. The query
+            // is skipped when the project offers no orchestration to select, so
+            // the common plain-pane `Ctrl+n` costs no extra round-trip.
+            let live_orch_cwds = if orchestrations.is_empty() {
+                Vec::new()
+            } else {
+                live_orchestration_cwds()
+            };
             NewPaneFormState::new(dir, name, command, modes, orchestrations)
+                .with_live_orchestration_cwds(live_orch_cwds)
         }
         // PRD #170: the picked dir is pre-seeded as the schedule's working_dir;
         // the Command field pre-fills from the resolved authoring command so a
@@ -12453,13 +12590,38 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     } else {
         0
     };
+    // PRD #140 M4.0: the same-cwd orchestration warning block — a blank
+    // separator row plus the copy lines — shown only when the selected
+    // orchestration's directory already hosts a live one. Empty otherwise, so
+    // every other form state keeps its exact prior geometry.
+    let warning_lines: &[&str] = if form.same_cwd_orchestration_warning() {
+        &SAME_CWD_ORCHESTRATION_WARNING
+    } else {
+        &[]
+    };
+    let warning_rows: u16 = if warning_lines.is_empty() {
+        0
+    } else {
+        warning_lines.len() as u16 + 1
+    };
+    // Widest warning line, so the modal grows to show the copy un-clipped
+    // instead of truncating the `/worktree-prd` pointer.
+    let warning_w: u16 = warning_lines
+        .iter()
+        .map(|l| l.chars().count() as u16)
+        .max()
+        .unwrap_or(0);
     // PRD #144: content-size & center. Width grows to fit the mode chip row
     // (plus borders + a little margin) but never below the comfortable 56-col
     // base; height is the reserved field rows. `modal_rect` clamps to 90% of
     // terminal. The `9 + name_rows` base reproduces the prior `10` when the Name
     // row is shown (unlocked) and trims a row when it is hidden (locked).
-    let desired_w = chip_row_w.saturating_add(4).max(56);
-    let desired_h = 9 + name_rows + agent_rows + mode_extra + cmd_rows + schedule_rows;
+    // PRD #140 M4.0: the warning block widens the modal when its copy is wider
+    // than the chip row (`warning_w` is 0 when no warning shows, so the width is
+    // unchanged in every other state).
+    let desired_w = chip_row_w.max(warning_w).saturating_add(4).max(56);
+    let desired_h =
+        9 + name_rows + agent_rows + mode_extra + cmd_rows + schedule_rows + warning_rows;
     let popup_area = modal_rect(desired_w, desired_h, area, 56, 10);
     let popup_width = popup_area.width;
 
@@ -12596,6 +12758,21 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
                 },
             ),
         ]));
+    }
+    // PRD #140 M4.0: the same-cwd shared-resource warning sits directly above
+    // the action row — the last thing read before Enter — and is purely
+    // informational: `[Submit]` below it is untouched, so the user may proceed
+    // into the shared directory deliberately.
+    if !warning_lines.is_empty() {
+        lines.push(Line::from(""));
+        for text in warning_lines {
+            lines.push(Line::styled(
+                *text,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
     }
     lines.push(Line::from(""));
     // PRD #80 M8: reserve a row for the [Submit]/[Cancel] buttons (overlaid).
@@ -13822,6 +13999,56 @@ pub fn render_new_pane_form_to_buffer(
     })
 }
 
+/// PRD #140 M4.0 L1 seam: render the new-pane form with an ORCHESTRATION
+/// selected into a `Buffer`, for a form directory of `form_cwd` and the
+/// directories `live_orchestration_cwds` that the daemon reports as already
+/// hosting a live orchestration.
+///
+/// Drives the production `render_new_pane_form` through a `TestBackend`, so the
+/// warning decision it exercises is literally the one the interactive `Ctrl+n`
+/// flow runs ([`live_orchestration_in_same_cwd`], fed there by
+/// [`live_orchestration_cwds`] instead of this parameter). A `form_cwd` present
+/// in the list renders [`SAME_CWD_ORCHESTRATION_WARNING`]; a fresh one renders
+/// the form unchanged. Either way the `[Submit]` action stays — the warning
+/// never blocks. Mirrors [`render_new_pane_form_to_buffer`].
+pub fn render_new_pane_orchestration_guard_to_buffer(
+    form_cwd: &str,
+    live_orchestration_cwds: &[&str],
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    let orchestrations = vec![OrchestrationConfig {
+        name: "tdd-cycle".to_string(),
+        roles: vec![crate::project_config::OrchestrationRoleConfig {
+            name: "orchestrator".to_string(),
+            command: "claude".to_string(),
+            start: true,
+            description: None,
+            prompt_template: None,
+            clear: true,
+        }],
+    }];
+    let mut form = NewPaneFormState::new(
+        std::path::PathBuf::from(form_cwd),
+        "myname".to_string(),
+        "mycmd".to_string(),
+        Vec::new(),
+        orchestrations,
+    )
+    .with_live_orchestration_cwds(
+        live_orchestration_cwds
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect(),
+    );
+    // Select the single orchestration option (index 0 is "No mode"; there are no
+    // plain modes) — the state the guard applies to.
+    form.selection_index = 1;
+    render_overlay_to_buffer(width, height, |frame| {
+        render_new_pane_form(frame, &form);
+    })
+}
+
 /// PRD #170 (unify) L1 seam: render the new-pane form MODE-LOCKED to schedule
 /// authoring into a `Buffer`. `edit` picks the variant — `false` builds the Add
 /// form (` New Schedule `, no edit row), `true` builds the Edit form
@@ -14492,6 +14719,76 @@ mod tests {
         assert_eq!(bucket.cwd, orch_cwd);
         assert_eq!(bucket.orchestration_name, "tdd-cycle");
         assert_eq!(bucket.role_slots.len(), 3);
+    }
+
+    /// Scenario: Hydrate two tabs with the same orchestration name and cwd,
+    /// giving each tab's orchestrator and coder panes a distinct shared
+    /// instance id. The tokened records must rebuild as two two-pane buckets,
+    /// while otherwise-identical legacy records without ids retain the
+    /// one-bucket fallback.
+    #[test]
+    fn partition_separates_same_name_cwd_orchestrations_by_instance_id() {
+        fn orchestration_panes(ids: [Option<&str>; 2]) -> Vec<HydratedPane> {
+            let mut panes = Vec::new();
+            for (tab_index, orchestration_id) in ids.into_iter().enumerate() {
+                for (role_index, (role_name, is_start_role)) in
+                    [("orchestrator", true), ("coder", false)]
+                        .into_iter()
+                        .enumerate()
+                {
+                    panes.push(hydrated(
+                        &format!("pane-{tab_index}-{role_name}"),
+                        &format!("agent-{tab_index}-{role_name}"),
+                        Some("/work/project"),
+                        Some(TabMembership::Orchestration {
+                            name: "tdd-cycle".into(),
+                            role_index,
+                            role_name: role_name.into(),
+                            is_start_role,
+                            orchestration_cwd: Some("/work/project".into()),
+                            display_title: None,
+                            orchestration_id: orchestration_id.map(str::to_string),
+                        }),
+                    ));
+                }
+            }
+            panes
+        }
+
+        let legacy = partition_hydrated_panes(&orchestration_panes([None, None]));
+        assert_eq!(
+            legacy.orchestration_buckets.len(),
+            1,
+            "legacy memberships without orchestration_id keep the (name, cwd) fallback"
+        );
+        assert_eq!(
+            legacy.orchestration_buckets[0].role_slots.len(),
+            4,
+            "the legacy fallback keeps all four panes in its single bucket"
+        );
+
+        let tokened = partition_hydrated_panes(&orchestration_panes([
+            Some("orch-tab-a"),
+            Some("orch-tab-b"),
+        ]));
+        assert_eq!(
+            tokened.orchestration_buckets.len(),
+            2,
+            "distinct orchestration_id values must rebuild two tabs; got {}",
+            tokened.orchestration_buckets.len()
+        );
+        assert!(
+            tokened
+                .orchestration_buckets
+                .iter()
+                .all(|bucket| bucket.role_slots.len() == 2),
+            "each rebuilt tab must retain exactly its orchestrator and coder panes: {:?}",
+            tokened
+                .orchestration_buckets
+                .iter()
+                .map(|bucket| &bucket.role_slots)
+                .collect::<Vec<_>>()
+        );
     }
 
     /// PRD #107 follow-up: the user-typed title persisted on each role

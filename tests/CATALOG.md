@@ -1626,6 +1626,15 @@ without depending on the config struct API.
 - **Does not assert:** the daemon-side `pane_orchestration_map` recording or the live delegate respawn (L2 path); the on-disk config reload inside `lookup_orchestration_role`.
 - **Platform coverage:** mac+linux+windows.
 
+#### orchestration/guard
+
+##### orchestration/guard/001 — Opening an orchestration in a cwd that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140).
+- **Layer:** L1 (in-process `TestBackend` via `render_new_pane_orchestration_guard_to_buffer`; no PTY, no subprocess).
+- **Agent:** none (the render seam supplies synthetic live-daemon orchestration cwd records).
+- **Asserts:** an orchestration selected for a cwd matching an existing live orchestration renders a warning containing `.dot-agent-deck` and `worktree` while retaining `[Submit]`; the same form for a fresh cwd renders neither warning substring.
+- **Does not assert:** exact warning copy or styling; daemon `list_agents` transport; worktree creation; blocking spawn behavior (the warning is informational).
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/layout
 
 ##### orchestration/layout/001 — Seven decks fit the single-column orchestration card area without scrolling (PRD #147).
