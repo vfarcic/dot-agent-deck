@@ -260,14 +260,14 @@ fn config_path() -> PathBuf {
     if let Ok(dir) = std::env::var("DOT_AGENT_DECK_CONFIG") {
         return PathBuf::from(dir);
     }
-    dirs_home().join(".config/dot-agent-deck/config.toml")
+    config_dir().join("config.toml")
 }
 
 fn session_path() -> PathBuf {
     if let Ok(dir) = std::env::var("DOT_AGENT_DECK_SESSION") {
         return PathBuf::from(dir);
     }
-    dirs_home().join(".config/dot-agent-deck/session.toml")
+    config_dir().join("session.toml")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -674,15 +674,17 @@ pub struct LoadedSchedules {
 }
 
 /// Global schedules path: `$XDG_CONFIG_HOME/dot-agent-deck/schedules.toml`,
-/// falling back to `~/.config/...`. `DOT_AGENT_DECK_SCHEDULES` overrides it so
-/// tests never touch the real home dir.
+/// falling back to `~/.config/...` (on Windows: `%APPDATA%\dot-agent-deck`,
+/// which has no XDG stage — see
+/// [`crate::platform::paths::xdg_config_home`]). `DOT_AGENT_DECK_SCHEDULES`
+/// overrides it so tests never touch the real home dir.
 pub fn schedules_path() -> PathBuf {
     if let Ok(p) = std::env::var("DOT_AGENT_DECK_SCHEDULES") {
         return PathBuf::from(p);
     }
-    match std::env::var("XDG_CONFIG_HOME") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join("dot-agent-deck/schedules.toml"),
-        _ => dirs_home().join(".config/dot-agent-deck/schedules.toml"),
+    match crate::platform::paths::xdg_config_home() {
+        Some(dir) => dir.join("dot-agent-deck/schedules.toml"),
+        None => config_dir().join("schedules.toml"),
     }
 }
 
@@ -910,7 +912,7 @@ fn star_prompt_path() -> PathBuf {
     if let Ok(p) = std::env::var("DOT_AGENT_DECK_STAR_PROMPT") {
         return PathBuf::from(p);
     }
-    dirs_home().join(".config/dot-agent-deck/star-prompt-state.json")
+    config_dir().join("star-prompt-state.json")
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -986,7 +988,7 @@ fn config_gen_state_path() -> PathBuf {
     if let Ok(p) = std::env::var("DOT_AGENT_DECK_CONFIG_GEN_STATE") {
         return PathBuf::from(p);
     }
-    dirs_home().join(".config/dot-agent-deck/config-gen-state.json")
+    config_dir().join("config-gen-state.json")
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1099,6 +1101,17 @@ impl Drop for ConfigGenStateEnvGuard {
 /// Unix, `%USERPROFILE%` on Windows.
 pub(crate) fn dirs_home() -> PathBuf {
     crate::platform::paths::home_dir()
+}
+
+/// Directory holding the user's dot-agent-deck config files. Delegates to
+/// [`crate::platform::paths::config_dir`] (PRD #163 M1): `~/.config/dot-agent-deck`
+/// on Unix — byte-for-byte what every caller previously spelled inline —
+/// `%APPDATA%\dot-agent-deck` on Windows.
+///
+/// Each per-file `DOT_AGENT_DECK_*` override is checked by its own resolver
+/// *before* this is called, so overrides stay authoritative.
+pub(crate) fn config_dir() -> PathBuf {
+    crate::platform::paths::config_dir()
 }
 
 // ---------------------------------------------------------------------------

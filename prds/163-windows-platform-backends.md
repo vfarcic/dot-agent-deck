@@ -1,6 +1,6 @@
 # PRD #163: Windows process, path & filesystem platform backends
 
-**Status**: Not Started
+**Status**: In Progress
 **Priority**: Medium
 **Created**: 2026-06-14
 
@@ -53,7 +53,7 @@ The #42 Foundation review (auditor + reviewer) confirmed no Unix regression but 
 
 These map to #42's M3–M7. Unix halves are behavior-preserving moves (Linux-testable, prove no regression); Windows behavior requires the `windows-latest` CI job (from #42) plus the e2e VM pass (in #164).
 
-- [ ] **paths + shell** (#42 M3) — platform-dispatch home/runtime/state/lock resolution and the shell-wrap; Unix unchanged; add Windows branches. Linux-testable + `cargo check --target`.
+- [x] **paths + shell** (#42 M3) — platform-dispatch home/runtime/state/lock resolution and the shell-wrap; Unix unchanged; add Windows branches. Linux-testable + `cargo check --target`.
 - [ ] **detach + lock** (#42 M4) — Windows `DETACHED_PROCESS`/Job-breakaway + named mutex; confirm on a runner the daemon survives parent exit and concurrent spawns serialize.
 - [ ] **peer-PID + lifecycle** (#42 M5) — `GetNamedPipeServerProcessId`; `daemon stop` graceful→force; Job-Object agent teardown.
 - [ ] **filesystem security** (#42 M6) — pipe security descriptors + dir ACLs; verify foreign-user denial on a runner.

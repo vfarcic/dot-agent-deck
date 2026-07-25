@@ -39,6 +39,31 @@ pub fn default_shell(shell_override: Option<&str>) -> String {
     }
 }
 
+/// Shell for a command line the **deck itself pinned** rather than one the user
+/// configured — the watch runner's fixed `clear`-and-rerun invocation, and the
+/// scheduler's deliberate "run this multi-word command under a predictable
+/// interpreter, not the daemon's `$SHELL`" override (PRD #127 C2).
+///
+/// `posix_shell` is returned verbatim on Unix, so each call site keeps the exact
+/// shell it pins today (`/bin/sh` for the scheduler's `SHELL` override, `sh` for
+/// the watch runner). Windows has no deterministic POSIX shell to pin, so it
+/// resolves the same interpreter [`default_shell`] would: `%COMSPEC%`, else
+/// `cmd.exe`.
+///
+/// Exists so those call sites stop carrying their own `#[cfg]` pair — the
+/// platform choice stays here at the seam (PRD #163 M1).
+pub fn fixed_command_shell(posix_shell: &str) -> String {
+    #[cfg(unix)]
+    {
+        posix_shell.to_string()
+    }
+    #[cfg(windows)]
+    {
+        let _ = posix_shell;
+        default_shell(None)
+    }
+}
+
 /// Flag passed to [`default_shell`] to run a command string: `-c` on Unix,
 /// `/C` on Windows (`cmd.exe`).
 pub fn shell_command_flag() -> &'static str {

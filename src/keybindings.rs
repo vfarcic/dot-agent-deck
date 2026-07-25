@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
-use crate::config::dirs_home;
+use crate::config::config_dir;
 
 /// The two config sections: `[global]` and `[dashboard]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -837,7 +837,7 @@ fn keybindings_path() -> PathBuf {
     if let Ok(path) = std::env::var("DOT_AGENT_DECK_KEYBINDINGS") {
         return PathBuf::from(path);
     }
-    dirs_home().join(".config/dot-agent-deck/keybindings.toml")
+    config_dir().join("keybindings.toml")
 }
 
 #[cfg(test)]

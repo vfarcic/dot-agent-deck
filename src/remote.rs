@@ -745,7 +745,7 @@ pub fn default_remotes_path() -> PathBuf {
     if let Ok(p) = std::env::var("DOT_AGENT_DECK_REMOTES") {
         return PathBuf::from(p);
     }
-    crate::config::dirs_home().join(".config/dot-agent-deck/remotes.toml")
+    crate::config::config_dir().join("remotes.toml")
 }
 
 // ---------------------------------------------------------------------------

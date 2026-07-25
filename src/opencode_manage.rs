@@ -22,8 +22,14 @@ fn stale_plugin_dir(root: &Path) -> PathBuf {
     root.join("plugin").join("dot-agent-deck")
 }
 
+/// PRD #163 M1: route the home lookup through the platform seam instead of
+/// reading `$HOME` with a `/tmp` fallback. `$HOME` is still the source on Unix,
+/// so the resolved roots are unchanged there; the old fallback only differed
+/// when `$HOME` was unset, where it pointed the OpenCode plugin roots at a
+/// world-writable `/tmp` — and on Windows, where `$HOME` is normally unset, it
+/// would have missed `%USERPROFILE%` entirely.
 fn home_dir() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+    crate::platform::paths::home_dir()
 }
 
 fn xdg_config_root(home: &Path) -> PathBuf {

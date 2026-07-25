@@ -134,6 +134,11 @@ fn lock_path_for(socket_path: &Path, override_root: Option<&Path>) -> PathBuf {
 /// when `XDG_RUNTIME_DIR` is unset — that path is owner-only (we mkdir
 /// 0700) and is the standard freedesktop user cache root.
 ///
+/// PRD #163 M1: the platform tail (the `XDG_RUNTIME_DIR`-then-`~/.cache` chain
+/// above, `%LOCALAPPDATA%\dot-agent-deck\locks` on Windows) lives in
+/// [`crate::platform::paths::lock_root_default`]; Unix resolution is unchanged.
+/// Both overrides below are still checked FIRST, so they stay authoritative.
+///
 /// `override_root` is the per-`Daemon` builder-supplied override
 /// (round-11 reviewer #B): tests pass it via
 /// [`Daemon::with_lock_dir_override`] to pin the resolved root at a
@@ -150,14 +155,7 @@ fn lock_root(override_root: Option<&Path>) -> PathBuf {
     if let Ok(explicit) = std::env::var("DOT_AGENT_DECK_LOCK_DIR") {
         return PathBuf::from(explicit);
     }
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR")
-        && !runtime_dir.is_empty()
-    {
-        return PathBuf::from(runtime_dir).join("dot-agent-deck");
-    }
-    crate::config::dirs_home()
-        .join(".cache")
-        .join("dot-agent-deck")
+    crate::platform::paths::lock_root_default()
 }
 
 /// PRD #93 M1.3 live-socket probe. Used by [`run_daemon_with`] to

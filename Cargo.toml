@@ -74,6 +74,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Pipes",
     "Win32_System_Threading",
     "Win32_Security",
+    # PRD #163 M1: `ConvertSidToStringSidW`, used by
+    # `platform::paths::endpoint_user_suffix` to derive the per-user named-pipe
+    # segment from the process token's SID (the non-colliding uid analogue).
+    # Also where `SetNamedSecurityInfo` lives for the M4 dir ACLs.
+    "Win32_Security_Authorization",
     "Win32_System_JobObjects",
 ] }
 # `%USERPROFILE%` / `%LOCALAPPDATA%` resolution for `src/platform/paths.rs`.

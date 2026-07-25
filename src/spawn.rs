@@ -428,10 +428,18 @@ fn spawn_one(
 /// (the command needs shell-wrapping). `agent_pty::spawn` consumes the SHELL
 /// override to pick the `-c` shell and does NOT export it into the child env
 /// (PRD #127 C2), so a single-word command carries no SHELL at all.
+///
+/// PRD #163 M1: the pinned shell comes from
+/// [`crate::platform::shell::fixed_command_shell`] — still `/bin/sh` on Unix,
+/// but `%COMSPEC%` on Windows, where pinning a POSIX path would hand
+/// `agent_pty::spawn` a shell that does not exist.
 fn pane_env(pane_id: &str, pin_sh: bool) -> Vec<(String, String)> {
     let mut env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())];
     if pin_sh {
-        env.push(("SHELL".to_string(), "/bin/sh".to_string()));
+        env.push((
+            "SHELL".to_string(),
+            crate::platform::shell::fixed_command_shell("/bin/sh"),
+        ));
     }
     env
 }

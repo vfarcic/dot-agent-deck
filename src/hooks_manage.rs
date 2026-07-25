@@ -15,9 +15,19 @@ const HOOK_TYPES: &[&str] = &[
     "SubagentStop",
 ];
 
+/// Claude Code's user settings file, in the location Claude itself uses:
+/// `~/.claude/settings.json`.
+///
+/// PRD #163 M1: resolved through the platform seam rather than a raw `$HOME`
+/// read with a `/tmp` fallback. `$HOME` is still the source on Unix, so the path
+/// is unchanged there; the old fallback only differed when `$HOME` was unset,
+/// where it wrote the hook settings into a world-writable `/tmp/.claude` — and on
+/// Windows, where `$HOME` is normally unset, it would have missed
+/// `%USERPROFILE%\.claude` entirely.
 fn settings_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".claude").join("settings.json")
+    crate::platform::paths::home_dir()
+        .join(".claude")
+        .join("settings.json")
 }
 
 fn read_settings(path: &PathBuf) -> Value {
