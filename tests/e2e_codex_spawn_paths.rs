@@ -39,21 +39,25 @@ fn recorder_path(record: &Path) -> (tempfile::TempDir, String) {
     (dir, path)
 }
 
-fn wait_for_launch(record: &Path) -> String {
+fn wait_for_launch(record: &Path) -> Vec<String> {
     assert!(
-        common::wait_for_file_substr_count(record, "codex", 1, Duration::from_secs(10)),
+        common::wait_for_file_substr_count(record, "WRAPPED", 1, Duration::from_secs(10)),
         "the Codex recorder was never launched"
     );
-    std::fs::read_to_string(record).expect("read Codex launch record")
+    // PRD #20 §4.2.1: startup scoped-trust runs `codex app-server` to read Codex's
+    // own hook hashes, which the PATH recorder also logs. That probe is not an
+    // agent launch, so the launch-path assertion looks past it.
+    common::recorded_agent_launches(record)
 }
 
 fn assert_only_wrapped(record: &Path) {
     let launched = wait_for_launch(record);
     assert!(
         launched
-            .lines()
+            .iter()
             .all(|line| line == "WRAPPED wrap --agent codex -- codex"),
-        "every Codex launch on this path must cross the Wrapper strategy exactly once; observed:\n{launched}"
+        "every Codex launch on this path must cross the Wrapper strategy exactly once; observed:\n{}",
+        launched.join("\n")
     );
 }
 

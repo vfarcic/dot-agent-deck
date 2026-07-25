@@ -3073,6 +3073,35 @@ pub fn wait_for_file_substr_count(
     }
 }
 
+/// The recorder line the deck's own Codex metadata probe produces.
+///
+/// PRD #20 §4.2.1: the deck records SCOPED, hash-pinned trust for its own Codex
+/// hooks, and the hashes come from Codex itself — `codex app-server` answering a
+/// `hooks/list` JSON-RPC request at startup. So a PATH `codex` recorder shim logs
+/// this line whenever a deck/daemon starts on a machine where `codex` resolves.
+/// It is a metadata probe, NOT an agent launch.
+#[allow(dead_code)]
+pub const CODEX_TRUST_PROBE_LAUNCH: &str = "BARE codex app-server";
+
+/// The lines a `codex`/`dot-agent-deck` PATH recorder logged, with the deck's own
+/// [`CODEX_TRUST_PROBE_LAUNCH`] metadata probe filtered out — i.e. only the lines
+/// that represent an actual AGENT launch.
+///
+/// Launch-path assertions ("a Codex pane always launches through the wrapper, never
+/// bare") are about how the agent was launched, so they must not trip over the
+/// deck's startup `codex app-server` probe. A genuine bare-Codex *agent* launch has
+/// the pane's own argv (or none at all) and is still reported here.
+#[allow(dead_code)]
+pub fn recorded_agent_launches(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != CODEX_TRUST_PROBE_LAUNCH)
+        .map(str::to_string)
+        .collect()
+}
+
 /// Poll until `name` no longer appears in the file at `path` (e.g. a schedule
 /// definition removed from `schedules.toml`), or the timeout elapses.
 #[allow(dead_code)]

@@ -879,6 +879,18 @@ fn main() -> ExitCode {
                 // otherwise. It honors `PI_CODING_AGENT_DIR` (else `~/.pi/agent`),
                 // so it lands where pi will look — see `orchestrator_ext`.
                 dot_agent_deck::orchestrator_ext::auto_materialize(&[]);
+                // PRD #20 §4.2.1: same precedent for Codex — install the deck's
+                // `hooks.json` into the active Codex home and record SCOPED,
+                // hash-pinned trust for exactly those entries, ONCE at daemon
+                // startup. Command-agnostic on purpose: the spawn seam can only
+                // detect a `codex` basename, so a launcher (`devbox run codex-big`,
+                // `run_codex.sh`) previously got no hooks at all. With the home
+                // prepared here, its hook events reach the pane through the
+                // inherited `DOT_AGENT_DECK_PANE_ID` regardless of launch method.
+                // Runs AFTER the login-shell PATH is applied so codex-presence is
+                // detected against the daemon's real PATH. Self-guards on codex
+                // being installed and a resolvable home; a no-op otherwise.
+                dot_agent_deck::codex_hooks_manage::auto_install_and_trust_at_startup();
                 run_daemon_serve_cli()
             }
             DaemonCmd::Hello => run_daemon_hello_cli(),
@@ -1190,9 +1202,11 @@ async fn run_tui_session() -> ExitCode {
     // `IntegrationStrategy` enum to a hardcoded incumbent) means a future agent
     // reusing `NativeHooks`/`Plugin` runs ITS OWN installer, not Claude's or
     // OpenCode's. Claude installs native hooks and OpenCode its plugin at
-    // startup; Pi (`Extension`) materializes at spawn-time (see `agent_pty`) and
-    // Codex (`Wrapper`) has no install step, so their `startup_auto_install` is
-    // `None` and they are skipped.
+    // startup; Codex installs its native `hooks.json` AND records scoped,
+    // hash-pinned trust for it here too (PRD #20 §4.2.1 — command-agnostic, so a
+    // launcher like `devbox run codex-big` that the spawn seam can't detect is
+    // still covered); Pi (`Extension`) materializes at spawn-time (see
+    // `agent_pty`), so its `startup_auto_install` is `None` and it is skipped.
     {
         use dot_agent_deck::agent_registry::ALL;
         for spec in ALL {

@@ -707,17 +707,21 @@ fn dispatch_004_orchestration_vs_single_agent() {
         "the prompt must reach the single-agent card of the plain dispatch"
     );
     assert!(
-        common::wait_for_file_substr_count(&launch_record, "codex", 2, W),
+        common::wait_for_file_substr_count(&launch_record, "WRAPPED", 2, W),
         "both issue-dispatch Codex paths must reach a launch recorder"
     );
-    let launches = std::fs::read_to_string(&launch_record).expect("read dispatch launch record");
+    // PRD #20 §4.2.1: the daemon's startup scoped-trust step runs `codex
+    // app-server` to read Codex's own hook hashes, which this PATH recorder also
+    // logs. It is a metadata probe, not an agent launch, so it is filtered out.
+    let launches = common::recorded_agent_launches(&launch_record);
     assert_eq!(
-        launches.lines().collect::<Vec<_>>(),
+        launches,
         vec![
             "WRAPPED wrap --agent codex -- codex",
             "WRAPPED wrap --agent codex -- codex",
         ],
-        "issue-dispatch single-agent and role spawns must both cross the Wrapper strategy; observed:\n{launches}"
+        "issue-dispatch single-agent and role spawns must both cross the Wrapper strategy; observed:\n{}",
+        launches.join("\n")
     );
 }
 

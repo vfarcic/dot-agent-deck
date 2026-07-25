@@ -137,6 +137,35 @@ fn opencode_uninstall() -> Result<(), String> {
 fn pi_materialize(env: &[(String, String)]) {
     crate::orchestrator_ext::auto_materialize(env);
 }
+/// PRD #20 §4.2.1: `dot-agent-deck hooks install --agent codex` — write the deck's
+/// `hooks.json` into the active Codex home and record scoped, hash-pinned trust
+/// for exactly those entries. The trust step is best-effort (it needs `codex` on
+/// `PATH` to answer `hooks/list`): the definitions are what the command promises,
+/// so a trust failure warns rather than failing the documented install.
+fn codex_install() -> Result<(), String> {
+    let home = crate::codex_hooks_manage::active_codex_home()
+        .ok_or_else(|| "no Codex home resolves (CODEX_HOME and HOME are both unset)".to_string())?;
+    let binary_path = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "dot-agent-deck".into());
+    crate::codex_hooks_manage::install_to(&home, &binary_path).map_err(|e| e.to_string())?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
+    if let Err(e) = crate::codex_hooks_manage::trust_deck_hooks_in(&home, &cwd) {
+        tracing::warn!("codex hooks install: could not record scoped hook trust: {e}");
+    }
+    Ok(())
+}
+/// PRD #20 §4.2.1: `dot-agent-deck hooks uninstall --agent codex`. Drops the deck's
+/// trust records FIRST (while Codex can still enumerate the definitions), then
+/// removes the deck's own rules from `hooks.json`, leaving user hooks alone.
+fn codex_uninstall() -> Result<(), String> {
+    let home = crate::codex_hooks_manage::active_codex_home()
+        .ok_or_else(|| "no Codex home resolves (CODEX_HOME and HOME are both unset)".to_string())?;
+    if let Err(e) = crate::codex_hooks_manage::untrust_deck_hooks_in(&home) {
+        tracing::warn!("codex hooks uninstall: could not drop scoped hook trust: {e}");
+    }
+    crate::codex_hooks_manage::uninstall_from(&home).map_err(|e| e.to_string())
+}
 
 /// Claude Code — native-hooks strategy (shipped).
 pub static CLAUDE_CODE: AgentSpec = AgentSpec {
@@ -194,13 +223,19 @@ pub static CODEX: AgentSpec = AgentSpec {
     default_command: Some("codex"),
     strategy: Some(IntegrationStrategy::Wrapper),
     badge_color: Color::LightYellow,
-    // Wrapper agents synthesize events from stdout — no hook install, no
-    // extension materialize (the `dot-agent-deck wrap` seam does the work).
-    hook_install: None,
-    hook_uninstall: None,
+    // Codex is a HYBRID (PRD #20 W1): the wrapper is its PTY host, but its rich
+    // events come from Codex's Claude-Code-compatible NATIVE hooks — so unlike a
+    // pure stdout wrapper it does have hook install/uninstall handlers (the
+    // documented `dot-agent-deck hooks install --agent codex`), and they also
+    // record/drop the scoped, hash-pinned trust those hooks need to run.
+    hook_install: Some(codex_install),
+    hook_uninstall: Some(codex_uninstall),
     materialize: None,
-    // Wrapper agents have no startup install step.
-    startup_auto_install: None,
+    // PRD #20 §4.2.1: install + trust ONCE at startup, command-agnostically, so
+    // Codex hooks fire however Codex is launched — including a launcher whose
+    // basename isn't `codex` (`devbox run codex-big`), which the spawn-command
+    // seam can't detect and which therefore got NO integration before.
+    startup_auto_install: Some(crate::codex_hooks_manage::auto_install_and_trust_at_startup),
 };
 
 /// Neutral entry for the "no recognized agent" placeholder. Not a real agent:
@@ -354,8 +389,9 @@ mod tests {
             "Pi materializes its extension at spawn time, not startup"
         );
         assert!(
-            spec(&AgentType::Codex).startup_auto_install.is_none(),
-            "Codex is a stdout wrapper — no startup install step"
+            spec(&AgentType::Codex).startup_auto_install.is_some(),
+            "Codex installs its native hooks + scoped trust at startup, \
+             command-agnostically (PRD #20 §4.2.1)"
         );
         assert!(
             spec(&AgentType::None).startup_auto_install.is_none(),
@@ -465,23 +501,31 @@ mod tests {
         assert!(spec(&AgentType::Pi).materialize.is_some());
         assert!(spec(&AgentType::Pi).hook_install.is_none());
 
-        // A Wrapper agent (Codex) and the neutral placeholder carry no
-        // hook-install / materialize handlers.
-        assert!(spec(&AgentType::Codex).hook_install.is_none());
+        // Codex is a HYBRID (PRD #20 W1/§4.2.1): the Wrapper is its PTY host, but
+        // its events come from NATIVE hooks, so it does carry hook handlers (the
+        // documented `hooks install --agent codex`) — while still materializing no
+        // extension. The neutral placeholder carries neither.
+        assert!(spec(&AgentType::Codex).hook_install.is_some());
+        assert!(spec(&AgentType::Codex).hook_uninstall.is_some());
         assert!(spec(&AgentType::Codex).materialize.is_none());
         assert!(spec(&AgentType::None).hook_install.is_none());
         assert!(spec(&AgentType::None).materialize.is_none());
 
-        // Claude and OpenCode install through DIFFERENT handlers — proof the
-        // handler is sourced per-spec, not from one per-strategy incumbent.
+        // Claude, OpenCode, and Codex install through DIFFERENT handlers — proof
+        // the handler is sourced per-spec, not from one per-strategy incumbent.
         let claude = spec(&AgentType::ClaudeCode)
             .hook_install
             .expect("Claude has an installer");
         let opencode = spec(&AgentType::OpenCode)
             .hook_install
             .expect("OpenCode has an installer");
+        let codex = spec(&AgentType::Codex)
+            .hook_install
+            .expect("Codex has an installer");
         assert!(
-            !std::ptr::fn_addr_eq(claude, opencode),
+            !std::ptr::fn_addr_eq(claude, opencode)
+                && !std::ptr::fn_addr_eq(claude, codex)
+                && !std::ptr::fn_addr_eq(opencode, codex),
             "each agent must resolve to its OWN installer, not a shared incumbent"
         );
     }

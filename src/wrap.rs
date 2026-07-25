@@ -532,27 +532,11 @@ impl Drop for RawModeGuard {
     }
 }
 
-/// The `--dangerously-bypass-hook-trust` flag the deck passes when it launches a
-/// wrapped `codex`. Codex requires non-managed command hooks to be trusted before
-/// they run; the deck authors its OWN hook definition (see
-/// [`crate::codex_hooks_manage`]), so it vets the source — itself.
-///
-/// PRD #20 W3-Pass-2 (finding #2 / M-1): this flag is INVOCATION-GLOBAL — it
-/// trusts EVERY enabled hook in the active `CODEX_HOME`, not only the deck's. So
-/// the deck injects it ONLY when the target `CODEX_HOME` contains no non-deck
-/// command hooks (see [`crate::codex_hooks_manage::foreign_command_hooks_present`]),
-/// i.e. when the only thing the bypass would trust is the deck's own vetted entry.
-/// If a third-party hook is present the deck does NOT bypass, so a user's
-/// unreviewed hook is never silently trusted.
-const CODEX_BYPASS_HOOK_TRUST_FLAG: &str = "--dangerously-bypass-hook-trust";
-
-/// Whether the wrapped program's basename is `codex`. PRD #20 W1 keys the
-/// trust-flag injection off the ACTUAL program, not the resolved agent identity:
-/// `wrap --agent codex -- /bin/sh` (the non-interactive I/O test) carries Codex
-/// identity but launches a shell, which must NOT receive a codex-only flag; and
-/// a launcher/script (`devbox run …`, `run_codex_agent.sh`) is not `codex`, so
-/// the flag can't be auto-injected into its eventual codex call (documented in
-/// `docs/develop/agent-adapters.md`).
+/// Whether the wrapped program's basename is `codex`. PRD #20 W1 keys the hook
+/// INSTALL off the ACTUAL program (in addition to the resolved identity), not the
+/// identity alone: `wrap --agent codex -- /bin/sh` (the non-interactive I/O test)
+/// carries Codex identity but launches a shell outside any pane, and must not
+/// write to the user's `~/.codex`.
 fn program_is_codex(program: &str) -> bool {
     std::path::Path::new(program)
         .file_name()
@@ -560,33 +544,18 @@ fn program_is_codex(program: &str) -> bool {
         == Some("codex")
 }
 
-/// Whether the wrapped program is a BARE `codex` command (no path component) —
-/// the codex the deck itself resolves through `PATH`. PRD #20 Greptile finding
-/// #2: the basename check alone (`program_is_codex`) also matches an EXPLICIT
-/// path to a `codex`-named launcher/wrapper script — and such a launcher can
-/// re-home `CODEX_HOME` at runtime and forward the injected invocation-global
-/// bypass to a Codex running under a DIFFERENT, uninspected hook set. The deck
-/// therefore auto-injects the bypass only for the bare `codex` it resolves
-/// itself; an explicit path is treated as a user launcher that must add the flag
-/// to its own `codex …` line (see the module docs / `docs/develop/agent-adapters.md`).
-fn program_is_bare_codex(program: &str) -> bool {
-    !program.contains('/') && program_is_codex(program)
-}
-
-/// The outcome of [`codex_spawn_prep`]: whether to inject the hook-trust bypass,
-/// and the vetted `CODEX_HOME` (resolved ONCE) to PIN on the spawned child so the
-/// home the deck vetted/installed into is exactly the home Codex loads.
+/// The outcome of [`codex_spawn_prep`]: the vetted `CODEX_HOME` (resolved ONCE) to
+/// PIN on the spawned child so the home the deck installed into and trusted is
+/// exactly the home Codex loads.
 struct CodexSpawnPrep {
-    /// Add [`CODEX_BYPASS_HOOK_TRUST_FLAG`] to the child's argv.
-    add_trust_flag: bool,
     /// `CODEX_HOME` to set explicitly on the spawned child's environment (finding
     /// #2). `None` when this invocation installs no Codex hooks / resolves no home.
     pinned_home: Option<std::path::PathBuf>,
 }
 
-/// PRD #20 W1 spawn wiring. Decides, for this wrap invocation, whether to
-/// install the deck's native Codex hooks, which `CODEX_HOME` to pin, and whether
-/// to inject the hook-trust bypass flag.
+/// PRD #20 W1 spawn wiring. Decides, for this wrap invocation, whether to install
+/// the deck's native Codex hooks, which `CODEX_HOME` to pin, and — for the hooks
+/// it just authored — records SCOPED trust so Codex will actually run them.
 ///
 /// - **Hooks install** fires whenever a Codex-identity agent will actually run
 ///   under this wrapper: a `codex` program (bare or path), OR a deck-spawned pane
@@ -597,24 +566,20 @@ struct CodexSpawnPrep {
 ///   `wrap --agent codex -- /bin/sh` (no pane, non-codex program), so a
 ///   non-interactive I/O wrap never writes to the user's `~/.codex`.
 /// - **`CODEX_HOME` pin** (finding #2): the vetted home is resolved ONCE and
-///   returned so the caller can set it EXPLICITLY on the child, keeping vet and
-///   launch on the same deck-controlled home instead of a value that could drift.
-/// - **The trust-bypass flag** is injected ONLY when ALL of the following hold,
-///   so it can never silently trust something the deck didn't author:
-///   1. the program is a BARE `codex` — the codex the deck resolves through
-///      `PATH` and whose home it pins. An explicit path to a `codex`-named file
-///      is a launcher/wrapper (which can re-home `CODEX_HOME` and forward the
-///      invocation-global bypass to an uninspected hook set, finding #2), so it
-///      must add the flag to its own `codex …` line, AND
-///   2. the resolved identity is [`AgentType::Codex`] — so
-///      `wrap --agent claude -- codex` neither installs Codex hooks nor bypasses
-///      trust, AND
-///   3. the vetted `CODEX_HOME` contains no non-deck command hooks
-///      ([`crate::codex_hooks_manage::foreign_command_hooks_present_in`]) — because
-///      the bypass is invocation-global, so with a third-party hook present it
-///      would trust the user's unreviewed hook too (finding #2 / M-1). When a
-///      foreign hook is present the deck skips the bypass and warns; its own
-///      events then degrade to stdout classification.
+///   returned so the caller can set it EXPLICITLY on the child, keeping install,
+///   trust, and launch on the same deck-controlled home instead of a value that
+///   could drift.
+/// - **Trust** (PRD #20 §4.1, Greptile P1): there is NO invocation-global
+///   `--dangerously-bypass-hook-trust` any more — nothing trust-related reaches
+///   argv, so no launcher (PATH shim, script, alias) can receive, forward, or
+///   re-home it. Instead
+///   [`crate::codex_hooks_manage::trust_deck_hooks_in`] records per-hook,
+///   hash-pinned trust for EXACTLY the entries the deck authored in the pinned
+///   home. That is launch-method agnostic (bare `codex`, `/abs/path/codex`,
+///   `./launcher.sh`, `devbox run codex-big` all behave identically) and strictly
+///   narrower than the old bypass: a third-party hook in the same `hooks.json`
+///   stays untrusted. Any failure is warned and the spawn continues — Codex then
+///   won't run the hooks and events degrade to stdout classification (fail-closed).
 fn codex_spawn_prep(
     program: &str,
     agent_type: &AgentType,
@@ -623,8 +588,8 @@ fn codex_spawn_prep(
     let program_codex = program_is_codex(program);
     let codex_identity = *agent_type == AgentType::Codex;
     let installs_hooks = codex_identity && (program_codex || pane_id.is_some());
-    // Resolve the vetted home ONCE, so the SAME path is installed into, vetted,
-    // and pinned on the child — vet and launch can't drift apart (finding #2).
+    // Resolve the vetted home ONCE, so the SAME path is installed into, trusted,
+    // and pinned on the child — they can't drift apart (finding #2).
     let pinned_home = if installs_hooks {
         crate::codex_hooks_manage::auto_install();
         crate::codex_hooks_manage::active_codex_home()
@@ -632,44 +597,20 @@ fn codex_spawn_prep(
         None
     };
 
-    // The invocation-global bypass is auto-injected only for a BARE `codex` the
-    // deck resolves itself; an explicit path is a user launcher (finding #2).
-    let add_trust_flag = if program_is_bare_codex(program) && codex_identity {
-        match pinned_home.as_deref() {
-            // Only bypass when there is a resolvable home to vet AND pin — never
-            // trust an unknown home globally.
-            None => {
-                tracing::warn!(
-                    "codex: no resolvable CODEX_HOME to vet/pin; not bypassing hook trust"
-                );
-                false
-            }
-            Some(home) => match crate::codex_hooks_manage::foreign_command_hooks_present_in(home) {
-                // Nothing but the deck's own vetted hook would be trusted.
-                Ok(false) => true,
-                Ok(true) => {
-                    tracing::warn!(
-                        "codex: third-party command hooks present in CODEX_HOME; not bypassing \
-                         hook trust (deck events degrade to stdout classification)"
-                    );
-                    false
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "codex: could not inspect CODEX_HOME hooks ({e}); not bypassing hook trust"
-                    );
-                    false
-                }
-            },
+    // Scoped trust for the hooks just installed, in the SAME pinned home. The
+    // child's cwd is the wrapper's cwd, which is what Codex resolves hooks for.
+    if let Some(home) = pinned_home.as_deref() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| home.to_path_buf());
+        match crate::codex_hooks_manage::trust_deck_hooks_in(home, &cwd) {
+            Ok(count) => tracing::debug!(count, "codex: recorded scoped trust for deck hooks"),
+            Err(e) => tracing::warn!(
+                "codex: could not record scoped hook trust ({e}); deck events degrade to stdout \
+                 classification"
+            ),
         }
-    } else {
-        false
-    };
-
-    CodexSpawnPrep {
-        add_trust_flag,
-        pinned_home,
     }
+
+    CodexSpawnPrep { pinned_home }
 }
 
 /// PRD #20 R20-002: the last catchable termination signal delivered to the
@@ -982,16 +923,14 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
 
     // PRD #20 W1: install the deck's native Codex hooks into the active
     // CODEX_HOME (for a `codex` program OR a deck-spawned Codex-identity launcher)
-    // and, for a bare `codex`, bypass Codex's hook-trust prompt for this
-    // deck-vetted spawn via the returned flag. Done once, before either path
-    // spawns. A launcher/script must add the flag to its own codex line.
+    // and record SCOPED, hash-pinned trust for exactly those hooks so Codex runs
+    // them — no invocation-global bypass reaches argv (PRD #20 §4.1). Done once,
+    // before either path spawns, and identically for every launch form.
     // PRD #20 Greptile finding #2: the returned `pinned_home` is set explicitly
-    // on the spawned child so the home the deck vetted is exactly the home Codex
-    // loads (vet and launch use the same, deck-controlled home).
-    let CodexSpawnPrep {
-        add_trust_flag,
-        pinned_home,
-    } = codex_spawn_prep(program, &emitter.agent_type, emitter.pane_id.as_deref());
+    // on the spawned child so the home the deck installed into and trusted is
+    // exactly the home Codex loads.
+    let CodexSpawnPrep { pinned_home } =
+        codex_spawn_prep(program, &emitter.agent_type, emitter.pane_id.as_deref());
 
     // R20-012 / finding #11: genuine per-descriptor routing. Detect the
     // tty-or-redirected nature of EACH standard descriptor independently. If any
@@ -1007,22 +946,9 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     ];
 
     if tty.iter().any(|&t| t) {
-        run_wrap_pty(
-            program,
-            args,
-            &emitter,
-            add_trust_flag,
-            pinned_home.as_deref(),
-            tty,
-        )
+        run_wrap_pty(program, args, &emitter, pinned_home.as_deref(), tty)
     } else {
-        run_wrap_pipe(
-            program,
-            args,
-            &emitter,
-            add_trust_flag,
-            pinned_home.as_deref(),
-        )
+        run_wrap_pipe(program, args, &emitter, pinned_home.as_deref())
     }
 }
 
@@ -1041,7 +967,6 @@ fn run_wrap_pty(
     program: &str,
     args: &[String],
     emitter: &Arc<Emitter>,
-    add_trust_flag: bool,
     pinned_codex_home: Option<&std::path::Path>,
     tty: [bool; 3],
 ) -> ExitCode {
@@ -1066,12 +991,9 @@ fn run_wrap_pty(
     // carries `DOT_AGENT_DECK_PANE_ID` / `_AGENT_ID` injected by the daemon), so
     // the child's own hooks and this wrapper's events attribute to the same pane.
     let mut cmd = StdCommand::new(program);
-    if add_trust_flag {
-        cmd.arg(CODEX_BYPASS_HOOK_TRUST_FLAG);
-    }
     cmd.args(args);
     // Finding #2: pin the vetted CODEX_HOME on the child so the home the deck
-    // inspected/installed into is exactly the home Codex loads.
+    // installed into and trusted is exactly the home Codex loads.
     if let Some(home) = pinned_codex_home {
         cmd.env("CODEX_HOME", home);
     }
@@ -1345,16 +1267,12 @@ fn run_wrap_pipe(
     program: &str,
     args: &[String],
     emitter: &Arc<Emitter>,
-    add_trust_flag: bool,
     pinned_codex_home: Option<&std::path::Path>,
 ) -> ExitCode {
     let mut cmd = StdCommand::new(program);
-    if add_trust_flag {
-        cmd.arg(CODEX_BYPASS_HOOK_TRUST_FLAG);
-    }
     cmd.args(args);
     // Finding #2: pin the vetted CODEX_HOME on the child so the home the deck
-    // inspected/installed into is exactly the home Codex loads.
+    // installed into and trusted is exactly the home Codex loads.
     if let Some(home) = pinned_codex_home {
         cmd.env("CODEX_HOME", home);
     }

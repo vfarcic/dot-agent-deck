@@ -410,13 +410,17 @@ fn spawn_006_single_and_role_codex_commands_are_wrapped() {
         common::wait_for_file_substr_count(&record, "WRAPPED", 2, Duration::from_secs(10)),
         "scheduled orchestration Codex role never launched"
     );
-    let launches = std::fs::read_to_string(&record).expect("read scheduler launch record");
+    // PRD #20 §4.2.1: the daemon's startup scoped-trust step runs `codex
+    // app-server` to read Codex's own hook hashes, which this PATH recorder also
+    // logs. It is a metadata probe, not an agent launch, so it is filtered out.
+    let launches = common::recorded_agent_launches(&record);
     assert_eq!(
-        launches.lines().collect::<Vec<_>>(),
+        launches,
         vec![
             "WRAPPED wrap --agent codex -- codex",
             "WRAPPED wrap --agent codex -- codex",
         ],
-        "scheduled single-agent and role spawns must both cross the Wrapper strategy exactly once; observed:\n{launches}"
+        "scheduled single-agent and role spawns must both cross the Wrapper strategy exactly once; observed:\n{}",
+        launches.join("\n")
     );
 }

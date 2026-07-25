@@ -533,6 +533,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
  "unicode-width",
