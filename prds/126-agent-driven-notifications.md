@@ -83,7 +83,7 @@ So every notify instruction is paired with a local append to an expectation log 
 
 ## Success Criteria
 
-- A channel is chosen and **verified reachable from every agent this repo runs** — the Pi orchestrator *and* the Claude workers — or the failure to reach one of them is recorded as a finding.
+- A channel is chosen and **verified reachable from every agent this repo runs** — all four families: Pi (`orchestrator`, `auditor`), Claude (`coder`, `release`), OpenCode (`reviewer`), and Codex (`tester`) — or the failure to reach one of them is recorded as a finding.
 - Reaching the test-plan gate (step 1) and the merge gate (step 7) produces a notification that arrives on a device that is not the terminal running the deck.
 - The expectation log exists, is written at every notifiable moment, and is reconciled against arrived notifications after each run.
 - At least **three** orchestrated PRD runs are observed, **including at least one long enough for the orchestrator to compact** (so the PRD #82 interaction is exercised rather than assumed).
@@ -95,9 +95,18 @@ So every notify instruction is paired with a local append to an expectation log 
 
 ### Prefer a CLI over an MCP
 
-This repo does not run one agent. The orchestrator is Pi (`command = "devbox run pi-big"`, `.dot-agent-deck.toml:74`) while the workers are Claude. #126 was originally written against Claude / Codex / Gemini / Aider and never covered Pi (PRD #201).
+This repo does not run one agent — it runs **four different agent CLIs**, and every one of them carries a notify instruction:
 
-A shell-callable CLI (`ntfy` / `curl` to a topic, or a two-line script in the repo) works for **any** agent with shell access, uniformly, with no per-agent MCP configuration. An MCP has to be wired up per agent and Pi may not support one at all. So the CLI is the default choice; Slack MCP led the original write-up mostly because it was already installed.
+| Family | Roles | Command (`.dot-agent-deck.toml`) |
+|---|---|---|
+| Pi | `orchestrator`, `auditor` | `devbox run pi-big` |
+| Claude | `coder`, `release` | `devbox run agent-orchestrator`, `devbox run agent-release` |
+| OpenCode | `reviewer` | `devbox run oc-big` |
+| Codex | `tester` | `devbox run codex-big` |
+
+This PRD was originally written against Claude / Codex / Gemini / Aider and never covered Pi (PRD #201) or OpenCode.
+
+A shell-callable CLI (`ntfy` / `curl` to a topic, or a two-line script in the repo) works for **any** agent with shell access, uniformly, with no per-agent MCP configuration. An MCP has to be wired up per agent, and wiring one into four different CLIs — one of which (Pi) may not support MCPs at all — is exactly the per-agent cost the CLI avoids. So the CLI is the default choice; Slack MCP led the original write-up mostly because it was already installed. **This four-family spread is the single strongest argument for the CLI**, and it only became visible once reachability was checked against each launcher rather than assumed from the orchestrator's.
 
 Fallback ladder if the Pi orchestrator cannot reach the chosen channel: (1) a plain CLI it can shell out to; (2) switch the orchestrator to the all-Claude command already sitting commented at `.dot-agent-deck.toml:75`; (3) record "orchestrator cannot notify" as the headline finding — it would be the single most important result this PRD could produce, since the orchestrator owns both user gates.
 
@@ -125,7 +134,7 @@ Do not misread that as "agents are unreliable at notifying". It is the same root
 
 ### Phase 1 — Decide and configure (no deck code)
 
-- [x] **M1.1** — Choose the destination and the delivery mechanism. Verify reachability from the Pi orchestrator and from a Claude worker before committing to it; walk the fallback ladder if Pi cannot reach it. Record the choice and the verification in this PRD. → see [M1.1 record](#m11-record-channel-choice-and-verification-2026-07-25).
+- [x] **M1.1** — Choose the destination and the delivery mechanism. Verify reachability from **every** agent family this repo runs — Pi, Claude, OpenCode, and Codex — before committing to it; walk the fallback ladder if Pi cannot reach it, and record any family that cannot self-notify as a finding. Record the choice and the verification in this PRD. → see [M1.1 record](#m11-record-channel-choice-and-verification-2026-07-25).
 - [x] **M1.2** — Define the expectation-log format and add the "append to `.dot-agent-deck/notify-log.md`" step to the same instructions that trigger a notification. Confirm the path is gitignored. → see [M1.2 record](#m12-record-expectation-log-format).
 - [x] **M1.3** — Extend this repo's `.dot-agent-deck.toml` role `prompt_template`s with the notify + log instructions per the [Where to fire](#where-to-fire) table, phrased fire-and-forget. → see [M1.3 record](#m13-record-where-the-instructions-landed).
 - [x] **M1.4** — Contributor note under `docs/develop/` documenting the setup and how to reproduce it. Not published (CLAUDE.md rule 11); linked from `CONTRIBUTING.md`. → `docs/develop/notifications-dogfood.md`, linked from `CONTRIBUTING.md`.
@@ -134,15 +143,26 @@ Do not misread that as "agents are unreliable at notifying". It is the same root
 
 **Chosen**: a plain `curl` POST to the public ntfy.sh topic **`dot-agent-deck-notify-0c0d15e13936d122`**, wrapped in a repo helper script `scripts/notify.sh` (`scripts/notify.sh <gate|done|blocked> <role> '<message>'`). No MCP, no account, no API key, no OAuth. Overridable per-machine via `DOT_AGENT_DECK_NOTIFY_TOPIC` / `DOT_AGENT_DECK_NOTIFY_SERVER` without touching code or config.
 
-**Verified reachable — the fallback ladder was not needed.** Both agent families this repo's *notifying* roles run were exercised against the real topic:
+**Verified reachable from all four agent families — the fallback ladder was not needed.** The first pass covered only Pi and Claude; review correctly caught that this repo also runs the `reviewer` through OpenCode and the `tester` through Codex, and that both receive `blocked` notify instructions. All four were then exercised against the real topic, and the Pi and Claude checks were re-run against the corrected script (see [Post-review corrections](#post-review-corrections-2026-07-25)):
 
-| From | How | Result |
-|---|---|---|
-| Claude worker shell (raw `curl`) | `curl -w '%{http_code}'` POST to the topic | **HTTP 200**, response body `{"id":"8lCxOr4PnHzO","event":"message","topic":"dot-agent-deck-notify-0c0d15e13936d122",…}` |
-| Claude worker shell (via helper) | `./scripts/notify.sh gate coder '…'` | exit 0; log rows `reached` + `send=ok http=200` |
-| **Pi orchestrator** | `devbox run -- pi -p --model anthropic/claude-haiku-4-5 --approve '…run ./scripts/notify.sh…'` | Pi shelled out successfully; **exit code 0**; log rows `reached` + `send=ok http=200` with `role=orchestrator` |
+| Family | Role | How | Exit | Log rows | HTTP |
+|---|---|---|---|---|---|
+| — | — | `curl -w '%{http_code}'` POST straight to the topic from a maintainer shell | 0 | n/a | **200**, body `{"id":"8lCxOr4PnHzO","event":"message","topic":"dot-agent-deck-notify-0c0d15e13936d122",…}` |
+| **Claude** | `coder` | `./scripts/notify.sh gate coder '…'` from the worker's own shell | **0** | `reached` + `send=ok`, id `inv-6a6541ca-322ccc-50b3` | **200** |
+| **Claude** | `release` | prompt piped to `devbox run -- claude -p --model haiku --allowedTools Bash` | **0** | `reached` + `send=ok`, id `inv-6a6542df-3269a3-5d01` | **200** |
+| **Pi** | `orchestrator` | `devbox run -- pi -p --model anthropic/claude-haiku-4-5 --approve '…run ./scripts/notify.sh…'` | **0** | `reached` + `send=ok`, id `inv-322b97-0e3f` | **200** |
+| **OpenCode** | `reviewer` | `devbox run -- opencode run --model openai/gpt-5.4-mini '…run ./scripts/notify.sh…'` | **0** | `reached` + `send=ok`, ids `inv-322842-79cf` and `inv-3229ba-63d3` | **200** |
+| **Codex** | `tester` | `devbox run -- codex exec --model gpt-5.6-sol --sandbox workspace-write -c sandbox_workspace_write.network_access=true '…run ./scripts/notify.sh…'` | **0** | `reached` + `send=ok`, id `inv-2-230f` | **200** |
 
-The Pi check used `pi -p` with a cheap model rather than the interactive `devbox run pi-big` the deck spawns; the bash tool being exercised is the same one, so what is verified is *shell reach*, which is the only thing at issue.
+Each check used the launcher's **non-interactive** form with a cheap model rather than the interactive command the deck spawns (`pi -p`, `claude -p`, `opencode run`, `codex exec`); the bash tool being exercised is the same one, so what is verified is *shell reach*, which is the only thing at issue. The per-agent commands are documented in `docs/develop/notifications-dogfood.md` so this is reproducible rather than a one-off claim.
+
+Two incidental observations from the OpenCode and Codex runs, both already folded back into the script and docs:
+
+- **OpenCode fired the helper twice** — its first invocation printed nothing, so it re-ran the command wrapped in `printf '%s' $?` to read the exit code. Harmless here, but it is a live demonstration of why `reached`/`send` rows need an invocation id: two invocations by the same role, five seconds apart, produce four rows that no timestamp can pair up.
+- **Codex reported PID 2** — it runs inside a PID namespace and reliably gets a low PID, so PIDs collide across sandboxed agents. The invocation id therefore mixes epoch + PID + `$RANDOM` rather than relying on the PID alone.
+- **Claude needs the prompt on stdin** under `devbox run --`, which swallows a positional prompt and makes `claude -p` exit with "Input must be provided either through stdin or as a prompt argument". Only affects the verification harness, not the deck's interactive spawn; documented so the reproduction steps work as written.
+
+**No agent failed to self-notify.** The success criterion's escape hatch ("or the failure to reach one of them is recorded as a finding") was not needed: all four families have a scriptable non-interactive path and all four reached the topic.
 
 **Failure path verified too** (so the log's negative evidence is trustworthy): pointed at an unreachable server, the helper still wrote the `reached` row, recorded `send=failed http=000 curl_exit=7`, and **exited 0**. With no arguments at all it also exits 0. Fire-and-forget holds by construction, not by convention.
 
@@ -157,10 +177,10 @@ File: `.dot-agent-deck/notify-log.md`. **Gitignored** — confirmed by `git chec
 Format is a Markdown table — renders on GitHub, greps cleanly, one event per line:
 
 ```markdown
-| timestamp (UTC) | role | kind | record | detail |
-|---|---|---|---|---|
-| 2026-07-25T22:40:33Z | coder | gate | reached  | helper script send path from a Claude worker shell |
-| 2026-07-25T22:40:34Z | coder | gate | send=ok  | http=200 topic=dot-agent-deck-notify-0c0d15e13936d122 |
+| timestamp (UTC) | invocation | role | kind | record | detail |
+|---|---|---|---|---|---|
+| 2026-07-25T23:07:54Z | inv-6a6541ca-322ccc-50b3 | coder | gate | reached | helper script send path from a Claude worker shell |
+| 2026-07-25T23:07:55Z | inv-6a6541ca-322ccc-50b3 | coder | gate | send=ok | http=200 topic=dot-agent-deck-notify-0c0d15e13936d122 |
 ```
 
 `scripts/notify.sh` appends **two** rows per invocation, which is how "reached a moment" stays independent from "attempted a send":
@@ -168,7 +188,13 @@ Format is a Markdown table — renders on GitHub, greps cleanly, one event per l
 1. `reached` — written **before** the send is attempted, so it survives a dead network, a missing `curl`, or the agent being killed mid-send.
 2. `send=ok` / `send=failed` / `send=skipped` — written **after**, carrying the HTTP status and `curl` exit code.
 
-The message is sanitized (newlines and `|` collapsed) so one event can never become two rows or break the table. Reconciliation procedure and the three gaps are documented in `docs/develop/notifications-dogfood.md`; note that gap #3, *never even reached*, is recorded by **omission** and must be reconstructed from the run's actual shape, because the log cannot report its own absence.
+Both rows carry the same **invocation id**, generated before the first append. Timestamps are second-resolution and roles run concurrently, so id is the only reliable key for pairing a `reached` with its send outcome — the OpenCode check above produced exactly the interleaving case that motivates it.
+
+The message is sanitized (newlines and `|` collapsed) so one event can never become two rows or break the table; the `DOT_AGENT_DECK_NOTIFY_TOPIC` override goes through the same sanitizer, since it lands in both the request URL and the log's detail column.
+
+**Logging is best-effort, and the docs say so.** `append` cannot be made to succeed against a read-only checkout, a bad `DOT_AGENT_DECK_NOTIFY_LOG`, or a full disk, and fire-and-forget forbids failing the caller over it. So it keeps the caller-facing exit 0 but prints `notify.sh: could not …` on **stderr**, plus a closing `N of 2 expectation-log rows were lost for <id>`. That is what keeps "the agent never invoked the helper" distinguishable from "the helper ran but could not log" — the two would otherwise be the same silence. A pre-run check that invokes the helper and confirms both rows appear at the real log path is documented as a prerequisite.
+
+Reconciliation procedure and the three gaps are documented in `docs/develop/notifications-dogfood.md`, including the per-run window (log line range), the definition of *attempted* as `send=ok` + `send=failed` (excluding `send=skipped`), the manual device-arrival tally, and the exact pre/post-compaction table to append to [Findings](#counts-and-gaps). Note that gap #3, *never even reached*, is recorded by **omission** and must be reconstructed from the run's actual shape, because the log cannot report its own absence.
 
 #### M1.3 record — where the instructions landed
 
@@ -185,9 +211,18 @@ All in `.dot-agent-deck.toml` role `prompt_template`s, anchored **inline at each
 
 Phrasing is fire-and-forget throughout — every site says "send and continue", "ignore its result", "never wait for an acknowledgment". No site says notify-and-wait. The orchestrator also carries an explicit **"do not notify on anything else"** line (per-step chatter would make the signal worthless) and an instruction to **tell the user in its next message if it reached a moment but could not run the script at all** — that self-report is the only way the reached-but-not-even-logged case leaves a trace.
 
+#### Post-review corrections (2026-07-25)
+
+Phase 1 was reviewed and security-audited before Phase 2 started. Both passes agreed on one **blocker**, and it is worth recording because it is a genuine finding about this design rather than a typo:
+
+- **`curl --data-binary "$message"` could exfiltrate a local file to the public topic.** `--data-binary` gives a leading `@` the meaning "read this file"; `@-` reads stdin. Agents pass free-form prose, and a message that begins with a path or an @mention is entirely plausible — so `scripts/notify.sh blocked coder '@/etc/passwd'` would have POSTed the file's contents to a world-readable topic, the exact thing the script header promises never happens. Fixed by switching to `--data-raw`, which sends the `@` literally. Verified against a local HTTP sink: `--data-binary "@<file>"` delivered the file's contents, `--data-raw "@<file>"` delivered the literal path, and the helper now delivers the literal path.
+  **This is a finding for Phase 3, not just a fix.** The riskiest part of the no-code approach turned out to be neither the agents nor the transport but the *payload plumbing* in the glue script — the one component a deck-side implementation would have owned and gotten right once, instead of once per project that copies this pattern.
+
+Also addressed, all in the glue rather than the deck: the topic override now goes through the same sanitizer as the message (a crafted env var could otherwise inject a spurious log row); both log rows carry an invocation id; and logging failures are reported on stderr instead of being silently swallowed. Zero `src/` diff throughout.
+
 ### Phase 2 — Run and observe
 
-- [ ] **M2.1** — **Prerequisite (manual, maintainer):** subscribe a device that is *not* the terminal running the deck to the topic — ntfy phone app or `https://ntfy.sh/dot-agent-deck-notify-0c0d15e13936d122` in a browser — *before* the first run. Phase 1 verified the send path (HTTP 200) but arrival is unverifiable from a shell, and an unsubscribed topic turns every successful send into an apparent miss. Then run at least three orchestrated PRDs under the configuration, including one long enough to compact. Do not tune the instructions mid-run; a change resets the sample.
+- [ ] **M2.1** — **Prerequisite (manual, maintainer):** subscribe a device that is *not* the terminal running the deck to the topic — ntfy phone app or `https://ntfy.sh/dot-agent-deck-notify-0c0d15e13936d122` in a browser — *before* the first run. Phase 1 verified the send path (HTTP 200) but arrival is unverifiable from a shell, and an unsubscribed topic turns every successful send into an apparent miss. Also run the **pre-run log check** (`docs/develop/notifications-dogfood.md`) — invoke the helper once and confirm both rows land at the real log path with no `notify.sh:` stderr note — since logging is best-effort and a silently broken log makes every gap this run produces uninterpretable. Record the log's line count before starting: the reconciliation window is a line range. Then run at least three orchestrated PRDs under the configuration, including one long enough to compact. Do not tune the instructions mid-run; a change resets the sample.
 - [ ] **M2.2** — Reconcile the expectation log against arrived notifications after each run. Append a findings section to this PRD with counts and every gap, plus any tripwire thoughts.
 
 ### Phase 3 — Decide what, if anything, the deck should do
@@ -239,7 +274,7 @@ Manual, per `feedback_validate_pre_pr`: three real orchestrated runs with log re
 
 ### Counts and gaps
 
-_Populated by M2.2. Empty until the dogfood has run._ The reconciliation must record, per run and split before/after any compaction: moments reached, notifications attempted, notifications arrived, and each of the three gaps (`reached`-but-not-`send=ok`; `send=ok`-but-never-arrived; the moment that produced no row at all).
+_Populated by M2.2. Empty until the dogfood has run._ The reconciliation must record, per run and split before/after any compaction: moments reached, notifications attempted (`send=ok` + `send=failed`, with `send=skipped` counted separately since no request left the machine), notifications arrived on the subscribed device, and each of the three gaps (`reached`-but-not-`send=ok`, identified by invocation id; `send=ok`-but-never-arrived; the moment that produced no row at all). The exact table to append here, the per-run log-line window that bounds the counts, and the commands that produce them are in [`docs/develop/notifications-dogfood.md`](../docs/develop/notifications-dogfood.md#the-record-to-append-to-the-prd) — do not invent a shape at reconciliation time.
 
 ### Tripwire thoughts caught during Phase 1 (2026-07-25)
 
