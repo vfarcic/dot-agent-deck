@@ -1,6 +1,6 @@
 # PRD #126: Agent-driven notifications — dogfood on dot-agent-deck development
 
-**Status**: Planning — narrowed 2026-07-25 to a no-code dogfood (see [Scope decision (2026-07-25)](#scope-decision-2026-07-25))
+**Status**: In progress — Phase 1 (configure) complete 2026-07-25; Phase 2 (run and observe) is next. Narrowed 2026-07-25 to a no-code dogfood (see [Scope decision (2026-07-25)](#scope-decision-2026-07-25))
 **Priority**: Medium
 **Created**: 2026-05-25
 **GitHub Issue**: [#126](https://github.com/vfarcic/dot-agent-deck/issues/126)
@@ -125,14 +125,69 @@ Do not misread that as "agents are unreliable at notifying". It is the same root
 
 ### Phase 1 — Decide and configure (no deck code)
 
-- [ ] **M1.1** — Choose the destination and the delivery mechanism. Verify reachability from the Pi orchestrator and from a Claude worker before committing to it; walk the fallback ladder if Pi cannot reach it. Record the choice and the verification in this PRD.
-- [ ] **M1.2** — Define the expectation-log format and add the "append to `.dot-agent-deck/notify-log.md`" step to the same instructions that trigger a notification. Confirm the path is gitignored.
-- [ ] **M1.3** — Extend this repo's `.dot-agent-deck.toml` role `prompt_template`s with the notify + log instructions per the [Where to fire](#where-to-fire) table, phrased fire-and-forget.
-- [ ] **M1.4** — Contributor note under `docs/develop/` documenting the setup and how to reproduce it. Not published (CLAUDE.md rule 11); linked from `CONTRIBUTING.md`.
+- [x] **M1.1** — Choose the destination and the delivery mechanism. Verify reachability from the Pi orchestrator and from a Claude worker before committing to it; walk the fallback ladder if Pi cannot reach it. Record the choice and the verification in this PRD. → see [M1.1 record](#m11-record-channel-choice-and-verification-2026-07-25).
+- [x] **M1.2** — Define the expectation-log format and add the "append to `.dot-agent-deck/notify-log.md`" step to the same instructions that trigger a notification. Confirm the path is gitignored. → see [M1.2 record](#m12-record-expectation-log-format).
+- [x] **M1.3** — Extend this repo's `.dot-agent-deck.toml` role `prompt_template`s with the notify + log instructions per the [Where to fire](#where-to-fire) table, phrased fire-and-forget. → see [M1.3 record](#m13-record-where-the-instructions-landed).
+- [x] **M1.4** — Contributor note under `docs/develop/` documenting the setup and how to reproduce it. Not published (CLAUDE.md rule 11); linked from `CONTRIBUTING.md`. → `docs/develop/notifications-dogfood.md`, linked from `CONTRIBUTING.md`.
+
+#### M1.1 record — channel choice and verification (2026-07-25)
+
+**Chosen**: a plain `curl` POST to the public ntfy.sh topic **`dot-agent-deck-notify-0c0d15e13936d122`**, wrapped in a repo helper script `scripts/notify.sh` (`scripts/notify.sh <gate|done|blocked> <role> '<message>'`). No MCP, no account, no API key, no OAuth. Overridable per-machine via `DOT_AGENT_DECK_NOTIFY_TOPIC` / `DOT_AGENT_DECK_NOTIFY_SERVER` without touching code or config.
+
+**Verified reachable — the fallback ladder was not needed.** Both agent families this repo's *notifying* roles run were exercised against the real topic:
+
+| From | How | Result |
+|---|---|---|
+| Claude worker shell (raw `curl`) | `curl -w '%{http_code}'` POST to the topic | **HTTP 200**, response body `{"id":"8lCxOr4PnHzO","event":"message","topic":"dot-agent-deck-notify-0c0d15e13936d122",…}` |
+| Claude worker shell (via helper) | `./scripts/notify.sh gate coder '…'` | exit 0; log rows `reached` + `send=ok http=200` |
+| **Pi orchestrator** | `devbox run -- pi -p --model anthropic/claude-haiku-4-5 --approve '…run ./scripts/notify.sh…'` | Pi shelled out successfully; **exit code 0**; log rows `reached` + `send=ok http=200` with `role=orchestrator` |
+
+The Pi check used `pi -p` with a cheap model rather than the interactive `devbox run pi-big` the deck spawns; the bash tool being exercised is the same one, so what is verified is *shell reach*, which is the only thing at issue.
+
+**Failure path verified too** (so the log's negative evidence is trustworthy): pointed at an unreachable server, the helper still wrote the `reached` row, recorded `send=failed http=000 curl_exit=7`, and **exited 0**. With no arguments at all it also exits 0. Fire-and-forget holds by construction, not by convention.
+
+**Not yet verified — arrival on a non-terminal device.** HTTP 200 proves ntfy *accepted* the message; it does not prove it *arrived* anywhere. Closing that requires the maintainer to subscribe a phone or browser to the topic, which is a Phase 2 (M2.1) manual prerequisite and the reason gap #2 below is reconciled by eye.
+
+**Accepted caveat — the topic is public.** ntfy.sh topics are unauthenticated: anyone who knows the name can read *and* publish to it, and the name is committed in a public repo. The random suffix prevents guessing, not lookup. Mitigation is payload discipline, enforced in the script's header comment and the docs: role + event kind + one short sentence, never secrets, tokens, diffs, or file contents. Acceptable for a payload that is literally "a gate was reached"; would not be acceptable for anything else. Noted as a real (if small) argument for a deck-side config field in Phase 3 — see tripwire thought T4.
+
+#### M1.2 record — expectation-log format
+
+File: `.dot-agent-deck/notify-log.md`. **Gitignored** — confirmed by `git check-ignore -v`, which resolves to `.gitignore:6:.dot-agent-deck/` (the pre-existing blanket rule for per-clone dev state). No `.gitignore` change was needed.
+
+Format is a Markdown table — renders on GitHub, greps cleanly, one event per line:
+
+```markdown
+| timestamp (UTC) | role | kind | record | detail |
+|---|---|---|---|---|
+| 2026-07-25T22:40:33Z | coder | gate | reached  | helper script send path from a Claude worker shell |
+| 2026-07-25T22:40:34Z | coder | gate | send=ok  | http=200 topic=dot-agent-deck-notify-0c0d15e13936d122 |
+```
+
+`scripts/notify.sh` appends **two** rows per invocation, which is how "reached a moment" stays independent from "attempted a send":
+
+1. `reached` — written **before** the send is attempted, so it survives a dead network, a missing `curl`, or the agent being killed mid-send.
+2. `send=ok` / `send=failed` / `send=skipped` — written **after**, carrying the HTTP status and `curl` exit code.
+
+The message is sanitized (newlines and `|` collapsed) so one event can never become two rows or break the table. Reconciliation procedure and the three gaps are documented in `docs/develop/notifications-dogfood.md`; note that gap #3, *never even reached*, is recorded by **omission** and must be reconstructed from the run's actual shape, because the log cannot report its own absence.
+
+#### M1.3 record — where the instructions landed
+
+All in `.dot-agent-deck.toml` role `prompt_template`s, anchored **inline at each role's real waiting point** rather than collected in a preamble, so each instruction reads at the moment it applies:
+
+| Role | Anchor | Kind |
+|---|---|---|
+| `orchestrator` | step 1, on the same line as "Surface the plan … and STOP" | `gate` |
+| `orchestrator` | step 7, on the same line as "Then pause — the user reviews the PR" | `gate` |
+| `orchestrator` | new "**Run finished.**" paragraph after the two-user-gates note | `done` |
+| `release` | on the "Once the PR is open, CI is green, and Greptile's review has settled … STOP" line, fired *before* the work-done report | `done` |
+| `coder` / `reviewer` / `auditor` | appended to each role's existing "if critical context is missing" sentence | `blocked` |
+| `tester` | new final paragraph, covering both "blocked" and the existing out-of-harness-reach report-back | `blocked` |
+
+Phrasing is fire-and-forget throughout — every site says "send and continue", "ignore its result", "never wait for an acknowledgment". No site says notify-and-wait. The orchestrator also carries an explicit **"do not notify on anything else"** line (per-step chatter would make the signal worthless) and an instruction to **tell the user in its next message if it reached a moment but could not run the script at all** — that self-report is the only way the reached-but-not-even-logged case leaves a trace.
 
 ### Phase 2 — Run and observe
 
-- [ ] **M2.1** — Run at least three orchestrated PRDs under the configuration, including one long enough to compact. Do not tune the instructions mid-run; a change resets the sample.
+- [ ] **M2.1** — **Prerequisite (manual, maintainer):** subscribe a device that is *not* the terminal running the deck to the topic — ntfy phone app or `https://ntfy.sh/dot-agent-deck-notify-0c0d15e13936d122` in a browser — *before* the first run. Phase 1 verified the send path (HTTP 200) but arrival is unverifiable from a shell, and an unsubscribed topic turns every successful send into an apparent miss. Then run at least three orchestrated PRDs under the configuration, including one long enough to compact. Do not tune the instructions mid-run; a change resets the sample.
 - [ ] **M2.2** — Reconcile the expectation log against arrived notifications after each run. Append a findings section to this PRD with counts and every gap, plus any tripwire thoughts.
 
 ### Phase 3 — Decide what, if anything, the deck should do
@@ -155,9 +210,10 @@ Rules 2 and 10 still apply: `cargo fmt --check` and `cargo clippy -- -D warnings
 
 ## Key Files
 
-- `.dot-agent-deck.toml` — this repo's orchestration roles; the orchestrator `prompt_template` (`:77-124`), its two user gates (`:117`), and the Pi/Claude command split (`:74-75`).
-- `docs/develop/` — where the contributor note lands (developer-facing, excluded from the Docusaurus build).
-- `.dot-agent-deck/notify-log.md` — the expectation log (gitignored, created at runtime).
+- `.dot-agent-deck.toml` — this repo's orchestration roles; the orchestrator `prompt_template`, its two user gates, the Pi/Claude command split, and (as of Phase 1) the inline notify instructions in every role.
+- `scripts/notify.sh` — the fire-and-forget helper: `curl` to the ntfy topic plus the two-record append to the expectation log. Always exits 0.
+- `docs/develop/notifications-dogfood.md` — the contributor note (developer-facing, excluded from the Docusaurus build, linked from `CONTRIBUTING.md`).
+- `.dot-agent-deck/notify-log.md` — the expectation log (gitignored via `.gitignore:6`, created at runtime).
 - `src/scheduler.rs:38-45,104` — the existing scheduler-internal `Notifier` / `NotifyEvent` / `StderrNotifier` seam. **Referenced so it is not disturbed**; this PRD does not touch it.
 
 ## Risks and Mitigations
@@ -181,4 +237,20 @@ Manual, per `feedback_validate_pre_pr`: three real orchestrated runs with log re
 
 ## Findings
 
-_Populated by M2.2. Empty until the dogfood has run._
+### Counts and gaps
+
+_Populated by M2.2. Empty until the dogfood has run._ The reconciliation must record, per run and split before/after any compaction: moments reached, notifications attempted, notifications arrived, and each of the three gaps (`reached`-but-not-`send=ok`; `send=ok`-but-never-arrived; the moment that produced no row at all).
+
+### Tripwire thoughts caught during Phase 1 (2026-07-25)
+
+Recorded per [the tripwire](#the-hard-constraint), **not acted on**, and carried into the M3.1 discussion. Each of these was a live "I'll just add a small thing to the deck" impulse while wiring Phase 1:
+
+- **T1 — "The `blocked` notify would be far more reliable as a wrapper around `dot-agent-deck work-done` than as an instruction each worker has to remember."** Every worker already calls `work-done` to finish, and its `--task` text already contains the blocked reason; firing the notification from inside that CLI would make a missed `blocked` notification structurally impossible. **This is precisely the evidence-destroying change the tripwire exists for** — it would move the notification from "the agent chose to do it" to "the deck did it", which is the exact hypothesis under test. Worth noting that it also quietly re-answers PRD #99's question in #99's favour, for the `blocked` event only.
+- **T2 — "Reconciliation would be trivial if the deck emitted its lifecycle events into the same log."** The scheduler-internal `Notifier` / `NotifyEvent` seam (`src/scheduler.rs:38-45`) already knows when a run starts, finishes, and fails; teeing those into `.dot-agent-deck/notify-log.md` would give an independent ground truth for "which moments actually occurred", collapsing gap #3 from manual reconstruction to a diff. Deliberately not done — the seam is explicitly off-limits here, and the manual reconstruction is the honest version at N=3 runs.
+- **T3 — "`prompt_template` is compaction-mortal, so an `agent_notification_hint` re-injected at each delegate would fix the thing we already predict will break."** This is the deferred config field resurfacing under the guise of a bug fix. It must not be added mid-flight: the predicted post-compaction silence is a *result* of this experiment (and a second independent symptom of PRD #82), and pre-emptively fixing it destroys that result. If the log shows a clean before/after-compaction split, the correct follow-up is #82's re-assert, not this field.
+- **T4 — "Having to commit a public topic name into a public repo is a wart a `[notifications]` config block would solve."** A deck-side config field (or an env passthrough the deck owns) would let the topic be private per-machine while keeping zero-setup defaults. Real, but small: the same effect is already available via `DOT_AGENT_DECK_NOTIFY_TOPIC`, at the cost of the maintainer remembering to export it. Recorded so Phase 3 weighs it as an *ergonomics* argument, not a capability one.
+- **T5 — non-tripwire, but adjacent.** Nothing in Phase 1 produced a "the deck must do this or it cannot work" thought. Every gap encountered had a no-code workaround, and the two genuinely deck-shaped items are still the pair [the scope decision names as un-informable by this dogfood](#what-this-cannot-tell-us-stated-up-front-so-the-result-is-not-over-read) — the inactivity nudge and the no-agent fallback. Phase 1 neither strengthens nor weakens the case for either, exactly as predicted.
+
+### Zero-diff check
+
+`git diff --stat -- src/` is empty on this branch. Phase 1 touched only `.dot-agent-deck.toml`, `scripts/notify.sh` (new), `docs/develop/notifications-dogfood.md` (new), `CONTRIBUTING.md`, and this PRD. `.gitignore` needed no change (`.dot-agent-deck/` already covers the log).
