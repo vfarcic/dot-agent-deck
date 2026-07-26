@@ -3368,6 +3368,22 @@ pub enum Action {
     ScheduleDelete(String),
 }
 
+/// Kitty/xterm modifier parameter for a CSI sequence: `1 + bitmask`, where
+/// shift=1, alt=2, ctrl=4. So Shift → 2, Alt → 3, Ctrl → 5, Ctrl+Shift → 6.
+fn csi_modifier_param(mods: KeyModifiers) -> u8 {
+    let mut bits = 0u8;
+    if mods.contains(KeyModifiers::SHIFT) {
+        bits |= 1;
+    }
+    if mods.contains(KeyModifiers::ALT) {
+        bits |= 2;
+    }
+    if mods.contains(KeyModifiers::CONTROL) {
+        bits |= 4;
+    }
+    1 + bits
+}
+
 /// Convert a crossterm `KeyEvent` into the byte sequence expected by a terminal PTY.
 fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     // Alt modifier: wrap the base key bytes with an ESC prefix.
@@ -3385,6 +3401,32 @@ fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
             } else {
                 ctrl
             });
+        }
+    }
+
+    // PRD #227: modifier-aware encoding for keys whose legacy byte form cannot
+    // carry a modifier at all — the deck used to forward Shift+Enter as a bare
+    // `\r`, i.e. literally the same bytes as a plain Enter, so the agent
+    // submitted instead of inserting a newline.
+    //
+    // Only SHIFT/CONTROL open this path. ALT on its own keeps its historical
+    // ESC-prefix form (Alt+Enter → `ESC\r`), because a genuine Alt+Enter is
+    // meaningful to some agents; when ALT accompanies SHIFT/CONTROL it is folded
+    // into the modifier bitmask rather than dropped.
+    if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        let m = csi_modifier_param(key.modifiers);
+        match key.code {
+            // CSI-u: `ESC[13;2u` is the only newline encoding verified to work
+            // across all supported agents (pi, claude, opencode, codex). It also
+            // carries no `\r`, so the submit-debounce correctly ignores it.
+            KeyCode::Enter => return Some(format!("\x1b[13;{m}u").into_bytes()),
+            // Legacy CSI-with-modifier form for arrows (Shift+Up → `ESC[1;2A`).
+            KeyCode::Up => return Some(format!("\x1b[1;{m}A").into_bytes()),
+            KeyCode::Down => return Some(format!("\x1b[1;{m}B").into_bytes()),
+            KeyCode::Right => return Some(format!("\x1b[1;{m}C").into_bytes()),
+            KeyCode::Left => return Some(format!("\x1b[1;{m}D").into_bytes()),
+            _ => {}
         }
     }
 
@@ -19225,6 +19267,18 @@ mod tests {
             Some(vec![b'\r'])
         );
         assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+            Some(b"\x1b[13;5u".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            Some(vec![0x1b, b'\r'])
+        );
+        assert_eq!(
             keyevent_to_bytes(&KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
             Some(vec![b'\t'])
         );
@@ -19261,6 +19315,14 @@ mod tests {
         assert_eq!(
             keyevent_to_bytes(&KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
             Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)),
+            Some(b"\x1b[1;2A".to_vec())
+        );
+        assert_eq!(
+            keyevent_to_bytes(&KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL)),
+            Some(b"\x1b[1;5A".to_vec())
         );
         assert_eq!(
             keyevent_to_bytes(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
