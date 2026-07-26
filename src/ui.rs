@@ -7149,6 +7149,65 @@ fn resolve_orchestration_for_restore(
     Ok((orch, snap.start_role_index))
 }
 
+/// PRD #227 M2: whether this process pushed `KeyboardEnhancementFlags`.
+///
+/// The push is *gated* (see [`push_keyboard_enhancement`]), so it does not
+/// always happen — and an unmatched pop is not harmless: it tells the terminal
+/// to discard the top of a stack this process never contributed to, which
+/// inside a multiplexer can be a flag set some other program owns. Both
+/// teardown paths (normal exit and the panic hook) consult this flag.
+static KEYBOARD_ENHANCEMENT_PUSHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// PRD #227 M2: ask the terminal for the enhanced (kitty) keyboard protocol so
+/// modifier-bearing keypresses reach the deck at all. Without it a
+/// kitty-capable terminal stays in legacy mode, where Shift+Enter has no
+/// distinct encoding and arrives as a bare `\r` — the modifier is gone before
+/// any deck code runs, so the modifier-aware encoder (M1/M3) never sees it.
+///
+/// Gated on `supports_keyboard_enhancement()`, which returns `false` inside
+/// tmux: there the outer terminal cannot deliver the encoding anyway, so the
+/// feature self-disables and the deck degrades to its previous behavior rather
+/// than pushing a mode nothing honors.
+///
+/// `DISAMBIGUATE_ESCAPE_CODES` **only** — deliberately not
+/// `REPORT_ALL_KEYS_AS_ESCAPE_CODES`, which would re-encode ordinary
+/// text-producing keys as CSI-u and change how every existing dashboard
+/// binding arrives.
+fn push_keyboard_enhancement() {
+    if !matches!(
+        crossterm::terminal::supports_keyboard_enhancement(),
+        Ok(true)
+    ) {
+        return;
+    }
+    if crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        ),
+    )
+    .is_ok()
+    {
+        KEYBOARD_ENHANCEMENT_PUSHED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// PRD #227 M2: undo [`push_keyboard_enhancement`]. Called from *both* teardown
+/// paths — normal exit and the panic hook — because a leaked push outlives the
+/// process and leaves the shell the user drops back into in the enhanced mode.
+///
+/// No-op unless this process actually pushed; the `swap` also makes a second
+/// call safe, so the two paths cannot double-pop.
+fn pop_keyboard_enhancement() {
+    if KEYBOARD_ENHANCEMENT_PUSHED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PopKeyboardEnhancementFlags,
+        );
+    }
+}
+
 pub fn run_tui(
     state: SharedState,
     pane: Arc<dyn PaneController>,
@@ -7166,6 +7225,11 @@ pub fn run_tui(
         if crate::embedded_pane::in_guarded_parser_feed() {
             return;
         }
+        // PRD #227 M2: pop the keyboard-enhancement flag on the crash path too.
+        // Unlike mouse capture, a leaked push is not merely cosmetic — it
+        // survives the process and corrupts key delivery in the shell the user
+        // is dropped back into.
+        pop_keyboard_enhancement();
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::DisableMouseCapture,
@@ -7183,6 +7247,14 @@ pub fn run_tui(
     )?;
 
     let mut terminal = ratatui::init();
+
+    // PRD #227 M2: raw mode and the alternate screen are up, so negotiate the
+    // enhanced keyboard protocol now — before the event loop starts polling,
+    // since the support probe reads the terminal's reply off stdin itself.
+    // Paired with `pop_keyboard_enhancement()` in the teardown below and in the
+    // panic hook installed above.
+    push_keyboard_enhancement();
+
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, keybindings);
     // PRD #196: restore the persisted global last-command so the new-pane form
@@ -9584,6 +9656,9 @@ pub fn run_tui(
     // EOF, and the agents survive — same property the round-7 loop
     // already guarded for the external-daemon case.
 
+    // PRD #227 M2: undo the enhanced-keyboard push (no-op if it never happened)
+    // alongside the mouse-capture / bracketed-paste restores.
+    pop_keyboard_enhancement();
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::DisableMouseCapture,
