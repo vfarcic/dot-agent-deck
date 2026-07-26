@@ -3492,19 +3492,82 @@ fn extract_selection_text(screen: &vt100::Screen, sel: &TextSelection, row_offse
     trimmed.to_string()
 }
 
-/// Copy text to the system clipboard using the OSC 52 escape sequence.
-/// Writes directly to `/dev/tty` to bypass ratatui's buffered terminal output.
-fn copy_to_clipboard_osc52(text: &str) {
-    use std::io::Write;
+/// Build the OSC 52 "set clipboard" escape sequence carrying `text`.
+///
+/// Split out of [`copy_to_clipboard_osc52`] so the *bytes* are constructed in
+/// exactly one place and are therefore identical on every platform — PRD #163
+/// M5 varies only the write target (`/dev/tty` vs `CONOUT$`), never the
+/// sequence — and so the construction is unit-testable without a terminal.
+fn osc52_clipboard_sequence(text: &str) -> String {
     let encoded = base64_encode(text.as_bytes());
     // Use ST (\x1b\\) terminator — more widely supported than BEL (\x07) in raw mode.
-    let seq = format!("\x1b]52;c;{encoded}\x1b\\");
-    // Write to /dev/tty directly so the escape sequence reaches the outer terminal
-    // even when ratatui has captured stdout.
-    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+    format!("\x1b]52;c;{encoded}\x1b\\")
+}
+
+/// Copy text to the system clipboard using the OSC 52 escape sequence.
+/// Writes directly to the controlling terminal to bypass ratatui's buffered
+/// terminal output.
+fn copy_to_clipboard_osc52(text: &str) {
+    use std::io::Write;
+    let seq = osc52_clipboard_sequence(text);
+    // Write to the controlling terminal directly so the escape sequence reaches
+    // the outer terminal even when ratatui has captured stdout. That is
+    // `/dev/tty` on Unix and the `CONOUT$` console pseudo-file on Windows
+    // (PRD #163 M5) — the one place the platform seam is an inline `cfg`
+    // rather than a `platform::` submodule, because only the open target
+    // differs, not the mechanism.
+    #[cfg(unix)]
+    let terminal = std::fs::OpenOptions::new().write(true).open("/dev/tty");
+    #[cfg(windows)]
+    let terminal = open_console_output();
+    if let Ok(mut tty) = terminal {
         let _ = tty.write_all(seq.as_bytes());
         let _ = tty.flush();
     }
+}
+
+/// Open the console's active screen buffer (`CONOUT$`) for writing — the
+/// Windows counterpart of Unix's `/dev/tty` for [`copy_to_clipboard_osc52`].
+///
+/// `CreateFileW` is called directly instead of going through
+/// `std::fs::OpenOptions`, which normalizes a bare relative path like
+/// `CONOUT$` into a `\\?\`-verbatim absolute path. The verbatim namespace
+/// bypasses the Win32 parser's special-casing of the reserved console names,
+/// so the open would land on a nonexistent file in the current directory
+/// instead of the console.
+#[cfg(windows)]
+fn open_console_output() -> std::io::Result<std::fs::File> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let wide: Vec<u16> = "CONOUT$".encode_utf16().chain(std::iter::once(0)).collect();
+
+    // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call;
+    // the null security-attributes and template-file arguments are the
+    // documented "defaults" form. `OPEN_EXISTING` is required for a console
+    // device (it is never created). The returned handle is owned by us and
+    // closed exactly once, by the `OwnedHandle` the returned `File` takes over.
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE || raw.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a valid, non-null, exclusively-owned handle from the
+    // successful `CreateFileW` above and is not used again after this point.
+    let owned = unsafe { OwnedHandle::from_raw_handle(raw as RawHandle) };
+    Ok(std::fs::File::from(owned))
 }
 
 /// Minimal base64 encoder (no external dependency needed).
@@ -13863,6 +13926,34 @@ mod tests {
 
     fn default_ui() -> UiState {
         UiState::default()
+    }
+
+    /// PRD #163 M5: the OSC 52 clipboard escape is built by one shared
+    /// function, so the bytes are identical on every platform — the Windows
+    /// backend changes only the *write target* (`CONOUT$` instead of
+    /// `/dev/tty`), never the sequence. Pin the exact framing (OSC `\x1b]`,
+    /// selector `52;c;`, base64 payload, ST `\x1b\\`) here, host-agnostically,
+    /// so a future platform branch cannot drift the wire bytes.
+    #[test]
+    fn osc52_clipboard_sequence_is_platform_independent() {
+        assert_eq!(osc52_clipboard_sequence("hi"), "\x1b]52;c;aGk=\x1b\\");
+        // Empty selection still produces a well-formed (clipboard-clearing)
+        // sequence rather than a bare prefix.
+        assert_eq!(osc52_clipboard_sequence(""), "\x1b]52;c;\x1b\\");
+        // Multi-byte UTF-8 is encoded from the raw bytes, not the chars.
+        assert_eq!(osc52_clipboard_sequence("é"), "\x1b]52;c;w6k=\x1b\\");
+
+        // Structural assertions independent of the payload: the ST terminator
+        // (not BEL) is what raw-mode terminals accept most widely.
+        let seq = osc52_clipboard_sequence("cargo test-fast\nsecond line");
+        assert!(seq.starts_with("\x1b]52;c;"), "unexpected prefix: {seq:?}");
+        assert!(seq.ends_with("\x1b\\"), "must terminate with ST: {seq:?}");
+        assert!(!seq.contains('\x07'), "must not use the BEL terminator");
+        let payload = seq
+            .strip_prefix("\x1b]52;c;")
+            .and_then(|s| s.strip_suffix("\x1b\\"))
+            .expect("sequence is prefix+payload+ST");
+        assert_eq!(payload, base64_encode(b"cargo test-fast\nsecond line"));
     }
 
     /// PRD #196: the new-pane Command-field seed resolver honors the fallback

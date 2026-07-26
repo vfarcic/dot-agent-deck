@@ -3372,6 +3372,36 @@ pub async fn wait_for_path_async(path: &Path, timeout: Duration) -> bool {
     }
 }
 
+/// Poll a spawned agent's PTY snapshot until the *rendered* screen contains
+/// `needle`, returning `(found, rendered_screen)`. The raw PTY byte stream is
+/// replayed through a `vt100` grid first, so a streamed/redrawn reply (an agent
+/// prints token-by-token with cursor moves) is matched on its final rendered
+/// state rather than on raw, escape-interleaved bytes. Ported from
+/// `e2e_delegate_work_done_chain.rs::wait_for_rendered_text` so the poll lives
+/// in `common` (Decision 21).
+#[allow(dead_code)]
+pub async fn wait_for_rendered_agent_text(
+    registry: &dot_agent_deck::agent_pty::AgentPtyRegistry,
+    agent_id: &str,
+    needle: &str,
+    timeout: Duration,
+) -> (bool, String) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let snap = registry.snapshot(agent_id).unwrap_or_default();
+        let mut parser = vt100::Parser::new(40, 120, 0);
+        parser.process(&snap);
+        let screen = parser.screen().contents();
+        if screen.contains(needle) {
+            return (true, screen);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return (false, screen);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// A background collector of an in-process daemon's re-broadcast `AgentEvent`s.
 /// Subscribe (via [`start`](Self::start)) BEFORE spawning the agent whose events
 /// you want, so its first status report can't be missed. Drop aborts the reader.
