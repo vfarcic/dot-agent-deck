@@ -1655,6 +1655,13 @@ without depending on the config struct API.
 - **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
 - **Cost note:** four short interactive Haiku turns (two delegates, two one-file tasks) — well under Decision 23's <$0.05/run bound.
 
+##### orchestration/route/002 — Detach/reattach of two same-`(name, cwd)` orchestration tabs rebuilds TWO distinct tabs, each keeping its own routing group, while a token-less (pre-#140) pair still rebuilds as ONE (PRD #140 M3.1).
+- **Layer:** L1/synthetic (warm in-process daemon + real attach socket, no PTY-attached binary and no LLM). Drives the production reattach chain end to end: `start_agent` stores `TabMembership` on the daemon's `AgentRecord` → `EmbeddedPaneController::hydrate_from_daemon` reads it back through `ListAgents` + `validate_tab_membership` → `partition_hydrated_panes` buckets by `OrchestrationIdentity` → `resolve_orch_config_for_hydration` / `OrchestrationConfig::synthesize_from_bucket_metadata` → `TabManager::open_orchestration_tab_with_existing_role_panes`. Synthetic is the right tier because the claim is about a hydration round trip, not about agent behaviour; the real-agent two-tab case is `orchestration/route/001`, which never detaches.
+- **Agent:** none (six `sh -c 'sleep 30'` stand-ins: `orchestrator` + `coder` for each of tab A, tab B, and a token-less legacy pair, all sharing one orchestration name and one cwd).
+- **Asserts:** every pane round-trips its own `orchestration_id` through the daemon echo; the partition yields THREE buckets (tab A, tab B, legacy) rather than one merged bucket, each holding exactly its own two panes; the two tokened buckets' `OrchestrationIdentity`s differ while the token-less bucket falls back to `NameCwd { name, cwd }`; rebuilding every bucket produces three orchestration tabs with each pane owned by exactly one tab; and (PRD #140 review) a dead role slot in each tokened tab mints a DISTINCT synthetic dead-slot id with its own placeholder card — pre-fix the `(cwd, orchestration_name)`-keyed id aliased across the two partitioned tabs onto one shared card — while the legacy identity keeps the pre-review byte format.
+- **Does not assert:** live delegate/work-done routing across the reattach (that is `orchestration/route/001` and the `src/state.rs` routing unit tests); PTY attach or scrollback replay of the rebuilt panes; the same-cwd spawn warning (`orchestration/guard/001`); the on-disk snapshot restore branch.
+- **Platform coverage:** linux+mac (the suite is `#![cfg(unix)]` — the mock attach servers bind Unix-domain sockets; Windows port tracked by #164).
+
 ### Session restore
 
 #### session/restore

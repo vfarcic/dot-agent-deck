@@ -265,25 +265,14 @@ fn ask_orchestrator_to_delegate(deck: &TuiDeck, orchestrator: &RolePane, role: &
     );
 }
 
-/// Scenario: Launch the real deck against a fixture whose single `route-iso`
-/// orchestration has three REAL interactive Claude Haiku roles
-/// (`orchestrator`/`coder`/`reviewer`), then open that SAME orchestration TWICE
-/// in the SAME directory through the production `Ctrl+N` flow — the second open
-/// must also show the non-blocking same-cwd warning pointing at
-/// `/worktree-prd`. The two tabs are byte-identical in `(name, cwd)` and are
-/// told apart only by the per-tab `orchestration_id` the daemon echoes back.
-/// Then start a task in EACH tab at the same time — the issue's own repro — by
-/// asking tab A's real orchestrator to delegate "create `route_alpha_5f3c.txt`"
-/// to its `coder` and tab B's real orchestrator to delegate "create
-/// `route_beta_9d21.txt`" to its `reviewer`. Assert that each delegate
-/// pointer landed ONLY in the delegating tab's worker pane (tab B's `coder` and
-/// tab A's `reviewer` — the panes the other tab's delegate would have hit — never
-/// see one), that each worker really did its own task (its uniquely-named
-/// sentinel file plus the daemon-written `work-done-{role}.md`), and that each
-/// worker's work-done feedback reached ONLY its own orchestrator pane (tab A's
-/// orchestrator never sees "Worker reviewer …", tab B's never sees "Worker coder
-/// …"). Real agents, PTY-attached, records a `full-stream.cast`;
-/// flaky-tolerant (real LLM) — run once, not looped.
+/// Scenario: Launch the real deck against a fixture whose `route-iso`
+/// orchestration has three REAL interactive Claude Haiku roles, then open that
+/// SAME orchestration TWICE in the SAME directory through the production
+/// `Ctrl+N` flow, asserting the second open shows the non-blocking same-cwd
+/// warning. Ask tab A's real orchestrator to delegate a uniquely-named sentinel
+/// task to its `coder` and tab B's to its `reviewer`, concurrently. Assert each
+/// delegate pointer, sentinel file and work-done feedback stayed inside the
+/// delegating tab and never reached the other tab's identically-named panes.
 #[spec("orchestration/route/001")]
 #[test]
 fn route_001_two_tabs_same_cwd_do_not_cross_deliver() {

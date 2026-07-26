@@ -47,10 +47,12 @@ use dot_agent_deck::daemon_protocol::{
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
 use dot_agent_deck::event::{AgentEvent, AgentType, EventType, Writable};
 use dot_agent_deck::state::{
-    ActiveTool, AppState, SessionSnapshot, SessionState, SessionStatus, SharedState,
+    ActiveTool, AppState, OrchestrationIdentity, SessionSnapshot, SessionState, SessionStatus,
+    SharedState,
 };
 use dot_agent_deck::ui::{
     dead_slot_pane_id, fill_dead_slots_with_placeholders, is_dead_slot_pane_id,
+    partition_hydrated_panes, resolve_orch_config_for_hydration,
 };
 use spec::spec;
 use std::collections::{HashMap, VecDeque};
@@ -1184,7 +1186,13 @@ async fn dead_role_stays_visible_on_reconnect_as_placeholder_card() {
             Some(h.agent_id.clone()),
         );
     }
-    fill_dead_slots_with_placeholders(&mut role_pane_ids, &cwd, orchestration_name, &mut state);
+    // Token-less spawn above → the LEGACY `(name, cwd)` routing identity, which
+    // is what namespaces the synthetic dead-slot id (PRD #140 review).
+    let legacy_identity = OrchestrationIdentity::NameCwd {
+        name: orchestration_name.to_string(),
+        cwd: cwd.clone(),
+    };
+    fill_dead_slots_with_placeholders(&mut role_pane_ids, &legacy_identity, &cwd, &mut state);
 
     // Every role slot is now filled.
     assert!(
@@ -1195,7 +1203,7 @@ async fn dead_role_stays_visible_on_reconnect_as_placeholder_card() {
     let dead_id = role_pane_ids[4].as_deref().unwrap();
     assert_eq!(
         dead_id,
-        dead_slot_pane_id(&cwd, orchestration_name, 4),
+        dead_slot_pane_id(&legacy_identity, 4),
         "dead slot id must be the deterministic synthetic"
     );
     assert!(is_dead_slot_pane_id(dead_id));
@@ -1232,6 +1240,346 @@ async fn dead_role_stays_visible_on_reconnect_as_placeholder_card() {
     // Clean up surviving agents so the test doesn't leak the `sleep 30`
     // children.
     for id in &spawned_ids[..spawned_ids.len() - 1] {
+        let _ = server.registry.close_agent(id);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PRD #140 M3.1 — detach/reattach of two same-`(name, cwd)` orchestration tabs.
+// ---------------------------------------------------------------------------
+// Synthetic tier on purpose: the assertion is about a HYDRATION ROUND TRIP
+// (does the daemon echo carry the per-tab token far enough for the TUI to
+// rebuild two tabs?), not about anything an LLM does. Real agents would add
+// cost and flake without touching the code under test. The PTY e2e
+// (`orchestration/route/001`) covers the live two-tab case with real agents but
+// never detaches, which is exactly the gap this fills.
+//
+// The path driven here is the production one end to end: `start_agent` stores
+// `TabMembership` on the daemon's `AgentRecord` → `hydrate_from_daemon` reads it
+// back over the attach socket via `ListAgents` (through
+// `validate_tab_membership`) → `partition_hydrated_panes` buckets by
+// `OrchestrationIdentity` → `resolve_orch_config_for_hydration` /
+// `synthesize_from_bucket_metadata` rebuilds each bucket's config →
+// `open_orchestration_tab_with_existing_role_panes` builds the tab.
+//
+// Written as a sync `#[test]` driving an explicit runtime for the same reason as
+// `restore_007` above: the linkage-check scanner only recognises a plain `fn`
+// after a `#[spec(...)]`.
+
+/// Scenario: Spawn two orchestration tabs' worth of role agents
+/// (`orchestrator` + `coder` each) on a warm daemon with byte-identical
+/// orchestration `name` and `orchestration_cwd`, told apart only by their
+/// per-tab `orchestration_id`, plus a third token-less pair standing in for a
+/// pre-#140 client, then detach and reattach by hydrating a fresh controller.
+/// Asserts the reattach rebuilds the two tokened pairs as TWO distinct
+/// orchestration tabs with disjoint role panes (each keeping its own routing
+/// group) while the token-less pair still merges into ONE tab, and that a dead
+/// role slot in each tokened tab mints its own placeholder card instead of the
+/// two tabs aliasing one.
+#[spec("orchestration/route/002")]
+#[test]
+fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build multi-thread runtime");
+    rt.block_on(route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner());
+}
+
+async fn route_002_reattach_rebuilds_two_same_cwd_orchestration_tabs_inner() {
+    let server = start_real_server().await;
+    let client = DaemonClient::new(server.path.clone());
+
+    // ONE orchestration name, ONE directory — the ambiguity the PRD is about.
+    let orchestration_name = "route-iso";
+    let cwd = server._dir.path().to_string_lossy().into_owned();
+    let role_names = ["orchestrator", "coder"];
+    // Tab A and Tab B carry distinct per-tab tokens; the third pair carries
+    // none, standing in for a client that predates PRD #140.
+    let tabs: [(&str, Option<&str>); 3] = [
+        ("a", Some("orch-inst-aaaa1111")),
+        ("b", Some("orch-inst-bbbb2222")),
+        ("legacy", None),
+    ];
+
+    let mut spawned_ids: Vec<String> = Vec::new();
+    for (tab_tag, orchestration_id) in tabs {
+        for (role_index, role_name) in role_names.iter().enumerate() {
+            let id = client
+                .start_agent(StartAgentOptions {
+                    command: Some("sh -c 'sleep 30'".to_string()),
+                    cwd: Some(cwd.clone()),
+                    display_name: Some(format!("{tab_tag}-{role_name}")),
+                    env: vec![(
+                        "DOT_AGENT_DECK_PANE_ID".to_string(),
+                        format!("pane-{tab_tag}-{role_name}"),
+                    )],
+                    tab_membership: Some(TabMembership::Orchestration {
+                        name: orchestration_name.to_string(),
+                        role_index,
+                        role_name: (*role_name).to_string(),
+                        is_start_role: role_index == 0,
+                        orchestration_cwd: Some(cwd.clone()),
+                        display_title: None,
+                        orchestration_id: orchestration_id.map(str::to_string),
+                    }),
+                    ..Default::default()
+                })
+                .await
+                .expect("start_agent should succeed");
+            spawned_ids.push(id);
+        }
+    }
+
+    // ---- Detach + reattach: a FRESH controller hydrating from the warm daemon.
+    let ctrl = Arc::new(EmbeddedPaneController::new(
+        server.path.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    let hydrated = {
+        let ctrl = ctrl.clone();
+        tokio::task::spawn_blocking(move || ctrl.hydrate_from_daemon())
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        hydrated.len(),
+        6,
+        "all six role panes across the three tabs should hydrate; got {hydrated:?}"
+    );
+
+    // The token survived the daemon echo + `validate_tab_membership` on every
+    // pane — the precondition for the partition to tell the tabs apart at all.
+    for h in &hydrated {
+        let Some(TabMembership::Orchestration {
+            orchestration_id, ..
+        }) = &h.tab_membership
+        else {
+            panic!("hydrated pane lost its Orchestration tab membership: {h:?}");
+        };
+        let expected = if h.pane_id.starts_with("pane-a-") {
+            Some("orch-inst-aaaa1111".to_string())
+        } else if h.pane_id.starts_with("pane-b-") {
+            Some("orch-inst-bbbb2222".to_string())
+        } else {
+            None
+        };
+        assert_eq!(
+            *orchestration_id, expected,
+            "pane {} must round-trip its own orchestration_id",
+            h.pane_id
+        );
+    }
+
+    // ---- Partition: the reattach's tab-reconstruction decision.
+    let partition = partition_hydrated_panes(&hydrated);
+    assert!(
+        partition.dashboard_pane_ids.is_empty(),
+        "no orchestration role pane should fall through to the dashboard; got {:?}",
+        partition.dashboard_pane_ids
+    );
+    assert_eq!(
+        partition.orchestration_buckets.len(),
+        3,
+        "two tokened tabs must rebuild as TWO buckets (not one merged bucket of \
+         four panes) and the token-less pair as ONE; got {:?}",
+        partition
+            .orchestration_buckets
+            .iter()
+            .map(|b| (b.orchestration_id.clone(), b.role_slots.len()))
+            .collect::<Vec<_>>()
+    );
+
+    let bucket_for = |token: Option<&str>| {
+        partition
+            .orchestration_buckets
+            .iter()
+            .find(|b| b.orchestration_id.as_deref() == token)
+            .unwrap_or_else(|| panic!("no bucket for orchestration_id {token:?}"))
+    };
+    let bucket_a = bucket_for(Some("orch-inst-aaaa1111"));
+    let bucket_b = bucket_for(Some("orch-inst-bbbb2222"));
+    let bucket_legacy = bucket_for(None);
+
+    for (label, bucket) in [("A", bucket_a), ("B", bucket_b), ("legacy", bucket_legacy)] {
+        // Same name, same cwd across all three — the identity is doing the work,
+        // not the tuple.
+        assert_eq!(bucket.orchestration_name, orchestration_name);
+        assert_eq!(bucket.cwd, cwd);
+        assert_eq!(
+            bucket.role_slots.len(),
+            2,
+            "tab {label} must keep BOTH of its own role panes; got {:?}",
+            bucket.role_slots
+        );
+    }
+
+    // Each bucket owns its own panes — the merge failure mode (one tab holding
+    // all four tokened panes while the other is orphaned) is excluded.
+    let panes_of = |bucket: &dot_agent_deck::ui::OrchestrationHydrationBucket| {
+        let mut ids: Vec<String> = bucket
+            .role_slots
+            .iter()
+            .map(|s| s.pane_id.clone())
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(
+        panes_of(bucket_a),
+        vec![
+            "pane-a-coder".to_string(),
+            "pane-a-orchestrator".to_string()
+        ]
+    );
+    assert_eq!(
+        panes_of(bucket_b),
+        vec![
+            "pane-b-coder".to_string(),
+            "pane-b-orchestrator".to_string()
+        ]
+    );
+    assert_eq!(
+        panes_of(bucket_legacy),
+        vec![
+            "pane-legacy-coder".to_string(),
+            "pane-legacy-orchestrator".to_string(),
+        ]
+    );
+
+    // The routing group each rebuilt tab retains: distinct for the two tokened
+    // tabs, the legacy `(name, cwd)` fallback for the token-less one.
+    assert_ne!(
+        bucket_a.identity(),
+        bucket_b.identity(),
+        "the two tokened tabs must remain distinct routing groups after reattach"
+    );
+    assert_eq!(
+        bucket_legacy.identity(),
+        OrchestrationIdentity::NameCwd {
+            name: orchestration_name.to_string(),
+            cwd: cwd.clone(),
+        },
+        "a token-less bucket must fall back to the legacy (name, cwd) identity"
+    );
+
+    // ---- Rebuild the tabs, exactly as the hydration loop in `ui.rs` does.
+    let mut tab_manager = dot_agent_deck::tab::TabManager::new(ctrl.clone());
+    for bucket in &partition.orchestration_buckets {
+        // `None` local config → the config is synthesised from the bucket's own
+        // role metadata, the remote-reconnect path.
+        let orch_config = resolve_orch_config_for_hydration(None, bucket);
+        assert_eq!(
+            orch_config.roles.len(),
+            2,
+            "synthesised config must carry both roles; got {orch_config:?}"
+        );
+        let mut role_pane_ids: Vec<Option<String>> = vec![None; orch_config.roles.len()];
+        for slot in &bucket.role_slots {
+            role_pane_ids[slot.role_index] = Some(slot.pane_id.clone());
+        }
+        tab_manager
+            .open_orchestration_tab_with_existing_role_panes(
+                &orch_config,
+                &bucket.cwd,
+                role_pane_ids,
+                bucket.display_title.as_deref(),
+            )
+            .expect("rebuilding an orchestration tab from its bucket should succeed");
+    }
+
+    // Three orchestration tabs (plus the dashboard), each owning its own two
+    // role panes and nothing else.
+    let orchestration_tabs: Vec<&dot_agent_deck::tab::Tab> = tab_manager
+        .tabs()
+        .iter()
+        .filter(|t| matches!(t, dot_agent_deck::tab::Tab::Orchestration { .. }))
+        .collect();
+    assert_eq!(
+        orchestration_tabs.len(),
+        3,
+        "reattach must rebuild three distinct orchestration tabs"
+    );
+    for pane_id in [
+        "pane-a-orchestrator",
+        "pane-a-coder",
+        "pane-b-orchestrator",
+        "pane-b-coder",
+        "pane-legacy-orchestrator",
+        "pane-legacy-coder",
+    ] {
+        let owning: Vec<usize> = tab_manager
+            .tabs()
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| match t {
+                dot_agent_deck::tab::Tab::Orchestration { role_pane_ids, .. } => {
+                    role_pane_ids.iter().any(|p| p == pane_id)
+                }
+                _ => false,
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            owning.len(),
+            1,
+            "pane {pane_id} must belong to exactly one rebuilt tab; got tabs {owning:?}"
+        );
+    }
+
+    // ---- PRD #140 review (B): a dead role slot must not alias across the two
+    // partitioned tabs. Both tabs' `coder` role dies (a `clear = false` worker
+    // that exited cleanly is absent from `list_agents`), so each tab rebuilds
+    // with role_index 1 empty. Pre-fix the synthetic id was namespaced by
+    // `(cwd, orchestration_name)` alone, so both tabs minted the SAME id and
+    // their two distinct dead roles shared ONE placeholder card.
+    let mut state = AppState::default();
+    let mut dead_ids: Vec<String> = Vec::new();
+    for bucket in [bucket_a, bucket_b] {
+        let mut role_pane_ids: Vec<Option<String>> =
+            vec![Some(format!("{}-orchestrator", bucket.cwd)), None];
+        fill_dead_slots_with_placeholders(
+            &mut role_pane_ids,
+            &bucket.identity(),
+            &bucket.cwd,
+            &mut state,
+        );
+        let dead_id = role_pane_ids[1]
+            .clone()
+            .expect("the dead role slot must be filled with a synthetic id");
+        assert!(is_dead_slot_pane_id(&dead_id));
+        dead_ids.push(dead_id);
+    }
+    assert_ne!(
+        dead_ids[0], dead_ids[1],
+        "two partitioned same-(name, cwd) tabs must mint DISTINCT dead-slot ids"
+    );
+    let placeholder_cards = state
+        .sessions
+        .values()
+        .filter(|s| s.pane_id.as_deref().is_some_and(is_dead_slot_pane_id))
+        .count();
+    assert_eq!(
+        placeholder_cards, 2,
+        "each partitioned tab's dead role needs its OWN placeholder card"
+    );
+    // The legacy (token-less) identity keeps the pre-review byte format, so an
+    // older client's reconnect still reproduces the same id it always did.
+    assert_eq!(
+        dead_slot_pane_id(&bucket_legacy.identity(), 1),
+        dead_slot_pane_id(
+            &OrchestrationIdentity::NameCwd {
+                name: orchestration_name.to_string(),
+                cwd: cwd.clone(),
+            },
+            1
+        )
+    );
+
+    drop(tab_manager);
+    drop(ctrl);
+    for id in &spawned_ids {
         let _ = server.registry.close_agent(id);
     }
 }
