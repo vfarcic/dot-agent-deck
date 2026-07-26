@@ -119,7 +119,7 @@ Captured so the analysis is not lost. If the issue thread establishes that same-
 
 - [x] **M5.0** — Routing unit tests in `src/state.rs`: two same-`(name,cwd)` orchestrations with distinct ids route delegate + work-done in isolation.
 - [x] **M5.1** — L2 PTY-attached e2e (rule 4): real binary, same orchestration in two tabs, no cross-delivery; `.cast`-recording, modeled on `scheduler/dispatch/013` and `tests/e2e_delegate_work_done_chain.rs`.
-- [ ] **M5.2** — Cross-version manual test (rule 12) — performed during `/prd-done` (rule 12): older daemon + newer TUI routes a single orchestration via the `NameCwd` fallback.
+- [x] **M5.2** — Cross-version manual test (rule 12) — performed during `/prd-done` (rule 12): older daemon + newer TUI routes a single orchestration via the `NameCwd` fallback.
 - [x] **M5.3** — `changelog.d/140.breaking.md` + changelog fragment; docs updated to the worktree-per-orchestration model.
 - [ ] **M5.4** — PR, Greptile review, cross-version contract check, merge, close #140.
 
