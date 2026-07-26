@@ -705,21 +705,31 @@ impl RemotesFile {
             source,
         })?;
 
-        let write_result = tmp_file.write_all(contents.as_bytes());
-        if let Err(source) = write_result {
-            // Best-effort cleanup; ignore secondary errors.
+        // Owner-only permissions BEFORE the first content byte (PRD #163 M4).
+        //
+        // Two reasons this runs here rather than after the write. (1) Defense in
+        // depth on Unix, as before: a stale temp file from a crashed previous save
+        // would not have had `OpenOptions::mode()` re-applied, so the bits have to
+        // be set explicitly. (2) On Windows this call is not a re-assert but the
+        // *only* enforcement — `std::fs::OpenOptions` has no
+        // `SECURITY_ATTRIBUTES` hook, so `set_create_mode_owner_only` cannot do
+        // anything there and `set_file_owner_only` applies the protected
+        // current-user-only DACL instead. Doing that after `write_all` would leave
+        // the credentials in this file readable under the parent directory's
+        // inherited ACL for the length of the write; doing it now means only an
+        // empty file is ever exposed. The end state on Unix is identical.
+        let perm_result = crate::platform::fsperm::set_file_owner_only(&tmp_file);
+        if let Err(source) = perm_result {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(RemoteConfigError::Io {
                 path: tmp_path.display().to_string(),
                 source,
             });
         }
-        // Defense in depth: if a stale temp file from a crashed previous save
-        // existed, the create-mode would NOT have re-applied the bits, so
-        // re-set owner-only permissions explicitly before the rename (PRD #42
-        // M1: via the platform seam — set 0o600 on Unix, no-op on Windows).
-        let perm_result = crate::platform::fsperm::set_file_owner_only(&tmp_file);
-        if let Err(source) = perm_result {
+
+        let write_result = tmp_file.write_all(contents.as_bytes());
+        if let Err(source) = write_result {
+            // Best-effort cleanup; ignore secondary errors.
             let _ = std::fs::remove_file(&tmp_path);
             return Err(RemoteConfigError::Io {
                 path: tmp_path.display().to_string(),

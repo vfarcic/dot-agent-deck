@@ -216,6 +216,22 @@ pub fn write_atomic(path: &Path, tasks: &[ScheduledTask]) -> Result<(), String> 
             tmp.display()
         )
     })?;
+    // PRD #163 M4: owner-only permissions on the open handle, before the first
+    // content byte. On Unix this re-asserts what `create_new` + mode 0600 already
+    // produced (harmless, and the same defense-in-depth the `remotes.toml` /
+    // `session.toml` writers do); on Windows it is the ONLY enforcement, because
+    // `std::fs::OpenOptions` has no `SECURITY_ATTRIBUTES` hook and
+    // `set_create_mode_owner_only` is therefore a no-op there. Without this call
+    // the schedules file — whose prompts may carry secrets (PRD #127 S1) — would
+    // rely solely on the parent directory's inherited ACL, which a
+    // `DOT_AGENT_DECK_SCHEDULES` override into a shared directory throws away.
+    if let Err(e) = crate::platform::fsperm::set_file_owner_only(&file) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "failed to set permissions on temp schedules file {}: {e}",
+            tmp.display()
+        ));
+    }
     use std::io::Write as _;
     let write_result = file
         .write_all(contents.as_bytes())

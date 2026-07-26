@@ -79,7 +79,7 @@ pub fn current_uid() -> u32 {
 pub fn endpoint_user_suffix() -> String {
     static SUFFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SUFFIX
-        .get_or_init(|| match current_user_sid_string() {
+        .get_or_init(|| match current_user_sid() {
             Ok(sid) if is_pipe_name_token(&sid) => sid,
             Ok(sid) => panic!(
                 "current-user SID {sid:?} is not usable as a named-pipe segment; \
@@ -112,6 +112,29 @@ fn is_pipe_name_token(token: &str) -> bool {
         && token
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// The current user's SID in canonical string form, cached, **without**
+/// [`endpoint_user_suffix`]'s panic-on-failure (PRD #163 M4).
+///
+/// `endpoint_user_suffix` must panic when the SID is unreadable: it feeds a pipe
+/// *name*, and the only alternative there is a colliding fallback. The filesystem
+/// security backend has a better option — fail the individual operation closed —
+/// so it needs the same one cached value as a `Result`. Both go through this,
+/// which is what keeps the pipe name, the pipe's DACL, the spawn mutex's DACL and
+/// the config-file DACLs from ever disagreeing about which user we are.
+///
+/// A process's token user SID cannot change, so the result (success *or* failure)
+/// is resolved once. The error is cached as a string because [`std::io::Error`]
+/// is not `Clone`; the kind is not load-bearing — every consumer treats "cannot
+/// read our own SID" as fatal-for-this-operation.
+#[cfg(windows)]
+pub(crate) fn current_user_sid() -> std::io::Result<String> {
+    static SID: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    match SID.get_or_init(|| current_user_sid_string().map_err(|err| err.to_string())) {
+        Ok(sid) => Ok(sid.clone()),
+        Err(message) => Err(std::io::Error::other(message.clone())),
+    }
 }
 
 /// Read the calling process's user SID and return it in the canonical string

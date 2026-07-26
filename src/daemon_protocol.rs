@@ -721,9 +721,10 @@ impl AttachResponse {
 /// the bind/accept readiness race that the old probe-and-retry pattern was
 /// papering over.
 pub fn bind_attach_listener(path: &Path) -> io::Result<IpcListener> {
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
+    // PRD #163 M4: only where the endpoint *is* a filesystem path. A `\\.\pipe\`
+    // name has no inode to go stale, and `remove_file` on one would fail rather
+    // than clean anything up — see `platform::ipc::remove_stale_endpoint`.
+    crate::platform::ipc::remove_stale_endpoint(path)?;
     // PRD #42 M2: `IpcListener::bind` does the umask-before-bind dance and the
     // defense-in-depth 0o600 restate that used to live here as a separate
     // `set_permissions` call, so the bound endpoint is owner-only unchanged.

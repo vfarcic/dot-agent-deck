@@ -425,21 +425,25 @@ impl SavedSession {
             .open(&tmp_path)
             .map_err(|e| format!("Failed to open temp session at {}: {e}", tmp_path.display()))?;
 
-        if let Err(e) = tmp_file.write_all(contents.as_bytes()) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(format!(
-                "Failed to write temp session at {}: {e}",
-                tmp_path.display()
-            ));
-        }
-        // Defense in depth: a stale temp file from a crashed previous save would
-        // keep its old mode (the create-mode only applies on create), so
-        // re-assert owner-only permissions explicitly before the rename (PRD #42
-        // M1: via the platform seam — set 0o600 on Unix, no-op on Windows).
+        // Owner-only permissions BEFORE the first content byte (PRD #163 M4).
+        // Defense in depth on Unix (a stale temp file from a crashed previous save
+        // would keep its old mode, since the create-mode only applies on create),
+        // and on Windows the *only* enforcement — `std::fs::OpenOptions` has no
+        // `SECURITY_ATTRIBUTES` hook, so this call is where the protected
+        // current-user-only DACL is applied. Running it before the write means the
+        // snapshot's command lines, project paths and prompts are never exposed
+        // under a loose inherited ACL; the end state on Unix is identical.
         if let Err(e) = crate::platform::fsperm::set_file_owner_only(&tmp_file) {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(format!(
                 "Failed to set permissions on temp session at {}: {e}",
+                tmp_path.display()
+            ));
+        }
+        if let Err(e) = tmp_file.write_all(contents.as_bytes()) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!(
+                "Failed to write temp session at {}: {e}",
                 tmp_path.display()
             ));
         }

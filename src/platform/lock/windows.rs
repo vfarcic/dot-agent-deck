@@ -30,23 +30,30 @@
 //! process sit on two different threads, so they genuinely contend instead of
 //! recursively re-entering one thread's ownership.
 //!
-//! Security: the mutex is created with a protected, current-user-only DACL, the
-//! Windows counterpart of the Unix lock file's 0o600-inside-a-0o700-dir
-//! (`lock_root_default` deliberately avoids world-writable roots so a foreign uid
-//! cannot pre-create the lock entry and DoS daemon startup — PRD #93 round-4
-//! auditor BLOCKER). The `Global\` namespace is open to all local users for
-//! *creation*, so the residual is the one inherent to any named-object design: a
-//! foreign user who creates the object **first** can hold it and stall our daemon
-//! start. The DACL closes the much wider hole — that anyone could open and hold
-//! the object *we* created. Detecting a pre-squatted object requires comparing its
-//! owner SID, which belongs with the rest of the object-security audit in #163 M4
-//! (`fsperm`).
+//! Security: the mutex is created with an explicit owner (`O:`) and a protected,
+//! current-user-only DACL, the Windows counterpart of the Unix lock file's
+//! 0o600-inside-a-0o700-dir (`lock_root_default` deliberately avoids world-writable
+//! roots so a foreign uid cannot pre-create the lock entry and DoS daemon startup —
+//! PRD #93 round-4 auditor BLOCKER). The DACL closes the wide hole: nobody else can
+//! open and hold the object *we* created.
+//!
+//! The `Global\` namespace is open to all local users for *creation*, so a DACL
+//! alone cannot tell us whether the object we just opened is ours. **PRD #163 M4**
+//! (which M2 deferred this to) closes that: when `CreateMutexW` reports the object
+//! already existed, its owner SID is compared against ours
+//! ([`crate::platform::fsperm::verify_object_owner_is_current_user`]) and a
+//! foreign-owned object is refused. That turns a foreign squat from an *indefinite
+//! block* — the wait would never be granted — into an immediate, diagnosable
+//! `PermissionDenied`. It cannot make the squat harmless (only the object's creator
+//! could), but a named-object DoS that says who did it is the best available
+//! outcome, and it is strictly better than hanging.
 
 use std::path::Path;
 use std::sync::mpsc;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, HANDLE, LocalFree, WAIT_ABANDONED, WAIT_OBJECT_0,
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, LocalFree, WAIT_ABANDONED,
+    WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -193,6 +200,10 @@ fn create_and_acquire(name: &str, user_sid: &str) -> std::io::Result<OwnedHandle
     // ownership" — ownership is taken by the wait below, so a caller that creates
     // the mutex and one that finds it already there follow the identical path.
     let handle = unsafe { CreateMutexW(&attrs, 0, wide.as_ptr()) };
+    // Read *immediately* after the call, before anything else can overwrite the
+    // thread's last error: `ERROR_ALREADY_EXISTS` is how `CreateMutexW` reports
+    // "you opened an existing object" on an otherwise successful return.
+    let preexisting = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
     drop(sd);
     if handle.is_null() {
         let err = std::io::Error::last_os_error();
@@ -202,6 +213,24 @@ fn create_and_acquire(name: &str, user_sid: &str) -> std::io::Result<OwnedHandle
         ));
     }
     let held = OwnedHandle(handle);
+
+    // PRD #163 M4: the DACL above only protects an object we created. If this one
+    // already existed it may belong to another local user (the `Global\` namespace
+    // is open to all for creation), in which case waiting on it would block
+    // forever — a foreign user's squat. Refuse instead, before the wait, and say
+    // whose SID owns it. Our own second acquisition in the same or another of our
+    // processes passes: we set `O:<our-sid>` explicitly at creation.
+    if preexisting
+        && let Err(reason) = crate::platform::fsperm::verify_object_owner_is_current_user(held.0)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to wait on the pre-existing spawn lock {name}: {reason}. Another local \
+                 user may be holding this object to stall daemon startup."
+            ),
+        ));
+    }
 
     // SAFETY: `held.0` is a live mutex handle; `INFINITE` is the documented
     // "block until granted" timeout.
@@ -237,10 +266,16 @@ impl Drop for OwnedHandle {
 }
 
 /// Build a protected, current-user-only security descriptor for the mutex from
-/// SDDL: `D:P` (a DACL with inheritance blocked) granting `GA` (generic all — for
-/// a mutex: synchronize + modify-state) to `user_sid` and to nobody else.
-/// Deliberately no `Everyone`/`Users` ACE, and no owner/group/SACL clause, so the
-/// defaults apply (creator becomes owner).
+/// SDDL: `O:` naming us as the object owner, plus `D:P` (a DACL with inheritance
+/// blocked) granting `GA` (generic all — for a mutex: synchronize + modify-state)
+/// to `user_sid` and to nobody else. Deliberately no `Everyone`/`Users` ACE and no
+/// SACL clause.
+///
+/// The explicit `O:` clause (PRD #163 M4) is what makes the pre-squat check in
+/// [`create_and_acquire`] reliable: relying on the token's *default* owner would
+/// leave the object owned by `Administrators` under the non-default
+/// "default owner for objects created by members of the Administrators group"
+/// policy, and our own elevated daemon would then fail its own owner check.
 ///
 /// `user_sid` is [`crate::platform::paths::endpoint_user_suffix`], which on
 /// Windows *is* the current user's SID in string form — the same value the mutex
@@ -250,7 +285,7 @@ impl Drop for OwnedHandle {
 /// Fails closed: if the descriptor cannot be built we do not fall back to the
 /// default (`Everyone`-openable) one.
 fn owner_only_security_descriptor(user_sid: &str) -> std::io::Result<OwnedLocalSd> {
-    let sddl = format!("D:P(A;;GA;;;{user_sid})");
+    let sddl = format!("O:{user_sid}D:P(A;;GA;;;{user_sid})");
     let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: `wide` is a NUL-terminated UTF-16 SDDL string, `sd` a valid

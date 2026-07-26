@@ -362,7 +362,14 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     }
     let _start_lock = crate::platform::lock::acquire_spawn_lock(&lock_path).await?;
 
-    if socket_path.exists() {
+    // PRD #163 M4: the probe-remove-bind dance above is inherently about a
+    // *filesystem* endpoint. On Windows the endpoint is a `\\.\pipe\` name with no
+    // inode: `exists()` is permanently false and `remove_file` would error rather
+    // than clear anything, so `stale_endpoint_artifact` short-circuits the whole
+    // block. Nothing is lost — the singleton guard there is
+    // `first_pipe_instance(true)` inside `IpcListener::bind`, which reports
+    // `AddrInUse` for exactly the case this branch exists to catch.
+    if crate::platform::ipc::stale_endpoint_artifact(socket_path) {
         if probe_socket_alive(socket_path).await {
             return Err(DaemonError::Io(io::Error::new(
                 io::ErrorKind::AddrInUse,

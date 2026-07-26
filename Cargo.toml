@@ -84,6 +84,14 @@ windows-sys = { version = "0.59", features = [
     # `killpg(SIGTERM)` stand-in `platform::proc` sends an agent's process group
     # before the `TerminateJobObject` backstop.
     "Win32_System_Console",
+    # PRD #163 M4: `CreateFileW`/`ReadFile`/`WriteFile` + `FILE_FLAG_OVERLAPPED`
+    # and the `SECURITY_SQOS_PRESENT` client flags — the wait-bounded synchronous
+    # named-pipe client that gives `ui::send_daemon_request_blocking` the
+    # read/write deadline Unix gets from `SO_RCVTIMEO`.
+    "Win32_Storage_FileSystem",
+    # PRD #163 M4: `OVERLAPPED` + `GetOverlappedResultEx`/`CancelIoEx`, the
+    # deadline mechanism for the above.
+    "Win32_System_IO",
 ] }
 # `%USERPROFILE%` / `%LOCALAPPDATA%` resolution for `src/platform/paths.rs`.
 dirs = "6"
