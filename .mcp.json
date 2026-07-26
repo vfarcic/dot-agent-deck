@@ -15,6 +15,13 @@
         "SLACK_TEAM_ID": "${SLACK_TEAM_ID}",
         "SLACK_CHANNEL_IDS": "${SLACK_CHANNEL_IDS}"
       }
+    },
+    "telegram": {
+      "command": "npx",
+      "args": ["-y", "telegram-mcp-bot@latest"],
+      "env": {
+        "TELEGRAM_BOT_TOKEN": "${TELEGRAM_BOT_TOKEN}"
+      }
     }
   }
 }
