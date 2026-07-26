@@ -154,25 +154,37 @@ export type StatusEvent = (typeof STATUS_EVENTS)[number];
  * Map a Pi lifecycle event name to the canonical agent state the extension
  * reports via `agent-event`, or `null` for events we intentionally ignore.
  *
- *   session_start    → waiting   (agent is up, awaiting the first prompt)
+ *   session_start    → finished  (agent is up, awaiting the first prompt → Idle)
  *   agent_start      → running   (an agent run has begun)
- *   agent_settled    → waiting   (Pi will not continue automatically; awaiting input)
+ *   agent_settled    → finished  (Pi settled its turn → Idle)
  *   session_shutdown → finished  (the Pi session is exiting)
+ *
+ * Parity with the other backends (Claude / OpenCode / Codex): a turn ending is
+ * `Idle`, NOT "Needs Input". Those agents map their turn-end signal
+ * (`Stop` / `session.idle`) to Idle and their session-start to Idle, and they
+ * surface "Needs Input" (`waiting`) ONLY on a genuine user-blocking signal —
+ * a permission prompt / attention notification. Pi's `agent_settled` is its
+ * turn-end analog and `session_start` is its pre-first-prompt state, so both
+ * report `finished` → Idle. Pi does not currently expose a permission/attention
+ * lifecycle event, so it never reports `waiting` — exactly like a Claude agent
+ * that never hits a permission prompt. `waiting` stays in the vocabulary
+ * (AGENT_STATES) so that a future Pi user-blocking event can map to it without
+ * a wire change.
  *
  * `agent_end` is deliberately NOT mapped: after it Pi may still auto-retry,
  * auto-compact, or drain queued follow-up messages, so it is not a reliable
- * idle signal — `agent_settled` is (see Pi's extension docs). Every unmapped
+ * turn-end signal — `agent_settled` is (see Pi's extension docs). Every unmapped
  * event returns `null`, so the caller emits no `agent-event` at all rather than
  * a wrong or default status.
  */
 export function piEventToAgentState(eventName: string): AgentState | null {
 	switch (eventName) {
 		case "session_start":
-			return "waiting";
+			return "finished";
 		case "agent_start":
 			return "running";
 		case "agent_settled":
-			return "waiting";
+			return "finished";
 		case "session_shutdown":
 			return "finished";
 		default:

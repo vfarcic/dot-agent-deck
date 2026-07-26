@@ -38,7 +38,7 @@
 //! ## `clear = true` + native delivery dissolves the old 10s-fallback fragility
 //! Workers default `clear = true`, so each delegate RESPAWNS the worker. The OLD
 //! injection path then waited `SESSION_START_WAIT` (~10s) before typing the task
-//! into the pane — and because pi maps `session_start → waiting` (it never emits
+//! into the pane — and because pi maps `session_start → finished` (it never emits
 //! `EventType::SessionStart`), that wait always burned the full fallback, so a
 //! slow pi boot could land the injected task before pi was input-ready. NATIVE
 //! delivery (PRD #201) removes that entirely: the daemon stashes the task as the
