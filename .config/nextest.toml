@@ -6,6 +6,17 @@ fail-fast = false
 [profile.default.junit]
 path = "target/nextest/default/junit.xml"
 
+# PRD #140 M5.1: `orchestration/route/001` boots SIX interactive Haiku panes
+# across two orchestration tabs and drives two concurrent
+# delegate -> work -> work-done chains through them, so its honest wall clock
+# exceeds the default 3 x 60s kill window — and being killed there costs the
+# test's own diagnostics (which pane did/didn't receive the signal). Scoped by
+# name so every other test keeps the strict default; still bounded, so a genuine
+# hang cannot run forever.
+[[profile.default.overrides]]
+filter = 'test(route_001_two_tabs_same_cwd_do_not_cross_deliver)'
+slow-timeout = { period = "60s", terminate-after = 8 }
+
 [profile.e2e]
 slow-timeout = { period = "120s", terminate-after = 2 }
 
