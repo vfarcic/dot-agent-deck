@@ -176,3 +176,96 @@ fn spawn_006_explicit_codex_identity_wraps_noninferable_launcher() {
         "explicit Codex identity must drive both launch wrapping and pane metadata"
     );
 }
+
+/// Scenario: Spawn a pane from the non-inferable `devbox run codex-big` command, then model a native Codex hook teaching the registry its display badge before respawning the pane. The captured launch lines before and after respawn must be byte-identical bare commands; learned display identity must never introduce a wrapper.
+#[spec("codex/spawn/007")]
+#[test]
+#[cfg(unix)]
+fn spawn_007_hook_learned_badge_does_not_change_respawn_launch() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build stable respawn runtime");
+    runtime.block_on(async {
+        use dot_agent_deck::agent_pty::{
+            AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions,
+        };
+
+        let fixture = tempfile::tempdir().expect("stable respawn fixture");
+        let bin_dir = fixture.path().join("bin");
+        let record = fixture.path().join("launch.log");
+        std::fs::create_dir_all(&bin_dir).expect("create stable respawn bin dir");
+        write_executable(
+            &bin_dir.join("devbox"),
+            "#!/bin/sh\nprintf 'BARE devbox %s\\n' \"$*\" >> \"$STABLE_RESPAWN_RECORD\"\nexec cat\n",
+        );
+        write_executable(
+            &bin_dir.join("dot-agent-deck"),
+            "#!/bin/sh\nprintf 'WRAPPED %s\\n' \"$*\" >> \"$STABLE_RESPAWN_RECORD\"\nexec cat\n",
+        );
+        let path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").expect("test runner PATH")
+        );
+        let registry = AgentPtyRegistry::new();
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("devbox run codex-big"),
+                env: vec![
+                    (DOT_AGENT_DECK_PANE_ID.into(), "stable-pane".into()),
+                    ("PATH".into(), path),
+                    (
+                        "STABLE_RESPAWN_RECORD".into(),
+                        record.to_string_lossy().into_owned(),
+                    ),
+                ],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn initially unwrapped launcher");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::read_to_string(&record)
+            .unwrap_or_default()
+            .lines()
+            .count()
+            < 1
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        registry.set_agent_type("stable-pane", &AgentType::Codex);
+        assert_eq!(
+            registry.agent_records()[0].agent_type,
+            Some(AgentType::Codex),
+            "native-hook learning should upgrade the display badge"
+        );
+
+        registry
+            .respawn_agent_for_pane("stable-pane", "devbox run codex-big")
+            .await
+            .expect("respawn non-inferable launcher");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::read_to_string(&record)
+            .unwrap_or_default()
+            .lines()
+            .count()
+            < 2
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let launched = std::fs::read_to_string(&record).unwrap_or_default();
+        registry.shutdown_all();
+
+        assert_eq!(
+            launched.lines().collect::<Vec<_>>(),
+            vec![
+                "BARE devbox run codex-big",
+                "BARE devbox run codex-big"
+            ],
+            "the respawn launch line must remain byte-identical after a hook-learned Codex badge; observed {launched:?}"
+        );
+    });
+}

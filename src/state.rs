@@ -41,8 +41,23 @@ pub(crate) const MAX_FIRST_PROMPTS: usize = 3;
 /// Agents that never emit `SessionStart` (e.g. `cat -u` in tests, or
 /// agent runtimes without dot-agent-deck's hooks installed) still get
 /// their prompt — just delayed by `SESSION_START_WAIT_TIMEOUT`.
+///
+/// PRD #225 M4: raised from the inherited Claude-era 10 s to 30 s, sized from
+/// measured Codex boot rather than guessed. On the diagnosis machine the
+/// wrapper→`node codex` gap alone was ~4 s (`devbox run codex-big`), with
+/// Codex's own TUI initialization on top; 10 s left almost no margin on a
+/// loaded machine. This value only matters when the gate FALLS THROUGH — i.e.
+/// the agent's native hooks never fired (not installed, not trusted) — and that
+/// path is load-bearing: it must wait long enough that the prompt lands in a
+/// live agent rather than in a launcher's line discipline, where it is echoed
+/// and lost. The cost of over-waiting is a delayed prompt; the cost of
+/// under-waiting is a silently dropped one, so this is deliberately generous.
+/// The healthy path is unaffected — a genuine `SessionStart` releases the gate
+/// in milliseconds. The scheduler mirror of this wait is overridable per-run via
+/// `DOT_AGENT_DECK_SESSION_START_WAIT_MS` (see
+/// [`crate::spawn`]) so the e2e harness never pays the full fallback.
 pub(crate) const SESSION_START_WAIT_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(10);
+    std::time::Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionStatus {
@@ -348,6 +363,41 @@ fn lookup_orchestration_role(
     orch.roles.into_iter().find(|r| r.name == role_name)
 }
 
+/// PRD #225 M3: does this `SessionStart` mean "the agent can accept input", or
+/// only "a session now exists so paint a card"?
+///
+/// `dot-agent-deck wrap` emits a `SessionStart` the instant `cmd.spawn()`
+/// returns (`crate::wrap`), tagged with
+/// [`crate::event::WRAPPER_FORK_SESSION_START_ORIGIN`]. At that moment the child
+/// is often still just the launcher — measured on a Codex pane, `node codex`
+/// started 4 s after the wrapper forked `devbox run codex-big`. A gate that
+/// accepted it wrote the prompt into a PTY where only `devbox` was running, and
+/// the prompt was lost (PRD #225 Defect 1).
+///
+/// The skip MUST be conditional, and the condition is "will a genuine
+/// `SessionStart` arrive later?". The registry answers that: an agent with a
+/// native-hook installer ([`crate::agent_registry::AgentSpec::hook_install`])
+/// emits its own `SessionStart` from an initialized session — Codex is the
+/// hybrid case (wrapper as PTY host, native hooks for rich events) — so its
+/// fork-time event can be safely ignored. A pure-Wrapper agent with no hook
+/// installer (Gemini, PRD #211) will NEVER emit another one, so for it the
+/// fork-time event is the only readiness signal there is and must release the
+/// gate; skipping it unconditionally would regress those agents to a full
+/// timeout on every delegate. Keying off a registry property rather than
+/// `agent_type == Codex` is what keeps the next wrapper adapter from inheriting
+/// this bug: a new Wrapper agent gets the right behavior from its registry entry
+/// alone, with no change here.
+///
+/// Events without the marker — native hooks, an OLDER wrapper build, the
+/// scheduler's synthetic card-surfacing event — are always treated as ready,
+/// which is exactly today's behavior.
+fn session_start_means_ready(event: &AgentEvent) -> bool {
+    !event.is_wrapper_fork_session_start()
+        || crate::agent_registry::spec(&event.agent_type)
+            .hook_install
+            .is_none()
+}
+
 /// PRD #92 F9 followup-6: block until the daemon's hook broadcast
 /// surfaces a `SessionStart` event for `pane_id`, or `timeout`
 /// elapses. The caller is expected to have called `event_tx.subscribe()`
@@ -385,7 +435,18 @@ fn lookup_orchestration_role(
 ///
 /// PRD #127: also reused by the scheduler spawn primitive
 /// ([`crate::spawn::spawn`]) to gate a freshly-spawned scheduled card's
-/// prompt delivery on the same readiness signal — hence `pub(crate)`.
+/// prompt delivery on the same readiness signal — hence `pub(crate)`. PRD #225
+/// M4 answers "does the scheduler want the same semantics?" with yes: a
+/// scheduled card's prompt is delivered by the identical
+/// `write_to_pane_and_submit` keystroke path into the identical PTY, so a
+/// fork-time event that isn't proof of interactivity is no more usable there
+/// than on the delegate path. Both call sites therefore share
+/// [`session_start_means_ready`] rather than diverging.
+///
+/// PRD #225 M3: a `SessionStart` carrying the wrapper's fork-time origin marker
+/// is SKIPPED (kept waiting on) when the agent will emit a genuine native one
+/// later — see [`session_start_means_ready`] for the discriminator and why the
+/// skip must be conditional.
 pub(crate) async fn wait_for_session_start(
     rx: &mut broadcast::Receiver<BroadcastMsg>,
     pane_id: &str,
@@ -403,6 +464,17 @@ pub(crate) async fn wait_for_session_start(
                     && event.pane_id.as_deref() == Some(pane_id)
                     && event.agent_id.as_deref() == Some(agent_id)
                 {
+                    if !session_start_means_ready(&event) {
+                        tracing::debug!(
+                            pane_id,
+                            agent_id,
+                            agent_type = ?event.agent_type,
+                            "readiness gate: ignoring the wrapper's fork-time \
+                             card-surfacing SessionStart; waiting for the agent's \
+                             native one"
+                        );
+                        continue;
+                    }
                     return true;
                 }
             }

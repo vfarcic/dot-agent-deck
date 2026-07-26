@@ -1617,6 +1617,20 @@ without depending on the config struct API.
 - **Does not assert:** the orchestrator pane's error-line rendering (L2 `orchestration/delegate/004`); the daemon-side log entry.
 - **Platform coverage:** mac+linux.
 
+##### orchestration/delegate/007 — A wrapped native-hook agent ignores its fork-time card-surfacing `SessionStart` for delegate readiness (PRD #225 M1).
+- **Layer:** L2 synthetic (real wrapper subprocess + in-process daemon hook socket + real `handle_delegate` + managed PTY; no LLM).
+- **Agent:** synthetic Codex executable backed by `cat`; the real `dot-agent-deck wrap` emits the early wrapper event and the test later injects the genuine native Codex event.
+- **Asserts:** after a `clear = true` respawn, the task pointer is absent from the replacement PTY while only the wrapper's fork-time `SessionStart` has arrived; after the matching native `SessionStart`, the pointer is delivered promptly.
+- **Does not assert:** real Codex boot timing or task execution (covered by the real-agent PRD milestone).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/008 — A hookless wrapper-like agent still treats its sole fork-time `SessionStart` as ready (PRD #225 M1 guard).
+- **Layer:** fast synthetic PTY integration (real `handle_delegate` + managed PTY + daemon broadcast; no socket or LLM).
+- **Agent:** hookless future-wrapper stand-in represented by the neutral registry identity because no shipped hookless Wrapper agent exists yet.
+- **Asserts:** a marked wrapper-fork `SessionStart` releases prompt delivery within two seconds, well before the ten-second fallback, when the agent has no native hook installer and will emit no later readiness event.
+- **Does not assert:** a concrete Gemini registry entry or wrapper classifier; those do not exist yet.
+- **Platform coverage:** mac+linux.
+
 #### orchestration/identity
 
 ##### orchestration/identity/001 — Opening an orchestration whose form/display name (worktree dir basename) differs from the TOML config orchestration name stamps the CANONICAL config name as the daemon IDENTITY, not the basename (PRD #107 regression).
@@ -1995,6 +2009,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Agent:** synthetic custom launcher explicitly declared as Codex.
 - **Asserts:** a command whose basename is not `codex` still executes exactly through `dot-agent-deck wrap --agent codex -- ...` when the caller supplies `AgentType::Codex`, and the live registry records that pane as Codex.
 - **Does not assert:** command-string inference (covered by the detection matrix) or real Codex behavior.
+- **Platform coverage:** mac+linux.
+
+##### codex/spawn/007 — A hook-learned Codex badge does not mutate a non-inferable pane's launch shape on respawn (PRD #225 M1).
+- **Layer:** fast PTY registry integration (`AgentPtyRegistry::spawn_agent` + hook-path `set_agent_type` + `respawn_agent_for_pane`, with PATH recorder stubs).
+- **Agent:** synthetic `devbox run codex-big` launcher whose basename intentionally does not infer an agent type.
+- **Asserts:** the initial and replacement exec records are byte-identical `devbox run codex-big` lines even after the registry badge upgrades from `None` to `Some(Codex)`; no `dot-agent-deck wrap` line appears on respawn.
+- **Does not assert:** daemon hook-socket ingestion of the badge (covered by `hooks/delivery/007`) or real Codex behavior.
 - **Platform coverage:** mac+linux.
 
 #### codex/hooks

@@ -52,7 +52,8 @@ use chrono::Utc;
 
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use crate::event::{
-    AGENT_EVENT_SCHEMA_VERSION, AgentEvent, AgentType, EventType, LiveTarget, TargetKind, Writable,
+    AGENT_EVENT_SCHEMA_VERSION, AgentEvent, AgentType, EventType, LiveTarget,
+    SESSION_START_ORIGIN_METADATA_KEY, TargetKind, WRAPPER_FORK_SESSION_START_ORIGIN, Writable,
 };
 
 /// A coarse activity state detected from a single line of wrapped output.
@@ -272,6 +273,26 @@ impl Emitter {
     /// the wrapper stays a transparent passthrough even with no daemon (the
     /// "arbitrary commands as a basic fallback" success criterion).
     fn emit(&self, event_type: EventType) {
+        self.emit_with_metadata(event_type, HashMap::new());
+    }
+
+    /// PRD #225 M3: the fork-time `SessionStart` this wrapper emits the moment
+    /// `cmd.spawn()` returns. Its ONLY job is to surface the dashboard card so a
+    /// slow-booting agent isn't invisible — the child is typically just the
+    /// launcher (`devbox`, a shell) at this point, seconds away from the real
+    /// agent TUI. Stamping [`SESSION_START_ORIGIN_METADATA_KEY`] lets readiness
+    /// gates tell this apart from a genuine "the session is up and accepting
+    /// input" signal; see [`crate::state::wait_for_session_start`].
+    fn emit_fork_session_start(&self) {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+        );
+        self.emit_with_metadata(EventType::SessionStart, metadata);
+    }
+
+    fn emit_with_metadata(&self, event_type: EventType, metadata: HashMap<String, String>) {
         let event = AgentEvent {
             session_id: self.session_id.clone(),
             agent_type: self.agent_type.clone(),
@@ -281,7 +302,7 @@ impl Emitter {
             cwd: self.cwd.clone(),
             timestamp: Utc::now(),
             user_prompt: None,
-            metadata: HashMap::new(),
+            metadata,
             pane_id: self.pane_id.clone(),
             agent_id: self.agent_id.clone(),
             agent_version: None,
@@ -1075,8 +1096,11 @@ fn run_wrap_pty(
         child.stderr.take()
     };
 
-    // The session has begun — surface the card immediately.
-    emitter.emit(EventType::SessionStart);
+    // The session has begun — surface the card immediately. PRD #225 M3: this is
+    // a CARD-SURFACING signal, not a readiness signal (the child may still be
+    // `devbox`/a shell for seconds before the agent TUI exists), so it carries
+    // the wrapper-fork origin marker.
+    emitter.emit_fork_session_start();
 
     // Raw-mode the outer terminal ONLY when stdin is itself a terminal, so
     // keystrokes (incl. Ctrl+C and CR) reach the inner PTY unmodified; restored
@@ -1309,7 +1333,9 @@ fn run_wrap_pipe(
     };
     let child_pid = child.id() as libc::pid_t;
 
-    emitter.emit(EventType::SessionStart);
+    // PRD #225 M3: same fork-time card-surfacing event as the PTY path, and the
+    // same marker — it says "a session exists", not "the agent is ready".
+    emitter.emit_fork_session_start();
 
     let child_stdout = child.stdout.take().expect("piped child stdout");
     let child_stderr = child.stderr.take().expect("piped child stderr");

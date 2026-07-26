@@ -438,10 +438,12 @@ fn pane_env(pane_id: &str, pin_sh: bool) -> Vec<(String, String)> {
 
 /// How long [`deliver`] waits for the spawned agent's `SessionStart` before
 /// falling through and writing the prompt anyway. Defaults to the daemon-wide
-/// [`crate::state::SESSION_START_WAIT_TIMEOUT`] (10s, matching the delegate
-/// path); overridable via `DOT_AGENT_DECK_SESSION_START_WAIT_MS` (milliseconds)
-/// so the e2e scheduler harness can shrink the no-hook fallback without a real
-/// 10s wait. Mirrors the [`reuse_debounce`] override idiom.
+/// [`crate::state::SESSION_START_WAIT_TIMEOUT`] (matching the delegate path —
+/// PRD #225 M4 sized it from measured Codex boot); overridable via
+/// `DOT_AGENT_DECK_SESSION_START_WAIT_MS` (milliseconds)
+/// so the e2e scheduler harness can shrink the no-hook fallback instead of
+/// paying the full production wait. Mirrors the [`reuse_debounce`] override
+/// idiom.
 fn session_start_wait_timeout() -> Duration {
     std::env::var("DOT_AGENT_DECK_SESSION_START_WAIT_MS")
         .ok()

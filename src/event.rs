@@ -404,6 +404,28 @@ pub fn agent_event_type_from_state(state: &str) -> Option<EventType> {
 /// don't emit it; consumers treat its absence as "no friendly name known".
 pub const DISPLAY_NAME_METADATA_KEY: &str = "display_name";
 
+/// `AgentEvent.metadata` key declaring WHERE a `SessionStart` came from (PRD
+/// #225 M3). Only the wrapper adapter sets it, with the single value
+/// [`WRAPPER_FORK_SESSION_START_ORIGIN`]; every other producer omits it, and
+/// consumers read an absent key as "this `SessionStart` came from an
+/// initialized session".
+///
+/// Additive on the wire in both directions: an OLD wrapper emits no key and a
+/// new daemon treats its event exactly as it does today; a NEW wrapper's key is
+/// ignored by an old daemon. That is a semantic no-op, not a
+/// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump.
+pub const SESSION_START_ORIGIN_METADATA_KEY: &str = "session_start_origin";
+
+/// The [`SESSION_START_ORIGIN_METADATA_KEY`] value meaning "this `SessionStart`
+/// was emitted by `dot-agent-deck wrap` right after `fork`/`exec`, purely to
+/// surface the dashboard card for a slow-booting agent" (PRD #225 M3). It does
+/// NOT mean the wrapped agent can accept input yet — for Codex the real TUI is
+/// still seconds away — so readiness gates
+/// ([`crate::state::wait_for_session_start`]) must not treat it as proof of
+/// interactivity for an agent that will emit a genuine native `SessionStart`
+/// later.
+pub const WRAPPER_FORK_SESSION_START_ORIGIN: &str = "wrapper_fork";
+
 /// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
 ///
 /// This versions the **payload shape of a single `AgentEvent` record** — the
@@ -554,6 +576,19 @@ pub struct AgentEvent {
     /// it `None`, which the UI reads as the historical live/writable default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_target: Option<LiveTarget>,
+}
+
+impl AgentEvent {
+    /// PRD #225 M3: does this event carry the wrapper's fork-time,
+    /// card-surfacing origin marker (see
+    /// [`WRAPPER_FORK_SESSION_START_ORIGIN`])? `false` for every event without
+    /// the marker — including everything an older wrapper or a native hook
+    /// emits — so the absent-key default is "a genuine, session-derived event".
+    pub fn is_wrapper_fork_session_start(&self) -> bool {
+        self.metadata
+            .get(SESSION_START_ORIGIN_METADATA_KEY)
+            .is_some_and(|origin| origin == WRAPPER_FORK_SESSION_START_ORIGIN)
+    }
 }
 
 /// Envelope for messages sent to the daemon over the Unix socket.
