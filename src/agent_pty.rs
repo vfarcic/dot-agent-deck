@@ -1269,10 +1269,11 @@ pub struct RunningAgent {
     /// never rewrite the exec line.
     pub agent_type: Option<AgentType>,
     /// PRD #225 M2: the SPAWN-TIME identity that drove this pane's launch shape
-    /// — i.e. the caller-supplied [`SpawnOptions::agent_type`] as it was at pane
-    /// creation. Immutable for the life of the pane and replayed verbatim by
-    /// [`AgentPtyRegistry::respawn_agent_for_pane`], which is what makes the
-    /// exec line byte-identical across a `clear = true` delegate.
+    /// — i.e. the caller-supplied [`SpawnOptions::agent_type`] as it was at this
+    /// child's spawn. It is the LAUNCH-side field:
+    /// [`AgentPtyRegistry::respawn_agent_for_pane`] reads it and
+    /// [`AgentPtyRegistry::set_agent_type`] never writes it, which is what keeps
+    /// a hook-learned badge out of the exec line.
     ///
     /// Defect 2 was exactly the absence of this split: a `devbox run codex-big`
     /// pane spawns UNWRAPPED (`AgentType::from_command` can't see through the
@@ -1283,9 +1284,19 @@ pub struct RunningAgent {
     /// codex -- devbox run codex-big`. A value recorded for display must not
     /// change how the pane launches.
     ///
-    /// `None` means "no explicit identity at creation" — the launch decision
-    /// then falls back to parsing the command in [`spawn`], which is
-    /// deterministic for the same command and so reproduces the same exec line.
+    /// It is a FALLBACK, not an override: a respawn derives the wrap decision
+    /// from the command it is actually launching and consults this field only
+    /// when that command implies no agent type (the `devbox run codex-big`
+    /// shape). See the invariant spelled out in
+    /// [`AgentPtyRegistry::respawn_agent_for_pane`] for why the derivation has to
+    /// come first. So the value tracks the identity of the command each child was
+    /// launched with — stable for a pane whose role command never changes, and
+    /// re-derived (not stale) for one whose command was edited.
+    ///
+    /// `None` means "no explicit identity, and the command implied none" — the
+    /// launch decision then falls back to parsing the command in [`spawn`], which
+    /// is deterministic for the same command and so reproduces the same exec
+    /// line.
     pub spawn_agent_type: Option<AgentType>,
     /// The full env vec passed to [`AgentPtyRegistry::spawn_agent`] at
     /// the original spawn, captured so
@@ -2453,12 +2464,24 @@ impl AgentPtyRegistry {
     /// `display_name`, `cwd`, `tab_membership`, `agent_type`) are
     /// captured from the existing entry and re-applied to the new
     /// spawn. PRD #225 M2: the two agent-type fields are re-applied through
-    /// DIFFERENT seams — [`RunningAgent::spawn_agent_type`] goes into
-    /// [`SpawnOptions::agent_type`] (it decides the launch shape) while the
-    /// observed [`RunningAgent::agent_type`] badge is restored afterwards via
-    /// [`AgentPtyRegistry::set_agent_type`]. That is the invariant "a pane's exec
-    /// line is fixed at creation and replayed verbatim": a type learned from a
-    /// hook event updates the badge, never the command that gets exec'd.
+    /// DIFFERENT seams — [`RunningAgent::spawn_agent_type`] feeds
+    /// [`SpawnOptions::agent_type`] (the launch side) while the observed
+    /// [`RunningAgent::agent_type`] badge is restored afterwards via
+    /// [`AgentPtyRegistry::set_agent_type`]. That split is what makes the invariant
+    /// below hold at all: a type learned from a hook event updates the badge,
+    /// never the command that gets exec'd.
+    ///
+    /// **Launch-shape invariant (PRD #225, review finding 1): the wrap decision
+    /// for a respawn is derived from the command actually being launched; the
+    /// pane's frozen spawn-time identity only fills in for a command that implies
+    /// no agent type.** `command` is the CURRENT role command, so an edit to
+    /// `.dot-agent-deck.toml` is honored — and the wrap decision follows that
+    /// edit instead of contradicting it (no `wrap --agent codex -- claude`). A
+    /// pane whose role command is unchanged therefore relaunches byte-identically,
+    /// whether its identity was explicit at creation or inferred from the command.
+    /// The reasoning, and the one residual limit, are at the `SpawnOptions`
+    /// construction below.
+    ///
     /// The TUI's pane card therefore stays put across the
     /// respawn: the daemon's `agent_records()` snapshot still lists
     /// the same `pane_id_env` and `tab_membership`, so a TUI that
@@ -2485,8 +2508,9 @@ impl AgentPtyRegistry {
     /// agent's stdout, so it can't observe "ready" directly here. The
     /// dispatch path subscribes to the daemon-wide hook broadcast
     /// before this call and waits for the new agent's `SessionStart`
-    /// event (10 s timeout fallback) — see
-    /// [`crate::state::SESSION_START_WAIT_TIMEOUT`].
+    /// event (with a timeout fallback) — see
+    /// [`crate::state::SESSION_START_WAIT_TIMEOUT`] for the duration and why the
+    /// fallback is load-bearing.
     pub async fn respawn_agent_for_pane(
         &self,
         pane_id_env: &str,
@@ -2604,9 +2628,42 @@ impl AgentPtyRegistry {
         // briefly mis-wrapping the new agent's first output until the
         // TUI's next resize landed.
         //
-        // PRD #225 M2: the identity handed to the spawn seam is the pane's
-        // SPAWN-TIME one, never the (possibly hook-learned) display badge —
-        // that is what keeps the exec line byte-identical across the respawn.
+        // PRD #225 M2: whatever identity is handed to the spawn seam, it is never
+        // the (possibly hook-learned) display badge — that is restored after the
+        // spawn, through the display-only `set_agent_type` seam.
+        //
+        // PRD #225 review finding 1 — the INVARIANT this seam enforces:
+        //
+        //   **A respawn's wrap decision is derived from the command it is
+        //   actually launching.** The pane's frozen `spawn_agent_type` only
+        //   supplies an identity that command CANNOT imply, and the
+        //   hook-learned display badge never participates at all.
+        //
+        // The caller passes the CURRENT role command (`crate::state` re-reads
+        // `.dot-agent-deck.toml` at delegate time), so the user may have edited
+        // it since the pane was created. Honoring that edit is deliberate — but
+        // then the wrap decision has to follow the command, or the two disagree:
+        // a pane frozen as `Some(Codex)` whose command was edited to `claude`
+        // would come back up as `dot-agent-deck wrap --agent codex -- claude`,
+        // launching Claude wrapped as Codex. Deriving first eliminates that
+        // case, and it makes `Some` and `None` behave the SAME way — before
+        // this, a frozen `Some` overrode the edited command while a frozen
+        // `None` silently re-derived from it inside `spawn`.
+        //
+        // Falling back to the frozen identity (rather than to nothing) is what
+        // keeps the launch shape stable for the shape that motivated the split:
+        // `devbox run codex-big` resolves to no agent type, so an explicit
+        // creation-time identity is the only thing that knows the pane is Codex,
+        // and dropping it would flip an initially-wrapped pane to bare on its
+        // first delegate — Defect 2 in reverse. The residual limit is inherent
+        // and documented: if the command implies nothing AND its underlying
+        // agent changed (`devbox run codex-big` → `devbox run claude-big`), the
+        // pane keeps its creation-time identity; that pane has to be recreated.
+        //
+        // `AgentType::from_command` never yields the neutral `AgentType::None`
+        // placeholder (it is absent from `agent_registry::ALL`), so a `Some`
+        // here always means a real agent won the derivation.
+        let respawn_agent_type = AgentType::from_command(Some(command)).or(spawn_agent_type);
         let opts = SpawnOptions {
             command: Some(command),
             cwd: cwd.as_deref(),
@@ -2615,7 +2672,7 @@ impl AgentPtyRegistry {
             cols: pty_cols,
             env: spawn_env,
             tab_membership,
-            agent_type: spawn_agent_type,
+            agent_type: respawn_agent_type,
         };
         let new_agent_id = self.spawn_agent(opts)?;
         // Step 4 (PRD #225 M2): re-apply the observed badge so the dashboard

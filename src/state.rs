@@ -622,7 +622,8 @@ async fn dispatch_one_owned(
     // via `get-seed` → `pi.sendUserMessage`, no PTY keystroke injection. This
     // ALSO dissolves the pi-specific fragility the old path had: pi never emits
     // `EventType::SessionStart`, so `wait_for_session_start` always burned the
-    // full ~10s timeout before injecting into a maybe-not-yet-ready pane. A
+    // full `SESSION_START_WAIT_TIMEOUT` (10s when this was written, 30s since
+    // PRD #225 M4) before injecting into a maybe-not-yet-ready pane. A
     // `clear = false` pi worker (no respawn → no `session_start`) keeps the
     // legacy injection — the native pull needs a fresh session to fire on, so
     // mid-session re-delegation is a documented further enhancement.

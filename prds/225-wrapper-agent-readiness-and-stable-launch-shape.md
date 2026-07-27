@@ -107,7 +107,7 @@ The second is probably cleaner but touches every reader of `RunningAgent.agent_t
 ## Success Criteria
 
 - Delegating to a `clear = true` Codex worker delivers the prompt and the worker starts working — verified with a real agent, not a stand-in.
-- A pane's exec line is byte-identical before and after its first delegate.
+- A pane's exec line is byte-identical before and after its first delegate, for an unchanged role command. (An *edited* role command is honored — and the wrap decision follows the edited command rather than the pane's original identity; see the 2026-07-27 decision below.)
 - Claude, OpenCode, and Pi delegate behavior is unchanged (no regression in the existing dispatch tests).
 - A Wrapper-strategy agent with no native hooks still receives its prompt without waiting out the full timeout.
 
@@ -127,3 +127,18 @@ The second is probably cleaner but touches every reader of `RunningAgent.agent_t
 
 ### 2026-07-26 — Diagnosis
 Root-caused live against daemon pid 3115616 without restarting it (three orchestrations were mid-flight). Evidence: process tree showing pane 21 wrapped vs. panes 15/27 unwrapped; process start times establishing the 4s fork→Codex gap; `worker-task-tester.md` mtime establishing that the delegate reached the daemon and only the injection was lost. No daemon restart, no code changes.
+
+### 2026-07-27 — Decision: the respawn wrap rule (review finding 1)
+
+Review found that "decided once at creation, replayed verbatim" and "honor an edited role command" cannot both be literally true, and that the first implementation satisfied neither consistently: `respawn_agent_for_pane` gets the CURRENT role command, so a frozen `Some(Codex)` overrode an edited command (`claude` would have relaunched as `dot-agent-deck wrap --agent codex -- claude` — Claude wrapped as Codex) while a frozen `None` silently re-derived from the edited command inside `spawn`. `Some` and `None` behaved differently.
+
+Adopted rule: **a respawn's wrap decision is derived from the command actually being launched; the frozen `spawn_agent_type` only fills in for a command that implies no agent type** (`AgentType::from_command(command).or(spawn_agent_type)` at the respawn seam). Why this one and not the alternatives:
+
+- It eliminates the "launch Claude wrapped as Codex" case outright, which freezing a resolved decision and replaying it verbatim does not — the wrong-agent wrap survives any freeze as long as the command is allowed to change.
+- It makes `Some` and `None` behave identically: the command's implied identity wins in both cases.
+- Keeping the frozen identity as a FALLBACK preserves what the split was for. `devbox run codex-big` resolves to nothing, so an explicit creation-time identity is the only thing that knows the pane is Codex; deriving with no fallback would flip an initially-wrapped launcher pane to bare on its first delegate — Defect 2 in reverse.
+- The hook-learned badge still never participates: it lives in `agent_type`, which the respawn re-applies *after* the spawn through the display-only `set_agent_type` seam.
+
+`spawn`'s own precedence is unchanged (an explicit caller identity still wins over the command — PRD #20 finding #19), because at creation there is no second source of truth to disagree with. Residual, documented limit: a command that implies nothing AND whose underlying agent changed (`devbox run codex-big` → `devbox run claude-big`) keeps its creation-time identity; that pane has to be recreated. Pinned by `codex/spawn/008` (both an unchanged and an edited role command, plus the badge following the newly launched command), documented at the seam in `src/agent_pty.rs` and in `docs/develop/agent-adapters.md` ("The launch-shape invariant").
+
+Same review pass bounded `DOT_AGENT_DECK_SESSION_START_WAIT_MS` to `[100 ms, SESSION_START_WAIT_TIMEOUT]` with a `warn!` on clamp: `=0` reintroduced exactly the prompt loss this PRD fixes (the gate stops waiting), and an unbounded value hangs delivery silently. The e2e harness's 5000 ms pin is inside the range.

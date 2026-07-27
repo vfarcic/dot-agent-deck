@@ -1618,16 +1618,16 @@ without depending on the config struct API.
 - **Platform coverage:** mac+linux.
 
 ##### orchestration/delegate/007 — A wrapped native-hook agent ignores its fork-time card-surfacing `SessionStart` for delegate readiness (PRD #225 M1).
-- **Layer:** L2 synthetic (real wrapper subprocess + in-process daemon hook socket + real `handle_delegate` + managed PTY; no LLM).
+- **Layer:** fast synthetic real-binary-subprocess integration (a real `dot-agent-deck wrap` child + in-process daemon hook socket + real `handle_delegate` + managed PTY; no vt100 attach, no LLM, no `e2e` feature gate).
 - **Agent:** synthetic Codex executable backed by `cat`; the real `dot-agent-deck wrap` emits the early wrapper event and the test later injects the genuine native Codex event.
 - **Asserts:** after a `clear = true` respawn, the task pointer is absent from the replacement PTY while only the wrapper's fork-time `SessionStart` has arrived; after the matching native `SessionStart`, the pointer is delivered promptly.
-- **Does not assert:** real Codex boot timing or task execution (covered by the real-agent PRD milestone).
+- **Does not assert:** real Codex boot timing or task execution (covered by the real-agent `orchestration/delegate/009`).
 - **Platform coverage:** mac+linux.
 
 ##### orchestration/delegate/008 — A hookless wrapper-like agent still treats its sole fork-time `SessionStart` as ready (PRD #225 M1 guard).
 - **Layer:** fast synthetic PTY integration (real `handle_delegate` + managed PTY + daemon broadcast; no socket or LLM).
 - **Agent:** hookless future-wrapper stand-in represented by the neutral registry identity because no shipped hookless Wrapper agent exists yet.
-- **Asserts:** a marked wrapper-fork `SessionStart` releases prompt delivery within two seconds, well before the ten-second fallback, when the agent has no native hook installer and will emit no later readiness event.
+- **Asserts:** a marked wrapper-fork `SessionStart` releases prompt delivery within two seconds — well inside the 30 s `SESSION_START_WAIT_TIMEOUT` fallback, so a pass cannot be the fallback firing — when the agent has no native hook installer and will emit no later readiness event.
 - **Does not assert:** a concrete Gemini registry entry or wrapper classifier; those do not exist yet.
 - **Platform coverage:** mac+linux.
 
@@ -1635,8 +1635,8 @@ without depending on the config struct API.
 - **Layer:** L2 PTY-attached REAL-agent (the real `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness — records a `full-stream.cast`; pre-PR e2e tier per CLAUDE.md rule 5, flaky-tolerant, never in CI).
 - **Agent:** a REAL interactive cheap-model Codex (`common::CODEX_TEST_MODEL`, no `-p`, no stand-in) as the `clear = true` `coder` role, wrapped from its first spawn because the role command's basename resolves to Codex; the `orchestrator` role is a deterministic script that invokes the genuine `dot-agent-deck delegate --to coder` CLI over the same hook socket a real orchestrator agent uses (the defect is entirely on the worker side, so a second LLM would add a flaky link without covering another line of the fix).
 - **Asserts:** opening the orchestration through the normal Ctrl+N new-pane form surfaces the `coder` role card live; the worker emits its GENUINE native Codex `SessionStart` (distinct from the wrapper's marked fork-time card-surfacing one) before anything is delegated; after the delegate the worker's card visibly enters `Thinking` — a status only Codex's native `UserPromptSubmit` hook can produce, so the injected pointer was submitted INSIDE the agent rather than echoed away by the launcher's line discipline; and the respawned worker creates the uniquely named sentinel `prd225-codex-delegate-6f21ba.txt` with the requested contents. Pre-fix the wrapper's fork-time event released the readiness gate seconds before the Codex TUI existed, the prompt was lost, and no sentinel ever appeared.
-- **Does not assert:** the work-done leg (logged as a soft observation; hard-covered by `codex/worker/001`); the exec-line stability half of PRD #225 (`codex/spawn/007`); the hookless-wrapper guard (`orchestration/delegate/008`).
-- **Platform coverage:** linux+mac (unix-only — writes an executable role script).
+- **Does not assert:** the work-done leg (logged as a soft observation; hard-covered by `codex/worker/001`); the launch-shape half of PRD #225 (`codex/spawn/007` for the hook-learned badge, `codex/spawn/008` for the respawn wrap decision); the hookless-wrapper guard (`orchestration/delegate/008`).
+- **Platform coverage:** mac+linux (unix-only — writes an executable role script).
 
 #### orchestration/identity
 
@@ -2022,7 +2022,14 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Layer:** fast PTY registry integration (`AgentPtyRegistry::spawn_agent` + hook-path `set_agent_type` + `respawn_agent_for_pane`, with PATH recorder stubs).
 - **Agent:** synthetic `devbox run codex-big` launcher whose basename intentionally does not infer an agent type.
 - **Asserts:** the initial and replacement exec records are byte-identical `devbox run codex-big` lines even after the registry badge upgrades from `None` to `Some(Codex)`; no `dot-agent-deck wrap` line appears on respawn.
-- **Does not assert:** daemon hook-socket ingestion of the badge (covered by `hooks/delivery/007`) or real Codex behavior.
+- **Does not assert:** daemon hook-socket ingestion of the badge (covered by `hooks/delivery/007`); an EDITED role command's effect on the wrap decision (`codex/spawn/008`); real Codex behavior.
+- **Platform coverage:** mac+linux.
+
+##### codex/spawn/008 — A respawn's wrap decision follows the command it is actually launching, so an explicit Codex identity can never wrap a different agent (PRD #225 review finding 1).
+- **Layer:** fast PTY registry integration (`AgentPtyRegistry::spawn_agent` + two `respawn_agent_for_pane` calls, with PATH recorder stubs for `devbox`, `claude`, and `dot-agent-deck`).
+- **Agent:** synthetic `devbox run codex-big` launcher spawned with an explicit `AgentType::Codex` identity, then respawned once with that same command and once with the role command edited to `claude --model haiku`.
+- **Asserts:** the unchanged respawn relaunches byte-identically as `dot-agent-deck wrap --agent codex -- devbox run codex-big` (the frozen identity is the only thing that knows this launcher is Codex); the edited respawn executes a bare `claude --model haiku` and never `wrap --agent codex -- claude …`; and the pane badge follows the newly launched command (`ClaudeCode`) instead of still advertising the replaced agent. Both halves are load-bearing — replaying the frozen identity verbatim wraps Claude as Codex, and dropping it flips the unchanged pane to bare.
+- **Does not assert:** the hook-learned badge path (`codex/spawn/007`); a launcher whose command implies no type AND whose underlying agent changed (`devbox run codex-big` → `devbox run claude-big`), which keeps its creation-time identity by documented design.
 - **Platform coverage:** mac+linux.
 
 #### codex/hooks

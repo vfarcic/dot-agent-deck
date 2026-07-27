@@ -269,3 +269,119 @@ fn spawn_007_hook_learned_badge_does_not_change_respawn_launch() {
         );
     });
 }
+
+/// Scenario: Spawn a pane with an explicit Codex identity on the non-inferable `devbox run codex-big` launcher, respawn it once with that same command, then respawn it again with the role command edited to a Claude one — with PATH recorder stubs capturing every exec line. The unchanged respawn must relaunch byte-identically through the Codex wrapper, while the edited command must launch as itself rather than being wrapped as Codex.
+#[spec("codex/spawn/008")]
+#[test]
+#[cfg(unix)]
+fn spawn_008_respawn_wrap_decision_follows_the_launched_command() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build launch-shape coherence runtime");
+    runtime.block_on(async {
+        use dot_agent_deck::agent_pty::{
+            AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions,
+        };
+
+        let fixture = tempfile::tempdir().expect("launch-shape coherence fixture");
+        let bin_dir = fixture.path().join("bin");
+        let record = fixture.path().join("launch.log");
+        std::fs::create_dir_all(&bin_dir).expect("create launch-shape bin dir");
+        write_executable(
+            &bin_dir.join("devbox"),
+            "#!/bin/sh\nprintf 'BARE devbox %s\\n' \"$*\" >> \"$SHAPE_RECORD\"\nexec cat\n",
+        );
+        write_executable(
+            &bin_dir.join("claude"),
+            "#!/bin/sh\nprintf 'BARE claude %s\\n' \"$*\" >> \"$SHAPE_RECORD\"\nexec cat\n",
+        );
+        write_executable(
+            &bin_dir.join("dot-agent-deck"),
+            "#!/bin/sh\nprintf 'WRAPPED %s\\n' \"$*\" >> \"$SHAPE_RECORD\"\nexec cat\n",
+        );
+        let path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").expect("test runner PATH")
+        );
+        // Wait until the recorder has appended `want` lines, so each launch is
+        // observed before the next respawn overwrites the pane.
+        let await_lines = |want: usize| {
+            let record = record.clone();
+            async move {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while std::fs::read_to_string(&record)
+                    .unwrap_or_default()
+                    .lines()
+                    .count()
+                    < want
+                    && std::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        };
+
+        let registry = AgentPtyRegistry::new();
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("devbox run codex-big"),
+                env: vec![
+                    (DOT_AGENT_DECK_PANE_ID.into(), "shape-pane".into()),
+                    ("PATH".into(), path),
+                    (
+                        "SHAPE_RECORD".into(),
+                        record.to_string_lossy().into_owned(),
+                    ),
+                ],
+                agent_type: Some(AgentType::Codex),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn explicitly identified Codex launcher");
+        await_lines(1).await;
+
+        // The role command is untouched: the frozen identity is the only thing
+        // that knows this launcher is Codex, so the wrapper must come back.
+        registry
+            .respawn_agent_for_pane("shape-pane", "devbox run codex-big")
+            .await
+            .expect("respawn with the unchanged role command");
+        await_lines(2).await;
+
+        // The user edited the role command in `.dot-agent-deck.toml` to a
+        // different agent. The wrap decision must follow the command actually
+        // being launched — never `wrap --agent codex -- claude …`.
+        registry
+            .respawn_agent_for_pane("shape-pane", "claude --model haiku")
+            .await
+            .expect("respawn with the edited role command");
+        await_lines(3).await;
+
+        let launched = std::fs::read_to_string(&record).unwrap_or_default();
+        let badge = registry
+            .agent_records()
+            .first()
+            .and_then(|entry| entry.agent_type.clone());
+        registry.shutdown_all();
+
+        assert_eq!(
+            launched
+                .lines()
+                .map(str::trim_end)
+                .collect::<Vec<_>>(),
+            vec![
+                "WRAPPED wrap --agent codex -- devbox run codex-big",
+                "WRAPPED wrap --agent codex -- devbox run codex-big",
+                "BARE claude --model haiku",
+            ],
+            "an unchanged role command must relaunch byte-identically while an edited one must launch as itself, never wrapped as the previous agent; observed {launched:?}"
+        );
+        assert_eq!(
+            badge,
+            Some(AgentType::ClaudeCode),
+            "the badge must follow the newly launched command too, not keep advertising the replaced agent"
+        );
+    });
+}
