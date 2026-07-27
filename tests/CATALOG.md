@@ -1064,6 +1064,16 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the exact sanitization output beyond "no raw control bytes survive into the rendered grid" (the pure-data `validate_tab_membership_*` tests pin the per-field policy).
 - **Platform coverage:** mac+linux.
 
+#### embed/key-forwarding
+
+##### embed/key-forwarding/001 — Shift+Enter typed into a focused embedded agent pane inserts a NEWLINE into the agent's draft instead of SUBMITTING it (PRD #227).
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness). Mirrors the `scheduler/dispatch/013` reference harness: imported Claude credentials, project-trust pre-seeded into the per-test HOME (`with_claude_trust_workdir`) so the first-run onboarding/trust gates clear with no keystroke, and `--allowedTools Bash` so no permission prompt can block the pane.
+- **Agent:** REAL interactive `claude` pinned to Haiku (`claude --model claude-haiku-4-5-20251001 --allowedTools Bash`, NO `-p`). A stand-in cannot cover this case: `cat` has no draft, so it cannot distinguish "inserted a newline" from "submitted" — which is the entire behavior under test.
+- **Asserts:** with the restored pane auto-focused, typing a first draft line, injecting `ESC[13;2u` (the CSI-u encoding of Shift+Enter a kitty-capable terminal emits) into the DECK's PTY, and typing a second line leaves the draft as TWO lines of ONE input box — the second marker renders on the row IMMEDIATELY BELOW the first. That adjacency is simultaneously the newline proof and the no-submission proof (a submitted first line would have been repainted into the transcript far above the box before the second line was typed). Independently: the uniquely-named sentinel `shiftnl-7f3c.txt` that the first line's directive would create if submitted does NOT exist in the pane cwd.
+- **Does not assert (soft, logged only):** that plain Enter then submits the two-line draft and the agent creates the sentinel — the positive control, left non-gating because it is the only step depending on a live model turn.
+- **Cost:** the load-bearing assertions submit nothing (zero LLM tokens); only the soft positive control spends one short Haiku turn.
+- **Platform coverage:** linux (pre-PR e2e tier; flaky-tolerant, run once, not looped).
+
 ### Hook delivery
 
 #### hooks/delivery
@@ -2733,6 +2743,6 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 | `dot-agent-deck watch` CLI subcommand ([docs/workspace-modes.md#dot-agent-deck-watch](../docs/workspace-modes.md)) | Non-TUI subcommand; an L2 test would only exercise its output formatting against a real shell — low value compared to the deck-rendering surface. |
 | `dot-agent-deck config get` / `config set` ([docs/configuration.md](../docs/configuration.md)) | Non-TUI; the underlying config field reflection is covered by pure-data tests (`*_get_set_field`, `*_get_set_fields`). |
 | `dot-agent-deck hooks install` / `uninstall` CLI commands ([docs/troubleshooting.md#hooks](../docs/troubleshooting.md)) | Auto-install path is catalogued as `hooks/install/001`–`003`; the explicit subcommand variants share the same install/uninstall code. A targeted L2 test will be added only if a divergence appears. |
-| Ghostty-specific Shift+Enter terminal config ([docs/troubleshooting.md#shift-enter-not-working-in-ghostty-terminal](../docs/troubleshooting.md)) | Outer-terminal config; no deck-side surface to test. |
+| Ghostty-specific Shift+Enter terminal config ([docs/troubleshooting.md#shift-enter-not-working-in-ghostty-terminal](../docs/troubleshooting.md)) | **No longer a skip** — PRD #227 showed the break was deck-side (`keyevent_to_bytes` collapsed `Enter + SHIFT` to a bare CR), so there IS a deck-side surface: it is now covered by `embed/key-forwarding/001`. Only the outer-terminal *configuration* itself (what a user types into `ghostty/config`) remains untestable here. |
 | Mode-tab card jump via `Enter` (broken per docs note → [#68](https://github.com/vfarcic/dot-agent-deck/issues/68)) | Documented as broken. The catalog will gain an entry once the bug is closed; until then leaving it uncovered avoids pinning the broken behavior. |
 | `--continue` "dashboard-first landing" detail ([docs/session-management.md#resuming-sessions](../docs/session-management.md)) | Implicit consequence of `session/restore/001`; not separately worth a catalog ID. Reconsider if the landing-tab logic ever has its own surface. |

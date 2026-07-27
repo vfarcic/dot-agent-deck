@@ -3389,18 +3389,38 @@ fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     // Alt modifier: wrap the base key bytes with an ESC prefix.
     let has_alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    // Ctrl+letter → control codes 0x01–0x1a (Alt adds ESC prefix)
+    // Ctrl+<key> → the C0 control byte (Alt adds ESC prefix)
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && let KeyCode::Char(c) = key.code
     {
-        let c = c.to_ascii_lowercase();
-        if c.is_ascii_lowercase() {
-            let ctrl = vec![c as u8 - b'a' + 1];
-            return Some(if has_alt {
-                [vec![0x1b], ctrl].concat()
-            } else {
-                ctrl
-            });
+        let lower = c.to_ascii_lowercase();
+        let ctrl_byte = if lower.is_ascii_lowercase() {
+            // Ctrl+letter → 0x01–0x1a.
+            Some(lower as u8 - b'a' + 1)
+        } else {
+            // PRD #227: the C0 controls that are NOT Ctrl+letter. In legacy
+            // mode the terminal collapses these to their control byte before
+            // crossterm ever sees them (Ctrl+[ arrives as `KeyCode::Esc`), but
+            // with the enhanced protocol active (M2) the terminal
+            // DISAMBIGUATES them into `CSI <code>;5u` and crossterm reports
+            // `Char(c) + CONTROL` instead. Without this arm they fell through
+            // to the base arm below and were forwarded as the literal
+            // character — so Ctrl+[ typed a `[` into the agent instead of
+            // acting as Escape (vim's leave-insert-mode chord).
+            match c {
+                '[' => Some(0x1b),
+                '\\' => Some(0x1c),
+                ']' => Some(0x1d),
+                '^' => Some(0x1e),
+                '_' => Some(0x1f),
+                '?' => Some(0x7f),
+                // NUL is reachable as either Ctrl+Space or Ctrl+@.
+                ' ' | '@' => Some(0x00),
+                _ => None,
+            }
+        };
+        if let Some(b) = ctrl_byte {
+            return Some(if has_alt { vec![0x1b, b] } else { vec![b] });
         }
     }
 
@@ -19377,6 +19397,33 @@ mod tests {
 
         let key = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
         assert_eq!(keyevent_to_bytes(&key), Some(vec![0x1a]));
+    }
+
+    /// PRD #227: the C0 controls that are NOT Ctrl+letter. With the enhanced
+    /// (kitty) protocol active (M2) the terminal disambiguates these into
+    /// `CSI <code>;5u`, which crossterm reports as `Char(c) + CONTROL` — so
+    /// Ctrl+[ arrives as `Char('[') + CONTROL`, not as the legacy
+    /// `KeyCode::Esc`. Each must still reach the pane as its single C0 byte
+    /// (Ctrl+[ = ESC is how vim leaves insert mode inside an embedded pane).
+    #[test]
+    fn keyevent_ctrl_c0_controls() {
+        for (ch, want) in [
+            ('[', 0x1bu8),
+            ('\\', 0x1c),
+            (']', 0x1d),
+            ('^', 0x1e),
+            ('_', 0x1f),
+            ('?', 0x7f),
+            (' ', 0x00),
+            ('@', 0x00),
+        ] {
+            let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
+            assert_eq!(
+                keyevent_to_bytes(&key),
+                Some(vec![want]),
+                "Ctrl+{ch:?} must forward the C0 byte {want:#04x}, not the literal character"
+            );
+        }
     }
 
     #[test]

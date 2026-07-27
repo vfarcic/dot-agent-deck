@@ -102,6 +102,7 @@ pub struct TuiDeckBuilder {
     credential_imports: Vec<CredentialImport>,
     keybindings_toml: Option<String>,
     claude_trust_paths: Vec<String>,
+    claude_trust_workdir: bool,
 }
 
 impl TuiDeckBuilder {
@@ -215,6 +216,18 @@ impl TuiDeckBuilder {
         self
     }
 
+    /// Like [`with_claude_project_trust`](Self::with_claude_project_trust) but
+    /// for the per-test WORK DIR — the copied-fixture root the deck runs in and
+    /// the cwd of a `with_continue_session` pane. That path is the harness's
+    /// tempdir, minted inside `launch`, so a caller cannot name it in advance;
+    /// this flag defers the seeding until it exists. Both the raw and the
+    /// canonicalized form are trusted, because the agent's own `cwd` may come
+    /// back symlink-resolved and the trust key is matched verbatim.
+    pub fn with_claude_trust_workdir(mut self) -> Self {
+        self.claude_trust_workdir = true;
+        self
+    }
+
     // NOTE (PRD #201): a `with_pi_extension()` builder that pre-staged the
     // bundled Pi extension into the per-test HOME was removed. Because `TuiDeck`
     // drives the REAL binary, its lazy-spawned daemon runs the `daemon serve`
@@ -267,8 +280,10 @@ pub struct TuiDeck {
     /// take_writer()` is single-shot (a 2nd call errors), so `send_keys` /
     /// `send_bytes` (and `click`/`scroll`, which call it 2×/1×) must share one
     /// stored writer rather than taking a fresh one per call. Behind a `Mutex`
-    /// so the write helpers can keep `&self`.
-    writer: Mutex<Box<dyn Write + Send>>,
+    /// so the write helpers can keep `&self`, and behind an `Arc` so the reader
+    /// thread can share it to answer the deck's terminal-capability queries
+    /// (see [`answer_terminal_queries`]).
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     parser: Arc<Mutex<vt100::Parser>>,
     last_byte_at: Arc<Mutex<Instant>>,
     cast_events: Arc<Mutex<Vec<CastEvent>>>,
@@ -312,6 +327,7 @@ impl TuiDeck {
             credential_imports: Vec::new(),
             keybindings_toml: None,
             claude_trust_paths: Vec::new(),
+            claude_trust_workdir: false,
         }
     }
 
@@ -413,9 +429,22 @@ impl TuiDeck {
         // clears its first-run onboarding + per-folder trust gates without a
         // human keystroke. The `~/.claude.json` lands in the SAME per-test HOME
         // the daemon (and every agent it spawns) inherits.
-        if !builder.claude_trust_paths.is_empty() {
-            seed_claude_project_trust(&home, &builder.claude_trust_paths)
-                .map_err(|e| e.to_string())?;
+        let mut claude_trust_paths = builder.claude_trust_paths.clone();
+        if builder.claude_trust_workdir {
+            // The work dir only exists now, so `with_claude_trust_workdir`
+            // could not name it. Trust the raw path AND its canonical form —
+            // the agent reports its cwd symlink-resolved on some platforms and
+            // the trust key is matched verbatim.
+            claude_trust_paths.push(work.to_string_lossy().into_owned());
+            if let Ok(canon) = std::fs::canonicalize(&work) {
+                let canon = canon.to_string_lossy().into_owned();
+                if !claude_trust_paths.contains(&canon) {
+                    claude_trust_paths.push(canon);
+                }
+            }
+        }
+        if !claude_trust_paths.is_empty() {
+            seed_claude_project_trust(&home, &claude_trust_paths).map_err(|e| e.to_string())?;
         }
 
         // Write the saved-session file the deck auto-restores on startup
@@ -560,10 +589,21 @@ impl TuiDeck {
         let reader_stop = Arc::new(AtomicBool::new(false));
         let cast_started_at = Instant::now();
 
+        // Take the PTY write side exactly once — `take_writer()` is
+        // single-shot, so the per-call `take_writer()` the write helpers used
+        // before panicked on their 2nd invocation (and dropped/closed the
+        // write side after the 1st). Stored for all writes, and shared with
+        // the reader thread so it can answer the deck's terminal-capability
+        // queries inline (PRD #227 M2, see `answer_terminal_queries`).
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(
+            pair.master.take_writer().expect("take PTY master writer"),
+        ));
+
         // Reader thread: pulls bytes off the PTY master, feeds the
-        // parser, updates `last_byte_at`, and appends to the cast log
+        // parser, updates `last_byte_at`, appends to the cast log
         // plus the byte-history buffer (M4.6 P1, for race-free
-        // `wait_for_strings_in_order`).
+        // `wait_for_strings_in_order`), and answers the deck's
+        // terminal-capability queries.
         let mut reader = pair.master.try_clone_reader().expect("clone PTY reader");
         let parser_for_reader = Arc::clone(&parser);
         let last_for_reader = Arc::clone(&last_byte_at);
@@ -571,10 +611,12 @@ impl TuiDeck {
         let history_for_reader = Arc::clone(&byte_history);
         let stop_for_reader = Arc::clone(&reader_stop);
         let start_for_reader = cast_started_at;
+        let writer_for_reader = Arc::clone(&writer);
         let reader_handle = std::thread::Builder::new()
             .name(format!("tui-deck-reader-{test_name}"))
             .spawn(move || {
                 let mut buf = [0u8; 4096];
+                let mut query_scan: Vec<u8> = Vec::new();
                 while !stop_for_reader.load(Ordering::Relaxed) {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
@@ -587,6 +629,11 @@ impl TuiDeck {
                                 data: chunk.to_vec(),
                             });
                             history_for_reader.lock().unwrap().extend_from_slice(chunk);
+                            answer_terminal_queries(
+                                chunk,
+                                &mut query_scan,
+                                &mut *writer_for_reader.lock().unwrap(),
+                            );
                         }
                         Err(e)
                             if e.kind() == std::io::ErrorKind::Interrupted
@@ -602,15 +649,9 @@ impl TuiDeck {
 
         let record_on_success = std::env::var_os("DOT_AGENT_DECK_RECORD").is_some();
 
-        // Take the PTY write side exactly once — `take_writer()` is
-        // single-shot, so the per-call `take_writer()` the write helpers used
-        // before panicked on their 2nd invocation (and dropped/closed the
-        // write side after the 1st). Store it for all writes.
-        let writer = pair.master.take_writer().expect("take PTY master writer");
-
         Ok(TuiDeck {
             pty_master: pair.master,
-            writer: Mutex::new(writer),
+            writer,
             parser,
             last_byte_at,
             cast_events,
@@ -802,6 +843,35 @@ impl TuiDeck {
         let deadline = Instant::now() + timeout;
         loop {
             if self.snapshot_grid().contains(needle) {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Like [`wait_for_grid_string_within`](Self::wait_for_grid_string_within)
+    /// but for a predicate over the whole rendered grid — for the cases a single
+    /// substring cannot express (a spatial relationship between two strings, a
+    /// count, an ordering).
+    ///
+    /// Returns `true` as soon as `pred` holds, `false` if `timeout` elapses.
+    /// Non-panicking on purpose: the caller re-checks the condition afterwards
+    /// so the failure diagnostic is its own detailed assertion rather than a
+    /// generic harness message. Prefer this over
+    /// [`wait_until_quiescent`](Self::wait_until_quiescent) whenever a LIVE
+    /// agent occupies a pane — an agent that animates a spinner never leaves the
+    /// deck's byte stream idle, so quiescence never arrives.
+    pub fn wait_for_grid_predicate_within(
+        &self,
+        timeout: Duration,
+        pred: impl Fn(&str) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if pred(&self.snapshot_grid()) {
                 return true;
             }
             if Instant::now() > deadline {
@@ -1208,6 +1278,85 @@ impl TuiDeck {
             s.push('\n');
         }
         s
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Terminal-capability query answering (PRD #227 M2)
+// ---------------------------------------------------------------------------
+
+/// Query the deck emits to detect the enhanced (kitty) keyboard protocol:
+/// `ESC [ ? u` (report current progressive-enhancement flags). Written by
+/// `crossterm::terminal::supports_keyboard_enhancement()`.
+const QUERY_KITTY_FLAGS: &[u8] = b"\x1b[?u";
+/// The second half of that probe: `ESC [ c` (primary device attributes, DA1).
+const QUERY_DA1: &[u8] = b"\x1b[c";
+/// Reply to [`QUERY_KITTY_FLAGS`]: `CSI ? 1 u` — "the terminal currently has
+/// DISAMBIGUATE_ESCAPE_CODES set". crossterm treats ANY flags reply (even
+/// `0`) as "the protocol is supported", so this is what makes the deck's
+/// `supports_keyboard_enhancement()` return `Ok(true)` and push its flag.
+const REPLY_KITTY_FLAGS: &[u8] = b"\x1b[?1u";
+/// Reply to [`QUERY_DA1`]: a plain VT220-class DA1 response. crossterm parses
+/// any `CSI ? … c` as `PrimaryDeviceAttributes` without inspecting the
+/// attributes, and drains it from its queue right after the flags reply.
+const REPLY_DA1: &[u8] = b"\x1b[?62;22c";
+/// Longest query pattern above, in bytes — how much trailing context the
+/// scan buffer must retain so a query split across two PTY reads still
+/// matches.
+const LONGEST_QUERY_LEN: usize = 4;
+
+/// Answer the terminal-capability queries the deck writes to its tty, so its
+/// startup probe returns immediately instead of blocking.
+///
+/// PRD #227 M2 made the deck call
+/// `crossterm::terminal::supports_keyboard_enhancement()` at TUI startup. That
+/// writes `ESC[?u ESC[c` to the tty and then blocks for up to **2000 ms**
+/// waiting for a reply. A PTY that never answers costs every L2 test ~2 s of
+/// its 10 s [`WAIT_TIMEOUT`] budget before the first frame paints — and leaves
+/// the enhanced protocol disabled, so no e2e test could exercise the
+/// modifier-aware forwarding path the PRD is about. Answering both halves
+/// makes the probe return in milliseconds AND models a kitty-capable terminal,
+/// which is the configuration the fix targets.
+///
+/// `scan` carries state across calls: unmatched bytes are consumed, and up to
+/// `LONGEST_QUERY_LEN - 1` trailing bytes are retained so a query straddling
+/// two reads is still found. Retained bytes are always match-free (the scan
+/// below runs to exhaustion), so no query is ever answered twice.
+fn answer_terminal_queries(chunk: &[u8], scan: &mut Vec<u8>, writer: &mut dyn Write) {
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .filter(|_| !needle.is_empty())
+    }
+
+    scan.extend_from_slice(chunk);
+    let mut reply: Vec<u8> = Vec::new();
+    loop {
+        // Answer in the order the queries appear on the wire, so the deck's
+        // crossterm sees the flags reply before the DA1 terminator.
+        let hit = [
+            (
+                find(scan, QUERY_KITTY_FLAGS),
+                QUERY_KITTY_FLAGS,
+                REPLY_KITTY_FLAGS,
+            ),
+            (find(scan, QUERY_DA1), QUERY_DA1, REPLY_DA1),
+        ]
+        .into_iter()
+        .filter_map(|(pos, q, r)| pos.map(|p| (p, q.len(), r)))
+        .min_by_key(|(pos, _, _)| *pos);
+        let Some((pos, qlen, r)) = hit else { break };
+        reply.extend_from_slice(r);
+        scan.drain(..pos + qlen);
+    }
+    if scan.len() > LONGEST_QUERY_LEN - 1 {
+        let cut = scan.len() - (LONGEST_QUERY_LEN - 1);
+        scan.drain(..cut);
+    }
+    if !reply.is_empty() {
+        let _ = writer.write_all(&reply);
+        let _ = writer.flush();
     }
 }
 
@@ -3445,6 +3594,35 @@ impl BroadcastEventLog {
 #[cfg(test)]
 mod harness_unit_tests {
     use super::*;
+
+    /// The whole probe arriving in one PTY read (the common case) is answered
+    /// with the flags reply first, then DA1 — the order crossterm expects.
+    #[test]
+    fn answer_terminal_queries_replies_to_a_single_chunk_probe() {
+        let mut scan = Vec::new();
+        let mut out: Vec<u8> = Vec::new();
+        answer_terminal_queries(b"\x1b[?u\x1b[c", &mut scan, &mut out);
+        assert_eq!(out, b"\x1b[?1u\x1b[?62;22c".to_vec());
+    }
+
+    /// A probe split across two reads must still be answered exactly once —
+    /// the scan buffer retains just enough trailing context to complete the
+    /// match, and retained bytes are guaranteed match-free so nothing is
+    /// answered twice.
+    #[test]
+    fn answer_terminal_queries_handles_a_split_probe_without_duplicating() {
+        let mut scan = Vec::new();
+        let mut out: Vec<u8> = Vec::new();
+        answer_terminal_queries(b"noise\x1b[?", &mut scan, &mut out);
+        assert!(out.is_empty(), "no complete query yet, got {out:?}");
+        answer_terminal_queries(b"u\x1b[c more", &mut scan, &mut out);
+        assert_eq!(out, b"\x1b[?1u\x1b[?62;22c".to_vec());
+
+        // Ordinary follow-up output must not re-trigger a reply.
+        let before = out.len();
+        answer_terminal_queries(b"plain output\r\n", &mut scan, &mut out);
+        assert_eq!(out.len(), before, "a second reply leaked: {out:?}");
+    }
 
     #[test]
     fn strip_jsonc_comments_drops_line_and_block_comments() {
