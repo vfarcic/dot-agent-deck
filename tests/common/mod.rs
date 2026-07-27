@@ -1508,8 +1508,43 @@ pub fn check_opencode_available() -> Result<(), String> {
     )
 }
 
-/// Cheap model used by Codex availability probes and real-agent e2e coverage.
-pub const CODEX_TEST_MODEL: &str = "gpt-5.1-codex-mini";
+/// Compiled-in default cheap model for Codex availability probes and real-agent
+/// e2e coverage. Correct for a ChatGPT-subscription (oauth) `~/.codex/auth.json`,
+/// which is what most dev boxes here log in with.
+const CODEX_TEST_MODEL_DEFAULT: &str = "gpt-5.1-codex-mini";
+
+/// Env var that overrides [`codex_test_model`] on a host whose Codex credentials
+/// cannot reach the default.
+pub const CODEX_TEST_MODEL_ENV: &str = "DOT_AGENT_DECK_CODEX_TEST_MODEL";
+
+/// Cheap model used by Codex availability probes and real-agent e2e coverage —
+/// [`CODEX_TEST_MODEL_DEFAULT`] unless `DOT_AGENT_DECK_CODEX_TEST_MODEL` is set
+/// to a non-empty value, which wins.
+///
+/// The override exists because the `codex-*` model family is served only to
+/// ChatGPT-subscription (oauth) credentials. With an **API-key**
+/// `~/.codex/auth.json`, `codex exec --model gpt-5.1-codex-mini` answers
+/// `404 Not Found: Model not found gpt-5.1-codex-mini` from
+/// `https://api.openai.com/v1/responses`, so [`check_codex_available`] fails its
+/// probe and every real-agent Codex test SKIPS — a silent no-coverage outcome
+/// that reads as a pass. Such a host exports e.g.
+/// `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5-nano` (an equally cheap model an API
+/// key *can* reach). The default is deliberately left alone so subscription-auth
+/// environments keep running codex-mini.
+///
+/// Single source of truth: [`check_codex_available`] probes the model this
+/// returns, so the availability gate and the model the tests actually launch can
+/// never disagree.
+pub fn codex_test_model() -> &'static str {
+    static MODEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODEL.get_or_init(|| {
+        std::env::var(CODEX_TEST_MODEL_ENV)
+            .ok()
+            .map(|raw| raw.trim().to_string())
+            .filter(|model| !model.is_empty())
+            .unwrap_or_else(|| CODEX_TEST_MODEL_DEFAULT.to_string())
+    })
+}
 
 /// Runtime-skip helper for real Codex coverage. A version check alone is not
 /// enough: this verifies persisted auth and performs one minimal model request,
@@ -1555,7 +1590,7 @@ pub fn check_codex_available() -> Result<(), String> {
             "--sandbox",
             "read-only",
             "--model",
-            CODEX_TEST_MODEL,
+            codex_test_model(),
             "-c",
             "model_reasoning_effort=\"low\"",
             "--color",
@@ -1586,7 +1621,11 @@ pub fn check_codex_available() -> Result<(), String> {
         .any(|marker| lower.contains(marker))
     {
         return Err(format!(
-            "Codex could not reach model {CODEX_TEST_MODEL} with the current authentication"
+            "Codex could not reach model {} with the current authentication — if this host's \
+             ~/.codex/auth.json is an API key rather than a ChatGPT subscription, set {} to a \
+             model the key can reach (e.g. gpt-5-nano)",
+            codex_test_model(),
+            CODEX_TEST_MODEL_ENV,
         ));
     }
     Ok(())

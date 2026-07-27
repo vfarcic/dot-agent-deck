@@ -211,7 +211,7 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
 
     let worker_command = format!(
         "codex --model {} --sandbox workspace-write --ask-for-approval never -c 'sandbox_workspace_write.network_access=true' -c 'model_reasoning_effort=\"low\"'",
-        common::CODEX_TEST_MODEL,
+        common::codex_test_model(),
     );
 
     let deck = TuiDeck::builder()

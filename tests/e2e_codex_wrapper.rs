@@ -126,7 +126,7 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
     );
     let command = format!(
         "codex --model {} --sandbox workspace-write --ask-for-approval never -c 'model_reasoning_effort=\"low\"'",
-        common::CODEX_TEST_MODEL,
+        common::codex_test_model(),
     );
     let config_dir = tempfile::tempdir().expect("Codex new-pane config");
     let config_path = config_dir.path().join("config.toml");
@@ -150,7 +150,7 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
     deck.send_keys(b"\r");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     assert!(
-        deck.wait_for_grid_string_within(common::CODEX_TEST_MODEL, Duration::from_secs(30)),
+        deck.wait_for_grid_string_within(common::codex_test_model(), Duration::from_secs(30)),
         "the bare interactive Codex UI never became ready in the new pane:\n{}",
         deck.snapshot_grid()
     );

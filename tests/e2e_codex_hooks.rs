@@ -240,7 +240,7 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
     );
     let command = format!(
         "codex --model {} --sandbox workspace-write --ask-for-approval never -c 'sandbox_workspace_write.network_access=true' -c 'model_reasoning_effort=\"low\"'",
-        common::CODEX_TEST_MODEL,
+        common::codex_test_model(),
     );
     let config_dir = tempfile::tempdir().expect("Codex hooks new-pane config");
     let config_path = config_dir.path().join("config.toml");
@@ -266,7 +266,7 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
     deck.send_keys(b"\r");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     assert!(
-        deck.wait_for_grid_string_within(common::CODEX_TEST_MODEL, Duration::from_secs(30)),
+        deck.wait_for_grid_string_within(common::codex_test_model(), Duration::from_secs(30)),
         "the wrapped interactive Codex UI never became ready:\n{}",
         deck.snapshot_grid()
     );
@@ -370,7 +370,7 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
             .any(|line| line.contains(" args=app-server"))
             && launches
                 .lines()
-                .any(|line| line.contains(&format!("--model {}", common::CODEX_TEST_MODEL))),
+                .any(|line| line.contains(&format!("--model {}", common::codex_test_model()))),
         "both the trust probe and interactive agent must run through the launcher script:\n{launches}"
     );
     assert!(

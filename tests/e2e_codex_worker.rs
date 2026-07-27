@@ -54,7 +54,7 @@ async fn codex_worker_001_inner() {
         .to_string();
     let command = format!(
         "codex --model {} --sandbox workspace-write --ask-for-approval never -c 'sandbox_workspace_write.network_access=true' -c 'model_reasoning_effort=\"low\"'",
-        common::CODEX_TEST_MODEL,
+        common::codex_test_model(),
     );
 
     std::fs::write(
