@@ -158,6 +158,28 @@ Note `dot-agent-deck wrap --agent claude -- codex` installs no Codex hooks and r
 
 If Codex still won't run the deck's hooks, the usual cause is a launcher that re-exports `CODEX_HOME` (the deck's pin only reaches the child it spawns) — drop that re-export, or trust the deck's hooks once through Codex's interactive `/hooks` review in that home. Until then the card falls back to the coarse stdout classifier: degraded status, no tool/prompt detail.
 
+#### The readiness contract every Wrapper adapter must satisfy (PRD #225)
+
+This is the trap the next wrapper adapter would otherwise walk straight into, so read it before you emit your first event.
+
+`dot-agent-deck wrap` emits an `EventType::SessionStart` the instant `cmd.spawn()` returns — see `Emitter::emit_fork_session_start` in [`src/wrap.rs`](../../src/wrap.rs). That event exists for **one** reason: to surface the dashboard card immediately, so a slow-booting agent is not invisible for several seconds. It is emitted at *fork* time, when the child is typically still just the launcher (`devbox`, a shell, `node` starting up) and the agent's own TUI does not exist yet. It therefore does **not** mean "this agent can accept input."
+
+Because the deck also uses `SessionStart` as a **readiness gate** — `wait_for_session_start` in [`src/state.rs`](../../src/state.rs), which `dispatch_one_owned` waits on before injecting a `clear = true` delegate's prompt, and which `crate::spawn::spawn` reuses for a scheduled card's prompt — those two meanings have to be told apart. The contract:
+
+1. **The wrapper's fork-time `SessionStart` MUST carry the origin marker.** `metadata["session_start_origin"] = "wrapper_fork"` — write it through the shared constants `SESSION_START_ORIGIN_METADATA_KEY` / `WRAPPER_FORK_SESSION_START_ORIGIN` in [`src/event.rs`](../../src/event.rs), and read it back with `AgentEvent::is_wrapper_fork_session_start()`. Every other producer (native hooks, a log watcher, an SDK adapter) omits the key, and an absent key means "this `SessionStart` came from an initialized session."
+2. **The gate skips a marked event only for agents that will emit a real one.** `session_start_means_ready` treats a marked event as *not ready* **iff** the agent's registry spec has a native-hook installer (`agent_registry::spec(&agent_type).hook_install.is_some()`). The discriminator is a registry property, not an `== Codex` special case, so a new adapter inherits the right behaviour from its registry entry alone.
+
+The two failure modes this balances, both silent:
+
+- **Marked event, native hooks present, no native `SessionStart` ever emitted → the delegate starves.** The gate correctly ignores the fork-time event, waits out `SESSION_START_WAIT_TIMEOUT` (30 s, sized from measured Codex boot rather than the inherited Claude-era 10 s), then writes the prompt blind. So set `hook_install` **only** if your agent genuinely posts a `SessionStart` hook once its session is live and interactive — that field is what the gate reads as the promise "a real readiness signal is still coming."
+- **Unmarked fork-time event on a hooked agent → the prompt is destroyed.** This is the original defect. The gate releases at fork time, the deck writes the prompt plus a CR into a PTY where only the launcher is running, and the line discipline (canonical mode, echo on) echoes the text back and swallows it. The agent then boots, clears the alternate screen, and sits at an empty composer — the operator sees a worker that "restarted and did nothing," and the *echo* is why they also report having seen the prompt arrive.
+
+The inverse case is just as load-bearing: **a pure-Wrapper agent with no native hooks (`hook_install: None` — Gemini, PRD #211) must still emit its fork-time event, and must rely on it as its sole readiness signal.** Skipping marked events unconditionally would regress every such agent to a full 30 s timeout on every delegate. So do not "fix" a hookless adapter by suppressing its fork-time event, and do not give it a `hook_install` it cannot honour.
+
+Wire compatibility is additive in both directions and is a **semantic no-op**, not a [`PROTOCOL_VERSION`](versioning.md) bump: an old wrapper sends no marker and a new daemon treats its event exactly as it does today (racy, no worse than before), and a new wrapper's marker is ignored by an old daemon. Rule 12's cross-version run still applies because the change touches the daemon and hooks.
+
+Coverage to mirror when you add a wrapper agent: `orchestration/delegate/007` (a marked fork-time event must *not* release a hooked agent), `orchestration/delegate/008` (a marked fork-time event *must* release a hookless one, well inside the fallback), `codex/spawn/007` (a hook-learned badge must never mutate the exec line across respawn), and the real-agent `orchestration/delegate/009` (a `clear = true` delegate to a real wrapped Codex worker delivers the prompt and the worker acts on it).
+
 **If you need a genuinely new mechanism (e.g. Aider's log-watcher):** implement a new [`IntegrationStrategy`] variant **once** — a new module that produces `AgentEvent`s (e.g. `dot-agent-deck watch --agent aider --log <path>` tailing a structured log and parsing entries) plus its dispatch. Note that today's `Commands::Watch` is an **unrelated generic interval-runner**, not a log watcher; a log-watcher strategy is a separate command. After the strategy exists once, the *second* agent that uses it is back on the cheap path (a registry entry naming the strategy).
 
 ### 4. Declare `live_target` / writability — `src/event.rs`, and your producer

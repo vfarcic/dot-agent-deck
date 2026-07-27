@@ -1631,6 +1631,13 @@ without depending on the config struct API.
 - **Does not assert:** a concrete Gemini registry entry or wrapper classifier; those do not exist yet.
 - **Platform coverage:** mac+linux.
 
+##### orchestration/delegate/009 — A `clear = true` delegate to a REAL wrapped Codex worker delivers the prompt and the worker acts on it — the user-visible end of PRD #225 (M5). [reel]
+- **Layer:** L2 PTY-attached REAL-agent (the real `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness — records a `full-stream.cast`; pre-PR e2e tier per CLAUDE.md rule 5, flaky-tolerant, never in CI).
+- **Agent:** a REAL interactive cheap-model Codex (`common::CODEX_TEST_MODEL`, no `-p`, no stand-in) as the `clear = true` `coder` role, wrapped from its first spawn because the role command's basename resolves to Codex; the `orchestrator` role is a deterministic script that invokes the genuine `dot-agent-deck delegate --to coder` CLI over the same hook socket a real orchestrator agent uses (the defect is entirely on the worker side, so a second LLM would add a flaky link without covering another line of the fix).
+- **Asserts:** opening the orchestration through the normal Ctrl+N new-pane form surfaces the `coder` role card live; the worker emits its GENUINE native Codex `SessionStart` (distinct from the wrapper's marked fork-time card-surfacing one) before anything is delegated; after the delegate the worker's card visibly enters `Thinking` — a status only Codex's native `UserPromptSubmit` hook can produce, so the injected pointer was submitted INSIDE the agent rather than echoed away by the launcher's line discipline; and the respawned worker creates the uniquely named sentinel `prd225-codex-delegate-6f21ba.txt` with the requested contents. Pre-fix the wrapper's fork-time event released the readiness gate seconds before the Codex TUI existed, the prompt was lost, and no sentinel ever appeared.
+- **Does not assert:** the work-done leg (logged as a soft observation; hard-covered by `codex/worker/001`); the exec-line stability half of PRD #225 (`codex/spawn/007`); the hookless-wrapper guard (`orchestration/delegate/008`).
+- **Platform coverage:** linux+mac (unix-only — writes an executable role script).
+
 #### orchestration/identity
 
 ##### orchestration/identity/001 — Opening an orchestration whose form/display name (worktree dir basename) differs from the TOML config orchestration name stamps the CANONICAL config name as the daemon IDENTITY, not the basename (PRD #107 regression).
