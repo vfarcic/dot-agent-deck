@@ -131,11 +131,13 @@ pub(crate) const SITE_AUDIT: &[PermissionSite] = &[
     PermissionSite {
         function: "set_create_mode_owner_only",
         unix: "OpenOptionsExt::mode(0o600) so the file is never created group/other-readable",
-        windows: WindowsCounterpart::JustifiedNoOp(
-            "std::fs::OpenOptions has no SECURITY_ATTRIBUTES hook, so create-time enforcement is \
-             not expressible. The property is not lost: every caller applies \
-             set_file_owner_only to the fresh handle immediately after open, before the first \
-             content byte, so only an empty file can exist under a loose inherited ACL.",
+        windows: WindowsCounterpart::Enforced(
+            "OpenOptionsExt::access_mode(GENERIC_WRITE | WRITE_DAC) — std::fs::OpenOptions has no \
+             SECURITY_ATTRIBUTES hook, so the DACL cannot be supplied AT create time, but \
+             WRITE_DAC on the handle is what lets set_file_owner_only apply it immediately after, \
+             before the first content byte. Without that right the access check frozen at open \
+             makes the DACL write fail ERROR_ACCESS_DENIED, so this is load-bearing, not a hint. \
+             Residual: an EMPTY file exists under the inherited ACL for the length of one call.",
         ),
     },
     PermissionSite {
@@ -143,7 +145,8 @@ pub(crate) const SITE_AUDIT: &[PermissionSite] = &[
         unix: "fchmod(0o600) on the open handle, re-asserted before the atomic rename",
         windows: WindowsCounterpart::Enforced(
             "handle-based SetSecurityInfo with a protected current-user-only DACL — no second \
-             name resolution for an attacker to redirect",
+             name resolution for an attacker to redirect. Requires the WRITE_DAC that \
+             set_create_mode_owner_only put on the handle",
         ),
     },
     PermissionSite {

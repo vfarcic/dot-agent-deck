@@ -702,8 +702,9 @@ impl RemotesFile {
         let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
 
         // PRD #42 M1: owner-only (0o600) creation mode comes from the platform
-        // seam — `.mode(0o600)` on Unix, a no-op-under-`%LOCALAPPDATA%`-ACL on
-        // Windows (#163).
+        // seam — `.mode(0o600)` on Unix; on Windows (#163) the DACL cannot be
+        // supplied at create time, so the seam instead puts `WRITE_DAC` on the
+        // handle, which is what lets the `set_file_owner_only` call below apply it.
         let mut open_opts = std::fs::OpenOptions::new();
         open_opts.create(true).write(true).truncate(true);
         crate::platform::fsperm::set_create_mode_owner_only(&mut open_opts);
@@ -719,10 +720,10 @@ impl RemotesFile {
         // depth on Unix, as before: a stale temp file from a crashed previous save
         // would not have had `OpenOptions::mode()` re-applied, so the bits have to
         // be set explicitly. (2) On Windows this call is not a re-assert but the
-        // *only* enforcement — `std::fs::OpenOptions` has no
-        // `SECURITY_ATTRIBUTES` hook, so `set_create_mode_owner_only` cannot do
-        // anything there and `set_file_owner_only` applies the protected
-        // current-user-only DACL instead. Doing that after `write_all` would leave
+        // *only* place the protected current-user-only DACL is applied —
+        // `std::fs::OpenOptions` has no `SECURITY_ATTRIBUTES` hook, so
+        // `set_create_mode_owner_only` can only pre-authorize this call by putting
+        // `WRITE_DAC` on the handle. Doing that after `write_all` would leave
         // the credentials in this file readable under the parent directory's
         // inherited ACL for the length of the write; doing it now means only an
         // empty file is ever exposed. The end state on Unix is identical.

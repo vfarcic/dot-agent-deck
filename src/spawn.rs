@@ -1150,9 +1150,29 @@ mod tests {
         assert_eq!(env[0].0, DOT_AGENT_DECK_PANE_ID);
         assert!(!env.iter().any(|(k, _)| k == "SHELL"));
 
-        // multi-word (pin_sh=true) → pane-id + the SHELL wrapper override.
+        // multi-word (pin_sh=true) → pane-id + the SHELL wrapper override. The
+        // *value* is platform-specific (`fixed_command_shell`): Unix pins the
+        // deterministic POSIX `/bin/sh`, Windows has no such shell to pin and
+        // resolves `%COMSPEC%` (else `cmd.exe`) instead. Asserting the real value
+        // on each platform rather than skipping the Windows half — the expectation
+        // is restated here independently, not read back out of the seam.
         let env = pane_env("sched-x-1", true);
-        assert!(env.iter().any(|(k, v)| k == "SHELL" && v == "/bin/sh"));
+        assert_eq!(env.len(), 2);
+        let shell = env
+            .iter()
+            .find(|(k, _)| k == "SHELL")
+            .map(|(_, v)| v.as_str())
+            .expect("a wrapped command must carry the SHELL override");
+        #[cfg(unix)]
+        assert_eq!(shell, "/bin/sh");
+        #[cfg(windows)]
+        {
+            let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+            assert_eq!(
+                shell, comspec,
+                "on Windows the pinned shell is %COMSPEC% (else cmd.exe), never a POSIX path"
+            );
+        }
     }
 
     // finding #2 — the synthetic SessionStart surfaced to attached TUIs is a

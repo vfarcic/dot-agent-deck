@@ -249,6 +249,35 @@ pub fn terminate_pid(pid: u32) -> std::io::Result<super::TerminateSignal> {
     Ok(super::TerminateSignal::Delivered)
 }
 
+/// Unix has nothing to pin, so this is an empty token — see [`pin_process`].
+#[derive(Debug)]
+pub struct PinnedProcess;
+
+impl Drop for PinnedProcess {
+    /// Nothing to release. Declared anyway so "the pin is held until here" is
+    /// expressible in the shared `daemon stop` flow on both platforms — an
+    /// explicit `drop(pinned)` there is a real release on Windows and must still
+    /// compile (and mean the same thing) here.
+    fn drop(&mut self) {}
+}
+
+/// Pin `pid`'s identity — a **justified no-op on Unix**, kept as a seam so the
+/// shared `daemon stop` flow does not grow a `cfg` branch (PRD #163 review).
+///
+/// POSIX offers no portable way to reserve a pid: the kernel frees it at reap
+/// time regardless of what the reaper holds, and the one mechanism that would
+/// (Linux `pidfd_open`) has no macOS counterpart. So Unix keeps exactly the
+/// behaviour it always had — zero syscalls here, and the residual TOCTOU window
+/// stays documented where it is accepted, at the top of
+/// [`crate::build_version_handshake::terminate_daemon_graceful`].
+///
+/// Always `Ok(Some(…))`: reporting "already gone" would change the Unix control
+/// flow, and reporting an error would refuse a stop that works today. The pid
+/// guards inside [`terminate_pid`] / [`force_kill_pid`] remain the only gate.
+pub fn pin_process(_pid: u32) -> std::io::Result<Option<PinnedProcess>> {
+    Ok(Some(PinnedProcess))
+}
+
 /// Send `SIGKILL` to `pid` (the daemon-stop `--force` escalation). Same guards
 /// as [`terminate_pid`].
 pub fn force_kill_pid(pid: u32) -> std::io::Result<()> {
@@ -337,6 +366,17 @@ mod tests {
         // refused with `InvalidInput`, never signalled.
         let err = checked_signal_pid(0).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// PRD #163 review — the Unix half of the pid-pin seam must stay a pure no-op,
+    /// including for the pids the by-signal guards reject. Anything else (an error,
+    /// or an `Ok(None)` read as "already gone") would change what `daemon stop`
+    /// does on Unix, and the whole point of the seam is that it does not.
+    #[test]
+    fn pinning_is_a_no_op_that_never_changes_the_unix_flow() {
+        assert!(pin_process(std::process::id()).unwrap().is_some());
+        assert!(pin_process(0).unwrap().is_some());
+        assert!(pin_process(u32::MAX).unwrap().is_some());
     }
 
     #[test]

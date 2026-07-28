@@ -422,8 +422,9 @@ impl SavedSession {
         let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
 
         // PRD #42 M1: owner-only (0o600) creation mode comes from the platform
-        // seam — `.mode(0o600)` on Unix, a no-op-under-`%LOCALAPPDATA%`-ACL on
-        // Windows (#163).
+        // seam — `.mode(0o600)` on Unix; on Windows (#163) the DACL cannot be
+        // supplied at create time, so the seam instead puts `WRITE_DAC` on the
+        // handle, which is what lets the `set_file_owner_only` call below apply it.
         let mut open_opts = std::fs::OpenOptions::new();
         open_opts.create(true).write(true).truncate(true);
         crate::platform::fsperm::set_create_mode_owner_only(&mut open_opts);
@@ -434,9 +435,10 @@ impl SavedSession {
         // Owner-only permissions BEFORE the first content byte (PRD #163 M4).
         // Defense in depth on Unix (a stale temp file from a crashed previous save
         // would keep its old mode, since the create-mode only applies on create),
-        // and on Windows the *only* enforcement — `std::fs::OpenOptions` has no
-        // `SECURITY_ATTRIBUTES` hook, so this call is where the protected
-        // current-user-only DACL is applied. Running it before the write means the
+        // and on Windows where the protected current-user-only DACL is applied at
+        // all — `std::fs::OpenOptions` has no `SECURITY_ATTRIBUTES` hook, so the
+        // create-mode seam can only pre-authorize this call (`WRITE_DAC`), not
+        // stand in for it. Running it before the write means the
         // snapshot's command lines, project paths and prompts are never exposed
         // under a loose inherited ACL; the end state on Unix is identical.
         if let Err(e) = crate::platform::fsperm::set_file_owner_only(&tmp_file) {

@@ -18,7 +18,10 @@
 //!   is platform code (`TerminateProcess`). Which of the two a platform uses is
 //!   declared by [`GRACEFUL_STOP_DELIVERY`] so the shared caller
 //!   ([`crate::build_version_handshake::terminate_daemon_graceful`]) never
-//!   branches on `cfg` and the wire format stays identical everywhere.
+//!   branches on `cfg` and the wire format stays identical everywhere. Because
+//!   that escalation names a *pid* long after the target was probed,
+//!   [`pin_process`] lets the caller hold the target's identity across the whole
+//!   sequence — a real handle on Windows, a documented no-op on Unix.
 //!
 //! Note: peer-credential PID *discovery* (`SO_PEERCRED`) lives in
 //! [`crate::platform::peercred`]; this module only owns kill/teardown.
@@ -127,13 +130,13 @@ pub(crate) fn checked_target_pid(pid: u32) -> std::io::Result<u32> {
 
 #[cfg(unix)]
 pub use unix::{
-    AgentProcessGroup, current_ppid, force_kill_child_and_wait, force_kill_pid,
-    send_sigterm_to_child_group, terminate_child_with_grace_and_wait, terminate_pid,
+    AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait, force_kill_pid,
+    pin_process, send_sigterm_to_child_group, terminate_child_with_grace_and_wait, terminate_pid,
 };
 #[cfg(windows)]
 pub use windows::{
-    AgentProcessGroup, current_ppid, force_kill_child_and_wait, force_kill_pid,
-    send_sigterm_to_child_group, terminate_child_with_grace_and_wait, terminate_pid,
+    AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait, force_kill_pid,
+    pin_process, send_sigterm_to_child_group, terminate_child_with_grace_and_wait, terminate_pid,
 };
 
 /// A [`portable_pty::Child`] stand-in over a real [`std::process::Child`], so the

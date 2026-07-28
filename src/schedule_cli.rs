@@ -206,7 +206,9 @@ pub fn write_atomic(path: &Path, tasks: &[ScheduledTask]) -> Result<(), String> 
         std::process::id()
     ));
     // PRD #42 M1: owner-only (0o600) creation mode from the platform seam.
-    // `create_new` keeps the O_EXCL / no-symlink-follow semantics on Unix.
+    // `create_new` keeps the O_EXCL / no-symlink-follow semantics on Unix; on
+    // Windows the seam adds `WRITE_DAC` to the handle so the DACL write below can
+    // succeed (#163).
     let mut open_opts = std::fs::OpenOptions::new();
     open_opts.write(true).create_new(true);
     crate::platform::fsperm::set_create_mode_owner_only(&mut open_opts);
@@ -219,9 +221,10 @@ pub fn write_atomic(path: &Path, tasks: &[ScheduledTask]) -> Result<(), String> 
     // PRD #163 M4: owner-only permissions on the open handle, before the first
     // content byte. On Unix this re-asserts what `create_new` + mode 0600 already
     // produced (harmless, and the same defense-in-depth the `remotes.toml` /
-    // `session.toml` writers do); on Windows it is the ONLY enforcement, because
-    // `std::fs::OpenOptions` has no `SECURITY_ATTRIBUTES` hook and
-    // `set_create_mode_owner_only` is therefore a no-op there. Without this call
+    // `session.toml` writers do); on Windows it is where the DACL is applied at
+    // all, because `std::fs::OpenOptions` has no `SECURITY_ATTRIBUTES` hook and
+    // `set_create_mode_owner_only` can therefore only pre-authorize this call
+    // (`WRITE_DAC` on the handle) rather than replace it. Without this call
     // the schedules file — whose prompts may carry secrets (PRD #127 S1) — would
     // rely solely on the parent directory's inherited ACL, which a
     // `DOT_AGENT_DECK_SCHEDULES` override into a shared directory throws away.

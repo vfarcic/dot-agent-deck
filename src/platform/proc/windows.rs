@@ -462,6 +462,50 @@ fn open_process(pid: u32, access: u32) -> std::io::Result<Option<OwnedHandle>> {
     Ok(Some(OwnedHandle(handle)))
 }
 
+/// A live claim on the *identity* of a pid: while this is held, Windows cannot
+/// hand `pid` to a different process (PRD #163 review — Greptile P1).
+///
+/// The mechanism is the one Win32 guarantee that makes by-pid termination safe: a
+/// process id stays reserved as long as any handle to the process **object** is
+/// open, even after the process itself exits. So one handle held across the whole
+/// `daemon stop` escalation — graceful ask, 5 s poll for the daemon to die, then
+/// `TerminateProcess` — makes it impossible for that final call to reach anything
+/// but the daemon we probed. Without it the recycling window is not a theoretical
+/// sliver but the *expected* path: we deliberately wait for the target to exit and
+/// then name its pid.
+///
+/// It carries no access rights worth having on purpose —
+/// `PROCESS_QUERY_LIMITED_INFORMATION` is the cheapest right that keeps the object
+/// alive, and the identity guarantee comes from holding *a* handle, not from which
+/// rights it holds. [`terminate_pid`] / [`force_kill_pid`] still open their own
+/// handles with the rights they need, and while a pin is held those opens
+/// provably resolve to the same process.
+///
+/// This is the anchor the agent teardown path already has for free (its caller
+/// holds a `std::process::Child`, whose handle pins the pid the same way) and that
+/// `daemon stop`, which only ever had a number, was missing.
+pub struct PinnedProcess(#[allow(dead_code)] OwnedHandle);
+
+impl std::fmt::Debug for PinnedProcess {
+    /// Deliberately opaque: the raw handle value is noise in a log line, and the
+    /// only thing worth knowing about a pin is that one is held.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PinnedProcess")
+    }
+}
+
+/// Pin `pid`'s identity for as long as the returned value is held — see
+/// [`PinnedProcess`].
+///
+/// `Ok(None)` means the process was already gone (the `ESRCH` analogue), so there
+/// is nothing to pin *and* nothing to terminate. `Err` means the pin genuinely
+/// failed (e.g. `ERROR_ACCESS_DENIED`); callers must treat that as "do not
+/// escalate by pid" rather than as "already gone", since an unpinned pid is
+/// exactly what makes escalation unsafe.
+pub fn pin_process(pid: u32) -> std::io::Result<Option<PinnedProcess>> {
+    Ok(open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?.map(PinnedProcess))
+}
+
 /// Classify the daemon PID for the *graceful* half of `daemon stop`.
 ///
 /// Windows has no `SIGTERM`, so — unlike the Unix backend — this call delivers
@@ -601,7 +645,7 @@ mod tests {
     }
 
     /// pid 0 must never reach `OpenProcess` (it names the System Idle Process) —
-    /// the guard turns it into `InvalidInput` on both by-PID entry points.
+    /// the guard turns it into `InvalidInput` on every by-PID entry point.
     #[test]
     fn by_pid_helpers_refuse_pid_zero() {
         assert_eq!(
@@ -612,6 +656,55 @@ mod tests {
             force_kill_pid(0).unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput
         );
+        assert_eq!(
+            pin_process(0).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// PRD #163 review (Greptile P1) — the property that makes `daemon stop`'s
+    /// by-pid escalation safe: a held [`PinnedProcess`] keeps the *process object*
+    /// (and therefore the pid) reserved after the process itself has exited **and**
+    /// after every other handle to it is closed. That is the whole window the old
+    /// code left open — it waits for the daemon to die, then names its pid.
+    ///
+    /// The helper's own `Child` handle is dropped before the assertion on purpose:
+    /// with it alive the pid would stay resolvable regardless, and the test would
+    /// pass without the pin doing anything.
+    #[test]
+    fn a_pin_reserves_the_pid_after_the_process_exits() {
+        let mut child = spawn_helper_tree();
+        let pid = child.id();
+
+        let pin = pin_process(pid)
+            .expect("pin a live process")
+            .expect("a live process must be pinnable");
+
+        force_kill_pid(pid).expect("TerminateProcess on the live helper");
+        child.wait().expect("wait for the terminated helper");
+        drop(child);
+
+        assert!(
+            open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)
+                .expect("opening a pinned pid must not error")
+                .is_some(),
+            "the pin must keep the pid resolvable, so nothing else can be handed it"
+        );
+        assert_eq!(
+            terminate_pid(pid).unwrap(),
+            TerminateSignal::AlreadyGone,
+            "and the pinned object must still report the real exit, not STILL_ACTIVE"
+        );
+
+        drop(pin);
+    }
+
+    /// A pid nothing holds cannot be pinned, and that is `Ok(None)` — the `ESRCH`
+    /// analogue — never an error. `daemon stop` reads it as "already gone" and
+    /// declines to escalate, which is the safe answer.
+    #[test]
+    fn pinning_a_nonexistent_pid_reports_already_gone() {
+        assert!(pin_process(u32::MAX).unwrap().is_none());
     }
 
     /// A pid that cannot be adopted degrades to "no job" instead of panicking or

@@ -36,7 +36,9 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE, LocalFree};
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_SUCCESS, GENERIC_WRITE, HANDLE, LocalFree,
+};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
     SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SetNamedSecurityInfoW, SetSecurityInfo,
@@ -45,6 +47,7 @@ use windows_sys::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, OWNER_SECURITY_INFORMATION,
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
 };
+use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
 
 /// Security-descriptor string for a **named pipe** instance: we are the owner and
 /// the only principal in a protected DACL.
@@ -127,28 +130,68 @@ pub fn create_owner_only_dir(dir: &Path) -> io::Result<()> {
     apply_owner_only_dacl_to_path(dir)
 }
 
-/// No-op **by necessity**, not by choice: `std::fs::OpenOptions` has no hook for
-/// a `SECURITY_ATTRIBUTES`, so there is no Windows analogue of Unix's
-/// `OpenOptionsExt::mode(0o600)` — the create-time half of the owner-only
-/// guarantee.
+/// Desired-access mask for a secret-bearing file the deck creates and then locks
+/// down: what `std` would have asked for on its own (`GENERIC_WRITE`, from
+/// `OpenOptions::write(true)`) **plus `WRITE_DAC`** — the right
+/// [`set_file_owner_only`] needs to replace the file's DACL.
 ///
-/// The guarantee itself is **not** dropped: every caller of this function also
-/// calls [`set_file_owner_only`] on the freshly-opened handle, which applies the
-/// protected owner-only DACL for real. PRD #163 M4 moved those calls to run
-/// *immediately after `open`, before the first content byte is written*, so the
-/// window in which a secret-bearing `remotes.toml`/`schedules.toml`/`session.toml`
-/// temp file exists under a loosened inherited ACL contains an empty file only.
-pub fn set_create_mode_owner_only(_opts: &mut std::fs::OpenOptions) {}
+/// `WRITE_DAC` is not optional and cannot be acquired later. A Win32 access check
+/// runs once, at `open`, and the granted mask is then frozen on the handle;
+/// `SetSecurityInfo` re-checks nothing, it just tests the frozen mask and fails
+/// `ERROR_ACCESS_DENIED` unless `DACL_SECURITY_INFORMATION` is backed by
+/// `WRITE_DAC`. `GENERIC_WRITE` maps to `FILE_GENERIC_WRITE`, which contains
+/// `READ_CONTROL` (via `STANDARD_RIGHTS_WRITE`) but *not* `WRITE_DAC` — so before
+/// this existed, every owner-only file DACL write failed with error 5 on a real
+/// Windows host while compiling and clippy-ing perfectly clean under
+/// `cargo check --target x86_64-pc-windows-msvc` (PRD #163: only the
+/// `windows-latest` `cargo nextest run` job executes this code).
+///
+/// Requesting `WRITE_DAC` is grantable wherever the deck legitimately writes:
+/// Windows grants the *owner* of an object `READ_CONTROL | WRITE_DAC` implicitly,
+/// and these files are always ones we just created. Where it is genuinely denied,
+/// `open` now fails loudly instead of producing a handle that can only ever
+/// half-secure the file — the fail-closed direction.
+const OWNER_ONLY_WRITE_ACCESS: u32 = GENERIC_WRITE | WRITE_DAC;
+
+/// Ask for the access rights the owner-only DACL write needs, since
+/// `std::fs::OpenOptions` has no hook for a `SECURITY_ATTRIBUTES` and therefore no
+/// Windows analogue of Unix's `OpenOptionsExt::mode(0o600)` — the DACL cannot be
+/// supplied *at* create time, only immediately after.
+///
+/// So this is the create-time half of the Windows owner-only guarantee, in the
+/// only form Win32 offers through `std`: [`OWNER_ONLY_WRITE_ACCESS`] on the
+/// handle, which is what makes the [`set_file_owner_only`] call every caller runs
+/// **before the first content byte** succeed. A secret-bearing
+/// `remotes.toml`/`schedules.toml`/`session.toml` temp file is therefore exposed
+/// under a loosened inherited ACL only while it is empty.
+///
+/// **Precondition:** the caller opens write-only (`OpenOptions::write(true)`,
+/// with `create`/`create_new`/`truncate` as needed).
+/// `OpenOptionsExt::access_mode` *overrides* the mask std derives from
+/// `read`/`write`/`append`, so a future caller that also wants to read through
+/// the same handle must widen [`OWNER_ONLY_WRITE_ACCESS`] rather than set
+/// `.read(true)` and expect it to be honoured. Every current caller — the three
+/// atomic config writers — is write-only.
+pub fn set_create_mode_owner_only(opts: &mut std::fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    opts.access_mode(OWNER_ONLY_WRITE_ACCESS);
+}
 
 /// Apply a protected current-user-only DACL to an already-open file — the
-/// counterpart of the Unix `fchmod(0o600)` re-assert, and (see
-/// [`set_create_mode_owner_only`]) the *only* place the owner-only property is
-/// actually established on Windows.
+/// counterpart of the Unix `fchmod(0o600)` re-assert, and the place the Windows
+/// owner-only property is actually established (its create-time half is only the
+/// `WRITE_DAC` request in [`set_create_mode_owner_only`]).
 ///
 /// Handle-based [`SetSecurityInfo`] rather than the path-based
 /// [`SetNamedSecurityInfoW`]: the handle is anchored to the file we just opened, so
 /// there is no second name resolution for an attacker to redirect between the
 /// `open` and the ACL write.
+///
+/// Consequently `file` MUST have been opened through
+/// [`set_create_mode_owner_only`] — a handle without `WRITE_DAC` in its frozen
+/// granted mask can never satisfy this call, and gets a hard
+/// `PermissionDenied` naming the cause rather than a silently unprotected file.
 pub fn set_file_owner_only(file: &std::fs::File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
 
@@ -170,7 +213,21 @@ pub fn set_file_owner_only(file: &std::fs::File) -> io::Result<()> {
             ptr::null(),
         )
     };
-    win32_error_to_result(rc, "SetSecurityInfo (owner-only file DACL)")
+    win32_error_to_result(rc, "SetSecurityInfo (owner-only file DACL)").map_err(|err| {
+        if rc == ERROR_ACCESS_DENIED {
+            // The one failure mode worth naming: it is not about the file's
+            // permissions but about the handle's, and it is invisible to
+            // `cargo check --target`.
+            return io::Error::new(
+                err.kind(),
+                format!(
+                    "{err} — the handle lacks WRITE_DAC; open the file through \
+                     set_create_mode_owner_only"
+                ),
+            );
+        }
+        err
+    })
 }
 
 /// No-op: a named pipe has no inode mode to restate after the fact. The
@@ -454,6 +511,19 @@ fn sid_to_string(sid: PSID) -> io::Result<String> {
     if unsafe { ConvertSidToStringSidW(sid, &mut wide) } == 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: `wide` is the NUL-terminated `LocalAlloc`'d string the call just
+    // handed back, and nothing else refers to it.
+    Ok(unsafe { take_local_wide_string(wide) })
+}
+
+/// Copy a NUL-terminated UTF-16 string out of an `advapi32`-`LocalAlloc`'d buffer
+/// and free the buffer.
+///
+/// # Safety
+///
+/// `wide` must be a non-null, NUL-terminated, `LocalAlloc`'d buffer that the
+/// caller owns and does not read again.
+unsafe fn take_local_wide_string(wide: *mut u16) -> String {
     let mut len = 0usize;
     // SAFETY: `wide` is NUL-terminated, so the scan stops inside the allocation.
     while unsafe { *wide.add(len) } != 0 {
@@ -461,10 +531,10 @@ fn sid_to_string(sid: PSID) -> io::Result<String> {
     }
     // SAFETY: `len` UTF-16 units of the live `LocalAlloc`'d buffer.
     let out = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(wide, len) });
-    // SAFETY: frees exactly the buffer `ConvertSidToStringSidW` allocated; `wide`
-    // is not read again.
+    // SAFETY: frees exactly the buffer the caller passed ownership of; `wide` is
+    // not read again.
     unsafe { LocalFree(wide.cast()) };
-    Ok(out)
+    out
 }
 
 /// Map a `WIN32_ERROR`-returning security API onto `io::Result`. These functions
@@ -480,6 +550,8 @@ fn win32_error_to_result(rc: u32, what: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+
     use super::*;
 
     // These run on the `windows-latest` CI job (`cargo nextest run`), where they
@@ -522,9 +594,76 @@ mod tests {
         assert!(owner_only_dacl("D:NO_ACCESS_CONTROL").is_err());
     }
 
+    /// Open a secret-bearing file exactly the way the three production writers do
+    /// — `write`/`create`/`truncate` plus the create-mode seam, which is what puts
+    /// `WRITE_DAC` on the handle. A test that opened it any other way would be
+    /// testing a handle production never produces.
+    fn open_like_a_config_writer(path: &Path) -> std::fs::File {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        set_create_mode_owner_only(&mut opts);
+        opts.open(path).expect("open the secret-bearing file")
+    }
+
+    /// The DACL the kernel actually stored for `file`, rendered as SDDL.
+    ///
+    /// Reading it back is the point: `set_file_owner_only` returning `Ok` is also
+    /// consistent with a DACL that kept its inherited ACEs, and "inherited ACEs
+    /// survived" is precisely the hole this milestone exists to close.
+    fn stored_dacl_sddl(file: &std::fs::File) -> String {
+        use std::os::windows::io::AsRawHandle;
+
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: the handle is live and owned by `file`; `dacl`/`sd` are valid
+        // out-pointers and the nulls are the documented "do not report this
+        // component" form. On success one `LocalAlloc`'d descriptor comes back,
+        // freed by the guard below.
+        let rc = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle() as HANDLE,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        win32_error_to_result(rc, "GetSecurityInfo (read the stored file DACL back)")
+            .expect("read the stored DACL back");
+        let sd = OwnedSecurityDescriptor(sd);
+
+        let mut wide: *mut u16 = ptr::null_mut();
+        // SAFETY: `sd.0` is the live descriptor owned by `sd`, `wide` is a valid
+        // out-pointer, and a null length pointer is the documented "do not report
+        // the length" form. On success the callee hands back a `LocalAlloc`'d
+        // NUL-terminated string, taken over below.
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd.0,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut wide,
+                ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            ok,
+            0,
+            "render the stored DACL as SDDL: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: `wide` is the NUL-terminated `LocalAlloc`'d string just handed
+        // back, and nothing else refers to it.
+        unsafe { take_local_wide_string(wide) }
+    }
+
     /// The file/dir ACL half, end to end against the real filesystem: a directory
-    /// and a file both take the protected owner-only DACL, and re-applying is
-    /// idempotent (`ensure_owner_only_dir` re-applies on every call by design).
+    /// and a file both take the protected owner-only DACL, re-applying is
+    /// idempotent (`ensure_owner_only_dir` re-applies on every call by design),
+    /// and the DACL the kernel kept for the file really is "us, and nobody else".
     #[test]
     fn owner_only_dacls_apply_to_a_real_dir_and_file() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -535,8 +674,57 @@ mod tests {
         create_owner_only_dir(&dir).expect("create-only on an existing dir is a no-op");
         create_owner_only_dir(&root.path().join("fresh")).expect("create-only on a fresh dir");
 
-        let file = std::fs::File::create(dir.join("secrets.toml")).expect("create file");
+        let file = open_like_a_config_writer(&dir.join("secrets.toml"));
         set_file_owner_only(&file).expect("apply the owner-only file DACL");
         set_file_owner_only(&file).expect("re-applying must be idempotent");
+
+        let sid = current_user_sid().expect("read the current user SID");
+        let sddl = stored_dacl_sddl(&file);
+        // Flags render before the first ACE (`D:PAI(A;;…)`); assert on the set,
+        // not on a fixed order.
+        let flags = sddl
+            .trim_start_matches("D:")
+            .split('(')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            flags.contains('P'),
+            "the stored DACL must be protected, so nothing the parent directory says can loosen \
+             it: {sddl}"
+        );
+        assert_eq!(
+            sddl.matches('(').count(),
+            1,
+            "exactly one ACE — a second one means another principal kept access to a \
+             secret-bearing file: {sddl}"
+        );
+        assert!(
+            sddl.contains(&format!(";;;{sid})")),
+            "that one ACE's trustee must be us: {sddl}"
+        );
+        assert!(
+            sddl.contains("(A;;"),
+            "it must be a plain allow-ACE with no ACE flags: {sddl}"
+        );
+        // Rights are asserted tolerantly on purpose: the SDDL renderer is free to
+        // spell FILE_ALL_ACCESS as the `FA` abbreviation or as the raw mask, and
+        // which one it picks is not a security property. "One ACE, and it is ours"
+        // above is.
+        let upper = sddl.to_ascii_uppercase();
+        assert!(
+            upper.contains("(A;;FA;;;") || upper.contains("0X1F01FF"),
+            "the ACE must grant FILE_ALL_ACCESS: {sddl}"
+        );
+    }
+
+    /// The other half of the create-mode contract: the seam asks for `WRITE_DAC`
+    /// on top of `GENERIC_WRITE`, which is the whole reason the handle-based DACL
+    /// write above can succeed. Pinned as data so a future "simplification" back
+    /// to a no-op fails here rather than at run time on a Windows host.
+    #[test]
+    fn the_create_mode_seam_requests_write_dac() {
+        assert_eq!(OWNER_ONLY_WRITE_ACCESS & WRITE_DAC, WRITE_DAC);
+        assert_eq!(OWNER_ONLY_WRITE_ACCESS & GENERIC_WRITE, GENERIC_WRITE);
     }
 }

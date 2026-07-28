@@ -116,7 +116,10 @@ impl std::error::Error for StopError {}
 ///    between the file probe and the connect, and `connect` itself is
 ///    the authoritative liveness signal.
 /// 2. `peer_pid(&stream)` — load-bearing: works against any daemon
-///    version because no protocol bytes are exchanged.
+///    version because no protocol bytes are exchanged. Then
+///    [`crate::platform::proc::pin_process`] on that pid, while the
+///    authenticated connection is still open, so nothing else can
+///    acquire the pid before the escalation in step 4 names it.
 /// 3. Send `ListAgents`. If ≥1 alive and `!force`, return
 ///    [`StopError::LiveAgents`] *without* signaling — the user must
 ///    detach the agents or pass `--force` consciously.
@@ -151,6 +154,34 @@ pub async fn run_daemon_stop(attach_path: &Path, force: bool) -> Result<StopOutc
     };
 
     let pid = peer_pid(&stream).map_err(StopError::PeerPid)?;
+
+    // PRD #163 review (Greptile P1): from here on the daemon is identified only by
+    // this number, and the pipe/socket that authenticated it is about to be
+    // dropped. That is fine on Unix (nothing can be pinned there anyway — see
+    // `platform::proc::pin_process`) but not on Windows, where the escalation ends
+    // in `TerminateProcess(OpenProcess(pid))` *after* deliberately waiting for the
+    // daemon to exit — precisely when the pid becomes available for reuse. So pin
+    // the identity now, while the connection still proves whose pid this is, and
+    // hold it past the last termination call below. The agent teardown path gets
+    // this for free from the `Child` handle its caller keeps; `daemon stop` had no
+    // such anchor.
+    let pinned = match crate::platform::proc::pin_process(pid) {
+        Ok(Some(pinned)) => pinned,
+        // Gone between the connect and the pin. Nothing to terminate, and
+        // terminating an unpinned pid is the bug this guards, so report the stop
+        // as done rather than escalating blind. Same answer the escalation state
+        // machine gives for its own `AlreadyGone` arm.
+        Ok(None) => {
+            debug!(
+                target: "daemon_stop",
+                pid,
+                "daemon exited between connect and pid pin; reporting stopped"
+            );
+            return Ok(StopOutcome::Stopped { pid });
+        }
+        Err(e) => return Err(StopError::KillFailed(e)),
+    };
+
     let (mut rd, mut wr) = stream.into_split();
     let resp = issue_command(&mut rd, &mut wr, &AttachRequest::ListAgents)
         .await
@@ -186,7 +217,14 @@ pub async fn run_daemon_stop(attach_path: &Path, force: bool) -> Result<StopOutc
     } else {
         None
     };
-    match terminate_daemon_graceful(pid, attach_path, STOP_GRACE_TIMEOUT, force_window).await {
+    let outcome =
+        terminate_daemon_graceful(pid, attach_path, STOP_GRACE_TIMEOUT, force_window).await;
+    // Explicit, and load-bearing: the pin must outlive the *last* by-pid call
+    // inside `terminate_daemon_graceful`, so it is released here and not a line
+    // earlier. (Dropping it at end of scope would be correct too; naming the drop
+    // stops a future refactor from shortening its life by accident.)
+    drop(pinned);
+    match outcome {
         Ok(TerminateOutcome::Stopped) => Ok(StopOutcome::Stopped { pid }),
         Ok(TerminateOutcome::Killed) => Ok(StopOutcome::ForceKilled { pid }),
         Err(HandshakeError::TerminateTimedOut) => Err(StopError::TimedOut { pid }),
