@@ -24,6 +24,8 @@ use dot_agent_deck::ui::{
 };
 use spec::spec;
 
+type UiActionCase = (char, &'static str, fn(&UiAction) -> bool);
+
 /// Stringify the rendered buffer — one line per row, cells joined into
 /// the symbol layer — so `insta` diffs read like the rendered widget
 /// itself. Mirrors the same helper in `tests/render_dashboard.rs`.
@@ -243,7 +245,7 @@ fn safety_003_ctrl_w_is_forwarded_only_in_pane_input() {
 #[test]
 fn safety_004_other_global_actions_remain_available_in_pane_input() {
     let config = KeybindingConfig::default();
-    let cases: [(char, &str, fn(&UiAction) -> bool); 3] = [
+    let cases: [UiActionCase; 3] = [
         ('d', "dashboard", |a| matches!(a, UiAction::DetachToNormal)),
         ('n', "new pane", |a| matches!(a, UiAction::NewPane)),
         ('t', "toggle layout", |a| {

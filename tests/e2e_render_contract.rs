@@ -133,14 +133,13 @@ fn layout_001_toggle_layout_keeps_pane_intact() {
 }
 
 /// Scenario: Launch the deck against the `modes` fixture, open a Mode tab
-/// (creating an embedded `demo`-mode pane), then close that tab with `Ctrl+W`,
-/// tearing the pane down and returning to a lone Dashboard. This exercises the
-/// pane open/close + reactive-recreation path. After the replace the dashboard
-/// must render cleanly: the tab strip collapses (no `×` close glyph remains)
-/// and no stale `demo mode` fragment from the closed pane lingers anywhere on
-/// screen. Invariant guard: scrambled fragments after a pane replace are
-/// transient (open/close resizes the affected PTYs on the spot), so this pins
-/// the "no stale fragment after replace" invariant; GREEN target at M4/M5.
+/// (creating an embedded `demo`-mode pane), return to command mode with Ctrl+D,
+/// request the close with Ctrl+W, and accept its confirmation with `y`, tearing
+/// the pane down and returning to a lone Dashboard. After the replace the
+/// dashboard must render cleanly: the tab strip collapses (no `×` close glyph
+/// remains) and no stale `demo mode` fragment from the closed pane lingers.
+/// This pins the "no stale fragment after replace" invariant; GREEN target at
+/// M4/M5.
 #[spec("render/layout/002")]
 #[test]
 fn layout_002_pane_close_leaves_no_stale_fragment() {
@@ -149,9 +148,12 @@ fn layout_002_pane_close_leaves_no_stale_fragment() {
         .launch_with_fixture("modes");
     open_mode_tab(&deck);
 
-    // Close the active Mode tab → its pane is torn down (== the click-to-close
-    // path covered by mouse/tabstrip/002).
-    deck.send_bytes(b"\x17"); // Ctrl+W → close tab
+    // Return from PaneInput to command mode, request the active Mode tab's
+    // close, and deliberately accept the safety confirmation.
+    deck.send_bytes(b"\x04"); // Ctrl+D → command mode
+    deck.send_bytes(b"\x17"); // Ctrl+W → arm close confirmation
+    deck.wait_for_string("Close selected pane?");
+    deck.send_bytes(b"y"); // confirm → close tab
 
     // Invariant: the tab strip collapses and no stale mode fragment remains.
     deck.wait_for_absence("×");

@@ -1445,7 +1445,7 @@ note).
 ##### render/layout/002 — Reactive pane recreation/replace leaves no scrambled fragments — the replacement pane renders cleanly.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** after a pane is recreated/replaced in place (open a second pane, close the first), the rendered grid contains the surviving pane's content and no leftover fragment of the removed pane at a stale position.
+- **Asserts:** after a pane is recreated/replaced in place (open a Mode tab, return to command mode, request its close with Ctrl+W, and accept the confirmation), the rendered grid contains the surviving Dashboard and no leftover fragment of the removed pane at a stale position.
 - **Does not assert:** the exact recreation trigger internals; per-cell colours.
 - **Platform coverage:** mac+linux.
 - **M1 status (PRD #84):** **Flag / invariant-check.** Pane open/close and reactive recreation (`src/ui.rs:1510`, `:2147` areas) currently resize the affected PTYs on the spot, so any scramble is transient. Invariant guard on "no stale fragment after replace". GREEN target at M4/M5.
@@ -1956,7 +1956,7 @@ These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept con
 ##### session/save/002 — Triggering a detach path (Ctrl+W close-pane) flushes a fresh snapshot reflecting the workspace, without quitting.
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path).
 - **Agent:** none (panes run `sleep 600`; no LLM).
-- **Asserts:** with two dashboard panes present and any prior snapshot removed, closing a pane with Ctrl+W writes a fresh `session.toml` that still reflects the (non-empty) workspace — proving the detach path flushes the snapshot mid-session, not only at clean quit.
+- **Asserts:** with two dashboard panes present and any prior snapshot removed, requesting a pane close with Ctrl+W and accepting the confirmation writes a fresh `session.toml` that still reflects the (non-empty) workspace — proving the detach path flushes the snapshot mid-session, not only at clean quit.
 - **Does not assert:** which specific pane survives the close; the coalescing/debounce window (`session/save/003`).
 - **Platform coverage:** mac+linux.
 
