@@ -3676,9 +3676,46 @@ fn csi_modifier_param(mods: KeyModifiers) -> u8 {
 /// so there is no legacy byte to preserve — mapping it would invent behavior
 /// rather than restore it.
 ///
-/// `keyevent_ctrl_c0_matches_crossterm_decoder` proves this is the exact inverse
-/// of crossterm's own decoder over `0x00..=0x1f` + `0x7f`, in both the legacy
-/// and the CSI-u wire forms.
+/// # The decoder half, verified by hand — RE-VERIFY ON A CROSSTERM UPGRADE
+///
+/// This table is only correct if crossterm decodes the way it is described
+/// above, and nothing in the test suite checks that. An automated round-trip
+/// test against the real decoder was written for PRD #227 and then withdrawn:
+/// `parse_event` is `pub(crate)`, so reaching it means handing crossterm a real
+/// tty on fd 0 — and crossterm 0.28's raw-mode flag and its lazily-built event
+/// reader are PROCESS-global, so such a probe can steal input from, or hang,
+/// unrelated tests sharing a `cargo test` process.
+///
+/// So the decoder half is recorded here instead, read out of
+/// `crossterm-0.28.1/src/event/sys/unix/parse.rs`. Legacy single bytes, in
+/// `parse_event`'s match order (earlier arms shadow later ones):
+///
+/// * `:35-91` — `0x1b` opens an escape sequence; alone, with no further input
+///   pending, it is `KeyCode::Esc`.
+/// * `:92-94` — `0x0d` is `Enter`.
+/// * `:95-101` — `0x0a` is `Enter` ONLY when raw mode is OFF (upstream issue
+///   #371). In raw mode — which is the only mode the deck forwards keys in — it
+///   falls through to the arm below and arrives as `Char('j') + CONTROL`.
+/// * `:102` — `0x09` is `Tab`, with NO `CONTROL` modifier.
+/// * `:103-105` — `0x7f` is `Backspace`, with NO `CONTROL` modifier.
+/// * `:106-109` — `0x01..=0x1a` is `Char(b - 0x01 + b'a') + CONTROL`.
+/// * `:110-113` — `0x1c..=0x1f` is `Char(b - 0x1c + b'4') + CONTROL`. There is
+///   no other legacy form for these four, which is why `4`–`7` are aliases.
+/// * `:114-117` — `0x00` is `Char(' ') + CONTROL`.
+///
+/// CSI-u (`parse_csi_u_encoded_key_code`, `:497`): the codepoint becomes
+/// `KeyCode::Char` verbatim (`:540-566`, with the same `Esc` / `Enter` / `Tab` /
+/// `Backspace` special cases as the legacy path), and the `;<n>` parameter goes
+/// through `parse_modifiers` (`:303`), which is `n.saturating_sub(1)` read as a
+/// bitmask — 1 SHIFT, 2 ALT, 4 CONTROL. So `CSI 91;5u` is `Char('[') + CONTROL`:
+/// under M2 every alias above arrives as its literal character plus `CONTROL`,
+/// which is the whole reason this function has to exist.
+///
+/// `keyevent_ctrl_c0_controls` and
+/// `ctrl_c0_byte_maps_exactly_the_documented_alias_set` pin the ENCODER against
+/// that reading, exhaustively over all 128 ASCII characters — but they cannot
+/// notice if the reading itself goes stale. Bumping crossterm means re-checking
+/// every line reference above by hand.
 fn ctrl_c0_byte(c: char) -> Option<u8> {
     match c {
         // `a`–`z` / `A`–`Z` → 0x01..=0x1a via the caret rule on the upcased char.
@@ -20298,260 +20335,6 @@ mod tests {
         // truncate the codepoint).
         for c in ['é', 'λ', '€', '🙂'] {
             assert_eq!(ctrl_c0_byte(c), None, "Ctrl+{c:?} is not a C0 alias");
-        }
-    }
-
-    /// PRD #227 review item A: run OUR encoder against THEIR decoder.
-    ///
-    /// crossterm's `parse_event` is `pub(crate)`, so the only way to reach the
-    /// real decoder is to give crossterm a terminal to read from: `tty_fd()`
-    /// returns stdin when stdin is a tty, so this installs a PTY slave on fd 0
-    /// and writes keypresses into the master. Bytes then travel the exact
-    /// production path — PTY line discipline, `Parser::advance`, `parse_event` —
-    /// instead of a hand-transcribed copy of crossterm's tables that could
-    /// silently drift from them on an upgrade.
-    ///
-    /// Restores fd 0 and raw mode on `Drop`, so a failing assertion cannot leave
-    /// the test process with a dangling stdin. Sound under `cargo nextest`
-    /// (process per test) and, for a plain `cargo test`, because no other test in
-    /// this crate reads stdin or drives crossterm's event source.
-    #[cfg(unix)]
-    struct CrosstermInputProbe {
-        master: std::fs::File,
-        /// Kept alive only so the slave end stays open for the probe's lifetime;
-        /// fd 0 is a `dup` of it and is what crossterm actually reads.
-        _slave: std::fs::File,
-        /// `dup` of the original fd 0, put back by `Drop`. `-1` if fd 0 was
-        /// closed when the probe started.
-        saved_stdin: libc::c_int,
-    }
-
-    #[cfg(unix)]
-    impl CrosstermInputProbe {
-        fn new() -> Self {
-            let mut master: libc::c_int = -1;
-            let mut slave: libc::c_int = -1;
-            // SAFETY: `openpty` writes the two fds through the out-pointers; the
-            // trailing name/termios/winsize arguments are documented as optional
-            // and passed as NULL.
-            let rc = unsafe {
-                libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                )
-            };
-            assert_eq!(
-                rc,
-                0,
-                "openpty failed ({}). This test needs a PTY to hand crossterm's own \
-                 decoder real input.",
-                std::io::Error::last_os_error()
-            );
-
-            // SAFETY: termios/fcntl calls on the fd `openpty` just handed us.
-            //
-            // RAW, because a canonical-mode slave withholds bytes until a newline
-            // and `cfmakeraw` also clears ISIG/IXON — so 0x03/0x1a/0x11 arrive as
-            // DATA instead of signalling or flow-controlling the test process.
-            // This is also the state the deck's own terminal is in.
-            //
-            // NON-BLOCKING, because crossterm reads only after `poll` reports
-            // POLLIN but loops and reads again while an escape sequence is
-            // incomplete; on a blocking fd that second read would hang the whole
-            // suite, whereas `EWOULDBLOCK` sends it back to `poll` and lets the
-            // per-keypress deadline below fail cleanly instead.
-            unsafe {
-                let mut tio: libc::termios = std::mem::zeroed();
-                assert_eq!(
-                    libc::tcgetattr(slave, &mut tio),
-                    0,
-                    "tcgetattr on the probe pty slave"
-                );
-                libc::cfmakeraw(&mut tio);
-                assert_eq!(
-                    libc::tcsetattr(slave, libc::TCSANOW, &tio),
-                    0,
-                    "tcsetattr on the probe pty slave"
-                );
-                let flags = libc::fcntl(slave, libc::F_GETFL);
-                assert_ne!(flags, -1, "F_GETFL on the probe pty slave");
-                assert_ne!(
-                    libc::fcntl(slave, libc::F_SETFL, flags | libc::O_NONBLOCK),
-                    -1,
-                    "F_SETFL O_NONBLOCK on the probe pty slave"
-                );
-            }
-
-            // SAFETY: `dup`/`dup2` on fd 0; the saved descriptor is restored in
-            // `Drop`. A negative `dup` result just means fd 0 was closed, which
-            // `Drop` handles.
-            let saved_stdin = unsafe { libc::dup(libc::STDIN_FILENO) };
-            let rc = unsafe { libc::dup2(slave, libc::STDIN_FILENO) };
-            assert_ne!(
-                rc,
-                -1,
-                "dup2 of the probe pty onto stdin failed ({})",
-                std::io::Error::last_os_error()
-            );
-            assert_eq!(
-                unsafe { libc::isatty(libc::STDIN_FILENO) },
-                1,
-                "stdin must be the probe pty, otherwise crossterm would fall back \
-                 to /dev/tty and read the developer's real terminal"
-            );
-
-            // crossterm's decoder branches on its OWN raw-mode flag for `0x0a`
-            // (upstream issue #371: in raw mode `\n` is Ctrl+J, in cooked mode it
-            // is Enter), so the probe has to match the deck: raw. `tty_fd()`
-            // resolves to the fd-0 pty installed above, so this cannot touch the
-            // developer's terminal.
-            crossterm::terminal::enable_raw_mode().expect("enable raw mode on the probe pty");
-            assert!(
-                crossterm::terminal::is_raw_mode_enabled().unwrap_or(false),
-                "crossterm must report raw mode, otherwise 0x0a decodes as Enter and \
-                 re-encodes as 0x0d"
-            );
-
-            // SAFETY: we own both fds; wrapping them in `File` transfers
-            // ownership so they close when the probe drops.
-            let (master, slave) = unsafe {
-                use std::os::unix::io::FromRawFd;
-                (
-                    std::fs::File::from_raw_fd(master),
-                    std::fs::File::from_raw_fd(slave),
-                )
-            };
-            Self {
-                master,
-                _slave: slave,
-                saved_stdin,
-            }
-        }
-
-        /// Feed `bytes` as if the terminal had sent them, and return the single
-        /// `KeyEvent` crossterm decodes from them.
-        fn decode(&self, bytes: &[u8]) -> KeyEvent {
-            use std::io::Write;
-            (&self.master)
-                .write_all(bytes)
-                .expect("write the keypress into the probe pty");
-            (&self.master).flush().expect("flush the probe pty");
-
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "crossterm decoded no key event from {bytes:02x?} within 5s"
-                );
-                if !crossterm::event::poll(std::time::Duration::from_millis(50))
-                    .expect("poll the probe pty")
-                {
-                    continue;
-                }
-                match crossterm::event::read().expect("read from the probe pty") {
-                    crossterm::event::Event::Key(key) => return key,
-                    // A stray resize/focus event is not what we asked about.
-                    _ => continue,
-                }
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for CrosstermInputProbe {
-        fn drop(&mut self) {
-            let _ = crossterm::terminal::disable_raw_mode();
-            // SAFETY: put back the fd 0 we replaced (or close the borrowed slot
-            // if there was nothing to put back).
-            unsafe {
-                if self.saved_stdin >= 0 {
-                    libc::dup2(self.saved_stdin, libc::STDIN_FILENO);
-                    libc::close(self.saved_stdin);
-                } else {
-                    libc::close(libc::STDIN_FILENO);
-                }
-            }
-        }
-    }
-
-    /// PRD #227 review item A: the encoder must be the exact INVERSE of
-    /// crossterm's decoder over the whole control range, in BOTH wire forms.
-    ///
-    /// This is the property test that the one-alias-at-a-time fixes kept missing.
-    /// `Ctrl+[` regressed under M2, was fixed by naming `[`, and then `Ctrl+3`
-    /// and `Ctrl+8` regressed the same way — because nothing asserted the
-    /// mapping was *complete*. Feeding every control byte through crossterm and
-    /// back out through [`keyevent_to_bytes`] catches all of them at once, and
-    /// catches the next one for free.
-    ///
-    /// Every byte in `0x00..=0x1f` plus `0x7f` round-trips; there is no
-    /// documented exception. `0x0a` is the one that DEPENDS on terminal state:
-    /// crossterm reports it as `Ctrl+J` in raw mode (which re-encodes to `0x0a`)
-    /// but as `Enter` in cooked mode (which would re-encode to `0x0d`), so the
-    /// probe asserts raw mode is active — matching the deck, which never runs
-    /// the pane-input path outside raw mode.
-    #[cfg(unix)]
-    #[test]
-    fn keyevent_ctrl_c0_matches_crossterm_decoder() {
-        let probe = CrosstermInputProbe::new();
-
-        // --- Phase 1: the LEGACY wire form. Every control byte a legacy
-        // terminal can deliver must survive decode → encode unchanged. ---
-        for byte in (0x00u8..=0x1f).chain(std::iter::once(0x7f)) {
-            let key = probe.decode(&[byte]);
-            assert_eq!(
-                keyevent_to_bytes(&key).as_deref(),
-                Some(&[byte][..]),
-                "control byte {byte:#04x} decoded by crossterm as {key:?} did not re-encode \
-                 to itself — the deck would forward something else to the agent's PTY"
-            );
-        }
-
-        // --- Phase 2: the M2 wire form. `DISAMBIGUATE_ESCAPE_CODES` makes the
-        // terminal send `CSI <codepoint>;5u` instead of the collapsed byte, so
-        // crossterm reports `Char(c) + CONTROL` and producing the byte becomes
-        // the deck's job. This is the form that regressed twice. ---
-        for (ch, want) in CTRL_C0_SYMBOL_ALIASES
-            .iter()
-            .copied()
-            .chain(ctrl_c0_letter_aliases())
-        {
-            // `1 + ctrl(4)` = 5 — the kitty modifier parameter for Ctrl alone.
-            let wire = format!("\x1b[{};5u", ch as u32);
-            let key = probe.decode(wire.as_bytes());
-            assert_eq!(
-                keyevent_to_bytes(&key).as_deref(),
-                Some(&[want][..]),
-                "{wire:?} (Ctrl+{ch:?}) decoded by crossterm as {key:?} must forward \
-                 {want:#04x}; forwarding the literal character instead is the Ctrl+[ / \
-                 Ctrl+3 regression"
-            );
-        }
-
-        // --- Phase 3: the modifier-bearing keys M1/M3 added, checked against
-        // the real decoder rather than a hand-made `KeyEvent`. Each of these is
-        // its own inverse: what a kitty terminal sends is exactly what the deck
-        // forwards. ---
-        for (wire, want) in [
-            // The headline of PRD #227.
-            ("\x1b[13;2u", "\x1b[13;2u"), // Shift+Enter
-            ("\x1b[13;5u", "\x1b[13;5u"), // Ctrl+Enter
-            ("\x1b[1;2A", "\x1b[1;2A"),   // Shift+Up
-            ("\x1b[1;2B", "\x1b[1;2B"),   // Shift+Down
-            ("\x1b[1;5C", "\x1b[1;5C"),   // Ctrl+Right
-            ("\x1b[1;5D", "\x1b[1;5D"),   // Ctrl+Left
-        ] {
-            let key = probe.decode(wire.as_bytes());
-            assert_eq!(
-                keyevent_to_bytes(&key).as_deref(),
-                Some(want.as_bytes()),
-                "{wire:?} decoded by crossterm as {key:?} must be forwarded verbatim as \
-                 {want:?}; collapsing it to the unmodified legacy byte is the bug PRD #227 \
-                 fixes"
-            );
         }
     }
 
