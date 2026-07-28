@@ -1,6 +1,6 @@
 # PRD #126: Agent-driven notifications + idle-worker detection
 
-**Status**: In progress — **rescoped 2026-07-27 from a no-code dogfood into a real, shipped feature** (see [Scope decision (2026-07-27, rescope to a real feature)](#scope-decision-2026-07-27-rescope-to-a-real-feature)). Phase 1 dogfood (config-only) completed and informed this rescope; its results are preserved in [Background](#background-the-dogfood-that-led-here). M1.1–M1.3 landed 2026-07-28 (`d34fbd4`); M1.4 is in progress.
+**Status**: In progress — **rescoped 2026-07-27 from a no-code dogfood into a real, shipped feature** (see [Scope decision (2026-07-27, rescope to a real feature)](#scope-decision-2026-07-27-rescope-to-a-real-feature)). Phase 1 dogfood (config-only) completed and informed this rescope; its results are preserved in [Background](#background-the-dogfood-that-led-here). M1 (detector + hardening + tests), M2 (recipe), M3 (docs) and M4 (dogfood retirement) all landed 2026-07-28. Fast tier **1173/1173**, scoped e2e **15/15**. Outstanding before merge: the rule-12 cross-version check (M1.5), the full e2e gate with recording, `/prd-done`, and the demo reel. M5 (validate on real runs) is post-merge and additionally blocked on `TELEGRAM_CHAT_ID` being provisioned.
 **Priority**: Medium
 **Created**: 2026-05-25
 **GitHub Issue**: [#126](https://github.com/vfarcic/dot-agent-deck/issues/126)
