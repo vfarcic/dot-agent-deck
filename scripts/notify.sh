@@ -18,6 +18,9 @@
 # Both rows carry the same invocation id, so `reached` and `send=...` stay
 # correlatable when two agents notify in the same second.
 #
+# The log's Markdown header is created atomically, so parallel agents cannot each
+# write one — see init_log below.
+#
 # Logging is BEST-EFFORT: a read-only checkout, a bad DOT_AGENT_DECK_NOTIFY_LOG,
 # or a full filesystem can leave zero or one row. Such a failure never changes
 # the exit code, but it IS reported on stderr ("notify.sh: could not append …"),
@@ -68,6 +71,38 @@ invocation="$(printf 'inv-%x-%x-%04x' "$(date -u +%s)" "$$" "$((RANDOM))")"
 note() { printf 'notify.sh: %s\n' "$1" >&2; }
 log_failures=0
 
+# Create the log with its header AT MOST ONCE, even when several agents notify at
+# the same instant — the normal case in this orchestration. A duplicate header
+# would break the line-based reconciliation, so the header is published
+# ATOMICALLY instead of being guarded by a check-then-write: each racer writes the
+# header into a private temp file and then hard-links it into place, and `ln`
+# fails if the log already exists. Exactly one racer wins; the losers fail
+# silently and go straight to appending their row. Because the log only becomes
+# visible complete, no racer can append a row into a half-written header either.
+# Nothing here takes a lock or waits, so it cannot block a caller.
+header() {
+  printf '# Notify expectation log — PRD #126 dogfood\n\n'
+  printf 'Appended by `scripts/notify.sh`. Two records per notifiable moment, sharing one invocation id: `reached` (written first) and `send=...` (written after the send attempt). Logging is best-effort — see the script header. Reconcile per `docs/develop/notifications-dogfood.md`.\n\n'
+  printf '| timestamp (UTC) | invocation | role | kind | record | detail |\n'
+  printf '|---|---|---|---|---|---|\n'
+}
+
+init_log() {
+  tmp="${log}.init.${invocation}"
+  if ( set -C; header >"$tmp" ) 2>/dev/null; then
+    # Losing this `ln` is the expected outcome for every racer but one: it means
+    # another invocation already published an identical header. Not a failure.
+    ln -- "$tmp" "$log" 2>/dev/null || true
+  fi
+  rm -f -- "$tmp" 2>/dev/null || true
+  # A filesystem without hard links (some network/FUSE mounts) fails every `ln`,
+  # which would leave the log headerless forever. Fall back to an exclusive
+  # create, which is still non-blocking and still admits only one writer.
+  if [ ! -s "$log" ]; then
+    ( set -C; header >"$log" ) 2>/dev/null || true
+  fi
+}
+
 # Logging is best-effort — it must never change the exit code — but a failure is
 # reported on stderr so "never invoked" stays distinguishable from "invoked but
 # could not log".
@@ -78,15 +113,13 @@ append() { # append <record> <detail>
     return 1
   fi
   if [ ! -s "$log" ]; then
-    if ! {
-      printf '# Notify expectation log — PRD #126 dogfood\n\n'
-      printf 'Appended by `scripts/notify.sh`. Two records per notifiable moment, sharing one invocation id: `reached` (written first) and `send=...` (written after the send attempt). Logging is best-effort — see the script header. Reconcile per `docs/develop/notifications-dogfood.md`.\n\n'
-      printf '| timestamp (UTC) | invocation | role | kind | record | detail |\n'
-      printf '|---|---|---|---|---|---|\n'
-    } >>"$log" 2>/dev/null; then
-      log_failures=$((log_failures + 1))
-      note "could not write the log header to ${log}; '$1' row not recorded"
-      return 1
+    init_log
+    # A missing header does not cost us the row, so it is not counted as a lost
+    # row — but it is still worth saying, because the table will render oddly.
+    # The usual cause is a leftover zero-byte log: an atomic create cannot claim a
+    # file that already exists, so delete it and the next invocation rebuilds it.
+    if [ ! -s "$log" ]; then
+      note "could not initialize the log header in ${log} (delete the file if it exists but is empty); rows are appended without one"
     fi
   fi
   if ! printf '| %s | %s | %s | %s | %s | %s |\n' \

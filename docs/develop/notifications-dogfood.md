@@ -98,7 +98,7 @@ tail -2 "$log"
 
 Expected: `exit=0`, **no** `notify.sh:` line on stderr, and two rows at the end of `$log` — one `reached` and one `send=ok`, sharing one invocation id. If the rows are absent, or stderr carries a `notify.sh: could not …` line, fix the log path or its permissions before starting; otherwise every gap this run produces is uninterpretable.
 
-If the log predates the `invocation` column (a five-column header), move it aside so the script writes a fresh header — mixing schemas breaks both the rendering and the greps.
+If the log predates the `invocation` column (a five-column header), move it aside so the script writes a fresh header — mixing schemas breaks both the rendering and the greps. Move or delete it rather than truncating it: the header is created **atomically** (written to a temp file, then hard-linked into place) so that parallel agents cannot each write one and leave a duplicate header that the line-based reconciliation below would mis-count. An atomic create cannot claim a path that already exists, so a leftover zero-byte log stays headerless and the script says so on stderr.
 
 ## Reconciling after a run
 
