@@ -22,20 +22,38 @@
 //!     basename is `codex`, so `AgentType::from_command` resolves it and the
 //!     pane is wrapped from its FIRST spawn, which is exactly the shape that
 //!     hits the readiness race even with PRD #225's Defect 2 fixed.
-//!   - The worker boots and emits its genuine native Codex `SessionStart`
-//!     (distinct from the wrapper's marked fork-time one — the whole point of
-//!     the fix), i.e. the orchestrator delegates to a worker that is really up,
-//!     as in production.
+//!   - The worker's role pane is focused (digit-jump, as a user does) and the
+//!     REAL Codex TUI is seen coming up in it — its header naming the pinned
+//!     model. That is the readiness precondition: the orchestrator only
+//!     delegates once the agent, not just the launcher, is on screen.
 //!   - The orchestrator runs the real `dot-agent-deck delegate --to coder`
 //!     CLI. The daemon writes the worker task file, RESPAWNS the worker
 //!     (`clear = true`), waits for the replacement's genuine readiness, and
 //!     injects the single-line task pointer.
-//!   - The worker's card visibly enters `Thinking` — a status that can only
-//!     come from Codex's native `UserPromptSubmit` hook, i.e. the prompt was
-//!     really submitted inside the agent, not echoed into a launcher's line
-//!     discipline — and the worker then creates the uniquely named sentinel
-//!     file. Pre-fix the prompt is swallowed, the pane sits at an empty
-//!     composer, and no sentinel ever appears.
+//!   - The worker's card visibly enters `Thinking`, the daemon broadcasts the
+//!     worker's GENUINE native Codex `SessionStart` (no wrapper-fork origin
+//!     marker — the distinction this PRD introduced) and a `Thinking` carrying
+//!     the injected pointer as its `user_prompt`. Only Codex's native
+//!     `UserPromptSubmit` hook sets that field (the wrapper's line classifier
+//!     always leaves it `None`), so it is proof the prompt was really submitted
+//!     inside the agent rather than echoed into a launcher's line discipline.
+//!     The worker then creates the uniquely named sentinel file. Pre-fix the
+//!     prompt is swallowed, the pane sits at an empty composer, and no sentinel
+//!     ever appears.
+//!
+//! ## Why readiness is asserted on the TUI, and the native events afterwards
+//! codex-cli 0.145.0 posts its native `SessionStart` when the first TURN
+//! starts — i.e. *after* a prompt is submitted — not when the TUI comes up. So
+//! gating the delegate on that native event would deadlock: the event is caused
+//! by the very delegate it would gate (measured: fork-time `SessionStart` at
+//! T+0, native one only at T+30s, the full `SESSION_START_WAIT_TIMEOUT`
+//! fallback, immediately followed by the prompt's own `UserPromptSubmit`).
+//! Hence the pre-delegate precondition is the user-visible one — the Codex TUI
+//! is up in the pane — exactly as `codex/live/001` does it, and the native
+//! events are asserted AFTER the delegate, where they legitimately prove
+//! delivery reached the agent. A consequence worth knowing: for Codex the M3
+//! readiness gate never fast-paths, every `clear = true` delegate pays the full
+//! timeout fallback (documented in `docs/develop/agent-adapters.md`).
 //!
 //! ## Why the orchestrator is a script and the worker is the real agent
 //! The defect lives entirely on the WORKER side of the delegate: prompt
@@ -188,21 +206,26 @@ fn open_orchestration(deck: &TuiDeck) {
 /// `clear = true` `coder` role runs a REAL interactive cheap-model Codex
 /// (wrapped from its first spawn, because the command's basename resolves to
 /// Codex), and open it through the normal Ctrl+N new-pane form so both role
-/// panes appear in a live orchestration tab. Detach to Normal mode so the role
-/// cards and their statuses are on screen, wait until the worker emits its
-/// GENUINE native Codex `SessionStart` (not the wrapper's marked fork-time
-/// card-surfacing one), then release the orchestrator, which delegates a
+/// panes appear in a live orchestration tab. Detach to Normal mode, press `2`
+/// to jump into the `coder` role pane, and wait until the REAL Codex TUI is
+/// visibly up in it (its header names the pinned model) — the readiness
+/// precondition a user can actually see; Codex posts its native `SessionStart`
+/// only once a turn starts, so waiting for that event here would deadlock on
+/// the delegate it gates. Detach back so the role cards and their live status
+/// badges are on screen, then release the orchestrator, which delegates a
 /// directive task. The daemon must write the worker task file, respawn the
 /// worker for `clear = true`, wait for the REPLACEMENT to be genuinely ready,
 /// and inject the single-line task pointer: the worker's card must visibly
-/// enter `Thinking` (a status only Codex's native `UserPromptSubmit` hook can
-/// produce, so the prompt was submitted inside the agent rather than echoed
-/// away by a launcher's line discipline) and the worker must create the
-/// uniquely named sentinel file with the requested contents. Pre-fix the
-/// wrapper's fork-time event released the gate ~4s before the Codex TUI
-/// existed, the prompt was lost, and no sentinel ever appeared. Reel-eligible
-/// (PTY-attached real agent, records a `full-stream.cast`); flaky-tolerant
-/// (real LLM) — run once, not looped.
+/// enter `Thinking`, the daemon must broadcast the worker's GENUINE native
+/// Codex `SessionStart` (not the wrapper's marked fork-time card-surfacing one)
+/// plus a `Thinking` whose `user_prompt` is the injected pointer — a field only
+/// Codex's native `UserPromptSubmit` hook sets, so the prompt was submitted
+/// inside the agent rather than echoed away by a launcher's line discipline —
+/// and the worker must create the uniquely named sentinel file with the
+/// requested contents. Pre-fix the wrapper's fork-time event released the gate
+/// ~4s before the Codex TUI existed, the prompt was lost, and no sentinel ever
+/// appeared. Reel-eligible (PTY-attached real agent, records a
+/// `full-stream.cast`); flaky-tolerant (real LLM) — run once, not looped.
 #[spec("orchestration/delegate/009")]
 #[test]
 #[cfg(unix)]
@@ -247,25 +270,40 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
     // The worker role card is on the live orchestration tab — what the user
     // sees before anything is delegated.
     deck.wait_for_string(WORKER_ROLE);
-    // Detach the focused role pane to Normal mode so the orchestration deck's
-    // role cards (and their live status badges) are the visible surface.
+    // Detach the focused role pane (the orchestration opens focused on its
+    // `start = true` role) to Normal mode; the Normal-mode button bar is the
+    // positive confirmation, so the digit below can never be typed into the
+    // orchestrator's stdin instead of being consumed by the deck.
     deck.send_bytes(b"\x04");
+    deck.wait_for_string("[New Pane Ctrl+N]");
+    // Jump into the SECOND role card — the `coder` worker — exactly as a user
+    // does to watch a worker boot. This focuses its pane and expands it, so the
+    // real Codex TUI is the visible surface.
+    deck.send_bytes(b"2");
 
-    // The readiness signal PRD #225 is about: the worker's GENUINE native Codex
-    // `SessionStart`, not the wrapper's fork-time card-surfacing one (which
-    // carries the `wrapper_fork` origin marker and means only "a card exists").
-    // Waiting for it here means the orchestrator delegates to a worker that is
-    // really up — production timing, not a boot race.
-    // A miss here panics with every observed event, which distinguishes "Codex
-    // never booted" from "Codex booted but its native hooks never fired".
-    events.wait_for(
-        |event| {
-            event.event_type == EventType::SessionStart
-                && event.agent_type == AgentType::Codex
-                && !event.is_wrapper_fork_session_start()
-        },
-        Duration::from_secs(180),
+    // THE READINESS PRECONDITION, on the surface the user can actually see: the
+    // worker's real Codex TUI is up (its header names the pinned model), so the
+    // delegate below lands in a booted agent and not in the launcher that owns
+    // the PTY for the first seconds. This is the `codex/live/001` pattern.
+    //
+    // It deliberately does NOT wait for a native Codex `SessionStart`:
+    // codex-cli 0.145.0 posts that when the first TURN starts, which for this
+    // worker only happens BECAUSE of the delegate this wait would gate — a
+    // circular precondition. The native events are asserted after the delegate
+    // instead (below), where they prove delivery rather than deadlock on it.
+    assert!(
+        deck.wait_for_grid_string_within(common::codex_test_model(), Duration::from_secs(60)),
+        "the `clear = true` worker's REAL Codex TUI never came up in its role pane (no {:?} \
+         header within 60s) — nothing has been delegated yet, so this is a boot/auth failure, \
+         not a delivery failure.\nFinal grid:\n{}",
+        common::codex_test_model(),
+        deck.snapshot_grid()
     );
+
+    // Detach again so the orchestration deck's role cards (and their live
+    // status badges) are the visible surface while the delegate runs.
+    deck.send_bytes(b"\x04");
+    deck.wait_for_string("[New Pane Ctrl+N]");
 
     // Release the orchestrator: it runs the real `dot-agent-deck delegate`.
     std::fs::write(work.join(DELEGATE_TRIGGER), "").expect("release the orchestrator's delegate");
@@ -278,15 +316,51 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
         .join(".dot-agent-deck")
         .join(format!("worker-task-{WORKER_ROLE}.md"));
 
-    // USER-VISIBLE proof that the prompt reached the agent itself: `Thinking`
-    // on a Codex card is derived from Codex's native `UserPromptSubmit` hook,
-    // so it can only appear if the respawned worker actually submitted the
-    // injected pointer. Pre-fix the bytes were written into the launcher's line
-    // discipline and echoed away, and no Codex event ever followed. Scanned
-    // over the deck's cumulative byte stream (nothing before the delegate can
-    // produce it: the worker is never prompted at spawn, and the script
-    // orchestrator emits no agent events at all).
-    let visibly_thinking = deck.wait_for_stream_string_within("Thinking", Duration::from_secs(180));
+    // The event PRD #225's readiness gate is about, now where it can actually
+    // happen: the respawned worker's GENUINE native Codex `SessionStart` — no
+    // `wrapper_fork` origin marker, so it is Codex itself and not the wrapper's
+    // fork-time card-surfacing event. It arrives only once the injected pointer
+    // starts a turn, so seeing it at all means the daemon respawned the worker
+    // and delivered into the live agent. A miss panics with every observed
+    // event, which distinguishes "the delegate never reached the daemon" from
+    // "it did, but nothing was ever submitted inside Codex".
+    events.wait_for(
+        |event| {
+            event.event_type == EventType::SessionStart
+                && event.agent_type == AgentType::Codex
+                && !event.is_wrapper_fork_session_start()
+        },
+        Duration::from_secs(75),
+    );
+
+    // The strongest proof the pointer was submitted INSIDE the agent: a Codex
+    // `Thinking` whose `user_prompt` is the injected pointer. Only Codex's
+    // native `UserPromptSubmit` hook populates that field — the wrapper's line
+    // classifier (which also maps output activity to `Thinking`) always leaves
+    // it `None` — so this cannot be satisfied by the worker's boot output.
+    // Pre-fix the bytes went into the launcher's line discipline and were
+    // echoed away, and no such event ever followed.
+    let submitted = events.wait_for(
+        |event| {
+            event.event_type == EventType::Thinking
+                && event.agent_type == AgentType::Codex
+                && event.user_prompt.is_some()
+        },
+        Duration::from_secs(30),
+    );
+    assert!(
+        submitted
+            .user_prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains(&format!("worker-task-{WORKER_ROLE}.md"))),
+        "the respawned Codex worker submitted a prompt, but not the delegated task pointer: \
+         {:?}",
+        submitted.user_prompt
+    );
+
+    // USER-VISIBLE counterpart of the event above: the worker's card carries
+    // the `Thinking` status on the orchestration deck the user is looking at.
+    let visibly_thinking = deck.wait_for_stream_string_within("Thinking", Duration::from_secs(30));
     assert!(
         visibly_thinking,
         "the delegated Codex worker never visibly entered `Thinking` — the injected task \
@@ -298,8 +372,10 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
     );
 
     // The load-bearing assertion: the worker ACTED on the delegated prompt.
+    // Bounded to fit inside nextest's 180s cap for this test (measured: the
+    // sentinel lands ~36s after the trigger, ~5s after the prompt is submitted).
     let sentinel = work.join(SENTINEL_NAME);
-    let created = common::wait_for_path(&sentinel, Duration::from_secs(300));
+    let created = common::wait_for_path(&sentinel, Duration::from_secs(60));
     assert!(
         created,
         "the `clear = true` Codex worker never created {SENTINEL_NAME:?} — the delegated \
@@ -320,11 +396,13 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
     // Soft narrative (NOT gating — the work-done leg is covered by
     // `codex/worker/001` and is too LLM-dependent to hard-gate here): did the
     // worker also follow the task file's completion footer back to the daemon?
+    // Kept short so a worker that never signals cannot push the run past
+    // nextest's 180s cap.
     let work_done = work
         .join(".dot-agent-deck")
         .join(format!("work-done-{WORKER_ROLE}.md"));
     eprintln!(
         "soft: worker signalled work-done through the hook socket = {}",
-        common::wait_for_path(&work_done, Duration::from_secs(60))
+        common::wait_for_path(&work_done, Duration::from_secs(30))
     );
 }
