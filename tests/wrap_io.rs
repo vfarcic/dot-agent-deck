@@ -14,9 +14,25 @@ use std::time::{Duration, Instant};
 use dot_agent_deck::event::AgentEvent;
 use spec::spec;
 
+/// A hook endpoint nothing can ever be listening on.
+///
+/// `wrap` resolves `DOT_AGENT_DECK_SOCKET` at *emit* time and tags each event
+/// with the ambient `DOT_AGENT_DECK_PANE_ID`, so a wrapper subprocess that
+/// inherits both writes `<pane>-session` status straight into whichever real
+/// pane is running the suite — a developer running these tests inside the deck
+/// watches their own card flip through session_start/thinking/idle. Every site
+/// below that does not care about emitted events points here instead and drops
+/// the inherited ids; `hook::send_to_socket` treats an unreachable endpoint as a
+/// no-op. `codex_wrap_005` is the deliberate exception: it binds a real socket
+/// because the events are what it asserts on.
+const UNREACHABLE_HOOK_SOCKET: &str = "/nonexistent/dot-agent-deck-wrap-tests.sock";
+
 fn run_wrap(script: &str, stdin: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .args(["wrap", "--agent", "codex", "--", "/bin/sh", "-c", script])
+        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -88,6 +104,9 @@ fn run_with_stderr_redirected() -> (bool, Vec<u8>, Vec<u8>) {
             "-c",
             "printf 'mixed-stderr-marker\\n' >&2",
         ])
+        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID")
         .stdin(Stdio::from(
             slave.try_clone().expect("clone PTY slave for stdin"),
         ))
@@ -117,6 +136,9 @@ fn run_with_stdout_redirected() -> (bool, Vec<u8>) {
              if [ -t 2 ]; then error=tty; else error=pipe; fi; \
              printf 'stdin=%s stderr=%s\\n' \"$input\" \"$error\"",
         ])
+        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID")
         .stdin(Stdio::from(
             slave.try_clone().expect("clone PTY slave for stdin"),
         ))
@@ -182,6 +204,9 @@ fn codex_wrap_003_each_descriptor_preserves_its_original_semantics() {
             "-c",
             "printf 'pipe-out\\n'; printf 'pipe-err\\n' >&2",
         ])
+        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(pipe_stderr))
@@ -202,6 +227,9 @@ fn codex_wrap_003_each_descriptor_preserves_its_original_semantics() {
             "-c",
             "cat > \"$WRAP_STDIN_RECORD\"",
         ])
+        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID")
         .env("WRAP_STDIN_RECORD", &binary_record)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -313,6 +341,93 @@ fn codex_wrap_005_standalone_sessions_have_unique_ids() {
     );
 }
 
+/// Scenario: Wrap a child that TRAPS SIGTERM and never exits, over an
+/// interactive PTY, then SIGTERM the wrapper exactly as the deck does when a
+/// pane closes. The wrapper must escalate to SIGKILL and reap the child within
+/// the deck's own grace window — the deck cannot signal the agent's process
+/// group itself, so anything the wrapper has not killed by the time the deck
+/// SIGKILLs the wrapper is orphaned to init.
+#[test]
+fn wrap_escalates_to_sigkill_before_the_deck_kills_the_wrapper() {
+    let fixture = tempfile::tempdir().expect("create escalation fixture");
+    let pid_path = fixture.path().join("child.pid");
+    let (master, slave) = open_pty();
+    let mut wrapper = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args([
+            "wrap",
+            "--agent",
+            "codex",
+            "--",
+            "/bin/sh",
+            "-c",
+            // Ignore SIGTERM outright: a wedged agent, and what every
+            // interactive shell does anyway.
+            "trap '' TERM; printf '%s\\n' \"$$\" > \"$WRAP_CHILD_PID_FILE\"; while :; do sleep 1; done",
+        ])
+        .env("WRAP_CHILD_PID_FILE", &pid_path)
+        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID")
+        .stdin(Stdio::from(
+            slave.try_clone().expect("clone PTY slave for stdin"),
+        ))
+        .stdout(Stdio::from(
+            slave.try_clone().expect("clone PTY slave for stdout"),
+        ))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .expect("spawn wrapper escalation probe");
+    let _master = master;
+
+    let read_child_pid = || -> Option<libc::pid_t> {
+        std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|c| c.trim().parse().ok())
+    };
+    assert!(
+        common::wait_until(Duration::from_secs(5), || read_child_pid().is_some()),
+        "wrapper never recorded its child pid"
+    );
+    let child_pid = read_child_pid().expect("child pid recorded");
+    assert!(
+        common::process_running(child_pid),
+        "precondition: child {child_pid} must be running before SIGTERM"
+    );
+
+    // SAFETY: the wrapper pid came from this test's live `Child`; signalling it
+    // is the behaviour under test.
+    let rc = unsafe { libc::kill(wrapper.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(rc, 0, "deliver SIGTERM to the wrapper");
+    let sent_at = Instant::now();
+
+    // The deck would SIGKILL the wrapper at AGENT_TERMINATE_GRACE. Give the
+    // wrapper that long, minus nothing — it has to be done BEFORE then.
+    let deadline = dot_agent_deck::agent_pty::AGENT_TERMINATE_GRACE;
+    let child_gone = common::wait_until(deadline, || !common::process_running(child_pid));
+    let elapsed = sent_at.elapsed();
+
+    if common::process_running(child_pid) {
+        // SAFETY: best-effort cleanup of this test's recorded child.
+        unsafe {
+            libc::kill(child_pid, libc::SIGKILL);
+        }
+    }
+    let _ = wrapper.kill();
+    let _ = wrapper.wait();
+
+    assert!(
+        child_gone,
+        "a SIGTERM-ignoring child must be SIGKILLed by the wrapper within {deadline:?} \
+         (took longer); otherwise the deck's SIGKILL removes the wrapper first and the \
+         child is orphaned to init"
+    );
+    assert!(
+        elapsed < deadline,
+        "child died after {elapsed:?}, at or past the deck's own {deadline:?} deadline — \
+         the two graces must not tie"
+    );
+}
+
 #[derive(Debug)]
 struct SignalOutcome {
     path: &'static str,
@@ -344,7 +459,10 @@ fn run_signal_case(
             "-c",
             "printf '%s\\n' \"$$\" > \"$WRAP_CHILD_PID_FILE\"; exec /bin/sleep 60",
         ])
-        .env("WRAP_CHILD_PID_FILE", &pid_path);
+        .env("WRAP_CHILD_PID_FILE", &pid_path)
+        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID");
 
     let _master = if interactive {
         let (master, slave) = open_pty();

@@ -23,7 +23,7 @@ use tokio::sync::broadcast;
 
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 use dot_agent_deck::event::{AgentType, BroadcastMsg};
-use dot_agent_deck::state::AppState;
+use dot_agent_deck::state::{AppState, OrchestrationIdentity};
 
 use spec::spec;
 
@@ -106,7 +106,10 @@ async fn delegate_005_pi_orchestrator_delegate_routes_to_worker_inner() {
     let worker_agent_id = spawn_worker_stub(&registry, &cwd_str, WORKER_PANE);
 
     let (event_tx, _rx) = broadcast::channel::<BroadcastMsg>(64);
-    let orchestration = ("pi-orchestration".to_string(), cwd_str.clone());
+    let orchestration = OrchestrationIdentity::NameCwd {
+        name: "pi-orchestration".to_string(),
+        cwd: cwd_str.clone(),
+    };
 
     // The Pi orchestrator is the ONLY valid delegate source; the coder worker
     // shares the orchestration. Registration mirrors the StartAgent path.
@@ -175,7 +178,10 @@ async fn delegate_006_pi_worker_delegate_is_rejected_by_role_guard_inner() {
     let worker_agent_id = spawn_worker_stub(&registry, &cwd_str, WORKER_PANE);
 
     let (event_tx, _rx) = broadcast::channel::<BroadcastMsg>(64);
-    let orchestration = ("pi-orchestration".to_string(), cwd_str.clone());
+    let orchestration = OrchestrationIdentity::NameCwd {
+        name: "pi-orchestration".to_string(),
+        cwd: cwd_str.clone(),
+    };
 
     // The Pi agent is a WORKER — registered in the role map but deliberately
     // NOT in orchestrator_pane_ids, so it is not the `start = true` role.

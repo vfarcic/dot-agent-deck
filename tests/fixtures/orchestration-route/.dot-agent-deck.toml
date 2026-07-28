@@ -1,0 +1,35 @@
+# Fixture for the L2 routing-isolation e2e (`orchestration/route/001`, PRD #140
+# M5.1): ONE orchestration, opened TWICE from the SAME directory so the two tabs
+# have byte-identical `(name, cwd)` and can only be told apart by the per-tab
+# `orchestration_id`.
+#
+# THREE roles, not two, on purpose. Each tab drives a DIFFERENT worker role
+# (tab A delegates to `coder`, tab B to `reviewer`), so every no-cross-delivery
+# check is a presence/absence question about a pane that has otherwise received
+# NOTHING — no occurrence counting in a redrawing agent TUI — and the two
+# work-done feedback strings the daemon writes back are role-specific
+# ("Worker coder …" vs "Worker reviewer …"), so they stay distinguishable even
+# inside one orchestrator pane.
+#
+# All three roles are REAL, fully interactive Claude Code panes pinned to Haiku
+# (no `-p`, no `cat` stand-in), so the run is a genuine spawn -> agent -> work
+# showcase. `clear = false` on the workers keeps each worker agent alive across
+# its delegate (no respawn), so its daemon-side agent id and its PTY scrollback
+# stay stable for the whole run.
+[[orchestrations]]
+name = "route-iso"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash"
+start = true
+
+[[orchestrations.roles]]
+name = "coder"
+command = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write"
+clear = false
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write"
+clear = false

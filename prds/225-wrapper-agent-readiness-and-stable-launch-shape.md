@@ -4,6 +4,7 @@
 **Priority**: High
 **Created**: 2026-07-26
 **GitHub Issue**: [#225](https://github.com/vfarcic/dot-agent-deck/issues/225)
+**Related**: [PRD #234](234-screen-state-observation-hookless-agents.md) (screen-state observation — the truth source for the hookless-agent readiness case this PRD defers; see Open Question 2 and Risks)
 **Feature flag**: None — this is a defect fix on a shipped surface (the delegate path), not a new user-visible surface. Rule 9 does not apply.
 
 ## Problem Statement
@@ -14,7 +15,7 @@ This was diagnosed live against a running daemon (pid 3115616) driving three wor
 
 ### Defect 1 — the readiness gate accepts a signal that does not mean "ready"
 
-`dispatch_one_owned` (`src/state.rs:562-710`) does the right thing in the right order: respawn, wait for readiness, then inject the prompt. Readiness is `wait_for_session_start` (`src/state.rs:389-415`), which returns on the first `SessionStart` matching the pane and the **new** agent id, with a 10s timeout fallback.
+`dispatch_one_owned` (`src/state.rs:509-767`) does the right thing in the right order: respawn, wait for readiness, then inject the prompt. Readiness is `wait_for_session_start` (`src/state.rs:444-471`), which returns on the first `SessionStart` matching the pane and the **new** agent id, with a 10s timeout fallback.
 
 For a wrapped agent that signal is a lie. `src/wrap.rs:1079` emits `EventType::SessionStart` immediately after `cmd.spawn()` returns — commented "the session has begun — surface the card immediately". It is emitted for the benefit of the *dashboard card*, at fork time, carrying the correct `pane_id` and `agent_id` from the environment. So it satisfies the gate exactly, and the 10s wait collapses to roughly zero.
 
@@ -37,9 +38,9 @@ Only Codex is affected today: it is the only shipped Wrapper-strategy agent, so 
 
 The pane does not start out wrapped. It becomes wrapped on its first delegate:
 
-1. The role command is `devbox run codex-big`. `AgentType::from_command` tokenizes it, resolves basename `devbox`, and returns `None` (`src/event.rs:148-222`). With no agent type, `wrap_launch_command` is a no-op, so the **initial spawn is unwrapped**.
-2. Codex's native hooks fire. The daemon learns the real type and records it: `src/daemon.rs:943` → `AgentPtyRegistry::set_agent_type` (`src/agent_pty.rs:2828`), an upgrade-only `None` → `Some(Codex)` write intended purely so `list_agents` reports the right badge after a reconnect.
-3. The first `clear = true` delegate calls `respawn_agent_for_pane`, which replays the captured record — including that learned `agent_type: Some(Codex)` (`src/agent_pty.rs:2566`).
+1. The role command is `devbox run codex-big`. `AgentType::from_command` tokenizes it, resolves basename `devbox`, and returns `None` (`src/event.rs:88-91`). With no agent type, `wrap_launch_command` is a no-op, so the **initial spawn is unwrapped**.
+2. Codex's native hooks fire. The daemon learns the real type and records it: `src/daemon.rs:943` → `AgentPtyRegistry::set_agent_type` (`src/agent_pty.rs:2967`), an upgrade-only `None` → `Some(Codex)` write intended purely so `list_agents` reports the right badge after a reconnect.
+3. The first `clear = true` delegate calls `respawn_agent_for_pane`, which replays the captured record — including that learned `agent_type: Some(Codex)` (`src/agent_pty.rs:2736`).
 4. `spawn_agent_inner` now resolves `Codex` and wraps: `dot-agent-deck wrap --agent codex -- devbox run codex-big`.
 
 So a value recorded for **display** silently changes the **exec line**, and the same pane runs a different process tree before and after its first delegate. This is what arms Defect 1, and it is a correctness problem in its own right — the respawn contract is supposed to reproduce the previous child's environment and geometry, not redefine how it launches.
@@ -61,14 +62,14 @@ The user-visible outcome: delegating to a Codex worker delivers the prompt and t
 
 - Readiness: separate "card surfaced" from "session ready" for Wrapper-strategy agents, and gate delegate prompt injection on the latter.
 - Wrap stability: the wrap decision is fixed at pane creation and survives respawn; `set_agent_type` no longer influences it.
-- The same readiness gate is reused by `crate::spawn::spawn` (`src/state.rs:386-388`) for scheduled cards — that call site must be fixed or consciously exempted, not left inconsistent.
+- The same readiness gate is reused by `crate::spawn::spawn` (`src/state.rs:442`) for scheduled cards — that call site must be fixed or consciously exempted, not left inconsistent.
 - Revisit `SESSION_START_WAIT_TIMEOUT` (currently 10s, `src/state.rs:44`) against measured Codex boot. On this machine the wrapper→`node codex` gap alone is 4s before Codex's own initialization; if the fallback ever has to carry a Codex pane, 10s is marginal.
 - Tests per CLAUDE.md rule 4, including a **real-agent e2e** on a cheap model (Codex mini) that delegates to a `clear = true` Codex worker and asserts the worker acts on the prompt — a sentinel-file scenario, since a stand-in like `cat` cannot reproduce a race with a real TUI's boot sequence.
 - Rule 12 cross-version contract check: this touches hooks, orchestration, and the daemon.
 
 ### Out of Scope
 
-- **Whether a script-launched Codex should be wrapped at all.** Codex is a documented *hybrid* (`src/agent_registry.rs:226-238`): the wrapper is its PTY host, but its rich events come from native hooks. Panes 15 and 27 run unwrapped today and report status fine, which suggests the wrapper may be optional for Codex. Deciding that is a larger design question — see Open Questions.
+- **Whether a script-launched Codex should be wrapped at all.** Codex is a documented *hybrid* (`src/agent_registry.rs:219-239`): the wrapper is its PTY host, but its rich events come from native hooks. Panes 15 and 27 run unwrapped today and report status fine, which suggests the wrapper may be optional for Codex. Deciding that is a larger design question — see Open Questions.
 - **Improving `AgentType::from_command` to see through `devbox run <script>`.** Tempting, but it generalizes badly to arbitrary launcher scripts and would only mask Defect 2 by making the initial spawn wrapped too. Explicitly not the fix.
 - The phantom dashboard cards observed alongside this (Codex cards that vanish when selected). Not root-caused, not implicated in prompt loss. Should be filed separately.
 - The five leaked e2e Codex processes (PPID 1, pointing at dead `/tmp/.tmp*/hook.sock` sockets, carrying a `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS=300` cap that never fired). Separate cleanup bug.
@@ -113,7 +114,7 @@ The second is probably cleaner but touches every reader of `RunningAgent.agent_t
 
 ## Risks
 
-- **Over-fitting to Codex.** The readiness contract has to hold for the next wrapper agent too, or PRD #211 inherits this bug. Mitigated by making the discriminator a registry property, not a Codex special case, and by documenting the contract in M7.
+- **Over-fitting to Codex.** The readiness contract has to hold for the next wrapper agent too, or PRD #211 inherits this bug. Mitigated by making the discriminator a registry property, not a Codex special case, and by documenting the contract in M7. Note this is only *partially* mitigated: a hookless wrapper agent has no real `SessionStart` to wait for, so it keeps today's behaviour (or eats the full timeout) no matter how the discriminator is expressed. That residual gap is [PRD #234](234-screen-state-observation-hookless-agents.md)'s to close, and is a conscious hand-off rather than an oversight — but it means "PRD #211 does not inherit this bug" is not true until #234 lands.
 - **The timeout fallback is load-bearing and untested.** If Codex's native hooks are not installed or not trusted, the gate falls through to the timeout. That path must still deliver a usable prompt, which is why M4 revisits the duration.
 - **Cross-version behavior behind a stable wire.** The marker is additive, but an old wrapper against a new daemon reverts to today's racy behavior. That is acceptable (no worse than current), but it must be a conscious, documented outcome rather than a surprise.
 
@@ -121,9 +122,16 @@ The second is probably cleaner but touches every reader of `RunningAgent.agent_t
 
 1. **Should Codex be wrapped at all when launched via a script?** It is a hybrid whose events come from native hooks, and unwrapped Codex panes work today. If the answer is "no", Defect 2's fix largely subsumes Defect 1 for Codex — but Defect 1 still has to be fixed for `command = "codex"` and for Gemini. Worth settling before M3.
 2. **Is `hook_install.is_some()` the right discriminator** for "this agent will emit a real `SessionStart`", or does that need to be an explicit field on `AgentSpec`? An explicit field is more honest about intent and survives an agent that installs hooks for other reasons.
+
+   **Choose this with [PRD #234](234-screen-state-observation-hookless-agents.md) in mind.** This PRD's fix is *provenance*-based — ignore the synthetic event, wait for the real one — which structurally requires a real one to exist, hence the conditional skip and the hookless hole below. #234 supplies the missing truth source for exactly that case (readiness observed from the screen: the agent has painted its input box, which a launcher script cannot fake). The discriminator chosen here should therefore express "**where does this agent's readiness signal come from**" rather than "does it install hooks", so #234's observed-readiness source can be added as a third answer without re-migrating every call site. An explicit `AgentSpec` field is the shape that survives that; `hook_install.is_some()` is the shape that does not.
 3. **Does the scheduler path want the same semantics?** A scheduled card's prompt has the same delivery problem, but the failure mode and acceptable latency may differ from an interactive delegate.
 
 ## Work Log
+
+### 2026-07-28 — Line references refreshed against `main`
+[PRD #140](140-orchestration-session-partitioning.md) (#228, merged as `cb307ca`) rewrote ~450 lines of `src/state.rs`, invalidating most of the code pointers in the diagnosis below. Refreshed against `main`: `dispatch_one_owned` 562-710 → **509-767**, `wait_for_session_start` 389-415 → **444-471**, the `crate::spawn::spawn` gate 386-388 → **442**, `from_command` 148-222 → **88-91** (it now delegates to the registry, hence the collapse), `AgentPtyRegistry::set_agent_type` 2828 → **2967**, the respawn `agent_type` replay 2566 → **2736**, the Codex hybrid spec 226-238 → **219-239**. Verified unchanged: `SESSION_START_WAIT_TIMEOUT` (`src/state.rs:44`), the `set_agent_type` call site (`src/daemon.rs:943`), the synthetic emit (`src/wrap.rs:1079`).
+
+Only the pointers moved — **both defects are unrevalidated against post-#140 `main`**. The diagnosis below stands as written for the code as of 2026-07-26; #140 touched `dispatch_one_owned` directly, so re-confirm the race still reproduces before starting M1 rather than assuming it.
 
 ### 2026-07-26 — Diagnosis
 Root-caused live against daemon pid 3115616 without restarting it (three orchestrations were mid-flight). Evidence: process tree showing pane 21 wrapped vs. panes 15/27 unwrapped; process start times establishing the 4s fork→Codex gap; `worker-task-tester.md` mtime establishing that the delegate reached the daemon and only the injection was lost. No daemon restart, no code changes.

@@ -5,6 +5,7 @@
 **Created**: 2026-07-14
 **GitHub Issue**: [#212](https://github.com/vfarcic/dot-agent-deck/issues/212)
 **Origin**: Follow-up to [PRD #20](20-multi-agent-support.md) (multi-agent machinery + Codex adapter), created as one of its final tasks. Unlike the [Gemini adapter (PRD #211)](211-gemini-adapter.md), which reuses the shipped wrapper strategy, this PRD introduces a **new** integration strategy — so it carries a one-time mechanism implementation.
+**Related**: [PRD #234](234-screen-state-observation-hookless-agents.md) — **re-test this PRD's premise before paying for the log-watcher.** The Problem Statement below rejects stdout-wrapping because Aider's "terminal output is a rich, redrawing TUI rather than a clean line stream to classify" — an objection #234 answers directly, by observing whether the rendered screen is changing instead of classifying lines. That does not obviously kill the log-watcher (a log carries tool-level detail no screen can), so the likely answer is *complement*: #234 for status, the log for detail. But if screen observation covers Aider's status adequately, the one-time mechanism cost this PRD carries needs re-justifying against what the log adds on top. See #234 Open Question 2.
 
 ## Problem Statement
 

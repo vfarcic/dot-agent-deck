@@ -28,7 +28,7 @@ use tokio::sync::broadcast;
 
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 use dot_agent_deck::event::{BroadcastMsg, DelegateSignal};
-use dot_agent_deck::state::AppState;
+use dot_agent_deck::state::{AppState, OrchestrationIdentity};
 
 mod common;
 
@@ -98,7 +98,10 @@ async fn delegate_injects_single_line_pointer_and_keeps_footer_in_task_file() {
     // StartAgent path records for a live orchestration tab: an
     // orchestrator pane (the only valid delegate source) and a worker
     // pane in the SAME orchestration.
-    let orchestration = ("test-orchestration".to_string(), cwd_str.clone());
+    let orchestration = OrchestrationIdentity::NameCwd {
+        name: "test-orchestration".to_string(),
+        cwd: cwd_str.clone(),
+    };
     let mut state = AppState::default();
     state
         .pane_role_map

@@ -30,9 +30,9 @@
 //! ## `pi/live/001` scenario: a single live Pi pane (deterministic status)
 //! A reliable single live Pi pane with a visible real status fully satisfies
 //! rule 4 on its own. A single directive-prompted Pi pane's lifecycle
-//! (`session_start`→waiting, `agent_start`→running) is the deterministic part —
-//! it fires regardless of what the model decides — so the status transition
-//! there does not hinge on a multi-agent LLM chain. The heavier orchestrator
+//! (`session_start`→Idle, `agent_start`→running/Thinking) is the deterministic
+//! part — it fires regardless of what the model decides — so the status
+//! transition there does not hinge on a multi-agent LLM chain. The heavier orchestrator
 //! route is pinned headless by `chain-smoke/pi/001` and, LIVE + injection-seeded,
 //! by `pi/live/002` below.
 //!
@@ -52,7 +52,7 @@
 //!   `with_pi_extension` staging.
 //! - **Status via `agent-event`, NO hook**: the Pi pane's card status is driven
 //!   ONLY by the extension shelling `dot-agent-deck agent-event` (mapped
-//!   `waiting`→Needs Input / `running`→Thinking). No `~/.claude/settings.json`
+//!   `running`→Thinking / `finished`→Idle). No `~/.claude/settings.json`
 //!   is touched — a Pi pane is hook-safe by construction.
 //!
 //! ## Credentials (Design Decision #5, harness caveat)
@@ -136,8 +136,11 @@ fn path_with_binary_dir() -> String {
 /// working live in the pane); detach to the dashboard with Ctrl+D so the Pi
 /// pane's CARD renders. Assert on the rendered vt100 grid that, driven ONLY by
 /// the extension's `agent-event` reports (NO hook installed): the card shows a
-/// real status TRANSITION — `Needs Input` (extension `session_start`→waiting)
-/// then `Thinking` (extension `agent_start`→running) — and its title carries the
+/// real, extension-driven status TRANSITION — `Thinking` (extension
+/// `agent_start`→running), an Idle → running transition the daemon never
+/// produces on its own for a hook-less Pi pane, then a settle back to `Idle`
+/// (extension `agent_settled`→finished, the mapping this fix changed — a
+/// regression to "Needs Input" would show here) — and its title carries the
 /// experimental-gated first-class Pi identity (`Pi ·`). Best-effort (logged, not
 /// gating): the directed sentinel file appears in the pane cwd. PTY-attached, so
 /// it records a `full-stream.cast` (reel-eligible, PRD #180); flaky-tolerant
@@ -226,33 +229,47 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
             .any(|k| lower.contains(k))
     };
 
-    // 1. `Needs Input` — the extension's `session_start`→waiting report. This is
-    //    a deck-specific status label (not something pi prints), so seeing it on
-    //    the grid proves the extension shelled `dot-agent-deck agent-event
-    //    --type waiting` and the card status followed — with NO hook. Fail fast
-    //    (assert before starting wait #2) so a single failing wait surfaces its
-    //    diagnostic under nextest's 180s terminate rather than being SIGKILL'd.
-    if !deck.wait_for_stream_string_within("Needs Input", Duration::from_secs(150)) {
-        let grid = deck.snapshot_grid();
-        panic!(
-            "the Pi pane's card never showed the `Needs Input` status within 150s — the \
-             extension's `agent-event --type waiting` (session_start) status path did not reach \
-             the card. api_error_on_grid={} (if true, an account/quota is the blocker, not the \
-             status path).\nFinal grid:\n{grid}",
-            api_errored(&grid)
-        );
-    }
-
-    // 2. `Thinking` — the extension's `agent_start`→running report once the
-    //    directive turn begins. Together with (1) this is the real WAITING →
-    //    RUNNING transition.
+    // Load-bearing: `Thinking` — the extension's `agent_start`→running report
+    // once the directive turn begins. `Thinking` is a deck-specific status label
+    // that the daemon NEVER produces on its own for a hook-less Pi pane (a
+    // freshly-spawned pane defaults to Idle), so seeing it on the grid proves the
+    // extension shelled `dot-agent-deck agent-event --type running` and the card
+    // status followed — with NO hook. This is the Idle → RUNNING transition;
+    // `session_start` now reports Idle for parity with the other backends
+    // (Claude/OpenCode/Codex show Idle, not "Needs Input", on turn-end and
+    // session-start), so `Thinking` — not the retired `Needs Input` — is the
+    // extension-only proof.
     if !deck.wait_for_stream_string_within("Thinking", Duration::from_secs(150)) {
         let grid = deck.snapshot_grid();
         panic!(
             "the Pi pane's card never showed the `Thinking` status within 150s — the extension's \
              `agent-event --type running` (agent_start) report never rendered, so the real \
-             WAITING → RUNNING transition was not observed. api_error_on_grid={}.\n\
-             Final grid:\n{grid}",
+             Idle → RUNNING transition was not observed. api_error_on_grid={} (if true, an \
+             account/quota is the blocker, not the status path).\nFinal grid:\n{grid}",
+            api_errored(&grid)
+        );
+    }
+
+    // Load-bearing: post-settlement `Idle` — the extension's `agent_settled`
+    // →finished report once the directive turn ("create the sentinel, then
+    // stop") completes. THIS is the mapping this fix changed (`agent_settled`
+    // used to report `waiting`→"Needs Input"); the `Thinking` assertion above
+    // only exercises the unchanged `agent_start`→running path, so without this a
+    // regression back to `waiting` would slip through. Scanned on the CURRENT
+    // reconstructed grid (NOT the from-offset-0 byte history): by the time
+    // `Thinking` was observed the card has already advanced past the initial
+    // session-start frame, so a `Idle` seen on the live grid now can ONLY be the
+    // settled state — correct by construction, no false-pass on the boot frame.
+    // If the mapping regressed, the settled card would read "Needs Input" and
+    // this would (correctly) fail. Generous ceiling: the model turn must finish.
+    if !deck.wait_for_grid_string_within("Idle", Duration::from_secs(150)) {
+        let grid = deck.snapshot_grid();
+        panic!(
+            "the Pi pane's card never settled back to `Idle` within 150s after the turn began — \
+             the extension's `agent-event --type finished` (agent_settled) report never rendered, \
+             so the changed turn-end → Idle mapping was not observed live (a regression to \
+             `waiting`/\"Needs Input\" would show here). api_error_on_grid={} (if true, an \
+             account/quota is the blocker, not the status path).\nFinal grid:\n{grid}",
             api_errored(&grid)
         );
     }

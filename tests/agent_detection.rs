@@ -79,6 +79,20 @@ fn spawn_005_respawn_wraps_codex() {
             bin_dir.display(),
             std::env::var("PATH").expect("test runner PATH")
         );
+        // Point the wrapper rewrite at the recorder. The rewrite names the
+        // co-located build by absolute path (so the suite tests what it just
+        // compiled rather than whatever is installed on $PATH), which means a
+        // fake `dot-agent-deck` on the child's PATH is no longer what runs —
+        // this override is the seam for observing it. Set on THIS process
+        // because the rewrite happens here, not in the child; nextest gives
+        // each test its own process, so it cannot leak sideways.
+        // SAFETY: single-threaded test process, set before the spawn below.
+        unsafe {
+            std::env::set_var(
+                dot_agent_deck::wrap::DOT_AGENT_DECK_WRAP_BIN,
+                bin_dir.join("dot-agent-deck"),
+            );
+        }
         let registry = AgentPtyRegistry::new();
         registry
             .spawn_agent(SpawnOptions {
@@ -140,6 +154,20 @@ fn spawn_006_explicit_codex_identity_wraps_noninferable_launcher() {
         bin_dir.display(),
         std::env::var("PATH").expect("test runner PATH")
     );
+    // Point the wrapper rewrite at the recorder. The rewrite names the
+    // co-located build by absolute path (so the suite tests what it just
+    // compiled rather than whatever is installed on $PATH), which means a
+    // fake `dot-agent-deck` on the child's PATH is no longer what runs —
+    // this override is the seam for observing it. Set on THIS process
+    // because the rewrite happens here, not in the child; nextest gives
+    // each test its own process, so it cannot leak sideways.
+    // SAFETY: single-threaded test process, set before the spawn below.
+    unsafe {
+        std::env::set_var(
+            dot_agent_deck::wrap::DOT_AGENT_DECK_WRAP_BIN,
+            bin_dir.join("dot-agent-deck"),
+        );
+    }
     let registry = AgentPtyRegistry::new();
     registry
         .spawn_agent(SpawnOptions {
