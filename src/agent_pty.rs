@@ -6,7 +6,7 @@
 //! trapped inside the TUI path. The daemon piece is the foundation for Phase 1
 //! (M1.2 streaming attach protocol) — see PRD #76 lines 140–146.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use thiserror::Error;
-use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast};
+use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, oneshot};
 
 use crate::event::{AgentType, OrchestrationSurface};
 use crate::pane_input::{PaneInputError, SUBMIT_DELAY, encode_pane_payload, escape_bytes_for_log};
@@ -1460,19 +1460,19 @@ pub struct AgentPtyRegistry {
     /// fingerprint is a CONFLICT (never a false replay). Bounded by LRU eviction —
     /// see [`MAX_DELIVERY_RESULTS`].
     delivery_ledger: Mutex<DeliveryLedger>,
-    /// PRD #126: delegations that are still awaiting a `work-done`, keyed by
-    /// the *worker's* `pane_id_env`. Armed by `AppState::handle_delegate`,
-    /// consumed either by the per-delegation watch task when its timeout
-    /// expires (→ idle prompt into the orchestrator pane) or by whatever
-    /// resolves the delegation first: `AppState::handle_work_done`, or the
-    /// worker pane being closed (`StopAgent`).
+    /// PRD #126: delegations that are still awaiting a `work-done` plus the set
+    /// of panes currently mid-close. Both live under ONE mutex so "mark this
+    /// pane closing AND drop its outstanding records" is a single atomic
+    /// transition — see [`AgentPtyRegistry::begin_pane_close`]. A two-mutex
+    /// version would leave a window where a concurrent `handle_delegate` arms
+    /// between the mark and the drop.
     ///
     /// Lives here rather than on `AppState` because both hook handlers run
     /// under a `read()` guard on the shared state — putting a mutable map on
     /// `AppState` would force those hot call sites to `write()`. Same
     /// interior-mutability shape as `dispatch_mutexes` / `user_input_at` /
     /// `delivery_ledger`.
-    outstanding_delegations: Mutex<HashMap<String, OutstandingDelegation>>,
+    delegations: Mutex<DelegationTracker>,
     /// PRD #126: monotonic generation stamped onto each
     /// [`OutstandingDelegation`]. A re-delegation to the same worker pane
     /// overwrites the record with a *newer* seq, so delegation #1's still
@@ -1481,13 +1481,39 @@ pub struct AgentPtyRegistry {
     /// Same trick (and the same reason to prefer it over `JoinHandle::abort`)
     /// as the daemon idle monitor's generation counter: cancellation is one
     /// atomic operation with no await and no race against the timer's wake-up.
+    ///
+    /// Reviewer nit (PRD #126 M1 review, finding 7): `fetch_add` wraps, so a
+    /// seq collision is not *mathematically* impossible — it needs ~2^64 arms
+    /// while one stale watch task is still sleeping. At one delegation per
+    /// nanosecond that is ~585 years inside a single timeout window, so
+    /// exhaustion is unreachable in practice rather than prevented by
+    /// construction. Deliberately NOT guarded with a checked
+    /// `fetch_update`/exhaustion proof: that is real complexity for a state no
+    /// running daemon can reach, and the drop-driven cancellation below now
+    /// retires stale tasks long before they could collide anyway.
     delegation_seq: AtomicU64,
 }
 
+/// PRD #126: the outstanding-delegation side state — records plus the
+/// mid-close pane set. See [`AgentPtyRegistry::delegations`].
+#[derive(Default)]
+struct DelegationTracker {
+    /// Keyed by the *worker's* `pane_id_env`; at most one (the newest)
+    /// delegation per worker pane.
+    records: HashMap<String, OutstandingDelegation>,
+    /// Panes between [`AgentPtyRegistry::begin_pane_close`] and
+    /// [`AgentPtyRegistry::finish_pane_close`]. Arming is refused for a pane in
+    /// this set (as worker *or* as orchestrator), which is what closes the
+    /// arm-after-cancel race: the SIGTERM grace window is up to
+    /// `AGENT_TERMINATE_GRACE` long, and a delegate landing inside it must not
+    /// leave a record that nothing removes.
+    closing_panes: HashSet<String>,
+}
+
 /// PRD #126: one delegation the daemon is still waiting on a `work-done` for.
-/// Carries everything the watch task needs to compose and deliver the idle
-/// prompt without re-entering `AppState`.
-#[derive(Debug, Clone)]
+/// Carries everything the watch task needs to compose, authorize and deliver
+/// the idle prompt without re-entering `AppState`.
+#[derive(Debug)]
 pub struct OutstandingDelegation {
     /// Generation of this record — see [`AgentPtyRegistry::delegation_seq`].
     pub seq: u64,
@@ -1496,8 +1522,69 @@ pub struct OutstandingDelegation {
     /// Pane of the orchestrator that issued the delegate; the idle prompt is
     /// submitted here.
     pub orchestrator_pane_id: String,
+    /// PRD #126 M1 audit (finding 2): the orchestrator's **registry agent id**
+    /// as of arming time. A pane id is only a string — after the orchestrator
+    /// is closed another agent (possibly in an unrelated orchestration) can be
+    /// spawned onto the same `pane_id_env`, and an unguarded write would submit
+    /// this orchestration's idle text into that stranger's session, where it
+    /// may be acted on with tools. Delivery therefore goes through
+    /// [`AgentPtyRegistry::write_and_submit_guarded`] with this id as the
+    /// expected target, so a rebind yields `WrongSession` and zero bytes.
+    pub orchestrator_agent_id: String,
+    /// Orchestration name the delegate belonged to, when known. Re-checked at
+    /// delivery time against the orchestrator pane's live registry membership
+    /// (see [`AgentPtyRegistry::pane_orchestration_name`]) so a pane that has
+    /// been re-homed into a *different* orchestration is refused as well.
+    pub orchestration: Option<String>,
     /// When the delegation was armed, for the elapsed-time wording.
     pub armed_at: Instant,
+    /// PRD #126 M1 review (finding 6): how many OLDER delegations to this same
+    /// worker pane were superseded without ever reporting `work-done`. The
+    /// orchestrator protocol forbids re-delegating before a worker reports, so
+    /// this is normally 0; when it is not, a late `work-done` from delegation
+    /// #1 retires one superseded delegation (decrementing this) instead of
+    /// clobbering delegation #2's still-live record — which used to leave the
+    /// newest delegation silent forever with no nudge.
+    superseded: u32,
+    /// PRD #126 M1 review (finding 2) / audit (finding 3): the live end of the
+    /// watch task's cancellation channel. Never *sent* on — the watch task
+    /// selects on it and exits as soon as it resolves, which happens when this
+    /// record is dropped out of the map (work-done, supersede, pane close, or
+    /// the timer's own take). That turns every cancellation into an immediate
+    /// task teardown instead of leaving an `Arc<AgentPtyRegistry>` and its
+    /// owned strings sleeping out the full (default two-hour) timeout.
+    _watch_cancel: oneshot::Sender<()>,
+}
+
+/// PRD #126: handed back by [`AgentPtyRegistry::arm_outstanding_delegation`] to
+/// the caller that spawns the watch task: the record's generation (proof of
+/// ownership for the seq-conditional take) and the cancellation channel the
+/// task must select on alongside its sleep.
+#[derive(Debug)]
+pub struct ArmedDelegation {
+    pub seq: u64,
+    pub cancel: oneshot::Receiver<()>,
+}
+
+/// PRD #126: what a `work-done` did to a worker pane's outstanding delegation.
+/// See [`AgentPtyRegistry::retire_outstanding_delegation`].
+#[derive(Debug)]
+pub enum DelegationRetirement {
+    /// Nothing was outstanding for that pane (the common case: no delegation,
+    /// or one already resolved).
+    Nothing,
+    /// The pane's only outstanding delegation was retired; dropping the
+    /// returned record cancels its watch.
+    Retired(OutstandingDelegation),
+    /// A *superseded* (older) delegation was retired. The newest record and its
+    /// watch stay armed — see `OutstandingDelegation::superseded`.
+    RetiredSuperseded {
+        role: String,
+        /// Generation of the record left armed.
+        seq: u64,
+        /// Superseded delegations still unaccounted for after this one.
+        remaining: u32,
+    },
 }
 
 struct RegistryInner {
@@ -1536,34 +1623,67 @@ impl AgentPtyRegistry {
             shutting_down: AtomicBool::new(false),
             user_input_at: Mutex::new(HashMap::new()),
             delivery_ledger: Mutex::new(DeliveryLedger::default()),
-            outstanding_delegations: Mutex::new(HashMap::new()),
+            delegations: Mutex::new(DelegationTracker::default()),
             delegation_seq: AtomicU64::new(1),
         }
     }
 
     /// PRD #126: record that `role`'s worker pane has just been delegated to
-    /// and owes a `work-done`. Returns the record's generation, which the
-    /// caller hands to its watch task so the task can prove — at wake-up time
-    /// — that the record it is about to consume is still *its own* delegation
-    /// (see [`Self::take_outstanding_delegation_if`]). Overwrites any previous
-    /// record for the pane: the freshest delegation is the one that counts.
+    /// and owes a `work-done`. Returns the record's generation (proof of
+    /// ownership for the watch task's seq-conditional take) plus the
+    /// cancellation channel that task must select on — see
+    /// [`ArmedDelegation`] and [`Self::take_outstanding_delegation_if`].
+    ///
+    /// Returns `None` — arming REFUSED, no record, and the caller must not
+    /// spawn a watch — when either the worker pane or the orchestrator pane is
+    /// mid-close ([`Self::begin_pane_close`]). That is the arm-after-cancel
+    /// guard: a `StopAgent` spends up to `AGENT_TERMINATE_GRACE` terminating
+    /// the child, and a delegate landing inside that window must not leave
+    /// behind a record that the close has already swept past.
+    ///
+    /// Overwrites any previous record for the pane — the freshest delegation is
+    /// the one the timer watches — but carries the older one forward in
+    /// `OutstandingDelegation::superseded` rather than forgetting it, so a
+    /// late `work-done` retires the *oldest* outstanding delegation instead of
+    /// disarming the newest. Dropping the replaced record here also cancels its
+    /// watch task immediately.
     pub fn arm_outstanding_delegation(
         &self,
         worker_pane_id: &str,
         role: &str,
         orchestrator_pane_id: &str,
-    ) -> u64 {
+        orchestrator_agent_id: &str,
+        orchestration: Option<&str>,
+    ) -> Option<ArmedDelegation> {
+        let mut tracker = self.delegations.lock().unwrap();
+        if tracker.closing_panes.contains(worker_pane_id)
+            || tracker.closing_panes.contains(orchestrator_pane_id)
+        {
+            return None;
+        }
         let seq = self.delegation_seq.fetch_add(1, Ordering::SeqCst);
-        self.outstanding_delegations.lock().unwrap().insert(
+        let superseded = tracker
+            .records
+            .get(worker_pane_id)
+            .map_or(0, |prev| prev.superseded.saturating_add(1));
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        tracker.records.insert(
             worker_pane_id.to_string(),
             OutstandingDelegation {
                 seq,
                 role: role.to_string(),
                 orchestrator_pane_id: orchestrator_pane_id.to_string(),
+                orchestrator_agent_id: orchestrator_agent_id.to_string(),
+                orchestration: orchestration.map(str::to_string),
                 armed_at: Instant::now(),
+                superseded,
+                _watch_cancel: cancel_tx,
             },
         );
-        seq
+        Some(ArmedDelegation {
+            seq,
+            cancel: cancel_rx,
+        })
     }
 
     /// PRD #126: atomically take the outstanding delegation for
@@ -1584,27 +1704,154 @@ impl AgentPtyRegistry {
         worker_pane_id: &str,
         seq: u64,
     ) -> Option<OutstandingDelegation> {
-        let mut map = self.outstanding_delegations.lock().unwrap();
-        if map.get(worker_pane_id).is_some_and(|d| d.seq == seq) {
-            map.remove(worker_pane_id)
+        let mut tracker = self.delegations.lock().unwrap();
+        if tracker
+            .records
+            .get(worker_pane_id)
+            .is_some_and(|d| d.seq == seq)
+        {
+            tracker.records.remove(worker_pane_id)
         } else {
             None
         }
     }
 
-    /// PRD #126: unconditionally drop the outstanding delegation for
-    /// `worker_pane_id` — the delegation was resolved (`work-done`) or the
-    /// worker pane went away (`StopAgent`), so no idle prompt is warranted for
-    /// any generation. Returns the dropped record (for logging) or `None` when
-    /// there was nothing outstanding, which is the common case.
-    pub fn cancel_outstanding_delegation(
-        &self,
-        worker_pane_id: &str,
-    ) -> Option<OutstandingDelegation> {
-        self.outstanding_delegations
+    /// PRD #126: a `work-done` arrived from `worker_pane_id`, so one outstanding
+    /// delegation is resolved and owes no idle prompt.
+    ///
+    /// PRD #126 M1 review (finding 6): "one" is deliberate. `WorkDoneSignal`
+    /// carries no delegation generation, so the daemon cannot tell *which*
+    /// delegation a completion belongs to. It used to remove the record
+    /// outright, which meant a late `work-done` from a superseded delegation
+    /// disarmed the newest one and the second task could then go silent forever
+    /// — the exact failure the detector exists to prevent. Now completions are
+    /// applied oldest-first: while superseded delegations remain unaccounted
+    /// for, a `work-done` retires one of THEM and the newest record (with its
+    /// armed watch) survives.
+    ///
+    /// Remaining hole, deliberately accepted: with no generation on the wire,
+    /// an OUT-OF-ORDER completion (the newest task reports while an older one
+    /// never does) is still credited to the older delegation, so the newest
+    /// record stays armed and produces one idle prompt for work that is
+    /// actually done. That failure direction is a discardable, self-describing
+    /// nudge — strictly safer than silence — and it only occurs in a state the
+    /// orchestrator protocol already forbids (re-delegating before the worker
+    /// reports).
+    pub fn retire_outstanding_delegation(&self, worker_pane_id: &str) -> DelegationRetirement {
+        let mut tracker = self.delegations.lock().unwrap();
+        let Some(record) = tracker.records.get_mut(worker_pane_id) else {
+            return DelegationRetirement::Nothing;
+        };
+        if record.superseded > 0 {
+            record.superseded -= 1;
+            return DelegationRetirement::RetiredSuperseded {
+                role: record.role.clone(),
+                seq: record.seq,
+                remaining: record.superseded,
+            };
+        }
+        DelegationRetirement::Retired(
+            tracker
+                .records
+                .remove(worker_pane_id)
+                .expect("record present under the same lock"),
+        )
+    }
+
+    /// PRD #126 M1 review (finding 1) / audit (finding 2): begin a race-safe
+    /// pane close. Atomically marks `pane_id` as closing and drops every
+    /// outstanding delegation that touches it — as the *worker* (keyed by the
+    /// pane) **and** as the *orchestrator* (records pointing their idle prompt
+    /// at it). Returns the dropped records for logging; dropping them cancels
+    /// their watch tasks.
+    ///
+    /// Called BEFORE child termination, which matters because `close_agent`
+    /// removes the registry entry and may then spend up to
+    /// `AGENT_TERMINATE_GRACE` in the SIGTERM grace loop: a timer firing in
+    /// that window used to inject the very nudge a deliberate close exists to
+    /// suppress. While the mark is set, [`Self::arm_outstanding_delegation`]
+    /// refuses, so a concurrent delegate cannot re-arm behind the sweep.
+    ///
+    /// The old cancellation was also keyed by worker pane ONLY, so closing the
+    /// ORCHESTRATOR left every worker's timer armed pointing at a pane id that a
+    /// later, unrelated agent could inherit — hence the sweep over both roles.
+    pub fn begin_pane_close(&self, pane_id: &str) -> Vec<OutstandingDelegation> {
+        let mut tracker = self.delegations.lock().unwrap();
+        tracker.closing_panes.insert(pane_id.to_string());
+        Self::drain_delegations_touching(&mut tracker, pane_id)
+    }
+
+    /// PRD #126: finish the close transition opened by
+    /// [`Self::begin_pane_close`]. Performs one final sweep (belt-and-braces
+    /// against anything armed in the window) and then clears the closing mark.
+    ///
+    /// `closed` distinguishes the outcomes but the rollback is deliberately
+    /// asymmetric: on a FAILED close the pane is un-marked so the still-live
+    /// agent can be delegated to again, but the records swept at `begin` are
+    /// **not** restored. Losing a watch fails safe (no idle prompt for a worker
+    /// whose pane we just tried to kill); resurrecting one could nag about a
+    /// delegation whose pane the user explicitly asked to close.
+    pub fn finish_pane_close(&self, pane_id: &str, closed: bool) -> Vec<OutstandingDelegation> {
+        let mut tracker = self.delegations.lock().unwrap();
+        let swept = Self::drain_delegations_touching(&mut tracker, pane_id);
+        if !closed {
+            tracing::debug!(
+                pane_id = %pane_id,
+                "pane close failed; clearing the closing mark without restoring dropped delegations"
+            );
+        }
+        tracker.closing_panes.remove(pane_id);
+        swept
+    }
+
+    /// PRD #126: whether `pane_id` is between [`Self::begin_pane_close`] and
+    /// [`Self::finish_pane_close`]. The idle watch re-checks this immediately
+    /// before writing (inside the guarded-send revalidation) so a close that
+    /// started after the record was taken still suppresses the prompt.
+    pub fn is_pane_closing(&self, pane_id: &str) -> bool {
+        self.delegations
             .lock()
             .unwrap()
-            .remove(worker_pane_id)
+            .closing_panes
+            .contains(pane_id)
+    }
+
+    /// Remove every record that names `pane_id` as its worker key or as its
+    /// orchestrator target. Caller holds the tracker lock.
+    fn drain_delegations_touching(
+        tracker: &mut DelegationTracker,
+        pane_id: &str,
+    ) -> Vec<OutstandingDelegation> {
+        let keys: Vec<String> = tracker
+            .records
+            .iter()
+            .filter(|(worker_pane, record)| {
+                worker_pane.as_str() == pane_id || record.orchestrator_pane_id == pane_id
+            })
+            .map(|(worker_pane, _)| worker_pane.clone())
+            .collect();
+        keys.iter()
+            .filter_map(|key| tracker.records.remove(key))
+            .collect()
+    }
+
+    /// PRD #126 M1 audit (finding 2): the orchestration name the live agent on
+    /// `pane_id` belongs to, per its registry `tab_membership`. `None` when no
+    /// live agent owns the pane, or when it carries no orchestration membership
+    /// (a dashboard/mode pane, or a pane spawned without membership metadata).
+    /// The idle watch uses it to refuse delivery into a pane that has since been
+    /// re-homed into a *different* orchestration; because `None` is legitimate,
+    /// only a positive mismatch refuses.
+    pub fn pane_orchestration_name(&self, pane_id: &str) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .agents
+            .values()
+            .find(|a| a.pane_id_env.as_deref() == Some(pane_id) && !a.exited.load(Ordering::SeqCst))
+            .and_then(|a| match a.tab_membership.as_ref() {
+                Some(TabMembership::Orchestration { name, .. }) => Some(name.clone()),
+                _ => None,
+            })
     }
 
     /// PRD #127 M2.2: record that a user keystroke just reached the pane with
@@ -2533,7 +2780,7 @@ impl AgentPtyRegistry {
     /// them onto the new agent's bus.
     ///
     /// The blocking termination work (up to
-    /// [`AGENT_TERMINATE_GRACE`] of `try_wait` polling, mirroring
+    /// `AGENT_TERMINATE_GRACE` of `try_wait` polling, mirroring
     /// `close_agent`'s contract) runs on a `spawn_blocking` pool task
     /// so the daemon's async runtime threads stay responsive. Mirrors
     /// the pattern `daemon_protocol.rs::handle_close_agent` uses for
@@ -5344,5 +5591,126 @@ mod spawn_tests {
             ledger.order.iter().cloned().collect::<Vec<_>>(),
             vec!["b".to_string(), "a".to_string()]
         );
+    }
+
+    /// PRD #126 M1 audit (finding 2): closing the ORCHESTRATOR must cancel the
+    /// workers' watches. Records are keyed by worker pane, so the old
+    /// pane-keyed cancellation left them armed against a pane id that a later,
+    /// unrelated agent could inherit.
+    #[test]
+    fn begin_pane_close_cancels_records_targeting_the_closing_orchestrator() {
+        let reg = AgentPtyRegistry::new();
+        let a = reg
+            .arm_outstanding_delegation("worker-a", "coder", "orch-1", "agent-7", Some("orch"))
+            .expect("arm worker-a");
+        let b = reg
+            .arm_outstanding_delegation("worker-b", "tester", "orch-1", "agent-7", Some("orch"))
+            .expect("arm worker-b");
+        let other = reg
+            .arm_outstanding_delegation("worker-c", "coder", "orch-2", "agent-9", Some("other"))
+            .expect("arm worker-c");
+
+        let (mut a_cancel, mut b_cancel) = (a.cancel, b.cancel);
+        let dropped = reg.begin_pane_close("orch-1");
+        assert_eq!(dropped.len(), 2, "both of orch-1's workers must be dropped");
+        // The returned records are for the caller's logging; releasing them is
+        // what resolves the watch channels, so both tasks exit immediately
+        // instead of sleeping out the timeout (finding 3). Every call site drops
+        // them within the same statement/block.
+        drop(dropped);
+        for cancel in [&mut a_cancel, &mut b_cancel] {
+            assert!(
+                matches!(cancel.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
+                "a dropped record must resolve its watch's cancellation channel"
+            );
+        }
+        assert!(
+            reg.take_outstanding_delegation_if("worker-c", other.seq)
+                .is_some(),
+            "an unrelated orchestration's record must survive the close"
+        );
+
+        // Arming is refused while the pane is mid-close, as worker or as
+        // orchestrator — that is the arm-after-cancel guard.
+        assert!(reg.is_pane_closing("orch-1"));
+        assert!(
+            reg.arm_outstanding_delegation("worker-a", "coder", "orch-1", "agent-7", None)
+                .is_none(),
+            "a delegate landing inside the close window must not arm"
+        );
+        assert!(
+            reg.arm_outstanding_delegation("orch-1", "coder", "orch-2", "agent-9", None)
+                .is_none(),
+            "the closing pane must also be refused as a worker target"
+        );
+
+        reg.finish_pane_close("orch-1", true);
+        assert!(!reg.is_pane_closing("orch-1"));
+        assert!(
+            reg.arm_outstanding_delegation("worker-a", "coder", "orch-1", "agent-7", None)
+                .is_some(),
+            "after the transition completes, arming works again"
+        );
+    }
+
+    /// PRD #126 M1 review (finding 6): a late `work-done` from a superseded
+    /// delegation must retire THAT delegation, leaving the newest record (and
+    /// its watch) armed — it used to clobber the newest record, after which the
+    /// re-delegated worker could go silent forever with no nudge.
+    #[test]
+    fn retire_applies_work_done_to_the_oldest_outstanding_delegation() {
+        let reg = AgentPtyRegistry::new();
+        let first = reg
+            .arm_outstanding_delegation("worker", "coder", "orch", "agent-1", None)
+            .expect("arm #1");
+        let second = reg
+            .arm_outstanding_delegation("worker", "coder", "orch", "agent-1", None)
+            .expect("arm #2");
+        assert!(second.seq > first.seq, "seq must be monotonic");
+
+        // Delegation #1's late completion retires the superseded delegation.
+        match reg.retire_outstanding_delegation("worker") {
+            DelegationRetirement::RetiredSuperseded { remaining, seq, .. } => {
+                assert_eq!(remaining, 0);
+                assert_eq!(seq, second.seq, "the newest record stays armed");
+            }
+            other => panic!("expected a superseded retirement, got {other:?}"),
+        }
+        // #2's watch is still live and still owns the record.
+        let taken = reg
+            .take_outstanding_delegation_if("worker", second.seq)
+            .expect("delegation #2 must still be outstanding");
+        assert_eq!(taken.seq, second.seq);
+        assert!(matches!(
+            reg.retire_outstanding_delegation("worker"),
+            DelegationRetirement::Nothing
+        ));
+    }
+
+    /// PRD #126 M1 review (finding 2) / audit (finding 3): removing a record
+    /// must WAKE its watch task, not just unlink it, or every superseded or
+    /// completed delegation leaves a task asleep for the full timeout.
+    #[test]
+    fn dropping_a_record_resolves_its_watch_cancellation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        rt.block_on(async {
+            let reg = AgentPtyRegistry::new();
+            let armed = reg
+                .arm_outstanding_delegation("worker", "coder", "orch", "agent-1", None)
+                .expect("arm");
+            match reg.retire_outstanding_delegation("worker") {
+                DelegationRetirement::Retired(_) => {}
+                other => panic!("expected a plain retirement, got {other:?}"),
+            }
+            // The sender was dropped with the record, so the watch's select arm
+            // is already resolved — no sleep, no wait.
+            assert!(
+                armed.cancel.await.is_err(),
+                "a dropped record must resolve the cancellation channel"
+            );
+        });
     }
 }

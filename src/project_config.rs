@@ -30,6 +30,22 @@ pub struct ProjectConfig {
     /// config means the [`DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES`] default,
     /// so existing configs keep working untouched.
     ///
+    /// **Accepted values** (PRD #126 M1 audit finding 4 — must flow into the
+    /// M3.1 docs page):
+    ///
+    /// * `0` — **detector disabled**. No idle watch is armed for this
+    ///   orchestration's delegations, so a silent worker is never reported and
+    ///   no timer is created. `0` does NOT mean "report immediately": that
+    ///   raced the worker's own dispatch and reported every worker as stuck
+    ///   before it had a chance to answer.
+    /// * `1` ..=
+    ///   [`MAX_WORKER_RESPONSE_TIMEOUT_MINUTES`](crate::state::MAX_WORKER_RESPONSE_TIMEOUT_MINUTES)
+    ///   (7 days) — honored as written.
+    /// * anything larger — rejected with a warning; the daemon falls back to
+    ///   [`DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES`]. Such a value is
+    ///   indistinguishable from "disabled" while still costing a live watch
+    ///   task, so it is treated as a misconfiguration rather than honored.
+    ///
     /// ⚠️ TOML placement: this is a **top-level scalar**, so it must appear
     /// *before* the first table header (`[[modes]]` / `[[orchestrations]]`).
     /// Appended at the end of the file it would silently become a key of the

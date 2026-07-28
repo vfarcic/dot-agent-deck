@@ -1352,6 +1352,29 @@ async fn handle_connection(
             let dispatched_worktree = stopping_record
                 .as_ref()
                 .and_then(crate::issue_dispatch_run::worktree_of_record);
+            // PRD #126 M1 review (finding 1) / audit (finding 2): open the
+            // race-safe close transition BEFORE terminating the child. This
+            // atomically marks the pane closing and drops every outstanding
+            // delegation that touches it — as the worker AND as the
+            // orchestrator. Three defects close here: the old cancellation ran
+            // only AFTER `close_agent`, so a timer firing during the up-to-3s
+            // SIGTERM grace window injected the very nudge a deliberate close
+            // exists to suppress; it was keyed by worker pane only, so closing
+            // an ORCHESTRATOR left every worker's timer armed against a pane id
+            // a later, unrelated agent could inherit; and it left a window in
+            // which a concurrent `handle_delegate` (holding only the state read
+            // guard) could arm after the cancellation, leaving a record nothing
+            // would remove. Arming is refused while the mark is set.
+            if let Some(pane_id) = pane_id_env.as_deref() {
+                let dropped = registry.begin_pane_close(pane_id);
+                if !dropped.is_empty() {
+                    tracing::debug!(
+                        pane_id = %pane_id,
+                        dropped = dropped.len(),
+                        "StopAgent: dropped outstanding delegations touching the closing pane"
+                    );
+                }
+            }
             // PRD #92 F8 followup (auditor #1): `close_agent` runs the
             // synchronous SIGTERM-with-grace loop in
             // `terminate_child_with_grace_and_wait`, which calls
@@ -1383,13 +1406,17 @@ async fn handle_connection(
             };
             match close_outcome {
                 Ok(()) => {
-                    if let Some(pane_id) = pane_id_env {
+                    if let Some(pane_id) = pane_id_env.as_deref() {
                         // PRD #126: a deliberately closed worker owes nothing.
                         // Without this, closing a stuck worker would still
                         // nag the orchestrator when its timeout expired hours
                         // later, pointing at a pane that no longer exists.
-                        registry.cancel_outstanding_delegation(&pane_id);
-                        state.write().await.unregister_pane(&pane_id);
+                        // Order matters: take the state write guard and
+                        // unregister the pane first, then sweep once more and
+                        // only then clear the closing mark, so no interleaving
+                        // leaves a record behind.
+                        state.write().await.unregister_pane(pane_id);
+                        registry.finish_pane_close(pane_id, true);
                     }
                     // PRD #120 M2.4 + S1: if this agent was dispatched into a
                     // per-issue worktree, the tab close is its cleanup trigger.
@@ -1414,7 +1441,18 @@ async fn handle_connection(
                     }
                     write_resp(&mut stream, &AttachResponse::ok()).await?
                 }
-                Err(msg) => write_resp(&mut stream, &AttachResponse::err(msg)).await?,
+                Err(msg) => {
+                    // PRD #126: the close failed, so the agent is still live.
+                    // Roll the transition back by clearing the closing mark —
+                    // future delegates to this pane can arm again. The records
+                    // swept at `begin` are deliberately NOT restored: losing a
+                    // watch fails safe, resurrecting one could nag about a pane
+                    // the user explicitly asked to close.
+                    if let Some(pane_id) = pane_id_env.as_deref() {
+                        registry.finish_pane_close(pane_id, false);
+                    }
+                    write_resp(&mut stream, &AttachResponse::err(msg)).await?
+                }
             }
         }
         AttachRequest::SetAgentLabel {
