@@ -1,6 +1,6 @@
 # PRD #225: Reliable prompt delivery to Wrapper-strategy agents on respawn
 
-**Status**: Not started
+**Status**: In progress — M1–M5 and M7 complete; M6 (rule-12 cross-version run) outstanding
 **Priority**: High
 **Created**: 2026-07-26
 **GitHub Issue**: [#225](https://github.com/vfarcic/dot-agent-deck/issues/225)
@@ -30,6 +30,8 @@ Measured on the live system, for the PRD-140 tester pane (pane 21, agent 63):
 The prompt lands in a PTY where only `devbox` is running. The line discipline (canonical mode, echo on) **echoes the text back**, which is why the operator reports "I saw it receive the prompt". Codex then boots, enters the alternate screen and clears it — which is what reads as "it restarted right after". There is no second restart; the real one happened earlier and was invisible because the pane still displayed the dead agent's frozen screen.
 
 Codex's *native* `SessionStart` — the one that genuinely means the session is up — arrives seconds later and is ignored, because the gate already returned.
+
+> **Correction (2026-07-28).** The second half of that sentence is wrong for codex-cli 0.145.0, and it was only caught by running a real agent. Codex's native `SessionStart` does **not** arrive "seconds later" on its own — it is posted when the first *turn* starts, i.e. **after a prompt is submitted**. It is therefore a *consequence* of the injected prompt, never a precondition for it. The diagnosis of the defect stands; the assumed shape of the fix does not. See the 2026-07-28 work-log entry.
 
 Only Codex is affected today: it is the only shipped Wrapper-strategy agent, so it is the only agent with a synthetic fork-time `SessionStart` racing a real one. Claude and OpenCode are unaffected because their only `SessionStart` comes from an initialized session.
 
@@ -96,13 +98,13 @@ The second is probably cleaner but touches every reader of `RunningAgent.agent_t
 
 ## Milestones
 
-- [ ] **M1 — Failing tests pin both defects.** A test that asserts the delegate prompt reaches a wrapped agent only after it is genuinely ready, and a test that asserts the exec line is identical across a respawn for an undetected-type command. Both RED against current `main`.
-- [ ] **M2 — Wrap decision is stable across respawn.** A pane's launch shape is fixed at creation; `set_agent_type` affects the badge only. M1's second test goes GREEN.
-- [ ] **M3 — Readiness gate distinguishes card-surfacing from session-ready.** Conditional on the agent having native hooks, so pure-wrapper agents keep working. M1's first test goes GREEN.
-- [ ] **M4 — Scheduler call site and timeout reconciled.** `crate::spawn::spawn`'s use of the same gate is fixed or consciously exempted, and `SESSION_START_WAIT_TIMEOUT` is set from measured boot times rather than inherited from the Claude-era tuning.
-- [ ] **M5 — Real-agent e2e passes.** A cheap-model Codex worker under a `clear = true` role receives a delegate and demonstrably acts on it (sentinel file), in the pre-PR e2e tier per rule 5.
-- [ ] **M6 — Cross-version contract check clean.** Per rule 12: branch TUI against a previous-release daemon, delegate still routes and hooks still arrive. Classification (`PROTOCOL_VERSION` bump vs. `.breaking.md` fragment vs. neither) recorded in the PR.
-- [ ] **M7 — Docs and changelog.** `docs/develop/agent-adapters.md` documents the readiness contract a Wrapper-strategy adapter must satisfy — this is the trap the next adapter author would otherwise walk into. Changelog fragment added.
+- [x] **M1 — Failing tests pin both defects.** A test that asserts the delegate prompt reaches a wrapped agent only after it is genuinely ready, and a test that asserts the exec line is identical across a respawn for an undetected-type command. Both RED against current `main`. — `orchestration/delegate/007` + `codex/spawn/007` (`a361231`); RED-before-green proven by reverting only `src/` to `8fb7bda`. `orchestration/delegate/008` is a non-regression guard for the hookless path (it passed pre-fix too).
+- [x] **M2 — Wrap decision is stable across respawn.** A pane's launch shape is fixed at creation; `set_agent_type` affects the badge only. M1's second test goes GREEN. — split-field approach in `a361231`: `RunningAgent::spawn_agent_type` drives the launch, `agent_type` is the display badge. Refined by the 2026-07-27 respawn rule (`7c048fe`, `codex/spawn/008`).
+- [x] **M3 — Readiness gate distinguishes card-surfacing from session-ready.** Conditional on the agent having native hooks, so pure-wrapper agents keep working. M1's first test goes GREEN. — `a361231`; discriminator is `hook_install.is_some()` (Open Question 2 resolved). **Caveat:** for Codex the gate never actually fast-paths — see the 2026-07-28 work-log entry.
+- [x] **M4 — Scheduler call site and timeout reconciled.** `crate::spawn::spawn`'s use of the same gate is fixed or consciously exempted, and `SESSION_START_WAIT_TIMEOUT` is set from measured boot times rather than inherited from the Claude-era tuning. — fixed consistently (not exempted) in `a361231`; timeout 10s → 30s; `DOT_AGENT_DECK_SESSION_START_WAIT_MS` clamped to `[100 ms, 30 s]` with `warn!` (`7c048fe`).
+- [x] **M5 — Real-agent e2e passes.** A cheap-model Codex worker under a `clear = true` role receives a delegate and demonstrably acts on it (sentinel file), in the pre-PR e2e tier per rule 5. — `orchestration/delegate/009` (`256c833`, precondition fixed in `f8faee6`): PASS 43.8s isolated / 45.0s in-suite on `gpt-5-nano`, sentinel `prd225-codex-delegate-6f21ba.txt` = `PRD225_DELEGATE_OK`, cast recorded, ` [reel]` marker intact.
+- [ ] **M6 — Cross-version contract check clean.** Per rule 12: branch TUI against a previous-release daemon, delegate still routes and hooks still arrive. Classification (`PROTOCOL_VERSION` bump vs. `.breaking.md` fragment vs. neither) recorded in the PR. — IN PROGRESS. Classification decided (additive marker → neither); the run itself is the outstanding evidence the reviewer flagged.
+- [x] **M7 — Docs and changelog.** `docs/develop/agent-adapters.md` documents the readiness contract a Wrapper-strategy adapter must satisfy — this is the trap the next adapter author would otherwise walk into. Changelog fragment added. — `256c833` + `91be871` (readiness contract, "The launch-shape invariant", the API-key/model-override note, and the measured Codex readiness finding); `changelog.d/225.bugfix.md`.
 
 ## Success Criteria
 
@@ -120,8 +122,8 @@ The second is probably cleaner but touches every reader of `RunningAgent.agent_t
 ## Open Questions
 
 1. **Should Codex be wrapped at all when launched via a script?** It is a hybrid whose events come from native hooks, and unwrapped Codex panes work today. If the answer is "no", Defect 2's fix largely subsumes Defect 1 for Codex — but Defect 1 still has to be fixed for `command = "codex"` and for Gemini. Worth settling before M3.
-2. **Is `hook_install.is_some()` the right discriminator** for "this agent will emit a real `SessionStart`", or does that need to be an explicit field on `AgentSpec`? An explicit field is more honest about intent and survives an agent that installs hooks for other reasons.
-3. **Does the scheduler path want the same semantics?** A scheduled card's prompt has the same delivery problem, but the failure mode and acceptable latency may differ from an interactive delegate.
+2. ~~**Is `hook_install.is_some()` the right discriminator**~~ — **RESOLVED (M3)**: yes, confirmed against `src/agent_registry.rs` (Codex `Some` via `codex_install`, Pi `None`), so no new `AgentSpec` field was added. Both halves of the condition were proven load-bearing by test. *Caveat from the 2026-07-28 finding*: the discriminator correctly identifies "this agent has native hooks", but for Codex those hooks do not emit a pre-prompt `SessionStart`, so the predicate it stands in for — "this agent will emit a real `SessionStart` before it needs a prompt" — is **not** what `hook_install.is_some()` actually tests. An explicit `AgentSpec` field for pre-prompt readiness would be the honest fix, and is part of the follow-up.
+3. ~~**Does the scheduler path want the same semantics?**~~ — **RESOLVED (M4)**: yes, fixed consistently rather than exempted. A scheduled card's prompt takes the identical `write_to_pane_and_submit` keystroke path into the identical PTY, so a non-interactive fork-time event is no more usable there than in a delegate. Rationale documented in the `wait_for_session_start` doc comment.
 
 ## Work Log
 
@@ -142,3 +144,29 @@ Adopted rule: **a respawn's wrap decision is derived from the command actually b
 `spawn`'s own precedence is unchanged (an explicit caller identity still wins over the command — PRD #20 finding #19), because at creation there is no second source of truth to disagree with. Residual, documented limit: a command that implies nothing AND whose underlying agent changed (`devbox run codex-big` → `devbox run claude-big`) keeps its creation-time identity; that pane has to be recreated. Pinned by `codex/spawn/008` (both an unchanged and an edited role command, plus the badge following the newly launched command), documented at the seam in `src/agent_pty.rs` and in `docs/develop/agent-adapters.md` ("The launch-shape invariant").
 
 Same review pass bounded `DOT_AGENT_DECK_SESSION_START_WAIT_MS` to `[100 ms, SESSION_START_WAIT_TIMEOUT]` with a `warn!` on clamp: `=0` reintroduced exactly the prompt loss this PRD fixes (the gate stops waiting), and an unbounded value hangs delivery silently. The e2e harness's 5000 ms pin is inside the range.
+
+### 2026-07-28 — The real-agent test invalidates the PRD's readiness premise (M5)
+
+Getting the real-agent e2e to actually *run* took two steps, and the second one produced the most important finding in this PRD.
+
+**Step 1 — the test was never executing.** `orchestration/delegate/009` reported libtest `ok` while silently skipping: this host's `~/.codex/auth.json` is an **API key**, and the entire `codex-*` family is subscription-only for such a key (`gpt-5.1-codex-mini` and `gpt-5.1-codex` both return `404 Model not found`). `check_codex_available()` probed, failed, and `skip_unless!` bailed — so the PRD's own required coverage, plus `codex/hooks/001`, `codex/worker/001`, and `codex/live/001`, had *never* run here. Fixed in `91be871` by making the model overridable via `DOT_AGENT_DECK_CODEX_TEST_MODEL` (compiled-in default deliberately unchanged for subscription-auth environments), with `check_codex_available()` probing the same resolved model so the gate and the launch cannot diverge. Probe results: `gpt-5.4-nano` → 400 (`tool_search` unsupported), **`gpt-5-nano` → OK (chosen, cheapest)**, `gpt-5-mini` → OK (fallback).
+
+**Step 2 — the finding.** With the test running, it deadlocked, and the reason invalidates the premise quoted in the Problem Statement. codex-cli 0.145.0 posts its native `SessionStart` when the **first turn starts** — after a prompt is submitted — not when the TUI is ready. Measured on a live delegate:
+
+| time | event |
+|---|---|
+| T+0.000s | `SessionStart` `origin=wrapper_fork` (respawn; the fork-time card event) |
+| T+29.999s | `SessionStart` `origin=-` (native — i.e. exactly the 30 s `SESSION_START_WAIT_TIMEOUT` fallback) |
+| T+30.004s | `Thinking` `user_prompt=Y` (the injected prompt's own `UserPromptSubmit`, 5 ms later) |
+
+So **M3's gate can never fast-path for Codex**: the signal it waits for is caused by the very prompt it is gating. Every `clear = true` Codex delegate pays the full 30 s timeout and *then* injects.
+
+**The defect is nonetheless fixed, and that is verified with a real agent**, which is the point of the rule-4 bar. After the fallback the prompt lands in a fully-booted live Codex TUI rather than in `devbox`'s line discipline, and the worker acts on it: sentinel `prd225-codex-delegate-6f21ba.txt` = `PRD225_DELEGATE_OK`, created ~36 s after the trigger. Claude/OpenCode/Pi are unaffected (their `SessionStart` is genuinely pre-prompt); a hookless wrapper agent still releases immediately (`orchestration/delegate/008`).
+
+**What it costs.** The risk this PRD itself flagged — *"the timeout fallback is load-bearing and untested"* — is now **always** in play for Codex rather than an edge case: every Codex delegate is 30 s slower, and a Codex that ever boots slower than 30 s loses its prompt again. M3 did not deliver a fast readiness signal for Codex; it deferred to the timeout every time.
+
+**Decision — Option 1 (ship scoped, follow up).** The user-visible defect is fixed and real-agent-verified, so #225 ships as scoped: the test's circular precondition is corrected and the latency limitation documented. The proper fix — a **wrapper-side "TUI ready" signal** emitted by `src/wrap.rs` once the child TUI initializes, which would remove both the 30 s latency and the load-bearing timeout — is deliberately *not* bolted on here; it deserves to be a separately-designed and separately-tested feature, and is filed as a follow-up. Rejected alternative (Option 2): expanding #225 to add that signal now, which pushes well past the stated scope.
+
+**Test correction (`f8faee6`).** `delegate_009`'s pre-delegate wait for a native `SessionStart` was replaced with the `codex/live/001` pattern — focus the worker pane and wait for the real Codex TUI header naming the resolved model, a signal that exists *before* any prompt. Every post-delegate assertion was kept and one was **strengthened**: the old "`Thinking` appears in the stream" check proved nothing, because `classify_codex_line` maps *any* non-blank Codex TUI line to `Thinking`, so the worker's own boot output already satisfied it with no delegate ever fired. The new hard assertion requires a `Thinking` whose `user_prompt` contains `worker-task-coder.md` — and only Codex's native `UserPromptSubmit` hook populates `user_prompt` (the wrapper always emits `None`), so it genuinely proves the pointer was submitted *inside* the agent rather than echoed away by the launcher. Result: PASS 43.8 s isolated, 45.0 s in-suite, cast recorded, ` [reel]` marker intact.
+
+**E2E gate.** `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5-nano DOT_AGENT_DECK_RECORD=1 cargo test-e2e` → 2016 tests, 2013 passed, **0 skipped** (the override means the Codex family genuinely runs on this host for the first time; `codex/worker/001` produced its first-ever real result, green). Three non-passes, all triaged and none a regression: `restore_014` fails identically on clean `main` @ `b68fb80` (brittle assertion — the `OpenCode - ` badge truncates `restored-opencode`, so `contains()` fails though the rendered status is correct); `chain_smoke_pi_002` and `codex_worker_001` failed only at the tail of the suite under parallel real-LLM load and each passes in isolation (25.4 s / 17.1 s). Fast tier 1121/1121; `fmt`/`clippy --all-targets --features e2e` clean.
