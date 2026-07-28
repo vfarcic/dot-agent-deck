@@ -18,6 +18,10 @@
   },
   "permission": {
     "webfetch": "allow",
-    "websearch": "allow"
+    "websearch": "allow",
+    "external_directory": {
+      "/home/vfarcic/.cargo/**": "allow",
+      "/home/vfarcic/.rustup/toolchains/**": "allow"
+    }
   }
 }
