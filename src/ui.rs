@@ -20368,12 +20368,12 @@ mod tests {
     /// still holding a registration for the PTY the probe just closed.
     ///
     /// [`keyevent_ctrl_c0_matches_crossterm_decoder`] therefore refuses to run
-    /// unless it owns the process (its `NEXTEST` guard). Under
-    /// process-per-test there is no competing consumer, so the deadline really
-    /// does bound `decode`, and the stale cached reader is harmless because the
-    /// process exits moments later. That same guard is what makes the panic
-    /// safety of [`Self::new`] acceptable — read its note before reusing this
-    /// type anywhere else.
+    /// unless it owns the process (its `NEXTEST_EXECUTION_MODE=process-per-test`
+    /// guard). Under process-per-test there is no competing consumer, so the
+    /// deadline really does bound `decode`, and the stale cached reader is
+    /// harmless because the process exits moments later. That same guard is what
+    /// makes the panic safety of [`Self::new`] acceptable — read its note before
+    /// reusing this type anywhere else.
     #[cfg(unix)]
     struct CrosstermInputProbe {
         master: std::fs::File,
@@ -20595,28 +20595,41 @@ mod tests {
     /// probe asserts raw mode is active — matching the deck, which never runs
     /// the pane-input path outside raw mode.
     ///
-    /// Runs only under `cargo nextest` (`cargo test-fast`, the fast-tier gate)
-    /// because [`CrosstermInputProbe`] is sound only with the process to itself;
-    /// see the guard at the top of the body.
+    /// Runs only under a process-per-test runner — `cargo nextest`, i.e.
+    /// `cargo test-fast`, the fast-tier gate — because [`CrosstermInputProbe`]
+    /// is sound only with the process to itself; see the guard at the top of the
+    /// body.
     #[cfg(unix)]
     #[test]
     fn keyevent_ctrl_c0_matches_crossterm_decoder() {
-        // Decision 26-style runtime skip. `NEXTEST` is set in every test process
-        // `cargo nextest` spawns, and nextest is process-per-test — which is the
-        // isolation [`CrosstermInputProbe`] documents as its precondition (fd 0
-        // surgery plus crossterm's process-global raw-mode flag and cached event
-        // reader). `cargo test-fast` is nextest, so the official fast-tier gate
-        // (CLAUDE.md rule 5) runs this test; a plain `cargo test` puts every unit
-        // test of the crate in ONE process, where a competing event consumer can
-        // turn `decode`'s bounded wait into an unbounded one, so there it skips
-        // rather than risking a hang.
-        if std::env::var_os("NEXTEST").is_none() {
+        // Decision 26-style runtime skip. The precondition
+        // [`CrosstermInputProbe`] documents is PROCESS ISOLATION, so the guard
+        // asserts that property directly instead of a proxy for it: nextest
+        // publishes its isolation model in `NEXTEST_EXECUTION_MODE`, and only the
+        // value `process-per-test` means "this process is yours". Every other
+        // reading skips — variable absent (a plain `cargo test` puts every unit
+        // test of the crate in ONE process), empty, renamed, or some future
+        // shared-process mode — because the guard has to fail safe: a sibling
+        // stdin/event consumer turns `decode`'s bounded wait into an unbounded one
+        // (a hang, not a failure), and a sibling toggling crossterm's
+        // process-global raw-mode flag makes phase 1's `0x0a` expectation WRONG
+        // rather than merely slow. A shared-process runner that still advertised
+        // itself as nextest would walk straight into both. `cargo test-fast` is
+        // nextest in process-per-test mode, so the official fast-tier gate
+        // (CLAUDE.md rule 5) runs this test.
+        let process_per_test = matches!(
+            std::env::var("NEXTEST_EXECUTION_MODE").as_deref(),
+            Ok("process-per-test")
+        );
+        if !process_per_test {
             eprintln!(
-                "SKIP: keyevent_ctrl_c0_matches_crossterm_decoder needs PROCESS ISOLATION \
-                 (it installs a PTY on fd 0 and drives crossterm's process-global raw-mode \
+                "SKIP: keyevent_ctrl_c0_matches_crossterm_decoder needs \
+                 NEXTEST_EXECUTION_MODE=process-per-test, i.e. PROCESS ISOLATION (it \
+                 installs a PTY on fd 0 and drives crossterm's process-global raw-mode \
                  flag and cached event reader). Run it under `cargo test-fast` / \
                  `cargo nextest run`, which is process-per-test; plain `cargo test` shares \
-                 one process across the whole crate and is skipped."
+                 one process across the whole crate, and any other execution mode is \
+                 skipped the same way."
             );
             return;
         }
