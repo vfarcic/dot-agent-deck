@@ -24,6 +24,27 @@ pub struct ProjectConfig {
     pub modes: Vec<ModeConfig>,
     #[serde(default)]
     pub orchestrations: Vec<OrchestrationConfig>,
+    /// PRD #126: how long the daemon waits for a delegated worker to send
+    /// `work-done` before injecting an idle prompt into the orchestrator's
+    /// pane (see [`crate::state::worker_response_timeout`]). Absent from a
+    /// config means the [`DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES`] default,
+    /// so existing configs keep working untouched.
+    ///
+    /// ⚠️ TOML placement: this is a **top-level scalar**, so it must appear
+    /// *before* the first table header (`[[modes]]` / `[[orchestrations]]`).
+    /// Appended at the end of the file it would silently become a key of the
+    /// last table and be ignored.
+    #[serde(default = "default_worker_response_timeout_minutes")]
+    pub worker_response_timeout_minutes: u64,
+}
+
+/// PRD #126: two hours — long enough that a worker chewing through a real
+/// task is never nagged, short enough that a genuinely stuck delegation
+/// surfaces within one working session.
+pub const DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES: u64 = 120;
+
+fn default_worker_response_timeout_minutes() -> u64 {
+    DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES
 }
 
 #[derive(Debug, Clone, Deserialize)]

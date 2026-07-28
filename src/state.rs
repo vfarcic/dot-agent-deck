@@ -11,7 +11,9 @@ use crate::event::{
     AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
     LiveTarget, OrchestrationSurface, WorkDoneSignal, Writable,
 };
-use crate::project_config::{OrchestrationRoleConfig, load_project_config};
+use crate::project_config::{
+    DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES, OrchestrationRoleConfig, load_project_config,
+};
 
 const MAX_RECENT_EVENTS: usize = 50;
 /// PRD #120 L1: cap on [`AppState::pending_orchestration_surfaces`]. The render
@@ -307,6 +309,153 @@ dot-agent-deck work-done --task \"Brief summary of what you accomplished. Includ
 /// lives in the task file instead of the injected pane prompt.
 pub fn compose_delegate_prompt(task_body: &str) -> String {
     task_body.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// PRD #126 test/e2e seam: overrides the resolved worker-response timeout with
+/// an integer number of **milliseconds**, so a test can make the idle detector
+/// fire in a second or two instead of two hours. Read at use time (never
+/// cached) and wins over the project config, mirroring the
+/// `resolve_features`/`seed_fallback_grace` env-over-file idiom. Milliseconds
+/// rather than minutes because the config knob's granularity is useless to a
+/// test: the smallest non-zero config value is already a whole minute.
+pub const DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS: &str =
+    "DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS";
+
+/// PRD #126: how long a delegated worker may stay silent before the daemon
+/// reports it to the orchestrator. Precedence, matching `resolve_features`:
+///
+/// 1. [`DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS`] (test/e2e seam, ms),
+/// 2. `worker_response_timeout_minutes` in the **orchestration** cwd's
+///    `.dot-agent-deck.toml`, falling back to the *worker's* cwd,
+/// 3. [`DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES`].
+///
+/// The orchestration cwd is preferred because that is where the
+/// `.dot-agent-deck.toml` *defining* the orchestration lives; PRD #120's
+/// issue-dispatch clones give worker panes their own divergent cwds. Reading
+/// the file per delegation (as `lookup_orchestration_role` already does) means
+/// an edited timeout takes effect on the next delegate without a respawn.
+pub fn worker_response_timeout(
+    orchestration_cwd: Option<&str>,
+    worker_cwd: Option<&str>,
+) -> std::time::Duration {
+    if let Some(ms) = std::env::var(DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return std::time::Duration::from_millis(ms);
+    }
+    let minutes = orchestration_cwd
+        .into_iter()
+        .chain(worker_cwd)
+        .find_map(|cwd| {
+            load_project_config(std::path::Path::new(cwd))
+                .ok()
+                .flatten()
+                .map(|cfg| cfg.worker_response_timeout_minutes)
+        })
+        .unwrap_or(DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES);
+    std::time::Duration::from_secs(minutes.saturating_mul(60))
+}
+
+/// PRD #126: render an elapsed span the way a human would say it, for the idle
+/// prompt's "was delegated N ago" clause. Deliberately coarse — the point is
+/// "this has been a while", not stopwatch precision — and always ASCII so the
+/// wording never depends on terminal font coverage.
+fn format_idle_elapsed(elapsed: std::time::Duration) -> String {
+    fn plural(n: u64, unit: &str) -> String {
+        format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+    }
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        return plural(seconds, "second");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return plural(minutes, "minute");
+    }
+    let (hours, remainder) = (minutes / 60, minutes % 60);
+    if remainder == 0 {
+        plural(hours, "hour")
+    } else {
+        format!("{}h {remainder}m", hours)
+    }
+}
+
+/// PRD #126: the single-line prompt the daemon submits into the orchestrator's
+/// pane when a delegated worker has gone quiet past its timeout.
+///
+/// Two hard constraints:
+///
+/// * **One line.** A multi-line payload is written as bracketed paste and never
+///   auto-submits (#187), so it would sit in the agent's input box forever.
+///   Routing through [`compose_delegate_prompt`] collapses whitespace, making
+///   the invariant structural rather than a matter of author discipline.
+/// * **Self-describing.** The daemon does not notify anyone — it only *reports*
+///   to the orchestrator, whose own instructions decide whether this warrants
+///   pinging the user, chasing the worker, or re-delegating. The wording says
+///   so explicitly, because the receiving agent has no other context for why
+///   an unsolicited prompt just appeared in its transcript.
+pub fn compose_idle_worker_prompt(role: &str, elapsed: std::time::Duration) -> String {
+    compose_delegate_prompt(&format!(
+        "Worker {role} was delegated {} ago and has not responded with work-done. \
+         It may be stuck, waiting on input, or still working: check its pane and decide \
+         how to proceed - if this needs the user, notify them; otherwise keep waiting, \
+         re-delegate, or reassign.",
+        format_idle_elapsed(elapsed)
+    ))
+}
+
+/// PRD #126: arm the idle watch for one just-armed delegation. Spawns a task
+/// that sleeps out the resolved timeout and then attempts a seq-conditional
+/// take of the registry record — `Some` means this delegation is genuinely
+/// still outstanding, so the idle prompt goes to the orchestrator pane; `None`
+/// means it was resolved, cancelled, or superseded, so the task expires
+/// silently. See [`AgentPtyRegistry::take_outstanding_delegation_if`] for why
+/// the take *is* the cancellation (no `JoinHandle`, no `abort`).
+///
+/// Structured exactly like [`crate::agent_pty::arm_seed_fallback`], the other
+/// daemon-side "sleep, then deliver only if nobody beat me to it" timer.
+fn arm_idle_worker_watch(
+    registry: Arc<AgentPtyRegistry>,
+    worker_pane_id: String,
+    seq: u64,
+    orchestration_cwd: Option<String>,
+    worker_cwd: Option<String>,
+) {
+    tokio::spawn(async move {
+        let timeout = worker_response_timeout(orchestration_cwd.as_deref(), worker_cwd.as_deref());
+        tokio::time::sleep(timeout).await;
+        let Some(delegation) = registry.take_outstanding_delegation_if(&worker_pane_id, seq) else {
+            tracing::debug!(
+                pane_id = %worker_pane_id,
+                seq,
+                "idle-worker watch: delegation already resolved or superseded; no prompt"
+            );
+            return;
+        };
+        let prompt = compose_idle_worker_prompt(
+            &sanitize_role_name(&delegation.role),
+            delegation.armed_at.elapsed(),
+        );
+        if let Err(e) = registry
+            .write_to_pane_and_submit(&delegation.orchestrator_pane_id, &prompt)
+            .await
+        {
+            warn!(
+                pane_id = %delegation.orchestrator_pane_id,
+                role = %delegation.role,
+                error = %e,
+                "idle-worker watch: failed to write idle prompt into orchestrator pane"
+            );
+        } else {
+            tracing::info!(
+                worker_pane_id = %worker_pane_id,
+                role = %delegation.role,
+                timeout_secs = timeout.as_secs(),
+                "idle-worker watch: reported a silent worker to the orchestrator"
+            );
+        }
+    });
 }
 
 /// CodeRabbit (PRD #93 round-9): build the file contents written to
@@ -1104,6 +1253,28 @@ impl AppState {
             let orchestrator_pane_id = signal.pane_id.clone();
             let task = signal.task.clone();
             let cwd = self.pane_cwd_map.get(&pane_id).cloned();
+
+            // PRD #126: this worker now owes a `work-done`. Arm the record
+            // (and its watch task) here, in the synchronous fan-out loop
+            // rather than inside `dispatch_one_owned`, for two reasons: the
+            // clock starts at delegate time instead of being skewed by a
+            // `clear = true` respawn's up-to-10s `SessionStart` wait, and a
+            // dispatch that bails early on a respawn failure — the most
+            // literal case of a silent worker — is still covered.
+            //
+            // `signal.to` is a Vec fanning out to N panes, so each target
+            // gets its own record and its own timer: one report per silent
+            // worker, not one aggregated report per delegate.
+            let seq =
+                registry.arm_outstanding_delegation(&pane_id, &target_role, &orchestrator_pane_id);
+            arm_idle_worker_watch(
+                Arc::clone(&registry),
+                pane_id.clone(),
+                seq,
+                orchestration.as_ref().map(|(_, orch_cwd)| orch_cwd.clone()),
+                cwd.clone(),
+            );
+
             tokio::spawn(async move {
                 dispatch_one_owned(
                     registry,
@@ -1135,6 +1306,18 @@ impl AppState {
     /// orchestration is complete; we log and exit without writing back a
     /// "completed" prompt to the orchestrator (it just issued it).
     pub async fn handle_work_done(&self, signal: WorkDoneSignal, registry: &AgentPtyRegistry) {
+        // PRD #126: the worker answered, so its idle watch is moot. Cancel
+        // FIRST — above every early return below — so an unknown pane, an
+        // orchestrator's own `--done`, or a missing orchestrator pane can
+        // never leave a record armed and produce a bogus idle prompt later.
+        if let Some(delegation) = registry.cancel_outstanding_delegation(&signal.pane_id) {
+            tracing::debug!(
+                pane_id = %signal.pane_id,
+                role = %delegation.role,
+                "work-done: cancelled the outstanding idle watch"
+            );
+        }
+
         let role_name = match self.pane_role_map.get(&signal.pane_id) {
             Some(name) => name.clone(),
             None => {

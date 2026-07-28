@@ -1384,6 +1384,11 @@ async fn handle_connection(
             match close_outcome {
                 Ok(()) => {
                     if let Some(pane_id) = pane_id_env {
+                        // PRD #126: a deliberately closed worker owes nothing.
+                        // Without this, closing a stuck worker would still
+                        // nag the orchestrator when its timeout expired hours
+                        // later, pointing at a pane that no longer exists.
+                        registry.cancel_outstanding_delegation(&pane_id);
                         state.write().await.unregister_pane(&pane_id);
                     }
                     // PRD #120 M2.4 + S1: if this agent was dispatched into a

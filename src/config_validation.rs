@@ -196,6 +196,8 @@ mod tests {
         ProjectConfig {
             modes,
             orchestrations: vec![],
+            worker_response_timeout_minutes:
+                crate::project_config::DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES,
         }
     }
 
@@ -225,6 +227,8 @@ mod tests {
         ProjectConfig {
             modes: vec![],
             orchestrations,
+            worker_response_timeout_minutes:
+                crate::project_config::DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES,
         }
     }
 

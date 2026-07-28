@@ -1460,6 +1460,44 @@ pub struct AgentPtyRegistry {
     /// fingerprint is a CONFLICT (never a false replay). Bounded by LRU eviction —
     /// see [`MAX_DELIVERY_RESULTS`].
     delivery_ledger: Mutex<DeliveryLedger>,
+    /// PRD #126: delegations that are still awaiting a `work-done`, keyed by
+    /// the *worker's* `pane_id_env`. Armed by `AppState::handle_delegate`,
+    /// consumed either by the per-delegation watch task when its timeout
+    /// expires (→ idle prompt into the orchestrator pane) or by whatever
+    /// resolves the delegation first: `AppState::handle_work_done`, or the
+    /// worker pane being closed (`StopAgent`).
+    ///
+    /// Lives here rather than on `AppState` because both hook handlers run
+    /// under a `read()` guard on the shared state — putting a mutable map on
+    /// `AppState` would force those hot call sites to `write()`. Same
+    /// interior-mutability shape as `dispatch_mutexes` / `user_input_at` /
+    /// `delivery_ledger`.
+    outstanding_delegations: Mutex<HashMap<String, OutstandingDelegation>>,
+    /// PRD #126: monotonic generation stamped onto each
+    /// [`OutstandingDelegation`]. A re-delegation to the same worker pane
+    /// overwrites the record with a *newer* seq, so delegation #1's still
+    /// sleeping watch task fails its seq-conditional take and expires
+    /// silently instead of firing a premature prompt against delegation #2.
+    /// Same trick (and the same reason to prefer it over `JoinHandle::abort`)
+    /// as the daemon idle monitor's generation counter: cancellation is one
+    /// atomic operation with no await and no race against the timer's wake-up.
+    delegation_seq: AtomicU64,
+}
+
+/// PRD #126: one delegation the daemon is still waiting on a `work-done` for.
+/// Carries everything the watch task needs to compose and deliver the idle
+/// prompt without re-entering `AppState`.
+#[derive(Debug, Clone)]
+pub struct OutstandingDelegation {
+    /// Generation of this record — see [`AgentPtyRegistry::delegation_seq`].
+    pub seq: u64,
+    /// The delegated role name (as registered in `pane_role_map`).
+    pub role: String,
+    /// Pane of the orchestrator that issued the delegate; the idle prompt is
+    /// submitted here.
+    pub orchestrator_pane_id: String,
+    /// When the delegation was armed, for the elapsed-time wording.
+    pub armed_at: Instant,
 }
 
 struct RegistryInner {
@@ -1498,7 +1536,75 @@ impl AgentPtyRegistry {
             shutting_down: AtomicBool::new(false),
             user_input_at: Mutex::new(HashMap::new()),
             delivery_ledger: Mutex::new(DeliveryLedger::default()),
+            outstanding_delegations: Mutex::new(HashMap::new()),
+            delegation_seq: AtomicU64::new(1),
         }
+    }
+
+    /// PRD #126: record that `role`'s worker pane has just been delegated to
+    /// and owes a `work-done`. Returns the record's generation, which the
+    /// caller hands to its watch task so the task can prove — at wake-up time
+    /// — that the record it is about to consume is still *its own* delegation
+    /// (see [`Self::take_outstanding_delegation_if`]). Overwrites any previous
+    /// record for the pane: the freshest delegation is the one that counts.
+    pub fn arm_outstanding_delegation(
+        &self,
+        worker_pane_id: &str,
+        role: &str,
+        orchestrator_pane_id: &str,
+    ) -> u64 {
+        let seq = self.delegation_seq.fetch_add(1, Ordering::SeqCst);
+        self.outstanding_delegations.lock().unwrap().insert(
+            worker_pane_id.to_string(),
+            OutstandingDelegation {
+                seq,
+                role: role.to_string(),
+                orchestrator_pane_id: orchestrator_pane_id.to_string(),
+                armed_at: Instant::now(),
+            },
+        );
+        seq
+    }
+
+    /// PRD #126: atomically take the outstanding delegation for
+    /// `worker_pane_id` **only if** it is still generation `seq`. This single
+    /// operation is what makes the detector correct on all three fronts:
+    ///
+    /// * **cancellation** — `work-done` (or a pane close) already took the
+    ///   record, so the timer's take returns `None` and it is a silent no-op;
+    /// * **one-shot** — the record is gone after the take, so one delegation
+    ///   can never produce two prompts;
+    /// * **re-delegation** — a newer delegate replaced the record with a
+    ///   higher `seq`, so the stale timer's take fails the generation check
+    ///   and leaves the newer record for the newer timer.
+    ///
+    /// Nothing is removed when the seq does not match.
+    pub fn take_outstanding_delegation_if(
+        &self,
+        worker_pane_id: &str,
+        seq: u64,
+    ) -> Option<OutstandingDelegation> {
+        let mut map = self.outstanding_delegations.lock().unwrap();
+        if map.get(worker_pane_id).is_some_and(|d| d.seq == seq) {
+            map.remove(worker_pane_id)
+        } else {
+            None
+        }
+    }
+
+    /// PRD #126: unconditionally drop the outstanding delegation for
+    /// `worker_pane_id` — the delegation was resolved (`work-done`) or the
+    /// worker pane went away (`StopAgent`), so no idle prompt is warranted for
+    /// any generation. Returns the dropped record (for logging) or `None` when
+    /// there was nothing outstanding, which is the common case.
+    pub fn cancel_outstanding_delegation(
+        &self,
+        worker_pane_id: &str,
+    ) -> Option<OutstandingDelegation> {
+        self.outstanding_delegations
+            .lock()
+            .unwrap()
+            .remove(worker_pane_id)
     }
 
     /// PRD #127 M2.2: record that a user keystroke just reached the pane with

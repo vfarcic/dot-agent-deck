@@ -2654,6 +2654,57 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the flag-gated visibility of the option in the cycler (covered by `prompt/new-pane/010`); the CLI write the agent ultimately performs (covered by `scheduler/cli/004`); the full seed-prompt text (loose substring on the issue-dispatch-specific tokens); the plain `schedule` seed (covered by `scheduler/form/002`).
 - **Platform coverage:** mac+linux.
 
+#### scheduler/idle-worker
+
+##### scheduler/idle-worker/001 — A delegated worker that never sends work-done produces a self-describing idle prompt in the orchestrator pane.
+- **Layer:** fast integration (in-process daemon state + real PTY registry; `cat` stand-ins).
+- **Agent:** none (synthetic `cat` panes; the orchestrator is raw/no-echo so one daemon submission appears once in the snapshot).
+- **Asserts:** after the test-only millisecond timeout, the orchestrator PTY contains one line with the ASCII needles `has not responded` and the target role name.
+- **Does not assert:** emoji, elapsed-time wording, or notification-channel behavior.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/002 — Work-done arriving before the timeout cancels that delegation's idle prompt.
+- **Layer:** fast integration (real `handle_delegate` + `handle_work_done`).
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** a parallel silent control delegation proves the detector fires, while the responsive worker's role never appears on an idle-prompt line after its work-done and timeout window.
+- **Does not assert:** work-done summary-file contents or the completion-feedback wording.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/003 — The worker-response timeout honors project config and defaults to 120 minutes.
+- **Layer:** fast integration plus focused project-config parse assertion.
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** an unset override yields `worker_response_timeout_minutes = 120`, while a top-level zero-minute config value placed before the first table header causes a silent delegation to fire immediately.
+- **Does not assert:** invalid or fractional timeout values.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/004 — An outstanding delegation produces only one idle prompt and never re-nags.
+- **Layer:** fast integration (in-process daemon state + raw/no-echo orchestrator PTY).
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** the first idle prompt appears, then the ASCII idle needle still occurs exactly once after another timeout window.
+- **Does not assert:** behavior after a later re-delegation (covered by `scheduler/idle-worker/005`).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/005 — Re-delegating to the same worker pane replaces the first timer without a premature or duplicate prompt.
+- **Layer:** fast integration (real repeated `handle_delegate` calls against one worker pane).
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** no prompt appears after delegation one's old deadline but before delegation two's deadline; delegation two then produces exactly one role-bearing idle prompt.
+- **Does not assert:** concurrent delegation to different worker panes.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/006 — Closing a delegated worker through StopAgent cancels its outstanding idle timer.
+- **Layer:** fast integration with an in-process attach server and the real StopAgent request.
+- **Agent:** none (`cat` stand-ins).
+- **Asserts:** a silent control worker proves the detector fires, while the stopped worker never appears on an idle-prompt line after the timeout.
+- **Does not assert:** worktree cleanup or TUI close-key behavior.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/011 — A silent delegated worker's idle prompt is visible in a PTY-attached orchestration pane.
+- **Layer:** L2 PTY (real `dot-agent-deck` binary and lazy daemon, rendered through the vt100 `TuiDeck` harness).
+- **Agent:** none (the `orch-deck` fixture uses live `cat` stand-ins; synthetic Delegate injected over the real hook socket, so this entry is intentionally not reel-marked).
+- **Asserts:** after opening the two-role orchestration with a tiny daemon timeout, the rendered surface visibly contains `has not responded`.
+- **Does not assert:** real-LLM reaction, notification delivery, emoji, or exact elapsed-time wording.
+- **Platform coverage:** mac+linux.
+
 #### scheduler/live
 
 ##### scheduler/live/001 — A scheduled fire surfaces its card LIVE to an already-attached TUI, without a disconnect/reconnect (PRD #127 finding #2).
