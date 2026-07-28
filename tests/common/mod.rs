@@ -1458,22 +1458,76 @@ fn render_grid_to_svg(grid: &str, cols: u16, rows: u16) -> String {
 }
 
 /// PRD #77 Decision 26 runtime-skip helper: returns `Ok(())` when the
-/// host has the Claude Code CLI on PATH and a readable credentials
+/// host has the Claude Code CLI on PATH and a **usable** credentials
 /// file; `Err(reason)` with a stable user-facing message otherwise.
 /// Tests pair this with [`skip_unless!`].
+///
+/// PRD #126: mere existence of `~/.claude/.credentials.json` used to be
+/// enough, so a truncated, unparseable or fully expired credential set passed
+/// the check and the scenario then failed deep inside a PTY wait with a
+/// confusing timeout. The extra checks below are all **cheap and offline** —
+/// no probe request, unlike [`check_codex_available`], because the equivalent
+/// `claude -p` round trip costs real tokens on every e2e run. Expiry is
+/// treated the way Claude Code itself treats it: an expired access token is
+/// fine while a live refresh token can still renew it, so only the case where
+/// BOTH are spent is reported as unusable.
 pub fn check_claude_available() -> Result<(), String> {
     if !cli_invocable("claude") {
         return Err("Claude Code CLI not installed (could not invoke `claude --version`)".into());
     }
-    let home = host_home();
-    let creds = home.join(".claude").join(".credentials.json");
-    if !creds.exists() {
-        // M3.1 auditor S1: surface the abstract path so the message
-        // doesn't leak whether the operator is on `/Users/<name>` vs
-        // `/root` vs `/home/<name>`.
+    // M3.1 auditor S1: every message below surfaces the abstract path so it
+    // doesn't leak whether the operator is on `/Users/<name>` vs `/root` vs
+    // `/home/<name>`.
+    const MISSING: &str = "Claude Code credentials not found at ~/.claude/.credentials.json — \
+                           log in with `claude login`";
+    let creds = host_home().join(".claude").join(".credentials.json");
+    // A symlink here would let a stray link outside the reviewed HOME decide
+    // the outcome; mirror `check_codex_available`'s regular-file requirement.
+    if !std::fs::symlink_metadata(&creds)
+        .map(|meta| meta.file_type().is_file())
+        .unwrap_or(false)
+    {
+        return Err(MISSING.into());
+    }
+    let raw = std::fs::read_to_string(&creds).map_err(|_| MISSING.to_string())?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|_| {
+        "Claude Code credentials at ~/.claude/.credentials.json are not valid JSON — \
+         log in again with `claude login`"
+            .to_string()
+    })?;
+    let oauth = parsed.get("claudeAiOauth").ok_or(
+        "Claude Code credentials at ~/.claude/.credentials.json carry no `claudeAiOauth` \
+         entry — log in with `claude login`",
+    )?;
+    let non_empty = |key: &str| {
+        oauth
+            .get(key)
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.is_empty())
+    };
+    if !non_empty("accessToken") && !non_empty("refreshToken") {
         return Err(
-            "Claude Code credentials not found at ~/.claude/.credentials.json — \
-             log in with `claude login`"
+            "Claude Code credentials at ~/.claude/.credentials.json carry no access or refresh \
+             token — log in with `claude login`"
+                .into(),
+        );
+    }
+    // Both timestamps are epoch MILLISECONDS. An absent field is treated as
+    // "no expiry information", never as expired.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let live = |key: &str| {
+        oauth
+            .get(key)
+            .and_then(|v| v.as_i64())
+            .is_none_or(|at| at > now_ms)
+    };
+    if !live("expiresAt") && !live("refreshTokenExpiresAt") {
+        return Err(
+            "Claude Code credentials at ~/.claude/.credentials.json are expired and cannot be \
+             refreshed — log in again with `claude login`"
                 .into(),
         );
     }
@@ -1607,14 +1661,48 @@ fn cli_invocable(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// PRD #126: opt-in switch that turns every runtime skip into a hard failure.
+///
+/// A runtime skip prints `SKIP: …` and RETURNS NORMALLY, so nextest reports a
+/// skipped real-agent test as **passed**. A pre-PR `cargo test-e2e` can
+/// therefore read fully green while a `[reel]`-marked scenario asserted
+/// nothing at all — and the demo reel then ships with that clip silently
+/// missing. Set this to a truthy value on any run whose whole point is that
+/// the real-agent coverage actually executed (release gates, reel builds);
+/// leave it unset for ad-hoc runs on a machine without the credentials, where
+/// the permissive skip is the useful behavior.
+pub const REQUIRE_REAL_E2E_ENV: &str = "DOT_AGENT_DECK_REQUIRE_REAL_E2E";
+
+/// Whether [`REQUIRE_REAL_E2E_ENV`] is set to a truthy value. `0`, `false`,
+/// `no`, empty and unset all mean "permissive skips"; anything else opts in.
+#[allow(dead_code)]
+pub fn require_real_e2e() -> bool {
+    match std::env::var(REQUIRE_REAL_E2E_ENV) {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
+        Err(_) => false,
+    }
+}
+
 /// Body of the `skip_unless!` early-return: if `result` is `Err`,
 /// print `SKIP: <reason>` to stderr and indicate to the caller it
 /// should return. Pairs with the `skip_unless!` macro below.
+///
+/// Under [`REQUIRE_REAL_E2E_ENV`] the same `Err` **panics** instead, carrying
+/// the reason, so an unmet precondition is reported as a failure rather than
+/// disappearing into a green run.
 #[doc(hidden)]
 pub fn _skip_if_err(result: Result<(), String>) -> bool {
     match result {
         Ok(()) => false,
         Err(reason) => {
+            assert!(
+                !require_real_e2e(),
+                "{REQUIRE_REAL_E2E_ENV} is set, so this real-agent test must RUN, not skip: \
+                 {reason}"
+            );
             eprintln!("SKIP: {reason}");
             true
         }

@@ -222,15 +222,12 @@ fn dispatch_013_orchestration_surfaces_and_delegates() {
     // Decision 26 runtime-skip: a missing CLI / credentials / token is an
     // environmental condition, not a broken test.
     skip_unless!(common::check_claude_available());
-    let token = match github_token() {
-        Ok(t) => t,
-        Err(reason) => {
-            // Same shape as `skip_unless!`'s early return (print `SKIP:` +
-            // return) for the token precondition.
-            eprintln!("SKIP: {reason}");
-            return;
-        }
-    };
+    // The token precondition goes through the SAME helper as `skip_unless!`
+    // (PRD #126) so `DOT_AGENT_DECK_REQUIRE_REAL_E2E` turns it into a hard
+    // failure too, instead of a missing token quietly reporting as a pass.
+    let token_result = github_token();
+    skip_unless!(token_result.clone().map(|_| ()));
+    let token = token_result.expect("github token checked above");
 
     // Workspace root where the daemon provisions the clone
     // (`<work>/github-issues`) and its per-issue worktree
