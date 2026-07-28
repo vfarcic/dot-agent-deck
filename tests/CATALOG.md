@@ -2709,7 +2709,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Layer:** fast integration with an in-process attach server, the real StopAgent request, and a second raw/no-echo `cat` spawned onto the freed `pane_id_env`.
 - **Agent:** none (`cat` stand-ins; the successor is raw/no-echo so any submitted byte is directly observable in its scrollback).
 - **Asserts:** the successor's own readiness marker is present (so absence of anything else is meaningful) while its PTY carries zero occurrences of the daemon clause and no fragment of the dead orchestration's role name, after two full timeout windows during which the successor owned the pane.
-- **Does not assert:** which of the two layered guards refused — the record sweep over orchestrator-side records at `begin_pane_close`, or the `write_and_submit_guarded` agent-id gate. Both must be removed before a stray submit appears.
+- **Does not assert:** which of the two layered guards refused — the record sweep over orchestrator-side records at `begin_pane_close`, or the `write_and_submit_guarded` agent-id gate. Both must be removed before a stray submit appears on THIS (StopAgent) path, because the sweep drops the record before any timer can wake; the identity gate on its own is isolated by `scheduler/idle-worker/014`, which reaches the same pane-reuse state through an orchestrator exit that runs no sweep at all.
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/idle-worker/009 — A timer whose deadline falls inside a pane's SIGTERM grace window does not fire the nudge that the deliberate close exists to suppress (PRD #126 M1 review finding 1).
@@ -2740,11 +2740,18 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** that the orchestrator delegated EXACTLY once. The daemon overwrites `worker-task-worker.md` on every delegate and nothing counts invocations, so the file's existence proves "at least one delegate reached the daemon" and no more. Also not asserted: the model's exact acknowledgement, notification-channel delivery, emoji, or exact elapsed-time wording.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/idle-worker/013 — A late work-done from a superseded delegation retires THAT delegation, leaving the re-delegated worker's own watch armed and still able to fire (PRD #126 M1 review finding 6).
-- **Layer:** fast integration (two `handle_delegate` calls against one worker pane, then one real `handle_work_done`).
+##### scheduler/idle-worker/013 — A late work-done from a superseded delegation retires THAT delegation, leaving the re-delegated worker's own watch armed and still able to fire — while a second completion does retire what the first left armed (PRD #126 M1 review finding 6).
+- **Layer:** fast integration (two `handle_delegate` calls against each of two worker panes on one clock, then real `handle_work_done` calls — one for the reported worker, two for the control).
 - **Agent:** none (`cat` stand-ins).
-- **Asserts:** after the late completion, delegation two's idle prompt still appears; it appears on delegation TWO's clock (no earlier than its own deadline, not the older delegation's); and exactly one prompt is produced.
-- **Does not assert:** the two accepted residuals recorded in the PRD — an out-of-order completion crediting the wrong delegation, and a consumed-then-re-delegated record being retired by a late completion. Both are documented limitations, not fixed behavior.
+- **Asserts:** after the late completion, delegation two's idle prompt still appears; it appears on delegation TWO's clock (no earlier than its own deadline, not the older delegation's); the second worker — twice delegated and twice completed — produces NO prompt, which is what distinguishes a real oldest-first retirement from a `work-done` that retired nothing at all (the surviving watch alone cannot tell them apart); and exactly one prompt exists across all four delegations.
+- **Does not assert:** the two accepted residuals recorded in the PRD — an out-of-order completion crediting the wrong delegation, and a consumed-then-re-delegated record being retired by a late completion. Both are documented limitations, not fixed behavior. Also not asserted: the `DelegationRetirement` variant returned to `handle_work_done` (observed only through the resulting prompt/no-prompt behavior).
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/014 — After the orchestrator's process ends ON ITS OWN — no StopAgent, so no close transition and no record sweep — an unrelated agent inheriting its pane id still receives nothing; the `write_and_submit_guarded` agent-id gate is the only guard in play (PRD #126 M1 audit finding 2).
+- **Layer:** fast integration; the orchestrator stub is a polling shell that exits when the test drops a flag file in its cwd (a genuine process exit, not a signalled close), after which a raw/no-echo `cat` takes the freed `pane_id_env`. No attach server, so no `StopAgent` exists in this test at all.
+- **Agent:** none (`cat` worker stand-in; the successor is raw/no-echo so any submitted byte is directly observable in its scrollback).
+- **Asserts:** two preconditions that stop it passing for the wrong reason — the orchestrator pane is NOT in a close transition after the exit (so the close-time sweep is provably not what suppresses the prompt), and the successor owned the pane before the delegation's deadline (so a stray timer had a live target to mis-deliver to) — then that after two further timeout windows the successor's PTY carries its own readiness marker, zero occurrences of the daemon clause, and no fragment of the dead orchestration's role name.
+- **Does not assert:** the pane-reuse-after-`StopAgent` path (covered by `scheduler/idle-worker/008`); the orchestration-membership half of the delivery revalidation (the successor is spawned without `tab_membership`, so that check legitimately abstains and the agent-id gate is what refuses).
 - **Platform coverage:** mac+linux.
 
 #### scheduler/live

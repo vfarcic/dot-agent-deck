@@ -1470,7 +1470,9 @@ fn render_grid_to_svg(grid: &str, cols: u16, rows: u16) -> String {
 /// `claude -p` round trip costs real tokens on every e2e run. Expiry is
 /// treated the way Claude Code itself treats it: an expired access token is
 /// fine while a live refresh token can still renew it, so only the case where
-/// BOTH are spent is reported as unusable.
+/// BOTH are spent is reported as unusable — see [`claude_oauth_usable`], which
+/// holds that half as a pure function so `tests/real_agent_preflight.rs` can
+/// assert every accepted and rejected credential shape.
 pub fn check_claude_available() -> Result<(), String> {
     if !cli_invocable("claude") {
         return Err("Claude Code CLI not installed (could not invoke `claude --version`)".into());
@@ -1499,6 +1501,33 @@ pub fn check_claude_available() -> Result<(), String> {
         "Claude Code credentials at ~/.claude/.credentials.json carry no `claudeAiOauth` \
          entry — log in with `claude login`",
     )?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    claude_oauth_usable(oauth, now_ms)
+}
+
+/// The credential-shape half of [`check_claude_available`], split out as a pure
+/// function of the `claudeAiOauth` object and the current epoch-millisecond
+/// clock so every shape below is covered by a test instead of by argument
+/// (`tests/real_agent_preflight.rs`).
+///
+/// PRD #126 audit follow-up: each expiry is bound to the presence of ITS OWN
+/// token. The first cut evaluated the two expiries independently of the two
+/// tokens, and because an ABSENT expiry means "no expiry information" (never
+/// "expired"), the missing half of an asymmetric credential set voted "live" for
+/// a token that was not there at all. So an expired sole access token with no
+/// refresh token passed, and so did an access-token-less set whose refresh token
+/// was already spent — precisely the "credentials look fine, then the real agent
+/// fails deep inside a PTY wait" case this check exists to catch.
+///
+/// Two deliberate decisions are preserved. An expired access token with a LIVE
+/// refresh token still passes, because Claude Code itself refreshes on that
+/// shape. And there is **no probe request**: revoked credentials and network
+/// failures remain an accepted false-positive class, since a live round trip
+/// would spend real tokens on every e2e run.
+pub fn claude_oauth_usable(oauth: &serde_json::Value, now_ms: i64) -> Result<(), String> {
     let non_empty = |key: &str| {
         oauth
             .get(key)
@@ -1514,17 +1543,16 @@ pub fn check_claude_available() -> Result<(), String> {
     }
     // Both timestamps are epoch MILLISECONDS. An absent field is treated as
     // "no expiry information", never as expired.
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
     let live = |key: &str| {
         oauth
             .get(key)
             .and_then(|v| v.as_i64())
             .is_none_or(|at| at > now_ms)
     };
-    if !live("expiresAt") && !live("refreshTokenExpiresAt") {
+    // A token is usable only if it is BOTH present and unexpired; an expiry
+    // alone says nothing about a token that does not exist.
+    let usable = |token_key: &str, expiry_key: &str| non_empty(token_key) && live(expiry_key);
+    if !usable("accessToken", "expiresAt") && !usable("refreshToken", "refreshTokenExpiresAt") {
         return Err(
             "Claude Code credentials at ~/.claude/.credentials.json are expired and cannot be \
              refreshed — log in again with `claude login`"

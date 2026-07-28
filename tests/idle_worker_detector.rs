@@ -4,7 +4,9 @@
 //! `AppState::handle_work_done` paths with daemon-owned PTYs. The role maps are
 //! populated exactly as `StartAgent` would populate them. Worker panes use
 //! `cat`; the orchestrator uses a raw, no-echo `cat`, making each daemon prompt
-//! appear exactly once in its observable PTY snapshot.
+//! appear exactly once in its observable PTY snapshot — except where a test
+//! needs the orchestrator to go away on its own, which is what
+//! [`OrchestratorStub::ExitsOnFlag`] is for.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -48,6 +50,26 @@ const WORKER_COMMAND: &str = "cat";
 /// suppress. `SHELL` is pinned so the `trap` builtin is POSIX `sh`'s (it is
 /// consumed as a wrapper choice and never exported into the child).
 const TERM_RESISTANT_WORKER_COMMAND: &str = "trap '' TERM; exec cat";
+
+/// File the [`OrchestratorStub::ExitsOnFlag`] stub polls for. Its appearance in
+/// the harness cwd is the test's remote control for a NATURAL orchestrator exit.
+const NATURAL_EXIT_FLAG: &str = "orchestrator-exit.flag";
+
+/// Which orchestrator stub a harness spawns onto [`ORCH_PANE`].
+enum OrchestratorStub {
+    /// Raw, no-echo `cat`: stays alive for the whole test, so every daemon
+    /// submission into the pane lands in an observable scrollback.
+    Persistent,
+    /// Same observable shape, but the process ENDS BY ITSELF the moment
+    /// [`NATURAL_EXIT_FLAG`] appears in its cwd. That is the path
+    /// `scheduler/idle-worker/008` cannot reach: `StopAgent` runs
+    /// `begin_pane_close`, whose sweep drops every record pointing at the pane
+    /// *before* any timer can wake, whereas a process that simply exits
+    /// triggers no close transition and therefore no sweep at all. On that path
+    /// the `write_and_submit_guarded` agent-id gate is the ONLY thing between a
+    /// still-armed timer and whichever agent inherits the freed pane id.
+    ExitsOnFlag,
+}
 
 /// Serializes process-environment changes when these tests are run with plain
 /// `cargo test`; nextest already runs each test in its own process.
@@ -119,6 +141,16 @@ impl IdleHarness {
     /// Same as [`IdleHarness::new`] but each worker names its own stub command,
     /// so a test can put a SIGTERM-ignoring worker next to an ordinary one.
     async fn with_workers(workers: &[(&str, &str)], project_config: Option<&str>) -> Self {
+        Self::with_orchestrator_stub(OrchestratorStub::Persistent, workers, project_config).await
+    }
+
+    /// Same as [`IdleHarness::with_workers`] but the orchestrator stub is
+    /// chosen too — see [`OrchestratorStub`].
+    async fn with_orchestrator_stub(
+        orchestrator: OrchestratorStub,
+        workers: &[(&str, &str)],
+        project_config: Option<&str>,
+    ) -> Self {
         common::init_test_env();
         let cwd = common::race_safe_tempdir();
         if let Some(contents) = project_config {
@@ -130,8 +162,14 @@ impl IdleHarness {
 
         // Raw no-echo cat gives one observable copy per injected prompt. The
         // readiness marker ensures termios has changed before a timer can fire.
-        let orchestrator_agent_id =
-            spawn_raw_cat_observer(&registry, ORCH_PANE, "ORCH-READY", &cwd_str);
+        let orchestrator_agent_id = match orchestrator {
+            OrchestratorStub::Persistent => {
+                spawn_raw_cat_observer(&registry, ORCH_PANE, "ORCH-READY", &cwd_str)
+            }
+            OrchestratorStub::ExitsOnFlag => {
+                spawn_exit_on_flag_observer(&registry, ORCH_PANE, "ORCH-READY", &cwd_str)
+            }
+        };
 
         let mut state = AppState::default();
         let orchestration = (ORCHESTRATION.to_string(), cwd_str.clone());
@@ -261,6 +299,30 @@ impl IdleHarness {
             .await
     }
 
+    /// Let an [`OrchestratorStub::ExitsOnFlag`] orchestrator end its own
+    /// process, then wait until the pane genuinely has no live owner so the
+    /// caller can hand the freed pane id to a successor.
+    ///
+    /// Deliberately NOT a `StopAgent`: nothing in this path calls
+    /// `begin_pane_close`, so no record sweep runs and the armed delegation
+    /// survives its orchestrator. The caller asserts `is_pane_closing` is false
+    /// afterwards to pin that down.
+    async fn end_orchestrator_process(&self) {
+        std::fs::write(self.cwd.path().join(NATURAL_EXIT_FLAG), b"exit\n")
+            .expect("write the orchestrator stub's exit flag");
+        let freed = tokio::time::timeout(Duration::from_secs(5), async {
+            while self.registry.pane_current_agent_id(ORCH_PANE).is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            freed.is_ok(),
+            "the orchestrator stub never exited on its own, so the pane id was never freed for \
+             reuse and the scenario under test could not occur"
+        );
+    }
+
     /// Stop an agent through the REAL `StopAgent` attach request, off the async
     /// runtime, and report how long the close took. A SIGTERM-ignoring child
     /// keeps the pane marked closing for the whole `AGENT_TERMINATE_GRACE`
@@ -343,6 +405,42 @@ fn spawn_raw_cat_observer(
             ..SpawnOptions::default()
         })
         .unwrap_or_else(|error| panic!("spawn raw-cat observer on {pane_id}: {error}"))
+}
+
+/// An orchestrator stub whose own shell owns the pane and leaves as soon as
+/// [`NATURAL_EXIT_FLAG`] appears in `cwd`: the process ends, the PTY reaches
+/// EOF, and the registry marks the agent exited WITHOUT any close transition
+/// having run. Nothing is `exec`d and no child is backgrounded, so the polling
+/// shell is the single process holding the slave fd — when it leaves, the pane
+/// is genuinely free (a surviving `cat` would hold the fd open and keep the
+/// pane "live" forever, silently defeating the test).
+///
+/// Termios is pinned like [`spawn_raw_cat_observer`]'s for consistency, but this
+/// pane is never an observation target: the successor that inherits its pane id
+/// is.
+fn spawn_exit_on_flag_observer(
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    marker: &str,
+    cwd: &str,
+) -> String {
+    let flag = std::path::Path::new(cwd).join(NATURAL_EXIT_FLAG);
+    let flag = flag.to_string_lossy();
+    let command = format!(
+        "stty -echo -icanon -icrnl -opost min 1 time 0; printf {marker}; \
+         while [ ! -f '{flag}' ]; do sleep 0.05; done"
+    );
+    registry
+        .spawn_agent(SpawnOptions {
+            command: Some(&command),
+            cwd: Some(cwd),
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string()),
+                ("SHELL".to_string(), "/bin/sh".to_string()),
+            ],
+            ..SpawnOptions::default()
+        })
+        .unwrap_or_else(|error| panic!("spawn exit-on-flag observer on {pane_id}: {error}"))
 }
 
 fn worker_pane(role: &str) -> String {
@@ -773,6 +871,87 @@ fn idle_worker_008_closed_orchestrator_pane_id_reuse_receives_nothing() {
     });
 }
 
+/// Scenario: Delegate to a silent worker, then let the ORCHESTRATOR's own process end — no StopAgent, so no close transition and no record sweep ever runs. A brand-new unrelated agent inherits the freed orchestrator pane id before the deadline, and after two further timeout windows its PTY must still hold nothing but its own readiness marker.
+#[spec("scheduler/idle-worker/014")]
+#[test]
+fn idle_worker_014_natural_orchestrator_exit_pane_id_reuse_receives_nothing() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(Some("1500"));
+    let timeout = Duration::from_millis(1500);
+    runtime().block_on(async {
+        let harness = IdleHarness::with_orchestrator_stub(
+            OrchestratorStub::ExitsOnFlag,
+            &[("orphaned-worker", WORKER_COMMAND)],
+            None,
+        )
+        .await;
+
+        let delegated_at = tokio::time::Instant::now();
+        harness.delegate(&["orphaned-worker"]).await;
+
+        // The orchestrator simply ENDS. Unlike `008`'s StopAgent, this path
+        // never enters `begin_pane_close`, so nothing sweeps the armed record
+        // and the identity gate is the only guard left.
+        harness.end_orchestrator_process().await;
+        assert!(
+            !harness.registry.is_pane_closing(ORCH_PANE),
+            "the orchestrator pane is in a CLOSE transition, so the close-time record sweep — \
+             not the identity gate — would be what suppresses the prompt, and this test would \
+             stop covering the natural-exit path"
+        );
+
+        // An unrelated agent takes the freed pane id, as any fresh spawn
+        // reusing a recycled `pane_id_env` would.
+        let successor = spawn_raw_cat_observer(
+            &harness.registry,
+            ORCH_PANE,
+            "SUCCESSOR-READY",
+            &harness.cwd_str(),
+        );
+        let ready = harness
+            .wait_for_snapshot_of(
+                &successor,
+                |snapshot| snapshot.contains("SUCCESSOR-READY"),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            ready.contains("SUCCESSOR-READY"),
+            "the successor agent never became ready, so it could not have observed a stray \
+             submit either; snapshot = {ready:?}"
+        );
+        assert!(
+            tokio::time::Instant::now() < delegated_at + timeout,
+            "the successor only took the pane AFTER the delegation's deadline had already \
+             passed, so the timer had nobody to mis-deliver to and this test would pass for the \
+             wrong reason: it became ready {:?} after the delegate (timeout {timeout:?})",
+            tokio::time::Instant::now() - delegated_at
+        );
+
+        // Two further timeout windows: the deadline passes while the successor
+        // owns the pane and is fully observable.
+        tokio::time::sleep(timeout * 2).await;
+        let snapshot = harness.snapshot_of(&successor);
+        assert!(
+            snapshot.contains("SUCCESSOR-READY"),
+            "the successor's own output vanished, so absence below proves nothing; \
+             snapshot = {snapshot:?}"
+        );
+        assert_eq!(
+            idle_count(&snapshot),
+            0,
+            "the dead orchestration's idle prompt was auto-submitted into an unrelated agent \
+             that merely inherited the pane id of an orchestrator which exited on its own; \
+             snapshot = {snapshot:?}"
+        );
+        assert!(
+            !snapshot.contains("orphaned-worker"),
+            "no fragment of the dead orchestration's delegation may reach the successor; \
+             snapshot = {snapshot:?}"
+        );
+    });
+}
+
 /// Scenario: Delegate to a silent control worker and to a worker that ignores SIGTERM, then StopAgent the TERM-resistant one so its three-second grace window brackets the detector deadline. The test asserts the overlap actually happened, then requires a prompt for the control and none for the worker whose close was in flight.
 #[spec("scheduler/idle-worker/009")]
 #[test]
@@ -898,7 +1077,7 @@ fn idle_worker_010_delegate_during_close_refuses_to_arm() {
     });
 }
 
-/// Scenario: Delegate twice to the same worker pane, then send a single late work-done standing in for delegation one's belated completion. That completion must retire only the superseded delegation, so delegation two's watch still fires — once, and no earlier than its own deadline.
+/// Scenario: Delegate twice to each of two worker panes on the same clock, then send ONE late work-done for the first worker (standing in for delegation one's belated completion) and TWO for the second. The first worker's delegation two must still be reported — on its own deadline, once — while the second worker, whose remaining delegation the second completion retired, must produce nothing at all.
 #[spec("scheduler/idle-worker/013")]
 #[test]
 fn idle_worker_013_late_first_completion_leaves_the_second_watch_armed() {
@@ -906,26 +1085,42 @@ fn idle_worker_013_late_first_completion_leaves_the_second_watch_armed() {
     let _env = EnvGuard::set(Some("1500"));
     let timeout = Duration::from_millis(1500);
     runtime().block_on(async {
-        let harness = IdleHarness::new(&["twice-delegated-worker"], None).await;
+        // `fully-completed-worker` is the BEHAVIORAL CONTROL for the retirement
+        // itself. Asserting only that delegation two survives a late completion
+        // would pass just as happily if `work-done` retired NOTHING — the
+        // surviving watch proves nothing about which record was consumed. Its
+        // second completion must consume the record the first one left armed, so
+        // a `work-done` that did nothing shows up here as an extra prompt.
+        // Listed FIRST in both delegate calls so its (slightly earlier) deadline
+        // could not hide behind the other worker's.
+        let harness =
+            IdleHarness::new(&["fully-completed-worker", "twice-delegated-worker"], None).await;
 
-        harness.delegate(&["twice-delegated-worker"]).await;
+        harness
+            .delegate(&["fully-completed-worker", "twice-delegated-worker"])
+            .await;
         tokio::time::sleep(Duration::from_millis(700)).await;
         let second_delegate_at = tokio::time::Instant::now();
-        harness.delegate(&["twice-delegated-worker"]).await;
+        harness
+            .delegate(&["fully-completed-worker", "twice-delegated-worker"])
+            .await;
 
-        // Delegation #1 finally reports, 300 ms after it was superseded. It
-        // owes exactly one retirement — and it must be #1's, not #2's.
+        // Each worker's delegation #1 finally reports, 300 ms after it was
+        // superseded. It owes exactly one retirement — and it must be #1's.
         tokio::time::sleep(Duration::from_millis(300)).await;
+        harness.work_done("fully-completed-worker").await;
         harness.work_done("twice-delegated-worker").await;
+        // Only the control's delegation #2 also reports.
+        harness.work_done("fully-completed-worker").await;
 
-        let snapshot = harness
+        let observed = harness
             .wait_for_idle_role("twice-delegated-worker", Duration::from_secs(4))
             .await;
         let observed_at = tokio::time::Instant::now();
         assert!(
-            idle_mentions_role(&snapshot, "twice-delegated-worker"),
+            idle_mentions_role(&observed, "twice-delegated-worker"),
             "delegation one's late work-done disarmed delegation two, so a re-delegated worker \
-             that then went silent was never reported; snapshot = {snapshot:?}"
+             that then went silent was never reported; snapshot = {observed:?}"
         );
         assert!(
             observed_at >= second_delegate_at + timeout - Duration::from_millis(250),
@@ -933,10 +1128,22 @@ fn idle_worker_013_late_first_completion_leaves_the_second_watch_armed() {
              {:?} after the second delegate (timeout {timeout:?})",
             observed_at - second_delegate_at
         );
+
+        // Settle before the negative assertions: the control's deadline is a
+        // hair EARLIER than the reported worker's, so anything it was going to
+        // emit has had its window and then some.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let snapshot = harness.wait_for_snapshot(|_| true, Duration::ZERO).await;
+        assert!(
+            !idle_mentions_role(&snapshot, "fully-completed-worker"),
+            "the second work-done did not retire the delegation the first one deliberately left \
+             armed — a work-done that retired NOTHING at all would look exactly like this; \
+             snapshot = {snapshot:?}"
+        );
         assert_eq!(
             idle_count(&snapshot),
             1,
-            "exactly one of the two delegations may report; snapshot = {snapshot:?}"
+            "exactly one of the four delegations may report; snapshot = {snapshot:?}"
         );
     });
 }
