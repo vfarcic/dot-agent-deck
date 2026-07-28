@@ -1,10 +1,10 @@
 # PRD #227: Modifier-aware key forwarding to embedded agent panes (Shift+Enter = newline)
 
-**Status**: Not started
+**Status**: Implemented (2026-07-28) — M1–M6 landed on `prd-227-modifier-aware-key-forwarding-to-embedded-agent-pa`; review + audit resolved; pre-PR e2e gate green (2167 tests, 0 failures). Awaiting PR, CI, and merge.
 **Priority**: High
 **Created**: 2026-07-26
 **GitHub Issue**: [#227](https://github.com/vfarcic/dot-agent-deck/issues/227)
-**Feature flag**: Undecided — see [Open Questions](#open-questions). This is a correctness fix to an existing input path rather than a new user-visible surface, so the working assumption is **no** `experimental` gate (CLAUDE.md rule 9), but the terminal-mode push in M2 is a global behavior change and the implementer should confirm the call before building it.
+**Feature flag**: **None** — decided (CLAUDE.md rule 9). This is a correctness fix to an existing input path, not a new user-visible surface, so it ships visible by default with no `experimental` gate and no `graduate-` follow-up. The M2 terminal-mode push was the part worth a second look; it is gated on `supports_keyboard_enhancement()`, so it self-disables where the terminal could not deliver it anyway.
 
 ## Problem Statement
 
@@ -112,12 +112,29 @@ The interactive keystroke path writes opaque bytes through the existing attach/P
 
 ## Milestones
 
-- [ ] **M1**: Encoder forwards `Enter + SHIFT` as `ESC[13;2u`, with L1 coverage — the documented Ghostty keybind path now works end to end
-- [ ] **M2**: Enhanced keyboard protocol pushed at startup and reliably popped (exit + panic), gated on terminal support — Shift+Enter works with no terminal config
-- [ ] **M3**: Remaining modifier-losing keys (Ctrl+Enter, Shift/Ctrl+arrows) forwarded faithfully; existing keybindings verified unregressed
-- [ ] **M4**: PTY-attached real-agent test proves newline-without-submit; all four agents verified in the pre-PR e2e tier
-- [ ] **M5**: Documentation corrected (`docs/troubleshooting.md` rewritten, `tests/CATALOG.md` entry updated) and changelog fragment added
-- [ ] **M6**: Cross-version contract answered per rule 12; feature ready for user testing
+- [x] **M1**: Encoder forwards `Enter + SHIFT` as `ESC[13;2u`, with L1 coverage — the documented Ghostty keybind path now works end to end (`c737a6e`)
+- [x] **M2**: Enhanced keyboard protocol pushed at startup and reliably popped (exit + panic), gated on terminal support — Shift+Enter works with no terminal config (`476b767`; leak on `?`-error returns closed by `KeyboardEnhancementGuard` in `ed93ab4`; `panic = "abort"` builds closed in `bc842e6`)
+- [x] **M3**: Remaining modifier-losing keys (Ctrl+Enter, Shift/Ctrl+arrows) forwarded faithfully; existing keybindings verified unregressed (`c737a6e`; the `Ctrl+[` regression M2 exposed fixed in `9dfe1a9`; the C0 map made exhaustive-by-construction via the caret rule `ch & 0x1f` plus xterm digit aliases in `bc842e6`)
+- [x] **M4**: PTY-attached real-agent test proves newline-without-submit (`9dfe1a9`), and M2's own negotiation is pinned by a deterministic companion test (`ed93ab4`) — **scope amended, see below**
+- [x] **M5**: Documentation corrected (`docs/troubleshooting.md` rewritten, `tests/CATALOG.md` entry updated) and changelog fragment added (`eefb2eb`)
+- [x] **M6**: Cross-version contract answered per rule 12 — no daemon/protocol/hook/orchestration file touched, so no `PROTOCOL_VERSION` bump and no semantic break (`eefb2eb`)
+
+### M4 scope amendment (2026-07-28)
+
+M4 originally read "all four agents verified in the pre-PR e2e tier". **Shipped instead:** one real-agent e2e (`embed/key-forwarding/001`, live interactive `claude` on Haiku) plus a deterministic no-agent companion (`embed/key-forwarding/002`) that pins M2's push/pop, over the manual acceptance matrix already recorded in [Verification Notes](#verification-notes-from-diagnosis) — which measured all four agents (pi, claude, opencode, codex) accepting `ESC[13;2u` on rendered screens.
+
+Rationale: three further live-agent PTY tests would each add API cost and flake surface to a tier that cannot run in CI, to re-confirm a matrix already measured by hand, for a bug fix. `ESC[13;2u` is a single agent-agnostic encoding — there is no per-agent code path for a per-agent test to cover. Re-run the manual matrix when adding a new agent adapter, per the existing risk-table mitigation.
+
+### Test coverage as shipped
+
+| Test | Tier | Pins |
+|---|---|---|
+| `ui::tests::keyevent_*` (incl. `keyevent_ctrl_c0_controls`, `ctrl_c0_byte_maps_exactly_the_documented_alias_set`) | L1 unit | The full encoder: modifier params 1–8, all 42 Ctrl→C0 aliases plus Alt+Ctrl forms, exhaustive over all 128 ASCII chars so a too-wide rule cannot pass |
+| `ui::tests::keyboard_enhancement_wire_bytes_are_the_ones_the_e2e_asserts` | L1 unit | Push = `CSI>1u`, pop = `CSI<1u`, so a crossterm bump fails fast |
+| `embed/key-forwarding/001` | L2 PTY, real agent | Shift+Enter inserts a newline **without submitting**, in one prompt-editor box, with the deck's startup negotiation asserted |
+| `embed/key-forwarding/002` | L2 PTY, no agent | Push at startup, matching pop exactly once after clean exit, push-before-pop ordering |
+
+**Known gap, accepted:** the round-trip test proving our encoder is the exact inverse of crossterm's decoder was withdrawn (it could hang CI via crossterm's process-global cached event reader). Detection of *our* drift is intact; detection of *crossterm's* drift is now a documented human step at upgrade time, recorded with line references in `ctrl_c0_byte`'s doc comment. A follow-up issue tracks restoring it via a dedicated single-test integration binary.
 
 ## Risks and Mitigations
 
@@ -130,10 +147,12 @@ The interactive keystroke path writes opaque bytes through the existing attach/P
 
 ## Open Questions
 
-1. **What does the maintainer's Ghostty actually emit for Shift+Enter today?** Unresolved because it needs a physical keypress. Running `cat -v` in a fresh Ghostty window (press Shift+Enter, then Enter, then Ctrl+D) distinguishes the cases: `^[` alone → `ESC+CR` (which would confirm why Claude works and Pi does not, and means M1 plus an ALT normalization suffices); `^[[13;2u` → CSI-u already, so only Gap 2 bites; a bare empty line → legacy CR, making M2 the binding constraint. This determines whether M2 is required or merely preferable.
-2. **Should `Enter + ALT` be normalized to `ESC[13;2u`?** It would make Pi work with neither a protocol push nor terminal config if the terminal emits `ESC+CR`, but it removes the ability to send a genuine Alt+Enter (which Pi treats as submit). Trade-off call, deliberately not pre-decided.
-3. **Experimental flag?** CLAUDE.md rule 9 asks the question for user-facing surfaces. The working assumption is no flag, since this is a fix to existing key handling rather than a new surface — but M2 changes terminal mode globally, which is the part worth a second look.
-4. **`opencode` / `codex` newline conventions** beyond CSI-u were not measured; worth completing the matrix if M3 touches ALT handling.
+All four are now **resolved** (2026-07-28). Kept with their answers rather than deleted, since the reasoning is what a future change to this path needs.
+
+1. **What does the maintainer's Ghostty actually emit for Shift+Enter today?** **Moot — never measured, and no longer load-bearing.** Both gaps were fixed independently, so the answer no longer decides anything: M1 makes the encoder faithful whatever arrives, and M2 makes the terminal emit CSI-u without user configuration. The question mattered only while we were choosing *which* gap to fix.
+2. **Should `Enter + ALT` be normalized to `ESC[13;2u`?** **No.** `Alt+Enter` keeps its legacy `ESC\r`, preserving the ability to send a genuine Alt+Enter (which Pi reads as submit). ALT folds into the CSI-u modifier bitmask only when combined with SHIFT/CONTROL. With M2 landed, the normalization's only benefit — rescuing a terminal that emits `ESC+CR` — is unnecessary.
+3. **Experimental flag?** **No flag.** A correctness fix to existing key handling is not a new surface (CLAUDE.md rule 9). M2's global terminal-mode change was the part worth the second look; it is gated on `supports_keyboard_enhancement()` and popped on every exit path, so it self-disables where unsupported and restores state on the way out.
+4. **`opencode` / `codex` newline conventions beyond CSI-u.** **Not needed.** M3 did not change ALT handling (see Q2), so the matrix gap it was contingent on never opened. All four agents were already measured accepting `ESC[13;2u`, which is the single encoding shipped.
 
 ## Verification Notes (from diagnosis)
 
