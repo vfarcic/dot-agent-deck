@@ -203,9 +203,13 @@ describe("native seed delivery: deliverAs mode", () => {
 
 describe("row 9: Pi event → agent state mapping", () => {
 	test("maps the four subscribed lifecycle events to canonical states", () => {
-		assert.equal(piEventToAgentState("session_start"), "waiting");
+		// Parity with Claude/OpenCode/Codex: a turn ending (agent_settled) and the
+		// pre-first-prompt state (session_start) are Idle (`finished`), NOT "Needs
+		// Input". Pi exposes no permission/attention event, so it never reports
+		// `waiting` — like a Claude agent that never hits a permission prompt.
+		assert.equal(piEventToAgentState("session_start"), "finished");
 		assert.equal(piEventToAgentState("agent_start"), "running");
-		assert.equal(piEventToAgentState("agent_settled"), "waiting");
+		assert.equal(piEventToAgentState("agent_settled"), "finished");
 		assert.equal(piEventToAgentState("session_shutdown"), "finished");
 	});
 

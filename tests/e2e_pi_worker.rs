@@ -38,7 +38,7 @@
 //! ## `clear = true` + native delivery dissolves the old 10s-fallback fragility
 //! Workers default `clear = true`, so each delegate RESPAWNS the worker. The OLD
 //! injection path then waited `SESSION_START_WAIT` (~10s) before typing the task
-//! into the pane — and because pi maps `session_start → waiting` (it never emits
+//! into the pane — and because pi maps `session_start → finished` (it never emits
 //! `EventType::SessionStart`), that wait always burned the full fallback, so a
 //! slow pi boot could land the injected task before pi was input-ready. NATIVE
 //! delivery (PRD #201) removes that entirely: the daemon stashes the task as the
@@ -309,7 +309,10 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         st.pane_role_map
             .insert(WORKER_PANE.to_string(), WORKER_ROLE.to_string());
         st.orchestrator_pane_ids.insert(ORCH_PANE.to_string());
-        let orch = ("pi-worker-orchestration".to_string(), cwd_str.clone());
+        let orch = dot_agent_deck::state::OrchestrationIdentity::NameCwd {
+            name: "pi-worker-orchestration".to_string(),
+            cwd: cwd_str.clone(),
+        };
         st.pane_orchestration_map
             .insert(ORCH_PANE.to_string(), orch.clone());
         st.pane_orchestration_map

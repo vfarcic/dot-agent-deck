@@ -5,6 +5,7 @@
 **Created**: 2026-07-14
 **GitHub Issue**: [#211](https://github.com/vfarcic/dot-agent-deck/issues/211)
 **Origin**: Follow-up to [PRD #20](20-multi-agent-support.md) (multi-agent machinery + Codex adapter), created as one of its final tasks. This PRD reuses the wrapper strategy PRD #20 shipped and proved with Codex.
+**Related**: [PRD #234](234-screen-state-observation-hookless-agents.md) — **revisit this PRD's approach before starting it.** Gemini CLI is a redrawing TUI with no hook surface, so the "Gemini-specific `classify_line` `RuleSet`" in the scope below has to guess status from repaint text — the guess `GENERIC`'s empty `idle_markers` deliberately declines to make. #234 supplies marker-free status (screen stability) and readiness for exactly this class of agent. If it lands first, this PRD likely collapses to a registry entry plus detection, with no rule set at all — a smaller change and a cleaner proof of the "reuse a shipped strategy" claim. See #234 Open Question 3.
 
 ## Problem Statement
 

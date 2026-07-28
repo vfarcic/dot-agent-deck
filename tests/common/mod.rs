@@ -995,6 +995,16 @@ impl TuiDeck {
         &self.fixture_path
     }
 
+    /// The deck's per-test `HOME` — the same one the lazily-spawned daemon and
+    /// every agent it spawns inherit. Tests that must seed HOME-relative agent
+    /// config for a directory only known AFTER launch (e.g. Claude's per-folder
+    /// trust for the tempdir fixture root, which
+    /// [`TuiDeckBuilder::with_claude_project_trust`] cannot know in advance)
+    /// write into it via [`seed_claude_trust_in_home`] before opening the pane.
+    pub fn home_dir(&self) -> &Path {
+        &self.home
+    }
+
     /// Return the parsed grid contents — used by `wait_for_string`
     /// internally and by tests that want to assert on full-screen
     /// state.
@@ -1731,6 +1741,18 @@ fn seed_claude_project_trust(test_home: &Path, trust_paths: &[String]) -> std::i
     let bytes = serde_json::to_vec(&cfg)
         .map_err(|e| std::io::Error::other(format!("serialize .claude.json: {e}")))?;
     write_credential_file_atomic_0o600(&test_home.join(".claude.json"), &bytes)
+}
+
+/// Public wrapper over [`seed_claude_project_trust`] for tests whose trusted
+/// directory is only known AFTER the deck launched — the per-test tempdir
+/// fixture root, which [`TuiDeckBuilder::with_claude_project_trust`] (a
+/// pre-launch builder step) cannot name in advance. Call it with
+/// [`TuiDeck::home_dir`] BEFORE the pane that runs `claude` in `trust_paths` is
+/// spawned; claude reads `~/.claude.json` at agent start, so the seeding only
+/// has to beat the spawn, not the launch.
+#[allow(dead_code)]
+pub fn seed_claude_trust_in_home(home: &Path, trust_paths: &[String]) -> std::io::Result<()> {
+    seed_claude_project_trust(home, trust_paths)
 }
 
 /// Strip the top-level `hooks` key from a Claude Code settings.json.
@@ -3011,6 +3033,217 @@ pub fn agent_records_on(socket: &Path) -> Vec<dot_agent_deck::agent_pty::AgentRe
     ) {
         Ok(resp) => resp.agent_records.unwrap_or_default(),
         Err(_) => Vec::new(),
+    }
+}
+
+/// One-shot read of a daemon-side pane's PTY scrollback via
+/// `AttachRequest::Snapshot`, over `socket`. The daemon replies `RESP ok`, then
+/// (when the ring is non-empty) a single `STREAM_OUT` frame carrying the whole
+/// snapshot, then `STREAM_END` — so unlike `AttachStream` this never subscribes
+/// to live bytes and returns as soon as the ring has been drained.
+///
+/// Returns the raw bytes exactly as the agent wrote them (escape sequences
+/// included); pair with [`terminal_search_key`] to search them wrap-insensitively.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn pane_snapshot_on(socket: &Path, agent_id: &str) -> Vec<u8> {
+    use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_STREAM_END, KIND_STREAM_OUT};
+    use std::io::{Read, Write};
+
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) else {
+        return Vec::new();
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+    let req = dot_agent_deck::daemon_protocol::AttachRequest::Snapshot {
+        id: agent_id.to_string(),
+    };
+    let payload = serde_json::to_vec(&req).expect("serialize Snapshot");
+    let mut header = [0u8; 5];
+    header[0] = KIND_REQ;
+    header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    if stream.write_all(&header).is_err() || stream.write_all(&payload).is_err() {
+        return Vec::new();
+    }
+    let _ = stream.flush();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out: Vec<u8> = Vec::new();
+    while Instant::now() < deadline {
+        let mut fh = [0u8; 5];
+        match stream.read_exact(&mut fh) {
+            Ok(()) => {}
+            Err(_) => break,
+        }
+        let kind = fh[0];
+        let len = u32::from_be_bytes([fh[1], fh[2], fh[3], fh[4]]) as usize;
+        let mut body = vec![0u8; len];
+        if len > 0 && read_exact_with_deadline(&mut stream, &mut body, deadline).is_err() {
+            break;
+        }
+        match kind {
+            KIND_STREAM_OUT => out.extend_from_slice(&body),
+            KIND_STREAM_END => break,
+            _ => continue,
+        }
+    }
+    out
+}
+
+/// Remove ANSI/VT control sequences from a raw PTY byte stream, leaving the
+/// printable text (and its line breaks) behind.
+///
+/// Handles the four families a full-screen agent TUI emits: CSI (`ESC [ … final`),
+/// OSC (`ESC ] … BEL | ST`), the string families DCS/SOS/PM/APC (`ESC P|X|^|_ … ST`),
+/// and plain two-byte escapes (charset selection, `ESC =`, …). Without this a
+/// naive substring search over the raw bytes can miss text that a redraw split
+/// with a colour reset, and a naive "drop the punctuation" pass would splice the
+/// escape's own digits INTO the word.
+#[allow(dead_code)]
+pub fn strip_ansi(bytes: &[u8]) -> String {
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != 0x1b {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let Some(&kind) = bytes.get(i) else { break };
+        match kind {
+            b'[' => {
+                i += 1;
+                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b']' | b'P' | b'X' | b'^' | b'_' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Collapse terminal text to a WRAP-INSENSITIVE search key: strip the escape
+/// sequences, then keep only `[A-Za-z0-9._/-]`.
+///
+/// An agent TUI renders inside a bordered box and hard-wraps long lines, so a
+/// pointer like `.dot-agent-deck/worker-task-coder.md` can reach the scrollback
+/// as `…worker-task-cod` / newline / `│ er.md`. Dropping every space, newline
+/// and box-drawing glyph rejoins it, while the kept set is narrow enough that a
+/// path- or sentence-shaped needle stays distinctive. Apply to BOTH the haystack
+/// and the needle (see [`search_key`]).
+#[allow(dead_code)]
+pub fn terminal_search_key(bytes: &[u8]) -> String {
+    search_key(&strip_ansi(bytes))
+}
+
+/// The [`terminal_search_key`] normalization for an already-decoded string —
+/// used on the needle side so both sides of the comparison agree.
+#[allow(dead_code)]
+pub fn search_key(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+        .collect()
+}
+
+/// A daemon-side pane's scrollback, collapsed to a [`terminal_search_key`].
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn pane_search_key_on(socket: &Path, agent_id: &str) -> String {
+    terminal_search_key(&pane_snapshot_on(socket, agent_id))
+}
+
+/// Poll a daemon-side pane's scrollback until `needle` appears in it
+/// (wrap-insensitively), or `timeout` elapses. Decision 21: the polling lives
+/// here, never in an `e2e_*.rs` body. The interval is deliberately coarse — each
+/// round pulls the pane's whole scrollback ring across the attach socket.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn wait_for_pane_text_on(
+    socket: &Path,
+    agent_id: &str,
+    needle: &str,
+    timeout: Duration,
+) -> bool {
+    let key = search_key(needle);
+    let deadline = Instant::now() + timeout;
+    loop {
+        if pane_search_key_on(socket, agent_id).contains(&key) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(750));
+    }
+}
+
+/// Block until every listed agent's scrollback has stopped growing for `quiet`
+/// AND has been producing output for at least `min_alive` — i.e. each
+/// interactive agent has finished painting its UI and is waiting for input.
+/// Returns whether every pane settled before `timeout` (a `false` is worth
+/// logging, not necessarily fataling: a still-busy agent may still accept
+/// injected input).
+///
+/// Mirrors `e2e_delegate_work_done_chain::wait_until_worker_ready`, but reads
+/// the panes through the daemon's attach socket so it works for agents the test
+/// did not spawn itself. The `min_alive` floor matters: a TUI agent can pause
+/// briefly mid-init before its input is interactive, and bytes injected during
+/// that lull are dropped.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn wait_until_panes_settled(
+    socket: &Path,
+    agent_ids: &[String],
+    quiet: Duration,
+    min_alive: Duration,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut last_len: HashMap<&str, usize> = HashMap::new();
+    let mut stable_since: HashMap<&str, Instant> = HashMap::new();
+    let mut first_output: HashMap<&str, Instant> = HashMap::new();
+    loop {
+        let mut all_ready = true;
+        for id in agent_ids {
+            let id = id.as_str();
+            let len = pane_snapshot_on(socket, id).len();
+            if len > 0 {
+                first_output.entry(id).or_insert_with(Instant::now);
+            }
+            if last_len.get(id).copied() != Some(len) {
+                last_len.insert(id, len);
+                stable_since.insert(id, Instant::now());
+            }
+            all_ready &= first_output
+                .get(id)
+                .is_some_and(|f| f.elapsed() >= min_alive)
+                && stable_since.get(id).is_some_and(|s| s.elapsed() >= quiet);
+        }
+        if all_ready {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
 }
 

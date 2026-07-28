@@ -321,6 +321,13 @@ pub async fn spawn(
             // the orchestrator pane's `SessionStart` can't be missed regardless
             // of spawn order (the orchestrator role is not necessarily first).
             let event_rx = event_tx.map(|tx| tx.subscribe());
+            // PRD #140 M1.3: one instance token per orchestration spawn
+            // request, minted before the role loop and stamped on every
+            // role's membership — the daemon-initiated counterpart of the
+            // interactive mint in `tab.rs`. Two scheduled fires of the same
+            // orchestration in the same working dir are then two distinct
+            // routing groups instead of one ambiguous `(name, cwd)` identity.
+            let orchestration_id = crate::agent_pty::mint_orchestration_id();
             for role in &roles {
                 let pane_id = next_pane_id(&req.task_name, Some(role.role_index));
                 let membership = TabMembership::Orchestration {
@@ -330,6 +337,7 @@ pub async fn spawn(
                     is_start_role: role.is_start_role,
                     orchestration_cwd: Some(req.working_dir.clone()),
                     display_title: None,
+                    orchestration_id: Some(orchestration_id.clone()),
                 };
                 let id = spawn_one(
                     registry,

@@ -69,6 +69,16 @@ async fn start_server() -> Server {
         (dir, path, listener)
     };
 
+    // This harness serves the attach protocol in-process, so no `daemon serve`
+    // is around to hand the registry a hook socket. Pin one inside the per-test
+    // tempdir anyway: agents spawned here are Codex-typed, so they launch via
+    // `dot-agent-deck wrap`, which posts `SessionStart`/`Idle` to whatever
+    // endpoint it resolves at emit time. Left unset that resolves the
+    // developer's own `XDG_RUNTIME_DIR` — the events land in their live deck as
+    // cards for panes like `pane-live-transition` that vanish when selected.
+    // Nothing listens on this path, and an unreachable socket is a no-op emit.
+    registry.set_hook_socket(dir.path().join("hook.sock"));
+
     let registry_for_task = registry.clone();
     let state_for_task = state.clone();
     let (event_tx, _) = tokio::sync::broadcast::channel(16);
@@ -401,6 +411,7 @@ async fn start_agent_rejects_orchestration_cwd_with_control_byte() {
                 is_start_role: false,
                 orchestration_cwd: Some("/proj/\x1b[31m".into()),
                 display_title: None,
+                orchestration_id: None,
             }),
             agent_type: None,
             seed: None,
@@ -438,6 +449,7 @@ async fn start_agent_with_orchestration_membership_round_trip() {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         },
     )
     .await;
@@ -456,6 +468,7 @@ async fn start_agent_with_orchestration_membership_round_trip() {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         })
     );
     server.registry.shutdown_all();

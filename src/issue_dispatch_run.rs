@@ -788,6 +788,7 @@ mod tests {
                 is_start_role: true,
                 orchestration_cwd: Some("/ws/task/.worktrees/issue-7".into()),
                 display_title: None,
+                orchestration_id: None,
             }),
         );
         assert_eq!(
@@ -881,6 +882,7 @@ mod tests {
                     is_start_role: role == "orchestrator",
                     orchestration_cwd: Some("/ws/task/.worktrees/issue-7".into()),
                     display_title: None,
+                    orchestration_id: None,
                 }),
             )
         };

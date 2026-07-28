@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.34.1] - 2026-07-26
+
+### Fixed
+
+- **Pi agents now show "Idle" between turns, like every other agent**
+  A Pi pane used to read **"Needs Input"** whenever it finished a turn — most visibly an orchestrator that had just delegated to a worker, or an auditor that had finished its pass — even though nothing needed the user: it was simply idle, waiting for the worker's result. Pi was the only backend that behaved this way. Claude, OpenCode, and Codex all show **Idle** when a turn ends and reserve "Needs Input" for a genuine prompt (a permission request or attention notification).
+  Pi now matches them: ending a turn reports **Idle**. Because Pi does not currently surface a permission/attention signal, a Pi pane simply never shows "Needs Input" — exactly like a Claude pane that never hits a permission prompt. This is a status-label change only; delegation and worker wake-up were always correct (a finished orchestrator is woken when its worker reports back), and nothing about the wire protocol changed.
+
+
+
 ## [0.34.0] - 2026-07-25
 
 ### Changed

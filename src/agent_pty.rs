@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -53,6 +54,23 @@ pub const DOT_AGENT_DECK_PANE_ID: &str = "DOT_AGENT_DECK_PANE_ID";
 /// [`crate::hook`] all reference the same symbol so two string
 /// literals can't drift apart.
 pub const DOT_AGENT_DECK_AGENT_ID: &str = "DOT_AGENT_DECK_AGENT_ID";
+
+/// Hook-ingestion endpoint override read by [`crate::config::socket_path`].
+///
+/// The daemon injects its OWN bound hook-socket path into every agent it
+/// spawns ([`AgentPtyRegistry::spawn_agent`]) so a child never has to
+/// re-resolve the endpoint from ambient environment. Everything downstream of
+/// a spawn that emits events — `dot-agent-deck wrap`, the `hook` /
+/// `agent-event` verbs, an agent's installed hook script — resolves this var
+/// at *emit* time, so without the injection a child inherits whatever
+/// `XDG_RUNTIME_DIR` its grandparent happened to carry. That is exactly how a
+/// test-spawned agent's events used to land in the developer's *live* daemon
+/// and surface as phantom dashboard cards: the test overrode
+/// [`DOT_AGENT_DECK_PANE_ID`] but not the socket, so the events arrived at the
+/// real deck tagged with a pane id it had never heard of.
+///
+/// A caller-supplied value always wins — the injection only fills the gap.
+pub const DOT_AGENT_DECK_SOCKET: &str = "DOT_AGENT_DECK_SOCKET";
 
 /// Test-only safety watchdog: when set truthy (`1`/`true`/`yes`/`on`), a
 /// `daemon serve` captures its parent pid at startup and gracefully exits once
@@ -318,7 +336,61 @@ pub enum TabMembership {
         /// older clients) means the title falls back to the canonical name.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_title: Option<String>,
+        /// PRD #140 M1.0: a per-TAB instance token, minted once when the
+        /// orchestration tab is created and stamped on every role pane in
+        /// that tab. Opaque to the daemon — it never parses or interprets
+        /// the value, it only compares it for equality when deciding which
+        /// panes belong to the same routing group
+        /// ([`crate::state::OrchestrationIdentity`]).
+        ///
+        /// Distinct from the other three identity-ish fields: `name` is the
+        /// CONFIG identity (which orchestration this is), `orchestration_cwd`
+        /// is the DIRECTORY disambiguator (round-11 auditor #C), and
+        /// `display_title` is presentation-only. Neither `name` nor
+        /// `orchestration_cwd` distinguishes two tabs of the SAME
+        /// orchestration opened from the SAME directory — that pair produces
+        /// byte-identical `(name, cwd)` identities and the daemon
+        /// cross-delivers delegate/work-done between them (issue #140). The
+        /// instance token is what makes each tab its own routing group.
+        ///
+        /// `Option<String>` with `#[serde(default, skip_serializing_if)]` so
+        /// older peers round-trip cleanly: a client predating this field
+        /// sends nothing and the daemon falls back to the `(name, cwd)`
+        /// identity, exactly the pre-#140 behaviour.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orchestration_id: Option<String>,
     },
+}
+
+/// PRD #140 M1.2/M1.3: mint a fresh per-tab orchestration instance token.
+///
+/// Called ONCE per orchestration tab (before the `for role in config.roles`
+/// loop) and stamped on every role pane's
+/// [`TabMembership::Orchestration::orchestration_id`], so all roles of one tab
+/// share a token and no two tabs ever do. The value is opaque — only equality
+/// matters — but it must satisfy [`is_valid_display_name`] so it survives
+/// [`validate_tab_membership`] at the wire boundary.
+///
+/// Uniqueness follows the same recipe as `ui::mint_delivery_id`: a per-PROCESS
+/// nonce (pid hashed with the epoch nanos at first use, so two processes — and
+/// a pid reused across restarts — never collide) combined with a global
+/// monotonic counter (so two tabs within one process never collide). The token
+/// deliberately does NOT need to be reproducible across restarts: a live tab
+/// re-hydrates its id from the daemon echo, it is never regenerated.
+pub fn mint_orchestration_id() -> String {
+    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nonce = *NONCE.get_or_init(|| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::process::id().hash(&mut h);
+        if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            dur.as_nanos().hash(&mut h);
+        }
+        h.finish()
+    });
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("orch-{nonce:016x}-{seq}")
 }
 
 impl TabMembership {
@@ -377,6 +449,7 @@ pub fn validate_tab_membership(mut tm: TabMembership) -> Option<TabMembership> {
         role_name,
         orchestration_cwd,
         display_title,
+        orchestration_id,
         ..
     } = &mut tm
     {
@@ -392,6 +465,22 @@ pub fn validate_tab_membership(mut tm: TabMembership) -> Option<TabMembership> {
         }
         if let Some(c) = orchestration_cwd.as_deref()
             && !is_valid_orchestration_cwd(c)
+        {
+            return None;
+        }
+        // PRD #140 M1.1: the instance token gets the same control-byte /
+        // size discipline as role_name and orchestration_cwd — it is echoed
+        // back through `list_agents` and logged, so a hostile same-user peer
+        // could otherwise smuggle escape sequences through it.
+        //
+        // An invalid token REJECTS the whole membership rather than being
+        // nulled out the way `display_title` is. `display_title` is cosmetic
+        // with a defined fallback; the instance token is a ROUTING key, and
+        // silently dropping it would merge two same-`(name, cwd)` tabs back
+        // into one routing group — reintroducing exactly the cross-delivery
+        // this PRD fixes, invisibly.
+        if let Some(id) = orchestration_id.as_deref()
+            && !is_valid_display_name(id)
         {
             return None;
         }
@@ -679,7 +768,57 @@ pub struct AgentPty {
 /// 3 s matches the F1 graceful-shutdown grace, which is the natural
 /// sibling. Hardcoded as a constant for now (one symbol to find) rather
 /// than lifted to `DashboardConfig` until a real user need surfaces.
-pub(crate) const AGENT_TERMINATE_GRACE: Duration = Duration::from_secs(3);
+/// `pub` so the wrapper-escalation test can assert against the real deadline
+/// instead of duplicating the number — a change here must keep that test honest.
+pub const AGENT_TERMINATE_GRACE: Duration = Duration::from_secs(3);
+
+/// Divisor giving the wrapper's grace from the deck's. See
+/// [`WRAP_TERMINATE_GRACE`] for why this is a fraction and not a thin
+/// subtraction.
+pub(crate) const WRAP_GRACE_DIVISOR: u32 = 2;
+
+/// The wrapper's own SIGTERM→SIGKILL grace, deliberately SHORTER than
+/// [`AGENT_TERMINATE_GRACE`].
+///
+/// A wrapped agent sits two levels below the deck, in a process group the deck
+/// cannot signal: portable-pty `setsid`s the wrapper, then the wrapper
+/// `setsid`s the agent again so it can own the inner PTY as its controlling
+/// terminal ([`crate::wrap`]). So `killpg(wrapper_pgid, …)` reaches the wrapper
+/// ONLY — the agent is reachable exclusively via the wrapper forwarding to its
+/// own child group.
+///
+/// Both graces used to be `AGENT_TERMINATE_GRACE`, which made teardown a race
+/// the wrapper could not win: the deck SIGTERMs the wrapper at T0 and SIGKILLs
+/// it at T0+grace, while the wrapper forwarded SIGTERM at ~T0 and armed its own
+/// escalation for ~T0+grace. Both deadlines fell together and the wrapper's is
+/// only checked on a reap-loop tick, so the deck killed the wrapper first and an
+/// agent that had not exited on SIGTERM — a wedged agent, or any interactive
+/// shell, which ignores SIGTERM — was orphaned to init.
+///
+/// Halving makes the wrapper always escalate first, so the agent is dead before
+/// the deck's SIGKILL removes the only process that can signal it.
+///
+/// A fraction, not a thin subtraction: the wrapper's chain is observe-signal →
+/// forward → wait out its grace → `SIGKILL` → reap, and the *observe* step
+/// depends on where the reap loop sits in its 50 ms cadence and how loaded the
+/// host is. A host running dozens of agents can stretch that tick, and any
+/// overrun puts the agent back to being orphaned — so the headroom should not be
+/// a couple of scheduler quanta. Half the budget cannot be eaten that way.
+/// Measured through `close_agent`, the wrapper escalates 1.503 s after observing
+/// SIGTERM, against the deck's 3.0 s.
+///
+/// The cost is deliberate: a slow-but-honest agent gets half as long to exit on
+/// SIGTERM before the wrapper escalates. Orphaning a live agent process is the
+/// worse outcome, and the deck's own grace is unchanged as the outer bound.
+pub(crate) const WRAP_TERMINATE_GRACE: Duration =
+    Duration::from_millis(AGENT_TERMINATE_GRACE.as_millis() as u64 / WRAP_GRACE_DIVISOR as u64);
+
+// The ordering above is load-bearing, not stylistic: if these ever became equal
+// (or inverted) the orphan bug returns silently, so pin it at compile time.
+const _: () = assert!(
+    WRAP_TERMINATE_GRACE.as_millis() < AGENT_TERMINATE_GRACE.as_millis(),
+    "the wrapper must escalate to SIGKILL strictly before the deck kills the wrapper"
+);
 
 // PRD #42 M1: the process-group teardown helpers (`pid_to_pgid`,
 // `signal_child_pgroup_or_fallback`, `force_kill_child_and_wait`,
@@ -1574,6 +1713,11 @@ pub struct AgentPtyRegistry {
     /// fingerprint is a CONFLICT (never a false replay). Bounded by LRU eviction —
     /// see [`MAX_DELIVERY_RESULTS`].
     delivery_ledger: Mutex<DeliveryLedger>,
+    /// The hook-ingestion socket this registry's daemon is bound to, injected
+    /// into spawned children as [`DOT_AGENT_DECK_SOCKET`]. `None` for a
+    /// registry with no owning daemon (in-process unit tests), in which case
+    /// no injection happens and children resolve the endpoint the old way.
+    hook_socket: Mutex<Option<PathBuf>>,
 }
 
 struct RegistryInner {
@@ -1612,7 +1756,19 @@ impl AgentPtyRegistry {
             shutting_down: AtomicBool::new(false),
             user_input_at: Mutex::new(HashMap::new()),
             delivery_ledger: Mutex::new(DeliveryLedger::default()),
+            hook_socket: Mutex::new(None),
         }
+    }
+
+    /// Record the hook-ingestion socket the owning daemon bound, so
+    /// [`spawn_agent`](Self::spawn_agent) can inject it into every child as
+    /// [`DOT_AGENT_DECK_SOCKET`]. Called once from
+    /// [`crate::daemon::run_daemon_with`] right after the bind succeeds.
+    ///
+    /// Idempotent and last-writer-wins: a daemon binds exactly one hook
+    /// socket for its lifetime, so a second call would carry the same path.
+    pub fn set_hook_socket(&self, path: PathBuf) {
+        *self.hook_socket.lock().unwrap() = Some(path);
     }
 
     /// PRD #127 M2.2: record that a user keystroke just reached the pane with
@@ -1749,6 +1905,19 @@ impl AgentPtyRegistry {
                     None
                 }
             });
+
+        // Point the child at THIS daemon's hook socket rather than letting it
+        // re-resolve the endpoint from inherited environment at emit time.
+        // A caller-supplied value wins (tests pin their own socket, and
+        // `respawn_agent_for_pane` replays a `spawn_env` that already carries
+        // ours), so this only fills the gap.
+        if !opts.env.iter().any(|(k, _)| k == DOT_AGENT_DECK_SOCKET)
+            && let Some(sock) = self.hook_socket.lock().unwrap().clone()
+            && let Some(sock) = sock.to_str()
+        {
+            opts.env
+                .push((DOT_AGENT_DECK_SOCKET.to_string(), sock.to_string()));
+        }
 
         // M2.11: capture display_name and cwd into the registry so renamed
         // panes survive a reconnect. Both go through the same validation
@@ -3246,6 +3415,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: Some("/proj/\0evil".into()),
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3259,6 +3429,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: Some("/proj/\x1b[31m".into()),
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3276,6 +3447,7 @@ mod tests {
             // cwd happens to match.
             orchestration_cwd: Some("relative/proj".into()),
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3290,6 +3462,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: Some(oversized),
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3303,6 +3476,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: Some("/home/user/project-a".into()),
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_some());
     }
@@ -3384,6 +3558,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3397,6 +3572,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_some());
     }
@@ -3414,6 +3590,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3427,6 +3604,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3445,6 +3623,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: Some("\x1b[31mpwn".into()),
+            orchestration_id: None,
         };
         let validated = validate_tab_membership(tm).expect("membership preserved");
         match validated {
@@ -3464,6 +3643,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: Some("My\0Run".into()),
+            orchestration_id: None,
         };
         let validated = validate_tab_membership(tm).expect("membership preserved");
         match validated {
@@ -3483,6 +3663,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: Some("My Custom Run".into()),
+            orchestration_id: None,
         };
         let validated = validate_tab_membership(tm).expect("membership preserved");
         match validated {
@@ -3505,8 +3686,162 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_some());
+    }
+
+    // -----------------------------------------------------------------
+    // PRD #140 M1.0 / M1.1 — the per-tab orchestration instance token.
+    // -----------------------------------------------------------------
+
+    /// M1.0: the token survives a serialize → deserialize round-trip. It is
+    /// the daemon's routing key, so losing it on the wire would silently
+    /// merge two tabs back into one routing group.
+    #[test]
+    fn tab_membership_orchestration_id_survives_serde_round_trip() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 1,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: Some("/home/user/project-a".into()),
+            display_title: Some("My Custom Run".into()),
+            orchestration_id: Some("abc".into()),
+        };
+        let json = serde_json::to_string(&tm).expect("serialize");
+        assert!(
+            json.contains("\"orchestration_id\":\"abc\""),
+            "token must be on the wire, got {json}"
+        );
+        let back: TabMembership = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, tm);
+    }
+
+    /// M1.0: `skip_serializing_if` keeps the field off the wire when absent,
+    /// so a NEWER client talking to an OLDER daemon sends the pre-#140 frame
+    /// shape byte for byte.
+    #[test]
+    fn tab_membership_omits_absent_orchestration_id_from_the_wire() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: true,
+            orchestration_cwd: None,
+            display_title: None,
+            orchestration_id: None,
+        };
+        let json = serde_json::to_string(&tm).expect("serialize");
+        assert!(
+            !json.contains("orchestration_id"),
+            "absent token must be skipped, got {json}"
+        );
+    }
+
+    /// M1.0: the older wire shape (no `orchestration_id` key at all — what an
+    /// OLDER client sends to a NEWER daemon) deserializes to `None`, which is
+    /// the daemon's cue to fall back to the `(name, cwd)` identity.
+    #[test]
+    fn tab_membership_without_orchestration_id_deserializes_to_none() {
+        let legacy = r#"{
+            "kind": "orchestration",
+            "name": "tdd-cycle",
+            "role_index": 2,
+            "role_name": "coder",
+            "is_start_role": false,
+            "orchestration_cwd": "/home/user/project-a"
+        }"#;
+        let tm: TabMembership = serde_json::from_str(legacy).expect("legacy shape parses");
+        match tm {
+            TabMembership::Orchestration {
+                orchestration_id,
+                orchestration_cwd,
+                ..
+            } => {
+                assert_eq!(orchestration_id, None);
+                assert_eq!(orchestration_cwd.as_deref(), Some("/home/user/project-a"));
+            }
+            _ => panic!("expected Orchestration variant"),
+        }
+    }
+
+    /// M1.1: a control-byte token is rejected outright. Unlike `display_title`
+    /// (nulled out, cosmetic), dropping a routing key silently would merge two
+    /// same-`(name, cwd)` tabs into one group — the very bug #140 fixes.
+    #[test]
+    fn validate_tab_membership_rejects_orchestration_id_with_ansi_escape() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: None,
+            display_title: None,
+            orchestration_id: Some("\x1b[31mpwn".into()),
+        };
+        assert!(validate_tab_membership(tm).is_none());
+    }
+
+    #[test]
+    fn validate_tab_membership_rejects_orchestration_id_with_nul_byte() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: None,
+            display_title: None,
+            orchestration_id: Some("orch\0-1".into()),
+        };
+        assert!(validate_tab_membership(tm).is_none());
+    }
+
+    #[test]
+    fn validate_tab_membership_rejects_oversized_orchestration_id() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: None,
+            display_title: None,
+            orchestration_id: Some("a".repeat(DISPLAY_NAME_MAX_LEN + 1)),
+        };
+        assert!(validate_tab_membership(tm).is_none());
+    }
+
+    #[test]
+    fn validate_tab_membership_accepts_well_formed_orchestration_id() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: Some("/home/user/project-a".into()),
+            display_title: None,
+            orchestration_id: Some(mint_orchestration_id()),
+        };
+        let validated = validate_tab_membership(tm).expect("membership preserved");
+        match validated {
+            TabMembership::Orchestration {
+                orchestration_id, ..
+            } => assert!(orchestration_id.is_some(), "token preserved verbatim"),
+            _ => panic!("expected Orchestration variant"),
+        }
+    }
+
+    /// M1.2/M1.3: two tabs created in the same process must never collide,
+    /// and every minted token must survive the wire-boundary validation
+    /// (otherwise the whole membership would be dropped at spawn).
+    #[test]
+    fn mint_orchestration_id_is_unique_and_wire_valid() {
+        let ids: std::collections::HashSet<String> =
+            (0..1000).map(|_| mint_orchestration_id()).collect();
+        assert_eq!(ids.len(), 1000, "minted tokens must not collide");
+        for id in &ids {
+            assert!(is_valid_display_name(id), "token {id} must pass validation");
+        }
     }
 }
 
@@ -4894,6 +5229,81 @@ mod spawn_tests {
             status.exit_code(),
             42,
             "opts.env PANE_ID was clobbered — scrub must run before opts.env is applied"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Hook-socket injection + pane provenance. Together these stop a child
+    // from re-resolving the hook endpoint out of inherited environment: a
+    // test-spawned agent whose events resolved the developer's real socket
+    // used to surface as a phantom card in whatever deck the test ran inside.
+    // ---------------------------------------------------------------------
+
+    /// Read back what the child actually saw for `DOT_AGENT_DECK_SOCKET` by
+    /// having it write the value to a file, so the assertion covers the real
+    /// child environment rather than the registry's bookkeeping.
+    fn child_observed_socket(
+        registry: &AgentPtyRegistry,
+        pane_id: &str,
+        extra_env: Vec<(String, String)>,
+    ) -> String {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let out = dir.path().join("socket.txt");
+        let mut env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())];
+        env.extend(extra_env);
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&format!(
+                    "sh -c 'printf \"%s\" \"${{DOT_AGENT_DECK_SOCKET:-<unset>}}\" > {}'",
+                    out.display()
+                )),
+                env,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+        // The child writes and exits promptly; poll rather than sleep a fixed
+        // span so a fast machine doesn't wait and a loaded one doesn't flake.
+        for _ in 0..200 {
+            if let Ok(v) = std::fs::read_to_string(&out)
+                && !v.is_empty()
+            {
+                return v;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("child never reported its DOT_AGENT_DECK_SOCKET");
+    }
+
+    #[test]
+    fn spawn_agent_injects_the_daemons_hook_socket_into_the_child() {
+        let registry = AgentPtyRegistry::new();
+        registry.set_hook_socket(PathBuf::from("/tmp/dad-test-daemon.sock"));
+        let observed = child_observed_socket(&registry, "pane-inject", vec![]);
+        registry.shutdown_all();
+        assert_eq!(
+            observed, "/tmp/dad-test-daemon.sock",
+            "the child must be handed the daemon's own hook socket, not left to \
+             re-resolve one from inherited environment at emit time"
+        );
+    }
+
+    #[test]
+    fn spawn_agent_lets_a_caller_supplied_hook_socket_win() {
+        let registry = AgentPtyRegistry::new();
+        registry.set_hook_socket(PathBuf::from("/tmp/dad-test-daemon.sock"));
+        let observed = child_observed_socket(
+            &registry,
+            "pane-explicit",
+            vec![(
+                DOT_AGENT_DECK_SOCKET.to_string(),
+                "/tmp/dad-test-caller.sock".to_string(),
+            )],
+        );
+        registry.shutdown_all();
+        assert_eq!(
+            observed, "/tmp/dad-test-caller.sock",
+            "injection must only fill a gap — an explicit socket (tests pinning \
+             their own, or a respawn replaying spawn_env) has to win"
         );
     }
 

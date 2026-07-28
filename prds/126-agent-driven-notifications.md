@@ -1,195 +1,184 @@
-# PRD #126: Agent-driven notifications with minimal deck-side fallback
+# PRD #126: Agent-driven notifications — dogfood on dot-agent-deck development
 
-**Status**: Planning — rescoped 2026-06-22 (see [Scope Decision](#scope-decision-2026-06-22))
+**Status**: Planning — narrowed 2026-07-25 to a no-code dogfood (see [Scope decision (2026-07-25)](#scope-decision-2026-07-25))
 **Priority**: Medium
 **Created**: 2026-05-25
 **GitHub Issue**: [#126](https://github.com/vfarcic/dot-agent-deck/issues/126)
 **Closes**: [#99](https://github.com/vfarcic/dot-agent-deck/issues/99) (supersedes prior orchestrator-only design)
-**Prerequisite for**: [#120](https://github.com/vfarcic/dot-agent-deck/issues/120) (scheduled issue dispatch). Note: the scheduler PRD #127 (cron-scheduled-prompt-dispatch) **shipped** and consumed this PRD's notification seam via a temporary `StderrNotifier` stub; #120 is the active downstream dependent.
-**Related**: PRD #8 (terminal bell — per-session, in-terminal), PRD #20 (multi-agent support), PRD #58 / #82 (orchestration lifecycle)
+**Related**: PRD #8 (terminal bell — per-session, in-terminal), PRD #20 (multi-agent support), PRD #82 (orchestrator role reinforcement — see [Interaction with PRD #82](#interaction-with-prd-82)), PRD #201 (Pi integration)
 
 ## Validation refresh (2026-06-14)
 
-Re-validated against current code — verdict: **current**. Nothing here has shipped yet (no `src/notifications.rs`, no `[notifications]` config block, no inactivity timer). The dependency relationships are real and live: PRD #99 is correctly closed/superseded by this PRD, and PRD #127 (cron scheduler) shipped consuming this PRD's notification seam via a temporary `StderrNotifier` stub. When implementing M2.2, fill the existing `Notifier`/`NotifyEvent`/`StderrNotifier` seam in `src/scheduler.rs` rather than inventing a new one.
+Re-validated against current code — verdict: **current**. Nothing here has shipped yet (no `src/notifications.rs`, no `[notifications]` config block, no inactivity timer). PRD #99 is correctly closed/superseded by this PRD.
 
 ## Scope Decision (2026-06-22)
 
-Rescoped after review. The happy path of this PRD — **agents notify the user via their own tools** — requires *no deck code*: a notification MCP/CLI on the agent (Slack MCP, ntfy, `osascript`, …) plus a notify-on-done/blocked/needs-input instruction injected at spawn. For a single project that instruction can go straight into each role's `prompt_template` in `.dot-agent-deck.toml`; the optional `agent_notification_hint` config field (M1.3) only generalizes it to ad-hoc panes and scheduled tasks that have no `prompt_template`.
+Rescoped after review. The happy path of this PRD — **agents notify the user via their own tools** — requires *no deck code*: a notification MCP/CLI on the agent (Slack MCP, ntfy, `osascript`, …) plus a notify-on-done/blocked/needs-input instruction injected at spawn. For a single project that instruction can go straight into each role's `prompt_template` in `.dot-agent-deck.toml`; an `agent_notification_hint` config field would only generalize it to ad-hoc panes and scheduled tasks that have no `prompt_template`.
 
-**Near-term deliverable** — the agent-driven path only: documentation showing users how to wire an MCP/CLI and add the notify-on-done/blocked/needs-input instruction, plus (optionally) the `agent_notification_hint` field so the hint applies project-wide.
+**Deferred until proven needed** — the two deck-side *safety nets*, being the only parts that genuinely cannot be done with MCP + config: the **inactivity nudge** (a timer plus inactivity-fired prompt injection, for a stuck-but-quiet agent that cannot self-notify) and the **no-agent fallback** (a minimal local desktop channel for pre-spawn scheduler failures and silent crashes, where there is no agent to delegate to at all).
 
-**Deferred until proven needed** — the two deck-side *safety nets*. They are the only parts that genuinely cannot be done with MCP + config, and we defer them rather than build on speculation:
-- **Inactivity nudge** — Phase 1's timer (M1.1) + inactivity-fired prompt injection (M1.2). A stuck or quiet agent cannot self-notify, so the deck would have to watch PTY output and inject the prompt.
-- **No-agent fallback** — all of Phase 2 (M2.1 desktop channel, M2.2 scheduler-failure / agent-crash wiring, M2.3 dedup). There is no agent to delegate to for a pre-spawn scheduler failure or a silently-crashed process, so the deck must fire a local desktop notification itself.
+## Scope decision (2026-07-25)
 
-Revisit if real usage shows the happy path is unreliable — agents forgetting to notify, hanging without noticing, or dying before notifying. Until then the `Notifier`/`StderrNotifier` seam in `src/scheduler.rs` (shipped by #127) stays as-is.
+Narrowed again. **This PRD's entire deliverable is now: make agent-driven notifications work for `dot-agent-deck`'s own development, changing no deck code.** Deciding whether the deck should be extended is explicitly deferred to a discussion *after* this ships, informed by what the dogfood shows.
+
+Three corrections to the prior scope motivated this:
+
+1. **The "revisit if unreliable" trigger had no source of evidence.** The 2026-06-22 rescope deferred the safety nets pending real usage, but nothing in the PRD produced that usage. This narrows the PRD to the thing that generates it.
+2. **The #120 prerequisite is stale.** #126 was listed as a prerequisite for PRD #120 (scheduled issue dispatch). #120 is **closed** — it shipped without this PRD. Nothing downstream is blocked by narrowing.
+3. **The "no `Notifier` trait in the deck" line was overtaken by events.** PRD #127 shipped `trait Notifier` / `NotifyEvent` (`src/scheduler.rs:38-45`) with `StderrNotifier` (`:104`) and live call sites in `src/spawn.rs` and `src/issue_dispatch_run.rs`. That seam is scheduler-internal, not a pluggable user-facing channel set, so this PRD's architectural objection to #99 still stands — but the wording was wrong and the seam is not to be touched here.
+
+### The hard constraint
+
+**No changes to `dot-agent-deck` source code.** Not a hook, not a config field, not "a tiny helper". Everything lands in this repo's `.dot-agent-deck.toml`, in `docs/develop/`, and in this PRD's findings section.
+
+**Tripwire:** if implementing this produces the thought "I'll just add a small thing to the deck" — stop, record the thought in the findings, and carry it into the Phase 3 discussion. That thought *is* the output of this PRD. Acting on it mid-flight destroys the evidence.
+
+### What this cannot tell us (stated up front, so the result is not over-read)
+
+The two deferred safety nets cover the cases where **no agent exists to delegate to**: a stuck-but-alive agent that cannot self-report, and a pre-spawn scheduler failure or silent crash where no process remains. Configuring `prompt_template`s produces **zero** data about either. A green dogfood is not evidence that the fallbacks are unnecessary.
+
+Those two must therefore be decided on reasoning rather than on this PRD's data — and for the scheduler-failure case the reasoning already looks settled: unattended scheduling with no human at a terminal has no other delivery path. Phase 3 records the decision either way; it does not pretend the dogfood informed it.
 
 ## Problem Statement
 
-Long-running agents and scheduled tasks in `dot-agent-deck` leave users with no reliable out-of-band signal that they need attention. The terminal bell (PRD #8) only reaches a focused terminal — useless once the user walks away. The original PRD #99 proposed solving this with a pluggable `Notifier` trait inside the deck plus four channel implementations (desktop, webhook, Slack, email), all wired into an orchestrator-completion lifecycle hook.
+Long-running agents and scheduled tasks leave users with no reliable out-of-band signal that they need attention. The terminal bell (PRD #8) only reaches a focused terminal — useless once the user walks away.
 
-Three things are wrong with that design:
+The original PRD #99 proposed a pluggable `Notifier` trait plus four channel implementations (desktop, webhook, Slack, email) wired to an orchestrator-completion hook. Three things are wrong with that:
 
-1. **The deck would re-implement what the ecosystem already provides.** Slack has an MCP server. So does Gmail. ntfy.sh, Pushover, `osascript`, `notify-send`, `gh`, `curl` — all exist and are well-maintained. A Rust trait + four channel implementations is duplication, and it makes the deck a credential holder for third-party services it has no business holding credentials for.
+1. **The deck would re-implement what the ecosystem already provides,** and would become a credential holder for third-party services it has no business holding credentials for.
+2. **The event source was too narrow** — orchestrator completion only, missing scheduled single-agent tasks, agent-side "blocked / needs input", and scheduler-side failures before any agent spawns.
+3. **Only the agent knows what "done" means in context.** A lifecycle hook can fire "orchestration ended"; the agent knows whether it finished, hit a wall, or needs a decision. Inferring that from outside is heuristic; declaring it from inside is explicit.
 
-2. **The event source was too narrow.** PRD #99 fires on orchestrator completion only. Scheduled tasks running as single-agent cards, agent-side "blocked / needs input" states, scheduler-side failures before any agent spawns — none of these are covered. Expanding #99's event model to cover them while keeping the channel-pluggability adds complexity without buying anything.
+### Why `dot-agent-deck`'s own development is the right first target
 
-3. **The agent is the only thing that knows what "done" means in context.** A lifecycle hook can fire "orchestration ended," but the agent itself knows whether it finished a task, hit a wall, or needs a decision. Inferring those from outside is heuristic; declaring them from inside is explicit.
-
-The result of #99 as currently scoped would be: the deck ships ~500 lines of credential-handling channel code that duplicates existing MCPs, covers one event type, and still doesn't reach the scheduler PRD's use cases.
-
-## Solution Overview
-
-Replace the pluggable-channels model with **agent-driven delegation plus a minimal deck-side fallback**:
-
-1. **Default path: agents notify via their own tools.** Users configure their agents (Claude Code, Codex, Gemini, Aider) with whatever notification tools they want — Slack MCP, ntfy CLI, `osascript`, Pushover, etc. The deck appends a configurable hint to the spawn prompt instructing the agent to notify the user on done / blocked / needs-input. The agent uses its own tools to deliver. The deck never touches Slack APIs, SMTP, or webhook URLs.
-
-2. **Inactivity timer fires via prompt injection.** The deck observes "no PTY output for N minutes" per agent. On expiry, it injects a prompt — *"You have been inactive for N minutes; please notify the user via your notification tools"* — into the agent's session, reusing the existing prompt-injection plumbing. The agent then notifies via its own tools. No new sending code path is added for inactivity.
-
-3. **One minimal deck-side desktop channel for events with no agent.** A single, non-pluggable local desktop notification (`notify-rust` or shell-out to `osascript` / `notify-send`). Used **only** when no agent exists to delegate to:
-   - Scheduler-side pre-spawn failures (clone failed, `mkdir` failed before any agent spawned).
-   - Agent crashed silently (process gone, can't inject a prompt anymore).
-
-   Not exposed to agents. Not pluggable. Not a trait. Maybe 30 lines of code.
-
-4. **Dedup rule.** When the deck fires its own desktop notification for a target, it marks that target as "user-notified" and suspends its inactivity timer. Without this, a crashed agent would generate a crash notification *and* an inactivity nudge 30 minutes later for the same dead target.
-
-The deck's notification responsibilities collapse to: one minimal local channel, an inactivity-timer-with-injection, a prompt-hint config field, and docs telling users how to set up their preferred MCP/CLI. No `Notifier` trait, no dispatcher, no third-party credentials, no per-event routing.
+This repo's orchestration has two **explicit** stopping points where the workflow halts and waits for a human — the test-plan approval (step 1) and the merge confirmation (step 7) of the orchestrator `prompt_template` (`.dot-agent-deck.toml:77-124`) — plus a long unattended stretch in step 5, where `release` opens the PR and waits for CI and Greptile to settle before reporting back. Those are exactly the walk-away moments this PRD exists for. If notifications do not pay off here, they will not pay off anywhere.
 
 ## Scope
 
 ### In Scope
 
-- **`agent_notification_hint` config field** in `.dot-agent-deck.toml`. User-authored string appended to the spawn-time prompt for every agent / orchestrator role. Optional. Ships with a reasonable default example users can copy and edit.
-- **Inactivity timer per agent / task.** Tracks last PTY-output timestamp. On `notify_when_inactive_after` expiry, injects the inactivity prompt into that agent's session. Resets on any PTY output (including the agent calling its own notify tool — that's PTY activity).
-- **Inactivity timer suspension rule.** When the deck fires its own desktop notification for a target, that target's inactivity timer is suspended (does not fire again until the next user-initiated action on the target).
-- **Minimal deck-side desktop channel.** Single non-pluggable implementation. Decision between `notify-rust` crate vs. shell-out to `osascript` / `notify-send` deferred to M1.1 based on transitive dep weight. Used by the deck only — never callable by agents.
-- **Configuration block** in `.dot-agent-deck.toml`:
-  ```toml
-  [notifications]
-  desktop_enabled = false                    # default: off
-  notify_when_inactive_after = "30m"         # default: unset (disabled)
-  agent_notification_hint = """
-  When you finish, get blocked, or need user input, send a notification
-  via your available tools (Slack MCP, ntfy CLI, osascript, etc).
-  """
-  ```
-- **Documentation under `site/`**: how to configure the hint, recommended MCP/CLI setups for common channels (Slack MCP first because the user already has it; ntfy and `osascript` as zero-setup alternatives), the inactivity model and its caveats, the deck-side desktop-channel role.
-- **Closing #99** with a comment explaining the supersession.
+- **A channel decision for this project** — one destination and one delivery mechanism, chosen, verified, and recorded (not left as a menu in user docs).
+- **An expectation log** — the instrumentation that makes the experiment falsifiable (see below).
+- **Notify instructions in this repo's `.dot-agent-deck.toml`** role `prompt_template`s, anchored to the workflow's real waiting points.
+- **A findings record** appended to this PRD.
+- **A contributor note** under `docs/develop/` describing the setup, so it is reproducible by anyone working on this repo (per CLAUDE.md rule 11 this is developer-facing and must not be published to the site).
 
-### Out of Scope (this PRD)
+### Out of Scope
 
-- **No `Notifier` trait, dispatcher, or pluggable channels in the deck.** This is the architectural inversion of #99; it must stay out of scope.
-- **No Slack / email / webhook / SMTP / Pushover implementations in deck code.** Those live in agent MCPs / CLIs.
-- **No per-event-type filtering** ("send `done` to Slack but `blocked` to desktop"). All agent-fired notifications go through whatever channel the agent's tool was configured with. Filtering is a follow-up PRD if noise becomes a real complaint.
-- **No two-way / bidirectional channels.** One-way only.
-- **No deck-side credentials of any kind.** Third-party tokens stay with the agent's MCP/CLI config.
-- **No agent-callable CLI** (`dot-agent-deck notify ...`). Agents use their own tools directly; we don't introduce a new shell entry-point for them to call.
-- **No secondary timer for "stuck agent that didn't process the injection".** Documented limitation; future PRD if it becomes a real pain.
-- **No orchestrator lifecycle hook.** The original #99 emission point is not implemented. The orchestrator role prompt should include the notification hint; lifecycle hooks are not needed.
-- **No "exactly-once" guarantee.** Agents may notify zero, one, or many times per run. Documented; acceptable for v1.
+- **Any change to `dot-agent-deck` source code.** See [The hard constraint](#the-hard-constraint).
+- **The `agent_notification_hint` config field.** It only generalizes the hint to panes and scheduled tasks that have no `prompt_template`; this repo's roles all have one. Revisit in Phase 3.
+- **The inactivity nudge and the no-agent desktop fallback.** Unchanged from the 2026-06-22 deferral; see [What this cannot tell us](#what-this-cannot-tell-us-stated-up-front-so-the-result-is-not-over-read).
+- **User-facing documentation of the pattern** (`docs/notifications.md`). Do not document a recommended practice before knowing it works. Phase 3 decides whether it graduates from `docs/develop/` to published docs.
+- **No `Notifier` trait, dispatcher, pluggable channels, per-event routing, deck-side credentials, agent-callable `notify` CLI, or two-way channels** — the architectural inversion of #99 stands.
+
+### The experiment must be able to fail
+
+**This is the design's load-bearing detail.** The failure mode under test is the *absence* of a signal: when an agent forgets to notify, compacts the instruction away, or dies first, the observable outcome is nothing — indistinguishable from "working correctly, nothing to report yet". Without instrumentation this PRD cannot produce negative evidence, and "it seemed fine" is not a finding.
+
+So every notify instruction is paired with a local append to an expectation log — the agent records *that it reached a notifiable moment* separately from *sending the notification*. Two independent records; the delta is the data.
+
+- Log file: `.dot-agent-deck/notify-log.md` (gitignored), one line per event: timestamp, role, event kind (`gate` / `done` / `blocked`), and whether the send was attempted.
+- The gap that matters is **reached-but-never-sent**, and the second gap — **sent-but-never-arrived** — is caught by reconciling the log against what actually showed up in the destination.
+- Reconciling is manual and that is fine at this scale; automating it would require deck code.
 
 ## Success Criteria
 
-- A user with `agent_notification_hint` configured can spawn an agent that has a notification MCP/CLI installed (e.g. Slack MCP), and the agent posts to that channel when it completes — without any deck-side Slack code, credentials, or webhook URL.
-- A user with `notify_when_inactive_after = "30m"` and a long-running agent sees a notification (delivered via that agent's own tools) approximately 30 minutes after the agent goes quiet — driven by deck-injected prompt, not by deck-side sending.
-- A scheduler-side failure (e.g. clone error before any agent spawns) produces a desktop notification via the minimal local channel.
-- An agent crash (process gone unexpectedly) produces a desktop notification via the minimal local channel, and the inactivity timer for that agent is suspended — no redundant inactivity nudge 30 minutes later.
-- The deck contains zero Slack / SMTP / webhook / Pushover code or credentials. `cargo tree` shows no third-party-service crates added.
-- `cargo fmt --check` and `cargo clippy -- -D warnings` pass. `cargo test` passes including new tests.
-- Documentation under `site/` covers the configuration, the inactivity model, recommended channel setups (Slack MCP / ntfy / osascript), and the documented limitations.
-- #99 is closed with a link to this PRD as the supersession.
+- A channel is chosen and **verified reachable from every agent this repo runs** — the Pi orchestrator *and* the Claude workers — or the failure to reach one of them is recorded as a finding.
+- Reaching the test-plan gate (step 1) and the merge gate (step 7) produces a notification that arrives on a device that is not the terminal running the deck.
+- The expectation log exists, is written at every notifiable moment, and is reconciled against arrived notifications after each run.
+- At least **three** orchestrated PRD runs are observed, **including at least one long enough for the orchestrator to compact** (so the PRD #82 interaction is exercised rather than assumed).
+- The findings section records, with counts: moments reached, notifications attempted, notifications arrived, and every gap — plus any "I want to change the deck for this" thoughts the tripwire caught.
+- **Zero diff under `src/`.** This is checkable and non-negotiable.
+- A Phase 3 decision is recorded for each deferred deck-side item, with its basis (dogfood evidence vs. reasoning) stated explicitly.
 
-## Open Questions (resolve during M1)
+## Design notes
 
-1. **`notify-rust` vs. shell-out for the desktop channel.** `notify-rust` is cross-platform but pulls in transitive deps; shell-out to `osascript` / `notify-send` is dep-free but platform-branched. Working assumption: try `notify-rust` first; if transitive dep weight is bad, fall back to shell-out with explicit platform detection. M1.1 picks one.
-2. **Inactivity detection signal.** "No PTY output for N minutes" is the proposed heuristic. Alternatives considered: "no tool calls for N minutes" (requires agent-specific introspection), "agent in waiting-for-input state" (requires reliable detection of that state). M1.2 confirms "no PTY output" is workable; if not, falls back to a simpler "session idle" measure already exposed by the deck.
-3. **Prompt-injection behavior when the agent is at a "waiting for user input" prompt.** Different agents may treat a stdin write differently in that state — some append to the input buffer, some treat it as a system message. M1.2 verifies Claude Code's behavior at minimum; documents per-agent caveats for the others.
-4. **What is "user-initiated action" for resetting suspension?** When the deck has suspended a timer after firing a desktop notification, what re-enables it? Options: any user keystroke into that agent, agent restart, manual config reload, tab close. Working assumption: agent restart and tab close are the meaningful events; suspension persists otherwise until the target is gone.
-5. **Default for `agent_notification_hint`.** Should we ship a sane default, or require the user to author one? Working assumption: ship a default (the example in the config block above) so the feature works out-of-the-box for users with Slack MCP / ntfy already configured. Users can override.
+### Prefer a CLI over an MCP
+
+This repo does not run one agent. The orchestrator is Pi (`command = "devbox run pi-big"`, `.dot-agent-deck.toml:74`) while the workers are Claude. #126 was originally written against Claude / Codex / Gemini / Aider and never covered Pi (PRD #201).
+
+A shell-callable CLI (`ntfy` / `curl` to a topic, or a two-line script in the repo) works for **any** agent with shell access, uniformly, with no per-agent MCP configuration. An MCP has to be wired up per agent and Pi may not support one at all. So the CLI is the default choice; Slack MCP led the original write-up mostly because it was already installed.
+
+Fallback ladder if the Pi orchestrator cannot reach the chosen channel: (1) a plain CLI it can shell out to; (2) switch the orchestrator to the all-Claude command already sitting commented at `.dot-agent-deck.toml:75`; (3) record "orchestrator cannot notify" as the headline finding — it would be the single most important result this PRD could produce, since the orchestrator owns both user gates.
+
+### Where to fire
+
+| Role | Moment | Kind |
+|---|---|---|
+| `orchestrator` | test plan posted, waiting for approval (step 1) | `gate` |
+| `orchestrator` | merge confirmation reached (step 7) | `gate` |
+| `orchestrator` | run finished or abandoned | `done` |
+| `coder` / `tester` / `reviewer` / `auditor` | blocked or missing critical context (already surfaced in work-done) | `blocked` |
+| `release` | PR checks + Greptile settled after the step 5 wait | `done` |
+
+### Fire-and-forget, always
+
+The instruction must read "send and continue", never "notify and wait for acknowledgment". An orchestrator that blocks on a notification it cannot confirm is a worse failure than no notification at all.
+
+### Interaction with PRD #82
+
+The notify instruction lives in the orchestrator's `prompt_template`, which is delivered as a `Read` tool result and is therefore **compaction-mortal** — the exact mechanism PRD #82 documents. Expect notifications to stop after the first compaction.
+
+Do not misread that as "agents are unreliable at notifying". It is the same root cause, and it makes this PRD a second, independently-observable symptom of #82 — which is useful to both. #82's post-compaction re-assert would restore the notify instruction along with the role, so if the dogfood shows a clean before/after-compaction split, that is evidence *for #82*, not for building notification machinery here.
 
 ## Milestones
 
-### Phase 1: Inactivity timer + prompt-injection plumbing
+### Phase 1 — Decide and configure (no deck code)
 
-> **Deferred (2026-06-22):** M1.1 and M1.2 (the inactivity nudge) are parked until proven needed — see [Scope Decision](#scope-decision-2026-06-22). M1.3 (the hint field) is the only near-term item in this phase, and is optional for single-project use (use `prompt_template` instead).
+- [ ] **M1.1** — Choose the destination and the delivery mechanism. Verify reachability from the Pi orchestrator and from a Claude worker before committing to it; walk the fallback ladder if Pi cannot reach it. Record the choice and the verification in this PRD.
+- [ ] **M1.2** — Define the expectation-log format and add the "append to `.dot-agent-deck/notify-log.md`" step to the same instructions that trigger a notification. Confirm the path is gitignored.
+- [ ] **M1.3** — Extend this repo's `.dot-agent-deck.toml` role `prompt_template`s with the notify + log instructions per the [Where to fire](#where-to-fire) table, phrased fire-and-forget.
+- [ ] **M1.4** — Contributor note under `docs/develop/` documenting the setup and how to reproduce it. Not published (CLAUDE.md rule 11); linked from `CONTRIBUTING.md`.
 
-- [ ] **M1.1** — Implement the inactivity timer: per-agent `last_pty_output` tracking, configurable threshold, fires on expiry. Resets on PTY output. Disabled when `notify_when_inactive_after` is unset.
-- [ ] **M1.2** — Wire the inactivity expiry to existing prompt-injection plumbing: on fire, inject the inactivity prompt into the target agent's session. Verify Claude Code's behavior at "waiting for user input" state; document per-agent caveats.
-- [ ] **M1.3** — Implement the `agent_notification_hint` config field. Append to spawn-time prompt for every agent / orchestrator role. Ship a sensible default.
+### Phase 2 — Run and observe
 
-### Phase 2: Deck-side desktop channel + dedup
+- [ ] **M2.1** — Run at least three orchestrated PRDs under the configuration, including one long enough to compact. Do not tune the instructions mid-run; a change resets the sample.
+- [ ] **M2.2** — Reconcile the expectation log against arrived notifications after each run. Append a findings section to this PRD with counts and every gap, plus any tripwire thoughts.
 
-> **Deferred (2026-06-22):** entire phase parked until proven needed (the no-agent fallback) — see [Scope Decision](#scope-decision-2026-06-22).
+### Phase 3 — Decide what, if anything, the deck should do
 
-- [ ] **M2.1** — Implement the minimal desktop channel. Decide `notify-rust` vs. shell-out based on transitive dep weight. Single file, no trait, not exposed to agents.
-- [ ] **M2.2** — Wire scheduler-side pre-spawn failures and agent-crash detection to the desktop channel. (Scheduler failure wiring is a stub here; the actual scheduler PRD will hook into it.)
-- [ ] **M2.3** — Implement the suspension/dedup rule: deck-fired desktop notification for a target → suspend that target's inactivity timer until a user-initiated reset event.
+- [ ] **M3.1** — Review the findings with the maintainer. For each deferred deck-side item (inactivity nudge, no-agent desktop fallback, `agent_notification_hint` field), record a decision **and its basis** — dogfood evidence where the dogfood could speak, explicit reasoning where it structurally could not.
+- [ ] **M3.2** — File follow-up issues for whatever Phase 3 approves. Nothing deferred may evaporate silently when this PRD closes.
+- [ ] **M3.3** — Decide whether the `docs/develop/` note graduates into published user docs under `docs/`.
 
-### Phase 3: Tests
+## Exit path (decide now, not at `/prd-done`)
 
-> **Deferred (2026-06-22):** M3.1/M3.2 test the inactivity timer, dedup, and crash paths — they defer with the Phase 1/2 features they cover. Near-term, only the optional hint-append (M1.3) needs a test.
+This PRD ships **no product change**, which makes the standard flow a poor fit. Expected shape:
 
-- [ ] **M3.1** — Unit tests: inactivity timer reset/expiry/suspension behavior, prompt-injection content, dedup rule.
-- [ ] **M3.2** — Integration test: spawn a fixture agent with the hint, simulate quiet PTY for N seconds, assert injection fires with expected content. Trigger a simulated agent crash, assert desktop notification fires and inactivity timer is suspended.
+- **No changelog fragment** — nothing user-facing changed. **No version bump. No release.**
+- **No test-plan gate with tests in it** — there is no deck behavior to cover, so CLAUDE.md rule 4 does not apply. `cargo test-fast` must still pass (it should be untouched).
+- **No demo reel** — the branch changes no e2e tests, so the adapter clean-skips by design.
+- **No cross-version contract check** (rule 12) — no daemon, protocol, orchestration-code, or hook change.
+- Merges as a config + docs commit; closes without a release once Phase 3's follow-ups are filed.
 
-### Phase 4: Docs, close #99, ship
-
-- [ ] **M4.1** — Documentation under `site/`: config reference, the inactivity model, recommended channel setups (Slack MCP, ntfy, `osascript`), known limitations.
-- [ ] **M4.2** — Close #99 with a comment linking to this PRD. Audit any existing docs that reference #99 and redirect them.
-- [ ] **M4.3** — Changelog fragment via `dot-ai-changelog-fragment`. Frame as "agents can now notify you out-of-band using their own tools; the deck nudges them and handles fallback for crashes."
-- [ ] **M4.4** — `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` all green. PR, review, audit, merge.
+Rules 2 and 10 still apply: `cargo fmt --check` and `cargo clippy -- -D warnings` before any commit, and no hard-wrapped Markdown prose.
 
 ## Key Files
 
-- `src/notifications.rs` (new) — inactivity timer, desktop channel, dedup state. Single module, ~150 LoC target.
-- `src/config.rs` — extend with the `[notifications]` block.
-- Existing prompt-injection module (TBD path; located in M1.2) — extended to accept inactivity-fired prompts.
-- `tests/inactivity_timer.rs` (new) — unit + integration tests for the timer and suspension behavior.
-- `site/content/docs/notifications.md` (new) — user-facing documentation.
+- `.dot-agent-deck.toml` — this repo's orchestration roles; the orchestrator `prompt_template` (`:77-124`), its two user gates (`:117`), and the Pi/Claude command split (`:74-75`).
+- `docs/develop/` — where the contributor note lands (developer-facing, excluded from the Docusaurus build).
+- `.dot-agent-deck/notify-log.md` — the expectation log (gitignored, created at runtime).
+- `src/scheduler.rs:38-45,104` — the existing scheduler-internal `Notifier` / `NotifyEvent` / `StderrNotifier` seam. **Referenced so it is not disturbed**; this PRD does not touch it.
 
 ## Risks and Mitigations
 
-- **Risk**: Users without any configured notification MCP / CLI get the hint injected but no actual delivery happens — silent no-op. They may not realize they need to set up Slack MCP / ntfy.
-  - *Mitigation*: Documentation calls this out prominently with a "Pick one" section recommending the easiest zero-setup option (`osascript` on macOS, `notify-send` on Linux, ntfy.sh elsewhere) before fancier options.
-
-- **Risk**: Stuck/wedged agent doesn't process the inactivity injection — user never gets notified.
-  - *Mitigation*: Documented limitation. Case 3 (agent crash detection) catches the case where the agent is fully dead. The narrow band of "alive but unresponsive" remains uncovered; follow-up PRD can add a secondary deck-side timer if it's a real pain.
-
-- **Risk**: Per-agent behavior when injecting prompts at "waiting for input" state varies. Some agents may append to the input field rather than treat the injection as a system message.
-  - *Mitigation*: M1.2 verifies Claude Code's behavior; per-agent caveats documented. PRD #20 (multi-agent support) is the natural place to remediate per-agent quirks if they emerge.
-
-- **Risk**: Inactivity threshold misfires for agents that legitimately work silently for long stretches (e.g. a long compilation in a sub-shell).
-  - *Mitigation*: Threshold is user-configurable and defaults to unset. Document that the heuristic is "no PTY output," so users who run silent long-haul work should set a higher threshold or disable.
-
-- **Risk**: The minimal desktop channel adds a heavy cross-platform crate (`notify-rust` and its deps) for what is supposed to be ~30 lines of code.
-  - *Mitigation*: M2.1 evaluates `cargo tree` for `notify-rust` before committing. If transitive deps balloon, fall back to shell-out with explicit `cfg(target_os)` branches.
-
-- **Risk**: Scope creep — users will ask for per-event-type routing, Slack-specific formatting, retry policies, batched digests.
-  - *Mitigation*: All of those are explicitly out of scope. Each becomes a follow-up PRD if usage proves the need. The "agent uses its own tools" model already pushes most of the policy questions to the user's MCP/CLI config, which is the right place for them.
-
-- **Risk**: Closing #99 may surprise watchers who expected that design to land.
-  - *Mitigation*: The close comment links to this PRD and explains the architectural inversion. The desktop-channel idea survives — just as the *only* channel, not the first of N.
-
-## Dependencies
-
-- Existing prompt-injection plumbing (already in the deck for orchestration role-prompt injection). M1.2 confirms it's reusable for inactivity-fired prompts.
-- Existing PTY-output observation (already in the deck for status indicators and bell). M1.1 confirms it's reusable for the inactivity timer.
-- `notify-rust` crate **or** shell-out to `osascript` / `notify-send`. M1.1 decides.
-- No external services. No new third-party credentials.
+- **Risk**: the experiment produces no falsifiable result because missed notifications are invisible.
+  - *Mitigation*: the expectation log — the whole reason it exists. If M1.2 is skipped, the PRD is worthless; treat it as gating.
+- **Risk**: results are read as a verdict on the deferred deck-side items, which the design cannot inform.
+  - *Mitigation*: stated up front in the scope decision and re-stated in M3.1, which forces the basis of each decision to be named.
+- **Risk**: N=1 project, one maintainer, one workflow — findings may not generalize to users on headless boxes running unattended schedules.
+  - *Mitigation*: accepted and recorded. Directional evidence for a decision that is currently being made on none.
+- **Risk**: scope leak into deck code once a rough edge appears.
+  - *Mitigation*: the tripwire, plus the checkable "zero diff under `src/`" success criterion.
+- **Risk**: a badly phrased instruction makes the orchestrator notify constantly, or stall waiting for acknowledgment.
+  - *Mitigation*: fire-and-forget phrasing; gates are the primary trigger rather than per-step chatter; the whole change is one revertible TOML commit.
+- **Risk**: post-compaction silence gets attributed to notifications rather than to PRD #82.
+  - *Mitigation*: at least one run must be long enough to compact, and findings must record before/after-compaction separately.
 
 ## Validation Strategy
 
-- **Unit**: inactivity timer (resets on PTY output, fires on expiry, suspension prevents re-fire), prompt-injection content (correct template substitution), dedup rule (deck-fired notification suspends timer for the right target).
-- **Integration**: spawn a fixture agent with the hint, simulate quiet PTY for N seconds, assert injection fires with expected content; simulate agent crash, assert desktop notification fires and timer is suspended; simulate scheduler-side mkdir failure, assert desktop notification fires.
-- **Manual** (per `feedback_validate_pre_pr`):
-  - Configure Slack MCP in a real agent, run a real orchestration, verify the agent posts to Slack at completion.
-  - Set `notify_when_inactive_after = "1m"` against a quiet agent, walk away, verify a Slack post arrives ~1 minute after silence.
-  - Trigger a scheduler-side failure (e.g. typo'd working_dir), verify a desktop notification appears.
-- **Regression**: existing terminal-bell behavior (PRD #8) unchanged; existing orchestration / dashboard / status-indicator behavior unchanged. The new notification module is additive — it should not change the shape of any existing test.
+Manual, per `feedback_validate_pre_pr`: three real orchestrated runs with log reconciliation after each (M2.1/M2.2). No automated tests — there is no deck behavior under test, and adding some would require deck code the constraint forbids. Regression surface is limited to this repo's own orchestration behaving as before, minus the new notifications; `cargo test-fast` stays green because nothing under `src/` moves.
 
-## CLAUDE.md Compliance
+## Findings
 
-- `cargo fmt --check` and `cargo clippy -- -D warnings` before every commit (project rule #2).
-- No `m*_*` or `prd*_*` prefixes in source/test filenames (project rule #3). Use semantic names: `src/notifications.rs`, `tests/inactivity_timer.rs`, `tests/desktop_notification.rs`.
-- Ask before creating branches or worktrees (project rule #1). `/prd-start` will prompt the user accordingly.
+_Populated by M2.2. Empty until the dogfood has run._

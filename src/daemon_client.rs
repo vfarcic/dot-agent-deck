@@ -1187,6 +1187,7 @@ mod tests {
                 is_start_role: false,
                 orchestration_cwd: None,
                 display_title: None,
+                orchestration_id: None,
             }),
             agent_type: None,
             rows: 0,
@@ -1203,6 +1204,7 @@ mod tests {
                 is_start_role: false,
                 orchestration_cwd: None,
                 display_title: None,
+                orchestration_id: None,
             }),
         );
     }

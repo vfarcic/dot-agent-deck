@@ -161,9 +161,10 @@ export default function orchestratorExtension(pi: ExtensionAPI): void {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
-		// Report status first (Needs Input), then deliver the native seed —
-		// which triggers a turn (→ agent_start → Thinking), the same real
-		// waiting→running transition the live-pane e2e asserts.
+		// Report status first (Idle — a Pi pane awaiting its first prompt is
+		// idle, matching every other backend's session-start), then deliver the
+		// native seed, which triggers a turn (→ agent_start → Thinking) — the
+		// real Idle→running transition the live-pane e2e asserts.
 		await reportStatus("session_start", ctx);
 		await deliverPendingSeed(ctx);
 	});

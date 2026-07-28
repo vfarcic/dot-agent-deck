@@ -398,6 +398,10 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // Hold the registry for the lifetime of the loop so its Drop fires
     // (killing any owned agents) when this future is dropped/aborted.
     let pty_registry = daemon.pty_registry;
+    // Tell the registry which hook endpoint we just bound, so every agent it
+    // spawns is handed that path explicitly instead of re-resolving it from
+    // inherited environment when it emits. See `DOT_AGENT_DECK_SOCKET`.
+    pty_registry.set_hook_socket(socket_path.to_path_buf());
     let state = daemon.state;
     let event_tx = daemon.event_tx;
     let client_count = daemon.client_count;

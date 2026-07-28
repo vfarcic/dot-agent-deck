@@ -32,7 +32,7 @@
 #![allow(dead_code)]
 
 use dot_agent_deck::event::{AgentEvent, AgentType, DelegateSignal, EventType, WorkDoneSignal};
-use dot_agent_deck::state::AppState;
+use dot_agent_deck::state::{AppState, OrchestrationIdentity};
 
 /// A scripted stand-in agent, identified by its [`AgentType`]. Instantiate
 /// with [`SyntheticAgent::new`] and drive it with [`agent_event`](Self::agent_event),
@@ -135,7 +135,7 @@ impl SyntheticAgent {
         state: &mut AppState,
         role: &str,
         is_orchestrator: bool,
-        orchestration: (String, String),
+        orchestration: OrchestrationIdentity,
         cwd: &str,
     ) {
         state.register_pane(self.pane_id.clone());
