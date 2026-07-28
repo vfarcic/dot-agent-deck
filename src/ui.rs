@@ -7500,6 +7500,47 @@ fn pop_keyboard_enhancement() {
     }
 }
 
+/// PRD #227 M2: RAII pairing for [`push_keyboard_enhancement`], so the pop
+/// happens on *every* way out of [`run_tui`] rather than only the one that
+/// reaches the explicit teardown.
+///
+/// The teardown at the end of `run_tui` still pops explicitly, because the
+/// ORDER of the escape sequences there is deliberate — the pop must precede
+/// `ratatui::restore()`. But the event loop between the push and that teardown
+/// propagates I/O errors with `?`: a failed `terminal.draw`, `event::read`, or
+/// `event::poll` returns early and skips every line below it, teardown
+/// included. A leaked push is not cosmetic like a leaked mouse-capture — it
+/// outlives the process and corrupts key delivery in the shell the user is
+/// dropped back into. This guard's `Drop` covers the normal return, the
+/// `?`-error returns, and an unwinding panic, which is what makes the
+/// changelog's unconditional "popped on exit, so it cannot leak" wording true.
+///
+/// It is also the backstop for the one path the panic hook deliberately skips:
+/// the hook returns early while `in_guarded_parser_feed()` (it must not tear
+/// down a terminal the render loop is still using), so if such a panic ever
+/// escapes `catch_unwind` instead of being swallowed, this `Drop` is what pops.
+///
+/// Idempotent by construction: [`pop_keyboard_enhancement`] is a test-and-clear
+/// on [`KEYBOARD_ENHANCEMENT_PUSHED`], so the explicit teardown pop, this
+/// `Drop`, and the panic hook can all fire in any combination without a second
+/// pop ever discarding a flag set that another program on the terminal's stack
+/// owns.
+struct KeyboardEnhancementGuard;
+
+impl KeyboardEnhancementGuard {
+    /// Perform the (gated) push and return the guard that will undo it.
+    fn push() -> Self {
+        push_keyboard_enhancement();
+        Self
+    }
+}
+
+impl Drop for KeyboardEnhancementGuard {
+    fn drop(&mut self) {
+        pop_keyboard_enhancement();
+    }
+}
+
 pub fn run_tui(
     state: SharedState,
     pane: Arc<dyn PaneController>,
@@ -7543,9 +7584,16 @@ pub fn run_tui(
     // PRD #227 M2: raw mode and the alternate screen are up, so negotiate the
     // enhanced keyboard protocol now — before the event loop starts polling,
     // since the support probe reads the terminal's reply off stdin itself.
-    // Paired with `pop_keyboard_enhancement()` in the teardown below and in the
-    // panic hook installed above.
-    push_keyboard_enhancement();
+    //
+    // Held as an RAII guard, NOT a bare call: the event loop below returns early
+    // via `?` on any terminal I/O error, which would skip the explicit
+    // `pop_keyboard_enhancement()` in the teardown and leak the enhanced mode
+    // into the user's shell. The guard's `Drop` pops on that path (and on an
+    // unwind); the explicit teardown pop stays because it must run BEFORE
+    // `ratatui::restore()`, and the pop is idempotent so the two never conflict.
+    // Bound to a NAMED binding — `let _ = …` would drop it immediately and pop
+    // the flag before the event loop ever runs.
+    let _keyboard_enhancement = KeyboardEnhancementGuard::push();
 
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, keybindings);
@@ -19936,6 +19984,110 @@ mod tests {
 
         let prompts = collect_recent_prompts(&session, 3);
         assert!(prompts.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------
+    // PRD #227 M2 — keyboard-enhancement push/pop lifecycle
+    // ---------------------------------------------------------------------------
+
+    // These two drive `KEYBOARD_ENHANCEMENT_PUSHED` (a process-global) directly
+    // rather than through `push_keyboard_enhancement()`, which self-disables
+    // under a test harness because `supports_keyboard_enhancement()` finds no
+    // kitty-capable terminal. Storing `true` is the stand-in for "the gated push
+    // succeeded". Safe to share the static across them because nextest runs each
+    // test in its own process; the pop they trigger writes 5 bytes of escape
+    // sequence to the captured test stdout and touches nothing else.
+    //
+    // The `?`-error return inside `run_tui`'s event loop that motivates the guard
+    // is NOT reachable in-process (it needs a real terminal whose `draw` /
+    // `read` / `poll` fails), so these cover the guard MECHANISM — that `Drop`
+    // pops at all, and that it cannot double-pop — rather than that specific
+    // call site. The end-to-end pop-on-exit evidence is the L2
+    // `embed/key-forwarding/002` assertion on the deck's real output stream.
+
+    /// Pin the exact bytes crossterm writes for the push and the pop.
+    ///
+    /// The L2 `embed/key-forwarding/002` test asserts on these literal sequences
+    /// in the deck's real output stream, which is the only direct evidence M2
+    /// ran at all. That assertion would silently stop proving anything if a
+    /// crossterm upgrade changed the encoding, so pin it here where the failure
+    /// is a compile-fast unit test naming the new form rather than a puzzling
+    /// PTY-test timeout. Note the pop is `CSI < 1 u`, NOT the `>` form.
+    #[test]
+    fn keyboard_enhancement_wire_bytes_are_the_ones_the_e2e_asserts() {
+        use crossterm::Command;
+
+        let mut push = String::new();
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        )
+        .write_ansi(&mut push)
+        .expect("format push command");
+        assert_eq!(
+            push, "\x1b[>1u",
+            "crossterm's PushKeyboardEnhancementFlags encoding changed; update the \
+             PUSH_ENHANCEMENT constant in tests/e2e_pane_shift_enter.rs to match"
+        );
+
+        let mut pop = String::new();
+        crossterm::event::PopKeyboardEnhancementFlags
+            .write_ansi(&mut pop)
+            .expect("format pop command");
+        assert_eq!(
+            pop, "\x1b[<1u",
+            "crossterm's PopKeyboardEnhancementFlags encoding changed; update the \
+             POP_ENHANCEMENT constant in tests/e2e_pane_shift_enter.rs to match"
+        );
+    }
+
+    /// The guard pops when it leaves scope — the property that covers every
+    /// `run_tui` exit path the explicit teardown misses.
+    #[test]
+    fn keyboard_enhancement_guard_pops_on_scope_exit() {
+        KEYBOARD_ENHANCEMENT_PUSHED.store(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            let _guard = KeyboardEnhancementGuard;
+            assert!(
+                KEYBOARD_ENHANCEMENT_PUSHED.load(std::sync::atomic::Ordering::SeqCst),
+                "the flag must stay set while the guard is alive — popping early \
+                 would disable the enhanced protocol for the whole session"
+            );
+        }
+        assert!(
+            !KEYBOARD_ENHANCEMENT_PUSHED.load(std::sync::atomic::Ordering::SeqCst),
+            "the guard's Drop must pop the keyboard-enhancement flag; without it a \
+             `?`-error return from run_tui's event loop leaks the enhanced mode \
+             into the shell the user is dropped back into"
+        );
+    }
+
+    /// The explicit teardown pop and the guard's `Drop` both firing must pop
+    /// exactly once, so neither can discard a flag set another program on the
+    /// terminal's stack owns.
+    #[test]
+    fn keyboard_enhancement_pop_is_idempotent() {
+        KEYBOARD_ENHANCEMENT_PUSHED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let guard = KeyboardEnhancementGuard;
+
+        // Stands in for the explicit pop in run_tui's normal teardown.
+        pop_keyboard_enhancement();
+        assert!(
+            !KEYBOARD_ENHANCEMENT_PUSHED.load(std::sync::atomic::Ordering::SeqCst),
+            "the first pop must clear the flag"
+        );
+
+        // The guard now drops on top of that. The test-and-clear means it finds
+        // the flag already false and emits nothing.
+        drop(guard);
+        assert!(
+            !KEYBOARD_ENHANCEMENT_PUSHED.load(std::sync::atomic::Ordering::SeqCst),
+            "a second pop must remain a no-op"
+        );
+
+        // A pop with no push at all is likewise inert (the tmux case, where the
+        // support probe returns false and nothing is ever pushed).
+        pop_keyboard_enhancement();
+        assert!(!KEYBOARD_ENHANCEMENT_PUSHED.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     // ---------------------------------------------------------------------------

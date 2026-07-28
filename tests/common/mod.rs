@@ -595,6 +595,17 @@ impl TuiDeck {
         // write side after the 1st). Stored for all writes, and shared with
         // the reader thread so it can answer the deck's terminal-capability
         // queries inline (PRD #227 M2, see `answer_terminal_queries`).
+        //
+        // Poisoning is accepted, not handled: every `lock()` on this mutex
+        // `unwrap()`s, so if a `send_bytes` on the test thread panics while
+        // holding it (a closed PTY write side is the realistic case), the mutex
+        // is poisoned and the reader thread's next `lock().unwrap()` panics too,
+        // killing the reader — capability queries stop being answered and the
+        // cast loses its tail. Deliberately left alone: the blast radius is one
+        // already-failing test process, and the test thread's own panic is the
+        // failure the developer sees. Recovering (`lock().unwrap_or_else(|e|
+        // e.into_inner())`) would keep a reader alive to write through a PTY that
+        // just proved unwritable, trading a clear failure for a confusing one.
         let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(
             pair.master.take_writer().expect("take PTY master writer"),
         ));
@@ -825,6 +836,21 @@ impl TuiDeck {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// The deck's cumulative raw OUTPUT byte stream since launch, lossily
+    /// decoded — escape sequences included, exactly as written to the tty.
+    ///
+    /// [`wait_for_stream_string_within`](Self::wait_for_stream_string_within)
+    /// answers "did this ever appear"; this is for the questions a `contains`
+    /// cannot express — how MANY times a sequence appears, and in what ORDER
+    /// relative to another. PRD #227 M2 needs both: the terminal-mode push must
+    /// appear before its matching pop, and the pop must appear exactly once (a
+    /// double pop would discard a flag set another program on the terminal's
+    /// stack owns). Escape bytes survive the decode unharmed — `ESC` is 0x1b,
+    /// valid UTF-8 — so a needle like `"\x1b[>1u"` matches literally.
+    pub fn stream_text(&self) -> String {
+        String::from_utf8_lossy(&self.byte_history.lock().unwrap()).into_owned()
     }
 
     /// Like [`wait_for_string`] (scans the RECONSTRUCTED vt100 grid, so

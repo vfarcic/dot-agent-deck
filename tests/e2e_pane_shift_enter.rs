@@ -34,20 +34,30 @@
 //! In a real agent's prompt editor a submitted draft LEAVES the input box (it is
 //! repainted into the transcript, several rows up, and the box is cleared before
 //! the next characters land). A draft that merely gained a newline keeps BOTH
-//! lines inside the box, on CONSECUTIVE rows. So the row of line two being
-//! exactly one below the row of line one is simultaneously the "a newline was
+//! lines inside the box, on CONSECUTIVE rows, bracketed by the box's own
+//! horizontal rules. So "line two is exactly one row below line one, and both
+//! sit inside one rule-delimited box" is simultaneously the "a newline was
 //! inserted" assertion and the "no submission happened" assertion, and neither
 //! depends on what the model decides to say. A second, independent negative
 //! backs it up: line one is a directive that would create a uniquely-named
-//! sentinel file if it were ever submitted, and that file must not exist.
+//! sentinel file if it were ever submitted, and that file must not exist — with
+//! a GATING positive control at the end proving the directive was executable, so
+//! the absence cannot pass vacuously.
 //!
-//! Decision 23 cost: the load-bearing assertions submit NOTHING, so they cost
-//! zero LLM tokens — only the soft positive control at the end (one plain Enter,
-//! one `touch`) spends a short Haiku turn. Local-only (Decision 8 / rule 5):
+//! ## What pins M2 (the startup protocol push)
+//! Step 1 above injects an ALREADY-CSI-u-encoded keypress, which crossterm
+//! decodes even with no enhancement flags pushed. So the draft assertions cover
+//! the M1 encoder and would still pass with M2 deleted. `001` therefore also
+//! asserts the push appears in the deck's output stream, and `002` covers the
+//! push/pop lifecycle on its own — deterministically, with no agent at all.
+//!
+//! Decision 23 cost: `001`'s draft assertions submit NOTHING, so they cost zero
+//! LLM tokens; only its positive control (one plain Enter, one `touch`) spends a
+//! short Haiku turn, and `002` spends none. Local-only (Decision 8 / rule 5):
 //! gated on the `e2e` feature so CI's `cargo test-fast` never compiles it.
 //! Flaky-tolerant (real agent) per rule 4 — run once, not looped.
 //!
-//! Bug fix, not a showcase: NO ` [reel]` marker on the catalog entry (PRD #180).
+//! Bug fix, not a showcase: NO ` [reel]` marker on the catalog entries (PRD #180).
 
 mod common;
 
@@ -77,8 +87,8 @@ const MARKER_TWO: &str = "bravo-7f3c";
 
 /// The file [`LINE_ONE`] directs the agent to create. Its ABSENCE is the
 /// independent no-submission signal; its later appearance (after a deliberate
-/// plain Enter) is the soft positive control proving the directive was
-/// executable all along.
+/// plain Enter) is the GATING positive control proving the directive was
+/// executable all along, without which the absence would prove nothing.
 const SENTINEL: &str = "shiftnl-7f3c.txt";
 
 /// Shift+Enter as a kitty CSI-u keypress: `CSI 13 ; 2 u` (keycode 13 = Enter,
@@ -90,40 +100,90 @@ const SHIFT_ENTER_CSI_U: &[u8] = b"\x1b[13;2u";
 /// The agent's own input-box affordance — present once its prompt editor is
 /// mounted and accepting keystrokes. Waiting on it (rather than typing blind
 /// into a booting TUI) is what keeps the keystroke sequence below deterministic.
+///
+/// UNPINNED third-party UI copy: this is Claude Code's own footer hint, so a
+/// Claude release that rewords it breaks the readiness wait (the test would then
+/// fail on the 120 s timeout below, with the grid in its diagnostic). It is
+/// isolated here as a single named constant precisely so that breakage is a
+/// ONE-LINE fix. A structural signal was considered instead and rejected: the
+/// only structural candidate is the input box's rules ([`is_rule_row`]), which
+/// the *deck's* own chrome also draws, so it would report ready before the agent
+/// has mounted anything.
 const AGENT_INPUT_READY: &str = "? for shortcuts";
 
-/// Are both draft markers on `grid` with the second on the row immediately
-/// below the first? `None` while either marker is still missing, so the settle
-/// wait can distinguish "not painted yet" from "painted, wrong geometry".
-fn draft_rows(grid: &str) -> Option<bool> {
-    let row_of = |needle: &str| grid.lines().position(|line| line.contains(needle));
-    let one = row_of(MARKER_ONE)?;
-    let two = row_of(MARKER_TWO)?;
-    Some(two == one + 1)
+/// What crossterm 0.28 writes for
+/// `PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)` — `CSI > 1 u`
+/// (`csi!(">")` + flag bits + `u`; DISAMBIGUATE is bit `0b0000_0001`). Seeing
+/// this in the deck's OUTPUT stream is the only direct evidence M2 ran, which is
+/// what stops this file from passing with M2 deleted: the CSI-u keypress injected
+/// below is decoded by crossterm even with no flags pushed, so it exercises the
+/// M1 encoder alone. Pinned against a crossterm upgrade by the L1 test
+/// `ui::tests::keyboard_enhancement_wire_bytes_are_the_ones_the_e2e_asserts`.
+const PUSH_ENHANCEMENT: &str = "\x1b[>1u";
+/// What crossterm 0.28 writes for `PopKeyboardEnhancementFlags` — `CSI < 1 u`.
+/// Note the `<`: it is NOT the `>` form the push uses.
+const POP_ENHANCEMENT: &str = "\x1b[<1u";
+
+/// Minimum run of `─` (U+2500) that marks a row as a horizontal RULE — a region
+/// boundary — rather than a row that merely contains incidental box-drawing.
+const RULE_MIN_RUN: usize = 20;
+
+/// Does `line` carry a long horizontal rule? The agent's prompt editor is
+/// bracketed by exactly two of these (its top and bottom edge), which is the
+/// structural signature [`draft_geometry`] uses to prove a row is draft content
+/// rather than transcript content.
+fn is_rule_row(line: &str) -> bool {
+    let mut run = 0usize;
+    for ch in line.chars() {
+        run = if ch == '─' { run + 1 } else { 0 };
+        if run >= RULE_MIN_RUN {
+            return true;
+        }
+    }
+    false
 }
 
-/// Scenario: Launch the REAL `dot-agent-deck` binary through the vt100 `TuiDeck`
-/// harness with a restored saved session whose one pane runs a REAL interactive
-/// `claude` on Haiku (`--allowedTools Bash`, NO `-p`), with the per-test HOME
-/// carrying imported credentials and pre-seeded project trust so the first-run
-/// onboarding and trust gates clear without a keystroke. The restored pane
-/// auto-focuses, so keys typed at the deck are forwarded to the embedded agent.
-/// Once the agent's prompt editor is up, type the draft line `Run: touch
-/// shiftnl-7f3c.txt`, then inject `ESC[13;2u` — the CSI-u encoding of
-/// Shift+Enter that a kitty-capable terminal emits — into the deck's PTY, then
-/// type a second line `Then stop. marker bravo-7f3c`. Assert on the rendered
-/// vt100 grid that the draft became TWO lines: both markers are on screen and
-/// the second sits on the row IMMEDIATELY BELOW the first, which is only true
-/// while both lines live inside the same input box. That adjacency is also the
-/// no-submission proof — a submitted first line would have been repainted into
-/// the transcript far above the box before the second line was typed. Back it
-/// with an independent negative: the directive's uniquely-named sentinel file
-/// `shiftnl-7f3c.txt` must NOT exist in the pane's cwd. Finally, best-effort
-/// (logged, not gating): press plain Enter and report whether the sentinel then
-/// appears — the positive control showing the directive was executable and that
-/// plain Enter still submits. PTY-attached, so it records a `full-stream.cast`;
-/// bug fix, so NOT reel-marked. Flaky-tolerant (real agent) — run once, not
-/// looped.
+/// Rows of the two draft markers, plus whether the prompt-editor box's rules sit
+/// immediately above the first and immediately below the second. `None` while
+/// either marker is still missing, so the settle wait can distinguish "not
+/// painted yet" from "painted, wrong geometry".
+///
+/// The rule checks are what scope the markers to the INPUT BOX. Row adjacency on
+/// its own reads any two consecutive rows alike, so a submitted draft that the
+/// agent repainted into the transcript as two consecutive lines would satisfy it
+/// vacuously. A two-line draft *inside the box* has the box's own rules directly
+/// bracketing it; the same two lines in the transcript have ordinary output or
+/// blank rows around them, with the box's top rule further down the grid.
+fn draft_geometry(grid: &str) -> Option<(usize, usize, bool, bool)> {
+    let lines: Vec<&str> = grid.lines().collect();
+    let row_of = |needle: &str| lines.iter().position(|line| line.contains(needle));
+    let one = row_of(MARKER_ONE)?;
+    let two = row_of(MARKER_TWO)?;
+    let rule_above = one
+        .checked_sub(1)
+        .and_then(|r| lines.get(r))
+        .is_some_and(|l| is_rule_row(l));
+    let rule_below = lines.get(two + 1).is_some_and(|l| is_rule_row(l));
+    Some((one, two, rule_above, rule_below))
+}
+
+/// Is the draft two lines of ONE prompt-editor box — consecutive rows, both
+/// inside the box's rules? `None` while either marker is still missing.
+fn draft_is_two_lines_of_one_box(grid: &str) -> Option<bool> {
+    let (one, two, rule_above, rule_below) = draft_geometry(grid)?;
+    Some(two == one + 1 && rule_above && rule_below)
+}
+
+/// Scenario: Launch the real `dot-agent-deck` through the vt100 `TuiDeck`
+/// harness with one auto-focused pane running a REAL interactive `claude` on
+/// Haiku, then type `Run: touch shiftnl-7f3c.txt`, inject `ESC[13;2u` (the CSI-u
+/// Shift+Enter a kitty-capable terminal emits) into the deck's PTY, and type
+/// `Then stop. marker bravo-7f3c`. Assert the deck negotiated the enhanced
+/// keyboard protocol at startup, and that the draft became two lines of ONE
+/// prompt-editor box — the second marker on the row immediately below the first,
+/// both bracketed by the box's rules — which is simultaneously the newline proof
+/// and the no-submission proof, backed by the directive's sentinel file
+/// `shiftnl-7f3c.txt` being absent until a deliberate plain Enter creates it.
 #[spec("embed/key-forwarding/001")]
 #[test]
 fn key_forwarding_001_shift_enter_inserts_newline_without_submitting() {
@@ -155,6 +215,19 @@ fn key_forwarding_001_shift_enter_inserts_newline_without_submitting() {
     // Command-Mode affordance. From here every key we send is forwarded to the
     // embedded agent rather than handled by the dashboard.
     deck.wait_for_string("[Command Mode Ctrl+D]");
+
+    // M2 is live for THIS run. Without this the file would pass with the startup
+    // protocol push deleted outright — the CSI-u keypress injected below is
+    // decoded by crossterm with no flags pushed, so the rest of the test pins
+    // only the M1 encoder. `embed/key-forwarding/002` covers the push/pop
+    // lifecycle on its own; this asserts the fix under test was actually in
+    // effect while the forwarding behavior below was measured.
+    assert!(
+        deck.wait_for_stream_string_within(PUSH_ENHANCEMENT, Duration::from_secs(30)),
+        "the deck never pushed the enhanced keyboard protocol (no {PUSH_ENHANCEMENT:?} in \
+         its output stream), so M2 is not in effect and the Shift+Enter behavior measured \
+         below would not reproduce for a user who has no terminal keybind configured."
+    );
 
     // Wait for the agent's prompt editor to mount before typing. Generous
     // ceiling (Design Decision #7): a real agent's boot is seconds, not
@@ -200,15 +273,14 @@ fn key_forwarding_001_shift_enter_inserts_newline_without_submitting() {
     // quiescence would simply time out. This wait does not decide the outcome —
     // the assertion below re-checks the settled grid either way, so a layout
     // that never settles still produces the detailed diagnostic.
-    deck.wait_for_grid_predicate_within(Duration::from_secs(15), |g| draft_rows(g) == Some(true));
+    deck.wait_for_grid_predicate_within(Duration::from_secs(15), |g| {
+        draft_is_two_lines_of_one_box(g) == Some(true)
+    });
 
     // --- Load-bearing assertion: the draft is TWO LINES of ONE input box. ---
     let grid = deck.snapshot_grid();
-    let (_, row_one) = deck.find_in_grid(MARKER_ONE).unwrap_or_else(|| {
-        panic!("the first draft line left the rendered grid entirely.\nFinal grid:\n{grid}")
-    });
-    let (_, row_two) = deck.find_in_grid(MARKER_TWO).unwrap_or_else(|| {
-        panic!("the second draft line left the rendered grid entirely.\nFinal grid:\n{grid}")
+    let (row_one, row_two, rule_above, rule_below) = draft_geometry(&grid).unwrap_or_else(|| {
+        panic!("a draft line left the rendered grid entirely.\nFinal grid:\n{grid}")
     });
 
     assert_eq!(
@@ -222,6 +294,21 @@ fn key_forwarding_001_shift_enter_inserts_newline_without_submitting() {
          box); an equal row means no newline was inserted at all. Either way the deck \
          collapsed `Enter + SHIFT` to a bare CR instead of forwarding \
          `ESC[13;2u`.\nFinal grid:\n{grid}"
+    );
+
+    // Adjacency alone cannot tell draft rows from transcript rows — a submitted
+    // draft the agent repainted into the transcript is two consecutive rows too.
+    // The prompt-editor box brackets its content with horizontal rules, so
+    // requiring one directly above the first line and one directly below the
+    // second is what proves these rows are the LIVE DRAFT rather than an echo of
+    // a submitted one.
+    assert!(
+        rule_above && rule_below,
+        "the two draft lines are on consecutive rows {row_one}/{row_two} but are NOT bracketed \
+         by the prompt editor's rules (rule directly above = {rule_above}, rule directly below \
+         = {rule_below}), so they are not the live draft inside one input box — most likely a \
+         SUBMITTED draft repainted into the transcript, which would mean Shift+Enter \
+         submitted.\nFinal grid:\n{grid}"
     );
 
     // --- Independent negative: nothing was submitted, so the directive on the
@@ -238,15 +325,97 @@ fn key_forwarding_001_shift_enter_inserts_newline_without_submitting() {
         deck.snapshot_grid()
     );
 
-    // --- Soft positive control (logged, NOT gating): plain Enter must still
-    // submit, and the directive must be executable — which is what makes the
-    // sentinel's absence above meaningful rather than vacuous. Left non-gating
-    // because it is the only step that depends on a live model turn, and rule 4
-    // keeps LLM variance out of load-bearing assertions. ---
+    // --- GATING positive control: plain Enter must still submit, and the
+    // directive must actually be executable. This is what makes the sentinel's
+    // absence above mean "nothing was submitted" rather than "nothing was
+    // submitted, or the agent was merely slow, or it declined the tool call".
+    // A non-gating control cannot distinguish those, so the negative it backs
+    // could pass vacuously — the whole point of asserting it.
+    //
+    // It is the one step that depends on a live model turn, so it carries the
+    // widest ceiling in the file (120 s). That is the deliberate trade: this file
+    // lives in the flaky-tolerant pre-PR e2e tier (rule 4/5), and a control that
+    // never fails is not a control. ---
     deck.send_bytes(b"\r");
-    let submitted = common::wait_for_path(&sentinel, Duration::from_secs(120));
-    eprintln!(
-        "positive control (soft): plain Enter submitted the two-line draft and the agent \
-         created {SENTINEL:?} = {submitted}"
+    assert!(
+        common::wait_for_path(&sentinel, Duration::from_secs(120)),
+        "positive control FAILED: after a plain Enter the agent never created {SENTINEL:?} \
+         within 120s. Plain Enter must still submit, and the first line's directive must be \
+         executable — without both, the sentinel's absence asserted above proves nothing \
+         about Shift+Enter (an agent that was slow or declined the tool call would leave the \
+         sentinel missing for entirely the wrong reason).\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: Launch the real `dot-agent-deck` through the vt100 `TuiDeck`
+/// harness with no pane at all, and assert its OUTPUT stream carries
+/// `ESC[>1u` — the enhanced-keyboard-protocol push (M2) — once the dashboard is
+/// up, since the harness answers the capability probe like a kitty-capable
+/// terminal. Then quit cleanly with Ctrl+C twice and assert the matching
+/// `ESC[<1u` pop appears exactly once, after the push, so the deck cannot leave
+/// the user's shell in the enhanced mode.
+#[spec("embed/key-forwarding/002")]
+#[test]
+fn key_forwarding_002_enhanced_keyboard_protocol_pushed_and_popped() {
+    // No agent, no credentials, no LLM: the whole behavior is the deck's own
+    // terminal negotiation, so this is fully deterministic and costs nothing.
+    let deck = TuiDeck::launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    // --- The push (Gap 1). The harness's `answer_terminal_queries` replies to
+    // the `ESC[?u` / `ESC[c` probe, so `supports_keyboard_enhancement()` returns
+    // true here and the gated push fires — modelling exactly the kitty-capable
+    // terminal the fix targets. ---
+    assert!(
+        deck.wait_for_stream_string_within(PUSH_ENHANCEMENT, Duration::from_secs(30)),
+        "the deck never pushed the enhanced keyboard protocol: no {PUSH_ENHANCEMENT:?} in its \
+         output stream. Without that push a kitty-capable terminal stays in legacy mode, where \
+         Shift+Enter has no distinct encoding and arrives as a bare CR — so the modifier is \
+         gone before any deck code runs and the M1 encoder never sees it. This is the M2 half \
+         of PRD #227, and it is what makes the fix work with NO user-side terminal \
+         configuration (docs/troubleshooting.md, changelog.d/227.feature.md).\nStream:\n{:?}",
+        deck.stream_text()
+    );
+
+    // --- The pop. Ctrl+C opens the quit-confirm dialog; a second Ctrl+C from
+    // inside it exits (`Action::Quit`), which is the deck's ordinary clean-exit
+    // path through the teardown that pops. ---
+    deck.send_bytes(b"\x03");
+    deck.wait_for_string("Quit dot-agent-deck?");
+    deck.send_bytes(b"\x03");
+
+    assert!(
+        deck.wait_for_stream_string_within(POP_ENHANCEMENT, Duration::from_secs(30)),
+        "the deck exited without popping the enhanced keyboard protocol: no {POP_ENHANCEMENT:?} \
+         in its output stream. A leaked push is not cosmetic — it outlives the process and \
+         corrupts key delivery in the shell the user is dropped back into.\nStream:\n{:?}",
+        deck.stream_text()
+    );
+
+    // Ordering and multiplicity, which a `contains` cannot express. A pop before
+    // its push would be popping some other program's flags, and a SECOND pop
+    // would discard whatever sits under ours on the terminal's stack — the reason
+    // the pop is a test-and-clear on a single `AtomicBool` rather than
+    // unconditional (see `pop_keyboard_enhancement`).
+    let stream = deck.stream_text();
+    let push_at = stream
+        .find(PUSH_ENHANCEMENT)
+        .expect("push asserted present above");
+    let pop_at = stream
+        .find(POP_ENHANCEMENT)
+        .expect("pop asserted present above");
+    assert!(
+        push_at < pop_at,
+        "the pop ({POP_ENHANCEMENT:?} at byte {pop_at}) precedes the push \
+         ({PUSH_ENHANCEMENT:?} at byte {push_at}), so the deck popped flags it had not pushed."
+    );
+    assert_eq!(
+        stream.matches(POP_ENHANCEMENT).count(),
+        1,
+        "expected exactly ONE {POP_ENHANCEMENT:?} pop for the single push. Both the normal \
+         teardown and the RAII guard's Drop run on a clean exit, so more than one here means \
+         the test-and-clear on KEYBOARD_ENHANCEMENT_PUSHED stopped making the pop idempotent \
+         and the deck can now discard a flag set another program owns."
     );
 }
