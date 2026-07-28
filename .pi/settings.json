@@ -1,5 +1,5 @@
 {
   "packages": [
-    "npm:pi-mcp-adapter"
+    "npm:pi-mcp-adapter@2.15.0"
   ]
 }
