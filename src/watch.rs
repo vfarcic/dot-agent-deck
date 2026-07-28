@@ -16,15 +16,13 @@ pub fn run_watch(interval_secs: u64, command: &str) -> ! {
         // Capture command output, then clear and print in one shot
         // to avoid auto-scroll issues with direct PTY output.
         //
-        // PRD #42 M1: route the shell-wrap through the `platform::shell` flag
-        // seam so the invocation is Windows-correct (`cmd.exe /C …`) instead of
-        // the previously-hardcoded `sh`. Unix behavior is preserved exactly:
-        // the watch command is a fixed POSIX command line, so Unix keeps the
-        // deterministic `sh -c …` rather than switching to `$SHELL`.
-        #[cfg(unix)]
-        let shell = "sh";
-        #[cfg(windows)]
-        let shell = crate::platform::shell::default_shell(None);
+        // PRD #42 M1 / #163 M1: route both the shell and the `-c`/`/C` flag
+        // through the `platform::shell` seam so the invocation is
+        // Windows-correct (`cmd.exe /C …`) instead of the previously-hardcoded
+        // `sh`. Unix behavior is preserved exactly: the watch command is a fixed
+        // POSIX command line, so Unix keeps the deterministic `sh -c …` rather
+        // than switching to `$SHELL`.
+        let shell = crate::platform::shell::fixed_command_shell("sh");
         let output = Command::new(shell)
             .arg(crate::platform::shell::shell_command_flag())
             .arg(command)

@@ -676,10 +676,18 @@ impl RemotesFile {
     pub fn save(&self, path: &Path) -> Result<(), RemoteConfigError> {
         use std::io::Write;
 
+        // PRD #163 auditor: create the parent through the fsperm seam, not plain
+        // `create_dir_all`, so the *directory* is owner-only too — the same call
+        // `schedules.toml` already makes. The per-file DACL/mode protects the
+        // contents; this protects the metadata (which remotes exist, by filename)
+        // when `DOT_AGENT_DECK_REMOTES_DIR` points somewhere shared. Create-only,
+        // so an existing directory is never surprise-tightened (PRD #127 S2).
         let parent = path.parent().unwrap_or(Path::new("."));
-        std::fs::create_dir_all(parent).map_err(|source| RemoteConfigError::Io {
-            path: parent.display().to_string(),
-            source,
+        crate::platform::fsperm::create_owner_only_dir(parent).map_err(|source| {
+            RemoteConfigError::Io {
+                path: parent.display().to_string(),
+                source,
+            }
         })?;
 
         let contents = toml::to_string_pretty(self)?;
@@ -694,8 +702,9 @@ impl RemotesFile {
         let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
 
         // PRD #42 M1: owner-only (0o600) creation mode comes from the platform
-        // seam — `.mode(0o600)` on Unix, a no-op-under-`%LOCALAPPDATA%`-ACL on
-        // Windows (#163).
+        // seam — `.mode(0o600)` on Unix; on Windows (#163) the DACL cannot be
+        // supplied at create time, so the seam instead puts `WRITE_DAC` on the
+        // handle, which is what lets the `set_file_owner_only` call below apply it.
         let mut open_opts = std::fs::OpenOptions::new();
         open_opts.create(true).write(true).truncate(true);
         crate::platform::fsperm::set_create_mode_owner_only(&mut open_opts);
@@ -705,21 +714,31 @@ impl RemotesFile {
             source,
         })?;
 
-        let write_result = tmp_file.write_all(contents.as_bytes());
-        if let Err(source) = write_result {
-            // Best-effort cleanup; ignore secondary errors.
+        // Owner-only permissions BEFORE the first content byte (PRD #163 M4).
+        //
+        // Two reasons this runs here rather than after the write. (1) Defense in
+        // depth on Unix, as before: a stale temp file from a crashed previous save
+        // would not have had `OpenOptions::mode()` re-applied, so the bits have to
+        // be set explicitly. (2) On Windows this call is not a re-assert but the
+        // *only* place the protected current-user-only DACL is applied —
+        // `std::fs::OpenOptions` has no `SECURITY_ATTRIBUTES` hook, so
+        // `set_create_mode_owner_only` can only pre-authorize this call by putting
+        // `WRITE_DAC` on the handle. Doing that after `write_all` would leave
+        // the credentials in this file readable under the parent directory's
+        // inherited ACL for the length of the write; doing it now means only an
+        // empty file is ever exposed. The end state on Unix is identical.
+        let perm_result = crate::platform::fsperm::set_file_owner_only(&tmp_file);
+        if let Err(source) = perm_result {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(RemoteConfigError::Io {
                 path: tmp_path.display().to_string(),
                 source,
             });
         }
-        // Defense in depth: if a stale temp file from a crashed previous save
-        // existed, the create-mode would NOT have re-applied the bits, so
-        // re-set owner-only permissions explicitly before the rename (PRD #42
-        // M1: via the platform seam — set 0o600 on Unix, no-op on Windows).
-        let perm_result = crate::platform::fsperm::set_file_owner_only(&tmp_file);
-        if let Err(source) = perm_result {
+
+        let write_result = tmp_file.write_all(contents.as_bytes());
+        if let Err(source) = write_result {
+            // Best-effort cleanup; ignore secondary errors.
             let _ = std::fs::remove_file(&tmp_path);
             return Err(RemoteConfigError::Io {
                 path: tmp_path.display().to_string(),
@@ -745,7 +764,7 @@ pub fn default_remotes_path() -> PathBuf {
     if let Ok(p) = std::env::var("DOT_AGENT_DECK_REMOTES") {
         return PathBuf::from(p);
     }
-    crate::config::dirs_home().join(".config/dot-agent-deck/remotes.toml")
+    crate::config::config_dir().join("remotes.toml")
 }
 
 // ---------------------------------------------------------------------------

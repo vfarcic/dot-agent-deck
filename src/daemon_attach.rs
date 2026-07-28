@@ -41,8 +41,11 @@ pub enum AttachError {
         #[source]
         source: std::io::Error,
     },
+    // "never became available" rather than "never appeared": on Windows the
+    // endpoint is a named pipe with no filesystem presence, so what timed out is
+    // the connect-probe, not a file materializing (PRD #163 M4).
     #[error(
-        "daemon failed to start within {timeout_ms}ms: socket {path} never appeared. Check {log_path} for daemon stderr."
+        "daemon failed to start within {timeout_ms}ms: endpoint {path} never became available. Check {log_path} for daemon stderr."
     )]
     DaemonStartTimeout {
         path: PathBuf,
@@ -73,6 +76,11 @@ pub enum AttachError {
 /// Both the pre-existing-socket and freshly-spawned-socket branches run
 /// [`verify_socket_trusted`] before returning so the caller knows the
 /// socket is owned by the current uid at mode 0o600.
+///
+/// PRD #163 M4: on a platform whose endpoint is not a filesystem path (Windows
+/// named pipes), the presence test is a connect-probe instead of `exists()`, and
+/// trust verification happens inside that connect. See the body for why an
+/// unconditional `exists()` would make Windows lazy-spawn always time out.
 pub async fn ensure_daemon_running<F>(
     socket_path: &Path,
     state_dir: &Path,
@@ -99,21 +107,35 @@ where
 
     // First check happens INSIDE the lock so a waiter that lost the race sees
     // the socket the winner created and skips the spawn.
-    if socket_path.exists() {
-        verify_socket_trusted(socket_path)?;
-        // Trust check only validates the inode (type, owner, mode) — it
-        // doesn't know whether anyone is listening. A daemon that died
-        // without unlinking (crash, SIGKILL, host reboot mid-write) leaves
-        // a stale socket on disk that would otherwise short-circuit lazy-
-        // spawn forever, with every subsequent client connect failing
-        // `ECONNREFUSED`. Probe-connect here so we can distinguish a live
-        // daemon from a leftover file; on failure, the inode is ours
-        // (trust check just validated uid + mode) so unlinking and
-        // falling through to the spawn branch is safe.
-        if probe_socket_alive(socket_path).await {
-            return Ok(());
+    //
+    // PRD #163 M4: "is the endpoint there yet?" is platform-shaped, and getting
+    // it wrong breaks lazy-spawn outright on Windows. A `\\.\pipe\` name has no
+    // filesystem presence, so `exists()` is permanently false there — every
+    // attach would spawn a second daemon and then time out waiting for a socket
+    // file that can never appear. Where the endpoint is not a path, the
+    // connect-probe *is* the presence test, and it doubles as the trust check
+    // (`IpcStream::connect` verifies the pipe server's owner SID before handing
+    // back a stream), so there is nothing to verify out of band and no inode to
+    // unlink. The Unix branch below is byte-for-byte what it always was.
+    if crate::platform::ipc::ENDPOINT_IS_FILESYSTEM_PATH {
+        if socket_path.exists() {
+            verify_socket_trusted(socket_path)?;
+            // Trust check only validates the inode (type, owner, mode) — it
+            // doesn't know whether anyone is listening. A daemon that died
+            // without unlinking (crash, SIGKILL, host reboot mid-write) leaves
+            // a stale socket on disk that would otherwise short-circuit lazy-
+            // spawn forever, with every subsequent client connect failing
+            // `ECONNREFUSED`. Probe-connect here so we can distinguish a live
+            // daemon from a leftover file; on failure, the inode is ours
+            // (trust check just validated uid + mode) so unlinking and
+            // falling through to the spawn branch is safe.
+            if probe_socket_alive(socket_path).await {
+                return Ok(());
+            }
+            let _ = std::fs::remove_file(socket_path);
         }
-        let _ = std::fs::remove_file(socket_path);
+    } else if probe_socket_alive(socket_path).await {
+        return Ok(());
     }
 
     spawn_fn().map_err(|source| AttachError::DaemonSpawnFailed { source })?;
@@ -121,8 +143,12 @@ where
     let log_path = state_dir.join("daemon.log");
     let start = Instant::now();
     loop {
-        if socket_path.exists() {
-            verify_socket_trusted(socket_path)?;
+        if crate::platform::ipc::ENDPOINT_IS_FILESYSTEM_PATH {
+            if socket_path.exists() {
+                verify_socket_trusted(socket_path)?;
+                return Ok(());
+            }
+        } else if probe_socket_alive(socket_path).await {
             return Ok(());
         }
         if start.elapsed() >= poll_timeout {

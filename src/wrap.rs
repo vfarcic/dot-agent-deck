@@ -52,7 +52,8 @@ use chrono::Utc;
 
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use crate::event::{
-    AGENT_EVENT_SCHEMA_VERSION, AgentEvent, AgentType, EventType, LiveTarget, TargetKind, Writable,
+    AGENT_EVENT_SCHEMA_VERSION, AgentEvent, AgentType, EventType, LiveTarget,
+    SESSION_START_ORIGIN_METADATA_KEY, TargetKind, WRAPPER_FORK_SESSION_START_ORIGIN, Writable,
 };
 
 /// A coarse activity state detected from a single line of wrapped output.
@@ -272,6 +273,26 @@ impl Emitter {
     /// the wrapper stays a transparent passthrough even with no daemon (the
     /// "arbitrary commands as a basic fallback" success criterion).
     fn emit(&self, event_type: EventType) {
+        self.emit_with_metadata(event_type, HashMap::new());
+    }
+
+    /// PRD #225 M3: the fork-time `SessionStart` this wrapper emits the moment
+    /// `cmd.spawn()` returns. Its ONLY job is to surface the dashboard card so a
+    /// slow-booting agent isn't invisible — the child is typically just the
+    /// launcher (`devbox`, a shell) at this point, seconds away from the real
+    /// agent TUI. Stamping [`SESSION_START_ORIGIN_METADATA_KEY`] lets readiness
+    /// gates tell this apart from a genuine "the session is up and accepting
+    /// input" signal; see [`crate::state::wait_for_session_start`].
+    fn emit_fork_session_start(&self) {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+        );
+        self.emit_with_metadata(EventType::SessionStart, metadata);
+    }
+
+    fn emit_with_metadata(&self, event_type: EventType, metadata: HashMap<String, String>) {
         let event = AgentEvent {
             session_id: self.session_id.clone(),
             agent_type: self.agent_type.clone(),
@@ -281,7 +302,7 @@ impl Emitter {
             cwd: self.cwd.clone(),
             timestamp: Utc::now(),
             user_prompt: None,
-            metadata: HashMap::new(),
+            metadata,
             pane_id: self.pane_id.clone(),
             agent_id: self.agent_id.clone(),
             agent_version: None,
@@ -394,7 +415,82 @@ pub fn wrap_launch_command(command: &str, agent_type: &AgentType) -> String {
     // wrapper resolves back through `detect_from_basename`); fall back to the
     // label only if an entry somehow ships without one.
     let name = spec.detect_basenames.first().copied().unwrap_or(spec.label);
-    format!("dot-agent-deck wrap --agent {name} -- {command}")
+    let deck = deck_binary_for_wrap();
+    format!("{deck} wrap --agent {name} -- {command}")
+}
+
+/// Test-only override for the binary [`wrap_launch_command`] names. Set to an
+/// absolute path so a test can point the rewrite at a recorder instead of the
+/// co-located build; production never sets it. Read in the *spawning* process, so
+/// a test sets it on itself (nextest gives each test its own process).
+pub const DOT_AGENT_DECK_WRAP_BIN: &str = "DOT_AGENT_DECK_WRAP_BIN";
+
+/// Which `dot-agent-deck` binary the rewrite should name: THIS process's own
+/// executable where it can be identified, otherwise a bare `dot-agent-deck` for
+/// `$PATH` to resolve.
+///
+/// The rewritten command runs through a login shell, which re-reads the user's
+/// profile and therefore resolves `$PATH` independently of whatever the spawning
+/// process was launched with. A bare name there silently runs a DIFFERENT BUILD
+/// than the one doing the spawning — `~/.local/bin/dot-agent-deck` in practice.
+/// Two consequences, one of which is a test-integrity hole:
+///
+/// - the test suite exercised the freshly-built deck as daemon/TUI but the
+///   INSTALLED RELEASE as the wrapper, so wrapper behaviour was validated
+///   against whatever the developer happened to have installed, and a wrapper
+///   fix could not be observed end-to-end by the suite at all;
+/// - a running deck could pair its daemon with a wrapper of another version.
+///
+/// Same rationale (and the same fix) as [`crate::daemon_attach`] locating the
+/// daemon via `current_exe` rather than `$PATH`.
+///
+/// Falls back to the bare name when the resolved path is unusable, so behaviour
+/// only ever improves on what `$PATH` would have found:
+/// - a test-harness executable — those live in `target/<profile>/deps/`, so a
+///   sibling `dot-agent-deck` one level up is preferred when present, which is
+///   what lets in-process tests drive the build they just compiled;
+/// - a path that no longer exists: Linux reports a replaced binary as
+///   `<path> (deleted)`, routine while rebuilding during development;
+/// - a path containing whitespace, which the shell would re-split (nothing
+///   quotes this command string).
+fn deck_binary_for_wrap() -> String {
+    const BARE: &str = "dot-agent-deck";
+    fn usable(path: &std::path::Path) -> Option<String> {
+        let text = path.to_str()?;
+        (path.file_name()? == BARE && !text.chars().any(char::is_whitespace) && path.is_file())
+            .then(|| text.to_string())
+    }
+
+    // Explicit override, consulted first. Resolving the co-located build is what
+    // makes the suite honest, but it also takes away the one seam a test had for
+    // observing the rewrite: planting a fake `dot-agent-deck` on `$PATH`. This is
+    // that seam back, in the same spirit as
+    // `daemon_attach::spawn_daemon_serve_detached_with_exe` — an explicit path so
+    // tests can point at a recorder. Production never sets it.
+    if let Ok(explicit) = std::env::var(DOT_AGENT_DECK_WRAP_BIN)
+        && !explicit.is_empty()
+    {
+        return explicit;
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        return BARE.to_string();
+    };
+    if let Some(found) = usable(&exe) {
+        return found;
+    }
+    let Some(dir) = exe.parent() else {
+        return BARE.to_string();
+    };
+    usable(&dir.join(BARE))
+        .or_else(|| {
+            (dir.file_name() == Some(std::ffi::OsStr::new("deps")))
+                .then(|| dir.parent().map(|up| up.join(BARE)))
+                .flatten()
+                .as_deref()
+                .and_then(usable)
+        })
+        .unwrap_or_else(|| BARE.to_string())
 }
 
 /// Whether `command` is already a `dot-agent-deck wrap …` invocation — the
@@ -729,7 +825,11 @@ impl SignalForwarder {
     fn terminate_with(&mut self, signal: libc::c_int) {
         if self.escalate_deadline.is_none() {
             kill_pid_group(self.pid, signal);
-            self.escalate_deadline = Some(Instant::now() + crate::agent_pty::AGENT_TERMINATE_GRACE);
+            // Strictly shorter than the deck's own grace against THIS wrapper —
+            // we are the only process that can signal the agent's group, so we
+            // have to finish before the deck kills us. See
+            // `WRAP_TERMINATE_GRACE`.
+            self.escalate_deadline = Some(Instant::now() + crate::agent_pty::WRAP_TERMINATE_GRACE);
         }
     }
 }
@@ -1075,8 +1175,11 @@ fn run_wrap_pty(
         child.stderr.take()
     };
 
-    // The session has begun — surface the card immediately.
-    emitter.emit(EventType::SessionStart);
+    // The session has begun — surface the card immediately. PRD #225 M3: this is
+    // a CARD-SURFACING signal, not a readiness signal (the child may still be
+    // `devbox`/a shell for seconds before the agent TUI exists), so it carries
+    // the wrapper-fork origin marker.
+    emitter.emit_fork_session_start();
 
     // Raw-mode the outer terminal ONLY when stdin is itself a terminal, so
     // keystrokes (incl. Ctrl+C and CR) reach the inner PTY unmodified; restored
@@ -1309,7 +1412,9 @@ fn run_wrap_pipe(
     };
     let child_pid = child.id() as libc::pid_t;
 
-    emitter.emit(EventType::SessionStart);
+    // PRD #225 M3: same fork-time card-surfacing event as the PTY path, and the
+    // same marker — it says "a session exists", not "the agent is ready".
+    emitter.emit_fork_session_start();
 
     let child_stdout = child.stdout.take().expect("piped child stdout");
     let child_stderr = child.stderr.take().expect("piped child stderr");
@@ -1606,10 +1711,53 @@ mod tests {
     /// the registry detection basename as the `--agent` alias.
     #[test]
     fn wrap_launch_command_wraps_wrapper_strategy() {
+        // The binary is resolved, not hardcoded (see `deck_binary_for_wrap`), so
+        // assert the shape: some `dot-agent-deck` followed by the exact wrap
+        // invocation. Under `cargo test` the resolved binary is the sibling the
+        // build just produced, so this is usually an absolute path.
+        let rewritten = wrap_launch_command("codex", &AgentType::Codex);
+        let (program, rest) = rewritten
+            .split_once(' ')
+            .expect("rewritten command has a program and arguments");
         assert_eq!(
-            wrap_launch_command("codex", &AgentType::Codex),
-            "dot-agent-deck wrap --agent codex -- codex"
+            std::path::Path::new(program)
+                .file_name()
+                .and_then(|n| n.to_str()),
+            Some("dot-agent-deck"),
+            "the rewrite must name a dot-agent-deck binary; got {rewritten:?}"
         );
+        assert_eq!(rest, "wrap --agent codex -- codex");
+    }
+
+    /// The rewrite must name THIS build, not whatever `$PATH` resolves to — the
+    /// command is run through a login shell that re-reads the user's profile, so
+    /// a bare name silently picks up an installed release. Pin that the resolved
+    /// program is the binary sitting next to the test harness.
+    #[test]
+    fn wrap_launch_command_names_this_build_not_path() {
+        let rewritten = wrap_launch_command("codex", &AgentType::Codex);
+        let program = rewritten.split_once(' ').expect("program present").0;
+        let sibling = std::env::current_exe().ok().and_then(|exe| {
+            let dir = exe.parent()?;
+            let direct = dir.join("dot-agent-deck");
+            if direct.is_file() {
+                return Some(direct);
+            }
+            (dir.file_name() == Some(std::ffi::OsStr::new("deps")))
+                .then(|| dir.parent().map(|up| up.join("dot-agent-deck")))
+                .flatten()
+                .filter(|p| p.is_file())
+        });
+        match sibling {
+            Some(expected) => assert_eq!(
+                program,
+                expected.to_str().expect("sibling path is UTF-8"),
+                "must resolve the co-located build, not a $PATH lookup"
+            ),
+            // No co-located binary (e.g. a bare `cargo test` before any build of
+            // the bin target) — falling back to the bare name is the contract.
+            None => assert_eq!(program, "dot-agent-deck"),
+        }
     }
 
     /// Non-Wrapper agents (and the neutral unknown type) launch bare — the

@@ -995,6 +995,16 @@ impl TuiDeck {
         &self.fixture_path
     }
 
+    /// The deck's per-test `HOME` — the same one the lazily-spawned daemon and
+    /// every agent it spawns inherit. Tests that must seed HOME-relative agent
+    /// config for a directory only known AFTER launch (e.g. Claude's per-folder
+    /// trust for the tempdir fixture root, which
+    /// [`TuiDeckBuilder::with_claude_project_trust`] cannot know in advance)
+    /// write into it via [`seed_claude_trust_in_home`] before opening the pane.
+    pub fn home_dir(&self) -> &Path {
+        &self.home
+    }
+
     /// Return the parsed grid contents — used by `wait_for_string`
     /// internally and by tests that want to assert on full-screen
     /// state.
@@ -1590,8 +1600,43 @@ pub fn check_opencode_available() -> Result<(), String> {
     )
 }
 
-/// Cheap model used by Codex availability probes and real-agent e2e coverage.
-pub const CODEX_TEST_MODEL: &str = "gpt-5.1-codex-mini";
+/// Compiled-in default cheap model for Codex availability probes and real-agent
+/// e2e coverage. Correct for a ChatGPT-subscription (oauth) `~/.codex/auth.json`,
+/// which is what most dev boxes here log in with.
+const CODEX_TEST_MODEL_DEFAULT: &str = "gpt-5.1-codex-mini";
+
+/// Env var that overrides [`codex_test_model`] on a host whose Codex credentials
+/// cannot reach the default.
+pub const CODEX_TEST_MODEL_ENV: &str = "DOT_AGENT_DECK_CODEX_TEST_MODEL";
+
+/// Cheap model used by Codex availability probes and real-agent e2e coverage —
+/// [`CODEX_TEST_MODEL_DEFAULT`] unless `DOT_AGENT_DECK_CODEX_TEST_MODEL` is set
+/// to a non-empty value, which wins.
+///
+/// The override exists because the `codex-*` model family is served only to
+/// ChatGPT-subscription (oauth) credentials. With an **API-key**
+/// `~/.codex/auth.json`, `codex exec --model gpt-5.1-codex-mini` answers
+/// `404 Not Found: Model not found gpt-5.1-codex-mini` from
+/// `https://api.openai.com/v1/responses`, so [`check_codex_available`] fails its
+/// probe and every real-agent Codex test SKIPS — a silent no-coverage outcome
+/// that reads as a pass. Such a host exports e.g.
+/// `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5-nano` (an equally cheap model an API
+/// key *can* reach). The default is deliberately left alone so subscription-auth
+/// environments keep running codex-mini.
+///
+/// Single source of truth: [`check_codex_available`] probes the model this
+/// returns, so the availability gate and the model the tests actually launch can
+/// never disagree.
+pub fn codex_test_model() -> &'static str {
+    static MODEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODEL.get_or_init(|| {
+        std::env::var(CODEX_TEST_MODEL_ENV)
+            .ok()
+            .map(|raw| raw.trim().to_string())
+            .filter(|model| !model.is_empty())
+            .unwrap_or_else(|| CODEX_TEST_MODEL_DEFAULT.to_string())
+    })
+}
 
 /// Runtime-skip helper for real Codex coverage. A version check alone is not
 /// enough: this verifies persisted auth and performs one minimal model request,
@@ -1637,7 +1682,7 @@ pub fn check_codex_available() -> Result<(), String> {
             "--sandbox",
             "read-only",
             "--model",
-            CODEX_TEST_MODEL,
+            codex_test_model(),
             "-c",
             "model_reasoning_effort=\"low\"",
             "--color",
@@ -1668,7 +1713,11 @@ pub fn check_codex_available() -> Result<(), String> {
         .any(|marker| lower.contains(marker))
     {
         return Err(format!(
-            "Codex could not reach model {CODEX_TEST_MODEL} with the current authentication"
+            "Codex could not reach model {} with the current authentication — if this host's \
+             ~/.codex/auth.json is an API key rather than a ChatGPT subscription, set {} to a \
+             model the key can reach (e.g. gpt-5-nano)",
+            codex_test_model(),
+            CODEX_TEST_MODEL_ENV,
         ));
     }
     Ok(())
@@ -1847,6 +1896,18 @@ fn seed_claude_project_trust(test_home: &Path, trust_paths: &[String]) -> std::i
     let bytes = serde_json::to_vec(&cfg)
         .map_err(|e| std::io::Error::other(format!("serialize .claude.json: {e}")))?;
     write_credential_file_atomic_0o600(&test_home.join(".claude.json"), &bytes)
+}
+
+/// Public wrapper over [`seed_claude_project_trust`] for tests whose trusted
+/// directory is only known AFTER the deck launched — the per-test tempdir
+/// fixture root, which [`TuiDeckBuilder::with_claude_project_trust`] (a
+/// pre-launch builder step) cannot name in advance. Call it with
+/// [`TuiDeck::home_dir`] BEFORE the pane that runs `claude` in `trust_paths` is
+/// spawned; claude reads `~/.claude.json` at agent start, so the seeding only
+/// has to beat the spawn, not the launch.
+#[allow(dead_code)]
+pub fn seed_claude_trust_in_home(home: &Path, trust_paths: &[String]) -> std::io::Result<()> {
+    seed_claude_project_trust(home, trust_paths)
 }
 
 /// Strip the top-level `hooks` key from a Claude Code settings.json.
@@ -3130,6 +3191,217 @@ pub fn agent_records_on(socket: &Path) -> Vec<dot_agent_deck::agent_pty::AgentRe
     }
 }
 
+/// One-shot read of a daemon-side pane's PTY scrollback via
+/// `AttachRequest::Snapshot`, over `socket`. The daemon replies `RESP ok`, then
+/// (when the ring is non-empty) a single `STREAM_OUT` frame carrying the whole
+/// snapshot, then `STREAM_END` — so unlike `AttachStream` this never subscribes
+/// to live bytes and returns as soon as the ring has been drained.
+///
+/// Returns the raw bytes exactly as the agent wrote them (escape sequences
+/// included); pair with [`terminal_search_key`] to search them wrap-insensitively.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn pane_snapshot_on(socket: &Path, agent_id: &str) -> Vec<u8> {
+    use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_STREAM_END, KIND_STREAM_OUT};
+    use std::io::{Read, Write};
+
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) else {
+        return Vec::new();
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+    let req = dot_agent_deck::daemon_protocol::AttachRequest::Snapshot {
+        id: agent_id.to_string(),
+    };
+    let payload = serde_json::to_vec(&req).expect("serialize Snapshot");
+    let mut header = [0u8; 5];
+    header[0] = KIND_REQ;
+    header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    if stream.write_all(&header).is_err() || stream.write_all(&payload).is_err() {
+        return Vec::new();
+    }
+    let _ = stream.flush();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out: Vec<u8> = Vec::new();
+    while Instant::now() < deadline {
+        let mut fh = [0u8; 5];
+        match stream.read_exact(&mut fh) {
+            Ok(()) => {}
+            Err(_) => break,
+        }
+        let kind = fh[0];
+        let len = u32::from_be_bytes([fh[1], fh[2], fh[3], fh[4]]) as usize;
+        let mut body = vec![0u8; len];
+        if len > 0 && read_exact_with_deadline(&mut stream, &mut body, deadline).is_err() {
+            break;
+        }
+        match kind {
+            KIND_STREAM_OUT => out.extend_from_slice(&body),
+            KIND_STREAM_END => break,
+            _ => continue,
+        }
+    }
+    out
+}
+
+/// Remove ANSI/VT control sequences from a raw PTY byte stream, leaving the
+/// printable text (and its line breaks) behind.
+///
+/// Handles the four families a full-screen agent TUI emits: CSI (`ESC [ … final`),
+/// OSC (`ESC ] … BEL | ST`), the string families DCS/SOS/PM/APC (`ESC P|X|^|_ … ST`),
+/// and plain two-byte escapes (charset selection, `ESC =`, …). Without this a
+/// naive substring search over the raw bytes can miss text that a redraw split
+/// with a colour reset, and a naive "drop the punctuation" pass would splice the
+/// escape's own digits INTO the word.
+#[allow(dead_code)]
+pub fn strip_ansi(bytes: &[u8]) -> String {
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != 0x1b {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let Some(&kind) = bytes.get(i) else { break };
+        match kind {
+            b'[' => {
+                i += 1;
+                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b']' | b'P' | b'X' | b'^' | b'_' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Collapse terminal text to a WRAP-INSENSITIVE search key: strip the escape
+/// sequences, then keep only `[A-Za-z0-9._/-]`.
+///
+/// An agent TUI renders inside a bordered box and hard-wraps long lines, so a
+/// pointer like `.dot-agent-deck/worker-task-coder.md` can reach the scrollback
+/// as `…worker-task-cod` / newline / `│ er.md`. Dropping every space, newline
+/// and box-drawing glyph rejoins it, while the kept set is narrow enough that a
+/// path- or sentence-shaped needle stays distinctive. Apply to BOTH the haystack
+/// and the needle (see [`search_key`]).
+#[allow(dead_code)]
+pub fn terminal_search_key(bytes: &[u8]) -> String {
+    search_key(&strip_ansi(bytes))
+}
+
+/// The [`terminal_search_key`] normalization for an already-decoded string —
+/// used on the needle side so both sides of the comparison agree.
+#[allow(dead_code)]
+pub fn search_key(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+        .collect()
+}
+
+/// A daemon-side pane's scrollback, collapsed to a [`terminal_search_key`].
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn pane_search_key_on(socket: &Path, agent_id: &str) -> String {
+    terminal_search_key(&pane_snapshot_on(socket, agent_id))
+}
+
+/// Poll a daemon-side pane's scrollback until `needle` appears in it
+/// (wrap-insensitively), or `timeout` elapses. Decision 21: the polling lives
+/// here, never in an `e2e_*.rs` body. The interval is deliberately coarse — each
+/// round pulls the pane's whole scrollback ring across the attach socket.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn wait_for_pane_text_on(
+    socket: &Path,
+    agent_id: &str,
+    needle: &str,
+    timeout: Duration,
+) -> bool {
+    let key = search_key(needle);
+    let deadline = Instant::now() + timeout;
+    loop {
+        if pane_search_key_on(socket, agent_id).contains(&key) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(750));
+    }
+}
+
+/// Block until every listed agent's scrollback has stopped growing for `quiet`
+/// AND has been producing output for at least `min_alive` — i.e. each
+/// interactive agent has finished painting its UI and is waiting for input.
+/// Returns whether every pane settled before `timeout` (a `false` is worth
+/// logging, not necessarily fataling: a still-busy agent may still accept
+/// injected input).
+///
+/// Mirrors `e2e_delegate_work_done_chain::wait_until_worker_ready`, but reads
+/// the panes through the daemon's attach socket so it works for agents the test
+/// did not spawn itself. The `min_alive` floor matters: a TUI agent can pause
+/// briefly mid-init before its input is interactive, and bytes injected during
+/// that lull are dropped.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn wait_until_panes_settled(
+    socket: &Path,
+    agent_ids: &[String],
+    quiet: Duration,
+    min_alive: Duration,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut last_len: HashMap<&str, usize> = HashMap::new();
+    let mut stable_since: HashMap<&str, Instant> = HashMap::new();
+    let mut first_output: HashMap<&str, Instant> = HashMap::new();
+    loop {
+        let mut all_ready = true;
+        for id in agent_ids {
+            let id = id.as_str();
+            let len = pane_snapshot_on(socket, id).len();
+            if len > 0 {
+                first_output.entry(id).or_insert_with(Instant::now);
+            }
+            if last_len.get(id).copied() != Some(len) {
+                last_len.insert(id, len);
+                stable_since.insert(id, Instant::now());
+            }
+            all_ready &= first_output
+                .get(id)
+                .is_some_and(|f| f.elapsed() >= min_alive)
+                && stable_since.get(id).is_some_and(|s| s.elapsed() >= quiet);
+        }
+        if all_ready {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// Poll `ListAgents` until an agent whose `display_name` equals `name` is
 /// present (`want_present = true`) or absent (`want_present = false`), or the
 /// timeout elapses. Returns whether the desired condition held.
@@ -3250,6 +3522,92 @@ pub fn wait_for_path(path: &Path, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(100));
     }
     path.exists()
+}
+
+/// Human description of what `path` holds *right now* — missing, unreadable,
+/// or its exact contents. Used by the content-polling waiters below so a
+/// timeout says whether the file never appeared, appeared empty, or simply
+/// carried the wrong text.
+#[allow(dead_code)]
+fn describe_file(path: &Path) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => format!("{} contains {contents:?}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            format!("{} does not exist", path.display())
+        }
+        Err(e) => format!("{} is unreadable: {e}", path.display()),
+    }
+}
+
+/// Bounded poll until `path` is readable AND `matches` accepts its contents.
+/// `Ok(())` on match; on timeout, `Err(`[`describe_file`]`)`.
+///
+/// Prefer this over [`wait_for_path`] + an immediate `read_to_string` whenever
+/// the assertion is about the file's CONTENTS. An agent that writes a sentinel
+/// with a shell redirect — `printf 'X' > sentinel.txt` — has the shell CREATE
+/// the file before `printf` writes into it, so a reader that waits only for
+/// EXISTENCE can win the race and observe an empty string (PRD #225; this is
+/// exactly how `orchestration/delegate/009` failed in-suite while passing in
+/// isolation). Polling the content closes that window.
+#[allow(dead_code)]
+fn wait_for_file_matching(
+    path: &Path,
+    timeout: Duration,
+    matches: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path)
+            && matches(&contents)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(describe_file(path));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Bounded poll until `path`'s TRIMMED contents equal `expected` exactly.
+/// See [`wait_for_file_matching`] for why content — not existence — is polled.
+#[allow(dead_code)]
+pub fn wait_for_file_trimmed_eq(
+    path: &Path,
+    expected: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    wait_for_file_matching(path, timeout, |contents| contents.trim() == expected)
+}
+
+/// Bounded poll until `path`'s contents contain `needle`. The bounded,
+/// non-panicking sibling of [`wait_for_file_contains`] (which is pinned to the
+/// harness-wide [`WAIT_TIMEOUT`]); see [`wait_for_file_matching`] for why
+/// content — not existence — is polled.
+#[allow(dead_code)]
+pub fn wait_for_file_containing(
+    path: &Path,
+    needle: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    wait_for_file_matching(path, timeout, |contents| contents.contains(needle))
+}
+
+/// Bounded poll until `path` holds at least `want` COMPLETE — i.e.
+/// newline-terminated — lines. For PATH recorder shims that append one line per
+/// exec (`printf '…\n' >> "$RECORD"`), which is how the launch-shape tests
+/// observe what was actually launched.
+///
+/// Counts newline terminators rather than [`str::lines`] deliberately:
+/// `lines()` also counts a half-written trailing line, so a reader using it can
+/// return the instant the shell has created the file and still read an
+/// incomplete record. That is the same race [`wait_for_file_matching`]
+/// documents, one level up.
+#[allow(dead_code)]
+pub fn wait_for_file_lines(path: &Path, want: usize, timeout: Duration) -> Result<(), String> {
+    wait_for_file_matching(path, timeout, |contents| {
+        contents.matches('\n').count() >= want
+    })
 }
 
 /// Blocking `read_exact` bounded by a wall-clock `deadline`, tolerating the
@@ -3485,6 +3843,36 @@ pub async fn wait_for_path_async(path: &Path, timeout: Duration) -> bool {
             return false;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Poll a spawned agent's PTY snapshot until the *rendered* screen contains
+/// `needle`, returning `(found, rendered_screen)`. The raw PTY byte stream is
+/// replayed through a `vt100` grid first, so a streamed/redrawn reply (an agent
+/// prints token-by-token with cursor moves) is matched on its final rendered
+/// state rather than on raw, escape-interleaved bytes. Ported from
+/// `e2e_delegate_work_done_chain.rs::wait_for_rendered_text` so the poll lives
+/// in `common` (Decision 21).
+#[allow(dead_code)]
+pub async fn wait_for_rendered_agent_text(
+    registry: &dot_agent_deck::agent_pty::AgentPtyRegistry,
+    agent_id: &str,
+    needle: &str,
+    timeout: Duration,
+) -> (bool, String) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let snap = registry.snapshot(agent_id).unwrap_or_default();
+        let mut parser = vt100::Parser::new(40, 120, 0);
+        parser.process(&snap);
+        let screen = parser.screen().contents();
+        if screen.contains(needle) {
+            return (true, screen);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return (false, screen);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 

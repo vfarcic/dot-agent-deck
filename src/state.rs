@@ -43,8 +43,23 @@ pub(crate) const MAX_FIRST_PROMPTS: usize = 3;
 /// Agents that never emit `SessionStart` (e.g. `cat -u` in tests, or
 /// agent runtimes without dot-agent-deck's hooks installed) still get
 /// their prompt — just delayed by `SESSION_START_WAIT_TIMEOUT`.
+///
+/// PRD #225 M4: raised from the inherited Claude-era 10 s to 30 s, sized from
+/// measured Codex boot rather than guessed. On the diagnosis machine the
+/// wrapper→`node codex` gap alone was ~4 s (`devbox run codex-big`), with
+/// Codex's own TUI initialization on top; 10 s left almost no margin on a
+/// loaded machine. This value only matters when the gate FALLS THROUGH — i.e.
+/// the agent's native hooks never fired (not installed, not trusted) — and that
+/// path is load-bearing: it must wait long enough that the prompt lands in a
+/// live agent rather than in a launcher's line discipline, where it is echoed
+/// and lost. The cost of over-waiting is a delayed prompt; the cost of
+/// under-waiting is a silently dropped one, so this is deliberately generous.
+/// The healthy path is unaffected — a genuine `SessionStart` releases the gate
+/// in milliseconds. The scheduler mirror of this wait is overridable per-run via
+/// `DOT_AGENT_DECK_SESSION_START_WAIT_MS` (see
+/// [`crate::spawn`]) so the e2e harness never pays the full fallback.
 pub(crate) const SESSION_START_WAIT_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(10);
+    std::time::Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionStatus {
@@ -223,6 +238,56 @@ impl SessionState {
     }
 }
 
+/// PRD #140 M2.0: the daemon's routing identity for an orchestration pane —
+/// the value of [`AppState::pane_orchestration_map`]. Two panes belong to the
+/// same routing group (a delegate from one can reach the other, a work-done
+/// from one can reach the other's orchestrator) **iff** their identities are
+/// equal. Nothing else about the value is interpreted.
+///
+/// Two variants, one per generation of client:
+///
+/// - [`Self::Instance`] — the client stamped a per-tab
+///   [`crate::agent_pty::TabMembership::Orchestration::orchestration_id`] on
+///   every role pane of the tab. Equality is the token, so two tabs of the
+///   SAME orchestration in the SAME directory are two distinct routing groups.
+///   This is what closes issue #140's cross-delivery.
+/// - [`Self::NameCwd`] — the pane came from a client predating #140 (no
+///   token). Falls back to the round-11 `(name, orchestration_cwd)` tuple,
+///   byte-equivalent to the pre-#140 behaviour: correct across directories and
+///   across differently-named orchestrations, ambiguous only for the
+///   same-name-same-directory case that has always been ambiguous.
+///
+/// Mixed-variant comparison is never equal (derived `PartialEq`), which is the
+/// right answer: a tokened pane and a token-less pane were produced by
+/// different clients and we have no evidence they share a tab.
+///
+/// Both variants carry `name` because the delegate dispatch also needs the
+/// orchestration's CONFIG name — [`lookup_orchestration_role`] resolves the
+/// target role's `prompt_template` / `clear` flag from it. Including it in
+/// `Instance` costs nothing for equality: every role pane of one tab is
+/// stamped with the same `name` at the construct site, so the token alone
+/// already decides the group.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum OrchestrationIdentity {
+    /// Per-tab instance token (PRD #140) plus the orchestration's config name.
+    Instance { id: String, name: String },
+    /// Legacy `(name, orchestration_cwd)` identity for clients that carry no
+    /// instance token.
+    NameCwd { name: String, cwd: String },
+}
+
+impl OrchestrationIdentity {
+    /// The orchestration's CONFIG name (`OrchestrationConfig.name`, or the
+    /// cwd-basename fallback the construct sites resolve). Present in both
+    /// variants; used for role-config lookup, never on its own for routing.
+    pub fn name(&self) -> &str {
+        match self {
+            OrchestrationIdentity::Instance { name, .. } => name,
+            OrchestrationIdentity::NameCwd { name, .. } => name,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct AppState {
     pub sessions: HashMap<String, SessionState>,
@@ -238,21 +303,26 @@ pub struct AppState {
     pub pane_cwd_map: HashMap<String, String>,
     /// Pane IDs that are orchestrator (start=true) roles — only these can delegate.
     pub orchestrator_pane_ids: HashSet<String>,
-    /// Maps pane_id → (orchestration name, orchestration cwd). Lets the
-    /// daemon's dispatch (`handle_delegate` / `handle_work_done`) scope
-    /// target lookups to panes in the *same* orchestration tab when
-    /// several tabs run in parallel (PRD #93 round-5).
+    /// Maps pane_id → [`OrchestrationIdentity`]. Lets the daemon's dispatch
+    /// (`handle_delegate` / `handle_work_done`) scope target lookups to panes
+    /// in the *same* orchestration tab when several tabs run in parallel
+    /// (PRD #93 round-5).
     ///
-    /// Round-11 auditor #C: the identity is a `(name, cwd)` tuple, not
-    /// just name. Two unnamed orchestrations whose `name`s both fall
+    /// Round-11 auditor #C: the identity used to be a `(name, cwd)` tuple,
+    /// not just name. Two unnamed orchestrations whose `name`s both fall
     /// back to the same cwd-basename — e.g. `~/project-a/foo` and
     /// `~/project-b/foo` — would otherwise collide here and a
     /// `Delegate` from A's orchestrator could cross-route to B's
-    /// coder. The cwd disambiguator is the cwd the TUI passed at
-    /// StartAgent time; in practice all role panes in one orchestration
-    /// share that cwd, so within-orchestration scoping still finds all
-    /// the right panes.
-    pub pane_orchestration_map: HashMap<String, (String, String)>,
+    /// coder.
+    ///
+    /// PRD #140 M2.0: that tuple is still ambiguous when the SAME
+    /// orchestration is opened twice from the SAME directory — the two tabs
+    /// produce byte-identical identities and delegate/work-done cross-deliver
+    /// between them. The value is now an [`OrchestrationIdentity`] whose
+    /// `Instance` variant keys on a per-tab token, with the `(name, cwd)`
+    /// tuple preserved as the `NameCwd` fallback for clients that predate
+    /// the token.
+    pub pane_orchestration_map: HashMap<String, OrchestrationIdentity>,
     /// PRD #120: orchestrations the daemon spawned WHILE this TUI is attached
     /// (the issue-dispatch path), queued for the TUI event loop to build into
     /// live tabs. The daemon publishes a
@@ -516,6 +586,46 @@ pub fn compose_idle_worker_prompt(role: &str, elapsed: std::time::Duration) -> S
     ))
 }
 
+/// PRD #126 + #140: does the orchestrator pane still belong to the orchestration
+/// the delegation was armed under? Used by the idle watch's guarded-send
+/// revalidation closure, immediately before the write.
+///
+/// `expected` is the daemon's routing identity captured at arm time
+/// (`pane_orchestration_map`'s value); `live` is the membership of whichever
+/// agent owns that pane *now*
+/// ([`crate::agent_pty::AgentPtyRegistry::pane_orchestration`]).
+///
+/// The rules, in the order they are decided:
+///
+/// * **Either side unknown → match.** A pane with no orchestration
+///   `tab_membership` (dashboard/mode pane, or one spawned without membership
+///   metadata) legitimately reports `None`, and the `write_and_submit_guarded`
+///   agent-id gate is the primary identity guard — this check is defense in
+///   depth, so it must not refuse on absence.
+/// * **Both sides carry PRD #140's per-tab token → compare the tokens.** This is
+///   the only comparison that distinguishes two tabs of the SAME orchestration
+///   opened from the SAME directory, which #140 made two distinct routing groups.
+/// * **Otherwise → compare the orchestration name**, the pre-#140 check, which is
+///   all a token-less (older-client) pane can be compared on.
+///
+/// Deliberately not comparing `NameCwd`'s cwd: the daemon folds
+/// `orchestration_cwd.or(StartAgent.cwd)` into the identity at `StartAgent` time
+/// and the registry membership holds only the un-defaulted field, so the two
+/// sources can disagree about the cwd for a perfectly healthy pane — a
+/// comparison that would refuse a legitimate nudge.
+fn orchestration_still_matches(
+    expected: Option<&OrchestrationIdentity>,
+    live: Option<&crate::agent_pty::PaneOrchestration>,
+) -> bool {
+    let (Some(expected), Some(live)) = (expected, live) else {
+        return true;
+    };
+    match (expected, live.instance_id.as_deref()) {
+        (OrchestrationIdentity::Instance { id, .. }, Some(live_id)) => id == live_id,
+        _ => expected.name() == live.name,
+    }
+}
+
 /// PRD #126: resolve the timeout, capture the orchestrator's identity, arm the
 /// registry record and spawn its watch — the whole "this worker now owes a
 /// work-done" step of one delegate target. Split out of `handle_delegate` so the
@@ -530,18 +640,21 @@ pub fn compose_idle_worker_prompt(role: &str, elapsed: std::time::Duration) -> S
 ///   than a nudge that might reach a stranger;
 /// * **the pane is mid-close** — [`AgentPtyRegistry::arm_outstanding_delegation`]
 ///   refuses, closing the arm-after-cancel race.
+///
+/// PRD #140 integration: `orchestration` is the daemon's routing identity, whose
+/// `Instance` variant carries no cwd, so `orchestration_cwd` is resolved by the
+/// caller (see [`AppState::orchestration_cwd_of`]) and passed separately rather
+/// than read back out of the identity.
 fn arm_idle_worker_watch_for_delegation(
     registry: &Arc<AgentPtyRegistry>,
     worker_pane_id: &str,
     role: &str,
     orchestrator_pane_id: &str,
-    orchestration: Option<&(String, String)>,
+    orchestration: Option<&OrchestrationIdentity>,
+    orchestration_cwd: Option<&str>,
     worker_cwd: Option<&str>,
 ) {
-    let Some(timeout) = worker_response_timeout(
-        orchestration.map(|(_, orch_cwd)| orch_cwd.as_str()),
-        worker_cwd,
-    ) else {
+    let Some(timeout) = worker_response_timeout(orchestration_cwd, worker_cwd) else {
         tracing::debug!(
             pane_id = %worker_pane_id,
             role = %role,
@@ -563,7 +676,7 @@ fn arm_idle_worker_watch_for_delegation(
         role,
         orchestrator_pane_id,
         &orchestrator_agent_id,
-        orchestration.map(|(name, _)| name.as_str()),
+        orchestration,
     ) else {
         tracing::debug!(
             pane_id = %worker_pane_id,
@@ -651,19 +764,12 @@ fn arm_idle_worker_watch(
                     if revalidate_registry.is_pane_closing(&revalidate_pane) {
                         return false;
                     }
-                    // Only a POSITIVE membership mismatch refuses: a pane with no
-                    // orchestration `tab_membership` (dashboard/mode pane, or one
-                    // spawned without membership metadata) legitimately reports
-                    // `None`, and the agent-id gate above already pins identity.
-                    match (
-                        expected_orchestration.as_deref(),
+                    orchestration_still_matches(
+                        expected_orchestration.as_ref(),
                         revalidate_registry
-                            .pane_orchestration_name(&revalidate_pane)
-                            .as_deref(),
-                    ) {
-                        (Some(expected), Some(current)) => expected == current,
-                        _ => true,
-                    }
+                            .pane_orchestration(&revalidate_pane)
+                            .as_ref(),
+                    )
                 },
             )
             .await;
@@ -738,6 +844,41 @@ fn lookup_orchestration_role(
     orch.roles.into_iter().find(|r| r.name == role_name)
 }
 
+/// PRD #225 M3: does this `SessionStart` mean "the agent can accept input", or
+/// only "a session now exists so paint a card"?
+///
+/// `dot-agent-deck wrap` emits a `SessionStart` the instant `cmd.spawn()`
+/// returns (`crate::wrap`), tagged with
+/// [`crate::event::WRAPPER_FORK_SESSION_START_ORIGIN`]. At that moment the child
+/// is often still just the launcher — measured on a Codex pane, `node codex`
+/// started 4 s after the wrapper forked `devbox run codex-big`. A gate that
+/// accepted it wrote the prompt into a PTY where only `devbox` was running, and
+/// the prompt was lost (PRD #225 Defect 1).
+///
+/// The skip MUST be conditional, and the condition is "will a genuine
+/// `SessionStart` arrive later?". The registry answers that: an agent with a
+/// native-hook installer ([`crate::agent_registry::AgentSpec::hook_install`])
+/// emits its own `SessionStart` from an initialized session — Codex is the
+/// hybrid case (wrapper as PTY host, native hooks for rich events) — so its
+/// fork-time event can be safely ignored. A pure-Wrapper agent with no hook
+/// installer (Gemini, PRD #211) will NEVER emit another one, so for it the
+/// fork-time event is the only readiness signal there is and must release the
+/// gate; skipping it unconditionally would regress those agents to a full
+/// timeout on every delegate. Keying off a registry property rather than
+/// `agent_type == Codex` is what keeps the next wrapper adapter from inheriting
+/// this bug: a new Wrapper agent gets the right behavior from its registry entry
+/// alone, with no change here.
+///
+/// Events without the marker — native hooks, an OLDER wrapper build, the
+/// scheduler's synthetic card-surfacing event — are always treated as ready,
+/// which is exactly today's behavior.
+fn session_start_means_ready(event: &AgentEvent) -> bool {
+    !event.is_wrapper_fork_session_start()
+        || crate::agent_registry::spec(&event.agent_type)
+            .hook_install
+            .is_none()
+}
+
 /// PRD #92 F9 followup-6: block until the daemon's hook broadcast
 /// surfaces a `SessionStart` event for `pane_id`, or `timeout`
 /// elapses. The caller is expected to have called `event_tx.subscribe()`
@@ -775,7 +916,18 @@ fn lookup_orchestration_role(
 ///
 /// PRD #127: also reused by the scheduler spawn primitive
 /// ([`crate::spawn::spawn`]) to gate a freshly-spawned scheduled card's
-/// prompt delivery on the same readiness signal — hence `pub(crate)`.
+/// prompt delivery on the same readiness signal — hence `pub(crate)`. PRD #225
+/// M4 answers "does the scheduler want the same semantics?" with yes: a
+/// scheduled card's prompt is delivered by the identical
+/// `write_to_pane_and_submit` keystroke path into the identical PTY, so a
+/// fork-time event that isn't proof of interactivity is no more usable there
+/// than on the delegate path. Both call sites therefore share
+/// [`session_start_means_ready`] rather than diverging.
+///
+/// PRD #225 M3: a `SessionStart` carrying the wrapper's fork-time origin marker
+/// is SKIPPED (kept waiting on) when the agent will emit a genuine native one
+/// later — see [`session_start_means_ready`] for the discriminator and why the
+/// skip must be conditional.
 pub(crate) async fn wait_for_session_start(
     rx: &mut broadcast::Receiver<BroadcastMsg>,
     pane_id: &str,
@@ -793,6 +945,17 @@ pub(crate) async fn wait_for_session_start(
                     && event.pane_id.as_deref() == Some(pane_id)
                     && event.agent_id.as_deref() == Some(agent_id)
                 {
+                    if !session_start_means_ready(&event) {
+                        tracing::debug!(
+                            pane_id,
+                            agent_id,
+                            agent_type = ?event.agent_type,
+                            "readiness gate: ignoring the wrapper's fork-time \
+                             card-surfacing SessionStart; waiting for the agent's \
+                             native one"
+                        );
+                        continue;
+                    }
                     return true;
                 }
             }
@@ -844,7 +1007,7 @@ pub(crate) async fn wait_for_session_start(
 async fn dispatch_one_owned(
     registry: Arc<AgentPtyRegistry>,
     event_tx: broadcast::Sender<BroadcastMsg>,
-    orchestration: Option<(String, String)>,
+    orchestration: Option<OrchestrationIdentity>,
     orchestrator_pane_id: String,
     target_role: String,
     pane_id: String,
@@ -860,10 +1023,11 @@ async fn dispatch_one_owned(
     // every delegate means a config edit between sessions takes
     // effect on the next delegate without a pane respawn. `None`
     // means "no template, fall back to the raw task".
+    // PRD #140 M2.0: the identity is no longer a `(name, cwd)` tuple, but the
+    // lookup still needs the orchestration's CONFIG name — hence
+    // `OrchestrationIdentity::name()`, which both variants answer.
     let role_config = match (cwd.as_deref(), orchestration.as_ref()) {
-        (Some(c), Some((orch_name, _orch_cwd))) => {
-            lookup_orchestration_role(c, orch_name, &target_role)
-        }
+        (Some(c), Some(identity)) => lookup_orchestration_role(c, identity.name(), &target_role),
         _ => None,
     };
     // When we have an orchestration context (cwd + orchestration
@@ -940,7 +1104,8 @@ async fn dispatch_one_owned(
     // via `get-seed` → `pi.sendUserMessage`, no PTY keystroke injection. This
     // ALSO dissolves the pi-specific fragility the old path had: pi never emits
     // `EventType::SessionStart`, so `wait_for_session_start` always burned the
-    // full ~10s timeout before injecting into a maybe-not-yet-ready pane. A
+    // full `SESSION_START_WAIT_TIMEOUT` (10s when this was written, 30s since
+    // PRD #225 M4) before injecting into a maybe-not-yet-ready pane. A
     // `clear = false` pi worker (no respawn → no `session_start`) keeps the
     // legacy injection — the native pull needs a fresh session to fire on, so
     // mid-session re-delegation is a documented further enhancement.
@@ -1387,12 +1552,119 @@ impl AppState {
     }
 
     /// Unregister a pane ID (e.g., when closing a pane).
+    ///
+    /// PRD #140 M2.3: `pane_orchestration_map`'s value type changed but the
+    /// cleanup is keyed on `pane_id`, so removal is unaffected — every routing
+    /// identity for the pane goes with the entry regardless of variant.
     pub fn unregister_pane(&mut self, pane_id: &str) {
         self.managed_pane_ids.remove(pane_id);
         self.pane_role_map.remove(pane_id);
         self.pane_cwd_map.remove(pane_id);
         self.orchestrator_pane_ids.remove(pane_id);
         self.pane_orchestration_map.remove(pane_id);
+    }
+
+    /// PRD #126 + #140: the **orchestration** cwd for `orchestrator_pane_id` —
+    /// the directory whose `.dot-agent-deck.toml` defines the orchestration, used
+    /// to resolve `worker_response_timeout_minutes` before falling back to the
+    /// worker's own cwd (they diverge for PRD #120's issue-dispatch clones, which
+    /// is exactly why that fallback order exists).
+    ///
+    /// Before PRD #140 this came straight out of `pane_orchestration_map`, whose
+    /// value was a `(name, orchestration_cwd)` tuple. #140 replaced that value
+    /// with an [`OrchestrationIdentity`] whose `Instance` variant keys on a
+    /// per-tab token and carries **no cwd at all**, so reading it back out of the
+    /// routing identity would silently resolve `None` for every modern client and
+    /// quietly downgrade the resolution to the worker cwd. Instead this rebuilds
+    /// the same value the daemon folded into the legacy tuple at `StartAgent`
+    /// time: the orchestrator pane's `TabMembership::orchestration_cwd`, else its
+    /// own per-pane cwd.
+    pub fn orchestration_cwd_of(
+        &self,
+        orchestrator_pane_id: &str,
+        registry: &AgentPtyRegistry,
+    ) -> Option<String> {
+        registry
+            .pane_orchestration(orchestrator_pane_id)
+            .and_then(|membership| membership.cwd)
+            .or_else(|| self.pane_cwd_map.get(orchestrator_pane_id).cloned())
+    }
+
+    /// The pure routing half of [`Self::handle_delegate`]: every
+    /// `(target_role, pane_id)` a delegate from `sender_pane_id` to roles `to`
+    /// fans out to, in the same order the dispatcher will use.
+    ///
+    /// Per-role filtering: same orchestration; never the orchestrator's own
+    /// pane (a role that names itself is almost certainly a misconfiguration;
+    /// we don't want the orchestrator's pane fed its own delegate prompt).
+    ///
+    /// PRD #140 M2.1: "same orchestration" is [`OrchestrationIdentity`]
+    /// equality — `Instance` vs `Instance` on the per-tab token, `NameCwd` vs
+    /// `NameCwd` on the legacy tuple, never across variants. The
+    /// orchestrator-self-exclusion and the role-name match are unchanged.
+    ///
+    /// PRD #126 M1 audit (finding 3): a role repeated within one signal
+    /// (`to: ["coder", "coder"]`) is de-duplicated. It used to dispatch the
+    /// same task twice into the same pane and — since `handle_delegate` arms one
+    /// idle-worker record per target — arm two records for it, the second
+    /// immediately superseding the first. Pure waste, and a way to leave a
+    /// record armed after a single `work-done`.
+    ///
+    /// Split out of `handle_delegate` so the routing decision is testable
+    /// without spawning PTYs — `handle_delegate` itself only does I/O once
+    /// this has decided the targets, so a test of this function is a test of
+    /// where a delegate actually lands (M5.0).
+    pub fn delegate_targets(&self, sender_pane_id: &str, to: &[String]) -> Vec<(String, String)> {
+        let orchestration = self.pane_orchestration_map.get(sender_pane_id);
+        let mut targets: Vec<(String, String)> = Vec::new();
+        let mut seen_roles: HashSet<&str> = HashSet::new();
+        for target_role in to {
+            if !seen_roles.insert(target_role.as_str()) {
+                warn!(role = %target_role, "delegate: duplicate target role in one signal; ignored");
+                continue;
+            }
+            let mut role_panes: Vec<String> = self
+                .pane_role_map
+                .iter()
+                .filter(|(pane_id, role)| {
+                    role.as_str() == target_role.as_str()
+                        && !self.orchestrator_pane_ids.contains(pane_id.as_str())
+                        && self.pane_orchestration_map.get(pane_id.as_str()) == orchestration
+                })
+                .map(|(pane_id, _)| pane_id.clone())
+                .collect();
+            if role_panes.is_empty() {
+                warn!(role = %target_role, "delegate: no worker pane found for role");
+                continue;
+            }
+            // `pane_role_map` is a `HashMap`, so its iteration order varies
+            // run to run. Sort for a stable fan-out order — the set is what
+            // matters for correctness, but a deterministic order keeps logs
+            // and tests reproducible.
+            role_panes.sort();
+            for pane_id in role_panes.drain(..) {
+                targets.push((target_role.clone(), pane_id));
+            }
+        }
+        targets
+    }
+
+    /// The pure routing half of [`Self::handle_work_done`]: the orchestrator
+    /// pane that should receive `worker_pane_id`'s completion feedback, or
+    /// `None` when the worker's orchestration has no live orchestrator.
+    ///
+    /// PRD #140 M2.2: scoped by [`OrchestrationIdentity`] equality. With a
+    /// per-tab `Instance` token at most ONE orchestrator can match, so the
+    /// answer is deterministic. Pre-#140 (and still, for the `NameCwd`
+    /// fallback) two same-`(name, cwd)` tabs both matched and the winner was
+    /// decided by `HashSet` iteration order — the non-deterministic half of
+    /// issue #140.
+    pub fn orchestrator_for_worker(&self, worker_pane_id: &str) -> Option<String> {
+        let orchestration = self.pane_orchestration_map.get(worker_pane_id);
+        self.orchestrator_pane_ids
+            .iter()
+            .find(|p| self.pane_orchestration_map.get(p.as_str()) == orchestration)
+            .cloned()
     }
 
     /// Handle an orchestrator's delegate signal: validate the sender, look
@@ -1439,45 +1711,16 @@ impl AppState {
         }
 
         let orchestration = self.pane_orchestration_map.get(&signal.pane_id).cloned();
-
-        // Collect every (target_role, pane_id) the delegate fans out to.
-        // Per-role filtering: same orchestration; never the orchestrator's
-        // own pane (a role that names itself is almost certainly a
-        // misconfiguration; we don't want the orchestrator's pane to be
-        // fed its own delegate prompt).
-        //
-        // PRD #126 M1 audit (finding 3): de-duplicate repeated roles within one
-        // signal. `to: ["coder", "coder"]` used to dispatch the same task twice
-        // into the same pane and arm two records for it — the second
-        // immediately superseding the first — which is pure waste and, before
-        // the supersede accounting below, a way to make one work-done leave a
-        // record armed.
-        let mut targets: Vec<(String, String)> = Vec::new();
-        let mut seen_roles: HashSet<&str> = HashSet::new();
-        for target_role in &signal.to {
-            if !seen_roles.insert(target_role.as_str()) {
-                warn!(role = %target_role, "delegate: duplicate target role in one signal; ignored");
-                continue;
-            }
-            let mut role_panes: Vec<String> = self
-                .pane_role_map
-                .iter()
-                .filter(|(pane_id, role)| {
-                    role.as_str() == target_role.as_str()
-                        && !self.orchestrator_pane_ids.contains(pane_id.as_str())
-                        && self.pane_orchestration_map.get(pane_id.as_str()).cloned()
-                            == orchestration
-                })
-                .map(|(pane_id, _)| pane_id.clone())
-                .collect();
-            if role_panes.is_empty() {
-                warn!(role = %target_role, "delegate: no worker pane found for role");
-                continue;
-            }
-            for pane_id in role_panes.drain(..) {
-                targets.push((target_role.clone(), pane_id));
-            }
-        }
+        // PRD #126 + #140: the cwd of the `.dot-agent-deck.toml` that DEFINES this
+        // orchestration, for resolving `worker_response_timeout_minutes`. Read
+        // once per delegate (it is a property of the orchestrator pane, not of
+        // each target) and separately from the routing identity, because #140's
+        // `Instance` variant carries no cwd — see [`Self::orchestration_cwd_of`].
+        let orchestration_cwd = self.orchestration_cwd_of(&signal.pane_id, registry);
+        // PRD #140 M2.1: routing (same-orchestration identity + never the
+        // orchestrator's own pane) lives in `delegate_targets`, which also
+        // applies PRD #126 M1 audit finding 3's duplicate-role de-duplication.
+        let targets = self.delegate_targets(&signal.pane_id, &signal.to);
 
         // PRD #92 F9 followup-6: async-dispatch. Each per-target future
         // runs in its own `tokio::spawn` so `handle_delegate` (and the
@@ -1529,6 +1772,7 @@ impl AppState {
                 &target_role,
                 &orchestrator_pane_id,
                 orchestration.as_ref(),
+                orchestration_cwd.as_deref(),
                 cwd.as_deref(),
             );
 
@@ -1632,14 +1876,11 @@ impl AppState {
         // worker. We scope by `pane_orchestration_map` so a parallel
         // orchestration tab's orchestrator pane doesn't receive a sibling
         // tab's worker feedback.
-        let orchestration = self.pane_orchestration_map.get(&signal.pane_id);
-        let orchestrator_pane_id = self
-            .orchestrator_pane_ids
-            .iter()
-            .find(|p| self.pane_orchestration_map.get(p.as_str()) == orchestration)
-            .cloned();
-
-        let Some(orch_pane_id) = orchestrator_pane_id else {
+        //
+        // PRD #140 M2.2: the scope is [`OrchestrationIdentity`] equality —
+        // see [`Self::orchestrator_for_worker`], which owns the lookup so it
+        // is unit-testable without PTYs.
+        let Some(orch_pane_id) = self.orchestrator_for_worker(&signal.pane_id) else {
             warn!(
                 pane_id = %signal.pane_id,
                 role = %role_name,
@@ -2179,6 +2420,361 @@ mod tests {
                 DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES * 60
             )),
             "no config file means the default"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // PRD #140 — routing identity. These exercise the pure halves of
+    // `handle_delegate` / `handle_work_done` (`delegate_targets` /
+    // `orchestrator_for_worker`), which decide WHERE a signal lands; the
+    // async remainder of those two functions only performs the I/O the
+    // decision dictates.
+    // ---------------------------------------------------------------------
+
+    /// Register one orchestration role pane exactly the way the daemon's
+    /// `StartAgent` handler does: managed-pane set, pane→role map, the
+    /// orchestrator set for the start role, and the routing identity.
+    fn register_role_pane(
+        state: &mut AppState,
+        pane_id: &str,
+        role: &str,
+        is_orchestrator: bool,
+        identity: OrchestrationIdentity,
+    ) {
+        state.register_pane(pane_id.to_string());
+        state
+            .pane_role_map
+            .insert(pane_id.to_string(), role.to_string());
+        if is_orchestrator {
+            state.orchestrator_pane_ids.insert(pane_id.to_string());
+        }
+        state
+            .pane_orchestration_map
+            .insert(pane_id.to_string(), identity);
+    }
+
+    fn instance(id: &str) -> OrchestrationIdentity {
+        OrchestrationIdentity::Instance {
+            id: id.to_string(),
+            // Same orchestration, same directory, same config name — the
+            // exact collision issue #140 reports. Only the token differs.
+            name: "tdd-cycle".to_string(),
+        }
+    }
+
+    fn name_cwd(name: &str, cwd: &str) -> OrchestrationIdentity {
+        OrchestrationIdentity::NameCwd {
+            name: name.to_string(),
+            cwd: cwd.to_string(),
+        }
+    }
+
+    /// Two tabs of the SAME orchestration in the SAME directory, told apart
+    /// only by their instance tokens. `orch_first` flips the insertion order
+    /// so neither `HashMap` nor `HashSet` iteration order can be what makes
+    /// the assertion pass.
+    fn two_same_name_cwd_tabs(a_first: bool) -> AppState {
+        /// Register one two-role tab: `{prefix}_orch` + `{prefix}_coder`.
+        fn add_tab(state: &mut AppState, prefix: &str, identity: OrchestrationIdentity) {
+            register_role_pane(
+                state,
+                &format!("{prefix}_orch"),
+                "orchestrator",
+                true,
+                identity.clone(),
+            );
+            register_role_pane(state, &format!("{prefix}_coder"), "coder", false, identity);
+        }
+        let mut state = AppState::default();
+        if a_first {
+            add_tab(&mut state, "A", instance("orch-aaaa-0"));
+            add_tab(&mut state, "B", instance("orch-bbbb-1"));
+        } else {
+            add_tab(&mut state, "B", instance("orch-bbbb-1"));
+            add_tab(&mut state, "A", instance("orch-aaaa-0"));
+        }
+        state
+    }
+
+    /// M5.0: a delegate from tab A's orchestrator reaches ONLY tab A's coder,
+    /// never tab B's — even though both tabs share `(name, cwd)`. Repeated
+    /// with both insertion orders and over many iterations because the maps
+    /// are hash-ordered: a single run could pass by luck.
+    #[test]
+    fn delegate_targets_never_cross_delivers_between_same_name_cwd_tabs() {
+        for a_first in [true, false] {
+            for _ in 0..64 {
+                let state = two_same_name_cwd_tabs(a_first);
+                let to = vec!["coder".to_string()];
+
+                let from_a = state.delegate_targets("A_orch", &to);
+                assert_eq!(
+                    from_a,
+                    vec![("coder".to_string(), "A_coder".to_string())],
+                    "A's delegate must reach exactly A_coder (a_first={a_first})"
+                );
+
+                let from_b = state.delegate_targets("B_orch", &to);
+                assert_eq!(
+                    from_b,
+                    vec![("coder".to_string(), "B_coder".to_string())],
+                    "B's delegate must reach exactly B_coder (a_first={a_first})"
+                );
+            }
+        }
+    }
+
+    /// M5.0: work-done from tab A's coder reaches ONLY tab A's orchestrator.
+    /// This is the half that used to be non-deterministic — the pre-#140
+    /// `.find()` over `orchestrator_pane_ids` matched both orchestrators and
+    /// `HashSet` order picked the winner.
+    #[test]
+    fn orchestrator_for_worker_is_deterministic_across_same_name_cwd_tabs() {
+        for a_first in [true, false] {
+            for _ in 0..64 {
+                let state = two_same_name_cwd_tabs(a_first);
+                assert_eq!(
+                    state.orchestrator_for_worker("A_coder").as_deref(),
+                    Some("A_orch"),
+                    "A_coder's work-done must reach A_orch (a_first={a_first})"
+                );
+                assert_eq!(
+                    state.orchestrator_for_worker("B_coder").as_deref(),
+                    Some("B_orch"),
+                    "B_coder's work-done must reach B_orch (a_first={a_first})"
+                );
+            }
+        }
+    }
+
+    /// M5.0: the orchestrator is still excluded from its own delegate fan-out
+    /// when a role name collides with the orchestrator's role — the
+    /// self-exclusion rule is unchanged by the identity switch.
+    #[test]
+    fn delegate_targets_still_excludes_the_sending_orchestrator() {
+        let state = two_same_name_cwd_tabs(true);
+        let targets = state.delegate_targets("A_orch", &["orchestrator".to_string()]);
+        assert!(
+            targets.is_empty(),
+            "an orchestrator must never be a delegate target, got {targets:?}"
+        );
+    }
+
+    /// PRD #126 M1 audit (finding 3), re-homed onto #140's routing seam: a role
+    /// repeated inside one delegate signal fans out ONCE. Two dispatches into one
+    /// pane arm two idle-worker records for it, the second superseding the first,
+    /// so a single `work-done` would leave one armed.
+    #[test]
+    fn delegate_targets_de_duplicates_a_repeated_target_role() {
+        let state = two_same_name_cwd_tabs(true);
+        let repeated = vec!["coder".to_string(), "coder".to_string()];
+        assert_eq!(
+            state.delegate_targets("A_orch", &repeated),
+            vec![("coder".to_string(), "A_coder".to_string())],
+            "a role named twice in one signal must yield exactly one target"
+        );
+    }
+
+    /// PRD #126 + #140: the idle watch's pre-write orchestration recheck. The
+    /// load-bearing case is the middle one — before the #140 merge the record
+    /// carried only the orchestration NAME, which both tabs of a same-directory
+    /// orchestration answer identically, so a name-only recheck could not tell a
+    /// re-homed pane from the original.
+    #[test]
+    fn orchestration_still_matches_compares_the_instance_token_when_both_sides_have_one() {
+        use crate::agent_pty::PaneOrchestration;
+
+        fn live(name: &str, instance_id: Option<&str>) -> PaneOrchestration {
+            PaneOrchestration {
+                name: name.to_string(),
+                instance_id: instance_id.map(str::to_string),
+                cwd: Some("/home/u/project".to_string()),
+            }
+        }
+
+        let armed_under = instance("orch-aaaa-0");
+        assert!(
+            orchestration_still_matches(
+                Some(&armed_under),
+                Some(&live("tdd-cycle", Some("orch-aaaa-0")))
+            ),
+            "the same tab must still match, or a live orchestration's nudge is silently dropped"
+        );
+        assert!(
+            !orchestration_still_matches(
+                Some(&armed_under),
+                Some(&live("tdd-cycle", Some("orch-bbbb-1")))
+            ),
+            "a DIFFERENT tab of the same orchestration in the same directory must not match — \
+             that is the pane-reuse mis-delivery #140's token exists to expose"
+        );
+
+        // Token-less (pre-#140 client) panes fall back to the name comparison,
+        // which is all such a pane can be compared on.
+        assert!(orchestration_still_matches(
+            Some(&armed_under),
+            Some(&live("tdd-cycle", None))
+        ));
+        assert!(!orchestration_still_matches(
+            Some(&armed_under),
+            Some(&live("some-other-orchestration", None))
+        ));
+        assert!(orchestration_still_matches(
+            Some(&name_cwd("foo", "/home/u/project-a")),
+            Some(&live("foo", Some("orch-aaaa-0")))
+        ));
+
+        // Absence is never a mismatch: a pane with no orchestration membership
+        // (dashboard/mode pane, or one spawned without membership metadata)
+        // legitimately reports `None`, and the guarded send's agent-id gate is
+        // the primary identity guard.
+        assert!(orchestration_still_matches(Some(&armed_under), None));
+        assert!(orchestration_still_matches(
+            None,
+            Some(&live("tdd-cycle", Some("orch-bbbb-1")))
+        ));
+        assert!(orchestration_still_matches(None, None));
+    }
+
+    /// PRD #126 + #140: the orchestration cwd for timeout resolution. #140's
+    /// `Instance` identity carries no cwd, so it comes from the orchestrator
+    /// pane's registry membership, falling back to its own per-pane cwd — never
+    /// from the routing identity, which would resolve `None` for every modern
+    /// client and silently downgrade to the worker cwd.
+    #[test]
+    fn orchestration_cwd_of_falls_back_to_the_orchestrator_pane_cwd() {
+        // A registry with no live agent on the pane: `pane_orchestration` yields
+        // `None`, which is the fallback branch.
+        let registry = AgentPtyRegistry::new();
+        let mut state = AppState::default();
+        register_role_pane(&mut state, "A_orch", "orchestrator", true, instance("i-0"));
+        assert_eq!(state.orchestration_cwd_of("A_orch", &registry), None);
+        state
+            .pane_cwd_map
+            .insert("A_orch".to_string(), "/home/u/project".to_string());
+        assert_eq!(
+            state.orchestration_cwd_of("A_orch", &registry).as_deref(),
+            Some("/home/u/project")
+        );
+    }
+
+    /// M4.1: cross-directory regression. Two orchestrations sharing a `name`
+    /// but living in different directories carry `NameCwd` identities (no
+    /// instance token — the older-client path) and must never cross-deliver.
+    /// This is the round-11 fix; it has to keep holding after the value-type
+    /// change.
+    #[test]
+    fn name_cwd_identities_never_cross_deliver_across_directories() {
+        for _ in 0..64 {
+            let mut state = AppState::default();
+            let a = name_cwd("foo", "/home/u/project-a");
+            let b = name_cwd("foo", "/home/u/project-b");
+            register_role_pane(&mut state, "A_orch", "orchestrator", true, a.clone());
+            register_role_pane(&mut state, "A_coder", "coder", false, a);
+            register_role_pane(&mut state, "B_orch", "orchestrator", true, b.clone());
+            register_role_pane(&mut state, "B_coder", "coder", false, b);
+
+            assert_eq!(
+                state.delegate_targets("A_orch", &["coder".to_string()]),
+                vec![("coder".to_string(), "A_coder".to_string())]
+            );
+            assert_eq!(
+                state.delegate_targets("B_orch", &["coder".to_string()]),
+                vec![("coder".to_string(), "B_coder".to_string())]
+            );
+            assert_eq!(
+                state.orchestrator_for_worker("A_coder").as_deref(),
+                Some("A_orch")
+            );
+            assert_eq!(
+                state.orchestrator_for_worker("B_coder").as_deref(),
+                Some("B_orch")
+            );
+        }
+    }
+
+    /// M5.2: the fallback path. An orchestration whose memberships carry NO
+    /// instance token builds `NameCwd` identities, and a single such
+    /// orchestration routes delegate + work-done exactly as it did pre-#140.
+    /// This is what a newer daemon does for an older TUI.
+    #[test]
+    fn name_cwd_fallback_routes_a_single_orchestration_unchanged() {
+        let mut state = AppState::default();
+        let id = name_cwd("tdd-cycle", "/home/u/project");
+        register_role_pane(&mut state, "orch", "orchestrator", true, id.clone());
+        register_role_pane(&mut state, "coder", "coder", false, id.clone());
+        register_role_pane(&mut state, "tester", "tester", false, id);
+
+        assert_eq!(
+            state.delegate_targets("orch", &["coder".to_string(), "tester".to_string()]),
+            vec![
+                ("coder".to_string(), "coder".to_string()),
+                ("tester".to_string(), "tester".to_string()),
+            ],
+            "fan-out to two roles resolves both worker panes"
+        );
+        assert_eq!(
+            state.orchestrator_for_worker("coder").as_deref(),
+            Some("orch")
+        );
+        assert_eq!(
+            state.orchestrator_for_worker("tester").as_deref(),
+            Some("orch")
+        );
+    }
+
+    /// A tokened pane and a token-less pane were produced by different
+    /// clients; nothing says they share a tab, so the two identity variants
+    /// must never compare equal. Otherwise a mid-upgrade daemon could route a
+    /// new client's delegate into an old client's pane.
+    #[test]
+    fn instance_and_name_cwd_identities_never_match_each_other() {
+        let mut state = AppState::default();
+        register_role_pane(
+            &mut state,
+            "new_orch",
+            "orchestrator",
+            true,
+            instance("orch-aaaa-0"),
+        );
+        register_role_pane(
+            &mut state,
+            "old_coder",
+            "coder",
+            false,
+            name_cwd("tdd-cycle", "/home/u/project"),
+        );
+
+        assert!(
+            state
+                .delegate_targets("new_orch", &["coder".to_string()])
+                .is_empty(),
+            "a tokened orchestrator must not reach a token-less worker"
+        );
+        assert_eq!(
+            state.orchestrator_for_worker("old_coder"),
+            None,
+            "a token-less worker must not resolve a tokened orchestrator"
+        );
+    }
+
+    /// M2.3: closing a pane drops its routing identity, so a later delegate
+    /// aimed at that role no longer resolves the dead pane.
+    #[test]
+    fn unregister_pane_drops_the_routing_identity() {
+        let mut state = two_same_name_cwd_tabs(true);
+        state.unregister_pane("A_coder");
+        assert!(!state.pane_orchestration_map.contains_key("A_coder"));
+        assert!(
+            state
+                .delegate_targets("A_orch", &["coder".to_string()])
+                .is_empty(),
+            "a closed worker must not stay a delegate target"
+        );
+        // B's tab is untouched.
+        assert_eq!(
+            state.delegate_targets("B_orch", &["coder".to_string()]),
+            vec![("coder".to_string(), "B_coder".to_string())]
         );
     }
 }

@@ -260,14 +260,14 @@ fn config_path() -> PathBuf {
     if let Ok(dir) = std::env::var("DOT_AGENT_DECK_CONFIG") {
         return PathBuf::from(dir);
     }
-    dirs_home().join(".config/dot-agent-deck/config.toml")
+    config_dir().join("config.toml")
 }
 
 fn session_path() -> PathBuf {
     if let Ok(dir) = std::env::var("DOT_AGENT_DECK_SESSION") {
         return PathBuf::from(dir);
     }
-    dirs_home().join(".config/dot-agent-deck/session.toml")
+    config_dir().join("session.toml")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -395,7 +395,13 @@ impl SavedSession {
 
         let path = session_path();
         let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-        std::fs::create_dir_all(parent)
+        // PRD #163 auditor: through the fsperm seam rather than plain
+        // `create_dir_all`, so the directory holding this snapshot is owner-only
+        // too — parity with `schedules.toml`/`remotes.toml`. The file's own
+        // mode/DACL protects the command lines and prompts inside; this protects
+        // the directory metadata when the config dir is redirected somewhere
+        // shared. Create-only: an existing directory keeps its mode (PRD #127 S2).
+        crate::platform::fsperm::create_owner_only_dir(parent)
             .map_err(|e| format!("Failed to create session directory: {e}"))?;
 
         let contents = toml::to_string_pretty(self)
@@ -416,8 +422,9 @@ impl SavedSession {
         let tmp_path = parent.join(format!("{file_name}.{}.tmp", std::process::id()));
 
         // PRD #42 M1: owner-only (0o600) creation mode comes from the platform
-        // seam — `.mode(0o600)` on Unix, a no-op-under-`%LOCALAPPDATA%`-ACL on
-        // Windows (#163).
+        // seam — `.mode(0o600)` on Unix; on Windows (#163) the DACL cannot be
+        // supplied at create time, so the seam instead puts `WRITE_DAC` on the
+        // handle, which is what lets the `set_file_owner_only` call below apply it.
         let mut open_opts = std::fs::OpenOptions::new();
         open_opts.create(true).write(true).truncate(true);
         crate::platform::fsperm::set_create_mode_owner_only(&mut open_opts);
@@ -425,21 +432,26 @@ impl SavedSession {
             .open(&tmp_path)
             .map_err(|e| format!("Failed to open temp session at {}: {e}", tmp_path.display()))?;
 
-        if let Err(e) = tmp_file.write_all(contents.as_bytes()) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(format!(
-                "Failed to write temp session at {}: {e}",
-                tmp_path.display()
-            ));
-        }
-        // Defense in depth: a stale temp file from a crashed previous save would
-        // keep its old mode (the create-mode only applies on create), so
-        // re-assert owner-only permissions explicitly before the rename (PRD #42
-        // M1: via the platform seam — set 0o600 on Unix, no-op on Windows).
+        // Owner-only permissions BEFORE the first content byte (PRD #163 M4).
+        // Defense in depth on Unix (a stale temp file from a crashed previous save
+        // would keep its old mode, since the create-mode only applies on create),
+        // and on Windows where the protected current-user-only DACL is applied at
+        // all — `std::fs::OpenOptions` has no `SECURITY_ATTRIBUTES` hook, so the
+        // create-mode seam can only pre-authorize this call (`WRITE_DAC`), not
+        // stand in for it. Running it before the write means the
+        // snapshot's command lines, project paths and prompts are never exposed
+        // under a loose inherited ACL; the end state on Unix is identical.
         if let Err(e) = crate::platform::fsperm::set_file_owner_only(&tmp_file) {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(format!(
                 "Failed to set permissions on temp session at {}: {e}",
+                tmp_path.display()
+            ));
+        }
+        if let Err(e) = tmp_file.write_all(contents.as_bytes()) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!(
+                "Failed to write temp session at {}: {e}",
                 tmp_path.display()
             ));
         }
@@ -674,15 +686,17 @@ pub struct LoadedSchedules {
 }
 
 /// Global schedules path: `$XDG_CONFIG_HOME/dot-agent-deck/schedules.toml`,
-/// falling back to `~/.config/...`. `DOT_AGENT_DECK_SCHEDULES` overrides it so
-/// tests never touch the real home dir.
+/// falling back to `~/.config/...` (on Windows: `%APPDATA%\dot-agent-deck`,
+/// which has no XDG stage — see
+/// [`crate::platform::paths::xdg_config_home`]). `DOT_AGENT_DECK_SCHEDULES`
+/// overrides it so tests never touch the real home dir.
 pub fn schedules_path() -> PathBuf {
     if let Ok(p) = std::env::var("DOT_AGENT_DECK_SCHEDULES") {
         return PathBuf::from(p);
     }
-    match std::env::var("XDG_CONFIG_HOME") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join("dot-agent-deck/schedules.toml"),
-        _ => dirs_home().join(".config/dot-agent-deck/schedules.toml"),
+    match crate::platform::paths::xdg_config_home() {
+        Some(dir) => dir.join("dot-agent-deck/schedules.toml"),
+        None => config_dir().join("schedules.toml"),
     }
 }
 
@@ -910,7 +924,7 @@ fn star_prompt_path() -> PathBuf {
     if let Ok(p) = std::env::var("DOT_AGENT_DECK_STAR_PROMPT") {
         return PathBuf::from(p);
     }
-    dirs_home().join(".config/dot-agent-deck/star-prompt-state.json")
+    config_dir().join("star-prompt-state.json")
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -986,7 +1000,7 @@ fn config_gen_state_path() -> PathBuf {
     if let Ok(p) = std::env::var("DOT_AGENT_DECK_CONFIG_GEN_STATE") {
         return PathBuf::from(p);
     }
-    dirs_home().join(".config/dot-agent-deck/config-gen-state.json")
+    config_dir().join("config-gen-state.json")
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1099,6 +1113,17 @@ impl Drop for ConfigGenStateEnvGuard {
 /// Unix, `%USERPROFILE%` on Windows.
 pub(crate) fn dirs_home() -> PathBuf {
     crate::platform::paths::home_dir()
+}
+
+/// Directory holding the user's dot-agent-deck config files. Delegates to
+/// [`crate::platform::paths::config_dir`] (PRD #163 M1): `~/.config/dot-agent-deck`
+/// on Unix — byte-for-byte what every caller previously spelled inline —
+/// `%APPDATA%\dot-agent-deck` on Windows.
+///
+/// Each per-file `DOT_AGENT_DECK_*` override is checked by its own resolver
+/// *before* this is called, so overrides stay authoritative.
+pub(crate) fn config_dir() -> PathBuf {
+    crate::platform::paths::config_dir()
 }
 
 // ---------------------------------------------------------------------------

@@ -53,9 +53,11 @@ The tests import only the import-free `src/orchestrator.ts`, so they need **no r
 
 | Pi event | `agent-event --type` | Meaning |
 |---|---|---|
-| `session_start` | `waiting` | Agent is up, awaiting the first prompt |
+| `session_start` | `finished` | Agent is up, awaiting the first prompt → Idle |
 | `agent_start` | `running` | An agent run has begun |
-| `agent_settled` | `waiting` | Pi will not continue automatically; awaiting input |
+| `agent_settled` | `finished` | Pi settled its turn → Idle |
 | `session_shutdown` | `finished` | The Pi session is exiting |
 
-`agent_end` is deliberately **not** mapped — after it, Pi may still auto-retry, auto-compact, or drain queued follow-up messages, so it is not a reliable idle signal; `agent_settled` is. Every other event is ignored (no `agent-event` emitted), so a bogus `--type` can never reach the CLI.
+**Parity with the other backends.** A turn ending is `Idle`, not "Needs Input". Claude, OpenCode, and Codex all map their turn-end signal (`Stop` / `session.idle`) and their session-start to Idle, and surface "Needs Input" (`waiting`) only on a genuine user-blocking signal — a permission prompt or attention notification. Pi's `agent_settled` is its turn-end analog, so it reports `finished` → Idle. Pi does not currently expose a permission/attention lifecycle event, so it never reports `waiting` — exactly like a Claude agent that never hits a permission prompt. `waiting` stays a valid `agent-event --type` so a future Pi user-blocking event can map to it with no wire change.
+
+`agent_end` is deliberately **not** mapped — after it, Pi may still auto-retry, auto-compact, or drain queued follow-up messages, so it is not a reliable turn-end signal; `agent_settled` is. Every other event is ignored (no `agent-event` emitted), so a bogus `--type` can never reach the CLI.

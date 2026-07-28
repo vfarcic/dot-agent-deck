@@ -9,7 +9,7 @@
 //! a UnixStream client, and verifies every message kind round-trips
 //! correctly — including concurrent attach-stream subscribers.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -68,6 +68,16 @@ async fn start_server() -> Server {
         let listener = bind_attach_listener(&path).expect("bind attach listener");
         (dir, path, listener)
     };
+
+    // This harness serves the attach protocol in-process, so no `daemon serve`
+    // is around to hand the registry a hook socket. Pin one inside the per-test
+    // tempdir anyway: agents spawned here are Codex-typed, so they launch via
+    // `dot-agent-deck wrap`, which posts `SessionStart`/`Idle` to whatever
+    // endpoint it resolves at emit time. Left unset that resolves the
+    // developer's own `XDG_RUNTIME_DIR` — the events land in their live deck as
+    // cards for panes like `pane-live-transition` that vanish when selected.
+    // Nothing listens on this path, and an unreachable socket is a no-op emit.
+    registry.set_hook_socket(dir.path().join("hook.sock"));
 
     let registry_for_task = registry.clone();
     let state_for_task = state.clone();
@@ -309,6 +319,47 @@ async fn observe_stream_input_outcome(
     )
 }
 
+/// How long a delivery-count file gets to reach its expected contents.
+/// Generous because it is only ever paid when something is genuinely broken;
+/// the happy path returns on the first poll.
+const DELIVERY_FILE_BUDGET: Duration = Duration::from_secs(20);
+
+/// Bounded poll until `path` holds exactly `want`.
+///
+/// A `SendResult::Applied` means the daemon wrote the payload and the submit CR
+/// to the PTY master and flushed (`deliver_payload_and_submit`) — NOT that the
+/// child shell has read, parsed and run the command. So a test that reads a
+/// `printf x >> file` counter the instant the response arrives is racing the
+/// shell with nothing synchronizing the two: it happens to win by microseconds
+/// on a fast Linux box and can lose on a slower, loaded runner, where the empty
+/// read then masquerades as a double-submit bug. Polling the CONTENTS closes
+/// that window while keeping the assertion exact.
+///
+/// Panics with what the file actually holds — separating "the delivery never
+/// executed" from "it executed more than once", which an unwaited read
+/// conflates. Growth past `want` fails immediately rather than burning the
+/// budget, since these payloads only ever append.
+async fn wait_for_delivery_writes(path: &Path, want: &str, what: &str) {
+    let deadline = tokio::time::Instant::now() + DELIVERY_FILE_BUDGET;
+    loop {
+        let observed = std::fs::read_to_string(path).unwrap_or_default();
+        if observed == want {
+            return;
+        }
+        assert!(
+            observed.len() < want.len(),
+            "{what}: {} holds {observed:?}, which overshot the expected {want:?} — the delivery submitted more than once",
+            path.display()
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what}: {} never reached {want:?} within {DELIVERY_FILE_BUDGET:?} (last read {observed:?})",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -401,6 +452,7 @@ async fn start_agent_rejects_orchestration_cwd_with_control_byte() {
                 is_start_role: false,
                 orchestration_cwd: Some("/proj/\x1b[31m".into()),
                 display_title: None,
+                orchestration_id: None,
             }),
             agent_type: None,
             seed: None,
@@ -438,6 +490,7 @@ async fn start_agent_with_orchestration_membership_round_trip() {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         },
     )
     .await;
@@ -456,6 +509,7 @@ async fn start_agent_with_orchestration_membership_round_trip() {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         })
     );
     server.registry.shutdown_all();
@@ -1674,6 +1728,18 @@ fn pane_input_010_retry_after_lost_response_is_idempotent() {
         let first = issue_json_request(&server, request.clone()).await;
         // The consumer loses `first` and retries the exact same delivery ID.
         let retry = issue_json_request(&server, request).await;
+        // Wait for the one legitimate write to actually execute, then hold still
+        // long enough for a second one to show up if the retry wrongly submitted.
+        // Without the wait, an "Applied" response says only that bytes reached
+        // the PTY, so an empty read here is indistinguishable from a double
+        // submit — which is how this arm failed on a macOS CI runner.
+        wait_for_delivery_writes(
+            &counter_path,
+            "x",
+            "the first delivery must reach the shell exactly once",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
         let writes = std::fs::read_to_string(&counter_path).unwrap_or_default();
 
         assert_eq!(
@@ -1729,6 +1795,15 @@ fn pane_input_010_retry_after_lost_response_is_idempotent() {
         drop(writer_guard);
         let concurrent_first = first_task.await.unwrap();
         let concurrent_second = second_task.await.unwrap();
+        // Same reasoning as the sequential arm: wait for the single legitimate
+        // write to execute before giving a duplicate its chance to appear. The
+        // fixed sleep alone assumed the shell had already run.
+        wait_for_delivery_writes(
+            &counter_path,
+            "x",
+            "the admitted concurrent delivery must reach the shell exactly once",
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(150)).await;
         let concurrent_writes = std::fs::read_to_string(&counter_path).unwrap_or_default();
         server.registry.close_agent(&agent_id).unwrap();

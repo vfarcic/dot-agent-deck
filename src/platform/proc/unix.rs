@@ -9,6 +9,32 @@ use std::time::Duration;
 // Agent process-group teardown (lifted from agent_pty.rs).
 // ---------------------------------------------------------------------------
 
+/// PRD #163 M3 — Unix has nothing to hold here.
+///
+/// An agent's descendant tree is already addressable on Unix: `portable-pty`
+/// `setsid`s the child, which makes it a process-group leader, so `killpg(pid,
+/// …)` reaches the agent *and* everything it spawned with no bookkeeping at all.
+/// This zero-sized type exists only so the spawn/teardown seam has the same
+/// shape on both platforms — Windows has no implicit grouping and must own a Job
+/// Object handle for the agent's whole lifetime (see the windows backend), which
+/// is why the handle has to be created at spawn and carried on
+/// [`crate::agent_pty::RunningAgent`].
+///
+/// Being a ZST, it is `Send`/`Sync`/`Default` for free and costs nothing in
+/// `AgentPty`/`RunningAgent`; the Unix teardown paths ignore it entirely and
+/// keep using `killpg`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AgentProcessGroup;
+
+impl AgentProcessGroup {
+    /// No-op on Unix: the process group the kill paths use is the one
+    /// `portable-pty`'s `setsid` already established, so there is nothing to
+    /// create and nothing that can fail.
+    pub fn adopt(_pid: Option<u32>) -> Self {
+        Self
+    }
+}
+
 /// PRD #92 F1 followup (defensive): convert a portable-pty `process_id()`
 /// (a `u32`) into a positive `libc::pid_t` suitable for `killpg`, or `None` if
 /// the raw value can't legally name a process group.
@@ -98,7 +124,14 @@ fn signal_child_pgroup_or_fallback(
 /// cannot be caught or ignored, so the kernel tears the process down and
 /// `wait()` returns promptly. Callers should drop the master/writer/reader
 /// handles before invoking this so any I/O blocked on the PTY unblocks first.
-pub fn force_kill_child_and_wait(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
+///
+/// `_group` is the cross-platform teardown handle (PRD #163 M3) and is unused on
+/// Unix — see [`AgentProcessGroup`]; the process group `killpg` addresses is
+/// implicit in the child's own pid.
+pub fn force_kill_child_and_wait(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    _group: &AgentProcessGroup,
+) {
     signal_child_pgroup_or_fallback(child, libc::SIGKILL, "force-kill");
     let _ = child.wait();
 }
@@ -107,9 +140,12 @@ pub fn force_kill_child_and_wait(child: &mut Box<dyn portable_pty::Child + Send 
 /// `SIGTERM` to the child's process group, polls `try_wait` until the child
 /// exits or `grace` elapses, then sends `SIGKILL` as the backstop and reaps the
 /// child.
+///
+/// `_group` is unused on Unix (see [`force_kill_child_and_wait`]).
 pub fn terminate_child_with_grace_and_wait(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     grace: Duration,
+    _group: &AgentProcessGroup,
 ) {
     // Phase 1: SIGTERM the process group.
     signal_child_pgroup_or_fallback(child, libc::SIGTERM, "graceful-close-sigterm");
@@ -213,6 +249,35 @@ pub fn terminate_pid(pid: u32) -> std::io::Result<super::TerminateSignal> {
     Ok(super::TerminateSignal::Delivered)
 }
 
+/// Unix has nothing to pin, so this is an empty token — see [`pin_process`].
+#[derive(Debug)]
+pub struct PinnedProcess;
+
+impl Drop for PinnedProcess {
+    /// Nothing to release. Declared anyway so "the pin is held until here" is
+    /// expressible in the shared `daemon stop` flow on both platforms — an
+    /// explicit `drop(pinned)` there is a real release on Windows and must still
+    /// compile (and mean the same thing) here.
+    fn drop(&mut self) {}
+}
+
+/// Pin `pid`'s identity — a **justified no-op on Unix**, kept as a seam so the
+/// shared `daemon stop` flow does not grow a `cfg` branch (PRD #163 review).
+///
+/// POSIX offers no portable way to reserve a pid: the kernel frees it at reap
+/// time regardless of what the reaper holds, and the one mechanism that would
+/// (Linux `pidfd_open`) has no macOS counterpart. So Unix keeps exactly the
+/// behaviour it always had — zero syscalls here, and the residual TOCTOU window
+/// stays documented where it is accepted, at the top of
+/// [`crate::build_version_handshake::terminate_daemon_graceful`].
+///
+/// Always `Ok(Some(…))`: reporting "already gone" would change the Unix control
+/// flow, and reporting an error would refuse a stop that works today. The pid
+/// guards inside [`terminate_pid`] / [`force_kill_pid`] remain the only gate.
+pub fn pin_process(_pid: u32) -> std::io::Result<Option<PinnedProcess>> {
+    Ok(Some(PinnedProcess))
+}
+
 /// Send `SIGKILL` to `pid` (the daemon-stop `--force` escalation). Same guards
 /// as [`terminate_pid`].
 pub fn force_kill_pid(pid: u32) -> std::io::Result<()> {
@@ -301,6 +366,17 @@ mod tests {
         // refused with `InvalidInput`, never signalled.
         let err = checked_signal_pid(0).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// PRD #163 review — the Unix half of the pid-pin seam must stay a pure no-op,
+    /// including for the pids the by-signal guards reject. Anything else (an error,
+    /// or an `Ok(None)` read as "already gone") would change what `daemon stop`
+    /// does on Unix, and the whole point of the seam is that it does not.
+    #[test]
+    fn pinning_is_a_no_op_that_never_changes_the_unix_flow() {
+        assert!(pin_process(std::process::id()).unwrap().is_some());
+        assert!(pin_process(0).unwrap().is_some());
+        assert!(pin_process(u32::MAX).unwrap().is_some());
     }
 
     #[test]

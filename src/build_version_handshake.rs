@@ -108,10 +108,12 @@ pub enum HandshakeError {
     /// present). The user-facing remediation is
     /// `dot-agent-deck daemon stop --force`.
     TerminateTimedOut,
-    /// `libc::kill` itself failed (EPERM if the daemon belongs to a
-    /// different user — shouldn't happen because the attach socket is
-    /// already trust-checked uid-equal — or ESRCH if the daemon died
-    /// between probe and kill).
+    /// The platform's termination call itself failed: `libc::kill` on Unix
+    /// (EPERM if the daemon belongs to a different user — shouldn't happen
+    /// because the attach socket is already trust-checked uid-equal — or ESRCH
+    /// if the daemon died between probe and kill); `OpenProcess` /
+    /// `TerminateProcess` on Windows (PRD #163 M3), with the same two shapes
+    /// (`ERROR_ACCESS_DENIED` / `ERROR_INVALID_PARAMETER`).
     TerminateFailed(io::Error),
 }
 
@@ -434,14 +436,21 @@ pub enum TerminateOutcome {
     Killed,
 }
 
-/// SIGTERM the daemon (by PID, obtained from `peer_pid()` on the attach
-/// socket) and poll for the daemon to actually go away. `daemon-is-gone`
+/// Ask the daemon to stop (it is identified by PID, obtained from `peer_pid()`
+/// on the attach socket) and poll for it to actually go away. `daemon-is-gone`
 /// is detected via `UnixStream::connect` failure (or the socket file
 /// being unlinked), polled every 100 ms up to `grace_timeout`. We don't
 /// rely on the socket *file* disappearing because the daemon doesn't
 /// unlink its socket inode on exit — only `bind(2)` cleanup on the
 /// next start does — so file-existence polling would unconditionally
 /// time out against a real production daemon.
+///
+/// This is the single graceful → poll → force escalation both flows share, and
+/// it is `cfg`-free: *how* each half is delivered is the platform's business
+/// (PRD #163 M3, [`crate::platform::proc::GRACEFUL_STOP_DELIVERY`]). Unix sends
+/// `SIGTERM` then `SIGKILL`; Windows, which has neither, sends the shared
+/// `KIND_SHUTDOWN`/ACK frame then `TerminateProcess`. "SIGTERM"/"SIGKILL" below
+/// name the two *stages*, not the Unix signals specifically.
 ///
 /// Phase 2 (TUI prompt) calls this with `force_kill_after = None` and
 /// surfaces a timeout as [`HandshakeError::TerminateTimedOut`]. Phase 3
@@ -492,9 +501,25 @@ pub async fn terminate_daemon_graceful(
     //
     // PRD #42 M1: the pid-guard + signal delivery moved to
     // `crate::platform::proc::{terminate_pid, force_kill_pid}` (Unix `kill`;
-    // Windows `TerminateProcess` lands in #163). Guard failures (pid 0 /
+    // Windows `TerminateProcess`, PRD #163 M3). Guard failures (pid 0 /
     // overflow) and `kill` errors both surface as `TerminateFailed`.
     //
+    // PRD #163 M3 — the *graceful* half is delivered differently per platform and
+    // the platform module owns the choice (`proc::GRACEFUL_STOP_DELIVERY`), so
+    // this shared state machine (graceful → poll → force) stays `cfg`-free and
+    // both flows through it — `daemon stop` and the build-mismatch prompt — keep
+    // behaving identically. Unix keeps its out-of-band `SIGTERM` below, which is
+    // what lets `daemon stop` drive a daemon predating every protocol surface
+    // (zero protocol bytes). Windows has no `SIGTERM`, so the graceful request is
+    // the EXISTING, cross-platform `KIND_SHUTDOWN`/ACK frame — same wire on every
+    // platform, no per-platform protocol branch — and `TerminateProcess` (via
+    // `force_kill_pid`) stays the escalation.
+    if crate::platform::proc::GRACEFUL_STOP_DELIVERY
+        == crate::platform::proc::GracefulStopDelivery::ShutdownProtocol
+    {
+        request_shutdown_over_protocol(attach_path).await;
+    }
+
     // The `AlreadyGone` (Unix `ESRCH`) arm is a clean already-gone success:
     // there is no live process to wait on, so — exactly like `main` — we
     // short-circuit straight to `Stopped` without entering the poll/escalate
@@ -520,6 +545,37 @@ pub async fn terminate_daemon_graceful(
     }
 }
 
+/// PRD #163 M3 — ask the daemon to shut itself down over the existing
+/// `KIND_SHUTDOWN`/ACK protocol. The graceful step on platforms whose
+/// [`crate::platform::proc::GRACEFUL_STOP_DELIVERY`] is
+/// [`GracefulStopDelivery::ShutdownProtocol`](crate::platform::proc::GracefulStopDelivery::ShutdownProtocol)
+/// (Windows: no `SIGTERM` exists, and a `DETACHED_PROCESS` daemon shares no
+/// console, so `CTRL_BREAK` cannot reach it either).
+///
+/// **Best-effort, infallible on purpose.** Every failure mode — no daemon
+/// listening, a wedged daemon that never acks, a build too old to know the frame
+/// — must fall through to the caller's poll + force escalation rather than abort
+/// it, which is exactly how a Unix `SIGTERM` the daemon ignores behaves. So the
+/// error is logged and swallowed; the authoritative "did it work" signal is
+/// [`poll_daemon_gone`], not the ack.
+///
+/// The wire is the plain cross-platform frame ([`DaemonClient::send_shutdown`],
+/// PRD #92 F1) — no platform branches inside the protocol, and no new protocol
+/// surface for this PRD.
+async fn request_shutdown_over_protocol(attach_path: &Path) {
+    if let Err(e) = DaemonClient::new(attach_path.to_path_buf())
+        .send_shutdown()
+        .await
+    {
+        tracing::debug!(
+            path = %attach_path.display(),
+            error = %e,
+            "KIND_SHUTDOWN request was not acknowledged; falling through to the poll and force \
+             escalation"
+        );
+    }
+}
+
 /// Poll until the daemon stops answering connects on `attach_path`, or
 /// `budget` elapses. Returns `true` on the former. Used by
 /// [`terminate_daemon_graceful`]'s wait loops.
@@ -534,7 +590,16 @@ pub async fn terminate_daemon_graceful(
 async fn poll_daemon_gone(attach_path: &Path, budget: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < budget {
-        if !attach_path.exists() {
+        // PRD #163 M3: the file-existence short-circuit is only meaningful where
+        // the endpoint *is* a filesystem object. A `\\.\pipe\…` name is not — it
+        // has no on-disk presence, so `exists()` is permanently false — and an
+        // unconditional check would declare every live Windows daemon gone on the
+        // first iteration: `daemon stop` would report `Stopped` for a daemon that
+        // is still running and never reach the `TerminateProcess` escalation.
+        // Where the endpoint has no filesystem presence, the connect attempt below
+        // is the only liveness signal (and it is the authoritative one on both
+        // platforms).
+        if crate::platform::ipc::ENDPOINT_IS_FILESYSTEM_PATH && !attach_path.exists() {
             return true;
         }
         if IpcStream::connect(attach_path).await.is_err() {
@@ -726,6 +791,66 @@ fn interactive_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PRD #163 M3 — the protocol-delivered graceful stop is best-effort: asked
+    /// against an endpoint no daemon is listening on it must return normally
+    /// (never panic, never propagate) so the caller still reaches its poll +
+    /// force escalation. Host-agnostic — the connect fails as `NotFound` on Unix
+    /// and as `ERROR_FILE_NOT_FOUND` on Windows, and both are swallowed.
+    ///
+    /// The sibling half of this contract — that Unix never takes this path at all,
+    /// keeping `daemon stop`'s zero-protocol-bytes property — is pinned by
+    /// `platform::proc`'s `graceful_stop_delivery_matches_the_platform_mechanism`.
+    #[tokio::test]
+    async fn shutdown_over_protocol_is_best_effort_when_no_daemon_answers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = if cfg!(windows) {
+            std::path::PathBuf::from(format!(
+                r"\\.\pipe\dot-agent-deck-test-no-daemon-{}",
+                std::process::id()
+            ))
+        } else {
+            dir.path().join("absent.sock")
+        };
+
+        // Returns `()`; the assertion is that it resolves at all — promptly, and
+        // without unwinding — rather than failing the stop flow.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            request_shutdown_over_protocol(&endpoint),
+        )
+        .await
+        .expect("a missing daemon must not stall the graceful-stop request");
+    }
+
+    /// PRD #163 M3 — "the daemon is gone" must not hinge on the endpoint existing
+    /// as a *file*: a `\\.\pipe\…` name never does, so on Windows the answer has
+    /// to come from the connect attempt. Pinning it here keeps both platforms
+    /// honest: an absent endpoint resolves to `true`, and it does so well inside
+    /// the budget rather than by burning it.
+    #[tokio::test]
+    async fn poll_daemon_gone_reports_gone_for_an_absent_endpoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = if cfg!(windows) {
+            std::path::PathBuf::from(format!(
+                r"\\.\pipe\dot-agent-deck-test-absent-{}",
+                std::process::id()
+            ))
+        } else {
+            dir.path().join("absent.sock")
+        };
+
+        let budget = Duration::from_secs(5);
+        let started = Instant::now();
+        assert!(
+            poll_daemon_gone(&endpoint, budget).await,
+            "an endpoint nothing is listening on must read as 'daemon gone'"
+        );
+        assert!(
+            started.elapsed() < budget,
+            "the answer must come from the failed connect, not from exhausting the budget"
+        );
+    }
 
     #[test]
     fn non_tty_error_message_names_both_build_ids() {

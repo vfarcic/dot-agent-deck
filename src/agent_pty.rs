@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read as _;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -54,6 +55,23 @@ pub const DOT_AGENT_DECK_PANE_ID: &str = "DOT_AGENT_DECK_PANE_ID";
 /// literals can't drift apart.
 pub const DOT_AGENT_DECK_AGENT_ID: &str = "DOT_AGENT_DECK_AGENT_ID";
 
+/// Hook-ingestion endpoint override read by [`crate::config::socket_path`].
+///
+/// The daemon injects its OWN bound hook-socket path into every agent it
+/// spawns ([`AgentPtyRegistry::spawn_agent`]) so a child never has to
+/// re-resolve the endpoint from ambient environment. Everything downstream of
+/// a spawn that emits events — `dot-agent-deck wrap`, the `hook` /
+/// `agent-event` verbs, an agent's installed hook script — resolves this var
+/// at *emit* time, so without the injection a child inherits whatever
+/// `XDG_RUNTIME_DIR` its grandparent happened to carry. That is exactly how a
+/// test-spawned agent's events used to land in the developer's *live* daemon
+/// and surface as phantom dashboard cards: the test overrode
+/// [`DOT_AGENT_DECK_PANE_ID`] but not the socket, so the events arrived at the
+/// real deck tagged with a pane id it had never heard of.
+///
+/// A caller-supplied value always wins — the injection only fills the gap.
+pub const DOT_AGENT_DECK_SOCKET: &str = "DOT_AGENT_DECK_SOCKET";
+
 /// Test-only safety watchdog: when set truthy (`1`/`true`/`yes`/`on`), a
 /// `daemon serve` captures its parent pid at startup and gracefully exits once
 /// it is orphaned (parent becomes `init`/pid 1, or otherwise changes). OFF by
@@ -77,7 +95,10 @@ pub const DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS: &str = "DOT_AGENT_DECK_TEST_MAX
 /// via `DOT_AGENT_DECK_SEED_FALLBACK_SECS` (integer seconds); a real-pi e2e sets
 /// it high so it can prove the NATIVE pull path ran rather than the fallback.
 /// Default matches the legacy pi injection latency (`SESSION_START_WAIT_TIMEOUT`
-/// always timed out at 10s for pi), plus a small margin for Node/Bun boot.
+/// always timed out for pi, at its then-10s value), plus a small margin for
+/// Node/Bun boot. Independent of that constant's current value — pi no longer
+/// waits on the readiness gate at all (it returns early to the native seed
+/// path), so PRD #225 M4's retune does not move this grace.
 pub const DOT_AGENT_DECK_SEED_FALLBACK_SECS: &str = "DOT_AGENT_DECK_SEED_FALLBACK_SECS";
 
 /// Resolve the native-seed PTY-injection fallback grace (see
@@ -318,7 +339,61 @@ pub enum TabMembership {
         /// older clients) means the title falls back to the canonical name.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_title: Option<String>,
+        /// PRD #140 M1.0: a per-TAB instance token, minted once when the
+        /// orchestration tab is created and stamped on every role pane in
+        /// that tab. Opaque to the daemon — it never parses or interprets
+        /// the value, it only compares it for equality when deciding which
+        /// panes belong to the same routing group
+        /// ([`crate::state::OrchestrationIdentity`]).
+        ///
+        /// Distinct from the other three identity-ish fields: `name` is the
+        /// CONFIG identity (which orchestration this is), `orchestration_cwd`
+        /// is the DIRECTORY disambiguator (round-11 auditor #C), and
+        /// `display_title` is presentation-only. Neither `name` nor
+        /// `orchestration_cwd` distinguishes two tabs of the SAME
+        /// orchestration opened from the SAME directory — that pair produces
+        /// byte-identical `(name, cwd)` identities and the daemon
+        /// cross-delivers delegate/work-done between them (issue #140). The
+        /// instance token is what makes each tab its own routing group.
+        ///
+        /// `Option<String>` with `#[serde(default, skip_serializing_if)]` so
+        /// older peers round-trip cleanly: a client predating this field
+        /// sends nothing and the daemon falls back to the `(name, cwd)`
+        /// identity, exactly the pre-#140 behaviour.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orchestration_id: Option<String>,
     },
+}
+
+/// PRD #140 M1.2/M1.3: mint a fresh per-tab orchestration instance token.
+///
+/// Called ONCE per orchestration tab (before the `for role in config.roles`
+/// loop) and stamped on every role pane's
+/// [`TabMembership::Orchestration::orchestration_id`], so all roles of one tab
+/// share a token and no two tabs ever do. The value is opaque — only equality
+/// matters — but it must satisfy [`is_valid_display_name`] so it survives
+/// [`validate_tab_membership`] at the wire boundary.
+///
+/// Uniqueness follows the same recipe as `ui::mint_delivery_id`: a per-PROCESS
+/// nonce (pid hashed with the epoch nanos at first use, so two processes — and
+/// a pid reused across restarts — never collide) combined with a global
+/// monotonic counter (so two tabs within one process never collide). The token
+/// deliberately does NOT need to be reproducible across restarts: a live tab
+/// re-hydrates its id from the daemon echo, it is never regenerated.
+pub fn mint_orchestration_id() -> String {
+    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nonce = *NONCE.get_or_init(|| {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::process::id().hash(&mut h);
+        if let Ok(dur) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            dur.as_nanos().hash(&mut h);
+        }
+        h.finish()
+    });
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("orch-{nonce:016x}-{seq}")
 }
 
 impl TabMembership {
@@ -377,6 +452,7 @@ pub fn validate_tab_membership(mut tm: TabMembership) -> Option<TabMembership> {
         role_name,
         orchestration_cwd,
         display_title,
+        orchestration_id,
         ..
     } = &mut tm
     {
@@ -392,6 +468,22 @@ pub fn validate_tab_membership(mut tm: TabMembership) -> Option<TabMembership> {
         }
         if let Some(c) = orchestration_cwd.as_deref()
             && !is_valid_orchestration_cwd(c)
+        {
+            return None;
+        }
+        // PRD #140 M1.1: the instance token gets the same control-byte /
+        // size discipline as role_name and orchestration_cwd — it is echoed
+        // back through `list_agents` and logged, so a hostile same-user peer
+        // could otherwise smuggle escape sequences through it.
+        //
+        // An invalid token REJECTS the whole membership rather than being
+        // nulled out the way `display_title` is. `display_title` is cosmetic
+        // with a defined fallback; the instance token is a ROUTING key, and
+        // silently dropping it would merge two same-`(name, cwd)` tabs back
+        // into one routing group — reintroducing exactly the cross-delivery
+        // this PRD fixes, invisibly.
+        if let Some(id) = orchestration_id.as_deref()
+            && !is_valid_display_name(id)
         {
             return None;
         }
@@ -414,7 +506,8 @@ pub fn validate_tab_membership(mut tm: TabMembership) -> Option<TabMembership> {
 
 /// Returns `true` if `value` is acceptable as an orchestration's
 /// identity cwd: non-empty, ≤ [`CWD_MAX_LEN`] bytes, free of ASCII
-/// control characters, AND an absolute path (starts with `/`).
+/// control characters, AND an absolute path for this platform
+/// ([`is_absolute_project_path`]).
 ///
 /// Round-12 auditor #2: the orchestration_cwd field is treated as
 /// the project root, so being absolute is part of the contract — a
@@ -423,7 +516,71 @@ pub fn validate_tab_membership(mut tm: TabMembership) -> Option<TabMembership> {
 /// orchestrations whose own resolved cwd happens to match. Reject up
 /// front instead.
 pub fn is_valid_orchestration_cwd(value: &str) -> bool {
-    is_valid_cwd(value) && value.starts_with('/')
+    is_valid_cwd(value) && is_absolute_project_path(value)
+}
+
+/// Whether `value` is an absolute project-root path **on this platform** — the
+/// only platform-dependent half of [`is_valid_orchestration_cwd`] and
+/// [`validate_orchestration_surface`], kept as one `cfg` seam so the
+/// classification rules themselves ([`is_posix_absolute_path`],
+/// [`is_windows_absolute_path`]) stay pure data and are unit-tested on every
+/// platform.
+///
+/// PRD #163 review: the rule used to be a bare `starts_with('/')` everywhere,
+/// which is correct on Unix and rejects *every* legitimate Windows working
+/// directory — a Windows daemon's own `current_dir()` is a drive-letter path
+/// (`C:\proj`) and a network project root is a UNC path (`\\server\share\proj`).
+/// The failure was silent in the worst way: an orchestration pane's
+/// `TabMembership` was dropped to `None` and a live `OrchestrationSurface` was
+/// discarded outright, so orchestration tabs simply never rehydrated on Windows.
+///
+/// - **Unix** keeps the historical rule byte-for-byte: a leading `/`, nothing
+///   else.
+/// - **Windows** accepts that *plus* its two native absolute forms. The POSIX
+///   form stays valid there on purpose rather than as laziness: a Windows TUI
+///   attached to a remote Unix daemon (`remotes.toml`) receives POSIX project
+///   roots, and this same validator runs on that receive path.
+fn is_absolute_project_path(value: &str) -> bool {
+    #[cfg(unix)]
+    {
+        is_posix_absolute_path(value)
+    }
+    #[cfg(windows)]
+    {
+        is_posix_absolute_path(value) || is_windows_absolute_path(value)
+    }
+}
+
+/// A POSIX absolute path: a leading `/`. The historical rule, and on Unix still
+/// the only accepted form.
+pub fn is_posix_absolute_path(value: &str) -> bool {
+    value.starts_with('/')
+}
+
+/// A Windows absolute path, in the two rooted forms Win32 resolves without
+/// consulting any per-process current directory:
+///
+/// - **UNC / device** — two leading separators: `\\server\share\proj`,
+///   `//server/share/proj`, `\\?\C:\proj`. Either separator is accepted because
+///   Win32 treats `/` and `\` interchangeably in paths.
+/// - **Drive-letter rooted** — `C:\proj` or `C:/proj`.
+///
+/// Deliberately *not* accepted, because neither is absolute:
+///
+/// - `C:proj` — drive-*relative*: it resolves against that drive's own current
+///   directory, so two orchestrations could resolve it to different real roots
+///   (exactly the collision the absolute-path contract exists to prevent).
+/// - `\proj` — rooted on the *current* drive, so it is likewise not a stable
+///   project identity.
+pub fn is_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let is_sep = |b: u8| b == b'\\' || b == b'/';
+    // `\\server\share`, `//server/share`, `\\?\C:\…`
+    if bytes.len() >= 2 && is_sep(bytes[0]) && is_sep(bytes[1]) {
+        return true;
+    }
+    // `C:\proj` / `C:/proj` — the separator is required (see the doc comment).
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && is_sep(bytes[2])
 }
 
 /// PRD #120 (H1/M1/L2): wire-boundary validation for the live
@@ -597,6 +754,14 @@ pub struct AgentPty {
     pub master: Box<dyn portable_pty::MasterPty + Send>,
     pub writer: Box<dyn std::io::Write + Send>,
     pub reader: Box<dyn std::io::Read + Send>,
+    /// PRD #163 M3 — the OS grouping that makes "tear down the agent *and*
+    /// everything it spawned" possible, established at spawn and handed to every
+    /// teardown helper. Zero-sized on Unix (the child is already its own process
+    /// group thanks to `portable-pty`'s `setsid`, which `killpg` addresses by
+    /// pid); on Windows it owns the agent's Job Object handle, whose membership is
+    /// only inherited forward — so it must be created here, at spawn, and live as
+    /// long as the agent. See [`crate::platform::proc::AgentProcessGroup`].
+    pub process_group: crate::platform::proc::AgentProcessGroup,
 }
 
 /// PRD #92 F8: hardcoded grace window between SIGTERM and the SIGKILL
@@ -606,7 +771,57 @@ pub struct AgentPty {
 /// 3 s matches the F1 graceful-shutdown grace, which is the natural
 /// sibling. Hardcoded as a constant for now (one symbol to find) rather
 /// than lifted to `DashboardConfig` until a real user need surfaces.
-pub(crate) const AGENT_TERMINATE_GRACE: Duration = Duration::from_secs(3);
+/// `pub` so the wrapper-escalation test can assert against the real deadline
+/// instead of duplicating the number — a change here must keep that test honest.
+pub const AGENT_TERMINATE_GRACE: Duration = Duration::from_secs(3);
+
+/// Divisor giving the wrapper's grace from the deck's. See
+/// [`WRAP_TERMINATE_GRACE`] for why this is a fraction and not a thin
+/// subtraction.
+pub(crate) const WRAP_GRACE_DIVISOR: u32 = 2;
+
+/// The wrapper's own SIGTERM→SIGKILL grace, deliberately SHORTER than
+/// [`AGENT_TERMINATE_GRACE`].
+///
+/// A wrapped agent sits two levels below the deck, in a process group the deck
+/// cannot signal: portable-pty `setsid`s the wrapper, then the wrapper
+/// `setsid`s the agent again so it can own the inner PTY as its controlling
+/// terminal ([`crate::wrap`]). So `killpg(wrapper_pgid, …)` reaches the wrapper
+/// ONLY — the agent is reachable exclusively via the wrapper forwarding to its
+/// own child group.
+///
+/// Both graces used to be `AGENT_TERMINATE_GRACE`, which made teardown a race
+/// the wrapper could not win: the deck SIGTERMs the wrapper at T0 and SIGKILLs
+/// it at T0+grace, while the wrapper forwarded SIGTERM at ~T0 and armed its own
+/// escalation for ~T0+grace. Both deadlines fell together and the wrapper's is
+/// only checked on a reap-loop tick, so the deck killed the wrapper first and an
+/// agent that had not exited on SIGTERM — a wedged agent, or any interactive
+/// shell, which ignores SIGTERM — was orphaned to init.
+///
+/// Halving makes the wrapper always escalate first, so the agent is dead before
+/// the deck's SIGKILL removes the only process that can signal it.
+///
+/// A fraction, not a thin subtraction: the wrapper's chain is observe-signal →
+/// forward → wait out its grace → `SIGKILL` → reap, and the *observe* step
+/// depends on where the reap loop sits in its 50 ms cadence and how loaded the
+/// host is. A host running dozens of agents can stretch that tick, and any
+/// overrun puts the agent back to being orphaned — so the headroom should not be
+/// a couple of scheduler quanta. Half the budget cannot be eaten that way.
+/// Measured through `close_agent`, the wrapper escalates 1.503 s after observing
+/// SIGTERM, against the deck's 3.0 s.
+///
+/// The cost is deliberate: a slow-but-honest agent gets half as long to exit on
+/// SIGTERM before the wrapper escalates. Orphaning a live agent process is the
+/// worse outcome, and the deck's own grace is unchanged as the outer bound.
+pub(crate) const WRAP_TERMINATE_GRACE: Duration =
+    Duration::from_millis(AGENT_TERMINATE_GRACE.as_millis() as u64 / WRAP_GRACE_DIVISOR as u64);
+
+// The ordering above is load-bearing, not stylistic: if these ever became equal
+// (or inverted) the orphan bug returns silently, so pin it at compile time.
+const _: () = assert!(
+    WRAP_TERMINATE_GRACE.as_millis() < AGENT_TERMINATE_GRACE.as_millis(),
+    "the wrapper must escalate to SIGKILL strictly before the deck kills the wrapper"
+);
 
 // PRD #42 M1: the process-group teardown helpers (`pid_to_pgid`,
 // `signal_child_pgroup_or_fallback`, `force_kill_child_and_wait`,
@@ -616,7 +831,7 @@ pub(crate) const AGENT_TERMINATE_GRACE: Duration = Duration::from_secs(3);
 // `crate::platform::proc::*`.
 
 fn force_kill_and_wait(pty: &mut AgentPty) {
-    crate::platform::proc::force_kill_child_and_wait(&mut pty.child);
+    crate::platform::proc::force_kill_child_and_wait(&mut pty.child, &pty.process_group);
 }
 
 /// RAII guard that owns a freshly-spawned child between the `spawn_command`
@@ -625,24 +840,46 @@ fn force_kill_and_wait(pty: &mut AgentPty) {
 /// later step in [`spawn`] like `take_writer` or `try_clone_reader` returned
 /// an error, or a panic unwound through the spawn path), the child is
 /// force-killed and reaped so no orphan process is left behind.
+///
+/// It carries the child's [`crate::platform::proc::AgentProcessGroup`] alongside
+/// it (PRD #163 M3) so this early-failure teardown reaps the whole descendant
+/// tree, exactly like the registry's later teardown paths — otherwise a spawn
+/// that failed *after* the child had already forked would leak its descendants
+/// on Windows.
 struct ChildGuard {
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    process_group: crate::platform::proc::AgentProcessGroup,
 }
 
 impl ChildGuard {
-    fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
-        Self { child: Some(child) }
+    fn new(
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        process_group: crate::platform::proc::AgentProcessGroup,
+    ) -> Self {
+        Self {
+            child: Some(child),
+            process_group,
+        }
     }
 
-    fn take(mut self) -> Box<dyn portable_pty::Child + Send + Sync> {
-        self.child.take().expect("ChildGuard already taken")
+    fn take(
+        mut self,
+    ) -> (
+        Box<dyn portable_pty::Child + Send + Sync>,
+        crate::platform::proc::AgentProcessGroup,
+    ) {
+        let child = self.child.take().expect("ChildGuard already taken");
+        // `self` still drops after this (it owns the group), and its `Drop` is a
+        // no-op once the child is gone, so hand the real group out and leave the
+        // guard with the empty `Default` one.
+        (child, std::mem::take(&mut self.process_group))
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            crate::platform::proc::force_kill_child_and_wait(&mut child);
+            crate::platform::proc::force_kill_child_and_wait(&mut child, &self.process_group);
         }
     }
 }
@@ -801,11 +1038,21 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
         .spawn_command(cmd)
         .map_err(|e| AgentPtyError::Spawn(e.to_string()))?;
 
+    // PRD #163 M3: adopt the child into the OS grouping its teardown will use, as
+    // early as possible. This is a no-op on Unix (`portable-pty` already `setsid`'d
+    // the child into its own process group, which `killpg` addresses by pid) and
+    // creates + populates the agent's Job Object on Windows. It has to happen here
+    // rather than at teardown because job membership is inherited forward only: a
+    // job joined later would not contain the descendants the child had already
+    // spawned. Infallible by contract — a Windows job quirk degrades teardown to a
+    // single-process kill (logged) instead of failing an otherwise-healthy spawn.
+    let process_group = crate::platform::proc::AgentProcessGroup::adopt(child.process_id());
+
     // Wrap the freshly-spawned child in an RAII guard *before* any fallible
     // step below: a failure in `take_writer` / `try_clone_reader` (or a
     // panic between them) would otherwise orphan the child. The guard is
     // taken on the success path and its child moved into the AgentPty.
-    let child_guard = ChildGuard::new(child);
+    let child_guard = ChildGuard::new(child, process_group);
 
     // Drop the slave — we interact through the master side only.
     drop(pair.slave);
@@ -820,11 +1067,13 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
         .try_clone_reader()
         .map_err(|e| AgentPtyError::Reader(e.to_string()))?;
 
+    let (child, process_group) = child_guard.take();
     Ok(AgentPty {
-        child: child_guard.take(),
+        child,
         master: pair.master,
         writer,
         reader,
+        process_group,
     })
 }
 
@@ -1214,6 +1463,13 @@ async fn deliver_payload_and_submit(
 /// (e.g. for `process_id()`) rely on `child` existing here.
 pub struct RunningAgent {
     pub child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// PRD #163 M3 — the agent's descendant-tree grouping, moved here from
+    /// [`AgentPty::process_group`] at insert time and handed to every teardown
+    /// path (`close_agent`, `respawn_agent_for_pane`, `shutdown_all`,
+    /// `shutdown_all_graceful`). Zero-sized on Unix; the agent's Job Object
+    /// handle on Windows, which must stay alive for as long as the agent does or
+    /// `TerminateJobObject` would have nothing to terminate.
+    pub process_group: crate::platform::proc::AgentProcessGroup,
     pub master: Box<dyn portable_pty::MasterPty + Send>,
     pub writer: Arc<AsyncMutex<Box<dyn std::io::Write + Send>>>,
     pub bus: Arc<AgentBus>,
@@ -1257,7 +1513,44 @@ pub struct RunningAgent {
     /// commands and non-agent panes stay `None`. Same forward-compat
     /// rationale as `display_name` / `tab_membership` — older clients
     /// that omit the field round-trip as `None`.
+    ///
+    /// PRD #225 M2: this is the OBSERVED / display identity — it starts as the
+    /// spawn-time identity and is upgraded in place by
+    /// [`AgentPtyRegistry::set_agent_type`] when a hook event reveals the real
+    /// agent. It drives the badge ONLY. The launch shape is decided from
+    /// [`RunningAgent::spawn_agent_type`], so learning a type from hooks can
+    /// never rewrite the exec line.
     pub agent_type: Option<AgentType>,
+    /// PRD #225 M2: the SPAWN-TIME identity that drove this pane's launch shape
+    /// — i.e. the caller-supplied [`SpawnOptions::agent_type`] as it was at this
+    /// child's spawn. It is the LAUNCH-side field:
+    /// [`AgentPtyRegistry::respawn_agent_for_pane`] reads it and
+    /// [`AgentPtyRegistry::set_agent_type`] never writes it, which is what keeps
+    /// a hook-learned badge out of the exec line.
+    ///
+    /// Defect 2 was exactly the absence of this split: a `devbox run codex-big`
+    /// pane spawns UNWRAPPED (`AgentType::from_command` can't see through the
+    /// launcher), Codex's native hooks then teach the registry `Some(Codex)`
+    /// purely for the badge, and the first respawn replayed that learned value
+    /// into `SpawnOptions::agent_type` — so `spawn` resolved a Wrapper-strategy
+    /// agent and the SAME pane came back up as `dot-agent-deck wrap --agent
+    /// codex -- devbox run codex-big`. A value recorded for display must not
+    /// change how the pane launches.
+    ///
+    /// It is a FALLBACK, not an override: a respawn derives the wrap decision
+    /// from the command it is actually launching and consults this field only
+    /// when that command implies no agent type (the `devbox run codex-big`
+    /// shape). See the invariant spelled out in
+    /// [`AgentPtyRegistry::respawn_agent_for_pane`] for why the derivation has to
+    /// come first. So the value tracks the identity of the command each child was
+    /// launched with — stable for a pane whose role command never changes, and
+    /// re-derived (not stale) for one whose command was edited.
+    ///
+    /// `None` means "no explicit identity, and the command implied none" — the
+    /// launch decision then falls back to parsing the command in [`spawn`], which
+    /// is deterministic for the same command and so reproduces the same exec
+    /// line.
+    pub spawn_agent_type: Option<AgentType>,
     /// The full env vec passed to [`AgentPtyRegistry::spawn_agent`] at
     /// the original spawn, captured so
     /// [`AgentPtyRegistry::respawn_agent_for_pane`] can re-apply it on
@@ -1460,6 +1753,11 @@ pub struct AgentPtyRegistry {
     /// fingerprint is a CONFLICT (never a false replay). Bounded by LRU eviction —
     /// see [`MAX_DELIVERY_RESULTS`].
     delivery_ledger: Mutex<DeliveryLedger>,
+    /// The hook-ingestion socket this registry's daemon is bound to, injected
+    /// into spawned children as [`DOT_AGENT_DECK_SOCKET`]. `None` for a
+    /// registry with no owning daemon (in-process unit tests), in which case
+    /// no injection happens and children resolve the endpoint the old way.
+    hook_socket: Mutex<Option<PathBuf>>,
     /// PRD #126: delegations that are still awaiting a `work-done` plus the set
     /// of panes currently mid-close. Both live under ONE mutex so "mark this
     /// pane closing AND drop its outstanding records" is a single atomic
@@ -1531,11 +1829,20 @@ pub struct OutstandingDelegation {
     /// [`AgentPtyRegistry::write_and_submit_guarded`] with this id as the
     /// expected target, so a rebind yields `WrongSession` and zero bytes.
     pub orchestrator_agent_id: String,
-    /// Orchestration name the delegate belonged to, when known. Re-checked at
-    /// delivery time against the orchestrator pane's live registry membership
-    /// (see [`AgentPtyRegistry::pane_orchestration_name`]) so a pane that has
-    /// been re-homed into a *different* orchestration is refused as well.
-    pub orchestration: Option<String>,
+    /// The daemon's routing identity for the orchestration the delegate
+    /// belonged to (`AppState::pane_orchestration_map`'s value), when known.
+    /// Re-checked at delivery time against the orchestrator pane's live registry
+    /// membership (see [`AgentPtyRegistry::pane_orchestration`]) so a pane that
+    /// has been re-homed into a *different* orchestration is refused as well.
+    ///
+    /// PRD #140 integration: this used to be the orchestration **name** alone.
+    /// Once two tabs of the same orchestration in the same directory became two
+    /// distinct routing groups, a name was no longer an orchestration identity —
+    /// both tabs answer the same name, so a name-only recheck could not tell
+    /// them apart. It now carries the whole
+    /// [`crate::state::OrchestrationIdentity`], whose `Instance` variant is the
+    /// per-tab token #140 routes on.
+    pub orchestration: Option<crate::state::OrchestrationIdentity>,
     /// When the delegation was armed, for the elapsed-time wording.
     pub armed_at: Instant,
     /// PRD #126 M1 review (finding 6): how many OLDER delegations to this same
@@ -1554,6 +1861,26 @@ pub struct OutstandingDelegation {
     /// task teardown instead of leaving an `Arc<AgentPtyRegistry>` and its
     /// owned strings sleeping out the full (default two-hour) timeout.
     _watch_cancel: oneshot::Sender<()>,
+}
+
+/// PRD #126: the orchestration membership of the live agent on a pane, as
+/// [`AgentPtyRegistry::pane_orchestration`] reads it back out of the registry's
+/// `tab_membership`. Deliberately the raw membership fields rather than a
+/// [`crate::state::OrchestrationIdentity`]: the daemon folds
+/// `orchestration_cwd.or(StartAgent.cwd)` into that identity's `NameCwd` variant
+/// at `StartAgent` time, and re-deriving it here from the membership alone would
+/// invent a *different* cwd for the same pane and turn a healthy revalidation
+/// into a refusal. The comparison rules live in
+/// [`crate::state::orchestration_still_matches`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneOrchestration {
+    /// `TabMembership::Orchestration::name` — the orchestration's config name.
+    pub name: String,
+    /// PRD #140's per-tab instance token (`orchestration_id`), when the client
+    /// that spawned this pane stamped one. `None` for a pre-#140 client.
+    pub instance_id: Option<String>,
+    /// The shared per-tab orchestration cwd, when the client sent one.
+    pub cwd: Option<String>,
 }
 
 /// PRD #126: handed back by [`AgentPtyRegistry::arm_outstanding_delegation`] to
@@ -1623,9 +1950,21 @@ impl AgentPtyRegistry {
             shutting_down: AtomicBool::new(false),
             user_input_at: Mutex::new(HashMap::new()),
             delivery_ledger: Mutex::new(DeliveryLedger::default()),
+            hook_socket: Mutex::new(None),
             delegations: Mutex::new(DelegationTracker::default()),
             delegation_seq: AtomicU64::new(1),
         }
+    }
+
+    /// Record the hook-ingestion socket the owning daemon bound, so
+    /// [`spawn_agent`](Self::spawn_agent) can inject it into every child as
+    /// [`DOT_AGENT_DECK_SOCKET`]. Called once from
+    /// [`crate::daemon::run_daemon_with`] right after the bind succeeds.
+    ///
+    /// Idempotent and last-writer-wins: a daemon binds exactly one hook
+    /// socket for its lifetime, so a second call would carry the same path.
+    pub fn set_hook_socket(&self, path: PathBuf) {
+        *self.hook_socket.lock().unwrap() = Some(path);
     }
 
     /// PRD #126: record that `role`'s worker pane has just been delegated to
@@ -1653,7 +1992,7 @@ impl AgentPtyRegistry {
         role: &str,
         orchestrator_pane_id: &str,
         orchestrator_agent_id: &str,
-        orchestration: Option<&str>,
+        orchestration: Option<&crate::state::OrchestrationIdentity>,
     ) -> Option<ArmedDelegation> {
         let mut tracker = self.delegations.lock().unwrap();
         if tracker.closing_panes.contains(worker_pane_id)
@@ -1674,7 +2013,7 @@ impl AgentPtyRegistry {
                 role: role.to_string(),
                 orchestrator_pane_id: orchestrator_pane_id.to_string(),
                 orchestrator_agent_id: orchestrator_agent_id.to_string(),
-                orchestration: orchestration.map(str::to_string),
+                orchestration: orchestration.cloned(),
                 armed_at: Instant::now(),
                 superseded,
                 _watch_cancel: cancel_tx,
@@ -1835,21 +2174,34 @@ impl AgentPtyRegistry {
             .collect()
     }
 
-    /// PRD #126 M1 audit (finding 2): the orchestration name the live agent on
-    /// `pane_id` belongs to, per its registry `tab_membership`. `None` when no
-    /// live agent owns the pane, or when it carries no orchestration membership
-    /// (a dashboard/mode pane, or a pane spawned without membership metadata).
-    /// The idle watch uses it to refuse delivery into a pane that has since been
-    /// re-homed into a *different* orchestration; because `None` is legitimate,
-    /// only a positive mismatch refuses.
-    pub fn pane_orchestration_name(&self, pane_id: &str) -> Option<String> {
+    /// PRD #126 M1 audit (finding 2): the orchestration membership of the live
+    /// agent on `pane_id`, per its registry `tab_membership`. `None` when no live
+    /// agent owns the pane, or when it carries no orchestration membership (a
+    /// dashboard/mode pane, or a pane spawned without membership metadata).
+    ///
+    /// The idle watch uses it twice: to refuse delivery into a pane that has
+    /// since been re-homed into a *different* orchestration (because `None` is
+    /// legitimate, only a positive mismatch refuses — see
+    /// [`crate::state::orchestration_still_matches`]), and, at arm time, to
+    /// recover the **orchestration cwd** for config resolution, which PRD #140's
+    /// `Instance` routing identity no longer carries.
+    pub fn pane_orchestration(&self, pane_id: &str) -> Option<PaneOrchestration> {
         let inner = self.inner.lock().unwrap();
         inner
             .agents
             .values()
             .find(|a| a.pane_id_env.as_deref() == Some(pane_id) && !a.exited.load(Ordering::SeqCst))
             .and_then(|a| match a.tab_membership.as_ref() {
-                Some(TabMembership::Orchestration { name, .. }) => Some(name.clone()),
+                Some(TabMembership::Orchestration {
+                    name,
+                    orchestration_id,
+                    orchestration_cwd,
+                    ..
+                }) => Some(PaneOrchestration {
+                    name: name.clone(),
+                    instance_id: orchestration_id.clone(),
+                    cwd: orchestration_cwd.clone(),
+                }),
                 _ => None,
             })
     }
@@ -1989,6 +2341,19 @@ impl AgentPtyRegistry {
                 }
             });
 
+        // Point the child at THIS daemon's hook socket rather than letting it
+        // re-resolve the endpoint from inherited environment at emit time.
+        // A caller-supplied value wins (tests pin their own socket, and
+        // `respawn_agent_for_pane` replays a `spawn_env` that already carries
+        // ours), so this only fills the gap.
+        if !opts.env.iter().any(|(k, _)| k == DOT_AGENT_DECK_SOCKET)
+            && let Some(sock) = self.hook_socket.lock().unwrap().clone()
+            && let Some(sock) = sock.to_str()
+        {
+            opts.env
+                .push((DOT_AGENT_DECK_SOCKET.to_string(), sock.to_string()));
+        }
+
         // M2.11: capture display_name and cwd into the registry so renamed
         // panes survive a reconnect. Both go through the same validation
         // helpers used by [`set_agent_label`] so the wire-format invariants
@@ -2070,7 +2435,14 @@ impl AgentPtyRegistry {
         // `opts.agent_type` intact for `spawn`'s wrapper decision while registry
         // metadata still records the caller-supplied identity (the
         // learn-from-event upgrade still fills it in for a bare shell spawn).
+        //
+        // PRD #225 M2: the same value seeds BOTH registry fields, but they
+        // diverge from here on — `agent_type` is the mutable display badge
+        // (`set_agent_type` upgrades it from a hook event) and
+        // `spawn_agent_type` is the frozen launch-shape decision the respawn
+        // path replays. See `RunningAgent::spawn_agent_type`.
         let agent_type = opts.agent_type.clone();
+        let spawn_agent_type = opts.agent_type.clone();
 
         // PRD #92 F9 followup-7: pre-allocate the registry id *before*
         // `spawn` so we can inject `DOT_AGENT_DECK_AGENT_ID = <id>` into
@@ -2201,6 +2573,7 @@ impl AgentPtyRegistry {
             master,
             writer,
             reader,
+            process_group,
         } = pty;
 
         let bus = Arc::new(AgentBus::new());
@@ -2218,6 +2591,7 @@ impl AgentPtyRegistry {
 
         let agent = RunningAgent {
             child,
+            process_group,
             master,
             writer: Arc::new(AsyncMutex::new(writer)),
             bus,
@@ -2226,6 +2600,7 @@ impl AgentPtyRegistry {
             cwd: cwd_stored,
             tab_membership,
             agent_type,
+            spawn_agent_type,
             spawn_env: captured_env,
             pty_rows: captured_rows,
             pty_cols: captured_cols,
@@ -2742,6 +3117,7 @@ impl AgentPtyRegistry {
         crate::platform::proc::terminate_child_with_grace_and_wait(
             &mut agent.child,
             AGENT_TERMINATE_GRACE,
+            &agent.process_group,
         );
         // Notify the idle monitor so it observes the registry shrink
         // immediately. The pump_reader thread will *also* signal once it
@@ -2768,7 +3144,26 @@ impl AgentPtyRegistry {
     /// Identity-preserving fields on [`RunningAgent`] (`pane_id_env`,
     /// `display_name`, `cwd`, `tab_membership`, `agent_type`) are
     /// captured from the existing entry and re-applied to the new
-    /// spawn. The TUI's pane card therefore stays put across the
+    /// spawn. PRD #225 M2: the two agent-type fields are re-applied through
+    /// DIFFERENT seams — [`RunningAgent::spawn_agent_type`] feeds
+    /// [`SpawnOptions::agent_type`] (the launch side) while the observed
+    /// [`RunningAgent::agent_type`] badge is restored afterwards via
+    /// [`AgentPtyRegistry::set_agent_type`]. That split is what makes the invariant
+    /// below hold at all: a type learned from a hook event updates the badge,
+    /// never the command that gets exec'd.
+    ///
+    /// **Launch-shape invariant (PRD #225, review finding 1): the wrap decision
+    /// for a respawn is derived from the command actually being launched; the
+    /// pane's frozen spawn-time identity only fills in for a command that implies
+    /// no agent type.** `command` is the CURRENT role command, so an edit to
+    /// `.dot-agent-deck.toml` is honored — and the wrap decision follows that
+    /// edit instead of contradicting it (no `wrap --agent codex -- claude`). A
+    /// pane whose role command is unchanged therefore relaunches byte-identically,
+    /// whether its identity was explicit at creation or inferred from the command.
+    /// The reasoning, and the one residual limit, are at the `SpawnOptions`
+    /// construction below.
+    ///
+    /// The TUI's pane card therefore stays put across the
     /// respawn: the daemon's `agent_records()` snapshot still lists
     /// the same `pane_id_env` and `tab_membership`, so a TUI that
     /// reattaches mid-respawn rebinds to the new agent cleanly.
@@ -2794,8 +3189,9 @@ impl AgentPtyRegistry {
     /// agent's stdout, so it can't observe "ready" directly here. The
     /// dispatch path subscribes to the daemon-wide hook broadcast
     /// before this call and waits for the new agent's `SessionStart`
-    /// event (10 s timeout fallback) — see
-    /// [`crate::state::SESSION_START_WAIT_TIMEOUT`].
+    /// event (with a timeout fallback) — see
+    /// [`crate::state::SESSION_START_WAIT_TIMEOUT`] for the duration and why the
+    /// fallback is load-bearing.
     pub async fn respawn_agent_for_pane(
         &self,
         pane_id_env: &str,
@@ -2830,6 +3226,7 @@ impl AgentPtyRegistry {
 
         let RunningAgent {
             child,
+            process_group,
             master,
             writer,
             bus: _,
@@ -2840,7 +3237,11 @@ impl AgentPtyRegistry {
             display_name,
             cwd,
             tab_membership,
-            agent_type,
+            // PRD #225 M2: the OBSERVED badge (possibly hook-learned). It is
+            // restored onto the fresh entry AFTER the spawn, so it can't reach
+            // `spawn`'s wrapper decision — only `spawn_agent_type` does.
+            agent_type: observed_agent_type,
+            spawn_agent_type,
             spawn_env,
             pty_rows,
             pty_cols,
@@ -2873,10 +3274,14 @@ impl AgentPtyRegistry {
         // the same worker. Same shape `daemon_protocol.rs` uses for
         // `close_agent`.
         let mut child = child;
+        // The process group moves onto the blocking task too — it is what the
+        // teardown's force phase reaps the descendant tree through (PRD #163 M3),
+        // and it is dropped there once the old child is gone.
         let join = tokio::task::spawn_blocking(move || {
             crate::platform::proc::terminate_child_with_grace_and_wait(
                 &mut child,
                 AGENT_TERMINATE_GRACE,
+                &process_group,
             );
         })
         .await;
@@ -2908,6 +3313,43 @@ impl AgentPtyRegistry {
         // default, silently dropping role-supplied env vars and
         // briefly mis-wrapping the new agent's first output until the
         // TUI's next resize landed.
+        //
+        // PRD #225 M2: whatever identity is handed to the spawn seam, it is never
+        // the (possibly hook-learned) display badge — that is restored after the
+        // spawn, through the display-only `set_agent_type` seam.
+        //
+        // PRD #225 review finding 1 — the INVARIANT this seam enforces:
+        //
+        //   **A respawn's wrap decision is derived from the command it is
+        //   actually launching.** The pane's frozen `spawn_agent_type` only
+        //   supplies an identity that command CANNOT imply, and the
+        //   hook-learned display badge never participates at all.
+        //
+        // The caller passes the CURRENT role command (`crate::state` re-reads
+        // `.dot-agent-deck.toml` at delegate time), so the user may have edited
+        // it since the pane was created. Honoring that edit is deliberate — but
+        // then the wrap decision has to follow the command, or the two disagree:
+        // a pane frozen as `Some(Codex)` whose command was edited to `claude`
+        // would come back up as `dot-agent-deck wrap --agent codex -- claude`,
+        // launching Claude wrapped as Codex. Deriving first eliminates that
+        // case, and it makes `Some` and `None` behave the SAME way — before
+        // this, a frozen `Some` overrode the edited command while a frozen
+        // `None` silently re-derived from it inside `spawn`.
+        //
+        // Falling back to the frozen identity (rather than to nothing) is what
+        // keeps the launch shape stable for the shape that motivated the split:
+        // `devbox run codex-big` resolves to no agent type, so an explicit
+        // creation-time identity is the only thing that knows the pane is Codex,
+        // and dropping it would flip an initially-wrapped pane to bare on its
+        // first delegate — Defect 2 in reverse. The residual limit is inherent
+        // and documented: if the command implies nothing AND its underlying
+        // agent changed (`devbox run codex-big` → `devbox run claude-big`), the
+        // pane keeps its creation-time identity; that pane has to be recreated.
+        //
+        // `AgentType::from_command` never yields the neutral `AgentType::None`
+        // placeholder (it is absent from `agent_registry::ALL`), so a `Some`
+        // here always means a real agent won the derivation.
+        let respawn_agent_type = AgentType::from_command(Some(command)).or(spawn_agent_type);
         let opts = SpawnOptions {
             command: Some(command),
             cwd: cwd.as_deref(),
@@ -2916,9 +3358,22 @@ impl AgentPtyRegistry {
             cols: pty_cols,
             env: spawn_env,
             tab_membership,
-            agent_type,
+            agent_type: respawn_agent_type,
         };
-        self.spawn_agent(opts)
+        let new_agent_id = self.spawn_agent(opts)?;
+        // Step 4 (PRD #225 M2): re-apply the observed badge so the dashboard
+        // card keeps the agent label the previous child taught us (`list_agents`
+        // → `AgentRecord.agent_type`) instead of reverting to "No agent" until
+        // the fresh child's first hook lands. Upgrade-only, so a pane created
+        // with an explicit identity keeps that identity, and a fresh child that
+        // turns out to be a different agent still corrects the badge via its own
+        // hooks. Deliberately AFTER the spawn: routing it through the same
+        // display-only seam the hook path uses is what guarantees it cannot
+        // influence the launch shape.
+        if let Some(observed) = observed_agent_type {
+            self.set_agent_type(pane_id_env, &observed);
+        }
+        Ok(new_agent_id)
     }
 
     /// Subscribe to an agent's live output and take its scrollback snapshot
@@ -3178,6 +3633,14 @@ impl AgentPtyRegistry {
     /// already-known type, mirroring the strict `None` → `Some` upgrade in
     /// [`crate::state::AppState::apply_event`]. A no-op when no live agent
     /// matches `pane_id_env` (unmanaged / external pane id, or empty id).
+    ///
+    /// PRD #225 M2: this writes the DISPLAY badge
+    /// ([`RunningAgent::agent_type`]) and deliberately never touches
+    /// [`RunningAgent::spawn_agent_type`], so a type learned from a hook event
+    /// cannot change how the pane relaunches. Before that split, this
+    /// display-only write leaked into the respawn's `SpawnOptions::agent_type`
+    /// and silently rewrote a bare `devbox run codex-big` pane into a wrapped
+    /// one on its first `clear = true` delegate (Defect 2).
     pub fn set_agent_type(&self, pane_id_env: &str, agent_type: &AgentType) {
         if *agent_type == AgentType::None || pane_id_env.is_empty() {
             return;
@@ -3302,7 +3765,10 @@ impl AgentPtyRegistry {
             inner.agents.drain().map(|(_, a)| a).collect()
         };
         for mut agent in agents {
-            crate::platform::proc::force_kill_child_and_wait(&mut agent.child);
+            crate::platform::proc::force_kill_child_and_wait(
+                &mut agent.child,
+                &agent.process_group,
+            );
         }
         // Wake the idle monitor if it's parked on `change_notify` — the
         // registry just emptied, so the next gate check should see
@@ -3374,9 +3840,14 @@ impl AgentPtyRegistry {
         // Phase 3: SIGKILL any survivor and reap. `force_kill_child_and_wait`
         // is no-op-safe on an already-exited child (ESRCH is logged-but-
         // ignored and `wait` returns the cached status), so this loop is
-        // safe to run unconditionally.
+        // safe to run unconditionally. On Windows this is where the
+        // `TerminateJobObject` backstop for each agent's descendant tree runs
+        // (PRD #163 M3) — phase 1's `CTRL_BREAK_EVENT` is best-effort only.
         for mut agent in agents {
-            crate::platform::proc::force_kill_child_and_wait(&mut agent.child);
+            crate::platform::proc::force_kill_child_and_wait(
+                &mut agent.child,
+                &agent.process_group,
+            );
         }
 
         self.change_notify.notify_one();
@@ -3469,6 +3940,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: Some("/proj/\0evil".into()),
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3482,6 +3954,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: Some("/proj/\x1b[31m".into()),
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3499,6 +3972,7 @@ mod tests {
             // cwd happens to match.
             orchestration_cwd: Some("relative/proj".into()),
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3513,6 +3987,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: Some(oversized),
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3526,8 +4001,73 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: Some("/home/user/project-a".into()),
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_some());
+    }
+
+    // PRD #163 review: the orchestration-cwd absoluteness rule used to be a bare
+    // `starts_with('/')`, which rejects every legitimate Windows working
+    // directory. These pin the two pure classifiers on EVERY platform (they are
+    // plain byte inspection, so Linux CI covers the Windows rule too) plus the
+    // platform composition in `is_absolute_project_path`.
+
+    #[test]
+    fn posix_absolute_path_classification() {
+        assert!(is_posix_absolute_path("/home/user/project-a"));
+        assert!(is_posix_absolute_path("/"));
+        assert!(!is_posix_absolute_path("relative/proj"));
+        assert!(!is_posix_absolute_path(""));
+        // A Windows path is NOT posix-absolute — that is the whole reason the
+        // second classifier exists.
+        assert!(!is_posix_absolute_path(r"C:\proj"));
+    }
+
+    #[test]
+    fn windows_absolute_path_accepts_drive_letter_and_unc() {
+        // Drive-letter rooted, both separators.
+        assert!(is_windows_absolute_path(r"C:\Users\dev\project-a"));
+        assert!(is_windows_absolute_path("C:/Users/dev/project-a"));
+        assert!(is_windows_absolute_path(r"z:\p"));
+        // UNC and the extended-length / device prefixes.
+        assert!(is_windows_absolute_path(r"\\server\share\project-a"));
+        assert!(is_windows_absolute_path("//server/share/project-a"));
+        assert!(is_windows_absolute_path(r"\\?\C:\project-a"));
+    }
+
+    #[test]
+    fn windows_absolute_path_rejects_relative_and_drive_relative() {
+        assert!(!is_windows_absolute_path("relative/proj"));
+        assert!(!is_windows_absolute_path(""));
+        // Drive-RELATIVE: resolves against that drive's own cwd, so it is not a
+        // stable project identity.
+        assert!(!is_windows_absolute_path("C:proj"));
+        assert!(!is_windows_absolute_path("C:"));
+        // Rooted on the *current* drive — same objection.
+        assert!(!is_windows_absolute_path(r"\proj"));
+        // Not a drive letter.
+        assert!(!is_windows_absolute_path("1:/proj"));
+    }
+
+    /// The platform composition: Unix stays byte-for-byte on the historical
+    /// POSIX-only rule, Windows accepts both families (its own daemon reports
+    /// `C:\…`, and a remote Unix daemon reports `/…`).
+    #[test]
+    fn orchestration_cwd_absoluteness_follows_the_platform() {
+        assert!(is_valid_orchestration_cwd("/home/user/project-a"));
+        assert!(!is_valid_orchestration_cwd("relative/proj"));
+
+        let windows_paths = [r"C:\Users\dev\project-a", r"\\server\share\project-a"];
+        for path in windows_paths {
+            assert_eq!(
+                is_valid_orchestration_cwd(path),
+                cfg!(windows),
+                "{path} must be accepted only where it is genuinely absolute"
+            );
+        }
+        // Control bytes are still refused regardless of the path family.
+        assert!(!is_valid_orchestration_cwd("C:\\proj\\\x1b[31m"));
+        assert!(!is_valid_orchestration_cwd("C:\\proj\\\0evil"));
     }
 
     // PRD #111 auditor BLOCKER: a hostile / buggy daemon sending an
@@ -3543,6 +4083,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3556,6 +4097,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_some());
     }
@@ -3573,6 +4115,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3586,6 +4129,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_none());
     }
@@ -3604,6 +4148,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: Some("\x1b[31mpwn".into()),
+            orchestration_id: None,
         };
         let validated = validate_tab_membership(tm).expect("membership preserved");
         match validated {
@@ -3623,6 +4168,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: Some("My\0Run".into()),
+            orchestration_id: None,
         };
         let validated = validate_tab_membership(tm).expect("membership preserved");
         match validated {
@@ -3642,6 +4188,7 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: Some("My Custom Run".into()),
+            orchestration_id: None,
         };
         let validated = validate_tab_membership(tm).expect("membership preserved");
         match validated {
@@ -3664,8 +4211,162 @@ mod tests {
             is_start_role: false,
             orchestration_cwd: None,
             display_title: None,
+            orchestration_id: None,
         };
         assert!(validate_tab_membership(tm).is_some());
+    }
+
+    // -----------------------------------------------------------------
+    // PRD #140 M1.0 / M1.1 — the per-tab orchestration instance token.
+    // -----------------------------------------------------------------
+
+    /// M1.0: the token survives a serialize → deserialize round-trip. It is
+    /// the daemon's routing key, so losing it on the wire would silently
+    /// merge two tabs back into one routing group.
+    #[test]
+    fn tab_membership_orchestration_id_survives_serde_round_trip() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 1,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: Some("/home/user/project-a".into()),
+            display_title: Some("My Custom Run".into()),
+            orchestration_id: Some("abc".into()),
+        };
+        let json = serde_json::to_string(&tm).expect("serialize");
+        assert!(
+            json.contains("\"orchestration_id\":\"abc\""),
+            "token must be on the wire, got {json}"
+        );
+        let back: TabMembership = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, tm);
+    }
+
+    /// M1.0: `skip_serializing_if` keeps the field off the wire when absent,
+    /// so a NEWER client talking to an OLDER daemon sends the pre-#140 frame
+    /// shape byte for byte.
+    #[test]
+    fn tab_membership_omits_absent_orchestration_id_from_the_wire() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: true,
+            orchestration_cwd: None,
+            display_title: None,
+            orchestration_id: None,
+        };
+        let json = serde_json::to_string(&tm).expect("serialize");
+        assert!(
+            !json.contains("orchestration_id"),
+            "absent token must be skipped, got {json}"
+        );
+    }
+
+    /// M1.0: the older wire shape (no `orchestration_id` key at all — what an
+    /// OLDER client sends to a NEWER daemon) deserializes to `None`, which is
+    /// the daemon's cue to fall back to the `(name, cwd)` identity.
+    #[test]
+    fn tab_membership_without_orchestration_id_deserializes_to_none() {
+        let legacy = r#"{
+            "kind": "orchestration",
+            "name": "tdd-cycle",
+            "role_index": 2,
+            "role_name": "coder",
+            "is_start_role": false,
+            "orchestration_cwd": "/home/user/project-a"
+        }"#;
+        let tm: TabMembership = serde_json::from_str(legacy).expect("legacy shape parses");
+        match tm {
+            TabMembership::Orchestration {
+                orchestration_id,
+                orchestration_cwd,
+                ..
+            } => {
+                assert_eq!(orchestration_id, None);
+                assert_eq!(orchestration_cwd.as_deref(), Some("/home/user/project-a"));
+            }
+            _ => panic!("expected Orchestration variant"),
+        }
+    }
+
+    /// M1.1: a control-byte token is rejected outright. Unlike `display_title`
+    /// (nulled out, cosmetic), dropping a routing key silently would merge two
+    /// same-`(name, cwd)` tabs into one group — the very bug #140 fixes.
+    #[test]
+    fn validate_tab_membership_rejects_orchestration_id_with_ansi_escape() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: None,
+            display_title: None,
+            orchestration_id: Some("\x1b[31mpwn".into()),
+        };
+        assert!(validate_tab_membership(tm).is_none());
+    }
+
+    #[test]
+    fn validate_tab_membership_rejects_orchestration_id_with_nul_byte() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: None,
+            display_title: None,
+            orchestration_id: Some("orch\0-1".into()),
+        };
+        assert!(validate_tab_membership(tm).is_none());
+    }
+
+    #[test]
+    fn validate_tab_membership_rejects_oversized_orchestration_id() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: None,
+            display_title: None,
+            orchestration_id: Some("a".repeat(DISPLAY_NAME_MAX_LEN + 1)),
+        };
+        assert!(validate_tab_membership(tm).is_none());
+    }
+
+    #[test]
+    fn validate_tab_membership_accepts_well_formed_orchestration_id() {
+        let tm = TabMembership::Orchestration {
+            name: "tdd-cycle".into(),
+            role_index: 0,
+            role_name: "coder".into(),
+            is_start_role: false,
+            orchestration_cwd: Some("/home/user/project-a".into()),
+            display_title: None,
+            orchestration_id: Some(mint_orchestration_id()),
+        };
+        let validated = validate_tab_membership(tm).expect("membership preserved");
+        match validated {
+            TabMembership::Orchestration {
+                orchestration_id, ..
+            } => assert!(orchestration_id.is_some(), "token preserved verbatim"),
+            _ => panic!("expected Orchestration variant"),
+        }
+    }
+
+    /// M1.2/M1.3: two tabs created in the same process must never collide,
+    /// and every minted token must survive the wire-boundary validation
+    /// (otherwise the whole membership would be dropped at spawn).
+    #[test]
+    fn mint_orchestration_id_is_unique_and_wire_valid() {
+        let ids: std::collections::HashSet<String> =
+            (0..1000).map(|_| mint_orchestration_id()).collect();
+        assert_eq!(ids.len(), 1000, "minted tokens must not collide");
+        for id in &ids {
+            assert!(is_valid_display_name(id), "token {id} must pass validation");
+        }
     }
 }
 
@@ -4894,7 +5595,11 @@ mod spawn_tests {
         drop(pair.slave);
         let pid = child.process_id().expect("child should expose a pid");
 
-        let guard = ChildGuard::new(child);
+        // Same adoption the real `spawn()` does, so the guard's teardown reaps
+        // the tree rather than just the direct child (PRD #163 M3; a no-op on
+        // Unix, where `killpg` addresses the group by pid).
+        let process_group = crate::platform::proc::AgentProcessGroup::adopt(Some(pid));
+        let guard = ChildGuard::new(child, process_group);
         // Drop the master *before* the guard so any PTY I/O the child is
         // blocked on unblocks before SIGKILL — matching the production
         // shutdown order.
@@ -5049,6 +5754,81 @@ mod spawn_tests {
             status.exit_code(),
             42,
             "opts.env PANE_ID was clobbered — scrub must run before opts.env is applied"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Hook-socket injection + pane provenance. Together these stop a child
+    // from re-resolving the hook endpoint out of inherited environment: a
+    // test-spawned agent whose events resolved the developer's real socket
+    // used to surface as a phantom card in whatever deck the test ran inside.
+    // ---------------------------------------------------------------------
+
+    /// Read back what the child actually saw for `DOT_AGENT_DECK_SOCKET` by
+    /// having it write the value to a file, so the assertion covers the real
+    /// child environment rather than the registry's bookkeeping.
+    fn child_observed_socket(
+        registry: &AgentPtyRegistry,
+        pane_id: &str,
+        extra_env: Vec<(String, String)>,
+    ) -> String {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let out = dir.path().join("socket.txt");
+        let mut env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())];
+        env.extend(extra_env);
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&format!(
+                    "sh -c 'printf \"%s\" \"${{DOT_AGENT_DECK_SOCKET:-<unset>}}\" > {}'",
+                    out.display()
+                )),
+                env,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+        // The child writes and exits promptly; poll rather than sleep a fixed
+        // span so a fast machine doesn't wait and a loaded one doesn't flake.
+        for _ in 0..200 {
+            if let Ok(v) = std::fs::read_to_string(&out)
+                && !v.is_empty()
+            {
+                return v;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("child never reported its DOT_AGENT_DECK_SOCKET");
+    }
+
+    #[test]
+    fn spawn_agent_injects_the_daemons_hook_socket_into_the_child() {
+        let registry = AgentPtyRegistry::new();
+        registry.set_hook_socket(PathBuf::from("/tmp/dad-test-daemon.sock"));
+        let observed = child_observed_socket(&registry, "pane-inject", vec![]);
+        registry.shutdown_all();
+        assert_eq!(
+            observed, "/tmp/dad-test-daemon.sock",
+            "the child must be handed the daemon's own hook socket, not left to \
+             re-resolve one from inherited environment at emit time"
+        );
+    }
+
+    #[test]
+    fn spawn_agent_lets_a_caller_supplied_hook_socket_win() {
+        let registry = AgentPtyRegistry::new();
+        registry.set_hook_socket(PathBuf::from("/tmp/dad-test-daemon.sock"));
+        let observed = child_observed_socket(
+            &registry,
+            "pane-explicit",
+            vec![(
+                DOT_AGENT_DECK_SOCKET.to_string(),
+                "/tmp/dad-test-caller.sock".to_string(),
+            )],
+        );
+        registry.shutdown_all();
+        assert_eq!(
+            observed, "/tmp/dad-test-caller.sock",
+            "injection must only fill a gap — an explicit socket (tests pinning \
+             their own, or a respawn replaying spawn_env) has to win"
         );
     }
 
@@ -5600,14 +6380,24 @@ mod spawn_tests {
     #[test]
     fn begin_pane_close_cancels_records_targeting_the_closing_orchestrator() {
         let reg = AgentPtyRegistry::new();
+        // PRD #140: the record carries the daemon's routing identity, so the
+        // fixture uses the same `Instance` token shape a current client stamps.
+        let orch = crate::state::OrchestrationIdentity::Instance {
+            id: "instance-1".to_string(),
+            name: "orch".to_string(),
+        };
+        let other_orch = crate::state::OrchestrationIdentity::Instance {
+            id: "instance-2".to_string(),
+            name: "other".to_string(),
+        };
         let a = reg
-            .arm_outstanding_delegation("worker-a", "coder", "orch-1", "agent-7", Some("orch"))
+            .arm_outstanding_delegation("worker-a", "coder", "orch-1", "agent-7", Some(&orch))
             .expect("arm worker-a");
         let b = reg
-            .arm_outstanding_delegation("worker-b", "tester", "orch-1", "agent-7", Some("orch"))
+            .arm_outstanding_delegation("worker-b", "tester", "orch-1", "agent-7", Some(&orch))
             .expect("arm worker-b");
         let other = reg
-            .arm_outstanding_delegation("worker-c", "coder", "orch-2", "agent-9", Some("other"))
+            .arm_outstanding_delegation("worker-c", "coder", "orch-2", "agent-9", Some(&other_orch))
             .expect("arm worker-c");
 
         let (mut a_cancel, mut b_cancel) = (a.cancel, b.cancel);
@@ -5712,5 +6502,46 @@ mod spawn_tests {
                 "a dropped record must resolve the cancellation channel"
             );
         });
+    }
+
+    /// PRD #126 + #140: the idle watch reads the orchestrator pane's live
+    /// membership back out of the registry for two decisions — the orchestration
+    /// cwd it resolves the timeout from, and the identity it revalidates against
+    /// immediately before submitting. Both need `orchestration_id` and
+    /// `orchestration_cwd`, which a name-only accessor dropped.
+    #[test]
+    fn pane_orchestration_reports_the_instance_token_and_orchestration_cwd() {
+        let reg = AgentPtyRegistry::new();
+        let id = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "orch-pane".to_string())],
+                tab_membership: Some(TabMembership::Orchestration {
+                    name: "tdd-cycle".to_string(),
+                    role_index: 0,
+                    role_name: "orchestrator".to_string(),
+                    is_start_role: true,
+                    orchestration_cwd: Some("/home/u/project".to_string()),
+                    display_title: None,
+                    orchestration_id: Some("orch-aaaa-0".to_string()),
+                }),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the orchestrator stub");
+
+        assert_eq!(
+            reg.pane_orchestration("orch-pane"),
+            Some(PaneOrchestration {
+                name: "tdd-cycle".to_string(),
+                instance_id: Some("orch-aaaa-0".to_string()),
+                cwd: Some("/home/u/project".to_string()),
+            })
+        );
+        // A pane nobody owns, and a pane whose agent is gone, both report
+        // `None` — which `orchestration_still_matches` treats as "no evidence
+        // of a mismatch", never as a refusal.
+        assert_eq!(reg.pane_orchestration("some-other-pane"), None);
+        reg.close_agent(&id).expect("close the orchestrator stub");
+        assert_eq!(reg.pane_orchestration("orch-pane"), None);
     }
 }

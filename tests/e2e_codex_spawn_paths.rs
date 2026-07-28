@@ -20,7 +20,15 @@ fn write_executable(path: &Path, contents: &str) {
 }
 
 #[cfg(unix)]
-fn recorder_path(record: &Path) -> (tempfile::TempDir, String) {
+/// Returns the recorder tempdir, a `$PATH` with it in front, and the path of its
+/// fake `dot-agent-deck`.
+///
+/// The third element is what makes these tests work now that the wrapper rewrite
+/// names the co-located build by absolute path instead of a bare `dot-agent-deck`
+/// for `$PATH` to resolve (so the suite tests the build it compiled, not whatever
+/// is installed). PATH interception no longer reaches the rewrite; the deck needs
+/// `DOT_AGENT_DECK_WRAP_BIN` pointed at the recorder instead.
+fn recorder_path(record: &Path) -> (tempfile::TempDir, String, PathBuf) {
     let dir = tempfile::tempdir().expect("recorder bin tempdir");
     write_executable(
         &dir.path().join("dot-agent-deck"),
@@ -36,7 +44,8 @@ fn recorder_path(record: &Path) -> (tempfile::TempDir, String) {
         std::env::var("PATH").expect("test runner PATH")
     );
     std::fs::write(record, "").expect("initialize launch record");
-    (dir, path)
+    let wrap_bin = dir.path().join("dot-agent-deck");
+    (dir, path, wrap_bin)
 }
 
 fn wait_for_launch(record: &Path) -> Vec<String> {
@@ -78,10 +87,11 @@ fn open_form(deck: &TuiDeck) {
 fn spawn_001_plain_restore_wraps_codex() {
     let fixture = tempfile::tempdir().expect("plain restore record dir");
     let record = fixture.path().join("plain-restore.log");
-    let (_bin, path) = recorder_path(&record);
+    let (_bin, path, wrap_bin) = recorder_path(&record);
     let _deck = TuiDeck::builder()
         .with_env("PATH", path)
         .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
         .with_continue_session("restored-codex", "codex")
         .launch_with_fixture("minimal");
     assert_only_wrapped(&record);
@@ -96,10 +106,11 @@ fn spawn_001_plain_restore_wraps_codex() {
 fn spawn_002_mode_pane_wraps_codex() {
     let fixture = tempfile::tempdir().expect("mode record dir");
     let record = fixture.path().join("mode.log");
-    let (_bin, path) = recorder_path(&record);
+    let (_bin, path, wrap_bin) = recorder_path(&record);
     let deck = TuiDeck::builder()
         .with_env("PATH", path)
         .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
         .launch_with_fixture("codex-spawn-paths");
     open_form(&deck);
     deck.send_keys(b"\x1b[C");
@@ -119,10 +130,11 @@ fn spawn_002_mode_pane_wraps_codex() {
 fn spawn_003_orchestration_role_wraps_codex() {
     let fixture = tempfile::tempdir().expect("orchestration record dir");
     let record: PathBuf = fixture.path().join("orchestration.log");
-    let (_bin, path) = recorder_path(&record);
+    let (_bin, path, wrap_bin) = recorder_path(&record);
     let deck = TuiDeck::builder()
         .with_env("PATH", path)
         .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
         .launch_with_fixture("codex-spawn-paths");
     open_form(&deck);
     deck.send_keys(b"\x1b[C\x1b[C");
@@ -141,10 +153,11 @@ fn spawn_003_orchestration_role_wraps_codex() {
 fn spawn_004_mode_restore_wraps_codex() {
     let fixture = tempfile::tempdir().expect("mode restore record dir");
     let record = fixture.path().join("mode-restore.log");
-    let (_bin, path) = recorder_path(&record);
+    let (_bin, path, wrap_bin) = recorder_path(&record);
     let _deck = TuiDeck::builder()
         .with_env("PATH", path)
         .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
         .with_continue_mode_session("restored-mode-codex", "codex", "wrapped-mode")
         .launch_with_fixture("codex-spawn-paths");
     assert_only_wrapped(&record);

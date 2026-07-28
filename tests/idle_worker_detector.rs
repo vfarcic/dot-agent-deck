@@ -15,12 +15,16 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::{RwLock, broadcast};
 
-use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+use dot_agent_deck::agent_pty::{
+    AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership,
+};
 use dot_agent_deck::daemon_protocol::{
     AttachRequest, bind_attach_listener, serve_attach_with_counter,
 };
 use dot_agent_deck::event::{BroadcastMsg, DelegateSignal, WorkDoneSignal};
-use dot_agent_deck::state::{AppState, SharedState, worker_response_timeout};
+use dot_agent_deck::state::{
+    AppState, OrchestrationIdentity, SharedState, worker_response_timeout,
+};
 use spec::spec;
 
 mod common;
@@ -28,6 +32,13 @@ mod common;
 const ORCH_PANE: &str = "idle-orchestrator-pane";
 const ORCH_ROLE: &str = "orchestrator";
 const ORCHESTRATION: &str = "idle-test-orchestration";
+/// PRD #140's per-tab instance token. The harness stamps it on the daemon's
+/// routing identity AND on the orchestrator pane's registry `TabMembership`,
+/// exactly as `StartAgent` does for a current client, so the idle watch's
+/// revalidation compares two *present* identities instead of short-circuiting on
+/// an absent one — the case that decides whether a live orchestration's nudge is
+/// delivered at all.
+const ORCHESTRATION_INSTANCE: &str = "idle-test-orchestration-instance-1";
 const TIMEOUT_ENV: &str = "DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS";
 
 /// The daemon-authored opening clause of `compose_idle_worker_prompt`, spelled
@@ -163,16 +174,30 @@ impl IdleHarness {
         // Raw no-echo cat gives one observable copy per injected prompt. The
         // readiness marker ensures termios has changed before a timer can fire.
         let orchestrator_agent_id = match orchestrator {
-            OrchestratorStub::Persistent => {
-                spawn_raw_cat_observer(&registry, ORCH_PANE, "ORCH-READY", &cwd_str)
-            }
-            OrchestratorStub::ExitsOnFlag => {
-                spawn_exit_on_flag_observer(&registry, ORCH_PANE, "ORCH-READY", &cwd_str)
-            }
+            OrchestratorStub::Persistent => spawn_raw_cat_observer_with_membership(
+                &registry,
+                ORCH_PANE,
+                "ORCH-READY",
+                &cwd_str,
+                Some(orchestrator_membership(&cwd_str)),
+            ),
+            OrchestratorStub::ExitsOnFlag => spawn_exit_on_flag_observer(
+                &registry,
+                ORCH_PANE,
+                "ORCH-READY",
+                &cwd_str,
+                Some(orchestrator_membership(&cwd_str)),
+            ),
         };
 
         let mut state = AppState::default();
-        let orchestration = (ORCHESTRATION.to_string(), cwd_str.clone());
+        // PRD #140: the daemon's routing identity. `Instance` is what a current
+        // client produces — two tabs of one orchestration in one directory are
+        // told apart by this token, not by `(name, cwd)`.
+        let orchestration = OrchestrationIdentity::Instance {
+            id: ORCHESTRATION_INSTANCE.to_string(),
+            name: ORCHESTRATION.to_string(),
+        };
         state
             .pane_role_map
             .insert(ORCH_PANE.to_string(), ORCH_ROLE.to_string());
@@ -392,6 +417,24 @@ fn spawn_raw_cat_observer(
     marker: &str,
     cwd: &str,
 ) -> String {
+    spawn_raw_cat_observer_with_membership(registry, pane_id, marker, cwd, None)
+}
+
+/// [`spawn_raw_cat_observer`] plus an optional registry `TabMembership`, which is
+/// what the harness gives its ORCHESTRATOR stub: the idle watch reads the
+/// orchestrator pane's live membership back out of the registry both to recover
+/// the orchestration cwd at arm time and to revalidate the orchestration identity
+/// immediately before submitting. Successor stubs that merely inherit a freed
+/// pane id pass `None` — an unrelated agent genuinely has no membership, and
+/// keeping it absent is what leaves the `write_and_submit_guarded` agent-id gate
+/// as the only guard in `008`/`014`.
+fn spawn_raw_cat_observer_with_membership(
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    marker: &str,
+    cwd: &str,
+    membership: Option<TabMembership>,
+) -> String {
     let command =
         format!("stty -echo -icanon -icrnl -opost min 1 time 0 && printf {marker} && exec cat -u");
     registry
@@ -402,9 +445,25 @@ fn spawn_raw_cat_observer(
                 (DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string()),
                 ("SHELL".to_string(), "/bin/sh".to_string()),
             ],
+            tab_membership: membership,
             ..SpawnOptions::default()
         })
         .unwrap_or_else(|error| panic!("spawn raw-cat observer on {pane_id}: {error}"))
+}
+
+/// The registry membership `StartAgent` would store for this harness's
+/// orchestrator pane: PRD #140's per-tab instance token plus the shared
+/// orchestration cwd.
+fn orchestrator_membership(cwd: &str) -> TabMembership {
+    TabMembership::Orchestration {
+        name: ORCHESTRATION.to_string(),
+        role_index: 0,
+        role_name: ORCH_ROLE.to_string(),
+        is_start_role: true,
+        orchestration_cwd: Some(cwd.to_string()),
+        display_title: None,
+        orchestration_id: Some(ORCHESTRATION_INSTANCE.to_string()),
+    }
 }
 
 /// An orchestrator stub whose own shell owns the pane and leaves as soon as
@@ -423,6 +482,7 @@ fn spawn_exit_on_flag_observer(
     pane_id: &str,
     marker: &str,
     cwd: &str,
+    membership: Option<TabMembership>,
 ) -> String {
     let flag = std::path::Path::new(cwd).join(NATURAL_EXIT_FLAG);
     let flag = flag.to_string_lossy();
@@ -438,6 +498,7 @@ fn spawn_exit_on_flag_observer(
                 (DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string()),
                 ("SHELL".to_string(), "/bin/sh".to_string()),
             ],
+            tab_membership: membership,
             ..SpawnOptions::default()
         })
         .unwrap_or_else(|error| panic!("spawn exit-on-flag observer on {pane_id}: {error}"))

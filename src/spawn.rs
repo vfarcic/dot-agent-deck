@@ -321,6 +321,13 @@ pub async fn spawn(
             // the orchestrator pane's `SessionStart` can't be missed regardless
             // of spawn order (the orchestrator role is not necessarily first).
             let event_rx = event_tx.map(|tx| tx.subscribe());
+            // PRD #140 M1.3: one instance token per orchestration spawn
+            // request, minted before the role loop and stamped on every
+            // role's membership — the daemon-initiated counterpart of the
+            // interactive mint in `tab.rs`. Two scheduled fires of the same
+            // orchestration in the same working dir are then two distinct
+            // routing groups instead of one ambiguous `(name, cwd)` identity.
+            let orchestration_id = crate::agent_pty::mint_orchestration_id();
             for role in &roles {
                 let pane_id = next_pane_id(&req.task_name, Some(role.role_index));
                 let membership = TabMembership::Orchestration {
@@ -330,6 +337,7 @@ pub async fn spawn(
                     is_start_role: role.is_start_role,
                     orchestration_cwd: Some(req.working_dir.clone()),
                     display_title: None,
+                    orchestration_id: Some(orchestration_id.clone()),
                 };
                 let id = spawn_one(
                     registry,
@@ -428,26 +436,85 @@ fn spawn_one(
 /// (the command needs shell-wrapping). `agent_pty::spawn` consumes the SHELL
 /// override to pick the `-c` shell and does NOT export it into the child env
 /// (PRD #127 C2), so a single-word command carries no SHELL at all.
+///
+/// PRD #163 M1: the pinned shell comes from
+/// [`crate::platform::shell::fixed_command_shell`] — still `/bin/sh` on Unix,
+/// but `%COMSPEC%` on Windows, where pinning a POSIX path would hand
+/// `agent_pty::spawn` a shell that does not exist.
 fn pane_env(pane_id: &str, pin_sh: bool) -> Vec<(String, String)> {
     let mut env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())];
     if pin_sh {
-        env.push(("SHELL".to_string(), "/bin/sh".to_string()));
+        env.push((
+            "SHELL".to_string(),
+            crate::platform::shell::fixed_command_shell("/bin/sh"),
+        ));
     }
     env
 }
 
+/// Floor for the `DOT_AGENT_DECK_SESSION_START_WAIT_MS` override (PRD #225
+/// hardening). Non-zero on purpose: the whole point of the readiness gate is
+/// that it WAITS, and `=0` (or `=1`) turns it back into the unsynchronized write
+/// that lost the prompt in the first place — the value would be a
+/// `tokio::time::timeout` that expires before any subscriber can be polled, so
+/// the fallback fires unconditionally. 100 ms is small enough that no test pays a
+/// meaningful cost and large enough that a genuine `SessionStart` already sitting
+/// on the broadcast bus still wins the race.
+const SESSION_START_WAIT_MIN: Duration = Duration::from_millis(100);
+
 /// How long [`deliver`] waits for the spawned agent's `SessionStart` before
 /// falling through and writing the prompt anyway. Defaults to the daemon-wide
-/// [`crate::state::SESSION_START_WAIT_TIMEOUT`] (10s, matching the delegate
-/// path); overridable via `DOT_AGENT_DECK_SESSION_START_WAIT_MS` (milliseconds)
-/// so the e2e scheduler harness can shrink the no-hook fallback without a real
-/// 10s wait. Mirrors the [`reuse_debounce`] override idiom.
+/// [`crate::state::SESSION_START_WAIT_TIMEOUT`] (matching the delegate path —
+/// PRD #225 M4 sized it from measured Codex boot); overridable via
+/// `DOT_AGENT_DECK_SESSION_START_WAIT_MS` (milliseconds)
+/// so the e2e scheduler harness can shrink the no-hook fallback instead of
+/// paying the full production wait. Mirrors the [`reuse_debounce`] override
+/// idiom.
+///
+/// The override is CLAMPED to `[SESSION_START_WAIT_MIN, ` the production default
+/// `]` — i.e. it can only ever *shorten* the wait, and only down to a floor that
+/// still waits. Both ends are real failure modes rather than hypotheticals: `=0`
+/// reintroduces the PRD #225 prompt loss (the gate stops waiting, so the prompt
+/// is written into whatever is running in the PTY, typically still the
+/// launcher), and an absurd value (`=86400000`) hangs delivery for the rest of
+/// the day for any agent whose native hooks never fire, with no output and no
+/// error to explain it. An out-of-range value is clamped with a `warn!` rather
+/// than rejected, so a mistyped harness pin degrades to the nearest sane
+/// behavior instead of silently breaking prompt delivery. A non-numeric value
+/// falls back to the default (also with a `warn!`).
 fn session_start_wait_timeout() -> Duration {
-    std::env::var("DOT_AGENT_DECK_SESSION_START_WAIT_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(crate::state::SESSION_START_WAIT_TIMEOUT)
+    let default = crate::state::SESSION_START_WAIT_TIMEOUT;
+    let Ok(raw) = std::env::var("DOT_AGENT_DECK_SESSION_START_WAIT_MS") else {
+        return default;
+    };
+    let Ok(ms) = raw.trim().parse::<u64>() else {
+        tracing::warn!(
+            value = %raw,
+            default_ms = default.as_millis(),
+            "DOT_AGENT_DECK_SESSION_START_WAIT_MS is not a non-negative integer \
+             number of milliseconds; using the default readiness wait"
+        );
+        return default;
+    };
+    let requested = Duration::from_millis(ms);
+    // `Ord::clamp` panics when min > max, so the floor yields to the ceiling
+    // instead of trusting that the production default stays above it — a future
+    // retune of `SESSION_START_WAIT_TIMEOUT` must not be able to turn this into
+    // a daemon panic.
+    let floor = SESSION_START_WAIT_MIN.min(default);
+    let clamped = requested.clamp(floor, default);
+    if clamped != requested {
+        tracing::warn!(
+            requested_ms = requested.as_millis(),
+            clamped_ms = clamped.as_millis(),
+            min_ms = floor.as_millis(),
+            max_ms = default.as_millis(),
+            "DOT_AGENT_DECK_SESSION_START_WAIT_MS is out of range; clamped. \
+             The override may only shorten the readiness wait, and never below \
+             a floor that still waits"
+        );
+    }
+    clamped
 }
 
 /// Deliver the prompt into a freshly-spawned pane, gated on the agent's
@@ -1134,9 +1201,29 @@ mod tests {
         assert_eq!(env[0].0, DOT_AGENT_DECK_PANE_ID);
         assert!(!env.iter().any(|(k, _)| k == "SHELL"));
 
-        // multi-word (pin_sh=true) → pane-id + the SHELL wrapper override.
+        // multi-word (pin_sh=true) → pane-id + the SHELL wrapper override. The
+        // *value* is platform-specific (`fixed_command_shell`): Unix pins the
+        // deterministic POSIX `/bin/sh`, Windows has no such shell to pin and
+        // resolves `%COMSPEC%` (else `cmd.exe`) instead. Asserting the real value
+        // on each platform rather than skipping the Windows half — the expectation
+        // is restated here independently, not read back out of the seam.
         let env = pane_env("sched-x-1", true);
-        assert!(env.iter().any(|(k, v)| k == "SHELL" && v == "/bin/sh"));
+        assert_eq!(env.len(), 2);
+        let shell = env
+            .iter()
+            .find(|(k, _)| k == "SHELL")
+            .map(|(_, v)| v.as_str())
+            .expect("a wrapped command must carry the SHELL override");
+        #[cfg(unix)]
+        assert_eq!(shell, "/bin/sh");
+        #[cfg(windows)]
+        {
+            let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+            assert_eq!(
+                shell, comspec,
+                "on Windows the pinned shell is %COMSPEC% (else cmd.exe), never a POSIX path"
+            );
+        }
     }
 
     // finding #2 — the synthetic SessionStart surfaced to attached TUIs is a
@@ -1179,6 +1266,50 @@ mod tests {
         let (tx, rx) = broadcast::channel::<BroadcastMsg>(8);
         drop(rx);
         surface_spawned_pane(&tx, "sched-x-0", "/tmp/x", None, "x");
+    }
+
+    /// PRD #225 hardening: the readiness-wait override may shorten the wait but
+    /// can neither disable it (`=0` reintroduced the prompt loss the PRD fixed)
+    /// nor stretch it past the production fallback, and a non-numeric value falls
+    /// back to the default rather than panicking. The e2e harness's 5000 ms pin
+    /// must survive the clamp untouched.
+    #[test]
+    fn session_start_wait_override_is_clamped_to_a_sane_range() {
+        // Serialize against any other test reading this process-global env var.
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("DOT_AGENT_DECK_SESSION_START_WAIT_MS").ok();
+        let default = crate::state::SESSION_START_WAIT_TIMEOUT;
+        for (raw, expected) in [
+            // The pin `tests/common` sets for the e2e scheduler harness.
+            ("5000", Duration::from_millis(5000)),
+            // Gate-disabling values are lifted to the floor.
+            ("0", SESSION_START_WAIT_MIN),
+            ("1", SESSION_START_WAIT_MIN),
+            // A day of hanging delivery is capped at the production fallback.
+            ("86400000", default),
+            // Unparseable → default, no panic.
+            ("soon", default),
+            ("-1", default),
+            ("", default),
+        ] {
+            // SAFETY: lock held for the duration; restored below.
+            unsafe {
+                std::env::set_var("DOT_AGENT_DECK_SESSION_START_WAIT_MS", raw);
+            }
+            assert_eq!(
+                session_start_wait_timeout(),
+                expected,
+                "DOT_AGENT_DECK_SESSION_START_WAIT_MS={raw:?} must resolve to {expected:?}"
+            );
+        }
+        // SAFETY: same lock; restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DOT_AGENT_DECK_SESSION_START_WAIT_MS", v),
+                None => std::env::remove_var("DOT_AGENT_DECK_SESSION_START_WAIT_MS"),
+            }
+        }
     }
 
     #[test]

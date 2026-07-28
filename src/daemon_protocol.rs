@@ -721,9 +721,10 @@ impl AttachResponse {
 /// the bind/accept readiness race that the old probe-and-retry pattern was
 /// papering over.
 pub fn bind_attach_listener(path: &Path) -> io::Result<IpcListener> {
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
+    // PRD #163 M4: only where the endpoint *is* a filesystem path. A `\\.\pipe\`
+    // name has no inode to go stale, and `remove_file` on one would fail rather
+    // than clean anything up — see `platform::ipc::remove_stale_endpoint`.
+    crate::platform::ipc::remove_stale_endpoint(path)?;
     // PRD #42 M2: `IpcListener::bind` does the umask-before-bind dance and the
     // defense-in-depth 0o600 restate that used to live here as a separate
     // `set_permissions` call, so the bound endpoint is owner-only unchanged.
@@ -1056,6 +1057,24 @@ async fn compute_write_and_submit_outcome(
     }
 }
 
+/// The orchestration bits of a `StartAgent`'s `TabMembership`, captured before
+/// the spawn moves `SpawnOptions` (PRD #93 round-5) and consumed afterwards to
+/// populate the daemon-side routing maps. A named struct rather than a tuple
+/// because PRD #140 added a fifth member and the positional form stopped being
+/// readable at the destructuring site.
+struct OrchestrationSpawnMeta {
+    /// The orchestration's resolved config name.
+    name: String,
+    /// This pane's role within the orchestration.
+    role_name: String,
+    /// Whether this pane is the orchestrator (start) role.
+    is_start_role: bool,
+    /// Round-11 auditor #C: the tab-wide cwd, the `NameCwd` disambiguator.
+    orchestration_cwd: Option<String>,
+    /// PRD #140: the per-tab instance token, when the client stamped one.
+    orchestration_id: Option<String>,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: IpcStream,
@@ -1241,20 +1260,24 @@ async fn handle_connection(
             // contract intact — pane_cwd_map gets StartAgent.cwd
             // per-pane, but pane_orchestration_map keys on the shared
             // orchestration cwd from the TabMembership.
-            let orchestration_meta: Option<(String, String, bool, Option<String>)> =
+            // PRD #140 M2.0: also pull the per-tab `orchestration_id` so the
+            // identity can key on it when present (see below).
+            let orchestration_meta: Option<OrchestrationSpawnMeta> =
                 tab_membership.as_ref().and_then(|tm| match tm {
                     TabMembership::Orchestration {
                         name,
                         role_name,
                         is_start_role,
                         orchestration_cwd,
+                        orchestration_id,
                         ..
-                    } if !role_name.is_empty() => Some((
-                        name.clone(),
-                        role_name.clone(),
-                        *is_start_role,
-                        orchestration_cwd.clone(),
-                    )),
+                    } if !role_name.is_empty() => Some(OrchestrationSpawnMeta {
+                        name: name.clone(),
+                        role_name: role_name.clone(),
+                        is_start_role: *is_start_role,
+                        orchestration_cwd: orchestration_cwd.clone(),
+                        orchestration_id: orchestration_id.clone(),
+                    }),
                     _ => None,
                 });
             let cwd_for_state = cwd.clone();
@@ -1297,7 +1320,13 @@ async fn handle_connection(
                     // dispatch.
                     if let (
                         Some(pane_id),
-                        Some((orch_name, role_name, is_start_role, orchestration_cwd)),
+                        Some(OrchestrationSpawnMeta {
+                            name: orch_name,
+                            role_name,
+                            is_start_role,
+                            orchestration_cwd,
+                            orchestration_id,
+                        }),
                     ) = (pane_id_env.as_deref(), orchestration_meta)
                     {
                         // Round-11 auditor #C: scope the orchestration
@@ -1318,12 +1347,31 @@ async fn handle_connection(
                         let orch_cwd = orchestration_cwd
                             .or_else(|| cwd_for_state.clone())
                             .unwrap_or_default();
+                        // PRD #140 M2.0: prefer the per-tab instance token
+                        // when the client stamped one. Two tabs of the same
+                        // orchestration in the same directory produce
+                        // identical `(name, cwd)` pairs, so the tuple alone
+                        // cannot tell their panes apart and delegate /
+                        // work-done cross-deliver between them (issue #140).
+                        // A client predating the token falls back to the
+                        // round-11 tuple — same routing behaviour as before,
+                        // so old and new clients coexist on one daemon.
+                        let identity = match orchestration_id {
+                            Some(id) => crate::state::OrchestrationIdentity::Instance {
+                                id,
+                                name: orch_name,
+                            },
+                            None => crate::state::OrchestrationIdentity::NameCwd {
+                                name: orch_name,
+                                cwd: orch_cwd,
+                            },
+                        };
                         let mut st = state.write().await;
                         st.register_pane(pane_id.to_string());
                         st.pane_role_map
                             .insert(pane_id.to_string(), role_name.clone());
                         st.pane_orchestration_map
-                            .insert(pane_id.to_string(), (orch_name, orch_cwd));
+                            .insert(pane_id.to_string(), identity);
                         if let Some(c) = cwd_for_state.clone() {
                             st.pane_cwd_map.insert(pane_id.to_string(), c);
                         }
@@ -2499,6 +2547,7 @@ mod tests {
                 is_start_role: false,
                 orchestration_cwd: None,
                 display_title: None,
+                orchestration_id: None,
             }),
             agent_type: None,
             seed: None,
@@ -2522,6 +2571,7 @@ mod tests {
                         is_start_role: false,
                         orchestration_cwd: None,
                         display_title: None,
+                        orchestration_id: None,
                     })
                 );
             }
@@ -2546,6 +2596,7 @@ mod tests {
                 is_start_role: false,
                 orchestration_cwd: None,
                 display_title: None,
+                orchestration_id: None,
             }),
             agent_type: None,
             rows: 0,

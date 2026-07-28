@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::BufRead as _;
 use std::io::Read as _;
 use std::io::Write as _;
 use std::process::ExitCode;
@@ -436,12 +437,24 @@ pub fn request_from_socket(json: &str) -> Option<String> {
     stream.flush().ok()?;
     // Half-close our write side so the daemon's line reader sees EOF after our
     // single request and doesn't block waiting for more (it reads in a loop).
+    // Best-effort: on a transport without a half-close primitive (Windows named
+    // pipes) this is a no-op, which is why the read below must not depend on EOF.
     let _ = stream.shutdown_write();
-    let mut buf = String::new();
-    stream.read_to_string(&mut buf).ok()?;
-    // The daemon writes exactly one JSON line; take the first line and trim the
-    // trailing newline.
-    Some(buf.lines().next().unwrap_or("").to_string())
+    // Read exactly the ONE reply line the daemon writes, rather than to EOF.
+    //
+    // PRD #163 M4: reading to EOF made this a deadlock on Windows. The daemon
+    // answers `get-seed` and then keeps its side open reading further lines, so it
+    // only closes once *we* do — and a named pipe has no half-close with which to
+    // tell it we are done while still wanting its reply. Stopping at the newline
+    // is EOF-independent and returns the identical value on Unix (the daemon
+    // writes exactly one JSON line). An absent/older daemon that never answers
+    // still terminates: it either closes (EOF → empty line) or hits the sync
+    // client's read deadline, and both fold into the caller's documented
+    // "no seed" → PTY-injection fallback.
+    let mut reader = std::io::BufReader::new(&mut stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    Some(line.trim_end_matches(['\n', '\r']).to_string())
 }
 
 #[cfg(test)]

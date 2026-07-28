@@ -134,6 +134,11 @@ fn lock_path_for(socket_path: &Path, override_root: Option<&Path>) -> PathBuf {
 /// when `XDG_RUNTIME_DIR` is unset — that path is owner-only (we mkdir
 /// 0700) and is the standard freedesktop user cache root.
 ///
+/// PRD #163 M1: the platform tail (the `XDG_RUNTIME_DIR`-then-`~/.cache` chain
+/// above, `%LOCALAPPDATA%\dot-agent-deck\locks` on Windows) lives in
+/// [`crate::platform::paths::lock_root_default`]; Unix resolution is unchanged.
+/// Both overrides below are still checked FIRST, so they stay authoritative.
+///
 /// `override_root` is the per-`Daemon` builder-supplied override
 /// (round-11 reviewer #B): tests pass it via
 /// [`Daemon::with_lock_dir_override`] to pin the resolved root at a
@@ -150,14 +155,7 @@ fn lock_root(override_root: Option<&Path>) -> PathBuf {
     if let Ok(explicit) = std::env::var("DOT_AGENT_DECK_LOCK_DIR") {
         return PathBuf::from(explicit);
     }
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR")
-        && !runtime_dir.is_empty()
-    {
-        return PathBuf::from(runtime_dir).join("dot-agent-deck");
-    }
-    crate::config::dirs_home()
-        .join(".cache")
-        .join("dot-agent-deck")
+    crate::platform::paths::lock_root_default()
 }
 
 /// PRD #93 M1.3 live-socket probe. Used by [`run_daemon_with`] to
@@ -364,7 +362,14 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     }
     let _start_lock = crate::platform::lock::acquire_spawn_lock(&lock_path).await?;
 
-    if socket_path.exists() {
+    // PRD #163 M4: the probe-remove-bind dance above is inherently about a
+    // *filesystem* endpoint. On Windows the endpoint is a `\\.\pipe\` name with no
+    // inode: `exists()` is permanently false and `remove_file` would error rather
+    // than clear anything, so `stale_endpoint_artifact` short-circuits the whole
+    // block. Nothing is lost — the singleton guard there is
+    // `first_pipe_instance(true)` inside `IpcListener::bind`, which reports
+    // `AddrInUse` for exactly the case this branch exists to catch.
+    if crate::platform::ipc::stale_endpoint_artifact(socket_path) {
         if probe_socket_alive(socket_path).await {
             return Err(DaemonError::Io(io::Error::new(
                 io::ErrorKind::AddrInUse,
@@ -393,6 +398,10 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // Hold the registry for the lifetime of the loop so its Drop fires
     // (killing any owned agents) when this future is dropped/aborted.
     let pty_registry = daemon.pty_registry;
+    // Tell the registry which hook endpoint we just bound, so every agent it
+    // spawns is handed that path explicitly instead of re-resolving it from
+    // inherited environment when it emits. See `DOT_AGENT_DECK_SOCKET`.
+    pty_registry.set_hook_socket(socket_path.to_path_buf());
     let state = daemon.state;
     let event_tx = daemon.event_tx;
     let client_count = daemon.client_count;

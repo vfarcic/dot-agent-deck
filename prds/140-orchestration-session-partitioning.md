@@ -1,6 +1,6 @@
 # PRD #140: Concurrent orchestration safety — routing correctness + worktree-per-orchestration model
 
-**Status**: Planning
+**Status**: Implementation complete — PR pending
 **Priority**: High
 **Created**: 2026-07-18
 **GitHub Issue**: [#140](https://github.com/vfarcic/dot-agent-deck/issues/140)
@@ -93,34 +93,34 @@ Captured so the analysis is not lost. If the issue thread establishes that same-
 
 ### Phase 1: Wire type and construct sites
 
-- [ ] **M1.0** — Add `orchestration_id: Option<String>` to `TabMembership::Orchestration` (`src/agent_pty.rs:231`) with the forward-compatible serde attrs. Serde round-trip test: field preserved; older-shape JSON → `None`.
-- [ ] **M1.1** — Extend `validate_tab_membership` (`src/agent_pty.rs:312`) to sanitize `orchestration_id`. Test rejects a control-byte id, accepts a valid one.
-- [ ] **M1.2** — Mint one id per tab at the interactive construct site (`src/tab.rs:531`), stamped on every role pane's membership.
-- [ ] **M1.3** — Mint one id per orchestration spawn at the scheduled / daemon-initiated construct site (`src/spawn.rs:326`).
+- [x] **M1.0** — Add `orchestration_id: Option<String>` to `TabMembership::Orchestration` (`src/agent_pty.rs:231`) with the forward-compatible serde attrs. Serde round-trip test: field preserved; older-shape JSON → `None`.
+- [x] **M1.1** — Extend `validate_tab_membership` (`src/agent_pty.rs:312`) to sanitize `orchestration_id`. Test rejects a control-byte id, accepts a valid one.
+- [x] **M1.2** — Mint one id per tab at the interactive construct site (`src/tab.rs:531`), stamped on every role pane's membership.
+- [x] **M1.3** — Mint one id per orchestration spawn at the scheduled / daemon-initiated construct site (`src/spawn.rs:326`).
 
 ### Phase 2: Daemon routing identity
 
-- [ ] **M2.0** — Change `pane_orchestration_map`'s value (`src/state.rs:205`) to an `Instance(id)` / `NameCwd(name, cwd)` identity; populate it in the daemon spawn handler (`src/daemon_protocol.rs:997`).
-- [ ] **M2.1** — Route `handle_delegate`'s target filter (`src/state.rs:816`) on the new identity; keep orchestrator-self-exclusion and role-match unchanged.
-- [ ] **M2.2** — Route `handle_work_done`'s orchestrator lookup (`src/state.rs:930`) on the new identity; the `.find()` is now deterministic because at most one orchestrator shares an instance id.
-- [ ] **M2.3** — Update map cleanup (`unregister_pane`, `src/state.rs:759`) and every other read site the type change touches; `cargo build` + `cargo clippy -- -D warnings` clean.
+- [x] **M2.0** — Change `pane_orchestration_map`'s value (`src/state.rs:205`) to an `Instance(id)` / `NameCwd(name, cwd)` identity; populate it in the daemon spawn handler (`src/daemon_protocol.rs:997`).
+- [x] **M2.1** — Route `handle_delegate`'s target filter (`src/state.rs:816`) on the new identity; keep orchestrator-self-exclusion and role-match unchanged.
+- [x] **M2.2** — Route `handle_work_done`'s orchestrator lookup (`src/state.rs:930`) on the new identity; the `.find()` is now deterministic because at most one orchestrator shares an instance id.
+- [x] **M2.3** — Update map cleanup (`unregister_pane`, `src/state.rs:759`) and every other read site the type change touches; `cargo build` + `cargo clippy -- -D warnings` clean.
 
 ### Phase 3: Hydration round-trip
 
-- [ ] **M3.0** — Ensure `orchestration_id` survives the daemon echo (`AgentRecord.tab_membership` → `list_agents` → `validate_tab_membership`) into the TUI bucketing at `src/ui.rs:2043`; bucket key includes the instance id.
-- [ ] **M3.1** — Detach/reattach test: two same-orchestration same-cwd tabs reconnect as two distinct tabs, each retaining its routing group.
+- [x] **M3.0** — Ensure `orchestration_id` survives the daemon echo (`AgentRecord.tab_membership` → `list_agents` → `validate_tab_membership`) into the TUI bucketing at `src/ui.rs:2043`; bucket key includes the instance id.
+- [x] **M3.1** — Detach/reattach test: two same-orchestration same-cwd tabs reconnect as two distinct tabs, each retaining its routing group.
 
 ### Phase 4: Guard + steer
 
-- [ ] **M4.0** — At new-orchestration spawn (`src/tab.rs:531` path), detect an existing live orchestration in the same cwd via the daemon's records; show a non-blocking warning naming the shared-file / shared-tree risk and pointing at `/worktree-prd`. Add a TUI test (L1) asserting the warning appears for a same-cwd second orchestration and not otherwise (CLAUDE.md rule 4).
-- [ ] **M4.1** — Cross-directory regression test: a delegate/work-done in `(name, cwdA)` never reaches `(name, cwdB)`.
+- [x] **M4.0** — At new-orchestration spawn (`src/tab.rs:531` path), detect an existing live orchestration in the same cwd via the daemon's records; show a non-blocking warning naming the shared-file / shared-tree risk and pointing at `/worktree-prd`. Add a TUI test (L1) asserting the warning appears for a same-cwd second orchestration and not otherwise (CLAUDE.md rule 4).
+- [x] **M4.1** — Cross-directory regression test: a delegate/work-done in `(name, cwdA)` never reaches `(name, cwdB)`.
 
 ### Phase 5: Tests, cross-version, docs, release
 
-- [ ] **M5.0** — Routing unit tests in `src/state.rs`: two same-`(name,cwd)` orchestrations with distinct ids route delegate + work-done in isolation.
-- [ ] **M5.1** — L2 PTY-attached e2e (rule 4): real binary, same orchestration in two tabs, no cross-delivery; `.cast`-recording, modeled on `scheduler/dispatch/013` and `tests/e2e_delegate_work_done_chain.rs`.
-- [ ] **M5.2** — Cross-version manual test (rule 12): older daemon + newer TUI routes a single orchestration via the `NameCwd` fallback.
-- [ ] **M5.3** — `changelog.d/140.breaking.md` + changelog fragment; docs updated to the worktree-per-orchestration model.
+- [x] **M5.0** — Routing unit tests in `src/state.rs`: two same-`(name,cwd)` orchestrations with distinct ids route delegate + work-done in isolation.
+- [x] **M5.1** — L2 PTY-attached e2e (rule 4): real binary, same orchestration in two tabs, no cross-delivery; `.cast`-recording, modeled on `scheduler/dispatch/013` and `tests/e2e_delegate_work_done_chain.rs`.
+- [x] **M5.2** — Cross-version manual test (rule 12) — performed during `/prd-done` (rule 12): older daemon + newer TUI routes a single orchestration via the `NameCwd` fallback.
+- [x] **M5.3** — `changelog.d/140.breaking.md` + changelog fragment; docs updated to the worktree-per-orchestration model.
 - [ ] **M5.4** — PR, Greptile review, cross-version contract check, merge, close #140.
 
 ## Key Files
