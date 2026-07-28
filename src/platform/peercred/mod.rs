@@ -90,5 +90,17 @@ mod tests {
         // From the server end the peer is the client — the direction a
         // server-pid-only implementation would get accidentally "right".
         assert_eq!(peer_pid(&server_end).expect("peer_pid from server"), me);
+
+        // PRD #163 review: the two assertions above cannot *fail* for a swapped
+        // Windows dispatch — both ends are this process, so the wrong Win32 call
+        // still answers `me`. Pin the direction itself on the connected pair, which
+        // is where the mapping is decided and where getting it wrong would make a
+        // daemon answering `daemon stop` terminate itself.
+        #[cfg(windows)]
+        {
+            use super::windows::{PeerQuery, peer_query_for};
+            assert_eq!(peer_query_for(&client_end), PeerQuery::ServerProcessId);
+            assert_eq!(peer_query_for(&server_end), PeerQuery::ClientProcessId);
+        }
     }
 }

@@ -35,6 +35,37 @@ pub fn home_dir() -> PathBuf {
     }
 }
 
+/// Home directory anchor for the **third-party tool config** writers —
+/// `hooks_manage`'s `~/.claude/settings.json` and `opencode_manage`'s
+/// `~/.config/opencode` / `~/.opencode` roots.
+///
+/// Identical to [`home_dir`] except for the Unix `$HOME`-unset fallback, which is
+/// `/tmp` here instead of `/`. That is not a preference, it is preservation: both
+/// call sites read `std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())`
+/// before PRD #163 M1 routed them through this module, and #163's bar is
+/// byte-for-byte Unix behavior — including in the `$HOME`-unset case, where the
+/// paths would otherwise move from `/tmp/.claude/settings.json` to
+/// `/.claude/settings.json` (a different file, and one an unprivileged user
+/// cannot even create). The fallback lives here, at the seam, rather than as a
+/// `cfg` in each call site.
+///
+/// Windows: exactly [`home_dir`] — `%USERPROFILE%` via the known-folder API. The
+/// `/tmp` fallback has no meaning there (nothing loads `C:\tmp\.claude`), and
+/// `$HOME` is normally unset on Windows, which is precisely why these two sites
+/// had to come through the seam at all.
+pub fn home_dir_with_tmp_fallback() -> PathBuf {
+    #[cfg(unix)]
+    {
+        std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+    }
+    #[cfg(windows)]
+    {
+        home_dir()
+    }
+}
+
 /// Current real uid, used to namespace the `/tmp` fallback sockets per user.
 /// Wraps `getuid(2)` so the single `unsafe` lives in one place.
 ///
@@ -515,6 +546,52 @@ mod tests {
             match prev_xdg {
                 Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
                 None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    /// PRD #163 review: the two third-party-tool config writers historically fell
+    /// back to `/tmp` when `$HOME` was unset, and #163's bar is byte-for-byte Unix
+    /// preservation — so the seam has to keep *two* fallbacks apart. With `$HOME`
+    /// set both resolvers agree; with it unset `home_dir` yields `/` (the
+    /// `config::dirs_home` behavior) and `home_dir_with_tmp_fallback` yields
+    /// `/tmp` (the `hooks_manage`/`opencode_manage` behavior). Nothing asserted
+    /// this before, which is how the regression got in.
+    #[cfg(unix)]
+    #[test]
+    fn tool_config_home_keeps_the_historical_tmp_fallback() {
+        let _guard = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var("HOME").ok();
+
+        // SAFETY: env-var lock held; restored on the way out.
+        unsafe {
+            std::env::set_var("HOME", "/home/somebody");
+        }
+        assert_eq!(home_dir(), PathBuf::from("/home/somebody"));
+        assert_eq!(
+            home_dir_with_tmp_fallback(),
+            PathBuf::from("/home/somebody"),
+            "with $HOME set the two resolvers must be identical"
+        );
+
+        // SAFETY: same lock held.
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+        assert_eq!(home_dir(), PathBuf::from("/"));
+        assert_eq!(
+            home_dir_with_tmp_fallback(),
+            PathBuf::from("/tmp"),
+            "the tool-config resolver must keep the pre-#163 /tmp fallback"
+        );
+
+        // SAFETY: same lock held; restoring the previous value.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
             }
         }
     }

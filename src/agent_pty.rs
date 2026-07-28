@@ -414,7 +414,8 @@ pub fn validate_tab_membership(mut tm: TabMembership) -> Option<TabMembership> {
 
 /// Returns `true` if `value` is acceptable as an orchestration's
 /// identity cwd: non-empty, ≤ [`CWD_MAX_LEN`] bytes, free of ASCII
-/// control characters, AND an absolute path (starts with `/`).
+/// control characters, AND an absolute path for this platform
+/// ([`is_absolute_project_path`]).
 ///
 /// Round-12 auditor #2: the orchestration_cwd field is treated as
 /// the project root, so being absolute is part of the contract — a
@@ -423,7 +424,71 @@ pub fn validate_tab_membership(mut tm: TabMembership) -> Option<TabMembership> {
 /// orchestrations whose own resolved cwd happens to match. Reject up
 /// front instead.
 pub fn is_valid_orchestration_cwd(value: &str) -> bool {
-    is_valid_cwd(value) && value.starts_with('/')
+    is_valid_cwd(value) && is_absolute_project_path(value)
+}
+
+/// Whether `value` is an absolute project-root path **on this platform** — the
+/// only platform-dependent half of [`is_valid_orchestration_cwd`] and
+/// [`validate_orchestration_surface`], kept as one `cfg` seam so the
+/// classification rules themselves ([`is_posix_absolute_path`],
+/// [`is_windows_absolute_path`]) stay pure data and are unit-tested on every
+/// platform.
+///
+/// PRD #163 review: the rule used to be a bare `starts_with('/')` everywhere,
+/// which is correct on Unix and rejects *every* legitimate Windows working
+/// directory — a Windows daemon's own `current_dir()` is a drive-letter path
+/// (`C:\proj`) and a network project root is a UNC path (`\\server\share\proj`).
+/// The failure was silent in the worst way: an orchestration pane's
+/// `TabMembership` was dropped to `None` and a live `OrchestrationSurface` was
+/// discarded outright, so orchestration tabs simply never rehydrated on Windows.
+///
+/// - **Unix** keeps the historical rule byte-for-byte: a leading `/`, nothing
+///   else.
+/// - **Windows** accepts that *plus* its two native absolute forms. The POSIX
+///   form stays valid there on purpose rather than as laziness: a Windows TUI
+///   attached to a remote Unix daemon (`remotes.toml`) receives POSIX project
+///   roots, and this same validator runs on that receive path.
+fn is_absolute_project_path(value: &str) -> bool {
+    #[cfg(unix)]
+    {
+        is_posix_absolute_path(value)
+    }
+    #[cfg(windows)]
+    {
+        is_posix_absolute_path(value) || is_windows_absolute_path(value)
+    }
+}
+
+/// A POSIX absolute path: a leading `/`. The historical rule, and on Unix still
+/// the only accepted form.
+pub fn is_posix_absolute_path(value: &str) -> bool {
+    value.starts_with('/')
+}
+
+/// A Windows absolute path, in the two rooted forms Win32 resolves without
+/// consulting any per-process current directory:
+///
+/// - **UNC / device** — two leading separators: `\\server\share\proj`,
+///   `//server/share/proj`, `\\?\C:\proj`. Either separator is accepted because
+///   Win32 treats `/` and `\` interchangeably in paths.
+/// - **Drive-letter rooted** — `C:\proj` or `C:/proj`.
+///
+/// Deliberately *not* accepted, because neither is absolute:
+///
+/// - `C:proj` — drive-*relative*: it resolves against that drive's own current
+///   directory, so two orchestrations could resolve it to different real roots
+///   (exactly the collision the absolute-path contract exists to prevent).
+/// - `\proj` — rooted on the *current* drive, so it is likewise not a stable
+///   project identity.
+pub fn is_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let is_sep = |b: u8| b == b'\\' || b == b'/';
+    // `\\server\share`, `//server/share`, `\\?\C:\…`
+    if bytes.len() >= 2 && is_sep(bytes[0]) && is_sep(bytes[1]) {
+        return true;
+    }
+    // `C:\proj` / `C:/proj` — the separator is required (see the doc comment).
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && is_sep(bytes[2])
 }
 
 /// PRD #120 (H1/M1/L2): wire-boundary validation for the live
@@ -3240,6 +3305,70 @@ mod tests {
             display_title: None,
         };
         assert!(validate_tab_membership(tm).is_some());
+    }
+
+    // PRD #163 review: the orchestration-cwd absoluteness rule used to be a bare
+    // `starts_with('/')`, which rejects every legitimate Windows working
+    // directory. These pin the two pure classifiers on EVERY platform (they are
+    // plain byte inspection, so Linux CI covers the Windows rule too) plus the
+    // platform composition in `is_absolute_project_path`.
+
+    #[test]
+    fn posix_absolute_path_classification() {
+        assert!(is_posix_absolute_path("/home/user/project-a"));
+        assert!(is_posix_absolute_path("/"));
+        assert!(!is_posix_absolute_path("relative/proj"));
+        assert!(!is_posix_absolute_path(""));
+        // A Windows path is NOT posix-absolute — that is the whole reason the
+        // second classifier exists.
+        assert!(!is_posix_absolute_path(r"C:\proj"));
+    }
+
+    #[test]
+    fn windows_absolute_path_accepts_drive_letter_and_unc() {
+        // Drive-letter rooted, both separators.
+        assert!(is_windows_absolute_path(r"C:\Users\dev\project-a"));
+        assert!(is_windows_absolute_path("C:/Users/dev/project-a"));
+        assert!(is_windows_absolute_path(r"z:\p"));
+        // UNC and the extended-length / device prefixes.
+        assert!(is_windows_absolute_path(r"\\server\share\project-a"));
+        assert!(is_windows_absolute_path("//server/share/project-a"));
+        assert!(is_windows_absolute_path(r"\\?\C:\project-a"));
+    }
+
+    #[test]
+    fn windows_absolute_path_rejects_relative_and_drive_relative() {
+        assert!(!is_windows_absolute_path("relative/proj"));
+        assert!(!is_windows_absolute_path(""));
+        // Drive-RELATIVE: resolves against that drive's own cwd, so it is not a
+        // stable project identity.
+        assert!(!is_windows_absolute_path("C:proj"));
+        assert!(!is_windows_absolute_path("C:"));
+        // Rooted on the *current* drive — same objection.
+        assert!(!is_windows_absolute_path(r"\proj"));
+        // Not a drive letter.
+        assert!(!is_windows_absolute_path("1:/proj"));
+    }
+
+    /// The platform composition: Unix stays byte-for-byte on the historical
+    /// POSIX-only rule, Windows accepts both families (its own daemon reports
+    /// `C:\…`, and a remote Unix daemon reports `/…`).
+    #[test]
+    fn orchestration_cwd_absoluteness_follows_the_platform() {
+        assert!(is_valid_orchestration_cwd("/home/user/project-a"));
+        assert!(!is_valid_orchestration_cwd("relative/proj"));
+
+        let windows_paths = [r"C:\Users\dev\project-a", r"\\server\share\project-a"];
+        for path in windows_paths {
+            assert_eq!(
+                is_valid_orchestration_cwd(path),
+                cfg!(windows),
+                "{path} must be accepted only where it is genuinely absolute"
+            );
+        }
+        // Control bytes are still refused regardless of the path family.
+        assert!(!is_valid_orchestration_cwd("C:\\proj\\\x1b[31m"));
+        assert!(!is_valid_orchestration_cwd("C:\\proj\\\0evil"));
     }
 
     // PRD #111 auditor BLOCKER: a hostile / buggy daemon sending an

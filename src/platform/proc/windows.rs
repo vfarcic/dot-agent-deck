@@ -17,6 +17,20 @@
 //! [`force_kill_child_and_wait`] and the last phase of
 //! [`terminate_child_with_grace_and_wait`] leak-free.
 //!
+//! Two consequences of "job membership is inherited forward only" are load-bearing
+//! and easy to get wrong, so both are pinned by tests and spelled out where they
+//! live:
+//!
+//! - The job must be created and joined **at spawn**, not at teardown — see
+//!   [`AgentProcessGroup::adopt`], which also documents the residual
+//!   post-`CreateProcess` adoption race that `portable-pty`'s ConPTY spawn makes
+//!   unavoidable in v1.
+//! - The **job handle**, never the direct child's exit status, decides the final
+//!   reap. A ConPTY child that exits while its own descendants keep running is
+//!   ordinary (a shell wrapper whose tool process outlives it), so a teardown that
+//!   short-circuits on "the direct child is gone" leaks exactly the tree the job
+//!   exists to reap — see phase 3 of [`terminate_child_with_grace_and_wait`].
+//!
 //! ## The graceful window is explicitly best-effort (v1 documented difference)
 //!
 //! PRD #163 (and #42 before it) locks this in: *"Graceful agent shutdown is
@@ -170,6 +184,47 @@ impl AgentProcessGroup {
     /// handle to the process, and Windows does not recycle a PID while any handle
     /// to the process object remains — so the pid cannot name a different process
     /// than the one we just spawned.
+    ///
+    /// # Known v1 limitation: the post-spawn adoption race
+    ///
+    /// Job membership is inherited *forward* only, and this call necessarily runs
+    /// **after** `CreateProcessW` has already returned a running child. Any
+    /// descendant the child manages to spawn in that window — between
+    /// `CreateProcessW` returning inside `portable-pty` and
+    /// `AssignProcessToJobObject` here — is **not** in the job, and neither are
+    /// that descendant's own descendants. `TerminateJobObject` cannot reap what
+    /// never joined, so such a process survives agent teardown. It is the one
+    /// descendant-leak path the Job Object does not close.
+    ///
+    /// The window is closable in principle and **not** closable in v1, for a
+    /// concrete reason rather than an ergonomic one. Both Win32 mechanisms need
+    /// control over the `CreateProcessW` call itself, which
+    /// `portable-pty`'s ConPTY backend does not delegate
+    /// (`portable-pty` 0.8.1, `src/win/psuedocon.rs`):
+    ///
+    /// - **`CREATE_SUSPENDED` + assign + `ResumeThread`** — the creation flags are
+    ///   hard-coded to `EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT`
+    ///   with no way to add a flag, and the primary-thread handle needed to resume
+    ///   is closed inside `spawn_command` before it returns.
+    /// - **`PROC_THREAD_ATTRIBUTE_JOB_LIST`** (the clean fix: the child is *born*
+    ///   in the job) — the `STARTUPINFOEX` attribute list is built internally with
+    ///   room for exactly one attribute, the pseudoconsole handle, and is never
+    ///   exposed.
+    ///
+    /// An *outer* job created before the spawn, which the child would inherit,
+    /// does not help either: to be inherited it would have to contain the daemon
+    /// itself, so terminating it would kill the daemon and every other agent —
+    /// and nesting a per-agent job inside it still leaves the escaped descendant
+    /// in the outer job only, i.e. outside the job we terminate.
+    ///
+    /// Closing this properly therefore means replacing `portable-pty`'s ConPTY
+    /// spawn (vendoring it, or upstreaming a "spawn into these jobs" option),
+    /// which PRD #163 scopes out of v1. Practically the exposure is small — the
+    /// window is the microseconds between `spawn_command` returning and the next
+    /// statement in [`crate::agent_pty::spawn`], while a real agent's first child
+    /// process is milliseconds-to-seconds into its startup — and it degrades the
+    /// same way the PRD's other Windows teardown gaps do: best-effort, logged, with
+    /// `TerminateJobObject` still reaping everything that *did* join the job.
     pub fn adopt(pid: Option<u32>) -> Self {
         let unassigned = Self { job: None };
 
@@ -320,6 +375,17 @@ pub fn force_kill_child_and_wait(
 /// (same 50 ms poll cadence, same "an early exiter is not penalised by the
 /// deadline" property) — only the two signals differ, and the first one is
 /// best-effort. See the module docs for exactly how it is weaker.
+///
+/// One deliberate structural difference from Unix, and the reason phase 3 is not
+/// simply skipped when the child exits inside the grace window (PRD #163 review):
+/// **the Job Object, not the direct child, decides when teardown is done.** On
+/// Unix an exited child means the process group is addressable but usually empty,
+/// and `killpg(SIGKILL)` on a group whose leader is gone is the same "reach the
+/// survivors" call phase 3 makes here — so returning early is harmless there. On
+/// Windows the direct child exiting says *nothing* about its job: a ConPTY child
+/// that spawns a tool process and exits (a shell wrapper, a launcher, `cmd /c`)
+/// leaves that tool process running *inside the job*, and nothing else will ever
+/// reap it. So an exited child still gets a `TerminateJobObject`.
 pub fn terminate_child_with_grace_and_wait(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     grace: Duration,
@@ -330,9 +396,13 @@ pub fn terminate_child_with_grace_and_wait(
 
     // Phase 2: poll `try_wait` until the child exits or the grace elapses.
     let deadline = std::time::Instant::now() + grace;
+    let mut child_exited = false;
     while std::time::Instant::now() < deadline {
         match child.try_wait() {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) => {
+                child_exited = true;
+                break;
+            }
             Ok(None) => {}
             Err(_) => break,
         }
@@ -341,6 +411,15 @@ pub fn terminate_child_with_grace_and_wait(
 
     // Phase 3: guaranteed backstop — reaches survivors *and* descendants
     // regardless of whether anything honoured the CTRL_BREAK.
+    if child_exited {
+        // `try_wait` already reaped the direct child, so there is no process for
+        // the single-process fallback to kill and no status left to `wait` for —
+        // but its descendants may still be in the job, so the job is still
+        // terminated. `terminate_tree` is a no-op-safe call on a job whose
+        // processes have all exited.
+        group.terminate_tree("graceful-close-terminate-job-after-child-exit");
+        return;
+    }
     reap_tree_or_fallback(child, group, "graceful-close-terminate-job");
     let _ = child.wait();
 }
@@ -565,6 +644,105 @@ mod tests {
         // still-open handle in `child` keeps the assertion pid-stable.
         child.wait().expect("wait for the reaped helper");
         assert_eq!(terminate_pid(pid).unwrap(), TerminateSignal::AlreadyGone);
+    }
+
+    /// Assign an **additional** live process to `group`'s job. Test-only, and the
+    /// point of it: it reproduces — deterministically, with a pid we know — the
+    /// state a real agent reaches by inheritance, where the job holds the direct
+    /// child *and* the tool processes it spawned. Building that with a genuine
+    /// grandchild (`cmd /C start /B …`) would leave us without the survivor's pid
+    /// to assert on, and job membership, not parentage, is what teardown acts on.
+    fn assign_extra_process_to_job(group: &AgentProcessGroup, pid: u32) -> bool {
+        let job = group.job.as_ref().expect("the group must own a job");
+        // SAFETY: no pointer arguments; `binherithandle: 0`; the pid names a live
+        // process the caller still holds a `std::process::Child` handle for, so it
+        // cannot have been recycled. A null return is failure, checked below.
+        let handle = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let handle = OwnedHandle(handle);
+        // SAFETY: both handles are live and owned here (the job by `group`, the
+        // process by `handle`); the call only records membership in the kernel and
+        // retains neither handle.
+        unsafe { AssignProcessToJobObject(job.0, handle.0) != 0 }
+    }
+
+    /// PRD #163 review — the descendant leak this fix closes: when the agent's
+    /// **direct child exits inside the CTRL_BREAK grace window** but processes it
+    /// spawned are still running, teardown must still `TerminateJobObject`. The job
+    /// handle, not the direct child's exit, decides when the tree is gone.
+    ///
+    /// Before the fix, phase 2's `try_wait` returning `Some` short-circuited the
+    /// whole backstop, so the survivor below lived on with nothing left to reap it
+    /// — the common shape on Windows, where a launcher/`cmd` wrapper exits the
+    /// moment it has started the real tool.
+    ///
+    /// The survivor is a 30-second `ping`, so the 10-second bounded wait is a real
+    /// assertion: it can only exit that early because the job terminated it.
+    #[test]
+    fn teardown_reaps_the_job_when_the_direct_child_exits_during_grace() {
+        // Stands in for a tool process the agent spawned and left behind. A bare
+        // `ping` rather than [`spawn_helper_tree`]'s `cmd`-wrapped one: only the pid
+        // we hand to the job below is guaranteed to be terminated, so a single
+        // process leaves nothing running past the test either way.
+        let mut survivor = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the stand-in descendant");
+        let survivor_pid = survivor.id();
+
+        // The direct child: exits immediately, like a launcher that has handed off.
+        let doomed = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the short-lived direct child");
+
+        let group = AgentProcessGroup::adopt(Some(doomed.id()));
+        assert!(
+            group.job.is_some(),
+            "a freshly spawned child must be adoptable into a job object"
+        );
+        assert!(
+            assign_extra_process_to_job(&group, survivor_pid),
+            "the stand-in descendant must join the agent's job"
+        );
+
+        let mut child: Box<dyn portable_pty::Child + Send + Sync> =
+            Box::new(crate::platform::proc::test_child::StdChild(doomed));
+        terminate_child_with_grace_and_wait(&mut child, Duration::from_secs(3), &group);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut reaped = false;
+        while std::time::Instant::now() < deadline {
+            if survivor
+                .try_wait()
+                .expect("try_wait on the stand-in descendant")
+                .is_some()
+            {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !reaped {
+            // Don't leave a 30s `ping` behind when the assertion below fails.
+            let _ = survivor.kill();
+        }
+        // Unconditional: reaps the handle either way (a no-op returning the cached
+        // status when the poll above already saw the exit).
+        let _ = survivor.wait();
+        assert!(
+            reaped,
+            "TerminateJobObject must still run when the direct child exits during the grace \
+             window, otherwise every descendant it spawned leaks"
+        );
     }
 
     /// The grace signal never throws: with no console to signal into (the daemon

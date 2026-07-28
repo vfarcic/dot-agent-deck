@@ -676,10 +676,18 @@ impl RemotesFile {
     pub fn save(&self, path: &Path) -> Result<(), RemoteConfigError> {
         use std::io::Write;
 
+        // PRD #163 auditor: create the parent through the fsperm seam, not plain
+        // `create_dir_all`, so the *directory* is owner-only too — the same call
+        // `schedules.toml` already makes. The per-file DACL/mode protects the
+        // contents; this protects the metadata (which remotes exist, by filename)
+        // when `DOT_AGENT_DECK_REMOTES_DIR` points somewhere shared. Create-only,
+        // so an existing directory is never surprise-tightened (PRD #127 S2).
         let parent = path.parent().unwrap_or(Path::new("."));
-        std::fs::create_dir_all(parent).map_err(|source| RemoteConfigError::Io {
-            path: parent.display().to_string(),
-            source,
+        crate::platform::fsperm::create_owner_only_dir(parent).map_err(|source| {
+            RemoteConfigError::Io {
+                path: parent.display().to_string(),
+                source,
+            }
         })?;
 
         let contents = toml::to_string_pretty(self)?;

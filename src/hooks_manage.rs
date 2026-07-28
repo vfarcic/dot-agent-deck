@@ -19,13 +19,16 @@ const HOOK_TYPES: &[&str] = &[
 /// `~/.claude/settings.json`.
 ///
 /// PRD #163 M1: resolved through the platform seam rather than a raw `$HOME`
-/// read with a `/tmp` fallback. `$HOME` is still the source on Unix, so the path
-/// is unchanged there; the old fallback only differed when `$HOME` was unset,
-/// where it wrote the hook settings into a world-writable `/tmp/.claude` — and on
-/// Windows, where `$HOME` is normally unset, it would have missed
-/// `%USERPROFILE%\.claude` entirely.
+/// read, so that on Windows — where `$HOME` is normally unset — this finds
+/// `%USERPROFILE%\.claude` instead of missing it entirely.
+///
+/// PRD #163 review: the seam function is
+/// [`crate::platform::paths::home_dir_with_tmp_fallback`], *not* `home_dir`,
+/// because the raw read this replaced fell back to `/tmp` when `$HOME` was unset.
+/// Unix behavior is therefore byte-for-byte what it was — including the
+/// `/tmp/.claude/settings.json` an unset `$HOME` resolves to.
 fn settings_path() -> PathBuf {
-    crate::platform::paths::home_dir()
+    crate::platform::paths::home_dir_with_tmp_fallback()
         .join(".claude")
         .join("settings.json")
 }

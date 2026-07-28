@@ -118,15 +118,26 @@ impl IpcStream {
     /// SID is checked against ours. A foreign-owned pipe at our endpoint name is
     /// refused with [`io::ErrorKind::PermissionDenied`] and the handle dropped, so
     /// no caller can write attach frames — or read a forged reply — from a
-    /// squatted pipe. `tokio`'s `ClientOptions` already defaults to
-    /// `SECURITY_IDENTIFICATION | SECURITY_SQOS_PRESENT`, so a hostile server
-    /// cannot impersonate us in the window before the check either.
+    /// squatted pipe.
+    ///
+    /// The impersonation half of that hardening is stated **explicitly** via
+    /// [`SECURITY_IDENTIFICATION`]`| `[`SECURITY_SQOS_PRESENT`] (PRD #163 auditor
+    /// low item): a pipe server can impersonate a client that connects at
+    /// `SECURITY_IMPERSONATION` or above, and the window before the owner-SID check
+    /// is exactly when a squatting server would try. `tokio`'s `ClientOptions`
+    /// happens to default to the same pair, but relying on a library's internal
+    /// default for a security property is how such properties get lost in a
+    /// dependency bump — so it is spelled out here, matching the sync
+    /// [`IpcClient::connect`] flags one-for-one.
     pub async fn connect(endpoint: &Path) -> io::Result<Self> {
         let name = endpoint.as_os_str();
         let retry_budget = CONNECT_RETRY_BUDGET;
         let mut waited = Duration::ZERO;
         loop {
-            match ClientOptions::new().open(name) {
+            match ClientOptions::new()
+                .security_qos_flags(SECURITY_IDENTIFICATION | SECURITY_SQOS_PRESENT)
+                .open(name)
+            {
                 Ok(client) => {
                     verify_server_owner(client.as_raw_handle(), endpoint)?;
                     return Ok(Self::Client(client));
@@ -356,7 +367,8 @@ impl IpcClient {
     /// per-user pipe name — cannot talk to a foreign-squatted pipe.
     /// `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` additionally denies a
     /// hostile server the ability to impersonate us in the window before the
-    /// check (matching `tokio`'s `ClientOptions` default on the async side).
+    /// check — stated explicitly on the async side too
+    /// ([`IpcStream::connect`]) rather than inherited from a `tokio` default.
     pub fn connect(endpoint: &Path) -> io::Result<Self> {
         let wide = wide_nul(endpoint.as_os_str());
         let mut waited = Duration::ZERO;

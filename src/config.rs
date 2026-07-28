@@ -395,7 +395,13 @@ impl SavedSession {
 
         let path = session_path();
         let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-        std::fs::create_dir_all(parent)
+        // PRD #163 auditor: through the fsperm seam rather than plain
+        // `create_dir_all`, so the directory holding this snapshot is owner-only
+        // too — parity with `schedules.toml`/`remotes.toml`. The file's own
+        // mode/DACL protects the command lines and prompts inside; this protects
+        // the directory metadata when the config dir is redirected somewhere
+        // shared. Create-only: an existing directory keeps its mode (PRD #127 S2).
+        crate::platform::fsperm::create_owner_only_dir(parent)
             .map_err(|e| format!("Failed to create session directory: {e}"))?;
 
         let contents = toml::to_string_pretty(self)

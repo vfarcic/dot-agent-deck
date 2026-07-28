@@ -23,13 +23,16 @@ fn stale_plugin_dir(root: &Path) -> PathBuf {
 }
 
 /// PRD #163 M1: route the home lookup through the platform seam instead of
-/// reading `$HOME` with a `/tmp` fallback. `$HOME` is still the source on Unix,
-/// so the resolved roots are unchanged there; the old fallback only differed
-/// when `$HOME` was unset, where it pointed the OpenCode plugin roots at a
-/// world-writable `/tmp` — and on Windows, where `$HOME` is normally unset, it
-/// would have missed `%USERPROFILE%` entirely.
+/// reading `$HOME` directly, so that on Windows — where `$HOME` is normally
+/// unset — the OpenCode plugin roots resolve under `%USERPROFILE%` instead of
+/// being missed entirely.
+///
+/// PRD #163 review: the seam function is
+/// [`crate::platform::paths::home_dir_with_tmp_fallback`], *not* `home_dir`,
+/// because the raw read this replaced fell back to `/tmp` when `$HOME` was unset.
+/// Unix behavior is therefore byte-for-byte what it was, in that case too.
 fn home_dir() -> PathBuf {
-    crate::platform::paths::home_dir()
+    crate::platform::paths::home_dir_with_tmp_fallback()
 }
 
 fn xdg_config_root(home: &Path) -> PathBuf {

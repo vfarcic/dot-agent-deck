@@ -34,6 +34,29 @@ use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPip
 
 use crate::platform::ipc::IpcStream;
 
+/// Which Win32 query answers "who is on the *other* end" for the end of the pipe
+/// we are holding.
+///
+/// Split out of [`peer_pid`] so the direction — the one part of this backend that
+/// fails **silently** when it is wrong (module docs: a daemon would terminate
+/// itself) — is a value a test can assert on, instead of a `match` arm buried
+/// behind two Win32 calls that both answer "our own pid" in a single-process test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PeerQuery {
+    /// We hold the client end, so the peer is the pipe *server* (the daemon).
+    ServerProcessId,
+    /// We hold the server end, so the peer is the connected *client*.
+    ClientProcessId,
+}
+
+/// The dispatch table from the table in the module docs, as code.
+pub(super) fn peer_query_for(stream: &IpcStream) -> PeerQuery {
+    match stream {
+        IpcStream::Client(_) => PeerQuery::ServerProcessId,
+        IpcStream::Server(_) => PeerQuery::ClientProcessId,
+    }
+}
+
 /// Return the PID of the process holding the *other* end of `stream`.
 pub fn peer_pid(stream: &IpcStream) -> std::io::Result<u32> {
     let mut pid: u32 = 0;
@@ -42,9 +65,9 @@ pub fn peer_pid(stream: &IpcStream) -> std::io::Result<u32> {
     // `stream` for the duration of this call; `pid` is a stack-allocated `u32`
     // that outlives the call and is the only thing the API writes to. Each
     // function returns a BOOL (nonzero on success) and retains neither argument.
-    let rc = match stream {
-        IpcStream::Client(_) => unsafe { GetNamedPipeServerProcessId(handle, &mut pid) },
-        IpcStream::Server(_) => unsafe { GetNamedPipeClientProcessId(handle, &mut pid) },
+    let rc = match peer_query_for(stream) {
+        PeerQuery::ServerProcessId => unsafe { GetNamedPipeServerProcessId(handle, &mut pid) },
+        PeerQuery::ClientProcessId => unsafe { GetNamedPipeClientProcessId(handle, &mut pid) },
     };
     if rc == 0 {
         return Err(std::io::Error::last_os_error());

@@ -110,6 +110,15 @@ const CODEX_HOOK_EVENTS: &[&str] = &[
 /// available so a guarded caller never falls back to a throwaway/`/tmp` home —
 /// in production this is the user's REAL `~/.codex`, preserving auth/skills/
 /// history (per the PRD design).
+///
+/// **Windows: deliberately a no-op, not an oversight (PRD #163 M1, reconfirmed in
+/// review).** `$HOME` is normally unset on Windows, so this returns `None` and
+/// every caller degrades to a documented skip. That is the correct outcome: the
+/// path we would have to guess belongs to a *third-party* tool, and Codex — not
+/// this project — decides where its home lives on Windows. Writing hooks into a
+/// location Codex does not read would be worse than not installing them: it looks
+/// like success and silently delivers nothing. Set `$CODEX_HOME` (which is
+/// honoured on every platform, above) to install Codex hooks on Windows.
 fn codex_home() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("CODEX_HOME")
         && !dir.is_empty()

@@ -136,6 +136,65 @@ pub use windows::{
     send_sigterm_to_child_group, terminate_child_with_grace_and_wait, terminate_pid,
 };
 
+/// A [`portable_pty::Child`] stand-in over a real [`std::process::Child`], so the
+/// teardown state machines in both backends can be driven against **real**
+/// processes without a PTY (PRD #163 review).
+///
+/// Lives here, not in a backend, because both the shared cross-platform test
+/// below and the Windows backend's descendant-leak test need it. Only the three
+/// methods the teardown path actually calls do anything; `clone_killer` is not on
+/// that path and returns a no-op killer rather than pretending to duplicate the
+/// handle.
+#[cfg(test)]
+pub(crate) mod test_child {
+    /// Wraps a real OS child. `Debug` is required by the `portable_pty` traits.
+    #[derive(Debug)]
+    pub(crate) struct StdChild(pub(crate) std::process::Child);
+
+    fn to_pty_status(status: std::process::ExitStatus) -> portable_pty::ExitStatus {
+        portable_pty::ExitStatus::with_exit_code(status.code().unwrap_or(0) as u32)
+    }
+
+    /// Stand-in for the killer handle `clone_killer` is contractually required to
+    /// produce. Nothing in the teardown path clones a killer, so it is never used.
+    #[derive(Debug)]
+    struct NoopKiller;
+
+    impl portable_pty::ChildKiller for NoopKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(NoopKiller)
+        }
+    }
+
+    impl portable_pty::ChildKiller for StdChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.0.kill()
+        }
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(NoopKiller)
+        }
+    }
+
+    impl portable_pty::Child for StdChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(self.0.try_wait()?.map(to_pty_status))
+        }
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            self.0.wait().map(to_pty_status)
+        }
+        fn process_id(&self) -> Option<u32> {
+            Some(self.0.id())
+        }
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +234,51 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         let msg = err.to_string();
         assert!(msg.contains("wildcard"), "{msg:?}");
+    }
+
+    /// PRD #163 review — the teardown contract both backends owe the caller for
+    /// the case `close_agent` hits whenever the user closes a pane whose agent
+    /// quit on its own: a child that exits **inside** the grace window must be
+    /// torn down promptly rather than costing the whole window, and must not panic
+    /// on a process there is nothing left to signal.
+    ///
+    /// Un-gated on purpose — it runs on the Linux and the `windows-latest`
+    /// `cargo nextest run` jobs, driving each backend's real state machine against
+    /// a real OS process. The Windows-specific half of the same fix (the job is
+    /// still terminated, so descendants of an exited child are reaped instead of
+    /// leaking) needs a second process in the job and lives in that backend's
+    /// tests.
+    #[test]
+    fn terminating_a_child_that_exits_during_the_grace_window_is_prompt() {
+        // A process that exits immediately, on either platform. Deliberately NOT
+        // reaped here: production reaps through the teardown call itself, so the
+        // pid must still be the child's (a zombie on Unix, a live process object
+        // on Windows) when the state machine runs.
+        let program = if cfg!(windows) { "cmd" } else { "true" };
+        let args: &[&str] = if cfg!(windows) {
+            &["/C", "exit", "0"]
+        } else {
+            &[]
+        };
+        let spawned = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a short-lived helper");
+
+        let group = AgentProcessGroup::adopt(Some(spawned.id()));
+        let mut child: Box<dyn portable_pty::Child + Send + Sync> =
+            Box::new(super::test_child::StdChild(spawned));
+
+        let grace = std::time::Duration::from_secs(3);
+        let started = std::time::Instant::now();
+        terminate_child_with_grace_and_wait(&mut child, grace, &group);
+        assert!(
+            started.elapsed() < grace,
+            "an already-exited child must not cost the full grace window (took {:?})",
+            started.elapsed()
+        );
     }
 }

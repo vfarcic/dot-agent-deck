@@ -109,6 +109,17 @@ fn resolve_agent_dir_inner(
 /// the process env: `$PI_CODING_AGENT_DIR` if set & non-empty, else
 /// `<HOME>/.pi/agent`. `None` only when neither yields a non-empty value — the
 /// CLI then errors rather than guess a location pi will never load.
+///
+/// **Windows: deliberately still a raw `$HOME` read (PRD #163 M1, reconfirmed in
+/// review), not a missed platform-seam site.** `$HOME` is normally unset on
+/// Windows, so this returns `None` and the caller reports "nowhere to install"
+/// instead of materializing the extension somewhere. Resolving `%USERPROFILE%`
+/// here would be *worse* than failing: the directory pi actually scans on Windows
+/// is pi's decision, and the two named above are the only inputs pi itself reads
+/// (`getAgentDir()`), which is the invariant this function exists to mirror. An
+/// extension written to a path pi never scans is indistinguishable from success
+/// and silently does nothing. `$PI_CODING_AGENT_DIR` is honoured on every
+/// platform, so a Windows user has an explicit, correct way in.
 fn agent_dir_strict() -> Option<PathBuf> {
     resolve_agent_dir_inner(
         std::env::var(ENV_PI_AGENT_DIR).ok().as_deref(),
