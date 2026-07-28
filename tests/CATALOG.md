@@ -2705,6 +2705,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** real-LLM reaction, notification delivery, emoji, or exact elapsed-time wording.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/idle-worker/012 — A real interactive Haiku orchestrator delegates to a silent worker and visibly receives the daemon's idle nudge. [reel]
+- **Layer:** L2 PTY (real `dot-agent-deck` binary and lazy daemon, with the restored orchestration rendered through the vt100 `TuiDeck` harness). Flaky-tolerant pre-PR tier; run once, not looped.
+- **Agent:** REAL interactive Claude Code orchestrator pinned to Haiku (`claude-haiku-4-5-20251001`, `--allowedTools Bash`, no `-p`) plus a long-lived `cat` worker that intentionally never sends work-done. Runtime-skipped when the Claude CLI or credentials are unavailable.
+- **Asserts:** the real orchestrator follows a directive to run the genuine `dot-agent-deck delegate` CLI exactly once (proved by the daemon-created `worker-task-worker.md`), then the daemon-authored `has not responded` nudge appears visibly on the attached orchestration grid after the test-only timeout.
+- **Does not assert:** the model's exact acknowledgement, notification-channel delivery, emoji, or exact elapsed-time wording.
+- **Platform coverage:** mac+linux.
+
 #### scheduler/live
 
 ##### scheduler/live/001 — A scheduled fire surfaces its card LIVE to an already-attached TUI, without a disconnect/reconnect (PRD #127 finding #2).
