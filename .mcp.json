@@ -18,7 +18,7 @@
     },
     "telegram": {
       "command": "npx",
-      "args": ["-y", "telegram-mcp-bot@latest"],
+      "args": ["-y", "telegram-mcp-bot@1.1.0"],
       "env": {
         "TELEGRAM_BOT_TOKEN": "${TELEGRAM_BOT_TOKEN}"
       }
