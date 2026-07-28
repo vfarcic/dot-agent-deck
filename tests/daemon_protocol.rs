@@ -9,7 +9,7 @@
 //! a UnixStream client, and verifies every message kind round-trips
 //! correctly — including concurrent attach-stream subscribers.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -317,6 +317,47 @@ async fn observe_stream_input_outcome(
         output.windows(marker.len()).any(|window| window == marker),
         non_output,
     )
+}
+
+/// How long a delivery-count file gets to reach its expected contents.
+/// Generous because it is only ever paid when something is genuinely broken;
+/// the happy path returns on the first poll.
+const DELIVERY_FILE_BUDGET: Duration = Duration::from_secs(20);
+
+/// Bounded poll until `path` holds exactly `want`.
+///
+/// A `SendResult::Applied` means the daemon wrote the payload and the submit CR
+/// to the PTY master and flushed (`deliver_payload_and_submit`) — NOT that the
+/// child shell has read, parsed and run the command. So a test that reads a
+/// `printf x >> file` counter the instant the response arrives is racing the
+/// shell with nothing synchronizing the two: it happens to win by microseconds
+/// on a fast Linux box and can lose on a slower, loaded runner, where the empty
+/// read then masquerades as a double-submit bug. Polling the CONTENTS closes
+/// that window while keeping the assertion exact.
+///
+/// Panics with what the file actually holds — separating "the delivery never
+/// executed" from "it executed more than once", which an unwaited read
+/// conflates. Growth past `want` fails immediately rather than burning the
+/// budget, since these payloads only ever append.
+async fn wait_for_delivery_writes(path: &Path, want: &str, what: &str) {
+    let deadline = tokio::time::Instant::now() + DELIVERY_FILE_BUDGET;
+    loop {
+        let observed = std::fs::read_to_string(path).unwrap_or_default();
+        if observed == want {
+            return;
+        }
+        assert!(
+            observed.len() < want.len(),
+            "{what}: {} holds {observed:?}, which overshot the expected {want:?} — the delivery submitted more than once",
+            path.display()
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what}: {} never reached {want:?} within {DELIVERY_FILE_BUDGET:?} (last read {observed:?})",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1687,6 +1728,18 @@ fn pane_input_010_retry_after_lost_response_is_idempotent() {
         let first = issue_json_request(&server, request.clone()).await;
         // The consumer loses `first` and retries the exact same delivery ID.
         let retry = issue_json_request(&server, request).await;
+        // Wait for the one legitimate write to actually execute, then hold still
+        // long enough for a second one to show up if the retry wrongly submitted.
+        // Without the wait, an "Applied" response says only that bytes reached
+        // the PTY, so an empty read here is indistinguishable from a double
+        // submit — which is how this arm failed on a macOS CI runner.
+        wait_for_delivery_writes(
+            &counter_path,
+            "x",
+            "the first delivery must reach the shell exactly once",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
         let writes = std::fs::read_to_string(&counter_path).unwrap_or_default();
 
         assert_eq!(
@@ -1742,6 +1795,15 @@ fn pane_input_010_retry_after_lost_response_is_idempotent() {
         drop(writer_guard);
         let concurrent_first = first_task.await.unwrap();
         let concurrent_second = second_task.await.unwrap();
+        // Same reasoning as the sequential arm: wait for the single legitimate
+        // write to execute before giving a duplicate its chance to appear. The
+        // fixed sleep alone assumed the shell had already run.
+        wait_for_delivery_writes(
+            &counter_path,
+            "x",
+            "the admitted concurrent delivery must reach the shell exactly once",
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(150)).await;
         let concurrent_writes = std::fs::read_to_string(&counter_path).unwrap_or_default();
         server.registry.close_agent(&agent_id).unwrap();

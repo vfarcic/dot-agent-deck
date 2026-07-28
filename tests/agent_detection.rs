@@ -6,6 +6,87 @@ use dot_agent_deck::event::{AgentType, AgentType::Codex};
 #[cfg(unix)]
 use spec::spec;
 
+mod common;
+
+/// Budget for a PATH recorder shim to append its launch line. The shims are one
+/// `printf` away from `exec cat`, so the happy path lands in milliseconds — this
+/// whole file passes in well under a second — and this ceiling is only ever paid
+/// when something is genuinely broken. Deliberately far above any plausible
+/// scheduling delay on a loaded CI runner executing a debug binary, so a timeout
+/// here means "nothing was ever recorded", never "the runner was slow".
+#[cfg(unix)]
+const RECORD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Serializes the launch-shape tests below and points the wrapper rewrite at a
+/// per-test recorder for as long as the guard lives.
+///
+/// [`wrap::DOT_AGENT_DECK_WRAP_BIN`](dot_agent_deck::wrap::DOT_AGENT_DECK_WRAP_BIN)
+/// is read from the *spawning* process's environment, so every test here mutates
+/// one process-global. `cargo nextest run` gives each test its own process and
+/// they cannot collide — but CI's Linux `build` job runs plain `cargo test`,
+/// where all tests in this binary are THREADS OF ONE PROCESS. Unserialized, a
+/// test's spawn then names a *sibling* test's recorder, whose shim appends to an
+/// env var that is unset in this child; the write goes nowhere and the recorder
+/// file stays empty forever. That is precisely how `codex/spawn/005` and
+/// `codex/spawn/006` failed on CI while passing locally under nextest (PRD
+/// #225). Holding the lock across the whole set-env → spawn → observe window
+/// makes the override honest under both runners, and is also what makes the
+/// `set_var` calls sound: no sibling test is running while it is held.
+#[cfg(unix)]
+static WRAP_BIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(unix)]
+struct WrapBinOverride {
+    _exclusive: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(unix)]
+impl WrapBinOverride {
+    fn pointing_at(recorder: &std::path::Path) -> Self {
+        // A test that panics while holding the lock poisons it; recover the
+        // guard rather than cascading one real failure into three confusing
+        // ones.
+        let exclusive = WRAP_BIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the guard above excludes every other test in this binary, so
+        // nothing else reads or writes the environment while this runs.
+        unsafe {
+            std::env::set_var(dot_agent_deck::wrap::DOT_AGENT_DECK_WRAP_BIN, recorder);
+        }
+        Self {
+            _exclusive: exclusive,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for WrapBinOverride {
+    fn drop(&mut self) {
+        // Leave no override pointing at a deleted fixture. SAFETY: as above —
+        // the exclusion guard is still held.
+        unsafe {
+            std::env::remove_var(dot_agent_deck::wrap::DOT_AGENT_DECK_WRAP_BIN);
+        }
+    }
+}
+
+/// Bounded wait for `record` to hold `want` complete launch lines, panicking
+/// with what the file actually holds when it does not.
+///
+/// The point is that the wait FAILS rather than falls through: asserting on a
+/// value that a timed-out wait produced reports the *symptom* of the timeout
+/// (`observed ""`) instead of the timeout itself, which is what made the CI
+/// failure above look like a wrap-strategy regression. This keeps the two
+/// diagnoses distinguishable — "no line was ever recorded" is this panic, "the
+/// wrong line was recorded" is the caller's `assert_eq!`.
+#[cfg(unix)]
+fn expect_launch_lines(record: &std::path::Path, want: usize) {
+    common::wait_for_file_lines(record, want, RECORD_WAIT).unwrap_or_else(|state| {
+        panic!(
+            "recorder never captured {want} complete launch line(s) within {RECORD_WAIT:?}: {state}"
+        )
+    });
+}
+
 /// Scenario: Infer Codex from common shell command forms rather than only when
 /// `codex` is the first whitespace token. Environment and sudo options that
 /// consume arguments, quoted paths, and nested command-mode shells must resolve
@@ -52,47 +133,39 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 #[test]
 #[cfg(unix)]
 fn spawn_005_respawn_wraps_codex() {
+    use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+
+    let fixture = tempfile::tempdir().expect("respawn recorder fixture");
+    let bin_dir = fixture.path().join("bin");
+    let record = fixture.path().join("respawn.log");
+    std::fs::create_dir(&bin_dir).expect("create respawn bin dir");
+    write_executable(
+        &bin_dir.join("dot-agent-deck"),
+        "#!/bin/sh\nprintf 'WRAPPED %s\\n' \"$*\" >> \"$CODEX_RESPAWN_RECORD\"\nexec cat\n",
+    );
+    write_executable(
+        &bin_dir.join("codex"),
+        "#!/bin/sh\nprintf 'BARE codex %s\\n' \"$*\" >> \"$CODEX_RESPAWN_RECORD\"\nexec cat\n",
+    );
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").expect("test runner PATH")
+    );
+    // Point the wrapper rewrite at the recorder. The rewrite names the
+    // co-located build by absolute path (so the suite tests what it just
+    // compiled rather than whatever is installed on $PATH), which means a fake
+    // `dot-agent-deck` on the child's PATH is no longer what runs — this
+    // override is the seam for observing it. Taken before the runtime is built
+    // (not inside the async block) so the guard is never held across an await.
+    let _wrap_bin = WrapBinOverride::pointing_at(&bin_dir.join("dot-agent-deck"));
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .expect("build respawn runtime");
     runtime.block_on(async {
-        use dot_agent_deck::agent_pty::{
-            AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions,
-        };
-
-        let fixture = tempfile::tempdir().expect("respawn recorder fixture");
-        let bin_dir = fixture.path().join("bin");
-        let record = fixture.path().join("respawn.log");
-        std::fs::create_dir(&bin_dir).expect("create respawn bin dir");
-        write_executable(
-            &bin_dir.join("dot-agent-deck"),
-            "#!/bin/sh\nprintf 'WRAPPED %s\\n' \"$*\" >> \"$CODEX_RESPAWN_RECORD\"\nexec cat\n",
-        );
-        write_executable(
-            &bin_dir.join("codex"),
-            "#!/bin/sh\nprintf 'BARE codex %s\\n' \"$*\" >> \"$CODEX_RESPAWN_RECORD\"\nexec cat\n",
-        );
-        let path = format!(
-            "{}:{}",
-            bin_dir.display(),
-            std::env::var("PATH").expect("test runner PATH")
-        );
-        // Point the wrapper rewrite at the recorder. The rewrite names the
-        // co-located build by absolute path (so the suite tests what it just
-        // compiled rather than whatever is installed on $PATH), which means a
-        // fake `dot-agent-deck` on the child's PATH is no longer what runs —
-        // this override is the seam for observing it. Set on THIS process
-        // because the rewrite happens here, not in the child; nextest gives
-        // each test its own process, so it cannot leak sideways.
-        // SAFETY: single-threaded test process, set before the spawn below.
-        unsafe {
-            std::env::set_var(
-                dot_agent_deck::wrap::DOT_AGENT_DECK_WRAP_BIN,
-                bin_dir.join("dot-agent-deck"),
-            );
-        }
         let registry = AgentPtyRegistry::new();
         registry
             .spawn_agent(SpawnOptions {
@@ -117,15 +190,8 @@ fn spawn_005_respawn_wraps_codex() {
         // the shim appends with `>>`, and the shell creates the file before
         // `printf` writes into it, so an existence-only wait can read an empty
         // string (PRD #225 — same defect as `orchestration/delegate/009`).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !std::fs::read_to_string(&record)
-            .unwrap_or_default()
-            .contains('\n')
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let launched = std::fs::read_to_string(&record).unwrap_or_default();
+        expect_launch_lines(&record, 1);
+        let launched = std::fs::read_to_string(&record).expect("read respawn recorder");
         assert_eq!(
             launched.trim(),
             "WRAPPED wrap --agent codex -- codex",
@@ -166,16 +232,8 @@ fn spawn_006_explicit_codex_identity_wraps_noninferable_launcher() {
     // co-located build by absolute path (so the suite tests what it just
     // compiled rather than whatever is installed on $PATH), which means a
     // fake `dot-agent-deck` on the child's PATH is no longer what runs —
-    // this override is the seam for observing it. Set on THIS process
-    // because the rewrite happens here, not in the child; nextest gives
-    // each test its own process, so it cannot leak sideways.
-    // SAFETY: single-threaded test process, set before the spawn below.
-    unsafe {
-        std::env::set_var(
-            dot_agent_deck::wrap::DOT_AGENT_DECK_WRAP_BIN,
-            bin_dir.join("dot-agent-deck"),
-        );
-    }
+    // this override is the seam for observing it.
+    let _wrap_bin = WrapBinOverride::pointing_at(&bin_dir.join("dot-agent-deck"));
     let registry = AgentPtyRegistry::new();
     registry
         .spawn_agent(SpawnOptions {
@@ -196,15 +254,8 @@ fn spawn_006_explicit_codex_identity_wraps_noninferable_launcher() {
     // shim appends with `>>`, and the shell creates the file before `printf`
     // writes into it, so an existence-only wait can read an empty string
     // (PRD #225 — same defect as `orchestration/delegate/009`).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !std::fs::read_to_string(&record)
-        .unwrap_or_default()
-        .contains('\n')
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    let launched = std::fs::read_to_string(&record).unwrap_or_default();
+    expect_launch_lines(&record, 1);
+    let launched = std::fs::read_to_string(&record).expect("read spawn recorder");
     let recorded_type = registry
         .agent_records()
         .first()
@@ -226,50 +277,41 @@ fn spawn_006_explicit_codex_identity_wraps_noninferable_launcher() {
 #[test]
 #[cfg(unix)]
 fn spawn_007_hook_learned_badge_does_not_change_respawn_launch() {
+    use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+
+    let fixture = tempfile::tempdir().expect("stable respawn fixture");
+    let bin_dir = fixture.path().join("bin");
+    let record = fixture.path().join("launch.log");
+    std::fs::create_dir_all(&bin_dir).expect("create stable respawn bin dir");
+    write_executable(
+        &bin_dir.join("devbox"),
+        "#!/bin/sh\nprintf 'BARE devbox %s\\n' \"$*\" >> \"$STABLE_RESPAWN_RECORD\"\nexec cat\n",
+    );
+    write_executable(
+        &bin_dir.join("dot-agent-deck"),
+        "#!/bin/sh\nprintf 'WRAPPED %s\\n' \"$*\" >> \"$STABLE_RESPAWN_RECORD\"\nexec cat\n",
+    );
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").expect("test runner PATH")
+    );
+    // Point the wrapper rewrite at the recorder (same seam as spawn/005 and
+    // spawn/006). Without it this assertion cannot fail for the regression it
+    // guards: the rewrite now names the co-located build by absolute path, so an
+    // unwanted wrapper would exec the REAL deck, which in turn execs `devbox run
+    // codex-big` — and the devbox stub would record the very same `BARE devbox
+    // run codex-big` line as the unwrapped launch. With the override, a wrapper
+    // shows up as a `WRAPPED …` line instead. Taken before the runtime is built
+    // (not inside the async block) so the guard is never held across an await.
+    let _wrap_bin = WrapBinOverride::pointing_at(&bin_dir.join("dot-agent-deck"));
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .expect("build stable respawn runtime");
     runtime.block_on(async {
-        use dot_agent_deck::agent_pty::{
-            AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions,
-        };
-
-        let fixture = tempfile::tempdir().expect("stable respawn fixture");
-        let bin_dir = fixture.path().join("bin");
-        let record = fixture.path().join("launch.log");
-        std::fs::create_dir_all(&bin_dir).expect("create stable respawn bin dir");
-        write_executable(
-            &bin_dir.join("devbox"),
-            "#!/bin/sh\nprintf 'BARE devbox %s\\n' \"$*\" >> \"$STABLE_RESPAWN_RECORD\"\nexec cat\n",
-        );
-        write_executable(
-            &bin_dir.join("dot-agent-deck"),
-            "#!/bin/sh\nprintf 'WRAPPED %s\\n' \"$*\" >> \"$STABLE_RESPAWN_RECORD\"\nexec cat\n",
-        );
-        let path = format!(
-            "{}:{}",
-            bin_dir.display(),
-            std::env::var("PATH").expect("test runner PATH")
-        );
-        // Point the wrapper rewrite at the recorder (same seam as spawn/005 and
-        // spawn/006). Without it this assertion cannot fail for the regression
-        // it guards: the rewrite now names the co-located build by absolute
-        // path, so an unwanted wrapper would exec the REAL deck, which in turn
-        // execs `devbox run codex-big` — and the devbox stub would record the
-        // very same `BARE devbox run codex-big` line as the unwrapped launch.
-        // With the override, a wrapper shows up as a `WRAPPED …` line instead.
-        // Set on THIS process because the rewrite happens here, not in the
-        // child; nextest gives each test its own process, so it cannot leak
-        // sideways.
-        // SAFETY: single-threaded test process, set before the spawn below.
-        unsafe {
-            std::env::set_var(
-                dot_agent_deck::wrap::DOT_AGENT_DECK_WRAP_BIN,
-                bin_dir.join("dot-agent-deck"),
-            );
-        }
         let registry = AgentPtyRegistry::new();
         registry
             .spawn_agent(SpawnOptions {
@@ -286,16 +328,7 @@ fn spawn_007_hook_learned_badge_does_not_change_respawn_launch() {
             })
             .expect("spawn initially unwrapped launcher");
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::fs::read_to_string(&record)
-            .unwrap_or_default()
-            .lines()
-            .count()
-            < 1
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        expect_launch_lines(&record, 1);
         registry.set_agent_type("stable-pane", &AgentType::Codex);
         assert_eq!(
             registry.agent_records()[0].agent_type,
@@ -307,17 +340,8 @@ fn spawn_007_hook_learned_badge_does_not_change_respawn_launch() {
             .respawn_agent_for_pane("stable-pane", "devbox run codex-big")
             .await
             .expect("respawn non-inferable launcher");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::fs::read_to_string(&record)
-            .unwrap_or_default()
-            .lines()
-            .count()
-            < 2
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let launched = std::fs::read_to_string(&record).unwrap_or_default();
+        expect_launch_lines(&record, 2);
+        let launched = std::fs::read_to_string(&record).expect("read stable respawn recorder");
         registry.shutdown_all();
 
         assert_eq!(
@@ -336,69 +360,44 @@ fn spawn_007_hook_learned_badge_does_not_change_respawn_launch() {
 #[test]
 #[cfg(unix)]
 fn spawn_008_respawn_wrap_decision_follows_the_launched_command() {
+    use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+
+    let fixture = tempfile::tempdir().expect("launch-shape coherence fixture");
+    let bin_dir = fixture.path().join("bin");
+    let record = fixture.path().join("launch.log");
+    std::fs::create_dir_all(&bin_dir).expect("create launch-shape bin dir");
+    write_executable(
+        &bin_dir.join("devbox"),
+        "#!/bin/sh\nprintf 'BARE devbox %s\\n' \"$*\" >> \"$SHAPE_RECORD\"\nexec cat\n",
+    );
+    write_executable(
+        &bin_dir.join("claude"),
+        "#!/bin/sh\nprintf 'BARE claude %s\\n' \"$*\" >> \"$SHAPE_RECORD\"\nexec cat\n",
+    );
+    write_executable(
+        &bin_dir.join("dot-agent-deck"),
+        "#!/bin/sh\nprintf 'WRAPPED %s\\n' \"$*\" >> \"$SHAPE_RECORD\"\nexec cat\n",
+    );
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").expect("test runner PATH")
+    );
+    // Point the wrapper rewrite at the recorder (same seam as spawn/005 and
+    // spawn/006). The rewrite names the co-located build by absolute path, so a
+    // fake `dot-agent-deck` on the child's PATH is no longer what runs — without
+    // this override the wrapped launches would exec the REAL deck and the
+    // recorder would only ever see the inner `devbox` line. Taken before the
+    // runtime is built (not inside the async block) so the guard is never held
+    // across an await.
+    let _wrap_bin = WrapBinOverride::pointing_at(&bin_dir.join("dot-agent-deck"));
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .expect("build launch-shape coherence runtime");
     runtime.block_on(async {
-        use dot_agent_deck::agent_pty::{
-            AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions,
-        };
-
-        let fixture = tempfile::tempdir().expect("launch-shape coherence fixture");
-        let bin_dir = fixture.path().join("bin");
-        let record = fixture.path().join("launch.log");
-        std::fs::create_dir_all(&bin_dir).expect("create launch-shape bin dir");
-        write_executable(
-            &bin_dir.join("devbox"),
-            "#!/bin/sh\nprintf 'BARE devbox %s\\n' \"$*\" >> \"$SHAPE_RECORD\"\nexec cat\n",
-        );
-        write_executable(
-            &bin_dir.join("claude"),
-            "#!/bin/sh\nprintf 'BARE claude %s\\n' \"$*\" >> \"$SHAPE_RECORD\"\nexec cat\n",
-        );
-        write_executable(
-            &bin_dir.join("dot-agent-deck"),
-            "#!/bin/sh\nprintf 'WRAPPED %s\\n' \"$*\" >> \"$SHAPE_RECORD\"\nexec cat\n",
-        );
-        let path = format!(
-            "{}:{}",
-            bin_dir.display(),
-            std::env::var("PATH").expect("test runner PATH")
-        );
-        // Point the wrapper rewrite at the recorder (same seam as spawn/005 and
-        // spawn/006). The rewrite names the co-located build by absolute path,
-        // so a fake `dot-agent-deck` on the child's PATH is no longer what runs
-        // — without this override the wrapped launches would exec the REAL deck
-        // and the recorder would only ever see the inner `devbox` line. Set on
-        // THIS process because the rewrite happens here, not in the child;
-        // nextest gives each test its own process, so it cannot leak sideways.
-        // SAFETY: single-threaded test process, set before the spawn below.
-        unsafe {
-            std::env::set_var(
-                dot_agent_deck::wrap::DOT_AGENT_DECK_WRAP_BIN,
-                bin_dir.join("dot-agent-deck"),
-            );
-        }
-        // Wait until the recorder has appended `want` lines, so each launch is
-        // observed before the next respawn overwrites the pane.
-        let await_lines = |want: usize| {
-            let record = record.clone();
-            async move {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                while std::fs::read_to_string(&record)
-                    .unwrap_or_default()
-                    .lines()
-                    .count()
-                    < want
-                    && std::time::Instant::now() < deadline
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                }
-            }
-        };
-
         let registry = AgentPtyRegistry::new();
         registry
             .spawn_agent(SpawnOptions {
@@ -415,7 +414,9 @@ fn spawn_008_respawn_wrap_decision_follows_the_launched_command() {
                 ..SpawnOptions::default()
             })
             .expect("spawn explicitly identified Codex launcher");
-        await_lines(1).await;
+        // Each launch is observed before the next respawn replaces the pane, so
+        // the recorded sequence stays attributable line by line.
+        expect_launch_lines(&record, 1);
 
         // The role command is untouched: the frozen identity is the only thing
         // that knows this launcher is Codex, so the wrapper must come back.
@@ -423,7 +424,7 @@ fn spawn_008_respawn_wrap_decision_follows_the_launched_command() {
             .respawn_agent_for_pane("shape-pane", "devbox run codex-big")
             .await
             .expect("respawn with the unchanged role command");
-        await_lines(2).await;
+        expect_launch_lines(&record, 2);
 
         // The user edited the role command in `.dot-agent-deck.toml` to a
         // different agent. The wrap decision must follow the command actually
@@ -432,9 +433,9 @@ fn spawn_008_respawn_wrap_decision_follows_the_launched_command() {
             .respawn_agent_for_pane("shape-pane", "claude --model haiku")
             .await
             .expect("respawn with the edited role command");
-        await_lines(3).await;
+        expect_launch_lines(&record, 3);
 
-        let launched = std::fs::read_to_string(&record).unwrap_or_default();
+        let launched = std::fs::read_to_string(&record).expect("read launch-shape recorder");
         let badge = registry
             .agent_records()
             .first()

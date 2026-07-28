@@ -3477,6 +3477,23 @@ pub fn wait_for_file_containing(
     wait_for_file_matching(path, timeout, |contents| contents.contains(needle))
 }
 
+/// Bounded poll until `path` holds at least `want` COMPLETE — i.e.
+/// newline-terminated — lines. For PATH recorder shims that append one line per
+/// exec (`printf '…\n' >> "$RECORD"`), which is how the launch-shape tests
+/// observe what was actually launched.
+///
+/// Counts newline terminators rather than [`str::lines`] deliberately:
+/// `lines()` also counts a half-written trailing line, so a reader using it can
+/// return the instant the shell has created the file and still read an
+/// incomplete record. That is the same race [`wait_for_file_matching`]
+/// documents, one level up.
+#[allow(dead_code)]
+pub fn wait_for_file_lines(path: &Path, want: usize, timeout: Duration) -> Result<(), String> {
+    wait_for_file_matching(path, timeout, |contents| {
+        contents.matches('\n').count() >= want
+    })
+}
+
 /// Blocking `read_exact` bounded by a wall-clock `deadline`, tolerating the
 /// per-read timeout set on the stream. Returns `Err` on EOF / hard error / the
 /// deadline passing before the buffer fills.
