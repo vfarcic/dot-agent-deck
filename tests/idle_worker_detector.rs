@@ -1,3 +1,21 @@
+// PRD #126: this suite is Unix-only at the source level, for the two reasons the
+// repo already gates on. (1) Every test's harness spawns a real PTY running a
+// POSIX-shell stub — `stty -echo -icanon`, `printf`, `exec cat -u`, `trap ''
+// TERM` under a pinned `SHELL=/bin/sh` — none of which exists on Windows, the
+// same rationale as `src/agent_pty.rs`'s `#[cfg(all(test, unix))] mod
+// spawn_tests`. (2) `006`/`008`/`009`/`010` additionally drive the REAL
+// `StopAgent` attach request over a Unix-domain socket via
+// `common::attach_request_on`, which is itself `#[cfg(unix)]`.
+//
+// Unlike the `e2e_*.rs` suites, this file is FAST tier, so CI's Windows job
+// (`cargo nextest run`, no `--features e2e`) does compile it — which is how the
+// missing gate surfaced there as an `attach_request_on` E0425 and nowhere else.
+// `#![cfg(unix)]` makes the crate empty on Windows so that build compiles and
+// does not panic; on Linux and macOS every test still runs and asserts exactly
+// as before, matching the `Platform coverage: mac+linux` already documented for
+// all 14 of these specs in `tests/CATALOG.md`. A named-pipe + ConPTY port of the
+// harness is tracked by #164 (M10).
+#![cfg(unix)]
 //! Fast-tier behavioral coverage for the daemon's idle-worker detector.
 //!
 //! These tests exercise the real `AppState::handle_delegate` and
