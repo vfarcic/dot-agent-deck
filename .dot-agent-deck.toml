@@ -48,6 +48,13 @@
 #      snapshot (your panes still restore on next launch)
 # =============================================================================
 
+# PRD #126: how long a delegated worker may stay silent before the daemon
+# reports it to the orchestrator. This is the default (120) stated explicitly —
+# and it MUST stay above the first `[[table]]` header below, because TOML would
+# otherwise read it as a key of the preceding table and silently ignore it.
+# `0` disables the detector; accepted range is 1..=10080 minutes.
+worker_response_timeout_minutes = 120
+
 [[modes]]
 name = "dev"
 init_command = "devbox shell"

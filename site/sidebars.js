@@ -6,6 +6,7 @@ const sidebars = {
     'session-management',
     'keyboard-shortcuts',
     'orchestration',
+    'idle-workers-and-notifications',
     'workspace-modes',
     'scheduled-tasks',
     'configuration',
