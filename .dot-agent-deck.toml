@@ -96,7 +96,7 @@ When the user's request relates to a PRD, read only the PRD file from the prds/ 
    - One-sentence Scenario summary.
    - Action: extend / modify / create / skip.
 
-   Surface the plan to the user as a Markdown table and STOP. Wait for explicit approval or refinement. Don't delegate any work until the plan is signed off. Immediately before you stop, send the **test-plan gate** notification (see **Notifications** below). Send and continue: ignore the result, and stop as normal.
+   Surface the plan to the user as a Markdown table and STOP. Wait for explicit approval or refinement. Don't delegate any work until the plan is signed off.
 
 2. **Execution phase.** Per the approved plan:
    - **L2 synthetic + L1 widget items** → TDD chain: delegate to **tester** (writes failing test, confirms RED, reports back), then to **coder** (implements — production code only, never editing the tester's test), then back to **tester** (confirms GREEN).
@@ -133,11 +133,12 @@ There are exactly TWO user gates in this workflow: the test-plan approval (step 
 
 **Fire-and-forget.** Send and continue — NEVER wait for an acknowledgment, never poll for delivery, never retry, and never let a send result change what you do next. A failed send is a lost notification, not a workflow event.
 
-You notify at exactly these five moments and nowhere else — per-step chatter defeats the purpose. Every message starts with `dot-agent-deck PRD #<n> — ` so that parallel orchestrations are distinguishable, and carries only *done* vs *needs attention* and *what*:
+**The selection rule.** The criterion is not "every pause for a human" but **every pause where the human may have walked away**. A gate that fires seconds into a run, with the user still sitting there watching, earns nothing; a gate that arrives after a long unattended stretch earns a lot. That is why the **test-plan gate (step 1) is deliberately NOT a notify moment** — it fires immediately after the run starts, the user is invariably still there, and a message about it is noise. Do not add it back.
+
+You notify at exactly these four moments and nowhere else — per-step chatter defeats the purpose. Every message starts with `dot-agent-deck PRD #<n> — ` so that parallel orchestrations are distinguishable, and carries only *done* vs *needs attention* and *what*:
 
 | Moment | Message |
 |---|---|
-| Test-plan gate (step 1), immediately before you stop | `dot-agent-deck PRD #<n> — needs approval: test plan ready` |
 | Escalation: a worker's `work-done` returned a question you cannot answer without the user | `dot-agent-deck PRD #<n> — needs input: <one line>` |
 | Merge gate (step 7), immediately before you pause | `dot-agent-deck PRD #<n> — needs go-ahead: merge PR #<pr>` |
 | Run finished — *fully* merged and closed, or abandoned. NEVER for partial progress. | `dot-agent-deck PRD #<n> — DONE: merged & closed` or `dot-agent-deck PRD #<n> — ABANDONED: <one-line reason>` |

@@ -178,6 +178,8 @@ The orchestrator delegates a task to one or more workers. The deck delivers the 
 
 ![Coder pane active and working after receiving a delegation from the orchestrator](./img/orchestration-coder.png)
 
+A worker that never signals completion would otherwise stall the pipeline silently, since the orchestrator is parked waiting for it and gets no turn in which to notice. The daemon covers that case on a timeout — see [Idle Workers & Notifications](idle-workers-and-notifications.md), which also shows how to turn the moments a run stops and waits for you into messages that reach you away from the terminal.
+
 ### Parallel delegation
 
 The orchestrator can delegate to multiple workers simultaneously — for example, sending a code change to both a reviewer and an auditor at the same time. Both workers start immediately and report back independently when done.
@@ -404,6 +406,7 @@ If you run two orchestration tabs from different directories that happen to have
 
 ## See also
 
+- [Idle Workers & Notifications](idle-workers-and-notifications.md) — the timeout that reports a silent worker to the orchestrator, and an example recipe for notifying yourself
 - [Workspace Modes](workspace-modes.md) — the simpler tab type that pairs an agent with live side panes
 - [Configuration](configuration.md) — global and project-level configuration options
 - [Keyboard Shortcuts](keyboard-shortcuts.md) — all keybindings, including tab navigation

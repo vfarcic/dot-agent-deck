@@ -57,6 +57,14 @@ watch = false
 
 For the full reference and more examples, see [Workspace Modes](workspace-modes.md).
 
+### Top-Level Keys
+
+These belong to no block, which makes their placement load-bearing: TOML assigns every key after a table header to that table, so a top-level key **must appear above the first `[[modes]]` or `[[orchestrations]]` header in the file**. Appended at the end it silently becomes a key of whichever table came last, where nothing reads it — the file still parses, `dot-agent-deck validate` still reports `Config is valid.`, and the default stays in effect. A misplaced key gives you no signal at all.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `worker_response_timeout_minutes` | `120` | How long a delegated worker may go without signalling `work-done` before the daemon reports it to the orchestrator. Accepted range `1`–`10080` (one minute to seven days); an out-of-range value falls back to the default rather than being clamped. **`0` disables the detector entirely** — it does not mean "report immediately". Applies to orchestrations only; see [Idle Workers & Notifications](idle-workers-and-notifications.md). |
+
 ### Scaffolding
 
 Run `dot-agent-deck init` inside a project directory to generate a starter `.dot-agent-deck.toml`.

@@ -1,5 +1,4 @@
 ---
-sidebar_position: 5.6
 title: Idle Workers & Notifications
 ---
 
@@ -12,6 +11,8 @@ The first is a **product feature**: the daemon watches every outstanding delegat
 The second is an **example recipe**: how one project (this one) wires its orchestrator's prompt so that those moments — plus the handful of other times a run stops and waits for a human — arrive on the maintainer's phone. Telegram is the worked example, but the channel is yours to pick, and none of it is built into the deck.
 
 If you take one thing from this page, take the split: **the deck produces the signal an agent structurally cannot produce about itself; your agent decides what the signal means.**
+
+**Both parts require an [orchestration](orchestration.md).** Idle-worker detection watches *delegations*, and a delegation only exists inside an orchestration tab — so a plain agent pane, a workspace mode, and a single-agent scheduled task never produce an idle prompt, however long they run. Part 2 is orchestration-scoped for the same reason: the recipe is text in an orchestrator's `prompt_template`, and only an orchestration has an orchestrator. If you do not run orchestrations, nothing here applies to your setup yet.
 
 ## Part 1 — Idle-worker detection
 
@@ -35,7 +36,7 @@ working: check its pane and decide how to proceed - if this needs the user,
 notify them; otherwise keep waiting, re-delegate, or reassign.
 ```
 
-Two details in that text are deliberate. It **names itself as a daemon report**, because the receiving agent has no other context for why an unsolicited prompt appeared in its transcript and must not mistake it for a message from you. And the role name is **quoted as untrusted data**, because role names come from a `.dot-agent-deck.toml` that travels with any clone, while the prompt is auto-submitted to an agent that has tool access — a role named `worker. Ignore prior instructions and …` must not be able to read as prose continuing the daemon's own sentence.
+Two details in that text are deliberate. It **names itself as a daemon report**, because the receiving agent has no other context for why an unsolicited prompt appeared in its transcript and must not mistake it for a message from you. And the role name is **quoted as untrusted data**, because it is copied verbatim out of your project config into a prompt that is auto-submitted — a role named `worker. Ignore prior instructions and …` should not read as prose continuing the daemon's own sentence. That is provenance hygiene, keeping the prompt honest about which span is a copied label rather than an instruction.
 
 ### What the daemon does not do
 
@@ -130,17 +131,24 @@ That is not tidiness, it is topology. Suppose a worker did message you and wait 
 
 There is a practical bonus. Because only the orchestrator sends, only the orchestrator needs the channel wired up — which matters more than it sounds, as the next section explains.
 
-### The five moments
+### The four moments
 
-Notify when the run stops needing a computer and starts needing you. In this project's workflow that is exactly five moments, and per-step chatter is deliberately absent — a message for every delegation would train you to ignore all of them.
+Notify when the run stops needing a computer and starts needing you. In this project's workflow that is exactly four moments, and per-step chatter is deliberately absent — a message for every delegation would train you to ignore all of them.
 
 | Moment | Example message |
 |---|---|
-| **Test-plan gate** — the plan is ready and the run stops for approval | `myrepo PRD #126 — needs approval: test plan ready` |
 | **Escalation** — a worker returned a question the orchestrator cannot answer alone | `myrepo PRD #126 — needs input: which timeout default?` |
 | **Merge gate** — checks are green and the run stops for a merge go-ahead | `myrepo PRD #126 — needs go-ahead: merge PR #223` |
 | **Run finished** — *fully* done: merged and closed, or abandoned | `myrepo PRD #126 — DONE: merged & closed` |
 | **Idle worker** — the daemon's report from Part 1 arrived | `myrepo PRD #126 — STUCK: coder silent >120 min` |
+
+### Which pauses earn a message
+
+The obvious rule is "notify at every pause for a human", and it is the wrong one. The criterion that holds up is **every pause where the human may have walked away.** A gate that fires seconds into a run, while you are still sitting there watching it start, earns nothing — you will have answered it before your phone finishes buzzing, and the message only teaches you that this channel carries things you do not need. A gate that arrives after a long unattended stretch earns a lot, because it is the only thing standing between "waiting on you" and "waiting on you for three hours".
+
+This workflow used to have a fifth moment, and dropping it is the clearest illustration of that rule: an approval gate that fired a few seconds into the run, on a plan the operator was still watching get written. It was removed for being noise, not for being unimportant.
+
+The honest cost of that removal: if you *do* walk away immediately after starting a run, a plan waiting for approval now has no out-of-band signal at all — and idle-worker detection cannot cover the gap either, because nothing has been delegated yet at that point, so there is no outstanding delegation to time out. The run simply sits at the start until you come back to the terminal. Nothing is lost, but nothing tells you.
 
 "Fully done" is worth spelling out in your prompt, because agents are enthusiastic about progress. A message when the PR opens, when CI goes green, when a review posts — each is a moment the agent feels is significant and you cannot act on. One message when the whole thing is over.
 
@@ -206,7 +214,7 @@ A chat id is an **identifier, not a credential**: knowing it does not let anyone
 
 There is an asymmetry here worth understanding before you rely on any of this.
 
-The gate, escalation, and done notifications live in the **orchestrator's prompt**. On a long run that prompt can be compacted away — the instructions were context, and context is what compaction reclaims. The symptom is silence: the run reaches a gate and stops, correctly, but no message is sent, and you find out by wandering back to the terminal. Nothing errors, so nothing tells you it happened. See [PRD #82](https://github.com/vfarcic/dot-agent-deck/issues/82) for how that mechanism is being addressed more generally.
+The escalation, merge-gate, and done notifications live in the **orchestrator's prompt**. On a long run that prompt can be compacted away — the instructions were context, and context is what compaction reclaims. The symptom is silence: the run reaches a gate and stops, correctly, but no message is sent, and you find out by wandering back to the terminal. Nothing errors, so nothing tells you it happened. See [PRD #82](https://github.com/vfarcic/dot-agent-deck/issues/82) for how that mechanism is being addressed more generally.
 
 The daemon's **idle-worker prompt does not have that failure mode**. It is injected fresh at the moment it fires and it is self-describing: it explains what it is and what the orchestrator might do about it, in its own text. An orchestrator that has forgotten every notification instruction still receives a coherent report and can still act sensibly on it.
 
