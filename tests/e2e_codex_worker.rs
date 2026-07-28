@@ -112,7 +112,10 @@ async fn codex_worker_001_inner() {
             .pane_role_map
             .insert(WORKER_PANE.to_string(), WORKER_ROLE.to_string());
         state.orchestrator_pane_ids.insert(ORCH_PANE.to_string());
-        let orchestration = ("codex-worker-orchestration".to_string(), cwd_str.clone());
+        let orchestration = dot_agent_deck::state::OrchestrationIdentity::NameCwd {
+            name: "codex-worker-orchestration".to_string(),
+            cwd: cwd_str.clone(),
+        };
         state
             .pane_orchestration_map
             .insert(ORCH_PANE.to_string(), orchestration.clone());

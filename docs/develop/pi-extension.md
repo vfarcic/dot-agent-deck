@@ -35,12 +35,14 @@ The extension subscribes with `pi.on(name, handler)` (note: `pi.events` is the *
 
 | Pi event | Reported state |
 |---|---|
-| `session_start` | `waiting` |
+| `session_start` | `finished` (Idle — awaiting first prompt) |
 | `agent_start` | `running` |
-| `agent_settled` | `waiting` |
+| `agent_settled` | `finished` (Idle — turn settled) |
 | `session_shutdown` | `finished` |
-| `agent_end` | *(deliberately unmapped)* — Pi may auto-retry/compact/drain follow-ups after it, so it is not a reliable idle signal; `agent_settled` is |
+| `agent_end` | *(deliberately unmapped)* — Pi may auto-retry/compact/drain follow-ups after it, so it is not a reliable turn-end signal; `agent_settled` is |
 | anything else | *(no `agent-event` emitted)* — so a bogus `--type` can never reach the CLI |
+
+**Parity with the other backends.** A turn ending is `Idle`, not "Needs Input". Claude, OpenCode, and Codex map their turn-end signal (`Stop` / `session.idle`) and session-start to Idle, and surface "Needs Input" (`waiting`) only on a genuine user-blocking signal (a permission prompt / attention notification). Pi's `agent_settled` is its turn-end analog, so it reports `finished` → Idle; because Pi exposes no permission/attention lifecycle event today, it never reports `waiting` — like a Claude agent that never hits a permission prompt. `waiting` stays a valid CLI `--type` (below) so a future Pi user-blocking event can map to it with no wire change.
 
 ## The `agent-event` CLI seam
 

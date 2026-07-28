@@ -135,6 +135,13 @@ fn run_wrapped_program(
         .env("CODEX_HOME_RECORD", &home_record)
         .env("CODEX_HOOK_LIST_RESPONSE", hook_response)
         .env("DOT_AGENT_DECK_PANE_ID", "codex-trust-test-pane")
+        // Pin the hook endpoint at a dead path inside the fixture. The wrapper
+        // emits `SessionStart`/`Idle` as it runs and resolves this var at emit
+        // time, so without it the events travel to whatever daemon the
+        // developer's `XDG_RUNTIME_DIR` points at — landing in their live deck
+        // as a card for a pane that does not exist. Nothing listens here, and
+        // `hook::send_to_socket` treats an unreachable socket as a no-op.
+        .env("DOT_AGENT_DECK_SOCKET", fixture_dir.join("nowhere.sock"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -187,6 +194,14 @@ fn run_fake_codex(
         .env("CODEX_ARGS_RECORD", &args_record)
         .env("CODEX_HOME_RECORD", fixture_dir.join("home.txt"))
         .env("CODEX_HOOK_LIST_RESPONSE", hook_list_response(Vec::new()))
+        // Same reason as `run_wrapped_program` above: the wrapper emits as it
+        // runs and resolves its endpoint at emit time. This site inherits no
+        // pane id of its own, so without the pin it tags events with the pane
+        // of whatever deck is running the suite and writes status into that
+        // real card.
+        .env("DOT_AGENT_DECK_SOCKET", fixture_dir.join("nowhere.sock"))
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

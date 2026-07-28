@@ -162,7 +162,8 @@ fn prepare_claude_home(worker_cwd: &str) -> TempDir {
 /// non-interactive) with the bundled extension loaded from the daemon's HOME. The
 /// cron never fires on its own (Jan 1 00:00) — the fire is driven by `RunNow`.
 /// A tiny `-p` prompt keeps the model turn cheap; the status we observe
-/// (session_start → waiting) fires on boot, before/independent of the turn.
+/// (session_start → finished/Idle on boot, then agent_start → running/Thinking
+/// on the turn) fires independent of the model's decision.
 fn pi_schedule_toml(working_dir: &str) -> String {
     format!(
         "[[scheduled_tasks]]\n\
@@ -282,7 +283,10 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
         st.pane_role_map
             .insert(WORKER_PANE.to_string(), WORKER_ROLE.to_string());
         st.orchestrator_pane_ids.insert(ORCH_PANE.to_string());
-        let orch = ("pi-orchestration".to_string(), cwd_str.clone());
+        let orch = dot_agent_deck::state::OrchestrationIdentity::NameCwd {
+            name: "pi-orchestration".to_string(),
+            cwd: cwd_str.clone(),
+        };
         st.pane_orchestration_map
             .insert(ORCH_PANE.to_string(), orch.clone());
         st.pane_orchestration_map
@@ -315,7 +319,7 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
     .expect("stage the bundled pi extension into the orchestrator HOME");
 
     // Collect the extension's `agent-event` broadcasts BEFORE spawning pi, so its
-    // session_start (→ waiting) status report can't be missed.
+    // session_start (→ finished/Idle) status report can't be missed.
     let event_log = common::BroadcastEventLog::start(&daemon.event_tx);
 
     // CRITICAL (harness caveat): explicitly propagate OPENROUTER_API_KEY + HOME
@@ -445,13 +449,17 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
 
     // 3. The Pi pane's status was tracked via the extension's `agent-event` path
     //    (no hook): a `Pi`-typed AgentEvent for the orchestrator pane rode the
-    //    daemon's broadcast. Match ONLY the extension's mapped states
-    //    (WaitingForInput / Thinking / Idle from `agent-event --type
-    //    waiting|running|finished`), NOT a `SessionStart` — so a Pi status here
-    //    can ONLY have come from the real extension shelling `agent-event`, never
-    //    a daemon-side `from_command` spawn-time guess. (This pane is spawned via
-    //    the low-level registry, which does not synthesize a spawn-time event, but
-    //    the filter makes the intent explicit and bulletproof.)
+    //    daemon's broadcast. Match ONLY the extension's mapped states — Thinking /
+    //    Idle (from `agent-event --type running|finished`; the extension now maps
+    //    session_start & agent_settled → finished/Idle and agent_start → running,
+    //    matching the other backends — `waiting`/WaitingForInput is reserved for a
+    //    future Pi permission event and kept in the arm for forward-compat), and
+    //    explicitly NOT a `SessionStart`. A raw non-`SessionStart` Pi event can
+    //    ONLY have come from the real extension shelling `agent-event`, never a
+    //    daemon-side `from_command` spawn-time guess (which broadcasts
+    //    `SessionStart`). (This pane is spawned via the low-level registry, which
+    //    does not synthesize a spawn-time event, but the filter makes the intent
+    //    explicit and bulletproof.)
     let pi_status = event_log
         .wait_for(
             |e| {
@@ -552,16 +560,18 @@ fn scheduler_pi_001_scheduled_unattended_status_via_extension() {
         .expect("run-now pi-unattended");
 
     // The real extension reports the Pi pane's status on boot (session_start →
-    // waiting) and the daemon re-broadcasts it. Generous window to absorb the pi
-    // spawn + Node/Bun boot + extension load, unattended.
+    // finished/Idle) and again on the turn (agent_start → running/Thinking), and
+    // the daemon re-broadcasts them. Generous window to absorb the pi spawn +
+    // Node/Bun boot + extension load, unattended.
     //
-    // CRITICAL: match ONLY the extension's mapped states — WaitingForInput /
-    // Thinking / Idle (the `agent-event --type waiting|running|finished`
-    // mappings) — and explicitly NOT `SessionStart`. The scheduler's spawn path
-    // (`surface_spawned_pane`) broadcasts a synthetic `SessionStart` carrying the
-    // `from_command`-guessed `Pi` type the instant the pane spawns, BEFORE pi's
-    // Node runtime boots or the extension loads. Matching that guess would be a
-    // false pass (it proves nothing about the real extension). Only a
+    // CRITICAL: match ONLY the extension's mapped states — Thinking / Idle (the
+    // `agent-event --type running|finished` mappings; `waiting`/WaitingForInput is
+    // reserved for a future Pi permission event and kept in the arm for
+    // forward-compat) — and explicitly NOT `SessionStart`. The scheduler's spawn
+    // path (`surface_spawned_pane`) broadcasts a synthetic `SessionStart` carrying
+    // the `from_command`-guessed `Pi` type the instant the pane spawns, BEFORE
+    // pi's Node runtime boots or the extension loads. Matching that guess would be
+    // a false pass (it proves nothing about the real extension). Only a raw
     // non-`SessionStart` Pi event can have originated from the real extension
     // shelling `dot-agent-deck agent-event` — which is exactly M4.2's claim.
     let ev = sub.wait_for(

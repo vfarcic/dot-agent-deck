@@ -538,6 +538,14 @@ impl TabManager {
             .clone()
             .unwrap_or_else(|| resolved_name.clone());
 
+        // PRD #140 M1.2: mint ONE instance token for the whole tab, before
+        // the role loop, and stamp it on every role's membership. This is
+        // what makes two tabs of the SAME orchestration in the SAME directory
+        // two distinct daemon-side routing groups — `resolved_name` and `cwd`
+        // are byte-identical between them, so without the token the daemon
+        // cross-delivers delegate/work-done between the two tabs (issue #140).
+        let orchestration_id = crate::agent_pty::mint_orchestration_id();
+
         // PRD #76 M2.12: tag each role pane with its orchestration tab
         // membership so the daemon-side registry can echo it back via
         // `list_agents` and the TUI rebuilds the orchestration tab on
@@ -559,6 +567,8 @@ impl TabManager {
                     // every role pane so reattach restores it (see the
                     // hydration path in `open_orchestration_tab_with_existing_role_panes`).
                     display_title: display_title_owned.clone(),
+                    // PRD #140 M1.2: same token on every role of this tab.
+                    orchestration_id: Some(orchestration_id.clone()),
                 }),
                 rows: spawn_rows,
                 cols: spawn_cols,

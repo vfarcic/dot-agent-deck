@@ -79,6 +79,20 @@ fn spawn_005_respawn_wraps_codex() {
             bin_dir.display(),
             std::env::var("PATH").expect("test runner PATH")
         );
+        // Point the wrapper rewrite at the recorder. The rewrite names the
+        // co-located build by absolute path (so the suite tests what it just
+        // compiled rather than whatever is installed on $PATH), which means a
+        // fake `dot-agent-deck` on the child's PATH is no longer what runs —
+        // this override is the seam for observing it. Set on THIS process
+        // because the rewrite happens here, not in the child; nextest gives
+        // each test its own process, so it cannot leak sideways.
+        // SAFETY: single-threaded test process, set before the spawn below.
+        unsafe {
+            std::env::set_var(
+                dot_agent_deck::wrap::DOT_AGENT_DECK_WRAP_BIN,
+                bin_dir.join("dot-agent-deck"),
+            );
+        }
         let registry = AgentPtyRegistry::new();
         registry
             .spawn_agent(SpawnOptions {
@@ -140,6 +154,20 @@ fn spawn_006_explicit_codex_identity_wraps_noninferable_launcher() {
         bin_dir.display(),
         std::env::var("PATH").expect("test runner PATH")
     );
+    // Point the wrapper rewrite at the recorder. The rewrite names the
+    // co-located build by absolute path (so the suite tests what it just
+    // compiled rather than whatever is installed on $PATH), which means a
+    // fake `dot-agent-deck` on the child's PATH is no longer what runs —
+    // this override is the seam for observing it. Set on THIS process
+    // because the rewrite happens here, not in the child; nextest gives
+    // each test its own process, so it cannot leak sideways.
+    // SAFETY: single-threaded test process, set before the spawn below.
+    unsafe {
+        std::env::set_var(
+            dot_agent_deck::wrap::DOT_AGENT_DECK_WRAP_BIN,
+            bin_dir.join("dot-agent-deck"),
+        );
+    }
     let registry = AgentPtyRegistry::new();
     registry
         .spawn_agent(SpawnOptions {
@@ -209,6 +237,23 @@ fn spawn_007_hook_learned_badge_does_not_change_respawn_launch() {
             bin_dir.display(),
             std::env::var("PATH").expect("test runner PATH")
         );
+        // Point the wrapper rewrite at the recorder (same seam as spawn/005 and
+        // spawn/006). Without it this assertion cannot fail for the regression
+        // it guards: the rewrite now names the co-located build by absolute
+        // path, so an unwanted wrapper would exec the REAL deck, which in turn
+        // execs `devbox run codex-big` — and the devbox stub would record the
+        // very same `BARE devbox run codex-big` line as the unwrapped launch.
+        // With the override, a wrapper shows up as a `WRAPPED …` line instead.
+        // Set on THIS process because the rewrite happens here, not in the
+        // child; nextest gives each test its own process, so it cannot leak
+        // sideways.
+        // SAFETY: single-threaded test process, set before the spawn below.
+        unsafe {
+            std::env::set_var(
+                dot_agent_deck::wrap::DOT_AGENT_DECK_WRAP_BIN,
+                bin_dir.join("dot-agent-deck"),
+            );
+        }
         let registry = AgentPtyRegistry::new();
         registry
             .spawn_agent(SpawnOptions {
@@ -306,6 +351,20 @@ fn spawn_008_respawn_wrap_decision_follows_the_launched_command() {
             bin_dir.display(),
             std::env::var("PATH").expect("test runner PATH")
         );
+        // Point the wrapper rewrite at the recorder (same seam as spawn/005 and
+        // spawn/006). The rewrite names the co-located build by absolute path,
+        // so a fake `dot-agent-deck` on the child's PATH is no longer what runs
+        // — without this override the wrapped launches would exec the REAL deck
+        // and the recorder would only ever see the inner `devbox` line. Set on
+        // THIS process because the rewrite happens here, not in the child;
+        // nextest gives each test its own process, so it cannot leak sideways.
+        // SAFETY: single-threaded test process, set before the spawn below.
+        unsafe {
+            std::env::set_var(
+                dot_agent_deck::wrap::DOT_AGENT_DECK_WRAP_BIN,
+                bin_dir.join("dot-agent-deck"),
+            );
+        }
         // Wait until the recorder has appended `want` lines, so each launch is
         // observed before the next respawn overwrites the pane.
         let await_lines = |want: usize| {

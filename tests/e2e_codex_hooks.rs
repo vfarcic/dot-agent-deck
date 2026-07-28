@@ -142,6 +142,11 @@ fn codex_hooks_002_script_launch_installs_exact_scoped_trust() {
         .env("CODEX_CHILD_RECORD", &child_record)
         .env("CODEX_HOOK_LIST_RESPONSE", deck_hook_response())
         .env("DOT_AGENT_DECK_PANE_ID", "script-codex-pane")
+        // Pin the hook endpoint at a dead path inside the fixture — see the
+        // same guard in `codex_hooks_safety.rs`. The wrapper resolves this at
+        // emit time, so leaving it unset sends this test's events to the
+        // developer's live daemon and mints a phantom card there.
+        .env("DOT_AGENT_DECK_SOCKET", fixture.path().join("nowhere.sock"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

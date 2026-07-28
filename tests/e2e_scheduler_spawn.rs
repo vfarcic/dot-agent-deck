@@ -384,6 +384,7 @@ fn spawn_006_single_and_role_codex_commands_are_wrapped() {
         bin_dir.display(),
         std::env::var("PATH").expect("test runner PATH")
     );
+    let wrap_bin = bin_dir.join("dot-agent-deck");
     let daemon = common::spawn_daemon_serve_with_env(
         Some(&schedules),
         "0",
@@ -392,6 +393,13 @@ fn spawn_006_single_and_role_codex_commands_are_wrapped() {
             (
                 "CODEX_SCHED_RECORD",
                 record.to_str().expect("record path UTF-8"),
+            ),
+            // The rewrite names the co-located build by absolute path now, so a
+            // fake `dot-agent-deck` on PATH is no longer what the wrapper
+            // resolves to. Point the rewrite at the recorder explicitly.
+            (
+                "DOT_AGENT_DECK_WRAP_BIN",
+                wrap_bin.to_str().expect("wrap bin path UTF-8"),
             ),
         ],
     );

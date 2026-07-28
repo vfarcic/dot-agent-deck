@@ -667,11 +667,16 @@ fn dispatch_004_orchestration_vs_single_agent() {
     let ghdir = stub.ghstub_dir();
     let cfg_str = cfg.to_string_lossy().into_owned();
     let record_str = launch_record.to_string_lossy().into_owned();
+    let wrapper_stub_str = wrapper_stub.to_string_lossy().into_owned();
     let env: Vec<(&str, &str)> = vec![
         ("PATH", path.as_str()),
         ("GHSTUB_DIR", ghdir.as_str()),
         ("DOT_AGENT_DECK_CONFIG", cfg_str.as_str()),
         ("CODEX_DISPATCH_RECORD", record_str.as_str()),
+        // The rewrite names the co-located build by absolute path now, so a
+        // fake `dot-agent-deck` on PATH is no longer what the wrapper
+        // resolves to. Point the rewrite at the recorder explicitly.
+        ("DOT_AGENT_DECK_WRAP_BIN", wrapper_stub_str.as_str()),
     ];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
 
