@@ -853,6 +853,42 @@ impl TuiDeck {
         String::from_utf8_lossy(&self.byte_history.lock().unwrap()).into_owned()
     }
 
+    /// Wait for the deck PROCESS to exit and for every byte it wrote on the way
+    /// out to be drained into the rolling history, then report whether it exited
+    /// successfully (`Some(true)`) or with a failure status (`Some(false)`).
+    /// `None` means it was still alive when `timeout` elapsed.
+    ///
+    /// Required by any assertion that COUNTS or ORDERS bytes from the teardown
+    /// path. [`wait_for_stream_string_within`](Self::wait_for_stream_string_within)
+    /// returns the instant the FIRST match appears, which during a shutdown is
+    /// before the process is actually gone — so a duplicate emitted a moment
+    /// later (a second terminal-mode pop from an RAII `Drop`, say) lands after
+    /// the snapshot, and an "exactly once" assertion passes against an
+    /// implementation that in fact does it twice. Draining to exit first closes
+    /// that window; the exit status additionally proves the quit path returned
+    /// cleanly instead of dying on the way out.
+    pub fn wait_for_exit_within(&mut self, timeout: Duration) -> Option<bool> {
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break status,
+                // Unwaitable (already reaped elsewhere) — report it as "did not
+                // observe a clean exit" rather than inventing a status.
+                Err(_) => return None,
+                Ok(None) => {}
+            }
+            if Instant::now() > deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // The writer is dead, so no NEW bytes can appear — but the reader thread
+        // may still be a poll cycle behind on what the PTY already buffered.
+        // Quiescence is the drain signal, and it is reached promptly now.
+        self.wait_until_quiescent();
+        Some(status.success())
+    }
+
     /// Like [`wait_for_string`] (scans the RECONSTRUCTED vt100 grid, so
     /// styled UI chrome — a bottom-bar affordance, a tab label, a card
     /// field — whose glyphs are written as separate styled runs is matched

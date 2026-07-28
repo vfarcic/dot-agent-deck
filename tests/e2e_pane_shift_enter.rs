@@ -352,15 +352,18 @@ fn key_forwarding_001_shift_enter_inserts_newline_without_submitting() {
 /// harness with no pane at all, and assert its OUTPUT stream carries
 /// `ESC[>1u` — the enhanced-keyboard-protocol push (M2) — once the dashboard is
 /// up, since the harness answers the capability probe like a kitty-capable
-/// terminal. Then quit cleanly with Ctrl+C twice and assert the matching
-/// `ESC[<1u` pop appears exactly once, after the push, so the deck cannot leave
-/// the user's shell in the enhanced mode.
+/// terminal. Then quit cleanly with Ctrl+C twice, wait for the process to
+/// actually exit, and assert the matching `ESC[<1u` pop appears exactly once,
+/// after the push, so the deck cannot leave the user's shell in the enhanced
+/// mode.
 #[spec("embed/key-forwarding/002")]
 #[test]
 fn key_forwarding_002_enhanced_keyboard_protocol_pushed_and_popped() {
     // No agent, no credentials, no LLM: the whole behavior is the deck's own
     // terminal negotiation, so this is fully deterministic and costs nothing.
-    let deck = TuiDeck::launch_with_fixture("minimal");
+    //
+    // `mut` for `wait_for_exit_within` below, which reaps the child.
+    let mut deck = TuiDeck::launch_with_fixture("minimal");
     deck.wait_for_string("No active sessions");
 
     // --- The push (Gap 1). The harness's `answer_terminal_queries` replies to
@@ -385,37 +388,68 @@ fn key_forwarding_002_enhanced_keyboard_protocol_pushed_and_popped() {
     deck.wait_for_string("Quit dot-agent-deck?");
     deck.send_bytes(b"\x03");
 
-    assert!(
-        deck.wait_for_stream_string_within(POP_ENHANCEMENT, Duration::from_secs(30)),
-        "the deck exited without popping the enhanced keyboard protocol: no {POP_ENHANCEMENT:?} \
-         in its output stream. A leaked push is not cosmetic — it outlives the process and \
-         corrupts key delivery in the shell the user is dropped back into.\nStream:\n{:?}",
+    // Wait for the PROCESS to be gone (and its output drained) before measuring,
+    // not merely for the first pop to appear. Two reasons, both load-bearing:
+    //
+    //  * MULTIPLICITY. `wait_for_stream_string_within` returns the instant the
+    //    first pop shows up, which is mid-shutdown — a SECOND pop written later
+    //    (the RAII guard's `Drop`, or the panic hook) would land after that
+    //    snapshot, so `count() == 1` would pass against an implementation that
+    //    genuinely double-pops. Given how much of this milestone is guard /
+    //    teardown / panic-hook restructuring, double-popping is exactly the
+    //    regression this assertion exists to catch, and it has to be measured on
+    //    the FINAL stream.
+    //  * CLEAN EXIT. A zero status proves the Ctrl+C path returned normally
+    //    rather than the pop being a side effect of the process dying.
+    let exited_cleanly = deck.wait_for_exit_within(Duration::from_secs(30));
+    assert_eq!(
+        exited_cleanly,
+        Some(true),
+        "the deck did not exit cleanly after two Ctrl+C ({exited_cleanly:?}; None = still \
+         running at the 30s ceiling). Terminal-mode restoration is only meaningful on an \
+         orderly exit, and the pop counts below are only trustworthy once the process is \
+         gone.\nFinal grid:\n{}\nStream:\n{:?}",
+        deck.snapshot_grid(),
         deck.stream_text()
     );
 
-    // Ordering and multiplicity, which a `contains` cannot express. A pop before
-    // its push would be popping some other program's flags, and a SECOND pop
-    // would discard whatever sits under ours on the terminal's stack — the reason
-    // the pop is a test-and-clear on a single `AtomicBool` rather than
-    // unconditional (see `pop_keyboard_enhancement`).
+    // The FINAL stream: the process is gone, so nothing more can be appended.
     let stream = deck.stream_text();
-    let push_at = stream
-        .find(PUSH_ENHANCEMENT)
-        .expect("push asserted present above");
-    let pop_at = stream
-        .find(POP_ENHANCEMENT)
-        .expect("pop asserted present above");
-    assert!(
-        push_at < pop_at,
-        "the pop ({POP_ENHANCEMENT:?} at byte {pop_at}) precedes the push \
-         ({PUSH_ENHANCEMENT:?} at byte {push_at}), so the deck popped flags it had not pushed."
+
+    assert_eq!(
+        stream.matches(PUSH_ENHANCEMENT).count(),
+        1,
+        "expected exactly ONE {PUSH_ENHANCEMENT:?} push. Zero means M2 never ran (a \
+         kitty-capable terminal then stays in legacy mode, where Shift+Enter has no distinct \
+         encoding and arrives as a bare CR — the modifier is gone before any deck code runs \
+         and the M1 encoder never sees it). More than one means the deck stacked pushes it \
+         cannot symmetrically pop, leaking the enhanced mode into the user's \
+         shell.\nStream:\n{stream:?}"
     );
     assert_eq!(
         stream.matches(POP_ENHANCEMENT).count(),
         1,
-        "expected exactly ONE {POP_ENHANCEMENT:?} pop for the single push. Both the normal \
-         teardown and the RAII guard's Drop run on a clean exit, so more than one here means \
-         the test-and-clear on KEYBOARD_ENHANCEMENT_PUSHED stopped making the pop idempotent \
-         and the deck can now discard a flag set another program owns."
+        "expected exactly ONE {POP_ENHANCEMENT:?} pop for the single push. Zero means the \
+         deck exited leaving the enhanced mode set — not cosmetic, it outlives the process \
+         and corrupts key delivery in the shell the user is dropped back into. More than one \
+         means the test-and-clear on KEYBOARD_ENHANCEMENT_PUSHED stopped making the pop \
+         idempotent, and the extra pop discards whatever sits UNDER ours on the terminal's \
+         stack — a flag set some other program owns. Both the explicit teardown and the RAII \
+         guard's `Drop` run on this exit path, so exactly one is the whole \
+         property.\nStream:\n{stream:?}"
+    );
+
+    // Ordering, which a count cannot express: a pop before its push would be
+    // popping some other program's flags.
+    let push_at = stream
+        .find(PUSH_ENHANCEMENT)
+        .expect("push counted exactly once above");
+    let pop_at = stream
+        .find(POP_ENHANCEMENT)
+        .expect("pop counted exactly once above");
+    assert!(
+        push_at < pop_at,
+        "the pop ({POP_ENHANCEMENT:?} at byte {pop_at}) precedes the push \
+         ({PUSH_ENHANCEMENT:?} at byte {push_at}), so the deck popped flags it had not pushed."
     );
 }

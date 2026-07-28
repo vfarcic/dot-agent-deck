@@ -1577,6 +1577,13 @@ thread_local! {
 /// hook uses this to suppress terminal teardown for a contained pane-processing
 /// panic (a bug in the third-party `vt100` parser) rather than crashing the
 /// whole TUI.
+///
+/// PRD #227 audit item C: that hook check is `#[cfg(panic = "unwind")]`, because
+/// under `panic = "abort"` the panic is not contained — nothing can catch it and
+/// the process dies, so skipping teardown would only leak the enhanced keyboard
+/// mode. That leaves this getter with no caller in an abort build, hence the
+/// conditional `dead_code` allowance.
+#[cfg_attr(panic = "abort", allow(dead_code))]
 pub(crate) fn in_guarded_parser_feed() -> bool {
     IN_GUARDED_PARSER_FEED.with(Cell::get)
 }

@@ -3642,44 +3642,72 @@ fn csi_modifier_param(mods: KeyModifiers) -> u8 {
     1 + bits
 }
 
+/// PRD #227: the C0 control byte a `Ctrl+<char>` keypress must forward to an
+/// embedded pane, or `None` when the character has no control-byte meaning (the
+/// caller then forwards the literal character, which is right for `Ctrl+1`,
+/// `Ctrl+,`, …).
+///
+/// This table exists because M2 moves the Ctrl translation out of the *terminal*
+/// and into *us*. In legacy mode the terminal collapsed the chord to its control
+/// byte before crossterm ever saw it (`Ctrl+[` arrived as `KeyCode::Esc`,
+/// `Ctrl+4` as `Char('4') + CONTROL` because crossterm re-derives that from the
+/// `0x1c` byte). With `DISAMBIGUATE_ESCAPE_CODES` active the terminal instead
+/// reports the *key* plus the modifier (`CSI 91;5u` → `Char('[') + CONTROL`), so
+/// producing the byte is now our job. Anything missing here does not merely fail
+/// to improve — it REGRESSES from the legacy behavior to a literal character.
+/// That is how the `Ctrl+[` bug came back as `Ctrl+3`/`Ctrl+8`: the fix
+/// enumerated aliases one at a time.
+///
+/// So this is written as RULES, not as an alias list:
+///
+/// * `@ A–Z [ \ ] ^ _` and Space — the ASCII caret rule, `byte = ch & 0x1f`.
+///   Space (0x20) masks to 0x00 by the same arithmetic, which is exactly why
+///   `Ctrl+Space` and `Ctrl+@` agree on NUL.
+/// * `a–z` — the same rule after upcasing, giving 0x01..=0x1a.
+/// * `2`–`8` — xterm's digit aliases: NUL, ESC, FS, GS, RS, US, DEL. `4`–`7` are
+///   also the *only* form crossterm's legacy parser produces for `0x1c..=0x1f`
+///   (`crossterm-0.28.1/src/event/sys/unix/parse.rs:110-113`), so they matter in
+///   legacy mode too, not just under M2.
+/// * `?` → DEL and `/` → US — xterm's two punctuation aliases that the caret
+///   rule cannot produce (`?` masks to 0x1f, `/` to 0x0f).
+///
+/// Deliberately NOT mapped: `` Ctrl+` ``. Its ASCII value (0x60) is outside
+/// xterm's Ctrl-translation range and no supported terminal collapses it to NUL,
+/// so there is no legacy byte to preserve — mapping it would invent behavior
+/// rather than restore it.
+///
+/// `keyevent_ctrl_c0_matches_crossterm_decoder` proves this is the exact inverse
+/// of crossterm's own decoder over `0x00..=0x1f` + `0x7f`, in both the legacy
+/// and the CSI-u wire forms.
+fn ctrl_c0_byte(c: char) -> Option<u8> {
+    match c {
+        // `a`–`z` / `A`–`Z` → 0x01..=0x1a via the caret rule on the upcased char.
+        'a'..='z' | 'A'..='Z' => Some(c.to_ascii_uppercase() as u8 & 0x1f),
+        // The caret rule proper: `@`→NUL, `[`→ESC, `\`→FS, `]`→GS, `^`→RS,
+        // `_`→US, and Space→NUL.
+        '@' | '[' | '\\' | ']' | '^' | '_' | ' ' => Some(c as u8 & 0x1f),
+        // xterm's digit aliases. `3`..`7` are contiguous with ESC..US.
+        '2' => Some(0x00),
+        '3'..='7' => Some(c as u8 - b'3' + 0x1b),
+        '8' | '?' => Some(0x7f),
+        '/' => Some(0x1f),
+        _ => None,
+    }
+}
+
 /// Convert a crossterm `KeyEvent` into the byte sequence expected by a terminal PTY.
 fn keyevent_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     // Alt modifier: wrap the base key bytes with an ESC prefix.
     let has_alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    // Ctrl+<key> → the C0 control byte (Alt adds ESC prefix)
+    // Ctrl+<key> → the C0 control byte (Alt adds ESC prefix). See
+    // [`ctrl_c0_byte`] for why the whole alias table lives behind one rule-based
+    // function instead of a list of match arms here.
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && let KeyCode::Char(c) = key.code
+        && let Some(b) = ctrl_c0_byte(c)
     {
-        let lower = c.to_ascii_lowercase();
-        let ctrl_byte = if lower.is_ascii_lowercase() {
-            // Ctrl+letter → 0x01–0x1a.
-            Some(lower as u8 - b'a' + 1)
-        } else {
-            // PRD #227: the C0 controls that are NOT Ctrl+letter. In legacy
-            // mode the terminal collapses these to their control byte before
-            // crossterm ever sees them (Ctrl+[ arrives as `KeyCode::Esc`), but
-            // with the enhanced protocol active (M2) the terminal
-            // DISAMBIGUATES them into `CSI <code>;5u` and crossterm reports
-            // `Char(c) + CONTROL` instead. Without this arm they fell through
-            // to the base arm below and were forwarded as the literal
-            // character — so Ctrl+[ typed a `[` into the agent instead of
-            // acting as Escape (vim's leave-insert-mode chord).
-            match c {
-                '[' => Some(0x1b),
-                '\\' => Some(0x1c),
-                ']' => Some(0x1d),
-                '^' => Some(0x1e),
-                '_' => Some(0x1f),
-                '?' => Some(0x7f),
-                // NUL is reachable as either Ctrl+Space or Ctrl+@.
-                ' ' | '@' => Some(0x00),
-                _ => None,
-            }
-        };
-        if let Some(b) = ctrl_byte {
-            return Some(if has_alt { vec![0x1b, b] } else { vec![b] });
-        }
+        return Some(if has_alt { vec![0x1b, b] } else { vec![b] });
     }
 
     // PRD #227: modifier-aware encoding for keys whose legacy byte form cannot
@@ -7519,6 +7547,10 @@ fn pop_keyboard_enhancement() {
 /// the hook returns early while `in_guarded_parser_feed()` (it must not tear
 /// down a terminal the render loop is still using), so if such a panic ever
 /// escapes `catch_unwind` instead of being swallowed, this `Drop` is what pops.
+/// That pairing is what makes the hook's early return safe — and it holds only
+/// under `panic = "unwind"`, which is why the hook gates that return on
+/// `cfg(panic = "unwind")` and does the teardown itself in an abort build, where
+/// no `Drop` runs at all (PRD #227 audit item C).
 ///
 /// Idempotent by construction: [`pop_keyboard_enhancement`] is a test-and-clear
 /// on [`KEYBOARD_ENHANCEMENT_PUSHED`], so the explicit teardown pop, this
@@ -7555,6 +7587,23 @@ pub fn run_tui(
         // screen out from under the render loop and exit the TUI, exactly the
         // crash this guard exists to prevent. Leave the terminal untouched and
         // let `catch_unwind` swallow it (the caller logs and drops the chunk).
+        //
+        // PRD #227 audit item C: gated on `panic = "unwind"`, which is every
+        // official build (`Cargo.toml` defines no `panic = "abort"` profile).
+        // The early return is only correct BECAUSE the panic is recoverable:
+        // under `panic = "abort"` nothing can catch it, `catch_unwind` never
+        // runs, `KeyboardEnhancementGuard::drop` never runs, and the process
+        // dies moments later — so returning here would leak the enhanced
+        // keyboard mode into the user's shell, the single failure mode this
+        // milestone exists to prevent. In an abort build the whole `if` is
+        // compiled out and the guarded case falls through to the full teardown
+        // below, which is the right trade when the deck is dying anyway.
+        //
+        // NOT solvable by simply moving the pop above this return: under unwind
+        // that would pop on every RECOVERED guarded-parser panic and silently
+        // disable Shift+Enter (and every other modifier-bearing key) for the
+        // rest of a session that keeps running perfectly well.
+        #[cfg(panic = "unwind")]
         if crate::embedded_pane::in_guarded_parser_feed() {
             return;
         }
@@ -20147,29 +20196,361 @@ mod tests {
         assert_eq!(keyevent_to_bytes(&key), Some(vec![0x1a]));
     }
 
+    /// Every NON-LETTER `Ctrl+<char>` alias, enumerated one at a time.
+    ///
+    /// Deliberately a hand-written list rather than a restatement of
+    /// [`ctrl_c0_byte`]'s rules: the rules are the implementation, this is the
+    /// intent, and the exhaustive sweep in
+    /// [`ctrl_c0_byte_maps_exactly_the_documented_alias_set`] fails if a rule ever
+    /// grows wider (or narrower) than the list.
+    const CTRL_C0_SYMBOL_ALIASES: &[(char, u8)] = &[
+        // NUL
+        ('@', 0x00),
+        (' ', 0x00),
+        ('2', 0x00),
+        // ESC — `Ctrl+[` is how vim leaves insert mode inside an embedded pane.
+        ('[', 0x1b),
+        ('3', 0x1b),
+        // FS
+        ('\\', 0x1c),
+        ('4', 0x1c),
+        // GS
+        (']', 0x1d),
+        ('5', 0x1d),
+        // RS
+        ('^', 0x1e),
+        ('6', 0x1e),
+        // US — `Ctrl+_` / `Ctrl+/` is readline's undo.
+        ('_', 0x1f),
+        ('7', 0x1f),
+        ('/', 0x1f),
+        // DEL
+        ('?', 0x7f),
+        ('8', 0x7f),
+    ];
+
+    /// Lowercase and uppercase `Ctrl+letter`, expressed as an ORDINAL (the nth
+    /// letter → byte n) rather than as the `& 0x1f` mask [`ctrl_c0_byte`] uses,
+    /// so the two formulations have to agree.
+    fn ctrl_c0_letter_aliases() -> Vec<(char, u8)> {
+        ('a'..='z')
+            .chain('A'..='Z')
+            .enumerate()
+            .map(|(i, c)| (c, (i % 26) as u8 + 1))
+            .collect()
+    }
+
     /// PRD #227: the C0 controls that are NOT Ctrl+letter. With the enhanced
     /// (kitty) protocol active (M2) the terminal disambiguates these into
     /// `CSI <code>;5u`, which crossterm reports as `Char(c) + CONTROL` — so
     /// Ctrl+[ arrives as `Char('[') + CONTROL`, not as the legacy
-    /// `KeyCode::Esc`. Each must still reach the pane as its single C0 byte
-    /// (Ctrl+[ = ESC is how vim leaves insert mode inside an embedded pane).
+    /// `KeyCode::Esc`. Each must still reach the pane as its single C0 byte.
+    ///
+    /// The DIGIT aliases are here for two independent reasons: they are xterm's
+    /// unshifted way to reach the same seven bytes (and under M2 the *only* way,
+    /// since `@ ^ _ ?` are shifted symbols the protocol reports as their
+    /// unshifted key), and `0x1c..=0x1f` decoded by crossterm's LEGACY parser
+    /// arrives as `Char('4'..='7') + CONTROL` too.
     #[test]
     fn keyevent_ctrl_c0_controls() {
-        for (ch, want) in [
-            ('[', 0x1bu8),
-            ('\\', 0x1c),
-            (']', 0x1d),
-            ('^', 0x1e),
-            ('_', 0x1f),
-            ('?', 0x7f),
-            (' ', 0x00),
-            ('@', 0x00),
-        ] {
+        for (ch, want) in CTRL_C0_SYMBOL_ALIASES
+            .iter()
+            .copied()
+            .chain(ctrl_c0_letter_aliases())
+        {
             let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
             assert_eq!(
                 keyevent_to_bytes(&key),
                 Some(vec![want]),
                 "Ctrl+{ch:?} must forward the C0 byte {want:#04x}, not the literal character"
+            );
+            // Alt+Ctrl+<char> keeps the ESC prefix in front of the same byte.
+            let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL | KeyModifiers::ALT);
+            assert_eq!(
+                keyevent_to_bytes(&key),
+                Some(vec![0x1b, want]),
+                "Alt+Ctrl+{ch:?} must forward ESC followed by {want:#04x}"
+            );
+        }
+    }
+
+    /// The alias table is a closed set: exhaustive over all 128 ASCII characters
+    /// plus a couple of non-ASCII ones, so neither a too-wide rule (`'0'..='9'`
+    /// swallowing Ctrl+0/Ctrl+1/Ctrl+9, which have no control byte) nor a
+    /// too-narrow one can pass.
+    #[test]
+    fn ctrl_c0_byte_maps_exactly_the_documented_alias_set() {
+        let letters = ctrl_c0_letter_aliases();
+        for byte in 0u8..=127 {
+            let c = byte as char;
+            let expected = letters
+                .iter()
+                .chain(CTRL_C0_SYMBOL_ALIASES)
+                .find(|(alias, _)| *alias == c)
+                .map(|(_, want)| *want);
+            assert_eq!(
+                ctrl_c0_byte(c),
+                expected,
+                "Ctrl+{c:?} ({byte:#04x}): the alias table and the documented set disagree"
+            );
+        }
+        // Non-ASCII must never be masked into a control byte (`c as u8` would
+        // truncate the codepoint).
+        for c in ['é', 'λ', '€', '🙂'] {
+            assert_eq!(ctrl_c0_byte(c), None, "Ctrl+{c:?} is not a C0 alias");
+        }
+    }
+
+    /// PRD #227 review item A: run OUR encoder against THEIR decoder.
+    ///
+    /// crossterm's `parse_event` is `pub(crate)`, so the only way to reach the
+    /// real decoder is to give crossterm a terminal to read from: `tty_fd()`
+    /// returns stdin when stdin is a tty, so this installs a PTY slave on fd 0
+    /// and writes keypresses into the master. Bytes then travel the exact
+    /// production path — PTY line discipline, `Parser::advance`, `parse_event` —
+    /// instead of a hand-transcribed copy of crossterm's tables that could
+    /// silently drift from them on an upgrade.
+    ///
+    /// Restores fd 0 and raw mode on `Drop`, so a failing assertion cannot leave
+    /// the test process with a dangling stdin. Sound under `cargo nextest`
+    /// (process per test) and, for a plain `cargo test`, because no other test in
+    /// this crate reads stdin or drives crossterm's event source.
+    #[cfg(unix)]
+    struct CrosstermInputProbe {
+        master: std::fs::File,
+        /// Kept alive only so the slave end stays open for the probe's lifetime;
+        /// fd 0 is a `dup` of it and is what crossterm actually reads.
+        _slave: std::fs::File,
+        /// `dup` of the original fd 0, put back by `Drop`. `-1` if fd 0 was
+        /// closed when the probe started.
+        saved_stdin: libc::c_int,
+    }
+
+    #[cfg(unix)]
+    impl CrosstermInputProbe {
+        fn new() -> Self {
+            let mut master: libc::c_int = -1;
+            let mut slave: libc::c_int = -1;
+            // SAFETY: `openpty` writes the two fds through the out-pointers; the
+            // trailing name/termios/winsize arguments are documented as optional
+            // and passed as NULL.
+            let rc = unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            assert_eq!(
+                rc,
+                0,
+                "openpty failed ({}). This test needs a PTY to hand crossterm's own \
+                 decoder real input.",
+                std::io::Error::last_os_error()
+            );
+
+            // SAFETY: termios/fcntl calls on the fd `openpty` just handed us.
+            //
+            // RAW, because a canonical-mode slave withholds bytes until a newline
+            // and `cfmakeraw` also clears ISIG/IXON — so 0x03/0x1a/0x11 arrive as
+            // DATA instead of signalling or flow-controlling the test process.
+            // This is also the state the deck's own terminal is in.
+            //
+            // NON-BLOCKING, because crossterm reads only after `poll` reports
+            // POLLIN but loops and reads again while an escape sequence is
+            // incomplete; on a blocking fd that second read would hang the whole
+            // suite, whereas `EWOULDBLOCK` sends it back to `poll` and lets the
+            // per-keypress deadline below fail cleanly instead.
+            unsafe {
+                let mut tio: libc::termios = std::mem::zeroed();
+                assert_eq!(
+                    libc::tcgetattr(slave, &mut tio),
+                    0,
+                    "tcgetattr on the probe pty slave"
+                );
+                libc::cfmakeraw(&mut tio);
+                assert_eq!(
+                    libc::tcsetattr(slave, libc::TCSANOW, &tio),
+                    0,
+                    "tcsetattr on the probe pty slave"
+                );
+                let flags = libc::fcntl(slave, libc::F_GETFL);
+                assert_ne!(flags, -1, "F_GETFL on the probe pty slave");
+                assert_ne!(
+                    libc::fcntl(slave, libc::F_SETFL, flags | libc::O_NONBLOCK),
+                    -1,
+                    "F_SETFL O_NONBLOCK on the probe pty slave"
+                );
+            }
+
+            // SAFETY: `dup`/`dup2` on fd 0; the saved descriptor is restored in
+            // `Drop`. A negative `dup` result just means fd 0 was closed, which
+            // `Drop` handles.
+            let saved_stdin = unsafe { libc::dup(libc::STDIN_FILENO) };
+            let rc = unsafe { libc::dup2(slave, libc::STDIN_FILENO) };
+            assert_ne!(
+                rc,
+                -1,
+                "dup2 of the probe pty onto stdin failed ({})",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(
+                unsafe { libc::isatty(libc::STDIN_FILENO) },
+                1,
+                "stdin must be the probe pty, otherwise crossterm would fall back \
+                 to /dev/tty and read the developer's real terminal"
+            );
+
+            // crossterm's decoder branches on its OWN raw-mode flag for `0x0a`
+            // (upstream issue #371: in raw mode `\n` is Ctrl+J, in cooked mode it
+            // is Enter), so the probe has to match the deck: raw. `tty_fd()`
+            // resolves to the fd-0 pty installed above, so this cannot touch the
+            // developer's terminal.
+            crossterm::terminal::enable_raw_mode().expect("enable raw mode on the probe pty");
+            assert!(
+                crossterm::terminal::is_raw_mode_enabled().unwrap_or(false),
+                "crossterm must report raw mode, otherwise 0x0a decodes as Enter and \
+                 re-encodes as 0x0d"
+            );
+
+            // SAFETY: we own both fds; wrapping them in `File` transfers
+            // ownership so they close when the probe drops.
+            let (master, slave) = unsafe {
+                use std::os::unix::io::FromRawFd;
+                (
+                    std::fs::File::from_raw_fd(master),
+                    std::fs::File::from_raw_fd(slave),
+                )
+            };
+            Self {
+                master,
+                _slave: slave,
+                saved_stdin,
+            }
+        }
+
+        /// Feed `bytes` as if the terminal had sent them, and return the single
+        /// `KeyEvent` crossterm decodes from them.
+        fn decode(&self, bytes: &[u8]) -> KeyEvent {
+            use std::io::Write;
+            (&self.master)
+                .write_all(bytes)
+                .expect("write the keypress into the probe pty");
+            (&self.master).flush().expect("flush the probe pty");
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "crossterm decoded no key event from {bytes:02x?} within 5s"
+                );
+                if !crossterm::event::poll(std::time::Duration::from_millis(50))
+                    .expect("poll the probe pty")
+                {
+                    continue;
+                }
+                match crossterm::event::read().expect("read from the probe pty") {
+                    crossterm::event::Event::Key(key) => return key,
+                    // A stray resize/focus event is not what we asked about.
+                    _ => continue,
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CrosstermInputProbe {
+        fn drop(&mut self) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            // SAFETY: put back the fd 0 we replaced (or close the borrowed slot
+            // if there was nothing to put back).
+            unsafe {
+                if self.saved_stdin >= 0 {
+                    libc::dup2(self.saved_stdin, libc::STDIN_FILENO);
+                    libc::close(self.saved_stdin);
+                } else {
+                    libc::close(libc::STDIN_FILENO);
+                }
+            }
+        }
+    }
+
+    /// PRD #227 review item A: the encoder must be the exact INVERSE of
+    /// crossterm's decoder over the whole control range, in BOTH wire forms.
+    ///
+    /// This is the property test that the one-alias-at-a-time fixes kept missing.
+    /// `Ctrl+[` regressed under M2, was fixed by naming `[`, and then `Ctrl+3`
+    /// and `Ctrl+8` regressed the same way — because nothing asserted the
+    /// mapping was *complete*. Feeding every control byte through crossterm and
+    /// back out through [`keyevent_to_bytes`] catches all of them at once, and
+    /// catches the next one for free.
+    ///
+    /// Every byte in `0x00..=0x1f` plus `0x7f` round-trips; there is no
+    /// documented exception. `0x0a` is the one that DEPENDS on terminal state:
+    /// crossterm reports it as `Ctrl+J` in raw mode (which re-encodes to `0x0a`)
+    /// but as `Enter` in cooked mode (which would re-encode to `0x0d`), so the
+    /// probe asserts raw mode is active — matching the deck, which never runs
+    /// the pane-input path outside raw mode.
+    #[cfg(unix)]
+    #[test]
+    fn keyevent_ctrl_c0_matches_crossterm_decoder() {
+        let probe = CrosstermInputProbe::new();
+
+        // --- Phase 1: the LEGACY wire form. Every control byte a legacy
+        // terminal can deliver must survive decode → encode unchanged. ---
+        for byte in (0x00u8..=0x1f).chain(std::iter::once(0x7f)) {
+            let key = probe.decode(&[byte]);
+            assert_eq!(
+                keyevent_to_bytes(&key).as_deref(),
+                Some(&[byte][..]),
+                "control byte {byte:#04x} decoded by crossterm as {key:?} did not re-encode \
+                 to itself — the deck would forward something else to the agent's PTY"
+            );
+        }
+
+        // --- Phase 2: the M2 wire form. `DISAMBIGUATE_ESCAPE_CODES` makes the
+        // terminal send `CSI <codepoint>;5u` instead of the collapsed byte, so
+        // crossterm reports `Char(c) + CONTROL` and producing the byte becomes
+        // the deck's job. This is the form that regressed twice. ---
+        for (ch, want) in CTRL_C0_SYMBOL_ALIASES
+            .iter()
+            .copied()
+            .chain(ctrl_c0_letter_aliases())
+        {
+            // `1 + ctrl(4)` = 5 — the kitty modifier parameter for Ctrl alone.
+            let wire = format!("\x1b[{};5u", ch as u32);
+            let key = probe.decode(wire.as_bytes());
+            assert_eq!(
+                keyevent_to_bytes(&key).as_deref(),
+                Some(&[want][..]),
+                "{wire:?} (Ctrl+{ch:?}) decoded by crossterm as {key:?} must forward \
+                 {want:#04x}; forwarding the literal character instead is the Ctrl+[ / \
+                 Ctrl+3 regression"
+            );
+        }
+
+        // --- Phase 3: the modifier-bearing keys M1/M3 added, checked against
+        // the real decoder rather than a hand-made `KeyEvent`. Each of these is
+        // its own inverse: what a kitty terminal sends is exactly what the deck
+        // forwards. ---
+        for (wire, want) in [
+            // The headline of PRD #227.
+            ("\x1b[13;2u", "\x1b[13;2u"), // Shift+Enter
+            ("\x1b[13;5u", "\x1b[13;5u"), // Ctrl+Enter
+            ("\x1b[1;2A", "\x1b[1;2A"),   // Shift+Up
+            ("\x1b[1;2B", "\x1b[1;2B"),   // Shift+Down
+            ("\x1b[1;5C", "\x1b[1;5C"),   // Ctrl+Right
+            ("\x1b[1;5D", "\x1b[1;5D"),   // Ctrl+Left
+        ] {
+            let key = probe.decode(wire.as_bytes());
+            assert_eq!(
+                keyevent_to_bytes(&key).as_deref(),
+                Some(want.as_bytes()),
+                "{wire:?} decoded by crossterm as {key:?} must be forwarded verbatim as \
+                 {want:?}; collapsing it to the unmodified legacy byte is the bug PRD #227 \
+                 fixes"
             );
         }
     }
