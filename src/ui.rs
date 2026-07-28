@@ -20410,13 +20410,22 @@ mod tests {
             // SAFETY: `openpty` writes the two fds through the out-pointers; the
             // trailing name/termios/winsize arguments are documented as optional
             // and passed as NULL.
+            //
+            // All three NULLs are `null_mut`, not `null`, because macOS and glibc
+            // disagree on the constness of the last two: Apple declares them
+            // `*mut termios` / `*mut winsize` while glibc declares them `*const`.
+            // `null_mut` satisfies both — exactly on macOS, and by the standard
+            // `*mut T` -> `*const T` coercion on Linux, which also pins the
+            // otherwise-free `T` from each parameter's expected type. `null()`
+            // builds on Linux and breaks the macOS build (rustc E0308), so do not
+            // "simplify" these back.
             let rc = unsafe {
                 libc::openpty(
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             };
             assert_eq!(
