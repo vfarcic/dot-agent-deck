@@ -124,21 +124,23 @@ The orchestrator is the sole notifier and the sole agent that waits on the user.
 - [x] **M1.2** — Implement daemon tracking of outstanding delegations + one-shot, race-safe, self-describing idle-prompt injection after the timeout. → commit `d34fbd4`.
 - [x] **M1.3** — `worker_response_timeout_minutes` config in `.dot-agent-deck.toml` (default 120), read by the daemon. → commit `d34fbd4`.
 - [x] **M1.4** — Automated tests (rule 4): L2 synthetic (delegate → advance clock → idle prompt injected; `work-done` before timeout → no injection; config value honored) plus at least one PTY-attached L2 exercising the user-visible pane behavior. → `idle_worker_001`–`006` (fast) + PTY `011` stand-in (`d34fbd4`), plus the real-agent reel-marked `012` (`4685fb9`). Fast tier 1138/1138, scoped e2e 8/8.
-- [ ] **M1.5** — Rule 12 cross-version manual test + a `changelog.d/126.feature.md` fragment.
+- [ ] **M1.5** — Rule 12 cross-version manual test + a `changelog.d/126.feature.md` fragment. *Fragment done* (`d10db23`); the cross-version manual test is outstanding.
 
 ### M2 — Orchestrator-only Telegram recipe (this repo's config)
 
-- [ ] **M2.1** — Rewrite the orchestrator `prompt_template` to fire Telegram (the MCP's send-message tool, `telegram_send_message` under `pi-mcp-adapter`) on the five triggers above; short messages prefixed repo + PRD #; fire-and-forget.
-- [ ] **M2.2** — Remove per-worker `blocked` pings; workers escalate via `work-done`.
-- [ ] **M2.3** — Keep a minimal orchestrator-side expectation log for falsifiability.
+- [x] **M2.1** — Rewrite the orchestrator `prompt_template` to fire Telegram (the MCP's send-message tool, `telegram_send_message` under `pi-mcp-adapter`) on the five triggers above; short messages prefixed repo + PRD #; fire-and-forget. → `7b19356`. The tool is described by role rather than hard-coded, and `chat_id` is **mandatory** with the reason stated (see the transport security record); reading `telegram_get_updates` is explicitly banned.
+- [x] **M2.2** — Remove per-worker `blocked` pings; workers escalate via `work-done`. → `7b19356`; verified no `notify.sh`/ntfy reference survives in `.dot-agent-deck.toml`.
+- [x] **M2.3** — Keep a minimal orchestrator-side expectation log for falsifiability. → `7b19356`: the orchestrator itself appends `timestamp | moment | message_id` (or `send=failed`/`send=skipped`) to the gitignored `.dot-agent-deck/notify-log.md`. No helper script exists any more.
+
+**Not yet operational:** `TELEGRAM_CHAT_ID` is **not provisioned** anywhere — absent from the environment and from `.env.vals.yaml` (which carries only `TELEGRAM_BOT_TOKEN`). Its absence deliberately **fails safe**: the orchestrator skips the send, logs `send=skipped`, and tells the user in-band, rather than omitting `chat_id` — which would fall back to the most recently active chat and be interceptable by any sender (see the transport security record). So no notification actually fires until the maintainer sets it. Note `.env.vals.yaml` is a **tracked** file whose credentials are `vals` references but which already carries `SLACK_TEAM_ID`/`SLACK_CHANNEL_IDS` as committed plaintext, so a plaintext chat id there would follow existing precedent *and* publish the id in a public repo; a `ref+gcpsecrets://` line or a gitignored `.env` avoids that. Maintainer's call, and a prerequisite for M5.
 
 ### M3 — Published user docs
 
-- [ ] **M3.1** — New `docs/` page (in `site/sidebars.js`) separating the idle-worker feature from the example recipe; placeholders only; recipe framed as an example.
+- [x] **M3.1** — New `docs/` page (in `site/sidebars.js`) separating the idle-worker feature from the example recipe; placeholders only; recipe framed as an example. → `74ba03e`: `docs/idle-workers-and-notifications.md` (`sidebar_position` 5.6, between orchestration and scheduled-tasks). Placeholders verified — no real chat id or bot handle appears anywhere in tracked files. The test-only `DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS` seam is deliberately **not** documented, so a published page cannot invite production use of it. `npm ci && npm run build` in `site/` passes with no broken links. Same commit adds an explicit `worker_response_timeout_minutes = 120` above the first table header in this repo's own config, so the file-parsing path is exercised and correct placement is demonstrated by example.
 
 ### M4 — Retire dogfood artifacts
 
-- [ ] **M4.1** — Remove `scripts/notify.sh` + ntfy prompt instructions; discard the interrupted Greptile-fix edits; retire/convert `docs/develop/notifications-dogfood.md`; reconcile PR #223.
+- [x] **M4.1** — Remove `scripts/notify.sh` + ntfy prompt instructions; discard the interrupted Greptile-fix edits; retire/convert `docs/develop/notifications-dogfood.md`; reconcile PR #223. → `7b19356`: script deleted (its half-finished ntfy edits go with it), all ntfy instructions gone from every role, and the dogfood note rewritten as a short historical pointer so the `CONTRIBUTING.md` link stays live. **PR #223 reconciliation is still outstanding** — its title and body still describe the abandoned "Phase 1 dogfood (no deck code)" scope; that happens at `/prd-done`.
 
 ### M5 — Validate on real runs (post-merge)
 
