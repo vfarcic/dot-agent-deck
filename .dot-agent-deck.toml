@@ -65,14 +65,14 @@ watch = false
 pattern = "git (log|status|show|diff)"
 watch = false
 
-# Dogfood: mixed agents — orchestrator/auditor=pi (Opus, high thinking), reviewer=opencode (gpt-5.6-pro), tester=codex (gpt-5.6-sol, high reasoning), coder/release=claude. Flip any role back via the commented all-claude command under it.
+# Dogfood: mixed agents — orchestrator/coder=claude (Opus), release=claude (Sonnet), and three GPT harnesses all on the same gpt-5.6-sol model: reviewer=pi, auditor=opencode, tester=codex — each at xhigh reasoning effort (opencode's comes from the `agent.build.variant` in opencode.json, since its TUI has no CLI flag for it). Flip any role via the commented alternative under it.
 [[orchestrations]]
 name = "dot-agent-deck"
 
 [[orchestrations.roles]]
 name = "orchestrator"
-command = "devbox run pi-big"
-# command = "devbox run agent-big"   # all-claude default
+command = "devbox run agent-orchestrator"
+# command = "devbox run pi-big"   # pi (Opus, high thinking)
 start = true
 prompt_template = """
 You coordinate the team. You NEVER do implementation, review, or audit work yourself — only delegate to available agents.
@@ -125,21 +125,21 @@ Context handoff (CRITICAL): every worker cold-starts with NO memory of prior con
 
 [[orchestrations.roles]]
 name = "coder"
-command = "devbox run agent-orchestrator"
-# command = "devbox run oc-coder"
+command = "devbox run agent-coder"
+# command = "devbox run oc-big"   # opencode (gpt-5.6-sol)
 description = "Implements features, fixes bugs, refactors code"
 prompt_template = "Implement the requested change. If the task references a PRD path under prds/, read it first. In a TDD chain, make the tester's failing test pass by changing PRODUCTION code only — never edit the tester-authored tests to force them green; if you think a tester test is wrong, report it back instead of editing it. Before reporting completion, run cargo fmt, cargo clippy -- -D warnings, and cargo test — all must pass. Then COMMIT your changes (use a descriptive message; reference the PRD number if relevant) — DO NOT signal work-done with uncommitted changes in the working tree. Run `git status` to verify the tree is clean before calling `dot-agent-deck work-done`. If critical context is missing from the task description, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."
 
 [[orchestrations.roles]]
 name = "reviewer"
-command = "devbox run oc-big"
+command = "devbox run pi-sol"
 # command = "devbox run agent-reviewer"   # all-claude default
 description = "Reviews code changes for correctness, style, and edge cases"
 prompt_template = "Review the change. Report findings only — do not modify code. Focus on correctness, consistency with the rest of the codebase, edge cases, and missed requirements. If the task references a PRD path, verify the implementation matches it. If critical context is missing (e.g. the diff or PRD path), surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."
 
 [[orchestrations.roles]]
 name = "auditor"
-command = "devbox run pi-big"
+command = "devbox run oc-big"
 # command = "devbox run agent-auditor"   # all-claude default
 description = "Audits code for security vulnerabilities and unsafe patterns"
 prompt_template = "Audit the change for security vulnerabilities, unsafe patterns, and OWASP top-10 class issues. Report findings only — do not modify code. If the task references a file or diff, read it before starting. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context."
