@@ -1195,6 +1195,29 @@ const CREATE_PANE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// gets the "stop-agent timed out" error message with a retry hint.
 const CTRL_W_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// PRD #241 M2: is this `stop-agent` failure the daemon telling us the agent
+/// is *already gone*?
+///
+/// The daemon answers a stop for an unknown id with a `Server` error whose
+/// message contains `"Agent <id> not found"`. That is not a failure of the
+/// close — it is precisely the state the close was trying to reach — so the
+/// caller both (a) retries once with the currently-bound id (the PRD #92 F12
+/// reattach race, where a *new* agent may have replaced the one we asked
+/// about) and (b) treats a second `not found` as an already-stopped success
+/// rather than re-inserting a ghost card the user can never dismiss.
+///
+/// Kept as the ONE place the string is sniffed. String-matching a daemon
+/// message is the fragile part of the design; a typed protocol error would be
+/// better, but that moves the wire shape and this PRD deliberately does not
+/// bump `PROTOCOL_VERSION`.
+fn is_agent_not_found(err: &crate::daemon_client::ClientError) -> bool {
+    matches!(
+        err,
+        crate::daemon_client::ClientError::Server(msg)
+            if msg.to_lowercase().contains("not found")
+    )
+}
+
 /// PRD #92 F12: initial wait between `list_agents` lookups when the
 /// per-pane attach stream has ended and we're trying to find the
 /// freshly-respawned agent for `pane_id_env`. The F9 clear=true delegate
@@ -1854,16 +1877,13 @@ impl PaneController for EmbeddedPaneController {
         // from the F9 respawn. If the retry also fails we fall through
         // to the existing log+restore path; we don't loop further.
         let (agent_id, stop_result) = s.runtime.block_on(async move {
-            use crate::daemon_client::ClientError;
             let first = tokio::time::timeout(
                 CTRL_W_STOP_TIMEOUT,
                 client.stop_agent(&initial_agent_id),
             )
             .await;
             match first {
-                Ok(Err(ClientError::Server(ref msg)))
-                    if msg.to_lowercase().contains("not found") =>
-                {
+                Ok(Err(ref e)) if is_agent_not_found(e) => {
                     let retry_id = shared_agent_id.lock().unwrap().clone();
                     tracing::debug!(
                         first_agent_id = %initial_agent_id,
@@ -1881,6 +1901,24 @@ impl PaneController for EmbeddedPaneController {
         match stop_result {
             Ok(Ok(())) => {
                 // Drop `s` → io_task aborts. No explicit abort needed.
+                Ok(())
+            }
+            // PRD #241 M2 (issue #218 follow-up): the daemon says the agent
+            // does not exist. Both attempts above targeted the shared id, so
+            // for a stale/ghost card the retry returns the same answer and the
+            // old code fell into the re-insert arm below — wedging the close
+            // forever behind an error whose retry could never succeed. An
+            // absent agent IS the state `stop-agent` was driving toward, so
+            // report success and let `s` drop (which aborts the io_task) so
+            // teardown completes and the card goes away. Every OTHER error —
+            // and the timeout arm — keeps the retain-and-surface path, because
+            // there the agent may genuinely still be alive on the daemon.
+            Ok(Err(ref e)) if is_agent_not_found(e) => {
+                tracing::info!(
+                    agent_id = %agent_id,
+                    error = %e,
+                    "stop-agent reports the agent is already gone — treating the close as complete"
+                );
                 Ok(())
             }
             Ok(Err(e)) => {

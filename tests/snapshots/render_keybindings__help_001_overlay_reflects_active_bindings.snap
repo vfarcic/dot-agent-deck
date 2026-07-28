@@ -9,7 +9,7 @@ expression: text
         ┌ Help ───────────────────────────────────────────────────────────────────────────────────────────────┐         
         │  Global (works from any pane)                       Mode Tab (in-tab navigation)                    │         
         │                                                                                                     │         
-        │  Ctrl+d             Command mode (dashboard)        j / Down           Focus next pane              │         
+        │  Ctrl+d             Toggle command / pane           j / Down           Focus next pane              │         
         │  Ctrl+n             Create new pane                 k / Up             Focus previous pane          │         
         │  Ctrl+w             Close selected pane             Enter           Enter PaneInput on selected     │         
         │  Alt+Shift+l        Toggle layout (stacked/tiled)   Esc             Deselect side pane              │         

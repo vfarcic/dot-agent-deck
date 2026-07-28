@@ -62,11 +62,11 @@ About 30 seconds after both the TUI and every managed agent are gone, the daemon
 2. Press `Ctrl+n` to open a new pane — pick a directory, give the pane a name, and enter the command to run (typically `claude`, `opencode`, `pi`, or `codex`)
 3. Watch the agent's status, tool calls, and prompts update on the dashboard in real-time
 4. To type into an agent, move keyboard focus into its pane: press `Ctrl+d` to enter command mode, then either `j`/`k` (or `Down`/`Up`) to cycle through cards or `1`–`9` to jump directly to a card
-5. To close the pane you're currently working in, press `Ctrl+w` — it closes the selected card and its pane, even while you're still typing in it. The dashboard tab itself can't be closed.
+5. To close a pane, press `Ctrl+d` to leave it, then `Ctrl+w` on the selected card and choose **Close** in the confirmation. While you're typing inside a pane, `Ctrl+w` is the shell's ordinary delete-previous-word — it never closes anything. The dashboard tab itself can't be closed.
 
 > **Tip:** The command can be any shell command, but real-time status, tool, and prompt tracking on the dashboard work for `claude`, `opencode`, `pi`, and `codex`.
 
-> **Tip:** Press `Ctrl+d` from any pane to enter command / navigation mode.
+> **Tip:** `Ctrl+d` toggles: press it in a pane to enter command / navigation mode, press it again to go back to the pane.
 
 ## Orchestration
 

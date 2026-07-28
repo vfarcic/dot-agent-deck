@@ -71,3 +71,20 @@ fn help_001_overlay_documents_canonical_shortcut_set() {
         "help overlay is missing these canonical shortcuts/commands: {missing:?}\n--- rendered overlay ---\n{buf}"
     );
 }
+
+/// Scenario: Render the default help overlay into a `TestBackend` buffer and snapshot its complete text. The Ctrl+D row must describe a bidirectional command-mode / pane-input toggle, so a user already on the dashboard can discover how to return to the pane.
+#[spec("dashboard/help/002")]
+#[test]
+fn help_002_overlay_documents_ctrl_d_toggle() {
+    let buf = buffer_text_lower(&render_help_overlay_to_buffer(110, 60));
+
+    insta::assert_snapshot!(buf);
+    assert!(
+        buf.contains("toggle command / pane"),
+        "Ctrl+D help must describe a bidirectional toggle, not only the dashboard destination\n--- rendered overlay ---\n{buf}"
+    );
+    assert!(
+        !buf.contains("command mode (dashboard)"),
+        "the stale one-way Ctrl+D description must be removed\n--- rendered overlay ---\n{buf}"
+    );
+}

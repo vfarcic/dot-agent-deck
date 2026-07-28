@@ -15,9 +15,11 @@
 //! were authored RED (the render fns did not exist yet) and went GREEN
 //! once the renderers landed.
 
-use dot_agent_deck::keybindings::{Action, KeybindingConfig, parse_binding};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use dot_agent_deck::keybindings::{Action as KbAction, KeybindingConfig, parse_binding};
 use dot_agent_deck::ui::{
-    render_button_bar_with_bindings_to_buffer, render_help_overlay_with_bindings_to_buffer,
+    Action as UiAction, UiMode, key_action_for_mode, render_button_bar_with_bindings_to_buffer,
+    render_help_overlay_with_bindings_to_buffer, render_hints_bar_for_mode_to_buffer,
     render_hints_bar_to_buffer,
 };
 use spec::spec;
@@ -44,10 +46,10 @@ fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
 fn remapped_config() -> KeybindingConfig {
     let mut c = KeybindingConfig::default();
     c.set(
-        Action::ToggleLayout,
+        KbAction::ToggleLayout,
         parse_binding("Alt+Shift+l").expect("valid notation"),
     );
-    c.set(Action::Help, parse_binding("F1").expect("valid notation"));
+    c.set(KbAction::Help, parse_binding("F1").expect("valid notation"));
     c
 }
 
@@ -55,8 +57,9 @@ fn remapped_config() -> KeybindingConfig {
 /// `Alt+Shift+l` and `help` remapped to `F1`, render the help overlay
 /// against that config into a `TestBackend` buffer, and snapshot it. The
 /// rendered overlay must show the CUSTOM key strings (`Alt+Shift+l`,
-/// `F1`) rather than the defaults — proving the overlay is generated from
-/// the active keybinding config, not from hardcoded strings.
+/// `F1`) rather than the defaults and describe Ctrl+D as a command/pane
+/// toggle — proving the overlay is generated from the active config without
+/// retaining the stale one-way help text.
 #[spec("keybindings/help/001")]
 #[test]
 fn help_001_overlay_reflects_active_bindings() {
@@ -82,6 +85,14 @@ fn help_001_overlay_reflects_active_bindings() {
         "help overlay must render the remapped help key (F1); overlay was \
          generated from hardcoded strings?\n{text}"
     );
+    assert!(
+        text.contains("Toggle command / pane"),
+        "Ctrl+D help must describe the dashboard/pane-input transition as a toggle\n{text}"
+    );
+    assert!(
+        !text.contains("Command mode (dashboard)"),
+        "the one-way Ctrl+D help copy must not survive\n{text}"
+    );
     insta::assert_snapshot!(text);
 }
 
@@ -89,7 +100,8 @@ fn help_001_overlay_reflects_active_bindings() {
 /// → `Alt+Shift+l`), render the dashboard hints bar against it into a
 /// `TestBackend` buffer, and snapshot it. The hints bar must show the
 /// custom key for the layout-toggle action rather than the default
-/// `Ctrl+t` — proving the hints bar is generated from the active config.
+/// `Ctrl+t`, and command mode must label Ctrl+D as `back to pane` rather than
+/// `dashboard`.
 #[spec("keybindings/hints/001")]
 #[test]
 fn hints_001_bar_reflects_active_bindings() {
@@ -107,6 +119,14 @@ fn hints_001_bar_reflects_active_bindings() {
         text.contains("Alt+Shift+l"),
         "hints bar must render the remapped toggle_layout key \
          (Alt+Shift+l); hints were generated from hardcoded strings?\n{text}"
+    );
+    assert!(
+        text.contains("Ctrl+d: back to pane"),
+        "the command-mode hints bar must tell the user how to return to the pane\n{text}"
+    );
+    assert!(
+        !text.contains("Ctrl+d: dashboard"),
+        "the command-mode hints bar must not name the mode the user is already in\n{text}"
     );
     insta::assert_snapshot!(text);
 }
@@ -126,7 +146,7 @@ fn hints_002_unbound_action_not_bare() {
     // as `(unbound)` in the hints bar, never as a bare `: <label>`.
     let mut config = KeybindingConfig::default();
     config.set(
-        Action::NewPane,
+        KbAction::NewPane,
         parse_binding("").expect("empty == unbound"),
     );
 
@@ -168,10 +188,10 @@ fn buttons_001_bar_reflects_active_bindings() {
     // track the active KeybindingConfig (remapped key shown, default not).
     let mut config = KeybindingConfig::default();
     config.set(
-        Action::NewPane,
+        KbAction::NewPane,
         parse_binding("Alt+P").expect("valid notation"),
     );
-    config.set(Action::Help, parse_binding("F1").expect("valid notation"));
+    config.set(KbAction::Help, parse_binding("F1").expect("valid notation"));
 
     // Width wide enough that the New-pane and Help buttons render in full.
     let buffer = render_button_bar_with_bindings_to_buffer(&config, 200, 1);
@@ -192,4 +212,106 @@ fn buttons_001_bar_reflects_active_bindings() {
         "button bar must show the remapped Help key (F1); labels were \
          hardcoded?\n{text}"
     );
+}
+
+/// Scenario: Resolve Ctrl+W once in PaneInput and once in command mode through the production key mapper. PaneInput must forward byte `0x17` to the PTY, while command mode must still request the selected-pane close path.
+#[spec("keybindings/safety/003")]
+#[test]
+fn safety_003_ctrl_w_is_forwarded_only_in_pane_input() {
+    let config = KeybindingConfig::default();
+    let ctrl_w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+
+    match key_action_for_mode(&config, UiMode::PaneInput, &ctrl_w) {
+        Some(UiAction::ForwardToPane(bytes)) => assert_eq!(
+            bytes,
+            vec![0x17],
+            "PaneInput Ctrl+W must reach the PTY as the readline word-delete byte"
+        ),
+        other => panic!("PaneInput Ctrl+W must fall through to PTY forwarding, got {other:?}"),
+    }
+    assert!(
+        matches!(
+            key_action_for_mode(&config, UiMode::Normal, &ctrl_w),
+            Some(UiAction::CloseSelected)
+        ),
+        "command-mode Ctrl+W must still resolve the close request"
+    );
+}
+
+/// Scenario: Resolve the other three global commands while PaneInput owns the keyboard. Ctrl+D, Ctrl+N, and Ctrl+T must retain their existing dashboard, new-pane, and layout actions; only Ctrl+W becomes mode-scoped.
+#[spec("keybindings/safety/004")]
+#[test]
+fn safety_004_other_global_actions_remain_available_in_pane_input() {
+    let config = KeybindingConfig::default();
+    let cases: [(char, &str, fn(&UiAction) -> bool); 3] = [
+        ('d', "dashboard", |a| matches!(a, UiAction::DetachToNormal)),
+        ('n', "new pane", |a| matches!(a, UiAction::NewPane)),
+        ('t', "toggle layout", |a| {
+            matches!(a, UiAction::ToggleLayout)
+        }),
+    ];
+
+    for (ch, label, expected) in cases {
+        let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
+        let action = key_action_for_mode(&config, UiMode::PaneInput, &key)
+            .unwrap_or_else(|| panic!("PaneInput must still resolve the global {label} action"));
+        assert!(
+            expected(&action),
+            "PaneInput Ctrl+{ch} resolved the wrong {label} action: {action:?}"
+        );
+    }
+}
+
+/// Scenario: Parse an existing `[global] close_pane = "Ctrl+x"` configuration and resolve its custom chord in both modes. Command mode must request close while PaneInput forwards Ctrl+X to the PTY, proving the key stayed in the compatible `[global]` table even though dispatch became mode-aware.
+#[spec("keybindings/remap/003")]
+#[test]
+fn remap_003_global_close_binding_survives_mode_gating() {
+    let (config, warnings) = KeybindingConfig::from_toml_str(
+        "[global]\n\
+         close_pane = \"Ctrl+x\"\n",
+    )
+    .expect("the existing [global] close_pane config must remain valid");
+    assert!(
+        warnings.is_empty(),
+        "compatible config warned: {warnings:?}"
+    );
+    let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+
+    assert!(
+        matches!(
+            key_action_for_mode(&config, UiMode::Normal, &ctrl_x),
+            Some(UiAction::CloseSelected)
+        ),
+        "the custom [global] close chord must request close in command mode"
+    );
+    match key_action_for_mode(&config, UiMode::PaneInput, &ctrl_x) {
+        Some(UiAction::ForwardToPane(bytes)) => assert_eq!(bytes, vec![0x18]),
+        other => panic!(
+            "the custom close chord must remain ordinary PTY input in PaneInput, got {other:?}"
+        ),
+    }
+}
+
+/// Scenario: Render the hints bar once for command mode and once for PaneInput using the same default bindings. Command mode must advertise Close and label Ctrl+D as `back to pane`; PaneInput must omit Close and retain Ctrl+D's `dashboard` destination.
+#[spec("keybindings/hints/003")]
+#[test]
+fn hints_003_bar_reflects_mode_scoped_close() {
+    let config = KeybindingConfig::default();
+    let normal = buffer_to_text(&render_hints_bar_for_mode_to_buffer(
+        &config,
+        UiMode::Normal,
+        120,
+        1,
+    ));
+    let pane_input = buffer_to_text(&render_hints_bar_for_mode_to_buffer(
+        &config,
+        UiMode::PaneInput,
+        120,
+        1,
+    ));
+
+    assert!(normal.contains("Ctrl+w: close"), "{normal}");
+    assert!(normal.contains("Ctrl+d: back to pane"), "{normal}");
+    assert!(!pane_input.contains(": close"), "{pane_input}");
+    assert!(pane_input.contains("Ctrl+d: dashboard"), "{pane_input}");
 }

@@ -1,0 +1,52 @@
+---
+source: tests/render_help_overlay.rs
+expression: buf
+---
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+                                                                                                              
+   ┌ help ───────────────────────────────────────────────────────────────────────────────────────────────┐    
+   │  global (works from any pane)                       mode tab (in-tab navigation)                    │    
+   │                                                                                                     │    
+   │  ctrl+d             toggle command / pane           j / down           focus next pane              │    
+   │  ctrl+n             create new pane                 k / up             focus previous pane          │    
+   │  ctrl+w             close selected pane             enter           enter paneinput on selected     │    
+   │  ctrl+t             toggle layout (stacked/tiled)   esc             deselect side pane              │    
+   │  ctrl+c             quit                            mouse click     focus pane                      │    
+   │                                                     ctrl+click      open hyperlink                  │    
+   │  tab navigation                                     ctrl+d             return to normal mode        │    
+   │                                                                                                     │    
+   │  tab / right / l    next tab                        new agent form                                  │    
+   │  shift+tab / left / h prev tab                                                                      │    
+   │  ctrl+pgdn          next tab                        tab             switch field                    │    
+   │  ctrl+pgup          prev tab                        ◀/▶             cycle mode                      │    
+   │                                                     enter           next field / confirm            │    
+   │  dashboard (command mode)                           esc             cancel                          │    
+   │                                                                                                     │    
+   │  j / down           select next card                directory picker                                │    
+   │  k / up             select previous card                                                            │    
+   │  1-9                jump to pane n                  j / down        select next                     │    
+   │  enter              focus selected pane             k / up          select previous                 │    
+   │  /                  filter sessions                 l / right / enter   enter directory             │    
+   │  esc                clear filter                    h / left / bksp     go up one level             │    
+   │  r                  rename session                  space           confirm current directory       │    
+   │  g                  generate .dot-agent-deck.toml   /               filter (case-insensitive)       │    
+   │  y / n              approve / deny permission       esc             clear filter (twice = close)    │    
+   │  s                  scheduled tasks manager         q               cancel                          │    
+   │  ?                  toggle this help                                                                │    
+   │                                                     session                                         │    
+   │                                                                                                     │    
+   │                                                     panes auto-saved continuously.                  │    
+   │                                                     restored automatically on launch.               │    
+   │  [close]                                                                                            │    
+   │  press ? or esc to close                                                                            │    
+   └─────────────────────────────────────────────────────────────────────────────────────────────────────┘

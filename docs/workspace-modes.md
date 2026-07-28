@@ -133,7 +133,7 @@ See [Keyboard Shortcuts](keyboard-shortcuts.md) for all keybindings.
 
 ### Closing a Mode Tab
 
-Press `Ctrl+w` on a mode tab to tear down the entire workspace — the agent and all side panes are stopped. The dashboard tab cannot be closed.
+From command mode (press `Ctrl+d` first if you're typing in a pane), press `Ctrl+w` on a mode tab and choose **Close** in the confirmation to tear down the entire workspace — the agent and all side panes are stopped. The dashboard tab cannot be closed.
 
 ### Jumping to a Mode Tab from the Dashboard
 
@@ -178,7 +178,7 @@ From the dashboard, press `g` on an agent's card to open a dialog with three opt
 - **No** — dismisses the dialog; the hint stays on the card.
 - **Never** — suppresses the hint permanently for this directory.
 
-After the agent creates the file, press `Ctrl+w` to close the current pane, then `Ctrl+n` to create a new one and select your mode.
+After the agent creates the file, press `Ctrl+d` to leave the pane, `Ctrl+w` and **Close** to close it, then `Ctrl+n` to create a new one and select your mode.
 
 To disable the hint globally: `dot-agent-deck config set auto_config_prompt false`.
 

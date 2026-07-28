@@ -23,10 +23,7 @@ dashboard/density/003
 dashboard/filter/001
 dashboard/filter/002
 dashboard/help/001
-dashboard/help/002
 dashboard/pane/001
-dashboard/pane/002
-dashboard/pane/003
 # dashboard/pane/005 — PRD #83 landed an L1 test
 # (tests/render_dashboard.rs::pane_005_highlight_follows_selected_session_id);
 # the former "Card row shows Dir/Last/Tools/Prmt" plan moved to

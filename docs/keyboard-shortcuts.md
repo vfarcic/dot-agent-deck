@@ -9,21 +9,29 @@ title: Keyboard Shortcuts
 
 Every keyboard action below is also reachable with the mouse — the dashboard is fully clickable, not keyboard-only. Each clickable affordance carries its keyboard shortcut inline, so the on-screen controls double as a legend, and clicking one performs exactly the same action as its shortcut.
 
-- **Persistent button bar.** The bottom row exposes the global commands — `[New Pane Ctrl+N]`, `[Close Ctrl+W]`, `[Toggle Layout Ctrl+T]`, `[Help ?]`, and `[Quit Ctrl+C]`. On terminals too narrow for the full labels it falls back to shortcut-only buttons (e.g. `[Ctrl+N]`). This replaces the old status-bar legend.
+- **Persistent button bar.** The bottom row exposes the global commands — `[New Pane Ctrl+N]`, `[Close Ctrl+W]`, `[Toggle Layout Ctrl+T]`, `[Help ?]`, and `[Quit Ctrl+C]`. On terminals too narrow for the full labels it falls back to shortcut-only buttons (e.g. `[Ctrl+N]`). This replaces the old status-bar legend. `[Close]` opens the same close confirmation the `Ctrl+W` key does.
 - **Tab strip.** Click a tab header to switch to it; Mode and Orchestration tabs carry a clickable `[×]` close affordance (the Dashboard tab has none).
 - **Dashboard cards.** Single-click a card to select it, double-click to focus its pane. The bar adds clickable `[Filter /]`, `[Rename r]`, and `[Generate g]` buttons.
 - **Dialogs, picker, and forms.** Each carries explicit clickable buttons alongside its keyboard controls: quit/config-gen/star/help dialog buttons; the directory picker's clickable rows, `..` parent, and `[Confirm]`/`[Cancel]`/`[Filter]`; the inline filter/rename `[Apply]`/`[Save]`/`[Cancel]`; the `[Detach Ctrl+D]` affordance while in a pane; and the new-pane form's clickable mode chips with `[Submit]`/`[Cancel]`.
 
 All the keyboard shortcuts below continue to work unchanged.
 
-## Global Shortcuts (work from any mode)
+## Global Shortcuts
 
-| Key | Action |
-|---|---|
-| `Ctrl+D` | Enter command / navigation mode |
-| `Ctrl+N` | New pane (directory picker, then name + command form) |
-| `Ctrl+W` | Close selected pane on the dashboard, or tear down the entire mode tab (agent + side panes) when used on a mode tab. The dashboard tab itself cannot be closed. |
-| `Ctrl+T` | Toggle stacked / tiled layout |
+| Key | Action | Works from |
+|---|---|---|
+| `Ctrl+D` | Toggle between command mode and the pane — press it in a pane to reach the dashboard, press it again to go back to the pane you came from | Any mode |
+| `Ctrl+N` | New pane (directory picker, then name + command form) | Any mode |
+| `Ctrl+T` | Toggle stacked / tiled layout | Any mode |
+| `Ctrl+W` | Close the selected pane on the dashboard, or tear down the entire mode tab (agent + side panes) when used on a mode tab — after a confirmation dialog. The dashboard tab itself cannot be closed. | **Command mode only** |
+
+### `Ctrl+W` closes only from command mode
+
+`Ctrl+W` is delete-previous-word in shells, readline, vim, and essentially every program you run inside a pane. So while you are typing in a pane, `Ctrl+W` is sent straight through to that program as `^W` (byte `0x17`) and deletes a word — it does not close anything. Press `Ctrl+D` first to reach command mode, and `Ctrl+W` there asks you to confirm before closing.
+
+The confirmation defaults to **Cancel**, so an accidental `Ctrl+W` followed by a reflexive `Enter` leaves your pane exactly where it was. Choosing **Close** stops the agent and removes the card.
+
+### `Ctrl+C`
 
 In PaneInput mode, `Ctrl+C` is delivered to the terminal as SIGINT (0x03). From the dashboard (command mode), pressing `Ctrl+C` opens a quit confirmation dialog; press it again to quit immediately, or use the dialog keys (see [Dialogs](#dialogs)) to choose Yes / No.
 
@@ -50,7 +58,7 @@ These shortcuts work in Normal mode when a mode tab is active.
 | `Esc` | Deselect side pane (return focus indicator to agent) |
 | Mouse click | Click a side pane to select it; click agent pane to deselect |
 
-In PaneInput mode, use `Ctrl+D` to return to Normal mode.
+In PaneInput mode, use `Ctrl+D` to return to Normal mode — and `Ctrl+D` again to go back into the pane.
 
 ## Dashboard
 
@@ -103,6 +111,7 @@ Several dashboard shortcuts open transient input fields or selection dialogs. Th
 | **Rename** | `r` | Type the new name · `Enter` to confirm · `Esc` to cancel |
 | **Generate config** | `g` | `Up`/`Down` (or `k`/`j`) to choose **Yes** / **No** / **Never** · `Enter` to confirm · `Esc` to cancel. **Yes** sends a prompt to the agent to write `.dot-agent-deck.toml`; **Never** suppresses the hint permanently for that directory. |
 | **Quit confirmation** | `Ctrl+C` from command mode | `Up`/`Down` (or `k`/`j`) to choose **Yes** / **No** · `Enter` to confirm · `Esc` to dismiss · `Ctrl+C` again to quit immediately |
+| **Close confirmation** | `Ctrl+W` from command mode, or the `[Close]` button | `Up`/`Down` (or `k`/`j`) to choose **Cancel** (default) / **Close** · `Enter` to confirm · `y` closes / `n` cancels in one keypress · `Esc` to dismiss. Only **Close** tears the pane (or mode tab) down. |
 | **Help overlay** | `?` | `?`, `Esc`, or `q` to dismiss |
 
 ## Customizing Keybindings
@@ -142,15 +151,17 @@ help = "F1"                      # open help with F1 instead of ?
 
 ### Actions and defaults
 
-`[global]` (work from any mode):
+`[global]`:
 
 | Action | Default | Description |
 |---|---|---|
-| `dashboard` | `Ctrl+d` | Enter command / navigation mode |
-| `new_pane` | `Ctrl+n` | New pane (directory picker → name + command) |
-| `close_pane` | `Ctrl+w` | Close selected pane / tear down mode tab |
-| `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout |
+| `dashboard` | `Ctrl+d` | Toggle between command mode and the pane — works from any mode |
+| `new_pane` | `Ctrl+n` | New pane (directory picker → name + command) — works from any mode |
+| `close_pane` | `Ctrl+w` | Close selected pane / tear down mode tab, with confirmation — **command mode only**; in a pane the chord is ordinary input for whatever is running there |
+| `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout — works from any mode |
 | `jump_1` … `jump_9` | `1` … `9` | Jump to card N and focus its pane |
+
+`close_pane` stays in `[global]` — the section names the TOML table your binding is read from, not the modes it applies in, so an existing `[global] close_pane = "…"` line keeps working. Whatever chord you bind it to is command-mode only and reaches the pane as ordinary input everywhere else.
 
 `[dashboard]` (command mode):
 

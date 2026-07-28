@@ -30,14 +30,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/pane/002 — Closing a pane via `Ctrl+w` removes its card from the dashboard.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** card count decreases by one; the focused card index stays within bounds.
+- **Asserts:** Ctrl+W opens the close confirmation; navigating from default Cancel to Close and confirming removes the card, and the focused card index stays within bounds.
 - **Does not assert:** which card receives focus next (`dashboard/selection/*` covers selection-after-close).
 - **Platform coverage:** mac+linux.
 
 ##### dashboard/pane/003 — The dashboard pane (tab 0) is never closable.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** `Ctrl+w` from the dashboard tab with no card selected is a no-op (no panic, dashboard still rendered, tab count unchanged).
+- **Asserts:** `Ctrl+w` from the dashboard tab with no card selected is a no-op: no confirmation opens, no panic occurs, the dashboard remains rendered, and the tab count is unchanged.
 - **Does not assert:** any status-line text.
 - **Platform coverage:** mac+linux.
 
@@ -204,7 +204,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/selection/012 — An inactive selection makes the close-pane action a no-op (no fall back to card 0).
 - **Layer:** L1 (in-process `dispatch_action(Action::CloseSelected)`).
 - **Agent:** none (3 synthetic dashboard cards with pane ids).
-- **Asserts:** with `selected_index = None` (inactive, nothing armed), dispatching `Action::CloseSelected` issues no `close_pane` call and removes no session — it does NOT close card 0. Encodes the PRD invariant (inactive = nothing armed) alongside `dashboard/pane/003`.
+- **Asserts:** with `selected_index = None` (inactive, nothing armed), dispatching `Action::CloseSelected` opens no confirmation, issues no `close_pane` call, and removes no session — it does NOT arm or close card 0. Encodes the PRD invariant (inactive = nothing armed) alongside `dashboard/pane/003`.
 - **Does not assert:** the active-selection close behaviour, or mode/orchestration whole-tab teardown.
 - **Platform coverage:** mac+linux+windows.
 
@@ -232,7 +232,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/selection/016 — The inactive-selection close no-op (012) does NOT suppress closing an active Mode/Orchestration tab via Ctrl+W.
 - **Layer:** L1 (in-process `dispatch_action(Action::CloseSelected)` against a recording `PaneController`).
 - **Agent:** none (a real Mode tab, then a real Orchestration tab; no dashboard cards armed).
-- **Asserts:** with a Mode tab active and `selected_index == None`, dispatching `Action::CloseSelected` closes that tab (tab count drops back to the lone Dashboard); the same holds for an active Orchestration tab. Bounds the `dashboard/selection/012` no-op gate: the inactive-selection guard suppresses closing an unarmed dashboard CARD, but a Mode/Orchestration TAB still closes via Ctrl+W. Regression for the PR #151 e2e failure `e2e_render_contract::layout_002` (keyboard Ctrl+W stopped closing a Mode tab because the close routed through the inactive-selection gate).
+- **Asserts:** with a Mode tab active and `selected_index == None`, dispatching `Action::CloseSelected` opens confirmation and `ConfirmCloseSelected` closes that tab (tab count drops back to the lone Dashboard); the same holds for an active Orchestration tab. Bounds the `dashboard/selection/012` no-op gate: the inactive-selection guard suppresses an unarmed dashboard CARD, but an active Mode/Orchestration TAB remains a valid confirmation target. Regression for the PR #151 e2e failure `e2e_render_contract::layout_002`.
 - **Does not assert:** the per-pane PTY teardown / role-pane stop (covered by the L2 `tabs/mode/002`, `tabs/orchestration/002`); the dashboard-card close no-op itself (covered by `dashboard/selection/012`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -315,7 +315,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/help/002 — Help overlay content matches the committed snapshot.
 - **Layer:** L1.
 - **Agent:** none.
-- **Asserts:** `insta` file snapshot of the overlay buffer.
+- **Asserts:** `insta` file snapshot of the overlay buffer; the Ctrl+D row describes a bidirectional command-mode / pane-input toggle rather than the one-way destination `Command mode (dashboard)`.
 - **Does not assert:** dynamic content (none today).
 - **Platform coverage:** mac+linux+windows.
 
@@ -479,6 +479,29 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** any beep or visual ack.
 - **Platform coverage:** mac+linux.
 
+#### prompt/close-confirm
+
+##### prompt/close-confirm/001 — Command-mode Ctrl+W opens a Cancel-default close confirmation.
+- **Layer:** L1 (in-process key mapper + close-confirm state + ratatui `TestBackend`).
+- **Agent:** none.
+- **Asserts:** Ctrl+W resolves `CloseSelected`, an available target opens the confirmation, and the rendered modal shows `Cancel` selected by default alongside `Close`.
+- **Does not assert:** daemon teardown after confirmation (covered by `lifecycle/stop/*` and `dashboard/pane/002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/close-confirm/002 — Cancel preserves the target while explicit confirmation authorizes one close.
+- **Layer:** L1 (in-process close-confirm state machine).
+- **Agent:** none.
+- **Asserts:** Enter on default Cancel yields `DismissModal` and zero destructive actions; navigating to Close and pressing Enter yields exactly one `ConfirmCloseSelected` action.
+- **Does not assert:** the controller's StopAgent wire result (covered by `lifecycle/stop/005`–`006`).
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/close-confirm/003 — The `[Close]` button and Ctrl+W share the same confirmation action path.
+- **Layer:** L1 (in-process action mapping).
+- **Agent:** none.
+- **Asserts:** command-mode Ctrl+W and the persistent `[Close]` button both produce `Action::CloseSelected`, and that action arms the same Cancel-default confirmation for both sources.
+- **Does not assert:** mouse coordinate decoding (covered by `mouse/button/*`).
+- **Platform coverage:** mac+linux+windows.
+
 #### prompt/pane-input
 
 ##### prompt/pane-input/001 — `Enter` on a focused side pane enters PaneInput mode.
@@ -619,6 +642,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** synthetic Codex live and history-only events bound by agent identity to pane-less `/bin/sh` targets.
 - **Asserts:** pre-lock history-only sends return `history-only` without bytes, a live-to-history transition while waiting for the writer is rejected after the lock, and a live pane-less target still receives its guarded prompt.
 - **Does not assert:** visible TUI feedback for the returned result.
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/021 — Ctrl+W performs real shell word deletion without closing the pane.
+- **Layer:** L2 (PTY-attached real binary and a real interactive Bash/readline pane).
+- **Agent:** none (the shell is the genuine user surface under test, not an agent stand-in).
+- **Asserts:** after typing two words, Ctrl+W deletes the previous word, the replacement word is what the submitted command visibly prints, and both the rendered pane and daemon agent record still exist.
+- **Does not assert:** close confirmation from command mode (covered by `prompt/close-confirm/*`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/pane-input/022 — Ctrl+W while editing a real interactive Claude Haiku prompt does not tear down the pane.
+- **Layer:** L2 (PTY-attached real binary, runtime-skipped when Claude CLI/credentials are unavailable; flaky-tolerant pre-PR tier).
+- **Agent:** REAL interactive Claude Code on `claude-haiku-4-5-20251001`, with onboarding/project trust seeded and `--allowedTools Bash Read`; no `-p`.
+- **Asserts:** after the real Claude pane registers, typing words and pressing Ctrl+W leaves its named card visible and its daemon-side agent record present when the user returns to command mode.
+- **Does not assert:** exact Claude prompt-edit rendering or an LLM response (the safety invariant is pane survival while interacting with the genuine agent).
 - **Platform coverage:** mac+linux.
 
 #### prompt/quit
@@ -1188,6 +1225,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** stdout content (loose contains-check).
 - **Platform coverage:** mac+linux.
 
+##### lifecycle/stop/005 — Closing an already-stopped daemon agent completes local teardown.
+- **Layer:** L1 (real `EmbeddedPaneController` against a synthetic Unix-socket daemon).
+- **Agent:** none (synthetic StartAgent / AttachStream; both StopAgent attempts return `Agent … not found`).
+- **Asserts:** `close_pane` returns success, removes the pane from the local registry, and does not re-insert the ghost card after the existing one-time retry.
+- **Does not assert:** the dashboard confirmation UI (`prompt/close-confirm/*`); daemon process termination (the synthetic daemon reports the agent already absent).
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/006 — A genuine StopAgent failure still retains the pane and surfaces the error.
+- **Layer:** L1 (real `EmbeddedPaneController` against a synthetic Unix-socket daemon).
+- **Agent:** none (synthetic StartAgent / AttachStream; StopAgent returns a non-NotFound server error).
+- **Asserts:** `close_pane` returns the daemon error, re-inserts the pane for retry, and does not apply the NotFound-only retry/classification to other failures.
+- **Does not assert:** the timeout arm (the existing retain-and-surface implementation remains unchanged); dashboard status-message layout.
+- **Platform coverage:** mac+linux.
+
 #### lifecycle/restart
 
 ##### lifecycle/restart/001 — `daemon restart` reuses the next-launch lazy-spawn — a subsequent `dot-agent-deck` launch comes up against a fresh daemon process.
@@ -1451,6 +1502,13 @@ without depending on the config struct API.
 - **Does not assert:** that the old `?` still opens help (the action was remapped, not added), help-overlay content beyond one anchor line.
 - **Platform coverage:** mac+linux.
 
+##### keybindings/remap/003 — Existing `[global] close_pane` remaps survive mode-gated dispatch.
+- **Layer:** L1 (TOML parse + in-process production key mapper).
+- **Agent:** none.
+- **Asserts:** `[global] close_pane = "Ctrl+x"` parses without warnings, the custom chord requests close in command mode, and the same chord remains ordinary `0x18` PTY input in PaneInput.
+- **Does not assert:** filesystem loading of `keybindings.toml` (covered by `keybindings/remap/001`); arbitrary per-mode config syntax (out of scope).
+- **Platform coverage:** mac+linux+windows.
+
 #### keybindings/safety
 
 ##### keybindings/safety/001 — `Ctrl+C` always opens the quit modal, even when another action is bound to `Ctrl+C`.
@@ -1466,6 +1524,20 @@ without depending on the config struct API.
 - **Asserts:** with a `keybindings.toml` that binds both `[dashboard] move_left = "Ctrl+C"` and `move_right = "Ctrl+C"`, pressing `Ctrl+C` still opens the quit/detach modal ("Quit dot-agent-deck?"). Complements safety/001 by covering the Normal-mode tab-cycle dispatch path: `Ctrl+C` is never routed through the configurable `move_left`/`move_right` matching, so it can't be turned into a tab switch. `Ctrl+C` is non-overridable. Regression guard for the `!is_ctrl_c` gate on that dispatch path.
 - **Does not assert:** tab-switch behaviour for non-`Ctrl+C` `move_left`/`move_right` bindings, conflict-resolution warning wording.
 - **Platform coverage:** mac+linux.
+
+##### keybindings/safety/003 — Ctrl+W is PTY input in PaneInput and a close request in command mode.
+- **Layer:** L1 (in-process production key mapper).
+- **Agent:** none.
+- **Asserts:** the same default Ctrl+W chord yields `ForwardToPane([0x17])` in `UiMode::PaneInput` and `CloseSelected` in `UiMode::Normal`; both halves live in one regression test.
+- **Does not assert:** readline's visible editing result or pane survival through the real binary (covered by `prompt/pane-input/021`).
+- **Platform coverage:** mac+linux+windows.
+
+##### keybindings/safety/004 — Mode-gating Close does not scope the other global commands.
+- **Layer:** L1 (in-process production key mapper).
+- **Agent:** none.
+- **Asserts:** Dashboard, NewPane, and ToggleLayout still resolve from PaneInput; only ClosePane falls through to PTY input.
+- **Does not assert:** each action's downstream UI mutation (covered by its feature-specific tests).
+- **Platform coverage:** mac+linux+windows.
 
 #### keybindings/unbind
 
@@ -1490,7 +1562,7 @@ without depending on the config struct API.
 ##### keybindings/help/001 — The help overlay is generated from the active keybinding config and shows remapped keys.
 - **Layer:** L1 (ratatui `TestBackend` + `insta` file snapshot).
 - **Agent:** none.
-- **Asserts:** rendered against a `KeybindingConfig` that remaps `toggle_layout` → `Alt+Shift+l` and `help` → `F1`, the help-overlay buffer shows those custom notations (the snapshot — and a substring guard on `Alt+Shift+l` / `F1`) rather than the defaults, proving the overlay is generated from the active config, not hardcoded strings. The defaults-content guard lives separately at `dashboard/help/002` and stays untouched.
+- **Asserts:** rendered against a `KeybindingConfig` that remaps `toggle_layout` → `Alt+Shift+l` and `help` → `F1`, the help-overlay buffer shows those custom notations and describes Ctrl+D as a command-mode / pane-input toggle, proving the overlay is generated from the active config while retaining the corrected semantics. The default-config content guard lives at `dashboard/help/002`.
 - **Does not assert:** the overlay's exact column layout or footer wording beyond what the committed snapshot pins; behaviour with the *default* config (that is `dashboard/help/002`'s job).
 - **Platform coverage:** mac+linux+windows.
 
@@ -1499,7 +1571,7 @@ without depending on the config struct API.
 ##### keybindings/hints/001 — The hints bar is generated from the active keybinding config and shows remapped keys.
 - **Layer:** L1 (ratatui `TestBackend` + `insta` file snapshot).
 - **Agent:** none.
-- **Asserts:** rendered against a `KeybindingConfig` that remaps `toggle_layout` → `Alt+Shift+l`, the hints-bar buffer shows the custom layout-toggle notation (the snapshot — and a substring guard on `Alt+Shift+l`) rather than the default `Ctrl+t`, proving the hints bar is generated from the active config.
+- **Asserts:** rendered in command mode against a `KeybindingConfig` that remaps `toggle_layout` → `Alt+Shift+l`, the hints-bar buffer shows the custom layout-toggle notation and labels Ctrl+D as `back to pane` rather than `dashboard`; the committed snapshot pins the complete mode-aware bar.
 - **Does not assert:** the full set of actions shown in the bar or their order beyond what the committed snapshot pins; truncation behaviour at narrow widths.
 - **Platform coverage:** mac+linux+windows.
 
@@ -1508,6 +1580,13 @@ without depending on the config struct API.
 - **Agent:** none.
 - **Asserts:** rendered against a default `KeybindingConfig` with `new_pane` unbound (empty notation), the hints-bar text substitutes `(unbound)` for the empty key (matching the help overlay) and renders `(unbound): new`; it never emits a bare `: new` with an empty key column (no leading `: <label>` and no mid-string `  : <label>`). Greptile P2 regression guard.
 - **Does not assert:** the exact placeholder wording beyond `(unbound)`, behaviour of other simultaneously-unbound actions, snapshot of the full bar.
+- **Platform coverage:** mac+linux+windows.
+
+##### keybindings/hints/003 — The hints bar reflects Close's mode scope and makes command-mode exit discoverable.
+- **Layer:** L1 (ratatui `TestBackend`, rendered once per mode).
+- **Agent:** none.
+- **Asserts:** command mode shows `Ctrl+w: close` and `Ctrl+d: back to pane`; PaneInput omits the close hint and labels Ctrl+D as `dashboard`.
+- **Does not assert:** narrow-width truncation or the separate PaneInput status-line layout.
 - **Platform coverage:** mac+linux+windows.
 
 #### keybindings/buttons

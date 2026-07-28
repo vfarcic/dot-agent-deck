@@ -162,13 +162,13 @@ These require command mode — press `Ctrl+d` first if you are typing in a role 
 |---|---|
 | `Left` / `Right` (or `h` / `l`) | Cycle to previous / next tab |
 | `1`–`9` | Jump to role card N and focus its pane |
+| `Ctrl+w` | Close the orchestration tab (stops all role panes), after a confirmation |
 
 These work from anywhere, including while typing in a role pane:
 
 | Key | Action |
 |---|---|
 | `Ctrl+PageDown` / `Ctrl+PageUp` | Cycle to next / previous tab |
-| `Ctrl+w` | Close the orchestration tab (stops all role panes) |
 
 The sidebar shows each role's status live (thinking, working, waiting, idle, error) so you can see at a glance who is busy without switching panes.
 

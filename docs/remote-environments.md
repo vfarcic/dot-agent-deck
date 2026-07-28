@@ -79,7 +79,7 @@ Two distinct user actions; very different consequences.
 
 | Action | What happens | When to use |
 |---|---|---|
-| **Stop** (`Ctrl+W` on a remote pane) | Sends `StopAgent` to the daemon over the local-on-remote socket; the daemon kills the PTY and removes the agent from the registry. | You're done with the agent; want it gone. |
+| **Stop** (`Ctrl+W` from command mode, then **Close**) | Sends `StopAgent` to the daemon over the local-on-remote socket; the daemon kills the PTY and removes the agent from the registry. If the daemon reports the agent is already gone, the card is removed anyway rather than wedging on an error you can never clear. | You're done with the agent; want it gone. |
 | **Detach** (Ctrl+C in dashboard, then "Detach" in the dialog) | The TUI sends an explicit `KIND_DETACH` frame to the daemon on its Unix socket, then exits. The daemon records a clean detach and keeps the agents running. The ssh session ends when the TUI exits. | You want to step away and come back later, and want the daemon's logs to show a voluntary detach. |
 | **Quit** (Ctrl+C in dashboard, then "Quit") | The TUI exits without sending a detach frame. The daemon observes EOF on its socket and treats it the same as detach — agents stay alive. The ssh session ends when the TUI exits. | You're done for the day; don't need the explicit signal. |
 | **Sleep / network drop** (no action) | SSH keepalive detects the dead connection within ~45s and ssh exits; `connect` then re-probes and **reconnects automatically** to the still-running agents, so the session resumes in place. The daemon and agents never stopped. See [Surviving sleep/wake](#surviving-sleepwake). | Implicit; happens automatically when the laptop sleeps or the network drops. |
