@@ -5,48 +5,24 @@ title: Troubleshooting
 
 # Troubleshooting
 
-## Shift+Enter Not Working in Ghostty Terminal
+## Shift+Enter Submits Instead of Inserting a Newline
 
-When running Claude Code or other AI coding agents inside dot-agent-deck with the **Ghostty terminal emulator**, Shift+Enter may not create newlines in chat inputs as expected.
+Inside an embedded agent pane, **Shift+Enter** inserts a newline into the agent's draft and plain **Enter** submits it — the same behavior you get running the agent directly. This works with **no terminal configuration** on any terminal that implements the enhanced ("kitty") keyboard protocol, which the deck negotiates for you at startup.
 
-### Why This Happens
+### What Used to Cause This
 
-Ghostty intercepts Shift+Enter for its own terminal features when applications enable mouse capture mode. This prevents the keystroke from reaching the embedded application.
+The break was never in your terminal emulator. It was two dot-agent-deck defects that compounded, both now fixed:
 
-### Solution
+- The deck never asked the terminal for the enhanced keyboard protocol, so a terminal that *could* encode Shift+Enter distinctly stayed in legacy mode and delivered a bare carriage return — the SHIFT modifier was gone before any deck code ran.
+- The deck's pane-input encoder dropped the SHIFT modifier even when it did arrive, mapping Enter to `\r` unconditionally. Shift+Enter and plain Enter were literally the same byte on the wire, so every agent read both as "submit".
 
-Add the following line to your Ghostty configuration file:
+Earlier versions of this page blamed Ghostty for intercepting the keystroke and prescribed adding `keybind = shift+enter=csi:13;2u` to the Ghostty config. That attribution was wrong, and the keybind could not have been the fix on its own — it made the modifier arrive, and the deck then discarded it. If you already have that line in `~/Library/Application Support/com.mitchellh.ghostty/config`, you can leave it: it still works and does no harm, it is simply no longer necessary.
 
-**Location:** `~/Library/Application Support/com.mitchellh.ghostty/config`
+### If It Still Submits
 
-```
-keybind = shift+enter=csi:13;2u
-```
-
-This uses the CSI u format (modern keyboard protocol) to send Shift+Enter with the SHIFT modifier preserved.
-
-### How to Apply
-
-1. Edit the Ghostty config file:
-   ```bash
-   nano ~/Library/Application\ Support/com.mitchellh.ghostty/config
-   ```
-
-2. Add the keybind line (you can add it anywhere in the file)
-
-3. Restart Ghostty or reload its configuration
-
-4. Test in dot-agent-deck: Shift+Enter should now create newlines in chat applications
-
-### Verification
-
-After applying the fix:
-- Regular **Enter** should submit messages
-- **Shift+Enter** should create newlines without submitting
-
-### Note
-
-This configuration only affects Ghostty. Other terminal emulators (iTerm2, Alacritty, Warp, etc.) typically work without additional configuration.
+- **You are running the deck inside tmux.** tmux reports no keyboard-enhancement support, so the deck skips the negotiation there and Shift+Enter falls back to its previous behavior. Either run the deck outside tmux, or have tmux pass extended keys through with `set -s extended-keys always` and `set -s extended-keys-format csi-u`.
+- **Your terminal does not implement the enhanced keyboard protocol.** Bind the keystroke to the CSI u encoding yourself if your terminal supports custom keybinds — in Ghostty that is the `keybind = shift+enter=csi:13;2u` line above. The deck forwards the modifier faithfully either way.
+- **You are on an older dot-agent-deck.** Upgrade; no configuration change is needed after that.
 
 ## Hooks
 
