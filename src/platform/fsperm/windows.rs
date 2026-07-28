@@ -605,6 +605,39 @@ mod tests {
         opts.open(path).expect("open the secret-bearing file")
     }
 
+    /// Render `sd`'s `D:` clause as SDDL.
+    ///
+    /// Shared by both sides of the comparison in the test below, which is what
+    /// makes that comparison meaningful: this renderer normalizes a trustee to its
+    /// well-known abbreviation where one exists (`LA` for the built-in
+    /// Administrator — who the CI runner happens to be), so only two strings that
+    /// both came through it can be compared.
+    fn render_dacl_sddl(sd: PSECURITY_DESCRIPTOR) -> String {
+        let mut wide: *mut u16 = ptr::null_mut();
+        // SAFETY: `sd` is a live descriptor owned by the caller, `wide` is a valid
+        // out-pointer, and a null length pointer is the documented "do not report
+        // the length" form. On success the callee hands back a `LocalAlloc`'d
+        // NUL-terminated string, taken over below.
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut wide,
+                ptr::null_mut(),
+            )
+        };
+        assert_ne!(
+            ok,
+            0,
+            "render a DACL as SDDL: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: `wide` is the NUL-terminated `LocalAlloc`'d string just handed
+        // back, and nothing else refers to it.
+        unsafe { take_local_wide_string(wide) }
+    }
+
     /// The DACL the kernel actually stored for `file`, rendered as SDDL.
     ///
     /// Reading it back is the point: `set_file_owner_only` returning `Ok` is also
@@ -634,30 +667,7 @@ mod tests {
         win32_error_to_result(rc, "GetSecurityInfo (read the stored file DACL back)")
             .expect("read the stored DACL back");
         let sd = OwnedSecurityDescriptor(sd);
-
-        let mut wide: *mut u16 = ptr::null_mut();
-        // SAFETY: `sd.0` is the live descriptor owned by `sd`, `wide` is a valid
-        // out-pointer, and a null length pointer is the documented "do not report
-        // the length" form. On success the callee hands back a `LocalAlloc`'d
-        // NUL-terminated string, taken over below.
-        let ok = unsafe {
-            ConvertSecurityDescriptorToStringSecurityDescriptorW(
-                sd.0,
-                SDDL_REVISION_1,
-                DACL_SECURITY_INFORMATION,
-                &mut wide,
-                ptr::null_mut(),
-            )
-        };
-        assert_ne!(
-            ok,
-            0,
-            "render the stored DACL as SDDL: {}",
-            io::Error::last_os_error()
-        );
-        // SAFETY: `wide` is the NUL-terminated `LocalAlloc`'d string just handed
-        // back, and nothing else refers to it.
-        unsafe { take_local_wide_string(wide) }
+        render_dacl_sddl(sd.0)
     }
 
     /// The file/dir ACL half, end to end against the real filesystem: a directory
@@ -679,42 +689,41 @@ mod tests {
         set_file_owner_only(&file).expect("re-applying must be idempotent");
 
         let sid = current_user_sid().expect("read the current user SID");
-        let sddl = stored_dacl_sddl(&file);
-        // Flags render before the first ACE (`D:PAI(A;;…)`); assert on the set,
-        // not on a fixed order.
-        let flags = sddl
-            .trim_start_matches("D:")
-            .split('(')
-            .next()
-            .unwrap_or_default()
-            .to_string();
+        let stored = stored_dacl_sddl(&file);
+
+        // Protected — nothing the parent directory says can loosen this file.
+        // Flags render before the first ACE (`D:PAI(A;;…)`), so assert on the set
+        // rather than a fixed order.
+        let flags = stored.trim_start_matches("D:").split('(').next();
         assert!(
-            flags.contains('P'),
-            "the stored DACL must be protected, so nothing the parent directory says can loosen \
-             it: {sddl}"
+            flags.is_some_and(|f| f.contains('P')),
+            "the stored DACL must be protected: {stored}"
         );
         assert_eq!(
-            sddl.matches('(').count(),
+            stored.matches('(').count(),
             1,
             "exactly one ACE — a second one means another principal kept access to a \
-             secret-bearing file: {sddl}"
+             secret-bearing file: {stored}"
         );
-        assert!(
-            sddl.contains(&format!(";;;{sid})")),
-            "that one ACE's trustee must be us: {sddl}"
-        );
-        assert!(
-            sddl.contains("(A;;"),
-            "it must be a plain allow-ACE with no ACE flags: {sddl}"
-        );
-        // Rights are asserted tolerantly on purpose: the SDDL renderer is free to
-        // spell FILE_ALL_ACCESS as the `FA` abbreviation or as the raw mask, and
-        // which one it picks is not a security property. "One ACE, and it is ours"
-        // above is.
-        let upper = sddl.to_ascii_uppercase();
-        assert!(
-            upper.contains("(A;;FA;;;") || upper.contains("0X1F01FF"),
-            "the ACE must grant FILE_ALL_ACCESS: {sddl}"
+
+        // …and that one ACE is exactly the one we meant to store — trustee, type,
+        // rights and ACE flags all. Compared against our intended descriptor after
+        // a round trip through the *same* renderer, not against a `S-1-5-…` string:
+        // the renderer normalizes well-known trustees to abbreviations (`LA` for
+        // the built-in Administrator, which is who the CI runner is), so matching a
+        // raw SID literal fails on an ACL that is perfectly correct.
+        let intended = security_descriptor_from_sddl(&file_sddl(&sid))
+            .expect("build the descriptor we intended to store");
+        let ace_of = |sddl: &str| {
+            let at = sddl
+                .find('(')
+                .unwrap_or_else(|| panic!("an SDDL DACL must contain an ACE: {sddl}"));
+            sddl[at..].to_string()
+        };
+        assert_eq!(
+            ace_of(&stored),
+            ace_of(&render_dacl_sddl(intended.0)),
+            "the stored ACE must be the owner-only ACE we asked for: {stored}"
         );
     }
 
