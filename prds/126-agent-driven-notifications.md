@@ -1,291 +1,211 @@
-# PRD #126: Agent-driven notifications — dogfood on dot-agent-deck development
+# PRD #126: Agent-driven notifications + idle-worker detection
 
-**Status**: In progress — Phase 1 (configure) complete 2026-07-25; Phase 2 (run and observe) is next. Narrowed 2026-07-25 to a no-code dogfood (see [Scope decision (2026-07-25)](#scope-decision-2026-07-25))
+**Status**: In progress — **rescoped 2026-07-27 from a no-code dogfood into a real, shipped feature** (see [Scope decision (2026-07-27, rescope to a real feature)](#scope-decision-2026-07-27-rescope-to-a-real-feature)). Phase 1 dogfood (config-only) completed and informed this rescope; its results are preserved in [Background](#background-the-dogfood-that-led-here). M1.1–M1.3 landed 2026-07-28 (`d34fbd4`); M1.4 is in progress.
 **Priority**: Medium
 **Created**: 2026-05-25
 **GitHub Issue**: [#126](https://github.com/vfarcic/dot-agent-deck/issues/126)
-**Closes**: [#99](https://github.com/vfarcic/dot-agent-deck/issues/99) (supersedes prior orchestrator-only design)
-**Related**: PRD #8 (terminal bell — per-session, in-terminal), PRD #20 (multi-agent support), PRD #82 (orchestrator role reinforcement — see [Interaction with PRD #82](#interaction-with-prd-82)), PRD #201 (Pi integration)
+**Closes**: [#99](https://github.com/vfarcic/dot-agent-deck/issues/99) (supersedes prior orchestrator-only `Notifier` design)
+**Related**: PRD #8 (terminal bell), PRD #20 (multi-agent), PRD #82 (orchestrator role reinforcement — see [Interaction with PRD #82](#interaction-with-prd-82)), PRD #201 (Pi integration)
 
-## Validation refresh (2026-06-14)
+## Scope decision (2026-07-27, rescope to a real feature)
 
-Re-validated against current code — verdict: **current**. Nothing here has shipped yet (no `src/notifications.rs`, no `[notifications]` config block, no inactivity timer). PRD #99 is correctly closed/superseded by this PRD.
+This PRD began as a **no-code dogfood** — wire agent notifications for this repo's own development with zero deck code, and let the experience decide whether the deck should be extended. That dogfood ran (config-only, ntfy over `curl`) and did its job: it confirmed the human-gate notifications can be driven from the orchestrator prompt, and it surfaced — immediately and concretely — the **one thing config alone cannot do: detect a worker that was delegated to and then went silent.** An LLM orchestrator, once it delegates and waits, gets no execution turns until the worker responds, so it cannot wake itself to notice a stuck/dead worker. That needs a wall-clock timer, which only the daemon can own.
 
-## Scope Decision (2026-06-22)
+The maintainer decided to **build that as a real, shipped product feature** (not a dev-only crutch), because it is generally useful to any orchestration, and because this release already carries other compatibility-affecting features. This PRD is therefore rescoped from "dogfood, no deck code" to:
 
-Rescoped after review. The happy path of this PRD — **agents notify the user via their own tools** — requires *no deck code*: a notification MCP/CLI on the agent (Slack MCP, ntfy, `osascript`, …) plus a notify-on-done/blocked/needs-input instruction injected at spawn. For a single project that instruction can go straight into each role's `prompt_template` in `.dot-agent-deck.toml`; an `agent_notification_hint` config field would only generalize it to ad-hoc panes and scheduled tasks that have no `prompt_template`.
+1. **A daemon-side idle-worker detector** — an *agnostic* capability: the daemon tracks each outstanding delegation and, after a configurable timeout with no response, **injects a self-describing prompt into the orchestrator**. The daemon does **not** send notifications; it reports the fact, and the orchestrator decides what to do (notify, re-delegate, abandon, surface in the TUI). This is the deferred "inactivity nudge" from #99/#126, done as a neutral primitive rather than a notifier.
+2. **A notification recipe** — orchestrator-only Telegram messages (via MCP), fired at the workflow's pause-for-human moments *and* on the daemon's idle-worker event.
+3. **Published user documentation** — one `docs/` page that (a) documents the idle-worker feature and its config knob and (b) shows an *example* recipe wiring those moments to a chat channel (Telegram as the worked example).
+4. **Retiring the dogfood artifacts** — remove the ntfy `scripts/notify.sh` glue and its per-role prompt instructions, replaced by the productized design above.
 
-**Deferred until proven needed** — the two deck-side *safety nets*, being the only parts that genuinely cannot be done with MCP + config: the **inactivity nudge** (a timer plus inactivity-fired prompt injection, for a stuck-but-quiet agent that cannot self-notify) and the **no-agent fallback** (a minimal local desktop channel for pre-spawn scheduler failures and silent crashes, where there is no agent to delegate to at all).
+### Decisions locked in this rescope
 
-## Scope decision (2026-07-25)
-
-Narrowed again. **This PRD's entire deliverable is now: make agent-driven notifications work for `dot-agent-deck`'s own development, changing no deck code.** Deciding whether the deck should be extended is explicitly deferred to a discussion *after* this ships, informed by what the dogfood shows.
-
-Three corrections to the prior scope motivated this:
-
-1. **The "revisit if unreliable" trigger had no source of evidence.** The 2026-06-22 rescope deferred the safety nets pending real usage, but nothing in the PRD produced that usage. This narrows the PRD to the thing that generates it.
-2. **The #120 prerequisite is stale.** #126 was listed as a prerequisite for PRD #120 (scheduled issue dispatch). #120 is **closed** — it shipped without this PRD. Nothing downstream is blocked by narrowing.
-3. **The "no `Notifier` trait in the deck" line was overtaken by events.** PRD #127 shipped `trait Notifier` / `NotifyEvent` (`src/scheduler.rs:38-45`) with `StderrNotifier` (`:104`) and live call sites in `src/spawn.rs` and `src/issue_dispatch_run.rs`. That seam is scheduler-internal, not a pluggable user-facing channel set, so this PRD's architectural objection to #99 still stands — but the wording was wrong and the seam is not to be touched here.
-
-### The hard constraint
-
-**No changes to `dot-agent-deck` source code.** Not a hook, not a config field, not "a tiny helper". Everything lands in this repo's `.dot-agent-deck.toml`, in `docs/develop/`, and in this PRD's findings section.
-
-**Tripwire:** if implementing this produces the thought "I'll just add a small thing to the deck" — stop, record the thought in the findings, and carry it into the Phase 3 discussion. That thought *is* the output of this PRD. Acting on it mid-flight destroys the evidence.
-
-### What this cannot tell us (stated up front, so the result is not over-read)
-
-The two deferred safety nets cover the cases where **no agent exists to delegate to**: a stuck-but-alive agent that cannot self-report, and a pre-spawn scheduler failure or silent crash where no process remains. Configuring `prompt_template`s produces **zero** data about either. A green dogfood is not evidence that the fallbacks are unnecessary.
-
-Those two must therefore be decided on reasoning rather than on this PRD's data — and for the scheduler-failure case the reasoning already looks settled: unattended scheduling with no human at a terminal has no other delivery path. Phase 3 records the decision either way; it does not pretend the dogfood informed it.
+- **Idle detection lives in the daemon**, exposed as an agnostic event (orchestrator decides the action) — not a notification feature baked into the daemon.
+- **Timeout is configurable** via a new key in `.dot-agent-deck.toml`, **default 120 minutes**. A rare false positive on a legitimately long task is an acceptable, discardable notification; v1 fires on **elapsed time since delegation**, not on a liveness/activity signal (that refinement is a later improvement if false positives prove annoying).
+- **Non-breaking is the target.** The idle prompt is delivered over the **existing prompt/input-injection path** (the same mechanism the scheduler and delegation already use to put text into a session), so **no new wire message type is introduced** and an older TUI simply never receives idle prompts. Rule 12's cross-version manual test is the arbiter; classified as a **feature** (non-breaking) unless implementation forces otherwise.
+- **Notifications are orchestrator-only.** The orchestrator is the only agent the user talks to and the only one that ever waits on the user. Workers never notify and never block on the user — a blocked/needs-input worker returns the question via `work-done`, and the orchestrator escalates. The per-worker `blocked` pings from the dogfood are **removed**.
+- **No experimental flag** (rule 9 answered "no") — the feature ships visible by default.
+- **User-facing docs** go in published `docs/` + `site/sidebars.js` (rule 11), not `docs/develop/`.
+- **Messages are short** and identify the orchestration (repo + PRD #), because the maintainer runs several in parallel — each message must say only *done* vs *needs attention* and *what*.
 
 ## Problem Statement
 
-Long-running agents and scheduled tasks leave users with no reliable out-of-band signal that they need attention. The terminal bell (PRD #8) only reaches a focused terminal — useless once the user walks away.
+Long-running agents and orchestrations leave users with no reliable out-of-band signal that they need attention. The terminal bell (PRD #8) only reaches a focused terminal — useless once the user walks away. PRD #99 proposed a pluggable `Notifier` trait plus four channel implementations wired to an orchestrator-completion hook; that was rejected because it makes the deck a credential holder, its event source was too narrow, and it inferred "done" from outside when only the agent knows what "done" means in context.
 
-The original PRD #99 proposed a pluggable `Notifier` trait plus four channel implementations (desktop, webhook, Slack, email) wired to an orchestrator-completion hook. Three things are wrong with that:
-
-1. **The deck would re-implement what the ecosystem already provides,** and would become a credential holder for third-party services it has no business holding credentials for.
-2. **The event source was too narrow** — orchestrator completion only, missing scheduled single-agent tasks, agent-side "blocked / needs input", and scheduler-side failures before any agent spawns.
-3. **Only the agent knows what "done" means in context.** A lifecycle hook can fire "orchestration ended"; the agent knows whether it finished, hit a wall, or needs a decision. Inferring that from outside is heuristic; declaring it from inside is explicit.
-
-### Why `dot-agent-deck`'s own development is the right first target
-
-This repo's orchestration has two **explicit** stopping points where the workflow halts and waits for a human — the test-plan approval (step 1) and the merge confirmation (step 7) of the orchestrator `prompt_template` (`.dot-agent-deck.toml:77-124`) — plus a long unattended stretch in step 5, where `release` opens the PR and waits for CI and Greptile to settle before reporting back. Those are exactly the walk-away moments this PRD exists for. If notifications do not pay off here, they will not pay off anywhere.
-
-## Scope
-
-### In Scope
-
-- **A channel decision for this project** — one destination and one delivery mechanism, chosen, verified, and recorded (not left as a menu in user docs).
-- **An expectation log** — the instrumentation that makes the experiment falsifiable (see below).
-- **Notify instructions in this repo's `.dot-agent-deck.toml`** role `prompt_template`s, anchored to the workflow's real waiting points.
-- **A findings record** appended to this PRD.
-- **A contributor note** under `docs/develop/` describing the setup, so it is reproducible by anyone working on this repo (per CLAUDE.md rule 11 this is developer-facing and must not be published to the site).
-
-### Out of Scope
-
-- **Any change to `dot-agent-deck` source code.** See [The hard constraint](#the-hard-constraint).
-- **The `agent_notification_hint` config field.** It only generalizes the hint to panes and scheduled tasks that have no `prompt_template`; this repo's roles all have one. Revisit in Phase 3.
-- **The inactivity nudge and the no-agent desktop fallback.** Unchanged from the 2026-06-22 deferral; see [What this cannot tell us](#what-this-cannot-tell-us-stated-up-front-so-the-result-is-not-over-read).
-- **User-facing documentation of the pattern** (`docs/notifications.md`). Do not document a recommended practice before knowing it works. Phase 3 decides whether it graduates from `docs/develop/` to published docs.
-- **No `Notifier` trait, dispatcher, pluggable channels, per-event routing, deck-side credentials, agent-callable `notify` CLI, or two-way channels** — the architectural inversion of #99 stands.
-
-### The experiment must be able to fail
-
-**This is the design's load-bearing detail.** The failure mode under test is the *absence* of a signal: when an agent forgets to notify, compacts the instruction away, or dies first, the observable outcome is nothing — indistinguishable from "working correctly, nothing to report yet". Without instrumentation this PRD cannot produce negative evidence, and "it seemed fine" is not a finding.
-
-So every notify instruction is paired with a local append to an expectation log — the agent records *that it reached a notifiable moment* separately from *sending the notification*. Two independent records; the delta is the data.
-
-- Log file: `.dot-agent-deck/notify-log.md` (gitignored), one line per event: timestamp, role, event kind (`gate` / `done` / `blocked`), and whether the send was attempted.
-- The gap that matters is **reached-but-never-sent**, and the second gap — **sent-but-never-arrived** — is caught by reconciling the log against what actually showed up in the destination.
-- Reconciling is manual and that is fine at this scale; automating it would require deck code.
-
-## Success Criteria
-
-- A channel is chosen and **verified reachable from every agent this repo runs** — all four families: Pi (`orchestrator`, `auditor`), Claude (`coder`, `release`), OpenCode (`reviewer`), and Codex (`tester`) — or the failure to reach one of them is recorded as a finding.
-- Reaching the test-plan gate (step 1) and the merge gate (step 7) produces a notification that arrives on a device that is not the terminal running the deck.
-- The expectation log exists, is written at every notifiable moment, and is reconciled against arrived notifications after each run.
-- At least **three** orchestrated PRD runs are observed, **including at least one long enough for the orchestrator to compact** (so the PRD #82 interaction is exercised rather than assumed).
-- The findings section records, with counts: moments reached, notifications attempted, notifications arrived, and every gap — plus any "I want to change the deck for this" thoughts the tripwire caught.
-- **Zero diff under `src/`.** This is checkable and non-negotiable.
-- A Phase 3 decision is recorded for each deferred deck-side item, with its basis (dogfood evidence vs. reasoning) stated explicitly.
-
-## Design notes
-
-### Prefer a CLI over an MCP
-
-This repo does not run one agent — it runs **four different agent CLIs**, and every one of them carries a notify instruction:
-
-| Family | Roles | Command (`.dot-agent-deck.toml`) |
-|---|---|---|
-| Pi | `orchestrator`, `auditor` | `devbox run pi-big` |
-| Claude | `coder`, `release` | `devbox run agent-orchestrator`, `devbox run agent-release` |
-| OpenCode | `reviewer` | `devbox run oc-big` |
-| Codex | `tester` | `devbox run codex-big` |
-
-This PRD was originally written against Claude / Codex / Gemini / Aider and never covered Pi (PRD #201) or OpenCode.
-
-A shell-callable CLI (`ntfy` / `curl` to a topic, or a two-line script in the repo) works for **any** agent with shell access, uniformly, with no per-agent MCP configuration. An MCP has to be wired up per agent, and wiring one into four different CLIs — one of which (Pi) may not support MCPs at all — is exactly the per-agent cost the CLI avoids. So the CLI is the default choice; Slack MCP led the original write-up mostly because it was already installed. **This four-family spread is the single strongest argument for the CLI**, and it only became visible once reachability was checked against each launcher rather than assumed from the orchestrator's.
-
-Fallback ladder if the Pi orchestrator cannot reach the chosen channel: (1) a plain CLI it can shell out to; (2) switch the orchestrator to the all-Claude command already sitting commented at `.dot-agent-deck.toml:75`; (3) record "orchestrator cannot notify" as the headline finding — it would be the single most important result this PRD could produce, since the orchestrator owns both user gates.
-
-### Where to fire
-
-| Role | Moment | Kind |
-|---|---|---|
-| `orchestrator` | test plan posted, waiting for approval (step 1) | `gate` |
-| `orchestrator` | merge confirmation reached (step 7) | `gate` |
-| `orchestrator` | run finished or abandoned | `done` |
-| `coder` / `tester` / `reviewer` / `auditor` | blocked or missing critical context (already surfaced in work-done) | `blocked` |
-| `release` | PR checks + Greptile settled after the step 5 wait | `done` |
-
-### Fire-and-forget, always
-
-The instruction must read "send and continue", never "notify and wait for acknowledgment". An orchestrator that blocks on a notification it cannot confirm is a worse failure than no notification at all.
+The correct split, confirmed by the dogfood: **the agent (orchestrator) owns *what happened and what to do about it*; the deck owns only the one signal an agent structurally cannot produce about itself — that a delegatee has gone silent.** This PRD builds exactly that boundary.
 
 ### Interaction with PRD #82
 
-The notify instruction lives in the orchestrator's `prompt_template`, which is delivered as a `Read` tool result and is therefore **compaction-mortal** — the exact mechanism PRD #82 documents. Expect notifications to stop after the first compaction.
+A notify instruction placed in the orchestrator's `prompt_template` is delivered as a `Read` tool result and is therefore **compaction-mortal** — notifications may stop after the first compaction, the same mechanism #82 documents. This PRD mitigates it where it matters most: the daemon's **injected idle prompt is self-describing** ("worker X has been silent for N minutes; if this needs the user, tell them"), so the idle path survives compaction even if the template policy is gone. The gate/done notifications remaining compaction-mortal is expected #82 behavior and is a known limitation, not a bug fixed here.
 
-Do not misread that as "agents are unreliable at notifying". It is the same root cause, and it makes this PRD a second, independently-observable symptom of #82 — which is useful to both. #82's post-compaction re-assert would restore the notify instruction along with the role, so if the dogfood shows a clean before/after-compaction split, that is evidence *for #82*, not for building notification machinery here.
+## What we're building
+
+### A. Daemon idle-worker detector (deck code)
+
+- The daemon tracks, per orchestration, each **outstanding delegation** (role + start time) and whether its `work-done` has arrived.
+- If a delegation has been outstanding longer than `worker_response_timeout_minutes` (default **120**) with no `work-done`, the daemon **injects one self-describing prompt** into the orchestrator session, e.g.: *"⏱ Worker `<role>` was delegated `<N>` minutes ago and has not responded. If this needs the user, notify them; otherwise decide how to proceed."*
+- **Agnostic:** the daemon contains **no notification logic**. It only reports the condition; the orchestrator's prompt decides the action.
+- **Race-safe by construction:** the timer is per-outstanding-delegation, so an arriving `work-done` cancels it. A near-simultaneous finish therefore cannot produce a contradictory idle prompt.
+- **Fires at a safe turn boundary** (unsolicited input delivered like any other injected prompt), never mid-reasoning.
+- **One-shot per delegation** in v1 (fire once, don't re-nag), to avoid a stuck run spamming.
+
+### B. Orchestrator-only Telegram notification recipe (this repo's config)
+
+The orchestrator `prompt_template` in this repo's `.dot-agent-deck.toml` fires a **short, fire-and-forget** Telegram message (via the `telegram` MCP, using the already-installed `pi-mcp-adapter` for Pi and the `telegram` entry in `.mcp.json`) at exactly these moments — each prefixed with **repo + PRD #**:
+
+**Tool name gotcha for M2.1 and the M3.1 docs page:** through `pi-mcp-adapter` the tool is exposed as **`telegram_send_message`** (server-name-prefixed), *not* `send_message`. A live Pi send failed on exactly that before retrying with the prefixed name — the adapter reported the server's tools as `telegram_send_message`, `telegram_get_updates`, `telegram_list_chats`, `telegram_send_photo`, and so on. The prompt must not say `send_message` unqualified. Note this is an adapter-naming detail, so the recipe wording should describe the tool by role ("the Telegram MCP's send-message tool") and let the reader match their own client's naming.
+
+| Trigger | Example message |
+|---|---|
+| Test-plan gate (step 1) | `dot-agent-deck PRD #N — needs approval: test plan ready` |
+| Escalation (a worker returned a needs-input question via `work-done`) | `dot-agent-deck PRD #N — needs input: <one line>` |
+| Merge gate (step 7) | `dot-agent-deck PRD #N — needs go-ahead: merge PR #<pr>` |
+| Full run done/abandoned (only when *fully* done) | `dot-agent-deck PRD #N — DONE: merged & closed` |
+| Daemon idle-worker event | `dot-agent-deck PRD #N — STUCK: <role> silent >N min` |
+
+Fire-and-forget throughout ("send and continue", never wait for ack). Per-worker `blocked` pings are removed.
+
+### C. Published user documentation
+
+One page under `docs/` (added to `site/sidebars.js`) with **two clearly separated parts**:
+
+1. **Feature: idle-worker detection.** What it does (agnostic event), the `worker_response_timeout_minutes` knob and its default, and that the daemon reports — it does not itself notify.
+2. **Example recipe: turn moments into messages.** A worked example wiring the orchestrator prompt to a chat channel, with **placeholders** (never the maintainer's real bot/chat), showing the Telegram MCP + `pi-mcp-adapter` setup as *one* channel while making clear the channel is the reader's choice. Framed as an example that works for us, not a guarantee.
+
+### D. Retire the dogfood artifacts
+
+Remove `scripts/notify.sh` and the per-role ntfy notify instructions from `.dot-agent-deck.toml`; discard the interrupted ntfy Greptile-fix edits; retire/convert `docs/develop/notifications-dogfood.md`. Reconcile PR #223 so it reflects the productized design end to end.
+
+## Scope
+
+### In scope
+
+- Daemon idle-worker detector (A) + its `.dot-agent-deck.toml` config knob.
+- Automated tests for the daemon feature (rule 4).
+- Orchestrator-only Telegram recipe in this repo's config (B).
+- Published user docs (C).
+- Removal of ntfy dogfood artifacts (D).
+- A minimal orchestrator-side expectation log kept for falsifiability (detect "reached a moment but did not send", e.g. after compaction). Lightweight; MCP's returned `message_id` already closes the "sent-but-never-arrived" gap.
+- Changelog fragment (feature) and cross-version contract check (rule 12).
+
+### Out of scope
+
+- **The no-agent / dead-orchestrator fallback** (a pre-spawn scheduler failure or a crashed orchestrator, where there is nobody to inject into or notify). Accepted **known limitation**; notifications are best-effort, not guaranteed. Candidate for a follow-up.
+- **Liveness/activity-based idle detection** (distinguishing "working but silent" from "hung"). v1 uses elapsed time with a long default; refine later only if false positives are annoying.
+- **Per-role / per-task timeouts.** v1 is a single configurable value.
+- **A pluggable `Notifier` trait, deck-side channels, deck-held credentials, or an agent-callable `notify` CLI.** The inversion of #99 stands — the deck reports idleness; the agent notifies.
+- **Re-nagging / repeated idle prompts** for the same delegation (one-shot in v1).
+
+## Success Criteria
+
+- Delegating to a worker that never responds causes the daemon to inject exactly one self-describing idle prompt into the orchestrator after the configured timeout; a `work-done` arriving first cancels it (no false idle prompt). Covered by automated tests.
+- `worker_response_timeout_minutes` in `.dot-agent-deck.toml` is honored (default 120).
+- The change is **non-breaking**: a branch daemon interoperates with a previous-release TUI (and vice versa) — delegate and hooks still flow; an old TUI simply never receives idle prompts. Confirmed by the rule-12 cross-version manual test.
+- This repo's orchestrator sends a Telegram message at each pause-for-human moment and on the idle event; messages are short and identify repo + PRD #. Workers send nothing.
+- The published docs page exists, separates the feature from the example recipe, uses placeholders, and is in `site/sidebars.js`.
+- The ntfy artifacts are gone; `cargo test-fast` (and, pre-PR, `cargo test-e2e`) pass.
+- A changelog **feature** fragment exists; version bump follows the release's policy.
+
+## Design notes
+
+### Delivery of the idle prompt (the key implementation question)
+
+Before implementing, confirm two things in `src/daemon_protocol.rs` and the daemon: (1) there is an existing message that injects text/input into a *running* session (the scheduler's injected `prompt` and delegation task delivery both put text into a session — reuse that path), and (2) how the protocol handles unknown message variants. Reusing the existing injection path introduces **no new wire shape**, which is what keeps the feature non-breaking. Only if a genuinely new daemon→TUI event variant is unavoidable does the compatibility classification need revisiting.
+
+### Fire-and-forget, orchestrator-only
+
+The orchestrator is the sole notifier and the sole agent that waits on the user. Workers escalate via `work-done`; the orchestrator turns an unanswerable-without-the-user question into one notification and pauses. This removes the dogfood's per-worker `blocked` pings, which pinged the user about things they could not act on and risked a worker blocking on a reply that (by the topology) can never reach it.
 
 ## Milestones
 
-### Phase 1 — Decide and configure (no deck code)
+### M1 — Daemon idle-worker detector
 
-- [x] **M1.1** — Choose the destination and the delivery mechanism. Verify reachability from **every** agent family this repo runs — Pi, Claude, OpenCode, and Codex — before committing to it; walk the fallback ladder if Pi cannot reach it, and record any family that cannot self-notify as a finding. Record the choice and the verification in this PRD. → see [M1.1 record](#m11-record-channel-choice-and-verification-2026-07-25).
-- [x] **M1.2** — Define the expectation-log format and add the "append to `.dot-agent-deck/notify-log.md`" step to the same instructions that trigger a notification. Confirm the path is gitignored. → see [M1.2 record](#m12-record-expectation-log-format).
-- [x] **M1.3** — Extend this repo's `.dot-agent-deck.toml` role `prompt_template`s with the notify + log instructions per the [Where to fire](#where-to-fire) table, phrased fire-and-forget. → see [M1.3 record](#m13-record-where-the-instructions-landed).
-- [x] **M1.4** — Contributor note under `docs/develop/` documenting the setup and how to reproduce it. Not published (CLAUDE.md rule 11); linked from `CONTRIBUTING.md`. → `docs/develop/notifications-dogfood.md`, linked from `CONTRIBUTING.md`.
+- [x] **M1.1** — Design verification (coder): confirm the reusable injection path and the protocol's unknown-variant handling; record the chosen approach and the non-breaking classification. → see [M1.1 record](#m11-record-design-verification-2026-07-28).
+- [x] **M1.2** — Implement daemon tracking of outstanding delegations + one-shot, race-safe, self-describing idle-prompt injection after the timeout. → commit `d34fbd4`.
+- [x] **M1.3** — `worker_response_timeout_minutes` config in `.dot-agent-deck.toml` (default 120), read by the daemon. → commit `d34fbd4`.
+- [x] **M1.4** — Automated tests (rule 4): L2 synthetic (delegate → advance clock → idle prompt injected; `work-done` before timeout → no injection; config value honored) plus at least one PTY-attached L2 exercising the user-visible pane behavior. → `idle_worker_001`–`006` (fast) + PTY `011` stand-in (`d34fbd4`), plus the real-agent reel-marked `012` (`4685fb9`). Fast tier 1138/1138, scoped e2e 8/8.
+- [ ] **M1.5** — Rule 12 cross-version manual test + a `changelog.d/126.feature.md` fragment.
 
-#### M1.1 record — channel choice and verification (2026-07-25)
+### M2 — Orchestrator-only Telegram recipe (this repo's config)
 
-**Chosen**: a plain `curl` POST to the public ntfy.sh topic **`dot-agent-deck-notify-0c0d15e13936d122`**, wrapped in a repo helper script `scripts/notify.sh` (`scripts/notify.sh <gate|done|blocked> <role> '<message>'`). No MCP, no account, no API key, no OAuth. Overridable per-machine via `DOT_AGENT_DECK_NOTIFY_TOPIC` / `DOT_AGENT_DECK_NOTIFY_SERVER` without touching code or config.
+- [ ] **M2.1** — Rewrite the orchestrator `prompt_template` to fire Telegram (the MCP's send-message tool, `telegram_send_message` under `pi-mcp-adapter`) on the five triggers above; short messages prefixed repo + PRD #; fire-and-forget.
+- [ ] **M2.2** — Remove per-worker `blocked` pings; workers escalate via `work-done`.
+- [ ] **M2.3** — Keep a minimal orchestrator-side expectation log for falsifiability.
 
-**Verified reachable from all four agent families — the fallback ladder was not needed.** The first pass covered only Pi and Claude; review correctly caught that this repo also runs the `reviewer` through OpenCode and the `tester` through Codex, and that both receive `blocked` notify instructions. All four were then exercised against the real topic, and the Pi and Claude checks were re-run against the corrected script (see [Post-review corrections](#post-review-corrections-2026-07-25)):
+### M3 — Published user docs
 
-| Family | Role | How | Exit | Log rows | HTTP |
-|---|---|---|---|---|---|
-| — | — | `curl -w '%{http_code}'` POST straight to the topic from a maintainer shell | 0 | n/a | **200**, body `{"id":"8lCxOr4PnHzO","event":"message","topic":"dot-agent-deck-notify-0c0d15e13936d122",…}` |
-| **Claude** | `coder` | `./scripts/notify.sh gate coder '…'` from the worker's own shell | **0** | `reached` + `send=ok`, id `inv-6a6541ca-322ccc-50b3` | **200** |
-| **Claude** | `release` | prompt piped to `devbox run -- claude -p --model haiku --allowedTools Bash` | **0** | `reached` + `send=ok`, id `inv-6a6542df-3269a3-5d01` | **200** |
-| **Pi** | `orchestrator` | `devbox run -- pi -p --model anthropic/claude-haiku-4-5 --approve '…run ./scripts/notify.sh…'` | **0** | `reached` + `send=ok`, id `inv-322b97-0e3f` | **200** |
-| **OpenCode** | `reviewer` | `devbox run -- opencode run --model openai/gpt-5.4-mini '…run ./scripts/notify.sh…'` | **0** | `reached` + `send=ok`, ids `inv-322842-79cf` and `inv-3229ba-63d3` | **200** |
-| **Codex** | `tester` | `devbox run -- codex exec --model gpt-5.6-sol --sandbox workspace-write -c sandbox_workspace_write.network_access=true '…run ./scripts/notify.sh…'` | **0** | `reached` + `send=ok`, id `inv-2-230f` | **200** |
+- [ ] **M3.1** — New `docs/` page (in `site/sidebars.js`) separating the idle-worker feature from the example recipe; placeholders only; recipe framed as an example.
 
-Each check used the launcher's **non-interactive** form with a cheap model rather than the interactive command the deck spawns (`pi -p`, `claude -p`, `opencode run`, `codex exec`); the bash tool being exercised is the same one, so what is verified is *shell reach*, which is the only thing at issue. The per-agent commands are documented in `docs/develop/notifications-dogfood.md` so this is reproducible rather than a one-off claim.
+### M4 — Retire dogfood artifacts
 
-Two incidental observations from the OpenCode and Codex runs, both already folded back into the script and docs:
+- [ ] **M4.1** — Remove `scripts/notify.sh` + ntfy prompt instructions; discard the interrupted Greptile-fix edits; retire/convert `docs/develop/notifications-dogfood.md`; reconcile PR #223.
 
-- **OpenCode fired the helper twice** — its first invocation printed nothing, so it re-ran the command wrapped in `printf '%s' $?` to read the exit code. Harmless here, but it is a live demonstration of why `reached`/`send` rows need an invocation id: two invocations by the same role, five seconds apart, produce four rows that no timestamp can pair up.
-- **Codex reported PID 2** — it runs inside a PID namespace and reliably gets a low PID, so PIDs collide across sandboxed agents. The invocation id therefore mixes epoch + PID + `$RANDOM` rather than relying on the PID alone.
-- **Claude needs the prompt on stdin** under `devbox run --`, which swallows a positional prompt and makes `claude -p` exit with "Input must be provided either through stdin or as a prompt argument". Only affects the verification harness, not the deck's interactive spawn; documented so the reproduction steps work as written.
+### M5 — Validate on real runs (post-merge)
 
-**No agent failed to self-notify.** The success criterion's escape hatch ("or the failure to reach one of them is recorded as a finding") was not needed: all four families have a scriptable non-interactive path and all four reached the topic.
+- [ ] **M5.1** — Run a couple of real orchestrated PRDs, including one long enough to compact; confirm the gate/escalation/done notifications and the idle event fire as intended; record any refinements.
 
-**Failure path verified too** (so the log's negative evidence is trustworthy): pointed at an unreachable server, the helper still wrote the `reached` row, recorded `send=failed http=000 curl_exit=7`, and **exited 0**. With no arguments at all it also exits 0. Fire-and-forget holds by construction, not by convention.
+## M1.1 record — design verification (2026-07-28)
 
-**Not yet verified — arrival on a non-terminal device.** HTTP 200 proves ntfy *accepted* the message; it does not prove it *arrived* anywhere. Closing that requires the maintainer to subscribe a phone or browser to the topic, which is a Phase 2 (M2.1) manual prerequisite and the reason gap #2 below is reconciled by eye.
+Verified against the code before implementing; this is what fixed the approach and the non-breaking classification.
 
-**Accepted caveat — the topic is public.** ntfy.sh topics are unauthenticated: anyone who knows the name can read *and* publish to it, and the name is committed in a public repo. The random suffix prevents guessing, not lookup. Mitigation is payload discipline, enforced in the script's header comment and the docs: role + event kind + one short sentence, never secrets, tokens, diffs, or file contents. Acceptable for a payload that is literally "a gate was reached"; would not be acceptable for anything else. Noted as a real (if small) argument for a deck-side config field in Phase 3 — see tripwire thought T4.
+**Delivery path (no new wire shape).** The idle prompt is injected via `AgentPtyRegistry::write_to_pane_and_submit(orchestrator_pane_id, text)` — already the exact primitive and target that `handle_work_done` uses to feed the orchestrator, and that the scheduler and delegation use elsewhere. The daemon calls the registry directly, so the bytes never become a protocol frame. The sibling `write_to_pane_notice` was rejected: it writes a visible-but-unsubmitted line, and we need the orchestrator to actually act.
 
-#### M1.2 record — expectation-log format
+**Non-breaking, `PROTOCOL_VERSION` stays 6.** Unknown-variant handling is a **hard error on every wire enum** — `AttachRequest` is `#[serde(tag = "op")]` with no `#[serde(other)]`, so an unknown op yields a malformed-request reply and a closed connection; `BroadcastMsg` is `#[serde(tag = "kind")]`, so an unknown kind kills the event stream (this is precisely why PRD #120 bumped 3→4). Only additive `#[serde(default, skip_serializing_if)]` struct fields are tolerated. The handshake is an **exact-match refusal**, so a needless bump would *itself* break interop. Because the idle prompt never crosses the wire, the cross-version matrix is better than this PRD originally assumed: a new daemon with an **old TUI still shows the idle prompt** (ordinary stream-out scrollback), and an old daemon with a new TUI simply has no detector. Classified **feature** → `changelog.d/126.feature.md`, patch bump. It would only become breaking if a `BroadcastMsg`/`KIND_*`/`AttachRequest` variant were added, or an existing field's meaning changed.
 
-File: `.dot-agent-deck/notify-log.md`. **Gitignored** — confirmed by `git check-ignore -v`, which resolves to `.gitignore:6:.dot-agent-deck/` (the pre-existing blanket rule for per-clone dev state). No `.gitignore` change was needed.
+**Tracking, arming, cancelling.** Arm in `handle_delegate`'s target loop — it has the orchestrator pane id, target role, worker pane id and timestamp, and arming there (rather than inside dispatch) avoids clock skew from the `clear = true` SessionStart wait while still covering an early-bailing respawn failure. Cancel at the **very top** of `handle_work_done`, above all of its early returns. State lives on `AgentPtyRegistry` as interior-mutability side-maps (the established precedent), **not** on `AppState`: both handlers run under a read guard, and moving to `write()` would widen a hot lock.
 
-Format is a Markdown table — renders on GitHub, greps cleanly, one event per line:
+**Three races, two of which this PRD had not identified.** (1) The finish-line race is handled for free by making the timer's first act on wake an **atomic take** under the registry mutex — work-done-first means the take returns `None` and the timer is a silent no-op, which also delivers one-shot behavior. (2) **Re-delegation to the same worker pane** overwrites the record, so delegation #1's still-sleeping timer would otherwise wake and consume delegation #2's record, firing a premature prompt — fixed with a monotonic **seq** in each record that each timer captures and the take checks conditionally. (3) A **deliberately closed worker pane** (`StopAgent` → `unregister_pane`) must also cancel, or closing a stuck worker still nags two hours later.
 
-```markdown
-| timestamp (UTC) | invocation | role | kind | record | detail |
-|---|---|---|---|---|---|
-| 2026-07-25T23:07:54Z | inv-6a6541ca-322ccc-50b3 | coder | gate | reached | helper script send path from a Claude worker shell |
-| 2026-07-25T23:07:55Z | inv-6a6541ca-322ccc-50b3 | coder | gate | send=ok | http=200 topic=dot-agent-deck-notify-0c0d15e13936d122 |
-```
+**Config.** `worker_response_timeout_minutes` on `ProjectConfig` with `#[serde(default)] = 120`. No `deny_unknown_fields` anywhere in `src/`, so adding the key is forward- and backward-compatible by construction. Resolution order is **env > file > default**, read from the *orchestration* cwd first and the worker cwd second (they diverge for PRD #120 issue-dispatch clones). **TOML gotcha that must be carried into the M3.1 docs page:** a top-level scalar key has to appear *above* the first table header — appending it to the end of a config whose tables start early silently makes it a key of the last table, where it is ignored.
 
-`scripts/notify.sh` appends **two** rows per invocation, which is how "reached a moment" stays independent from "attempted a send":
+**Test seam.** There is no injectable or virtual clock anywhere in `src/` or `tests/`, and a multi-thread tokio test with real PTYs could not use one anyway. The established pattern is an env override read at use time, so the detector reads `DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS` (milliseconds), letting tests run in ~1–2s. Observation works by making the orchestrator pane a `cat` stub that echoes injected bytes into the snapshot.
 
-1. `reached` — written **before** the send is attempted, so it survives a dead network, a missing `curl`, or the agent being killed mid-send.
-2. `send=ok` / `send=failed` / `send=skipped` — written **after**, carrying the HTTP status and `curl` exit code.
+**Known limitation.** A daemon **restart** loses all in-memory outstanding records and silently disarms every pending timer. Worth stating on the docs page.
 
-Both rows carry the same **invocation id**, generated before the first append. Timestamps are second-resolution and roles run concurrently, so id is the only reliable key for pairing a `reached` with its send outcome — the OpenCode check above produced exactly the interleaving case that motivates it.
+## Orchestration finding — the Codex tester cannot commit in a worktree
 
-The message is sanitized (newlines and `|` collapsed) so one event can never become two rows or break the table; the `DOT_AGENT_DECK_NOTIFY_TOPIC` override goes through the same sanitizer, since it lands in both the request URL and the log's detail column.
+Recorded because it cost two delegation round-trips on this PRD and will recur on every worktree run until it is addressed.
 
-**Logging is best-effort, and the docs say so.** `append` cannot be made to succeed against a read-only checkout, a bad `DOT_AGENT_DECK_NOTIFY_LOG`, or a full disk, and fire-and-forget forbids failing the caller over it. So it keeps the caller-facing exit 0 but prints `notify.sh: could not …` on **stderr**, plus a closing `N of 2 expectation-log rows were lost for <id>`. That is what keeps "the agent never invoked the helper" distinguishable from "the helper ran but could not log" — the two would otherwise be the same silence. A pre-run check that invokes the helper and confirms both rows appear at the real log path is documented as a prerequisite.
+The `tester` role runs Codex with `--sandbox workspace-write`. In a **git worktree**, `.git` is a *file* pointing at `<parent-repo>/.git/worktrees/<name>/`, so the real index lives **outside** the sandbox's writable root. Every `git add`/`commit` therefore fails, and Codex surfaces it as a "read-only index" — which reads like a permissions bug but is not: the index file is mode `rw-rw-r--` and owned by the user, and the orchestrator can commit the very same files without issue. The same role would commit fine in a plain branch checkout, where `.git` sits inside the workspace.
 
-Reconciliation procedure and the three gaps are documented in `docs/develop/notifications-dogfood.md`, including the per-run window (log line range), the definition of *attempted* as `send=ok` + `send=failed` (excluding `send=skipped`), the manual device-arrival tally, and the exact pre/post-compaction table to append to [Findings](#counts-and-gaps). Note that gap #3, *never even reached*, is recorded by **omission** and must be reconstructed from the run's actual shape, because the log cannot report its own absence.
+Consequences and the workaround used here: the tester's files must be committed by someone outside the sandbox. Having the **coder** stage them (the earlier approach) works but puts the tester's tests in reach of the role explicitly forbidden from editing them, so the safer route is for the **orchestrator** to commit them directly after verifying `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` itself, since rule 2 binds whoever commits.
 
-#### M1.3 record — where the instructions landed
+Real fixes, in preference order: grant the tester's sandbox write access to the parent repo's `.git/worktrees/` path; or run the tester unsandboxed for worktree PRDs; or stop using worktrees for runs that involve the Codex tester. This belongs in `CLAUDE.md` or `docs/develop/` once a fix is chosen — it is a standing property of the role configuration, not a fact about this PRD.
 
-All in `.dot-agent-deck.toml` role `prompt_template`s, anchored **inline at each role's real waiting point** rather than collected in a preamble, so each instruction reads at the moment it applies:
+## Exit path
 
-| Role | Anchor | Kind |
-|---|---|---|
-| `orchestrator` | step 1, on the same line as "Surface the plan … and STOP" | `gate` |
-| `orchestrator` | step 7, on the same line as "Then pause — the user reviews the PR" | `gate` |
-| `orchestrator` | new "**Run finished.**" paragraph after the two-user-gates note | `done` |
-| `release` | on the "Once the PR is open, CI is green, and Greptile's review has settled … STOP" line, fired *before* the work-done report | `done` |
-| `coder` / `reviewer` / `auditor` | appended to each role's existing "if critical context is missing" sentence | `blocked` |
-| `tester` | new final paragraph, covering both "blocked" and the existing out-of-harness-reach report-back | `blocked` |
+This now ships a real feature, so the normal flow applies (reversing the dogfood's exit path):
 
-Phrasing is fire-and-forget throughout — every site says "send and continue", "ignore its result", "never wait for an acknowledgment". No site says notify-and-wait. The orchestrator also carries an explicit **"do not notify on anything else"** line (per-step chatter would make the signal worthless) and an instruction to **tell the user in its next message if it reached a moment but could not run the script at all** — that self-report is the only way the reached-but-not-even-logged case leaves a trace.
+- **Rule 4 applies** — the daemon feature needs L2 tests, including a PTY-attached one (M1.4).
+- **Changelog fragment** — a `changelog.d/126.feature.md` (feature; non-breaking target). Include the demo-reel link if one is produced.
+- **Version bump** — per the release's policy; the feature rides this release's shared version.
+- **Rule 12** — cross-version manual test to confirm non-breaking (M1.5).
+- Rules 2 and 10 still apply (fmt/clippy before commit; no hard-wrapped Markdown prose).
 
-#### Post-review corrections (2026-07-25)
+## Background: the dogfood that led here
 
-Phase 1 was reviewed and security-audited before Phase 2 started. Both passes agreed on one **blocker**, and it is worth recording because it is a genuine finding about this design rather than a typo:
+The config-only Phase 1 (ntfy over `curl`, wrapped in `scripts/notify.sh`, now being retired) verified the channel was reachable and fire-and-forget, and produced the findings that justify this rescope:
 
-- **`curl --data-binary "$message"` could exfiltrate a local file to the public topic.** `--data-binary` gives a leading `@` the meaning "read this file"; `@-` reads stdin. Agents pass free-form prose, and a message that begins with a path or an @mention is entirely plausible — so `scripts/notify.sh blocked coder '@/etc/passwd'` would have POSTed the file's contents to a world-readable topic, the exact thing the script header promises never happens. Fixed by switching to `--data-raw`, which sends the `@` literally. Verified against a local HTTP sink: `--data-binary "@<file>"` delivered the file's contents, `--data-raw "@<file>"` delivered the literal path, and the helper now delivers the literal path.
-  **This is a finding for Phase 3, not just a fix.** The riskiest part of the no-code approach turned out to be neither the agents nor the transport but the *payload plumbing* in the glue script — the one component a deck-side implementation would have owned and gotten right once, instead of once per project that copies this pattern.
+- **Telegram reachability is proven from Pi and Claude.** After the rescope to Telegram/MCP, live sends succeeded from the **Pi orchestrator** (via the `pi-mcp-adapter`, message_id 17) and from **Claude** (native `.mcp.json` discovery, message_id 18) to the maintainer's chat. `pi-mcp-adapter@2.15.0` (MIT) was source-reviewed clean and installed project-local (`.pi/settings.json`); `telegram` was added to `.mcp.json` with an env-placeholder token wired via `vals`.
+- **"One `.mcp.json` for every agent" is a myth** — only Claude reads it natively; OpenCode uses `opencode.json`, Codex uses `~/.codex/config.toml`. This is why **orchestrator-only** notifications are the right design: only the orchestrator (Pi, which now has the adapter) needs to send, so the other agents' MCP-config divergence is irrelevant.
+- **The felt need for the idle detector** was the decisive tripwire: the maintainer immediately wanted "notify me if a worker goes silent for too long", which config provably cannot deliver — the origin of milestone M1.
+- Earlier dogfood tripwire thoughts (T1–T5) — wrapping `blocked` inside `work-done`, teeing the scheduler `Notifier` seam into the log, an `agent_notification_hint` field, a `[notifications]` config block for a private topic — remain recorded as design inputs; several are now moot (orchestrator-only + MCP) or superseded by the idle-detector decision.
 
-Also addressed, all in the glue rather than the deck: the topic override now goes through the same sanitizer as the message (a crafted env var could otherwise inject a spurious log row); both log rows carry an invocation id; and logging failures are reported on stderr instead of being silently swallowed. Zero `src/` diff throughout.
-
-### Phase 2 — Run and observe
-
-- [ ] **M2.1** — **Prerequisite (manual, maintainer):** subscribe a device that is *not* the terminal running the deck to the topic — ntfy phone app or `https://ntfy.sh/dot-agent-deck-notify-0c0d15e13936d122` in a browser — *before* the first run. Phase 1 verified the send path (HTTP 200) but arrival is unverifiable from a shell, and an unsubscribed topic turns every successful send into an apparent miss. Also run the **pre-run log check** (`docs/develop/notifications-dogfood.md`) — invoke the helper once and confirm both rows land at the real log path with no `notify.sh:` stderr note — since logging is best-effort and a silently broken log makes every gap this run produces uninterpretable. Record the log's line count before starting: the reconciliation window is a line range. Then run at least three orchestrated PRDs under the configuration, including one long enough to compact. Do not tune the instructions mid-run; a change resets the sample.
-- [ ] **M2.2** — Reconcile the expectation log against arrived notifications after each run. Append a findings section to this PRD with counts and every gap, plus any tripwire thoughts.
-
-### Phase 3 — Decide what, if anything, the deck should do
-
-- [ ] **M3.1** — Review the findings with the maintainer. For each deferred deck-side item (inactivity nudge, no-agent desktop fallback, `agent_notification_hint` field), record a decision **and its basis** — dogfood evidence where the dogfood could speak, explicit reasoning where it structurally could not.
-- [ ] **M3.2** — File follow-up issues for whatever Phase 3 approves. Nothing deferred may evaporate silently when this PRD closes.
-- [ ] **M3.3** — Decide whether the `docs/develop/` note graduates into published user docs under `docs/`.
-
-## Exit path (decide now, not at `/prd-done`)
-
-This PRD ships **no product change**, which makes the standard flow a poor fit. Expected shape:
-
-- **No changelog fragment** — nothing user-facing changed. **No version bump. No release.**
-- **No test-plan gate with tests in it** — there is no deck behavior to cover, so CLAUDE.md rule 4 does not apply. `cargo test-fast` must still pass (it should be untouched).
-- **No demo reel** — the branch changes no e2e tests, so the adapter clean-skips by design.
-- **No cross-version contract check** (rule 12) — no daemon, protocol, orchestration-code, or hook change.
-- Merges as a config + docs commit; closes without a release once Phase 3's follow-ups are filed.
-
-Rules 2 and 10 still apply: `cargo fmt --check` and `cargo clippy -- -D warnings` before any commit, and no hard-wrapped Markdown prose.
+Two security notes carried forward: every stdio MCP server declared in `.mcp.json` is spawned with the full parent environment (standard MCP-host behavior — all secrets visible to each server); and the MCP SDK carries 4 moderate, Windows-only transitive advisories. Both accepted.
 
 ## Key Files
 
-- `.dot-agent-deck.toml` — this repo's orchestration roles; the orchestrator `prompt_template`, its two user gates, the Pi/Claude command split, and (as of Phase 1) the inline notify instructions in every role.
-- `scripts/notify.sh` — the fire-and-forget helper: `curl` to the ntfy topic plus the two-record append to the expectation log. Always exits 0.
-- `docs/develop/notifications-dogfood.md` — the contributor note (developer-facing, excluded from the Docusaurus build, linked from `CONTRIBUTING.md`).
-- `.dot-agent-deck/notify-log.md` — the expectation log (gitignored via `.gitignore:6`, created at runtime).
-- `src/scheduler.rs:38-45,104` — the existing scheduler-internal `Notifier` / `NotifyEvent` / `StderrNotifier` seam. **Referenced so it is not disturbed**; this PRD does not touch it.
+- `src/daemon_protocol.rs`, the daemon, and the session prompt/input-injection path — where the idle-worker detector and its delivery live.
+- `.dot-agent-deck.toml` — the new `worker_response_timeout_minutes` knob and this repo's rewritten orchestrator `prompt_template`.
+- `.mcp.json` — the `telegram` MCP server (added); `.pi/settings.json` — the `pi-mcp-adapter` install.
+- `docs/` + `site/sidebars.js` — the published feature/recipe page.
+- `scripts/notify.sh`, `docs/develop/notifications-dogfood.md` — dogfood artifacts to remove/retire.
 
 ## Risks and Mitigations
 
-- **Risk**: the experiment produces no falsifiable result because missed notifications are invisible.
-  - *Mitigation*: the expectation log — the whole reason it exists. If M1.2 is skipped, the PRD is worthless; treat it as gating.
-- **Risk**: results are read as a verdict on the deferred deck-side items, which the design cannot inform.
-  - *Mitigation*: stated up front in the scope decision and re-stated in M3.1, which forces the basis of each decision to be named.
-- **Risk**: N=1 project, one maintainer, one workflow — findings may not generalize to users on headless boxes running unattended schedules.
-  - *Mitigation*: accepted and recorded. Directional evidence for a decision that is currently being made on none.
-- **Risk**: scope leak into deck code once a rough edge appears.
-  - *Mitigation*: the tripwire, plus the checkable "zero diff under `src/`" success criterion.
-- **Risk**: a badly phrased instruction makes the orchestrator notify constantly, or stall waiting for acknowledgment.
-  - *Mitigation*: fire-and-forget phrasing; gates are the primary trigger rather than per-step chatter; the whole change is one revertible TOML commit.
-- **Risk**: post-compaction silence gets attributed to notifications rather than to PRD #82.
-  - *Mitigation*: at least one run must be long enough to compact, and findings must record before/after-compaction separately.
-
-## Validation Strategy
-
-Manual, per `feedback_validate_pre_pr`: three real orchestrated runs with log reconciliation after each (M2.1/M2.2). No automated tests — there is no deck behavior under test, and adding some would require deck code the constraint forbids. Regression surface is limited to this repo's own orchestration behaving as before, minus the new notifications; `cargo test-fast` stays green because nothing under `src/` moves.
-
-## Findings
-
-### Counts and gaps
-
-_Populated by M2.2. Empty until the dogfood has run._ The reconciliation must record, per run and split before/after any compaction: moments reached, notifications attempted (`send=ok` + `send=failed`, with `send=skipped` counted separately since no request left the machine), notifications arrived on the subscribed device, and each of the three gaps (`reached`-but-not-`send=ok`, identified by invocation id; `send=ok`-but-never-arrived; the moment that produced no row at all). The exact table to append here, the per-run log-line window that bounds the counts, and the commands that produce them are in [`docs/develop/notifications-dogfood.md`](../docs/develop/notifications-dogfood.md#the-record-to-append-to-the-prd) — do not invent a shape at reconciliation time.
-
-### Tripwire thoughts caught during Phase 1 (2026-07-25)
-
-Recorded per [the tripwire](#the-hard-constraint), **not acted on**, and carried into the M3.1 discussion. Each of these was a live "I'll just add a small thing to the deck" impulse while wiring Phase 1:
-
-- **T1 — "The `blocked` notify would be far more reliable as a wrapper around `dot-agent-deck work-done` than as an instruction each worker has to remember."** Every worker already calls `work-done` to finish, and its `--task` text already contains the blocked reason; firing the notification from inside that CLI would make a missed `blocked` notification structurally impossible. **This is precisely the evidence-destroying change the tripwire exists for** — it would move the notification from "the agent chose to do it" to "the deck did it", which is the exact hypothesis under test. Worth noting that it also quietly re-answers PRD #99's question in #99's favour, for the `blocked` event only.
-- **T2 — "Reconciliation would be trivial if the deck emitted its lifecycle events into the same log."** The scheduler-internal `Notifier` / `NotifyEvent` seam (`src/scheduler.rs:38-45`) already knows when a run starts, finishes, and fails; teeing those into `.dot-agent-deck/notify-log.md` would give an independent ground truth for "which moments actually occurred", collapsing gap #3 from manual reconstruction to a diff. Deliberately not done — the seam is explicitly off-limits here, and the manual reconstruction is the honest version at N=3 runs.
-- **T3 — "`prompt_template` is compaction-mortal, so an `agent_notification_hint` re-injected at each delegate would fix the thing we already predict will break."** This is the deferred config field resurfacing under the guise of a bug fix. It must not be added mid-flight: the predicted post-compaction silence is a *result* of this experiment (and a second independent symptom of PRD #82), and pre-emptively fixing it destroys that result. If the log shows a clean before/after-compaction split, the correct follow-up is #82's re-assert, not this field.
-- **T4 — "Having to commit a public topic name into a public repo is a wart a `[notifications]` config block would solve."** A deck-side config field (or an env passthrough the deck owns) would let the topic be private per-machine while keeping zero-setup defaults. Real, but small: the same effect is already available via `DOT_AGENT_DECK_NOTIFY_TOPIC`, at the cost of the maintainer remembering to export it. Recorded so Phase 3 weighs it as an *ergonomics* argument, not a capability one.
-- **T5 — non-tripwire, but adjacent.** Nothing in Phase 1 produced a "the deck must do this or it cannot work" thought. Every gap encountered had a no-code workaround, and the two genuinely deck-shaped items are still the pair [the scope decision names as un-informable by this dogfood](#what-this-cannot-tell-us-stated-up-front-so-the-result-is-not-over-read) — the inactivity nudge and the no-agent fallback. Phase 1 neither strengthens nor weakens the case for either, exactly as predicted.
-
-### Zero-diff check
-
-`git diff --stat -- src/` is empty on this branch. Phase 1 touched only `.dot-agent-deck.toml`, `scripts/notify.sh` (new), `docs/develop/notifications-dogfood.md` (new), `CONTRIBUTING.md`, and this PRD. `.gitignore` needed no change (`.dot-agent-deck/` already covers the log).
+- **False-positive idle alerts on legitimately long tasks.** *Mitigation:* 120-min default makes it rare; a false alert is a discardable message; one-shot avoids spam. Liveness-based detection deferred.
+- **The change accidentally breaks TUI↔daemon compatibility.** *Mitigation:* reuse the existing injection path (no new wire shape); rule-12 cross-version manual test gates it.
+- **Idle prompt injected mid-turn or racing a finish.** *Mitigation:* deliver only at a turn boundary; per-delegation timer cancelled by `work-done`.
+- **Post-compaction silence of the recipe notifications.** *Mitigation:* the daemon's injected idle prompt is self-describing (survives compaction); gate/done notifications' compaction-mortality is a documented known limitation (#82).
+- **Publishing the recipe before it is battle-tested.** *Mitigation:* frame it as an example, and validate on real runs (M5) including a compacting one.
+- **The no-agent / dead-orchestrator gap.** *Mitigation:* explicitly out of scope and documented as a known limitation.
