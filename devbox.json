@@ -45,7 +45,7 @@
       "oc-big":             ["opencode --model openai/gpt-5.6-sol"],
       "oc-release":         ["opencode --model openai/gpt-5.4-mini"],
       "oc-kimi":            ["opencode --model openrouter/moonshotai/kimi-k2.6"],
-      "codex-big":          ["codex --model gpt-5.6-sol --sandbox workspace-write --ask-for-approval never -c sandbox_workspace_write.network_access=true -c model_reasoning_effort=xhigh"]
+      "codex-big":          ["codex --model gpt-5.6-sol --sandbox danger-full-access --ask-for-approval never -c model_reasoning_effort=xhigh"]
     }
   }
 }
