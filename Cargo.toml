@@ -20,7 +20,17 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ratatui = "0.30"
-crossterm = "0.28"
+# PRD #227: EXACT pin. `ui::ctrl_c0_byte` documents crossterm 0.28.1's decoder
+# behavior down to `src/event/sys/unix/parse.rs` line numbers, because the deck's
+# Ctrl+<char> → C0 encoder has to be that decoder's exact inverse. Changing this
+# line is therefore a decoder change: re-verify those `parse.rs` references by
+# hand, and re-read `ctrl_c0_byte`'s contract, before bumping it. (The
+# `keyevent_ctrl_c0_matches_crossterm_decoder` round-trip test catches an
+# encoder/decoder mismatch under `cargo test-fast`, but not a stale line
+# reference.) NOTE: ratatui 0.30 pulls crossterm 0.29 in via `ratatui-crossterm`;
+# the two coexist because 0.28/0.29 are semver-incompatible, and this pin binds
+# only OUR direct dependency — the one `src/ui.rs` reads events from.
+crossterm = "=0.28.1"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 # PRD #20 §4.1.3: FORMAT-PRESERVING edits of the user's real `~/.codex/config.toml`

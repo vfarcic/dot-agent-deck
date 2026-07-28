@@ -3676,19 +3676,25 @@ fn csi_modifier_param(mods: KeyModifiers) -> u8 {
 /// so there is no legacy byte to preserve — mapping it would invent behavior
 /// rather than restore it.
 ///
-/// # The decoder half, verified by hand — RE-VERIFY ON A CROSSTERM UPGRADE
+/// # The decoder half — RE-VERIFY ON A CROSSTERM UPGRADE
 ///
 /// This table is only correct if crossterm decodes the way it is described
-/// above, and nothing in the test suite checks that. An automated round-trip
-/// test against the real decoder was written for PRD #227 and then withdrawn:
-/// `parse_event` is `pub(crate)`, so reaching it means handing crossterm a real
-/// tty on fd 0 — and crossterm 0.28's raw-mode flag and its lazily-built event
-/// reader are PROCESS-global, so such a probe can steal input from, or hang,
-/// unrelated tests sharing a `cargo test` process.
+/// above. Two things hold that down:
 ///
-/// So the decoder half is recorded here instead, read out of
-/// `crossterm-0.28.1/src/event/sys/unix/parse.rs`. Legacy single bytes, in
-/// `parse_event`'s match order (earlier arms shadow later ones):
+/// 1. `keyevent_ctrl_c0_matches_crossterm_decoder` round-trips every byte below
+///    through the REAL decoder — it puts a PTY on fd 0 so crossterm's
+///    `pub(crate)` `parse_event` runs on genuine terminal input — and so fails
+///    the moment the encoder stops being the decoder's inverse. It needs the
+///    process to itself (crossterm 0.28's raw-mode flag and its lazily-built
+///    event reader are PROCESS-global), so it runs under `cargo test-fast` /
+///    `cargo nextest` and skips under a plain `cargo test`.
+/// 2. `Cargo.toml` pins the direct dependency to `=0.28.1`, so the decoder
+///    cannot change without a deliberate edit to that line.
+///
+/// The hand-read decoder tables stay recorded here because they are the *why*
+/// behind the rules above, and because (1) proves agreement without explaining
+/// it. Read out of `crossterm-0.28.1/src/event/sys/unix/parse.rs`; legacy single
+/// bytes, in `parse_event`'s match order (earlier arms shadow later ones):
 ///
 /// * `:35-91` — `0x1b` opens an escape sequence; alone, with no further input
 ///   pending, it is `KeyCode::Esc`.
@@ -3713,9 +3719,11 @@ fn csi_modifier_param(mods: KeyModifiers) -> u8 {
 ///
 /// `keyevent_ctrl_c0_controls` and
 /// `ctrl_c0_byte_maps_exactly_the_documented_alias_set` pin the ENCODER against
-/// that reading, exhaustively over all 128 ASCII characters — but they cannot
-/// notice if the reading itself goes stale. Bumping crossterm means re-checking
-/// every line reference above by hand.
+/// that reading, exhaustively over all 128 ASCII characters, with no PTY needed;
+/// `keyevent_ctrl_c0_matches_crossterm_decoder` pins the reading itself against
+/// the shipped decoder. What none of them can do is keep the LINE REFERENCES
+/// above accurate: relaxing the `=0.28.1` pin in `Cargo.toml` means re-checking
+/// every one of them by hand, even when the round-trip test stays green.
 fn ctrl_c0_byte(c: char) -> Option<u8> {
     match c {
         // `a`–`z` / `A`–`Z` → 0x01..=0x1a via the caret rule on the upcased char.
@@ -20335,6 +20343,340 @@ mod tests {
         // truncate the codepoint).
         for c in ['é', 'λ', '€', '🙂'] {
             assert_eq!(ctrl_c0_byte(c), None, "Ctrl+{c:?} is not a C0 alias");
+        }
+    }
+
+    /// PRD #227 review item A: run OUR encoder against THEIR decoder.
+    ///
+    /// crossterm's `parse_event` is `pub(crate)`, so the only way to reach the
+    /// real decoder is to give crossterm a terminal to read from: `tty_fd()`
+    /// returns stdin when stdin is a tty, so this installs a PTY slave on fd 0
+    /// and writes keypresses into the master. Bytes then travel the exact
+    /// production path — PTY line discipline, `Parser::advance`, `parse_event` —
+    /// instead of a hand-transcribed copy of crossterm's tables that could
+    /// silently drift from them on an upgrade.
+    ///
+    /// # Only sound when the test owns the process
+    ///
+    /// Every piece of state this probe touches is PROCESS-global, not per-test:
+    /// fd 0, crossterm 0.28's raw-mode flag, and crossterm's lazily-built event
+    /// reader (cached in a process-wide `Mutex<Option<...>>`). A concurrent
+    /// stdin/event user in the same process could consume the queued event
+    /// between this probe's `poll` and its `read`, at which point `event::read`
+    /// blocks and the 5 s deadline in [`Self::decode`] never gets a chance to
+    /// fire — a hang, not a failure. The cached reader also outlives `Drop`,
+    /// still holding a registration for the PTY the probe just closed.
+    ///
+    /// [`keyevent_ctrl_c0_matches_crossterm_decoder`] therefore refuses to run
+    /// unless it owns the process (its `NEXTEST` guard). Under
+    /// process-per-test there is no competing consumer, so the deadline really
+    /// does bound `decode`, and the stale cached reader is harmless because the
+    /// process exits moments later. That same guard is what makes the panic
+    /// safety of [`Self::new`] acceptable — read its note before reusing this
+    /// type anywhere else.
+    #[cfg(unix)]
+    struct CrosstermInputProbe {
+        master: std::fs::File,
+        /// Kept alive only so the slave end stays open for the probe's lifetime;
+        /// fd 0 is a `dup` of it and is what crossterm actually reads.
+        _slave: std::fs::File,
+        /// `dup` of the original fd 0, put back by `Drop`; `-1` if that `dup`
+        /// failed. `-1` does NOT prove fd 0 was closed — `dup` also fails with
+        /// `EMFILE`/`EINTR` on a perfectly valid stdin — so `Drop` reads it only
+        /// as "nothing to put back" and never closes fd 0 on its strength.
+        saved_stdin: libc::c_int,
+    }
+
+    #[cfg(unix)]
+    impl CrosstermInputProbe {
+        /// # Panic safety: none, deliberately
+        ///
+        /// The two `openpty` descriptors stay bare `c_int`s until the last few
+        /// lines, so any failing assertion below leaks them, and one that fires
+        /// after the `dup2` also leaves fd 0 pointing at the probe PTY with
+        /// crossterm's raw-mode flag set. No `Drop` runs, because `Self` does not
+        /// exist yet.
+        ///
+        /// That is acceptable for exactly one reason: the only caller refuses to
+        /// run unless it owns the process, so a panic here means a dedicated,
+        /// already-failed process that is about to exit and take the leaked
+        /// descriptors and the redirected fd 0 with it. There is no sibling test
+        /// left to corrupt, and no production code in this process at all.
+        /// Loosen that guard — or call this from anywhere else — and this needs
+        /// real `OwnedFd` plumbing first.
+        fn new() -> Self {
+            let mut master: libc::c_int = -1;
+            let mut slave: libc::c_int = -1;
+            // SAFETY: `openpty` writes the two fds through the out-pointers; the
+            // trailing name/termios/winsize arguments are documented as optional
+            // and passed as NULL.
+            let rc = unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            assert_eq!(
+                rc,
+                0,
+                "openpty failed ({}). This test needs a PTY to hand crossterm's own \
+                 decoder real input.",
+                std::io::Error::last_os_error()
+            );
+
+            // SAFETY: termios/fcntl calls on the fd `openpty` just handed us,
+            // which is open and unshared for the whole block. On an assertion
+            // failure the two fds leak — see the panic-safety note above for why
+            // that is tolerable here.
+            //
+            // RAW, because a canonical-mode slave withholds bytes until a newline
+            // and `cfmakeraw` also clears ISIG/IXON — so 0x03/0x1a/0x11 arrive as
+            // DATA instead of signalling or flow-controlling the test process.
+            // This is also the state the deck's own terminal is in.
+            //
+            // NON-BLOCKING, because crossterm reads only after `poll` reports
+            // POLLIN but loops and reads again while an escape sequence is
+            // incomplete; on a blocking fd that second read would hang the whole
+            // process, whereas `EWOULDBLOCK` sends it back to `poll` and lets the
+            // per-keypress deadline in `decode` fail cleanly instead.
+            unsafe {
+                let mut tio: libc::termios = std::mem::zeroed();
+                assert_eq!(
+                    libc::tcgetattr(slave, &mut tio),
+                    0,
+                    "tcgetattr on the probe pty slave ({})",
+                    std::io::Error::last_os_error()
+                );
+                libc::cfmakeraw(&mut tio);
+                assert_eq!(
+                    libc::tcsetattr(slave, libc::TCSANOW, &tio),
+                    0,
+                    "tcsetattr on the probe pty slave ({})",
+                    std::io::Error::last_os_error()
+                );
+                let flags = libc::fcntl(slave, libc::F_GETFL);
+                assert_ne!(
+                    flags,
+                    -1,
+                    "F_GETFL on the probe pty slave ({})",
+                    std::io::Error::last_os_error()
+                );
+                assert_ne!(
+                    libc::fcntl(slave, libc::F_SETFL, flags | libc::O_NONBLOCK),
+                    -1,
+                    "F_SETFL O_NONBLOCK on the probe pty slave ({})",
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            // SAFETY: `dup`/`dup2` on fd 0 with an fd we own. The `dup` result is
+            // stashed unchecked ON PURPOSE: a failure only costs us the ability to
+            // restore fd 0 in `Drop`, which in this process nobody observes, and
+            // `-1` is explicitly NOT read as "fd 0 was closed" (see the field's
+            // doc). The `dup2` itself is asserted, because without it crossterm
+            // would read the developer's real terminal rather than the probe.
+            let saved_stdin = unsafe { libc::dup(libc::STDIN_FILENO) };
+            let rc = unsafe { libc::dup2(slave, libc::STDIN_FILENO) };
+            assert_ne!(
+                rc,
+                -1,
+                "dup2 of the probe pty onto stdin failed ({})",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(
+                unsafe { libc::isatty(libc::STDIN_FILENO) },
+                1,
+                "stdin must be the probe pty, otherwise crossterm would fall back \
+                 to /dev/tty and read the developer's real terminal"
+            );
+
+            // crossterm's decoder branches on its OWN raw-mode flag for `0x0a`
+            // (upstream issue #371: in raw mode `\n` is Ctrl+J, in cooked mode it
+            // is Enter), so the probe has to match the deck: raw. `tty_fd()`
+            // resolves to the fd-0 pty installed above, so this cannot touch the
+            // developer's terminal.
+            crossterm::terminal::enable_raw_mode().expect("enable raw mode on the probe pty");
+            assert!(
+                crossterm::terminal::is_raw_mode_enabled().unwrap_or(false),
+                "crossterm must report raw mode, otherwise 0x0a decodes as Enter and \
+                 re-encodes as 0x0d"
+            );
+
+            // SAFETY: both fds came from our own `openpty` and have not been
+            // handed to anything that closes them, so wrapping them in `File`
+            // moves sole ownership to `Self` and they close on `Drop`. (fd 0 is a
+            // separate descriptor — the `dup2` above — and is dealt with there.)
+            // This is the first point at which anything is owned; every assertion
+            // before it leaks.
+            let (master, slave) = unsafe {
+                use std::os::unix::io::FromRawFd;
+                (
+                    std::fs::File::from_raw_fd(master),
+                    std::fs::File::from_raw_fd(slave),
+                )
+            };
+            Self {
+                master,
+                _slave: slave,
+                saved_stdin,
+            }
+        }
+
+        /// Feed `bytes` as if the terminal had sent them, and return the single
+        /// `KeyEvent` crossterm decodes from them.
+        ///
+        /// The deadline is a real bound only because the caller owns the process:
+        /// with no other event consumer, a `poll` that reports POLLIN is followed
+        /// by a `read` that cannot be beaten to the queued event, so `read`
+        /// returns rather than blocking past the deadline.
+        fn decode(&self, bytes: &[u8]) -> KeyEvent {
+            use std::io::Write;
+            (&self.master)
+                .write_all(bytes)
+                .expect("write the keypress into the probe pty");
+            (&self.master).flush().expect("flush the probe pty");
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "crossterm decoded no key event from {bytes:02x?} within 5s"
+                );
+                if !crossterm::event::poll(std::time::Duration::from_millis(50))
+                    .expect("poll the probe pty")
+                {
+                    continue;
+                }
+                match crossterm::event::read().expect("read from the probe pty") {
+                    crossterm::event::Event::Key(key) => return key,
+                    // A stray resize/focus event is not what we asked about.
+                    _ => continue,
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CrosstermInputProbe {
+        fn drop(&mut self) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            // SAFETY: put back the fd 0 we replaced, using a descriptor this
+            // struct owns. If the `dup` in `new` failed there is nothing to put
+            // back, and fd 0 is left as the (soon to be closed) probe pty rather
+            // than closed outright — closing it would be acting on an inference
+            // `dup` failure does not support. Harmless: the caller owns the
+            // process and it is about to exit.
+            unsafe {
+                if self.saved_stdin >= 0 {
+                    libc::dup2(self.saved_stdin, libc::STDIN_FILENO);
+                    libc::close(self.saved_stdin);
+                }
+            }
+        }
+    }
+
+    /// PRD #227 review item A: the encoder must be the exact INVERSE of
+    /// crossterm's decoder over the whole control range, in BOTH wire forms.
+    ///
+    /// This is the property test that the one-alias-at-a-time fixes kept missing.
+    /// `Ctrl+[` regressed under M2, was fixed by naming `[`, and then `Ctrl+3`
+    /// and `Ctrl+8` regressed the same way — because nothing asserted the
+    /// mapping was *complete*. Feeding every control byte through crossterm and
+    /// back out through [`keyevent_to_bytes`] catches all of them at once, and
+    /// catches the next one for free.
+    ///
+    /// Every byte in `0x00..=0x1f` plus `0x7f` round-trips; there is no
+    /// documented exception. `0x0a` is the one that DEPENDS on terminal state:
+    /// crossterm reports it as `Ctrl+J` in raw mode (which re-encodes to `0x0a`)
+    /// but as `Enter` in cooked mode (which would re-encode to `0x0d`), so the
+    /// probe asserts raw mode is active — matching the deck, which never runs
+    /// the pane-input path outside raw mode.
+    ///
+    /// Runs only under `cargo nextest` (`cargo test-fast`, the fast-tier gate)
+    /// because [`CrosstermInputProbe`] is sound only with the process to itself;
+    /// see the guard at the top of the body.
+    #[cfg(unix)]
+    #[test]
+    fn keyevent_ctrl_c0_matches_crossterm_decoder() {
+        // Decision 26-style runtime skip. `NEXTEST` is set in every test process
+        // `cargo nextest` spawns, and nextest is process-per-test — which is the
+        // isolation [`CrosstermInputProbe`] documents as its precondition (fd 0
+        // surgery plus crossterm's process-global raw-mode flag and cached event
+        // reader). `cargo test-fast` is nextest, so the official fast-tier gate
+        // (CLAUDE.md rule 5) runs this test; a plain `cargo test` puts every unit
+        // test of the crate in ONE process, where a competing event consumer can
+        // turn `decode`'s bounded wait into an unbounded one, so there it skips
+        // rather than risking a hang.
+        if std::env::var_os("NEXTEST").is_none() {
+            eprintln!(
+                "SKIP: keyevent_ctrl_c0_matches_crossterm_decoder needs PROCESS ISOLATION \
+                 (it installs a PTY on fd 0 and drives crossterm's process-global raw-mode \
+                 flag and cached event reader). Run it under `cargo test-fast` / \
+                 `cargo nextest run`, which is process-per-test; plain `cargo test` shares \
+                 one process across the whole crate and is skipped."
+            );
+            return;
+        }
+
+        let probe = CrosstermInputProbe::new();
+
+        // --- Phase 1: the LEGACY wire form. Every control byte a legacy
+        // terminal can deliver must survive decode → encode unchanged. ---
+        for byte in (0x00u8..=0x1f).chain(std::iter::once(0x7f)) {
+            let key = probe.decode(&[byte]);
+            assert_eq!(
+                keyevent_to_bytes(&key).as_deref(),
+                Some(&[byte][..]),
+                "control byte {byte:#04x} decoded by crossterm as {key:?} did not re-encode \
+                 to itself — the deck would forward something else to the agent's PTY"
+            );
+        }
+
+        // --- Phase 2: the M2 wire form. `DISAMBIGUATE_ESCAPE_CODES` makes the
+        // terminal send `CSI <codepoint>;5u` instead of the collapsed byte, so
+        // crossterm reports `Char(c) + CONTROL` and producing the byte becomes
+        // the deck's job. This is the form that regressed twice. ---
+        for (ch, want) in CTRL_C0_SYMBOL_ALIASES
+            .iter()
+            .copied()
+            .chain(ctrl_c0_letter_aliases())
+        {
+            // `1 + ctrl(4)` = 5 — the kitty modifier parameter for Ctrl alone.
+            let wire = format!("\x1b[{};5u", ch as u32);
+            let key = probe.decode(wire.as_bytes());
+            assert_eq!(
+                keyevent_to_bytes(&key).as_deref(),
+                Some(&[want][..]),
+                "{wire:?} (Ctrl+{ch:?}) decoded by crossterm as {key:?} must forward \
+                 {want:#04x}; forwarding the literal character instead is the Ctrl+[ / \
+                 Ctrl+3 regression"
+            );
+        }
+
+        // --- Phase 3: the modifier-bearing keys M1/M3 added, checked against
+        // the real decoder rather than a hand-made `KeyEvent`. Each of these is
+        // its own inverse: what a kitty terminal sends is exactly what the deck
+        // forwards. ---
+        for (wire, want) in [
+            // The headline of PRD #227.
+            ("\x1b[13;2u", "\x1b[13;2u"), // Shift+Enter
+            ("\x1b[13;5u", "\x1b[13;5u"), // Ctrl+Enter
+            ("\x1b[1;2A", "\x1b[1;2A"),   // Shift+Up
+            ("\x1b[1;2B", "\x1b[1;2B"),   // Shift+Down
+            ("\x1b[1;5C", "\x1b[1;5C"),   // Ctrl+Right
+            ("\x1b[1;5D", "\x1b[1;5D"),   // Ctrl+Left
+        ] {
+            let key = probe.decode(wire.as_bytes());
+            assert_eq!(
+                keyevent_to_bytes(&key).as_deref(),
+                Some(want.as_bytes()),
+                "{wire:?} decoded by crossterm as {key:?} must be forwarded verbatim as \
+                 {want:?}; collapsing it to the unmodified legacy byte is the bug PRD #227 \
+                 fixes"
+            );
         }
     }
 
