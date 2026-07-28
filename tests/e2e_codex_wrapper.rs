@@ -163,14 +163,26 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
         Duration::from_secs(120),
     );
     assert_eq!(thinking.agent_type, AgentType::Codex);
+    // Polled on CONTENT, not existence: a shell redirect creates the proof file
+    // before it writes into it, so waiting only for the path to appear can read
+    // an empty string (PRD #225). Same exact-match semantics as before —
+    // trimmed contents must equal the sentinel name.
+    //
+    // Bounded at 120s, not the old 180s: 180s IS nextest's kill window for the
+    // whole test, so a wait that long can never actually elapse — the harness
+    // kills the test first and the diagnostics below are never printed. 120s
+    // leaves headroom for this assertion to fail *with* its message (measured
+    // in isolation: the whole test is ~16s).
     let proof_path = deck.workdir().join(INTERACTIVE_PROOF_NAME);
-    assert!(
-        common::wait_for_path(&proof_path, Duration::from_secs(180)),
-        "interactive Codex never completed the requested shell work; final grid:\n{}",
-        deck.snapshot_grid()
-    );
-    let proof = std::fs::read_to_string(&proof_path).expect("read interactive Codex proof");
-    assert_eq!(proof.trim(), SENTINEL_NAME);
+    if let Err(observed) =
+        common::wait_for_file_trimmed_eq(&proof_path, SENTINEL_NAME, Duration::from_secs(120))
+    {
+        panic!(
+            "interactive Codex never completed the requested shell work; observed: {observed}; \
+             final grid:\n{}",
+            deck.snapshot_grid()
+        );
+    }
     deck.send_keys(b"/exit");
     deck.wait_for_string("/exit");
     deck.send_keys(b"\r");

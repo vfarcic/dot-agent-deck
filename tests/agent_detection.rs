@@ -113,8 +113,16 @@ fn spawn_005_respawn_wraps_codex() {
             .await
             .expect("respawn pane as Codex");
 
+        // Wait for a COMPLETE recorded line, not merely for the file to exist:
+        // the shim appends with `>>`, and the shell creates the file before
+        // `printf` writes into it, so an existence-only wait can read an empty
+        // string (PRD #225 — same defect as `orchestration/delegate/009`).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !record.exists() && std::time::Instant::now() < deadline {
+        while !std::fs::read_to_string(&record)
+            .unwrap_or_default()
+            .contains('\n')
+            && std::time::Instant::now() < deadline
+        {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let launched = std::fs::read_to_string(&record).unwrap_or_default();
@@ -184,8 +192,16 @@ fn spawn_006_explicit_codex_identity_wraps_noninferable_launcher() {
         })
         .expect("spawn explicitly identified Codex launcher");
 
+    // Wait for a COMPLETE recorded line, not merely for the file to exist: the
+    // shim appends with `>>`, and the shell creates the file before `printf`
+    // writes into it, so an existence-only wait can read an empty string
+    // (PRD #225 — same defect as `orchestration/delegate/009`).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !record.exists() && std::time::Instant::now() < deadline {
+    while !std::fs::read_to_string(&record)
+        .unwrap_or_default()
+        .contains('\n')
+        && std::time::Instant::now() < deadline
+    {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let launched = std::fs::read_to_string(&record).unwrap_or_default();

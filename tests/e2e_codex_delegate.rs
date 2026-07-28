@@ -371,27 +371,32 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
         deck.snapshot_grid()
     );
 
-    // The load-bearing assertion: the worker ACTED on the delegated prompt.
+    // The load-bearing assertion: the worker ACTED on the delegated prompt —
+    // the sentinel exists AND carries exactly the requested contents.
+    //
+    // Polled on CONTENT, not existence. The directive asks for a shell redirect
+    // (`printf 'PRD225_DELEGATE_OK' > …`), and `>` CREATES the file before
+    // `printf` writes into it: a reader that waits only for the path to appear
+    // can win that race and read an empty string. That is a flaw in how this
+    // test OBSERVES the result, not in what it proves — the exact-match
+    // semantics below are unchanged (trimmed contents must equal the sentinel).
+    //
     // Bounded to fit inside nextest's 180s cap for this test (measured: the
     // sentinel lands ~36s after the trigger, ~5s after the prompt is submitted).
     let sentinel = work.join(SENTINEL_NAME);
-    let created = common::wait_for_path(&sentinel, Duration::from_secs(60));
-    assert!(
-        created,
-        "the `clear = true` Codex worker never created {SENTINEL_NAME:?} — the delegated \
-         prompt was not delivered to (or not acted on by) the respawned agent. \
-         task_pointer_written={} orchestrator_log={:?}\nFinal grid:\n{}",
-        task_pointer.exists(),
-        orchestrator_log(),
-        deck.snapshot_grid()
-    );
-    assert_eq!(
-        std::fs::read_to_string(&sentinel)
-            .expect("read the delegated sentinel")
-            .trim(),
-        SENTINEL_CONTENT,
-        "the Codex worker created the sentinel with unexpected contents"
-    );
+    if let Err(observed) =
+        common::wait_for_file_trimmed_eq(&sentinel, SENTINEL_CONTENT, Duration::from_secs(60))
+    {
+        panic!(
+            "the `clear = true` Codex worker never produced {SENTINEL_NAME:?} with the exact \
+             contents {SENTINEL_CONTENT:?} — the delegated prompt was not delivered to (or not \
+             acted on by) the respawned agent. observed: {observed}; \
+             task_pointer_written={} orchestrator_log={:?}\nFinal grid:\n{}",
+            task_pointer.exists(),
+            orchestrator_log(),
+            deck.snapshot_grid()
+        );
+    }
 
     // Soft narrative (NOT gating — the work-done leg is covered by
     // `codex/worker/001` and is too LLM-dependent to hard-gate here): did the

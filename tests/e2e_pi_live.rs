@@ -590,22 +590,23 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
     );
 
     // Full chain — the delegated claude worker created the sentinel (proves the
-    // real worker ran the delegated task via the daemon route).
+    // real worker ran the delegated task via the daemon route). Polled on
+    // CONTENT, not existence: a shell redirect creates the file before writing
+    // into it, so waiting only for the path to appear can read an empty string
+    // (PRD #225). Same `contains` semantics as before.
     let sentinel = project_dir.join(ORCH_SENTINEL_NAME);
-    assert!(
-        common::wait_for_path(&sentinel, Duration::from_secs(90)),
-        "the delegated claude worker never created the sentinel {ORCH_SENTINEL_NAME:?} within \
-         90s. The delegation reached the worker (task file written), so the worker ran but did \
-         not complete the task. api_error_on_grid={}.\nFinal grid:\n{}",
-        api_errored(&deck.snapshot_grid()),
-        deck.snapshot_grid()
-    );
-    let contents = std::fs::read_to_string(&sentinel).expect("read sentinel file");
-    assert!(
-        contents.contains(ORCH_SENTINEL_CONTENT),
-        "sentinel {ORCH_SENTINEL_NAME:?} exists but does not contain {ORCH_SENTINEL_CONTENT:?}; \
-         got:\n{contents}"
-    );
+    if let Err(observed) =
+        common::wait_for_file_containing(&sentinel, ORCH_SENTINEL_CONTENT, Duration::from_secs(90))
+    {
+        panic!(
+            "the delegated claude worker never created the sentinel {ORCH_SENTINEL_NAME:?} with \
+             {ORCH_SENTINEL_CONTENT:?} within 90s. The delegation reached the worker (task file \
+             written), so the worker ran but did not complete the task. observed: {observed}; \
+             api_error_on_grid={}.\nFinal grid:\n{}",
+            api_errored(&deck.snapshot_grid()),
+            deck.snapshot_grid()
+        );
+    }
 
     // Full chain — work-done returned to the orchestrator: the daemon wrote the
     // per-role summary file (`handle_work_done`), proving the worker ran

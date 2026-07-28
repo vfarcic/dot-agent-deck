@@ -3408,6 +3408,75 @@ pub fn wait_for_path(path: &Path, timeout: Duration) -> bool {
     path.exists()
 }
 
+/// Human description of what `path` holds *right now* — missing, unreadable,
+/// or its exact contents. Used by the content-polling waiters below so a
+/// timeout says whether the file never appeared, appeared empty, or simply
+/// carried the wrong text.
+#[allow(dead_code)]
+fn describe_file(path: &Path) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => format!("{} contains {contents:?}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            format!("{} does not exist", path.display())
+        }
+        Err(e) => format!("{} is unreadable: {e}", path.display()),
+    }
+}
+
+/// Bounded poll until `path` is readable AND `matches` accepts its contents.
+/// `Ok(())` on match; on timeout, `Err(`[`describe_file`]`)`.
+///
+/// Prefer this over [`wait_for_path`] + an immediate `read_to_string` whenever
+/// the assertion is about the file's CONTENTS. An agent that writes a sentinel
+/// with a shell redirect — `printf 'X' > sentinel.txt` — has the shell CREATE
+/// the file before `printf` writes into it, so a reader that waits only for
+/// EXISTENCE can win the race and observe an empty string (PRD #225; this is
+/// exactly how `orchestration/delegate/009` failed in-suite while passing in
+/// isolation). Polling the content closes that window.
+#[allow(dead_code)]
+fn wait_for_file_matching(
+    path: &Path,
+    timeout: Duration,
+    matches: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path)
+            && matches(&contents)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(describe_file(path));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Bounded poll until `path`'s TRIMMED contents equal `expected` exactly.
+/// See [`wait_for_file_matching`] for why content — not existence — is polled.
+#[allow(dead_code)]
+pub fn wait_for_file_trimmed_eq(
+    path: &Path,
+    expected: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    wait_for_file_matching(path, timeout, |contents| contents.trim() == expected)
+}
+
+/// Bounded poll until `path`'s contents contain `needle`. The bounded,
+/// non-panicking sibling of [`wait_for_file_contains`] (which is pinned to the
+/// harness-wide [`WAIT_TIMEOUT`]); see [`wait_for_file_matching`] for why
+/// content — not existence — is polled.
+#[allow(dead_code)]
+pub fn wait_for_file_containing(
+    path: &Path,
+    needle: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    wait_for_file_matching(path, timeout, |contents| contents.contains(needle))
+}
+
 /// Blocking `read_exact` bounded by a wall-clock `deadline`, tolerating the
 /// per-read timeout set on the stream. Returns `Err` on EOF / hard error / the
 /// deadline passing before the buffer fills.
