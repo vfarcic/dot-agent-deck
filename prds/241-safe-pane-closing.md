@@ -1,6 +1,6 @@
 # PRD #241: Safe pane closing — scope Ctrl+W to command mode, confirm destructive close, unwedge NotFound
 
-**Status**: Not started
+**Status**: Implementation complete — PR pending (M1–M5 done; M6 partial)
 **Priority**: High
 **Created**: 2026-07-28
 **GitHub Issue**: [#241](https://github.com/vfarcic/dot-agent-deck/issues/241)
@@ -162,12 +162,40 @@ Touches the daemon RPC path, so the question is owed explicitly. Expected answer
 
 ## Milestones
 
-- [ ] **M1**: `ClosePane` mode-gated — `Ctrl+W` reaches the PTY in `PaneInput`, still closes from command mode; other global actions unregressed
-- [ ] **M2**: `NotFound` treated as already-stopped — ghost cards close cleanly; genuine stop failures still retain the pane
-- [ ] **M3**: Confirmation dialog on the close action (keybinding and `[Close]` button), defaulting to Cancel
-- [ ] **M4**: Command-mode exit discoverable — mode-aware hints bar and help overlay; `close` not advertised where unavailable
-- [ ] **M5**: L1 coverage plus PTY-attached L2 (real shell word-delete, real-agent no-teardown) green in the pre-PR e2e tier
+- [x] **M1**: `ClosePane` mode-gated — `Ctrl+W` reaches the PTY in `PaneInput`, still closes from command mode; other global actions unregressed
+- [x] **M2**: `NotFound` treated as already-stopped — ghost cards close cleanly; genuine stop failures still retain the pane
+- [x] **M3**: Confirmation dialog on the close action (keybinding and `[Close]` button), defaulting to Cancel
+- [x] **M4**: Command-mode exit discoverable — mode-aware hints bar and help overlay; `close` not advertised where unavailable
+- [x] **M5**: L1 coverage plus PTY-attached L2 (real shell word-delete, real-agent no-teardown) green in the pre-PR e2e tier
 - [ ] **M6**: Docs updated, changelog fragment added, rule 12 cross-version answer recorded; #88, #192, #218 closed with the fix referenced
+  - [x] Docs updated (`docs/keyboard-shortcuts.md` plus four cross-references)
+  - [x] Rule 12 cross-version answer recorded and **verified** — see Implementation Notes
+  - [ ] Changelog fragment — written by the release step during `/prd-done`'s first push
+  - [ ] #88, #192, #218 closed with the fix referenced — happens at merge
+
+## Implementation Notes
+
+Recorded because the implementation diverged from the plan in ways a future reader would otherwise have to re-derive. Commits: `ea98c68` (M1–M4 + docs), `6912998` (two pre-existing close flows made confirmation-aware), `991f270` (review/audit findings), `1a8eb7f` (tests driven through real dispatch + blocker guards), `b56ed08` (real-agent test reaches its assertion).
+
+**`dashboard_hints_string` was never on the live path — not even before this PRD.** The Solution Overview calls it "the single source of truth for both the live bar and the `render_hints_bar_to_buffer` snapshot entrypoint". That is wrong: the live hints row *is the button bar*, so M4's first cut changed only a string the running app never rendered, and its test passed over a dead seam. Both now read one shared `ModeGlobals::for_mode`, and `Ctrl+D` was made a genuine two-way toggle (`resume_pane_input_target`) so the new "back to pane" hint is actually true. Anything else assuming `dashboard_hints_string` is live should be treated with the same suspicion.
+
+**The confirmation had to be bound to a stable target.** Storing a selection index was not enough — `Ctrl+PgUp`/`Ctrl+PgDn` still resolved while the modal was open, so a confirmed close could destroy a different tab than the one armed. A `CloseTarget` (tab id or session id) is captured at arm time and re-resolved at confirm time; if the target is gone, nothing closes. Root cause of the leak: the existing `blocking_overlay` / `modal_active` lists are **mouse-only**, so they never guarded keyboard navigation.
+
+**M2's predicate is narrower than "contains `not found`".** The original match would classify any error containing the phrase (`pane not found`, `session not found`, a wrapped `file not found`) as already-stopped and silently discard a **live** pane. It is now the exact id-scoped `Agent {id} not found`. A respawn race also needed closing: the daemon is asked who owns the pane slot, so a *replacement* agent is stopped rather than orphaned.
+
+**Open Question 1 — skippable confirmation:** shipped the plain modal, no opt-out, per the PRD's own recommendation. A `y`/`n` one-keypress shortcut was added and then **removed**: a `y` that arrived before the modal rendered could confirm a close the user never saw. Confirming is `Down`+`Enter`; the event loop now discards input queued before the modal actually rendered (the mouse burst path was the live hole).
+
+**Open Question 2 — tab vs pane copy:** the modal does **not** distinguish. Closing behaves identically either way (same code path); the dialog is purely a guard, so it reads `Close selected pane?` even when the target is a whole tab. Now that `CloseTarget` separates `Tab` from `Session`, naming the pane count is a cheap follow-up if the copy proves confusing.
+
+**Open Question 3 — typed daemon error:** declined, with reason. Older daemons only ever send the string, so a typed variant would not remove the string match — it would add wire surface and force a `PROTOCOL_VERSION` bump for no safety gain. The match is confined to one `is_agent_not_found` helper.
+
+**Open Question 4 — is the modal still worth it:** yes, shipped. #88 and #192 asked for it by name and both describe *deliberate* misclicks that mode-scoping does not catch.
+
+**Close entry points:** four exist and all confirm — the chord, the `[Close]` button, the tab-strip `×`, and the modal's own `[Close]`. The tab-strip click originally bypassed the modal entirely. Six further paths were audited and excluded with reasons (two spawn-failure rollbacks, `TabManager::close_tab` internals, `ModeManager` reactive-pool churn, the quit dialog's Stop, and TUI-exit detach).
+
+**Rule 12 cross-version result (verified, not just asserted):** no `PROTOCOL_VERSION` bump — it remains 6. This branch's TUI was run against a **v0.35.0** daemon: attach, delegate routing, status/`work-done` hook delivery, the close confirmation, and the stale-pane `NotFound` close all worked. No contract break behind a stable wire, so no `.breaking.md` fragment is owed.
+
+**E2E gate:** 2153 passed, 0 skipped. Two failures were investigated rather than retried — `prompt/pane-input/022` was a real test defect (the new-pane Name field seeds from the directory basename, so the label landed behind a nondeterministic tempdir prefix and the readiness wait never matched, meaning the test had never reached its `Ctrl+W` press); and an OpenCode failure in `tests/e2e_delegate_work_done_chain.rs` (`NotFound(worker-pane)`) was confirmed **pre-existing** by reproducing it on `origin/main` — OpenCode cannot open its sandbox-blocked log path and exits. That test carries no `tests/CATALOG.md` entry, which is why it stayed invisible until it failed.
 
 ## Risks and Mitigations
 
