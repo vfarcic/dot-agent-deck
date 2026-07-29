@@ -19,7 +19,7 @@ use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_REQ, read_frame, write_resp,
 };
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
-use dot_agent_deck::pane::PaneController;
+use dot_agent_deck::pane::{PaneController, PaneError};
 use spec::spec;
 use tempfile::TempDir;
 use tokio::net::{UnixListener, UnixStream};
@@ -37,6 +37,10 @@ struct StopErrorDaemon {
 enum StopPlan {
     Error(&'static str),
     NotFound(ListPlan),
+    ChainedHandover,
+    EndlessChurn { stop_reply_delay: Duration },
+    ReplacementError(&'static str),
+    ReplacementTimeout,
 }
 
 #[derive(Clone, Copy)]
@@ -64,6 +68,22 @@ impl StopErrorDaemon {
         Self::spawn_not_found(ListPlan::Replacement(replacement_id))
     }
 
+    fn spawn_chained_handover() -> Self {
+        Self::spawn_with_plan(StopPlan::ChainedHandover)
+    }
+
+    fn spawn_endless_churn(stop_reply_delay: Duration) -> Self {
+        Self::spawn_with_plan(StopPlan::EndlessChurn { stop_reply_delay })
+    }
+
+    fn spawn_replacement_error(error: &'static str) -> Self {
+        Self::spawn_with_plan(StopPlan::ReplacementError(error))
+    }
+
+    fn spawn_replacement_timeout() -> Self {
+        Self::spawn_with_plan(StopPlan::ReplacementTimeout)
+    }
+
     fn spawn_with_plan(stop_plan: StopPlan) -> Self {
         let dir = tempfile::tempdir().expect("synthetic daemon tempdir");
         let socket_path = dir.path().join("daemon.sock");
@@ -74,11 +94,13 @@ impl StopErrorDaemon {
 
         let stop_requests = Arc::new(Mutex::new(Vec::new()));
         let list_requests = Arc::new(AtomicUsize::new(0));
+        let slot_owner = Arc::new(AtomicUsize::new(2));
         let pane_id_env = Arc::new(Mutex::new(None));
         let first_stop_at = Arc::new(Mutex::new(None));
         let shutdown = Arc::new(AtomicBool::new(false));
         let requests_for_thread = Arc::clone(&stop_requests);
         let lists_for_thread = Arc::clone(&list_requests);
+        let slot_owner_for_thread = Arc::clone(&slot_owner);
         let pane_id_for_thread = Arc::clone(&pane_id_env);
         let first_stop_for_thread = Arc::clone(&first_stop_at);
         let shutdown_for_thread = Arc::clone(&shutdown);
@@ -96,6 +118,7 @@ impl StopErrorDaemon {
                             let (stream, _) = accepted.expect("accept synthetic daemon client");
                             let stop_requests = Arc::clone(&requests_for_thread);
                             let list_requests = Arc::clone(&lists_for_thread);
+                            let slot_owner = Arc::clone(&slot_owner_for_thread);
                             let pane_id_env = Arc::clone(&pane_id_for_thread);
                             let first_stop_at = Arc::clone(&first_stop_for_thread);
                             tokio::spawn(async move {
@@ -104,6 +127,7 @@ impl StopErrorDaemon {
                                     stop_plan,
                                     stop_requests,
                                     list_requests,
+                                    slot_owner,
                                     pane_id_env,
                                     first_stop_at,
                                 ).await;
@@ -152,6 +176,7 @@ async fn handle_connection(
     stop_plan: StopPlan,
     stop_requests: Arc<Mutex<Vec<String>>>,
     list_requests: Arc<AtomicUsize>,
+    slot_owner: Arc<AtomicUsize>,
     pane_id_env: Arc<Mutex<Option<String>>>,
     first_stop_at: Arc<Mutex<Option<Instant>>>,
 ) {
@@ -212,6 +237,38 @@ async fn handle_connection(
                         AttachResponse::err(format!("Agent {id} not found"))
                     }
                 }
+                StopPlan::ChainedHandover => match id.as_str() {
+                    "agent-2" => {
+                        slot_owner.store(3, Ordering::SeqCst);
+                        AttachResponse::err("Agent agent-2 not found")
+                    }
+                    "agent-3" => {
+                        slot_owner.store(0, Ordering::SeqCst);
+                        AttachResponse::ok()
+                    }
+                    _ => AttachResponse::err(format!("Agent {id} not found")),
+                },
+                StopPlan::EndlessChurn { stop_reply_delay } => {
+                    let owner = format!("agent-{}", slot_owner.load(Ordering::SeqCst));
+                    if id == owner {
+                        tokio::time::sleep(stop_reply_delay).await;
+                        slot_owner.fetch_add(1, Ordering::SeqCst);
+                    }
+                    AttachResponse::err(format!("Agent {id} not found"))
+                }
+                StopPlan::ReplacementError(error) => {
+                    if id == "agent-2" {
+                        AttachResponse::err(error)
+                    } else {
+                        AttachResponse::err(format!("Agent {id} not found"))
+                    }
+                }
+                StopPlan::ReplacementTimeout => {
+                    if id == "agent-2" {
+                        std::future::pending::<()>().await;
+                    }
+                    AttachResponse::err(format!("Agent {id} not found"))
+                }
             };
             write_resp(&mut stream, &response)
                 .await
@@ -220,35 +277,40 @@ async fn handle_connection(
         AttachRequest::ListAgents => {
             list_requests.fetch_add(1, Ordering::SeqCst);
             let list_plan = match stop_plan {
-                StopPlan::Error(_) | StopPlan::NotFound(ListPlan::Empty) => ListPlan::Empty,
-                StopPlan::NotFound(list_plan) => list_plan,
+                StopPlan::Error(_) | StopPlan::NotFound(ListPlan::Empty) => Some(ListPlan::Empty),
+                StopPlan::NotFound(list_plan) => Some(list_plan),
+                StopPlan::ChainedHandover
+                | StopPlan::EndlessChurn { .. }
+                | StopPlan::ReplacementError(_)
+                | StopPlan::ReplacementTimeout => None,
             };
-            if let ListPlan::Error(error) = list_plan {
+            if let Some(ListPlan::Error(error)) = list_plan {
                 write_resp(&mut stream, &AttachResponse::err(error))
                     .await
                     .expect("reply to ListAgents with error");
                 return;
             }
-            if matches!(list_plan, ListPlan::Timeout) {
+            if matches!(list_plan, Some(ListPlan::Timeout)) {
                 std::future::pending::<()>().await;
             }
             let replacement_id = match list_plan {
-                ListPlan::Replacement(id) => Some(id),
-                ListPlan::DelayedReplacement {
+                Some(ListPlan::Replacement(id)) => Some(id.to_string()),
+                Some(ListPlan::DelayedReplacement {
                     replacement_id,
                     delay,
-                } => first_stop_at
+                }) => first_stop_at
                     .lock()
                     .unwrap()
                     .as_ref()
                     .filter(|started| started.elapsed() >= delay)
-                    .map(|_| replacement_id),
-                ListPlan::Empty | ListPlan::Error(_) | ListPlan::Timeout => None,
+                    .map(|_| replacement_id.to_string()),
+                Some(ListPlan::Empty | ListPlan::Error(_) | ListPlan::Timeout) => None,
+                None => Some(format!("agent-{}", slot_owner.load(Ordering::SeqCst))),
             };
             let records = replacement_id
                 .map(|replacement_id| {
                     vec![AgentRecord {
-                        id: replacement_id.to_string(),
+                        id: replacement_id,
                         pane_id_env: pane_id_env.lock().unwrap().clone(),
                         display_name: None,
                         cwd: None,
@@ -308,6 +370,62 @@ fn assert_unverified_warning(warnings: Vec<String>, pane_id: &str, reason: &str)
         warning.contains(reason),
         "the warning must explain why verification failed: {warning}"
     );
+}
+
+fn assert_slot_churn_warning(warnings: Vec<String>, pane_id: &str) {
+    assert_eq!(
+        warnings.len(),
+        1,
+        "bounded pane-slot churn must produce exactly one warning: {warnings:?}"
+    );
+    let warning = &warnings[0];
+    assert!(
+        warning.contains(&format!("Closed pane {pane_id}")),
+        "the warning must say that the requested pane was closed: {warning}"
+    );
+    assert!(
+        warning.contains("pane slot kept changing owners"),
+        "the warning must identify repeated slot handovers: {warning}"
+    );
+    assert!(
+        warning.contains("close could not be verified"),
+        "the warning must identify the close as unverified: {warning}"
+    );
+    assert!(
+        warning.contains("may still be running unattended"),
+        "the warning must name the unattended-agent risk: {warning}"
+    );
+}
+
+type BoundedClose = (
+    tokio::runtime::Runtime,
+    EmbeddedPaneController,
+    String,
+    Result<(), PaneError>,
+    Duration,
+);
+
+fn close_with_deadline(
+    runtime: tokio::runtime::Runtime,
+    controller: EmbeddedPaneController,
+    pane_id: String,
+    deadline: Duration,
+) -> BoundedClose {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let started = Instant::now();
+        let result = controller.close_pane(&pane_id);
+        let elapsed = started.elapsed();
+        sender
+            .send((runtime, controller, pane_id, result, elapsed))
+            .expect("return bounded close result to test thread");
+    });
+
+    let closed = receiver
+        .recv_timeout(deadline)
+        .unwrap_or_else(|error| panic!("close_pane did not return within {deadline:?}: {error}"));
+    worker.join().expect("join bounded close test thread");
+    closed
 }
 
 /// Scenario: Create and attach a pane through a synthetic daemon, then have both StopAgent attempts report that the agent is not found and ListAgents prove its stable slot empty. Closing must remove the ghost card successfully without producing an unverified-close warning.
@@ -517,5 +635,169 @@ fn stop_011_list_timeout_completes_with_warning() {
     assert!(
         controller.take_close_warnings().is_empty(),
         "the timeout warning queue must drain exactly once"
+    );
+}
+
+/// Scenario: Make the original pane agent disappear, then have replacement B disappear while its StopAgent request is in flight because replacement C takes over the same slot. Closing must chase the handover through C, stop that last owner, remove the pane, and emit no warning for the verified close.
+#[spec("lifecycle/stop/012")]
+#[test]
+fn stop_012_chained_handover_stops_last_slot_owner() {
+    let daemon = StopErrorDaemon::spawn_chained_handover();
+    let (_runtime, controller, pane_id) = controller_for(&daemon);
+
+    let result = controller.close_pane(&pane_id);
+
+    assert!(result.is_ok(), "chained-handover close failed: {result:?}");
+    assert!(
+        daemon.stop_requests().iter().any(|id| id == "agent-3"),
+        "the close must send StopAgent to C, the last owner of the pane slot: {:?}",
+        daemon.stop_requests()
+    );
+    assert!(
+        controller.pane_ids().is_empty(),
+        "the pane must be removed after the last slot owner is stopped"
+    );
+    assert!(
+        controller.take_close_warnings().is_empty(),
+        "a close verified after chasing a handover must not be announced as unverified"
+    );
+}
+
+/// Scenario: Make every StopAgent request lose a race to a fresh owner of the same pane slot, with immediate synthetic replies. Closing must return quickly at its replacement-round bound, remove the pane, and queue exactly one warning about the unverified close and unattended-agent risk.
+#[spec("lifecycle/stop/013")]
+#[test]
+fn stop_013_fast_slot_churn_is_bounded_and_announced() {
+    let daemon = StopErrorDaemon::spawn_endless_churn(Duration::ZERO);
+    let (runtime, controller, pane_id) = controller_for(&daemon);
+
+    let (_runtime, controller, pane_id, result, elapsed) =
+        close_with_deadline(runtime, controller, pane_id, Duration::from_secs(13));
+
+    assert!(result.is_ok(), "bounded churn close failed: {result:?}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "immediate churn must hit the replacement-round cap instead of waiting for the total budget: {elapsed:?}"
+    );
+    let replacement_stops = daemon
+        .stop_requests()
+        .into_iter()
+        .filter(|id| id != "agent-1")
+        .count();
+    assert_eq!(
+        replacement_stops, 3,
+        "the synthetic fast-churn path must exercise the three-round cap"
+    );
+    assert!(
+        controller.pane_ids().is_empty(),
+        "bound exhaustion completes teardown instead of restoring a ghost card"
+    );
+    assert_slot_churn_warning(controller.take_close_warnings(), &pane_id);
+    assert!(
+        controller.take_close_warnings().is_empty(),
+        "the churn warning queue must drain exactly once"
+    );
+}
+
+/// Scenario: Make each attempted replacement stop take four seconds and then lose to another owner of the pane slot. Closing must return before a third slow reply can finish, proving the total wall-clock budget is distinct from the round cap, while removing the pane and announcing the unverified close once.
+#[spec("lifecycle/stop/014")]
+#[test]
+fn stop_014_slow_slot_churn_hits_total_budget() {
+    let daemon = StopErrorDaemon::spawn_endless_churn(Duration::from_secs(4));
+    let (runtime, controller, pane_id) = controller_for(&daemon);
+
+    let (_runtime, controller, pane_id, result, elapsed) =
+        close_with_deadline(runtime, controller, pane_id, Duration::from_secs(13));
+
+    assert!(
+        result.is_ok(),
+        "budget-bounded churn close failed: {result:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(7_500),
+        "the slow variant must wait for two delayed replacement replies: {elapsed:?}"
+    );
+    let replacement_stops = daemon
+        .stop_requests()
+        .into_iter()
+        .filter(|id| id != "agent-1")
+        .count();
+    assert_eq!(
+        replacement_stops, 2,
+        "the total budget must stop slow churn before the three-round cap"
+    );
+    assert!(
+        controller.pane_ids().is_empty(),
+        "total-budget exhaustion completes teardown instead of restoring a ghost card"
+    );
+    assert_slot_churn_warning(controller.take_close_warnings(), &pane_id);
+    assert!(
+        controller.take_close_warnings().is_empty(),
+        "the churn warning queue must drain exactly once"
+    );
+}
+
+/// Scenario: Let replacement B take over after the original agent disappears, then make B's StopAgent request return a genuine server error. Closing must surface that error, retain the pane for retry, and never absorb the failure into the slot-churn warning path.
+#[spec("lifecycle/stop/015")]
+#[test]
+fn stop_015_replacement_error_retains_pane() {
+    let daemon = StopErrorDaemon::spawn_replacement_error(
+        "permission denied while stopping replacement agent",
+    );
+    let (_runtime, controller, pane_id) = controller_for(&daemon);
+
+    let error = controller
+        .close_pane(&pane_id)
+        .expect_err("a replacement StopAgent server error must remain visible");
+
+    assert!(
+        error.to_string().contains("permission denied"),
+        "the surfaced close error must preserve the replacement stop failure: {error}"
+    );
+    assert!(
+        daemon.stop_requests().iter().any(|id| id == "agent-2"),
+        "the failure must come from stopping the replacement slot owner"
+    );
+    assert_eq!(
+        controller.pane_ids(),
+        vec![pane_id],
+        "a replacement stop failure must retain the pane for retry"
+    );
+    assert!(
+        controller.take_close_warnings().is_empty(),
+        "a genuine stop failure must not be degraded into an unverified-close warning"
+    );
+}
+
+/// Scenario: Let replacement B take over after the original agent disappears, then leave B's StopAgent request unanswered past the close timeout. Closing must return a timeout error, retain the pane for retry, and never absorb the timeout into the slot-churn warning path.
+#[spec("lifecycle/stop/016")]
+#[test]
+fn stop_016_replacement_timeout_retains_pane() {
+    let daemon = StopErrorDaemon::spawn_replacement_timeout();
+    let (runtime, controller, pane_id) = controller_for(&daemon);
+
+    let (_runtime, controller, pane_id, result, elapsed) =
+        close_with_deadline(runtime, controller, pane_id, Duration::from_secs(7));
+    let error = result.expect_err("a replacement StopAgent timeout must remain visible");
+
+    assert!(
+        elapsed >= Duration::from_millis(4_500),
+        "the test must exercise the real replacement StopAgent timeout: {elapsed:?}"
+    );
+    assert!(
+        error.to_string().contains("timed out"),
+        "the surfaced close error must identify the replacement stop timeout: {error}"
+    );
+    assert!(
+        daemon.stop_requests().iter().any(|id| id == "agent-2"),
+        "the timeout must come from stopping the replacement slot owner"
+    );
+    assert_eq!(
+        controller.pane_ids(),
+        vec![pane_id],
+        "a replacement stop timeout must retain the pane for retry"
+    );
+    assert!(
+        controller.take_close_warnings().is_empty(),
+        "a stop timeout must not be degraded into an unverified-close warning"
     );
 }

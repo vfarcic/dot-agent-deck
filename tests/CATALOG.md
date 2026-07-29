@@ -1288,6 +1288,41 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** rendering the queued warning on the TUI status line.
 - **Platform coverage:** mac+linux.
 
+##### lifecycle/stop/012 — A chained pane-slot handover stops the last owner before teardown.
+- **Layer:** L1 (real `EmbeddedPaneController` against a stateful synthetic Unix-socket daemon).
+- **Agent:** none (both stale `agent-1` StopAgent attempts return exact NotFound; ListAgents reports replacement B; stopping B returns exact NotFound after replacement C takes the slot; stopping C succeeds).
+- **Asserts:** close sends StopAgent to C, returns success, removes the pane only after the final owner is stopped, and emits no unverified-close warning.
+- **Does not assert:** an exact number of stop requests; the guard pins the last owner being stopped so alternative depth-handling implementations remain valid.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/013 — Immediate unresolvable pane-slot churn is round-bounded and announced.
+- **Layer:** L1 (real `EmbeddedPaneController` against a stateful synthetic Unix-socket daemon, with a 13-second test-side hang ceiling).
+- **Agent:** none (every replacement StopAgent returns exact NotFound after handing the stable pane slot to a fresh synthetic agent).
+- **Asserts:** immediate churn returns well before the total budget through the three-replacement round cap, removes the pane, and queues exactly one drainable warning saying the slot kept changing owners, the close could not be verified, and an agent may still be running unattended.
+- **Does not assert:** rendering the queued warning on the TUI status line; the wall-clock budget path (covered by `lifecycle/stop/014`).
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/014 — Slow unresolvable pane-slot churn is wall-clock-bounded and announced.
+- **Layer:** L1 (real `EmbeddedPaneController` against a stateful timing-controlled synthetic Unix-socket daemon, with a 13-second test-side hang ceiling).
+- **Agent:** none (each replacement StopAgent takes four seconds before returning exact NotFound and handing the stable pane slot to another synthetic agent).
+- **Asserts:** the total budget ends resolution after two delayed replacement stops and before the three-round cap, close returns success and removes the pane, and exactly one drainable slot-churn/unattended-agent warning is queued.
+- **Does not assert:** rendering the queued warning on the TUI status line; real process stop latency.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/015 — A genuine replacement-agent stop failure retains the pane and surfaces the error.
+- **Layer:** L1 (real `EmbeddedPaneController` against a stateful synthetic Unix-socket daemon).
+- **Agent:** none (the stale original agent returns exact NotFound, ListAgents reports replacement B, and B's StopAgent returns a permission-denied server error).
+- **Asserts:** close reaches B, surfaces its daemon error, retains the pane for retry, and emits no unverified-close warning instead of absorbing the failure into slot churn.
+- **Does not assert:** presentation of the surfaced error in the TUI status row; the replacement timeout arm (covered by `lifecycle/stop/016`).
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/016 — A replacement-agent stop timeout retains the pane and surfaces the timeout.
+- **Layer:** L1 (real `EmbeddedPaneController` against a stateful synthetic Unix-socket daemon, with a seven-second test-side hang ceiling).
+- **Agent:** none (the stale original agent returns exact NotFound, ListAgents reports replacement B, and B's StopAgent never replies).
+- **Asserts:** close reaches B, exercises the real five-second stop timeout, surfaces the timeout, retains the pane for retry, and emits no unverified-close warning instead of absorbing the timeout into slot churn.
+- **Does not assert:** presentation of the surfaced error in the TUI status row; OS-level process termination.
+- **Platform coverage:** mac+linux.
+
 #### lifecycle/restart
 
 ##### lifecycle/restart/001 — `daemon restart` reuses the next-launch lazy-spawn — a subsequent `dot-agent-deck` launch comes up against a fresh daemon process.
