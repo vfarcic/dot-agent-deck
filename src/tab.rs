@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::agent_pty::TabMembership;
 use crate::event::{AgentType, EventType};
 use crate::mode_manager::{ModeManager, ModeManagerError};
-use crate::pane::{AgentSpawnOptions, CloseTabOutcome, PaneController};
+use crate::pane::{AgentSpawnOptions, CloseTabOutcome, PaneController, close_panes_concurrently};
 use crate::project_config::{ModeConfig, OrchestrationConfig, resolve_orchestration_name};
 use crate::state::SessionState;
 
@@ -776,11 +776,28 @@ impl TabManager {
     /// resulting partial failure left agents alive in the daemon
     /// registry while their cards vanished from the dashboard.
     ///
-    /// Callers now inspect `outcome.closed` to know which dashboard
-    /// cards may be removed and `outcome.failed` to know which cards
-    /// must be preserved (with the rendered error surfaced via
-    /// `ui.status_message`). The tab itself is always removed from
-    /// `self.tabs` — only the cards behave differently.
+    /// Callers inspect `outcome.closed` to know which dashboard cards
+    /// may be removed and `outcome.failed` to know which cards must be
+    /// preserved (with the rendered error surfaced via
+    /// `ui.status_message`).
+    ///
+    /// **PRD #241 — the tab is removed LAST, and only if every pane
+    /// closed.** Until this PRD the tab was removed from `self.tabs`
+    /// *before* the per-pane closes ran, so a genuine `stop-agent`
+    /// failure produced an incoherent result: the tab was gone while
+    /// the failed pane's card was deliberately retained "so the user
+    /// can retry" — with nothing left to press `Ctrl+W` on. Now:
+    ///
+    /// * every pane closes first (concurrently — see
+    ///   [`close_panes_concurrently`]);
+    /// * `outcome.is_clean()` removes the tab, exactly as before;
+    /// * any failure keeps the tab, and the panes that DID close are
+    ///   forgotten from it via [`Self::forget_closed_panes`].
+    ///
+    /// Closing is deliberately **not transactional**: panes that
+    /// already closed stay closed. The retained tab therefore holds
+    /// only what could not be stopped, which is both the honest state
+    /// and the one where a retry re-attempts exactly the failures.
     pub fn close_tab(&mut self, index: usize) -> Result<CloseTabOutcome, TabError> {
         if index == 0 {
             return Err(TabError::CannotCloseDashboard);
@@ -789,50 +806,52 @@ impl TabManager {
             return Err(TabError::IndexOutOfBounds(index));
         }
 
-        let tab = self.tabs.remove(index);
-        let outcome = match tab {
+        // Enumerate the tab's panes WITHOUT mutating it — the tab has to
+        // survive intact in case a close fails. `managed_pane_ids` lists the
+        // same persistent-then-reactive side panes `deactivate_mode` used to
+        // close here, in the same order, and the agent pane follows them.
+        let pane_ids: Vec<String> = match &self.tabs[index] {
             Tab::Mode {
-                mut mode_manager,
+                mode_manager,
                 agent_pane_id,
                 ..
             } => {
-                // `deactivate_mode` now returns the per-pane outcome
-                // for the persistent + reactive side panes. `Err` only
-                // fires when there is no active mode — propagating it
-                // here would lose the agent-pane close result, so we
-                // fold a NoActiveMode into a fresh empty outcome and
-                // let the agent-pane close drive the merge below.
-                let mut outcome = mode_manager.deactivate_mode().unwrap_or_default();
-                // Close the agent pane PTY so it doesn't linger on the dashboard.
+                let mut ids = mode_manager.managed_pane_ids();
+                // An empty id is the "no agent pane" marker, not a pane.
                 if !agent_pane_id.is_empty() {
-                    let result = self.pane_controller.close_pane(&agent_pane_id);
-                    outcome.record(agent_pane_id, result);
+                    ids.push(agent_pane_id.clone());
                 }
-                outcome
+                ids
             }
-            Tab::Orchestration { role_pane_ids, .. } => {
-                let mut outcome = CloseTabOutcome::default();
-                for id in &role_pane_ids {
-                    // M2.12: skip the empty-string dead-slot sentinel
-                    // inserted by `open_orchestration_tab_with_existing_role_panes`
-                    // for roles that didn't survive reconnect — there's
-                    // no pane to close, and leaking "" through a pane-id
-                    // API confuses downstream callers.
-                    // Symptom 2 fix (`.dot-agent-deck/agent-card-lifecycle-bugs.md`):
-                    // also skip synthetic dead-slot pane ids
-                    // (`__dead-slot__-...`) — those carry a placeholder
-                    // session on the dashboard but have no backing PTY,
-                    // so `close_pane` would fail with NotFound.
-                    if id.is_empty() || crate::ui::is_dead_slot_pane_id(id) {
-                        continue;
-                    }
-                    let result = self.pane_controller.close_pane(id);
-                    outcome.record(id.clone(), result);
-                }
-                outcome
-            }
-            Tab::Dashboard { .. } => CloseTabOutcome::default(),
+            Tab::Orchestration { role_pane_ids, .. } => role_pane_ids
+                .iter()
+                // M2.12: skip the empty-string dead-slot sentinel
+                // inserted by `open_orchestration_tab_with_existing_role_panes`
+                // for roles that didn't survive reconnect — there's
+                // no pane to close, and leaking "" through a pane-id
+                // API confuses downstream callers.
+                // Symptom 2 fix (`.dot-agent-deck/agent-card-lifecycle-bugs.md`):
+                // also skip synthetic dead-slot pane ids
+                // (`__dead-slot__-...`) — those carry a placeholder
+                // session on the dashboard but have no backing PTY,
+                // so `close_pane` would fail with NotFound.
+                .filter(|id| !id.is_empty() && !crate::ui::is_dead_slot_pane_id(id))
+                .cloned()
+                .collect(),
+            Tab::Dashboard { .. } => Vec::new(),
         };
+
+        let outcome = close_panes_concurrently(self.pane_controller.as_ref(), &pane_ids);
+
+        if !outcome.is_clean() {
+            // At least one agent is still alive on the daemon. Keep the tab so
+            // the user has something to retry against, minus whatever really
+            // did close.
+            self.forget_closed_panes(index, &outcome.closed);
+            return Ok(outcome);
+        }
+
+        self.tabs.remove(index);
 
         // Adjust active_index after removal.
         if self.active_index >= self.tabs.len() {
@@ -845,6 +864,68 @@ impl TabManager {
         }
 
         Ok(outcome)
+    }
+
+    /// PRD #241: strike the panes that successfully closed off a tab that is
+    /// being KEPT because a sibling pane's close failed.
+    ///
+    /// Successfully-closed panes are already out of the controller's registry,
+    /// so leaving their ids on the tab would make the next `Ctrl+W` re-close
+    /// them, collect "Pane N not found" errors, and keep the tab forever — the
+    /// same permanently-unclosable state issue #218 reported for a single card.
+    /// Closed side panes are dropped from the mode's pools; a closed agent pane
+    /// or orchestration role slot becomes the pre-existing empty-string dead
+    /// slot, which every pane-id consumer (`close_tab`, `all_managed_pane_ids`,
+    /// `tab_index_for_pane`, the resize pass) already skips. Focus pointing at
+    /// a pane that no longer exists is reset to the tab's default.
+    fn forget_closed_panes(&mut self, index: usize, closed: &[String]) {
+        if closed.is_empty() {
+            return;
+        }
+        let gone: HashSet<&str> = closed.iter().map(String::as_str).collect();
+        match &mut self.tabs[index] {
+            Tab::Mode {
+                mode_manager,
+                agent_pane_id,
+                focused_pane_id,
+                ..
+            } => {
+                mode_manager.forget_panes(&gone);
+                if gone.contains(agent_pane_id.as_str()) {
+                    agent_pane_id.clear();
+                }
+                if focused_pane_id
+                    .as_deref()
+                    .is_some_and(|id| gone.contains(id))
+                {
+                    *focused_pane_id = None;
+                }
+            }
+            Tab::Orchestration {
+                role_pane_ids,
+                role_statuses,
+                focused_role_pane_id,
+                ..
+            } => {
+                for (slot, id) in role_pane_ids.iter_mut().enumerate() {
+                    if gone.contains(id.as_str()) {
+                        id.clear();
+                        // Matches the convention `open_orchestration_tab_with_existing_role_panes`
+                        // already uses for an absent role pane.
+                        if let Some(status) = role_statuses.get_mut(slot) {
+                            *status = OrchestrationRoleStatus::Failed;
+                        }
+                    }
+                }
+                if focused_role_pane_id
+                    .as_deref()
+                    .is_some_and(|id| gone.contains(id))
+                {
+                    *focused_role_pane_id = None;
+                }
+            }
+            Tab::Dashboard { .. } => {}
+        }
     }
 
     /// Collect all managed pane IDs across all mode tabs.

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use regex::Regex;
@@ -66,6 +67,18 @@ impl ReactivePool {
     fn replace(&mut self, old_id: &str, new_id: String) {
         if let Some(pos) = self.pane_ids.iter().position(|id| id == old_id) {
             self.pane_ids[pos] = new_id;
+        }
+    }
+
+    /// PRD #241: drop panes that are already gone. `next` is a rotating cursor
+    /// into `pane_ids`, so it has to be re-clamped or the next `allocate` would
+    /// index past the shortened pool.
+    fn forget(&mut self, gone: &HashSet<&str>) {
+        self.pane_ids.retain(|id| !gone.contains(id.as_str()));
+        if self.pane_ids.is_empty() {
+            self.next = 0;
+        } else {
+            self.next %= self.pane_ids.len();
         }
     }
 }
@@ -489,6 +502,31 @@ impl ModeManager {
             }
             None => Vec::new(),
         }
+    }
+
+    /// PRD #241: forget side panes that have already been torn down, without
+    /// trying to close them again.
+    ///
+    /// Used only by the partial-failure path of
+    /// [`crate::tab::TabManager::close_tab`]: closing a tab is not
+    /// transactional, so when one pane's `stop-agent` genuinely fails the tab
+    /// is kept — but it must be kept describing what is *left*, not what it
+    /// used to own. Without this, the retry would call `close_pane` on the
+    /// panes that already closed, get "Pane N not found" back, and the tab
+    /// could never be closed again: the wedge class this PRD exists to remove.
+    ///
+    /// Deliberately does **not** clear `active_mode` when the lists empty out.
+    /// The mode is still the tab's mode; it simply has no side panes left, and
+    /// the agent pane close is tracked separately by the tab.
+    pub fn forget_panes(&mut self, gone: &HashSet<&str>) {
+        let Some(mode) = self.active_mode.as_mut() else {
+            return;
+        };
+        mode.persistent_pane_ids
+            .retain(|id| !gone.contains(id.as_str()));
+        mode.reactive_pool.forget(gone);
+        mode.pending_commands
+            .retain(|pending| !gone.contains(pending.pane_id.as_str()));
     }
 
     /// Returns `true` if the given pane belongs to the reactive pool.

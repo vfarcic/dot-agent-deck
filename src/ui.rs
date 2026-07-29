@@ -3937,17 +3937,48 @@ fn handle_pane_input_key(key: KeyEvent) -> Action {
 }
 
 /// PRD #241 M3: the close-confirmation dialog's whole state — which option is
-/// highlighted. Index 0 is **Cancel** and it is the [`Default`], following the
-/// same reasoning as the quit dialog's Detach default: `Ctrl+W` is already in
-/// people's fingers, so the muscle memory must not become destructive.
+/// highlighted, and how much the confirmed close would destroy. Index 0 is
+/// **Cancel** and it is the [`Default`], following the same reasoning as the
+/// quit dialog's Detach default: `Ctrl+W` is already in people's fingers, so the
+/// muscle memory must not become destructive.
 ///
-/// Deliberately holds no identity of what is being closed: that lives in
+/// Deliberately holds no *identity* of what is being closed: that lives in
 /// [`UiState::close_confirm_target`] as a [`CloseTarget`]. See its docs for why
-/// the two are separate.
+/// the two are separate. `scope` is not identity — it is the one bit of the
+/// resolved close the dialog has to be able to say out loud.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CloseConfirmState {
     /// 0 = Cancel (default), 1 = Close.
     pub selected: usize,
+    /// What the confirmed close will actually tear down, decided by
+    /// [`resolve_close_plan`] — the same function the confirmed close itself
+    /// branches on. Defaults to [`CloseScope::Pane`], the narrower claim.
+    pub scope: CloseScope,
+}
+
+/// PRD #241 fact-check follow-up: how much a confirmed close destroys, and
+/// therefore which words the dialog is allowed to use.
+///
+/// The dialog used to read `Close selected pane?` for every target, which is a
+/// lie on a Mode or Orchestration tab: that close takes the whole tab and every
+/// pane in it. Crucially the lie was NOT fixable by branching on
+/// [`CloseTarget`], because `CloseTarget::Session` does not mean "one card" —
+/// the confirmed close resolves the armed session, discovers its pane belongs to
+/// a Mode/Orchestration tab, and closes that entire tab. Only a plain dashboard
+/// pane reaches the one-pane branch. So the wording is derived from
+/// [`resolve_close_plan`], the single function the teardown itself branches on,
+/// and the two cannot disagree without the close changing shape.
+///
+/// Deliberately carries no pane COUNT. A number here would have to be recomputed
+/// against a moving world (reactive pools grow and shrink, roles die into dead
+/// slots), and a confidently wrong "3 panes" is worse than no number at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CloseScope {
+    /// Exactly one plain dashboard pane and its card.
+    #[default]
+    Pane,
+    /// A whole Mode / Orchestration tab: every pane it owns.
+    Tab,
 }
 
 /// PRD #241 review F1: the STABLE identity of whatever a close confirmation was
@@ -3995,11 +4026,32 @@ fn tab_id_of(tab: &Tab) -> Option<TabId> {
 }
 
 /// The dialog's options, in render/selection order. Index 0 is the
-/// non-destructive default.
-const CLOSE_CONFIRM_OPTIONS: [(&str, &str); 2] = [
-    ("Cancel", "keep it open"),
-    ("Close", "stop the agent and remove it"),
-];
+/// non-destructive default. Only the confirm option's description changes with
+/// the scope — Cancel means the same thing either way.
+fn close_confirm_options(scope: CloseScope) -> [(&'static str, &'static str); 2] {
+    match scope {
+        CloseScope::Pane => [
+            ("Cancel", "keep it open"),
+            ("Close", "stop the agent and remove it"),
+        ],
+        CloseScope::Tab => [
+            ("Cancel", "keep it open"),
+            ("Close", "stop all agents and remove the tab"),
+        ],
+    }
+}
+
+/// The dialog's question, phrased for what the close will actually take.
+fn close_confirm_header(scope: CloseScope) -> &'static str {
+    match scope {
+        CloseScope::Pane => "  Close selected pane?",
+        CloseScope::Tab => "  Close this tab and all its panes?",
+    }
+}
+
+/// How many options the dialog offers — the same for every scope, so the key
+/// handler does not need to know which one is on screen.
+const CLOSE_CONFIRM_OPTION_COUNT: usize = 2;
 
 /// PRD #241 M3: decide whether a dispatched action needs the close
 /// confirmation, and seed the dialog when it does.
@@ -4028,11 +4080,93 @@ pub fn close_confirmation_for_action(
 /// enters through the identical transition: Cancel selected, the target's
 /// stable identity recorded, and the "not drawn yet" flag reset so no
 /// already-queued keystroke can answer a dialog the user has not seen (F5).
-fn arm_close_confirmation(ui: &mut UiState, prompt: CloseConfirmState, target: CloseTarget) {
-    ui.close_confirm = prompt;
+/// `scope` comes from [`resolve_close_plan`] against `target` — the SAME
+/// function `Action::ConfirmCloseSelected` branches on — so the sentence the
+/// user reads and the teardown they authorise are decided once. It is frozen
+/// here with the target for the same reason the target itself is frozen: the
+/// dialog describes what was armed, never what happens to be selected later.
+fn arm_close_confirmation(
+    ui: &mut UiState,
+    prompt: CloseConfirmState,
+    target: CloseTarget,
+    scope: CloseScope,
+) {
+    ui.close_confirm = CloseConfirmState { scope, ..prompt };
     ui.close_confirm_target = Some(target);
     ui.close_confirm_displayed = false;
     ui.mode = UiMode::CloseConfirm;
+}
+
+/// PRD #241: **the** decision of what a confirmed close will destroy.
+///
+/// One function, two consumers that must never disagree: the confirmation
+/// dialog's wording (via [`CloseScope`], captured at arm time) and the confirmed
+/// teardown in `Action::ConfirmCloseSelected`, which matches directly on the
+/// returned plan. Before this existed the dialog inferred its copy from the
+/// [`CloseTarget`] variant, which is not the same question — a
+/// `CloseTarget::Session` whose pane belongs to a Mode/Orchestration tab closes
+/// that whole tab, so "Session" never implied "one pane".
+///
+/// `None` means a confirmed close would do nothing: the armed tab or session is
+/// gone. The caller says so rather than retargeting.
+fn resolve_close_plan(
+    target: &CloseTarget,
+    tab_manager: &TabManager,
+    snapshot: &AppState,
+) -> Option<ClosePlan> {
+    match target {
+        // PR #151 (e2e layout_002 regression): a Mode/Orchestration TAB is a
+        // close target in its own right, independent of the dashboard selection
+        // (which is `None` while such a tab is active). PRD #241 review F1:
+        // resolve the ARMED tab's id back to its current index rather than
+        // closing `active_index()`, so switching tabs under the open dialog
+        // cannot redirect the teardown. (selection_016)
+        CloseTarget::Tab(id) => {
+            tab_index_for_id(tab_manager, *id).map(|index| ClosePlan::Tab { index })
+        }
+        // PRD #113 finding 2: on the Dashboard the destructive close needs a
+        // session that still exists AND still owns a pane. Nothing armed means
+        // no card-0 fallback (that fallback is reserved for Enter/Focus), so an
+        // unarmed dashboard can never silently close card 0.
+        CloseTarget::Session(sid) => {
+            let pane_id = snapshot.sessions.get(sid)?.pane_id.clone()?;
+            // The armed card may be the face of a pane that lives inside a
+            // Mode/Orchestration tab. Closing it closes the tab — every pane in
+            // it — which is exactly why the dialog cannot read the target
+            // variant and call it a day.
+            match tab_manager
+                .tab_index_for_agent_pane(&pane_id)
+                .or_else(|| tab_manager.tab_index_for_pane(&pane_id))
+            {
+                Some(index) => Some(ClosePlan::Tab { index }),
+                None => Some(ClosePlan::Pane {
+                    session_id: sid.clone(),
+                    pane_id,
+                }),
+            }
+        }
+    }
+}
+
+/// PRD #241: the resolved shape of a confirmed close — see
+/// [`resolve_close_plan`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClosePlan {
+    /// Tear down the Mode/Orchestration tab at this index and every pane it
+    /// owns.
+    Tab { index: usize },
+    /// Tear down exactly one plain dashboard pane and drop its card.
+    Pane { session_id: String, pane_id: String },
+}
+
+impl ClosePlan {
+    /// How much this plan destroys, in the terms the dialog speaks.
+    fn scope(&self) -> CloseScope {
+        match self {
+            ClosePlan::Tab { .. } => CloseScope::Tab,
+            ClosePlan::Pane { .. } => CloseScope::Pane,
+        }
+    }
 }
 
 /// PRD #241 M3: what would a close act on right now — and nothing, if nothing?
@@ -4093,7 +4227,7 @@ pub fn handle_close_confirm_key(state: &mut CloseConfirmState, key: KeyEvent) ->
             Action::Continue
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if state.selected + 1 < CLOSE_CONFIRM_OPTIONS.len() {
+            if state.selected + 1 < CLOSE_CONFIRM_OPTION_COUNT {
                 state.selected += 1;
             }
             Action::Continue
@@ -5950,12 +6084,16 @@ fn hit_test_card(card_rects: &[(usize, Rect)], col: u16, row: u16) -> Option<usi
         .find_map(|(idx, rect)| point_in_rect(rect, col, row).then_some(*idx))
 }
 
-/// PRD #80 M3: close the tab at `idx` and reconcile shared state, reusing the
-/// same teardown the Ctrl+W tab-close path performs — unregister every
-/// successfully-closed pane, drop the matching sessions (keeping any that
-/// failed to close so the user can retry), clean their metadata, and resweep
-/// the dashboard layout. Used by [`Action::CloseTab`] (a `[×]` click); the
-/// Ctrl+W card path keeps its own inline message that names the specific pane.
+/// PRD #80 M3: close the tab at `idx` and reconcile shared state — unregister
+/// every successfully-closed pane, drop the matching sessions (keeping any that
+/// failed to close so the user can retry), clean their metadata, and resweep the
+/// dashboard layout.
+///
+/// PRD #241: the ONE tab teardown. Every door that destroys a tab — the `Ctrl+W`
+/// chord on an active Mode/Orchestration tab, a `[×]` click on the tab strip,
+/// and a confirmed close on a dashboard card whose pane lives inside such a tab
+/// — resolves to [`ClosePlan::Tab`] and lands here, so they cannot drift apart
+/// in what they remove or what they report.
 fn close_tab_by_index(
     idx: usize,
     ui: &mut UiState,
@@ -5984,8 +6122,6 @@ fn close_tab_by_index(
             if outcome.is_clean() {
                 ui.status_message = Some(("Closed tab".to_string(), std::time::Instant::now()));
             } else {
-                let failed_ids: Vec<&str> =
-                    outcome.failed.iter().map(|(id, _)| id.as_str()).collect();
                 let first_err = outcome
                     .failed
                     .first()
@@ -5995,13 +6131,23 @@ fn close_tab_by_index(
                     tracing::warn!(
                         pane_id = %id,
                         error = %e,
-                        "M3: close_pane failed during [×] tab teardown — card preserved"
+                        "M3: close_pane failed during tab teardown — pane and tab preserved"
                     );
                 }
+                // PRD #241: the tab is still here — `close_tab` keeps it when
+                // any pane refuses to stop, holding exactly the panes that did
+                // not close. Say that, because the previous wording ("Close
+                // partially failed …") was reported next to a tab that had
+                // already vanished, leaving the advice to retry with nothing to
+                // retry on. Closing is not transactional, so name both halves:
+                // what went, and what stayed.
+                let failed = outcome.failed.len();
+                let closed = outcome.closed.len();
                 ui.status_message = Some((
                     format!(
-                        "Close partially failed for {} pane(s) — first error: {first_err}",
-                        failed_ids.len()
+                        "Closed {closed} pane(s); {failed} could not be stopped, so the tab is \
+                         kept with them — press {} to retry. First error: {first_err}",
+                        display_notation(&ui.keybindings, KbAction::ClosePane)
                     ),
                     std::time::Instant::now(),
                 ));
@@ -6275,7 +6421,12 @@ fn dispatch_action(
                 close_confirmation_for_action(&Action::CloseSelected, target.is_some())
                 && let Some(target) = target
             {
-                arm_close_confirmation(ui, prompt, target);
+                // PRD #241: the dialog's wording comes from the SAME resolution
+                // `ConfirmCloseSelected` runs below, so it can never promise a
+                // pane and take a tab.
+                let scope = resolve_close_plan(&target, tab_manager, snapshot)
+                    .map_or(CloseScope::Pane, |plan| plan.scope());
+                arm_close_confirmation(ui, prompt, target, scope);
             }
             // No target (PRD #113 finding 2: an inactive dashboard selection
             // means nothing is armed) — stay exactly as silent as before, and
@@ -6295,146 +6446,79 @@ fn dispatch_action(
             ui.mode = UiMode::Normal;
             ui.close_confirm_displayed = false;
             let target = ui.close_confirm_target.take();
-            // PR #151 (e2e layout_002 regression): a Mode/Orchestration TAB is a
-            // close target in its own right, independent of the dashboard
-            // selection (which is `None` while such a tab is active — the gate
-            // that used to wrongly suppress the keyboard tab-close). PRD #241
-            // review F1: resolve the ARMED tab's id back to its current index
-            // rather than closing `active_index()`, so switching tabs under the
-            // open dialog cannot redirect the teardown. (selection_016)
-            let armed_tab_idx = match &target {
-                Some(CloseTarget::Tab(id)) => tab_index_for_id(tab_manager, *id),
-                _ => None,
-            };
-            // PRD #113 finding 2: on the Dashboard the destructive close needs a
-            // session that still exists AND still owns a pane. Nothing armed
-            // means no card-0 fallback (that fallback is reserved for
-            // Enter/Focus), so an unarmed dashboard can never silently close
-            // card 0.
-            let armed_session = match &target {
-                Some(CloseTarget::Session(sid)) => snapshot
-                    .sessions
-                    .get(sid)
-                    .and_then(|session| session.pane_id.clone())
-                    .map(|pane_id| (sid.clone(), pane_id)),
-                _ => None,
-            };
-            // PRD #241 review F1: something WAS armed and it no longer resolves —
-            // its tab or its session went away while the dialog was open. Close
-            // NOTHING and say so; the one thing a confirmation must never do is
-            // retarget onto whatever is selected now.
-            if target.is_some() && armed_tab_idx.is_none() && armed_session.is_none() {
-                ui.status_message = Some((
-                    "Nothing closed — what this confirmation was armed against is gone".to_string(),
-                    std::time::Instant::now(),
-                ));
-            }
-            if let Some(tab_idx) = armed_tab_idx {
-                close_tab_by_index(tab_idx, ui, state, tab_manager);
-            } else if let Some((sid, armed_pane_id)) = armed_session {
-                let pane_id = &armed_pane_id;
-                let closed_pane_id = pane_id.clone();
-                // Check if this pane belongs to a mode or orchestration tab.
-                let mode_tab_idx = tab_manager
-                    .tab_index_for_agent_pane(pane_id)
-                    .or_else(|| tab_manager.tab_index_for_pane(pane_id));
-                if let Some(tab_idx) = mode_tab_idx {
-                    // Close the entire tab (agent + side panes, or all role panes).
-                    match tab_manager.close_tab(tab_idx) {
-                        Ok(outcome) => {
-                            let mut st = state.blocking_write();
-                            for id in &outcome.closed {
-                                st.unregister_pane(id);
-                            }
-                            // Remove sessions whose pane_id is in the closed set ONLY.
-                            let closed_set: std::collections::HashSet<&str> =
-                                outcome.closed.iter().map(String::as_str).collect();
-                            st.sessions.retain(|_, s| {
-                                s.pane_id
-                                    .as_ref()
-                                    .is_none_or(|pid| !closed_set.contains(pid.as_str()))
-                            });
-                            drop(st);
-                            // Clean pane_metadata only for the successfully-closed panes.
-                            for id in &outcome.closed {
-                                ui.pane_metadata.remove(id);
-                            }
-                            if outcome.is_clean() {
-                                ui.status_message = Some((
-                                    format!("Closed tab containing pane {closed_pane_id}"),
-                                    std::time::Instant::now(),
-                                ));
-                            } else {
-                                let failed_ids: Vec<&str> =
-                                    outcome.failed.iter().map(|(id, _)| id.as_str()).collect();
-                                let first_err = outcome
-                                    .failed
-                                    .first()
-                                    .map(|(_, e)| e.as_str())
-                                    .unwrap_or("");
-                                for (id, e) in &outcome.failed {
-                                    tracing::warn!(
-                                        pane_id = %id,
-                                        error = %e,
-                                        "F4: close_pane failed during tab teardown — card preserved"
-                                    );
-                                }
-                                ui.status_message = Some((
-                                    format!(
-                                        "Close partially failed for {} pane(s) — first error: {first_err}",
-                                        failed_ids.len()
-                                    ),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                            // PRD #84 M4: remaining panes are sized by the
-                            // pre-draw `resize_panes_to_layout` next frame.
-                        }
-                        Err(e) => {
-                            ui.status_message = Some((
-                                format!("Failed to close tab: {e}"),
-                                std::time::Instant::now(),
-                            ));
-                        }
+            // PRD #241: re-resolve the ARMED target through the same function
+            // that decided the dialog's wording. Whatever it says here is what
+            // the user was shown, because the two share this call.
+            let plan = target
+                .as_ref()
+                .and_then(|target| resolve_close_plan(target, tab_manager, snapshot));
+            match plan {
+                // PRD #241 review F1: something WAS armed and it no longer
+                // resolves — its tab or its session went away while the dialog
+                // was open. Close NOTHING and say so; the one thing a
+                // confirmation must never do is retarget onto whatever is
+                // selected now.
+                None => {
+                    if target.is_some() {
+                        ui.status_message = Some((
+                            "Nothing closed — what this confirmation was armed against is gone"
+                                .to_string(),
+                            std::time::Instant::now(),
+                        ));
                     }
-                } else {
-                    // Plain dashboard pane — close just this one and inspect the result.
-                    match pane.close_pane(pane_id) {
+                }
+                // A whole Mode/Orchestration tab: the agent pane plus every side
+                // or role pane. Reached both from a tab that was active when the
+                // chord landed AND from a dashboard card whose pane turns out to
+                // live in such a tab — which is why the dialog said "this tab
+                // and all its panes" either way.
+                Some(ClosePlan::Tab { index }) => {
+                    close_tab_by_index(index, ui, state, tab_manager);
+                }
+                // Plain dashboard pane — close just this one and inspect the
+                // result. PRD #92 F4: preserve the card / session on failure so
+                // the user can see the error and retry.
+                Some(ClosePlan::Pane {
+                    session_id,
+                    pane_id,
+                }) => {
+                    match pane.close_pane(&pane_id) {
                         Ok(()) => {
                             let mut st = state.blocking_write();
-                            st.sessions.remove(&sid);
-                            st.unregister_pane(&closed_pane_id);
+                            st.sessions.remove(&session_id);
+                            st.unregister_pane(&pane_id);
                             drop(st);
-                            ui.pane_metadata.remove(&closed_pane_id);
-                            ui.status_message = Some((
-                                format!("Closed pane {closed_pane_id}"),
-                                std::time::Instant::now(),
-                            ));
+                            ui.pane_metadata.remove(&pane_id);
+                            ui.status_message =
+                                Some((format!("Closed pane {pane_id}"), std::time::Instant::now()));
                         }
                         Err(e) => {
                             tracing::warn!(
-                                pane_id = %closed_pane_id,
+                                pane_id = %pane_id,
                                 error = %e,
                                 "F4: close_pane failed — card preserved for retry"
                             );
                             ui.status_message = Some((
                                 format!(
-                                    "Failed to close pane {closed_pane_id}: {e} — press {} to retry",
+                                    "Failed to close pane {pane_id}: {e} — press {} to retry",
                                     display_notation(&ui.keybindings, KbAction::ClosePane)
                                 ),
                                 std::time::Instant::now(),
                             ));
                         }
                     }
-                }
-                // (PRD #241 M3: the "leave PaneInput after a close" reset that
-                // used to live here is now unconditional at the top of this
-                // arm — a confirmed close always arrives from the modal.)
-                // Clamp selected_index so it doesn't point past the now-shorter list.
-                if let Some(idx) = ui.selected_index
-                    && idx > 0
-                {
-                    ui.selected_index = Some(idx - 1);
+                    // (PRD #241 M3: the "leave PaneInput after a close" reset
+                    // that used to live here is now unconditional at the top of
+                    // this arm — a confirmed close always arrives from the
+                    // modal.)
+                    // Clamp selected_index so it doesn't point past the
+                    // now-shorter list. The tab branch above does the same
+                    // inside `close_tab_by_index`.
+                    if let Some(idx) = ui.selected_index
+                        && idx > 0
+                    {
+                        ui.selected_index = Some(idx - 1);
+                    }
                 }
             }
             // PRD #89 M1.3 — Ctrl+W close-pane is a detach path; flush a fresh
@@ -6501,7 +6585,13 @@ fn dispatch_action(
         // (`dashboard/pane/003`), so a stray `×` hit on it stays a no-op.
         Action::CloseTab(idx) => {
             if let Some(id) = tab_manager.tabs().get(idx).and_then(tab_id_of) {
-                arm_close_confirmation(ui, CloseConfirmState::default(), CloseTarget::Tab(id));
+                // A tab-strip `×` always takes the whole tab, so the dialog says
+                // so — through the same `resolve_close_plan` seam as every other
+                // door rather than a second hand-written answer.
+                let target = CloseTarget::Tab(id);
+                let scope = resolve_close_plan(&target, tab_manager, snapshot)
+                    .map_or(CloseScope::Pane, |plan| plan.scope());
+                arm_close_confirmation(ui, CloseConfirmState::default(), target, scope);
             }
         }
         // PRD #80 M4 / PRD #83: single-click a card → select exactly that card
@@ -11264,7 +11354,7 @@ fn render_overlays(frame: &mut Frame, ui: &mut UiState, active_mode_name: Option
         ui.modal_button_rects = render_quit_confirm(frame, ui.quit_confirm_selected);
     }
     if ui.mode == UiMode::CloseConfirm {
-        ui.modal_button_rects = render_close_confirm(frame, ui.close_confirm.selected);
+        ui.modal_button_rects = render_close_confirm(frame, &ui.close_confirm);
         // PRD #241 review F5: the dialog has now reached the screen, so input
         // arriving from here on is a genuine answer to it. Until this flip, the
         // run loop refuses to feed it anything (see the drain at the top of the
@@ -12284,7 +12374,8 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize) -> Vec<(Action, Rect)
 /// [`render_quit_confirm`] — a centered popup with an option list, a keyboard
 /// hint row, and clickable buttons — with Cancel first and highlighted by
 /// default so the reflexive Enter is the harmless one.
-fn render_close_confirm(frame: &mut Frame, selected: usize) -> Vec<(Action, Rect)> {
+fn render_close_confirm(frame: &mut Frame, state: &CloseConfirmState) -> Vec<(Action, Rect)> {
+    let selected = state.selected;
     let area = frame.area();
     let popup_width = 64u16.min(area.width.saturating_sub(4));
     let popup_height = 9u16.min(area.height.saturating_sub(4));
@@ -12297,7 +12388,7 @@ fn render_close_confirm(frame: &mut Frame, selected: usize) -> Vec<(Action, Rect
     let mut text = vec![
         Line::from(""),
         Line::styled(
-            "  Close selected pane?",
+            close_confirm_header(state.scope),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -12305,7 +12396,7 @@ fn render_close_confirm(frame: &mut Frame, selected: usize) -> Vec<(Action, Rect
         Line::from(""),
     ];
 
-    for (i, (label, desc)) in CLOSE_CONFIRM_OPTIONS.iter().enumerate() {
+    for (i, (label, desc)) in close_confirm_options(state.scope).iter().enumerate() {
         let cursor = if i == selected { ">" } else { " " };
         let style = if i == selected {
             Style::default()
@@ -14487,13 +14578,20 @@ pub fn render_quit_confirm_to_buffer(
 /// PRD #241 M3 (L1 `prompt/close-confirm/001`): render the close confirmation
 /// into a standalone Buffer through the SAME `render_close_confirm` the live
 /// modal draws, so the snapshot and the running dialog cannot drift.
+///
+/// `state.scope` selects the target-aware copy exactly as it does live: a
+/// `CloseConfirmState` with the default [`CloseScope::Pane`] renders the
+/// single-pane wording, and one carrying [`CloseScope::Tab`] renders the
+/// whole-tab wording. Production never picks the scope by hand — see
+/// [`resolve_close_plan`] — so a test that wants the tab copy should set the
+/// field, not assume it.
 pub fn render_close_confirm_to_buffer(
     state: &CloseConfirmState,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
     draw_to_buffer(width, height, |frame| {
-        render_close_confirm(frame, state.selected);
+        render_close_confirm(frame, state);
     })
 }
 
