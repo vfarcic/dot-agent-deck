@@ -9288,6 +9288,19 @@ pub fn run_tui(
                     );
                 }
             }
+            // PRD #241 F3b (review finding G2): a close that COMPLETED without
+            // being able to query the daemon may have left an agent running
+            // unattended. `close_pane` returns `Ok(())` there (nothing to retry —
+            // the card is already gone), so the warning arrives on this queue
+            // instead of the `Result`. Show it on the same status line the close
+            // path uses for its other outcomes; queued after the handler's
+            // "Closed pane N", so the warning is what the user is left reading.
+            // A single status line holds one message, so if several blind closes
+            // land in the same frame the last one is displayed — every one of them
+            // is also logged at WARN by `close_pane`.
+            for warning in embedded.take_close_warnings() {
+                ui.status_message = Some((warning, std::time::Instant::now()));
+            }
         }
 
         // Drain all pending events before re-rendering. This avoids a full
