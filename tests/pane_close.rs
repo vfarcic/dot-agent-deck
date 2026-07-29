@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dot_agent_deck::agent_pty::AgentRecord;
 use dot_agent_deck::daemon_protocol::{
@@ -36,7 +36,19 @@ struct StopErrorDaemon {
 #[derive(Clone, Copy)]
 enum StopPlan {
     Error(&'static str),
+    NotFound(ListPlan),
+}
+
+#[derive(Clone, Copy)]
+enum ListPlan {
+    Empty,
     Replacement(&'static str),
+    DelayedReplacement {
+        replacement_id: &'static str,
+        delay: Duration,
+    },
+    Error(&'static str),
+    Timeout,
 }
 
 impl StopErrorDaemon {
@@ -44,8 +56,12 @@ impl StopErrorDaemon {
         Self::spawn_with_plan(StopPlan::Error(stop_error))
     }
 
+    fn spawn_not_found(list_plan: ListPlan) -> Self {
+        Self::spawn_with_plan(StopPlan::NotFound(list_plan))
+    }
+
     fn spawn_with_replacement(replacement_id: &'static str) -> Self {
-        Self::spawn_with_plan(StopPlan::Replacement(replacement_id))
+        Self::spawn_not_found(ListPlan::Replacement(replacement_id))
     }
 
     fn spawn_with_plan(stop_plan: StopPlan) -> Self {
@@ -59,10 +75,12 @@ impl StopErrorDaemon {
         let stop_requests = Arc::new(Mutex::new(Vec::new()));
         let list_requests = Arc::new(AtomicUsize::new(0));
         let pane_id_env = Arc::new(Mutex::new(None));
+        let first_stop_at = Arc::new(Mutex::new(None));
         let shutdown = Arc::new(AtomicBool::new(false));
         let requests_for_thread = Arc::clone(&stop_requests);
         let lists_for_thread = Arc::clone(&list_requests);
         let pane_id_for_thread = Arc::clone(&pane_id_env);
+        let first_stop_for_thread = Arc::clone(&first_stop_at);
         let shutdown_for_thread = Arc::clone(&shutdown);
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -79,6 +97,7 @@ impl StopErrorDaemon {
                             let stop_requests = Arc::clone(&requests_for_thread);
                             let list_requests = Arc::clone(&lists_for_thread);
                             let pane_id_env = Arc::clone(&pane_id_for_thread);
+                            let first_stop_at = Arc::clone(&first_stop_for_thread);
                             tokio::spawn(async move {
                                 handle_connection(
                                     stream,
@@ -86,6 +105,7 @@ impl StopErrorDaemon {
                                     stop_requests,
                                     list_requests,
                                     pane_id_env,
+                                    first_stop_at,
                                 ).await;
                             });
                         }
@@ -133,6 +153,7 @@ async fn handle_connection(
     stop_requests: Arc<Mutex<Vec<String>>>,
     list_requests: Arc<AtomicUsize>,
     pane_id_env: Arc<Mutex<Option<String>>>,
+    first_stop_at: Arc<Mutex<Option<Instant>>>,
 ) {
     let Some((kind, payload)) = read_frame(&mut stream)
         .await
@@ -157,6 +178,14 @@ async fn handle_connection(
             write_resp(&mut stream, &AttachResponse::ok())
                 .await
                 .expect("reply to AttachStream");
+            if matches!(
+                stop_plan,
+                StopPlan::NotFound(ListPlan::DelayedReplacement { .. })
+            ) {
+                // End the old agent's stream so the pane I/O task enters its
+                // real replacement-lookup state before close begins.
+                return;
+            }
             // Keep the long-lived attach connection open until the controller
             // tears down the pane and drops its stream task.
             while read_frame(&mut stream).await.ok().flatten().is_some() {}
@@ -165,10 +194,24 @@ async fn handle_connection(
             stop_requests.lock().unwrap().push(id.clone());
             let response = match stop_plan {
                 StopPlan::Error(stop_error) => AttachResponse::err(stop_error),
-                StopPlan::Replacement(replacement_id) if id == replacement_id => {
-                    AttachResponse::ok()
+                StopPlan::NotFound(list_plan) => {
+                    let replacement_id = match list_plan {
+                        ListPlan::Replacement(id)
+                        | ListPlan::DelayedReplacement {
+                            replacement_id: id, ..
+                        } => Some(id),
+                        ListPlan::Empty | ListPlan::Error(_) | ListPlan::Timeout => None,
+                    };
+                    if replacement_id == Some(id.as_str()) {
+                        AttachResponse::ok()
+                    } else {
+                        first_stop_at
+                            .lock()
+                            .unwrap()
+                            .get_or_insert_with(Instant::now);
+                        AttachResponse::err(format!("Agent {id} not found"))
+                    }
                 }
-                StopPlan::Replacement(_) => AttachResponse::err(format!("Agent {id} not found")),
             };
             write_resp(&mut stream, &response)
                 .await
@@ -176,20 +219,47 @@ async fn handle_connection(
         }
         AttachRequest::ListAgents => {
             list_requests.fetch_add(1, Ordering::SeqCst);
-            let records = match stop_plan {
-                StopPlan::Error(_) => Vec::new(),
-                StopPlan::Replacement(replacement_id) => vec![AgentRecord {
-                    id: replacement_id.to_string(),
-                    pane_id_env: pane_id_env.lock().unwrap().clone(),
-                    display_name: None,
-                    cwd: None,
-                    tab_membership: None,
-                    agent_type: None,
-                    rows: 24,
-                    cols: 80,
-                    live: None,
-                }],
+            let list_plan = match stop_plan {
+                StopPlan::Error(_) | StopPlan::NotFound(ListPlan::Empty) => ListPlan::Empty,
+                StopPlan::NotFound(list_plan) => list_plan,
             };
+            if let ListPlan::Error(error) = list_plan {
+                write_resp(&mut stream, &AttachResponse::err(error))
+                    .await
+                    .expect("reply to ListAgents with error");
+                return;
+            }
+            if matches!(list_plan, ListPlan::Timeout) {
+                std::future::pending::<()>().await;
+            }
+            let replacement_id = match list_plan {
+                ListPlan::Replacement(id) => Some(id),
+                ListPlan::DelayedReplacement {
+                    replacement_id,
+                    delay,
+                } => first_stop_at
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .filter(|started| started.elapsed() >= delay)
+                    .map(|_| replacement_id),
+                ListPlan::Empty | ListPlan::Error(_) | ListPlan::Timeout => None,
+            };
+            let records = replacement_id
+                .map(|replacement_id| {
+                    vec![AgentRecord {
+                        id: replacement_id.to_string(),
+                        pane_id_env: pane_id_env.lock().unwrap().clone(),
+                        display_name: None,
+                        cwd: None,
+                        tab_membership: None,
+                        agent_type: None,
+                        rows: 24,
+                        cols: 80,
+                        live: None,
+                    }]
+                })
+                .unwrap_or_default();
             write_resp(&mut stream, &AttachResponse::agent_records(records))
                 .await
                 .expect("reply to ListAgents");
@@ -215,7 +285,32 @@ fn controller_for(
     (runtime, controller, pane_id)
 }
 
-/// Scenario: Create and attach a pane through a synthetic daemon, then have both StopAgent attempts report that the agent is not found. Closing must treat that response as already stopped, return success, and remove the pane from the local registry instead of restoring a ghost card.
+fn assert_unverified_warning(warnings: Vec<String>, pane_id: &str, reason: &str) {
+    assert_eq!(
+        warnings.len(),
+        1,
+        "an unverified close must produce exactly one warning: {warnings:?}"
+    );
+    let warning = &warnings[0];
+    assert!(
+        warning.contains(&format!("Closed pane {pane_id}")),
+        "the warning must say that the requested pane was closed: {warning}"
+    );
+    assert!(
+        warning.contains("could not query the daemon"),
+        "the warning must identify the close as unverified: {warning}"
+    );
+    assert!(
+        warning.contains("may still be running unattended"),
+        "the warning must name the unattended-agent risk: {warning}"
+    );
+    assert!(
+        warning.contains(reason),
+        "the warning must explain why verification failed: {warning}"
+    );
+}
+
+/// Scenario: Create and attach a pane through a synthetic daemon, then have both StopAgent attempts report that the agent is not found and ListAgents prove its stable slot empty. Closing must remove the ghost card successfully without producing an unverified-close warning.
 #[spec("lifecycle/stop/005")]
 #[test]
 fn stop_005_not_found_completes_teardown() {
@@ -240,6 +335,10 @@ fn stop_005_not_found_completes_teardown() {
     assert!(
         daemon.list_requests() > 0,
         "the test must exercise the real pane-slot resolution after both NotFound replies"
+    );
+    assert!(
+        controller.take_close_warnings().is_empty(),
+        "a daemon-verified empty slot must not produce an unverified-close warning"
     );
 }
 
@@ -309,7 +408,7 @@ fn stop_007_unrelated_not_found_errors_retain_live_pane() {
     }
 }
 
-/// Scenario: Create a pane whose original agent disappears while a replacement now owns the same stable pane slot. After both stale-id StopAgent attempts return exact NotFound, close must discover the replacement through ListAgents, stop it, and complete teardown without orphaning it.
+/// Scenario: Create a pane whose original agent disappears while a replacement now owns the same stable pane slot. Close must discover and stop the replacement before teardown, without producing an unverified-close warning.
 #[spec("lifecycle/stop/008")]
 #[test]
 fn stop_008_replacement_slot_owner_is_stopped() {
@@ -331,5 +430,92 @@ fn stop_008_replacement_slot_owner_is_stopped() {
     assert!(
         daemon.list_requests() > 0,
         "the replacement must be discovered through the real ListAgents path"
+    );
+    assert!(
+        controller.take_close_warnings().is_empty(),
+        "a replacement that was found and stopped must not produce an unverified-close warning"
+    );
+}
+
+/// Scenario: End a pane's attach stream so it starts looking for a respawn, then begin closing while the daemon reports the slot empty. A replacement appearing about five seconds later must still be discovered and stopped before the pane is removed.
+#[spec("lifecycle/stop/009")]
+#[test]
+fn stop_009_late_replacement_is_stopped() {
+    let daemon = StopErrorDaemon::spawn_not_found(ListPlan::DelayedReplacement {
+        replacement_id: "agent-2",
+        delay: Duration::from_millis(4_800),
+    });
+    let (_runtime, controller, pane_id) = controller_for(&daemon);
+
+    let reattach_deadline = Instant::now() + Duration::from_secs(1);
+    while daemon.list_requests() == 0 && Instant::now() < reattach_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        daemon.list_requests() > 0,
+        "the ended attach stream must put the pane I/O task into its real reattaching state"
+    );
+
+    let result = controller.close_pane(&pane_id);
+
+    assert!(result.is_ok(), "late-replacement close failed: {result:?}");
+    assert!(
+        controller.pane_ids().is_empty(),
+        "the pane may be removed only after its late replacement is stopped"
+    );
+    assert_eq!(
+        daemon.stop_requests(),
+        vec!["agent-1", "agent-1", "agent-2"],
+        "a replacement appearing near the respawn worst case must not be orphaned"
+    );
+    assert!(
+        controller.take_close_warnings().is_empty(),
+        "a late replacement that was found and stopped is still a verified close"
+    );
+}
+
+/// Scenario: After both StopAgent attempts report exact NotFound, make ListAgents return a daemon error. Closing must remove the pane successfully and queue exactly one warning that explains the unverified close and unattended-agent risk.
+#[spec("lifecycle/stop/010")]
+#[test]
+fn stop_010_list_failure_completes_with_warning() {
+    let daemon = StopErrorDaemon::spawn_not_found(ListPlan::Error("registry unavailable"));
+    let (_runtime, controller, pane_id) = controller_for(&daemon);
+
+    let result = controller.close_pane(&pane_id);
+
+    assert!(result.is_ok(), "unverifiable close failed: {result:?}");
+    assert!(
+        controller.pane_ids().is_empty(),
+        "a ListAgents error must not restore the ghost card"
+    );
+    assert_unverified_warning(
+        controller.take_close_warnings(),
+        &pane_id,
+        "registry unavailable",
+    );
+    assert!(
+        controller.take_close_warnings().is_empty(),
+        "the warning queue must drain exactly once"
+    );
+}
+
+/// Scenario: After both StopAgent attempts report exact NotFound, leave ListAgents wedged past its timeout. Closing must remove the pane successfully and queue exactly one warning that explains the timed-out verification and unattended-agent risk.
+#[spec("lifecycle/stop/011")]
+#[test]
+fn stop_011_list_timeout_completes_with_warning() {
+    let daemon = StopErrorDaemon::spawn_not_found(ListPlan::Timeout);
+    let (_runtime, controller, pane_id) = controller_for(&daemon);
+
+    let result = controller.close_pane(&pane_id);
+
+    assert!(result.is_ok(), "timed-out verification failed: {result:?}");
+    assert!(
+        controller.pane_ids().is_empty(),
+        "a ListAgents timeout must not restore the ghost card"
+    );
+    assert_unverified_warning(controller.take_close_warnings(), &pane_id, "timed out");
+    assert!(
+        controller.take_close_warnings().is_empty(),
+        "the timeout warning queue must drain exactly once"
     );
 }

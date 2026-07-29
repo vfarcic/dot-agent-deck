@@ -1242,7 +1242,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### lifecycle/stop/005 — Closing an already-stopped daemon agent completes local teardown.
 - **Layer:** L1 (real `EmbeddedPaneController` against a synthetic Unix-socket daemon).
 - **Agent:** none (synthetic StartAgent / AttachStream; both StopAgent attempts return exact `Agent agent-1 not found`, and ListAgents reports the stable pane slot empty).
-- **Asserts:** `close_pane` performs both stale-id attempts, enters the real ListAgents slot-resolution path, returns success for the proven-empty slot, removes the pane, and does not re-insert the ghost card.
+- **Asserts:** `close_pane` performs both stale-id attempts, enters the real ListAgents slot-resolution path, returns success for the proven-empty slot, removes the pane, does not re-insert the ghost card, and emits no unverified-close warning.
 - **Does not assert:** the dashboard confirmation UI (`prompt/close-confirm/*`); daemon process termination (the synthetic daemon reports the agent already absent).
 - **Platform coverage:** mac+linux.
 
@@ -1263,8 +1263,29 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### lifecycle/stop/008 — A replacement agent occupying the pane slot is stopped before local teardown.
 - **Layer:** L1 (real `EmbeddedPaneController` against a synthetic Unix-socket daemon).
 - **Agent:** none (both stale `agent-1` StopAgent attempts return exact NotFound; ListAgents reports `agent-2` with the same `pane_id_env`; stopping `agent-2` succeeds).
-- **Asserts:** the request sequence is `agent-1`, `agent-1`, `agent-2`; replacement discovery uses ListAgents; only then does `close_pane` succeed and remove the pane.
+- **Asserts:** the request sequence is `agent-1`, `agent-1`, `agent-2`; replacement discovery uses ListAgents; only then does `close_pane` succeed and remove the pane; no unverified-close warning is emitted.
 - **Does not assert:** the asynchronous real-agent respawn mechanism that creates the replacement.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/009 — A replacement appearing near the respawn worst case is stopped before local teardown.
+- **Layer:** L1 (real `EmbeddedPaneController` against a timing-controlled synthetic Unix-socket daemon).
+- **Agent:** none (the initial AttachStream ends to put pane I/O into reattachment; both stale-id StopAgent attempts return exact NotFound; ListAgents reports the stable slot empty for 4.8 seconds before exposing `agent-2`).
+- **Asserts:** close keeps polling through the documented slow-respawn window, sends StopAgent to the late replacement, removes the pane only after that stop succeeds, and emits no unverified-close warning.
+- **Does not assert:** a real agent process's SIGTERM/startup timing; the synthetic delay deterministically represents that handover gap.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/010 — A ListAgents error completes close with one unattended-agent warning.
+- **Layer:** L1 (real `EmbeddedPaneController` against a synthetic Unix-socket daemon).
+- **Agent:** none (both StopAgent attempts return exact NotFound; ListAgents returns `registry unavailable`).
+- **Asserts:** close returns success and removes the pane instead of restoring the ghost card; exactly one drainable warning says the pane was closed, daemon verification failed, and an agent may still be running unattended.
+- **Does not assert:** rendering the queued warning on the TUI status line.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/011 — A ListAgents timeout completes close with one unattended-agent warning.
+- **Layer:** L1 (real `EmbeddedPaneController` against a synthetic Unix-socket daemon).
+- **Agent:** none (both StopAgent attempts return exact NotFound; ListAgents accepts the request but never replies).
+- **Asserts:** close returns success after the bounded lookup timeout and removes the pane instead of restoring the ghost card; exactly one drainable warning says the pane was closed, verification timed out, and an agent may still be running unattended.
+- **Does not assert:** rendering the queued warning on the TUI status line.
 - **Platform coverage:** mac+linux.
 
 #### lifecycle/restart
