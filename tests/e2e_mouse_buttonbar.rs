@@ -12,6 +12,8 @@
 
 mod common;
 
+use std::time::Duration;
+
 use common::TuiDeck;
 use spec::spec;
 
@@ -93,4 +95,47 @@ fn buttonbar_004_click_scheduled_tasks_opens_manager() {
     // listing the seeded task. `btnopen` is unique to the dialog list.
     deck.wait_for_string("btnopen");
     drop(dir);
+}
+
+/// Scenario: Launch one live card, enter Help so the production bar renders `[Close Ctrl+W]` disabled, click that dimmed button, then click Help's own `[Close]` control. Help must close normally with no close-confirm modal and the daemon agent must remain alive, proving the disabled bar button was not hit-testable.
+#[spec("mouse/buttonbar/007")]
+#[test]
+fn buttonbar_007_dimmed_close_is_inert_outside_command_mode() {
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
+        .with_continue_session("dimmed-close-target", "cat")
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    deck.send_bytes(b"\x04");
+    deck.wait_for_string("[Back to Pane Ctrl+D]");
+    deck.send_bytes(b"?");
+    deck.wait_for_string("Create new pane");
+
+    let (close_col, close_row) = deck
+        .find_in_grid("[Close Ctrl+W]")
+        .expect("Help mode must still render the dimmed Close button");
+    deck.click(close_col + 1, close_row);
+
+    // The help overlay's exact `[Close]` label is distinct from the bar's
+    // `[Close Ctrl+W]`. If the dimmed click wrongly armed close confirmation,
+    // this second real click either hits that modal or leaves it visible; both
+    // outcomes fail the assertions below.
+    let (help_close_col, help_close_row) = deck
+        .find_in_grid("[Close]")
+        .expect("the Help overlay must render its own Close button");
+    deck.click(help_close_col + 1, help_close_row);
+    deck.wait_for_absence("Create new pane");
+    deck.wait_for_string("[Back to Pane Ctrl+D]");
+
+    let grid = deck.snapshot_grid();
+    assert!(!grid.contains("Close selected pane?"), "{grid}");
+    assert!(
+        common::wait_for_agent_display_name(
+            deck.attach_socket_path(),
+            "dimmed-close-target",
+            true,
+            Duration::from_secs(1),
+        ),
+        "clicking the dimmed Close button outside command mode must not stop the agent"
+    );
 }

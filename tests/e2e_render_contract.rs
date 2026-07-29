@@ -134,8 +134,8 @@ fn layout_001_toggle_layout_keeps_pane_intact() {
 
 /// Scenario: Launch the deck against the `modes` fixture, open a Mode tab
 /// (creating an embedded `demo`-mode pane), return to command mode with Ctrl+D,
-/// request the close with Ctrl+W, and accept its confirmation with `y`, tearing
-/// the pane down and returning to a lone Dashboard. After the replace the
+/// request the close with Ctrl+W, move from Cancel to Close, and press Enter,
+/// tearing the pane down and returning to a lone Dashboard. After the replace the
 /// dashboard must render cleanly: the tab strip collapses (no `×` close glyph
 /// remains) and no stale `demo mode` fragment from the closed pane lingers.
 /// This pins the "no stale fragment after replace" invariant; GREEN target at
@@ -153,7 +153,8 @@ fn layout_002_pane_close_leaves_no_stale_fragment() {
     deck.send_bytes(b"\x04"); // Ctrl+D → command mode
     deck.send_bytes(b"\x17"); // Ctrl+W → arm close confirmation
     deck.wait_for_string("Close selected pane?");
-    deck.send_bytes(b"y"); // confirm → close tab
+    deck.send_bytes(b"\x1b[B"); // Down → select Close
+    deck.send_bytes(b"\r"); // Enter → confirm close tab
 
     // Invariant: the tab strip collapses and no stale mode fragment remains.
     deck.wait_for_absence("×");

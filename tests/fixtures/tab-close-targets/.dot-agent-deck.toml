@@ -1,0 +1,18 @@
+# Two visibly distinct synthetic modes for close-target identity tests. Each
+# mode keeps a side pane alive with a unique sentinel, so the rendered grid
+# proves which tab remains active without an LLM or production-only test hook.
+[[modes]]
+name = "alpha"
+reactive_panes = 0
+
+[[modes.panes]]
+command = "printf 'ALPHA_TAB_SENTINEL\\n'; sleep 600"
+name = "Alpha sentinel"
+
+[[modes]]
+name = "beta"
+reactive_panes = 0
+
+[[modes.panes]]
+command = "printf 'BETA_TAB_SENTINEL\\n'; sleep 600"
+name = "Beta sentinel"

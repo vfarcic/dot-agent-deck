@@ -7,21 +7,19 @@
 //! build an in-memory state, render it into a `Buffer`, and snapshot the
 //! stringified buffer.
 //!
-//! These exercise two render entrypoints — `render_help_overlay_to_buffer`
-//! and `render_hints_bar_to_buffer` in `dot_agent_deck::ui`. Both must
-//! generate their content from the *active* `KeybindingConfig` (not from
-//! hardcoded strings), which these tests prove by remapping bindings and
-//! asserting the custom key notation appears in the rendered output. They
-//! were authored RED (the render fns did not exist yet) and went GREEN
-//! once the renderers landed.
+//! These exercise the help overlay and the same `render_bottom_bar` path the
+//! running app draws. Both must generate their content from the *active*
+//! `KeybindingConfig` (not from hardcoded strings), which these tests prove by
+//! remapping bindings and asserting the custom key notation appears in the
+//! rendered output.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dot_agent_deck::keybindings::{Action as KbAction, KeybindingConfig, parse_binding};
 use dot_agent_deck::ui::{
-    Action as UiAction, UiMode, key_action_for_mode, render_button_bar_with_bindings_to_buffer,
-    render_help_overlay_with_bindings_to_buffer, render_hints_bar_for_mode_to_buffer,
-    render_hints_bar_to_buffer,
+    Action as UiAction, UiMode, key_action_for_mode, render_button_bar_for_mode_to_buffer,
+    render_button_bar_with_bindings_to_buffer, render_help_overlay_with_bindings_to_buffer,
 };
+use ratatui::style::Modifier;
 use spec::spec;
 
 type UiActionCase = (char, &'static str, fn(&UiAction) -> bool);
@@ -39,6 +37,21 @@ fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
         out.push('\n');
     }
     out
+}
+
+fn span_has_modifier(buffer: &ratatui::buffer::Buffer, needle: &str, modifier: Modifier) -> bool {
+    let area = buffer.area();
+    for y in 0..area.height {
+        let line = (0..area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>();
+        if let Some(byte_start) = line.find(needle) {
+            let start = line[..byte_start].chars().count() as u16;
+            return (start..start + needle.chars().count() as u16)
+                .all(|x| buffer[(x, y)].modifier.contains(modifier));
+        }
+    }
+    false
 }
 
 /// A `KeybindingConfig` with two actions remapped away from their
@@ -98,80 +111,46 @@ fn help_001_overlay_reflects_active_bindings() {
     insta::assert_snapshot!(text);
 }
 
-/// Scenario: Build the same remapped `KeybindingConfig` (`toggle_layout`
-/// → `Alt+Shift+l`), render the dashboard hints bar against it into a
-/// `TestBackend` buffer, and snapshot it. The hints bar must show the
-/// custom key for the layout-toggle action rather than the default
-/// `Ctrl+t`, and command mode must label Ctrl+D as `back to pane` rather than
-/// `dashboard`.
+/// Scenario: Build the same remapped `KeybindingConfig` (`toggle_layout` → `Alt+Shift+l`), render the production dashboard button bar against it, and snapshot it. The live bar must show the custom layout key and command mode's `[Back to Pane Ctrl+D]` affordance.
 #[spec("keybindings/hints/001")]
 #[test]
 fn hints_001_bar_reflects_active_bindings() {
-    // PRD #40 catalog: keybindings/hints/001 — hints bar rendered against
-    // a remapped config shows the custom keys (dynamic generation).
     let config = remapped_config();
 
-    // Single-row hints bar at the default 120-column width.
-    let width: u16 = 120;
-    let height: u16 = 1;
-    let buffer = render_hints_bar_to_buffer(&config, width, height);
+    let buffer = render_button_bar_with_bindings_to_buffer(&config, 200, 2);
 
     let text = buffer_to_text(&buffer);
     assert!(
-        text.contains("Alt+Shift+l"),
-        "hints bar must render the remapped toggle_layout key \
-         (Alt+Shift+l); hints were generated from hardcoded strings?\n{text}"
+        text.contains("Alt+Shift+L"),
+        "the live button bar must render the remapped toggle_layout key\n{text}"
     );
     assert!(
-        text.contains("Ctrl+d: back to pane"),
-        "the command-mode hints bar must tell the user how to return to the pane\n{text}"
-    );
-    assert!(
-        !text.contains("Ctrl+d: dashboard"),
-        "the command-mode hints bar must not name the mode the user is already in\n{text}"
+        text.contains("[Back to Pane Ctrl+D]"),
+        "the live command-mode bar must tell the user how to return to the pane\n{text}"
     );
     insta::assert_snapshot!(text);
 }
 
-/// Scenario: Build a default `KeybindingConfig` and unbind `new_pane`
-/// (`set(NewPane, parse_binding("").unwrap())`), then render the hints
-/// bar against it. An unbound action has an empty notation, so the hints
-/// bar must substitute `(unbound)` for its key (matching the help
-/// overlay's behaviour) and render `(unbound): new` — never a bare
-/// `: new` with an empty key column. Asserts on the buffer text directly
-/// (no `insta` snapshot) so this guard needs no `.snap` accept step.
-/// Greptile P2 regression guard.
+/// Scenario: Unbind `new_pane` in a default keybinding config and render the production button bar. The live New Pane button must show `(unbound)` rather than an empty shortcut field.
 #[spec("keybindings/hints/002")]
 #[test]
 fn hints_002_unbound_action_not_bare() {
-    // PRD #40 catalog: keybindings/hints/002 — an unbound action renders
-    // as `(unbound)` in the hints bar, never as a bare `: <label>`.
     let mut config = KeybindingConfig::default();
     config.set(
         KbAction::NewPane,
         parse_binding("").expect("empty == unbound"),
     );
 
-    let buffer = render_hints_bar_to_buffer(&config, 120, 1);
+    let buffer = render_button_bar_with_bindings_to_buffer(&config, 200, 2);
     let text = buffer_to_text(&buffer);
-    let line = text.lines().next().unwrap_or("");
 
     assert!(
-        text.contains("(unbound)"),
-        "unbound new_pane must render as '(unbound): new', not a bare key. \
-         Hints bar text was:\n{line:?}"
-    );
-    // The bare artifact for the first (new_pane) slot is a line that
-    // begins with ': new'; a mid-string empty slot would show '  : '.
-    assert!(
-        !line.trim_start().starts_with(": "),
-        "hints bar starts with a bare ': <label>' (empty key column) — \
-         unbound new_pane was not substituted with '(unbound)'. Line:\n{line:?}"
+        text.contains("[New Pane (unbound)]"),
+        "the live New Pane button must render an explicit unbound shortcut\n{text}"
     );
     assert!(
-        !text.contains("  : "),
-        "hints bar contains a bare '  : <label>' (empty key column) for some \
-         unbound action. Text:\n{line:?}"
+        !text.contains("[New Pane ]"),
+        "the live bar must not leave the New Pane shortcut blank\n{text}"
     );
 }
 
@@ -294,26 +273,36 @@ fn remap_003_global_close_binding_survives_mode_gating() {
     }
 }
 
-/// Scenario: Render the hints bar once for command mode and once for PaneInput using the same default bindings. Command mode must advertise Close and label Ctrl+D as `back to pane`; PaneInput must omit Close and retain Ctrl+D's `dashboard` destination.
+/// Scenario: Render the exact production bottom-bar path in command mode, Help, and PaneInput using the same bindings. Command mode must show enabled Back-to-Pane and Close buttons, Help must render Close dimmed while the mode mapper keeps it inert, and PaneInput must show only the Command Mode return affordance.
 #[spec("keybindings/hints/003")]
 #[test]
 fn hints_003_bar_reflects_mode_scoped_close() {
     let config = KeybindingConfig::default();
-    let normal = buffer_to_text(&render_hints_bar_for_mode_to_buffer(
-        &config,
-        UiMode::Normal,
-        120,
-        1,
-    ));
-    let pane_input = buffer_to_text(&render_hints_bar_for_mode_to_buffer(
-        &config,
-        UiMode::PaneInput,
-        120,
-        1,
-    ));
+    let normal_buffer = render_button_bar_for_mode_to_buffer(&config, UiMode::Normal, 200, 2);
+    let help_buffer = render_button_bar_for_mode_to_buffer(&config, UiMode::Help, 200, 2);
+    let pane_input_buffer =
+        render_button_bar_for_mode_to_buffer(&config, UiMode::PaneInput, 200, 2);
+    let normal = buffer_to_text(&normal_buffer);
+    let help = buffer_to_text(&help_buffer);
+    let pane_input = buffer_to_text(&pane_input_buffer);
 
-    assert!(normal.contains("Ctrl+w: close"), "{normal}");
-    assert!(normal.contains("Ctrl+d: back to pane"), "{normal}");
-    assert!(!pane_input.contains(": close"), "{pane_input}");
-    assert!(pane_input.contains("Ctrl+d: dashboard"), "{pane_input}");
+    assert!(normal.contains("[Back to Pane Ctrl+D]"), "{normal}");
+    assert!(normal.contains("[Close Ctrl+W]"), "{normal}");
+    assert!(
+        !span_has_modifier(&normal_buffer, "[Close Ctrl+W]", Modifier::DIM),
+        "command-mode Close must be enabled\n{normal}"
+    );
+    assert!(help.contains("[Command Mode Ctrl+D]"), "{help}");
+    assert!(help.contains("[Close Ctrl+W]"), "{help}");
+    assert!(
+        span_has_modifier(&help_buffer, "[Close Ctrl+W]", Modifier::DIM),
+        "Close must render dimmed outside command mode\n{help}"
+    );
+    let ctrl_w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+    assert!(
+        key_action_for_mode(&config, UiMode::Help, &ctrl_w).is_none(),
+        "the dimmed Help-mode Close affordance must be inert"
+    );
+    assert!(pane_input.contains("[Command Mode Ctrl+D]"), "{pane_input}");
+    assert!(!pane_input.contains("[Close Ctrl+W]"), "{pane_input}");
 }
