@@ -11,23 +11,23 @@ expression: text
         │                                                                                                     │         
         │  Ctrl+d             Toggle command / pane           j / Down           Focus next pane              │         
         │  Ctrl+n             Create new pane                 k / Up             Focus previous pane          │         
-        │  Ctrl+w             Close selected pane             Enter           Enter PaneInput on selected     │         
-        │  Alt+Shift+l        Toggle layout (stacked/tiled)   Esc             Deselect side pane              │         
-        │  Ctrl+c             Quit                            Mouse click     Focus pane                      │         
-        │                                                     Ctrl+click      Open hyperlink                  │         
-        │  Tab Navigation                                     Ctrl+d             Return to Normal mode        │         
-        │                                                                                                     │         
-        │  Tab / Right / l    Next tab                        New Agent Form                                  │         
-        │  Shift+Tab / Left / h Prev tab                                                                      │         
-        │  Ctrl+PgDn          Next tab                        Tab             Switch field                    │         
-        │  Ctrl+PgUp          Prev tab                        ◀/▶             Cycle mode                      │         
-        │                                                     Enter           Next field / confirm            │         
-        │  Dashboard (command mode)                           Esc             Cancel                          │         
-        │                                                                                                     │         
-        │  j / Down           Select next card                Directory Picker                                │         
-        │  k / Up             Select previous card                                                            │         
-        │  1-9                Jump to pane N                  j / Down        Select next                     │         
-        │  Enter              Focus selected pane             k / Up          Select previous                 │         
+        │  Alt+Shift+l        Toggle layout (stacked/tiled)   Enter           Enter PaneInput on selected     │         
+        │  Ctrl+c             Quit                            Esc             Deselect side pane              │         
+        │                                                     Mouse click     Focus pane                      │         
+        │  Tab Navigation                                     Ctrl+click      Open hyperlink                  │         
+        │                                                     Ctrl+d             Return to Normal mode        │         
+        │  Tab / Right / l    Next tab                                                                        │         
+        │  Shift+Tab / Left / h Prev tab                      New Agent Form                                  │         
+        │  Ctrl+PgDn          Next tab                                                                        │         
+        │  Ctrl+PgUp          Prev tab                        Tab             Switch field                    │         
+        │                                                     ◀/▶             Cycle mode                      │         
+        │  Dashboard (command mode)                           Enter           Next field / confirm            │         
+        │                                                     Esc             Cancel                          │         
+        │  j / Down           Select next card                                                                │         
+        │  k / Up             Select previous card            Directory Picker                                │         
+        │  1-9                Jump to pane N                                                                  │         
+        │  Enter              Focus selected pane             j / Down        Select next                     │         
+        │  Ctrl+w             Close selected pane (confirms)  k / Up          Select previous                 │         
         │  /                  Filter sessions                 l / Right / Enter   Enter directory             │         
         │  Esc                Clear filter                    h / Left / Bksp     Go up one level             │         
         │  r                  Rename session                  Space           Confirm current directory       │         

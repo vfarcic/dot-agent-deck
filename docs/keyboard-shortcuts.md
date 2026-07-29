@@ -9,10 +9,10 @@ title: Keyboard Shortcuts
 
 Every keyboard action below is also reachable with the mouse — the dashboard is fully clickable, not keyboard-only. Each clickable affordance carries its keyboard shortcut inline, so the on-screen controls double as a legend, and clicking one performs exactly the same action as its shortcut.
 
-- **Persistent button bar.** The bottom row exposes the global commands — `[New Pane Ctrl+N]`, `[Close Ctrl+W]`, `[Toggle Layout Ctrl+T]`, `[Help ?]`, and `[Quit Ctrl+C]`. On terminals too narrow for the full labels it falls back to shortcut-only buttons (e.g. `[Ctrl+N]`). This replaces the old status-bar legend. `[Close]` opens the same close confirmation the `Ctrl+W` key does.
-- **Tab strip.** Click a tab header to switch to it; Mode and Orchestration tabs carry a clickable `[×]` close affordance (the Dashboard tab has none).
+- **Persistent button bar.** The bottom row exposes the global commands — `[Back to Pane Ctrl+D]`, `[New Pane Ctrl+N]`, `[Close Ctrl+W]`, `[Toggle Layout Ctrl+T]`, `[Help ?]`, and `[Quit Ctrl+C]`. On terminals too narrow for the full labels the bar wraps to a second row rather than dropping any of them. This replaces the old status-bar legend. The bar follows the mode you are in: the first button reads `[Back to Pane Ctrl+D]` in command mode and `[Command Mode Ctrl+D]` while you are typing in a pane, and `[Close Ctrl+W]` is dimmed and inert outside command mode, matching the key. `[Close]` opens the same close confirmation the `Ctrl+W` key does.
+- **Tab strip.** Click a tab header to switch to it; Mode and Orchestration tabs carry a clickable `[×]` close affordance (the Dashboard tab has none). The `[×]` opens the same close confirmation as `Ctrl+W` and the `[Close]` button — every route into a pane teardown asks first.
 - **Dashboard cards.** Single-click a card to select it, double-click to focus its pane. The bar adds clickable `[Filter /]`, `[Rename r]`, and `[Generate g]` buttons.
-- **Dialogs, picker, and forms.** Each carries explicit clickable buttons alongside its keyboard controls: quit/config-gen/star/help dialog buttons; the directory picker's clickable rows, `..` parent, and `[Confirm]`/`[Cancel]`/`[Filter]`; the inline filter/rename `[Apply]`/`[Save]`/`[Cancel]`; the `[Detach Ctrl+D]` affordance while in a pane; and the new-pane form's clickable mode chips with `[Submit]`/`[Cancel]`.
+- **Dialogs, picker, and forms.** Each carries explicit clickable buttons alongside its keyboard controls: quit/config-gen/star/help dialog buttons; the directory picker's clickable rows, `..` parent, and `[Confirm]`/`[Cancel]`/`[Filter]`; the inline filter/rename `[Apply]`/`[Save]`/`[Cancel]`; the `[Command Mode Ctrl+D]` affordance while in a pane; and the new-pane form's clickable mode chips with `[Submit]`/`[Cancel]`.
 
 All the keyboard shortcuts below continue to work unchanged.
 
@@ -111,7 +111,7 @@ Several dashboard shortcuts open transient input fields or selection dialogs. Th
 | **Rename** | `r` | Type the new name · `Enter` to confirm · `Esc` to cancel |
 | **Generate config** | `g` | `Up`/`Down` (or `k`/`j`) to choose **Yes** / **No** / **Never** · `Enter` to confirm · `Esc` to cancel. **Yes** sends a prompt to the agent to write `.dot-agent-deck.toml`; **Never** suppresses the hint permanently for that directory. |
 | **Quit confirmation** | `Ctrl+C` from command mode | `Up`/`Down` (or `k`/`j`) to choose **Yes** / **No** · `Enter` to confirm · `Esc` to dismiss · `Ctrl+C` again to quit immediately |
-| **Close confirmation** | `Ctrl+W` from command mode, or the `[Close]` button | `Up`/`Down` (or `k`/`j`) to choose **Cancel** (default) / **Close** · `Enter` to confirm · `y` closes / `n` cancels in one keypress · `Esc` to dismiss. Only **Close** tears the pane (or mode tab) down. |
+| **Close confirmation** | `Ctrl+W` from command mode, the `[Close]` button, or a tab's `[×]` | `Up`/`Down` (or `k`/`j`) to choose **Cancel** (default) / **Close** · `Enter` to confirm · `Esc` to dismiss. Only **Close** tears the pane (or tab) down, and it closes exactly what was selected when the dialog opened — the dialog holds the keyboard while it is up, and any keystroke you typed before it appeared is discarded rather than answering it. |
 | **Help overlay** | `?` | `?`, `Esc`, or `q` to dismiss |
 
 ## Customizing Keybindings

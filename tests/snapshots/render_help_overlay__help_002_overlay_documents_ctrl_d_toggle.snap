@@ -19,23 +19,23 @@ expression: buf
    │                                                                                                     │    
    │  ctrl+d             toggle command / pane           j / down           focus next pane              │    
    │  ctrl+n             create new pane                 k / up             focus previous pane          │    
-   │  ctrl+w             close selected pane             enter           enter paneinput on selected     │    
-   │  ctrl+t             toggle layout (stacked/tiled)   esc             deselect side pane              │    
-   │  ctrl+c             quit                            mouse click     focus pane                      │    
-   │                                                     ctrl+click      open hyperlink                  │    
-   │  tab navigation                                     ctrl+d             return to normal mode        │    
-   │                                                                                                     │    
-   │  tab / right / l    next tab                        new agent form                                  │    
-   │  shift+tab / left / h prev tab                                                                      │    
-   │  ctrl+pgdn          next tab                        tab             switch field                    │    
-   │  ctrl+pgup          prev tab                        ◀/▶             cycle mode                      │    
-   │                                                     enter           next field / confirm            │    
-   │  dashboard (command mode)                           esc             cancel                          │    
-   │                                                                                                     │    
-   │  j / down           select next card                directory picker                                │    
-   │  k / up             select previous card                                                            │    
-   │  1-9                jump to pane n                  j / down        select next                     │    
-   │  enter              focus selected pane             k / up          select previous                 │    
+   │  ctrl+t             toggle layout (stacked/tiled)   enter           enter paneinput on selected     │    
+   │  ctrl+c             quit                            esc             deselect side pane              │    
+   │                                                     mouse click     focus pane                      │    
+   │  tab navigation                                     ctrl+click      open hyperlink                  │    
+   │                                                     ctrl+d             return to normal mode        │    
+   │  tab / right / l    next tab                                                                        │    
+   │  shift+tab / left / h prev tab                      new agent form                                  │    
+   │  ctrl+pgdn          next tab                                                                        │    
+   │  ctrl+pgup          prev tab                        tab             switch field                    │    
+   │                                                     ◀/▶             cycle mode                      │    
+   │  dashboard (command mode)                           enter           next field / confirm            │    
+   │                                                     esc             cancel                          │    
+   │  j / down           select next card                                                                │    
+   │  k / up             select previous card            directory picker                                │    
+   │  1-9                jump to pane n                                                                  │    
+   │  enter              focus selected pane             j / down        select next                     │    
+   │  ctrl+w             close selected pane (confirms)  k / up          select previous                 │    
    │  /                  filter sessions                 l / right / enter   enter directory             │    
    │  esc                clear filter                    h / left / bksp     go up one level             │    
    │  r                  rename session                  space           confirm current directory       │    
