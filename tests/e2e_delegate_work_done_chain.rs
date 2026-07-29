@@ -282,16 +282,37 @@ async fn opencode_auto_submits_daemon_injected_prompt() {
         .expect("worker cwd is UTF-8")
         .to_string();
 
-    // OpenCode model ids are provider-qualified (`provider/model`); a bare
-    // `gpt-4o-mini` is rejected as "Invalid model format". A small model is
-    // plenty for a one-line arithmetic reply.
+    // Pin the hook endpoint at a path nothing is listening on. This test only
+    // asserts what RENDERS in the worker's pane, so it needs no event
+    // ingestion at all — but OpenCode loads the deck's globally-installed
+    // plugin, which posts a `SessionStart` to whatever `DOT_AGENT_DECK_SOCKET`
+    // resolves to at emit time.
+    //
+    // Unpinned, that resolved to the *developer's live daemon* whenever the
+    // suite ran from inside a deck pane (2026-07-29): the real deck ingested
+    // this test's events and drew a card for `WORKER_PANE` on the user's
+    // dashboard — a card no tab owned and no pane backed, so selecting it
+    // deleted it. `agent_pty::spawn` now scrubs the inherited value, so this
+    // pin is belt-and-braces rather than the only guard; it stays because the
+    // sibling Claude arm pins its own socket for the same reason, and a test
+    // that spawns a real agent should never depend on ambient environment.
+    let dead_hook_socket = cwd.path().join("no-listener.sock");
     let worker_agent_id = registry
         .spawn_agent(SpawnOptions {
+            // OpenCode model ids are provider-qualified (`provider/model`); a
+            // bare `gpt-4o-mini` is rejected as "Invalid model format". A small
+            // model is plenty for a one-line arithmetic reply.
             command: Some("opencode --model openrouter/openai/gpt-4o-mini"),
             cwd: Some(cwd_str.as_str()),
             rows: 40,
             cols: 120,
-            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+                (
+                    "DOT_AGENT_DECK_SOCKET".to_string(),
+                    dead_hook_socket.display().to_string(),
+                ),
+            ],
             ..SpawnOptions::default()
         })
         .expect("spawn opencode worker");

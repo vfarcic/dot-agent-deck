@@ -1021,6 +1021,39 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
     // with this set would otherwise leak it into every child it spawns,
     // where it's meaningless to the child's environment.
     cmd.env_remove(DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS);
+    // The endpoint vars, for the same reason as `PANE_ID` above but with a
+    // worse failure mode: a mistagged pane id merely misroutes within one
+    // deck, whereas an inherited endpoint points the child at a *different
+    // deck's daemon* entirely.
+    //
+    // Observed in production on 2026-07-29. `cargo test-e2e` run from inside
+    // a deck pane inherits that pane's `DOT_AGENT_DECK_SOCKET`. A test that
+    // builds a bare `AgentPtyRegistry` (no `hook_socket`, so the injector
+    // below at `spawn_agent` has nothing to fill the gap with) and spawns a
+    // real agent without pinning its own socket therefore hands that agent
+    // the developer's LIVE daemon: its `SessionStart` was ingested by the
+    // real deck, which painted a card for the test's synthetic pane id
+    // ("worker-pane") on the user's dashboard.
+    //
+    // `ATTACH_SOCKET` matters more, not less: the attach endpoint is what
+    // `daemon stop` speaks, so an inherited one lets a child address the
+    // control plane of a daemon it does not own.
+    //
+    // Scrubbing is safe because every legitimate producer supplies the value
+    // explicitly and therefore still wins under the scrub-then-overlay order:
+    // `spawn_agent` injects the registry's own `hook_socket`, and callers that
+    // pin their own (tests, `respawn_agent_for_pane` replaying `spawn_env`)
+    // pass it through `opts.env`. What changes is only the *unpinned* case,
+    // which goes from "silently addresses whichever daemon happens to be in
+    // the ambient environment" to "no endpoint" — a child that emits nowhere
+    // rather than into a stranger's deck.
+    //
+    // `DOT_AGENT_DECK_STATE_DIR` is deliberately NOT scrubbed: no agent-side
+    // flow reads it (the CLI paths agents invoke — `delegate`, `work-done` —
+    // are endpoint-only), so removing it would be churn without a failure
+    // mode to point at.
+    cmd.env_remove(DOT_AGENT_DECK_SOCKET);
+    cmd.env_remove("DOT_AGENT_DECK_ATTACH_SOCKET");
 
     for (k, v) in &opts.env {
         // PRD #127 C2: `SHELL` in `opts.env` is a wrapper-choice override only
@@ -5321,6 +5354,93 @@ mod spawn_tests {
             status.exit_code(),
             0,
             "child saw inherited DOT_AGENT_DECK_PANE_ID — agent_pty::spawn must scrub it"
+        );
+    }
+
+    #[test]
+    fn spawn_scrubs_hook_socket_env_from_child() {
+        // The endpoint counterpart of the PANE_ID scrub, and the one with
+        // teeth: an inherited PANE_ID misroutes inside one deck, an inherited
+        // DOT_AGENT_DECK_SOCKET points the child at a DIFFERENT deck's daemon.
+        //
+        // Regression guard for the 2026-07-29 production leak: `cargo test-e2e`
+        // running inside a deck pane inherited that pane's socket, and a test
+        // spawning a real agent without pinning its own handed the agent the
+        // developer's live daemon — which ingested the test agent's
+        // `SessionStart` and drew a card for it on the real dashboard.
+        let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // SAFETY: serialized by ENV_TEST_LOCK; prior value is restored
+        // before the lock is released.
+        let prior = std::env::var(DOT_AGENT_DECK_SOCKET).ok();
+        unsafe {
+            std::env::set_var(DOT_AGENT_DECK_SOCKET, "/run/user/1000/someone-elses.sock");
+        }
+
+        // Spawn without pinning the socket via opts.env — the child must not
+        // observe the inherited value. Exit 0 if absent, 1 if inherited.
+        let pty = spawn(SpawnOptions {
+            command: Some("sh -c 'exit ${DOT_AGENT_DECK_SOCKET:+1}'"),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+        let mut child = pty.child;
+        let status = child.wait().expect("wait should succeed");
+
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_SOCKET, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_SOCKET),
+            }
+        }
+
+        assert_eq!(
+            status.exit_code(),
+            0,
+            "child saw inherited DOT_AGENT_DECK_SOCKET — agent_pty::spawn must scrub it, \
+             or a test agent will post its hook events into the developer's live daemon"
+        );
+    }
+
+    #[test]
+    fn spawn_opts_env_overrides_hook_socket_scrub() {
+        // The scrub must not clobber a deliberately-supplied socket: the
+        // `spawn_agent` injector and every socket-pinning caller depend on
+        // opts.env winning under the scrub-then-overlay order. Without this,
+        // fixing the leak above would break every legitimate producer.
+        let _g = ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // SAFETY: serialized by ENV_TEST_LOCK; prior value is restored
+        // before the lock is released.
+        let prior = std::env::var(DOT_AGENT_DECK_SOCKET).ok();
+        unsafe {
+            std::env::set_var(DOT_AGENT_DECK_SOCKET, "/run/user/1000/someone-elses.sock");
+        }
+
+        // Exit 0 only when the child sees exactly the pinned value.
+        let pty = spawn(SpawnOptions {
+            command: Some(
+                "sh -c '[ \"$DOT_AGENT_DECK_SOCKET\" = /tmp/pinned.sock ] && exit 0 || exit 1'",
+            ),
+            env: vec![(DOT_AGENT_DECK_SOCKET.into(), "/tmp/pinned.sock".into())],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+        let mut child = pty.child;
+        let status = child.wait().expect("wait should succeed");
+
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(DOT_AGENT_DECK_SOCKET, v),
+                None => std::env::remove_var(DOT_AGENT_DECK_SOCKET),
+            }
+        }
+
+        assert_eq!(
+            status.exit_code(),
+            0,
+            "opts.env DOT_AGENT_DECK_SOCKET was clobbered — the scrub must run \
+             BEFORE opts.env is applied, or the daemon can't hand agents its own socket"
         );
     }
 
