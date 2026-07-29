@@ -93,7 +93,7 @@ fn tabstrip_002_click_close_glyph_closes_tab() {
 
     // The glyph is a request, not a one-click teardown: the tab and its close
     // affordance remain behind the shared Cancel-default modal.
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close this tab and all its panes?");
     assert!(deck.snapshot_grid().contains('×'));
     deck.send_bytes(b"\x1b[B"); // Down → select Close
     deck.send_bytes(b"\r"); // Enter → confirm
@@ -121,7 +121,7 @@ fn tabstrip_003_inactive_close_binds_target_and_modal_suppresses_navigation() {
         .find_in_grid("×")
         .expect("two Mode tabs must render close affordances");
     deck.click(col, row);
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close this tab and all its panes?");
     assert!(deck.snapshot_grid().contains("BETA_TAB_SENTINEL"));
 
     // Each navigation chord is followed by a modal-selection move that makes

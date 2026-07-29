@@ -130,6 +130,10 @@ fn buttonbar_007_dimmed_close_is_inert_outside_command_mode() {
     let grid = deck.snapshot_grid();
     assert!(!grid.contains("Close selected pane?"), "{grid}");
     assert!(
+        !grid.contains("Close this tab and all its panes?"),
+        "{grid}"
+    );
+    assert!(
         common::wait_for_agent_display_name(
             deck.attach_socket_path(),
             "dimmed-close-target",

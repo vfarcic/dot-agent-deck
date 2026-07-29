@@ -19,7 +19,9 @@ use dot_agent_deck::daemon_protocol::{
     AttachRequest, AttachResponse, KIND_REQ, read_frame, write_resp,
 };
 use dot_agent_deck::embedded_pane::EmbeddedPaneController;
-use dot_agent_deck::pane::{PaneController, PaneError};
+use dot_agent_deck::pane::{PaneController, PaneDirection, PaneError, PaneInfo, RenameOutcome};
+use dot_agent_deck::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+use dot_agent_deck::tab::TabManager;
 use spec::spec;
 use tempfile::TempDir;
 use tokio::net::{UnixListener, UnixStream};
@@ -800,4 +802,122 @@ fn stop_016_replacement_timeout_retains_pane() {
         controller.take_close_warnings().is_empty(),
         "a stop timeout must not be degraded into an unverified-close warning"
     );
+}
+
+struct DelayedCloseController {
+    delays: std::collections::HashMap<String, Duration>,
+}
+
+impl PaneController for DelayedCloseController {
+    fn focus_pane(&self, _pane_id: &str) -> Result<(), PaneError> {
+        Ok(())
+    }
+
+    fn close_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+        let delay = self
+            .delays
+            .get(pane_id)
+            .copied()
+            .expect("every orchestration pane has a scripted close delay");
+        std::thread::sleep(delay);
+        Ok(())
+    }
+
+    fn create_pane(&self, _command: Option<&str>, _cwd: Option<&str>) -> Result<String, PaneError> {
+        Err(PaneError::NotAvailable)
+    }
+
+    fn list_panes(&self) -> Result<Vec<PaneInfo>, PaneError> {
+        Ok(Vec::new())
+    }
+
+    fn resize_pane(
+        &self,
+        _pane_id: &str,
+        _direction: PaneDirection,
+        _amount: u16,
+    ) -> Result<(), PaneError> {
+        Ok(())
+    }
+
+    fn rename_pane(&self, _pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+        Ok(RenameOutcome::applied(name))
+    }
+
+    fn toggle_layout(&self) -> Result<(), PaneError> {
+        Ok(())
+    }
+
+    fn write_to_pane(&self, _pane_id: &str, _text: &str) -> Result<(), PaneError> {
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "delayed-close"
+    }
+
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+fn six_role_orchestration() -> OrchestrationConfig {
+    OrchestrationConfig {
+        name: "six-role-close".to_string(),
+        roles: (0..6)
+            .map(|index| OrchestrationRoleConfig {
+                name: format!("role-{index}"),
+                command: "cat".to_string(),
+                start: index == 0,
+                description: None,
+                prompt_template: None,
+                clear: false,
+            })
+            .collect(),
+    }
+}
+
+/// Scenario: Close a hydrated six-role orchestration whose panes each sleep for a distinct known delay before succeeding. The whole tab must finish well below the sequential sum, and the returned closed ids must remain in role order rather than completion order.
+#[spec("lifecycle/stop/019")]
+#[test]
+fn stop_019_tab_close_is_concurrent_and_keeps_pane_order() {
+    let pane_ids: Vec<String> = (0..6).map(|index| format!("pane-{index}")).collect();
+    let scripted_delays = [400, 350, 300, 250, 200, 150]
+        .into_iter()
+        .map(Duration::from_millis);
+    let delays = pane_ids
+        .iter()
+        .cloned()
+        .zip(scripted_delays)
+        .collect::<std::collections::HashMap<_, _>>();
+    let controller = Arc::new(DelayedCloseController { delays });
+    let mut tabs = TabManager::new(controller);
+    let (tab_index, _) = tabs
+        .open_orchestration_tab_with_existing_role_panes(
+            &six_role_orchestration(),
+            "/work",
+            pane_ids.iter().cloned().map(Some).collect(),
+            None,
+        )
+        .expect("open hydrated six-role orchestration");
+
+    let started = Instant::now();
+    let outcome = tabs.close_tab(tab_index).expect("close orchestration tab");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "six closes totaling 1.65s sequentially must fan out concurrently under the 1.0s ceiling; elapsed {elapsed:?}"
+    );
+    assert_eq!(
+        outcome.closed, pane_ids,
+        "close results must retain role/pane input order despite staggered completion"
+    );
+    assert!(outcome.failed.is_empty());
+    assert_eq!(tabs.tab_count(), 1, "a clean close removes the whole tab");
+    eprintln!("six-pane concurrent tab close elapsed {elapsed:?} (ceiling 1s)");
 }

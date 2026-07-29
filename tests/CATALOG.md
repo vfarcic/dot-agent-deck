@@ -37,7 +37,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/pane/003 — The dashboard pane (tab 0) is never closable.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** `Ctrl+w` from the dashboard tab with no card selected is a no-op: no confirmation opens, no panic occurs, the dashboard remains rendered, and the tab count is unchanged.
+- **Asserts:** `Ctrl+w` from the dashboard tab with no card selected is a no-op: neither the pane-scoped nor tab-scoped confirmation opens, no panic occurs, the dashboard remains rendered, and the tab count is unchanged.
 - **Does not assert:** any status-line text.
 - **Platform coverage:** mac+linux.
 
@@ -484,21 +484,21 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### prompt/close-confirm/001 — Command-mode Ctrl+W opens a Cancel-default close confirmation.
 - **Layer:** L1 (in-process key mapper + close-confirm state + ratatui `TestBackend`).
 - **Agent:** none.
-- **Asserts:** Ctrl+W resolves `CloseSelected`, an available target opens the confirmation, and the rendered modal shows `Cancel` selected by default alongside `Close`.
+- **Asserts:** Ctrl+W resolves `CloseSelected`, an available target opens the confirmation, both pane- and tab-scoped states render their exact blast-radius sentence/description without copy leakage, and `Cancel` remains selected by default.
 - **Does not assert:** daemon teardown after confirmation (covered by `lifecycle/stop/*` and `dashboard/pane/002`).
 - **Platform coverage:** mac+linux+windows.
 
 ##### prompt/close-confirm/002 — Cancel preserves the target while explicit confirmation authorizes one close.
 - **Layer:** L2 (real-binary PTY plus real daemon registry).
 - **Agent:** none (continued `cat` pane).
-- **Asserts:** production Ctrl+W opens the Cancel-default modal; Enter on Cancel preserves the rendered card and daemon agent record; a fresh Ctrl+W followed by Down+Enter removes both.
+- **Asserts:** production Ctrl+W on a plain dashboard pane opens the pane-scoped `Close selected pane?` Cancel-default modal; Enter on Cancel preserves the rendered card and daemon agent record; a fresh Ctrl+W followed by Down+Enter removes both.
 - **Does not assert:** StopAgent error classification (covered by `lifecycle/stop/005`–`008`).
 - **Platform coverage:** mac+linux.
 
 ##### prompt/close-confirm/003 — The `[Close]` button and Ctrl+W share the same confirmation action path.
 - **Layer:** L2 (real-binary PTY; production button render, SGR mouse decoding, and keyboard dispatch).
 - **Agent:** none (continued `cat` pane).
-- **Asserts:** clicking the live `[Close Ctrl+W]` button opens the same rendered Cancel-default modal as Ctrl+W, and neither path tears down the daemon agent before explicit confirmation.
+- **Asserts:** clicking the live `[Close Ctrl+W]` button opens the same rendered pane-scoped Cancel-default modal as Ctrl+W, and neither path tears down the daemon agent before explicit confirmation.
 - **Does not assert:** tab-strip `×` dispatch (covered by `mouse/tabstrip/002`–`003`).
 - **Platform coverage:** mac+linux.
 
@@ -514,6 +514,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none (continued `cat` pane; the hook gives the same pane a distinct replacement agent/session identity in rendered state).
 - **Asserts:** after Ctrl+W arms the original session identity, a different-agent SessionStart replaces it on the same pane; confirming surfaces `Nothing closed`, retains the card, and leaves the daemon agent alive rather than closing the replacement.
 - **Does not assert:** tab identity binding (covered independently by `mouse/tabstrip/003`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/close-confirm/006 — A dashboard Session target that belongs to a Mode tab uses whole-tab copy and teardown.
+- **Layer:** L2 (real-binary PTY against a protocol-faithful scripted daemon).
+- **Agent:** none (a hydrated Mode agent pane rendered as a dashboard card plus one persistent side pane).
+- **Asserts:** arming Ctrl+W from the selected dashboard card renders `Close this tab and all its panes?`, never the pane sentence; confirming sends stops for both daemon panes and removes the tab only after the registry is empty.
+- **Does not assert:** internal `CloseTarget`/`ClosePlan` variants; the rendered promise and observable blast radius are the contract.
 - **Platform coverage:** mac+linux.
 
 #### prompt/pane-input
@@ -1323,6 +1330,27 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** presentation of the surfaced error in the TUI status row; OS-level process termination.
 - **Platform coverage:** mac+linux.
 
+##### lifecycle/stop/017 — A partially failed tab close stays visible and succeeds on retry.
+- **Layer:** L2 (real-binary PTY against a protocol-faithful scripted daemon).
+- **Agent:** none (a hydrated Mode tab with one agent pane and one persistent side pane; the side pane's first StopAgent is denied and its retry succeeds).
+- **Asserts:** the first confirmed whole-tab close removes the successful pane, retains the failed pane and its tab/`×`, and renders that the tab was kept; after switching into the retained tab, a second confirmed close removes the failed pane, daemon record, and tab.
+- **Does not assert:** an exact count of `close_pane` calls; the observable retry outcome is the contract.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/018 — Already-gone and unverified-success panes do not block whole-tab removal.
+- **Layer:** L2 (real-binary PTY against a protocol-faithful scripted daemon).
+- **Agent:** none (two hydrated one-pane Mode tabs: exact id-scoped NotFound with an empty slot, then exact NotFound whose ListAgents verification fails).
+- **Asserts:** both outcomes remove the tab; the proven-gone close renders no unattended-agent warning, while DoneUnverified renders exactly one such warning on the live status line.
+- **Does not assert:** warning expiry timing or terminal styling.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/019 — A six-pane tab closes concurrently while preserving pane order in its outcome.
+- **Layer:** L1 (in-process `TabManager` with a delay-scripted `PaneController`).
+- **Agent:** none (six hydrated orchestration role panes with staggered 150–400 ms synthetic close delays).
+- **Asserts:** the close completes below a 1.0-second wall-clock ceiling versus a 1.65-second sequential sum, reports closed pane ids in original role order rather than completion order, and removes the clean tab.
+- **Does not assert:** production daemon/RPC latency; the synthetic delays isolate fan-out semantics.
+- **Platform coverage:** mac+linux.
+
 #### lifecycle/restart
 
 ##### lifecycle/restart/001 — `daemon restart` reuses the next-launch lazy-spawn — a subsequent `dot-agent-deck` launch comes up against a fresh daemon process.
@@ -1529,7 +1557,7 @@ note).
 ##### render/layout/002 — Reactive pane recreation/replace leaves no scrambled fragments — the replacement pane renders cleanly.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** after a pane is recreated/replaced in place (open a Mode tab, return to command mode, request its close with Ctrl+W, then choose Close with Down+Enter), the rendered grid contains the surviving Dashboard and no leftover fragment of the removed pane at a stale position.
+- **Asserts:** after a pane is recreated/replaced in place (open a Mode tab, return to command mode, request its close with Ctrl+W, observe the tab-scoped confirmation, then choose Close with Down+Enter), the rendered grid contains the surviving Dashboard and no leftover fragment of the removed pane at a stale position.
 - **Does not assert:** the exact recreation trigger internals; per-cell colours.
 - **Platform coverage:** mac+linux.
 - **M1 status (PRD #84):** **Flag / invariant-check.** Pane open/close and reactive recreation (`src/ui.rs:1510`, `:2147` areas) currently resize the affected PTYs on the spot, so any scramble is transient. Invariant guard on "no stale fragment after replace". GREEN target at M4/M5.
@@ -2398,7 +2426,7 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 ##### mouse/buttonbar/007 — The dimmed Close button is inert outside command mode.
 - **Layer:** L2 (real-binary PTY with production button rendering and SGR mouse hit-testing).
 - **Agent:** none (continued `cat` pane).
-- **Asserts:** Help mode still visibly renders `[Close Ctrl+W]`; clicking it does not arm close confirmation; Help's own `[Close]` then dismisses the overlay normally; the daemon agent remains alive.
+- **Asserts:** Help mode still visibly renders `[Close Ctrl+W]`; clicking it arms neither the pane-scoped nor tab-scoped close confirmation; Help's own `[Close]` then dismisses the overlay normally; the daemon agent remains alive.
 - **Does not assert:** the DIM cell modifier itself (covered through the live buffer path by `keybindings/hints/003`).
 - **Platform coverage:** mac+linux.
 
@@ -2414,14 +2442,14 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 ##### mouse/tabstrip/002 — Mode/Orchestration tabs carry a clickable `[×]` close affordance (Dashboard has none); clicking it closes the tab.
 - **Layer:** L1 (glyph presence/absence) + L2 (click-to-close).
 - **Agent:** none.
-- **Asserts:** the strip renders exactly one `×` per closeable tab and none for the Dashboard; clicking a Mode tab's `[×]` leaves the tab intact behind the shared Cancel-default confirmation, and Down+Enter then closes it.
+- **Asserts:** the strip renders exactly one `×` per closeable tab and none for the Dashboard; clicking a Mode tab's `[×]` leaves the tab intact behind the tab-scoped `Close this tab and all its panes?` Cancel-default confirmation, and Down+Enter then closes it.
 - **Does not assert:** which tab gets focus after close.
 - **Platform coverage:** mac+linux (L1 half: +windows).
 
 ##### mouse/tabstrip/003 — An inactive tab's `×` binds confirmation to that stable tab while modal navigation is suppressed.
 - **Layer:** L2 (real-binary PTY with two distinct synthetic Mode tabs and production SGR mouse/key dispatch).
 - **Agent:** none (the `alpha` and `beta` fixture modes run long-lived side panes with unique rendered sentinel text).
-- **Asserts:** with `BETA_TAB_SENTINEL` active, clicking the inactive alpha tab's `×` arms alpha; Ctrl+PageUp and Ctrl+PageDown leave beta rendered; confirmation removes alpha while beta and its single remaining `×` survive.
+- **Asserts:** with `BETA_TAB_SENTINEL` active, clicking the inactive alpha tab's `×` arms alpha with tab-scoped copy; Ctrl+PageUp and Ctrl+PageDown leave beta rendered; confirmation removes alpha while beta and its single remaining `×` survive.
 - **Does not assert:** dashboard-session identity replacement (covered by `prompt/close-confirm/005`).
 - **Platform coverage:** mac+linux.
 

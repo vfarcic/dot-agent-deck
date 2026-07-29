@@ -63,6 +63,10 @@ fn pane_003_empty_dashboard_never_opens_close_confirmation() {
         !grid.contains("Close selected pane?"),
         "an empty dashboard must not arm a close confirmation\n{grid}"
     );
+    assert!(
+        !grid.contains("Close this tab and all its panes?"),
+        "an empty dashboard must not leak a tab-scoped close confirmation\n{grid}"
+    );
 }
 
 /// Scenario: Launch one live dashboard card and drive Ctrl+W through the real binary twice. Enter on the Cancel-default modal must preserve the card and daemon agent, while a fresh Ctrl+W followed by Down+Enter must remove both.

@@ -152,7 +152,7 @@ fn layout_002_pane_close_leaves_no_stale_fragment() {
     // close, and deliberately accept the safety confirmation.
     deck.send_bytes(b"\x04"); // Ctrl+D → command mode
     deck.send_bytes(b"\x17"); // Ctrl+W → arm close confirmation
-    deck.wait_for_string("Close selected pane?");
+    deck.wait_for_string("Close this tab and all its panes?");
     deck.send_bytes(b"\x1b[B"); // Down → select Close
     deck.send_bytes(b"\r"); // Enter → confirm close tab
 
