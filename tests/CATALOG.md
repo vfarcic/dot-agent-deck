@@ -668,8 +668,8 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### prompt/pane-input/022 — Ctrl+W while editing a real interactive Claude Haiku prompt does not tear down the pane.
 - **Layer:** L2 (PTY-attached real binary, runtime-skipped when Claude CLI/credentials are unavailable; flaky-tolerant pre-PR tier).
 - **Agent:** REAL interactive Claude Code on `claude-haiku-4-5-20251001`, with onboarding/project trust seeded and `--allowedTools Bash Read`; no `-p`.
-- **Asserts:** after the real Claude pane registers, typing words and pressing Ctrl+W leaves its named card visible and its daemon-side agent record present when the user returns to command mode.
-- **Does not assert:** exact Claude prompt-edit rendering or an LLM response (the safety invariant is pane survival while interacting with the genuine agent).
+- **Asserts:** after the real Claude pane registers under its temp-directory-prefixed display name and the genuine interactive prompt renders, typing two sentinel words and pressing Ctrl+W visibly deletes the final word, proving the keystroke reached Claude; returning to command mode leaves the pane visible and the same daemon-side agent record present.
+- **Does not assert:** an LLM response (the safety invariant and native prompt-edit behavior are proven without submitting a model turn).
 - **Platform coverage:** mac+linux.
 
 #### prompt/quit
