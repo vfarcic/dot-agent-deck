@@ -46,7 +46,7 @@ futures-util = "=0.3.33"
 regex = "1"
 open = "5"
 unicode-width = "0.2"
-cron = "0.16.0"
+cron = "0.17.0"
 
 [dev-dependencies]
 tempfile = "3"
