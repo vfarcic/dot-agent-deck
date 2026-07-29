@@ -49,51 +49,51 @@
         }
       }
     },
-    "asciinema@3.2.0": {
-      "last_modified": "2026-05-08T21:03:27Z",
-      "resolved": "github:NixOS/nixpkgs/b3da656039dc7a6240f27b2ef8cc6a3ef3bccae7#asciinema",
+    "asciinema@3.2.1": {
+      "last_modified": "2026-07-23T05:10:05Z",
+      "resolved": "github:NixOS/nixpkgs/7525d999cd850b9a488817abc89c75dc733acf17#asciinema",
       "source": "devbox-search",
-      "version": "3.2.0",
+      "version": "3.2.1",
       "systems": {
         "aarch64-darwin": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/6jllrz04svnr1xxzywbbykgwarfq6pmj-asciinema-3.2.0",
+              "path": "/nix/store/1w1zdfimlj1b7hpm6fzhgi6admphibq3-asciinema-3.2.1",
               "default": true
             }
           ],
-          "store_path": "/nix/store/6jllrz04svnr1xxzywbbykgwarfq6pmj-asciinema-3.2.0"
+          "store_path": "/nix/store/1w1zdfimlj1b7hpm6fzhgi6admphibq3-asciinema-3.2.1"
         },
         "aarch64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/413jlfgry7m2zd31m8iqnk2pir20b1p0-asciinema-3.2.0",
+              "path": "/nix/store/68vjhfifd0x3kw3rb4vbm6ijz1vvfh3s-asciinema-3.2.1",
               "default": true
             }
           ],
-          "store_path": "/nix/store/413jlfgry7m2zd31m8iqnk2pir20b1p0-asciinema-3.2.0"
+          "store_path": "/nix/store/68vjhfifd0x3kw3rb4vbm6ijz1vvfh3s-asciinema-3.2.1"
         },
         "x86_64-darwin": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/90zb6rmkdia30vvyc87hlznpydfd4yv2-asciinema-3.2.0",
+              "path": "/nix/store/dm5ykwi5qlimwjsacby2b1x470da221i-asciinema-3.2.1",
               "default": true
             }
           ],
-          "store_path": "/nix/store/90zb6rmkdia30vvyc87hlznpydfd4yv2-asciinema-3.2.0"
+          "store_path": "/nix/store/dm5ykwi5qlimwjsacby2b1x470da221i-asciinema-3.2.1"
         },
         "x86_64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/rbh9jvrblsgac93lv18ddywcjkk7bf8v-asciinema-3.2.0",
+              "path": "/nix/store/08pa276wls6h7ljywgy1gm19hw9vq8ls-asciinema-3.2.1",
               "default": true
             }
           ],
-          "store_path": "/nix/store/rbh9jvrblsgac93lv18ddywcjkk7bf8v-asciinema-3.2.0"
+          "store_path": "/nix/store/08pa276wls6h7ljywgy1gm19hw9vq8ls-asciinema-3.2.1"
         }
       }
     },
