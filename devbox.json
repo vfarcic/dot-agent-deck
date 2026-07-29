@@ -1,24 +1,24 @@
 {
   "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.16.0/.schema/devbox.schema.json",
   "packages": [
-    "vals@0.43.9",
+    "vals@0.44.5",
     "go-task@3.48.0",
-    "kubernetes-helm@3.19.1",
-    "git@2.53.0",
+    "kubernetes-helm@3.20.2",
+    "git@2.55.0",
     "upcloud-cli@3.29.0",
-    "gh@2.92.0",
+    "gh@2.96.0",
     "asciinema@3.2.1",
     "cargo-nextest@0.9.140",
-    "rustc@1.94.1",
-    "cargo@1.94.1",
-    "clippy@1.94.1",
-    "rustfmt@1.94.1",
+    "rustc@1.97.0",
+    "cargo@1.97.0",
+    "clippy@1.97.0",
+    "rustfmt@1.97.0",
     "path:gcloud#google-cloud-sdk",
     "asciinema-agg@1.9.0",
     "ffmpeg@8.1.2",
     "jq@1.8.2",
     "curl@8.17.0",
-    "ripgrep@15.1.0"
+    "ripgrep@15.2.0"
   ],
   "shell": {
     "init_hook": [
