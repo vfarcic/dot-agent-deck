@@ -60,7 +60,7 @@ serial_test = "3"
 toml = "0.8"
 # PRD #77 Decision 22: insta pinned to a specific version, not `latest`,
 # so a future patch release cannot silently reshape snapshot diffs.
-insta = { version = "=1.47.2", features = ["yaml"] }
+insta = { version = "=1.48.0", features = ["yaml"] }
 spec = { path = "xtask/spec" }
 # PRD #77 Decision 30 / M4: the L2 harness's recording dump also
 # regenerates the paired .md so local DOT_AGENT_DECK_RECORD=1 runs
