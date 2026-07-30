@@ -37,7 +37,7 @@ toml = "0.9"
 # (scoped Codex hook trust). A serde round-trip through `toml` would reformat the
 # file and strip every comment; `toml_edit` (cargo's own crate) inserts/replaces
 # only the `hooks.state."<key>"` tables and leaves every other byte intact.
-toml_edit = "0.22"
+toml_edit = "0.25"
 # reqwest 0.13 renamed 0.12's `rustls-tls` feature to `rustls`, which now also
 # brings its own root-certificate source (rustls-platform-verifier, i.e. the OS
 # trust store). Deliberately NOT naming a roots feature here: 0.13.1 offered
