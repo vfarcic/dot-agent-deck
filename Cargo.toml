@@ -62,7 +62,7 @@ semver = "1"
 # a trade worth making for a platform that is not a release target (WSL2 runs the
 # Unix paths natively). Revisit together with native-Windows support; until then
 # 0.8.1 keeps the flag, and the whole problem, out of the tree.
-portable-pty = "=0.8.1"
+portable-pty = "=0.9.0"
 vt100 = "0.16"
 futures-util = "=0.3.33"
 regex = "1"
