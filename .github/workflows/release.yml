@@ -113,7 +113,7 @@ jobs:
           BINARY_NAME="dot-agent-deck-${{ matrix.artifact_suffix }}${{ matrix.binary_ext }}"
           cp "target/${{ matrix.target }}/release/dot-agent-deck${{ matrix.binary_ext }}" "$BINARY_NAME"
           echo "BINARY_NAME=$BINARY_NAME" >> "$GITHUB_ENV"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dot-agent-deck-${{ matrix.artifact_suffix }}
           path: ${{ env.BINARY_NAME }}
@@ -126,7 +126,7 @@ jobs:
       - uses: arduino/setup-task@v3.0.0
         with:
           version: 3.x
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
