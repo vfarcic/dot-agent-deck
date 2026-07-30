@@ -34,10 +34,29 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2 # v2
+      - uses: taiki-e/install-action@nextest
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
       - run: cargo build --release
-      - run: cargo test
+      # `cargo nextest run`, NOT `cargo test` — the same runner as the
+      # `cargo test-fast` local gate, and as build-macos/build-windows which
+      # already use it. `cargo test` runs the whole tier in ONE process with
+      # parallel threads; nextest gives each test its own process.
+      #
+      # That difference produced real flakes. On 2026-07-30, two different
+      # timing-sensitive tests failed here and nowhere else:
+      # `delegate_injects_single_line_pointer_and_keeps_footer_in_task_file`
+      # (waiting on a PTY write; task file came back empty) and
+      # `login_shell::tests::captures_path_despite_large_stdout_banner`
+      # (subprocess plus a large stdout drain). Both passed on re-run with no
+      # code change, both passed on macOS and Windows in the SAME runs, and
+      # `cargo nextest run` passed 1343/1343 locally throughout — the three jobs
+      # were a natural experiment and only the `cargo test` one flaked.
+      #
+      # Aligning the runners also makes a CI failure reproducible locally, which
+      # neither of those was, and makes "green locally" mean the same thing as
+      # "green in CI".
+      - run: cargo nextest run
 
   # PRD #42 M8 — native Windows (x86_64-pc-windows-msvc) compile + clippy +
   # unit-test gate, running parallel to the Linux `build` job so a Windows-only
