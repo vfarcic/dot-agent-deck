@@ -73,7 +73,7 @@ cron = "0.17.0"
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"
-serial_test = "3"
+serial_test = "4"
 # PRD #201 `pi/live/002`: the injection-seeded orchestration e2e stages a
 # `session.toml` with an `OrchestrationSnapshot` by serializing a real
 # `config::SavedSession` — integration tests don't inherit the package deps, so
