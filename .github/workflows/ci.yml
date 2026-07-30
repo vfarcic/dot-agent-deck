@@ -57,6 +57,15 @@ jobs:
       # neither of those was, and makes "green locally" mean the same thing as
       # "green in CI".
       - run: cargo nextest run
+      # CLAUDE.md rule 7 has always SAID this runs in CI ("CI's linkage-check
+      # rule 7 fails the build if the Scenario comment is missing or the
+      # generator fails"), and the build-macos/build-windows comment says these
+      # steps "stay on the Linux job" — but no such step existed, so nothing
+      # enforced either claim. Added 2026-07-30 after a revert removed two
+      # `#[spec]`-annotated tests and left their tests/CATALOG.md entries
+      # orphaned: linkage-check was failing on main and no gate noticed, because
+      # it only ever ran when somebody invoked it by hand.
+      - run: cargo xtask linkage-check
 
   # PRD #42 M8 — native Windows (x86_64-pc-windows-msvc) compile + clippy +
   # unit-test gate, running parallel to the Linux `build` job so a Windows-only

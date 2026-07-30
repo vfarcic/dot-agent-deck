@@ -441,20 +441,6 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** stdout classification or socket transport (covered by `codex/wrap/001`).
 - **Platform coverage:** mac+linux+windows.
 
-##### status/agent-event/005 — A respawned agent whose first event is NOT a `SessionStart` still retires the previous card, so one pane keeps one card.
-- **Layer:** L1 (two `SyntheticAgent` generations on one pane, applied through `AppState::apply_event`).
-- **Agent:** synthetic Pi identity (the only shipped agent with no `SessionStart`).
-- **Asserts:** after a `clear = true` respawn mints a new `agent_id`, the outgoing generation's card is retired by the incoming generation's first `agent-event` (`Thinking`), leaving exactly one session on the pane, carrying the new `agent_id`.
-- **Does not assert:** the orchestration deck's rendering of the duplicate (the unreachable-highlight consequence is pinned by the `sync_and_derive_selection` unit tests in `src/tab.rs`); the Pi extension's own state mapping (TS unit tests).
-- **Platform coverage:** mac+linux+windows.
-
-##### status/agent-event/006 — A delayed event from the OUTGOING agent does not retire the incoming agent's live card.
-- **Layer:** L1 (out-of-order `AgentEvent` timestamps applied through `AppState::apply_event`).
-- **Agent:** synthetic Pi identity.
-- **Asserts:** once the incoming generation has established its card, an older-timestamped event from the previous `agent_id` leaves that live card intact — the monotonicity guard that makes retiring on a non-`SessionStart` event safe.
-- **Does not assert:** that the stale event is dropped entirely (it may still surface its own card; what must hold is that the LIVE card survives).
-- **Platform coverage:** mac+linux+windows.
-
 ### Agent protocol
 
 #### protocol/live-target
