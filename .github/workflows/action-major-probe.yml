@@ -1,0 +1,80 @@
+# TEMPORARY PROBE — delete once #290 and #291 are decided.
+#
+# Both PRs bump actions that live ONLY on paths no PR exercises:
+#   #290  docker/setup-buildx-action v3 -> v4   (docs.yml is path-filtered to
+#         docs/** and site/**, so a workflow-only change does not run it;
+#         docs-publish.yml is workflow_call, i.e. release-time only)
+#   #291  actions/upload-artifact v4 -> v7 and download-artifact v4 -> v8,
+#         in release.yml, which runs ONLY on a tag
+#
+# So merging them blind means the first execution is a release. This probe runs
+# the new versions on a PR and asserts the CONTRACT release.yml depends on,
+# rather than just "the action didn't error".
+name: action major probe
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/action-major-probe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # #291: release.yml uploads one artifact per build-matrix target under a
+  # distinct name, then finalize downloads them ALL with `merge-multiple: true`
+  # so they land FLAT in dist/ for `task checksums`. If v8 changed or dropped
+  # that input the binaries land in per-artifact subdirectories, checksums finds
+  # nothing, and the release breaks after the tag already exists.
+  artifact-roundtrip:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        suffix: [linux-amd64, linux-arm64]
+    steps:
+      - run: echo "payload-${{ matrix.suffix }}" > "dot-agent-deck-${{ matrix.suffix }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dot-agent-deck-${{ matrix.suffix }}
+          path: dot-agent-deck-${{ matrix.suffix }}
+
+  artifact-collect:
+    needs: artifact-roundtrip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Assert the flat layout release.yml relies on
+        run: |
+          set -euo pipefail
+          echo "--- dist tree ---"; find dist -type f | sort
+          for f in dot-agent-deck-linux-amd64 dot-agent-deck-linux-arm64; do
+            test -f "dist/$f" || {
+              echo "FAIL: dist/$f missing — merge-multiple did not flatten."
+              echo "release.yml's 'task checksums' would find nothing."
+              exit 1
+            }
+          done
+          # Nothing nested: a subdirectory means per-artifact layout returned.
+          if find dist -mindepth 2 -type f | grep -q .; then
+            echo "FAIL: nested files under dist/ — layout changed."; exit 1
+          fi
+          echo "OK: upload@v7 -> download@v8 with merge-multiple stays flat"
+
+  # #290: prove buildx v4 initialises AND can actually run a build, since the
+  # docs image build is what depends on it.
+  buildx-v4:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v4
+      - name: Assert buildx is usable
+        run: |
+          set -euo pipefail
+          docker buildx version
+          docker buildx inspect --bootstrap >/dev/null
+          printf 'FROM alpine:3\nRUN echo probe\n' > Dockerfile.probe
+          docker buildx build -f Dockerfile.probe --load -t buildx-probe:local .
+          echo "OK: setup-buildx-action@v4 initialises and builds"
