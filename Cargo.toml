@@ -32,7 +32,7 @@ ratatui = "0.30"
 # only OUR direct dependency — the one `src/ui.rs` reads events from.
 crossterm = "=0.29.0"
 clap = { version = "4", features = ["derive"] }
-toml = "0.9"
+toml = "1.0"
 # PRD #20 §4.1.3: FORMAT-PRESERVING edits of the user's real `~/.codex/config.toml`
 # (scoped Codex hook trust). A serde round-trip through `toml` would reformat the
 # file and strip every comment; `toml_edit` (cargo's own crate) inserts/replaces
@@ -79,7 +79,7 @@ serial_test = "4"
 # `config::SavedSession` — integration tests don't inherit the package deps, so
 # `toml` is listed here too (same version pin as the package dep). `libc` is now
 # Unix-only, declared under `[target.'cfg(unix)'.dev-dependencies]` below.
-toml = "0.9"
+toml = "1.0"
 # PRD #77 Decision 22: insta pinned to a specific version, not `latest`,
 # so a future patch release cannot silently reshape snapshot diffs.
 insta = { version = "=1.48.0", features = ["yaml"] }
