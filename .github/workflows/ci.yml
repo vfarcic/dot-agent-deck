@@ -4,6 +4,18 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened]
+  # Also verify main AFTER a merge. Without this, CI only ever saw proposed
+  # changes, so a broken main stayed invisible until some later PR inherited the
+  # break and failed for reasons that had nothing to do with it. That is exactly
+  # what happened on 2026-07-29: #269 merged with all three build jobs red, and
+  # main was unbuildable for about a day while every subsequent PR failed at the
+  # first cargo step.
+  #
+  # This matters more, not less, with Renovate automerging non-major bumps: those
+  # land without a human looking, so the post-merge check is what turns "main is
+  # broken" from a discovery into a notification.
+  push:
+    branches: [main]
   workflow_dispatch:
 
 concurrency:

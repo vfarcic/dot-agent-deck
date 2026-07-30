@@ -31,9 +31,23 @@
     {
       "matchManagers": ["cargo"],
       "matchUpdateTypes": ["minor"],
+      "matchCurrentVersion": ">=1.0.0",
       "automerge": true,
       "automergeType": "pr",
-      "description": "Minor bumps automerge on green CI. NOTE: for a 0.x crate, Cargo treats a minor bump (e.g. 0.12 -> 0.13) as BREAKING, so these rely on CI catching the break. If a 0.x minor ever lands something CI cannot see, tighten this to patch-only or add matchCurrentVersion: '>=1.0.0'."
+      "description": "Minor bumps automerge on green CI — but only for crates already at 1.0 or later, where a minor is genuinely backwards-compatible under semver. This is the `matchCurrentVersion` the earlier note here recommended, applied 2026-07-30 after an automerge-eligible portable-pty 0.8 -> 0.9 landed PSUEDOCONSOLE_INHERIT_CURSOR and stalled every Windows pane. 0.x minors are handled by the next rule."
+    },
+    {
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor"],
+      "matchCurrentVersion": "<1.0.0",
+      "automerge": false,
+      "labels": ["dependencies", "manual-review"],
+      "description": "A 0.x minor is a BREAKING change as far as Cargo is concerned (0.8 -> 0.9 is not compatible), so it is a major in everything but Renovate's label. Held for a human, matching the intent 'automerge anything that is not a major'. Stated as its own rule rather than left to the default so the intent is explicit and labelled: portable-pty 0.9.0 reached main through exactly this gap."
+    },
+    {
+      "matchPackageNames": ["portable-pty"],
+      "enabled": false,
+      "description": "Renovate ignores this crate entirely: no PRs, and no Dependency Dashboard entry to remember to check. portable-pty is held at =0.8.1 deliberately (see the Cargo.toml comment): 0.9.0 sets PSUEDOCONSOLE_INHERIT_CURSOR, so ConPTY withholds a Windows pane's output until a terminal answers ESC[6n, stalling every pane. Renovate re-proposed 0.9.0 within minutes of the v0.35.1 release; a standing PR for a pin held on purpose is pure noise, and the unpin is gated on a PRODUCT decision (native Windows support), not on a version becoming available — so no dependency bot can know when the time is right. Safe to silence because the `security` CI job runs `cargo audit` on every PR and every push to main, so a vulnerability in this crate surfaces there regardless of Renovate. The reminder to revisit lives in the Cargo.toml comment and the tracking issue, i.e. where the Windows decision will actually be made."
     },
     {
       "matchManagers": ["devbox"],
@@ -59,7 +73,7 @@
       "automergeType": "pr"
     },
     {
-      "matchPackageNames": ["crossterm", "futures-util", "insta", "portable-pty"],
+      "matchPackageNames": ["crossterm", "futures-util", "insta"],
       "automerge": false,
       "labels": ["dependencies", "manual-review"],
       "description": "Deliberate EXACT pins in Cargo.toml, never automerged. crossterm's pin is load-bearing: `ui::ctrl_c0_byte` documents crossterm 0.28.1's decoder behaviour and `keyevent_ctrl_c0_matches_crossterm_decoder` guards it (PRD #227). See also #242 (crossterm 0.28.1 + 0.29.0 coexist because ratatui 0.30 pulls 0.29 via ratatui-crossterm). portable-pty is pinned at =0.8.1 because 0.9.0 sets PSUEDOCONSOLE_INHERIT_CURSOR, which makes ConPTY withhold a Windows pane's output until a terminal answers ESC[6n — see the Cargo.toml comment. WITHOUT this entry a 0.8 -> 0.9 bump counts as a `minor` for the cargo rule above and would AUTOMERGE, silently reintroducing the stall; that is how 0.9.0 landed the first time."
