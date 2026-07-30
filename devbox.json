@@ -3,7 +3,7 @@
   "packages": [
     "vals@0.44.5",
     "go-task@3.48.0",
-    "kubernetes-helm@3.20.2",
+    "kubernetes-helm@4.2.3",
     "git@2.55.0",
     "upcloud-cli@3.29.0",
     "gh@2.96.0",
