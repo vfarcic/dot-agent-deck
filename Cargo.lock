@@ -609,7 +609,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "vt100",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "xtask-docs",
 ]
 

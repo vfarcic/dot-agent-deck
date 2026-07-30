@@ -87,7 +87,7 @@ libc = "0.2"
 # are declared here so the `#[cfg(windows)]` backends under `src/platform/`
 # have them available; the real implementations land in PRD #163.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Pipes",
     "Win32_System_Threading",
