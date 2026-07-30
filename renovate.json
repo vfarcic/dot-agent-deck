@@ -59,10 +59,10 @@
       "automergeType": "pr"
     },
     {
-      "matchPackageNames": ["crossterm", "futures-util", "insta"],
+      "matchPackageNames": ["crossterm", "futures-util", "insta", "portable-pty"],
       "automerge": false,
       "labels": ["dependencies", "manual-review"],
-      "description": "Deliberate EXACT pins in Cargo.toml, never automerged. crossterm's pin is load-bearing: `ui::ctrl_c0_byte` documents crossterm 0.28.1's decoder behaviour and `keyevent_ctrl_c0_matches_crossterm_decoder` guards it (PRD #227). See also #242 (crossterm 0.28.1 + 0.29.0 coexist because ratatui 0.30 pulls 0.29 via ratatui-crossterm)."
+      "description": "Deliberate EXACT pins in Cargo.toml, never automerged. crossterm's pin is load-bearing: `ui::ctrl_c0_byte` documents crossterm 0.28.1's decoder behaviour and `keyevent_ctrl_c0_matches_crossterm_decoder` guards it (PRD #227). See also #242 (crossterm 0.28.1 + 0.29.0 coexist because ratatui 0.30 pulls 0.29 via ratatui-crossterm). portable-pty is pinned at =0.8.1 because 0.9.0 sets PSUEDOCONSOLE_INHERIT_CURSOR, which makes ConPTY withhold a Windows pane's output until a terminal answers ESC[6n — see the Cargo.toml comment. WITHOUT this entry a 0.8 -> 0.9 bump counts as a `minor` for the cargo rule above and would AUTOMERGE, silently reintroducing the stall; that is how 0.9.0 landed the first time."
     },
     {
       "matchUpdateTypes": ["major"],
