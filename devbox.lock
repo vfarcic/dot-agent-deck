@@ -135,87 +135,87 @@
         }
       }
     },
-    "cargo@1.97.0": {
-      "last_modified": "2026-07-23T05:10:05Z",
-      "resolved": "github:NixOS/nixpkgs/7525d999cd850b9a488817abc89c75dc733acf17#cargo",
+    "cargo@1.97.1": {
+      "last_modified": "2026-08-01T16:34:20Z",
+      "resolved": "github:NixOS/nixpkgs/a5cbcfe954791221bfffe2307f7d1a1bf61a871e#cargo",
       "source": "devbox-search",
-      "version": "1.97.0",
+      "version": "1.97.1",
       "systems": {
         "aarch64-darwin": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/dl8ydfqs2ilm1p26baiqi6zh68jxsyii-cargo-1.97.0",
+              "path": "/nix/store/qxkwknjc7vxn3bgikxkpf0bzz76w1cwi-cargo-1.97.1",
               "default": true
             }
           ],
-          "store_path": "/nix/store/dl8ydfqs2ilm1p26baiqi6zh68jxsyii-cargo-1.97.0"
+          "store_path": "/nix/store/qxkwknjc7vxn3bgikxkpf0bzz76w1cwi-cargo-1.97.1"
         },
         "aarch64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/lp3dyvgayzmnc1zdml5sq6iazfysd0az-cargo-1.97.0",
+              "path": "/nix/store/5a10b0byalr42xpsyklzmrsfgnknqjw6-cargo-1.97.1",
               "default": true
             }
           ],
-          "store_path": "/nix/store/lp3dyvgayzmnc1zdml5sq6iazfysd0az-cargo-1.97.0"
+          "store_path": "/nix/store/5a10b0byalr42xpsyklzmrsfgnknqjw6-cargo-1.97.1"
         },
         "x86_64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/l7v00m55rb130bhql2kr74pq8sdpl41c-cargo-1.97.0",
+              "path": "/nix/store/k72ws5y5hqp187dasmnfikm0hz5xy432-cargo-1.97.1",
               "default": true
             }
           ],
-          "store_path": "/nix/store/l7v00m55rb130bhql2kr74pq8sdpl41c-cargo-1.97.0"
+          "store_path": "/nix/store/k72ws5y5hqp187dasmnfikm0hz5xy432-cargo-1.97.1"
         }
       }
     },
-    "clippy@1.97.0": {
-      "last_modified": "2026-07-23T05:10:05Z",
-      "resolved": "github:NixOS/nixpkgs/7525d999cd850b9a488817abc89c75dc733acf17#clippy",
+    "clippy@1.97.1": {
+      "last_modified": "2026-08-01T16:34:20Z",
+      "resolved": "github:NixOS/nixpkgs/a5cbcfe954791221bfffe2307f7d1a1bf61a871e#clippy",
       "source": "devbox-search",
-      "version": "1.97.0",
+      "version": "1.97.1",
       "systems": {
         "aarch64-darwin": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/i5y5jzjqgh0gab9bqnyma663nf5v1n1i-clippy-1.97.0",
+              "path": "/nix/store/jd8916d32g8q2121jk1nn52bgw3b9p7i-clippy-1.97.1",
               "default": true
             }
           ],
-          "store_path": "/nix/store/i5y5jzjqgh0gab9bqnyma663nf5v1n1i-clippy-1.97.0"
+          "store_path": "/nix/store/jd8916d32g8q2121jk1nn52bgw3b9p7i-clippy-1.97.1"
         },
         "aarch64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/sscvmgv3chk0h6rmipxa9pm7smp89lqh-clippy-1.97.0",
+              "path": "/nix/store/rwfvqb9xf5m3bs26a4m0pajfhblc03mb-clippy-1.97.1",
               "default": true
             },
             {
               "name": "debug",
-              "path": "/nix/store/wzy2b0mn26f8z5yyds4r094mr53dx4x8-clippy-1.97.0-debug"
+              "path": "/nix/store/714wnsshwkmxp77rxrjmjqisbjdiibvr-clippy-1.97.1-debug"
             }
           ],
-          "store_path": "/nix/store/sscvmgv3chk0h6rmipxa9pm7smp89lqh-clippy-1.97.0"
+          "store_path": "/nix/store/rwfvqb9xf5m3bs26a4m0pajfhblc03mb-clippy-1.97.1"
         },
         "x86_64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/bijimpgbih6bwc8sykr5fijcjim2qfgr-clippy-1.97.0",
+              "path": "/nix/store/lav2qs01gd9v1j2msbky6dilasayv104-clippy-1.97.1",
               "default": true
             },
             {
               "name": "debug",
-              "path": "/nix/store/b5v9zhindmwznbqhy5jpnk93bqnq0x1z-clippy-1.97.0-debug"
+              "path": "/nix/store/6wjjjrk8xv9lwp9ird2gppdzvvjzlwyj-clippy-1.97.1-debug"
             }
           ],
-          "store_path": "/nix/store/bijimpgbih6bwc8sykr5fijcjim2qfgr-clippy-1.97.0"
+          "store_path": "/nix/store/lav2qs01gd9v1j2msbky6dilasayv104-clippy-1.97.1"
         }
       }
     },
@@ -741,107 +741,107 @@
         }
       }
     },
-    "rustc@1.97.0": {
-      "last_modified": "2026-07-23T05:10:05Z",
+    "rustc@1.97.1": {
+      "last_modified": "2026-08-01T16:34:20Z",
       "plugin_version": "0.0.1",
-      "resolved": "github:NixOS/nixpkgs/7525d999cd850b9a488817abc89c75dc733acf17#rustc",
+      "resolved": "github:NixOS/nixpkgs/a5cbcfe954791221bfffe2307f7d1a1bf61a871e#rustc",
       "source": "devbox-search",
-      "version": "1.97.0",
+      "version": "1.97.1",
       "systems": {
         "aarch64-darwin": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/zc86y3qlir5sz52wwfsxgibgbvr9zvfs-rustc-wrapper-1.97.0",
+              "path": "/nix/store/30vxq1swhjzrxq29mvzhf0b4xcvqmzds-rustc-wrapper-1.97.1",
               "default": true
             },
             {
               "name": "man",
-              "path": "/nix/store/nl5i76zrhnvdv96m10gvllcw1cibx3kf-rustc-wrapper-1.97.0-man",
+              "path": "/nix/store/6xcrb8jy3dgy5xmiqa0amq7v02vjsc7p-rustc-wrapper-1.97.1-man",
               "default": true
             },
             {
               "name": "doc",
-              "path": "/nix/store/pc05v0bvacr9bnsvddrf0md37zkj29dj-rustc-wrapper-1.97.0-doc"
+              "path": "/nix/store/288kqi06y566q39csv4n9p1kxhvaizka-rustc-wrapper-1.97.1-doc"
             }
           ],
-          "store_path": "/nix/store/zc86y3qlir5sz52wwfsxgibgbvr9zvfs-rustc-wrapper-1.97.0"
+          "store_path": "/nix/store/30vxq1swhjzrxq29mvzhf0b4xcvqmzds-rustc-wrapper-1.97.1"
         },
         "aarch64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/zbjqiyva7jjqb2m8drxj17306zkn0lmc-rustc-wrapper-1.97.0",
+              "path": "/nix/store/bda3jw7479qjdsbfzawki0742yrlj0nj-rustc-wrapper-1.97.1",
               "default": true
             },
             {
               "name": "man",
-              "path": "/nix/store/cng3lybfqzr10wzpdxmsb236magpb4nk-rustc-wrapper-1.97.0-man",
+              "path": "/nix/store/q1n5pbzblksxq0dy037wqx6rnjc3lxw3-rustc-wrapper-1.97.1-man",
               "default": true
             },
             {
               "name": "doc",
-              "path": "/nix/store/sq2qc9vlxybv30nw13n29rlia1fz52lv-rustc-wrapper-1.97.0-doc"
+              "path": "/nix/store/zzc8w4yf4z4bkx2aypl7hlany6f5kqys-rustc-wrapper-1.97.1-doc"
             }
           ],
-          "store_path": "/nix/store/zbjqiyva7jjqb2m8drxj17306zkn0lmc-rustc-wrapper-1.97.0"
+          "store_path": "/nix/store/bda3jw7479qjdsbfzawki0742yrlj0nj-rustc-wrapper-1.97.1"
         },
         "x86_64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/h6c2mbpmxih3mfadhvl6jzf090n419yv-rustc-wrapper-1.97.0",
+              "path": "/nix/store/gf0kxr0014wbjmx5sh4mfjn83yabxkhw-rustc-wrapper-1.97.1",
               "default": true
             },
             {
               "name": "man",
-              "path": "/nix/store/kpynwsfikb91k3i4jyvj8ggz68p2hfai-rustc-wrapper-1.97.0-man",
+              "path": "/nix/store/m14lki6gnq3klp6z1vhwzrscvvhg3hpz-rustc-wrapper-1.97.1-man",
               "default": true
             },
             {
               "name": "doc",
-              "path": "/nix/store/q2nc6mlp8yivnyxr6cg8m71nahrnjgdg-rustc-wrapper-1.97.0-doc"
+              "path": "/nix/store/8iads8jv6j40bkhal548jf6d964kv35a-rustc-wrapper-1.97.1-doc"
             }
           ],
-          "store_path": "/nix/store/h6c2mbpmxih3mfadhvl6jzf090n419yv-rustc-wrapper-1.97.0"
+          "store_path": "/nix/store/gf0kxr0014wbjmx5sh4mfjn83yabxkhw-rustc-wrapper-1.97.1"
         }
       }
     },
-    "rustfmt@1.97.0": {
-      "last_modified": "2026-07-23T05:10:05Z",
-      "resolved": "github:NixOS/nixpkgs/7525d999cd850b9a488817abc89c75dc733acf17#rustfmt",
+    "rustfmt@1.97.1": {
+      "last_modified": "2026-08-01T16:34:20Z",
+      "resolved": "github:NixOS/nixpkgs/a5cbcfe954791221bfffe2307f7d1a1bf61a871e#rustfmt",
       "source": "devbox-search",
-      "version": "1.97.0",
+      "version": "1.97.1",
       "systems": {
         "aarch64-darwin": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/8h81rjmqzngdy0x7myvf88b82h9brg71-rustfmt-1.97.0",
+              "path": "/nix/store/wsh1i4q2zaxm9p9r1zg13rgwf01rg822-rustfmt-1.97.1",
               "default": true
             }
           ],
-          "store_path": "/nix/store/8h81rjmqzngdy0x7myvf88b82h9brg71-rustfmt-1.97.0"
+          "store_path": "/nix/store/wsh1i4q2zaxm9p9r1zg13rgwf01rg822-rustfmt-1.97.1"
         },
         "aarch64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/1294vmf2lv5f68y70r4zydis60g4z34x-rustfmt-1.97.0",
+              "path": "/nix/store/6xqc9q52b8ynry520950b2kbqwh84svj-rustfmt-1.97.1",
               "default": true
             }
           ],
-          "store_path": "/nix/store/1294vmf2lv5f68y70r4zydis60g4z34x-rustfmt-1.97.0"
+          "store_path": "/nix/store/6xqc9q52b8ynry520950b2kbqwh84svj-rustfmt-1.97.1"
         },
         "x86_64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/i7qpcas4xd1kz9k98yh2c0w8ld0x288b-rustfmt-1.97.0",
+              "path": "/nix/store/96b7jb9ybpb4nhbg6ivrmm11a3gvhwqr-rustfmt-1.97.1",
               "default": true
             }
           ],
-          "store_path": "/nix/store/i7qpcas4xd1kz9k98yh2c0w8ld0x288b-rustfmt-1.97.0"
+          "store_path": "/nix/store/96b7jb9ybpb4nhbg6ivrmm11a3gvhwqr-rustfmt-1.97.1"
         }
       }
     },
