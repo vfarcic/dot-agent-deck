@@ -29,9 +29,15 @@ Warm, this completes in about five seconds; cold, about fifteen.
 
 Because the shims produce deliberately unusable native libraries, the script hardcodes the `check` subcommand. Do not repoint it at `build` or `test` — those link, and would link against garbage.
 
-### If it breaks again
+### Why CI runs this too
 
-It rotted once already, silently, for exactly one reason: **nothing in CI runs this script.** `build-windows` compiles natively on `windows-latest` and never invokes it, so a change to the dependency graph can take the local check out without any red anywhere. #269 (reqwest 0.13, which swapped rustls' provider from `ring` to `aws-lc-rs`) did precisely that, and it went unnoticed until #368 diagnosed it. If a future dependency bump pulls in another native library that the shims do not cover, the failure will again look like a wall of C errors from a crate you have never heard of — the tell is that the compiler being invoked is plain `gcc` and the target is Windows. Fix it at the shim, not by trusting the red.
+It rotted once, silently, for exactly one reason: **nothing in CI ran this script.** `build-windows` compiles natively on `windows-latest` and never invokes it, so a dependency-graph change could take the local check out with no red anywhere. #269 (reqwest 0.13, which swapped rustls' provider from `ring` to `aws-lc-rs`) did precisely that, and it went unnoticed until #368 diagnosed it.
+
+So `ci.yml` now has a `windows-cross-check` job that runs this script on `ubuntu-latest`. It is **not** a second Windows code gate — `build-windows` owns that and does it properly, with a real build, clippy and tests on a real Windows runner. This job answers one question: *does the script itself still work?* It runs in parallel and the critical path is `build-macos`, so it costs roughly no wall-clock. Same reasoning as the `cargo xtask linkage-check` step, added after that check sat red on `main` unnoticed because it only ever ran by hand.
+
+That job needs neither an MSVC toolchain nor devbox: the shims *supply* a toolchain rather than merely overriding devbox's `CC`/`AR` exports, so the script also works on a bare machine with both unset.
+
+If a future dependency bump pulls in another native library the shims do not cover, that job goes red and the failure will look like a wall of C errors from a crate you have never heard of. The tell is that the compiler being invoked is plain `gcc` while the target is Windows. Fix it at the shim.
 
 ## Reading the result
 

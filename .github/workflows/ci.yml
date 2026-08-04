@@ -143,6 +143,51 @@ jobs:
       # it only ever ran when somebody invoked it by hand.
       - run: cargo xtask linkage-check
 
+  # Issue #368 — run the LOCAL Windows pre-PR gate in CI, for one reason only:
+  # so that it cannot rot again. `scripts/windows-cross-check.sh` had been
+  # failing on every branch, bare `main` included, ever since #269 moved rustls
+  # onto its `aws-lc-rs` provider, whose build script compiles ~600 C files that
+  # a Linux host cannot cross-compile. Nothing noticed for months, because
+  # nothing in CI ran the script — `build-windows` compiles natively and never
+  # invokes it.
+  #
+  # This is NOT a second Windows code gate. `build-windows` below owns that and
+  # does it properly (real build + clippy + tests on a real Windows runner).
+  # This job answers a different question: *does the script itself still work?*
+  # A dependency bump can pull in another native library and break it without
+  # breaking anything else, and the breakage is then seen only by whoever next
+  # runs /verify-pr — who pays for a fresh diagnosis and learns to ignore the
+  # step. Exactly the reasoning behind the `cargo xtask linkage-check` step
+  # above, which was added after linkage-check sat red on main unnoticed because
+  # it only ever ran when somebody invoked it by hand.
+  #
+  # Cheap: it runs in parallel, and the critical path is build-macos, so it adds
+  # ~0 wall-clock. It needs neither an MSVC toolchain (the script shims cc and
+  # lib.exe, and `cargo check` never links) nor devbox — the shims supply the
+  # toolchain rather than merely overriding devbox's CC/AR exports, so a bare
+  # runner with CC and AR unset is enough (verified).
+  windows-cross-check:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Type-check the workspace for Windows from Linux
+        run: |
+          set -euo pipefail
+          # Resolve the toolchain directory instead of trusting the script's
+          # local-machine default: the name here is whatever
+          # dtolnay/rust-toolchain resolved `stable` to, which need not be
+          # literally `stable-*`.
+          WINDOWS_CROSS_CHECK_TOOLCHAIN="$(rustup show home)/toolchains/$(rustup show active-toolchain | cut -d' ' -f1)"
+          export WINDOWS_CROSS_CHECK_TOOLCHAIN
+          echo "toolchain: $WINDOWS_CROSS_CHECK_TOOLCHAIN"
+          scripts/windows-cross-check.sh
+
   # PRD #42 M8 — native Windows (x86_64-pc-windows-msvc) compile + clippy +
   # unit-test gate, running parallel to the Linux `build` job so a Windows-only
   # break is visible independently. Uses rustup via dtolnay/rust-toolchain (the
