@@ -184,11 +184,28 @@ global_job_config:
       # silently-cold cache, hence the one source of truth.
       - export CARGO_HOME="$(bash .semaphore/ci.sh cargo-home)"
       - bash .semaphore/ci.sh bootstrap
+      # TEMPORARY SCAFFOLDING, AND THE SCRIPT SAYS SO TOO. This pipeline cannot
+      # be observed from a development machine — no Semaphore access there, and
+      # every attempt costs a real push — and its first real run failed with logs
+      # nobody could read. So this step prints what the installer actually left
+      # on disk IMMEDIATELY BEFORE the unguarded `source` on the next line, which
+      # is the most likely thing to have killed that run. It is pure observation
+      # and returns 0 whatever it finds, so it cannot fail a job. TRIM IT once a
+      # green run has proved the bootstrap; otherwise it is permanent noise at
+      # the head of every job on both platforms. Full argument, and what it
+      # deliberately does NOT do, is above `cmd_diagnose_nix_env` in ci.sh.
+      - bash .semaphore/ci.sh diagnose-nix-env
       # The bootstrap ran in its own shell, so the PATH and NIX_REMOTE it
       # exported died with it. Re-establish them in the shell the job's own
       # commands run in. `nix-daemon.sh` ships inside the `nix` package itself,
       # so it is present after any multi-user install on either platform, and
       # it is what points a non-root client at the daemon.
+      #
+      # DELIBERATELY UNGUARDED. If this path is wrong, every job dies here — and
+      # that is the intended behaviour, because the alternative (skip the source
+      # when the file is missing) only moves the failure to `devbox run` with nix
+      # off PATH. The diagnostic step above exists so that this failure is
+      # self-explaining rather than opaque.
       - . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
       # Where ci.sh puts the pinned devbox binary. A directory the agent user
       # owns, so nothing had to be `sudo`-placed in /usr/local/bin.

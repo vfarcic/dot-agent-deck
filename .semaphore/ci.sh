@@ -75,6 +75,13 @@
 # `nix-daemon.sh`, or realising the devbox environment on a real agent. It is
 # written against documented behaviour, deliberately preferring boring constructs
 # over clever ones; expect the next run to still need fixes.
+#
+# Which is why the `diagnose-nix-env` subcommand exists — a TEMPORARY step the
+# prologue runs between the bootstrap and the unguarded `nix-daemon.sh` source,
+# so that the next failure comes with the evidence needed to fix it instead of
+# costing another push. Read the comment above `cmd_diagnose_nix_env` before
+# either extending it or deleting it; deleting it once the bootstrap is green is
+# the intended end state.
 # =============================================================================
 
 set -euo pipefail
@@ -82,6 +89,14 @@ set -euo pipefail
 # Where the nix binaries land in a multi-user (daemon) install, on both Linux
 # and macOS.
 NIX_BIN="/nix/var/nix/profiles/default/bin"
+
+# The profile script a multi-user install leaves behind, which is what points a
+# non-root client at the daemon. ONE constant because two things read it —
+# `load_nix_env` sources it, `cmd_diagnose_nix_env` reports on it — and a
+# diagnostic that reports on a *different* path than the code uses is worse than
+# no diagnostic. semaphore.yml necessarily spells the same path out a third time,
+# inline in the prologue; that copy is the thing being diagnosed.
+NIX_PROFILE_SCRIPT="/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh"
 
 # ---------------------------------------------------------------------------
 # Pinned installers
@@ -438,12 +453,215 @@ install_nix() {
 # and at the CA bundle. Guarded with `if`, not `&&`: under `set -e` a failing
 # `[ -f … ] && …` would end the script rather than skip the source.
 load_nix_env() {
-  local profile="/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh"
-  if [ -f "$profile" ]; then
+  if [ -f "$NIX_PROFILE_SCRIPT" ]; then
     # shellcheck disable=SC1090
-    . "$profile"
+    . "$NIX_PROFILE_SCRIPT"
   fi
   export PATH="$NIX_BIN:$PATH"
+}
+
+# ---------------------------------------------------------------------------
+# diagnose-nix-env — WHY THIS STEP EXISTS AND WHEN TO DELETE IT
+# ---------------------------------------------------------------------------
+#
+# THIS IS TEMPORARY SCAFFOLDING, NOT A FEATURE. It exists because this pipeline
+# cannot be observed from a development machine: there is no Semaphore access
+# here, every attempt costs a real push, and the first real run failed with logs
+# nobody could read. So the next run has to explain itself rather than buy one
+# more round trip.
+#
+# WHAT IT IS AIMED AT. semaphore.yml's prologue sources `$NIX_PROFILE_SCRIPT`
+# UNGUARDED, immediately after the bootstrap. If the installer does not leave a
+# file at exactly that path, that line kills every job on both platforms right
+# after the bootstrap step — which is the single most likely reading of "it
+# failed and we cannot see why". This step runs IMMEDIATELY BEFORE that line and
+# prints what the installer actually left on disk, so the failure arrives with
+# its own explanation attached.
+#
+# WHAT IT DELIBERATELY DOES NOT DO. It does not guard the source line, does not
+# fall back to another profile path, and does not repair anything. Guarding
+# alone would only move the failure to `devbox run` with nix off PATH — one
+# opaque failure traded for another. Diagnosing and repairing are separate jobs
+# and this is the first one.
+#
+# IT MUST NOT FAIL THE JOB. Everything below is pure observation, so errexit is
+# turned OFF for the body and the function returns 0 unconditionally. That is
+# the opposite of the rule everywhere else in this file — in the cache path a
+# swallowed error is how a corrupt archive becomes indistinguishable from a miss
+# — and it is correct only because nothing here decides anything.
+#
+# TRIM IT ONCE THE BOOTSTRAP IS PROVEN. A permanent forty-line dump at the head
+# of every job on both platforms is noise, and noise is what stops being read.
+# When a green run has shown where the profile lives and that the daemon is up,
+# cut this to the two or three lines that turned out to matter, or delete the
+# subcommand and its prologue line outright.
+diag() { printf '   %s\n' "$*"; }
+
+# Indent a command's combined output under its label, so a multi-line probe
+# stays visually attached to the question it answers.
+diag_out() { sed 's/^/      /'; }
+
+cmd_diagnose_nix_env() {
+  # See the comment block above: observation only, so a probe that fails is a
+  # result, not an error. `set -u` stays on, hence `${VAR:-}` throughout.
+  set +e
+
+  log "nix-env diagnostics (temporary — see the comment above cmd_diagnose_nix_env)"
+
+  diag "uname -a:"
+  uname -a 2>&1 | diag_out
+  diag "whoami: $(whoami 2>&1)   id: $(id 2>&1)"
+  # Distinguished on purpose: "no sudo binary" and "sudo refuses without a
+  # password" are different diagnoses, and the installer escalates itself, so
+  # either one is fatal to the bootstrap in a different way.
+  if ! command -v sudo >/dev/null 2>&1; then
+    diag "sudo: NOT INSTALLED — the nix installer escalates itself and needs it"
+  elif sudo -n true 2>/dev/null; then
+    diag "sudo -n true: OK (passwordless escalation available)"
+  else
+    diag "sudo -n true: FAILED — no passwordless escalation for $(whoami 2>&1)"
+  fi
+
+  # An explicit allowlist, NOT `env | grep SEMAPHORE_`: Semaphore puts cache and
+  # registry credentials in that same namespace (SEMAPHORE_CACHE_USERNAME,
+  # SEMAPHORE_REGISTRY_PASSWORD, ...), and this output is meant to be pasted
+  # into a chat window.
+  diag "SEMAPHORE_AGENT_MACHINE_TYPE='${SEMAPHORE_AGENT_MACHINE_TYPE:-}'"
+  diag "SEMAPHORE_AGENT_MACHINE_OS_IMAGE='${SEMAPHORE_AGENT_MACHINE_OS_IMAGE:-}'"
+  diag "SEMAPHORE_AGENT_MACHINE_ENVIRONMENT_TYPE='${SEMAPHORE_AGENT_MACHINE_ENVIRONMENT_TYPE:-}'"
+  diag "SEMAPHORE_GIT_REF_TYPE='${SEMAPHORE_GIT_REF_TYPE:-}'"
+  diag "SEMAPHORE_GIT_BRANCH='${SEMAPHORE_GIT_BRANCH:-}'"
+  diag "SEMAPHORE_GIT_REF='${SEMAPHORE_GIT_REF:-}'"
+  diag "SEMAPHORE_GIT_PR_NUMBER='${SEMAPHORE_GIT_PR_NUMBER:-}'"
+  # `is_trusted_ref` was argued from the docs; this line checks it against
+  # reality, and says whether this run would have written the cache at all.
+  if is_trusted_ref; then
+    diag "is_trusted_ref: YES — this run WOULD store into the '$CACHE_NS' namespace"
+  else
+    diag "is_trusted_ref: no — this run restores read-only and stores nothing"
+  fi
+
+  # The devbox closure is 4.4 GiB unpacked on x86_64-linux. Recording the free
+  # space removes "the agent ran out of disk" from the suspect list for good.
+  diag "df -h (checkout, /, and /nix if it exists):"
+  if [ -e /nix ]; then
+    # One invocation so the mounts share a header — and on macOS this is where a
+    # separate /nix APFS volume shows up as its own line.
+    df -h "$PWD" / /nix 2>&1 | diag_out
+  else
+    df -h "$PWD" / 2>&1 | diag_out
+  fi
+
+  if [ -e /nix ]; then
+    diag "/nix exists:"
+    ls -ld /nix 2>&1 | diag_out
+    # Same substring on both platforms: Linux prints
+    # `/dev/sda1 on /nix type ext4 (...)`, macOS `/dev/disk3s7 on /nix (apfs, ...)`.
+    # The macOS line is also how the separate APFS volume announces itself.
+    local mnt
+    mnt="$(mount 2>/dev/null | grep ' on /nix ')"
+    if [ -n "$mnt" ]; then
+      diag "/nix mount entry:"
+      printf '%s\n' "$mnt" | diag_out
+    else
+      diag "/nix is not a mount point (no 'on /nix' entry in mount output)"
+    fi
+  else
+    diag "/nix DOES NOT EXIST"
+  fi
+
+  # The highest-value lines in this whole step: what the installer actually left
+  # in the profile.d directory, rather than a yes/no on one guessed filename.
+  # Both spellings on purpose — `ls -ld <dir>` names the directory and resolves a
+  # symlink to the store, `ls -la <dir>/` (trailing slash) lists what is IN it.
+  #
+  # Ancestor walk done with `${var%/*}` rather than `dirname`: it terminates by
+  # construction and needs no external command, so a stripped PATH cannot turn a
+  # diagnostic into a hang.
+  local prof_dir probe
+  prof_dir="${NIX_PROFILE_SCRIPT%/*}"
+  if [ -d "$prof_dir" ]; then
+    diag "$prof_dir:"
+    ls -ld "$prof_dir" 2>&1 | diag_out
+    diag "$prof_dir/ contents:"
+    ls -la "$prof_dir/" 2>&1 | diag_out
+  else
+    diag "$prof_dir DOES NOT EXIST"
+    probe="$prof_dir"
+    while [ -n "$probe" ] && [ ! -e "$probe" ]; do
+      probe="${probe%/*}"
+    done
+    [ -n "$probe" ] || probe="/"
+    diag "deepest existing ancestor: $probe"
+    ls -ld "$probe" 2>&1 | diag_out
+    if [ -d "$probe" ]; then
+      ls -la "$probe/" 2>&1 | diag_out
+    fi
+  fi
+
+  # The exact path semaphore.yml sources unguarded.
+  if [ -f "$NIX_PROFILE_SCRIPT" ]; then
+    diag "$NIX_PROFILE_SCRIPT: present"
+    ls -l "$NIX_PROFILE_SCRIPT" 2>&1 | diag_out
+  else
+    diag "$NIX_PROFILE_SCRIPT: ABSENT — the prologue's unguarded 'source' of this"
+    diag "   path is the next thing to run, and it will kill this job."
+  fi
+
+  local nix_path
+  nix_path="$(command -v nix 2>/dev/null)"
+  if [ -n "$nix_path" ]; then
+    diag "nix on PATH: $nix_path ($(nix --version 2>&1 | head -n 1))"
+  else
+    diag "nix: NOT on PATH"
+  fi
+  if [ -x "$NIX_BIN/nix" ]; then
+    diag "$NIX_BIN/nix: present ($("$NIX_BIN/nix" --version 2>&1 | head -n 1))"
+  else
+    diag "$NIX_BIN/nix: absent"
+  fi
+  diag "PATH=$PATH"
+  diag "NIX_REMOTE='${NIX_REMOTE:-}'"
+
+  local sock="/nix/var/nix/daemon-socket/socket"
+  if [ -S "$sock" ]; then
+    diag "daemon socket: present ($sock)"
+  elif [ -e "$sock" ]; then
+    diag "daemon socket: $sock exists but is NOT a socket"
+  else
+    diag "daemon socket: absent ($sock)"
+  fi
+  # Whichever service manager this platform has; neither being present is a
+  # legitimate answer, not a failure.
+  if command -v systemctl >/dev/null 2>&1; then
+    diag "systemctl is-active nix-daemon.socket:  $(systemctl is-active nix-daemon.socket 2>&1)"
+    diag "systemctl is-active nix-daemon.service: $(systemctl is-active nix-daemon.service 2>&1)"
+  elif command -v launchctl >/dev/null 2>&1; then
+    diag "launchctl print system/org.nixos.nix-daemon:"
+    launchctl print system/org.nixos.nix-daemon 2>&1 | head -n 3 | diag_out
+  else
+    diag "no systemctl and no launchctl — service status not probed"
+  fi
+
+  # Determinate's installer does not write a log file; what it does leave is an
+  # install receipt, and macOS additionally gets the daemon's launchd stderr.
+  # These are CANDIDATES that are reported if present, not paths assumed to exist.
+  local artefact found=0
+  for artefact in /nix/receipt.json /nix/nix-installer /var/log/nix-daemon.log; do
+    if [ -e "$artefact" ]; then
+      found=1
+      diag "installer artefact:"
+      ls -l "$artefact" 2>&1 | diag_out
+    fi
+  done
+  if [ "$found" -eq 0 ]; then
+    diag "no installer artefact at any of: /nix/receipt.json /nix/nix-installer /var/log/nix-daemon.log"
+  fi
+
+  log "end nix-env diagnostics"
+
+  set -e
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -915,11 +1133,14 @@ cmd_save_cargo_target_cache() {
 case "${1:-}" in
   cargo-home) cargo_home_abs ;;
   bootstrap) cmd_bootstrap ;;
+  # Temporary. See the comment above `cmd_diagnose_nix_env`, including when to
+  # delete this arm again.
+  diagnose-nix-env) cmd_diagnose_nix_env ;;
   restore-cargo-cache) cmd_restore_cargo_cache ;;
   save-cargo-cache) cmd_save_cargo_cache ;;
   save-cargo-target-cache) cmd_save_cargo_target_cache ;;
   *)
-    echo "usage: $0 <cargo-home|bootstrap|restore-cargo-cache|save-cargo-cache|save-cargo-target-cache>" >&2
+    echo "usage: $0 <cargo-home|bootstrap|diagnose-nix-env|restore-cargo-cache|save-cargo-cache|save-cargo-target-cache>" >&2
     exit 2
     ;;
 esac
