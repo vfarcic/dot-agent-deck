@@ -204,14 +204,13 @@ fn write_recorder_agent(project_dir: &Path, role: &str) -> String {
         .to_string()
 }
 
-/// Scenario: Stage a `session.toml` describing two dashboard panes
-/// (`restored-alpha`, `restored-beta`, both `sleep 600`) at the path
-/// `DOT_AGENT_DECK_SESSION` points to, then launch the deck against a fresh
-/// (empty) daemon with NO `--continue` flag. Auto-restore must recreate both
-/// saved panes as dashboard cards without any flag. RED today: the snapshot
-/// load is gated behind `if continue_session` in `run_tui`, so with no flag the
-/// block never runs and neither saved pane appears — the dashboard stays at
-/// "No active sessions".
+/// Scenario: Stage a `session.toml` describing two dashboard panes (`r-alpha`,
+/// `r-beta`, both `sleep 600`) at the path `DOT_AGENT_DECK_SESSION` points to,
+/// then launch the deck against a fresh (empty) daemon with NO `--continue`
+/// flag. Auto-restore must recreate both saved panes as dashboard cards, under
+/// their saved names, without any flag — the snapshot load in `run_tui` is
+/// unconditional since PRD #89 Phase 2, so a dashboard still reading "No active
+/// sessions" (or showing only one of the two) is a regression.
 #[spec("session/restore/001")]
 #[test]
 fn restore_001_no_flag_startup_restores_panes_from_snapshot() {
@@ -224,10 +223,7 @@ fn restore_001_no_flag_startup_restores_panes_from_snapshot() {
     stage_session_snapshot(
         &session_file,
         session_dir.path(),
-        &[
-            ("restored-alpha", "sleep 600"),
-            ("restored-beta", "sleep 600"),
-        ],
+        &[("r-alpha", "sleep 600"), ("r-beta", "sleep 600")],
     );
 
     // No `--continue` — `launch_with_fixture` only passes the flag when a
@@ -241,18 +237,31 @@ fn restore_001_no_flag_startup_restores_panes_from_snapshot() {
         )
         .launch_with_fixture("modes");
 
-    // After Phase 2, both saved panes auto-restore as dashboard cards. Their
-    // saved names appear in the card title rows (e.g. "1 restored-alpha").
+    // After Phase 2, both saved panes auto-restore as dashboard cards, and both
+    // names must be readable on the cards themselves.
+    //
+    // The names are deliberately SHORT. Cards render `<type> · <name>` and the
+    // dashboard truncates the name to the card width (the same truncation the
+    // OpenCode-badge assertion further down this file documents at length): with
+    // the embedded pane column taking two thirds of the row, a card fits about
+    // ten characters of name, so the original `restored-alpha` / `restored-beta`
+    // rendered as `restored-…` and `restored-be…`. That still passed only because
+    // `PaneLayout::Stacked` used to draw a collapsed 1-row frame per non-focused
+    // pane, whose title spelled out the second pane's full name in the pane
+    // column. PRD #311 removes those frames — only the focused pane is drawn — so
+    // the full `restored-beta` is no longer anywhere on screen and a full-name
+    // match cannot succeed. Short names keep the assertion about what this test
+    // is actually for (both panes come back, under their saved names) instead of
+    // depending on a pane-column frame that no longer exists.
     let restored = common::wait_until(Duration::from_secs(10), || {
         let grid = deck.snapshot_grid();
-        grid.contains("restored-alpha") && grid.contains("restored-beta")
+        grid.contains("r-alpha") && grid.contains("r-beta")
     });
     assert!(
         restored,
         "PRD #89 M2.1: launching with NO --continue and a 2-pane snapshot on disk must \
-         auto-restore BOTH saved panes (`restored-alpha`, `restored-beta`) as dashboard \
-         cards, but they never appeared. RED until the snapshot-load block in `run_tui` \
-         is made unconditional (today it is gated on `continue_session`).\nFinal grid:\n{}",
+         auto-restore BOTH saved panes (`r-alpha`, `r-beta`) as dashboard cards, but they \
+         never appeared.\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
 }
