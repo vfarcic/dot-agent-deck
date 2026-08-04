@@ -63,8 +63,13 @@ tasks:
     cmds:
       - cargo audit
 
+  # Deliberately NOT "run everything CI runs": this is the Linux `build` job's
+  # cargo commands plus `security`'s, in order. It omits `ci-build-debug` (the
+  # macOS/Windows debug build) and it does not touch anything ci.yml does
+  # outside those cargo invocations — no toolchain/devbox provisioning, no
+  # `devbox` smoke job, no `windows-cross-check`.
   ci:
-    desc: Run every CI step in order (convenience; each step is also invokable on its own as ci-*)
+    desc: "Run the Linux `build` job's cargo steps plus `security`, in order (each is also invokable on its own as ci-*)"
     cmds:
       - task: ci-fmt
       - task: ci-clippy

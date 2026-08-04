@@ -17,3 +17,9 @@ site/.docusaurus/
 
 # dot-ai skills lock (transient, like scheduled_tasks.lock above)
 .dot-ai.lock
+
+# Checkout-relative CI cache paths used by `.semaphore/ci.sh` (PRD #376). They
+# only appear if that script is run by hand while debugging it, but they are
+# multi-GB when they do.
+/.cargo-home/
+/.semaphore-cache-restore/

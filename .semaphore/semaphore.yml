@@ -24,7 +24,7 @@
 #   this block      | ci.yml job     | machine                    | steps
 #   ----------------|----------------|----------------------------|--------------------------------------------------
 #   build           | build          | f1-standard-4 / ubuntu2404 | fmt, clippy, build --release, nextest, linkage-check
-#   build-macos     | build-macos    | a2-standard-4 / macOS      | build, clippy, nextest
+#   build-macos     | build-macos    | a2-standard-4 / macOS      | build (debug), clippy, nextest
 #   security        | security       | f1-standard-4 / ubuntu2404 | cargo audit
 #
 # WHAT IT DELIBERATELY DOES NOT MIRROR
@@ -52,11 +52,28 @@
 #
 # There is no `jetify-com/devbox-install-action` here — that is a GitHub
 # marketplace action and does not exist on Semaphore. `.semaphore/ci.sh`
-# hand-rolls the equivalent (install nix, restore the nix store from cache,
-# install devbox, realise the devbox.json environment) and every build step then
-# runs through `devbox run -- task ci-*`. Read that script's header for the
-# mechanism and for the list of steps whose behaviour is assumed rather than
-# observed.
+# hand-rolls the equivalent (install a PINNED, digest-verified nix installer,
+# install a PINNED, digest-verified devbox, realise the devbox.json environment
+# by substituting from cache.nixos.org) and every build step then runs through
+# `devbox run -- task ci-*`. Read that script's header for the mechanism and for
+# the list of steps whose behaviour is assumed rather than observed.
+#
+# THERE IS NO NIX-STORE CACHE, ON PURPOSE. The first version of this pipeline
+# cached `/nix/store` through a privileged `sudo tar -C /` round trip that was
+# both unsafe (unverified archive extracted at `/` as root) and dead (it stored
+# an absolute path, which Semaphore's `cache store` strips the leading `/` from,
+# so the restore could never hit). It is gone rather than repaired. Every job
+# now substitutes the closure from `cache.nixos.org`, which nix verifies by
+# signature, and COLD BOOTSTRAP IS THE BASELINE M5 MEASURES. `.semaphore/ci.sh`
+# carries the full argument, including the signed `nix copy` shape to use if
+# store caching is ever added back.
+#
+# CACHE TRUST. Only a push to the default branch writes the cache; branch and
+# pull-request runs restore read-only. Restores never land on the checkout. That
+# check lives in a script the untrusted ref also controls, so it is defence in
+# depth, NOT an authorization boundary — the real boundary is provider-side and
+# is listed in `docs/develop/ci-entrypoints.md` as a required step before a
+# Semaphore project is connected.
 #
 # NOT VALIDATED AGAINST A LIVE RUNNER
 #
@@ -117,6 +134,14 @@ global_job_config:
   prologue:
     commands:
       - checkout
+      # CARGO_HOME is moved INSIDE the checkout, and the value comes from the
+      # script rather than being written twice. Semaphore's `cache store` strips
+      # a leading `/` and `cache restore` extracts relative to the working
+      # directory, so only a checkout-relative path round-trips; leaving the
+      # cargo home at `$HOME/.cargo` is what made the previous cache design
+      # unable to work. Two hardcoded copies of this path would drift into a
+      # silently-cold cache, hence the one source of truth.
+      - export CARGO_HOME="$(bash .semaphore/ci.sh cargo-home)"
       - bash .semaphore/ci.sh bootstrap
       # The bootstrap ran in its own shell, so the PATH and NIX_REMOTE it
       # exported died with it. Re-establish them in the shell the job's own
@@ -124,27 +149,42 @@ global_job_config:
       # so it is present after any multi-user install on either platform, and
       # it is what points a non-root client at the daemon.
       - . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
-      # devbox's installer puts the binary here.
-      - export PATH="/usr/local/bin:$PATH"
-  epilogue:
-    always:
-      commands:
-        # Deliberately `always`: the nix store is warm whether or not the tests
-        # passed, and a red run that still leaves a warm store behind is worth
-        # having. Writes only when the key is absent — see .semaphore/ci.sh.
-        - bash .semaphore/ci.sh save-nix-cache
+      # Where ci.sh puts the pinned devbox binary. A directory the agent user
+      # owns, so nothing had to be `sudo`-placed in /usr/local/bin.
+      - export PATH="$HOME/.local/bin:$PATH"
 
 # Every block declares `dependencies: []` so all three start at once, the way
 # GHA's independent jobs do. Without it Semaphore runs blocks sequentially,
 # which would make the wall-clock comparison in M5 meaningless. (Semaphore
 # requires that either every block declares dependencies or none does.)
+#
+# EVERY BLOCK IS ALSO TAG-GUARDED — `run: when: "tag !~ '.*'"`, i.e. run only
+# when this workflow was not triggered by a tag push. Semaphore treats tag
+# pushes as a trigger by default, and this pipeline on a release tag would start
+# build/audit/cache work alongside `release.yml` and report a second status.
+# That is the release-shaped behaviour the PRD rules out, so the guard is here.
+#
+# TWO HONEST LIMITS ON THAT GUARD. It is written against Semaphore's documented
+# Conditions DSL and has never been evaluated by a runner, like everything else
+# in this file. And even when it works it only skips the WORK: Semaphore still
+# creates a workflow for the tag push and still reports a status for it. The real
+# fix is DISABLING TAG TRIGGERS IN THE PROJECT SETTINGS, which is a required
+# step in the activation checklist in `docs/develop/ci-entrypoints.md`. This is
+# defence in depth; that setting is the boundary.
 blocks:
   # Mirrors ci.yml's `build` job (ci.yml:103-144), step for step and in the same
   # order, so a failure lands on the same step name a GHA failure would. One job
   # rather than five parallel ones on purpose: each job pays its own nix
   # bootstrap and its own cache restore, so splitting would multiply the
   # bootstrap cost by five and measure the wrong thing.
+  #
+  # SOLE WRITER of the two non-platform cargo cache keys (registry, git db) plus
+  # its own platform `target/`. `has_key` is not atomic, so two blocks that both
+  # miss and both store the same key duplicate GiB of work and confound M5;
+  # ownership is therefore explicit rather than "whoever gets there first".
   - name: build
+    run:
+      when: "tag !~ '.*'"
     dependencies: []
     task:
       prologue:
@@ -166,12 +206,13 @@ blocks:
           commands:
             # `on_pass` only, matching rust-cache's default of not saving after
             # a failed job: a half-built `target/` is not worth propagating.
+            # Writes nothing at all unless this is a push to the default branch.
             - bash .semaphore/ci.sh save-cargo-cache
 
   # Mirrors ci.yml's `build-macos` job (ci.yml:245-261): host build, clippy,
   # nextest on Apple Silicon.
   #
-  # TWO THINGS TO KNOW BEFORE READING THE NUMBERS THIS BLOCK PRODUCES:
+  # THREE THINGS TO KNOW BEFORE READING THE NUMBERS THIS BLOCK PRODUCES:
   #
   # 1. MEMORY. a2-standard-4 is 4 vCPU / 8 GB against ubuntu-latest's 16 GB, and
   #    it runs the same compile-heavy tier. Memory pressure is a live
@@ -183,11 +224,20 @@ blocks:
   #    misses, at nixpkgs rev a5cbcfe954791221bfffe2307f7d1a1bf61a871e). It did
   #    not prove any of it RUNS correctly there — ci.yml:294-295 records that
   #    the aarch64-darwin lock entries have never been exercised by any CI job,
-  #    and that is still true. It also did not cover
-  #    `path:gcloud#google-cloud-sdk`, which is not in devbox.lock at all; that
-  #    flake's closure is provisioned by `devbox run` like everything else, and
-  #    if it has no darwin substitutes this block builds it from source.
+  #    and that is still true.
+  # 3. `path:gcloud#google-cloud-sdk` — the one devbox.json entry with no
+  #    devbox.lock pin — HAS NOW BEEN CHECKED TOO, and it does not build the SDK
+  #    from source. At the March-2024 nixpkgs revision `gcloud/flake.lock` pins,
+  #    the aarch64-darwin plan is 91 substitutable paths (318.7 MiB download /
+  #    1.8 GiB unpacked) plus 5 locally-built derivations, none of which invokes
+  #    a compiler: three component-tarball unpacks and the `withExtraComponents`
+  #    copy-and-sed composition. The base `google-cloud-sdk` itself substitutes
+  #    (84.8 MiB xz / 466 MiB unpacked). The composition is built locally on
+  #    x86_64-linux too, so this is symmetric, not a darwin gap. See the PRD's
+  #    M2 note for the evidence.
   - name: build-macos
+    run:
+      when: "tag !~ '.*'"
     dependencies: []
     task:
       agent:
@@ -215,7 +265,11 @@ blocks:
       epilogue:
         on_pass:
           commands:
-            - bash .semaphore/ci.sh save-cargo-cache
+            # `save-cargo-target-cache`, NOT `save-cargo-cache`: this block
+            # RESTORES the registry and git-db keys but must never write them,
+            # because it shares them with `build` and `has_key` is not atomic.
+            # It owns only its own platform `target/` key.
+            - bash .semaphore/ci.sh save-cargo-target-cache
 
   # Mirrors ci.yml's `security` job (ci.yml:264-273) — with one improvement that
   # is the cheapest win in the whole PRD: ci.yml:272 runs `cargo install
@@ -229,6 +283,8 @@ blocks:
   # actually needs it. (What this job could usefully cache is the RustSec
   # advisory-db clone; ci.yml does not, so neither does this, for parity.)
   - name: security
+    run:
+      when: "tag !~ '.*'"
     dependencies: []
     task:
       jobs:
