@@ -147,15 +147,22 @@ jobs:
   # unit-test gate, running parallel to the Linux `build` job so a Windows-only
   # break is visible independently. Uses rustup via dtolnay/rust-toolchain (the
   # devbox/nix toolchain used locally is Linux-only) and the runner's native
-  # MSVC toolchain — no cross-compile lib.exe→ar shim (that was a Linux-only
-  # cross-check artifact; windows-latest archives natively).
+  # MSVC toolchain — no cross-compile cc/lib.exe→ar shims (those are Linux-only
+  # cross-check artifacts; windows-latest compiles and archives natively).
   #
-  # SCOPE: foundation gate only. The Unix-domain-socket daemon/attach/hook
-  # integration suites and the L2 PTY e2e suite are gated to Unix at the source
-  # level (#![cfg(unix)]), so they compile to empty crates here. Porting that
-  # harness to Windows named pipes + ConPTY and running full integration/e2e on
-  # a Windows VM is tracked by #164 (M10). aarch64-pc-windows-msvc is #164 (M9),
-  # not M8.
+  # SCOPE: foundation gate only, and the two exclusions have DIFFERENT
+  # mechanisms:
+  #   * the Unix-domain-socket daemon/attach/hook integration suites are gated
+  #     to Unix at the source level (#![cfg(unix)]), so they compile to empty
+  #     crates here;
+  #   * the L2 PTY e2e suite is excluded because this job runs `cargo nextest
+  #     run` WITHOUT `--features e2e` — all but two `tests/e2e_*.rs` files open
+  #     with a bare `#![cfg(feature = "e2e")]` and carry no Unix gate at all, so
+  #     they are never compiled here rather than compiled-and-emptied.
+  # That second point is why `scripts/windows-cross-check.sh --features e2e` is
+  # red locally and is not a gate (issue #368). Porting the harness to Windows
+  # named pipes + ConPTY and running full integration/e2e on a Windows VM is
+  # tracked by #164 (M10). aarch64-pc-windows-msvc is #164 (M9), not M8.
   build-windows:
     needs: changes
     if: needs.changes.outputs.devbox_only != 'true'

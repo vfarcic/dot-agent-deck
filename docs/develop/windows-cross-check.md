@@ -17,15 +17,21 @@ rustup target add x86_64-pc-windows-msvc   # one-time
 scripts/windows-cross-check.sh
 ```
 
-Extra arguments pass through to `cargo check`, so `scripts/windows-cross-check.sh --features e2e` also covers the L2 suites (which CI's Windows job does *not* compile — see above).
+Extra arguments pass through to `cargo check`. Note that `--features e2e` is **not** a gate you can hold yourself to today: no `tests/e2e_*.rs` file carries a file-level `#![cfg(unix)]`, while the L2 harness helpers they all call (`spawn_daemon_serve`, `attach_request_on`, `agent_records_on`, `TuiDeck::subscribe_events`, …) are per-item `#[cfg(unix)]` — so that run reports dozens of `E0425`s that describe the L2 tier's standing Unix-only status, not anything you introduced. CI's Windows job does not compile those targets either (`cargo nextest run` **without** `--features e2e`), so nothing is being hidden. A Windows-clean L2 tier is part of #164; until then, run the check without extra features.
 
 Three details, all handled inside the script, are the difference between this working and appearing impossible:
 
 - **Use rustup's toolchain, not devbox's.** The devbox/nix `cargo`/`rustc` on `PATH` are Linux-only — they ship no `x86_64-pc-windows-msvc` `rust-std`, so the run dies early with a misleading `error[E0463]: can't find crate for core` *even though `rustup target add` reports the target installed*. `rustup` installed it into `~/.rustup/toolchains/...`, which the nix toolchain never consults. Pin both `RUSTC` and the `cargo` binary to the rustup toolchain.
-- **Shim `lib.exe`.** devbox exports `AR=ar` and `CC=gcc` globally, and `cc-rs` picks those up even for an MSVC target. `ring`'s build script then hands GNU `ar` MSVC-style flags and it aborts on `ar: invalid option -- ':'`. A tiny shim that rewrites `-out:X`/`-nologo` into `ar crs X …` is enough: `cargo check` never links, so the archive only has to exist. (This is the "cross-compile `lib.exe`→`ar` shim" the `build-windows` comment in `ci.yml` mentions as a Linux-only artifact — `windows-latest` archives natively and needs none of it.)
+- **Shim the C compiler and the archiver.** devbox exports `CC=gcc` and `AR=ar` globally and `cc-rs` honours both even for an MSVC target, so a native Linux toolchain gets handed a Windows cross-compile and both native-build stages break. On *compile*, `aws-lc-sys` — rustls' default `aws-lc-rs` provider — builds ~600 C files, and Linux gcc reads Linux system headers, so it dies on `unknown type name 'pthread_rwlock_t'`, because Windows has no pthreads. On *archive*, GNU `ar` is handed MSVC `lib.exe` flags and aborts on `ar: invalid option -- ':'`. Since `cargo check` never links, nothing ever reads either artefact — an object only has to be a valid archive member and an archive only has to exist — so the script fakes both: `CC` hands back one prebuilt empty object per compile (skipping the C build entirely), and `AR` rewrites `-out:X`/`-nologo` into `ar crs X …`. Both overrides are the per-target `CC_x86_64_pc_windows_msvc` / `AR_x86_64_pc_windows_msvc` spellings, so a build script compiling for the *host* still gets the real toolchain. The Rust half — type-checking against the target's pre-generated bindings — is untouched and real. (The `AR` half is the "cross-compile `lib.exe`→`ar` shim" the `build-windows` comment in `ci.yml` mentions as a Linux-only artifact; `windows-latest` compiles and archives natively and needs neither.)
 - **Use a separate `CARGO_TARGET_DIR`.** The rustup and nix toolchains are different rustc versions; sharing `target/` makes each run invalidate the other's cache and forces a full rebuild of the next `cargo test-fast`.
 
-Warm, this completes in about ten seconds.
+Warm, this completes in about five seconds; cold, about fifteen.
+
+Because the shims produce deliberately unusable native libraries, the script hardcodes the `check` subcommand. Do not repoint it at `build` or `test` — those link, and would link against garbage.
+
+### If it breaks again
+
+It rotted once already, silently, for exactly one reason: **nothing in CI runs this script.** `build-windows` compiles natively on `windows-latest` and never invokes it, so a change to the dependency graph can take the local check out without any red anywhere. #269 (reqwest 0.13, which swapped rustls' provider from `ring` to `aws-lc-rs`) did precisely that, and it went unnoticed until #368 diagnosed it. If a future dependency bump pulls in another native library that the shims do not cover, the failure will again look like a wall of C errors from a crate you have never heard of — the tell is that the compiler being invoked is plain `gcc` and the target is Windows. Fix it at the shim, not by trusting the red.
 
 ## Reading the result
 
