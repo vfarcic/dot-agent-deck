@@ -59,14 +59,16 @@
 # the list of steps whose behaviour is assumed rather than observed.
 #
 # THERE IS NO NIX-STORE CACHE, ON PURPOSE. The first version of this pipeline
-# cached `/nix/store` through a privileged `sudo tar -C /` round trip that was
-# both unsafe (unverified archive extracted at `/` as root) and dead (it stored
-# an absolute path, which Semaphore's `cache store` strips the leading `/` from,
-# so the restore could never hit). It is gone rather than repaired. Every job
-# now substitutes the closure from `cache.nixos.org`, which nix verifies by
-# signature, and COLD BOOTSTRAP IS THE BASELINE M5 MEASURES. `.semaphore/ci.sh`
-# carries the full argument, including the signed `nix copy` shape to use if
-# store caching is ever added back.
+# cached `/nix/store` through a privileged `sudo tar -C /` round trip, and an
+# unverified archive extracted at `/` as root is reason enough on its own. (This
+# comment used to add that it was also DEAD, because `cache store` strips a
+# leading `/` — that mechanism has since been disproved against the cache CLI's
+# source, which preserves absolute paths with tar's `-P`. See `.semaphore/ci.sh`;
+# the safety argument does not depend on it, and `-P` in fact sharpens it.) It is
+# gone rather than repaired. Every job now substitutes the closure from
+# `cache.nixos.org`, which nix verifies by signature, and COLD BOOTSTRAP IS THE
+# BASELINE M5 MEASURES. `.semaphore/ci.sh` carries the full argument, including
+# the signed `nix copy` shape to use if store caching is ever added back.
 #
 # CACHE TRUST. Only a push to the default branch writes the cache; branch and
 # pull-request runs restore read-only. Restores never land on the checkout. That
@@ -75,12 +77,30 @@
 # is listed in `docs/develop/ci-entrypoints.md` as a required step before a
 # Semaphore project is connected.
 #
-# NOT VALIDATED AGAINST A LIVE RUNNER
+# VALIDATION STATUS — IT HAS RUN ONCE, AND IT FAILED
 #
-# No Semaphore project is connected to `vfarcic/dot-agent-deck`, so this file
-# has never been executed. It parses as YAML and every key used here is from
-# Semaphore's documented v1.0 schema, and that is the entire extent of the
-# verification. Treat the first real run as debugging, not as a measurement.
+# A Semaphore Cloud project IS now connected to `vfarcic/dot-agent-deck`, and this
+# pipeline ran for the first time on 2026-08-04. It FAILED
+# (`ci/semaphoreci/push` → failure). Job-level logs were not available to whoever
+# is reading this next unless the user supplies them, so the failing STEP is not
+# recorded here — do not assume it was fixed.
+#
+# One provable bug was found and fixed afterwards, by checking this file's
+# assumptions against current documentation rather than by reading a log:
+# `SEMAPHORE_GIT_DEPTH: "0"` (see the `env_vars` comment below). It hard-fails
+# pull-request runs in the prologue and merely wastes retries on branch pushes, so
+# it may or may not be the failure that was observed.
+#
+# Every key used here is from Semaphore's documented v1.0 schema, and the
+# individually load-bearing assumptions — block-level `run`/`when`, the tag
+# condition's semantics, `global_job_config.prologue` ordering, the `cache` CLI
+# exit codes and path handling, `SEMAPHORE_GIT_REF_TYPE`/`_BRANCH` values, the
+# machine types and `os_image` strings, `execution_time_limit`, `dependencies: []`
+# — were each verified against docs or against the provider's own source on
+# 2026-08-04. What is still unverified is the BOOTSTRAP: nothing here has been
+# observed installing nix, installing devbox, realising the devbox environment, or
+# exercising the real `cache` CLI on an agent. Treat the next run as debugging,
+# not as a measurement.
 # =============================================================================
 
 version: v1.0
@@ -103,27 +123,48 @@ execution_time_limit:
 
 global_job_config:
   env_vars:
-    # Semaphore's `checkout` does a shallow clone by default. Ask for the whole
-    # history instead.
+    # THERE IS DELIBERATELY NO `SEMAPHORE_GIT_DEPTH` HERE. It used to be set to
+    # "0", meaning "full clone". THAT WAS A BUG, and it is the one thing in this
+    # file that has now been disproved rather than merely unverified:
     #
-    # WHY, precisely — because the obvious reason is WRONG and worth correcting
-    # in writing: `cargo xtask linkage-check` does NOT shell out to git. Its
-    # seven checks read `tests/CATALOG.md`, the `tests/` tree and
-    # `xtask/linkage-check/m2.allowlist` from the working tree, and rule 7
-    # additionally runs the docs generator in-process. The three
-    # `Command::new("git")` sites in `xtask/linkage-check/src/list_tests.rs`
-    # belong to a DIFFERENT subcommand of the same binary — `cargo xtask
-    # list-tests`, which diffs the branch against `origin/main` and is invoked
+    #   * Semaphore documents the variable as "the shallow clone depth level for
+    #     the checkout command. The default value is 50" — a DEPTH, with no
+    #     documented sentinel for "unlimited".
+    #   * The toolbox passes it straight through: `libcheckout` defaults it to 50
+    #     only when UNSET (`[ -z … ]`), then runs
+    #     `git clone --depth "${SEMAPHORE_GIT_DEPTH}" …`. A literal "0" reaches
+    #     git untouched.
+    #   * git rejects it: `git clone --depth 0` fails with
+    #     `fatal: depth 0 is not a positive number` (measured, git 2.55.0).
+    #
+    # What that produced depends on the ref type, which is why it could look like
+    # it worked. `SEMAPHORE_GIT_REF_TYPE` is always set on a real run, so
+    # `checkout` takes the `refbased` path:
+    #   * branch push — falls through to `checkout::shallow`, whose depth clone is
+    #     guarded by `if !`, so the failure is swallowed and a FULL clone runs as
+    #     the "branch not found" fallback. Survives, after burning the clone
+    #     retries and printing a misleading reason.
+    #   * pull-request run — the depth clone is NOT guarded, and the next line is
+    #     `cd "${SEMAPHORE_GIT_DIR}" || exit`. The directory was never created, so
+    #     checkout EXITS and every job dies in this prologue before any build step.
+    #
+    # The default (50) is now used, and that is strictly more history than the GHA
+    # control has: `ci.yml` uses `actions/checkout@v7` with no `fetch-depth`,
+    # i.e. a depth-1 clone. Nothing in CI needs more — `cargo xtask
+    # linkage-check` does NOT shell out to git; its seven checks read
+    # `tests/CATALOG.md`, the `tests/` tree and
+    # `xtask/linkage-check/m2.allowlist` from the working tree, and rule 7 runs
+    # the docs generator in-process. The three `Command::new("git")` sites in
+    # `xtask/linkage-check/src/list_tests.rs` belong to a DIFFERENT subcommand,
+    # `cargo xtask list-tests`, which diffs against `origin/main` and is invoked
     # by the release flow, never by CI.
     #
-    # So full history is insurance, not a requirement: it keeps every git-shaped
-    # xtask working if one is ever added to a CI step, and it costs one clone of
-    # a small repository. Note that even a full clone only guarantees the
-    # branch's own history — if a future step needs the `origin/main`
-    # remote-tracking ref, check `git rev-parse origin/main` and add an explicit
-    # `git fetch --no-tags origin main` rather than assuming it is there.
-    - name: SEMAPHORE_GIT_DEPTH
-      value: "0"
+    # If a future CI step does need history, set a POSITIVE depth, or fetch
+    # explicitly (`git fetch --no-tags --depth=N origin main`). Do not reach for
+    # "0" again. Note also that no clone here guarantees the `origin/main`
+    # remote-tracking ref — check `git rev-parse origin/main` rather than
+    # assuming it.
+    #
     # Parity with GHA, not a divergence from it: `Swatinem/rust-cache` disables
     # incremental compilation by default, so the `ci.yml` jobs already build
     # non-incrementally. Incremental artifacts are also the single largest
@@ -164,13 +205,30 @@ global_job_config:
 # build/audit/cache work alongside `release.yml` and report a second status.
 # That is the release-shaped behaviour the PRD rules out, so the guard is here.
 #
-# TWO HONEST LIMITS ON THAT GUARD. It is written against Semaphore's documented
-# Conditions DSL and has never been evaluated by a runner, like everything else
-# in this file. And even when it works it only skips the WORK: Semaphore still
-# creates a workflow for the tag push and still reports a status for it. The real
-# fix is DISABLING TAG TRIGGERS IN THE PROJECT SETTINGS, which is a required
-# step in the activation checklist in `docs/develop/ci-entrypoints.md`. This is
-# defence in depth; that setting is the boundary.
+# THE EXPRESSION IS NOW CONFIRMED, THE GUARD IS STILL ONLY HALF A FIX.
+#
+# `tag !~ '.*'` reads like it should never be true — `.*` matches the empty
+# string in every PCRE engine — so it was worth checking rather than trusting.
+# Semaphore's Conditions DSL special-cases an empty keyword value, and its
+# implementation (`renderedtext/when`) asserts exactly this case in its own test
+# suite, in a test named "empty string value of keyword parameter does not match
+# '.*' regex":
+#
+#     params = %{"branch" => "master", "tag" => "", "pull_request" => "123"}
+#     assert {:ok, false} = When.evaluate("tag =~ '.*'", params)
+#     assert {:ok, true}  = When.evaluate("tag !~ '.*'", params)
+#
+# So on a branch push the guard is TRUE and the block runs; on a tag push `tag`
+# is non-empty and it is FALSE and the block is skipped. `tag =~ '.*'` is also
+# the idiom Semaphore's own docs use for "on any tag", and this is its negation.
+#
+# THE LIMIT THAT REMAINS: even working perfectly it only skips the WORK. A skipped
+# block "immediately finish[es] with a `passed` result and a `skipped`
+# result_reason", so Semaphore still creates a workflow for the tag push and still
+# reports a status for it. The real fix is DISABLING TAG TRIGGERS IN THE PROJECT
+# SETTINGS, which is a required step in the activation checklist in
+# `docs/develop/ci-entrypoints.md`. This is defence in depth; that setting is the
+# boundary.
 blocks:
   # Mirrors ci.yml's `build` job (ci.yml:103-144), step for step and in the same
   # order, so a failure lands on the same step name a GHA failure would. One job

@@ -29,27 +29,52 @@
 #
 # THE ONE SEMAPHORE CACHE BEHAVIOUR EVERYTHING HERE IS SHAPED BY
 #
-# `cache store <key> <path>` STRIPS A LEADING `/` from the path, and
-# `cache restore <key>` extracts RELATIVE TO THE WORKING DIRECTORY. So an
-# absolute path does not round-trip: store `/home/semaphore/.cargo/registry`
-# and you get a checkout-relative `home/semaphore/.cargo/registry` back, which
-# no later `has_key`/path check will ever match. The first version of this
-# script stored the nix store under an absolute `$HOME/...` path and tested for
-# the absolute path on restore, so the restore could never hit and every job
-# cold-provisioned — a cache that had never been capable of working.
+# EVERY path this script hands to `cache store` is CHECKOUT-RELATIVE, and that is
+# also why `CARGO_HOME` is moved inside the checkout (`cargo-home` subcommand)
+# instead of being left at `$HOME/.cargo`. Please do not "helpfully" undo it.
 #
-# Consequence, and please do not "helpfully" undo it: EVERY path this script
-# hands to `cache store` is CHECKOUT-RELATIVE. That is also why `CARGO_HOME` is
-# moved inside the checkout (`cargo-home` subcommand) instead of being left at
-# `$HOME/.cargo`.
+# THE REASON, CORRECTED 2026-08-04 against the cache CLI's source, because the
+# reason written here originally was wrong in its mechanism. This file used to
+# claim that `cache store` strips a leading `/` so an absolute path "does not
+# round-trip". Semaphore's docs do say tar "automatically removes any leading /
+# from a given path value" — but the implementation
+# (`cache-cli/pkg/archive/shell_out_archiver.go`) branches on whether the path is
+# absolute and uses tar's `-P` when it is:
 #
-# UNVALIDATED
+#     Compress:   filepath.IsAbs(src) ? `tar czPf dst src`  : `tar czf dst src`
+#     Decompress: filepath.IsAbs(dst) ? `tar xzPf tmp -C .` : `tar xzf tmp -C .`
 #
-# No Semaphore project is connected to this repository, so NOTHING in this file
-# has ever run on a Semaphore agent. It is written against Semaphore's
-# documented toolbox CLI, deliberately preferring boring constructs over clever
-# ones. Expect the first real run to need fixes; the comments flag each step
-# whose behaviour is assumed rather than observed.
+# `-P` PRESERVES the leading `/`, and the decompress side picks its branch from
+# the FIRST MEMBER of the archive. So an absolute path does round-trip — back to
+# its absolute location — and the original justification does not hold.
+#
+# Checkout-relative paths are still the right choice, for the reason that
+# survives: a relative archive is extracted WITHOUT `-P`, i.e. tar strips leading
+# `/` and refuses `..` members, and everything lands under the current directory.
+# That is what makes `restore_member`'s scratch directory meaningful at all (see
+# the comment above `adopt_restored_member`, which now records the verified
+# behaviour of the `-P` branch and what it costs).
+#
+# VALIDATION STATUS
+#
+# A Semaphore project IS now connected to this repository and the pipeline ran for
+# the first time on 2026-08-04 — and FAILED. Job logs were not available when this
+# note was written, so the failing step is not recorded; do not read the existence
+# of this paragraph as "it was diagnosed".
+#
+# What HAS been verified since, against Semaphore's docs and the toolbox's own
+# source rather than against a log: the `cache` CLI's exit codes (a miss is 0, an
+# error is 0 unless `CACHE_FAIL_ON_ERROR=true`, `has_key` is nonzero when absent),
+# its tar path handling including the `-P` branch, and the
+# `SEMAPHORE_GIT_REF_TYPE`/`SEMAPHORE_GIT_BRANCH` values `is_trusted_ref` depends
+# on. Each is cited at its use site, and two comments here were WITHDRAWN as wrong
+# in the process — look for "corrected" and "WITHDRAWN".
+#
+# STILL NOT OBSERVED, and this is the bulk of the risk: the bootstrap. Nothing
+# here has been seen installing nix, installing devbox, sourcing
+# `nix-daemon.sh`, or realising the devbox environment on a real agent. It is
+# written against documented behaviour, deliberately preferring boring constructs
+# over clever ones; expect the next run to still need fixes.
 # =============================================================================
 
 set -euo pipefail
@@ -439,11 +464,16 @@ load_nix_env() {
 #    from the dump's own claimed hashes, without recomputing content hashes or
 #    checking binary-cache signatures. Net effect: whoever could write that
 #    cache key got root code execution in a later trusted job.
-# 2. IT HAD NEVER WORKED, which is why nobody noticed (1). It stored an absolute
-#    `$HOME/.cache/...` path, and `cache store` strips the leading `/`, so the
-#    restore produced a checkout-relative `home/...` tree while the code tested
-#    for the absolute path. Every job cold-provisioned. Any "warm bootstrap"
-#    number this had produced would have been fiction.
+# 2. IT WAS ALSO BUILT ON A MECHANISM NOBODY HAD CHECKED. It stored an absolute
+#    `$HOME/.cache/...` path, and this comment used to assert that `cache store`
+#    strips the leading `/`, so the restore could never hit and every job
+#    cold-provisioned. That assertion is WITHDRAWN: the cache CLI archives an
+#    absolute path with `tar czPf` and restores it with `tar xzPf`, which
+#    preserves the leading `/` (see the corrected header comment). Whether the
+#    deleted code hit or missed was therefore never established either way, and
+#    it is moot — the code is gone. What is NOT moot is that the same `-P`
+#    behaviour makes reason (1) worse, not better: absolute members extracted as
+#    root are the escape, not a hypothetical.
 #
 # WHY IT WAS NOT SIMPLY REPLACED WITH A SIGNED `nix copy`. The safe shape is
 # real and is written down here so the next person does not reinvent the tar:
@@ -615,18 +645,25 @@ cmd_bootstrap() {
 #     member, only if it is a real directory holding nothing but real files and
 #     real directories, reached through no symlinked ancestor on either side of
 #     the rename, with no file in it linked from outside it.
-#   * It DOES NOT CONFINE THE EXTRACTOR. `cache restore` writes before any of
-#     this code sees the scratch directory. If Semaphore's implementation
-#     honours absolute or `..` members, those files landed somewhere else
-#     already, and a scratch-only cleanup can neither detect nor undo them.
-#     Whether it honours them is UNVERIFIED: nothing here has run on an agent.
+#   * It DOES NOT CONFINE THE EXTRACTOR, and that is now CONFIRMED rather than
+#     suspected. `cache restore` writes before any of this code sees the scratch
+#     directory, and the cache CLI decompresses with
+#     `tar xzPf <tmp> -C .` — WITH `-P` — whenever the archive's FIRST MEMBER is
+#     an absolute path (`cache-cli/pkg/archive/shell_out_archiver.go`, read
+#     2026-08-04). `-P` is precisely the flag that tells tar to honour absolute
+#     and `..` members instead of sanitising them, and the producer of the
+#     archive chooses that first member. So a crafted archive CAN write outside
+#     the scratch directory — outside the checkout entirely — before any check
+#     below runs, and a scratch-only cleanup can neither detect nor undo it.
+#     (An archive whose first member is relative gets the no-`-P` branch, where
+#     tar does sanitise. Ours are all relative; an attacker's need not be.)
 #
-# So this is one layer of defence in depth, with one unverified provider
-# behaviour standing between it and a real containment claim. Establishing that
-# behaviour on a real agent — or sandboxing the restore so that only the scratch
-# directory is writable — is a prerequisite before this pipeline is trusted with
-# a cache shared across trust levels. It is an explicit item on the activation
-# checklist in `docs/develop/ci-entrypoints.md`.
+# So this is one layer of defence in depth against a hazard that is real, not
+# hypothetical. It limits ADOPTION and cannot limit EXTRACTION. Sandboxing the
+# restore so that only the scratch directory is writable — or keeping untrusted
+# refs out of this cache namespace provider-side — is a prerequisite before this
+# pipeline is trusted with a cache shared across trust levels. It is an explicit
+# item on the activation checklist in `docs/develop/ci-entrypoints.md`.
 #
 # The scratch directory sits inside the checkout so that adopting a member is a
 # rename rather than a multi-GiB copy across filesystems.
@@ -762,13 +799,29 @@ restore_member() {
   rm -rf "$scratch"
   mkdir -p "$scratch"
 
-  # A restore that did not exit 0 is a MISS, never a partial hit. There used to
-  # be a `|| true` here on the grounds that a miss is normal — but the same
-  # nonzero exit also covers "wrote half the member, then failed", and adopting
-  # that hands the job a `target/` or a registry that looks warm and is not.
-  # Which of the two a nonzero status means is unverified (nobody has run the
-  # real CLI); both are treated as a miss, so it does not need to be known.
-  if ! (cd "$scratch" && cache restore "$key"); then
+  # A restore that did not exit 0 is a MISS, never a partial hit.
+  #
+  # THE EXIT-CODE CONTRACT, now taken from the docs rather than guessed at:
+  # a cache MISS is not an error — "`cache restore` … If no archives are restored
+  # the command exits with exit status 0" — and `has_key` is the one that "exits
+  # with non-zero status if the key is not found". So a miss arrives here as 0
+  # with an empty scratch directory, and it is `adopt_restored_member` that
+  # reports it (the member simply is not there). This branch is therefore NOT the
+  # miss path.
+  #
+  # What it catches is a genuine cache ERROR, e.g. a failed connection or a
+  # corrupt archive that tar bailed out of half-way. By default those ALSO exit 0,
+  # which would leave a half-written member to be adopted and hand the job a
+  # `target/` that looks warm and is not — so `CACHE_FAIL_ON_ERROR=true` is set
+  # for this one invocation, which is what makes an error distinguishable from a
+  # miss at all.
+  #
+  # It is scoped to this subshell ON PURPOSE and must not be exported globally:
+  # with it set, a `cache store` that hits a transient cache-server error also
+  # exits nonzero, and under `set -e` that would fail the epilogue and turn a
+  # green build red over a cache hiccup. Here the nonzero is caught and demoted to
+  # a miss, so the worst case is a cold build.
+  if ! (cd "$scratch" && CACHE_FAIL_ON_ERROR=true cache restore "$key"); then
     log "  MISS: 'cache restore' did not succeed for $key — nothing adopted, this run builds it cold"
     rm -rf "$scratch"
     return 0
