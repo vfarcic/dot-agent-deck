@@ -23,9 +23,9 @@
 #
 #   this block      | ci.yml job     | machine                    | steps
 #   ----------------|----------------|----------------------------|--------------------------------------------------
-#   build           | build          | f1-standard-4 / ubuntu2404 | fmt, clippy, build --release, nextest, linkage-check
+#   build           | build          | e1-standard-4 / ubuntu2404 | fmt, clippy, build --release, nextest, linkage-check
 #   build-macos     | build-macos    | a2-standard-4 / macOS      | build (debug), clippy, nextest
-#   security        | security       | f1-standard-4 / ubuntu2404 | cargo audit
+#   security        | security       | e1-standard-4 / ubuntu2404 | cargo audit
 #
 # WHAT IT DELIBERATELY DOES NOT MIRROR
 #
@@ -77,19 +77,39 @@
 # is listed in `docs/develop/ci-entrypoints.md` as a required step before a
 # Semaphore project is connected.
 #
-# VALIDATION STATUS — IT HAS RUN ONCE, AND IT FAILED
+# VALIDATION STATUS — IT HAS RUN TWICE. macOS IS GREEN. LINUX HAS NEVER STARTED.
 #
-# A Semaphore Cloud project IS now connected to `vfarcic/dot-agent-deck`, and this
-# pipeline ran for the first time on 2026-08-04. It FAILED
-# (`ci/semaphoreci/push` → failure). Job-level logs were not available to whoever
-# is reading this next unless the user supplies them, so the failing STEP is not
-# recorded here — do not assume it was fixed.
+# A Semaphore Cloud project IS connected to `vfarcic/dot-agent-deck`, and this
+# pipeline ran twice on 2026-08-04, with the identical pattern both times:
 #
-# One provable bug was found and fixed afterwards, by checking this file's
-# assumptions against current documentation rather than by reading a log:
-# `SEMAPHORE_GIT_DEPTH: "0"` (see the `env_vars` comment below). It hard-fails
-# pull-request runs in the prologue and merely wastes retries on branch pushes, so
-# it may or may not be the failure that was observed.
+#   block        | machine       | result | evidence
+#   -------------|---------------|--------|------------------------------------------
+#   build        | f1-standard-4 | failed | `start_time: 0` — no agent, no commands
+#   security     | f1-standard-4 | failed | `start_time: 0` — same
+#   build-macos  | a2-standard-4 | PASSED | 5m45s, cold nix bootstrap, no cache
+#
+# THE LINUX FAILURES WERE MACHINE-TYPE AVAILABILITY, NOT THIS PIPELINE. The API
+# error is explicit: "Selected machine type is not available in this
+# organization." `f1-standard-4` is not on this org's plan, so no agent was ever
+# assigned and not one command ran — which means nothing in `.semaphore/ci.sh` was
+# implicated on Linux, and the `SEMAPHORE_GIT_DEPTH=0` fix recorded below, while a
+# genuine latent bug, was NOT the cause of these two failures. Both Linux blocks
+# now run on `e1-standard-4`; the `agent` comment below carries the choice and its
+# caveats. THE LINUX BOOTSTRAP HAS STILL NEVER EXECUTED A SINGLE COMMAND — treat
+# the next Linux run as debugging, not as a measurement.
+#
+# WHAT build-macos's GREEN RUN RETIRES, EMPIRICALLY. The job printed its own
+# `diagnose-nix-env` output, so these are observations and not inferences: the
+# APFS `/nix` volume gets created (`/dev/disk2s7 on /nix (apfs, local, nosuid,
+# journaled, noatime, nobrowse)`); the PINNED v3.21.9 installer is what ran (the
+# `profile.d` symlink resolves into `…-determinate-nix-3.21.9`); `nix-daemon.sh`
+# is present at exactly the path the deliberately-unguarded `source` below uses;
+# `devbox run` realises the closure on `aarch64-darwin`, whose lock entries no CI
+# job had ever exercised; 8 GB suffices for the debug build plus clippy plus the
+# full nextest tier; and the cache trust gate behaves correctly in production —
+# the branch push reported `is_trusted_ref: no` and stored nothing, exactly as
+# designed. One passing run is not a track record, but none of the above is
+# speculation any more.
 #
 # Every key used here is from Semaphore's documented v1.0 schema, and the
 # individually load-bearing assumptions — block-level `run`/`when`, the tag
@@ -97,21 +117,59 @@
 # exit codes and path handling, `SEMAPHORE_GIT_REF_TYPE`/`_BRANCH` values, the
 # machine types and `os_image` strings, `execution_time_limit`, `dependencies: []`
 # — were each verified against docs or against the provider's own source on
-# 2026-08-04. What is still unverified is the BOOTSTRAP: nothing here has been
-# observed installing nix, installing devbox, realising the devbox environment, or
-# exercising the real `cache` CLI on an agent. Treat the next run as debugging,
-# not as a measurement.
+# 2026-08-04. One lesson from the two failed Linux jobs: verifying a machine type
+# against the DOCS is not enough, because the catalogue an org may actually use is
+# a PLAN property. A documented, correctly-spelled machine type still fails with
+# every job at `start_time: 0` and no logs at all.
 # =============================================================================
 
 version: v1.0
 name: CI (devbox/nix spike — mirrors .github/workflows/ci.yml)
 
 # Default agent — the two Linux blocks inherit it; build-macos overrides it.
-# f1-standard-4 is 4 vCPU / 16 GB, matching `ubuntu-latest`'s shape as closely
-# as Semaphore's catalogue allows.
+#
+# e1-standard-4 is 4 vCPU / 8 GB / 35 GB disk, and it is NOT the first choice —
+# `f1-standard-4` was, and it is NOT AVAILABLE ON THIS ORGANIZATION'S PLAN. That
+# is what killed the first two runs, with both Linux jobs at `start_time: 0` and
+# the API reporting "Selected machine type is not available in this
+# organization." The catalogue this org can actually provide is `a2-standard-4`,
+# `e1-standard-1`, `e1-standard-4`, `e1-standard-8`, `e2-standard-2` and
+# `f1-standard-2` — note `f1-standard-2` IS offered, so it is specifically the
+# `-4` size of F1 that is gated, not the F1 generation.
+#
+# WHY e1-standard-4 OUT OF WHAT IS AVAILABLE, because the next reader will ask:
+#
+#   * vCPU PARITY WITH THE GHA CONTROL. `ubuntu-latest` is 4 vCPU / 16 GB.
+#     `e1-standard-4` matches the vCPU count, and vCPU count dominates compile
+#     wall clock — which is exactly what M5 measures.
+#   * `e1-standard-8` (8 vCPU / 16 GB) would match the RAM but DOUBLE the CPU,
+#     making Semaphore look artificially fast and the comparison invalid.
+#   * `f1-standard-2` and `e2-standard-2` are 2 vCPU; they understate.
+#   * The 8 GB-against-16 GB gap is no longer speculative. `a2-standard-4` is
+#     also 4 vCPU / 8 GB and it PASSED the full compile + clippy + nextest tier
+#     on this very branch, so 8 GB is proven adequate for this workload. Not a
+#     perfect transfer, and the gap is stated rather than glossed: that job runs
+#     `ci-build-debug` while this one runs `ci-build` (`--release`) plus
+#     `linkage-check`. What keeps it a small gap is that `Cargo.toml` declares no
+#     `[profile.release]` overrides, so the release build is stock — no fat LTO,
+#     no `codegen-units = 1` — and therefore has no single memory-hungry link
+#     step that a debug build would not also have.
+#   * 35 GB of disk against a 4.4 GiB devbox closure plus `target/` is ample
+#     (`f1-standard-4` would have had 65 GB).
+#
+# `os_image: ubuntu2404` does NOT move with the machine type: E1, E2 and F1 all
+# offer `ubuntu2204` and `ubuntu2404`, so the image string is unchanged.
+#
+# THE LEGACY CAVEAT — A LIMITATION ON THE MEASUREMENT, NOT A TODO SOMEBODY CAN
+# CLOSE HERE. Semaphore's docs say "The E1 and E2 generations are legacy machine
+# types … F1 and R1 are the recommended machine types for Linux workloads." So
+# M5's Linux numbers will come from a generation the provider is steering away
+# from. The clean fix is a plan upgrade unlocking `f1-standard-4` — the exact
+# `ubuntu-latest` analogue and the recommended generation — which is the
+# repository owner's commercial decision, not this file's.
 agent:
   machine:
-    type: f1-standard-4
+    type: e1-standard-4
     os_image: ubuntu2404
 
 # A cold nix bootstrap plus a release build plus the full nextest tier can
@@ -186,14 +244,18 @@ global_job_config:
       - bash .semaphore/ci.sh bootstrap
       # TEMPORARY SCAFFOLDING, AND THE SCRIPT SAYS SO TOO. This pipeline cannot
       # be observed from a development machine — no Semaphore access there, and
-      # every attempt costs a real push — and its first real run failed with logs
-      # nobody could read. So this step prints what the installer actually left
-      # on disk IMMEDIATELY BEFORE the unguarded `source` on the next line, which
-      # is the most likely thing to have killed that run. It is pure observation
-      # and returns 0 whatever it finds, so it cannot fail a job. TRIM IT once a
-      # green run has proved the bootstrap; otherwise it is permanent noise at
-      # the head of every job on both platforms. Full argument, and what it
-      # deliberately does NOT do, is above `cmd_diagnose_nix_env` in ci.sh.
+      # every attempt costs a real push — so this step prints what the installer
+      # actually left on disk IMMEDIATELY BEFORE the unguarded `source` on the
+      # next line. It is pure observation and returns 0 whatever it finds, so it
+      # cannot fail a job. Full argument, and what it deliberately does NOT do,
+      # is above `cmd_diagnose_nix_env` in ci.sh.
+      #
+      # IT HAS ALREADY EARNED ITS KEEP ON macOS — its output is the evidence for
+      # every claim in the VALIDATION STATUS block at the top of this file (APFS
+      # volume, pinned installer version, `nix-daemon.sh` present, trust gate
+      # declining to store). KEEP IT ANYWAY: the Linux blocks have still never
+      # executed a command, so on that platform it has not served its purpose
+      # yet. Trim it once a LINUX run has been green too, not before.
       - bash .semaphore/ci.sh diagnose-nix-env
       # The bootstrap ran in its own shell, so the PATH and NIX_REMOTE it
       # exported died with it. Re-establish them in the shell the job's own
@@ -287,19 +349,26 @@ blocks:
   # Mirrors ci.yml's `build-macos` job (ci.yml:245-261): host build, clippy,
   # nextest on Apple Silicon.
   #
-  # THREE THINGS TO KNOW BEFORE READING THE NUMBERS THIS BLOCK PRODUCES:
+  # THIS IS THE ONE BLOCK THAT HAS ACTUALLY RUN, AND IT PASSED — on the first
+  # attempt and again on the second, with no macOS-specific fix in between,
+  # 5m45s with a fully cold nix bootstrap and no cache of any kind. DO NOT CHANGE
+  # ITS MACHINE OR ITS os_image. Two of the three warnings that used to head this
+  # block are retired by that run; the third still stands:
   #
-  # 1. MEMORY. a2-standard-4 is 4 vCPU / 8 GB against ubuntu-latest's 16 GB, and
-  #    it runs the same compile-heavy tier. Memory pressure is a live
-  #    possibility, and it will present as a killed compiler rather than as an
-  #    obvious OOM.
-  # 2. THE DARWIN TOOLCHAIN HAS NEVER RUN. M2 proved every pinned devbox.lock
+  # 1. MEMORY — RESOLVED. a2-standard-4 is 4 vCPU / 8 GB against
+  #    ubuntu-latest's 16 GB, and the worry was a compiler killed under memory
+  #    pressure presenting as something other than an obvious OOM. It ran the
+  #    debug build, clippy and the full nextest tier inside 8 GB. One passing run
+  #    is not a track record, but it is no longer speculation — and it is the
+  #    evidence that let the Linux blocks move to a 4 vCPU / 8 GB machine too.
+  # 2. THE DARWIN TOOLCHAIN — NOW RUN, ONCE. M2 proved every pinned devbox.lock
   #    package is SUBSTITUTABLE for aarch64-darwin from cache.nixos.org
   #    (narinfo 200 on all of them, a full 30-path runtime-closure walk with no
   #    misses, at nixpkgs rev a5cbcfe954791221bfffe2307f7d1a1bf61a871e). It did
-  #    not prove any of it RUNS correctly there — ci.yml:294-295 records that
-  #    the aarch64-darwin lock entries have never been exercised by any CI job,
-  #    and that is still true.
+  #    not prove any of it RUNS correctly there — this run did. `devbox run`
+  #    realised the closure on a real aarch64-darwin agent and every step passed,
+  #    so ci.yml:294-295's note that the aarch64-darwin lock entries have never
+  #    been exercised by any CI job is now true of GHA only.
   # 3. `path:gcloud#google-cloud-sdk` — the one devbox.json entry with no
   #    devbox.lock pin — HAS NOW BEEN CHECKED TOO, and it does not build the SDK
   #    from source. At the March-2024 nixpkgs revision `gcloud/flake.lock` pins,

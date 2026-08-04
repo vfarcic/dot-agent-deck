@@ -55,33 +55,41 @@
 # the comment above `adopt_restored_member`, which now records the verified
 # behaviour of the `-P` branch and what it costs).
 #
-# VALIDATION STATUS
+# VALIDATION STATUS — THIS SCRIPT HAS RUN, ON macOS ONLY, AND IT WORKED THERE
 #
-# A Semaphore project IS now connected to this repository and the pipeline ran for
-# the first time on 2026-08-04 — and FAILED. Job logs were not available when this
-# note was written, so the failing step is not recorded; do not read the existence
-# of this paragraph as "it was diagnosed".
+# A Semaphore project IS connected to this repository and the pipeline ran twice on
+# 2026-08-04. `build-macos` PASSED both times (5m45s, cold bootstrap, no cache);
+# both LINUX blocks failed without ever starting — `start_time: 0`, no agent
+# assigned, not one command executed, because `f1-standard-4` is not available on
+# this organization's plan. So nothing below was implicated in those failures, and
+# nothing below has ever executed on Linux either.
 #
-# What HAS been verified since, against Semaphore's docs and the toolbox's own
-# source rather than against a log: the `cache` CLI's exit codes (a miss is 0, an
-# error is 0 unless `CACHE_FAIL_ON_ERROR=true`, `has_key` is nonzero when absent),
-# its tar path handling including the `-P` branch, and the
+# WHAT THE macOS RUN OBSERVED (via `diagnose-nix-env`, so measured rather than
+# inferred): the pinned v3.21.9 nix installer runs and creates the APFS `/nix`
+# volume; `$NIX_PROFILE_SCRIPT` exists at exactly the path semaphore.yml sources
+# unguarded; the devbox install lands in `$HOME/.local/bin`; `devbox run` realises
+# the aarch64-darwin closure; and `is_trusted_ref` correctly reported `no` on a
+# non-default-branch push, so the trust gate declined to store. That is the whole
+# bootstrap plus the cache trust decision, working on one platform.
+#
+# What HAS been verified against Semaphore's docs and the toolbox's own source
+# rather than against a log: the `cache` CLI's exit codes (a miss is 0, an error is
+# 0 unless `CACHE_FAIL_ON_ERROR=true`, `has_key` is nonzero when absent), its tar
+# path handling including the `-P` branch, and the
 # `SEMAPHORE_GIT_REF_TYPE`/`SEMAPHORE_GIT_BRANCH` values `is_trusted_ref` depends
 # on. Each is cited at its use site, and two comments here were WITHDRAWN as wrong
 # in the process — look for "corrected" and "WITHDRAWN".
 #
-# STILL NOT OBSERVED, and this is the bulk of the risk: the bootstrap. Nothing
-# here has been seen installing nix, installing devbox, sourcing
-# `nix-daemon.sh`, or realising the devbox environment on a real agent. It is
-# written against documented behaviour, deliberately preferring boring constructs
-# over clever ones; expect the next run to still need fixes.
+# STILL NOT OBSERVED: the whole Linux path, and the real `cache` CLI's STORE side
+# on either platform (only a non-trusted-ref restore has run, which stores
+# nothing). Expect the first Linux run to still need fixes.
 #
-# Which is why the `diagnose-nix-env` subcommand exists — a TEMPORARY step the
-# prologue runs between the bootstrap and the unguarded `nix-daemon.sh` source,
-# so that the next failure comes with the evidence needed to fix it instead of
-# costing another push. Read the comment above `cmd_diagnose_nix_env` before
-# either extending it or deleting it; deleting it once the bootstrap is green is
-# the intended end state.
+# Which is why the `diagnose-nix-env` subcommand is still here — a TEMPORARY step
+# the prologue runs between the bootstrap and the unguarded `nix-daemon.sh`
+# source. It has already paid for itself on macOS; it stays until a LINUX run has
+# been green, because that is the platform whose failure it has yet to explain.
+# Read the comment above `cmd_diagnose_nix_env` before either extending it or
+# deleting it.
 # =============================================================================
 
 set -euo pipefail
@@ -466,14 +474,22 @@ load_nix_env() {
 #
 # THIS IS TEMPORARY SCAFFOLDING, NOT A FEATURE. It exists because this pipeline
 # cannot be observed from a development machine: there is no Semaphore access
-# here, every attempt costs a real push, and the first real run failed with logs
-# nobody could read. So the next run has to explain itself rather than buy one
-# more round trip.
+# here, every attempt costs a real push, and the first runs failed with logs
+# nobody could read at the time. So a run has to explain itself rather than buy
+# one more round trip.
+#
+# IT WORKED, ON macOS. Its output on the green `build-macos` run is the evidence
+# behind every empirical claim in semaphore.yml's VALIDATION STATUS block: the
+# APFS `/nix` volume, the pinned installer version read off the resolved
+# `profile.d` store path, `nix-daemon.sh` present where the unguarded `source`
+# expects it, and `is_trusted_ref: no` on a branch push. DO NOT DELETE IT YET
+# ANYWAY — the Linux blocks have never executed a command, so on that platform it
+# has not yet done the job it was written for.
 #
 # WHAT IT IS AIMED AT. semaphore.yml's prologue sources `$NIX_PROFILE_SCRIPT`
 # UNGUARDED, immediately after the bootstrap. If the installer does not leave a
-# file at exactly that path, that line kills every job on both platforms right
-# after the bootstrap step — which is the single most likely reading of "it
+# file at exactly that path, that line kills every job on the platform right
+# after the bootstrap step — which was the single most likely reading of "it
 # failed and we cannot see why". This step runs IMMEDIATELY BEFORE that line and
 # prints what the installer actually left on disk, so the failure arrives with
 # its own explanation attached.
@@ -490,11 +506,11 @@ load_nix_env() {
 # swallowed error is how a corrupt archive becomes indistinguishable from a miss
 # — and it is correct only because nothing here decides anything.
 #
-# TRIM IT ONCE THE BOOTSTRAP IS PROVEN. A permanent forty-line dump at the head
-# of every job on both platforms is noise, and noise is what stops being read.
-# When a green run has shown where the profile lives and that the daemon is up,
-# cut this to the two or three lines that turned out to matter, or delete the
-# subcommand and its prologue line outright.
+# TRIM IT ONCE THE BOOTSTRAP IS PROVEN ON BOTH PLATFORMS. A permanent forty-line
+# dump at the head of every job is noise, and noise is what stops being read.
+# macOS has shown where the profile lives and that the daemon is up; Linux has
+# not run at all. When it has, cut this to the two or three lines that turned out
+# to matter, or delete the subcommand and its prologue line outright.
 diag() { printf '   %s\n' "$*"; }
 
 # Indent a command's combined output under its label, so a multi-line probe
