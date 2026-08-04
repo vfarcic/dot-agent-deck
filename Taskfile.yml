@@ -78,6 +78,21 @@ tasks:
       - task: ci-linkage-check
       - task: ci-audit
 
+  # Deliberately NOT named `ci-refresh-installer-digests`: the `ci-*` prefix
+  # above means "a command ci.yml runs", and docs/develop/ci-entrypoints.md
+  # enumerates exactly those seven. This is a maintenance tool, not a CI step.
+  #
+  # It is the second half of a Renovate bump. `renovate.json`'s custom manager
+  # (grouped `Semaphore CI installers`) moves the two installer VERSION strings
+  # in .semaphore/ci.sh but cannot compute the sha256 of a release asset, so
+  # that PR is not automerged and is not mergeable until this has been run and
+  # committed onto the branch. Add `--check` (script only) to verify without
+  # writing.
+  refresh-installer-digests:
+    desc: "Regenerate the sha256 digests .semaphore/ci.sh pins its nix-installer and devbox downloads to, for the versions currently pinned there (run after a Renovate bump of those pins)"
+    cmds:
+      - scripts/refresh-installer-digests.sh
+
   docs-install:
     desc: Install documentation site dependencies
     dir: site

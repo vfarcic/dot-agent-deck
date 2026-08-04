@@ -19,6 +19,18 @@
     "enabled": true,
     "schedule": ["at any time"]
   },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.semaphore/ci\\.sh$/"],
+      "matchStrings": [
+        "# renovate: datasource=github-releases depName=(?<depName>\\S+)\\n(?:NIX_INSTALLER_VERSION|DEVBOX_VERSION)=\"(?<currentValue>[^\"]+)\"\\n"
+      ],
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "semver",
+      "description": "The two installer pins in `.semaphore/ci.sh` — Determinate's nix-installer and devbox — which no built-in manager can see because they are shell variables. Semaphore has no equivalent of `jetify-com/devbox-install-action`, so that script hand-provisions both, and PRD #376 pinned them to an exact version + sha256 rather than piping a floating URL into a shell (one of them performs a privileged multi-user nix install). Pinning without automation rots, hence this manager. The pattern is anchored on the `# renovate:` annotation IMMEDIATELY followed by the annotated assignment, so it can match neither a digest, nor the same version appearing in a URL or a comment, nor a future unrelated `*_VERSION` variable. READ THE `Semaphore CI installers` PACKAGE RULE BELOW BEFORE CHANGING ANYTHING HERE: this manager bumps the version and cannot touch the six sha256 digests next to it, which is why that bump must not automerge."
+    }
+  ],
   "packageRules": [
     {
       "matchManagers": ["cargo"],
@@ -83,6 +95,19 @@
       "automerge": false,
       "labels": ["dependencies", "manual-review"],
       "description": "Deliberate EXACT pins in Cargo.toml, never automerged. crossterm's pin is load-bearing: `ui::ctrl_c0_byte` documents crossterm 0.28.1's decoder behaviour and `keyevent_ctrl_c0_matches_crossterm_decoder` guards it (PRD #227). See also #242 (crossterm 0.28.1 + 0.29.0 coexist because ratatui 0.30 pulls 0.29 via ratatui-crossterm). portable-pty is pinned at =0.8.1 because 0.9.0 sets PSUEDOCONSOLE_INHERIT_CURSOR, which makes ConPTY withhold a Windows pane's output until a terminal answers ESC[6n — see the Cargo.toml comment. WITHOUT this entry a 0.8 -> 0.9 bump counts as a `minor` for the cargo rule above and would AUTOMERGE, silently reintroducing the stall; that is how 0.9.0 landed the first time."
+    },
+    {
+      "matchManagers": ["custom.regex"],
+      "matchPackageNames": ["DeterminateSystems/nix-installer", "jetify-com/devbox"],
+      "groupName": "Semaphore CI installers",
+      "labels": ["dependencies", "semaphore", "manual-review"],
+      "automerge": false,
+      "prBodyNotes": [
+        "⚠️ **This bump is only half of the change, and must not be merged as-is.** `.semaphore/ci.sh` pins a sha256 digest per platform for each of these installers and verifies it before executing the download — a privileged multi-user nix install in one case. Renovate can move the version string but cannot compute the digest of a release asset, so this PR currently points a new version at the *previous* release's digests and every Semaphore job would fail closed on `digest mismatch`.",
+        "Second half, mechanical: run `task refresh-installer-digests` (or `scripts/refresh-installer-digests.sh`) from the repository root and commit the result onto this branch. It re-reads the versions this PR set, takes devbox's digests from the vendor's own `checksums.txt`, self-hashes the nix-installer binaries (Determinate publishes no checksum), and refuses to write anything if a download fails. `--check` verifies without writing. If a nix-installer digest changed, update the date in the self-recorded disclosure comment above the table in the same commit.",
+        "This group is deliberately **not automerged** for exactly that reason — see `docs/develop/ci-entrypoints.md`."
+      ],
+      "description": "The `.semaphore/ci.sh` installer pins from the custom manager above. AUTOMERGE IS OFF ON PURPOSE and stated explicitly rather than left to the default: Renovate bumps the version but cannot recompute the six paired sha256 digests, so an automerged bump would land a pipeline on `main` that hard-fails `verify_sha256` on every run — silent breakage of a provider nobody is watching yet, which is the worst version of it. `prBodyNotes` above carries the refresh command so the PR is actionable in one step. Checked for precedence when this was added (2026-08-04): no other rule in this array can switch automerge on for these deps — the four `matchManagers: [\"cargo\"]` rules, the two `devbox` rules, `github-actions` and the `site/**` npm rule all match a different manager, `portable-pty`/`crossterm`/`futures-util`/`insta` match different package names, and the final `major` rule sets automerge false as well. Nothing in the `extends` presets enables automerge either. The rule is nonetheless placed late in the array so a future broad automerge rule inserted above it loses."
     },
     {
       "matchUpdateTypes": ["major"],

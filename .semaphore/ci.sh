@@ -80,17 +80,45 @@ NIX_BIN="/nix/var/nix/profiles/default/bin"
 #     `nix-installer.sh` shim, with no `.sha256` sidecar — and no GitHub build
 #     provenance attestation either (`gh attestation verify` returns 404 for
 #     both projects). So the digests below are SELF-RECORDED: measured here on
-#     2026-08-04 against the pinned release assets. That defends against a
+#     2026-08-04 against the pinned release assets, and re-measured by
+#     `scripts/refresh-installer-digests.sh` whenever the pin moves — so UPDATE
+#     THAT DATE when a refresh changes one of them. That defends against a
 #     pinned artifact being mutated later, which is the realistic risk; it does
 #     not defend against the artifact having been wrong when it was recorded.
 #     If Determinate ever starts publishing checksums or attestations, switch to
 #     verifying those instead of trusting this line.
 #
-# Neither pin is Renovate-managed: `renovate.json` has no custom manager for
-# shell-script pins, so bumping these is a manual step. A `customManagers`
-# regex entry would fix that and is a follow-up, not something to bolt on to an
-# unproven pipeline.
+# RENOVATE MANAGES THE TWO VERSION STRINGS BELOW AND NOT THE DIGESTS ABOVE.
+#
+# `renovate.json` has a custom manager for this file — grouped as `Semaphore CI
+# installers`, which is the string to grep for — that matches the two
+# `# renovate:`-annotated pins below and bumps them like any other dependency.
+# It cannot compute the sha256 of a GitHub release asset, so its PR moves a
+# version and leaves the digest table above describing the PREVIOUS release — at
+# which point `verify_sha256` fails closed on the first step of every job. That
+# is why the matching rule in `renovate.json` sets `automerge: false` for these
+# two deps specifically, and it is the one thing here not to tidy up: an
+# automerged version-only bump would put a pipeline on the default branch that
+# hard-fails every run, on a provider nobody is watching yet.
+#
+# The second half of such a bump is mechanical, and the PR is not mergeable
+# until it has been run and the result committed onto the branch:
+#
+#     task refresh-installer-digests          # or, equivalently:
+#     scripts/refresh-installer-digests.sh    # --check to verify without writing
+#
+# It reads the versions pinned below, takes devbox's digests from the vendor's
+# `checksums.txt` and self-hashes the nix-installer binaries — preserving the
+# distinction drawn above — and rewrites the table above in place, refusing to
+# write anything at all if a download or a lookup fails.
+#
+# Each annotation below must stay on the line IMMEDIATELY above its assignment —
+# that adjacency is what the regex matches, and a blank line between them turns
+# the pin back into something no bot is watching.
+
+# renovate: datasource=github-releases depName=DeterminateSystems/nix-installer
 NIX_INSTALLER_VERSION="v3.21.9"
+# renovate: datasource=github-releases depName=jetify-com/devbox
 DEVBOX_VERSION="0.17.5"
 
 # `<asset-name> <sha256>` per platform. Unlisted platform => hard failure, not
