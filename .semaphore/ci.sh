@@ -141,6 +141,11 @@ cargo_home_abs() { printf '%s/%s' "$PWD" "$CARGO_HOME_REL"; }
 # round-trip an archive whose members are `Taskfile.yml` or `devbox.json`, and a
 # restore that lands on the checkout hands the archive's producer code execution
 # in this job. See the trust-model comment below for who that producer can be.
+#
+# What this scratch directory is NOT: a sandbox. `cache restore` writes into it
+# before any code here runs, so it constrains what gets ADOPTED, not what the
+# extractor may already have written elsewhere. The comment above
+# `restore_member` states that limit precisely.
 CACHE_SCRATCH_DIR=".semaphore-cache-restore"
 
 # Upper bound on the `target/` directory we are willing to push through the
@@ -215,8 +220,11 @@ artifact. Do not 'fix' it by deleting the check."
 #    `target/` archives would evict the trusted archives every run depends on.
 #    A branch that wants a warm cache of its own gets one by merging.
 # 2. Restores never land on the checkout. Every restore unpacks into
-#    `$CACHE_SCRATCH_DIR` and only an ALLOWLISTED member is moved into place;
-#    anything else in the archive is logged and deleted.
+#    `$CACHE_SCRATCH_DIR` and only an ALLOWLISTED member that passes validation
+#    is moved into place; anything else in the archive is logged and deleted.
+#    That is a limit on what an archive can get ADOPTED INTO PLACE — it is NOT
+#    containment of the extractor, which has already run by then. See the
+#    comment above `restore_member`, which states exactly how far it goes.
 # 3. No prefix-fallback restores. The previous version restored
 #    `cargo-target-v1-<platform>-<toolchain>-` and even `cargo-target-v1-` as
 #    fallbacks, which widens the surface from "guess one key" to "store under
@@ -563,42 +571,192 @@ cmd_bootstrap() {
 #     workspace, so `target/` stays empty and sharing the key would let it store
 #     an empty archive under a key `build` needs.
 
-# Unpack one cache key into a scratch directory, then move ONLY the member we
-# expect into place. Anything else the archive contained is reported and
-# deleted: a restore is untrusted input (trust-model comment above), and the one
-# thing this can enforce locally is that it cannot write outside the paths this
-# script owns.
+# ---------------------------------------------------------------------------
+# Adopting a restored member — WHAT THIS DOES AND DOES NOT PROTECT AGAINST
+# ---------------------------------------------------------------------------
 #
-# Two limits, stated rather than implied. The scratch directory sits inside the
-# checkout so that adopting a member is a rename rather than a multi-GiB copy
-# across filesystems; that contains ordinary relative members, but it does not
-# defend against a cache CLI that honours `..` members — which is a property of
-# Semaphore's implementation that nobody here can verify, and one more reason
-# the real boundary is provider-side isolation.
+# A restore is untrusted input (trust-model comment above). `restore_member`
+# unpacks one key into a scratch directory, VALIDATES what came out, and moves
+# exactly one expected member into place; everything else is logged and deleted,
+# and every failure is a cache miss rather than a partial adoption.
+#
+# WHAT THAT IS WORTH, stated precisely — an earlier version of this comment
+# claimed more than the code can deliver:
+#
+#   * It limits what an archive can get ADOPTED INTO PLACE. One allowlisted
+#     member, only if it is a real directory holding nothing but real files and
+#     real directories, reached through no symlinked ancestor on either side of
+#     the rename, with no file in it linked from outside it.
+#   * It DOES NOT CONFINE THE EXTRACTOR. `cache restore` writes before any of
+#     this code sees the scratch directory. If Semaphore's implementation
+#     honours absolute or `..` members, those files landed somewhere else
+#     already, and a scratch-only cleanup can neither detect nor undo them.
+#     Whether it honours them is UNVERIFIED: nothing here has run on an agent.
+#
+# So this is one layer of defence in depth, with one unverified provider
+# behaviour standing between it and a real containment claim. Establishing that
+# behaviour on a real agent — or sandboxing the restore so that only the scratch
+# directory is writable — is a prerequisite before this pipeline is trusted with
+# a cache shared across trust levels. It is an explicit item on the activation
+# checklist in `docs/develop/ci-entrypoints.md`.
+#
+# The scratch directory sits inside the checkout so that adopting a member is a
+# rename rather than a multi-GiB copy across filesystems.
+
+# Prints the offending component and returns 0 if any component of a
+# checkout-relative path is a symlink.
+#
+# `-e`/`-d` FOLLOW symlinks, so neither can see a symlinked ANCESTOR: make
+# `.semaphore-cache-restore/.cargo-home` a link to any directory on the agent
+# and `[ -e .semaphore-cache-restore/.cargo-home/registry ]` is true for a
+# directory that is not in the scratch tree at all — which the `mv` would then
+# move out of that external location. `-L` per component is the only test that
+# sees it. Used on BOTH sides of the rename: a symlinked destination ancestor is
+# the same escape in reverse.
+path_has_symlink_component() {
+  local rest="$1" prefix="" comp
+  while [ -n "$rest" ]; do
+    comp="${rest%%/*}"
+    if [ "$comp" = "$rest" ]; then rest=""; else rest="${rest#*/}"; fi
+    if [ -z "$comp" ]; then continue; fi
+    prefix="${prefix:+$prefix/}$comp"
+    if [ -L "$prefix" ]; then
+      printf '%s' "$prefix"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Everything in a tree that is not a plain file or a plain directory. Empty
+# output means clean.
+tree_nonplain_entries() {
+  find "$1" \( -type l -o -type b -o -type c -o -type p -o -type s \) -print
+}
+
+# Inodes inside a tree whose link count exceeds the number of links to them
+# found IN that tree — i.e. regular files that are also linked from outside it.
+#
+# A blunt `-links +1` rejection is not usable: cargo hardlinks its uplifted
+# binaries (`target/debug/foo` <-> `target/debug/deps/foo-<hash>`), which is
+# 9,011 of the 33,896 files in a local `target/`, so it would reject every
+# genuine archive. Counting links per inode separates "linked to its own
+# sibling" from "linked to something on the agent". `find -links` and `ls -ldi`
+# are POSIX, unlike GNU `find -printf '%i %n'`, so this works on the macOS agent
+# too. Fields of `ls -ldi`: inode, mode, link count.
+tree_external_hardlinks() {
+  find "$1" -type f -links +1 -exec ls -ldi {} + |
+    awk '$1 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ { seen[$1]++; nlink[$1] = $3 + 0 }
+         END { for (i in seen) if (seen[i] < nlink[i]) print i }'
+}
+
+# Move ONE expected member out of a restored archive into the checkout, or
+# refuse and leave the checkout untouched. Returns 0 only if the member was
+# adopted. Every refusal is a cache miss: the job cold-builds, which is slow and
+# correct. Nothing here ever repairs a suspicious tree.
+adopt_restored_member() {
+  local scratch="$1" member="$2"
+  local src="$scratch/$member" dest_dir offender
+
+  # The member is a constant from `cmd_restore_cargo_cache`, never archive
+  # input — assert that anyway, so a future edit cannot turn the walks below
+  # into nonsense by passing an absolute or `..`-bearing path.
+  case "$member" in
+    /* | */../* | ../* | */..) die "internal error: member '$member' must be a relative path without '..'" ;;
+  esac
+
+  # `-L` before `-e`, because `-e` is false for a dangling symlink and true for
+  # whatever a live one points at; both are cases we want to see, not miss.
+  if [ ! -L "$src" ] && [ ! -e "$src" ]; then
+    log "  MISS: '$member' not present in the restored archive — this run builds it cold"
+    return 1
+  fi
+
+  if offender="$(path_has_symlink_component "$src")"; then
+    log "  REJECTED '$member': '$offender' is a symlink, so this member is not inside $scratch"
+    return 1
+  fi
+
+  if [ ! -d "$src" ]; then
+    log "  REJECTED '$member': the restored member is not a real directory"
+    return 1
+  fi
+
+  # RULE: reject ALL symlinks and special files in the adopted tree, not only
+  # the ones that resolve outside it. Two reasons. (a) "Resolves outside" has to
+  # be computed, and a chain of links can defeat a lexical computation while a
+  # real resolution is a second filesystem round trip to get wrong; the blunt
+  # rule cannot be argued into being wrong. (b) It costs nothing measurable
+  # here: a full local `target/` (33,896 files) and a populated
+  # `~/.cargo/{registry,git}` contain zero symlinks — measured 2026-08-04. If a
+  # dependency ever legitimately puts one in `target/`, this fails CLOSED (cold
+  # build, loudly logged) and the deliberate fix is to relax the rule to
+  # "reject links whose resolved target escapes the member", not to delete it.
+  if ! offender="$(tree_nonplain_entries "$src")"; then
+    log "  REJECTED '$member': could not scan the restored tree"
+    return 1
+  fi
+  if [ -n "$offender" ]; then
+    log "  REJECTED '$member': restored tree contains symlinks or special files:"
+    printf '%s\n' "$offender" | sed -n '1,20s|^|    |p'
+    return 1
+  fi
+
+  # A hardlink into an existing file on the agent would let a later write
+  # through the adopted tree edit that file in place.
+  if ! offender="$(tree_external_hardlinks "$src")"; then
+    log "  REJECTED '$member': could not check hardlinks in the restored tree"
+    return 1
+  fi
+  if [ -n "$offender" ]; then
+    log "  REJECTED '$member': restored tree hardlinks file(s) outside it (inodes: $(printf '%s' "$offender" | tr '\n' ' '))"
+    return 1
+  fi
+
+  # Destination side. `mkdir -p` first — `.cargo-home` does not exist on a cold
+  # agent — then check, because `mkdir -p` is satisfied by an existing symlink.
+  dest_dir="$(dirname "$member")"
+  mkdir -p "$dest_dir"
+  if offender="$(path_has_symlink_component "$dest_dir")"; then
+    log "  REJECTED '$member': destination ancestor '$offender' is a symlink"
+    return 1
+  fi
+
+  # `rm -rf` on a symlinked destination removes the link, not its target.
+  rm -rf "$member"
+  mv "$src" "$member"
+  return 0
+}
+
 restore_member() {
   local key="$1" member="$2" scratch="$CACHE_SCRATCH_DIR"
 
   rm -rf "$scratch"
   mkdir -p "$scratch"
-  # `|| true`: a miss is normal and must not fail the job.
-  (cd "$scratch" && cache restore "$key") || true
 
-  if [ -e "$scratch/$member" ]; then
-    rm -rf "$member"
-    mkdir -p "$(dirname "$member")"
-    mv "$scratch/$member" "$member"
+  # A restore that did not exit 0 is a MISS, never a partial hit. There used to
+  # be a `|| true` here on the grounds that a miss is normal — but the same
+  # nonzero exit also covers "wrote half the member, then failed", and adopting
+  # that hands the job a `target/` or a registry that looks warm and is not.
+  # Which of the two a nonzero status means is unverified (nobody has run the
+  # real CLI); both are treated as a miss, so it does not need to be known.
+  if ! (cd "$scratch" && cache restore "$key"); then
+    log "  MISS: 'cache restore' did not succeed for $key — nothing adopted, this run builds it cold"
+    rm -rf "$scratch"
+    return 0
+  fi
+
+  if adopt_restored_member "$scratch" "$member"; then
     log "  restored '$member' from $key"
     # Drop the now-empty ancestor directories of the member just adopted, so
     # the leftover report below names only genuinely unexpected members. Only
     # empty directories are removed, so this cannot reach the checkout.
     rmdir -p "$(dirname "$scratch/$member")" 2>/dev/null || true
-  else
-    log "  MISS: '$member' not present for $key — this run builds it cold"
   fi
 
-  # Whatever is left was not asked for. Say so; do not trust it.
+  # Whatever is left was not asked for, or was refused. Say so; do not trust it.
   if [ -n "$(ls -A "$scratch" 2>/dev/null)" ]; then
-    log "  discarding unexpected members restored under $key:"
+    log "  discarding unexpected or rejected members restored under $key:"
     find "$scratch" -mindepth 1 -maxdepth 2 -print | sed 's/^/    /'
   fi
   rm -rf "$scratch"
