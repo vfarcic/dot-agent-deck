@@ -1,0 +1,237 @@
+# =============================================================================
+# PRD #376 — Semaphore CI spike. MIRRORS .github/workflows/ci.yml. Replaces
+# nothing.
+# =============================================================================
+#
+# READ THIS FIRST IF YOU ARE COMPARING THE TWO FILES.
+#
+# `.github/workflows/ci.yml` is the merge gate. It is NOT modified by this PRD
+# and must not be: Renovate automerges cargo/devbox bumps against it being
+# green, and — for as long as PRD #376's measurement is open — it is the
+# experimental control this pipeline is measured against. Wiring `ci.yml` to
+# route through `task ci-*` would look like finishing the job and would destroy
+# the comparison. Don't.
+#
+# This pipeline is a SPIKE. It is not a required status check anywhere, nothing
+# depends on it being green, and it has no promotions, no deployment targets and
+# no publishing of any kind — mirroring `ci.yml`, which has no side effects
+# either. Since it cannot publish, there is no double-publish problem to guard
+# against, and so there are deliberately no publish flags or kill switches (PRD
+# #376 Work Log decision 3: separate destinations, never flags).
+#
+# WHAT IT MIRRORS
+#
+#   this block      | ci.yml job     | machine                    | steps
+#   ----------------|----------------|----------------------------|--------------------------------------------------
+#   build           | build          | f1-standard-4 / ubuntu2404 | fmt, clippy, build --release, nextest, linkage-check
+#   build-macos     | build-macos    | a2-standard-4 / macOS      | build, clippy, nextest
+#   security        | security       | f1-standard-4 / ubuntu2404 | cargo audit
+#
+# WHAT IT DELIBERATELY DOES NOT MIRROR
+#
+#   * `build-windows` — OUT OF SCOPE, permanently for this PRD. nix has no
+#     native Windows support and Semaphore Cloud has no hosted Windows runner
+#     (only self-hosted agents). Windows keeps rustup plus marketplace actions
+#     on GHA; two toolchain-provisioning paths is the accepted end state, not a
+#     gap somebody should close here.
+#   * `windows-cross-check` — same reason: it exists to keep a Linux-hosted
+#     Windows type-check honest, and it is a GHA-side gate.
+#   * `changes` — the Renovate-devbox-only skip gate. It is GitHub-API-shaped
+#     (it reads the PR's file list) and it is a conditional; the PRD asks for
+#     none. The cost of not having it is that a devbox-only bump runs the full
+#     set here.
+#   * `devbox` (the smoke job) — structurally subsumed. Every job below resolves
+#     devbox.lock and runs the pinned tools, which is the one thing that job
+#     exists to prove.
+#   * `ci.yml`'s `concurrency: cancel-in-progress`. Semaphore expresses that
+#     with `auto_cancel`, whose `when` expressions are exactly the kind of
+#     construct nobody can validate without a live runner. Left out; the cost
+#     is redundant runs on rapid pushes, and it is one line to add later.
+#
+# TOOLCHAIN PROVISIONING
+#
+# There is no `jetify-com/devbox-install-action` here — that is a GitHub
+# marketplace action and does not exist on Semaphore. `.semaphore/ci.sh`
+# hand-rolls the equivalent (install nix, restore the nix store from cache,
+# install devbox, realise the devbox.json environment) and every build step then
+# runs through `devbox run -- task ci-*`. Read that script's header for the
+# mechanism and for the list of steps whose behaviour is assumed rather than
+# observed.
+#
+# NOT VALIDATED AGAINST A LIVE RUNNER
+#
+# No Semaphore project is connected to `vfarcic/dot-agent-deck`, so this file
+# has never been executed. It parses as YAML and every key used here is from
+# Semaphore's documented v1.0 schema, and that is the entire extent of the
+# verification. Treat the first real run as debugging, not as a measurement.
+# =============================================================================
+
+version: v1.0
+name: CI (devbox/nix spike — mirrors .github/workflows/ci.yml)
+
+# Default agent — the two Linux blocks inherit it; build-macos overrides it.
+# f1-standard-4 is 4 vCPU / 16 GB, matching `ubuntu-latest`'s shape as closely
+# as Semaphore's catalogue allows.
+agent:
+  machine:
+    type: f1-standard-4
+    os_image: ubuntu2404
+
+# A cold nix bootstrap plus a release build plus the full nextest tier can
+# plausibly exceed the default per-job limit, and a pipeline that dies at the
+# limit produces a misleading measurement rather than a failure. Two hours is
+# generous on purpose; M5's numbers, not this ceiling, are the thing to read.
+execution_time_limit:
+  hours: 2
+
+global_job_config:
+  env_vars:
+    # Semaphore's `checkout` does a shallow clone by default. Ask for the whole
+    # history instead.
+    #
+    # WHY, precisely — because the obvious reason is WRONG and worth correcting
+    # in writing: `cargo xtask linkage-check` does NOT shell out to git. Its
+    # seven checks read `tests/CATALOG.md`, the `tests/` tree and
+    # `xtask/linkage-check/m2.allowlist` from the working tree, and rule 7
+    # additionally runs the docs generator in-process. The three
+    # `Command::new("git")` sites in `xtask/linkage-check/src/list_tests.rs`
+    # belong to a DIFFERENT subcommand of the same binary — `cargo xtask
+    # list-tests`, which diffs the branch against `origin/main` and is invoked
+    # by the release flow, never by CI.
+    #
+    # So full history is insurance, not a requirement: it keeps every git-shaped
+    # xtask working if one is ever added to a CI step, and it costs one clone of
+    # a small repository. Note that even a full clone only guarantees the
+    # branch's own history — if a future step needs the `origin/main`
+    # remote-tracking ref, check `git rev-parse origin/main` and add an explicit
+    # `git fetch --no-tags origin main` rather than assuming it is there.
+    - name: SEMAPHORE_GIT_DEPTH
+      value: "0"
+    # Parity with GHA, not a divergence from it: `Swatinem/rust-cache` disables
+    # incremental compilation by default, so the `ci.yml` jobs already build
+    # non-incrementally. Incremental artifacts are also the single largest
+    # cacheable-but-worthless part of `target/` (1.4 GiB of a measured 8.5 GiB
+    # local tree).
+    - name: CARGO_INCREMENTAL
+      value: "0"
+  prologue:
+    commands:
+      - checkout
+      - bash .semaphore/ci.sh bootstrap
+      # The bootstrap ran in its own shell, so the PATH and NIX_REMOTE it
+      # exported died with it. Re-establish them in the shell the job's own
+      # commands run in. `nix-daemon.sh` ships inside the `nix` package itself,
+      # so it is present after any multi-user install on either platform, and
+      # it is what points a non-root client at the daemon.
+      - . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+      # devbox's installer puts the binary here.
+      - export PATH="/usr/local/bin:$PATH"
+  epilogue:
+    always:
+      commands:
+        # Deliberately `always`: the nix store is warm whether or not the tests
+        # passed, and a red run that still leaves a warm store behind is worth
+        # having. Writes only when the key is absent — see .semaphore/ci.sh.
+        - bash .semaphore/ci.sh save-nix-cache
+
+# Every block declares `dependencies: []` so all three start at once, the way
+# GHA's independent jobs do. Without it Semaphore runs blocks sequentially,
+# which would make the wall-clock comparison in M5 meaningless. (Semaphore
+# requires that either every block declares dependencies or none does.)
+blocks:
+  # Mirrors ci.yml's `build` job (ci.yml:103-144), step for step and in the same
+  # order, so a failure lands on the same step name a GHA failure would. One job
+  # rather than five parallel ones on purpose: each job pays its own nix
+  # bootstrap and its own cache restore, so splitting would multiply the
+  # bootstrap cost by five and measure the wrong thing.
+  - name: build
+    dependencies: []
+    task:
+      prologue:
+        commands:
+          - bash .semaphore/ci.sh restore-cargo-cache
+      jobs:
+        - name: fmt, clippy, build --release, nextest, linkage-check
+          commands:
+            # `task ci-*`, not raw cargo. That is the entire point of M1: the
+            # invocation layer is provider-agnostic where being so costs
+            # nothing, and a contributor runs these exact commands locally.
+            - devbox run -- task ci-fmt
+            - devbox run -- task ci-clippy
+            - devbox run -- task ci-build
+            - devbox run -- task ci-test
+            - devbox run -- task ci-linkage-check
+      epilogue:
+        on_pass:
+          commands:
+            # `on_pass` only, matching rust-cache's default of not saving after
+            # a failed job: a half-built `target/` is not worth propagating.
+            - bash .semaphore/ci.sh save-cargo-cache
+
+  # Mirrors ci.yml's `build-macos` job (ci.yml:245-261): host build, clippy,
+  # nextest on Apple Silicon.
+  #
+  # TWO THINGS TO KNOW BEFORE READING THE NUMBERS THIS BLOCK PRODUCES:
+  #
+  # 1. MEMORY. a2-standard-4 is 4 vCPU / 8 GB against ubuntu-latest's 16 GB, and
+  #    it runs the same compile-heavy tier. Memory pressure is a live
+  #    possibility, and it will present as a killed compiler rather than as an
+  #    obvious OOM.
+  # 2. THE DARWIN TOOLCHAIN HAS NEVER RUN. M2 proved every pinned devbox.lock
+  #    package is SUBSTITUTABLE for aarch64-darwin from cache.nixos.org
+  #    (narinfo 200 on all of them, a full 30-path runtime-closure walk with no
+  #    misses, at nixpkgs rev a5cbcfe954791221bfffe2307f7d1a1bf61a871e). It did
+  #    not prove any of it RUNS correctly there — ci.yml:294-295 records that
+  #    the aarch64-darwin lock entries have never been exercised by any CI job,
+  #    and that is still true. It also did not cover
+  #    `path:gcloud#google-cloud-sdk`, which is not in devbox.lock at all; that
+  #    flake's closure is provisioned by `devbox run` like everything else, and
+  #    if it has no darwin substitutes this block builds it from source.
+  - name: build-macos
+    dependencies: []
+    task:
+      agent:
+        machine:
+          type: a2-standard-4
+          # macos-xcode26 is the other documented image for this machine. The
+          # build needs a working system cc for build scripts and linking and
+          # nothing else from Xcode, so either should do.
+          os_image: macos-xcode16
+      prologue:
+        commands:
+          - bash .semaphore/ci.sh restore-cargo-cache
+      jobs:
+        - name: build, clippy, nextest (aarch64-apple-darwin)
+          commands:
+            # `ci-build-debug`, NOT `ci-build`: ci.yml's macOS job runs plain
+            # `cargo build` (ci.yml:256) while the Linux job runs `cargo build
+            # --release` (ci.yml:116). Using the release entrypoint here would
+            # hand an 8 GB machine strictly more work than its GHA counterpart
+            # does and quietly confound the very comparison this block exists
+            # for.
+            - devbox run -- task ci-build-debug
+            - devbox run -- task ci-clippy
+            - devbox run -- task ci-test
+      epilogue:
+        on_pass:
+          commands:
+            - bash .semaphore/ci.sh save-cargo-cache
+
+  # Mirrors ci.yml's `security` job (ci.yml:264-273) — with one improvement that
+  # is the cheapest win in the whole PRD: ci.yml:272 runs `cargo install
+  # cargo-audit --locked`, compiling the tool from source on every single run.
+  # Here it comes pinned from devbox.json (`cargo-audit@0.22.2`).
+  #
+  # No cargo cache in this block, and that is not an oversight: `cargo audit`
+  # reads Cargo.lock and never compiles the workspace, so `target/` stays empty.
+  # Sharing the target key with `build` would let whichever job finishes first
+  # write an EMPTY archive under it and poison the cache for the job that
+  # actually needs it. (What this job could usefully cache is the RustSec
+  # advisory-db clone; ci.yml does not, so neither does this, for parity.)
+  - name: security
+    dependencies: []
+    task:
+      jobs:
+        - name: cargo audit
+          commands:
+            - devbox run -- task ci-audit

@@ -1,6 +1,78 @@
 version: "3"
 
 tasks:
+  # PRD #376 M1 — one thin entrypoint per step that .github/workflows/ci.yml
+  # runs, so the same commands are invokable outside GitHub Actions (a local
+  # devbox shell, an agent, or a second CI provider that has no equivalent of
+  # the marketplace actions ci.yml depends on).
+  #
+  # DELIBERATELY one task per step, NOT a single `task ci` that hides which
+  # step failed: ci.yml splits its work across jobs so a platform-specific or
+  # step-specific break is visible independently, and these entrypoints
+  # preserve that granularity. `ci` below is a convenience that calls them in
+  # order; it is not a replacement for invoking one directly.
+  #
+  # Each command is copied VERBATIM from ci.yml — no extra flags, no `--locked`
+  # where ci.yml has none, and `cargo nextest run` rather than `cargo test`
+  # (ci.yml:117-134 documents at length why nextest specifically). Keeping them
+  # identical is what makes a divergence show up as a diff here rather than as
+  # a behaviour change. ci.yml itself is intentionally NOT routed through these
+  # tasks: it stays the unmodified control for the M5 measurement.
+
+  ci-fmt:
+    desc: "CI step (ci.yml `build`): check formatting"
+    cmds:
+      - cargo fmt --check
+
+  ci-clippy:
+    desc: "CI step (ci.yml `build`): lint with warnings as errors"
+    cmds:
+      - cargo clippy -- -D warnings
+
+  ci-build:
+    desc: "CI step (ci.yml `build`): release build"
+    cmds:
+      - cargo build --release
+
+  # ci.yml runs a DEBUG build, not the release build above, on its macOS and
+  # Windows jobs (ci.yml:223, :256). That is a seventh distinct command, not a
+  # variant of `ci-build` — the PRD's "six commands" counted the Linux `build`
+  # job plus `security` and glossed over it. It gets its own entrypoint because
+  # the Semaphore macOS block has to reproduce what the GHA macOS job does; if
+  # it ran the release build instead, an 8 GB machine would be handed strictly
+  # more work than its GHA counterpart and the M5 comparison for that platform
+  # would be confounded. Not part of the aggregate `ci` task below, which
+  # mirrors the Linux gate.
+  ci-build-debug:
+    desc: "CI step (ci.yml `build-macos`/`build-windows`): debug build"
+    cmds:
+      - cargo build
+
+  ci-test:
+    desc: "CI step (ci.yml `build`): fast test tier via nextest (no e2e feature)"
+    cmds:
+      - cargo nextest run
+
+  ci-linkage-check:
+    desc: "CI step (ci.yml `build`): enforce catalog↔test linkage (CLAUDE.md rule 7)"
+    cmds:
+      - cargo xtask linkage-check
+
+  ci-audit:
+    desc: "CI step (ci.yml `security`): audit Cargo.lock for known advisories"
+    cmds:
+      - cargo audit
+
+  ci:
+    desc: Run every CI step in order (convenience; each step is also invokable on its own as ci-*)
+    cmds:
+      - task: ci-fmt
+      - task: ci-clippy
+      - task: ci-build
+      - task: ci-test
+      - task: ci-linkage-check
+      - task: ci-audit
+
   docs-install:
     desc: Install documentation site dependencies
     dir: site

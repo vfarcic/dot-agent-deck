@@ -33,6 +33,11 @@ cargo --version
 cargo clippy --version
 rustfmt --version
 cargo nextest --version
+# `--version` only: a bare `cargo audit` would fetch the RustSec advisory
+# database over the network, which is the `security` job's business, not this
+# script's. This line exists so the new devbox pin is covered by the ONE job
+# that can see a devbox.json change at all (PRD #376 M1).
+cargo audit --version
 
 echo "== repo tooling =="
 vals version

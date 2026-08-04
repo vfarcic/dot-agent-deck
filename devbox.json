@@ -8,6 +8,7 @@
     "gh@2.97.0",
     "asciinema@3.2.1",
     "cargo-nextest@0.9.140",
+    "cargo-audit@0.22.2",
     "rustc@1.97.1",
     "cargo@1.97.1",
     "clippy@1.97.1",
