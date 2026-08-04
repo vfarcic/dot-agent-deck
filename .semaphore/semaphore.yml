@@ -21,11 +21,15 @@
 #
 # WHAT IT MIRRORS
 #
-#   this block      | ci.yml job     | machine                    | steps
-#   ----------------|----------------|----------------------------|--------------------------------------------------
-#   build           | build          | e1-standard-4 / ubuntu2404 | fmt, clippy, build --release, nextest, linkage-check
-#   build-macos     | build-macos    | a2-standard-4 / macOS      | build (debug), clippy, nextest
-#   security        | security       | e1-standard-4 / ubuntu2404 | cargo audit
+#   this block      | ci.yml job     | machine + os_image            | steps
+#   ----------------|----------------|-------------------------------|-----------------------------------------------
+#   build           | build          | f1-standard-4 / ubuntu2204    | fmt, clippy, build --release, nextest, linkage-check
+#   build-macos     | build-macos    | a2-standard-4 / macos-xcode16 | build (debug), clippy, nextest
+#   security        | security       | f1-standard-4 / ubuntu2204    | cargo audit
+#
+# The image is spelled out on every row on purpose. Semaphore selects a machine
+# AND an image as a PAIR, and a table that recorded only the machine type is what
+# hid the cause of three failed runs — see the `agent` comment below.
 #
 # WHAT IT DELIBERATELY DOES NOT MIRROR
 #
@@ -77,26 +81,39 @@
 # is listed in `docs/develop/ci-entrypoints.md` as a required step before a
 # Semaphore project is connected.
 #
-# VALIDATION STATUS — IT HAS RUN TWICE. macOS IS GREEN. LINUX HAS NEVER STARTED.
+# VALIDATION STATUS — IT HAS RUN THREE TIMES. macOS IS GREEN. LINUX HAS NEVER
+# STARTED.
 #
 # A Semaphore Cloud project IS connected to `vfarcic/dot-agent-deck`, and this
-# pipeline ran twice on 2026-08-04, with the identical pattern both times:
+# pipeline ran three times on 2026-08-04, with the identical pattern every time.
+# Note the os_image column, because it is the one that never moved:
 #
-#   block        | machine       | result | evidence
-#   -------------|---------------|--------|------------------------------------------
-#   build        | f1-standard-4 | failed | `start_time: 0` — no agent, no commands
-#   security     | f1-standard-4 | failed | `start_time: 0` — same
-#   build-macos  | a2-standard-4 | PASSED | 5m45s, cold nix bootstrap, no cache
+#   block        | machine       | os_image      | result | evidence
+#   -------------|---------------|---------------|--------|-------------------------
+#   build        | f1-standard-4 | ubuntu2404    | failed | `start_time: 0` — no
+#                |               |               |        | agent, no commands (1,2)
+#   build        | e1-standard-4 | ubuntu2404    | failed | `start_time: 0` — same
+#                |               |               |        | error, run 3
+#   security     | f1-standard-4 | ubuntu2404    | failed | `start_time: 0` — same
+#   security     | e1-standard-4 | ubuntu2404    | failed | `start_time: 0` — same
+#   build-macos  | a2-standard-4 | macos-xcode16 | PASSED | 5m45s, cold nix
+#                |               |               |        | bootstrap, no cache
 #
-# THE LINUX FAILURES WERE MACHINE-TYPE AVAILABILITY, NOT THIS PIPELINE. The API
-# error is explicit: "Selected machine type is not available in this
-# organization." `f1-standard-4` is not on this org's plan, so no agent was ever
-# assigned and not one command ran — which means nothing in `.semaphore/ci.sh` was
-# implicated on Linux, and the `SEMAPHORE_GIT_DEPTH=0` fix recorded below, while a
-# genuine latent bug, was NOT the cause of these two failures. Both Linux blocks
-# now run on `e1-standard-4`; the `agent` comment below carries the choice and its
-# caveats. THE LINUX BOOTSTRAP HAS STILL NEVER EXECUTED A SINGLE COMMAND — treat
-# the next Linux run as debugging, not as a measurement.
+# THE LINUX FAILURES WERE A REFUSED (machine, os_image) SELECTION, NOT THIS
+# PIPELINE. The API error is identical for both refused rows: "Selected machine
+# type is not available in this organization." No agent was ever assigned and not
+# one command ran — which means nothing in `.semaphore/ci.sh` was implicated on
+# Linux, and the `SEMAPHORE_GIT_DEPTH=0` fix recorded below, while a genuine latent
+# bug, was NOT the cause of any of these failures.
+#
+# WHICH HALF OF THE PAIR IS AT FAULT IS STILL OPEN, and the table is laid out to
+# make that obvious: the machine type was varied twice and `ubuntu2404` was held
+# constant all three times, so `ubuntu2404` is the one thing common to every
+# refusal, while the only configuration that works uses a different image
+# entirely. The blocks now run `f1-standard-4` + `ubuntu2204`; the `agent` comment
+# below carries the reasoning, the two dead hypotheses and the stop rule. THE
+# LINUX BOOTSTRAP HAS STILL NEVER EXECUTED A SINGLE COMMAND — treat the next Linux
+# run as debugging, not as a measurement.
 #
 # WHAT build-macos's GREEN RUN RETIRES, EMPIRICALLY. The job printed its own
 # `diagnose-nix-env` output, so these are observations and not inferences: the
@@ -117,10 +134,21 @@
 # exit codes and path handling, `SEMAPHORE_GIT_REF_TYPE`/`_BRANCH` values, the
 # machine types and `os_image` strings, `execution_time_limit`, `dependencies: []`
 # — were each verified against docs or against the provider's own source on
-# 2026-08-04. One lesson from the two failed Linux jobs: verifying a machine type
-# against the DOCS is not enough, because the catalogue an org may actually use is
-# a PLAN property. A documented, correctly-spelled machine type still fails with
-# every job at `start_time: 0` and no logs at all.
+# 2026-08-04.
+#
+# TWO LESSONS FROM THE THREE FAILED LINUX JOBS, both about how they were debugged
+# rather than about the schema:
+#
+#   1. Verifying against the DOCS is not enough, and neither is checking a list of
+#      types the UI shows. A documented, correctly-spelled, list-visible selection
+#      still fails with every job at `start_time: 0` and no logs at all, because
+#      what an org may actually run is a provider-side property. The only reliable
+#      probe is a job that gets an agent.
+#   2. THE SELECTION IS A PAIR, SO DEBUG BOTH HALVES. `machine.type` and
+#      `machine.os_image` are chosen together, the refusal names only the machine,
+#      and three runs were spent varying the machine while the image never moved.
+#      Change one element at a time — but make sure you have changed EVERY element
+#      at least once before you start theorising about entitlement.
 # =============================================================================
 
 version: v1.0
@@ -128,49 +156,101 @@ name: CI (devbox/nix spike — mirrors .github/workflows/ci.yml)
 
 # Default agent — the two Linux blocks inherit it; build-macos overrides it.
 #
-# e1-standard-4 is 4 vCPU / 8 GB / 35 GB disk, and it is NOT the first choice —
-# `f1-standard-4` was, and it is NOT AVAILABLE ON THIS ORGANIZATION'S PLAN. That
-# is what killed the first two runs, with both Linux jobs at `start_time: 0` and
-# the API reporting "Selected machine type is not available in this
-# organization." The catalogue this org can actually provide is `a2-standard-4`,
-# `e1-standard-1`, `e1-standard-4`, `e1-standard-8`, `e2-standard-2` and
-# `f1-standard-2` — note `f1-standard-2` IS offered, so it is specifically the
-# `-4` size of F1 that is gated, not the F1 generation.
+# THE VARIABLE UNDER TEST HERE IS `os_image`, NOT `type`. Read that before
+# changing either line.
 #
-# WHY e1-standard-4 OUT OF WHAT IS AVAILABLE, because the next reader will ask:
+# `f1-standard-4` is 4 vCPU / 16 GB / 65 GB disk, the exact `ubuntu-latest`
+# analogue and the generation Semaphore's docs recommend for Linux. It was the
+# first choice, it was refused twice, and it is back — because the evidence now
+# points at the IMAGE rather than at the machine.
 #
-#   * vCPU PARITY WITH THE GHA CONTROL. `ubuntu-latest` is 4 vCPU / 16 GB.
-#     `e1-standard-4` matches the vCPU count, and vCPU count dominates compile
-#     wall clock — which is exactly what M5 measures.
-#   * `e1-standard-8` (8 vCPU / 16 GB) would match the RAM but DOUBLE the CPU,
-#     making Semaphore look artificially fast and the comparison invalid.
-#   * `f1-standard-2` and `e2-standard-2` are 2 vCPU; they understate.
-#   * The 8 GB-against-16 GB gap is no longer speculative. `a2-standard-4` is
-#     also 4 vCPU / 8 GB and it PASSED the full compile + clippy + nextest tier
-#     on this very branch, so 8 GB is proven adequate for this workload. Not a
-#     perfect transfer, and the gap is stated rather than glossed: that job runs
-#     `ci-build-debug` while this one runs `ci-build` (`--release`) plus
-#     `linkage-check`. What keeps it a small gap is that `Cargo.toml` declares no
-#     `[profile.release]` overrides, so the release build is stock — no fat LTO,
-#     no `codegen-units = 1` — and therefore has no single memory-hungry link
-#     step that a debug build would not also have.
-#   * 35 GB of disk against a 4.4 GiB devbox closure plus `target/` is ample
-#     (`f1-standard-4` would have had 65 GB).
+# THE REFUSAL HISTORY. MACHINE AND IMAGE ON EVERY ROW, because a table that
+# recorded only the machine type is precisely what hid this for three runs:
 #
-# `os_image: ubuntu2404` does NOT move with the machine type: E1, E2 and F1 all
-# offer `ubuntu2204` and `ubuntu2404`, so the image string is unchanged.
+#   machine       | os_image      | verdict | evidence
+#   --------------|---------------|---------|---------------------------------
+#   f1-standard-4 | ubuntu2404    | REFUSED | `start_time: 0`, "Selected machine
+#                 |               |         | type is not available in this
+#                 |               |         | organization" (runs 1 and 2)
+#   e1-standard-4 | ubuntu2404    | REFUSED | `start_time: 0`, IDENTICAL error
+#                 |               |         | (run 3)
+#   a2-standard-4 | macos-xcode16 | WORKS   | build-macos passed, 5m45s
 #
-# THE LEGACY CAVEAT — A LIMITATION ON THE MEASUREMENT, NOT A TODO SOMEBODY CAN
-# CLOSE HERE. Semaphore's docs say "The E1 and E2 generations are legacy machine
-# types … F1 and R1 are the recommended machine types for Linux workloads." So
-# M5's Linux numbers will come from a generation the provider is steering away
-# from. The clean fix is a plan upgrade unlocking `f1-standard-4` — the exact
-# `ubuntu-latest` analogue and the recommended generation — which is the
-# repository owner's commercial decision, not this file's.
+# `ubuntu2404` IS THE ONE THING COMMON TO EVERY REFUSAL. The machine type moved
+# twice; the image never moved at all. The only working configuration in this repo
+# uses a different image entirely. Semaphore selects a machine AND an image as a
+# pair, so "Selected machine type is not available in this organization" is equally
+# consistent with the IMAGE being the unavailable half — the error names the
+# machine because that is the field it reports on, not because it has ruled the
+# image in.
+#
+# TWO HYPOTHESES WERE ADVANCED BEFORE THIS ONE AND BOTH WERE WRONG. They are
+# recorded rather than deleted, because the failure mode is more instructive than
+# the answer:
+#
+#   1. PLAN ENTITLEMENT — "this org's plan does not grant the machine." Killed by
+#      pricing. Semaphore lists Ubuntu x64 4 vCPU at $0.015/min and macOS 4 vCPU at
+#      $0.09/min; macOS is 6x the price of the Linux machine being refused, and
+#      macOS WORKS on this org. No plan tier grants the $0.09/min machine while
+#      withholding the $0.015/min one.
+#   2. NEW-PLAN F1/E1 MIGRATION — "E1/E2 are retired under the new plan and F1 is
+#      granted only at the -2 size." Built directly on hypothesis 1, so it fell
+#      with it. It also required believing that a six-type list (`a2-standard-4`,
+#      `e1-standard-1`, `e1-standard-4`, `e1-standard-8`, `e2-standard-2`,
+#      `f1-standard-2`) was an entitlement grant; `e1-standard-4` is on that list
+#      and was refused anyway, so it never was one. Treat such a list as
+#      documentation.
+#
+# Free credit is not the constraint either, which was the other thing worth ruling
+# out: macOS at $0.09/min x 5m45s is about $0.52/run, so three runs cost roughly
+# $1.55 against a $15/month free credit.
+#
+# WHY BOTH VARIABLES MOVE AT ONCE HERE, since that is a real cost and it was a
+# deliberate trade rather than an oversight. Relative to run 3 (`e1-standard-4` +
+# `ubuntu2404`) this changes the machine AND the image:
+#
+#   * If the image is the blocker, `f1-standard-4` + `ubuntu2204` gets M3 green AND
+#     restores the 4 vCPU / 16 GB machine that makes M5's comparison worth making.
+#     One run buys both.
+#   * The alternatives were worse. `f1-standard-2` (2 vCPU) would have unblocked M3
+#     while permanently crippling M5 with a 2x core handicap against a 4 vCPU
+#     control. `e1-standard-4` + `ubuntu2204` would have isolated the image
+#     cleanly, but it spends the run on a legacy generation nobody wants to measure
+#     on.
+#   * THE CONFOUND IS ACKNOWLEDGED: if this run is refused, this run alone will not
+#     say whether the machine or the image is at fault. That is accepted, because
+#     the upside case ends the problem outright and the downside case is where the
+#     guessing stops regardless — see the stop rule below.
+#
+# `ubuntu2204` is documented for E1, E2 and F1 alike, so this is a legal pairing on
+# paper. SO WAS `ubuntu2404`. That is the caution to carry: "documented" has now
+# been wrong about this exact field once already.
+#
+# THE STOP RULE, IF THIS RUN IS ALSO REFUSED. Stop guessing. Four hypotheses will
+# have been advanced and three will have been wrong; a fifth deserves no more
+# credit than the fourth. The next action is NOT another machine or another image —
+# it is to read the organization's actual entitlement or open a Semaphore support
+# ticket, and to treat M3 as blocked on an account/commercial question rather than
+# an engineering one. The PRD carries this too.
+#
+# The plan/entitlement question is worth raising with the repository owner NOW
+# rather than after this result, because it is needed on the SUCCESS path too: if
+# `f1-standard-4` turns out to be genuinely ungranted, no image fixes that.
+#
+# The rest, briefly:
+#
+#   * RAM and disk are no longer arguments to have. 16 GB matches `ubuntu-latest`
+#     exactly, and 65 GB of disk against a 4.4 GiB devbox closure plus `target/` is
+#     ample. (`a2-standard-4` separately proved 8 GB is enough for this workload,
+#     but the Linux blocks no longer need that result.)
+#   * Pricing, verified: `f1-standard-4` $0.015/min, `f1-standard-2` $0.0075/min,
+#     macOS 4 vCPU $0.09/min, $15/month free credit. No per-minute figure outside
+#     that list should be trusted; two of them have already been wrong in this
+#     repo.
 agent:
   machine:
-    type: e1-standard-4
-    os_image: ubuntu2404
+    type: f1-standard-4
+    os_image: ubuntu2204
 
 # A cold nix bootstrap plus a release build plus the full nextest tier can
 # plausibly exceed the default per-job limit, and a pipeline that dies at the
@@ -352,15 +432,20 @@ blocks:
   # THIS IS THE ONE BLOCK THAT HAS ACTUALLY RUN, AND IT PASSED — on the first
   # attempt and again on the second, with no macOS-specific fix in between,
   # 5m45s with a fully cold nix bootstrap and no cache of any kind. DO NOT CHANGE
-  # ITS MACHINE OR ITS os_image. Two of the three warnings that used to head this
-  # block are retired by that run; the third still stands:
+  # ITS MACHINE OR ITS os_image: `a2-standard-4` + `macos-xcode16` is the ONLY
+  # (machine, os_image) pair in this repository proven to get a real agent, which
+  # makes it the control for every selection question — do not spend it. Two of the
+  # three warnings that used to head this block are retired by that run; the third
+  # still stands:
   #
   # 1. MEMORY — RESOLVED. a2-standard-4 is 4 vCPU / 8 GB against
   #    ubuntu-latest's 16 GB, and the worry was a compiler killed under memory
   #    pressure presenting as something other than an obvious OOM. It ran the
   #    debug build, clippy and the full nextest tier inside 8 GB. One passing run
-  #    is not a track record, but it is no longer speculation — and it is the
-  #    evidence that let the Linux blocks move to a 4 vCPU / 8 GB machine too.
+  #    is not a track record, but it is no longer speculation. It is also no longer
+  #    load-bearing for anything else: the Linux blocks are on a 16 GB machine that
+  #    matches the control, so this is a macOS result about a macOS machine and
+  #    nothing more.
   # 2. THE DARWIN TOOLCHAIN — NOW RUN, ONCE. M2 proved every pinned devbox.lock
   #    package is SUBSTITUTABLE for aarch64-darwin from cache.nixos.org
   #    (narinfo 200 on all of them, a full 30-path runtime-closure walk with no

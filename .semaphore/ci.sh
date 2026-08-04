@@ -57,12 +57,16 @@
 #
 # VALIDATION STATUS — THIS SCRIPT HAS RUN, ON macOS ONLY, AND IT WORKED THERE
 #
-# A Semaphore project IS connected to this repository and the pipeline ran twice on
-# 2026-08-04. `build-macos` PASSED both times (5m45s, cold bootstrap, no cache);
-# both LINUX blocks failed without ever starting — `start_time: 0`, no agent
-# assigned, not one command executed, because `f1-standard-4` is not available on
-# this organization's plan. So nothing below was implicated in those failures, and
-# nothing below has ever executed on Linux either.
+# A Semaphore project IS connected to this repository and the pipeline ran three
+# times on 2026-08-04. `build-macos` PASSED and has never failed (5m45s, cold
+# bootstrap, no cache); both LINUX blocks failed without ever starting on all three —
+# `start_time: 0`, no agent assigned, not one command executed, because the
+# requested (machine, os_image) selection was refused. All three refusals paired a
+# varying machine with the SAME image: `f1-standard-4` + `ubuntu2404` on runs 1–2,
+# `e1-standard-4` + `ubuntu2404` with the identical error on run 3. The blocks now
+# target `f1-standard-4` + `ubuntu2204` — the image is the variable under test; see
+# semaphore.yml's `agent` comment. So nothing below was implicated in those
+# failures, and nothing below has ever executed on Linux either.
 #
 # WHAT THE macOS RUN OBSERVED (via `diagnose-nix-env`, so measured rather than
 # inferred): the pinned v3.21.9 nix installer runs and creates the APFS `/nix`
