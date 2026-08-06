@@ -42,30 +42,25 @@ fn has_role_status(grid: &str, role: &str, status: &str) -> bool {
         .any(|line| line.contains(&role_needle) && line.contains(status))
 }
 
-/// Escape `s` as a single POSIX shell word using the standard single-quote
-/// idiom (close the quote, emit an escaped literal `'`, reopen the quote), so
-/// an embedded build path containing shell metacharacters can't be
-/// misinterpreted by the `/bin/sh` script it's spliced into.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
-
 /// Overwrite the fixture's `beta-agent.sh` placeholder with the ABSOLUTE path
 /// of the freshly built test binary baked in (mirrors `write_card_agent` in
 /// `e2e_dashboard_selection.rs`), rather than relying on `dot-agent-deck`
 /// resolving correctly on PATH — a dev machine may have a separately
 /// installed `dot-agent-deck` shadowing the build under test.
 fn write_beta_agent(deck: &TuiDeck) {
-    let bin = shell_quote(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
     let body = format!(
         "#!/bin/sh\n\
          printf 'BETA_ROLE_SENTINEL\\n'\n\
-         printf '%s' '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"beta-sess\"}}' \\\n\
-         | {bin} hook --agent claude-code >/dev/null 2>&1\n\
+         {session_start}\
          sleep 1\n\
-         printf '%s' '{{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"beta-sess\",\"tool_name\":\"Bash\"}}' \\\n\
-         | {bin} hook --agent claude-code >/dev/null 2>&1\n\
-         sleep 600\n"
+         {pre_tool_use}\
+         sleep 600\n",
+        session_start = common::claude_session_start_line(bin, "beta-sess"),
+        pre_tool_use = common::claude_hook_line(
+            bin,
+            r#"{"hook_event_name":"PreToolUse","session_id":"beta-sess","tool_name":"Bash"}"#,
+        ),
     );
     let path = deck.workdir().join("beta-agent.sh");
     std::fs::write(&path, body).expect("overwrite beta-agent.sh with resolved binary path");

@@ -171,10 +171,10 @@ fn manager_002_edit_spawns_seeded_authoring_agent_prefilled() {
             &path,
             format!(
                 "#!/bin/sh\n\
-                 printf '%s' '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"authoring\"}}' \
-                 | \"{bin}\" hook claude-code >/dev/null 2>&1\n\
+                 {hook}\
                  while IFS= read -r l; do printf '%s\\n' \"$l\" >> \"{rec}\"; done\n",
-                rec = record.to_string_lossy()
+                rec = record.to_string_lossy(),
+                hook = common::claude_session_start_line(bin, "authoring"),
             ),
         )
         .unwrap_or_else(|e| panic!("write {name} shim: {e}"));
@@ -575,10 +575,10 @@ fn write_recorder_shim(shim_dir: &std::path::Path, name: &str, record: &std::pat
         format!(
             "#!/bin/sh\n\
              pwd >> \"{rec}\"\n\
-             printf '%s' '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"authoring\"}}' \
-             | \"{bin}\" hook claude-code >/dev/null 2>&1\n\
+             {hook}\
              while IFS= read -r l; do printf '%s\\n' \"$l\" >> \"{rec}\"; done\n",
-            rec = record.to_string_lossy()
+            rec = record.to_string_lossy(),
+            hook = common::claude_session_start_line(bin, "authoring"),
         ),
     )
     .unwrap_or_else(|e| panic!("write {name} shim: {e}"));

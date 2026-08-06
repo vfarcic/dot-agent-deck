@@ -12,7 +12,7 @@
 //! ## Exercising the agent-ready gate
 //! Delivery is gated on the agent's readiness signal (the `SessionStart` hook
 //! event, as orchestrations use). The test's agent is a fixture script that
-//! self-posts `SessionStart` via `dot-agent-deck hook claude-code` — the real
+//! self-posts `SessionStart` via `dot-agent-deck hook --agent claude-code` — the real
 //! hook path — using the `DOT_AGENT_DECK_PANE_ID` injected per-pane and the
 //! `DOT_AGENT_DECK_SOCKET` inherited from the daemon. After posting readiness
 //! it records every line written into its PTY stdin to a cwd-relative file, so
@@ -41,9 +41,9 @@ fn write_agent_script(work: &std::path::Path, tag: &str) -> String {
     let body = format!(
         "#!/bin/sh\n\
          echo started >> started-{tag}.log\n\
-         printf '%s' '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"seedtest-{tag}\"}}' \
-         | \"{bin}\" hook claude-code >/dev/null 2>&1\n\
-         while IFS= read -r l; do printf '%s\\n' \"$l\" >> record-{tag}.log; done\n"
+         {hook}\
+         while IFS= read -r l; do printf '%s\\n' \"$l\" >> record-{tag}.log; done\n",
+        hook = common::claude_session_start_line(bin, &format!("seedtest-{tag}")),
     );
     let path = work.join(&script_name);
     std::fs::write(&path, body).expect("write agent script");

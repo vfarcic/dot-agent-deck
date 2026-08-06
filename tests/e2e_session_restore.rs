@@ -185,11 +185,11 @@ fn write_recorder_agent(project_dir: &Path, role: &str) -> String {
     let body = format!(
         "#!/bin/sh\n\
          echo started >> \"{started}\"\n\
-         printf '%s' '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"restore-{role}\"}}' \
-         | \"{bin}\" hook claude-code >/dev/null 2>&1\n\
+         {hook}\
          while IFS= read -r l; do printf '%s\\n' \"$l\" >> \"{record}\"; done\n",
         started = started.display(),
         record = record.display(),
+        hook = common::claude_session_start_line(bin, &format!("restore-{role}")),
     );
     std::fs::write(&script_path, body).expect("write recorder agent script");
     #[cfg(unix)]

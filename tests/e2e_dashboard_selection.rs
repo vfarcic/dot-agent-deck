@@ -39,10 +39,10 @@ fn write_card_agent(work: &std::path::Path) -> String {
     let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
     let body = format!(
         "#!/bin/sh\n\
-         printf '%s' '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"modecard\"}}' \
-         | \"{bin}\" hook claude-code >/dev/null 2>&1\n\
+         {hook}\
          echo ready > started-card.log\n\
-         sleep 600\n"
+         sleep 600\n",
+        hook = common::claude_session_start_line(bin, "modecard"),
     );
     let path = work.join("card-agent.sh");
     std::fs::write(&path, body).expect("write mode agent script");
