@@ -124,7 +124,21 @@ chmod +x "$CC_SHIM" "$AR_SHIM"
 # A dedicated target dir: this toolchain is a different rustc version than the
 # nix one, so sharing `target/` would make each run invalidate the other's cache
 # and force a full rebuild of the next `cargo test-fast`.
-TARGET_DIR="${WINDOWS_CROSS_CHECK_TARGET_DIR:-${TMPDIR:-/tmp}/dot-agent-deck-win-check}"
+#
+# Defaults under the XDG cache dir, NOT $TMPDIR: `/tmp` is a RAM-backed tmpfs on
+# some machines, where this ~1 GB target dir is charged against memory and swap
+# instead of disk. On the maintainer's box it was found holding 949 MB of a
+# completely full 8 GB swap, and tmpfs pages cannot be reclaimed like page cache —
+# only deleting the files frees them. A build cache also *wants* to survive
+# reboots, which `/tmp` does not, so this is the better default on every host
+# rather than a workaround for one.
+#
+# Falls back to $TMPDIR only when neither XDG_CACHE_HOME nor HOME is set, so a
+# stripped environment still gets a usable path instead of `/.cache/...`.
+# Override with WINDOWS_CROSS_CHECK_TARGET_DIR.
+_cache_root="${XDG_CACHE_HOME:-${HOME:+$HOME/.cache}}"
+TARGET_DIR="${WINDOWS_CROSS_CHECK_TARGET_DIR:-${_cache_root:-${TMPDIR:-/tmp}}/dot-agent-deck/win-check}"
+mkdir -p "$TARGET_DIR"
 
 echo "==> cargo check --tests --target $TARGET (target-dir: $TARGET_DIR)"
 # The compiler and archiver overrides are per-target and their names are
