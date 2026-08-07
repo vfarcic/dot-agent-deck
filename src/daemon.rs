@@ -43,6 +43,74 @@ pub fn idle_shutdown_from_env() -> Option<Duration> {
     }
 }
 
+/// Spawn the production termination-signal watch, routing SIGTERM/SIGINT into
+/// the shared `shutdown` notify so a stop reuses the ONE audited teardown path
+/// (sockets unlinked, `AgentPtyRegistry` dropped, tasks aborted).
+///
+/// Why this exists: `daemon stop` / `daemon restart` terminate the daemon with
+/// SIGTERM (see [`crate::daemon_stop`]), and the build-version handshake
+/// SIGTERMs it silently on the no-agents path. With no handler installed the
+/// default disposition applied — the process died instantly, so its owned
+/// agents died by PTY hangup instead of an orderly registry teardown and,
+/// worst of all, **nothing was logged**. A daemon that vanished mid-session
+/// left no evidence of whether it was stopped, crashed, or was OOM-killed;
+/// reconstructing one real incident took kernel logs and an external watchdog
+/// to establish something the daemon itself should have said in one line.
+///
+/// Logged at `warn!` (not `info!`) for the same reason the give-up warnings in
+/// `embedded_pane` are: losing the daemon terminates every managed agent, so
+/// it is a user-visible outcome that must survive a default log filter.
+fn spawn_termination_signal_watch(shutdown: Arc<Notify>) -> Option<tokio::task::JoinHandle<()>> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        // Registering can only fail if the runtime can't install the handler
+        // (no signal driver). That is not fatal — the daemon simply keeps the
+        // pre-existing default disposition — so log and carry on.
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "could not install SIGTERM handler; termination will not be logged");
+                return None;
+            }
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "could not install SIGINT handler; termination will not be logged");
+                return None;
+            }
+        };
+        Some(tokio::spawn(async move {
+            let sig = tokio::select! {
+                _ = sigterm.recv() => "SIGTERM",
+                _ = sigint.recv() => "SIGINT",
+            };
+            warn!(
+                signal = sig,
+                "daemon received termination signal; initiating graceful shutdown \
+                 (every managed agent will be stopped)"
+            );
+            shutdown.notify_one();
+        }))
+    }
+    #[cfg(windows)]
+    {
+        Some(tokio::spawn(async move {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                warn!(error = %e, "could not await Ctrl-C; termination will not be logged");
+                return;
+            }
+            warn!(
+                signal = "CTRL_C",
+                "daemon received termination signal; initiating graceful shutdown \
+                 (every managed agent will be stopped)"
+            );
+            shutdown.notify_one();
+        }))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test-only self-defense: orphan watchdog + max-lifetime backstop.
 //
@@ -443,6 +511,11 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // expires, the hook loop's `select!` arm wakes up, and the loop exits.
     let shutdown = Arc::new(Notify::new());
 
+    // Production termination watch: route SIGTERM/SIGINT through the same
+    // `shutdown` notify. Armed unconditionally — unlike the two backstops
+    // below, this is not test-only: `daemon stop` IS a SIGTERM.
+    let signal_handle = spawn_termination_signal_watch(shutdown.clone());
+
     // Test-only orphan watchdog: when `DOT_AGENT_DECK_EXIT_WHEN_ORPHANED` is
     // truthy, gracefully shut down (via the SAME `shutdown` signal the idle
     // monitor uses — so sockets/agents tear down cleanly) once this daemon is
@@ -588,6 +661,9 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         h.abort();
     }
     if let Some(h) = max_lifetime_handle {
+        h.abort();
+    }
+    if let Some(h) = signal_handle {
         h.abort();
     }
     drop(pty_registry);
@@ -844,7 +920,12 @@ async fn run_hook_loop(
             // is dropped, which doesn't leak the listener (only the
             // partially-built tokio future).
             _ = shutdown.notified() => {
-                info!("Daemon hook loop exiting on idle shutdown");
+                // Deliberately does NOT name a cause: `shutdown` is notified by
+                // the idle monitor, the termination-signal watch, the orphan
+                // watchdog, and the max-lifetime backstop. Each logs its own
+                // reason before notifying, so naming one here (this used to say
+                // "on idle shutdown") mislabels the other three.
+                info!("Daemon hook loop exiting on shutdown signal");
                 return Ok(());
             }
             accept_res = listener.accept() => match accept_res {

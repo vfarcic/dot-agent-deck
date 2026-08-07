@@ -722,6 +722,61 @@ extern "C" fn handle_wrap_signal(sig: libc::c_int) {
     WRAP_PENDING_SIGNAL.store(sig, Ordering::SeqCst);
 }
 
+/// Test-only self-defense for the wrapper: the orphan watchdog + max-lifetime
+/// backstop that `daemon serve` has had all along (`daemon::run_daemon_with`),
+/// applied to `wrap`.
+///
+/// Both env vars were previously read ONLY by the daemon, so a wrapper whose
+/// test died without running its cleanup `Drop` (SIGKILL / panic-abort / nextest
+/// timeout) leaked to PID 1 and stayed there **forever** — no orphan exit, no
+/// lifetime cap. Observed in the wild: three `wrap --agent codex` stubs alive
+/// for three days from a worktree that had already been deleted, two of them
+/// spinning a `while [ ! -e "$WRAP_START" ]; do sleep 0.01; done` shell loop at
+/// ~100 wakeups/second against a sentinel whose tempdir was long gone.
+///
+/// Termination is requested through [`WRAP_PENDING_SIGNAL`] rather than by
+/// exiting or killing directly, so it takes the SAME audited path a real
+/// SIGTERM takes: the reap loop forwards to the child's process group and
+/// escalates to `SIGKILL` after [`crate::agent_pty::WRAP_TERMINATE_GRACE`]
+/// (so a child that traps `TERM` still dies), and [`RawModeGuard`] still
+/// restores the terminal. Both reap loops poll on a 50 ms cadence and call
+/// `SignalForwarder::tick`, so the store is observed promptly.
+///
+/// Env-gated and OFF by default: a production wrapper sets neither var and so
+/// never arms the thread.
+#[cfg(unix)]
+fn arm_wrap_self_defense() {
+    use crate::agent_pty::{
+        DOT_AGENT_DECK_EXIT_WHEN_ORPHANED, DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS,
+    };
+    use crate::daemon::{parse_bool_flag, parse_max_lifetime_secs, should_exit_orphaned};
+
+    let exit_when_orphaned = std::env::var(DOT_AGENT_DECK_EXIT_WHEN_ORPHANED)
+        .map(|v| parse_bool_flag(&v))
+        .unwrap_or(false);
+    let max_lifetime = std::env::var(DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS)
+        .ok()
+        .and_then(|v| parse_max_lifetime_secs(&v));
+    if !exit_when_orphaned && max_lifetime.is_none() {
+        return;
+    }
+
+    let original_ppid = crate::platform::proc::current_ppid();
+    let deadline = max_lifetime.map(|d| Instant::now() + d);
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let orphaned = exit_when_orphaned
+                && should_exit_orphaned(original_ppid, crate::platform::proc::current_ppid());
+            let expired = deadline.is_some_and(|d| Instant::now() >= d);
+            if orphaned || expired {
+                WRAP_PENDING_SIGNAL.store(libc::SIGTERM, Ordering::SeqCst);
+                return;
+            }
+        }
+    });
+}
+
 /// PRD #20 finding #12: a RESTORABLE guard that installs async handlers for
 /// `SIGTERM` / `SIGHUP` / `SIGINT` and restores the previous dispositions on
 /// drop. It is installed BEFORE the child is spawned so a signal arriving in the
@@ -984,6 +1039,10 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
+
+    // Armed before either spawn path so a wrapper orphaned during setup is
+    // still covered (mirrors `SignalGuard::install`'s spawn-window rationale).
+    arm_wrap_self_defense();
 
     let agent_type = resolve_agent_type(agent_override, program);
     let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID).ok();

@@ -16,6 +16,14 @@
 //!
 //! Decision 21: all bounded polling lives in `common` (`wait_until` /
 //! `process_running`), never as a raw `sleep` in this test body.
+//!
+//! `lifecycle/sigterm/001` covers the sibling production path: the daemon used
+//! to install NO signal handler at all, so the SIGTERM that `daemon stop` /
+//! `daemon restart` send (see `daemon_stop`) hit the default disposition — the
+//! process died instantly, its agents died by PTY hangup rather than an orderly
+//! registry teardown, and NOTHING was logged. A daemon that vanished
+//! mid-session left no evidence of whether it was stopped, crashed, or was
+//! OOM-killed.
 
 mod common;
 
@@ -108,6 +116,90 @@ fn orphan_exit_001_orphaned_daemon_self_exits() {
     );
 
     // Defensive: if somehow still alive, don't leak it out of the test.
+    if common::process_running(daemon_pid) {
+        // SAFETY: best-effort cleanup kill.
+        unsafe {
+            libc::kill(daemon_pid, libc::SIGKILL);
+        }
+    }
+}
+
+/// Scenario: Start `dot-agent-deck daemon serve` with idle shutdown DISABLED and
+/// file logging pointed at a tempdir, wait for it to bind its attach socket,
+/// then send it a plain SIGTERM — the same signal `daemon stop` / `daemon
+/// restart` use. Assert the daemon exits within a few seconds AND that it left a
+/// log line naming the signal, so a daemon that vanishes mid-session is never
+/// again silent about why.
+#[spec("lifecycle/sigterm/001")]
+#[test]
+fn sigterm_001_daemon_logs_and_exits_gracefully_on_sigterm() {
+    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let dir = common::race_safe_tempdir();
+    let work = dir.path();
+    let home = work.join("home");
+    std::fs::create_dir_all(&home).expect("create HOME");
+    let attach_socket = work.join("attach.sock");
+    let hook_socket = work.join("hook.sock");
+    let state_dir = work.join("state");
+    let log_path = work.join("deck.log");
+
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let mut daemon = std::process::Command::new(bin)
+        .arg("daemon")
+        .arg("serve")
+        .env_clear()
+        .env("PATH", &path_env)
+        .env("HOME", &home)
+        .env("DOT_AGENT_DECK_SOCKET", &hook_socket)
+        .env("DOT_AGENT_DECK_ATTACH_SOCKET", &attach_socket)
+        .env("DOT_AGENT_DECK_STATE_DIR", &state_dir)
+        // Only the signal handler may end this daemon.
+        .env("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS", "0")
+        .env("DOT_AGENT_DECK_LOG", &log_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn `dot-agent-deck daemon serve`");
+
+    let daemon_pid = daemon.id() as i32;
+
+    // Bound the wait on readiness: once the attach socket exists the signal
+    // handler is installed (both are set up before the hook loop runs).
+    assert!(
+        common::wait_until(Duration::from_secs(10), || attach_socket.exists()),
+        "daemon never bound its attach socket"
+    );
+
+    // The behavior under test: a plain SIGTERM, exactly what `daemon stop` sends.
+    // SAFETY: kill(2) with a real pid and SIGTERM; ESRCH/EPERM are ignored.
+    unsafe {
+        libc::kill(daemon_pid, libc::SIGTERM);
+    }
+
+    assert!(
+        common::wait_until(Duration::from_secs(10), || !common::process_running(
+            daemon_pid
+        )),
+        "daemon (pid {daemon_pid}) did not exit on SIGTERM"
+    );
+    let _ = daemon.wait();
+
+    // The point of the fix: the termination is ON THE RECORD. Without the
+    // handler the default disposition killed the process with an empty log.
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        log.contains("received termination signal"),
+        "the daemon exited on SIGTERM but logged nothing about it — the whole \
+         point of the handler is that a vanished daemon explains itself.\n\
+         log was:\n{log}"
+    );
+    assert!(
+        log.contains("SIGTERM"),
+        "the termination log line must name the signal that caused it.\n\
+         log was:\n{log}"
+    );
+
+    // Defensive: never leak the daemon out of the test.
     if common::process_running(daemon_pid) {
         // SAFETY: best-effort cleanup kill.
         unsafe {

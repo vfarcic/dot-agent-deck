@@ -1532,6 +1532,16 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the max-lifetime backstop (`DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`, covered by the daemon pure-data unit tests) or production daemons (the watchdog is OFF unless the env var is set).
 - **Platform coverage:** mac+linux.
 
+#### lifecycle/sigterm
+
+##### lifecycle/sigterm/001 — A daemon sent SIGTERM (what `daemon stop` / `daemon restart` deliver) exits through its graceful shutdown path AND logs the signal, instead of dying silently under the default disposition.
+- **Layer:** L2.
+- **Agent:** none (a bare `daemon serve` with idle shutdown disabled, so only the signal handler can end it).
+- **Asserts:** after a plain `kill(pid, SIGTERM)` the daemon process terminates within a few seconds, and its `DOT_AGENT_DECK_LOG` file contains a termination line naming `SIGTERM`.
+- **Does not assert:** agent teardown ordering under signal shutdown, or `SIGINT` (the handler treats both identically and the CLI only ever sends `SIGTERM`); `--force`'s SIGKILL escalation stays with `lifecycle/stop/003`.
+- **Regression origin:** the daemon installed no signal handler at all, so a stopped daemon left no log line — a real session lost seven live agent panes and the daemon's own log said nothing about why.
+- **Platform coverage:** linux+mac (Unix signals; the Windows build watches Ctrl-C instead).
+
 #### lifecycle/version
 
 ##### lifecycle/version/001 — A build environment that pre-sets `DAD_VERSION` / `DAD_BUILD_ID` produces a binary that reports those values, and changing either one invalidates the cached build (issue #250).

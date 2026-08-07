@@ -52,6 +52,23 @@ pub const QUIESCENT_IDLE_MS: u64 = 50;
 /// budget — quiescence and string-signal waits are bounded internally.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Max-lifetime cap for tests that spawn `dot-agent-deck wrap` DIRECTLY (rather
+/// than through [`TuiDeck`] / `DaemonProc`, which inject their own cap), so a
+/// wrapper orphaned by a SIGKILLed / timed-out / panicking test self-exits
+/// instead of leaking to PID 1 forever.
+///
+/// This is not hypothetical: three `wrap --agent codex` stubs from this file's
+/// own probes were found alive for **three days**, from a worktree that had
+/// already been deleted — two of them spinning a shell `sleep 0.01` loop at
+/// ~100 wakeups/second, and one holding `trap '' TERM` so no SIGTERM could
+/// reach it. The wrapper honours the cap as of the same change that added this
+/// constant; before that the env var was read only by `daemon serve`.
+///
+/// Deliberately generous (120 s) relative to these sub-10 s probes: it is a
+/// leak backstop, not a test timeout, so it must never be the thing that ends a
+/// legitimately slow run.
+pub const WRAP_TEST_MAX_LIFETIME_SECS: &str = "120";
+
 /// Decision 20: pinned PTY dimensions for the deck. Resize tests
 /// override via `TuiDeck::resize`.
 const DEFAULT_COLS: u16 = 120;

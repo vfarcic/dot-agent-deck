@@ -31,6 +31,10 @@ fn run_wrap(script: &str, stdin: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .args(["wrap", "--agent", "codex", "--", "/bin/sh", "-c", script])
         .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env(
+            "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS",
+            common::WRAP_TEST_MAX_LIFETIME_SECS,
+        )
         .env_remove("DOT_AGENT_DECK_PANE_ID")
         .env_remove("DOT_AGENT_DECK_AGENT_ID")
         .stdin(Stdio::piped())
@@ -105,6 +109,10 @@ fn run_with_stderr_redirected() -> (bool, Vec<u8>, Vec<u8>) {
             "printf 'mixed-stderr-marker\\n' >&2",
         ])
         .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env(
+            "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS",
+            common::WRAP_TEST_MAX_LIFETIME_SECS,
+        )
         .env_remove("DOT_AGENT_DECK_PANE_ID")
         .env_remove("DOT_AGENT_DECK_AGENT_ID")
         .stdin(Stdio::from(
@@ -137,6 +145,10 @@ fn run_with_stdout_redirected() -> (bool, Vec<u8>) {
              printf 'stdin=%s stderr=%s\\n' \"$input\" \"$error\"",
         ])
         .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env(
+            "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS",
+            common::WRAP_TEST_MAX_LIFETIME_SECS,
+        )
         .env_remove("DOT_AGENT_DECK_PANE_ID")
         .env_remove("DOT_AGENT_DECK_AGENT_ID")
         .stdin(Stdio::from(
@@ -205,6 +217,10 @@ fn codex_wrap_003_each_descriptor_preserves_its_original_semantics() {
             "printf 'pipe-out\\n'; printf 'pipe-err\\n' >&2",
         ])
         .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env(
+            "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS",
+            common::WRAP_TEST_MAX_LIFETIME_SECS,
+        )
         .env_remove("DOT_AGENT_DECK_PANE_ID")
         .env_remove("DOT_AGENT_DECK_AGENT_ID")
         .stdin(Stdio::null())
@@ -228,6 +244,10 @@ fn codex_wrap_003_each_descriptor_preserves_its_original_semantics() {
             "cat > \"$WRAP_STDIN_RECORD\"",
         ])
         .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env(
+            "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS",
+            common::WRAP_TEST_MAX_LIFETIME_SECS,
+        )
         .env_remove("DOT_AGENT_DECK_PANE_ID")
         .env_remove("DOT_AGENT_DECK_AGENT_ID")
         .env("WRAP_STDIN_RECORD", &binary_record)
@@ -312,6 +332,10 @@ fn codex_wrap_005_standalone_sessions_have_unique_ids() {
                 "while [ ! -e \"$WRAP_START\" ]; do sleep 0.01; done; printf 'working\\n'; sleep 0.1",
             ])
             .env("DOT_AGENT_DECK_SOCKET", &socket)
+            .env(
+                "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS",
+                common::WRAP_TEST_MAX_LIFETIME_SECS,
+            )
             .env("WRAP_START", &start)
             .env_remove("DOT_AGENT_DECK_PANE_ID")
             .env_remove("DOT_AGENT_DECK_AGENT_ID")
@@ -366,6 +390,10 @@ fn wrap_escalates_to_sigkill_before_the_deck_kills_the_wrapper() {
         ])
         .env("WRAP_CHILD_PID_FILE", &pid_path)
         .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env(
+            "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS",
+            common::WRAP_TEST_MAX_LIFETIME_SECS,
+        )
         .env_remove("DOT_AGENT_DECK_PANE_ID")
         .env_remove("DOT_AGENT_DECK_AGENT_ID")
         .stdin(Stdio::from(
@@ -461,6 +489,10 @@ fn run_signal_case(
         ])
         .env("WRAP_CHILD_PID_FILE", &pid_path)
         .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        .env(
+            "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS",
+            common::WRAP_TEST_MAX_LIFETIME_SECS,
+        )
         .env_remove("DOT_AGENT_DECK_PANE_ID")
         .env_remove("DOT_AGENT_DECK_AGENT_ID");
 
@@ -576,5 +608,88 @@ fn codex_wrap_004_termination_signals_reap_children_on_every_path() {
                 .iter()
                 .all(|outcome| outcome.wrapper_exited && outcome.child_gone),
         "wrapper must forward SIGTERM and SIGHUP and reap its child on both paths; outcomes: {outcomes:#?}"
+    );
+}
+
+/// Scenario: Start a wrapper whose child ignores SIGTERM and loops forever, with
+/// the max-lifetime backstop pinned to 1 second. Nothing signals the wrapper —
+/// the cap alone must end it. Assert BOTH the wrapper and its TERM-ignoring
+/// child are gone within a few seconds, proving an orphaned wrapper can no
+/// longer outlive its test (three such stubs once survived for three days).
+#[test]
+fn wrap_max_lifetime_backstop_ends_an_unsignalled_wrapper_and_its_child() {
+    let fixture = tempfile::tempdir().expect("create lifetime backstop fixture");
+    let pid_path = fixture.path().join("child.pid");
+    let (master, slave) = open_pty();
+    let mut wrapper = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args([
+            "wrap",
+            "--agent",
+            "codex",
+            "--",
+            "/bin/sh",
+            "-c",
+            // Same shape as the escalation probe: a child that cannot be ended
+            // by a polite SIGTERM, so passing this test requires the backstop to
+            // drive the full forward-then-escalate teardown.
+            "trap '' TERM; printf '%s\\n' \"$$\" > \"$WRAP_CHILD_PID_FILE\"; while :; do sleep 1; done",
+        ])
+        .env("WRAP_CHILD_PID_FILE", &pid_path)
+        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        // The behaviour under test: the shortest cap the parser accepts.
+        .env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "1")
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID")
+        .stdin(Stdio::from(
+            slave.try_clone().expect("clone PTY slave for stdin"),
+        ))
+        .stdout(Stdio::from(
+            slave.try_clone().expect("clone PTY slave for stdout"),
+        ))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .expect("spawn wrapper lifetime probe");
+    let _master = master;
+
+    let read_child_pid = || -> Option<libc::pid_t> {
+        std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|c| c.trim().parse().ok())
+    };
+    assert!(
+        common::wait_until(Duration::from_secs(5), || read_child_pid().is_some()),
+        "wrapper never recorded its child pid"
+    );
+    let child_pid = read_child_pid().expect("child pid recorded");
+
+    // 1 s cap + ~1 s watchdog poll + the reap loop's 50 ms tick + the SIGKILL
+    // escalation grace. 15 s is generous headroom on a loaded machine while
+    // still failing fast if the backstop never fires at all.
+    let budget = Duration::from_secs(15);
+    let wrapper_pid = wrapper.id() as libc::pid_t;
+    let wrapper_gone = common::wait_until(budget, || !common::process_running(wrapper_pid));
+    let child_gone = common::wait_until(budget, || !common::process_running(child_pid));
+
+    // Never leak this test's own probes, whatever the outcome above.
+    for pid in [child_pid, wrapper_pid] {
+        if common::process_running(pid) {
+            // SAFETY: best-effort cleanup of pids this test created.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = wrapper.wait();
+
+    assert!(
+        wrapper_gone,
+        "the wrapper outlived its max-lifetime cap — an orphaned wrapper would \
+         leak to PID 1 indefinitely, which is exactly the three-day leak this \
+         backstop exists to prevent"
+    );
+    assert!(
+        child_gone,
+        "the wrapper exited but its TERM-ignoring child survived — the backstop \
+         must escalate to SIGKILL so no descendant is left spinning"
     );
 }

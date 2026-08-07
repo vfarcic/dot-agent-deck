@@ -2330,7 +2330,7 @@ async fn run_pane_io_task(
         // on top of the agent the daemon is about to hand us.
         io_state.store(IO_REATTACHING, Ordering::SeqCst);
         match resolve_and_reattach(&client, &pane_id).await {
-            Some((new_agent_id, new_conn)) => {
+            Ok((new_agent_id, new_conn)) => {
                 tracing::debug!(
                     pane_id = %pane_id,
                     new_agent_id = %new_agent_id,
@@ -2340,17 +2340,73 @@ async fn run_pane_io_task(
                 conn_opt = Some(new_conn);
                 io_state.store(IO_ATTACHED, Ordering::SeqCst);
             }
-            None => {
+            Err(gave_up) => {
                 // See the `warn!` rationale above: terminal and user-visible.
+                // `reason` now separates "the daemon stopped answering" from
+                // "the daemon answered and this pane has no agent" — see
+                // `ReattachGiveUp`. The counts ride along so a reader can tell a
+                // clean single miss from a whole window of failed round-trips.
                 tracing::warn!(
                     pane_id = %pane_id,
-                    reason = "no-live-agent",
+                    reason = gave_up.reason(),
+                    list_attempts = gave_up.attempts,
+                    list_errors = gave_up.errors,
+                    last_error = gave_up.last_error.as_deref().unwrap_or("none"),
                     budget_secs = REATTACH_LOOKUP_TOTAL_BUDGET.as_secs(),
                     "auto-reattach: no live agent for pane within the retry window; giving up on this pane"
                 );
+                // NOTE: still `AgentGone` — the user-facing pane text is
+                // deliberately unchanged here. A distinct daemon-unreachable
+                // `PaneLostReason` would be a better message, but it changes
+                // rendered pane/status strings and belongs with its own L1
+                // snapshot coverage rather than riding along on a logging fix.
                 *lost.lock().unwrap() = Some(PaneLostReason::AgentGone);
                 break 'outer;
             }
+        }
+    }
+}
+
+/// Why a [`resolve_and_reattach`] lookup ran out its budget, so the caller's
+/// terminal `warn!` can name the actual cause.
+///
+/// The give-up used to report a flat `reason = "no-live-agent"` for two
+/// completely different failures, because the distinguishing detail was logged
+/// only at `debug!` (off unless `DOT_AGENT_DECK_LOG` is set):
+///
+/// * every `list_agents` call FAILED — the daemon is unreachable/gone, and the
+///   agents may well still be alive; or
+/// * `list_agents` answered fine and simply had no record for this pane — the
+///   agent really is gone daemon-side.
+///
+/// The two have different remedies (restart/reconnect the daemon vs. reopen the
+/// pane), and telling them apart after the fact mattered in a real incident: a
+/// daemon was terminated under seven live panes and every pane reported the
+/// agent-gone wording, so the logs alone could not show that ONE shared cause —
+/// not seven dying agents — was responsible.
+struct ReattachGiveUp {
+    /// Total `list_agents` round-trips attempted within the budget.
+    attempts: u32,
+    /// How many of those returned an error rather than a record set.
+    errors: u32,
+    /// The last transport error seen, if any.
+    last_error: Option<String>,
+}
+
+impl ReattachGiveUp {
+    /// `true` when NO `list_agents` call ever succeeded, i.e. the daemon — not
+    /// the agent — is what went missing. Requires at least one attempt so an
+    /// empty run can never masquerade as a daemon fault.
+    fn daemon_unreachable(&self) -> bool {
+        self.attempts > 0 && self.errors == self.attempts
+    }
+
+    /// The `reason` field for the terminal give-up log.
+    fn reason(&self) -> &'static str {
+        if self.daemon_unreachable() {
+            "daemon-unreachable"
+        } else {
+            "no-live-agent"
         }
     }
 }
@@ -2362,15 +2418,19 @@ async fn run_pane_io_task(
 /// [`REATTACH_LOOKUP_TOTAL_BUDGET`]. This covers the F9 respawn-in-flight
 /// gap, which spans from a few milliseconds (sh-based test agents) to
 /// several seconds (Claude Code via devbox, especially when SIGTERM is
-/// trapped). Returns `None` if no live agent matches the pane within
-/// the budget, or if every `attach` attempt fails.
+/// trapped). Returns `Err(`[`ReattachGiveUp`]`)` — carrying WHY — if no live
+/// agent matches the pane within the budget, or if every `attach` attempt fails.
 async fn resolve_and_reattach(
     client: &DaemonClient,
     pane_id_env: &str,
-) -> Option<(String, AttachConnection)> {
+) -> Result<(String, AttachConnection), ReattachGiveUp> {
     let start = tokio::time::Instant::now();
     let mut delay = REATTACH_LOOKUP_INITIAL_DELAY;
+    let mut attempts: u32 = 0;
+    let mut errors: u32 = 0;
+    let mut last_error: Option<String> = None;
     loop {
+        attempts = attempts.saturating_add(1);
         match client.list_agents().await {
             Ok(records) => {
                 let new_id_opt = records
@@ -2379,7 +2439,7 @@ async fn resolve_and_reattach(
                     .map(|r| r.id);
                 if let Some(new_id) = new_id_opt {
                     match client.attach(&new_id).await {
-                        Ok(conn) => return Some((new_id, conn)),
+                        Ok(conn) => return Ok((new_id, conn)),
                         Err(e) => tracing::debug!(
                             agent_id = %new_id,
                             error = %e,
@@ -2388,14 +2448,22 @@ async fn resolve_and_reattach(
                     }
                 }
             }
-            Err(e) => tracing::debug!(
-                error = %e,
-                "auto-reattach: list_agents failed; retrying after backoff"
-            ),
+            Err(e) => {
+                errors = errors.saturating_add(1);
+                last_error = Some(e.to_string());
+                tracing::debug!(
+                    error = %e,
+                    "auto-reattach: list_agents failed; retrying after backoff"
+                );
+            }
         }
 
         if start.elapsed() >= REATTACH_LOOKUP_TOTAL_BUDGET {
-            return None;
+            return Err(ReattachGiveUp {
+                attempts,
+                errors,
+                last_error,
+            });
         }
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(REATTACH_LOOKUP_MAX_DELAY);
@@ -3212,6 +3280,51 @@ mod tests {
         assert_ne!(
             PaneLostReason::AgentKeptCrashing.user_message(),
             PaneLostReason::AgentGone.user_message()
+        );
+    }
+
+    /// A give-up in which EVERY `list_agents` round-trip failed is the daemon
+    /// going missing, not the agent — the remedy differs, so the log must not
+    /// call it `no-live-agent`.
+    #[test]
+    fn reattach_give_up_reports_daemon_unreachable_when_every_lookup_errored() {
+        let all_failed = ReattachGiveUp {
+            attempts: 4,
+            errors: 4,
+            last_error: Some("connection refused".into()),
+        };
+        assert!(all_failed.daemon_unreachable());
+        assert_eq!(all_failed.reason(), "daemon-unreachable");
+    }
+
+    /// The complements: a lookup that answered at least once genuinely has no
+    /// agent for the pane, and a zero-attempt give-up must never be reported as
+    /// a daemon fault (nothing was ever asked).
+    #[test]
+    fn reattach_give_up_reports_no_live_agent_when_any_lookup_succeeded() {
+        let answered = ReattachGiveUp {
+            attempts: 4,
+            errors: 3,
+            last_error: Some("transient".into()),
+        };
+        assert!(!answered.daemon_unreachable());
+        assert_eq!(answered.reason(), "no-live-agent");
+
+        let clean = ReattachGiveUp {
+            attempts: 2,
+            errors: 0,
+            last_error: None,
+        };
+        assert_eq!(clean.reason(), "no-live-agent");
+
+        let never_asked = ReattachGiveUp {
+            attempts: 0,
+            errors: 0,
+            last_error: None,
+        };
+        assert!(
+            !never_asked.daemon_unreachable(),
+            "0 attempts / 0 errors must not read as 'every lookup failed'"
         );
     }
 
