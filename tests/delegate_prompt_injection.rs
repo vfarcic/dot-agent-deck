@@ -157,6 +157,49 @@ async fn poll_until_after_time_advance(
     }
 }
 
+/// Extra virtual time an `advance` needs in order to CROSS a timer that was
+/// armed exactly `nominal` ago on a paused clock (#402).
+///
+/// Tokio's timer wheel counts whole milliseconds: a deadline is rounded UP to
+/// the next tick (`deadline_to_tick` adds 999_999 ns before truncating) while
+/// `now` is truncated DOWN to one. A timer armed at real offset `a` therefore
+/// expires at tick `ceil(a) + nominal_ms`, but `advance(nominal)` only moves
+/// `now` to tick `floor(a + delta + nominal)`, where `delta` is the REAL time
+/// that elapsed between the daemon task arming the timer and this test calling
+/// `tokio::time::pause()`. On the delegate path `delta` is "whatever is left of
+/// a 20 ms `wait_for_replacement_agent` poll tick once the respawn finished" —
+/// a load-dependent coin flip. When it lands under a millisecond,
+/// `advance(nominal)` stops one tick SHORT and the timer does not fire.
+///
+/// The resulting failure is silent and total rather than off-by-a-little: the
+/// fallback then fires on the NEXT advance instead, so the readiness buffer is
+/// armed a full advance late, its deadline sits beyond every remaining advance,
+/// nothing is ever written to the worker PTY, and the final assertion reports an
+/// EMPTY snapshot. No amount of real-clock polling recovers it, because the
+/// paused clock never moves again. One whole tick of overshoot makes the
+/// crossing a property of the advance instead of host scheduling; two is
+/// used so the margin does not itself depend on where `a` fell inside its tick.
+#[cfg(unix)]
+const TIMER_TICK_SLACK: Duration = Duration::from_millis(2);
+
+/// `tokio::time::advance`, then drain the runtime so the task woken by the
+/// crossed deadline reaches ITS next await before the caller advances again.
+///
+/// `advance` yields exactly once. Every later advance in the
+/// `orchestration/delegate/011` scenarios is measured from the instant the
+/// delegate task arms the readiness-buffer sleep, so "the woken task actually
+/// ran" is a precondition of those advances, not a nicety — if it slips to the
+/// following advance the buffer deadline moves with it and the pointer is never
+/// delivered inside the test's virtual budget. Yields only: no real sleep, so
+/// the paused clock stays exactly where the caller put it.
+#[cfg(unix)]
+async fn advance_and_run(duration: Duration) {
+    tokio::time::advance(duration).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+}
+
 #[cfg(unix)]
 fn write_executable(path: &std::path::Path, contents: &str) {
     use std::os::unix::fs::PermissionsExt;
@@ -892,8 +935,12 @@ async fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner() {
     let new_agent_id = wait_for_replacement_agent(&registry, WORKER_PANE, &old_agent_id).await;
 
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(30)).await;
-    tokio::task::yield_now().await;
+    // Cross the 30 s `SessionStart` fallback, with a tick of overshoot so the
+    // crossing does not depend on how much real time happened to pass between
+    // the daemon task arming that timeout and the `pause()` above — see
+    // `TIMER_TICK_SLACK` (#402). Every advance below is relative to the instant
+    // the readiness-buffer sleep is armed, which is this one.
+    advance_and_run(Duration::from_secs(30) + TIMER_TICK_SLACK).await;
     std::thread::sleep(Duration::from_millis(100));
     let after_timeout = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
@@ -902,8 +949,7 @@ async fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner() {
         String::from_utf8_lossy(&after_timeout)
     );
 
-    tokio::time::advance(Duration::from_millis(DELEGATE_READINESS_BUFFER_MS - 2)).await;
-    tokio::task::yield_now().await;
+    advance_and_run(Duration::from_millis(DELEGATE_READINESS_BUFFER_MS - 2)).await;
     std::thread::sleep(Duration::from_millis(100));
     let just_before_buffer = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
@@ -964,10 +1010,9 @@ async fn delegate_011_one_millisecond_buffer_is_a_real_wait_inner() {
         .await;
     let new_agent_id = wait_for_replacement_agent(&registry, WORKER_PANE, &old_agent_id).await;
 
-    tokio::time::advance(Duration::from_secs(30)).await;
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
-    }
+    // `TIMER_TICK_SLACK` (#402): same fallback crossing as the scenario above,
+    // and the 1 ms buffer armed here leaves even less room to absorb a miss.
+    advance_and_run(Duration::from_secs(30) + TIMER_TICK_SLACK).await;
     std::thread::sleep(Duration::from_millis(50));
     let at_fallback = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
@@ -1028,14 +1073,11 @@ async fn delegate_011_overflow_buffer_clamps_to_thirty_seconds_inner() {
         .await;
     let new_agent_id = wait_for_replacement_agent(&registry, WORKER_PANE, &old_agent_id).await;
 
-    tokio::time::advance(Duration::from_secs(30)).await;
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::advance(Duration::from_millis(1001)).await;
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
-    }
+    // `TIMER_TICK_SLACK` (#402): the fallback crossing again. The 1001 ms step
+    // below still straddles the 1000 ms default it must NOT have fallen back
+    // to, because it is measured from the instant this advance arms the buffer.
+    advance_and_run(Duration::from_secs(30) + TIMER_TICK_SLACK).await;
+    advance_and_run(Duration::from_millis(1001)).await;
     std::thread::sleep(Duration::from_millis(50));
     let after_default = registry.snapshot(&new_agent_id).unwrap_or_default();
     assert!(
