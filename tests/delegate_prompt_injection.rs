@@ -1917,3 +1917,233 @@ fn delegate_no_event_window_parses_one_whitespace_and_overflow() {
             );
         });
 }
+
+// --- upstream #309 / #330: `delegate` never tells its caller anything -----
+//
+// Both issues share one root cause: `src/main.rs`'s `Delegate` arm is
+// fire-and-forget (`hook::send_to_socket` then `ExitCode::SUCCESS`), so a
+// rejected delegate (#309 — the non-orchestrator and unknown-pane early
+// returns at `src/state.rs` only `warn!()` and write nothing back) and a
+// successful one (#330 — a real acceptance is just as silent, which is what
+// prompts a confirmatory re-run that arms a duplicate delegation) are both
+// exit 0 with no output. Unlike every other test in this file, these three
+// invoke the REAL `dot-agent-deck delegate` CLI as a subprocess against a
+// real daemon socket (`common::spawn_inprocess_daemon`) — the in-process
+// `state.handle_delegate(...)` calls above never go through `src/main.rs`'s
+// CLI arm at all, so they cannot observe its exit code or stderr/stdout.
+//
+// Deliberately NOT pinned: exit code value, stderr/stdout wording, or frame
+// shape. The fix's wire shape (see upstream #309's sketch of a daemon reply)
+// is an open design decision — asserting `!status.success()` and "stderr is
+// non-empty" pins only the observable contract these issues demand, mirroring
+// fork #17's `result.is_err()` precedent.
+
+#[cfg(unix)]
+struct CliDelegateResult {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run the real `dot-agent-deck delegate` CLI as a subprocess against
+/// `hook_path`, exactly as a role's shell would from inside a pane —
+/// `DOT_AGENT_DECK_PANE_ID` is the only thing that identifies the caller to
+/// the daemon.
+#[cfg(unix)]
+async fn run_delegate_cli(
+    hook_path: &std::path::Path,
+    pane_id: &str,
+    to: &str,
+    task: &str,
+) -> CliDelegateResult {
+    let hook_path = hook_path.to_path_buf();
+    let pane_id = pane_id.to_string();
+    let to = to.to_string();
+    let task = task.to_string();
+    tokio::task::spawn_blocking(move || {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+            .arg("delegate")
+            .arg("--to")
+            .arg(&to)
+            .arg("--task")
+            .arg(&task)
+            .env(DOT_AGENT_DECK_PANE_ID, &pane_id)
+            .env("DOT_AGENT_DECK_SOCKET", &hook_path)
+            .output()
+            .expect("run the real `dot-agent-deck delegate` CLI as a subprocess");
+        CliDelegateResult {
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    })
+    .await
+    .expect("delegate CLI subprocess task did not panic")
+}
+
+/// Scenario: Register a non-orchestrator worker pane, then run the REAL `dot-agent-deck delegate` CLI as a subprocess from that pane against a real daemon socket. Today the daemon's role guard (`src/state.rs:3014`, "delegate from non-orchestrator pane") only logs and returns, and the fire-and-forget CLI arm (`src/main.rs:675`) exits 0 regardless — so the caller cannot tell its delegation was rejected. Assert the CLI exits non-zero and writes a reason to stderr (upstream #309).
+#[spec("orchestration/delegate/016")]
+#[test]
+#[cfg(unix)]
+fn delegate_016_non_orchestrator_rejection_is_visible_to_the_caller() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build non-orchestrator-visibility runtime")
+        .block_on(delegate_016_non_orchestrator_rejection_is_visible_to_the_caller_inner());
+}
+
+#[cfg(unix)]
+async fn delegate_016_non_orchestrator_rejection_is_visible_to_the_caller_inner() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let cwd = common::race_safe_tempdir();
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+
+    // WORKER_PANE is a KNOWN pane (in pane_role_map) but not in
+    // orchestrator_pane_ids — the guard at state.rs:3008/3014 rejects it,
+    // distinct from the unknown-pane guard `orchestration/delegate/017`
+    // exercises.
+    {
+        let mut state = daemon.state.write().await;
+        register_orchestration(&mut state, &cwd_str);
+    }
+
+    let result = run_delegate_cli(
+        &daemon.hook_path,
+        WORKER_PANE,
+        WORKER_ROLE,
+        "Escalate: do the orchestrator's job.",
+    )
+    .await;
+
+    assert!(
+        !result.status.success(),
+        "a delegate rejected as non-orchestrator must exit non-zero, or the caller believes \
+         it shipped (upstream #309); got status={:?} stdout={:?} stderr={:?}",
+        result.status,
+        result.stdout,
+        result.stderr
+    );
+    assert!(
+        !result.stderr.trim().is_empty(),
+        "a rejected delegate must say WHY on stderr, not just fail silently (upstream #309); \
+         status={:?} stdout={:?} stderr={:?}",
+        result.status,
+        result.stdout,
+        result.stderr
+    );
+}
+
+/// Scenario: Run the REAL `dot-agent-deck delegate` CLI as a subprocess from a pane the daemon has never seen (absent from `pane_role_map` entirely), against a real daemon socket. Today the sibling early return (`src/state.rs:3005`, "delegate from unknown pane") is silent in exactly the same way as the non-orchestrator guard, and the CLI still exits 0. Assert the CLI exits non-zero and writes a reason to stderr (upstream #309).
+#[spec("orchestration/delegate/017")]
+#[test]
+#[cfg(unix)]
+fn delegate_017_unknown_pane_rejection_is_visible_to_the_caller() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build unknown-pane-visibility runtime")
+        .block_on(delegate_017_unknown_pane_rejection_is_visible_to_the_caller_inner());
+}
+
+#[cfg(unix)]
+async fn delegate_017_unknown_pane_rejection_is_visible_to_the_caller_inner() {
+    let daemon = common::spawn_inprocess_daemon().await;
+
+    // Deliberately no pane_role_map entry at all for this pane id — hits
+    // the state.rs:3005 early return before the orchestrator-role check
+    // `orchestration/delegate/016` exercises even runs.
+    let result = run_delegate_cli(
+        &daemon.hook_path,
+        "totally-unregistered-pane",
+        WORKER_ROLE,
+        "Escalate: do the orchestrator's job.",
+    )
+    .await;
+
+    assert!(
+        !result.status.success(),
+        "a delegate from an unknown pane must exit non-zero, or the caller believes it \
+         shipped (upstream #309); got status={:?} stdout={:?} stderr={:?}",
+        result.status,
+        result.stdout,
+        result.stderr
+    );
+    assert!(
+        !result.stderr.trim().is_empty(),
+        "a rejected delegate must say WHY on stderr, not just fail silently (upstream #309); \
+         status={:?} stdout={:?} stderr={:?}",
+        result.status,
+        result.stdout,
+        result.stderr
+    );
+}
+
+/// Scenario: Register a real orchestrator pane and a `cat`-stub `coder` worker pane in the same orchestration, then run the REAL `dot-agent-deck delegate` CLI as a subprocess from the orchestrator pane against a real daemon socket. Today the CLI exits 0 with empty stdout regardless of whether the daemon accepted the delegation, which is exactly what pushed a real orchestrator to re-run an identical `delegate` "to check" and arm a duplicate record (upstream #330). Assert stdout is non-empty and names the delegated role, so a successful call is self-confirming.
+#[spec("orchestration/delegate/018")]
+#[test]
+#[cfg(unix)]
+fn delegate_018_successful_delegate_confirms_itself_on_stdout() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build successful-delegate-confirmation runtime")
+        .block_on(delegate_018_successful_delegate_confirms_itself_on_stdout_inner());
+}
+
+#[cfg(unix)]
+async fn delegate_018_successful_delegate_confirms_itself_on_stdout_inner() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let cwd = common::race_safe_tempdir();
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+
+    daemon
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            cwd: Some(&cwd_str),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn worker stub");
+    {
+        let mut state = daemon.state.write().await;
+        register_orchestration(&mut state, &cwd_str);
+    }
+
+    let result = run_delegate_cli(
+        &daemon.hook_path,
+        ORCH_PANE,
+        WORKER_ROLE,
+        "List the files in the current directory.",
+    )
+    .await;
+
+    assert!(
+        result.status.success(),
+        "a valid delegate from the orchestrator pane must succeed; got status={:?} \
+         stdout={:?} stderr={:?}",
+        result.status,
+        result.stdout,
+        result.stderr
+    );
+    assert!(
+        !result.stdout.trim().is_empty(),
+        "a successful delegate must confirm itself on stdout, or the orchestrator has no way \
+         to tell success from a silently dropped delegation short of re-running it — which is \
+         precisely what arms a duplicate record (upstream #330); stderr={:?}",
+        result.stderr
+    );
+    assert!(
+        result.stdout.contains(WORKER_ROLE),
+        "the confirmation must identify WHAT was armed (e.g. the delegated role), or a \
+         duplicate delegation stays just as indistinguishable from a first success as an \
+         empty confirmation would be (upstream #330); stdout={:?}",
+        result.stdout
+    );
+
+    daemon.registry.shutdown_all();
+}

@@ -2248,6 +2248,27 @@ without depending on the config struct API.
 - **Platform coverage:** mac+linux (unix-only PTY/UDS; local real-agent tier).
 - **Cost note:** one short GPT-4o-mini worker turn per observation.
 
+##### orchestration/delegate/016 — A `delegate` rejected because the caller's pane is not the orchestrator is visible to the caller: the CLI exits non-zero and names the reason on stderr (upstream #309).
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck delegate` CLI as a subprocess + an in-process daemon hook socket, `common::spawn_inprocess_daemon`, + real `handle_delegate`; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a known worker pane registered in `pane_role_map` but absent from `orchestrator_pane_ids`; the CLI subprocess is invoked with that pane's `DOT_AGENT_DECK_PANE_ID`).
+- **Asserts:** the subprocess's exit status is non-zero and its stderr is non-empty. Deliberately does not pin the exact message or exit code value — the fix's wire shape (a daemon reply, per upstream #309's sketch) is an open design decision.
+- **Does not assert:** the daemon-side log entry; the unknown-pane sibling guard (`orchestration/delegate/017`); the in-process `handle_delegate` non-delivery contract already covered by `orchestration/delegate/004`/`006`.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/017 — A `delegate` rejected because the caller's pane is unknown to the daemon is visible to the caller in the same way as `/016` (upstream #309).
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck delegate` CLI as a subprocess + an in-process daemon hook socket; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — the CLI subprocess is invoked with a pane id the daemon has never registered in `pane_role_map`).
+- **Asserts:** the subprocess's exit status is non-zero and its stderr is non-empty, exercising the sibling early return (`src/state.rs:3005`) distinct from `/016`'s guard.
+- **Does not assert:** the exact message or exit code value; the non-orchestrator guard (`orchestration/delegate/016`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/018 — A successful `delegate` confirms itself on stdout, naming the delegated role, so the caller never needs a confirmatory re-run (upstream #330).
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck delegate` CLI as a subprocess + an in-process daemon hook socket + real `handle_delegate` + a `cat`-stub worker pane; no vt100 attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a real orchestrator pane and a `cat`-stub `coder` worker pane registered in the same orchestration; the CLI subprocess is invoked with the orchestrator pane's `DOT_AGENT_DECK_PANE_ID`).
+- **Asserts:** the subprocess exits successfully, its stdout is non-empty, and its stdout contains the delegated role name. Deliberately does not pin the exact confirmation wording or format (e.g. upstream #330's `delegated to coder (pane <pane-id>)` sketch) — only that the confirmation identifies what was armed.
+- **Does not assert:** the duplicate-delegation distinguishability itself (upstream #330's actual knock-on harm — too slow/indirect to pin without the idle-worker detector firing, see the tester's `work-done` report); the pane-delivery contract already covered by `orchestration/delegate/001`/`005`.
+- **Platform coverage:** mac+linux.
+
 #### orchestration/focus
 
 ##### orchestration/focus/002 — The full lock-governed focus contract, end to end in a real Orchestration tab: LOCKED by default with focus on the orchestrator; a worker's `WaitingForInput` visibly pulls focus to itself and its resolution visibly returns focus to the orchestrator on the all-clear edge; `Ctrl+d` then `Ctrl+e` unlocks; a manual focus choice on a non-orchestrator role then sticks through both a fresh waiting episode and its all-clear, because unlocked runs no auto-focus branch at all (PRD #393 M5, the CLAUDE.md rule 4 headline test for this PRD). `orchestration_focus_001` — the PRD #373 M2 inactivity snap-back's PTY proof, and this catalog section's only entry before it — was deleted outright at PRD #393 M4 along with the production behavior it covered; `002` re-establishes the section covering the successor behavior M4/M4b/M5 actually shipped.
