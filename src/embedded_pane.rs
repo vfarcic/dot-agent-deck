@@ -2353,6 +2353,7 @@ async fn run_pane_io_task(
                     list_errors = gave_up.list_errors,
                     trailing_list_errors = gave_up.trailing_list_errors,
                     attach_errors = gave_up.attach_errors,
+                    trailing_attach_errors = gave_up.trailing_attach_errors,
                     last_error = gave_up.last_error.as_deref().unwrap_or("none"),
                     budget_secs = REATTACH_LOOKUP_TOTAL_BUDGET.as_secs(),
                     "auto-reattach: no live agent for pane within the retry window; giving up on this pane"
@@ -2413,11 +2414,37 @@ struct ReattachGiveUp {
     trailing_list_errors: u32,
     /// How many times a matching agent WAS found but `attach` to it failed.
     attach_errors: u32,
+    /// Attach failures that are still the LIVE story — cleared the moment a
+    /// successful lookup reports no agent for this pane, because that answer is
+    /// authoritative and supersedes an attach failure against an agent that has
+    /// since disappeared.
+    ///
+    /// The aggregate version was a third Greptile P1 in the same family as
+    /// [`Self::trailing_list_errors`]: one early attach failure outranked nine
+    /// later authoritative "no such agent" answers and reported `attach-failing`
+    /// for a pane whose agent had demonstrably gone.
+    trailing_attach_errors: u32,
     /// The last error seen from either call, if any.
     last_error: Option<String>,
 }
 
 impl ReattachGiveUp {
+    // THE RULE, since three of the four review findings on this struct were the
+    // same mistake in different clothes: classification reads ONLY the trailing
+    // state — the most recent authoritative evidence — never the aggregate
+    // counters. A fault that has since been superseded is history and must not
+    // outrank what the last round-trip actually established. The aggregates exist
+    // solely to enrich the log line.
+    //
+    // Concretely, each iteration updates the trailing state like this:
+    //   * `list_agents` errored          → daemon is the live fault
+    //   * agent found, `attach` errored   → attach path is the live fault
+    //   * lookup fine, agent NOT found    → AUTHORITATIVE: the agent is gone,
+    //                                       so both trailing faults are cleared
+    //
+    // A new failure mode added here must extend that table, not add another
+    // aggregate test alongside it.
+
     /// `true` when the window ENDED with the daemon not answering, i.e. the
     /// daemon — not the agent — is what went missing. Requires at least one
     /// attempt so an empty run can never masquerade as a daemon fault.
@@ -2431,12 +2458,11 @@ impl ReattachGiveUp {
         self.attempts > 0 && self.trailing_list_errors > 0
     }
 
-    /// `true` when the pane's agent was found at least once but `attach` to it
-    /// never succeeded. Checked AFTER [`Self::daemon_unreachable`], so a run that
-    /// merely began with a reachable daemon and then lost it is still reported as
-    /// the daemon's fault.
+    /// `true` when an attach failure is still the live story at give-up time.
+    /// Checked AFTER [`Self::daemon_unreachable`], so a window that ended with the
+    /// daemon silent is reported as the daemon's fault.
     fn attach_failing(&self) -> bool {
-        self.attach_errors > 0
+        self.trailing_attach_errors > 0
     }
 
     /// The `reason` field for the terminal give-up log.
@@ -2470,6 +2496,7 @@ async fn resolve_and_reattach(
     let mut list_errors: u32 = 0;
     let mut trailing_list_errors: u32 = 0;
     let mut attach_errors: u32 = 0;
+    let mut trailing_attach_errors: u32 = 0;
     let mut last_error: Option<String> = None;
     loop {
         attempts = attempts.saturating_add(1);
@@ -2483,14 +2510,22 @@ async fn resolve_and_reattach(
                     .into_iter()
                     .find(|r| r.pane_id_env.as_deref() == Some(pane_id_env))
                     .map(|r| r.id);
-                if let Some(new_id) = new_id_opt {
-                    match client.attach(&new_id).await {
+                match new_id_opt {
+                    None => {
+                        // AUTHORITATIVE: the daemon answered and has no agent for
+                        // this pane. That settles it — any earlier attach failure
+                        // was against an agent that has since gone, so it must not
+                        // keep claiming the diagnosis.
+                        trailing_attach_errors = 0;
+                    }
+                    Some(new_id) => match client.attach(&new_id).await {
                         Ok(conn) => return Ok((new_id, conn)),
                         Err(e) => {
                             // Counted, not just logged: the agent demonstrably
                             // EXISTS, so a give-up here must not be reported as
                             // `no-live-agent` and blamed on a missing agent.
                             attach_errors = attach_errors.saturating_add(1);
+                            trailing_attach_errors = trailing_attach_errors.saturating_add(1);
                             last_error = Some(e.to_string());
                             tracing::debug!(
                                 agent_id = %new_id,
@@ -2498,7 +2533,7 @@ async fn resolve_and_reattach(
                                 "auto-reattach: attach to new agent failed; retrying after backoff"
                             );
                         }
-                    }
+                    },
                 }
             }
             Err(e) => {
@@ -2518,6 +2553,7 @@ async fn resolve_and_reattach(
                 list_errors,
                 trailing_list_errors,
                 attach_errors,
+                trailing_attach_errors,
                 last_error,
             });
         }
@@ -3348,6 +3384,7 @@ mod tests {
             attempts: 4,
             list_errors: 4,
             trailing_list_errors: 4,
+            trailing_attach_errors: 0,
             attach_errors: 0,
             last_error: Some("connection refused".into()),
         };
@@ -3367,6 +3404,7 @@ mod tests {
             // Not all 10 — the first lookup answered, it simply had no record yet.
             list_errors: 9,
             trailing_list_errors: 9,
+            trailing_attach_errors: 0,
             attach_errors: 0,
             last_error: Some("connection refused".into()),
         };
@@ -3393,6 +3431,7 @@ mod tests {
             list_errors: 5,
             // Every trailing lookup succeeded — the blip is history.
             trailing_list_errors: 0,
+            trailing_attach_errors: 0,
             attach_errors: 0,
             last_error: Some("earlier blip".into()),
         };
@@ -3409,6 +3448,7 @@ mod tests {
             attempts: 5,
             trailing_list_errors: 0,
             list_errors: 0,
+            trailing_attach_errors: 0,
             attach_errors: 5,
             last_error: Some("attach refused".into()),
         };
@@ -3430,6 +3470,7 @@ mod tests {
             attempts: 4,
             list_errors: 3,
             trailing_list_errors: 3,
+            trailing_attach_errors: 0,
             attach_errors: 1,
             last_error: Some("connection refused".into()),
         };
@@ -3446,6 +3487,7 @@ mod tests {
             attempts: 4,
             list_errors: 2,
             trailing_list_errors: 0,
+            trailing_attach_errors: 0,
             attach_errors: 1,
             last_error: Some("attach refused".into()),
         };
@@ -3464,6 +3506,7 @@ mod tests {
             attempts: 4,
             trailing_list_errors: 0,
             list_errors: 3,
+            trailing_attach_errors: 0,
             attach_errors: 0,
             last_error: Some("transient".into()),
         };
@@ -3474,6 +3517,7 @@ mod tests {
             attempts: 2,
             trailing_list_errors: 0,
             list_errors: 0,
+            trailing_attach_errors: 0,
             attach_errors: 0,
             last_error: None,
         };
@@ -3483,6 +3527,7 @@ mod tests {
             attempts: 0,
             trailing_list_errors: 0,
             list_errors: 0,
+            trailing_attach_errors: 0,
             attach_errors: 0,
             last_error: None,
         };
