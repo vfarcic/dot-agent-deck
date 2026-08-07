@@ -88,6 +88,15 @@ fn nonblank_rows(buffer: &Buffer) -> usize {
 }
 
 fn selected_card_fixture() -> SessionState {
+    // `last_activity` is nudged 30s into the future of `now` (issue #350):
+    // `mode_deck_001_selected_card_styles` pins this fixture's rendered card
+    // into a color/style-aware snapshot, and the bottom border's `Last:` field
+    // is computed by `format_elapsed` (src/ui.rs) from `Utc::now()` at render
+    // time, not at fixture-build time. Seeding it to exactly `now` raced that
+    // computation across a whole second boundary under any scheduling delay.
+    // The forward nudge relies on `format_elapsed`'s existing clamp of a
+    // negative delta to zero (`delta.num_seconds().max(0)`), so the rendered
+    // value holds at `0s` for 30s. Committed snapshot is unchanged.
     let now = chrono::Utc::now();
     SessionState {
         session_id: "mode-card".to_string(),
@@ -96,7 +105,7 @@ fn selected_card_fixture() -> SessionState {
         status: SessionStatus::Working,
         active_tool: None,
         started_at: now,
-        last_activity: now,
+        last_activity: now + chrono::Duration::seconds(30),
         recent_events: VecDeque::new(),
         tool_count: 0,
         last_user_prompt: None,
