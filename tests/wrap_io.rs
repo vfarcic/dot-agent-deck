@@ -649,7 +649,6 @@ fn wrap_max_lifetime_backstop_ends_an_unsignalled_wrapper_and_its_child() {
         .stderr(Stdio::from(slave))
         .spawn()
         .expect("spawn wrapper lifetime probe");
-    let _master = master;
 
     let read_child_pid = || -> Option<libc::pid_t> {
         std::fs::read_to_string(&pid_path)
@@ -674,15 +673,29 @@ fn wrap_max_lifetime_backstop_ends_an_unsignalled_wrapper_and_its_child() {
     //    the reap loop forwarded SIGTERM and, since this child traps TERM,
     //    escalated to SIGKILL. Bounded by the 1 s cap + up to ~1 s of watchdog
     //    poll + the reap loop's 50 ms tick + WRAP_TERMINATE_GRACE (1.5 s).
-    // 2. The wrapper then exits, so nothing is left at PID 1. Its teardown adds
-    //    the bounded post-exit drain (a 300 ms settle, then up to
-    //    AGENT_TERMINATE_GRACE, then a 500 ms final wait), so the arithmetic
-    //    worst case is ~7.5 s. Both budgets sit far above that: the failure worth
-    //    catching is "never exits", and a tight bound only manufactures flakes on
-    //    a contended runner.
+    // 2. The wrapper then exits, so nothing is left at PID 1 — but only once the
+    //    outer terminal is gone, which is why `master` is dropped between the two
+    //    waits rather than held for the whole test.
+    //
+    //    Holding it for both waits is what failed on macOS at 60 s, with the
+    //    child already dead: the wrapper's stdin pump was still blocked reading
+    //    an outer PTY slave whose master this test kept open, and macOS does not
+    //    surface that as EOF/EIO the way Linux does. That condition is also not
+    //    the leak being guarded against — when a SIGKILLed test orphans a
+    //    wrapper, the test's terminal descriptors die WITH it. Dropping the
+    //    master models that, and keeps the assertion meaningful instead of
+    //    platform-dependent.
+    //
+    //    The drop happens AFTER the child is confirmed dead, deliberately: a
+    //    closed downstream terminal is itself a teardown trigger (the R20-001
+    //    settle-then-terminate path), so dropping earlier could kill the child
+    //    for a reason unrelated to the backstop and make step 1 vacuous.
     let child_gone = common::wait_until(Duration::from_secs(30), || {
         !common::process_running(child_pid)
     });
+
+    drop(master);
+
     let wrapper_pid = wrapper.id() as libc::pid_t;
     let wrapper_gone = common::wait_until(Duration::from_secs(60), || {
         !common::process_running(wrapper_pid)
