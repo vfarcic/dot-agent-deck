@@ -2147,3 +2147,332 @@ async fn delegate_018_successful_delegate_confirms_itself_on_stdout_inner() {
 
     daemon.registry.shutdown_all();
 }
+
+// ---------------------------------------------------------------------
+// upstream #331 / fork #76 — the work-done output path collision.
+//
+// `handle_work_done` (`src/state.rs`) builds its on-disk output path from
+// role name + cwd ONLY — never from which pane, delegation, or
+// orchestration instance sent the signal — and writes unconditionally,
+// with no existence check. These two tests pin the resulting data loss as
+// an END-STATE (content that must survive, an announcement that must
+// occur), not as a specific filename: the fix under discussion may key the
+// path on `pane_id` and archive-on-collision, but that mechanism is a
+// recommendation, not a settled contract, so neither test hardcodes
+// `work-done-coder.md` as anything other than TODAY's known write target.
+// ---------------------------------------------------------------------
+
+/// Recursively read every file under `dir` and concatenate their contents.
+/// A survival check built on this does not need to know (or predict) the
+/// exact filename(s) a fix ends up choosing — a report that survives under
+/// a renamed, suffixed, or archived path is still found.
+#[cfg(unix)]
+fn all_dot_agent_deck_text(dir: &std::path::Path) -> String {
+    fn walk(dir: &std::path::Path, out: &mut String) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if let Ok(contents) = std::fs::read_to_string(&path) {
+                out.push_str(&contents);
+                out.push('\n');
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(dir, &mut out);
+    out
+}
+
+/// Scenario: Two different panes — standing in for two live orchestrations
+/// that happen to share a `coder` role name and a working directory (fork
+/// #76's reported collision) — each call the real `handle_work_done` with
+/// distinct, marked report content. Both reports must remain discoverable
+/// somewhere under `.dot-agent-deck/` afterward.
+#[cfg(unix)]
+#[spec("orchestration/delegate/019")]
+#[test]
+fn delegate_019_same_role_same_cwd_concurrent_work_done_does_not_clobber() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build same-role collision runtime")
+        .block_on(async {
+            common::init_test_env();
+            let cwd = common::race_safe_tempdir();
+            let cwd_str = cwd.path().to_string_lossy().into_owned();
+
+            let mut state = AppState::default();
+            for pane in ["collision-coder-a", "collision-coder-b"] {
+                state.register_pane(pane.to_string());
+                state
+                    .pane_role_map
+                    .insert(pane.to_string(), "coder".to_string());
+                state.pane_cwd_map.insert(pane.to_string(), cwd_str.clone());
+            }
+
+            let registry = AgentPtyRegistry::new();
+
+            const REPORT_A: &str = "REPORT-FROM-ORCHESTRATION-A-CODER-7f3a1c";
+            const REPORT_B: &str = "REPORT-FROM-ORCHESTRATION-B-CODER-9c1e4d";
+
+            state
+                .handle_work_done(
+                    WorkDoneSignal {
+                        pane_id: "collision-coder-a".to_string(),
+                        task: REPORT_A.to_string(),
+                        done: false,
+                        timestamp: chrono::Utc::now(),
+                    },
+                    &registry,
+                )
+                .await;
+            state
+                .handle_work_done(
+                    WorkDoneSignal {
+                        pane_id: "collision-coder-b".to_string(),
+                        task: REPORT_B.to_string(),
+                        done: false,
+                        timestamp: chrono::Utc::now(),
+                    },
+                    &registry,
+                )
+                .await;
+
+            let combined = all_dot_agent_deck_text(&cwd.path().join(".dot-agent-deck"));
+            assert!(
+                combined.contains(REPORT_A),
+                "orchestration A's coder report is gone after orchestration B's coder \
+                 reported on the same role/cwd (fork #76): the shared, role-only-keyed \
+                 output path let B's write destroy A's. Combined .dot-agent-deck \
+                 contents:\n{combined}"
+            );
+            assert!(
+                combined.contains(REPORT_B),
+                "orchestration B's coder report never made it to disk at all. Combined \
+                 .dot-agent-deck contents:\n{combined}"
+            );
+        });
+}
+
+/// Extract the `.dot-agent-deck/...` pointer path the daemon names in a
+/// work-done feedback string, e.g. out of "Worker coder has completed their
+/// task. Read .dot-agent-deck/work-done-coder.md for their full report." —
+/// this is how the ORCHESTRATOR itself is meant to find the report
+/// (`src/state.rs`'s feedback composer), so a test that wants to know the
+/// daemon's true output path follows the same pointer rather than
+/// reconstructing the filename from role/cwd.
+#[cfg(unix)]
+fn extract_dot_agent_deck_pointer(feedback: &[u8]) -> String {
+    let text = String::from_utf8_lossy(feedback);
+    let needle = ".dot-agent-deck/";
+    let start = text
+        .find(needle)
+        .unwrap_or_else(|| panic!("no {needle:?} path found in orchestrator feedback: {text:?}"));
+    let rest = &text[start..];
+    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+/// Wait until `needle` has appeared at least twice (non-overlapping) in the
+/// agent's cumulative snapshot, or a bounded timeout elapses. Used to prove
+/// a SECOND work-done's feedback landed, distinct from the first.
+#[cfg(unix)]
+async fn wait_for_second_occurrence(
+    registry: &AgentPtyRegistry,
+    agent_id: &str,
+    needle: &[u8],
+    timeout: Duration,
+) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let snapshot = registry.snapshot(agent_id).unwrap_or_default();
+        let count = snapshot
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count();
+        if count >= 2 || tokio::time::Instant::now() >= deadline {
+            return snapshot;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Drive ONE worker pane through two real `handle_work_done` calls against a
+/// fresh orchestrator + cwd. When `inject_external_write_between_calls` is
+/// set, after the FIRST call the daemon's own feedback pointer is parsed to
+/// discover its true output path (never assumed), and a distinct marker is
+/// written there directly via the filesystem — standing in for upstream
+/// #331's actual mechanism: a worker using a generic file-writing tool to
+/// park a report at that path, independent of any `work-done` call. The
+/// SECOND `handle_work_done` call then arrives exactly as #331 describes:
+/// unconditionally, with no existence check on what's already there.
+///
+/// Returns the orchestrator's cumulative PTY snapshot after both calls (so a
+/// caller can diff it against a baseline run with no injected collision) and
+/// the `.dot-agent-deck` directory path (so a caller can inspect what
+/// survived on disk).
+#[cfg(unix)]
+async fn run_two_work_done_calls(
+    label: &str,
+    inject_external_write_between_calls: bool,
+) -> (Vec<u8>, std::path::PathBuf) {
+    common::init_test_env();
+    let cwd = common::race_safe_tempdir();
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    let orch_pane = format!("{label}-orch");
+    let worker_pane = format!("{label}-coder");
+
+    let observer = cwd.path().join(format!("{label}-observer"));
+    write_executable(
+        &observer,
+        "#!/bin/sh\nstty raw -echo\nprintf READY-MARKER\nexec cat -u\n",
+    );
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let orch_agent_id = registry
+        .spawn_agent(SpawnOptions {
+            command: Some(&observer.to_string_lossy()),
+            cwd: Some(&cwd_str),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), orch_pane.clone())],
+            ..SpawnOptions::default()
+        })
+        .unwrap_or_else(|e| panic!("spawn {label} orchestrator: {e}"));
+    let ready = wait_for_snapshot_needle(
+        &registry,
+        &orch_agent_id,
+        b"READY-MARKER",
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(
+        snapshot_contains(&ready, b"READY-MARKER"),
+        "{label} orchestrator stub never became observable; snapshot = {:?}",
+        String::from_utf8_lossy(&ready)
+    );
+
+    let mut state = AppState::default();
+    let orchestration = OrchestrationIdentity::NameCwd {
+        name: format!("{label}-orchestration"),
+        cwd: cwd_str.clone(),
+    };
+    state
+        .pane_role_map
+        .insert(orch_pane.clone(), "orchestrator".to_string());
+    state
+        .pane_role_map
+        .insert(worker_pane.clone(), "coder".to_string());
+    state.orchestrator_pane_ids.insert(orch_pane.clone());
+    state
+        .pane_orchestration_map
+        .insert(orch_pane.clone(), orchestration.clone());
+    state
+        .pane_orchestration_map
+        .insert(worker_pane.clone(), orchestration);
+    state
+        .pane_cwd_map
+        .insert(worker_pane.clone(), cwd_str.clone());
+
+    state
+        .handle_work_done(
+            WorkDoneSignal {
+                pane_id: worker_pane.clone(),
+                task: "ORIGINAL-REPORT-MARKER".to_string(),
+                done: false,
+                timestamp: chrono::Utc::now(),
+            },
+            &registry,
+        )
+        .await;
+    let after_first = wait_for_snapshot_needle(
+        &registry,
+        &orch_agent_id,
+        b"has completed their task",
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(
+        snapshot_contains(&after_first, b"has completed their task"),
+        "{label}: first work-done never produced orchestrator feedback; snapshot = {:?}",
+        String::from_utf8_lossy(&after_first)
+    );
+
+    if inject_external_write_between_calls {
+        let pointer = extract_dot_agent_deck_pointer(&after_first);
+        let target = cwd.path().join(&pointer);
+        std::fs::write(&target, "PRE-EXISTING-VALUABLE-REPORT-MARKER").unwrap_or_else(|e| {
+            panic!(
+                "simulate a generic file-writing tool parking a report at {}: {e}",
+                target.display()
+            )
+        });
+    }
+
+    state
+        .handle_work_done(
+            WorkDoneSignal {
+                pane_id: worker_pane.clone(),
+                task: "BRIEF-SUMMARY-MARKER".to_string(),
+                done: false,
+                timestamp: chrono::Utc::now(),
+            },
+            &registry,
+        )
+        .await;
+    let after_second = wait_for_second_occurrence(
+        &registry,
+        &orch_agent_id,
+        b"has completed their task",
+        Duration::from_secs(2),
+    )
+    .await;
+
+    registry.shutdown_all();
+    (after_second, cwd.path().join(".dot-agent-deck"))
+}
+
+/// Scenario: Simulate upstream #331 — a report already sits at the daemon's
+/// own work-done output path (discovered from its own feedback pointer, not
+/// assumed) when a second, differently-sourced `work-done` call arrives from
+/// the same worker pane. Compare against a baseline run with nothing
+/// pre-existing: the prior content must survive somewhere on disk, and the
+/// collision must be ANNOUNCED — the orchestrator's feedback must differ
+/// from the no-collision baseline, not be byte-identical to it.
+#[cfg(unix)]
+#[spec("orchestration/delegate/020")]
+#[test]
+fn delegate_020_existing_report_survives_and_collision_is_announced() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build existing-report collision runtime")
+        .block_on(async {
+            let (baseline_feedback, _baseline_dir) =
+                run_two_work_done_calls("baseline", false).await;
+            let (collision_feedback, collision_dir) =
+                run_two_work_done_calls("collision", true).await;
+
+            let combined = all_dot_agent_deck_text(&collision_dir);
+            assert!(
+                combined.contains("PRE-EXISTING-VALUABLE-REPORT-MARKER"),
+                "a report that was already sitting at the daemon's own work-done output \
+                 path (upstream #331's mechanism) is gone after a second, differently- \
+                 sourced work-done call overwrote it unconditionally with no existence \
+                 check. Combined .dot-agent-deck contents:\n{combined}"
+            );
+            assert_ne!(
+                collision_feedback,
+                baseline_feedback,
+                "a work-done call that clobbered a pre-existing report produced BYTE- \
+                 IDENTICAL orchestrator feedback to an otherwise-identical call with \
+                 nothing pre-existing — the collision was silent, not announced.\n\
+                 collision feedback = {:?}\nbaseline feedback = {:?}",
+                String::from_utf8_lossy(&collision_feedback),
+                String::from_utf8_lossy(&baseline_feedback)
+            );
+        });
+}
