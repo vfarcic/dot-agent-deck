@@ -2350,7 +2350,8 @@ async fn run_pane_io_task(
                     pane_id = %pane_id,
                     reason = gave_up.reason(),
                     list_attempts = gave_up.attempts,
-                    list_errors = gave_up.errors,
+                    list_errors = gave_up.list_errors,
+                    attach_errors = gave_up.attach_errors,
                     last_error = gave_up.last_error.as_deref().unwrap_or("none"),
                     budget_secs = REATTACH_LOOKUP_TOTAL_BUDGET.as_secs(),
                     "auto-reattach: no live agent for pane within the retry window; giving up on this pane"
@@ -2370,26 +2371,36 @@ async fn run_pane_io_task(
 /// Why a [`resolve_and_reattach`] lookup ran out its budget, so the caller's
 /// terminal `warn!` can name the actual cause.
 ///
-/// The give-up used to report a flat `reason = "no-live-agent"` for two
+/// The give-up used to report a flat `reason = "no-live-agent"` for three
 /// completely different failures, because the distinguishing detail was logged
 /// only at `debug!` (off unless `DOT_AGENT_DECK_LOG` is set):
 ///
 /// * every `list_agents` call FAILED — the daemon is unreachable/gone, and the
-///   agents may well still be alive; or
+///   agents may well still be alive;
+/// * `list_agents` answered and named a live agent for this pane, but every
+///   `attach` to it failed — the agent exists and the daemon is reachable, so
+///   the fault is in the attach/stream path; or
 /// * `list_agents` answered fine and simply had no record for this pane — the
 ///   agent really is gone daemon-side.
 ///
-/// The two have different remedies (restart/reconnect the daemon vs. reopen the
-/// pane), and telling them apart after the fact mattered in a real incident: a
-/// daemon was terminated under seven live panes and every pane reported the
-/// agent-gone wording, so the logs alone could not show that ONE shared cause —
-/// not seven dying agents — was responsible.
+/// All three have different remedies (reconnect the daemon vs. investigate the
+/// attach path vs. reopen the pane), and telling them apart after the fact
+/// mattered in a real incident: a daemon was terminated under seven live panes
+/// and every pane reported the agent-gone wording, so the logs alone could not
+/// show that ONE shared cause — not seven dying agents — was responsible.
+///
+/// The attach-failure case was a Greptile P1 on the first draft of this struct,
+/// which counted only `list_agents` errors: a pane disconnected by a persistent
+/// attach failure was reported as `no-live-agent`, i.e. blamed on an agent that
+/// was demonstrably still registered.
 struct ReattachGiveUp {
     /// Total `list_agents` round-trips attempted within the budget.
     attempts: u32,
     /// How many of those returned an error rather than a record set.
-    errors: u32,
-    /// The last transport error seen, if any.
+    list_errors: u32,
+    /// How many times a matching agent WAS found but `attach` to it failed.
+    attach_errors: u32,
+    /// The last error seen from either call, if any.
     last_error: Option<String>,
 }
 
@@ -2398,13 +2409,23 @@ impl ReattachGiveUp {
     /// the agent — is what went missing. Requires at least one attempt so an
     /// empty run can never masquerade as a daemon fault.
     fn daemon_unreachable(&self) -> bool {
-        self.attempts > 0 && self.errors == self.attempts
+        self.attempts > 0 && self.list_errors == self.attempts
+    }
+
+    /// `true` when the pane's agent was found at least once but `attach` to it
+    /// never succeeded. Checked AFTER [`Self::daemon_unreachable`], so a run that
+    /// merely began with a reachable daemon and then lost it is still reported as
+    /// the daemon's fault.
+    fn attach_failing(&self) -> bool {
+        self.attach_errors > 0
     }
 
     /// The `reason` field for the terminal give-up log.
     fn reason(&self) -> &'static str {
         if self.daemon_unreachable() {
             "daemon-unreachable"
+        } else if self.attach_failing() {
+            "attach-failing"
         } else {
             "no-live-agent"
         }
@@ -2427,7 +2448,8 @@ async fn resolve_and_reattach(
     let start = tokio::time::Instant::now();
     let mut delay = REATTACH_LOOKUP_INITIAL_DELAY;
     let mut attempts: u32 = 0;
-    let mut errors: u32 = 0;
+    let mut list_errors: u32 = 0;
+    let mut attach_errors: u32 = 0;
     let mut last_error: Option<String> = None;
     loop {
         attempts = attempts.saturating_add(1);
@@ -2440,16 +2462,23 @@ async fn resolve_and_reattach(
                 if let Some(new_id) = new_id_opt {
                     match client.attach(&new_id).await {
                         Ok(conn) => return Ok((new_id, conn)),
-                        Err(e) => tracing::debug!(
-                            agent_id = %new_id,
-                            error = %e,
-                            "auto-reattach: attach to new agent failed; retrying after backoff"
-                        ),
+                        Err(e) => {
+                            // Counted, not just logged: the agent demonstrably
+                            // EXISTS, so a give-up here must not be reported as
+                            // `no-live-agent` and blamed on a missing agent.
+                            attach_errors = attach_errors.saturating_add(1);
+                            last_error = Some(e.to_string());
+                            tracing::debug!(
+                                agent_id = %new_id,
+                                error = %e,
+                                "auto-reattach: attach to new agent failed; retrying after backoff"
+                            );
+                        }
                     }
                 }
             }
             Err(e) => {
-                errors = errors.saturating_add(1);
+                list_errors = list_errors.saturating_add(1);
                 last_error = Some(e.to_string());
                 tracing::debug!(
                     error = %e,
@@ -2461,7 +2490,8 @@ async fn resolve_and_reattach(
         if start.elapsed() >= REATTACH_LOOKUP_TOTAL_BUDGET {
             return Err(ReattachGiveUp {
                 attempts,
-                errors,
+                list_errors,
+                attach_errors,
                 last_error,
             });
         }
@@ -3290,11 +3320,56 @@ mod tests {
     fn reattach_give_up_reports_daemon_unreachable_when_every_lookup_errored() {
         let all_failed = ReattachGiveUp {
             attempts: 4,
-            errors: 4,
+            list_errors: 4,
+            attach_errors: 0,
             last_error: Some("connection refused".into()),
         };
         assert!(all_failed.daemon_unreachable());
         assert_eq!(all_failed.reason(), "daemon-unreachable");
+    }
+
+    /// Greptile P1 on the first draft: a pane whose agent WAS listed but could
+    /// never be attached to was reported as `no-live-agent`, blaming an agent
+    /// that was demonstrably still registered.
+    #[test]
+    fn reattach_give_up_reports_attach_failing_when_the_agent_was_found_but_unattachable() {
+        let attach_broken = ReattachGiveUp {
+            attempts: 5,
+            list_errors: 0,
+            attach_errors: 5,
+            last_error: Some("attach refused".into()),
+        };
+        assert!(!attach_broken.daemon_unreachable());
+        assert!(attach_broken.attach_failing());
+        assert_eq!(attach_broken.reason(), "attach-failing");
+    }
+
+    /// Precedence: a run that lost the daemon partway (some list errors AND an
+    /// earlier attach failure) is the daemon's fault, not the attach path's —
+    /// `daemon_unreachable` is only true when EVERY lookup failed, so a mixed
+    /// run falls through to `attach-failing` rather than silently outranking it.
+    #[test]
+    fn reattach_give_up_precedence_between_daemon_and_attach_faults() {
+        let every_list_failed_too = ReattachGiveUp {
+            attempts: 3,
+            list_errors: 3,
+            attach_errors: 1,
+            last_error: Some("both".into()),
+        };
+        assert_eq!(
+            every_list_failed_too.reason(),
+            "daemon-unreachable",
+            "when no lookup ever succeeded the daemon is the cause, even if an \
+             earlier attach also failed"
+        );
+
+        let mixed = ReattachGiveUp {
+            attempts: 4,
+            list_errors: 2,
+            attach_errors: 1,
+            last_error: Some("mixed".into()),
+        };
+        assert_eq!(mixed.reason(), "attach-failing");
     }
 
     /// The complements: a lookup that answered at least once genuinely has no
@@ -3304,7 +3379,8 @@ mod tests {
     fn reattach_give_up_reports_no_live_agent_when_any_lookup_succeeded() {
         let answered = ReattachGiveUp {
             attempts: 4,
-            errors: 3,
+            list_errors: 3,
+            attach_errors: 0,
             last_error: Some("transient".into()),
         };
         assert!(!answered.daemon_unreachable());
@@ -3312,14 +3388,16 @@ mod tests {
 
         let clean = ReattachGiveUp {
             attempts: 2,
-            errors: 0,
+            list_errors: 0,
+            attach_errors: 0,
             last_error: None,
         };
         assert_eq!(clean.reason(), "no-live-agent");
 
         let never_asked = ReattachGiveUp {
             attempts: 0,
-            errors: 0,
+            list_errors: 0,
+            attach_errors: 0,
             last_error: None,
         };
         assert!(

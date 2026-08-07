@@ -207,3 +207,86 @@ fn sigterm_001_daemon_logs_and_exits_gracefully_on_sigterm() {
         }
     }
 }
+
+/// Scenario: Start a daemon, then send it TWO SIGTERMs in a row. The first
+/// begins graceful shutdown; the second must force an immediate exit with status
+/// 143 rather than being swallowed. Installing a handler replaces the default
+/// disposition process-wide, so without this escape hatch a wedged shutdown
+/// could no longer be ended with `pkill` — which sends SIGTERM by default.
+#[spec("lifecycle/sigterm/002")]
+#[test]
+fn sigterm_002_second_signal_forces_exit_instead_of_being_swallowed() {
+    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let dir = common::race_safe_tempdir();
+    let work = dir.path();
+    let home = work.join("home");
+    std::fs::create_dir_all(&home).expect("create HOME");
+    let attach_socket = work.join("attach.sock");
+    let hook_socket = work.join("hook.sock");
+    let state_dir = work.join("state");
+    let log_path = work.join("deck.log");
+
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let mut daemon = std::process::Command::new(bin)
+        .arg("daemon")
+        .arg("serve")
+        .env_clear()
+        .env("PATH", &path_env)
+        .env("HOME", &home)
+        .env("DOT_AGENT_DECK_SOCKET", &hook_socket)
+        .env("DOT_AGENT_DECK_ATTACH_SOCKET", &attach_socket)
+        .env("DOT_AGENT_DECK_STATE_DIR", &state_dir)
+        .env("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS", "0")
+        .env("DOT_AGENT_DECK_LOG", &log_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn `dot-agent-deck daemon serve`");
+
+    let daemon_pid = daemon.id() as i32;
+    assert!(
+        common::wait_until(Duration::from_secs(10), || attach_socket.exists()),
+        "daemon never bound its attach socket"
+    );
+
+    // First signal: begins graceful shutdown. Wait for the handler to have
+    // consumed it (its log line is the observable), so the second signal is
+    // unambiguously the SECOND one rather than a race with the first.
+    // SAFETY: kill(2) with a real pid and SIGTERM.
+    unsafe {
+        libc::kill(daemon_pid, libc::SIGTERM);
+    }
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            std::fs::read_to_string(&log_path)
+                .unwrap_or_default()
+                .contains("received termination signal")
+        }),
+        "the daemon never logged the first termination signal"
+    );
+
+    // Second signal. Either the daemon already finished its graceful exit (fine
+    // — the hatch was simply not needed), or it is still shutting down and this
+    // must force it out. Both outcomes are "the process is gone"; what must NOT
+    // happen is the signal being swallowed and the daemon lingering.
+    // SAFETY: kill(2) with a real pid and SIGTERM; ESRCH is ignored.
+    unsafe {
+        libc::kill(daemon_pid, libc::SIGTERM);
+    }
+    assert!(
+        common::wait_until(Duration::from_secs(10), || !common::process_running(
+            daemon_pid
+        )),
+        "daemon (pid {daemon_pid}) survived two SIGTERMs — the second was \
+         swallowed by the installed handler, so a wedged shutdown could not be \
+         killed with `pkill`"
+    );
+    let _ = daemon.wait();
+
+    if common::process_running(daemon_pid) {
+        // SAFETY: best-effort cleanup kill.
+        unsafe {
+            libc::kill(daemon_pid, libc::SIGKILL);
+        }
+    }
+}

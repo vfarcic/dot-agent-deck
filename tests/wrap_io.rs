@@ -662,13 +662,31 @@ fn wrap_max_lifetime_backstop_ends_an_unsignalled_wrapper_and_its_child() {
     );
     let child_pid = read_child_pid().expect("child pid recorded");
 
-    // 1 s cap + ~1 s watchdog poll + the reap loop's 50 ms tick + the SIGKILL
-    // escalation grace. 15 s is generous headroom on a loaded machine while
-    // still failing fast if the backstop never fires at all.
-    let budget = Duration::from_secs(15);
+    // Two SEPARATE properties, waited on child-first so a failure says which one
+    // broke. The first draft used one 15 s budget and waited on the wrapper
+    // first; when that tripped on a macOS runner the message accused the backstop
+    // of never firing, while the child had in fact already been killed — the
+    // backstop HAD worked and only the wrapper's own teardown was still
+    // finishing. That is precisely the "one message for two unrelated causes"
+    // trap this branch fixes in `auto-reattach`; do not reintroduce it here.
+    //
+    // 1. The child is dead — the backstop's actual contract: the watchdog fired,
+    //    the reap loop forwarded SIGTERM and, since this child traps TERM,
+    //    escalated to SIGKILL. Bounded by the 1 s cap + up to ~1 s of watchdog
+    //    poll + the reap loop's 50 ms tick + WRAP_TERMINATE_GRACE (1.5 s).
+    // 2. The wrapper then exits, so nothing is left at PID 1. Its teardown adds
+    //    the bounded post-exit drain (a 300 ms settle, then up to
+    //    AGENT_TERMINATE_GRACE, then a 500 ms final wait), so the arithmetic
+    //    worst case is ~7.5 s. Both budgets sit far above that: the failure worth
+    //    catching is "never exits", and a tight bound only manufactures flakes on
+    //    a contended runner.
+    let child_gone = common::wait_until(Duration::from_secs(30), || {
+        !common::process_running(child_pid)
+    });
     let wrapper_pid = wrapper.id() as libc::pid_t;
-    let wrapper_gone = common::wait_until(budget, || !common::process_running(wrapper_pid));
-    let child_gone = common::wait_until(budget, || !common::process_running(child_pid));
+    let wrapper_gone = common::wait_until(Duration::from_secs(60), || {
+        !common::process_running(wrapper_pid)
+    });
 
     // Never leak this test's own probes, whatever the outcome above.
     for pid in [child_pid, wrapper_pid] {
@@ -682,14 +700,15 @@ fn wrap_max_lifetime_backstop_ends_an_unsignalled_wrapper_and_its_child() {
     let _ = wrapper.wait();
 
     assert!(
-        wrapper_gone,
-        "the wrapper outlived its max-lifetime cap — an orphaned wrapper would \
-         leak to PID 1 indefinitely, which is exactly the three-day leak this \
-         backstop exists to prevent"
+        child_gone,
+        "the backstop never took the child down — either the watchdog did not \
+         fire, or the reap loop never escalated past the SIGTERM this child \
+         ignores. This is the three-day leak the backstop exists to prevent."
     );
     assert!(
-        child_gone,
-        "the wrapper exited but its TERM-ignoring child survived — the backstop \
-         must escalate to SIGKILL so no descendant is left spinning"
+        wrapper_gone,
+        "the backstop killed the child but the WRAPPER never exited, so it would \
+         still be left behind at PID 1. Its post-exit teardown is meant to be \
+         bounded; an unbounded wait in the drain path looks exactly like this."
     );
 }
