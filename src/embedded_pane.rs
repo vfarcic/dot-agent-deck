@@ -3421,6 +3421,32 @@ mod tests {
         );
     }
 
+    /// Fourth Greptile P1, the same mistake as the third but on the attach
+    /// counter: an early attach failure was kept for the whole window, so it
+    /// outranked later AUTHORITATIVE "no agent for this pane" answers and reported
+    /// `attach-failing` for a pane whose agent had demonstrably disappeared. A
+    /// successful lookup that finds no agent now clears the trailing attach fault.
+    #[test]
+    fn reattach_give_up_lets_an_authoritative_no_agent_answer_supersede_an_attach_fault() {
+        let agent_vanished_after_an_attach_failure = ReattachGiveUp {
+            attempts: 10,
+            list_errors: 0,
+            trailing_list_errors: 0,
+            // It happened, and stays in the log…
+            attach_errors: 1,
+            // …but nine later lookups answered "no such agent", which settles it.
+            trailing_attach_errors: 0,
+            last_error: Some("attach refused".into()),
+        };
+        assert!(!agent_vanished_after_an_attach_failure.attach_failing());
+        assert_eq!(
+            agent_vanished_after_an_attach_failure.reason(),
+            "no-live-agent",
+            "an attach failure against an agent that has since gone must not \
+             outrank the daemon's authoritative answer that it is gone"
+        );
+    }
+
     /// The converse: failures EARLY that recovered must not be blamed on the
     /// daemon. The window ended with the daemon answering and no record for the
     /// pane, so the agent really is gone.
@@ -3446,10 +3472,12 @@ mod tests {
     fn reattach_give_up_reports_attach_failing_when_the_agent_was_found_but_unattachable() {
         let attach_broken = ReattachGiveUp {
             attempts: 5,
-            trailing_list_errors: 0,
             list_errors: 0,
-            trailing_attach_errors: 0,
+            trailing_list_errors: 0,
             attach_errors: 5,
+            // Every attach failed and none was ever superseded by a no-agent
+            // answer, so the attach fault is still the live story.
+            trailing_attach_errors: 5,
             last_error: Some("attach refused".into()),
         };
         assert!(!attach_broken.daemon_unreachable());
@@ -3470,8 +3498,10 @@ mod tests {
             attempts: 4,
             list_errors: 3,
             trailing_list_errors: 3,
-            trailing_attach_errors: 0,
             attach_errors: 1,
+            // Still 1: only a SUCCESSFUL lookup with no match clears this, and
+            // every lookup after the attach failure errored out.
+            trailing_attach_errors: 1,
             last_error: Some("connection refused".into()),
         };
         assert_eq!(
@@ -3487,8 +3517,10 @@ mod tests {
             attempts: 4,
             list_errors: 2,
             trailing_list_errors: 0,
-            trailing_attach_errors: 0,
             attach_errors: 1,
+            // The agent is still being found, so the attach failure was never
+            // superseded — it is the standing fault.
+            trailing_attach_errors: 1,
             last_error: Some("attach refused".into()),
         };
         assert_eq!(
