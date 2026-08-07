@@ -2351,6 +2351,7 @@ async fn run_pane_io_task(
                     reason = gave_up.reason(),
                     list_attempts = gave_up.attempts,
                     list_errors = gave_up.list_errors,
+                    trailing_list_errors = gave_up.trailing_list_errors,
                     attach_errors = gave_up.attach_errors,
                     last_error = gave_up.last_error.as_deref().unwrap_or("none"),
                     budget_secs = REATTACH_LOOKUP_TOTAL_BUDGET.as_secs(),
@@ -2398,6 +2399,18 @@ struct ReattachGiveUp {
     attempts: u32,
     /// How many of those returned an error rather than a record set.
     list_errors: u32,
+    /// CONSECUTIVE `list_agents` failures at the END of the window — reset to 0
+    /// by every success. This, not [`Self::list_errors`], decides whether the
+    /// daemon is the culprit: what matters is whether the daemon was answering
+    /// when we gave up, not whether it ever answered.
+    ///
+    /// A second Greptile P1 caught the aggregate version: requiring
+    /// `list_errors == attempts` meant a single early success — e.g. the very
+    /// first lookup, before the respawning agent had registered — followed by the
+    /// daemon dying for the rest of the window fell through to `no-live-agent`.
+    /// That is the exact shape of the incident this diagnostic exists for, so the
+    /// aggregate got the one case it most needed to get right backwards.
+    trailing_list_errors: u32,
     /// How many times a matching agent WAS found but `attach` to it failed.
     attach_errors: u32,
     /// The last error seen from either call, if any.
@@ -2405,11 +2418,17 @@ struct ReattachGiveUp {
 }
 
 impl ReattachGiveUp {
-    /// `true` when NO `list_agents` call ever succeeded, i.e. the daemon — not
-    /// the agent — is what went missing. Requires at least one attempt so an
-    /// empty run can never masquerade as a daemon fault.
+    /// `true` when the window ENDED with the daemon not answering, i.e. the
+    /// daemon — not the agent — is what went missing. Requires at least one
+    /// attempt so an empty run can never masquerade as a daemon fault.
+    ///
+    /// A single trailing failure is deliberately enough. At give-up time the last
+    /// thing known is that the daemon did not answer, and the alternative —
+    /// blaming an agent whose absence was never actually observed — is the worse
+    /// error. The exact counts ride along in the log for anyone who needs to tell
+    /// a one-off blip from a sustained outage.
     fn daemon_unreachable(&self) -> bool {
-        self.attempts > 0 && self.list_errors == self.attempts
+        self.attempts > 0 && self.trailing_list_errors > 0
     }
 
     /// `true` when the pane's agent was found at least once but `attach` to it
@@ -2449,12 +2468,17 @@ async fn resolve_and_reattach(
     let mut delay = REATTACH_LOOKUP_INITIAL_DELAY;
     let mut attempts: u32 = 0;
     let mut list_errors: u32 = 0;
+    let mut trailing_list_errors: u32 = 0;
     let mut attach_errors: u32 = 0;
     let mut last_error: Option<String> = None;
     loop {
         attempts = attempts.saturating_add(1);
         match client.list_agents().await {
             Ok(records) => {
+                // The daemon answered, so it is reachable AS OF NOW. Anything it
+                // failed to answer earlier is history and must not outrank the
+                // current state when the reason is chosen.
+                trailing_list_errors = 0;
                 let new_id_opt = records
                     .into_iter()
                     .find(|r| r.pane_id_env.as_deref() == Some(pane_id_env))
@@ -2479,6 +2503,7 @@ async fn resolve_and_reattach(
             }
             Err(e) => {
                 list_errors = list_errors.saturating_add(1);
+                trailing_list_errors = trailing_list_errors.saturating_add(1);
                 last_error = Some(e.to_string());
                 tracing::debug!(
                     error = %e,
@@ -2491,6 +2516,7 @@ async fn resolve_and_reattach(
             return Err(ReattachGiveUp {
                 attempts,
                 list_errors,
+                trailing_list_errors,
                 attach_errors,
                 last_error,
             });
@@ -3321,11 +3347,57 @@ mod tests {
         let all_failed = ReattachGiveUp {
             attempts: 4,
             list_errors: 4,
+            trailing_list_errors: 4,
             attach_errors: 0,
             last_error: Some("connection refused".into()),
         };
         assert!(all_failed.daemon_unreachable());
         assert_eq!(all_failed.reason(), "daemon-unreachable");
+    }
+
+    /// Second Greptile P1: the aggregate `list_errors == attempts` test meant one
+    /// early success — the very first lookup, before a respawning agent had
+    /// registered — followed by the daemon dying for the rest of the window was
+    /// reported as `no-live-agent`. That is the exact shape of the incident this
+    /// diagnostic exists for, so classification keys off the TAIL of the window.
+    #[test]
+    fn reattach_give_up_reports_daemon_unreachable_when_the_daemon_died_mid_window() {
+        let died_after_first_success = ReattachGiveUp {
+            attempts: 10,
+            // Not all 10 — the first lookup answered, it simply had no record yet.
+            list_errors: 9,
+            trailing_list_errors: 9,
+            attach_errors: 0,
+            last_error: Some("connection refused".into()),
+        };
+        assert!(
+            died_after_first_success.daemon_unreachable(),
+            "a daemon that answered once and then died for the rest of the window \
+             is still the cause; the agent's absence was never actually observed"
+        );
+        assert_eq!(
+            died_after_first_success.reason(),
+            "daemon-unreachable",
+            "aggregate counting reported this as no-live-agent — the one case the \
+             classifier most needed to get right"
+        );
+    }
+
+    /// The converse: failures EARLY that recovered must not be blamed on the
+    /// daemon. The window ended with the daemon answering and no record for the
+    /// pane, so the agent really is gone.
+    #[test]
+    fn reattach_give_up_ignores_transient_failures_that_recovered() {
+        let recovered = ReattachGiveUp {
+            attempts: 8,
+            list_errors: 5,
+            // Every trailing lookup succeeded — the blip is history.
+            trailing_list_errors: 0,
+            attach_errors: 0,
+            last_error: Some("earlier blip".into()),
+        };
+        assert!(!recovered.daemon_unreachable());
+        assert_eq!(recovered.reason(), "no-live-agent");
     }
 
     /// Greptile P1 on the first draft: a pane whose agent WAS listed but could
@@ -3335,6 +3407,7 @@ mod tests {
     fn reattach_give_up_reports_attach_failing_when_the_agent_was_found_but_unattachable() {
         let attach_broken = ReattachGiveUp {
             attempts: 5,
+            trailing_list_errors: 0,
             list_errors: 0,
             attach_errors: 5,
             last_error: Some("attach refused".into()),
@@ -3350,26 +3423,36 @@ mod tests {
     /// run falls through to `attach-failing` rather than silently outranking it.
     #[test]
     fn reattach_give_up_precedence_between_daemon_and_attach_faults() {
-        let every_list_failed_too = ReattachGiveUp {
-            attempts: 3,
+        // An attach failed early, then the daemon went away and never came back.
+        // The daemon outranks the attach fault: it is the live problem, and the
+        // attach can't even be retried while the daemon is unreachable.
+        let daemon_died_after_an_attach_failure = ReattachGiveUp {
+            attempts: 4,
             list_errors: 3,
+            trailing_list_errors: 3,
             attach_errors: 1,
-            last_error: Some("both".into()),
+            last_error: Some("connection refused".into()),
         };
         assert_eq!(
-            every_list_failed_too.reason(),
+            daemon_died_after_an_attach_failure.reason(),
             "daemon-unreachable",
-            "when no lookup ever succeeded the daemon is the cause, even if an \
-             earlier attach also failed"
+            "the window ended with the daemon silent, so that is the cause to \
+             report even though an attach also failed earlier"
         );
 
-        let mixed = ReattachGiveUp {
+        // The reverse tail: the daemon is answering at give-up time and the only
+        // standing fault is the attach path.
+        let attach_fault_with_a_recovered_blip = ReattachGiveUp {
             attempts: 4,
             list_errors: 2,
+            trailing_list_errors: 0,
             attach_errors: 1,
-            last_error: Some("mixed".into()),
+            last_error: Some("attach refused".into()),
         };
-        assert_eq!(mixed.reason(), "attach-failing");
+        assert_eq!(
+            attach_fault_with_a_recovered_blip.reason(),
+            "attach-failing"
+        );
     }
 
     /// The complements: a lookup that answered at least once genuinely has no
@@ -3379,6 +3462,7 @@ mod tests {
     fn reattach_give_up_reports_no_live_agent_when_any_lookup_succeeded() {
         let answered = ReattachGiveUp {
             attempts: 4,
+            trailing_list_errors: 0,
             list_errors: 3,
             attach_errors: 0,
             last_error: Some("transient".into()),
@@ -3388,6 +3472,7 @@ mod tests {
 
         let clean = ReattachGiveUp {
             attempts: 2,
+            trailing_list_errors: 0,
             list_errors: 0,
             attach_errors: 0,
             last_error: None,
@@ -3396,6 +3481,7 @@ mod tests {
 
         let never_asked = ReattachGiveUp {
             attempts: 0,
+            trailing_list_errors: 0,
             list_errors: 0,
             attach_errors: 0,
             last_error: None,
