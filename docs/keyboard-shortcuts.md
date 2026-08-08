@@ -19,6 +19,7 @@ A mode tab's side panes scroll when the pointer is over them; anywhere else the 
 | `Ctrl+N` | New pane (directory picker, then name + command form) | Any mode |
 | `Ctrl+T` | Toggle stacked / tiled layout — stacked shows only the focused pane at full height, tiled shows every pane at once | Any mode |
 | `Ctrl+W` | Close the selected pane on the dashboard, or tear down the entire mode tab (agent + side panes) when used on a mode tab — after a confirmation dialog. The dashboard tab itself cannot be closed. | **Command mode only** |
+| `Ctrl+E` | Toggle the command-entry lock — whether you can type directly into a worker pane on an orchestration tab. See [`Ctrl+E` locks command entry to the orchestrator pane](#ctrle-locks-command-entry-to-the-orchestrator-pane). | **Command mode only, on an orchestration tab** |
 
 ### Which mode you're in
 
@@ -35,6 +36,20 @@ Three other things follow the mode:
 `Ctrl+W` is delete-previous-word in shells, readline, vim, and essentially every program you run inside a pane. So while you are typing in a pane, `Ctrl+W` is sent straight through to that program as `^W` (byte `0x17`) and deletes a word — it does not close anything. Press `Ctrl+D` first, and `Ctrl+W` there asks you to confirm before closing.
 
 The confirmation defaults to **Cancel**, so an accidental `Ctrl+W` followed by a reflexive `Enter` leaves your pane exactly where it was. Choosing **Close** stops the agent and removes the card.
+
+### `Ctrl+E` locks command entry to the orchestrator pane
+
+On an **orchestration tab**, typing into a worker pane is locked by default. Your keystrokes reach the orchestrator's pane exactly as before; aim them at a worker role and they are dropped rather than delivered, and the bottom bar says `Pane locked — Ctrl+d then Ctrl+e to unlock`. Press `Ctrl+D` to reach command mode, then `Ctrl+E`, and the deck reports `Pane entry: unlocked`; the same chord locks it again.
+
+**This is not a read-only mode, and it does not apply anywhere else.** Dashboard and mode tabs are untouched, nothing is disabled, and every pane still shows live output and scrolls normally. On an orchestration tab the lock costs one deliberate `Ctrl+D`, `Ctrl+E` before you can type at a worker — and that pause is the point. An orchestration is one workflow with a single coordinator, and an open pane invites the reflex of answering a worker's question on the spot. Doing that puts a second, uncoordinated actor inside the workflow: you change state the orchestrator believes it owns, with no way for it to find out. Most often this is not even deliberate — you inspect a worker pane, get distracted, and type your next instruction into the wrong pane. The lock turns that reflex into a decision, and the default has to be locked for it to mean anything.
+
+Three details worth knowing:
+
+- **`Ctrl+E` is command-mode only**, for the same reason `Ctrl+W` is. `Ctrl+E` is readline's `end-of-line` (byte `0x05`) in shells, agents, and anything else running inside a pane. While you are typing in a pane the deck does not claim it, so the byte reaches the program and moves your cursor to the end of the line as usual.
+- **The lock is one setting for the whole deck.** Unlocking on one orchestration tab unlocks all of them, and a newly opened orchestration tab adopts whatever the current setting is. It describes how you are working right now, not which tab you happened to open. It is not saved across restarts — every deck starts locked.
+- **A worker that has stopped and asked you something is not locked.** While a role pane reports `WaitingForInput`, every key reaches it with no unlock at all, and the lock re-engages the moment that status clears. Answering a question the agent itself asked is a response to a request, not an interruption of one. The flip side: an agent that never reports `WaitingForInput` gets no such exemption, and reaching it still needs a deliberate `Ctrl+D`, `Ctrl+E`.
+
+Focus follows the same setting. While locked, the deck steers focus for you: onto a worker the moment it starts waiting on you, then back to the orchestrator once nothing is waiting any more. While unlocked, the deck moves focus nowhere at all — it stays exactly where you put it until you lock again.
 
 ### `Ctrl+C`
 
@@ -174,9 +189,10 @@ help = "F1"                      # open help with F1 instead of ?
 | `new_pane` | `Ctrl+n` | New pane (directory picker → name + command) — works from any mode |
 | `close_pane` | `Ctrl+w` | Close selected pane / tear down mode tab, with confirmation — **command mode only**; in a pane the chord is ordinary input for whatever is running there |
 | `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout — works from any mode |
+| `toggle_orchestration_lock` | `Ctrl+e` | Toggle the orchestration command-entry lock — **command mode only, on an orchestration tab**; everywhere else the chord is ordinary input for whatever is running in the pane |
 | `jump_1` … `jump_9` | `1` … `9` | Jump to card N and focus its pane |
 
-`close_pane` lives in `[global]` because the section names the TOML table your binding is read from, not the modes it applies in. Whatever chord you bind it to is command-mode only and reaches the pane as ordinary input everywhere else.
+`close_pane` and `toggle_orchestration_lock` live in `[global]` because the section names the TOML table your binding is read from, not the modes it applies in. Whatever chord you bind either to is command-mode only and reaches the pane as ordinary input everywhere else.
 
 `[dashboard]` (command mode):
 

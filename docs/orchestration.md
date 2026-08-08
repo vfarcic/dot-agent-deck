@@ -91,6 +91,7 @@ These require command mode — press `Ctrl+d` first if you are typing in a role 
 | `Left` / `Right` (or `h` / `l`) | Cycle to previous / next tab |
 | `1`–`9` | Jump to role card N and focus its pane |
 | `Ctrl+w` | Close the orchestration tab (stops all role panes), after a confirmation |
+| `Ctrl+e` | Toggle the command-entry lock — whether you can type directly into a worker pane (see below) |
 
 These work from anywhere, including while typing in a role pane:
 
@@ -101,6 +102,24 @@ These work from anywhere, including while typing in a role pane:
 The sidebar shows each role's status live (thinking, working, waiting, idle, error) so you can see at a glance who is busy without switching panes.
 
 In the default `Stacked` pane layout, only the focused role's pane is drawn — switching roles swaps which pane is visible, but every other role's agent keeps running underneath, and the sidebar is what tells you it's still busy or idle. Toggle to `Tiled` (`Ctrl+t`) to see every role's pane at once.
+
+### Typing into a worker is locked by default
+
+You talk to the orchestrator; the orchestrator talks to the workers. On an orchestration tab the deck makes that the default rather than a convention you have to remember: keystrokes aimed at a worker role are dropped instead of delivered, and the bottom bar says `Pane locked — Ctrl+d then Ctrl+e to unlock`. The orchestrator's own pane is never locked, and Dashboard and mode tabs are not affected at all.
+
+The reason is that an orchestration is one workflow with a single coordinator. Type into a worker and you become a second, uncoordinated actor inside it: you change state the orchestrator believes it owns, and there is no path for it to learn that you did. What you usually get is not an obviously broken deck but a quietly diverged one — commonly the orchestrator and a worker contradicting each other into a deadlock. And most of the time it is not even deliberate: you open a worker pane to see how it is doing, get distracted, and type your next instruction into the pane that happens to be in front of you rather than the one you meant.
+
+**Nothing is read-only, and nothing is taken away.** When you do want to reach into a worker — a provider hiccup parked an agent, a weaker model never called `work-done`, an agent is waiting somewhere you did not expect — it costs one deliberate `Ctrl+d`, `Ctrl+e`. That pause is the whole feature: it converts a reflex into a decision. Unlocking reports `Pane entry: unlocked`; the same chord locks it again. The setting is one value for the whole deck, so unlocking on one orchestration tab unlocks all of them and a newly opened tab adopts the current value; it is not saved across restarts, so every deck starts locked.
+
+**A worker that has stopped and asked you something is never locked.** While a role pane reports `WaitingForInput` — an agent showing a permission prompt, a numbered option list, or a plain "what next?" — every key reaches it with no unlock at all, and the lock re-engages the instant that status clears. Answering a question the agent itself asked is a response to a request, not an intrusion into one. Two limits are worth knowing: an agent that never reports `WaitingForInput` gets no exemption and still needs the deliberate unlock, and a pane that is temporarily typeable for this reason looks no different from a locked one, so a stuck or mis-reported status leaves a pane open with no visual cue.
+
+`Ctrl+e` is claimed only in command mode, like `Ctrl+w`. While you are typing in a role pane the deck does not take it, so `0x05` reaches the agent and readline's `end-of-line` works normally.
+
+#### Focus follows the lock
+
+While the deck is **locked**, it steers focus for you within the active orchestration tab: onto a role pane the moment it starts waiting on you — the lowest-numbered one first if several are waiting at once, advancing as each is dealt with — and back to the orchestrator once nothing is waiting any more. Focus never leaves the active tab to chase a waiting pane elsewhere; the tab label's colour already flags that.
+
+While the deck is **unlocked**, no automatic focus move happens at all. Focus stays exactly where you put it — through a worker starting to wait, and through it finishing — until you lock again.
 
 ## How delegation works
 

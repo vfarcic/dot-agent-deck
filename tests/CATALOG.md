@@ -2058,6 +2058,150 @@ without depending on the config struct API.
 - **Does not assert:** exact warning copy or styling; daemon `list_agents` transport; worktree creation; blocking spawn behavior (the warning is informational).
 - **Platform coverage:** mac+linux+windows.
 
+#### orchestration/lock
+
+##### orchestration/lock/001 — `scope_command_entry_lock` claims `Ctrl+E` only on an Orchestration tab in command mode.
+- **Layer:** L1 (pure function, `src/ui.rs`'s own `#[cfg(test)]` module — the scoping helper is module-private).
+- **Agent:** none.
+- **Asserts:** table-driven over the full cross product of `is_orchestration_tab` (true/false) × every `UiMode` variant × the action being `ToggleOrchestrationLock`, some other action (`Quit`), or `None`: the toggle survives ONLY at `(true, UiMode::Normal)`; every other action passes through untouched in EVERY cell (including `(false, non-Normal)`, ruling out a blanket "drop the action" implementation); `None` in always yields `None` out. The `UiMode` list is guarded by an exhaustive match so a new variant cannot silently drop out of the cross product.
+- **Does not assert:** anything about a real pane — this is a mechanism test, present so a later failure localises. The real-pane proof is `orchestration/lock/009`.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/002 — A freshly opened orchestration tab observes the deck-global command-entry lock LOCKED.
+- **Layer:** L1 (real `Action::SpawnPane` dispatched through `dispatch_action` against a capturing pane controller).
+- **Agent:** none (two-role `cat` stub orchestration config).
+- **Asserts:** after a real spawn, the active tab is a `Tab::Orchestration` and `ui.command_entry_locked` is `true`. Locked-by-default is load-bearing: a lock you must remember to engage protects nothing.
+- **Does not assert:** the gate's own behaviour (`orchestration/lock/006`/`008`); persistence across restarts (the lock is not persisted).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/003 — `Ctrl+e` resolves to the toggle from command mode and flips the deck-global lock both ways.
+- **Layer:** L1 (`key_action_for_mode`, the production `KeyEvent -> Action` seam, plus two real `dispatch_action` calls).
+- **Agent:** none.
+- **Asserts:** with the DEFAULT keybinding config, `Ctrl+e` in `UiMode::Normal` resolves to `Action::ToggleOrchestrationLock`; dispatching it once unlocks and twice re-locks `ui.command_entry_locked`.
+- **Does not assert:** the full `is_orchestration_tab × mode` matrix (that is `orchestration/lock/001`); a user-remapped chord.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/004 — Toggling the lock on ANY Orchestration tab changes what EVERY Orchestration tab observes, and a new tab adopts the current value.
+- **Layer:** L1 (two real orchestration tabs spawned through `dispatch_action`, plus real `switch_to` round-trips).
+- **Agent:** none.
+- **Asserts:** tab A starts locked and toggling on A unlocks; a brand-new tab B ADOPTS the unlocked value rather than resetting to locked; switching back to A observes the same unlocked value; toggling FROM B and returning to A shows A observing B's change. Pins that unlocking never has to be repeated per tab.
+- **Does not assert:** that the lock reaches beyond Orchestration tabs — deck-global storage moves where the value lives, not how far it reaches (`orchestration/lock/005`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/005 — Dashboard and Mode tabs are never gated, even while the deck-global lock is engaged.
+- **Layer:** L1 (`gate_pane_input_key` called directly against a real Dashboard tab and a real spawned Mode tab).
+- **Agent:** none.
+- **Asserts:** with `ui.command_entry_locked = true` (the strongest case) and an EMPTY status map (so the `WaitingForInput` carve-out cannot fire and the pass-through can only come from the tab-kind match), `Action::ForwardToPane` passes through UNCHANGED on both tab types. Guards the obvious mis-reading of deck-global storage as deck-global reach.
+- **Does not assert:** the Orchestration-tab gate itself (`orchestration/lock/006`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/006 — A locked non-orchestrator pane reporting `WaitingForInput` passes keystrokes through, and the gate re-engages the moment the status clears.
+- **Layer:** L1 (`gate_pane_input_key` against a real two-role orchestration and a focus-echoing pane controller).
+- **Agent:** none (synthetic `pane_id -> SessionStatus` maps).
+- **Asserts:** walking both edges on the SAME worker pane — no recorded status (dropped, the baseline) → `WaitingForInput` (passes through unchanged) → `Working` (dropped again, so the hole cannot outlive the status that opened it). Also that the orchestrator pane's own input is never gated whatever status is attached to it (proving the never-gated rule is not reordered behind the new check), and that an unlocked deck ignores `WaitingForInput` entirely.
+- **Does not assert:** that any particular agent actually emits `WaitingForInput` — that is the agent's contract, not this feature's. An agent that never reports it gets no carve-out and still needs a deliberate unlock.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/007 — An ambiguous pane status (two sessions sharing one `pane_id`) DENIES the carve-out — fail closed, not fail open.
+- **Layer:** L1 (`build_pane_status_for_gate` feeding the unchanged `gate_pane_input_key`, against a real locked orchestration with its worker focused).
+- **Agent:** none (two synthetic `AppState`s standing in for the daemon-observed collision).
+- **Asserts:** two sessions colliding on one `pane_id` and DISAGREEING on `WaitingForInput`-ness resolve to no exemption and the keystroke is dropped; a single, unambiguous `WaitingForInput` session still resolves to `WaitingForInput` and still passes the keystroke through — so failing closed cannot be bought by breaking the carve-out outright. The guard has to live in the producer: a `HashMap<&str, SessionStatus>` cannot represent the collision, so by the time the gate reads the map the ambiguity is already gone.
+- **Does not assert:** the collision semantics of `build_pane_status` itself, which is deliberately left as-is — its consumers are cosmetic, and only the lock's feed hardens. The rule here is "any duplicate", not "any disagreeing duplicate".
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/lock/008 — On a real locked orchestration tab the orchestrator's own input still reaches its PTY while a worker's does not, and `Ctrl+d`,`Ctrl+e` reverses that.
+- **Layer:** L2 PTY-attached (the real binary through the vt100 `TuiDeck` harness).
+- **Agent:** none (fixture `tests/fixtures/orch-deck`: two `cat` stub roles, no LLM tokens spent).
+- **Asserts:** a sentinel typed into the focused orchestrator pane echoes on the grid even though the deck is LOCKED by default; after jumping to the non-orchestrator `worker` role, a second sentinel does NOT appear within 2s; after `Ctrl+d` → `Ctrl+e` → `Ctrl+d`, a third sentinel typed into the still-focused worker pane echoes normally.
+- **Does not assert:** what a real agent does with the forwarded bytes (`orchestration/lock/012`); the `WaitingForInput` carve-out (`orchestration/lock/011`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/lock/009 — `Ctrl+e` reaches a focused role pane's PTY as readline's `end-of-line`, and still toggles the lock from command mode.
+- **Layer:** L2 PTY-attached (the real binary through the vt100 `TuiDeck` harness; terminal-cursor observation).
+- **Agent:** none (fixture `tests/fixtures/orch-lock-bash-role`: a real interactive `bash --noprofile --norc -i` orchestrator role plus a `cat` stub worker).
+- **Asserts:** with a partial line typed into the focused orchestrator pane, `Ctrl+a` (readline `beginning-of-line`, a chord the deck never binds — a control proving the harness can observe cursor movement at all) moves the cursor left within the same row; `Ctrl+e` then returns it to exactly the end-of-line position, proving `0x05` genuinely reached the PTY rather than being claimed as `Action::ToggleOrchestrationLock`. Then `Ctrl+d` → `Ctrl+e` from command mode, and a sentinel typed into the worker pane now reaches its PTY, proving the chord still toggles the lock from the mode it IS claimed in.
+- **Does not assert:** what a given program does with `0x05` beyond readline's documented `end-of-line` — that is the program's business.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/lock/010 — Global chords still fire while a worker pane is focused and the deck is locked.
+- **Layer:** L2 PTY-attached.
+- **Agent:** none (fixture `tests/fixtures/orch-deck`).
+- **Asserts:** with the non-orchestrator worker role focused and the deck LOCKED, `Ctrl+t` (`toggle_layout`) surfaces its `Layout:` status message — global chords resolve before the PTY-forward fallback the lock gates. Regression guard against an overly-broad gate.
+- **Does not assert:** the layout change itself (covered by the layout tests).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/lock/011 — On a real locked pane, a reported `WaitingForInput` opens the gate and the status clearing closes it again.
+- **Layer:** L2 PTY-attached; the status is injected as a bare `AgentEvent` over the hook socket — the SAME wire the real `dot-agent-deck agent-event` CLI rides.
+- **Agent:** none, deliberately. A real agent would self-skip wherever credentials are absent, leaving this headline behaviour with ZERO automated CI coverage; the status arrives over the genuine production wire either way, and what a stand-in gives up is only proof that some particular agent emits that status.
+- **Asserts:** the baseline drop with no status recorded; then, after injecting `WaitingForInput` for the worker's real `(pane_id_env, agent_id)` pair, a keystroke reaches the worker's PTY and echoes; then, after injecting `Thinking`, a re-focused worker drops keystrokes again. The injector blocks on `ListAgents`' live-status join rather than the daemon's broadcast, so the daemon's own state — not just its wire — is known to reflect the change before focus/echo is asserted.
+- **Does not assert:** that any real agent emits `WaitingForInput`; the auto-focus steering that the same status also drives (`orchestration/focus/*`) — the worker is re-focused explicitly so this cannot ride that as a proxy.
+- **Platform coverage:** mac+linux (unix-only: the injector writes to a Unix-domain hook socket).
+
+##### orchestration/lock/012 — A REAL Claude agent never receives a directive typed at a locked worker pane, and does receive it once unlocked.
+- **Layer:** L2 PTY-attached, real-agent tier. Runtime-skipped when the `claude` CLI or credentials are absent.
+- **Agent:** REAL Claude Code (Haiku, `claude-haiku-4-5-20251001`, `--allowedTools Bash`) as the non-orchestrator `worker` role; the orchestrator stays `cat` (already proven never-gated) to keep the run to a single real agent turn. Fixture `tests/fixtures/orch-lock-live`.
+- **Asserts:** a create-a-sentinel-file directive typed into the locked worker pane never results in that file existing (20s); after `Ctrl+d` → `Ctrl+e` → `Ctrl+d`, a second directive with a DIFFERENT sentinel does result in its file being created (120s); and the first sentinel STILL does not exist afterwards, proving gated keystrokes are dropped outright rather than queued for delivery once unlocked. On-disk file presence is the observable, so the assertion survives LLM phrasing and terminal-redraw variance.
+- **Does not assert:** anything when skipped — where credentials are absent this test executes nothing, so `orchestration/lock/008`/`011` carry the CI-visible coverage.
+- **Platform coverage:** mac+linux (real-agent tier is local-only).
+
+#### orchestration/focus
+
+##### orchestration/focus/001 — Auto-focus follows the lowest-order `WaitingForInput` role pane on the active tab, and never touches another tab.
+- **Layer:** L1 (`TabManager::auto_focus_waiting_pane` driven with synthetic `SessionStatus` maps; `src/tab.rs`).
+- **Agent:** none (three-role orchestration: `orchestrator` < `alpha` < `beta`).
+- **Asserts:** nothing waiting leaves manual focus alone; a newly-waiting pane steals focus; ties resolve to the LOWEST-order waiting pane, even stealing focus mid-input from a higher-order pane that is itself still waiting; an already-lowest focused pane is a no-op (no flicker); resolving the focused pane advances to the next-lowest still-waiting pane. A second orchestration tab then proves a background tab's newly-waiting pane has zero effect and never flips which tab is active.
+- **Does not assert:** the all-clear return move (`orchestration/focus/002`); ordering by wait time — ascending `role_pane_ids` order is the contract, and "longest blocked first" would need a new per-pane timestamp.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/focus/002 — The all-clear move back to the orchestrator is edge-triggered, fires exactly once per waiting episode, and re-arms for the next.
+- **Layer:** L1 (the real per-frame sequence — `observe_waiting_panes`, then `auto_focus_waiting_pane` → `auto_focus_all_clear` — gated exactly as the `src/ui.rs` render-loop site gates it).
+- **Agent:** none.
+- **Asserts:** a manual focus is left alone while nothing is waiting; a newly-waiting pane steals focus; once it resolves, focus snaps back to the orchestrator role exactly ONCE — not on every subsequent frame, and not again for a later manual focus change until a NEW pane starts and resolves waiting. A level-triggered version would pin focus to the orchestrator every frame and the human could never look at another pane at all. A second (background) orchestration tab proves the move never touches an inactive tab or switches which tab is active.
+- **Does not assert:** the single-frame episode (`orchestration/focus/003`); the render-loop application of the returned id (`orchestration/focus/007`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/focus/003 — A waiting episode observed in a SINGLE frame still edge-triggers the all-clear move.
+- **Layer:** L1 (the real per-frame sequence).
+- **Agent:** none.
+- **Asserts:** a role goes `WaitingForInput` on one frame and resolves by the next, with no intervening frame in which it is both still waiting and already focused. The first frame steers focus onto it — so `auto_focus_waiting_pane` WINS the chain and `auto_focus_all_clear` never runs on the only frame the episode is observed — and the second frame must still fire the all-clear. This is why the observation lives OUTSIDE the chain: recording the edge inside `auto_focus_all_clear` loses it entirely and strands focus on the resolved pane.
+- **Does not assert:** the multi-frame episode (`orchestration/focus/002`), which always has a still-waiting frame in between and is exactly where a dropped edge hides.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/focus/004 — While LOCKED, focus visits every waiting role in ascending order and returns to the orchestrator on the all-clear.
+- **Layer:** L1 (the real per-frame sequence; four-role orchestration `orchestrator` < `alpha` < `beta` < `gamma`).
+- **Agent:** none.
+- **Asserts:** all three non-orchestrator roles go `WaitingForInput` together and focus lands on `alpha` first, advancing to `beta` then `gamma` as each resolves, then returning to the orchestrator once nothing is left waiting, with a further quiet frame moving nothing. Three concurrent waiters are needed: with fewer, "picked one" and "advanced through them in order" are indistinguishable.
+- **Does not assert:** the unlocked half (`orchestration/focus/005`).
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/focus/005 — While UNLOCKED no auto-focus branch fires at all, and re-locking must not replay a stale all-clear edge.
+- **Layer:** L1 (the real per-frame sequence with the call site's `locked` gate modelled explicitly, plus `TabManager::clear_waiting_pane_latch`).
+- **Agent:** none.
+- **Asserts:** a waiting pane already in flight does not steal focus while unlocked, and its later resolution fires no all-clear either, so a manual focus choice survives the whole stretch untouched. Then THE STALE-LATCH ASSERTION: re-locking must NOT fire an all-clear for the episode the human already handled by hand — without the latch clearing, `observe_waiting_panes` compares its frozen `had_waiting_pane == true` against the now-idle status and misreads it as a fresh edge, yanking focus off where the human left it. Finally, re-locking resumes normal steering and all-clear pinning for a fresh episode.
+- **Does not assert:** an episode that both begins AND ends inside the unlocked stretch — that case is already safe with no fix (the chain is fully skipped, so nothing touches the latch), which is why this test is written against the STRADDLING trace instead. A test written against the simpler wording passes without the fix and proves nothing.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/focus/006 — The locked→unlocked transition clears EVERY Orchestration tab's latch, not just the active one.
+- **Layer:** L1 (two orchestration tabs; the real per-frame sequence with the `locked` gate modelled).
+- **Agent:** none.
+- **Asserts:** tab A latches a waiting episode while active and locked; the user switches to tab B and unlocks, so the deck-global toggle's latch-clearing call fires with B active, not A; A's worker resolves unobserved; on re-lock and return to A, A's first locked frame must treat the resolved role as old news rather than a fresh edge, leaving focus where the user left it. This is `orchestration/focus/005`'s bug reappearing across tabs whenever the clearing is scoped to the active tab instead of the deck-global lock it compensates for.
+- **Does not assert:** the mechanism used to reach that outcome — only that every Orchestration tab's edge state is reset on the transition.
+- **Platform coverage:** mac+linux+windows.
+
+##### orchestration/focus/007 — The whole lock-governed focus contract, on the real binary, as a user sees it.
+- **Layer:** L2 PTY-attached (the real binary through the vt100 `TuiDeck` harness), asserted purely on the rendered grid via the expanded-pane header `┌<role>`, which only the currently focused role ever draws.
+- **Agent:** none (fixture `tests/fixtures/orch-focus-lifecycle`: `orchestrator` + `alpha` + `beta`, all `printf`+`sleep` stubs). Three roles are required: the "manual focus sticks" half needs a role OTHER than the one going `WaitingForInput`, since where the focused and waiting role are the same pane a genuine stick is indistinguishable from `auto_focus_waiting_pane`'s own same-pane no-op. `WaitingForInput` is injected over the hook socket exactly as `orchestration/lock/011` does.
+- **Asserts:** (1) a freshly opened tab shows the orchestrator's expanded box — LOCKED by default; (2) injecting `WaitingForInput` for `alpha` visibly steers focus onto ITS box; (3) injecting `Thinking` visibly returns focus to the orchestrator — the all-clear edge; (4) `Ctrl+d`,`Ctrl+e` surfaces `Pane entry: unlocked`; (5) manually jumping to `beta` and then injecting a fresh `WaitingForInput`/`Thinking` pair for `alpha` moves focus NOWHERE — `beta`'s box survives both events, and a sentinel typed at the end appears inside `beta`'s own box, proving it still holds live PTY focus rather than merely still being drawn.
+- **Does not assert:** the `TabManager`-level contract in isolation (`orchestration/focus/001`-`006`); the keystroke gate (`orchestration/lock/*`).
+- **Platform coverage:** mac+linux (unix-only: the injector writes to a Unix-domain hook socket).
+
+##### orchestration/focus/008 — The waiting-focus branch defers a focus steal, rather than applying it immediately, while a keystroke is still queued for the currently-focused waiting pane.
+- **Layer:** L1 (in-process unit test; `src/tab.rs`, alongside `orchestration/focus/001`-`006`).
+- **Agent:** none (mock `PaneController`; synthetic `SessionStatus` map, no panes/PTYs).
+- **Asserts:** with a real `TabManager`-opened 3-role Orchestration tab (`orchestrator` < `alpha` < `beta`), `beta` (higher role order) goes `WaitingForInput` and steals focus with no input pending, as `orchestration/focus/001` pins; `alpha` (LOWER role order than `beta`) then ALSO goes `WaitingForInput` on a frame where `input_pending` is true (modeling a keystroke still queued for `beta`) — the steal to `alpha` must be deferred, returning `None` and leaving focus on `beta`, not yanked away from the pane the queued keystroke is aimed at; once `input_pending` clears on a later frame, the deferred steer to `alpha` must still fire, proving the guard DEFERS the move rather than dropping it, mirroring `TabManager::auto_focus_all_clear`'s existing "no one-shot latch" contract. Drives `TabManager::auto_focus_locked(pane_status, input_pending)`, the seam that folds both `auto_focus_waiting_pane` and `auto_focus_all_clear` behind ONE shared `input_pending` guard mirroring the real per-frame call site's shape.
+- **Does not assert:** the real `src/ui.rs` per-frame call site actually computing `input_pending` from `crossterm::event::poll` or applying the result via `pane.focus_pane` (out of L1 `TabManager` reach — it would need a PTY-attached L2 test, and an L2 test was evaluated and rejected: the underlying terminal race is not economically reproducible there, since it requires a keystroke to be sitting in the terminal's input queue on the exact frame a lower-order pane transitions to `WaitingForInput`); the deck-global lock gate itself (`ui.command_entry_locked`, covered by `orchestration/focus/005`/`006`); the multi-waiter ordering contract, covered exhaustively by `orchestration/focus/001`/`004`.
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/layout
 
 ##### orchestration/layout/001 — Seven decks fit the single-column orchestration card area without scrolling (PRD #147).

@@ -1557,6 +1557,24 @@ struct UiState {
     update_available: Option<String>,
     /// Layout mode for embedded terminal panes (stacked or tiled).
     pane_layout: PaneLayout,
+    /// The command-entry lock: while engaged, a keystroke aimed at a focused
+    /// NON-orchestrator role pane of an Orchestration tab is dropped instead of
+    /// reaching that pane's PTY (see [`gate_pane_input_key`]), and the deck
+    /// steers focus itself (see the auto-focus chain in the render loop).
+    /// Toggled by `Ctrl+E` from command mode. **Locked by default** — a lock
+    /// you must remember to engage protects nothing.
+    ///
+    /// Deck-global, deliberately, and stored next to [`Self::pane_layout`] for
+    /// the same reason: it describes how someone is working right now, not
+    /// which tab they happened to open. A per-tab lock means unlocking has to
+    /// be repeated in every Orchestration tab, with nothing on screen saying
+    /// why the state set moments ago does not apply here.
+    ///
+    /// What is deck-global is WHERE the value lives, not how far it reaches:
+    /// the gate still matches only [`Tab::Orchestration`], so Dashboard and
+    /// Mode tabs are never gated whatever this says. Not persisted — every
+    /// deck starts locked.
+    command_entry_locked: bool,
     /// Warnings collected during session save/restore, flushed after terminal restore.
     session_warnings: Vec<String>,
     /// PRD #89 review-fix G1: tracks whether the most recent periodic snapshot
@@ -1849,6 +1867,7 @@ impl UiState {
             last_bell_status: HashMap::new(),
             update_available: None,
             pane_layout: PaneLayout::Stacked,
+            command_entry_locked: true,
             session_warnings: Vec::new(),
             session_snapshot_write_failed: false,
             selection: None,
@@ -3600,6 +3619,11 @@ pub enum Action {
     /// PRD #80: toggle the embedded-pane layout between stacked and tiled
     /// (Ctrl+T).
     ToggleLayout,
+    /// Toggle the deck-global command-entry lock (Ctrl+E), which decides
+    /// whether keystrokes reach a focused non-orchestrator role pane's PTY.
+    /// Only ever reaches the handler from an Orchestration tab in command mode
+    /// — [`scope_command_entry_lock`] un-resolves it everywhere else.
+    ToggleOrchestrationLock,
     /// PRD #80: leave `PaneInput` and return to Normal (command) mode on the
     /// current tab (Ctrl+D).
     DetachToNormal,
@@ -4181,6 +4205,97 @@ fn handle_pane_input_key(key: KeyEvent) -> Action {
     } else {
         Action::Continue
     }
+}
+
+/// Status message shown when a keystroke is dropped because the command-entry
+/// lock is engaged. Follows this codebase's existing no-op-with-feedback
+/// convention (e.g. `RequestConfigGen`'s "No active agent session to send
+/// prompt to.").
+///
+/// It names `Ctrl+D` **first**, and that is load-bearing rather than
+/// stylistic: this message is only ever shown from `UiMode::PaneInput`, which
+/// — since [`scope_command_entry_lock`] claims the chord in `UiMode::Normal`
+/// only — is precisely the mode where `Ctrl+E` alone does nothing. Naming just
+/// the unlock chord would instruct the user to press a chord that provably
+/// cannot work from where they are standing.
+const ORCHESTRATION_LOCK_STATUS_MESSAGE: &str = "Pane locked — Ctrl+d then Ctrl+e to unlock";
+
+/// Gate the PTY-forward fallback [`handle_pane_input_key`] produces against the
+/// command-entry lock. When the active tab is [`Tab::Orchestration`], the lock
+/// is engaged, and the focused pane is neither the orchestrator
+/// (`role_pane_ids[start_role_index]`) nor waiting for input, a would-be
+/// [`Action::ForwardToPane`] is dropped (returned as [`Action::Continue`])
+/// before it ever reaches that pane's PTY.
+///
+/// The orchestrator pane's own input is never gated, and non-orchestration tabs
+/// are unaffected — the `Tab::Orchestration` match below is what bounds the
+/// lock's reach, and it is the only thing that does. This is also the sole gate
+/// site, so global chords resolved earlier by [`global_action_for_mode`] never
+/// pass through it.
+///
+/// **Nothing becomes read-only.** The lock does not remove worker input, it
+/// gates it behind one deliberate `Ctrl+D`, `Ctrl+E`. Every reach-into-a-worker
+/// fail-safe stays reachable at that cost.
+///
+/// **The `WaitingForInput` carve-out.** While the focused non-orchestrator role
+/// pane reports [`SessionStatus::WaitingForInput`], the lock stops gating that
+/// pane and the keystroke passes through untouched. The lock's subject is the
+/// *unsolicited* interruption of a working agent; an agent that has stopped and
+/// asked is already blocked on a human, so answering it is a response to a
+/// request rather than an intrusion into state the orchestrator believes it
+/// owns. The exemption is a pure read of live status with nothing latched
+/// anywhere, so the gate re-engages on the very next keystroke once the status
+/// clears. Chosen over an always-allowed navigation-key allowlist because it
+/// reuses a signal the deck already computes every frame, needs no per-agent key
+/// knowledge, and can answer a free-text prompt — which an allowlist cannot.
+/// **Accepted limitation:** an agent that never reports `WaitingForInput` gets
+/// no carve-out and still needs a deliberate unlock.
+///
+/// `pane_status` is the `pane_id -> SessionStatus` join
+/// [`build_pane_status_for_gate`] returns, handed straight over by the call
+/// site. That producer — not this consumer — is where ambiguity is resolved: it
+/// omits any `pane_id` claimed by more than one session, and the `Some(...)`
+/// match below then denies the exemption for a missing key without needing to
+/// know why it is missing. See its docs for why the guard cannot live here.
+fn gate_pane_input_key(
+    action: Action,
+    ui: &UiState,
+    tab_manager: &TabManager,
+    pane: &dyn PaneController,
+    pane_status: &HashMap<&str, SessionStatus>,
+) -> Action {
+    if !matches!(action, Action::ForwardToPane(_)) {
+        return action;
+    }
+    if !ui.command_entry_locked {
+        return action;
+    }
+    let Tab::Orchestration {
+        role_pane_ids,
+        start_role_index,
+        ..
+    } = tab_manager.active_tab()
+    else {
+        return action;
+    };
+    let orchestrator_pane_id = role_pane_ids.get(*start_role_index).map(String::as_str);
+    let focused_pane_id = pane.focused_pane_id();
+    if focused_pane_id.as_deref() == orchestrator_pane_id {
+        return action;
+    }
+    // The carve-out is checked LAST so it can only ever widen what gets
+    // through — the orchestrator's never-gated rule above and the
+    // tab-kind/lock guards before it keep their existing meaning whatever
+    // status happens to be attached to a pane.
+    if let Some(pane_id) = focused_pane_id.as_deref()
+        && matches!(
+            pane_status.get(pane_id),
+            Some(SessionStatus::WaitingForInput)
+        )
+    {
+        return action;
+    }
+    Action::Continue
 }
 
 /// PRD #241 M3: the close-confirmation dialog's whole state — which option is
@@ -6376,6 +6491,9 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
     if kb.matches(KbAction::ClosePane, key) {
         return Some(Action::CloseSelected);
     }
+    if kb.matches(KbAction::ToggleOrchestrationLock, key) {
+        return Some(Action::ToggleOrchestrationLock);
+    }
     // Ctrl+PageDown / Ctrl+PageUp: non-configurable tab navigation.
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
@@ -6423,6 +6541,42 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
     }
 }
 
+/// Un-resolve `Ctrl+E` (`ToggleOrchestrationLock`) unless the active tab is an
+/// Orchestration tab **and** the deck is in command mode.
+///
+/// Same conflict class, and the same trade, as [`global_action_for_mode`]'s
+/// `CloseSelected` scoping above: `Ctrl+E` is `0x05`, readline's
+/// `end-of-line`. A globally-bound chord that a pane's occupant also wants is
+/// claimed only in command mode, and the user pays one extra `Ctrl+D` rather
+/// than losing the chord entirely. Without this, an Orchestration tab would
+/// swallow the byte unconditionally and a focused role pane's PTY would never
+/// receive it — so the user could not move to the end of a line they were
+/// typing at the agent.
+///
+/// It cannot live inside `global_action_for_mode` the way `CloseSelected`'s
+/// mode term does, because it needs one thing that function has no access to:
+/// which KIND of tab is active. `is_orchestration_tab` is true **only** for
+/// [`Tab::Orchestration`], whose `role_pane_ids[start_role_index]` is what
+/// gives the chord something to mean; on a Dashboard or Mode tab the lock
+/// reaches nothing, so claiming the chord there would cost the byte for no
+/// behaviour. Kept a standalone pure function rather than an inline `if` at the
+/// call site because it is then unit-testable without a PTY — an inline
+/// condition is only reachable through the full event loop.
+fn scope_command_entry_lock(
+    action: Option<Action>,
+    is_orchestration_tab: bool,
+    mode: UiMode,
+) -> Option<Action> {
+    match action {
+        Some(Action::ToggleOrchestrationLock)
+            if !is_orchestration_tab || mode != UiMode::Normal =>
+        {
+            None
+        }
+        other => other,
+    }
+}
+
 /// PRD #241 M1 (L1 `keybindings/safety/003`, `/004`, `keybindings/remap/003`):
 /// resolve a key the way the live loop does for a given mode.
 ///
@@ -6431,8 +6585,17 @@ fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -
 /// PTY-forwarding fall-through (`handle_pane_input_key`). Returning `None`
 /// means "no global command and nothing to forward", i.e. the key belongs to
 /// that mode's own handler.
+///
+/// The `ToggleOrchestrationLock` pass below applies [`scope_command_entry_lock`]'s
+/// MODE term only, with `is_orchestration_tab: true`. Mode is this helper's
+/// whole subject and is knowable here, so leaving it out would make the helper
+/// over-report `Ctrl+E` as claimed in `PaneInput` — the exact thing the scoping
+/// exists to stop. Tab kind is not knowable here and is applied at the live
+/// call site, so this helper answers for the most permissive tab.
 pub fn key_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -> Option<Action> {
-    if let Some(action) = global_action_for_mode(kb, mode, key) {
+    if let Some(action) =
+        scope_command_entry_lock(global_action_for_mode(kb, mode, key), true, mode)
+    {
         return Some(action);
     }
     if mode == UiMode::PaneInput {
@@ -6919,6 +7082,37 @@ fn dispatch_action(
             // pre-draw `resize_panes_to_layout` re-sizes every pane to the new
             // split on the next frame (it reads `pane_layout`).
             ui.status_message = Some((format!("Layout: {mode_name}"), std::time::Instant::now()));
+        }
+        // Ctrl+e: toggle the deck-global command-entry lock. The action only
+        // ever reaches here from an Orchestration tab in command mode —
+        // `scope_command_entry_lock` un-resolves it everywhere else — so there
+        // is no per-tab guard left to apply.
+        Action::ToggleOrchestrationLock => {
+            ui.command_entry_locked = !ui.command_entry_locked;
+            // On the locked→unlocked half ONLY, drop the waiting-episode latch
+            // on EVERY Orchestration tab: the lock is deck-global, so
+            // unlocking stops observation everywhere at once and any tab can
+            // be left holding a frozen latch, not just the one active right
+            // now. From this frame on the render loop stops calling
+            // `observe_waiting_panes`, so a latch left standing here would
+            // freeze at its current value and be misread on re-lock as a fresh
+            // all-clear edge for an episode the human already dealt with by
+            // hand. Clearing on the unlocked→locked half instead would be
+            // wrong: that half is followed by frames that observe, so it has
+            // nothing to compensate for, and it would discard an edge the deck
+            // is about to act on legitimately.
+            if !ui.command_entry_locked {
+                tab_manager.clear_waiting_pane_latch();
+            }
+            let lock_name = if ui.command_entry_locked {
+                "locked"
+            } else {
+                "unlocked"
+            };
+            ui.status_message = Some((
+                format!("Pane entry: {lock_name}"),
+                std::time::Instant::now(),
+            ));
         }
         // Ctrl+d: TOGGLE between command mode and the focused pane, staying on
         // the current tab.
@@ -8761,6 +8955,15 @@ fn handle_key_event(
     // while the user is typing in a pane.
     if action.is_none() && !is_ctrl_c {
         action = global_action_for_mode(&kb, ui.mode, &key);
+        // Same reasoning as `close_pane` above, one step further: `Ctrl+E` is
+        // claimed only on an Orchestration tab, and only in command mode.
+        // `global_action_for_mode` has no tab context, so a `Ctrl+E` typed into
+        // a focused pane would otherwise be claimed here and never reach the
+        // PTY — breaking readline's end-of-line for the agent the user is
+        // typing at. Un-resolving it lets the key fall through to the normal
+        // `PaneInput` forwarding path (`0x05`) instead.
+        let is_orchestration_tab = matches!(tab_manager.active_tab(), Tab::Orchestration { .. });
+        action = scope_command_entry_lock(action, is_orchestration_tab, ui.mode);
     }
 
     // PRD #341 M5: command-mode focused-pane scrolling (`scroll_pane_up` /
@@ -8835,7 +9038,32 @@ fn handle_key_event(
             }
             UiMode::DirPicker => handle_dir_picker_key(key, ui),
             UiMode::NewPaneForm => handle_new_pane_form_key(key, ui),
-            UiMode::PaneInput => handle_pane_input_key(key),
+            UiMode::PaneInput => {
+                let candidate = handle_pane_input_key(key);
+                // The gate needs live per-pane status for the
+                // `WaitingForInput` carve-out, and `UiState` caches none — so
+                // build the join from the `snapshot` already in scope here and
+                // hand it over. Deliberately `build_pane_status_for_gate`, not
+                // the plain `build_pane_status` the pane borders read: it omits
+                // any `pane_id` claimed by more than one session, so an
+                // ambiguous pane can never earn the carve-out.
+                let gated = gate_pane_input_key(
+                    candidate.clone(),
+                    ui,
+                    tab_manager,
+                    pane,
+                    &build_pane_status_for_gate(snapshot),
+                );
+                if matches!(candidate, Action::ForwardToPane(_))
+                    && matches!(gated, Action::Continue)
+                {
+                    ui.status_message = Some((
+                        ORCHESTRATION_LOCK_STATUS_MESSAGE.to_string(),
+                        std::time::Instant::now(),
+                    ));
+                }
+                gated
+            }
             UiMode::StarPrompt => handle_star_prompt_key(key, ui),
             UiMode::ConfigGenPrompt => handle_config_gen_prompt_key(key, ui),
             UiMode::QuitConfirm => {
@@ -10180,6 +10408,59 @@ pub fn run_tui(
                 role_pane_ids: role_pane_ids.clone(),
             },
         };
+        // Focus follows the lock. While the command-entry lock is engaged the
+        // deck steers the active Orchestration tab's focus itself: onto the
+        // lowest-order `WaitingForInput` role pane while one exists, and back
+        // to the orchestrator on the all-clear edge. While unlocked the WHOLE
+        // chain — observation included — is skipped, so the deck makes no focus
+        // decision at all and nothing fights the human's manual choice. Focus
+        // stays exactly where they put it until the deck is locked again.
+        //
+        // The status join is the same `build_pane_status` the pane borders read,
+        // so no new data flow is introduced. `Some(new_id)` means focus actually
+        // moved, so it is re-focused on the live pane controller.
+        //
+        // The gate lives here, at the call site, rather than inside
+        // `TabManager`: the lock is a `UiState` concern and nothing in
+        // `src/tab.rs` knows it exists — the same seam `gate_pane_input_key`
+        // reads it from. Skipping `observe_waiting_panes` means a latch set
+        // before an unlock could otherwise survive across it; the toggle
+        // handler calls `clear_waiting_pane_latch` on the locked→unlocked half
+        // to compensate (see that method's doc comment for the straddling trace
+        // this protects).
+        if ui.command_entry_locked {
+            let pane_status_for_focus: HashMap<&str, SessionStatus> = build_pane_status(&snapshot);
+            // The observation runs FIRST and outside the chain, because it must
+            // happen on every locked frame no matter which branch below wins.
+            tab_manager.observe_waiting_panes(&pane_status_for_focus);
+            // The `poll(0ms)` peek is a pending-input guard, computed ONCE per
+            // frame and threaded into the decision as a plain `bool`. A focus
+            // move applied on this frame lands before the event loop below
+            // drains what is already queued, and a key read after focus moved
+            // is forwarded to whatever pane is focused THEN — not the one it
+            // was typed at. So both branches of the decision defer while input
+            // is pending:
+            //
+            // - all-clear: fires exactly when the user has just answered the
+            //   last prompt and is likely still typing, and the resulting key
+            //   would reach the ORCHESTRATOR's PTY, which the command-entry
+            //   lock deliberately does not gate.
+            // - waiting-focus: a lower-role-order pane going `WaitingForInput`
+            //   steals focus from the waiting pane the user is mid-answer to,
+            //   and because the new pane is itself `WaitingForInput` the lock's
+            //   carve-out forwards the queued keystrokes straight to it.
+            //
+            // Deferring costs nothing in either case: the all-clear edge is
+            // latched in `all_clear_pending` and survives until consumed, and
+            // the waiting target is recomputed from the status snapshot every
+            // frame. See `TabManager::auto_focus_locked`.
+            let input_pending = crossterm::event::poll(std::time::Duration::from_millis(0))?;
+            if let Some(new_id) =
+                tab_manager.auto_focus_locked(&pane_status_for_focus, input_pending)
+            {
+                let _ = pane.focus_pane(&new_id);
+            }
+        }
         let tab_bar_labels: Vec<String> = tab_manager
             .tabs()
             .iter()
@@ -11817,6 +12098,55 @@ pub(crate) fn build_pane_status(state: &AppState) -> HashMap<&str, SessionStatus
         .sessions
         .values()
         .filter_map(|s| s.pane_id.as_deref().map(|pid| (pid, s.status.clone())))
+        .collect()
+}
+
+/// The same `pane_id -> SessionStatus` join as [`build_pane_status`], but
+/// **fail-closed on ambiguity**: a `pane_id` claimed by more than one session
+/// is OMITTED from the result entirely, whatever those sessions' statuses say.
+///
+/// Only [`gate_pane_input_key`] — the `WaitingForInput` carve-out — reads this.
+/// **Omission means "deny"**: the gate tests
+/// `matches!(pane_status.get(pane_id), Some(SessionStatus::WaitingForInput))`,
+/// which is false for a missing key, so leaving an ambiguous pane out of the
+/// map is exactly what makes the carve-out refuse to widen the lock. A single,
+/// unambiguous session behaves identically to [`build_pane_status`].
+///
+/// **Why this is a separate function, and why it must be the producer** — do
+/// not merge it back into [`build_pane_status`], and do not try to move the
+/// check into the gate instead:
+///
+/// - [`build_pane_status`] is deliberately left as-is. Its consumers (pane
+///   border colouring) want today's behaviour, and a colour being wrong on a
+///   collision is cosmetic. The lock is the security-shaped one, so only the
+///   lock's feed hardens.
+/// - `HashMap<&str, SessionStatus>` is one key, one value by construction, so a
+///   collision cannot be *represented* in the join's output at all — by the time
+///   the gate reads the map the ambiguity has already been discarded and no
+///   consumer-side check, however clever, can recover it. Only the raw
+///   `state.sessions` collection still knows, which is why the guard has to live
+///   here, on the producing side.
+/// - The rule is "any duplicate", not "any *disagreeing* duplicate". Permitting
+///   agreeing duplicates would hand an attacker on the status wire precisely
+///   what they want: a second session that also claims `WaitingForInput` would
+///   sail through. "Closed only when the duplicates happen to disagree" is not
+///   fail-closed.
+pub(crate) fn build_pane_status_for_gate(state: &AppState) -> HashMap<&str, SessionStatus> {
+    // `None` marks a pane_id seen more than once; it is dropped below rather
+    // than resolved, since there is no defensible way to pick a winner.
+    let mut joined: HashMap<&str, Option<SessionStatus>> = HashMap::new();
+    for session in state.sessions.values() {
+        let Some(pane_id) = session.pane_id.as_deref() else {
+            continue;
+        };
+        joined
+            .entry(pane_id)
+            .and_modify(|slot| *slot = None)
+            .or_insert_with(|| Some(session.status.clone()));
+    }
+    joined
+        .into_iter()
+        .filter_map(|(pane_id, status)| status.map(|status| (pane_id, status)))
         .collect()
 }
 
@@ -27399,5 +27729,775 @@ mod tests {
         let acted =
             apply_stream_rejection_feedback(&mut ui, Some("focused"), "focused", "exited", now);
         assert!(!acted, "a rejection while not in PaneInput must be ignored");
+    }
+
+    // -----------------------------------------------------------------------
+    // The command-entry lock on Orchestration tabs
+    // -----------------------------------------------------------------------
+
+    /// Exhaustive match over every `UiMode` variant, returning `mode`
+    /// unchanged — a compile-time guard so the cross product below cannot
+    /// silently go stale if a new `UiMode` variant is added without updating
+    /// the list this function is applied to.
+    fn assert_exhaustive_ui_mode(mode: UiMode) -> UiMode {
+        match mode {
+            UiMode::Normal
+            | UiMode::Filter
+            | UiMode::Help
+            | UiMode::Rename
+            | UiMode::DirPicker
+            | UiMode::NewPaneForm
+            | UiMode::PaneInput
+            | UiMode::StarPrompt
+            | UiMode::ConfigGenPrompt
+            | UiMode::QuitConfirm
+            | UiMode::StopConfirm
+            | UiMode::ScheduledTasks
+            | UiMode::CloseConfirm => mode,
+        }
+    }
+
+    /// Every `UiMode` variant, run through [`assert_exhaustive_ui_mode`] so
+    /// the list can't quietly drop a variant a future edit adds to the enum.
+    fn all_ui_modes() -> Vec<UiMode> {
+        [
+            UiMode::Normal,
+            UiMode::Filter,
+            UiMode::Help,
+            UiMode::Rename,
+            UiMode::DirPicker,
+            UiMode::NewPaneForm,
+            UiMode::PaneInput,
+            UiMode::StarPrompt,
+            UiMode::ConfigGenPrompt,
+            UiMode::QuitConfirm,
+            UiMode::StopConfirm,
+            UiMode::ScheduledTasks,
+            UiMode::CloseConfirm,
+        ]
+        .into_iter()
+        .map(assert_exhaustive_ui_mode)
+        .collect()
+    }
+
+    /// Two-role `orchestrator` (start) / `worker` orchestration config, shared
+    /// by the lock tests below.
+    fn lock_test_orch_config(name: &str) -> OrchestrationConfig {
+        OrchestrationConfig {
+            name: name.to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    name: "orchestrator".to_string(),
+                    command: "cat".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    name: "worker".to_string(),
+                    command: "cat".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+            ],
+        }
+    }
+
+    /// Dispatches a real `Action::SpawnPane` opening a fresh orchestration
+    /// (via [`lock_test_orch_config`]) against `tm`, making it the active tab.
+    /// Shared setup for the lock tests below.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_lock_test_orchestration(
+        tm: &mut TabManager,
+        pc: &dyn crate::pane::PaneController,
+        ui: &mut UiState,
+        state: &SharedState,
+        snapshot: &AppState,
+        frame_area: Rect,
+        tmp_dir: &std::path::Path,
+        name: &str,
+    ) {
+        let req = NewPaneRequest {
+            dir: tmp_dir.to_path_buf(),
+            name: name.to_string(),
+            command: String::new(),
+            mode_config: None,
+            orchestration_config: Some(lock_test_orch_config(name)),
+            seed_prompt: None,
+        };
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            ui,
+            pc,
+            state,
+            tm,
+            snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+    }
+
+    /// Scenario: Table-driven unit test of the pure `scope_command_entry_lock`
+    /// function over the full cross product of `is_orchestration_tab`
+    /// (true/false) x every `UiMode` variant x the action being
+    /// `ToggleOrchestrationLock`, some other action (`Quit`), or `None`.
+    /// Confirms `ToggleOrchestrationLock` survives ONLY at
+    /// `(is_orchestration_tab = true, UiMode::Normal)`, that every other action
+    /// passes through completely untouched in every cell (including
+    /// `(false, non-Normal)`, ruling out a blanket "drop the action"
+    /// implementation), and that `None` in always yields `None` out. This is a
+    /// mechanism test only — it proves nothing about a real pane on its own;
+    /// that real-pane proof is `orchestration/lock/009`'s job.
+    #[spec("orchestration/lock/001")]
+    #[test]
+    fn lock_001_scope_command_entry_lock_claims_only_when_orchestration_and_normal_mode() {
+        let modes = all_ui_modes();
+
+        for is_orchestration_tab in [true, false] {
+            for &mode in &modes {
+                let claims = is_orchestration_tab && mode == UiMode::Normal;
+
+                let lock_result = scope_command_entry_lock(
+                    Some(Action::ToggleOrchestrationLock),
+                    is_orchestration_tab,
+                    mode,
+                );
+                if claims {
+                    assert!(
+                        matches!(lock_result, Some(Action::ToggleOrchestrationLock)),
+                        "ToggleOrchestrationLock should survive at \
+                         (is_orchestration_tab={is_orchestration_tab}, mode={mode:?}), \
+                         got {lock_result:?}"
+                    );
+                } else {
+                    assert!(
+                        lock_result.is_none(),
+                        "ToggleOrchestrationLock should be un-resolved (None) at \
+                         (is_orchestration_tab={is_orchestration_tab}, mode={mode:?}), \
+                         got {lock_result:?}"
+                    );
+                }
+
+                // Every OTHER action must pass through completely untouched in
+                // EVERY cell, including (false, non-Normal) — this is the
+                // assertion that rules out implementing the scoping as a
+                // blanket "drop the action" rather than one scoped
+                // specifically to ToggleOrchestrationLock.
+                let other_result =
+                    scope_command_entry_lock(Some(Action::Quit), is_orchestration_tab, mode);
+                assert!(
+                    matches!(other_result, Some(Action::Quit)),
+                    "a non-ToggleOrchestrationLock action must pass through \
+                     untouched at (is_orchestration_tab={is_orchestration_tab}, \
+                     mode={mode:?}), got {other_result:?}"
+                );
+
+                // None in, None out, in every cell.
+                let none_result = scope_command_entry_lock(None, is_orchestration_tab, mode);
+                assert!(
+                    none_result.is_none(),
+                    "None must pass through as None at \
+                     (is_orchestration_tab={is_orchestration_tab}, mode={mode:?}), \
+                     got {none_result:?}"
+                );
+            }
+        }
+    }
+
+    /// Scenario: Dispatch a real `Action::SpawnPane` opening a fresh
+    /// orchestration and assert the deck-global command-entry lock starts
+    /// LOCKED. Locked-by-default is load-bearing rather than an opinionated
+    /// default — a lock you must remember to engage protects nothing.
+    #[spec("orchestration/lock/002")]
+    #[test]
+    fn lock_002_new_orchestration_tab_starts_locked() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-default",
+        );
+
+        assert!(
+            matches!(tm.active_tab(), Tab::Orchestration { .. }),
+            "expected a real orchestration tab to be active"
+        );
+        assert!(
+            ui.command_entry_locked,
+            "a freshly opened orchestration tab must observe the deck-global \
+             command-entry lock LOCKED — only the orchestrator pane accepts \
+             direct input until Ctrl+e unlocks it"
+        );
+    }
+
+    /// Scenario: Confirm `Ctrl+e` resolves to `Action::ToggleOrchestrationLock`
+    /// through the production `key_action_for_mode` seam from `UiMode::Normal`
+    /// (command mode, the only mode the chord is claimed in), then dispatch the
+    /// action twice against a real orchestration tab and confirm the deck-global
+    /// `ui.command_entry_locked` flips locked -> unlocked -> locked. The full
+    /// `is_orchestration_tab x mode` matrix is `orchestration/lock/001`'s job,
+    /// not this test's.
+    #[spec("orchestration/lock/003")]
+    #[test]
+    fn lock_003_ctrl_e_toggles_the_lock() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-toggle",
+        );
+
+        // Ctrl+e must resolve to the toggle action from Normal (command) mode
+        // using the DEFAULT keybinding config (no user remap involved).
+        let kb = KeybindingConfig::default();
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        let resolved = key_action_for_mode(&kb, UiMode::Normal, &ctrl_e);
+        assert!(
+            matches!(resolved, Some(Action::ToggleOrchestrationLock)),
+            "Ctrl+e must resolve to Action::ToggleOrchestrationLock from \
+             Normal (command) mode"
+        );
+
+        let _ = dispatch_action(
+            Action::ToggleOrchestrationLock,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            !ui.command_entry_locked,
+            "the first Ctrl+e toggle should UNLOCK the deck-global lock"
+        );
+
+        let _ = dispatch_action(
+            Action::ToggleOrchestrationLock,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            ui.command_entry_locked,
+            "the second Ctrl+e toggle should RE-LOCK the deck-global lock"
+        );
+    }
+
+    /// Scenario: Spawn orchestration tab A, toggle the lock while A is active,
+    /// then spawn a brand-new orchestration tab B and confirm B observes the
+    /// SAME now-unlocked deck-global value rather than defaulting back to
+    /// locked. Switch back to A and confirm it observes the same unlocked value
+    /// too. Then toggle FROM tab B and confirm tab A observes THAT change as
+    /// well — toggling on any Orchestration tab changes what every Orchestration
+    /// tab observes, so unlocking never has to be repeated per tab.
+    #[spec("orchestration/lock/004")]
+    #[test]
+    fn lock_004_toggle_is_deck_global_across_orchestration_tabs() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        // Tab A: spawn (starts LOCKED, the deck-global default), then toggle it
+        // via the real toggle action.
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-shared-a",
+        );
+        let idx_a = tm.active_index();
+        assert!(
+            ui.command_entry_locked,
+            "tab A must start locked — the deck-global default"
+        );
+        let _ = dispatch_action(
+            Action::ToggleOrchestrationLock,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            !ui.command_entry_locked,
+            "toggling on tab A should unlock the deck-global lock"
+        );
+
+        // Tab B: a brand-new orchestration tab must ADOPT the current
+        // deck-global value (unlocked) rather than resetting to locked — there
+        // is no per-tab field left for it to default from.
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-shared-b",
+        );
+        let idx_b = tm.active_index();
+        assert_ne!(idx_a, idx_b, "tab B must be a distinct tab from tab A");
+        assert!(
+            !ui.command_entry_locked,
+            "a newly opened orchestration tab must ADOPT the current \
+             deck-global value (unlocked, set by tab A's toggle) rather than \
+             defaulting back to locked"
+        );
+
+        // Switch back to A: still unlocked — one shared value, unaffected by
+        // which tab happens to be active.
+        assert!(tm.switch_to(idx_a), "switching back to tab A must succeed");
+        assert!(
+            !ui.command_entry_locked,
+            "tab A must observe the same unlocked deck-global value after \
+             spawning tab B — there is no per-tab state left to diverge"
+        );
+
+        // Toggle FROM tab B, then switch back to A: A must observe the change
+        // too.
+        assert!(tm.switch_to(idx_b), "switching to tab B must succeed");
+        let _ = dispatch_action(
+            Action::ToggleOrchestrationLock,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            ui.command_entry_locked,
+            "toggling on tab B should re-lock the deck-global lock"
+        );
+        assert!(tm.switch_to(idx_a), "switching back to tab A must succeed");
+        assert!(
+            ui.command_entry_locked,
+            "tab A must observe tab B's toggle — toggling on ANY Orchestration \
+             tab must change what every Orchestration tab observes"
+        );
+    }
+
+    /// Scenario: Deck-global storage moves WHERE the lock value lives, not WHERE
+    /// it reaches. Set the deck-global lock ENGAGED (the strongest case) and
+    /// confirm `gate_pane_input_key` passes an `Action::ForwardToPane` through
+    /// UNCHANGED on the always-present Dashboard tab and on a freshly opened
+    /// Mode tab — the gate must still match only `Tab::Orchestration`, never
+    /// widening onto other tab types now that the lock it reads is deck-global.
+    #[spec("orchestration/lock/005")]
+    #[test]
+    fn lock_005_dashboard_and_mode_tabs_stay_ungated_when_deck_locked() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone()); // tab 0 = Dashboard, always present
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        // The strongest case: the deck-global lock is engaged.
+        ui.command_entry_locked = true;
+
+        // An EMPTY status map is the neutral value for the carve-out's
+        // parameter. No pane reports `WaitingForInput`, so the carve-out cannot
+        // fire and the pass-through asserted below can only come from the
+        // tab-kind match — which is exactly this test's claim, unweakened.
+        let no_status: HashMap<&str, SessionStatus> = HashMap::new();
+
+        assert!(
+            matches!(tm.active_tab(), Tab::Dashboard { .. }),
+            "expected the always-present Dashboard tab to be active"
+        );
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &no_status,
+        );
+        match gated {
+            Action::ForwardToPane(bytes) => assert_eq!(
+                bytes,
+                vec![b'x'],
+                "a Dashboard tab must never gate ForwardToPane, even while the \
+                 deck-global lock is engaged"
+            ),
+            other => panic!(
+                "expected ForwardToPane to pass through unchanged on a \
+                 Dashboard tab, got {other:?}"
+            ),
+        }
+
+        // Open a Mode tab and repeat: same never-gated guarantee.
+        let req = mode_card_request(
+            tmp.path().to_str().expect("utf8 tmp path"),
+            "cat",
+            mode_config_local("lock-mode", 1),
+        );
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(req)),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &[],
+            None,
+            frame_area,
+        );
+        assert!(
+            matches!(tm.active_tab(), Tab::Mode { .. }),
+            "expected the Mode tab to be active after spawning it"
+        );
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &no_status,
+        );
+        match gated {
+            Action::ForwardToPane(bytes) => assert_eq!(
+                bytes,
+                vec![b'x'],
+                "a Mode tab must never gate ForwardToPane, even while the \
+                 deck-global lock is engaged"
+            ),
+            other => panic!(
+                "expected ForwardToPane to pass through unchanged on a Mode \
+                 tab, got {other:?}"
+            ),
+        }
+    }
+
+    /// Scenario: While a locked non-orchestrator pane's live status is
+    /// `WaitingForInput`, `gate_pane_input_key` must pass an
+    /// `Action::ForwardToPane` through UNCHANGED instead of dropping it — the
+    /// agent has stopped and asked, so a keystroke answering it is a response to
+    /// a request, not an unsolicited intrusion. Spawns a real two-role
+    /// orchestration (deck LOCKED, the default) with a focus-echoing pane
+    /// controller, then walks both edges on the SAME worker pane: no recorded
+    /// status (dropped) -> `WaitingForInput` (passes through) -> `Working`
+    /// (dropped again, proving the hole doesn't outlive the status that opened
+    /// it). Also pins that the orchestrator pane's own input stays unaffected by
+    /// ANY status, and that an unlocked deck ignores `WaitingForInput` entirely.
+    #[spec("orchestration/lock/006")]
+    #[test]
+    fn lock_006_waiting_for_input_carve_out() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(FocusEchoPC::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-waiting",
+        );
+        assert!(
+            ui.command_entry_locked,
+            "a freshly opened orchestration tab must start locked"
+        );
+
+        let Tab::Orchestration {
+            role_pane_ids,
+            start_role_index,
+            ..
+        } = tm.active_tab()
+        else {
+            panic!("expected a real orchestration tab to be active");
+        };
+        let orchestrator_id = role_pane_ids[*start_role_index].clone();
+        let worker_id = role_pane_ids
+            .iter()
+            .find(|id| id.as_str() != orchestrator_id.as_str())
+            .cloned()
+            .expect("lock_test_orch_config has one non-orchestrator worker role");
+
+        // Focus the worker explicitly rather than relying on incidental mock
+        // behaviour — `FocusEchoPC` genuinely echoes it back.
+        pc.focus_pane(&worker_id).expect("focus worker pane");
+
+        let no_status: HashMap<&str, SessionStatus> = HashMap::new();
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &no_status,
+        );
+        assert!(
+            matches!(gated, Action::Continue),
+            "baseline: a locked worker pane with no recorded status must still \
+             be gated, got {gated:?}"
+        );
+
+        let mut waiting_status: HashMap<&str, SessionStatus> = HashMap::new();
+        waiting_status.insert(worker_id.as_str(), SessionStatus::WaitingForInput);
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &waiting_status,
+        );
+        match gated {
+            Action::ForwardToPane(bytes) => assert_eq!(
+                bytes,
+                vec![b'x'],
+                "a locked worker pane reporting WaitingForInput must pass a \
+                 keystroke through UNCHANGED — the agent stopped and asked, so \
+                 answering it is a response, not an intrusion"
+            ),
+            other => panic!(
+                "expected ForwardToPane to pass through unchanged while the \
+                 focused pane is WaitingForInput, got {other:?}"
+            ),
+        }
+
+        // Re-engage: the SAME pane, now Working — the carve-out must not
+        // outlive the status that opened it.
+        let mut working_status: HashMap<&str, SessionStatus> = HashMap::new();
+        working_status.insert(worker_id.as_str(), SessionStatus::Working);
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &working_status,
+        );
+        assert!(
+            matches!(gated, Action::Continue),
+            "the gate must RE-ENGAGE the instant the worker's status clears \
+             from WaitingForInput — got {gated:?} while status was Working"
+        );
+
+        // The orchestrator pane's own input is unaffected either way — never
+        // gated, waiting or not. Repeated here WITH a status attached (the
+        // closest status the carve-out reasons about) to prove the never-gated
+        // rule doesn't get reordered behind the new check.
+        pc.focus_pane(&orchestrator_id)
+            .expect("focus orchestrator pane");
+        let mut orch_waiting: HashMap<&str, SessionStatus> = HashMap::new();
+        orch_waiting.insert(orchestrator_id.as_str(), SessionStatus::WaitingForInput);
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &orch_waiting,
+        );
+        assert!(
+            matches!(gated, Action::ForwardToPane(_)),
+            "the orchestrator pane's own input must never be gated, regardless \
+             of its status, got {gated:?}"
+        );
+
+        // Unlocked deck: WaitingForInput is irrelevant when the lock itself is
+        // off — there is nothing to carve a hole out of.
+        pc.focus_pane(&worker_id).expect("focus worker pane");
+        ui.command_entry_locked = false;
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &waiting_status,
+        );
+        assert!(
+            matches!(gated, Action::ForwardToPane(_)),
+            "an unlocked deck must pass ForwardToPane through regardless of \
+             WaitingForInput, got {gated:?}"
+        );
+    }
+
+    /// Scenario: `build_pane_status` joins session values into a
+    /// `pane_id`-keyed map with NO dedupe, so when two sessions share a
+    /// `pane_id` the surviving value is whichever iteration order reaches last
+    /// — and a `HashMap` cannot even REPRESENT the collision, so the ambiguity
+    /// is already gone by the time the carve-out reads it. This test spawns a
+    /// real locked orchestration and focuses its worker pane (so the tab-kind
+    /// and lock guards ahead of the carve-out are exercised for real), then
+    /// builds two synthetic `AppState`s — one with a SINGLE `WaitingForInput`
+    /// session on the worker's `pane_id`, one with TWO sessions sharing it
+    /// (`Working` and `WaitingForInput`) — and resolves each through
+    /// `build_pane_status_for_gate` before handing the result to
+    /// `gate_pane_input_key`. Ambiguous must DENY the exemption; unambiguous
+    /// must still grant it, so failing closed can't be bought by breaking the
+    /// carve-out outright.
+    #[spec("orchestration/lock/007")]
+    #[test]
+    fn lock_007_ambiguous_status_fails_closed() {
+        let frame_area = Rect::new(0, 0, 200, 50);
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(FocusEchoPC::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+
+        spawn_lock_test_orchestration(
+            &mut tm,
+            pc.as_ref(),
+            &mut ui,
+            &state,
+            &snapshot,
+            frame_area,
+            tmp.path(),
+            "lock-ambiguous",
+        );
+        assert!(
+            ui.command_entry_locked,
+            "a freshly opened orchestration tab must start locked"
+        );
+
+        let Tab::Orchestration {
+            role_pane_ids,
+            start_role_index,
+            ..
+        } = tm.active_tab()
+        else {
+            panic!("expected a real orchestration tab to be active");
+        };
+        let orchestrator_id = role_pane_ids[*start_role_index].clone();
+        let worker_id = role_pane_ids
+            .iter()
+            .find(|id| id.as_str() != orchestrator_id.as_str())
+            .cloned()
+            .expect("lock_test_orch_config has one non-orchestrator worker role");
+
+        pc.focus_pane(&worker_id).expect("focus worker pane");
+
+        // Two sessions collide on the SAME pane_id, disagreeing on
+        // WaitingForInput-ness: the locked, focused worker's real session is
+        // Working, while a colliding session says WaitingForInput.
+        let mut real = make_session(SessionStatus::Working);
+        real.session_id = "sess-real-working".into();
+        real.pane_id = Some(worker_id.clone());
+
+        let mut duplicate = make_session(SessionStatus::WaitingForInput);
+        duplicate.session_id = "sess-duplicate-waiting".into();
+        duplicate.pane_id = Some(worker_id.clone());
+
+        let mut collision_state = AppState::default();
+        collision_state
+            .sessions
+            .insert(real.session_id.clone(), real);
+        collision_state
+            .sessions
+            .insert(duplicate.session_id.clone(), duplicate);
+
+        let ambiguous_status = build_pane_status_for_gate(&collision_state);
+        assert_ne!(
+            ambiguous_status.get(worker_id.as_str()),
+            Some(&SessionStatus::WaitingForInput),
+            "a pane_id with two disagreeing sessions must not resolve to \
+             WaitingForInput for the gate — that is the fact the carve-out \
+             needs in order to fail closed"
+        );
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &ambiguous_status,
+        );
+        assert!(
+            matches!(gated, Action::Continue),
+            "an ambiguous pane_id (colliding sessions disagreeing on \
+             WaitingForInput) must DENY the exemption and drop the keystroke — \
+             fail closed, not fail open — got {gated:?}"
+        );
+
+        // The unambiguous case must still work, through the SAME resolver.
+        let mut clean = make_session(SessionStatus::WaitingForInput);
+        clean.session_id = "sess-clean-waiting".into();
+        clean.pane_id = Some(worker_id.clone());
+        let mut clean_state = AppState::default();
+        clean_state.sessions.insert(clean.session_id.clone(), clean);
+
+        let single_status = build_pane_status_for_gate(&clean_state);
+        assert_eq!(
+            single_status.get(worker_id.as_str()),
+            Some(&SessionStatus::WaitingForInput),
+            "a single, unambiguous WaitingForInput session must still resolve \
+             to WaitingForInput for the gate"
+        );
+        let gated = gate_pane_input_key(
+            Action::ForwardToPane(vec![b'x']),
+            &ui,
+            &tm,
+            pc.as_ref(),
+            &single_status,
+        );
+        match gated {
+            Action::ForwardToPane(bytes) => assert_eq!(
+                bytes,
+                vec![b'x'],
+                "a single, unambiguous WaitingForInput session must still pass \
+                 the keystroke through unchanged"
+            ),
+            other => panic!(
+                "expected the unambiguous WaitingForInput carve-out to still \
+                 pass ForwardToPane through unchanged, got {other:?}"
+            ),
+        }
     }
 }

@@ -1,0 +1,19 @@
+# Fixture for the L2 real-pane proof that Ctrl+e is claimed only in command
+# mode (orchestration/lock/009). The orchestrator (start) role runs a real
+# interactive bash/readline shell instead of a `cat` stub, so readline's
+# beginning-of-line (Ctrl+a) / end-of-line (Ctrl+e) bindings can actually run
+# when their raw bytes are forwarded. The non-orchestrator `worker` role is a
+# `cat` stub (no LLM tokens spent) so the SAME test can observe the
+# command-entry lock's toggle state the way orchestration/lock/008 does: by
+# checking whether a keystroke reaches the worker's PTY.
+[[orchestrations]]
+name = "lock-bash-role"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "env PS1='CTRLE> ' bash --noprofile --norc -i"
+start = true
+
+[[orchestrations.roles]]
+name = "worker"
+command = "cat"
