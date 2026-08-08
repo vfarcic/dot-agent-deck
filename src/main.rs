@@ -199,6 +199,15 @@ enum Commands {
         #[command(subcommand)]
         cmd: SnapshotCmd,
     },
+    /// Reclaim git worktrees whose PR is merged, whose tree is clean, and
+    /// which the deck can prove it created. Never inspects git ancestry for
+    /// merge state — squash-merges never enter `main`'s ancestry, and an
+    /// ancestor branch with no PR must never be removed. The branch always
+    /// survives; only the worktree directory is removed.
+    Worktree {
+        #[command(subcommand)]
+        cmd: WorktreeCmd,
+    },
     /// Wrap an agent command, passing its stdio through transparently while
     /// tee-ing output through pattern detection into `AgentEvent`s (PRD #20 M6
     /// — the generic stdout-wrapper integration strategy). The child stays
@@ -409,6 +418,32 @@ enum SnapshotCmd {
     /// dashboard instead of restoring the previous workspace. Registry-only
     /// `remote remove` intentionally does NOT touch this global snapshot.
     Clear,
+}
+
+#[derive(Subcommand)]
+enum WorktreeCmd {
+    /// List every linked worktree with its resolved PR state, cleanliness,
+    /// ownership, and gate verdict (remove/ask/keep) with a reason. Read-only
+    /// — never removes anything.
+    List {
+        /// Emit a versioned JSON document (`{schema_version, worktrees}`)
+        /// instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove every worktree the gate marks `remove` (deck-owned, merged,
+    /// clean) unconditionally. A worktree the deck cannot prove it created is
+    /// reported as reclaimable-pending-confirmation and left alone unless
+    /// `--yes` is passed. A dirty worktree, an open/closed-unmerged PR, or an
+    /// unresolvable PR state always keeps, `--yes` or not. Never deletes the
+    /// branch.
+    Reclaim {
+        /// Authorize removing worktrees the deck did NOT prove it created
+        /// (the `ask` verdict), in addition to the ones it did. Has no effect
+        /// on worktrees the gate already keeps for another reason.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -992,6 +1027,10 @@ fn main() -> ExitCode {
                 }
             }
         },
+        Some(Commands::Worktree { cmd }) => match cmd {
+            WorktreeCmd::List { json } => run_worktree_list_cli(json),
+            WorktreeCmd::Reclaim { yes } => run_worktree_reclaim_cli(yes),
+        },
         Some(Commands::Connect { name }) => run_connect(name),
         Some(Commands::Schedule { action }) => run_schedule_cli(action),
         Some(Commands::Snapshot { cmd }) => match cmd {
@@ -1368,6 +1407,79 @@ fn run_connect(name: Option<String>) -> ExitCode {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {
             eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `dot-agent-deck worktree list [--json]`. Pure CLI-subprocess operation
+/// over `git`/`gh` in the current directory's repo — no daemon involved, so
+/// this is plain synchronous code, no `#[tokio::main]`. Row shaping and the
+/// gate itself live in [`dot_agent_deck::worktree_reclaim`]; this wrapper
+/// only translates the outcome into stdout/stderr text and an exit code.
+fn run_worktree_list_cli(json: bool) -> ExitCode {
+    use dot_agent_deck::worktree_reclaim::{
+        WorktreeListDocument, examine_worktrees, format_list_human,
+    };
+
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("worktree list: failed to resolve current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let reports = match examine_worktrees(&cwd) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("worktree list: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if json {
+        match serde_json::to_string(&WorktreeListDocument::new(reports)) {
+            Ok(j) => {
+                println!("{j}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("worktree list: failed to serialize JSON: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        print!("{}", format_list_human(&reports));
+        ExitCode::SUCCESS
+    }
+}
+
+/// `dot-agent-deck worktree reclaim [--yes]`. Removes every worktree the
+/// gate marks `remove` (deck-owned, merged PR, clean tree) unconditionally,
+/// and — only with `--yes` — also those it marks `ask` (merged and clean,
+/// but the deck cannot prove it created them). Without `--yes`, `ask`-verdict
+/// worktrees are left alone and reported as a pending decision that leads
+/// the output, naming their exact paths and the ready-to-copy `--yes`
+/// command. Always exits successfully once it has finished examining and
+/// acting on every worktree; only a failure to enumerate worktrees at all
+/// (e.g. not a git repo) is reported as failure.
+fn run_worktree_reclaim_cli(yes: bool) -> ExitCode {
+    use dot_agent_deck::worktree_reclaim::{format_reclaim_human, run_reclaim};
+
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("worktree reclaim: failed to resolve current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match run_reclaim(&cwd, yes) {
+        Ok(outcome) => {
+            print!("{}", format_reclaim_human(&outcome));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("worktree reclaim: {e}");
             ExitCode::FAILURE
         }
     }
