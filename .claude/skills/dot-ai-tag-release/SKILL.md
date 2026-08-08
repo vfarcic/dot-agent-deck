@@ -44,7 +44,31 @@ git commit --allow-empty -m "chore: prepare release [version]"
 git push origin HEAD
 ```
 
-### Step 4: Create and Push Tag
+### Step 4: Sync the Flake Version Pin
+
+Do this **before** creating the tag, so the tagged tree carries the right pin.
+
+`flake.nix` pins the released version in a `version = "..."` let-binding and hands it to the build as `DAD_VERSION`. It has to: a Nix source build gets a tarball with no `.git` for `build.rs` to describe, so with no pin the binary reports the `0.1.0` placeholder from `Cargo.toml`. `release.yml` hard-fails the release when the pin and the tag disagree, and it does so in `prepare`, which runs *after* the tag has been pushed. A missed bump therefore costs you a deleted remote tag, not just a re-run.
+
+The pin carries **no leading `v`**. The tag is `v0.35.7`; the pin is `0.35.7`. Strip it.
+
+```bash
+# [version] is the tag as everywhere else in this skill (e.g. v0.35.8).
+# [version-no-v] is that same string with the leading `v` removed (0.35.8).
+sed -i.bak -E 's/^([[:space:]]*)version = "[^"]+";$/\1version = "[version-no-v]";/' flake.nix && rm flake.nix.bak
+git diff flake.nix
+```
+
+The diff must show exactly one changed line: `release.yml` also refuses to release unless `flake.nix` contains exactly one anchored `version = "...";` line. Then commit and push:
+
+```bash
+git commit -am "chore: pin flake version to [version]"
+git push origin HEAD
+```
+
+If the repository has no `flake.nix`, skip this step.
+
+### Step 5: Create and Push Tag
 
 After confirmation:
 ```bash
@@ -52,14 +76,14 @@ git tag -a [version] -m "[Brief description summarizing the fragments]"
 git push origin [version]
 ```
 
-### Step 5: Confirm Success
+### Step 6: Confirm Success
 
 Show the user:
 1. The tag created
 2. The tag URL on GitHub (if applicable)
 3. Note that CI/CD will generate release notes from the fragments
 
-### Step 6: Clean Up Merged Worktrees and Branches
+### Step 7: Clean Up Merged Worktrees and Branches
 
 Once the release is tagged, the branches and worktrees whose work it contains are
 done. Run the read-only detection script bundled with this skill:
@@ -110,7 +134,7 @@ git worktree prune
 - **Use semantic versioning**: Follow semver strictly based on fragment types. While the project is pre-1.0 (`v0.x`), the minor digit is the compatibility boundary, so `breaking` fragments bump the minor and `feature`/`bugfix` fragments are patch releases; from `1.0` onward, standard semver applies (`breaking`→major, `feature`→minor, `bugfix`→patch). The `.claude/skills/dot-ai-tag-release/analyze.sh` output already reflects this.
 - **Brief tag message**: Summarize the release in 1-2 sentences
 - **Never tag [skip ci] commits**: Always create a preparation commit first
-- **Clean up only after tagging**: Run the cleanup step (Step 6) once the release
+- **Clean up only after tagging**: Run the cleanup step (Step 7) once the release
   is cut, never before — and always confirm the detected list with the user, since
   removing worktrees and deleting branches is destructive
 

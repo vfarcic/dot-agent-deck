@@ -21,6 +21,109 @@ brew tap vfarcic/tap
 brew install dot-agent-deck
 ```
 
+## Nix
+
+Requires Nix with flakes enabled (`nix-command` and `flakes` in `experimental-features`). The flake builds from source against the committed `Cargo.lock`, so there is no per-release hash to maintain, and it pins the released version, so `dot-agent-deck --version` reports the real version rather than a source-build placeholder. It covers `x86_64-linux`, `aarch64-linux` and `aarch64-darwin`. Intel Macs are served by the release binaries and the Homebrew tap instead, because the nixpkgs this flake pins has dropped `x86_64-darwin`.
+
+Run it once without installing anything:
+
+```bash
+nix run github:vfarcic/dot-agent-deck
+```
+
+Arguments after `--` reach the binary, so `nix run github:vfarcic/dot-agent-deck -- hooks install` works too. Pin a specific release by appending its tag: `github:vfarcic/dot-agent-deck/<tag>`. That works for any release from the first one that ships the flake onwards; earlier tags predate it, so there is no flake at that revision to build.
+
+Install it into your user profile:
+
+```bash
+nix profile install github:vfarcic/dot-agent-deck
+```
+
+**As a flake input.** NixOS and home-manager users add the flake as an input and take the package from it:
+
+```nix
+{
+  inputs.dot-agent-deck.url = "github:vfarcic/dot-agent-deck";
+  # Optional. Build against your nixpkgs rather than the one this flake pins.
+  inputs.dot-agent-deck.inputs.nixpkgs.follows = "nixpkgs";
+
+  # NixOS
+  environment.systemPackages = [ inputs.dot-agent-deck.packages.${pkgs.system}.default ];
+
+  # home-manager
+  home.packages = [ inputs.dot-agent-deck.packages.${pkgs.system}.default ];
+}
+```
+
+The `follows` line is the usual tradeoff: one nixpkgs in your closure instead of two, paid for by building against a nixpkgs this project has not tested against, which has to be recent enough to carry rustc 1.85 or newer.
+
+**Via the overlay.** If you would rather reach it as `pkgs.dot-agent-deck` everywhere, apply the overlay instead:
+
+```nix
+{
+  nixpkgs.overlays = [ inputs.dot-agent-deck.overlays.default ];
+
+  environment.systemPackages = [ pkgs.dot-agent-deck ];
+}
+```
+
+The overlay always builds against *your* nixpkgs, never the pinned one, so that rustc 1.85 minimum applies here whether or not you set `follows`. The crate is edition 2024, which is where the floor comes from.
+
+### The home-manager module
+
+`homeModules.default` installs the binary and writes your configuration declaratively. Import it and turn it on:
+
+```nix
+{
+  imports = [ inputs.dot-agent-deck.homeModules.default ];
+
+  programs.dot-agent-deck = {
+    enable = true;
+
+    # ~/.config/dot-agent-deck/config.toml
+    settings = {
+      default_command = "claude";
+      worker_response_timeout_minutes = 90;
+      idle_art = {
+        enabled = true;
+        provider = "anthropic";
+      };
+    };
+
+    # ~/.config/dot-agent-deck/keybindings.toml
+    keybindings = {
+      global = {
+        toggle_layout = "Alt+Shift+l";
+        new_pane = "";            # empty string unbinds an action
+      };
+      dashboard.help = "F1";
+    };
+  };
+}
+```
+
+`settings` and `keybindings` are freeform attribute sets rendered to TOML, so anything the two files accept can go in them. See [Configuration](configuration.md) for `config.toml` and [Keyboard Shortcuts](keyboard-shortcuts.md#customizing-keybindings) for the keybinding actions and their defaults. Each file is written only when its attribute set is non-empty, so `enable = true` on its own installs the package and leaves any config you already have untouched.
+
+`package` defaults to this flake's package built against your own nixpkgs, which is exactly what the overlay produces, so applying the overlay and importing the module gets you one build of the tool rather than two. Set it explicitly to `inputs.dot-agent-deck.packages.${pkgs.system}.default` if you would rather build against the nixpkgs this flake pins.
+
+**What the module deliberately does not manage.** Only `config.toml` and `keybindings.toml`. The other three files in that directory are left alone on purpose:
+
+| File | Why it is left alone |
+|---|---|
+| `session.toml` | Runtime state the deck writes itself (your saved workspace). home-manager symlinks its files read-only out of the Nix store, so managing it would stop the deck saving. |
+| `remotes.toml` | Written imperatively by `dot-agent-deck remote add`, same problem. |
+| `schedules.toml` | The one file whose location honours `$XDG_CONFIG_HOME`, unlike its neighbours. Managing it correctly needs handling the other two files must not get, so it is left for a follow-up. |
+
+**Hooks are still a one-off imperative step.** The module does not run `dot-agent-deck hooks install` for you, because that command edits *other* tools' configuration (Claude, OpenCode, Codex and friends), which sits outside home-manager's ownership and does not roll back when you switch generations. Run it once yourself after the first activation:
+
+```bash
+dot-agent-deck hooks install
+```
+
+### Contributing?
+
+`nix develop` is a consumer-oriented shell carrying just the Rust toolchain; contributors should use devbox instead, which pins the toolchain version and ships the recording and docs tooling the test suites need.
+
 ## Download Binary
 
 Download the latest binary for your platform from the [Releases](https://github.com/vfarcic/dot-agent-deck/releases/latest) page. Binaries are available for Linux (amd64, arm64) and macOS (amd64, arm64).

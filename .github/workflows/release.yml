@@ -104,6 +104,80 @@ jobs:
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Verify the flake version matches the release
+        # flake.nix pins the released version in a let-binding and hands it to
+        # the build as DAD_VERSION, because a `nix run github:...` build gets a
+        # source tarball with no `.git` for `build.rs` to describe and would
+        # otherwise fall back to the `0.1.0` placeholder. That pin is a
+        # hand-maintained line: a release that bumps the tag without bumping the
+        # flake ships a source build reporting the wrong version, which is the
+        # same class of bug the DAD_VERSION seam (#250) was added to prevent, and
+        # the `Build` job below already uses that seam for the same reason.
+        # Fail the release loudly here rather than publish the mismatch.
+        #
+        # Bound through `env:` for the reason spelled out on the step above: a
+        # `${{ }}` expression is substituted as raw text before bash parses the
+        # line, so nothing from the GitHub context is ever shell code.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # `export` does not cross into another `run:` block, so the `LC_ALL=C`
+          # pinned in the step above is not in scope here. Nothing below is
+          # locale-sensitive today; pinned for the same reason it is pinned
+          # there, so nothing added to this step later can introduce a
+          # locale-dependent match.
+          export LC_ALL=C
+          # A grep/sed over flake.nix, not `nix eval --raw
+          # .#packages.x86_64-linux.default.version`. The eval is the robust read
+          # but it needs Nix on the runner, and `prepare` is a short metadata job
+          # with no Nix: installing it and evaluating the flake would put minutes
+          # on the critical path of every release to read one string literal. The
+          # `nix` job in ci.yml already proves the flake evaluates and builds; all
+          # this step has to do is compare a version.
+          #
+          # The cheap read is only worth it if it cannot silently match nothing,
+          # or match the wrong line, and pass. So the pattern is anchored to a
+          # whole line and the match count is asserted to be exactly 1: an empty
+          # or ambiguous extraction is a hard failure, not a pass.
+          matches=$(grep -cE '^[[:space:]]*version = "[^"]+";[[:space:]]*$' flake.nix || true)
+          if [ "${matches:-0}" -ne 1 ]; then
+            echo "::error::Refusing to release: expected exactly one anchored 'version = \"...\";' line in flake.nix, found ${matches:-0}. The extraction pattern in this step no longer fits the file, so the version pin cannot be checked."
+            exit 1
+          fi
+          # Same pattern as the guard, character for character: a `[^"]*`
+          # extractor would be a strict superset of a `[^"]+` guard, so it could
+          # also print a `version = "";` line the guard did not count and the
+          # captured value would carry a leading newline.
+          FLAKE_VERSION=$(sed -nE 's/^[[:space:]]*version = "([^"]+)";[[:space:]]*$/\1/p' flake.nix)
+          if [ -z "$FLAKE_VERSION" ]; then
+            echo "::error::Refusing to release: the pinned version in flake.nix extracted as an empty string."
+            exit 1
+          fi
+          if [ "$FLAKE_VERSION" != "$VERSION" ]; then
+            # Both values are safe to interpolate into the message: VERSION
+            # passed the SemVer gate above, and FLAKE_VERSION was extracted with
+            # the same pattern the guard counted, so "exactly one line matched"
+            # and "exactly one clean extraction" are the same statement, and
+            # `[^"]+` excludes quotes and newlines alike. Neither value can
+            # start a line with `::` and forge a workflow command.
+            echo "::error::Refusing to release: flake.nix pins version '$FLAKE_VERSION' but the release is '$VERSION'. Bump the version let-binding in flake.nix so the Nix build reports the release it actually is."
+            exit 1
+          fi
+          # A matching pin is necessary but not sufficient. `version` is only a
+          # let-binding, and everything above still passes if the derivation has
+          # stopped handing it to the build: `DAD_VERSION = "0.1.0";` next to
+          # `version = "0.35.7";` agrees with the tag and ships a binary
+          # reporting the placeholder, which is precisely the bug this step
+          # exists to catch. So assert the wire too, under the same anchoring
+          # discipline as the pin: exactly one whole-line `DAD_VERSION =
+          # version;`, with zero or several a hard failure rather than a pass.
+          wired=$(grep -cE '^[[:space:]]*DAD_VERSION = version;[[:space:]]*$' flake.nix || true)
+          if [ "${wired:-0}" -ne 1 ]; then
+            echo "::error::Refusing to release: expected exactly one anchored 'DAD_VERSION = version;' line in flake.nix, found ${wired:-0}. The pinned version is no longer wired to the build, so the Nix build reports whatever that env value now says rather than the release it claims to be."
+            exit 1
+          fi
+          echo "flake.nix pins '$FLAKE_VERSION', which matches the release, and hands it to the build as DAD_VERSION."
       - name: Assemble changelog
         id: changelog
         env:

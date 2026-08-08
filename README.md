@@ -14,6 +14,18 @@ dot-agent-deck hooks install
 dot-agent-deck
 ```
 
+With Nix, run it without installing anything:
+
+```bash
+nix run github:vfarcic/dot-agent-deck
+```
+
+Or add it to a flake, for home-manager and NixOS users:
+
+```nix
+inputs.dot-agent-deck.url = "github:vfarcic/dot-agent-deck";
+```
+
 ## Documentation
 
 For installation guides, configuration, keyboard shortcuts, and more, visit the documentation site:

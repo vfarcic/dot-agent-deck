@@ -40,6 +40,14 @@ jobs:
   # Same reasoning as the path filter on aarch64-crossbuild-check.yml: run the
   # expensive leg exactly when the thing it guards changed.
   #
+  # The `flake.nix` / `flake.lock` pair gets the mirror-image treatment, and for
+  # the mirror-image reason: no Rust job installs its toolchain through Nix
+  # either, so a lock refresh cannot move what they compile. The `nix` job is the
+  # one check that can see it, so that one keeps running while the Rust matrix
+  # sits out. This is not hypothetical traffic: renovate.json turns
+  # lockFileMaintenance on globally, and Renovate's `nix` manager refreshes
+  # `flake.lock` on that schedule, so it is a weekly PR.
+  #
   # Scoped to Renovate on purpose. A HUMAN PR touching only devbox files still
   # gets the full matrix — the cost is trivial at that frequency, and the author
   # may well be mid-way through a change that grows beyond devbox on the next
@@ -48,6 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       devbox_only: ${{ steps.detect.outputs.devbox_only }}
+      flake_only: ${{ steps.detect.outputs.flake_only }}
     steps:
       - id: detect
         env:
@@ -67,6 +76,7 @@ jobs:
           if [ "${PR_AUTHOR:-}" != "renovate[bot]" ]; then
             echo "author='${PR_AUTHOR:-}' is not Renovate -> full CI"
             echo "devbox_only=false" >> "$GITHUB_OUTPUT"
+            echo "flake_only=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -83,26 +93,40 @@ jobs:
           if [ -z "$files" ]; then
             echo "no files reported -> full CI"
             echo "devbox_only=false" >> "$GITHUB_OUTPUT"
+            echo "flake_only=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
+          # Both flags start true and any file outside their family clears them,
+          # so a PR touching devbox.lock AND flake.lock clears both and gets the
+          # full matrix. Deliberate: the two reductions rest on different jobs
+          # surviving, and nothing here has looked at whether they interact.
+          devbox_only=true
+          flake_only=true
           while IFS= read -r f; do
             case "$f" in
-              devbox.json | devbox.lock) ;;
+              devbox.json | devbox.lock) flake_only=false ;;
+              flake.nix | flake.lock) devbox_only=false ;;
               *)
-                echo "'$f' is outside devbox -> full CI"
-                echo "devbox_only=false" >> "$GITHUB_OUTPUT"
-                exit 0
+                echo "'$f' is outside devbox and outside the flake -> full CI"
+                devbox_only=false
+                flake_only=false
+                break
                 ;;
             esac
           done <<< "$files"
 
-          echo "devbox files only -> skipping the Rust jobs"
-          echo "devbox_only=true" >> "$GITHUB_OUTPUT"
+          if [ "$devbox_only" = true ]; then
+            echo "devbox files only -> skipping the Rust jobs and the nix job"
+          elif [ "$flake_only" = true ]; then
+            echo "flake files only -> skipping the Rust jobs, keeping nix"
+          fi
+          echo "devbox_only=$devbox_only" >> "$GITHUB_OUTPUT"
+          echo "flake_only=$flake_only" >> "$GITHUB_OUTPUT"
 
   build:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -171,7 +195,7 @@ jobs:
   # runner with CC and AR unset is enough (verified).
   windows-cross-check:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -215,7 +239,7 @@ jobs:
   # tracked by #164 (M10). aarch64-pc-windows-msvc is #164 (M9), not M8.
   build-windows:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -252,7 +276,7 @@ jobs:
   # `cargo nextest run` runs the same test-fast tier as the Linux `build` job.
   build-macos:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -274,7 +298,7 @@ jobs:
   # `cargo audit` reads Cargo.lock, which a devbox-only PR cannot touch.
   security:
     needs: changes
-    if: needs.changes.outputs.devbox_only != 'true'
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -284,6 +308,86 @@ jobs:
       - uses: Swatinem/rust-cache@v2 # v2
       - run: cargo install cargo-audit --locked
       - run: cargo audit
+
+  # PRD #231 M2: the only check that exercises the root flake.nix. Nothing else
+  # in CI evaluates or builds it: the Rust jobs install their toolchain via
+  # dtolnay/rust-toolchain, and the `devbox` job below resolves devbox.json,
+  # which is a different flake for a different purpose. Without this job a
+  # nixpkgs bump that breaks the derivation, or a Cargo.lock change that crane
+  # cannot vendor, is discovered by the first user who types
+  # `nix run github:vfarcic/dot-agent-deck`, the exact install path #231 asked
+  # for.
+  #
+  # `nix flake check` and not `nix build`: it evaluates every output (packages,
+  # apps, devShells, overlays), so a typo in an output nobody builds still fails
+  # here, and `checks.default` is the package itself, so the check compiles
+  # rather than merely evaluating. `-L` streams full build logs, which is the
+  # difference between a diagnosable rustc error and "builder failed".
+  #
+  # `--all-systems` because a bare `nix flake check` silently narrows to the
+  # runner's own system and prints "the check omitted these incompatible
+  # systems: aarch64-darwin, aarch64-linux". Three quarters of the outputs would
+  # then never be looked at from this x86_64-linux runner, which is exactly the
+  # "typo in an output nobody builds" case above. It only *evaluates* the
+  # foreign-system outputs and still builds nothing but the native one, so it
+  # costs seconds. It earned its keep immediately: it is what caught that
+  # `eachDefaultSystem` was promising an x86_64-darwin output the pinned nixpkgs
+  # throws on.
+  #
+  # Gated on `devbox_only` only, NOT on `flake_only`: a Renovate PR touching only
+  # devbox.json cannot change what this builds, so it sits that one out like the
+  # Rust jobs do, but a `flake.lock` refresh is precisely what it exists to
+  # verify, so it is the job that stays when the Rust matrix steps aside. Worth
+  # gating at all because this is one of the heaviest jobs in the file: a
+  # from-source release build of the whole crate.
+  nix:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The Determinate installer rather than cachix/install-nix-action: it is
+      # what the cache action below is built to pair with, and it turns on
+      # flakes (`nix-command`, `flakes`) without a hand-written extra-conf.
+      - uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          # `determinate` defaults to TRUE, which installs Determinate Nix (a
+          # downstream distribution) and runs its FlakeHub login on every job.
+          # Two problems, and the noisy one is not the important one. The noisy
+          # one: without `id-token: write` that login cannot work, so it prints
+          # "FlakeHub is disabled because the workflow is misconfigured" on a job
+          # whose next comment explains at length that the permission is
+          # withheld on purpose. The important one: it would prove the flake
+          # builds on Determinate Nix, when the people this job protects are the
+          # ones who type `nix run github:vfarcic/dot-agent-deck` on upstream
+          # Nix. Off, the runner gets upstream Nix and the check answers the
+          # question actually being asked.
+          determinate: false
+          # No telemetry ping from the installer. Same setting on the cache
+          # action below, so the "no third-party service" claim there covers the
+          # whole job rather than just the cache backend.
+          diagnostic-endpoint: ""
+      # Caching the Nix store is not optional here, for the same reason the
+      # `devbox` job sets enable-cache: a cold run rebuilds every dependency
+      # from source. This job's cold cost is worse than devbox's, since
+      # checks.default is a full release build of the crate and its whole
+      # dependency tree. Magic Nix Cache stores that in GitHub Actions' own
+      # cache, so there is no third-party service and no secret, and forks and
+      # PRs get the cache too.
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+        with:
+          # GitHub Actions cache only. Left at its default, this action
+          # opportunistically reaches for FlakeHub Cache, which wants an OIDC
+          # token: the job would then need `id-token: write`, a permission this
+          # workflow deliberately does not grant (it declares only
+          # `contents: read` and `pull-requests: read`), in order to use a hosted
+          # service the project has no account with. Off, this is a plain, free,
+          # self-contained store cache.
+          use-flakehub: false
+          # The other half of "no third-party service": the cache action pings a
+          # diagnostic endpoint of its own by default.
+          diagnostic-endpoint: ""
+      - run: nix flake check -L --all-systems
 
   # devbox.json / devbox.lock had NO CI coverage until this job. Every other job
   # installs its toolchain directly (dtolnay/rust-toolchain, taiki-e/install-action,
