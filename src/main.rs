@@ -340,6 +340,18 @@ enum DaemonCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Print a read-only snapshot of the daemon's managed agents: pane id,
+    /// label, cwd, orchestration role, live status, and active tool. Fork
+    /// #47: a CLI consumer of the existing `AttachRequest::ListAgents` — it
+    /// never starts, stops, attaches to, resizes, writes to, or subscribes
+    /// to any agent, and a missing/unreachable daemon is reported rather
+    /// than lazily spawned.
+    Status {
+        /// Emit a versioned JSON document (`{schema_version, agents}`)
+        /// instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -910,6 +922,7 @@ fn main() -> ExitCode {
             DaemonCmd::Hello => run_daemon_hello_cli(),
             DaemonCmd::Stop { force } => run_daemon_stop_cli(force),
             DaemonCmd::Restart { force } => run_daemon_restart_cli(force),
+            DaemonCmd::Status { json } => run_daemon_status_cli(json),
         },
         Some(Commands::Remote { cmd }) => match cmd {
             RemoteCmd::Add {
@@ -1402,6 +1415,62 @@ fn run_daemon_hello_cli() -> ExitCode {
     };
     println!("{json}");
     ExitCode::SUCCESS
+}
+
+/// `dot-agent-deck daemon status [--json]`. Read-only CLI
+/// consumer of the existing `AttachRequest::ListAgents`
+/// ([`dot_agent_deck::daemon_client::DaemonClient::list_agents`]) — no new
+/// attach request type, no `PROTOCOL_VERSION` bump (see
+/// `.dot-agent-deck/47-status-query-design.md` in the root checkout). Row
+/// shaping lives in [`dot_agent_deck::daemon_status`]; this wrapper only
+/// bounds the round trip with [`dot_agent_deck::daemon_status::STATUS_REQUEST_TIMEOUT`]
+/// and translates the outcome into stdout/stderr text and an exit code.
+///
+/// "Unavailable" (no daemon, a transport error, or a timed-out request) is
+/// reported as failure — a status query that got no answer learned nothing,
+/// unlike `daemon stop`'s idempotent "no daemon running" — but deliberately
+/// never with clap's own exit code 2, so a caller can tell "this build
+/// doesn't understand the request" apart from "the daemon didn't answer".
+/// Never spawns, retries, or otherwise perturbs the daemon it's asking
+/// about: a timeout abandons the query rather than looping.
+#[tokio::main]
+async fn run_daemon_status_cli(json: bool) -> ExitCode {
+    use dot_agent_deck::daemon_status::{
+        STATUS_REQUEST_TIMEOUT, StatusDocument, build_status_agents, format_human,
+    };
+
+    let client = DaemonClient::new(attach_socket_path());
+    let records = match tokio::time::timeout(STATUS_REQUEST_TIMEOUT, client.list_agents()).await {
+        Ok(Ok(records)) => records,
+        Ok(Err(e)) => {
+            eprintln!("daemon status: unavailable ({e})");
+            return ExitCode::FAILURE;
+        }
+        Err(_elapsed) => {
+            eprintln!(
+                "daemon status: unavailable (no response within {}s)",
+                STATUS_REQUEST_TIMEOUT.as_secs()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let agents = build_status_agents(records);
+    if json {
+        match serde_json::to_string(&StatusDocument::new(agents)) {
+            Ok(j) => {
+                println!("{j}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("daemon status: failed to serialize JSON: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        print!("{}", format_human(&agents));
+        ExitCode::SUCCESS
+    }
 }
 
 /// `dot-agent-deck daemon stop [--force]` — PRD #103 Phase 3 (M3.2).

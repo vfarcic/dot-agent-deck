@@ -563,6 +563,36 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** actual pane delivery or rendered feedback (covered by `prompt/pane-input/004`).
 - **Platform coverage:** mac+linux+windows.
 
+#### daemon/status
+
+##### daemon/status/001 — `dot-agent-deck daemon status` names a managed agent and visibly reflects a driven live status, not a placeholder identical to an agent with no session.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status` CLI as a subprocess + an in-process daemon attach socket, `common::spawn_inprocess_daemon`, + real `ListAgents`; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — two `cat`-stub worker panes registered as managed; one is driven to `Thinking` over the daemon's hook socket exactly as `agent-event --type running` would, the other never receives an event, as a same-daemon control).
+- **Asserts:** the subprocess exits successfully; its stdout names both the driven and the control agent by pane id; and, after normalizing BOTH the pane id and the registry agent id out of each agent's own output lines (the latter differs per spawn regardless of live status), the driven agent's text differs from the control agent's — proving the command actually surfaces the live status rather than an identical placeholder or one that differs only by identity fields. Deliberately does not pin column layout, exact status wording, or row ordering.
+- **Does not assert:** `--json` output shape (`daemon/status/002`); the no-daemon path (`daemon/status/003`); prompt/task redaction (`daemon/status/004`).
+- **Platform coverage:** mac+linux.
+
+##### daemon/status/002 — `dot-agent-deck daemon status --json` emits a machine-readable document carrying `schema_version` with an entry for the managed agent.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status --json` CLI as a subprocess + an in-process daemon attach socket + real `ListAgents`; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a `cat`-stub worker pane driven to `Thinking` over the daemon's hook socket).
+- **Asserts:** the subprocess exits successfully; its stdout parses as a JSON object; the parsed document carries a `schema_version` key; and the raw JSON text names the managed agent by its pane id. Deliberately does not pin any field name beyond `schema_version`, since the rest of the document shape is the coder's to choose (the design rationale).
+- **Does not assert:** the human-readable table (`daemon/status/001`); full field-by-field JSON shape.
+- **Platform coverage:** mac+linux.
+
+##### daemon/status/003 — `dot-agent-deck daemon status` against an unreachable daemon fails distinguishably from a crash and from clap's own unrecognized-subcommand error, and never brings a daemon into existence at the socket it queried.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status` CLI as a subprocess against a scratch attach-socket path with nothing listening; no in-process daemon, no PTY, no LLM, no `e2e` feature gate).
+- **Agent:** none.
+- **Asserts:** the subprocess does not report success; its stderr carries no Rust panic; its exit code is not clap's own generic usage/parse-error code (`2`) and its stderr carries no clap `Usage:` banner — ruling out "this build's CLI does not understand the `status` subcommand" as the reason for the failure, so it stays distinguishable from a genuinely-handled "no daemon reachable" outcome; and the queried socket path still does not exist on disk afterward, proving the diagnostic never spawned a daemon. Deliberately does not pin the exact exit code value or message wording (the design rationale).
+- **Does not assert:** the live-agent path (`daemon/status/001`/`002`); prompt redaction (`daemon/status/004`).
+- **Platform coverage:** mac+linux.
+
+##### daemon/status/004 — `dot-agent-deck daemon status` never prints prompt text into its output.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status` CLI as a subprocess + an in-process daemon attach socket + real `ListAgents`; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a `cat`-stub worker pane driven to `Thinking` over the daemon's hook socket with a distinctive sentinel seeded into `user_prompt`, landing in `SessionState::last_user_prompt`/`first_prompts`).
+- **Asserts:** the subprocess exits successfully and the seeded sentinel never appears anywhere in its combined stdout/stderr.
+- **Does not assert:** `--json` output (the design doc scopes the no-prompt-text requirement to the human view); task-file/delegate text (out of scope for `ListAgents`-derived data).
+- **Platform coverage:** mac+linux.
+
 ### Prompts
 
 #### prompt/permission
