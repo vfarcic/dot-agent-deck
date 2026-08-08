@@ -1662,6 +1662,84 @@ pub struct RunningAgent {
     pub seed_delivered_native: bool,
 }
 
+impl RunningAgent {
+    /// PRD #386 M3: `true` when this pane's PTY child has a transitive
+    /// descendant sitting in a **different POSIX session** than the child
+    /// itself — i.e. something the agent `setsid`-detached off the pane's
+    /// terminal is still alive, so the pane is actively busy even if no
+    /// agent-emitted hook/wrapper event says so (the gap this closes: an agent
+    /// shelling out to a long-running command with no event in between reports
+    /// stale `Idle`).
+    ///
+    /// **This replaced PRD #370's `tcgetpgrp` body, which never fired in any
+    /// real pane.** Claude Code runs its Bash-tool child on pipes, in a session
+    /// of its own, off the pane's PTY entirely — so the pane's foreground pgid
+    /// never moves and the old body computed `pid != pid` → `Some(false)`,
+    /// permanently. The descendant scan asks the question the process topology
+    /// can actually answer; see [`crate::platform::proc::descendant_shell_activity`]
+    /// for the discriminator and for the CI trap it must never fall into.
+    ///
+    /// `shapes` is the optional argv cross-check, and it is a **veto**: pass
+    /// only the shapes that were measured against *this* pane's agent kind, and
+    /// an empty slice for an agent whose shape has never been measured (see
+    /// [`crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES`] and
+    /// [`AgentPtyRegistry::shell_foreground_busy_snapshot`], which does that
+    /// selection). Handing every pane one agent's fingerprint would silently
+    /// suppress the signal for all the others.
+    ///
+    /// `None` when there is no signal to act on: the platform can't enumerate
+    /// processes at all (`crate::platform::proc::process_table` returns `None`
+    /// unconditionally on Windows — see that module), this child's own pid is
+    /// unavailable, or the child is not in the sampled table. Callers must treat
+    /// `None` as "no opinion", never as "not busy".
+    pub fn shell_foreground_busy(
+        &self,
+        shapes: &[crate::platform::proc::ShellToolShape],
+    ) -> Option<bool> {
+        let table = crate::platform::proc::process_table()?;
+        self.shell_activity_in(&table, shapes)
+    }
+
+    /// The classification half of [`Self::shell_foreground_busy`], against a
+    /// table the caller already sampled.
+    ///
+    /// Split out so the daemon's poll loop pays for **one** `ps -A` per tick
+    /// rather than one per pane (PRD #386's Technical Approach, Route A:
+    /// "parsed once into a table and reused for *every* pane in that poll"),
+    /// and so every pane in a tick is classified against one consistent sample.
+    fn shell_activity_in(
+        &self,
+        table: &[crate::platform::proc::ProcessInfo],
+        shapes: &[crate::platform::proc::ShellToolShape],
+    ) -> Option<bool> {
+        let shell_pid = self.child.process_id()? as i32;
+        crate::platform::proc::descendant_shell_activity(table, shell_pid, shapes)
+    }
+}
+
+/// PRD #386 M3, Open Question 2 — which entry of
+/// [`crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES`], if any, applies to a
+/// pane running `agent_type`.
+///
+/// Only Claude's shell-tool argv shape was ever measured, so only a Claude pane
+/// selects one; every other agent kind (and every pane whose kind is not known
+/// yet, including a bare shell pane) selects nothing and is classified by the
+/// structural session-id test alone. That asymmetry is the whole point: the argv
+/// cross-check is a veto, so applying Claude's fingerprint to a Codex/OpenCode/Pi
+/// pane would reject a genuinely detached descendant and leave the pane reading
+/// `Idle` with nothing logged — a silent false negative, which is exactly the
+/// #370 failure mode this PRD exists to end. Structural-only over-triggers at
+/// worst, which is visible and fixable.
+///
+/// Keyed off [`crate::platform::proc::ShellToolShape::agent`] rather than a
+/// string literal so the catalog and this mapping cannot drift apart.
+fn shell_tool_shape_key(agent_type: Option<&AgentType>) -> Option<&'static str> {
+    match agent_type {
+        Some(AgentType::ClaudeCode) => Some(crate::platform::proc::CLAUDE_BASH_TOOL_SHAPE.agent),
+        _ => None,
+    }
+}
+
 /// Snapshot of one daemon-side agent that the M2.x rehydration path needs.
 /// Carries the registry id plus the spawn-time `DOT_AGENT_DECK_PANE_ID`
 /// captured in [`RunningAgent::pane_id_env`], so the TUI can rebuild its
@@ -4000,6 +4078,74 @@ impl AgentPtyRegistry {
         records
     }
 
+    /// PRD #370 M2 / PRD #386 M3: a snapshot of `(pane_id, shell_activity)` for
+    /// every live agent that has both a known `pane_id_env` and a platform that
+    /// can enumerate processes at all. Panes without a `pane_id_env` can't be
+    /// correlated back to a session via `AppState::pane_hook_session_id`, and a
+    /// pane the scan has no opinion about (Windows; see
+    /// [`RunningAgent::shell_foreground_busy`]) is skipped rather than guessed
+    /// at, so the daemon's poll loop only ever acts on a real signal. One lock
+    /// acquisition covers every agent, matching [`Self::agent_records`]'s shape,
+    /// so the poll loop doesn't take the registry lock once per pane per tick.
+    ///
+    /// `shapes` is the **catalog** of measured argv cross-check shapes (the
+    /// daemon passes [`crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES`]), not
+    /// a set applied uniformly: this is the one place that sees both a pane's
+    /// agent kind and the catalog, so it is where PRD #386's Open Question 2 is
+    /// resolved — each pane gets only the shapes measured against *its own*
+    /// agent kind, and nothing at all when its kind has never been measured.
+    /// See [`shell_tool_shape_key`] for why applying one agent's fingerprint to
+    /// every pane would be a silent false negative rather than a harmless
+    /// belt-and-braces check.
+    ///
+    /// The process table is sampled **once**, before the registry lock is taken
+    /// — one `ps -A` per tick reused for every pane (PRD #386 Route A), and no
+    /// fork/exec while holding a lock the TUI-facing paths also take.
+    pub fn shell_foreground_busy_snapshot(
+        &self,
+        shapes: &[crate::platform::proc::ShellToolShape],
+    ) -> Vec<(String, bool)> {
+        let Some(table) = crate::platform::proc::process_table() else {
+            return Vec::new();
+        };
+        let inner = self.inner.lock().unwrap();
+        inner
+            .agents
+            .values()
+            .filter(|agent| !agent.exited.load(Ordering::SeqCst))
+            .filter_map(|agent| {
+                let pane_id = agent.pane_id_env.clone()?;
+                let key = shell_tool_shape_key(agent.agent_type.as_ref());
+                let for_pane: Vec<crate::platform::proc::ShellToolShape> = shapes
+                    .iter()
+                    .copied()
+                    .filter(|shape| Some(shape.agent) == key)
+                    .collect();
+                let busy = agent.shell_activity_in(&table, &for_pane)?;
+                Some((pane_id, busy))
+            })
+            .collect()
+    }
+
+    /// PRD #370 M2 test-only seam: `inner` is private (by design — every
+    /// other cross-module accessor returns an owned snapshot, never the
+    /// live lock), but `daemon.rs`'s integration test needs to type into a
+    /// spawned pane's PTY directly to prove the real monitor task reacts to
+    /// it. `#[cfg(test)]` keeps this out of the production API surface
+    /// entirely.
+    #[cfg(test)]
+    pub(crate) fn agent_writer(
+        &self,
+        id: &str,
+    ) -> Option<Arc<AsyncMutex<Box<dyn std::io::Write + Send>>>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .get(id)
+            .map(|a| a.writer.clone())
+    }
+
     /// Update the per-agent display name and cwd captured in the registry
     /// (M2.11). Each value is validated independently — invalid display
     /// names are rejected and stored as `None`, invalid cwds likewise.
@@ -6059,6 +6205,167 @@ mod spawn_tests {
             pid_is_dead(pid),
             "pid {pid} should be dead after ChildGuard drop"
         );
+    }
+
+    // PRD #370 M1: the pure detection primitive `foreground_pgid` is built
+    // on. A real interactive shell is its own foreground process-group
+    // leader while sitting at its prompt; once it forks a foreground job
+    // (any command without `&`), job control makes that job the new
+    // foreground process group until it finishes, then the shell reclaims
+    // it. This is the OS-level fact the whole PRD hangs a "shell is busy"
+    // signal on, independent of any agent-emitted hook/wrapper event.
+    #[cfg(unix)]
+    #[test]
+    fn foreground_pgid_differs_while_a_foreground_child_runs() {
+        use std::io::Write as _;
+
+        let pty_system = NativePtySystem::default();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        // Deliberately `/bin/sh`, not `$SHELL`: whether a shell enables job
+        // control (and thus forks a new foreground pgid per command) when
+        // spawned this way is shell-dependent — e.g. interactive zsh here
+        // did not exhibit it, while `/bin/sh` reliably does. `/bin/sh` keeps
+        // this test deterministic across developer machines regardless of
+        // login shell.
+        let cmd = CommandBuilder::new("/bin/sh");
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn should succeed");
+        let shell_pid = child.process_id().expect("child should expose a pid") as i32;
+        drop(pair.slave);
+
+        // Poll for the idle baseline — right after spawn the shell may not
+        // have claimed the foreground pgid yet.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut idle_pgid = crate::platform::proc::foreground_pgid(pair.master.as_ref());
+        while idle_pgid != Some(shell_pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            idle_pgid = crate::platform::proc::foreground_pgid(pair.master.as_ref());
+        }
+        assert_eq!(
+            idle_pgid,
+            Some(shell_pid),
+            "an idle shell should be its own foreground process group"
+        );
+
+        // Start a foreground job that keeps running, so it becomes the new
+        // foreground pgid until it exits.
+        let mut writer = pair.master.take_writer().expect("take_writer");
+        writer.write_all(b"sleep 5\n").expect("write sleep command");
+        writer.flush().expect("flush");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut busy_pgid = crate::platform::proc::foreground_pgid(pair.master.as_ref());
+        while busy_pgid == Some(shell_pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            busy_pgid = crate::platform::proc::foreground_pgid(pair.master.as_ref());
+        }
+        assert_ne!(
+            busy_pgid,
+            Some(shell_pid),
+            "a running foreground child must not report the shell's own pgid"
+        );
+
+        // A single-pid `child.kill()` (SIGHUP) only reaches `/bin/sh` itself,
+        // not the still-running `sleep 5` foreground job it forked into its
+        // own process group — `sh` then blocks in its own `wait()` for that
+        // child, so a plain `child.wait()` here would hang for the rest of
+        // the 5 s sleep. `force_kill_child_and_wait` reaches the whole group
+        // (`killpg(SIGKILL)`, same as production teardown), so `sleep 5`
+        // dies too and this returns promptly. Drop the writer/master first
+        // per that function's own doc, so any PTY I/O they're blocked on
+        // unblocks before the kill.
+        drop(writer);
+        drop(pair.master);
+        let group = crate::platform::proc::AgentProcessGroup::adopt(Some(shell_pid as u32));
+        crate::platform::proc::force_kill_child_and_wait(&mut child, &group);
+    }
+
+    /// PRD #370 M1, **superseded by PRD #386 M3 — kept as a documented boundary
+    /// case, with its assertion inverted rather than deleted.**
+    ///
+    /// This test typed `sleep 5` straight into the pane's PTY and asserted the
+    /// pane read `Some(true)`, because #370's `tcgetpgrp` body answered "who
+    /// owns the terminal's foreground". #386 replaced that body with a
+    /// descendant scan that answers "is something detached into a POSIX session
+    /// of its own still alive", and a job typed into the pane's own PTY is
+    /// **deliberately not busy** under it: `sh` forks it into a new process
+    /// *group*, but it stays in the pane's *session* on the pane's tty, exactly
+    /// where every long-lived confounder a real agent pane carries also sits
+    /// (`npm exec @upstash/context7-mcp`, `engram mcp`, `caffeinate -i -t 300`).
+    /// Counting it would mean counting those too, which pins every pane at
+    /// `Working` forever — the false positive the PRD calls worse than the stale
+    /// `Idle` it replaces, because it is unfalsifiable to the user.
+    ///
+    /// So the behaviour change is intended, and the record of the boundary being
+    /// considered is worth more than a deleted test. What the new mechanism
+    /// *does* fire on — a real `setsid`-detached child on pipes, off the pane's
+    /// PTY entirely, which is the topology a real Claude Bash-tool call has and
+    /// the one #370 could never see — is covered by `status/shell-activity/004`
+    /// in `tests/shell_activity.rs`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_foreground_busy_ignores_a_non_detached_foreground_child() {
+        use std::io::Write as _;
+
+        let registry = AgentPtyRegistry::new();
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+
+        let busy = |registry: &AgentPtyRegistry| -> Option<bool> {
+            registry
+                .inner
+                .lock()
+                .unwrap()
+                .agents
+                .get(&id)
+                .and_then(|a| a.shell_foreground_busy(&[]))
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut state = busy(&registry);
+        while state != Some(false) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            state = busy(&registry);
+        }
+        assert_eq!(state, Some(false), "an idle shell should not read busy");
+
+        let writer = {
+            let inner = registry.inner.lock().unwrap();
+            inner.agents.get(&id).unwrap().writer.clone()
+        };
+        {
+            let mut w = writer.lock().await;
+            w.write_all(b"sleep 5\n").expect("write sleep command");
+            w.flush().expect("flush");
+        }
+
+        // Sampled repeatedly rather than once, so this fails if the signal ever
+        // rises even briefly — the old `Some(true)` assertion is inverted here,
+        // not just dropped.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            assert_eq!(
+                busy(&registry),
+                Some(false),
+                "a foreground job typed into the pane's own PTY stays in the pane's POSIX \
+                 session, so PRD #386's descendant scan must NOT read it as busy — this \
+                 supersedes #370's tcgetpgrp behaviour, which reported `true` here and \
+                 `false` for the detached Bash-tool child that actually matters"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        registry.close_agent(&id).unwrap();
     }
 
     #[test]

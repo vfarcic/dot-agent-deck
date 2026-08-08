@@ -2021,10 +2021,45 @@ fn render_grid_to_svg(grid: &str, cols: u16, rows: u16) -> String {
 /// BOTH are spent is reported as unusable — see [`claude_oauth_usable`], which
 /// holds that half as a pure function so `tests/real_agent_preflight.rs` can
 /// assert every accepted and rejected credential shape.
+///
+/// PRD #386: the credential set is no longer necessarily a FILE. Claude Code
+/// 2.x on macOS keeps it in the login Keychain as the generic-password item
+/// `Claude Code-credentials`, and `~/.claude/.credentials.json` is simply
+/// absent on a migrated host — measured on this repo's dev machine on
+/// 2026-08-06 (no file at all, Keychain item present, `claude` 2.1.220
+/// working). The file check therefore falls back to a Keychain probe instead
+/// of reporting "not found". Without that fallback EVERY real-agent test in
+/// this suite silently self-skips on macOS and reports PASS — and that is
+/// exactly the tier CLAUDE.md rule 5 exception (a) says must be run locally
+/// BECAUSE CI has no credentials to run it, so both sides would be green while
+/// proving nothing.
 pub fn check_claude_available() -> Result<(), String> {
     if !cli_invocable("claude") {
         return Err("Claude Code CLI not installed (could not invoke `claude --version`)".into());
     }
+    match check_claude_credentials_file() {
+        Ok(()) => Ok(()),
+        // A usable file is authoritative; when it is absent OR unusable the
+        // Keychain may still hold a live credential set, so the fallback
+        // decides. This never weakens the gate into "always available" — a host
+        // with neither still skips, and now names both storage locations so the
+        // next person isn't sent hunting for a file this Claude Code version
+        // never writes.
+        Err(file_reason) => {
+            if claude_keychain_credentials_present() {
+                Ok(())
+            } else {
+                Err(format!("{file_reason}{CLAUDE_KEYCHAIN_HINT}"))
+            }
+        }
+    }
+}
+
+/// The file half of [`check_claude_available`]: `~/.claude/.credentials.json`
+/// exists as a regular file, parses, and carries a usable `claudeAiOauth`
+/// entry. Kept as the first-choice path — Linux and pre-2.x installs still
+/// store credentials here.
+fn check_claude_credentials_file() -> Result<(), String> {
     // M3.1 auditor S1: every message below surfaces the abstract path so it
     // doesn't leak whether the operator is on `/Users/<name>` vs `/root` vs
     // `/home/<name>`.
@@ -2049,11 +2084,167 @@ pub fn check_claude_available() -> Result<(), String> {
         "Claude Code credentials at ~/.claude/.credentials.json carry no `claudeAiOauth` \
          entry — log in with `claude login`",
     )?;
-    let now_ms = std::time::SystemTime::now()
+    claude_oauth_usable(oauth, now_epoch_ms())
+}
+
+/// Epoch milliseconds for the credential expiry checks, shared by the file and
+/// Keychain halves of the gate so the two cannot drift apart in how they read
+/// the clock. `0` on the impossible pre-epoch clock, which makes every expiry
+/// look live — the same fail-open-then-fail-loudly direction the rest of this
+/// gate takes.
+fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    claude_oauth_usable(oauth, now_ms)
+        .unwrap_or(0)
+}
+
+/// Would the gate accept this credential document? Parses the bytes, requires a
+/// `claudeAiOauth` entry, and applies [`claude_oauth_usable`] — the one place
+/// that question is answered, so the availability check, the Keychain probe and
+/// the import all judge a credential set by the same rule regardless of where
+/// it came from.
+///
+/// Takes bytes rather than a parsed value so callers holding a secret buffer
+/// can classify it and then zero it. The parse does put a second copy of the
+/// secret in the `serde_json::Value`, which cannot be zeroed the way a byte
+/// buffer can; it is local, dropped when this returns, and never read except
+/// through `claude_oauth_usable`.
+fn claude_credential_document_usable(raw: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(raw)
+        .ok()
+        .as_ref()
+        .and_then(|parsed| parsed.get("claudeAiOauth"))
+        .is_some_and(|oauth| claude_oauth_usable(oauth, now_epoch_ms()).is_ok())
+}
+
+/// Service name Claude Code 2.x files its OAuth credential set under in the
+/// macOS login Keychain.
+#[cfg(target_os = "macos")]
+const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+
+/// Appended to the file-side failure when the Keychain fallback also came up
+/// empty, so a genuinely credential-less host is told about BOTH locations.
+/// Empty off macOS, where there is no Keychain to have checked and the
+/// pre-existing message is still the whole truth.
+#[cfg(target_os = "macos")]
+const CLAUDE_KEYCHAIN_HINT: &str = " (and the macOS login Keychain holds no usable `Claude Code-credentials` item \
+     either — Claude Code 2.x stores the credential set there rather than in the \
+     file, and it is checked for the same `claudeAiOauth` shape and expiry as the \
+     file is)";
+#[cfg(not(target_os = "macos"))]
+const CLAUDE_KEYCHAIN_HINT: &str = "";
+
+/// Whether the macOS login Keychain holds a **usable** Claude Code credential
+/// set — the same question [`check_claude_credentials_file`] asks of the file,
+/// asked of the Keychain.
+///
+/// PRD #386 auditor finding: this used to answer only "`security` exited 0 with
+/// non-empty output", so the two halves of the gate disagreed — an expired or
+/// malformed Keychain item passed where byte-identical content in a file was
+/// rejected. It now parses the exported document and applies the identical
+/// `claudeAiOauth` + [`claude_oauth_usable`] test, so a host is judged the same
+/// way whichever store its credentials live in. The consequence of the old
+/// asymmetry was a test that ran and then failed loudly deep in a PTY wait
+/// (never a silent green — [`claude_keychain_credentials_export`] already
+/// refuses to seed a test HOME from anything that is not a `claudeAiOauth`
+/// document), which is why it was a correctness fix rather than a blocker.
+///
+/// PRIVACY, load-bearing and unchanged by that fix: this yields a BOOLEAN and
+/// nothing else. `-w` prints the password itself, so the secret is read into a
+/// local buffer purely to be classified; the buffer is zeroed before it drops,
+/// never returned, and never formatted into an error, a panic, a log line, a
+/// test artifact or a `.cast` recording. stderr is discarded for the same
+/// reason, and `claude_oauth_usable`'s `Err` string — which names only the
+/// abstract `~/.claude/.credentials.json` path, per the M3.1 auditor S1
+/// property — is collapsed to a bool here rather than propagated.
+///
+/// The parse does put a second copy of the secret on the heap inside the
+/// `serde_json::Value`, which cannot be zeroed the way the byte buffer can.
+/// That copy is local, dropped at the end of this function, and never read
+/// except through `claude_oauth_usable` — the same handling
+/// [`claude_keychain_credentials_export`] has always given its own parse of
+/// the same bytes.
+///
+/// `security` resolves the login keychain from `$HOME`, so the probe is pinned
+/// to [`host_home`]: under a relocated HOME it answers "keychain not found"
+/// (exit 44) no matter what the real user has.
+#[cfg(target_os = "macos")]
+fn claude_keychain_credentials_present() -> bool {
+    let probe = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"])
+        .env("HOME", host_home())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match probe {
+        Ok(mut out) => {
+            let usable = out.status.success() && claude_credential_document_usable(&out.stdout);
+            out.stdout.fill(0);
+            usable
+        }
+        Err(_) => false,
+    }
+}
+
+/// Non-macOS hosts keep the file-only behaviour unchanged: Linux Claude Code
+/// still writes `~/.claude/.credentials.json`, and CI — which has no
+/// credentials either way — must keep skipping.
+#[cfg(not(target_os = "macos"))]
+fn claude_keychain_credentials_present() -> bool {
+    false
+}
+
+/// Export Claude Code's credential set out of the macOS login Keychain, so
+/// [`import_claude_credentials`] can seed a per-test HOME that cannot reach the
+/// Keychain itself.
+///
+/// `None` when there is no such item, when `security` cannot be run, or when
+/// what came back is not a **usable** `claudeAiOauth` credential document (the
+/// same rule the gate applies — see [`claude_credential_document_usable`]) —
+/// the caller then reports its file-side error instead, so an unrelated,
+/// malformed or spent keychain item can never be written into a test HOME as
+/// if it were a login.
+///
+/// These bytes ARE the secret, unlike [`claude_keychain_credentials_present`]'s
+/// boolean. They are returned solely to be handed to
+/// [`write_credential_file_atomic_0o600`] — never logged, never formatted into
+/// an error, and never echoed to a terminal, so they cannot reach a `.cast`
+/// recording. That is the same handling the file-sourced bytes have always had.
+#[cfg(target_os = "macos")]
+fn claude_keychain_credentials_export() -> Option<Vec<u8>> {
+    let probe = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"])
+        .env("HOME", host_home())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !probe.status.success() {
+        return None;
+    }
+    // `security -w` terminates the password with a newline; truncate in place
+    // rather than copying, so the secret lives in exactly one buffer.
+    let mut bytes = probe.stdout;
+    while bytes.last().is_some_and(|b| b.is_ascii_whitespace()) {
+        bytes.pop();
+    }
+    // Same usability rule the gate applies (PRD #386 review): an expired or
+    // malformed Keychain item is not a source worth seeding a test HOME from,
+    // and returning it would hand the caller a credential set
+    // `check_claude_available` would have rejected.
+    if !claude_credential_document_usable(&bytes) {
+        bytes.fill(0);
+        return None;
+    }
+    Some(bytes)
+}
+
+/// Non-macOS hosts have no Keychain to export from; the file is the only
+/// source. See [`claude_keychain_credentials_present`].
+#[cfg(not(target_os = "macos"))]
+fn claude_keychain_credentials_export() -> Option<Vec<u8>> {
+    None
 }
 
 /// The credential-shape half of [`check_claude_available`], split out as a pure
@@ -2469,13 +2660,38 @@ fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
     let dst_root = test_home.join(".claude");
     std::fs::create_dir_all(&dst_root)?;
 
+    // PRD #386: the SOURCE is not necessarily a file any more. Claude Code 2.x
+    // on macOS keeps the credential set in the login Keychain and writes no
+    // `~/.claude/.credentials.json` at all, so the read below is a hard
+    // NotFound on a migrated host — which is what turned this import into a
+    // launch-time panic the moment `check_claude_available` learned about the
+    // Keychain. The DESTINATION still has to be a file: `security` resolves the
+    // login keychain from `$HOME`, so a daemon-spawned `claude` running under
+    // the relocated per-test HOME cannot reach the real user's keychain (it
+    // answers "keychain not found", exit 44 — measured) and has nothing but
+    // this imported file to authenticate from.
+    //
+    // PRD #386 review (Greptile P1): the source is chosen by USABILITY, not by
+    // mere readability. `check_claude_available` accepts the host when EITHER
+    // source is usable, so a stale/expired/malformed but perfectly readable
+    // `~/.claude/.credentials.json` sitting beside a live Keychain item used to
+    // pass preflight (on the Keychain) and then seed the test HOME from the
+    // file — launching the isolated `claude` with credentials the gate had
+    // already rejected, and failing the real-agent test deep in a PTY wait on a
+    // host that is genuinely logged in. Same rule, same order, as the gate:
+    // a usable file wins, else the Keychain, else copy what we have and let it
+    // fail loudly rather than silently importing nothing.
     let src_creds = src_root.join(".credentials.json");
-    let creds_bytes = read_credential_file_no_symlink(
+    let creds_bytes = match read_credential_file_no_symlink(
         &src_creds,
-        "Claude Code credentials not found at ~/.claude/.credentials.json — \
-         log in with `claude login`",
+        "Claude Code credentials not found at ~/.claude/.credentials.json \
+         nor in the macOS login Keychain — log in with `claude login`",
         "~/.claude/.credentials.json",
-    )?;
+    ) {
+        Ok(bytes) if claude_credential_document_usable(&bytes) => bytes,
+        Ok(bytes) => claude_keychain_credentials_export().unwrap_or(bytes),
+        Err(file_err) => claude_keychain_credentials_export().ok_or(file_err)?,
+    };
     write_credential_file_atomic_0o600(&dst_root.join(".credentials.json"), &creds_bytes)?;
 
     // settings.json: copy if present, with `hooks` stripped. Claude's
@@ -4022,6 +4238,34 @@ impl EventSub {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Like [`Self::wait_for`], but returns `None` instead of panicking when
+    /// `timeout` elapses with no match. For a caller that must distinguish
+    /// "the precondition this run needed was never met" (inconclusive) from
+    /// "the precondition landed and the assertion under it failed" (a real
+    /// regression) — a bare `wait_for` collapses both into the same panic.
+    pub fn try_wait_for(
+        &self,
+        pred: impl Fn(&dot_agent_deck::event::AgentEvent) -> bool,
+        timeout: Duration,
+    ) -> Option<dot_agent_deck::event::AgentEvent> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(ev) = self.events.lock().unwrap().iter().find(|e| pred(e)) {
+                return Some(ev.clone());
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Every broadcast `AgentEvent` collected so far, for building a
+    /// diagnostic message when [`Self::try_wait_for`] times out.
+    pub fn snapshot(&self) -> Vec<dot_agent_deck::event::AgentEvent> {
+        self.events.lock().unwrap().clone()
     }
 }
 

@@ -192,7 +192,18 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// enforces the identity/idempotency guards. Documented as a semantic
 /// cross-version consideration in `changelog.d/20.breaking.md`; a
 /// previous-release-daemon manual test is required at release.
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// PRD #370 bumped 6 → 7: [`crate::event::EventType`] gained `ShellBusy` /
+/// `ShellIdle` variants (the daemon-synthesized "a foreground shell command
+/// is running" signal), following the exact precedent PRD #201 set for
+/// `AgentType::Pi` above — a pre-#370 reader has neither variant nor a
+/// `#[serde(other)]` catch-all, so a `KIND_EVENT` frame carrying one fails
+/// its whole-frame decode. The bump forces `probe_remote_protocol` to refuse
+/// the old-reader/new-daemon pairing with a clean `ProtocolMismatch` instead
+/// of a mid-session crash. `EventType` now also carries `#[serde(other)]`
+/// (mirroring `AgentType`'s retrofit), so future event-type additions need
+/// no further bump.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
