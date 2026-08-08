@@ -72,21 +72,70 @@ use crate::spawn::{SpawnRequest, spawn};
 /// instant the agent is registered. Wiped on daemon restart; a post-restart
 /// close finds no entry and leaves the worktree in place (reclaimed by the
 /// worktree-exists idempotency signal on the next fire).
-pub type WorktreeRegistry = Arc<Mutex<HashMap<PathBuf, PathBuf>>>;
+pub type WorktreeRegistry = Arc<Mutex<HashMap<PathBuf, WorktreeEntry>>>;
+
+/// What the close handler needs to clean up one recorded worktree: the clone
+/// that owns it (always preserved) and which removal policy applies.
+///
+/// The policy travels WITH the entry because the tab-close handler
+/// (`daemon_protocol.rs`) is shared by both producers and cannot otherwise tell
+/// them apart — it sees only a path. Inferring provenance from the path shape
+/// (`<clone>/.worktrees/issue-<n>` vs. the `<repo>-dispatch-<slug>` sibling)
+/// would silently apply the wrong policy the moment either layout changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    /// The clone that owns the worktree. Preserved by removal.
+    pub clone_dir: PathBuf,
+    /// Removal policy — see [`RemovalPolicy`].
+    pub policy: RemovalPolicy,
+}
+
+/// Whether a recorded worktree may be removed while it still holds
+/// uncommitted work.
+///
+/// The two producers want opposite things, and both are right for their case:
+///
+/// * [`RemovalPolicy::Force`] — PRD #120 issue-dispatch. The worktree lives
+///   inside a daemon-owned `gh repo clone`, never a human checkout, and the
+///   reuse-the-vacated-slot model *depends* on the directory actually going
+///   away: `dispatch_decision` treats a present worktree as "issue already
+///   claimed", so a worktree left behind skips that issue on every later fire,
+///   permanently. Forcing is what keeps the slot reclaimable.
+/// * [`RemovalPolicy::KeepIfDirty`] — PRD #220 dispatch. The name is chosen by
+///   an LLM and the tree is a sibling of the user's own checkout, so Ctrl+W
+///   reads as "close this view", not "destroy uncommitted work". A leaked
+///   worktree costs disk; a force-removed one costs work, and that asymmetry
+///   decides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalPolicy {
+    /// Remove unconditionally (`--force`), discarding uncommitted changes.
+    Force,
+    /// Refuse to remove a worktree with uncommitted changes; leave it in place
+    /// and log so the user can recover the work.
+    KeepIfDirty,
+}
 
 /// Construct an empty [`WorktreeRegistry`].
 pub fn new_worktree_registry() -> WorktreeRegistry {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-/// Record a freshly-created per-issue worktree (→ its owning clone) for
+/// Record a freshly-created worktree (→ its owning clone + removal policy) for
 /// tab-close cleanup. Idempotent: a re-recorded worktree just refreshes the
-/// clone mapping.
-pub fn record_worktree(worktrees: &WorktreeRegistry, worktree_dir: &Path, clone_dir: &Path) {
-    worktrees
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(worktree_dir.to_path_buf(), clone_dir.to_path_buf());
+/// entry.
+pub fn record_worktree(
+    worktrees: &WorktreeRegistry,
+    worktree_dir: &Path,
+    clone_dir: &Path,
+    policy: RemovalPolicy,
+) {
+    worktrees.lock().unwrap_or_else(|e| e.into_inner()).insert(
+        worktree_dir.to_path_buf(),
+        WorktreeEntry {
+            clone_dir: clone_dir.to_path_buf(),
+            policy,
+        },
+    );
 }
 
 /// The per-issue worktree a closing agent was dispatched into, derived from its
@@ -101,13 +150,14 @@ pub fn worktree_of_record(record: &AgentRecord) -> Option<PathBuf> {
     }
 }
 
-/// If `worktree_dir` is a dispatched issue worktree, drop its registry entry and
-/// return the owning clone dir; `None` otherwise (an ordinary agent's cwd, or an
-/// entry already taken). The close watcher only calls this once it has confirmed
-/// (via [`worktree_still_in_use`]) that the LAST agent rooted in the worktree has
-/// closed, so for a multi-role orchestration the entry survives every earlier
-/// sibling close and is taken exactly once, on the final close.
-pub fn take_worktree(worktrees: &WorktreeRegistry, worktree_dir: &Path) -> Option<PathBuf> {
+/// If `worktree_dir` is a dispatched worktree, drop its registry entry and
+/// return it (owning clone + removal policy); `None` otherwise (an ordinary
+/// agent's cwd, or an entry already taken). The close watcher only calls this
+/// once it has confirmed (via [`worktree_still_in_use`]) that the LAST agent
+/// rooted in the worktree has closed, so for a multi-role orchestration the
+/// entry survives every earlier sibling close and is taken exactly once, on the
+/// final close.
+pub fn take_worktree(worktrees: &WorktreeRegistry, worktree_dir: &Path) -> Option<WorktreeEntry> {
     worktrees
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -127,22 +177,46 @@ pub fn worktree_still_in_use(records: &[AgentRecord], worktree_dir: &Path) -> bo
 }
 
 /// Remove a dispatched worktree from its clone (`git -C <clone> worktree remove
-/// <worktree> --force`), PRESERVING the clone. Best-effort: a non-zero exit
-/// (already removed, locked) or a spawn error is logged, not fatal — the tab is
-/// already gone.
-pub async fn remove_worktree(worktree_dir: &Path, clone_dir: &Path) {
-    let res = run_status(
-        "git",
-        &[
-            "-C",
-            &clone_dir.to_string_lossy(),
-            "worktree",
-            "remove",
-            &worktree_dir.to_string_lossy(),
-            "--force",
-        ],
-    )
-    .await;
+/// <worktree>`), PRESERVING the clone. Best-effort: a non-zero exit (already
+/// removed, locked) or a spawn error is logged, not fatal — the tab is already
+/// gone.
+///
+/// `policy` decides what happens when the worktree still holds uncommitted work
+/// — see [`RemovalPolicy`] for why the two producers need opposite answers.
+/// Under [`RemovalPolicy::KeepIfDirty`] a dirty tree (or a status probe that
+/// fails, so dirtiness is unknown) is left in place and logged; under
+/// [`RemovalPolicy::Force`] the tree is removed regardless, which is what keeps
+/// PRD #120's vacated slot reclaimable.
+pub async fn remove_worktree(worktree_dir: &Path, clone_dir: &Path, policy: RemovalPolicy) {
+    let worktree = worktree_dir.to_string_lossy();
+    if policy == RemovalPolicy::KeepIfDirty {
+        let status = run_capture_args("git", &["-C", &worktree, "status", "--porcelain"]).await;
+        match status {
+            Ok(output) if !output.trim().is_empty() => {
+                tracing::warn!(
+                    worktree = %worktree_dir.display(),
+                    "dispatch: worktree has uncommitted changes; leaving in place"
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    worktree = %worktree_dir.display(),
+                    error = %e,
+                    "dispatch: could not check worktree status; leaving in place"
+                );
+                return;
+            }
+        }
+    }
+
+    let clone = clone_dir.to_string_lossy();
+    let mut args = vec!["-C", &clone, "worktree", "remove", &worktree];
+    if policy == RemovalPolicy::Force {
+        args.push("--force");
+    }
+    let res = run_status("git", &args).await;
     match res {
         Ok(()) => tracing::info!(
             worktree = %worktree_dir.display(),
@@ -314,9 +388,14 @@ async fn dispatch_one_issue(
     // fire can claim it in the TOCTOU window after the idempotency check above
     // (see `create_worktree`); that benign race is a skip, not a failure —
     // mirroring the `dispatch_decision` worktree-presence skip.
-    match create_worktree(clone_dir, &paths.worktree_dir, &paths.branch).await? {
+    match create_worktree(clone_dir, &paths.worktree_dir, &paths.branch, true).await? {
         WorktreeCreation::Created => {}
-        WorktreeCreation::AlreadyClaimed => {
+        // `reuse_existing_branch: true` above means `BranchExists` is never
+        // returned to this caller — an existing `agent/issue-<n>` is ATTACHED,
+        // which is exactly what keeps the vacated slot reclaimable. Treated as a
+        // skip alongside `AlreadyClaimed` so the match stays exhaustive if that
+        // ever changes.
+        WorktreeCreation::AlreadyClaimed | WorktreeCreation::BranchExists => {
             notifier.notify(NotifyEvent::IssueDispatchSkipped {
                 task: task_name.to_string(),
                 repo: cfg.repo.clone(),
@@ -332,7 +411,16 @@ async fn dispatch_one_issue(
     // from a fast client) well before it returns, so recording after the spawn
     // would race a prompt close. The close watcher matches the agent to this
     // worktree by its record's cwd, not by an agent id we don't have yet.
-    record_worktree(worktrees, &paths.worktree_dir, clone_dir);
+    // `RemovalPolicy::Force`: this worktree lives inside a daemon-owned clone,
+    // and the reuse-the-vacated-slot model depends on the directory actually
+    // going away on tab close — a tree left behind makes `dispatch_decision`
+    // skip the issue on every later fire. See [`RemovalPolicy`].
+    record_worktree(
+        worktrees,
+        &paths.worktree_dir,
+        clone_dir,
+        RemovalPolicy::Force,
+    );
 
     // M2.3 — spawn one agent into the worktree, delivering the substituted
     // prompt. `spawn` branches on the worktree's `.dot-agent-deck.toml`.
@@ -350,6 +438,12 @@ async fn dispatch_one_issue(
         working_dir: paths.worktree_dir.to_string_lossy().into_owned(),
         command: default_command.map(str::to_string),
         prompt: substitute_issue_number(prompt_template, issue),
+        // `None`: issue-dispatch keeps deriving the shape from the cloned repo's
+        // own config, exactly as before the PRD #220 selector existed.
+        resolved_target: None,
+        // Unchanged behaviour: the prompt is delivered verbatim. Giving this path
+        // the orchestrator context is #222's work, not this PR's.
+        compose_orchestrator_context: false,
     };
     if let Err(e) = spawn(req, registry, notifier, event_tx, true).await {
         // The spawn failed after the worktree was created/recorded: no agent
@@ -576,13 +670,25 @@ fn parse_open_pr_present(json: &str) -> Result<bool, String> {
     Ok(!arr.is_empty())
 }
 
-/// Outcome of [`create_worktree`]: either we created the per-issue worktree, or
-/// a concurrent fire had already claimed it (the benign TOCTOU race below),
-/// which the caller surfaces as a skip rather than a failure.
+/// Outcome of [`create_worktree`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorktreeCreation {
+pub enum WorktreeCreation {
+    /// The worktree was created.
     Created,
+    /// The worktree DIRECTORY is already there — a concurrent fire claimed it in
+    /// the benign TOCTOU window described below. Callers surface this as a skip
+    /// rather than a failure.
     AlreadyClaimed,
+    /// The worktree directory is absent but the head BRANCH already exists, and
+    /// the caller asked not to reuse it (`reuse_existing_branch: false`).
+    ///
+    /// Distinct from [`Self::AlreadyClaimed`] because the two need different
+    /// messages and have different fixes: "another dispatch is using this" (wait
+    /// or pick another name) versus "a previous dispatch left this branch
+    /// behind" (delete the branch, or pick another name). Collapsing them made
+    /// a reused name report a worktree conflict that the user could see was not
+    /// true — the directory is plainly gone — with no hint of the real cause.
+    BranchExists,
 }
 
 /// M2.2: create the per-issue worktree on `agent/issue-<n>`. The `.worktrees`
@@ -592,9 +698,13 @@ enum WorktreeCreation {
 /// dispatched, had its tab closed without a PR, and is still open leaves
 /// `agent/issue-<n>` behind. A naive `worktree add -b <branch>` would then fail
 /// ("a branch named … already exists") on EVERY later fire, permanently wedging
-/// the reuse-the-vacated-slot model. So probe for the branch first: attach the
-/// existing branch (no `-b`) when it is already there, and only create it (`-b`)
-/// when it is not.
+/// the reuse-the-vacated-slot model. So probe for the branch first: when
+/// `reuse_existing_branch` is true, attach the existing branch (no `-b`) when it is
+/// already there, and only create it (`-b`) when it is not. When
+/// `reuse_existing_branch` is false, an existing branch is reported as
+/// [`WorktreeCreation::BranchExists`] so the caller can refuse the dispatch and
+/// say WHY — the branch may hold committed work from a previous dispatch of the
+/// same name, so it is never deleted implicitly.
 ///
 /// TOCTOU: the caller only reaches here after [`dispatch_decision`] saw the
 /// worktree dir ABSENT, but a concurrent fire of the same task can create it in
@@ -604,10 +714,11 @@ enum WorktreeCreation {
 /// [`WorktreeCreation::AlreadyClaimed`] (→ skip) instead of a hard failure. A
 /// genuine add failure (bad ref, permissions, …) leaves the dir absent and
 /// still propagates as `Err`.
-async fn create_worktree(
+pub async fn create_worktree(
     clone_dir: &Path,
     worktree_dir: &Path,
     branch: &str,
+    reuse_existing_branch: bool,
 ) -> Result<WorktreeCreation, String> {
     if let Some(parent) = worktree_dir.parent() {
         std::fs::create_dir_all(parent)
@@ -629,6 +740,9 @@ async fn create_worktree(
     )
     .await
     .is_ok();
+    if branch_exists && !reuse_existing_branch {
+        return Ok(WorktreeCreation::BranchExists);
+    }
     let add = if branch_exists {
         run_status("git", &["-C", &clone, "worktree", "add", &wt, branch]).await
     } else {
@@ -666,7 +780,7 @@ fn parse_issue_numbers(json: &str) -> Result<Vec<u64>, String> {
 
 /// Run a subprocess that must exit zero; on failure return a message carrying
 /// the program, args, exit status, and any stderr.
-async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
+pub async fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
     let output = tokio::process::Command::new(program)
         .args(args)
         .output()
@@ -738,17 +852,19 @@ mod tests {
         let wt7 = PathBuf::from("/ws/task/.worktrees/issue-7");
         let wt8 = PathBuf::from("/ws/task/.worktrees/issue-8");
         let clone = PathBuf::from("/ws/task");
-        record_worktree(&reg, &wt7, &clone);
-        record_worktree(&reg, &wt8, &clone);
+        record_worktree(&reg, &wt7, &clone, RemovalPolicy::Force);
+        record_worktree(&reg, &wt8, &clone, RemovalPolicy::Force);
 
-        // The registry primitive returns a recorded worktree's clone exactly
-        // once, then drops the entry (a re-take finds nothing). The close watcher
+        // The registry primitive returns a recorded worktree's entry exactly
+        // once, then drops it (a re-take finds nothing). The close watcher
         // only calls `take_worktree` after `worktree_still_in_use` confirms the
         // last rooted agent has closed, so this once-only take is correct even
         // for a multi-role tab. issue-8 is untouched.
-        assert_eq!(take_worktree(&reg, &wt7), Some(clone.clone()));
+        let taken = take_worktree(&reg, &wt7).expect("issue-7 was recorded");
+        assert_eq!(taken.clone_dir, clone);
+        assert_eq!(taken.policy, RemovalPolicy::Force);
         assert_eq!(take_worktree(&reg, &wt7), None);
-        assert_eq!(take_worktree(&reg, &wt8), Some(clone));
+        assert_eq!(take_worktree(&reg, &wt8).map(|e| e.clone_dir), Some(clone));
     }
 
     #[test]
@@ -918,7 +1034,7 @@ mod tests {
         // Simulate the concurrent fire having already created the worktree dir.
         std::fs::create_dir_all(&worktree_dir).unwrap();
 
-        let outcome = create_worktree(&clone_dir, &worktree_dir, "agent/issue-7").await;
+        let outcome = create_worktree(&clone_dir, &worktree_dir, "agent/issue-7", false).await;
         assert_eq!(
             outcome,
             Ok(WorktreeCreation::AlreadyClaimed),
@@ -936,7 +1052,7 @@ mod tests {
         std::fs::create_dir_all(&clone_dir).unwrap();
         let worktree_dir = clone_dir.join(".worktrees").join("issue-9"); // absent
 
-        let outcome = create_worktree(&clone_dir, &worktree_dir, "agent/issue-9").await;
+        let outcome = create_worktree(&clone_dir, &worktree_dir, "agent/issue-9", false).await;
         assert!(
             outcome.is_err(),
             "a real add failure with no worktree on disk must propagate as Err, got {outcome:?}"

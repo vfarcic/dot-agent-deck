@@ -983,6 +983,15 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** launch wrapping (covered by `codex/spawn/*` and `codex/live/001`) or custom command arguments.
 - **Platform coverage:** mac+linux.
 
+##### prompt/new-pane/016 — Selecting the experimental "dispatcher" option in the new-pane form opens a live dispatcher dashboard card whose real Claude agent, given a goal, invokes `dot-agent-deck dispatch` itself and the daemon creates the promised sibling git worktree (PRD #220). [reel]
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness with imported Claude credentials — records a `full-stream.cast`). The freshly-built binary's dir is prepended to the PATH the deck → daemon → agents inherit, so the agent's `dot-agent-deck dispatch` resolves to the build under test rather than a host-installed binary that predates the verb.
+- **Agent:** Claude Code (interactive `claude`, real Anthropic API — receives the dispatcher seed prompt via gated delivery, acts on the typed goal, and runs the `dispatch` verb itself; no stand-in).
+- **Asserts:** the dispatcher surfaces LIVE as a dashboard CARD within 60s of form submission (`1 session(s)`, no tab strip — a mode tab would instead route through `render_mode_tab`'s 50/50 split and render the agent at half width beside an empty column, which is the shape this pins against); that the seed actually reached the pane (a distinctive `DISPATCHER_SEED_PROMPT` phrase, so it cannot pass on an unseeded agent); then, after a directive one-unit goal is typed into the pane, the sibling worktree `../<repo>-dispatch-probe-unit` appears on disk within 180s — proving agent → `dispatch` CLI → daemon → `git worktree add` end to end, at the sibling (never nested) path.
+- **Also asserts (added after real use found three defects underneath the original green run):** that the unit comes up as a real AGENT — a second live session whose card carries an agent type — because `SpawnRequest.command: None` reads as `$SHELL` in the spawn path, so the previous assertions passed while the unit was a bash prompt with the task text typed into it. Verified to be capable of failing by reintroducing `command: None`. The typed goal also names `--single`, so the shape selector is exercised end to end rather than steering the agent back onto the legacy config-derived path.
+- **Does not assert:** the dispatched unit's own OUTPUT; an `--orchestration` dispatch (covered deterministically by `dispatch::tests::an_orchestration_dispatch_writes_the_delegation_protocol_and_the_task`, which spawns `cat` roles and asserts the orchestrator-context file — no LLM tokens); the return edge (#220's own deferred Phase 2 — NOT #174, which depends on this PRD rather than tracking it); cleanup on tab close (covered by `src/dispatch.rs` unit tests).
+- **Platform coverage:** mac+linux.
+- **Note:** the fixture repo is given an initial commit by the test — the harness `git init`s fixtures but never commits, and `git worktree add` cannot branch from an unborn HEAD.
+
 ### Focus / navigation
 
 #### focus/dashboard

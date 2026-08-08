@@ -22,6 +22,7 @@
   "shell": {
     "init_hook": [
       "export PATH=\"$HOME/.local/bin:$PATH\"",
+      "[ -n \"$DAD_DEV_BIN\" ] && export PATH=\"$DAD_DEV_BIN:$PATH\" || true",
       "[ -n \"$USE_VALS\" ] && eval \"$(vals env -export -f .env.vals.yaml)\" || true",
       "[ -f .env ] && source .env || true"
     ],

@@ -17,6 +17,22 @@ path = "target/nextest/default/junit.xml"
 filter = 'test(route_001_two_tabs_same_cwd_do_not_cross_deliver)'
 slow-timeout = { period = "60s", terminate-after = 8 }
 
+# PRD #220: `prompt/new-pane/016` drives a REAL interactive agent through a
+# dispatch turn, then waits for the daemon's `git worktree add` to land on disk.
+# An agent that answers instead of acting is re-nudged on a 70s cadence (up to 3
+# rounds), so the honest wall clock can approach 210s plus deck launch — past the
+# default 3 x 60s kill window. Being killed there costs the assertion's grid dump,
+# which is the only way to tell "agent never called dispatch" apart from "dispatch
+# ran and failed" (same reasoning as route_001 above). Scoped by name; still
+# bounded, so a wedged agent cannot run forever.
+#
+# The filter tracks the TEST FUNCTION name, not the `#[spec]` id, so it must be
+# updated in lockstep with any rename — a stale filter matches nothing and
+# silently drops this test back to the 3 x 60s default, killing it mid-wait.
+[[profile.default.overrides]]
+filter = 'test(new_pane_016_dispatcher_opens_dashboard_card_with_real_agent)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 # Issue #250: `lifecycle/version/001` is the only test that has to `cargo build`
 # the binary itself (with DAD_VERSION / DAD_BUILD_ID pre-set in the build env),
 # so its wall clock is a compile, not a run. It runs three builds — one cold,

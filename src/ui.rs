@@ -510,6 +510,78 @@ Rules:
 - CONFIRM the full entry (every field, especially repo and max_per_run) with the user before you call `schedule add`.
 - AFTER `schedule add` succeeds, tell the user this authoring pane existed ONLY to create the schedule and can be closed now — when the schedule fires, each dispatched issue surfaces live as its own tab on the deck.";
 
+/// PRD #220: display name of the built-in "dispatcher" option in the new-pane
+/// Mode cycler — appended after `schedule: issues`. Selecting it opens a
+/// dispatcher tab: an ordinary agent that additionally knows the
+/// `dot-agent-deck dispatch <name>` verb.
+const DISPATCHER_MODE_NAME: &str = "dispatcher";
+
+/// PRD #220 M3.0: the seed prompt for the dispatcher mode.
+///
+/// Scope is deliberately MECHANICS ONLY — what the `dispatch` verb is, what it
+/// does, and the constraints that follow from process isolation. It carries no
+/// opinion on how the user should organise work, matching both schedule-authoring
+/// seeds (which cover only which CLI to use, which flags do not apply, and where
+/// results surface). An earlier version cast the pane as a planner ("decompose
+/// into independent units", "keep the number of units reasonable (2-6)", "NEVER
+/// do the work yourself") — that was cut: the deck does not own the user's
+/// workflow, and the last line actively forbade the pane from doing anything else
+/// the user asked. See the Design record in `prds/220-…md`.
+const DISPATCHER_SEED_PROMPT: &str = "\
+You are an ordinary assistant with one extra effector available: the `dot-agent-deck dispatch` verb, which starts an isolated line of work in its own git worktree. Help the user with whatever they ask, exactly as you normally would. When they say to START something as a separate line of work, reach for `dispatch` rather than doing that work here.
+
+## The verb
+  dot-agent-deck dispatch <name> [--task <text>] [--task-file <path>] (--single | --orchestration [<name>])
+  dot-agent-deck dispatch --list-targets
+
+- <name> is a short slug naming this line of work (e.g. `fix-auth-bug`, `prd-220`). It names the worktree and its branch.
+- --task carries the prompt the isolated agent receives. --task-file reads that text from a file (or `-` for stdin) instead; the two are mutually exclusive.
+
+## Choosing the shape — ASK, do not guess
+A unit can start as ONE agent or as a multi-role ORCHESTRATION (a team that divides the work). Which one the user wants is not inferable from the request: \"work on these three features\" usually wants a team per feature, while \"verify these three PRs\" usually wants one agent each — and both arrive here as the same words. Guessing wrong is expensive and visible.
+
+So, before the FIRST dispatch of a session:
+1. Run `dot-agent-deck dispatch --list-targets`. It prints the shapes this repo actually offers (always `single`, plus each orchestration by name).
+2. If more than one is offered, show the user the list and ask which they want. If only `single` is offered, say so and use it — there is nothing to ask.
+3. Pass their answer on every dispatch: `--single`, or `--orchestration <name>`.
+
+Reuse the answer for later dispatches in the same conversation rather than asking again, unless the user changes it or the new unit is clearly different in kind.
+
+## What it does
+- Creates a git worktree as a SIBLING of this repo, at ../<repo>-dispatch-<name>, on branch agent/dispatch-<name>. Isolation is automatic — never create or pick a worktree yourself.
+- Starts the shape you selected inside it, delivering the --task text as its opening prompt.
+- Returns immediately and reports what was started and where.
+
+## Rules
+- The --task text must be SELF-CONTAINED — independent of THIS CONVERSATION, not of the repo. The dispatched agent is a fresh process and cannot see anything said here, so state the goal and the expected outcome in the task itself.
+- The unit works in a copy of THIS REPO, so it already has the code, the docs, the PRDs and the skills. REFERENCE them by path instead of pasting their contents: `--task \"Execute the /prd-full skill for PRD 220\"` is complete as it stands. Never paste a skill's or a file's contents into --task.
+- Use paths RELATIVE to the repo root. An absolute path into this checkout points the unit back at the directory you are in, which defeats the isolation it was just given.
+- Pass --single or --orchestration explicitly. With neither, the shape falls back to whatever the repo's config implies, which is the guess this asking exists to avoid.
+- `dispatch` is fire-and-forget: there is NO return edge yet, so a dispatched unit's completion does NOT come back to this pane. Never tell the user results will report back here — give them the worktree path instead, and point at the unit's own tab on the deck.
+- A <name> is single-use. Removing a worktree keeps its branch, so re-dispatching the same name is refused while agent/dispatch-<name> still exists — pick a different name, or delete that branch once you are done with it.
+- Relay the path that `dispatch` reports for each line of work, so the user can follow it.";
+
+/// PRD #220: build the dispatcher `ModeConfig` — a seeded single-agent mode that
+/// teaches the agent the `dispatch` verb (see [`DISPATCHER_SEED_PROMPT`]).
+///
+/// Appends the pane's own `working_dir`, since the seed's `../<repo>-dispatch-…`
+/// layout is relative to it and the agent otherwise has to infer it.
+fn build_dispatcher_mode(working_dir: &std::path::Path) -> ModeConfig {
+    let seed = format!(
+        "{seed}\n\nworking_dir: {dir}\n\nThe repo at that path is the main worktree — the one dispatched worktrees are created as siblings of.",
+        seed = DISPATCHER_SEED_PROMPT,
+        dir = working_dir.display(),
+    );
+    ModeConfig {
+        name: DISPATCHER_MODE_NAME.to_string(),
+        init_command: None,
+        seed_prompt: Some(seed),
+        panes: Vec::new(),
+        rules: Vec::new(),
+        reactive_panes: 0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // "Scheduled Tasks" management dialog (PRD #127 M3.3)
 // ---------------------------------------------------------------------------
@@ -869,6 +941,13 @@ struct NewPaneFormState {
     /// offers the `schedule: issues` option after `schedule`; when false it is
     /// hidden and the cycler shape is byte-for-byte the pre-feature baseline.
     show_issue_dispatch: bool,
+    /// PRD #220: the built-in "dispatcher" authoring mode, appended after
+    /// `schedule: issues` in the cycler. Carries the authoring seed prompt
+    /// that teaches the agent to decompose work and call `dispatch` per unit.
+    dispatcher_authoring: ModeConfig,
+    /// PRD #220: when true the cycler offers the `dispatcher` option after
+    /// `schedule: issues`. Gated behind the experimental feature flag.
+    show_dispatcher: bool,
     selection_index: usize, // 0 = "No mode", 1..M = modes, M+1..M+O = orchestrations, then "schedule" [, "schedule: issues"]
     /// PRD #20 finding #8: the selected agent's index into
     /// [`crate::agent_registry::ALL`], or `None` when the user hasn't picked one
@@ -962,6 +1041,7 @@ impl NewPaneFormState {
             rules: Vec::new(),
             reactive_panes: 0,
         };
+        let dispatcher_authoring = build_dispatcher_mode(&dir);
         Self {
             dir,
             name,
@@ -974,6 +1054,10 @@ impl NewPaneFormState {
             // render wrapper once at construction so the count/name/cycler-cap
             // all observe one consistent value.
             show_issue_dispatch: crate::features::show_issue_dispatch_authoring(),
+            dispatcher_authoring,
+            // PRD #220: gated behind the dedicated dispatcher experimental flag
+            // (CLAUDE.md #9); can be promoted to permanent when the feature stabilizes.
+            show_dispatcher: crate::features::show_dispatcher(),
             selection_index: 0,
             agent_selection: None,
             has_mode_field,
@@ -1045,6 +1129,7 @@ impl NewPaneFormState {
             rules: Vec::new(),
             reactive_panes: 0,
         };
+        let dispatcher_authoring = build_dispatcher_mode(&dir);
         let mut form = Self {
             dir,
             name: SCHEDULE_MODE_NAME.to_string(),
@@ -1057,6 +1142,8 @@ impl NewPaneFormState {
             // only — the issue-dispatch option lives on the `Ctrl+n` cycler, and
             // the locked form hides the cycler entirely, so it never appears here.
             show_issue_dispatch: false,
+            dispatcher_authoring,
+            show_dispatcher: false,
             selection_index: 0,
             agent_selection: None,
             has_mode_field: true,
@@ -1087,6 +1174,12 @@ impl NewPaneFormState {
         self.schedule_index() + 1
     }
 
+    /// PRD #220: cycler index of the dispatcher option — appended after
+    /// `schedule: issues`. Only meaningful when `show_dispatcher` is true.
+    fn dispatcher_index(&self) -> usize {
+        self.issue_dispatch_index() + if self.show_issue_dispatch { 1 } else { 0 }
+    }
+
     /// Whether the built-in "schedule" authoring option is currently selected.
     fn is_schedule_selected(&self) -> bool {
         self.selection_index == self.schedule_index()
@@ -1097,20 +1190,35 @@ impl NewPaneFormState {
         self.show_issue_dispatch && self.selection_index == self.issue_dispatch_index()
     }
 
+    /// PRD #220: whether the dispatcher option is selected.
+    fn is_dispatcher_selected(&self) -> bool {
+        self.show_dispatcher && self.selection_index == self.dispatcher_index()
+    }
+
     /// PRD #120: whether the current selection is a throwaway authoring option
     /// (plain `schedule` OR `schedule: issues`). Drives the shared
     /// "↳ authoring (one-off)" hint + its reserved render row.
+    ///
+    /// PRD #220: `dispatcher` is deliberately NOT a member. The schedule options
+    /// really are one-off — their own seeds tell the user the pane existed only to
+    /// write the schedule and can be closed. A dispatcher pane has continued
+    /// purpose: the user keeps talking to it and may dispatch again, and it is a
+    /// real mode tab rather than a throwaway authoring card (see
+    /// `build_new_pane_request`). Labelling it "authoring (one-off)" told the user
+    /// the opposite.
     fn is_authoring_selected(&self) -> bool {
         self.is_schedule_selected() || self.is_issue_dispatch_selected()
     }
 
     fn mode_option_count(&self) -> usize {
         // +1 for the built-in "schedule" authoring option appended at the end,
-        // +1 more for the flag-gated "schedule: issues" option when shown.
+        // +1 more for the flag-gated "schedule: issues" option when shown,
+        // +1 more for the dispatcher option (PRD #220).
         1 + self.modes.len()
             + self.orchestrations.len()
             + 1
             + if self.show_issue_dispatch { 1 } else { 0 }
+            + if self.show_dispatcher { 1 } else { 0 }
     }
 
     fn select_next_mode(&mut self) {
@@ -1124,6 +1232,11 @@ impl NewPaneFormState {
     }
 
     fn selected_mode(&self) -> Option<&ModeConfig> {
+        // PRD #220: the dispatcher mode — checked first since it is appended
+        // after the schedule options in the cycler.
+        if self.is_dispatcher_selected() {
+            return Some(&self.dispatcher_authoring);
+        }
         // PRD #120: the flag-gated issue-dispatch authoring option — its synthetic
         // mode supplies the cycler's title/chip ("schedule: issues mode"); the
         // spawned request swaps in the issue-dispatch seed (see
@@ -1172,6 +1285,9 @@ impl NewPaneFormState {
         } else if self.show_issue_dispatch && idx == self.issue_dispatch_index() {
             // PRD #120: the flag-gated issue-dispatch authoring option.
             ISSUE_DISPATCH_MODE_NAME.to_string()
+        } else if self.show_dispatcher && idx == self.dispatcher_index() {
+            // PRD #220: the dispatcher mode.
+            DISPATCHER_MODE_NAME.to_string()
         } else {
             // PRD #127 M3.2: built-in "schedule" authoring option.
             SCHEDULE_MODE_NAME.to_string()
@@ -2260,173 +2376,12 @@ fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'
 // ---------------------------------------------------------------------------
 // Orchestrator prompt construction
 // ---------------------------------------------------------------------------
-
-/// Build the orchestrator context file content.
-/// Includes the role's own prompt_template, the available-agents list, and
-/// delegation protocol instructions.
-fn build_orchestrator_context(config: &OrchestrationConfig) -> String {
-    let mut content = String::new();
-
-    // 1. Orchestrator's own prompt_template.
-    if let Some(start_role) = config.roles.iter().find(|r| r.start)
-        && let Some(ref tpl) = start_role.prompt_template
-    {
-        content.push_str(tpl);
-        content.push_str("\n\n");
-    }
-
-    // 2. Available agents list.
-    content.push_str("## Available agents\n\n");
-    for role in &config.roles {
-        if role.start {
-            continue;
-        }
-        let desc = role.description.as_deref().unwrap_or("(no description)");
-        content.push_str(&format!("- **{}**: {}\n", role.name, desc));
-    }
-
-    // 3. Delegation protocol.
-    //
-    // Issue #303: the task text reaches this CLI through YOUR shell, so
-    // `--task "…"` is rewritten before argv is built — backticks and `$(…)` are
-    // executed, `$VAR` substituted, an unescaped `"` ends the argument, a `\`
-    // removes itself — while the delegation still reports success. The file form
-    // is therefore the unconditional default here, with the reason stated inline
-    // (an orchestrator that does not know WHY drifts back to `--task`).
-    //
-    // The audit of the first cut (auditor finding 1) showed that protecting only
-    // the final `--task-file` read is not enough: an `echo "…"` expands the
-    // content BEFORE it reaches disk, and an unquoted path can itself carry
-    // command substitution or `..` traversal. Hence the four creation rules, and
-    // the persistence/secrets note (#329's advice half).
-    //
-    // Round 3 then deleted the shell fallback that round 2 had recommended. A
-    // quoted `<<'EOF'` delimiter disables expansion inside the heredoc, but a
-    // task line that is exactly `EOF` terminates it and Bash parses and executes
-    // every line after it — and task files are exactly where untrusted text
-    // (issue bodies, code, another agent's brief) lands. "Use a fresh
-    // unpredictable delimiter and check the payload for it" is a rule an agent
-    // must get right on every single input, with silent command execution as the
-    // failure mode, so the only recommendation left is a non-shell file writer.
-    //
-    // Round 4 restored the *inline* fallback — not the shell one. Round 3's
-    // premise, "every agent in this system has a file-writing tool", confused
-    // having a tool with being authorized to use it: the e2e gate then caught a
-    // real Haiku worker launched with `--allowedTools Bash Read` calling `Write`
-    // and parking forever on the approval prompt. Guidance that depends on an
-    // unguaranteed permission produces exactly the silent stall #303 is about,
-    // so all three branches (file / short plain inline / say you cannot) are now
-    // stated outright rather than left to inference.
-    content.push_str("\n## Delegation protocol\n\n");
-    content.push_str(
-        "To delegate work to an agent, use `delegate` with one command per agent. \
-         Pass the task as a **file** — `--task-file` is the default, not an escape hatch:\n\n\
-         ```bash\n\
-         dot-agent-deck delegate --to <role-name> --task-file '.dot-agent-deck/<task-slug>.md'\n\
-         ```\n\n\
-         Four rules for producing that file. The last two are about the *path*, not the \
-         contents:\n\n\
-         - Write it with your **file-writing tool**. Do not construct it with shell redirection \
-         or a heredoc: a line of the task text can terminate the heredoc, and everything after \
-         that line is then executed as shell commands.\n\
-         - Invent a **fresh slug** for `<task-slug>` from `[a-z0-9][a-z0-9-]*` only, at most 40 \
-         characters. Never build it out of an issue title, a branch name, or any other text you \
-         did not write yourself.\n\
-         - No `/`, no `\\` and no `..` in the slug — the file goes directly in \
-         `.dot-agent-deck/`.\n\
-         - **Single-quote the whole path** in every command you run.\n\n\
-         Task and summary files persist on disk after the handoff. Keep credentials, customer \
-         data and other secrets out of them, pick a path that does not already exist, and delete \
-         exactly that path once the handoff has succeeded.\n\n\
-         **If you have no file-writing tool, or it is not authorized and invoking it would stop \
-         you at an approval prompt, do not wait there — skip the file and use the inline form \
-         below.** Never substitute shell redirection or a heredoc for the missing tool.\n\n\
-         `--task \"…\"` is the fallback for exactly that case, and is safe only when the whole \
-         task is **a single line of plain text with no backticks, no `$`, no `\"`, no `\\` and no \
-         `!`**:\n\n\
-         ```bash\n\
-         dot-agent-deck delegate --to <role-name> --task \"Short plain task description.\"\n\
-         ```\n\n\
-         Why the allowlist is that narrow: everything after `--task` is processed by **your own \
-         shell** before dot-agent-deck receives it. Backticks and `$(…)` are executed and \
-         replaced by their output — usually empty — `$VAR` becomes its value or nothing, a \
-         balanced inner `\"` is removed and changes how the rest of the argument is quoted, a \
-         `\\` before `$`, a backtick, `\"` or `\\` removes itself, and a `\\` at the end of a \
-         line removes itself *and* the newline. `!` is excluded because a Bash with history \
-         expansion on rewrites it before argv is built. An unmatched `\"` aborts the command \
-         outright; everything else is dropped silently while the delegation still reports \
-         success, so the worker acts on a task with pieces missing and nobody sees an error. \
-         `--task-file` is read from disk verbatim, so none of this applies to it.\n\n\
-         If a task will not fit that one plain line and you cannot write a file, say so plainly \
-         to the user and ask for the file-writing tool to be authorized, rather than improvising \
-         a way around the allowlist.\n\n\
-         To delegate to multiple agents in parallel, make **one call per agent** so each gets its own task:\n\n\
-         ```bash\n\
-         dot-agent-deck delegate --to coder --task-file '.dot-agent-deck/login-endpoint-coder.md'\n\
-         dot-agent-deck delegate --to reviewer --task-file '.dot-agent-deck/login-endpoint-reviewer.md'\n\
-         ```\n\n\
-         If all agents should receive the **exact same task**, you may combine them in one call:\n\n\
-         ```bash\n\
-         dot-agent-deck delegate --to <role1> --to <role2> --task-file '.dot-agent-deck/<task-slug>.md'\n\
-         ```\n\n\
-         When all work is complete and you are satisfied with the results:\n\n\
-         ```bash\n\
-         dot-agent-deck work-done --done --task-file '.dot-agent-deck/final-summary-<summary-slug>.md'\n\
-         ```\n\
-         (or `dot-agent-deck work-done --done --task \"Final summary.\"` when that summary really is \
-         one plain line). The same four rules apply to that file: `<summary-slug>` is a fresh slug \
-         you invent, the path must not already exist before you write it, and you delete exactly \
-         that path once the command has exited successfully.\n\n\
-         **Shell safety and context length are two different problems.** Writing long context to \
-         `.dot-agent-deck/<task-slug>.md` and *referencing that path inside* `--task \"…\"` keeps the \
-         task description short, but the description itself still goes through your shell. Passing \
-         the file with `--task-file` is what keeps the shell out of the text. One file solves both \
-         at once: write the full task to `.dot-agent-deck/<task-slug>.md` and hand it over with \
-         `--task-file`.\n",
-    );
-
-    // 4. Important guidelines.
-    content.push_str(
-        "\n## Important\n\n\
-         Wait for the user to tell you what to work on.\n\n\
-         Once you know the task, delegate immediately via the CLI commands above. \
-         Do NOT ask for confirmation before delegating. \
-         Do NOT offer to design, analyze, or plan — that is the workers' job. \
-         Do NOT ask 'should I proceed?' or 'do you want me to delegate?' — just delegate. \
-         Your only job: understand what needs doing, frame clear task descriptions, and hand off.\n\n\
-         Never send a new task to a worker that is still working on a previous task. \
-         Wait for its work-done signal before delegating again to the same worker. \
-         Delegating to different workers in parallel is fine.\n\n\
-         Delegation is one-way: orchestrator → worker. Workers NEVER delegate to other workers \
-         — a `dot-agent-deck delegate` call from inside a worker does not route back through your \
-         notification stream, so the downstream task is silently dropped and the calling worker \
-         waits forever (or signals work-done in a paused state). When briefing a worker, never \
-         instruct them to \"delegate the fix to coder\" or \"hand off to <other role>\". \
-         Instead, tell them to report the diagnosis back and signal work-done; you (the orchestrator) \
-         will delegate the next hop. The chain you coordinate is: worker A diagnoses → reports → \
-         you delegate to worker B → worker B works → reports → you re-engage worker A.\n\n\
-         When a task related to a PRD is fully completed (all workers done, reviews passed), \
-         run `/prd-update-progress` yourself before signaling `--done` or moving to the next task.\n",
-    );
-
-    content
-}
-
-// ---------------------------------------------------------------------------
-// M6: Skill file auto-deployment
-// ---------------------------------------------------------------------------
-
-/// Write the orchestrator context to a file and return a one-liner to inject.
-/// Multi-line prompts don't submit in Claude Code via PTY, so we use a file reference.
-fn prepare_orchestrator_prompt(config: &OrchestrationConfig, cwd: &str) -> Option<String> {
-    let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
-    std::fs::create_dir_all(&dir).ok()?;
-    let file_path = dir.join("orchestrator-context.md");
-    let content = build_orchestrator_context(config);
-    std::fs::write(&file_path, &content).ok()?;
-    Some("Read .dot-agent-deck/orchestrator-context.md for your role, available agents, and delegation protocol. Acknowledge your role and wait for instructions.".to_string())
-}
-
+//
+// MOVED to `src/orchestrator_context.rs` (PRD #222 parity): the daemon spawn
+// path needs the same composition, and two copies is what left a
+// daemon-started orchestration without its delegation protocol. Imported below
+// so this module's call site and tests are unchanged.
+use crate::orchestrator_context::prepare_orchestrator_prompt;
 // ---------------------------------------------------------------------------
 // PRD #76 M2.12: hydration partition
 // ---------------------------------------------------------------------------
@@ -6218,6 +6173,36 @@ fn record_candidate(command: &str) -> Option<String> {
 /// Shared by the Enter-submit key arm and the `[Submit]` button
 /// ([`Action::FormSubmit`]) so click and key spawn an identical pane.
 fn build_new_pane_request(form: &NewPaneFormState, default_command: &str) -> NewPaneRequest {
+    // PRD #220: the dispatcher option — a seeded single agent that knows the
+    // `dot-agent-deck dispatch <name>` verb.
+    //
+    // Spawned as a dashboard CARD (`mode_config: None`) carrying the seed via
+    // `seed_prompt`, exactly like the two schedule options below and for the
+    // same reason PRD #127 gave: a mode tab routes through `render_mode_tab`'s
+    // 50/50 split, so a mode declaring no side panes (which is what the
+    // dispatcher is — `panes: []`, `reactive_panes: 0`) renders the agent at
+    // half width with an empty column beside it. `mode_side_pane_dims` halves
+    // the width unconditionally, so there is no way to opt out of the split
+    // while remaining a mode tab.
+    //
+    // The synthetic `ModeConfig` is still built for the CYCLER (title + chip via
+    // `selected_mode`); only the spawn shape differs. Same split as
+    // `schedule: issues`, whose synthetic mode names the cycler while its seed
+    // rides on the request.
+    if form.is_dispatcher_selected() {
+        return NewPaneRequest {
+            dir: form.dir.clone(),
+            name: form.name.clone(),
+            command: if form.command.trim().is_empty() {
+                resolve_authoring_command(default_command)
+            } else {
+                form.command.clone()
+            },
+            mode_config: None,
+            orchestration_config: None,
+            seed_prompt: build_dispatcher_mode(&form.dir).seed_prompt,
+        };
+    }
     // PRD #120: the flag-gated "schedule: issues" authoring option — like the
     // plain "schedule" option it is a throwaway single-agent authoring CARD, but
     // its seed authors an ISSUE-DISPATCH task (`schedule add --repo …`) instead
@@ -7675,7 +7660,10 @@ fn dispatch_action(
                     // name to the tab TITLE only, via `display_title`; the
                     // identity stays the canonical `orch_config.name`.
                     let display_title = (!req.name.is_empty()).then(|| req.name.clone());
-                    let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str);
+                    // `None`: the interactive path carries no caller task — the user
+                    // types their instructions after the orchestrator acknowledges.
+                    // Output is byte-for-byte the pre-#222 text.
+                    let prompt = prepare_orchestrator_prompt(&orch_config, &dir_str, None);
                     // PRD #89 M2b.2: keep a copy of the prepared prompt for the
                     // capture snapshot below — `prompt` itself is moved into
                     // `open_orchestration_tab`. Empty when the orchestration
@@ -17719,6 +17707,7 @@ pub fn render_new_pane_form_schedule_to_buffer(
 mod tests {
     use super::*;
     use crate::event::{AgentEvent, AgentType, EventType};
+    use crate::orchestrator_context::build_orchestrator_context;
     use crate::project_config::OrchestrationRoleConfig;
     use chrono::{Duration, Utc};
     use ratatui::Terminal;
@@ -20834,7 +20823,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let cwd = dir.path().to_str().unwrap();
-        let prompt = prepare_orchestrator_prompt(&config, cwd);
+        let prompt = prepare_orchestrator_prompt(&config, cwd, None);
         assert!(prompt.is_some());
         let prompt = prompt.unwrap();
         // One-liner referencing the file.
@@ -25266,6 +25255,190 @@ mod tests {
 
         f.focused = f.prev_field();
         assert_eq!(f.focused, FormField::Command);
+    }
+
+    // --- PRD #220: dispatcher mode constants and builder ---
+
+    #[test]
+    fn dispatcher_mode_name_and_seed_constants() {
+        assert_eq!(DISPATCHER_MODE_NAME, "dispatcher");
+        assert!(
+            DISPATCHER_SEED_PROMPT.contains("dispatch"),
+            "seed must contain 'dispatch'"
+        );
+        assert!(
+            DISPATCHER_SEED_PROMPT.contains("worktree"),
+            "seed must contain 'worktree'"
+        );
+    }
+
+    #[test]
+    fn build_dispatcher_mode_produces_correct_config() {
+        let mode = build_dispatcher_mode(std::path::Path::new("/tmp/test-repo"));
+        assert_eq!(mode.name, DISPATCHER_MODE_NAME);
+        let seed = mode
+            .seed_prompt
+            .expect("dispatcher mode must have a seed prompt");
+        assert!(
+            seed.starts_with(DISPATCHER_SEED_PROMPT),
+            "seed must start with the constant prompt, got:\n{seed}"
+        );
+        assert!(
+            seed.contains("working_dir: /tmp/test-repo"),
+            "seed must contain the working_dir, got:\n{seed}"
+        );
+        assert!(
+            seed.contains("siblings of"),
+            "seed must mention sibling worktree layout, got:\n{seed}"
+        );
+    }
+
+    /// PRD #220 seed scope: the seed teaches Agent Deck MECHANICS, not work
+    /// methodology. The planner framing was cut deliberately (see the Design
+    /// record in `prds/220-…md`), and "NEVER do the work yourself" in particular
+    /// forbade the pane from doing anything else the user asked. Pinned so it
+    /// cannot drift back in.
+    #[test]
+    fn dispatcher_seed_teaches_mechanics_not_work_methodology() {
+        for banned in [
+            "decompose",
+            "independent units",
+            "parallel-ready",
+            "2-6",
+            "NEVER do the work yourself",
+        ] {
+            assert!(
+                !DISPATCHER_SEED_PROMPT.contains(banned),
+                "the dispatcher seed must not carry work-methodology copy, found {banned:?}"
+            );
+        }
+        // The mechanics it MUST still carry.
+        for required in [
+            "dot-agent-deck dispatch <name>",
+            "SELF-CONTAINED",
+            "../<repo>-dispatch-<name>",
+            "single-use",
+            "fire-and-forget",
+            // The shape choice is a deck mechanic (which spawn shape to start),
+            // not a work-methodology opinion — so it belongs, and the seed must
+            // tell the agent to ASK rather than infer it.
+            "--list-targets",
+            "--single",
+            "--orchestration",
+            "ASK, do not guess",
+            // The unit shares the repo, so referencing beats pasting — and paths
+            // must be relative, or an absolute one points the unit back at the
+            // caller's checkout and undoes the isolation.
+            "REFERENCE them by path",
+            "RELATIVE to the repo root",
+        ] {
+            assert!(
+                DISPATCHER_SEED_PROMPT.contains(required),
+                "the dispatcher seed must still teach {required:?}"
+            );
+        }
+    }
+
+    /// PRD #220: the flag-ON cycler wiring. `dispatcher_index()` is index
+    /// arithmetic over two independently-gated options, which is exactly what
+    /// breaks silently — and the only other coverage is the credential-gated e2e
+    /// test, so without this the wiring is untested on a machine with no agent
+    /// CLI installed.
+    #[test]
+    fn dispatcher_occupies_the_last_cycler_slot_when_shown() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp"),
+            String::new(),
+            String::new(),
+            vec![make_mode("a")],
+            vec![],
+        );
+        // Both experimental options on, independent of the ambient env flag.
+        f.show_issue_dispatch = true;
+        f.show_dispatcher = true;
+
+        // "No mode" + 1 mode + schedule + schedule: issues + dispatcher.
+        assert_eq!(f.mode_option_count(), 5);
+        let last = f.mode_option_count() - 1;
+        assert_eq!(
+            f.dispatcher_index(),
+            last,
+            "dispatcher must be the LAST cycler slot, after schedule: issues"
+        );
+        assert_eq!(f.mode_option_name(last), DISPATCHER_MODE_NAME);
+
+        f.selection_index = last;
+        assert!(f.is_dispatcher_selected());
+        assert_eq!(
+            f.selected_mode().map(|m| m.name.as_str()),
+            Some(DISPATCHER_MODE_NAME)
+        );
+        // PRD #220: a dispatcher pane has continued purpose, so it must NOT be
+        // labelled "↳ authoring (one-off)" the way the schedule options are.
+        assert!(
+            !f.is_authoring_selected(),
+            "dispatcher is a real mode tab, not throwaway authoring"
+        );
+
+        // Flag off: the cycler shape is the pre-feature baseline and the
+        // dispatcher is unreachable.
+        f.show_dispatcher = false;
+        f.selection_index = 0;
+        assert_eq!(f.mode_option_count(), 4);
+        assert!(!f.is_dispatcher_selected());
+    }
+
+    /// PRD #220: submitting the dispatcher option must spawn a dashboard CARD,
+    /// never a mode tab.
+    ///
+    /// A mode tab routes through `render_mode_tab`'s 50/50 split, and
+    /// `mode_side_pane_dims` halves the width unconditionally — so a mode with no
+    /// side panes (which the dispatcher is) renders the agent at half width beside
+    /// an empty column. PRD #127 hit this first and fixed it the same way for the
+    /// `schedule` option. This pins the spawn shape so it cannot regress: the
+    /// synthetic mode is for the cycler's title/chip only, and the seed must ride
+    /// on the REQUEST.
+    #[test]
+    fn dispatcher_submits_as_a_dashboard_card_not_a_mode_tab() {
+        let mut f = NewPaneFormState::new(
+            PathBuf::from("/tmp/repo"),
+            String::new(),
+            String::new(),
+            vec![],
+            vec![],
+        );
+        f.show_issue_dispatch = true;
+        f.show_dispatcher = true;
+        f.selection_index = f.dispatcher_index();
+        assert!(
+            f.is_dispatcher_selected(),
+            "test targets the dispatcher slot"
+        );
+
+        let req = build_new_pane_request(&f, "claude");
+        assert!(
+            req.mode_config.is_none(),
+            "the dispatcher must NOT spawn a mode tab — that is the 50/50-split bug"
+        );
+        assert!(req.orchestration_config.is_none());
+        let seed = req
+            .seed_prompt
+            .as_deref()
+            .expect("the dispatcher card must carry its seed on the request");
+        assert!(
+            seed.starts_with(DISPATCHER_SEED_PROMPT),
+            "the card's seed must be the dispatcher seed, got:\n{seed}"
+        );
+        assert!(
+            seed.contains("working_dir: /tmp/repo"),
+            "the seed must still be dir-qualified, got:\n{seed}"
+        );
+
+        // The cycler still names it, via the synthetic mode.
+        assert_eq!(
+            f.selected_mode().map(|m| m.name.as_str()),
+            Some(DISPATCHER_MODE_NAME)
+        );
     }
 
     // --- PRD #127 M3.3: "Scheduled Tasks" manager dialog pure-data helpers ---

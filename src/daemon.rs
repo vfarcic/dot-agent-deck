@@ -717,7 +717,15 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     });
 
-    let result = run_hook_loop(listener, state, event_tx, pty_registry.clone(), shutdown).await;
+    let result = run_hook_loop(
+        listener,
+        state,
+        event_tx,
+        pty_registry.clone(),
+        shutdown,
+        worktree_registry.clone(),
+    )
+    .await;
 
     if let Some(h) = attach_handle {
         h.abort();
@@ -835,6 +843,12 @@ fn make_schedule_callback(
         working_dir: task.working_dir.clone(),
         command: task.command.clone(),
         prompt: task.prompt.clone(),
+        // `None`: a scheduled task's shape still comes from its working dir's
+        // config. The PRD #220 selector is a `dispatch`-only surface.
+        resolved_target: None,
+        // Unchanged behaviour: the prompt is delivered verbatim. Giving this path
+        // the orchestrator context is #222's work, not this PR's.
+        compose_orchestrator_context: false,
     };
     let new_tab_per_fire = task.new_tab_per_fire;
     Arc::new(move || {
@@ -980,6 +994,7 @@ async fn run_hook_loop(
     event_tx: broadcast::Sender<BroadcastMsg>,
     pty_registry: Arc<AgentPtyRegistry>,
     shutdown: Arc<Notify>,
+    worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
 ) -> Result<(), DaemonError> {
     loop {
         tokio::select! {
@@ -1002,6 +1017,7 @@ async fn run_hook_loop(
                 let state = state.clone();
                 let event_tx = event_tx.clone();
                 let pty_registry = pty_registry.clone();
+                let worktree_registry = worktree_registry.clone();
                 tokio::spawn(async move {
                     // PRD #201: split so the read-only `get-seed` verb can write
                     // a reply back on the same connection. Every other message
@@ -1040,6 +1056,81 @@ async fn run_hook_loop(
                                         .handle_delegate(signal, &pty_registry, &event_tx)
                                         .await;
                                 }
+                                DaemonMessage::Dispatch(signal) => {
+                                    info!(
+                                        pane_id = %signal.pane_id,
+                                        name = %signal.name,
+                                        "Received dispatch signal"
+                                    );
+                                    use crate::dispatch::{self, DispatchContext};
+
+                                    use std::path::PathBuf;
+
+                                    // Phase 1: resolve caller cwd from the PTY registry's
+                                    // AgentRecord.cwd, not AppState::pane_cwd_map.
+                                    // pane_cwd_map is only populated for orchestration
+                                    // panes; mode panes (including the dispatcher mode)
+                                    // never get an entry there, which would make every
+                                    // dispatch from a mode pane a silent no-op.
+                                    let cwd = {
+                                        let records = pty_registry.agent_records();
+                                        records
+                                            .iter()
+                                            .find(|r| r.pane_id_env.as_deref() == Some(&signal.pane_id))
+                                            .and_then(|r| r.cwd.clone())
+                                    };
+                                    let cwd = match cwd {
+                                        Some(c) => c,
+                                        None => {
+                                            warn!(pane_id = %signal.pane_id, "dispatch from unknown pane");
+                                            continue;
+                                        }
+                                    };
+
+                                    // Phase 2: do the slow I/O (git worktree + spawn)
+                                    // OUTSIDE any AppState lock so concurrent hook
+                                    // processing is never stalled.
+                                    // The deck's configured default command, so a
+                                    // single-agent dispatch starts an AGENT rather
+                                    // than `$SHELL`. Same resolution as the
+                                    // issue-dispatch arm above; empty → the Claude
+                                    // default inside `handle_dispatch`.
+                                    let default_command = {
+                                        let dc = crate::config::DashboardConfig::load()
+                                            .default_command
+                                            .trim()
+                                            .to_string();
+                                        if dc.is_empty() { None } else { Some(dc) }
+                                    };
+                                    let ctx = DispatchContext {
+                                        working_dir: PathBuf::from(&cwd),
+                                        registry: pty_registry.clone(),
+                                        event_tx: event_tx.clone(),
+                                        worktrees: worktree_registry.clone(),
+                                        default_command,
+                                    };
+                                    let task = signal.task.as_deref().unwrap_or_default();
+                                    let result = dispatch::handle_dispatch(
+                                        &ctx,
+                                        &signal.name,
+                                        task,
+                                        signal.shape.as_ref(),
+                                    )
+                                    .await;
+
+                                    // Deliver result to the caller pane (doesn't need
+                                    // any AppState lock — uses the PTY registry).
+                                    if let Err(e) = pty_registry
+                                        .write_to_pane_and_submit(&signal.pane_id, &result.message)
+                                        .await
+                                    {
+                                        warn!(
+                                            pane_id = %signal.pane_id,
+                                            error = %e,
+                                            "dispatch: failed to write result into caller pane"
+                                        );
+                                    }
+                                }
                                 DaemonMessage::WorkDone(signal) => {
                                     info!(
                                         pane_id = %signal.pane_id,
@@ -1065,6 +1156,37 @@ async fn run_hook_loop(
                                     );
                                     let resp =
                                         crate::event::GetSeedResponse { seed };
+                                    if let Ok(json) = serde_json::to_string(&resp) {
+                                        let line = format!("{json}\n");
+                                        let _ =
+                                            write_half.write_all(line.as_bytes()).await;
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
+                                DaemonMessage::ListTargets(req) => {
+                                    // PRD #220: the shape menu, computed HERE so it
+                                    // comes from the same cwd and the same config
+                                    // the dispatch will use. Resolving the cwd from
+                                    // `AgentRecord.cwd` — not from the CLI's own
+                                    // `current_dir()` — is the whole point: those
+                                    // two diverge whenever the agent has `cd`'d, and
+                                    // a menu that disagrees with the spawn sends the
+                                    // user to a target that cannot start.
+                                    let cwd = {
+                                        let records = pty_registry.agent_records();
+                                        records
+                                            .iter()
+                                            .find(|r| r.pane_id_env.as_deref() == Some(&req.pane_id))
+                                            .and_then(|r| r.cwd.clone())
+                                    };
+                                    info!(
+                                        pane_id = %req.pane_id,
+                                        resolved_cwd = ?cwd,
+                                        "Received list-targets request"
+                                    );
+                                    let resp = crate::dispatch::list_targets_response(
+                                        cwd.as_deref().map(std::path::Path::new),
+                                    );
                                     if let Ok(json) = serde_json::to_string(&resp) {
                                         let line = format!("{json}\n");
                                         let _ =
@@ -1272,7 +1394,8 @@ mod hook_ingestion_tests {
 
         let handle = tokio::spawn({
             let registry = registry.clone();
-            async move { run_hook_loop(listener, state, event_tx, registry, shutdown).await }
+            let wtr = crate::issue_dispatch_run::new_worktree_registry();
+            async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
         });
 
         // Synthetic SessionStart for the shell pane, carrying the real type.
@@ -1355,7 +1478,8 @@ mod hook_ingestion_tests {
         let shutdown = Arc::new(Notify::new());
         let handle = tokio::spawn({
             let registry = registry.clone();
-            async move { run_hook_loop(listener, state, event_tx, registry, shutdown).await }
+            let wtr = crate::issue_dispatch_run::new_worktree_registry();
+            async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
         });
 
         // Helper: send one get_seed request line and read the single reply line.

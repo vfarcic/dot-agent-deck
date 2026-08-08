@@ -1477,15 +1477,25 @@ async fn handle_connection(
                     // preserved) and drop the registry entry. The child is already
                     // reaped, so the worktree is no longer a live cwd. No-op for
                     // ordinary agents and for earlier sibling-role closes.
+                    // PRD #220: the removal POLICY travels with the registry
+                    // entry, because this handler serves both producers and sees
+                    // only a path — issue-dispatch needs the force removal its
+                    // slot-reclaim model depends on, while a PRD #220 dispatch
+                    // sibling must keep uncommitted work. See `RemovalPolicy`.
                     if let Some(worktree) = dispatched_worktree
                         && !crate::issue_dispatch_run::worktree_still_in_use(
                             &registry.agent_records(),
                             &worktree,
                         )
-                        && let Some(clone) =
+                        && let Some(entry) =
                             crate::issue_dispatch_run::take_worktree(&worktree_registry, &worktree)
                     {
-                        crate::issue_dispatch_run::remove_worktree(&worktree, &clone).await;
+                        crate::issue_dispatch_run::remove_worktree(
+                            &worktree,
+                            &entry.clone_dir,
+                            entry.policy,
+                        )
+                        .await;
                     }
                     write_resp(&mut stream, &AttachResponse::ok()).await?
                 }

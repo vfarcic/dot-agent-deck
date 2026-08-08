@@ -67,6 +67,17 @@ tasks:
         # the branch" while actually exercising the installed release.
         export PATH="$(dirname "$bin"):$PATH"
 
+        # ...and the PATH prepend above is NOT enough on its own. Agents here are
+        # launched through `devbox run <script>` (see .dot-agent-deck.toml's role
+        # commands), and a NESTED devbox re-derives PATH from its own environment:
+        # the prepend above is DISCARDED, and devbox.json's init_hook then puts
+        # $HOME/.local/bin first — so a bare `dot-agent-deck` in a pane reaches the
+        # INSTALLED RELEASE. Measured: level-1 PATH starts with the build dir,
+        # level-2 (the agent) starts with $HOME/.local/bin and has no build dir at
+        # all. Ordinary env vars DO survive that nesting, so hand the dir over as
+        # one and let init_hook re-prepend it inside every devbox layer.
+        export DAD_DEV_BIN="$(dirname "$bin")"
+
         echo "deck:    $bin"
         echo "config:  $dir"
         echo "sandbox: $sandbox   (task run-stop to shut its daemon down)"

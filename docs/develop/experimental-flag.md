@@ -58,5 +58,6 @@ This lets work-in-progress code merge to `main` without exposing unfinished UI d
 |---|---|---|---|
 | `show_experimental_footer()` | The experimental dashboard footer | #139 | — |
 | `show_issue_dispatch_authoring()` | The new-pane `schedule: issues` modal authoring option (PRD #120 creation UX) | #120 | `graduate-issue-dispatch` |
+| `show_dispatcher()` | The new-pane `dispatcher` Mode-cycler authoring option (PRD #220 agent decompose-and-dispatch workflow). The `dispatch` CLI verb and its daemon handler are NOT gated. | #220 | `graduate-dispatcher` |
 
 > **`show_issue_dispatch_authoring()` is a render seam, like the others (redesigned 2026-06-24).** An earlier iteration gated `issue_dispatch` *behaviour* (the daemon's schedule-fire activation seam) — that is **gone**. A configured `issue_dispatch` task now runs **unconditionally**; the flag, config parsing, and the `schedule add --repo …` CLI are all flag-free. The wrapper now gates ONLY the new-pane Mode-cycler `schedule: issues` authoring option (a render/input seam in `src/ui.rs`) — i.e. the experimental *creation UX* for the task type, not the task type itself. This keeps the flag presentation-only, consistent with the default model.

@@ -81,6 +81,40 @@ pub struct SpawnRequest {
     pub command: Option<String>,
     /// Prompt delivered into the spawned agent / orchestrator pane.
     pub prompt: String,
+    /// PRD #220: a target the CALLER already resolved, used verbatim instead of
+    /// deriving one from `working_dir`'s config.
+    ///
+    /// `dispatch` sets this because it must decide from the CALLER's repo config —
+    /// the config the user saw in `--list-targets` — not from the worktree's. The
+    /// two differ in two ways that both produced wrong outcomes: the worktree is a
+    /// HEAD checkout, so uncommitted config is invisible to it; and
+    /// `load_project_config` normalises an unnamed orchestration to its DIRECTORY
+    /// BASENAME, so the same entry is `myrepo` from the repo and
+    /// `myrepo-dispatch-unit` from the worktree — a name the listing offers and the
+    /// spawn can never match.
+    ///
+    /// Resolving caller-side also means a bad `--orchestration <name>` fails BEFORE
+    /// `git worktree add`, instead of burning a create/remove/branch-delete cycle
+    /// and surfacing as "failed to spawn agent".
+    ///
+    /// `None` (the scheduler and issue-dispatch producers) keeps the
+    /// config-derived behaviour untouched.
+    pub resolved_target: Option<SpawnTarget>,
+    /// Compose the ORCHESTRATOR CONTEXT (roles + delegation protocol + this
+    /// request's prompt as a task) instead of delivering `prompt` verbatim.
+    ///
+    /// `true` only for PRD #220 `dispatch`. Without it a dispatched orchestration's
+    /// orchestrator is never told that it IS one, so it works alone while every
+    /// worker waits for a delegation that cannot arrive.
+    ///
+    /// Deliberately NOT enabled for the scheduler (#127) or issue-dispatch (#120),
+    /// even though both have the identical defect and the composition is now shared.
+    /// Turning it on there changes what lands in a SHIPPED feature's pane: the
+    /// orchestrator receives a one-line pointer instead of the prompt text, and
+    /// three #120/#127 e2e tests assert that text arriving verbatim (a `cat`-based
+    /// stub never reads the file). That is #222's job to do deliberately, with those
+    /// tests updated as part of it — not a side effect of the dispatcher PR.
+    pub compose_orchestrator_context: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -164,7 +198,133 @@ pub enum SpawnTarget {
     /// `$SHELL` (resolved by the spawn path, mirroring the new-deck dialog).
     SingleAgent { command: Option<String> },
     /// An orchestration tab rooted at the target dir.
-    Orchestration { name: String, roles: Vec<RoleSpawn> },
+    ///
+    /// `config` is the CHOSEN orchestration's own config, carried through so the
+    /// spawn can compose the orchestrator's context (roles + delegation protocol)
+    /// without re-finding it by name — re-resolution is what let the listing and
+    /// the spawn disagree in the first place. See
+    /// [`crate::orchestrator_context::prepare_orchestrator_prompt`].
+    Orchestration {
+        name: String,
+        roles: Vec<RoleSpawn>,
+        config: Box<crate::project_config::OrchestrationConfig>,
+    },
+}
+
+/// PRD #220: a caller's explicit choice of spawn shape, overriding what the
+/// target dir's config would imply.
+///
+/// Exists because the config-derived default is not knowable by the caller's
+/// intent: "work on this feature" wants a team, "verify this PR" wants one
+/// agent, and both arrive as the same `dispatch` call into the same repo. Only
+/// the user knows which, so `dispatch` asks and passes the answer down. Absent
+/// (`None`), [`decide_target`]'s config-derived behaviour is unchanged, which is
+/// what keeps the scheduler and issue-dispatch paths exactly as they were.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnShapeOverride {
+    /// Force a single agent even when the dir defines `[[orchestrations]]`.
+    SingleAgent,
+    /// Force an orchestration: `None` = the dir's first (same as the config
+    /// default), `Some(name)` = the one with that `name`, or an error if no
+    /// orchestration carries it.
+    Orchestration(Option<String>),
+}
+
+/// [`decide_target`], with an optional caller override (PRD #220).
+///
+/// `Err` only for an override naming an orchestration the dir does not define —
+/// a silent fallback there would spawn something other than what the user chose,
+/// which is exactly the class of surprise this selector exists to remove. The
+/// message lists what IS available so the caller can correct itself.
+pub fn decide_target_with_override(
+    config: Option<&ProjectConfig>,
+    dir: &Path,
+    schedule_command: Option<&str>,
+    over: Option<&SpawnShapeOverride>,
+) -> Result<SpawnTarget, String> {
+    match over {
+        None => Ok(decide_target(config, dir, schedule_command)),
+        Some(SpawnShapeOverride::SingleAgent) => Ok(SpawnTarget::SingleAgent {
+            command: schedule_command.map(|c| c.to_string()),
+        }),
+        Some(SpawnShapeOverride::Orchestration(None)) => {
+            // The FIRST ROLE-BEARING orchestration, matching what `--list-targets`
+            // offers. `decide_target` inspects only `orchestrations.first()`, so a
+            // roleless placeholder in slot 0 made the bare form refuse a repo whose
+            // second entry was perfectly spawnable — and told the user to add config
+            // that already existed.
+            let orch = config
+                .and_then(|cfg| cfg.orchestrations.iter().find(|o| !o.roles.is_empty()))
+                .ok_or_else(|| {
+                    format!(
+                        "no orchestration with roles is defined in {}: add an \
+                         `[[orchestrations]]` section with at least one role, or dispatch a \
+                         single agent instead",
+                        dir.display()
+                    )
+                })?;
+            Ok(SpawnTarget::Orchestration {
+                name: resolve_orchestration_name(&orch.name, dir),
+                roles: roles_of(orch),
+                config: Box::new(orch.clone()),
+            })
+        }
+        Some(SpawnShapeOverride::Orchestration(Some(want))) => {
+            let cfg = config.ok_or_else(|| {
+                format!(
+                    "no `.dot-agent-deck.toml` in {}, so no orchestration named '{want}' exists",
+                    dir.display()
+                )
+            })?;
+            let orch = cfg
+                .orchestrations
+                .iter()
+                // Skip roleless entries: two entries can resolve to the SAME name
+                // (e.g. an unnamed `roles = []` plus a real one), and without this
+                // filter `find` could return the empty one and refuse a target the
+                // listing legitimately offered.
+                .filter(|o| !o.roles.is_empty())
+                .find(|o| resolve_orchestration_name(&o.name, dir) == *want)
+                .ok_or_else(|| {
+                    let available: Vec<String> = cfg
+                        .orchestrations
+                        .iter()
+                        .filter(|o| !o.roles.is_empty())
+                        .map(|o| resolve_orchestration_name(&o.name, dir))
+                        .collect();
+                    if available.is_empty() {
+                        format!("no orchestration named '{want}', and none are defined")
+                    } else {
+                        format!(
+                            "no orchestration named '{want}'; available: {}",
+                            available.join(", ")
+                        )
+                    }
+                })?;
+            if orch.roles.is_empty() {
+                return Err(format!("orchestration '{want}' defines no roles"));
+            }
+            Ok(SpawnTarget::Orchestration {
+                name: resolve_orchestration_name(&orch.name, dir),
+                roles: roles_of(orch),
+                config: Box::new(orch.clone()),
+            })
+        }
+    }
+}
+
+/// Flatten one orchestration's configured roles into [`RoleSpawn`]s.
+fn roles_of(orch: &crate::project_config::OrchestrationConfig) -> Vec<RoleSpawn> {
+    orch.roles
+        .iter()
+        .enumerate()
+        .map(|(i, r)| RoleSpawn {
+            role_index: i,
+            role_name: r.name.clone(),
+            command: r.command.clone(),
+            is_start_role: r.start,
+        })
+        .collect()
 }
 
 /// Decide what to open from the target dir's config and the schedule's command.
@@ -181,18 +341,11 @@ pub fn decide_target(
         && !orch.roles.is_empty()
     {
         let name = resolve_orchestration_name(&orch.name, dir);
-        let roles = orch
-            .roles
-            .iter()
-            .enumerate()
-            .map(|(i, r)| RoleSpawn {
-                role_index: i,
-                role_name: r.name.clone(),
-                command: r.command.clone(),
-                is_start_role: r.start,
-            })
-            .collect();
-        return SpawnTarget::Orchestration { name, roles };
+        return SpawnTarget::Orchestration {
+            name,
+            roles: roles_of(orch),
+            config: Box::new(orch.clone()),
+        };
     }
     SpawnTarget::SingleAgent {
         command: schedule_command.map(|c| c.to_string()),
@@ -246,9 +399,18 @@ pub async fn spawn(
         });
     }
 
-    // 2. Branch on the target dir's config.
-    let config = load_config_for_dir(dir);
-    let target = decide_target(config.as_ref(), dir, req.command.as_deref());
+    // 2. Branch on the target dir's config, unless the caller chose explicitly
+    //    (PRD #220 `dispatch --single` / `--orchestration`). A named
+    //    orchestration that the dir does not define is an error, never a silent
+    //    fallback to something the user did not pick.
+    let target = match req.resolved_target.clone() {
+        Some(t) => t,
+        None => decide_target(
+            load_config_for_dir(dir).as_ref(),
+            dir,
+            req.command.as_deref(),
+        ),
+    };
 
     // 3. Spawn + deliver.
     match target {
@@ -314,7 +476,11 @@ pub async fn spawn(
                 on_tab_closed: None,
             })
         }
-        SpawnTarget::Orchestration { name, roles } => {
+        SpawnTarget::Orchestration {
+            name,
+            roles,
+            config: orch_config,
+        } => {
             let orch_idx = orchestrator_role_index(&roles);
             let mut agents = Vec::with_capacity(roles.len());
             // PRD #127 readiness gate: SUBSCRIBE before any pane is spawned so
@@ -366,6 +532,33 @@ pub async fn spawn(
             if let Some(tx) = event_tx {
                 surface_spawned_orchestration(tx, &name, &req.working_dir, &roles, &agents);
             }
+            // PRD #222 parity: compose the ORCHESTRATOR CONTEXT, exactly as the
+            // interactive `Ctrl+n` path does, instead of delivering the caller's
+            // task on its own.
+            //
+            // Without this the orchestrator was never told that it IS an
+            // orchestrator, which roles exist, or how to `delegate` — so it acted
+            // on the task alone and every worker sat idle waiting for a delegation
+            // that could not arrive. In a six-role repo that is one working agent
+            // and five idle ones, and it looks like it worked.
+            //
+            // The caller's task is folded INTO the context file rather than
+            // concatenated onto the pointer line, because a multi-line prompt does
+            // not submit reliably through a PTY and task text is arbitrary. If the
+            // file cannot be written we fall back to the bare task rather than
+            // delivering nothing — a degraded orchestrator still beats a silent one.
+            let prompt = if req.compose_orchestrator_context {
+                crate::orchestrator_context::prepare_orchestrator_prompt(
+                    &orch_config,
+                    &req.working_dir,
+                    Some(req.prompt.as_str()),
+                )
+                .unwrap_or_else(|| req.prompt.clone())
+            } else {
+                // #120 / #127: unchanged — the prompt is delivered verbatim. See
+                // `compose_orchestrator_context` for why this is not flipped here.
+                req.prompt.clone()
+            };
             // Deliver the prompt to the orchestrator role pane, gated on that
             // pane's readiness (its registry agent_id is the gate's match key).
             let delivery_pane_id = agents[orch_idx].pane_id.clone();
@@ -375,7 +568,7 @@ pub async fn spawn(
                 delivery_pane_id.clone(),
                 delivery_agent_id,
                 event_rx,
-                req.prompt.clone(),
+                prompt,
                 detach_delivery,
             )
             .await;
@@ -985,7 +1178,7 @@ mod tests {
         // The schedule command is ignored for the orchestration branch.
         let t = decide_target(Some(&cfg), dir, Some("ignored"));
         match t {
-            SpawnTarget::Orchestration { name, roles } => {
+            SpawnTarget::Orchestration { name, roles, .. } => {
                 assert_eq!(name, "digest");
                 assert_eq!(roles.len(), 2);
                 assert_eq!(roles[0].role_name, "orchestrator");
@@ -996,6 +1189,168 @@ mod tests {
             }
             other => panic!("expected orchestration, got {other:?}"),
         }
+    }
+
+    // --- PRD #220: the caller's explicit shape override ---
+
+    fn two_orchestration_config() -> ProjectConfig {
+        parse_config(
+            "[[orchestrations]]\nname = \"digest\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"sh\"\n\n\
+             [[orchestrations]]\nname = \"review\"\n\n\
+             [[orchestrations.roles]]\nname = \"lead\"\ncommand = \"cat\"\nstart = true\n",
+        )
+    }
+
+    /// `None` must leave the config-derived behaviour byte-for-byte unchanged —
+    /// that is what keeps the scheduler and issue-dispatch producers untouched.
+    #[test]
+    fn shape_override_absent_matches_plain_decide_target() {
+        let cfg = two_orchestration_config();
+        let dir = Path::new("/tmp/x");
+        for cmd in [Some("claude"), None] {
+            assert_eq!(
+                decide_target_with_override(Some(&cfg), dir, cmd, None),
+                Ok(decide_target(Some(&cfg), dir, cmd))
+            );
+            assert_eq!(
+                decide_target_with_override(None, dir, cmd, None),
+                Ok(decide_target(None, dir, cmd))
+            );
+        }
+    }
+
+    /// The "verify these PRs" case: one agent, even though the repo defines
+    /// orchestrations. Without the override this dir always yields a team.
+    #[test]
+    fn shape_override_single_agent_wins_over_config_orchestrations() {
+        let cfg = two_orchestration_config();
+        let dir = Path::new("/tmp/x");
+        assert!(matches!(
+            decide_target(Some(&cfg), dir, Some("claude")),
+            SpawnTarget::Orchestration { .. }
+        ));
+        assert_eq!(
+            decide_target_with_override(
+                Some(&cfg),
+                dir,
+                Some("claude"),
+                Some(&SpawnShapeOverride::SingleAgent)
+            ),
+            Ok(SpawnTarget::SingleAgent {
+                command: Some("claude".to_string())
+            })
+        );
+    }
+
+    /// A bare `--orchestration` takes the dir's first (matching the config
+    /// default); a named one picks that orchestration even when it is NOT first.
+    #[test]
+    fn shape_override_orchestration_by_name_selects_beyond_the_first() {
+        let cfg = two_orchestration_config();
+        let dir = Path::new("/tmp/x");
+
+        let first = decide_target_with_override(
+            Some(&cfg),
+            dir,
+            None,
+            Some(&SpawnShapeOverride::Orchestration(None)),
+        );
+        assert!(matches!(
+            first,
+            Ok(SpawnTarget::Orchestration { ref name, .. }) if name == "digest"
+        ));
+
+        let second = decide_target_with_override(
+            Some(&cfg),
+            dir,
+            None,
+            Some(&SpawnShapeOverride::Orchestration(Some("review".into()))),
+        );
+        match second {
+            Ok(SpawnTarget::Orchestration { name, roles, .. }) => {
+                assert_eq!(name, "review");
+                assert_eq!(
+                    roles.len(),
+                    1,
+                    "the SECOND orchestration's roles, not the first's"
+                );
+                assert_eq!(roles[0].role_name, "lead");
+            }
+            other => panic!("expected the named orchestration, got {other:?}"),
+        }
+    }
+
+    /// A name the dir does not define must ERROR, never silently fall back —
+    /// spawning something other than what the user chose is the exact surprise
+    /// this selector exists to remove. The message names what IS available.
+    #[test]
+    fn shape_override_unknown_orchestration_errors_and_lists_available() {
+        let cfg = two_orchestration_config();
+        let dir = Path::new("/tmp/x");
+        let err = decide_target_with_override(
+            Some(&cfg),
+            dir,
+            None,
+            Some(&SpawnShapeOverride::Orchestration(Some("nope".into()))),
+        )
+        .expect_err("an unknown orchestration name must not silently fall back");
+        assert!(err.contains("nope"), "error must name the request: {err}");
+        assert!(
+            err.contains("digest") && err.contains("review"),
+            "error must list the available orchestrations: {err}"
+        );
+    }
+
+    /// Asking for an orchestration where none is defined errors too, rather than
+    /// quietly starting a single agent the user did not ask for.
+    #[test]
+    fn shape_override_orchestration_without_any_defined_errors() {
+        let dir = Path::new("/tmp/x");
+        let bare = decide_target_with_override(
+            None,
+            dir,
+            Some("claude"),
+            Some(&SpawnShapeOverride::Orchestration(None)),
+        );
+        assert!(bare.is_err(), "no config → no orchestration to start");
+
+        let modes_only = parse_config("[[modes]]\nname = \"dev\"\n");
+        assert!(
+            decide_target_with_override(
+                Some(&modes_only),
+                dir,
+                None,
+                Some(&SpawnShapeOverride::Orchestration(None))
+            )
+            .is_err(),
+            "a config with modes but no orchestrations → error"
+        );
+    }
+
+    /// A roleless `[[orchestrations]]` is skipped by `decide_target`, so naming it
+    /// must error rather than spawn an empty team.
+    #[test]
+    fn shape_override_roleless_orchestration_errors() {
+        // `roles` carries no serde default, so the empty list must be explicit.
+        let cfg = parse_config("[[orchestrations]]\nname = \"empty\"\nroles = []\n");
+        let dir = Path::new("/tmp/x");
+        assert!(
+            decide_target_with_override(
+                Some(&cfg),
+                dir,
+                None,
+                Some(&SpawnShapeOverride::Orchestration(Some("empty".into())))
+            )
+            .is_err(),
+            "an orchestration with no roles is not a spawnable target"
+        );
+        // And it is invisible to `--list-targets`, so it is never offered.
+        assert!(
+            crate::dispatch::available_orchestrations(Some(&cfg), dir).is_empty(),
+            "a roleless orchestration must not be listed as a target"
+        );
     }
 
     #[test]

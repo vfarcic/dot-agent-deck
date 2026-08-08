@@ -1465,7 +1465,8 @@ fn form_007_issue_dispatch_option_seeds_issue_dispatch_authoring() {
     deck.send_keys(b"\x0e"); // Ctrl+n → directory picker
     deck.send_keys(b" "); // Space → confirm current dir → new-pane form
     deck.wait_for_string("No mode"); // Mode field is up (cycler at "No mode")
-    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8
+    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C"); // Right ×8 → saturate
+    deck.send_keys(b"\x1b[D"); // Left ×1 → schedule: issues (before dispatcher)
     // The dialog title becomes "… — schedule: issues mode" only when the
     // issue-dispatch option is the SELECTED one, so it is a selection-dependent
     // signal (the bare `[schedule: issues]` chip renders at every cycler index).

@@ -108,7 +108,7 @@ pub struct ModeRule {
     pub interval: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct OrchestrationConfig {
     #[serde(default)]
     pub name: String,
@@ -206,7 +206,7 @@ impl OrchestrationConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct OrchestrationRoleConfig {
     pub name: String,
     pub command: String,

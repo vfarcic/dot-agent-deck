@@ -98,6 +98,15 @@ pub fn show_issue_dispatch_authoring() -> bool {
     experimental_enabled()
 }
 
+/// Production wrapper for the dispatcher mode in the new-pane Mode cycler
+/// (PRD #220). One wrapper per feature (CLAUDE.md #9) so `grep show_dispatcher`
+/// finds the single gate at graduation. Like `show_issue_dispatch_authoring`, this
+/// is a *presentation* switch: it gates ONLY the `dispatcher` cycler option in
+/// `src/ui.rs`; the underlying `dispatch` CLI and daemon handler run unconditionally.
+pub fn show_dispatcher() -> bool {
+    experimental_enabled()
+}
+
 /// Guards [`init_and_watch`] so the periodic watcher thread is spawned at
 /// most once per process (reviewer #4 / audit INFO-3): a second call is a
 /// no-op rather than leaking a duplicate poll thread.
