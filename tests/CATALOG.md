@@ -1932,6 +1932,34 @@ without depending on the config struct API.
 - **Does not assert:** the time spent in the recovery path.
 - **Platform coverage:** mac+linux.
 
+##### error/socket/003 — `request_from_socket` returns `None` within a bounded wait against a daemon that reads the request and then never replies and never closes, instead of hanging forever.
+- **Layer:** L1 (`src/hook.rs`'s `#[cfg(test)] mod tests`; a synthetic stub daemon over a real temp Unix socket, no PTY, no daemon binary, no real agent).
+- **Agent:** none (a `std::thread` stub daemon that accepts one connection, reads the request line, then sleeps well past the bound without replying or closing).
+- **Asserts:** `request_from_socket`, driven on a worker thread and awaited via `mpsc::recv_timeout` at 15s (comfortably above the production 5s bound the fix adds), returns before the 15s bound and the returned value is exactly `None` — a timed-out/unbounded daemon must fold into the same "no seed" bucket as a daemon that closes without replying, not a distinct outcome. A `RecvTimeoutError::Timeout` is treated as the RED failure (`request_from_socket` is unbounded) and fails the test with an explicit panic message rather than hanging until nextest's own timeout.
+- **Does not assert:** the exact timeout duration chosen by the fix (only that it is comfortably under 15s); `SocketReply`'s three-way outcome (only `request_from_socket`'s two-way `None` collapse is exercised here — the richer outcome exists for a not-yet-submitted caller); real daemon behavior; Windows named-pipe timeout semantics.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
+##### error/socket/004 — `request_from_socket` still returns the reply from a daemon that is merely slow, not absent — a bound that fires too eagerly must not be mistaken for "no seed".
+- **Layer:** L1 (`src/hook.rs`'s `#[cfg(test)] mod tests`; same synthetic stub-daemon setup as `error/socket/003`).
+- **Agent:** none (a `std::thread` stub daemon that accepts one connection, reads the request line, sleeps 300ms — comfortably inside the production 5s bound — then writes one JSON reply line).
+- **Asserts:** `request_from_socket` returns `Some("{\"seed\":\"abc123\"}")` — the exact reply line, unmodified — proving the timeout bound added for `error/socket/003` does not fire against a daemon that is merely slow. Passes both before and after the fix; it is a correctness control, not a timing measurement, and the delay is deliberately far from the 5s bound to avoid flaking under scheduler jitter.
+- **Does not assert:** the timeout duration itself (`error/socket/003` pins the unbounded-hang failure mode; this test never reaches the bound); daemon behavior beyond a single reply line; real daemon timing.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
+##### error/socket/005 — `request_from_socket` still hangs against a peer that dribbles one non-newline byte just before each per-read timeout, because every byte resets it.
+- **Layer:** L1 (`src/hook.rs`'s `#[cfg(test)] mod tests`; same synthetic stub-daemon setup as `error/socket/003`/`004`).
+- **Agent:** none (a `std::thread` stub daemon that accepts one connection, reads the request line, then writes a single non-newline byte every 200ms for 20s without ever sending a newline).
+- **Asserts:** `request_from_socket`, driven on a worker thread and awaited via `mpsc::recv_timeout` at a 15s ceiling — comfortably above whatever operation-level deadline the fix adds, and comfortably inside the 20s the drip keeps running — returns before the ceiling. A `RecvTimeoutError::Timeout` is the RED failure (the per-read timeout keeps getting reset and never fires) and fails the test with an explicit panic rather than hanging until nextest's own timeout. Deliberately does not pin the exact deadline value so it keeps passing once any sane operation-level bound exists.
+- **Does not assert:** the exact operation-level deadline chosen by the fix; the reply-length cap (a separate, deliberately out-of-scope follow-up); any other caller of the shared, vulnerable `request_from_socket_inner` code path with a different timeout value — this test exercises the choke point itself, so any future caller inherits the same coverage.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
+##### error/socket/006 — A daemon that closes without writing any bytes back folds into `SocketReply::NoReply`, not `SocketReply::Line("")`.
+- **Layer:** L1 (`src/hook.rs`'s `#[cfg(test)] mod tests`; same synthetic stub-daemon setup as `error/socket/003`/`004`/`005`).
+- **Agent:** none (a `std::thread` stub daemon that accepts one connection, reads the request line, then closes without writing a single byte).
+- **Asserts:** `request_from_socket_at` returns `SocketReply::NoReply`. Before the fix, an EOF with an empty in-progress buffer returned `Some(String::new())` (`SocketReply::Line("")`), contradicting `SocketReply::NoReply`'s own doc comment, which already names "the daemon closed without answering" as a `NoReply` case.
+- **Does not assert:** the *partial*-line-then-EOF case (some bytes written, then closed before the newline) — that is deliberately left returning `Line(partial)`, unchanged by this fix; `SocketReply::Unreachable`; timing.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
 #### error/config
 
 ##### error/config/001 — `.dot-agent-deck.toml` with an invalid regex makes the new-pane form refuse the mode and surface a status-line message.
