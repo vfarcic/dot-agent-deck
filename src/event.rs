@@ -650,6 +650,133 @@ pub struct GetSeedResponse {
     pub seed: Option<String>,
 }
 
+/// Issues #309 / #330: the daemon's reply to a [`DaemonMessage::Delegate`],
+/// written as a single JSON line back on the hook-socket connection.
+///
+/// `delegate` used to be fire-and-forget: the CLI flushed its request and
+/// exited 0 whatever the daemon then did with it. A delegation routed to three
+/// workers, one refused for coming from a worker pane, and one naming a role no
+/// pane answers to were all indistinguishable to the caller — exit 0, no output.
+///
+/// #330 is what that costs. With no way to tell a delivered delegation from a
+/// dropped one, an orchestrator re-ran the identical command to find out, which
+/// superseded the delegation it had just armed and — under the default
+/// `clear = true` — SIGTERMed the very worker it was checking on. The surviving
+/// record then produced a false idle-worker report two hours later.
+///
+/// Like [`GetSeedResponse`] this rides the UNVERSIONED hook socket and does not
+/// move the attach `PROTOCOL_VERSION` — see the cross-version note on
+/// [`DaemonMessage::GetSeed`]. An older CLI never reads the line (the daemon's
+/// write is best-effort, so the resulting EPIPE is ignored); a newer CLI against
+/// an older daemon reads no line and degrades to the previous fire-and-forget
+/// behaviour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegateResponse {
+    /// Did the daemon route the task to at least one worker pane?
+    ///
+    /// `false` means nothing was armed and nothing was dispatched — the caller's
+    /// delegation had no effect whatsoever.
+    ///
+    /// `true` means **accepted, routed and armed — NOT delivered.**
+    /// [`crate::state::AppState::handle_delegate`] returns as soon as the
+    /// per-target dispatch tasks are spawned, deliberately, so the CLI does not
+    /// block on an up-to-30s respawn + `SessionStart` wait. Any wording built on
+    /// this field must not claim the worker received anything.
+    pub ok: bool,
+    /// Why the delegation was refused, when `ok` is `false`.
+    ///
+    /// Phrased for an agent reading it back out of its own tool output, so it
+    /// names the remedy rather than only the diagnosis — a rejection nobody can
+    /// act on teaches nobody (#309).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// One entry per worker pane the task was routed to, in fan-out order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegated: Vec<DelegateAck>,
+    /// Non-fatal advisories: a role in `--to` that matched no pane while others
+    /// did, a role repeated within one signal, or an outstanding delegation this
+    /// one superseded. Each is a complete sentence — the CLI prints them
+    /// verbatim, one per line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+impl DelegateResponse {
+    /// A refusal: nothing armed, nothing dispatched, `reason` explaining both
+    /// what happened and what to do about it.
+    pub fn refused(reason: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            error: Some(reason.into()),
+            delegated: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+}
+
+/// One `(role, pane)` pair a [`DaemonMessage::Delegate`] was routed to. The pane
+/// id is included because it is the only handle that distinguishes two panes
+/// holding the same role, and it is what the caller needs in order to go look at
+/// the pane it just handed work to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegateAck {
+    pub role: String,
+    pub pane_id: String,
+}
+
+/// Issues #309 / #330: the daemon's reply to a [`DaemonMessage::WorkDone`],
+/// written as a single JSON line back on the hook-socket connection.
+///
+/// Same silence, same cost, one important difference:
+/// [`crate::state::AppState::handle_work_done`] *awaits* the feedback write into
+/// the orchestrator's pane before it returns, so unlike [`DelegateResponse`]
+/// this reply can honestly report DELIVERY rather than acceptance. That covers
+/// the failure `docs/orchestration.md` currently documents as unobservable —
+/// "if the orchestrator's pane is closed, the feedback write fails silently" —
+/// by telling the reporting worker that its report reached nobody.
+///
+/// Rides the unversioned hook socket on the same terms as [`DelegateResponse`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkDoneResponse {
+    /// Did the completion reach an orchestrator?
+    ///
+    /// `true` also covers the orchestrator's own `--done`, which completes the
+    /// orchestration and has no one to report to by design.
+    pub ok: bool,
+    /// Why the completion reached nobody, when `ok` is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The orchestrator pane the feedback line was written into, when one was
+    /// found and the write succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_to: Option<String>,
+    /// Where the daemon wrote the summary, when it wrote one.
+    ///
+    /// Worth reporting on its own: the daemon's output path is role-keyed and
+    /// predictable, so a worker that chose the same path for its `--task-file`
+    /// input has just had that input overwritten (#331). Naming the path is the
+    /// caller's only chance to notice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_path: Option<String>,
+    /// Non-fatal advisories — a summary file that could not be written while the
+    /// feedback still landed, and similar partial outcomes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+impl WorkDoneResponse {
+    /// A refusal: the completion reached nobody and nothing was recorded.
+    pub fn refused(reason: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            error: Some(reason.into()),
+            reported_to: None,
+            summary_path: None,
+            warnings: Vec::new(),
+        }
+    }
+}
+
 /// Signal sent by the orchestrator via `dot-agent-deck delegate`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateSignal {

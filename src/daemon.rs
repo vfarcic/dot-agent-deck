@@ -974,6 +974,33 @@ async fn run_idle_monitor(
     }
 }
 
+/// Write one JSON line of reply back on a hook-socket connection, best-effort.
+///
+/// Issues #309 / #330: shared by every answering verb on this socket so they
+/// cannot drift into different framing — one line, newline-terminated, flushed.
+///
+/// Every failure is deliberately ignored. A CLI older than the reply it is being
+/// sent has already closed its read side, which surfaces here as EPIPE; a
+/// serialization failure is a bug in the payload, not something the daemon can
+/// act on mid-connection. In both cases the daemon's own work is already done —
+/// the delegate is armed, the completion is delivered — and taking the
+/// connection handler down over an unheard reply would turn a cosmetic problem
+/// into a real one. This is precisely what lets these replies be added without a
+/// `PROTOCOL_VERSION` bump.
+async fn write_json_line<W, T>(write_half: &mut W, payload: &T)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    T: serde::Serialize,
+{
+    let Ok(json) = serde_json::to_string(payload) else {
+        warn!("failed to serialize a hook-socket reply; sending nothing");
+        return;
+    };
+    let line = format!("{json}\n");
+    let _ = write_half.write_all(line.as_bytes()).await;
+    let _ = write_half.flush().await;
+}
+
 async fn run_hook_loop(
     listener: IpcListener,
     state: SharedState,
@@ -1004,9 +1031,14 @@ async fn run_hook_loop(
                 let pty_registry = pty_registry.clone();
                 tokio::spawn(async move {
                     // PRD #201: split so the read-only `get-seed` verb can write
-                    // a reply back on the same connection. Every other message
-                    // on this socket is fire-and-forget, so the write half is
-                    // only ever used by the `GetSeed` arm below.
+                    // a reply back on the same connection.
+                    //
+                    // Issues #309 / #330: `delegate` and `work-done` now answer
+                    // on the same seam. Every reply is best-effort — an older
+                    // CLI never reads the line and simply closes, so the write
+                    // fails with EPIPE and is ignored. The daemon must not care
+                    // whether anyone is listening; that is what makes adding
+                    // these replies safe without a `PROTOCOL_VERSION` bump.
                     let (read_half, mut write_half) = tokio::io::split(stream);
                     let reader = tokio::io::BufReader::new(read_half);
                     let mut lines = reader.lines();
@@ -1034,11 +1066,18 @@ async fn run_hook_loop(
                                     // `SessionStart` event before writing
                                     // the prompt (event-driven readiness,
                                     // replacing the F9 250ms fixed delay).
-                                    state
+                                    let resp = state
                                         .read()
                                         .await
                                         .handle_delegate(signal, &pty_registry, &event_tx)
                                         .await;
+                                    info!(
+                                        ok = resp.ok,
+                                        delegated = resp.delegated.len(),
+                                        warnings = resp.warnings.len(),
+                                        "Answered delegate signal"
+                                    );
+                                    write_json_line(&mut write_half, &resp).await;
                                 }
                                 DaemonMessage::WorkDone(signal) => {
                                     info!(
@@ -1046,7 +1085,17 @@ async fn run_hook_loop(
                                         done = signal.done,
                                         "Received work-done signal"
                                     );
-                                    state.read().await.handle_work_done(signal, &pty_registry).await;
+                                    let resp = state
+                                        .read()
+                                        .await
+                                        .handle_work_done(signal, &pty_registry)
+                                        .await;
+                                    info!(
+                                        ok = resp.ok,
+                                        reported_to = ?resp.reported_to,
+                                        "Answered work-done signal"
+                                    );
+                                    write_json_line(&mut write_half, &resp).await;
                                 }
                                 DaemonMessage::GetSeed(req) => {
                                     // PRD #201 native prompt delivery: hand the
@@ -1065,12 +1114,7 @@ async fn run_hook_loop(
                                     );
                                     let resp =
                                         crate::event::GetSeedResponse { seed };
-                                    if let Ok(json) = serde_json::to_string(&resp) {
-                                        let line = format!("{json}\n");
-                                        let _ =
-                                            write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
-                                    }
+                                    write_json_line(&mut write_half, &resp).await;
                                 }
                             }
                         } else if let Ok(event) = serde_json::from_str::<AgentEvent>(&line) {

@@ -8,8 +8,9 @@ use tracing::warn;
 use crate::agent_pty::AgentPtyRegistry;
 use crate::config_validation::sanitize_role_name;
 use crate::event::{
-    AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateSignal, EventType,
-    LiveTarget, OrchestrationSurface, WorkDoneSignal, Writable,
+    AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, DelegateAck, DelegateResponse,
+    DelegateSignal, EventType, LiveTarget, OrchestrationSurface, WorkDoneResponse, WorkDoneSignal,
+    Writable,
 };
 use crate::project_config::{
     DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES, OrchestrationRoleConfig, load_project_config,
@@ -421,6 +422,25 @@ impl OrchestrationIdentity {
             OrchestrationIdentity::NameCwd { name, .. } => name,
         }
     }
+}
+
+/// Issues #309 / #330: where a `delegate` fans out to, **and** which requested
+/// roles produced nothing. Returned by [`AppState::delegate_routing`].
+///
+/// The two failure lists are separate because they mean different things to the
+/// caller. An unresolved role is a mistake to fix — a typo, a renamed role, a
+/// closed pane, a cross-tab delegate. A duplicate role inside one signal is
+/// harmless and already de-duplicated (PRD #126 M1 audit finding 3); it is
+/// reported only so the caller learns the second mention did nothing, rather
+/// than believing it doubled the work.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DelegateRouting {
+    /// `(target_role, pane_id)` pairs in the order the dispatcher will use them.
+    pub targets: Vec<(String, String)>,
+    /// Requested roles that matched no worker pane in this orchestration.
+    pub unresolved_roles: Vec<String>,
+    /// Roles named more than once in a single signal; the repeats were ignored.
+    pub duplicate_roles: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1065,6 +1085,16 @@ fn orchestration_still_matches(
 /// `Instance` variant carries no cwd, so `orchestration_cwd` is resolved by the
 /// caller (see [`AppState::orchestration_cwd_of`]) and passed separately rather
 /// than read back out of the identity.
+///
+/// Issue #330: returns how long the delegation this one displaced had been
+/// outstanding, when it displaced one, so `handle_delegate` can report the
+/// supersede to the caller. Note the coupling this creates, deliberately and
+/// with a limit: the fact is a by-product of arming the idle record, so with the
+/// detector disabled (`worker_response_timeout_minutes = 0`) there is no record
+/// to compare against and a supersede goes unreported. That is the correct
+/// trade — an operator who switched the detector off is not owed its
+/// book-keeping — but it does mean the warning is a property of the detector
+/// being on, not a guarantee of the delegate contract.
 fn arm_idle_worker_watch_for_delegation(
     registry: &Arc<AgentPtyRegistry>,
     worker_pane_id: &str,
@@ -1073,14 +1103,14 @@ fn arm_idle_worker_watch_for_delegation(
     orchestration: Option<&OrchestrationIdentity>,
     orchestration_cwd: Option<&str>,
     worker_cwd: Option<&str>,
-) {
+) -> Option<std::time::Duration> {
     let Some(timeout) = worker_response_timeout(orchestration_cwd, worker_cwd) else {
         tracing::debug!(
             pane_id = %worker_pane_id,
             role = %role,
             "idle-worker detector disabled; no watch armed for this delegation"
         );
-        return;
+        return None;
     };
     let Some(orchestrator_agent_id) = registry.pane_current_agent_id(orchestrator_pane_id) else {
         warn!(
@@ -1089,7 +1119,7 @@ fn arm_idle_worker_watch_for_delegation(
             "idle-worker watch not armed: no live agent owns the orchestrator pane, so an idle \
              prompt could not be bound to a verifiable delivery target"
         );
-        return;
+        return None;
     };
     let Some(armed) = registry.arm_outstanding_delegation(
         worker_pane_id,
@@ -1103,14 +1133,24 @@ fn arm_idle_worker_watch_for_delegation(
             role = %role,
             "idle-worker watch not armed: the worker or orchestrator pane is closing"
         );
-        return;
+        return None;
     };
+    let superseded_previous = armed.superseded_previous;
+    if let Some(outstanding_for) = superseded_previous {
+        warn!(
+            pane_id = %worker_pane_id,
+            role = %role,
+            outstanding_for_secs = outstanding_for.as_secs(),
+            "delegate: superseded an outstanding delegation for this worker"
+        );
+    }
     arm_idle_worker_watch(
         Arc::clone(registry),
         worker_pane_id.to_string(),
         armed,
         timeout,
     );
+    superseded_previous
 }
 
 /// PRD #126: arm the idle watch for one just-armed delegation. Spawns a task
@@ -1149,7 +1189,11 @@ fn arm_idle_worker_watch(
     armed: crate::agent_pty::ArmedDelegation,
     timeout: std::time::Duration,
 ) {
-    let crate::agent_pty::ArmedDelegation { seq, cancel } = armed;
+    let crate::agent_pty::ArmedDelegation {
+        seq,
+        cancel,
+        superseded_previous: _,
+    } = armed;
     tokio::spawn(async move {
         tokio::select! {
             _ = tokio::time::sleep(timeout) => {}
@@ -1705,6 +1749,50 @@ fn lookup_orchestration_role(
         .into_iter()
         .find(|o| o.name == orchestration_name)?;
     orch.roles.into_iter().find(|r| r.name == role_name)
+}
+
+/// Issue #330: does delegating to `role` restart the worker, discarding whatever
+/// it was doing? `None` when the answer cannot be determined — no worker cwd, no
+/// orchestration identity, or a role that is no longer in the config.
+///
+/// Only consulted when a delegate actually superseded an outstanding one, since
+/// it costs the same config read [`lookup_orchestration_role`] does and the
+/// answer is only interesting when there was live work to lose. `None` is
+/// reported as an unqualified supersede rather than guessed either way: the
+/// dispatcher treats a missing role config as "no respawn", but it also warns
+/// about that separately, and asserting "your worker kept its session" on the
+/// strength of a config we failed to read would be the wrong thing to be
+/// confident about.
+fn delegate_role_clears(
+    worker_cwd: Option<&str>,
+    orchestration: Option<&OrchestrationIdentity>,
+    role_name: &str,
+) -> Option<bool> {
+    let cwd = worker_cwd?;
+    let identity = orchestration?;
+    lookup_orchestration_role(cwd, identity.name(), role_name).map(|role| role.clear)
+}
+
+/// Issues #309 / #330: render role names for a caller-facing message.
+///
+/// `{:?}` rather than bare interpolation is load-bearing, not styling. These
+/// strings are echoed back into an agent's context, and the CLI's contract is
+/// one warning per line — a role name carrying a newline, a control character or
+/// a stray quote would otherwise break that framing. Rust's `Debug` for `str`
+/// quotes the value and escapes exactly those characters.
+///
+/// Deliberately NOT [`quote_untrusted_role`]'s frame: that exists for text the
+/// daemon *injects into an unrelated agent's input* as a user turn, where the
+/// role label arrives from project config the receiving agent never chose. Here
+/// the names are the caller's own `--to` arguments being read back to it in its
+/// own tool output, so the heavyweight frame would add noise without closing a
+/// gap.
+fn quote_role_list(roles: &[String]) -> String {
+    roles
+        .iter()
+        .map(|role| format!("{role:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// PRD #225 M3: does this `SessionStart` mean "the agent can accept input", or
@@ -2720,13 +2808,35 @@ impl AppState {
     /// without spawning PTYs — `handle_delegate` itself only does I/O once
     /// this has decided the targets, so a test of this function is a test of
     /// where a delegate actually lands (M5.0).
+    ///
+    /// Issues #309 / #330: this is now a thin projection of
+    /// [`Self::delegate_routing`], which additionally reports the roles that
+    /// resolved to nothing. Kept as its own method because the routing *set* is
+    /// what a decade of tests here assert on, and those assertions should not
+    /// have to care that the daemon now also explains itself to the caller.
     pub fn delegate_targets(&self, sender_pane_id: &str, to: &[String]) -> Vec<(String, String)> {
+        self.delegate_routing(sender_pane_id, to).targets
+    }
+
+    /// [`Self::delegate_targets`] plus the reasons a requested role produced no
+    /// target — the half that used to exist only as a `warn!` in the daemon log.
+    ///
+    /// Issue #330 is about a `delegate` that reports success whatever happens,
+    /// and the widest version of that is not either early return #309 names: it
+    /// is a `--to` role that matches no pane in the orchestration. A typo, a
+    /// role renamed in `.dot-agent-deck.toml`, a closed worker pane, or a
+    /// cross-tab delegate all land here, and all of them dispatch nothing, arm
+    /// nothing, and exit 0. `docs/orchestration.md` documents the symptom
+    /// ("Worker receives no task") and can only offer the daemon log as the
+    /// diagnostic, because until now there was nowhere else for it to go.
+    pub fn delegate_routing(&self, sender_pane_id: &str, to: &[String]) -> DelegateRouting {
         let orchestration = self.pane_orchestration_map.get(sender_pane_id);
-        let mut targets: Vec<(String, String)> = Vec::new();
+        let mut routing = DelegateRouting::default();
         let mut seen_roles: HashSet<&str> = HashSet::new();
         for target_role in to {
             if !seen_roles.insert(target_role.as_str()) {
                 warn!(role = %target_role, "delegate: duplicate target role in one signal; ignored");
+                routing.duplicate_roles.push(target_role.clone());
                 continue;
             }
             let mut role_panes: Vec<String> = self
@@ -2741,6 +2851,7 @@ impl AppState {
                 .collect();
             if role_panes.is_empty() {
                 warn!(role = %target_role, "delegate: no worker pane found for role");
+                routing.unresolved_roles.push(target_role.clone());
                 continue;
             }
             // `pane_role_map` is a `HashMap`, so its iteration order varies
@@ -2749,10 +2860,10 @@ impl AppState {
             // and tests reproducible.
             role_panes.sort();
             for pane_id in role_panes.drain(..) {
-                targets.push((target_role.clone(), pane_id));
+                routing.targets.push((target_role.clone(), pane_id));
             }
         }
-        targets
+        routing
     }
 
     /// The pure routing half of [`Self::handle_work_done`]: the orchestrator
@@ -2796,15 +2907,32 @@ impl AppState {
     /// same orchestration (via `pane_orchestration_map`) so a parallel
     /// orchestration tab's `coder` pane doesn't receive a sibling tab's
     /// task.
+    ///
+    /// Issues #309 / #330: returns a [`DelegateResponse`] describing which of
+    /// those outcomes actually occurred, so the caller stops having to guess.
+    /// Every path out of here used to be a bare `return` behind a `warn!`, which
+    /// made a routed delegation, an anti-spoofing rejection and a `--to` naming
+    /// a role no pane answers to identical from the CLI's side: exit 0, no
+    /// output. The daemon log held the answer and nobody was reading it.
+    ///
+    /// `ok` means **accepted, routed and armed — not delivered.** The per-target
+    /// dispatch is deliberately spawned rather than awaited (see the fan-out
+    /// loop below), so this returns before any prompt reaches a worker. Callers
+    /// must not phrase the reply as proof of receipt.
     pub async fn handle_delegate(
         &self,
         signal: DelegateSignal,
         registry: &Arc<AgentPtyRegistry>,
         event_tx: &broadcast::Sender<BroadcastMsg>,
-    ) {
+    ) -> DelegateResponse {
         if !self.pane_role_map.contains_key(&signal.pane_id) {
             warn!(pane_id = %signal.pane_id, "delegate from unknown pane");
-            return;
+            return DelegateResponse::refused(format!(
+                "pane {:?} is not known to this daemon (it has no role on record), so there is no \
+                 orchestration to delegate within. Usually DOT_AGENT_DECK_PANE_ID is wrong, or the \
+                 pane has not finished registering with its orchestration yet.",
+                signal.pane_id
+            ));
         }
         if !self.orchestrator_pane_ids.contains(&signal.pane_id) {
             let role = self
@@ -2813,7 +2941,12 @@ impl AppState {
                 .cloned()
                 .unwrap_or_default();
             warn!(pane_id = %signal.pane_id, role = %role, "delegate from non-orchestrator pane");
-            return;
+            return DelegateResponse::refused(format!(
+                "this pane holds the role {:?}, and only the orchestrator (the role with \
+                 `start = true`) may delegate. Delegation is one-way: if you are a worker, report \
+                 your own progress with `work-done` and let the orchestrator decide the next hop.",
+                role
+            ));
         }
 
         let orchestration = self.pane_orchestration_map.get(&signal.pane_id).cloned();
@@ -2824,9 +2957,53 @@ impl AppState {
         // `Instance` variant carries no cwd — see [`Self::orchestration_cwd_of`].
         let orchestration_cwd = self.orchestration_cwd_of(&signal.pane_id, registry);
         // PRD #140 M2.1: routing (same-orchestration identity + never the
-        // orchestrator's own pane) lives in `delegate_targets`, which also
+        // orchestrator's own pane) lives in `delegate_routing`, which also
         // applies PRD #126 M1 audit finding 3's duplicate-role de-duplication.
-        let targets = self.delegate_targets(&signal.pane_id, &signal.to);
+        let routing = self.delegate_routing(&signal.pane_id, &signal.to);
+        let DelegateRouting {
+            targets,
+            unresolved_roles,
+            duplicate_roles,
+        } = routing;
+
+        // Issue #330: nothing resolved, so nothing is armed and nothing is
+        // dispatched. This is the widest silent-success path of the three — a
+        // typo in `--to`, a role renamed in `.dot-agent-deck.toml`, a closed
+        // worker pane, or a delegate aimed across orchestration tabs all land
+        // here — and it is the one neither #309 nor #330 names.
+        if targets.is_empty() {
+            return DelegateResponse::refused(format!(
+                "no worker pane in this orchestration answers to {}. The role name must match the \
+                 `name` field in .dot-agent-deck.toml exactly (it is case-sensitive), and the \
+                 worker must be part of the same orchestration tab — you cannot delegate across \
+                 tabs. Nothing was delegated.",
+                quote_role_list(&signal.to)
+            ));
+        }
+
+        let mut warnings: Vec<String> = Vec::new();
+        // Partial fan-out: some roles routed, others did not. Not a refusal —
+        // real work was handed out — but the caller must not be left believing
+        // the roles that missed are working on anything.
+        if !unresolved_roles.is_empty() {
+            warnings.push(format!(
+                "no worker pane answers to {}; {} received nothing. Check the role name against \
+                 .dot-agent-deck.toml and that the pane is in this orchestration tab.",
+                quote_role_list(&unresolved_roles),
+                if unresolved_roles.len() == 1 {
+                    "that role"
+                } else {
+                    "those roles"
+                },
+            ));
+        }
+        if !duplicate_roles.is_empty() {
+            warnings.push(format!(
+                "{} named more than once in one delegate; the repeats were ignored and the task \
+                 was sent to each matching pane exactly once.",
+                quote_role_list(&duplicate_roles),
+            ));
+        }
 
         // PRD #92 F9 followup-6: async-dispatch. Each per-target future
         // runs in its own `tokio::spawn` so `handle_delegate` (and the
@@ -2848,6 +3025,7 @@ impl AppState {
         // overlap); per-pane work still serializes against itself via
         // the per-pane dispatch mutex acquired inside the task body —
         // see [`AgentPtyRegistry::pane_dispatch_lock`].
+        let mut delegated: Vec<DelegateAck> = Vec::new();
         for (target_role, pane_id) in targets {
             let registry = Arc::clone(registry);
             let event_tx = event_tx.clone();
@@ -2855,6 +3033,10 @@ impl AppState {
             let orchestrator_pane_id = signal.pane_id.clone();
             let task = signal.task.clone();
             let cwd = self.pane_cwd_map.get(&pane_id).cloned();
+            delegated.push(DelegateAck {
+                role: target_role.clone(),
+                pane_id: pane_id.clone(),
+            });
 
             // PRD #126: this worker now owes a `work-done`. Arm the record
             // (and its watch task) here, in the synchronous fan-out loop
@@ -2872,7 +3054,7 @@ impl AppState {
             // a disabled detector (`0`, PRD #126 M1 audit finding 4) arms no
             // record and spawns no task at all, and so the orchestrator's
             // registry identity is captured while the delegate is still live.
-            arm_idle_worker_watch_for_delegation(
+            let superseded_previous = arm_idle_worker_watch_for_delegation(
                 &registry,
                 &pane_id,
                 &target_role,
@@ -2881,6 +3063,43 @@ impl AppState {
                 orchestration_cwd.as_deref(),
                 cwd.as_deref(),
             );
+
+            // Issue #330: this delegate displaced one that was still outstanding
+            // — the exact state a confirmatory re-run produces, and the state the
+            // orchestrator protocol already forbids ("never send a new task to a
+            // worker that is still working"). It is legal and sometimes intended
+            // (interrupt-and-redirect), so it warns rather than refuses; what
+            // matters is that it stops being invisible until the false idle
+            // report arrives two hours later.
+            //
+            // The `clear` lookup is deliberately inside this branch. It reads
+            // `.dot-agent-deck.toml` from disk, and it is only worth paying for
+            // when there is actually a supersede to describe — which is rare,
+            // whereas this loop is the hot path. `dispatch_one_owned` resolves
+            // the same config again for the dispatch itself; duplicating the
+            // read on the rare path is cheaper than hoisting it onto every
+            // delegate, and it keeps the config snapshot the dispatcher acts on
+            // exactly where it was.
+            if let Some(outstanding_for) = superseded_previous {
+                let restarts =
+                    delegate_role_clears(cwd.as_deref(), orchestration.as_ref(), &target_role);
+                warnings.push(format!(
+                    "{:?} already had a delegation outstanding ({} ago); this one superseded it{}. \
+                     If you did not mean to interrupt it, that work is gone — the worker owes you \
+                     one work-done, not two.",
+                    target_role,
+                    format_idle_elapsed(outstanding_for),
+                    match restarts {
+                        Some(true) =>
+                            ", and because the role sets `clear = true` the worker was restarted, \
+                             discarding its in-progress session",
+                        Some(false) =>
+                            " (the role sets `clear = false`, so the worker kept its \
+                             session and now has two tasks in its transcript)",
+                        None => "",
+                    }
+                ));
+            }
 
             // PRD #249 M3: resolved HERE, next to the idle watch's own
             // resolution and for the same reasons — see [`SilenceWatch`]. The
@@ -2914,6 +3133,13 @@ impl AppState {
                 .await;
             });
         }
+
+        DelegateResponse {
+            ok: true,
+            error: None,
+            delegated,
+            warnings,
+        }
     }
 
     /// Handle a worker's work-done signal: write the per-role summary file
@@ -2930,7 +3156,24 @@ impl AppState {
     /// `done: true` from the orchestrator pane itself signals the whole
     /// orchestration is complete; we log and exit without writing back a
     /// "completed" prompt to the orchestrator (it just issued it).
-    pub async fn handle_work_done(&self, signal: WorkDoneSignal, registry: &AgentPtyRegistry) {
+    ///
+    /// Issues #309 / #330: returns a [`WorkDoneResponse`] so a worker learns
+    /// whether its report actually reached anyone. `work-done` was silent on
+    /// exactly the same terms as `delegate`, and it has one failure the
+    /// documentation already admits is invisible — `docs/orchestration.md`'s
+    /// "if the orchestrator's pane is closed, the feedback write fails silently,
+    /// [but] the `.dot-agent-deck/work-done-<role>.md` file is still written and
+    /// can be read manually". A worker that finished its task and reported into
+    /// the void had no way to know, and neither did anyone else until someone
+    /// wondered why the orchestrator never moved.
+    ///
+    /// Unlike [`Self::handle_delegate`] this awaits the feedback write, so `ok`
+    /// here really does mean **delivered**, not merely accepted.
+    pub async fn handle_work_done(
+        &self,
+        signal: WorkDoneSignal,
+        registry: &AgentPtyRegistry,
+    ) -> WorkDoneResponse {
         // PRD #126: the worker answered, so one outstanding delegation is
         // resolved. Retire FIRST — above every early return below — so an
         // unknown pane, an orchestrator's own `--done`, or a missing
@@ -3003,7 +3246,13 @@ impl AppState {
             Some(name) => name.clone(),
             None => {
                 warn!(pane_id = %signal.pane_id, "work-done from unknown pane");
-                return;
+                return WorkDoneResponse::refused(format!(
+                    "pane {:?} is not known to this daemon (it has no role on record), so there is \
+                     no orchestrator to report to and nothing was recorded. Usually \
+                     DOT_AGENT_DECK_PANE_ID is wrong, or the pane has not finished registering \
+                     with its orchestration yet.",
+                    signal.pane_id
+                ));
             }
         };
 
@@ -3014,19 +3263,44 @@ impl AppState {
                 task = %signal.task,
                 "orchestration complete (orchestrator --done)"
             );
-            return;
+            return WorkDoneResponse {
+                ok: true,
+                error: None,
+                reported_to: None,
+                summary_path: None,
+                warnings: Vec::new(),
+            };
         }
 
         // Write summary to .dot-agent-deck/work-done-{role}.md
         let safe_name = sanitize_role_name(&role_name);
+        let mut warnings: Vec<String> = Vec::new();
+        let mut summary_path: Option<String> = None;
         if let Some(cwd) = self.pane_cwd_map.get(&signal.pane_id) {
             let dir = std::path::Path::new(cwd).join(".dot-agent-deck");
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 warn!(dir = %dir.display(), role = %role_name, error = %e, "failed to create work-done directory");
+                warnings.push(format!(
+                    "could not create {}: {e}. The summary was not saved; the orchestrator will be \
+                     pointed at a file that is not there.",
+                    dir.display()
+                ));
             }
             let file_path = dir.join(format!("work-done-{safe_name}.md"));
             if let Err(e) = std::fs::write(&file_path, &signal.task) {
                 warn!(path = %file_path.display(), role = %role_name, error = %e, "failed to write work-done summary");
+                warnings.push(format!(
+                    "could not write {}: {e}. The summary was not saved; the orchestrator will be \
+                     pointed at a file that is not there.",
+                    file_path.display()
+                ));
+            } else {
+                // Reported even on success: this path is role-keyed and
+                // predictable, so a worker that used it for its own
+                // `--task-file` input has just had that input overwritten by
+                // the summary it passed (#331). Naming it is the only chance
+                // the caller gets to notice.
+                summary_path = Some(file_path.display().to_string());
             }
         }
 
@@ -3044,14 +3318,34 @@ impl AppState {
                 role = %role_name,
                 "work-done: no orchestrator pane found for this orchestration"
             );
-            return;
+            return WorkDoneResponse {
+                ok: false,
+                error: Some(format!(
+                    "no orchestrator pane is live in this orchestration, so the completion reached \
+                     nobody.{} If the orchestrator was closed, nothing will pick this up until one \
+                     is running again.",
+                    match &summary_path {
+                        Some(path) => format!(" The summary was still written to {path}."),
+                        None => String::new(),
+                    }
+                )),
+                reported_to: None,
+                summary_path,
+                warnings,
+            };
         };
 
         // If the work-done came from the orchestrator itself (without
         // --done), skip the feedback write — the orchestrator doesn't need
         // to be reminded of its own work.
         if signal.pane_id == orch_pane_id {
-            return;
+            return WorkDoneResponse {
+                ok: true,
+                error: None,
+                reported_to: None,
+                summary_path,
+                warnings,
+            };
         }
 
         let feedback = format!(
@@ -3068,6 +3362,31 @@ impl AppState {
                 error = %e,
                 "work-done: failed to write feedback into orchestrator pane"
             );
+            // The case `docs/orchestration.md` documents as silent. The summary
+            // file is on disk and readable; what failed is the only thing that
+            // would have told anyone to go and read it.
+            return WorkDoneResponse {
+                ok: false,
+                error: Some(format!(
+                    "the completion could not be written into the orchestrator pane \
+                     ({orch_pane_id}): {e}.{} Nothing will prompt the orchestrator to read it.",
+                    match &summary_path {
+                        Some(path) => format!(" The summary was still written to {path}."),
+                        None => String::new(),
+                    }
+                )),
+                reported_to: None,
+                summary_path,
+                warnings,
+            };
+        }
+
+        WorkDoneResponse {
+            ok: true,
+            error: None,
+            reported_to: Some(orch_pane_id),
+            summary_path,
+            warnings,
         }
     }
 

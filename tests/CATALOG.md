@@ -2068,6 +2068,76 @@ without depending on the config struct API.
 - **Platform coverage:** mac+linux (unix-only PTY/UDS; local real-agent tier).
 - **Cost note:** one short GPT-4o-mini worker turn per observation.
 
+##### orchestration/delegate/016 — A `delegate` from a pane the daemon does not know is refused with a reason naming the likely cause (#309).
+- **Layer:** L1 (in-process — the real `AppState::handle_delegate` against a daemon-owned registry; `cat` PTY stubs, no daemon socket, no subprocess).
+- **Agent:** none (synthetic `cat` panes; the role maps are populated exactly as `StartAgent` populates them).
+- **Asserts:** the returned `DelegateResponse` is `ok = false`, acks nothing, and carries a non-empty reason naming `DOT_AGENT_DECK_PANE_ID` — the usual cause — so the caller can act on it. Pre-fix this path was a bare `return` behind a `warn!` and the CLI reported success.
+- **Does not assert:** the CLI's exit code, stdout or stderr (a separate layer, covered once the CLI reads the reply); the daemon log entry; the wire framing of the reply.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/017 — A `delegate` from a worker pane is refused, naming the caller's own role and the verb it should use instead (#309).
+- **Layer:** L1 (in-process, as `/016`).
+- **Agent:** none (synthetic `cat` panes).
+- **Asserts:** a `delegate` sent from the `coder` pane returns `ok = false` with a reason naming the `coder` role the caller actually holds and pointing at `work-done`. Exercises the anti-spoofing guard's *observability*: the guard itself is already pinned by `orchestration/delegate/004` and `/006`, but a rejection nobody can see teaches nobody.
+- **Does not assert:** that no task was delivered to the worker pane (covered by `/006`); CLI-level behavior.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/018 — A successful `delegate` acks the role AND the pane it routed to (#330).
+- **Layer:** L1 (in-process, as `/016`).
+- **Agent:** none (synthetic `cat` panes).
+- **Asserts:** the response is `ok = true` with no error, exactly one ack whose `role` is `coder` and whose `pane_id` is the worker pane, and no warnings. The pane id matters on its own — it is the only thing distinguishing two panes holding the same role, and a confirmation naming it is what stops an orchestrator re-running the command to find out whether the first one worked.
+- **Does not assert:** that the task was *delivered* — `handle_delegate` returns once dispatch is spawned, so the ack means accepted/routed/armed only (delivery is `/001`, `/005`, `/014`, `/015`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/019 — A `--to` role that matches no pane is refused rather than silently dropped (#330, the unfiled third silent path).
+- **Layer:** L1 (in-process, as `/016`).
+- **Agent:** none (synthetic `cat` panes).
+- **Asserts:** delegating to a role with no pane in the orchestration returns `ok = false`, acks nothing, and gives a reason naming both the unresolved role and `.dot-agent-deck.toml`. This is the widest of the silent-success paths — a typo, a renamed role, a closed worker pane, or a cross-tab delegate all land here — and it is the one neither #309 nor #330 names; `docs/orchestration.md`'s "Worker receives no task" could previously only offer the daemon log as the diagnostic.
+- **Does not assert:** the `warn!` in `delegate_routing`; CLI-level behavior.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/020 — A partial fan-out succeeds but names the role that received nothing.
+- **Layer:** L1 (in-process, as `/016`).
+- **Agent:** none (synthetic `cat` panes).
+- **Asserts:** one `delegate` naming both a resolvable and an unresolvable role is `ok = true` (real work was handed out) with exactly one ack, plus a warning naming the role that missed — so the caller does not sit waiting on a worker that was never given anything.
+- **Does not assert:** ordering of warnings; the refusal case where *every* role misses (`/019`).
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/021 — Re-delegating to a busy worker warns that live work was displaced and that `clear = true` restarted it (#330 root cause).
+- **Layer:** L1 (in-process, as `/016`, plus a real `.dot-agent-deck.toml` so the `clear` flag resolves from disk).
+- **Agent:** none (synthetic `cat` panes; the `coder` role is configured `clear = true`).
+- **Asserts:** a first `delegate` warns about nothing; a second `delegate` to the same worker while the first is still outstanding is still `ok = true` — interrupt-and-redirect is a documented recovery path, so the daemon warns rather than refuses — and carries a warning naming the worker, saying the previous delegation was superseded, and saying the worker was restarted. That last clause is the destructive half: under the default `clear = true` a duplicate delegate SIGTERMs the running agent and discards its session, which no acknowledgement can undo. Pre-fix the supersede was invisible until PRD #126's detector fired a false idle report up to two hours later.
+- **Does not assert:** the idle-worker report itself (`idle_worker_*`); the oldest-first `work-done` accounting (`delegate_work_done_cancels_only_matching_silence_watch`); that the respawn actually completed.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/022 — A `work-done` with no live orchestrator reports reaching nobody, and still names the summary file.
+- **Layer:** L1 (in-process — the real `AppState::handle_work_done`; `cat` PTY stubs).
+- **Agent:** none (synthetic `cat` panes; the orchestrator pane is unregistered to model its closure).
+- **Asserts:** the returned `WorkDoneResponse` is `ok = false` with no `reported_to`, a reason naming the missing orchestrator, and a `summary_path` that is still populated. This is the failure `docs/orchestration.md` documents as silent — "if the orchestrator's pane is closed, the feedback write fails silently" — now told to the worker that just reported into the void, with the summary path so the content is recoverable.
+- **Does not assert:** the PTY write path itself; what a closed orchestrator pane renders.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/023 — A delivered `work-done` names the orchestrator pane it reached and the summary file it wrote.
+- **Layer:** L1 (in-process, as `/022`).
+- **Agent:** none (synthetic `cat` panes).
+- **Asserts:** `ok = true`, `reported_to` is the orchestrator pane, and `summary_path` both names `work-done-coder.md` and exists on disk. Unlike `delegate`, this handler *awaits* the feedback write, so its reply can honestly claim delivery rather than acceptance. Naming the summary path also gives a worker its only chance to notice that this role-keyed, predictable path is the one it must not pass as its own `--task-file` input (#331).
+- **Does not assert:** the feedback wording injected into the orchestrator pane (covered by `orchestration/delegate/003`); #331's clobber guard, which is a separate change.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/024 — The orchestrator's own `work-done --done` is a success with nobody to report to.
+- **Layer:** L1 (in-process, as `/022`).
+- **Agent:** none (synthetic `cat` panes).
+- **Asserts:** `ok = true`, no error, and no `reported_to` — completing the orchestration has no recipient by design, so it must not borrow the "reached nobody" failure a worker in the same position gets.
+- **Does not assert:** any downstream orchestration-complete handling.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/025 — A role named twice in one `delegate` is acked once and the repeat reported as ignored.
+- **Layer:** L1 (in-process, as `/016`).
+- **Agent:** none (synthetic `cat` panes).
+- **Asserts:** `to: ["coder", "coder"]` yields `ok = true` with exactly one ack plus a warning naming the role — guarding the ack list against drifting from PRD #126 M1 audit finding 3's de-duplication, since a caller reading two acks would believe it had doubled the work.
+- **Does not assert:** the de-duplication itself (already pinned by `delegate_targets_de_duplicates_a_repeated_target_role`).
+- **Platform coverage:** mac+linux.
+
 #### orchestration/identity
 
 ##### orchestration/identity/001 — Opening an orchestration whose form/display name (worktree dir basename) differs from the TOML config orchestration name stamps the CANONICAL config name as the daemon IDENTITY, not the basename (PRD #107 regression).

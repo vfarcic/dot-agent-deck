@@ -2021,6 +2021,18 @@ pub struct PaneOrchestration {
 pub struct ArmedDelegation {
     pub seq: u64,
     pub cancel: oneshot::Receiver<()>,
+    /// Issue #330: how long the delegation this arm just displaced had been
+    /// outstanding, or `None` when the worker owed nothing.
+    ///
+    /// The supersede itself is long-standing and correct — PRD #126 built the
+    /// oldest-first accounting precisely so a re-delegated worker is still
+    /// watched. What was missing is any sign that it happened: nothing told the
+    /// orchestrator that the delegate it just issued displaced live work, so a
+    /// *duplicate* delegate (the #330 case, where a silent success prompted a
+    /// confirmatory re-run) was indistinguishable from a first one. Reported
+    /// back to the caller it is also the only immediate signal that the default
+    /// `clear = true` has just restarted a worker mid-task.
+    pub superseded_previous: Option<Duration>,
 }
 
 /// PRD #126: what a `work-done` did to a worker pane's outstanding delegation.
@@ -2154,10 +2166,19 @@ impl AgentPtyRegistry {
             return None;
         }
         let seq = self.delegation_seq.fetch_add(1, Ordering::SeqCst);
-        let superseded = tracker
-            .records
-            .get(worker_pane_id)
-            .map_or(0, |prev| prev.superseded.saturating_add(1));
+        // Issue #330: both facts come from the SAME lookup, under the one lock,
+        // so the count the record carries and the elapsed time reported to the
+        // caller describe the same displaced delegation.
+        let (superseded, superseded_previous) =
+            tracker
+                .records
+                .get(worker_pane_id)
+                .map_or((0, None), |prev| {
+                    (
+                        prev.superseded.saturating_add(1),
+                        Some(prev.armed_at.elapsed()),
+                    )
+                });
         let (cancel_tx, cancel_rx) = oneshot::channel();
         tracker.records.insert(
             worker_pane_id.to_string(),
@@ -2175,6 +2196,7 @@ impl AgentPtyRegistry {
         Some(ArmedDelegation {
             seq,
             cancel: cancel_rx,
+            superseded_previous,
         })
     }
 
