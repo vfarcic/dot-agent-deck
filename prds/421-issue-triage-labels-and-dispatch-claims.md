@@ -40,7 +40,8 @@ A claim the deck *maintains* rots. The only production site that reclaims a disp
 Phase 3 therefore follows #422's rule — **derive the verdict from live GitHub state at decision time; never trust a flag to have been cleared.** Concretely, an assignee alone is not a claim. A claim is *fresh assignment plus no evidence the work is dead*:
 
 - **Claim age comes from GitHub, not from deck-local state.** `GET /repos/{owner}/{repo}/issues/{n}/events` returns each event's `created_at` (verified against this repo; assignment events additionally carry `assignee`). The age of the most recent `assigned` event is therefore computable with no local bookkeeping, which is exactly what makes it survive a daemon restart, a machine swap, or a `~/.config` wipe.
-- **A claim older than a configurable TTL is stale and does not gate.** The issue is dispatched anyway and re-assigned, which refreshes the clock. Self-healing by construction: the worst case is one duplicate dispatch after the TTL, never a permanently wedged issue.
+- **A claim older than a configurable TTL is stale and does not gate.** The issue is dispatched anyway and the claim is **re-stamped** so the clock moves forward. Self-healing by construction: the worst case is one duplicate dispatch after the TTL, never a permanently wedged issue.
+- **Re-stamping cannot be a bare `--add-assignee @me`** (Greptile P1, PR #464). GitHub's assignee API is idempotent: adding an assignee who is *already* assigned is a no-op that emits **no new `assigned` event**. So the naive "dispatch and re-assign" refreshes nothing — the derived age stays pinned at the original assignment, the claim reads stale forever, and it silently stops gating from the first TTL expiry onward. That is worse than a wedged issue because it fails *open* and quietly: the protection evaporates with no signal. Re-stamping must therefore be an explicit **unassign-then-reassign** pair, which does emit a fresh `assigned` event. **M3.1 must confirm the no-new-event behaviour empirically before this design is built on** — it is the assumption the whole TTL rests on, and it was asserted rather than measured when this PRD was first written.
 - **The open-PR signal still wins.** An open PR on `agent/issue-<n>` means real work exists regardless of claim age.
 
 This is what makes the phase safe, and it is why **M3.3 is the load-bearing milestone**: if a stale claim can wedge an issue, the phase is a regression however well the rest works.
@@ -96,6 +97,13 @@ A pure argv builder in `src/issue_dispatch.rs` (unit-testable, alongside `issue_
 
 Write ordering is the one thing that must not be got wrong: **claim only after `spawn` returns `Ok`** (`src/issue_dispatch_run.rs:448`), so a failed dispatch never leaves a claim. Release from the existing close path (`src/daemon_protocol.rs:1501-1510`), beside `remove_worktree`.
 
+**Release must not be unconditional** (Greptile P1, PR #464). `--add-assignee @me` is idempotent and harmless, but `--remove-assignee @me` is destructive and **cannot tell the deck's own claim from the user's**, because they are the same GitHub identity. So a human who assigns themselves to an issue, which the deck then dispatches and later closes, has their own signal silently deleted. The same applies to two decks sharing one GitHub account: the first tab to close unassigns while the second is still working, and the issue reads as free.
+
+This is the sharp edge of choosing assignment over a deck-owned label, and it lands in Phase 2 — the phase otherwise characterised as safe because it is display-only. Two candidate mitigations, to be decided in M2.2:
+
+- **Release only a claim the deck can prove it created.** Local provenance is exactly what [#425](https://github.com/vfarcic/dot-agent-deck/issues/425)'s worktree ownership marker provides, so this converges with work already proposed rather than inventing a second mechanism. Preferred if #425 lands first.
+- **Do not release at all**; let the TTL expire the claim. Consistent with "derive, don't maintain", and it removes the destructive call entirely. Cost: the assignment lingers for up to one TTL after the tab closes, so the issue looks busier than it is.
+
 Best-effort means a missing permission, a read-only repo, or a `gh` failure logs at WARN and the dispatch proceeds. This is correct for Phase 2 precisely because the claim is decorative there — and it is exactly why Phase 3 cannot simply trust the claim to exist.
 
 ### Phase 3 — claim-aware dispatch
@@ -139,16 +147,16 @@ Issue #421's closing observation is correct and worth acting on separately: **#1
 ### Phase 2: Visible claim (display-only)
 
 - [ ] **M2.1** — Pure argv builders + unit tests for assign/unassign.
-- [ ] **M2.2** — Claim written after a successful spawn, released on tab close; best-effort at every step, never fatal.
+- [ ] **M2.2** — Claim written after a successful spawn; best-effort at every step, never fatal. **Decide and implement the release policy** — release only deck-created claims (via #425's ownership marker), or do not release and let the TTL expire it. An unconditional `--remove-assignee @me` is not acceptable: it deletes a human's own assignment.
 - [ ] **M2.3** — `gh` stub learns `issue edit`, with tests asserting the claim is written on dispatch and cleared on close. **The stub currently `exit 1`s on unrecognised argv (`tests/e2e_issue_dispatch.rs:101-102`), so a best-effort write would otherwise be silently swallowed and every existing test would stay green while proving nothing** — the stub arms are what make this milestone real.
 - [ ] **M2.4** — `tests/e2e_issue_dispatch_real.rs` verified against the live fixture (`vfarcic/dot-agent-deck-tests` issue #1) across two consecutive runs, leaving it unassigned afterwards.
 - [ ] **M2.5** — Docs updated.
 
 ### Phase 3: Claim-aware dispatch
 
-- [ ] **M3.1** — Claim state derived from live GitHub at decision time (assignee + age of the most recent `assigned` event); no deck-local claim bookkeeping anywhere.
+- [ ] **M3.1** — Claim state derived from live GitHub at decision time (assignee + age of the most recent `assigned` event); no deck-local claim bookkeeping anywhere. **Empirically confirm first** that a redundant `--add-assignee` emits no new `assigned` event — the TTL design is void if that assumption is wrong in either direction.
 - [ ] **M3.2** — Third signal wired into `dispatch_decision` with an exhaustive truth table; short-circuit order preserved so a `gh` failure cannot turn a local skip into a failure.
-- [ ] **M3.3** — **Stale claims self-heal.** A claim older than the TTL does not gate; the issue dispatches and re-assigns. Proven by a test that dispatches against a pre-aged claim written by no local daemon. *This is the milestone the phase is only safe with — treat it as a hard gate, not a nice-to-have.*
+- [ ] **M3.3** — **Stale claims self-heal.** A claim older than the TTL does not gate; the issue dispatches and the claim is re-stamped via unassign-then-reassign, so the derived age actually moves. Proven by a test that dispatches against a pre-aged claim written by no local daemon, **and asserts the age advanced afterwards** — without that second assertion the test passes against the broken idempotent-assign design. *This is the milestone the phase is only safe with — treat it as a hard gate, not a nice-to-have.*
 - [ ] **M3.4** — Kill switch on `IssueDispatchConfig`, defaulting to off, with validation and a test.
 - [ ] **M3.5** — Cross-version manual run per rule 12 (old daemon + new TUI, isolated `DOT_AGENT_DECK_LOG`/sockets/`HOME`), plus the `changelog.d/421.md` fragment recording the mixed-fleet skew.
 
@@ -176,6 +184,9 @@ Issue #421's closing observation is correct and worth acting on separately: **#1
 | Risk | Mitigation |
 | --- | --- |
 | **A stale claim wedges an issue permanently.** The central hazard; the reason issue #421's original "write a label and gate on it" shape was not adopted. | TTL derived from GitHub's own event timestamps, so it needs no local state to survive a restart (M3.1/M3.3). Kill switch (M3.4). Gating off by default until observed. |
+| **The TTL clock never advances, so the claim silently stops gating.** Greptile P1 on PR #464. A redundant `--add-assignee @me` is a no-op emitting no new `assigned` event, so the naive re-assign refreshes nothing and the claim reads stale forever. Fails *open* and without a signal — the worst shape a safety mechanism can take. | Re-stamp via explicit unassign-then-reassign (M3.3), and confirm the underlying event behaviour empirically before building on it (M3.1). The M3.3 test must assert the age *advanced*, not merely that a re-dispatch happened. |
+| **Releasing a claim deletes a human's own assignment.** Greptile P1 on PR #464. `--remove-assignee @me` cannot distinguish the deck's claim from the user's — same GitHub identity. Also fires when two decks share one account. Lands in Phase 2, the phase otherwise treated as safe. | Release only deck-created claims via #425's ownership marker, or do not release at all and let the TTL expire it (M2.2). An unconditional release is ruled out. |
+| **Assignment is a shared identity, not deck-owned vocabulary.** Root cause of both P1s above, and the strongest argument against choosing assignment over an `in-progress` label. | Accepted with the mitigations above. Recorded here explicitly so the trade-off is revisitable: a deck-written label has neither failure mode, at the cost of per-repo vocabulary that `--add-label` requires to exist. |
 | **The live e2e fixture is mutated or wedged.** `tests/e2e_issue_dispatch_real.rs` runs against real GitHub, `max_per_run = 1`, on a permanent issue titled "DO NOT CLOSE" (verified: 0 comments, one label). A claim that is also a skip signal makes the second run skip its only issue and go red. | M2.4 gates on two consecutive green runs that leave the fixture unassigned. Assignment (unlike a label) needs no per-repo vocabulary, so the fixture repo needs no setup. |
 | **Best-effort writes are silently untested.** The `gh` stub `exit 1`s on unknown argv, so a swallowed write leaves every test green. | M2.3 makes the stub arms and the assertions a milestone in their own right. |
 | **The triage agent exceeds its remit.** Decided: scoped by prompt only, no argv allowlist. The same `gh issue edit` it needs also takes `--title`, `--body`, `--add-assignee`, `--milestone`; `gh issue close` sits beside it. It runs unattended, on a cron, as the repo owner. | Accepted deliberately. Bounded in practice by M1.4's spot-check before the schedule is trusted, and by the fact that issue edits are fully reversible and auditable in the issue's own event history. Revisit if a run misbehaves. |
@@ -185,5 +196,5 @@ Issue #421's closing observation is correct and worth acting on separately: **#1
 ## Open Questions
 
 1. **What TTL?** Long enough that a legitimately slow agent is not preempted, short enough that a dead claim clears within a working day. A starting proposal is 24h, revisited after M1.4-style observation.
-2. **Should the deck reconcile claims it did not write?** An issue assigned by a *human* currently reads as claimed. That is arguably correct — a human working an issue is a real claim — but it means assigning yourself to an issue quietly opts it out of dispatch. Worth deciding explicitly rather than discovering.
+2. **Should the deck reconcile claims it did not write?** An issue assigned by a *human* reads as claimed. That is arguably correct on the **read** side — a human working an issue is a real claim — but it means assigning yourself quietly opts an issue out of dispatch. The **write** side is not a question but a defect, now tracked in Risks and M2.2: release must never delete an assignment the deck cannot prove it made.
 3. **Does triage want a `sort` interaction with dispatch?** Once priorities exist, `query = "is:open label:priority:high sort:created-asc"` becomes the natural dispatch filter. PRD #222 already proposes a first-class `sort` field; these two should be aligned rather than solved twice.
