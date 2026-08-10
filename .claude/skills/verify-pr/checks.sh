@@ -244,12 +244,21 @@ else
     # `|| true`, not `|| echo 0`: grep -c already PRINTS "0" when it matches
     # nothing and only then exits 1, so `|| echo 0` produces "0\n0" and the
     # numeric test below dies with "integer expression expected".
-    skips=$(grep -c '^SKIP: ' "$e2e_log" 2>/dev/null || true)
+    #
+    # `^[[:space:]]*`, not `^`: `--success-output=final` INDENTS captured test
+    # output by four spaces, so a column-0 anchor never matches and this whole
+    # safeguard silently reports zero (issues #452, #490 — measured on real
+    # logs from verifying #391 and #467, where four genuine skips counted 0).
+    skips=$(grep -cE '^[[:space:]]*SKIP: ' "$e2e_log" 2>/dev/null || true)
     [[ "$skips" =~ ^[0-9]+$ ]] || skips=0
     printf 'E2E_RUNTIME_SKIPS=%s\n' "$skips" >>"${out}/env.txt"
     printf 'E2E_RUNTIME_SKIPS=%s\n' "$skips"
     if [ "$skips" -gt 0 ]; then
-      grep '^SKIP: ' "$e2e_log" | sort -u >"${out}/e2e-skips.txt"
+      # Strip the indent BEFORE `sort -u`, so the file reads cleanly and two
+      # identical reasons captured at different depths dedupe to one line.
+      grep -E '^[[:space:]]*SKIP: ' "$e2e_log" \
+        | sed -E 's/^[[:space:]]+//' \
+        | sort -u >"${out}/e2e-skips.txt"
       record e2e-real-coverage ATTENTION 0 "${out}/e2e-skips.txt" \
         "${skips} real-agent test(s) skipped and still counted as PASSED. If any covers this PR's surface, rerun it with DOT_AGENT_DECK_REQUIRE_REAL_E2E=1 and treat 'cannot run' as UNVERIFIED, not green."
     fi
