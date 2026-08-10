@@ -207,7 +207,7 @@ fn collect(temp_root: &Path, opts: &Options) -> std::io::Result<Vec<Candidate>> 
             age,
         });
     }
-    out.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    out.sort_by_key(|entry| std::cmp::Reverse(entry.bytes));
     Ok(out)
 }
 

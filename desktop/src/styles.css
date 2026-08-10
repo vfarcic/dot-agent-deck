@@ -508,3 +508,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+/* Early-developer-preview tag under the brand mark: the app is incomplete by
+   design right now, and unlabeled gaps read as bugs. */
+.preview-tag { margin-top: 7px; padding: 2px 6px; border: 1px solid #8a6d3b; border-radius: 4px; color: #d9b36a; font-size: 7px; font-weight: 800; letter-spacing: .12em; }

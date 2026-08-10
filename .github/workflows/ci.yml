@@ -114,8 +114,16 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.140
+      # Tauri's Linux build deps, needed only because clippy/nextest below run
+      # with --workspace, which now includes desktop/src-tauri
+      # (dot-agent-deck-desktop). Without --workspace that crate's ~2,850 lines
+      # of Rust and all its tests were invisible to CI.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev
       - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --workspace -- -D warnings
       - run: cargo build --release
       # `cargo nextest run`, NOT `cargo test` — the same runner as the
       # `cargo test-fast` local gate, and as build-macos/build-windows which
@@ -135,7 +143,7 @@ jobs:
       # Aligning the runners also makes a CI failure reproducible locally, which
       # neither of those was, and makes "green locally" mean the same thing as
       # "green in CI".
-      - run: cargo nextest run
+      - run: cargo nextest run --workspace
       # CLAUDE.md rule 7 has always SAID this runs in CI ("CI's linkage-check
       # rule 7 fails the build if the Scenario comment is missing or the
       # generator fails"), and the build-macos/build-windows comment says these

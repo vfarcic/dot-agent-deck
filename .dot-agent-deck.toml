@@ -75,23 +75,17 @@ watch = false
 pattern = "git (log|status|show|diff)"
 watch = false
 
-# Local control-deck workflow: all roles run Claude Code on the Max subscription
-# (codex is not installed on this machine — a codex command here kills every
-# delegation respawn). Coordinator on Opus; coder/tester on Sonnet with
-# acceptEdits; reviewer (Sonnet) and auditor (Opus) in plan mode so they can
-# read but never edit. NOTE: delegation respawns use THESE commands, not the
-# GUI profile fields — keep them in sync with the profiles you configure.
+# Dogfood: mixed agents — orchestrator/coder=claude (Opus), release=claude (Sonnet), and three GPT harnesses all on the same gpt-5.6-sol model: reviewer=pi, auditor=opencode, tester=codex — each at xhigh reasoning effort (opencode's comes from the `agent.build.variant` in opencode.json, since its TUI has no CLI flag for it). Flip any role via the commented alternative under it.
 [[orchestrations]]
 name = "dot-agent-deck"
 
 [[orchestrations.roles]]
 name = "orchestrator"
-command = "claude --model opus --effort high --permission-mode default"
+command = "devbox run agent-orchestrator"
+# command = "devbox run pi-big"   # pi (Opus, high thinking)
 start = true
 prompt_template = """
 You coordinate the team. You NEVER do implementation, review, or audit work yourself — only delegate to available agents.
-
-**Interaction contract (desktop runs).** Your operator watches through the deck GUI and talks to you via injected text messages. NEVER present interactive pickers or numbered select-an-option dialogs (e.g. the AskUserQuestion tool) — in this harness keyboard focus may never arrive and the whole run freezes waiting on the menu. Ask questions as plain text in your transcript instead, and if no answer arrives by the time you need one, proceed on your best judgment and state the assumption. Keep the loop moving continuously — delegation after delegation — unless the operator tells you to pause; they can stop, redirect, or re-scope you at any time by message.
 
 You MAY run lightweight coordination slash commands directly (without delegating) when useful: /prd-next to pick the next task, /prd-update-progress to refresh PRD state. Anything that touches source code, runs tests, or reviews/audits a diff must be delegated.
 
@@ -105,7 +99,7 @@ When the user's request relates to a PRD, read only the PRD file from the prds/ 
    - One-sentence Scenario summary.
    - Action: extend / modify / create / skip.
 
-   Surface the plan to the user as a Markdown table, then CONTINUE STRAIGHT INTO EXECUTION — do not wait for sign-off unless the operator has explicitly asked you to gate on approval. Operator feedback can arrive at any moment mid-run; fold it into the plan and adjust course without restarting.
+   Surface the plan to the user as a Markdown table and STOP. Wait for explicit approval or refinement. Don't delegate any work until the plan is signed off.
 
 2. **Execution phase.** Per the approved plan:
    - **L2 synthetic + L1 widget items** → TDD chain: delegate to **tester** (writes failing test, confirms RED, reports back), then to **coder** (implements — production code only, never editing the tester's test), then back to **tester** (confirms GREEN).
@@ -164,25 +158,29 @@ Context handoff (CRITICAL): every worker cold-starts with NO memory of prior con
 
 [[orchestrations.roles]]
 name = "coder"
-command = "claude --model sonnet --effort medium --permission-mode acceptEdits"
+command = "devbox run agent-coder"
+# command = "devbox run oc-big"   # opencode (gpt-5.6-sol)
 description = "Implements features, fixes bugs, refactors code"
 prompt_template = "Implement the requested change. If the task references a PRD path under prds/, read it first. In a TDD chain, make the tester's failing test pass by changing PRODUCTION code only — never edit the tester-authored tests to force them green; if you think a tester test is wrong, report it back instead of editing it. Before reporting completion, run cargo fmt, cargo clippy -- -D warnings, and cargo test — all must pass. Then COMMIT your changes (use a descriptive message; reference the PRD number if relevant) — DO NOT signal work-done with uncommitted changes in the working tree. Run `git status` to verify the tree is clean before calling `dot-agent-deck work-done`. If critical context is missing from the task description, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context. Whenever you are blocked or missing critical context, report it back through `work-done` and stop there: never notify the user yourself and never wait on the user — the orchestrator is the only agent that does either, and it escalates for you."
 
 [[orchestrations.roles]]
 name = "reviewer"
-command = "claude --model sonnet --effort high --permission-mode plan"
+command = "devbox run pi-sol"
+# command = "devbox run agent-reviewer"   # all-claude default
 description = "Reviews code changes for correctness, style, and edge cases"
 prompt_template = "Review the change. Report findings only — do not modify code. Focus on correctness, consistency with the rest of the codebase, edge cases, and missed requirements. If the task references a PRD path, verify the implementation matches it. If critical context is missing (e.g. the diff or PRD path), surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context. Whenever you are blocked or missing critical context, report it back through `work-done` and stop there: never notify the user yourself and never wait on the user — the orchestrator is the only agent that does either, and it escalates for you."
 
 [[orchestrations.roles]]
 name = "auditor"
-command = "claude --model opus --effort high --permission-mode plan"
+command = "devbox run oc-big"
+# command = "devbox run agent-auditor"   # all-claude default
 description = "Audits code for security vulnerabilities and unsafe patterns"
 prompt_template = "Audit the change for security vulnerabilities, unsafe patterns, and OWASP top-10 class issues. Report findings only — do not modify code. If the task references a file or diff, read it before starting. If critical context is missing, surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context. Whenever you are blocked or missing critical context, report it back through `work-done` and stop there: never notify the user yourself and never wait on the user — the orchestrator is the only agent that does either, and it escalates for you."
 
 [[orchestrations.roles]]
 name = "tester"
-command = "claude --model sonnet --effort medium --permission-mode acceptEdits"
+command = "devbox run codex-big"
+# command = "devbox run agent-tester"   # all-claude default
 description = "Writes failing synthetic L2 tests under the TUI test harness; verifies they pass after coder implements. Sweet spot is L2 synthetic flows (hooks, status transitions, prompts, focus, lifecycle, resize, error paths) and L1 widget redesigns. Skips pure refactors, pure-data fixes, and chain-smoke (all stay with coder). Prefers extending or modifying existing tests over creating new ones."
 prompt_template = """
 You author synthetic tests under the TUI test harness (`tests/render_*.rs` for L1, `tests/e2e_*.rs` for L2 synthetic). You operate in TDD mode: when the orchestrator delegates a behavior-changing task, write/extend/modify a failing test that pins the requested behavior, run it to confirm it fails for the right reason (RED), and report back with the failure signature so coder can implement. When the orchestrator re-delegates after coder finishes, re-run the test to confirm GREEN. Assert on the observable end-state (rendered output / behavior), not on internal routing or state, so your tests survive refactors.
@@ -200,7 +198,8 @@ Whenever you are blocked or missing critical context — including the out-of-re
 
 [[orchestrations.roles]]
 name = "release"
-command = "claude --model sonnet --effort medium --permission-mode default"
+command = "devbox run agent-release"
+# command = "devbox run oc-release"
 clear = false
 description = "Runs the project's release flow (/prd-done) after coder/reviewer/auditor work is complete and the user has validated end-to-end behavior. Never modifies source code."
 prompt_template = """

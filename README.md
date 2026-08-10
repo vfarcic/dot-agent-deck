@@ -14,6 +14,19 @@ dot-agent-deck hooks install
 dot-agent-deck
 ```
 
+## Desktop GUI (early developer preview)
+
+An optional desktop control room for the same daemon lives in [`desktop/`](desktop/). It is an early preview and is not part of the release artifacts.
+
+Try it in your browser in under a minute — no Rust toolchain, no daemon, no API cost. Fixture mode renders a fully simulated run (agents, terminals, metrics, evidence) so you can explore the whole UI safely:
+
+```bash
+cd desktop && pnpm install && pnpm dev
+# then open http://localhost:1420/?fixture=1
+```
+
+To run it for real against a local daemon: `pnpm tauri dev` (requires Rust; see [docs/develop/desktop-gui.md](docs/develop/desktop-gui.md)).
+
 ## Documentation
 
 For installation guides, configuration, keyboard shortcuts, and more, visit the documentation site:

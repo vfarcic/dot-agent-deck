@@ -294,6 +294,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
     <div className={`control-deck ${evidenceOpen ? "with-evidence" : ""}`}>
       <aside className="rail" aria-label="Primary navigation">
         <div className="brand-mark" aria-label="Agent Deck"><span>AD</span><i aria-hidden="true" /></div>
+        <span className="preview-tag" title="This app is an early developer preview: known gaps are incompleteness, not necessarily bugs.">PREVIEW</span>
         <nav>
           <RailButton icon={FolderGit2} label="Projects" active={projectsOpen} onClick={() => setProjectsOpen(true)} testId="open-projects" />
           <RailButton icon={Activity} label="Runs" active={!projectsOpen && !workflowOpen && !profilesOpen && !promptsOpen} onClick={() => { setProjectsOpen(false); setWorkflowOpen(false); setProfilesOpen(false); setPromptsOpen(false); }} />
@@ -344,7 +345,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
         {mode === "fixture" && (
           <div className="fixture-bar">
             <span><Sparkles size={13} /> DEMO DATA</span>
-            <p>Deterministic run fixture · no external agents or files are being changed.</p>
+            <p>Deterministic run fixture · every agent, metric, and transcript on screen is simulated — none of this data is real, and no external agents or files are being touched.</p>
             <button data-testid="fixture-advance" onClick={() => void perform({ type: "advance_fixture" })}>Advance fixture <ArrowRight size={13} /></button>
           </div>
         )}
