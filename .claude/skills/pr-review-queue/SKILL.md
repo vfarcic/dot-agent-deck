@@ -49,6 +49,7 @@ query($owner:String!, $repo:String!) {
         author { login }
         reviewDecision
         assignees(first:10) { nodes { login } }
+        reviewRequests(first:10) { nodes { requestedReviewer { ... on User { login } } } }
         reviewThreads(first:100) { totalCount nodes { isResolved } }
       }
     }
@@ -58,6 +59,7 @@ query($owner:String!, $repo:String!) {
   | {number, title, author: .author.login, draft: .isDraft, branch: .headRefName,
      decision: .reviewDecision,
      assignees: [.assignees.nodes[].login],
+     requested: [.reviewRequests.nodes[].requestedReviewer.login],
      threads: .reviewThreads.totalCount,
      unresolved: ([.reviewThreads.nodes[] | select(.isResolved | not)] | length)}'
 ```
@@ -68,11 +70,15 @@ Two honest limits of that query, both worth a sentence in your output rather tha
 
 `reviewDecision` is legitimately `null` on a PR nobody has been asked to review yet. `null` is **not** `CHANGES_REQUESTED`, so it stays eligible — do not treat a missing decision as a blocker.
 
+**`requested` is displayed, not filtered on.** Selecting on the requested-reviewer field instead of assignees is the obvious-looking alternative and it is wrong here, for a mechanical reason: `.github/CODEOWNERS` carries one pathless rule and **GitHub omits the author when auto-requesting from code owners**, so a maintainer is never a requested reviewer on their own PR. Filtering on it would make it impossible to queue your own PR — and queueing your own PR is a first-class use of this skill, since a maintainer wants the *verdict* from a full `/verify-pr` run whether or not they can ever approve it. That is the same reason step 5 has to explain self-approval at all. An empty assignee set is therefore read as "unclaimed", not as "someone else's": with a two-maintainer repo an unclaimed PR genuinely is either maintainer's to pick up, and step 2 shows `requested` alongside each row so the user can see who was actually asked and drop the ones they do not want. The human picking the batch is the disambiguator, not the filter.
+
 Draft status is **not** an eligibility criterion. A draft still verifies fine; carry the flag into the task text instead, because `/verify-pr`'s Phase 0 acts on it and a draft verdict is advice rather than a merge decision.
 
 ## Step 2 — Show the queue and ask how many
 
-Print every eligible PR with **number, title, author, and why it qualifies** — the assignee state, the thread count, the review decision. Show the excluded ones too, one line each with the reason; the exclusions are the part the user is most likely to disagree with, and they cannot correct a filter they cannot see.
+Print every eligible PR with **number, title, author, and why it qualifies** — the assignee state, the thread count, the review decision, and who is currently *requested* to review it. Show the excluded ones too, one line each with the reason; the exclusions are the part the user is most likely to disagree with, and they cannot correct a filter they cannot see.
+
+Call out the two rows a user most often wants to drop by hand, since neither is an eligibility rule: a PR **authored by the runner** (the verdict is available, the approval never will be) and a PR **requested from the other maintainer** (eligible because unassigned, but already routed to a human).
 
 Then **ask how many to dispatch**. Default conservatively. Do not assume "all of them", and do not offer "all" as the recommended option.
 
@@ -90,7 +96,31 @@ Running `scan.sh` gives you the fresh state and step 4's file buckets in one rea
 bash .claude/skills/verify-pr/scan.sh <n>
 ```
 
-It runs from the main checkout, creates nothing, and touches no worktree. Read `PR_STATE`, `PR_DRAFT`, `PR_HEAD_BRANCH`, and `PR_AUTHOR` from it. If `PR_STATE` is no longer `OPEN`, **skip that PR and say so** in the final report — do not silently drop it, and do not quietly substitute the next PR down the queue to keep the count the user asked for.
+It runs from the main checkout, creates nothing, and touches no worktree. Read `PR_STATE`, `PR_DRAFT`, `PR_HEAD_BRANCH`, and `PR_AUTHOR` from it.
+
+**Re-validate all three eligibility criteria, not just open-or-closed.** `scan.sh` carries neither the unresolved-thread count nor the review decision, so pair it with a single-PR repeat of step 1's query — the same staleness that closes a PR also lands review comments on one:
+
+```bash
+gh api graphql -f query='
+query($owner:String!, $repo:String!, $pr:Int!) {
+  repository(owner:$owner, name:$repo) {
+    pullRequest(number:$pr) {
+      state isDraft
+      reviewDecision
+      assignees(first:10) { nodes { login } }
+      reviewThreads(first:100) { totalCount nodes { isResolved } }
+    }
+  }
+}' -F owner="$OWNER" -F repo="$REPO" -F pr=<n> --jq '
+  .data.repository.pullRequest
+  | {state, decision: .reviewDecision,
+     assignees: [.assignees.nodes[].login],
+     unresolved: ([.reviewThreads.nodes[] | select(.isResolved | not)] | length)}'
+```
+
+**Skip the PR and say so** if it is no longer `OPEN`, if `unresolved` is no longer `0`, if the decision is now `CHANGES_REQUESTED`, or if it has been assigned to someone else since listing. Never silently drop one, and never quietly substitute the next PR down the queue to keep the count the user asked for.
+
+The thread criterion is the one most likely to flip, because it flips on ordinary activity rather than on a rare event. Any automated reviewer's findings are review threads: a Greptile P1 landing between listing and dispatch moves `unresolved` from `0` to non-zero and hands the PR back to its author, which is exactly the criterion doing its job. (Measured on this PR: eligible when the queue was listed, `unresolved: 2` a few minutes later once Greptile posted.) A gap of even a few minutes is enough, which is why this check belongs immediately before *this* dispatch rather than once for the batch — and why it is worth the second API call to catch before spending the e2e tier, not after.
 
 Yes, the dispatched agent will run `scan.sh` again as its own Phase 0. That duplication is intentional and nearly free: it is a handful of read-only API calls, and it is what lets you write a tailored risk note without reading the diff yourself.
 
