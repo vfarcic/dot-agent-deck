@@ -1,0 +1,339 @@
+# Semaphore port of .github/workflows/ci.yml + docs.yml + aarch64-crossbuild-check.yml
+#
+# The GitHub Actions workflows are UNCHANGED and still authoritative. This file
+# is an evaluation of Semaphore running side by side with them; see
+# docs/develop/semaphore-ci.md for the full mapping, the behavior differences,
+# and the pieces that deliberately did not port.
+#
+# WHY THREE GHA WORKFLOWS COLLAPSE INTO ONE PIPELINE FILE
+#
+# GitHub Actions keys triggers per workflow file (`on: pull_request: paths:`),
+# so "only run the aarch64 cross-build when Cargo.lock moved" is expressed by
+# giving that job its own file. Semaphore inverts this: ONE pipeline is the
+# entry point for every push, PR and tag, and per-block `run.when` +
+# `change_in()` decides what actually executes. Same outcome — an unrelated PR
+# still pays nothing for the docs or aarch64 legs — but the condition now lives
+# next to the block it guards instead of in a separate file's `on:` stanza.
+version: v1.0
+name: CI
+
+agent:
+  machine:
+    type: f1-standard-2
+    os_image: ubuntu2404
+
+# GHA equivalent: `concurrency: {group: ci-${{ github.ref }}, cancel-in-progress: true}`.
+#
+# DELIBERATELY NOT A LITERAL PORT ON `main`. GHA cancels in-progress runs on
+# every ref including main, which quietly undercuts the reason ci.yml added its
+# `push: branches: [main]` trigger in the first place — that trigger exists so a
+# broken main is a notification rather than a discovery (the 2026-07-29 incident
+# in ci.yml's header), and a cancelled post-merge run notifies nobody. So main
+# queues instead of cancelling, and every merged commit gets verified. Feature
+# branches cancel exactly as they do today.
+auto_cancel:
+  running:
+    when: "branch != 'main'"
+  queued:
+    when: "branch = 'main'"
+
+global_job_config:
+  prologue:
+    commands:
+      - checkout
+  env_vars:
+    # Pinned, never floating — the standing rule recorded in ci.yml's `devbox`
+    # job comment. NOTE for whoever maintains this: renovate.json's
+    # customManagers match `toolchain:` and `tool: cargo-nextest@` under
+    # .github/workflows ONLY, so these two values are NOT auto-updated and will
+    # drift from the GHA pins unless the config is widened. Called out in
+    # docs/develop/semaphore-ci.md.
+    - name: RUST_TOOLCHAIN
+      value: "1.97.1"
+    - name: NEXTEST_VERSION
+      value: "0.9.140"
+
+blocks:
+  # ci.yml's `build` job. The heaviest block in the file: it is the only place
+  # `--features e2e` is type-checked, and it runs the full 1705-test fast tier.
+  #
+  # f1-standard-4 rather than the pipeline default f1-standard-2 — this block
+  # compiles the workspace three times over (clippy with the e2e feature, a
+  # release build, then the test binaries) and 2 vCPU makes it the critical
+  # path for the whole pipeline.
+  - name: Build (Linux)
+    dependencies: []
+    # ci.yml's `changes` job, in one line. That job exists to skip the Rust
+    # matrix when a Renovate PR touched nothing but devbox/flake files, since
+    # no Rust job installs its toolchain through either.
+    #
+    # BEHAVIOR DIFFERENCE, on purpose (agreed when this branch was created):
+    # `change_in` has no notion of PR author, so this skips for HUMAN PRs too,
+    # where ci.yml deliberately keeps the full matrix. The upside is that this
+    # is evaluated before an agent boots, so it actually costs nothing; the
+    # shell-guard alternative that could read the author would have to boot the
+    # agent first to ask.
+    run:
+      when: "change_in('/', {exclude: ['/devbox.json', '/devbox.lock', '/flake.nix', '/flake.lock'], default_branch: 'main'})"
+    task:
+      agent:
+        machine:
+          type: f1-standard-4
+          os_image: ubuntu2404
+      prologue:
+        commands:
+          - export RUST_COMPONENTS=rustfmt,clippy
+          - bash .semaphore/scripts/setup-rust.sh
+          - export PATH="$HOME/.cargo/bin:$PATH"
+          # GHA equivalent: Swatinem/rust-cache@v2. `cache store` takes exactly
+          # ONE path (toolbox footgun), so the registry and the build directory
+          # are two keys rather than one call with two arguments.
+          - cache restore cargo-registry-$(checksum Cargo.lock),cargo-registry-main
+          - cache restore cargo-target-linux-$(checksum Cargo.lock),cargo-target-linux-main
+      epilogue:
+        on_pass:
+          commands:
+            - cache store cargo-registry-$(checksum Cargo.lock) $HOME/.cargo/registry
+            - cache store cargo-target-linux-$(checksum Cargo.lock) target
+      jobs:
+        - name: fmt, clippy, build, test
+          commands:
+            - cargo fmt --check
+            # All three flags are load-bearing (CLAUDE.md rule 2): --all-targets
+            # and --features e2e per issue #407, --workspace per #436. Without
+            # the feature every tests/e2e_*.rs compiles to an empty crate and
+            # this type-checks no test file at all.
+            - cargo clippy --workspace --all-targets --features e2e -- -D warnings
+            - cargo build --release
+            # nextest, not `cargo test` — process-per-test, matching the local
+            # `cargo test-fast` alias. --workspace per issue #489, or the
+            # xtask/* tests run in no gate anywhere.
+            - cargo nextest run --workspace
+            - cargo xtask linkage-check
+
+  # ci.yml's `windows-cross-check` job: proves scripts/windows-cross-check.sh
+  # itself still works, from Linux. This is NOT the Windows code gate — see the
+  # note under "Build (macOS)" and docs/develop/semaphore-ci.md for what
+  # happened to that.
+  - name: Windows cross-check
+    dependencies: []
+    run:
+      when: "change_in('/', {exclude: ['/devbox.json', '/devbox.lock', '/flake.nix', '/flake.lock'], default_branch: 'main'})"
+    task:
+      prologue:
+        commands:
+          - export RUST_TARGETS=x86_64-pc-windows-msvc
+          - bash .semaphore/scripts/setup-rust.sh
+          - export PATH="$HOME/.cargo/bin:$PATH"
+          - cache restore cargo-registry-$(checksum Cargo.lock),cargo-registry-main
+      jobs:
+        - name: Type-check the workspace for Windows from Linux
+          commands:
+            # Resolve the toolchain dir from rustup rather than hardcoding it:
+            # the directory is named for the pinned toolchain and changes on
+            # every version bump. Same reasoning as the GHA step.
+            - export WINDOWS_CROSS_CHECK_TOOLCHAIN="$(rustup show home)/toolchains/$(rustup show active-toolchain | cut -d' ' -f1)"
+            # Single-quoted as a whole: a plain YAML scalar containing ": "
+            # parses as a mapping, so `- echo "toolchain: $X"` would silently
+            # become a key/value pair rather than a command.
+            - 'echo "toolchain: $WINDOWS_CROSS_CHECK_TOOLCHAIN"'
+            - scripts/windows-cross-check.sh
+
+  # ci.yml's `build-macos` job. Semaphore's macOS agents are Apple Silicon, so
+  # this covers aarch64-apple-darwin exactly, same as the GHA macos-latest
+  # runner it replaces.
+  #
+  # NOTE ON ITS SIBLING: ci.yml's `build-windows` job has NO equivalent here.
+  # Semaphore Cloud offers no Windows agents at all, so native MSVC build +
+  # clippy + nextest stays on GitHub Actions. This is the single largest gap in
+  # the port and is documented in docs/develop/semaphore-ci.md.
+  - name: Build (macOS)
+    dependencies: []
+    run:
+      when: "change_in('/', {exclude: ['/devbox.json', '/devbox.lock', '/flake.nix', '/flake.lock'], default_branch: 'main'})"
+    task:
+      agent:
+        machine:
+          type: a2-standard-4
+          os_image: macos-xcode16
+      prologue:
+        commands:
+          # The macOS images ship no Rust at all, so setup-rust.sh installs
+          # rustup from scratch here. `sem-version` is not an option: on macOS
+          # the toolbox supports only ruby and node.
+          - export RUST_COMPONENTS=clippy
+          - bash .semaphore/scripts/setup-rust.sh
+          - export PATH="$HOME/.cargo/bin:$PATH"
+          - cache restore cargo-registry-macos-$(checksum Cargo.lock),cargo-registry-macos-main
+      epilogue:
+        on_pass:
+          commands:
+            - cache store cargo-registry-macos-$(checksum Cargo.lock) $HOME/.cargo/registry
+      jobs:
+        - name: build, clippy, test
+          commands:
+            - cargo build
+            # Bare clippy, matching the GHA job: --all-targets --features e2e
+            # would drag in the Unix-only L2 tier. macOS IS unix so it would
+            # mostly compile, but the GHA job deliberately mirrors the Linux
+            # invocation minus those flags so a test-only lint cannot fail
+            # macOS-only and be unreproducible on the Linux pre-push gate.
+            - cargo clippy -- -D warnings
+            - cargo nextest run --workspace
+
+  # ci.yml's `security` job.
+  - name: Security audit
+    dependencies: []
+    run:
+      when: "change_in('/', {exclude: ['/devbox.json', '/devbox.lock', '/flake.nix', '/flake.lock'], default_branch: 'main'})"
+    task:
+      prologue:
+        commands:
+          - bash .semaphore/scripts/setup-rust.sh
+          - export PATH="$HOME/.cargo/bin:$PATH"
+          # cargo-audit is compiled from source by `cargo install`, which is
+          # slow enough to be worth its own cache key. Keyed on the toolchain
+          # rather than on Cargo.lock: it is a standalone tool, unaffected by
+          # this repo's dependency graph.
+          - cache restore cargo-audit-bin-$RUST_TOOLCHAIN
+      epilogue:
+        on_pass:
+          commands:
+            - cache store cargo-audit-bin-$RUST_TOOLCHAIN $HOME/.cargo/bin/cargo-audit
+      jobs:
+        - name: cargo audit
+          commands:
+            - command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --locked
+            - cargo audit
+
+  # ci.yml's `nix` job — the only check that exercises the root flake.nix.
+  #
+  # Gated on the devbox pair ONLY, not on the flake pair: a flake.lock refresh
+  # is precisely what this exists to verify, so it is the block that stays when
+  # the Rust matrix steps aside. Mirrors the GHA `if:` exactly.
+  - name: Nix flake check
+    dependencies: []
+    run:
+      when: "change_in('/', {exclude: ['/devbox.json', '/devbox.lock'], default_branch: 'main'})"
+    task:
+      agent:
+        machine:
+          type: f1-standard-4
+          os_image: ubuntu2404
+      prologue:
+        commands:
+          # The Determinate installer with `determinate=false`, matching the
+          # GHA job: the people this check protects are the ones who type
+          # `nix run github:vfarcic/dot-agent-deck` on UPSTREAM Nix, so
+          # verifying against Determinate's downstream distribution would
+          # answer a different question.
+          - curl -fsSL https://install.determinate.systems/nix | sh -s -- install linux --no-confirm --init none --extra-conf "experimental-features = nix-command flakes"
+          - . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+      jobs:
+        - name: nix flake check
+          commands:
+            # --all-systems because a bare `nix flake check` silently narrows
+            # to the runner's own system and skips three quarters of the
+            # outputs. -L streams full build logs, which is the difference
+            # between a diagnosable rustc error and "builder failed".
+            - nix flake check -L --all-systems
+
+  # ci.yml's `devbox` job. Ungated there and ungated here — it is the ONLY
+  # check that resolves devbox.lock and runs a pinned tool, so a Renovate
+  # devbox bump has to hit it.
+  - name: Devbox smoke
+    dependencies: []
+    task:
+      jobs:
+        - name: devbox run smoke
+          commands:
+            - curl -fsSL https://get.jetify.com/devbox | FORCE=1 bash
+            # A FILE, not an inline `bash -c '…'`: devbox flattens its trailing
+            # args into one string and re-parses them through a shell, so a
+            # quoted multi-line argument is destroyed before bash sees it.
+            - devbox run -- bash scripts/devbox-smoke.sh
+
+  # docs.yml's `docs-build` job. In GHA this is a separate workflow keyed on
+  # `paths: [docs/**, site/**]`; here the same scoping is the `change_in` below.
+  - name: Docs site
+    dependencies: []
+    run:
+      when: "change_in(['/docs', '/site'], {default_branch: 'main'})"
+    task:
+      prologue:
+        commands:
+          - sem-version node 24
+          - cache restore site-node-modules-$(checksum site/package-lock.json),site-node-modules-main
+      epilogue:
+        on_pass:
+          commands:
+            - cache store site-node-modules-$(checksum site/package-lock.json) site/node_modules
+      jobs:
+        - name: build site and docker image
+          commands:
+            - cd site && npm ci && npm run build && cd ..
+            # `load`, never `push` — this is the PR gate, so it only proves the
+            # image builds. Publishing is docs-publish.yml's job.
+            - docker build -f site/Dockerfile -t ghcr.io/vfarcic/dot-agent-deck-docs:test .
+
+  # aarch64-crossbuild-check.yml, whole. release.yml cross-compiles
+  # aarch64-unknown-linux-gnu with `cross`, and that leg runs ONLY on a tag — so
+  # without this block a change that breaks it is invisible until the release is
+  # already going out.
+  #
+  # Scoped to the dependency graph, exactly as the GHA `paths:` filter is: it is
+  # the C-library cross-build (aws-lc-sys, ~600 C files) that breaks, and only a
+  # dependency change can break it.
+  #
+  # STAYS ON `cross` + Docker rather than moving to a native r1 ARM agent.
+  # Semaphore does have native ARM machines, and building there would be
+  # faster — but this block's whole purpose is to prove THE CROSS LEG that
+  # release.yml actually uses. A native build would be green while the release
+  # path stayed broken. (r1 agents also do not support Docker, so they could not
+  # run `cross` anyway.)
+  - name: aarch64 cross-build check
+    dependencies: []
+    run:
+      when: "change_in(['/Cargo.toml', '/Cargo.lock', '/.semaphore/semaphore.yml'], {default_branch: 'main'})"
+    task:
+      agent:
+        machine:
+          type: f1-standard-4
+          os_image: ubuntu2404
+      prologue:
+        commands:
+          - export RUST_TARGETS=aarch64-unknown-linux-gnu
+          - bash .semaphore/scripts/setup-rust.sh
+          - export PATH="$HOME/.cargo/bin:$PATH"
+          - cache restore cargo-registry-$(checksum Cargo.lock),cargo-registry-main
+      jobs:
+        - name: cross build aarch64
+          commands:
+            - command -v cross >/dev/null 2>&1 || cargo install cross --locked
+            - cross build --release --target aarch64-unknown-linux-gnu
+            # Assert the ARTIFACT, not the exit status: a host-arch fallback
+            # would otherwise read as success, and a pipeline during the
+            # original work reported exit 0 for a build that had in fact failed.
+            - test -f target/aarch64-unknown-linux-gnu/release/dot-agent-deck
+            - file target/aarch64-unknown-linux-gnu/release/dot-agent-deck | grep -q 'ARM aarch64'
+            - find target/aarch64-unknown-linux-gnu -name 'libaws_lc_*.a' -o -name '*aws-lc-sys*' | head -20
+            - 'echo "OK: aarch64 binary produced with the aws-lc-rs TLS backend"'
+
+# GHA release.yml triggers on `push: tags: ['v*']` and runs INDEPENDENTLY of CI.
+# Semaphore has no per-workflow tag trigger, so the release is a promotion off
+# this pipeline instead. Two consequences, both called out in
+# docs/develop/semaphore-ci.md:
+#
+#   * the full CI matrix now runs on the tag before anything is published,
+#     which is stricter than today (`result = 'passed'` is what gates the
+#     promotion, so it has to);
+#   * `workflow_dispatch` with a version input becomes a MANUAL promotion — the
+#     "Publish docs only" entry below — since Semaphore has no dispatch trigger.
+promotions:
+  - name: Release
+    pipeline_file: release.yml
+    auto_promote:
+      when: "result = 'passed' and tag =~ '^v.*'"
+
+  - name: Publish docs only
+    pipeline_file: docs-publish.yml

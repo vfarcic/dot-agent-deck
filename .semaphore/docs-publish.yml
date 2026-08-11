@@ -1,0 +1,115 @@
+# Semaphore port of .github/workflows/docs-publish.yml.
+#
+# Two entry points, mirroring the GHA file's two triggers:
+#
+#   * auto-promoted from release.yml  -> the `workflow_call` path. Publishes
+#     `v<version>` plus `:latest` and bumps Chart.yaml.
+#   * manually promoted from semaphore.yml ("Publish docs only") -> the
+#     `workflow_dispatch` path, i.e. the /publish-docs skill. Publishes
+#     `main-<sha>` and touches only values.yaml.
+#
+# GHA distinguishes them with `inputs.image_tag` being set or empty. Semaphore
+# has no reusable-workflow inputs, so the discriminator is the tag on the
+# commit: a promoted release pipeline carries SEMAPHORE_GIT_TAG_NAME, a manual
+# promotion off a main build does not. Same two behaviors, same branch point.
+#
+# NOTE: this sidesteps the v0.35.9 failure mode by construction. There, the GHA
+# `docs` job called this workflow via `uses:` WITHOUT `secrets: inherit`, so
+# `secrets.RELEASE_TOKEN` was empty in the callee, checkout silently fell back
+# to `github.token`, and the push to main died on GH013 — after the image had
+# already been published. A Semaphore promotion binds its own secrets
+# explicitly, so there is no inheritance to forget.
+version: v1.0
+name: Docs Publish
+
+agent:
+  machine:
+    type: f1-standard-2
+    os_image: ubuntu2404
+
+# GHA: `concurrency: {group: docs-publish, cancel-in-progress: false}`. This
+# pipeline pushes a commit to main, so two of them interleaving would race on
+# the chart bump.
+queue:
+  name: docs-publish
+  scope: project
+  processing: serialized
+
+global_job_config:
+  secrets:
+    - name: dot-agent-deck-release
+  prologue:
+    commands:
+      - checkout
+
+blocks:
+  - name: Publish
+    dependencies: []
+    task:
+      jobs:
+        - name: build, push and bump chart
+          commands:
+            # Resolve the tag list and chart version. `main-<sha>` for a manual
+            # publish; `v<version>` plus `:latest` for a release.
+            - |
+              if [ -n "${SEMAPHORE_GIT_TAG_NAME:-}" ]; then
+                IMAGE_TAG="$SEMAPHORE_GIT_TAG_NAME"
+                CHART_VERSION="${SEMAPHORE_GIT_TAG_NAME#v}"
+                PUSH_LATEST=true
+                ORIGIN=workflow_call
+              else
+                IMAGE_TAG="main-$(git rev-parse --short=7 HEAD)"
+                CHART_VERSION=""
+                PUSH_LATEST=false
+                ORIGIN=manual
+              fi
+              export IMAGE_TAG CHART_VERSION PUSH_LATEST ORIGIN
+              echo "image_tag=$IMAGE_TAG chart_version=${CHART_VERSION:-<none>} push_latest=$PUSH_LATEST origin=$ORIGIN"
+
+            # GHA equivalent: docker/login-action against ghcr.io. GHA uses the
+            # job's own GITHUB_TOKEN, which has `packages: write` from the
+            # workflow `permissions:` block; Semaphore has no such ambient
+            # identity, so the admin PAT in the release secret is what
+            # authenticates here too.
+            - echo "$RELEASE_TOKEN" | docker login ghcr.io -u vfarcic --password-stdin
+
+            - docker build -f site/Dockerfile -t "ghcr.io/vfarcic/dot-agent-deck-docs:${IMAGE_TAG}" .
+            - docker push "ghcr.io/vfarcic/dot-agent-deck-docs:${IMAGE_TAG}"
+            - |
+              if [ "$PUSH_LATEST" = "true" ]; then
+                docker tag "ghcr.io/vfarcic/dot-agent-deck-docs:${IMAGE_TAG}" ghcr.io/vfarcic/dot-agent-deck-docs:latest
+                docker push ghcr.io/vfarcic/dot-agent-deck-docs:latest
+              fi
+
+            - sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.52.5/yq_linux_amd64
+            - sudo chmod +x /usr/local/bin/yq
+            - yq -i '.image.tag = strenv(IMAGE_TAG)' site/helm/values.yaml
+            - |
+              if [ -n "$CHART_VERSION" ]; then
+                yq -i '.version = strenv(CHART_VERSION)' site/helm/Chart.yaml
+                yq -i '.appVersion = "v" + strenv(CHART_VERSION)' site/helm/Chart.yaml
+              fi
+
+            # Same protected-main mechanics as release.yml's Prepare block.
+            - git config user.name "github-actions[bot]"
+            - git config user.email "github-actions[bot]@users.noreply.github.com"
+            - git remote set-url origin "https://x-access-token:${RELEASE_TOKEN}@github.com/vfarcic/dot-agent-deck.git"
+            - git stash --include-untracked || true
+            - git checkout main
+            # Sync before re-applying so the push fast-forwards even if main
+            # advanced in between — e.g. the changelog commit that release.yml's
+            # Prepare block pushed a few minutes earlier.
+            - git pull --rebase --autostash origin main
+            - git stash pop || true
+            - git add site/helm/Chart.yaml site/helm/values.yaml
+            - |
+              if git diff --cached --quiet; then
+                echo "No chart changes to commit"
+              else
+                if [ "$ORIGIN" = "manual" ]; then
+                  git commit -m "chore: publish docs image ${IMAGE_TAG} [skip ci]"
+                else
+                  git commit -m "chore: update docs chart to ${IMAGE_TAG} [skip ci]"
+                fi
+                git push origin main
+              fi

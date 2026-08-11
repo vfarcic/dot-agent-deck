@@ -1,0 +1,201 @@
+# Semaphore port of .github/workflows/release.yml.
+#
+# Reached by AUTO-PROMOTION from semaphore.yml when a `v*` tag's CI passed.
+# GitHub Actions triggers this workflow directly off `push: tags: ['v*']`,
+# independently of CI; Semaphore has no per-file tag trigger, so the promotion
+# is the mechanism. Net effect is stricter than today — the full CI matrix has
+# to be green on the tagged commit before anything is published, because
+# `result = 'passed'` is what gates the promotion.
+#
+# SECRETS. GHA reads `secrets.RELEASE_TOKEN`, `secrets.HOMEBREW_TAP_TOKEN` and
+# `secrets.SCOOP_BUCKET_TOKEN` from the repository. Semaphore secrets are
+# explicit org-level resources, so ONE secret named `dot-agent-deck-release`
+# must exist carrying all three as env vars. It does not exist yet — see
+# docs/develop/semaphore-ci.md for the `sem-ai secret create` command.
+version: v1.0
+name: Release
+
+agent:
+  machine:
+    type: f1-standard-4
+    os_image: ubuntu2404
+
+# A release must never be cancelled halfway through by a second tag landing:
+# the changelog commit is already on main by then, and the GitHub release,
+# Homebrew formula and Scoop manifest publish in that order. GHA expresses this
+# as `concurrency: {group: release, cancel-in-progress: false}`; Semaphore's
+# equivalent is a serialized named queue.
+queue:
+  name: release
+  scope: project
+  processing: serialized
+
+global_job_config:
+  secrets:
+    - name: dot-agent-deck-release
+  prologue:
+    commands:
+      - checkout
+  env_vars:
+    - name: RUST_TOOLCHAIN
+      value: "1.97.1"
+
+blocks:
+  # GHA's `prepare` job. Everything that must be settled BEFORE a single binary
+  # is built: is the tag valid SemVer, does flake.nix agree with it, and what do
+  # the release notes say.
+  - name: Prepare
+    dependencies: []
+    task:
+      agent:
+        machine:
+          type: f1-standard-2
+          os_image: ubuntu2404
+      jobs:
+        - name: validate version and commit changelog
+          commands:
+            - export DAD_VERSION="$(bash .semaphore/scripts/resolve-version.sh)"
+            - 'echo "Releasing: $DAD_VERSION"'
+            - bash .semaphore/scripts/verify-flake-version.sh "$DAD_VERSION"
+
+            # GHA writes the assembled changelog to a job output and hands it to
+            # softprops/action-gh-release as the release body. Semaphore blocks
+            # share no outputs, so it travels as a workflow artifact instead and
+            # `Finalize` feeds it to `gh release create --notes-file`.
+            - chmod +x scripts/assemble-changelog.sh
+            - scripts/assemble-changelog.sh "$DAD_VERSION" > /tmp/release-notes.md
+            - artifact push workflow /tmp/release-notes.md --destination release-notes.md --force
+
+            # `main` is ruleset-protected (CLAUDE.md rule 8): a plain push is
+            # rejected with GH013. RELEASE_TOKEN is the admin PAT whose identity
+            # the ruleset lets bypass. On GHA this is wired at checkout time via
+            # `token:`; here `checkout` has already run against the project's
+            # own credentials, so the remote is rewritten for the push only.
+            - git config user.name "github-actions[bot]"
+            - git config user.email "github-actions[bot]@users.noreply.github.com"
+            - git remote set-url origin "https://x-access-token:${RELEASE_TOKEN}@github.com/vfarcic/dot-agent-deck.git"
+            - git add CHANGELOG.md changelog.d/
+            - git stash
+            - git checkout main
+            # Sync local main to remote before re-applying our changes so the
+            # push fast-forwards cleanly even if main advanced in between.
+            - git pull --rebase --autostash origin main
+            - git stash pop || true
+            - git add CHANGELOG.md changelog.d/
+            # Single-quoted as a whole: the ": " in the commit message would
+            # otherwise make YAML parse this line as a mapping, not a command.
+            - 'git diff --cached --quiet || git commit -m "docs: update changelog for v$DAD_VERSION"'
+            - git push origin main
+
+  # GHA's `build` matrix, Linux half. Split from macOS because Semaphore picks
+  # the agent per BLOCK, not per matrix entry — the GHA matrix's `os:` column
+  # has no in-matrix equivalent.
+  - name: Build (Linux)
+    dependencies: ["Prepare"]
+    task:
+      prologue:
+        commands:
+          - export RUST_TARGETS="$TARGET"
+          - bash .semaphore/scripts/setup-rust.sh
+          - export PATH="$HOME/.cargo/bin:$PATH"
+          - cache restore cargo-registry-$(checksum Cargo.lock),cargo-registry-main
+      jobs:
+        - name: build
+          matrix:
+            - env_var: TARGET
+              values:
+                - x86_64-unknown-linux-gnu
+                - aarch64-unknown-linux-gnu
+          commands:
+            - export DAD_VERSION="$(bash .semaphore/scripts/resolve-version.sh)"
+            - bash .semaphore/scripts/build-release-target.sh
+
+  # GHA's `build` matrix, macOS half. The agents are Apple Silicon; the
+  # x86_64-apple-darwin leg cross-compiles to Intel from there, which is what
+  # the GHA macos-latest runner already does.
+  - name: Build (macOS)
+    dependencies: ["Prepare"]
+    task:
+      agent:
+        machine:
+          type: a2-standard-4
+          os_image: macos-xcode16
+      prologue:
+        commands:
+          - export RUST_TARGETS="$TARGET"
+          - bash .semaphore/scripts/setup-rust.sh
+          - export PATH="$HOME/.cargo/bin:$PATH"
+          - cache restore cargo-registry-macos-$(checksum Cargo.lock),cargo-registry-macos-main
+      jobs:
+        - name: build
+          matrix:
+            - env_var: TARGET
+              values:
+                - x86_64-apple-darwin
+                - aarch64-apple-darwin
+          commands:
+            - export DAD_VERSION="$(bash .semaphore/scripts/resolve-version.sh)"
+            - bash .semaphore/scripts/build-release-target.sh
+
+  # GHA's `finalize` job. The one block holding the publishing tokens.
+  - name: Finalize
+    dependencies: ["Build (Linux)", "Build (macOS)"]
+    task:
+      agent:
+        machine:
+          type: f1-standard-2
+          os_image: ubuntu2404
+      prologue:
+        commands:
+          # GHA equivalent: arduino/setup-task@v3.0.0. Not preinstalled on the
+          # agent image, and the Taskfile targets below are what actually
+          # generate and publish the Homebrew formula and Scoop manifest.
+          - curl -sL https://taskfile.dev/install.sh | sh -s -- -b /usr/local/bin v3.48.0
+          # `--force` because checkout has already populated the working tree
+          # and the toolbox refuses to overwrite an existing path otherwise.
+          - artifact pull workflow dist --force
+          - artifact pull workflow release-notes.md --force
+          - ls -la dist
+      jobs:
+        - name: publish release, homebrew and scoop
+          commands:
+            - export DAD_VERSION="$(bash .semaphore/scripts/resolve-version.sh)"
+            - task checksums
+
+            # Pre-release versions carry a SemVer pre-release suffix and route
+            # to a parallel `dot-agent-deck-beta` formula / manifest, so stable
+            # users on `brew upgrade dot-agent-deck` never see them.
+            - |
+              if [ "${DAD_VERSION#*-}" != "$DAD_VERSION" ]; then
+                export CHANNEL_NAME=dot-agent-deck-beta
+                export PRERELEASE_FLAG=--prerelease
+              else
+                export CHANNEL_NAME=dot-agent-deck
+                export PRERELEASE_FLAG=
+              fi
+              echo "channel=$CHANNEL_NAME"
+
+            # GHA equivalent: softprops/action-gh-release. The GitHub CLI is
+            # preinstalled on the agent image, so no install step is needed.
+            # `--fail-on-no-commits` has no counterpart; the explicit `ls` of
+            # the asset list below is what stands in for
+            # `fail_on_unmatched_files: true`.
+            - test -n "$(ls dist/dot-agent-deck-* 2>/dev/null)"
+            - export GITHUB_TOKEN="$RELEASE_TOKEN"
+            - gh release create "v$DAD_VERSION" --title "v$DAD_VERSION" --notes-file release-notes.md $PRERELEASE_FLAG dist/dot-agent-deck-* dist/checksums.txt
+
+            - task homebrew-formula "VERSION=v$DAD_VERSION" "NAME=$CHANNEL_NAME"
+            - task homebrew-publish "VERSION=v$DAD_VERSION" "NAME=$CHANNEL_NAME"
+            - task scoop-manifest "VERSION=v$DAD_VERSION" "NAME=$CHANNEL_NAME"
+            - task scoop-publish "VERSION=v$DAD_VERSION" "NAME=$CHANNEL_NAME"
+
+# GHA's `docs` job calls docs-publish.yml as a reusable workflow with
+# `secrets: inherit`. Semaphore has no reusable-workflow mechanism, so it is a
+# promotion to a sibling pipeline — which sidesteps the v0.35.9 failure mode
+# entirely, since a promoted pipeline binds its own secrets rather than
+# inheriting (or silently failing to inherit) the caller's.
+promotions:
+  - name: Publish docs
+    pipeline_file: docs-publish.yml
+    auto_promote:
+      when: "result = 'passed'"
