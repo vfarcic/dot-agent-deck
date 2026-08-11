@@ -7,7 +7,7 @@
     "upcloud-cli@3.29.0",
     "gh@2.97.0",
     "asciinema@3.2.1",
-    "cargo-nextest@0.9.140",
+    "cargo-nextest@0.9.143",
     "rustc@1.97.1",
     "cargo@1.97.1",
     "clippy@1.97.1",
