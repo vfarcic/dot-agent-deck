@@ -22,11 +22,24 @@ set -euo pipefail
 # here so nothing added later can reintroduce a locale-dependent comparison.
 export LC_ALL=C
 
-if [ -z "${SEMAPHORE_GIT_TAG_NAME:-}" ]; then
-  echo "ERROR: SEMAPHORE_GIT_TAG_NAME is empty. This pipeline only runs for tag-triggered workflows." >&2
-  exit 1
+if [ -n "${SEMAPHORE_GIT_TAG_NAME:-}" ]; then
+  VERSION="${SEMAPHORE_GIT_TAG_NAME#v}"
+else
+  # No tag: this is a dry run of the release path off a branch, which is the
+  # normal case here since this pipeline never publishes anything. Fall back to
+  # the version flake.nix pins so the build still exercises the real
+  # DAD_VERSION injection seam (issue #250) end to end.
+  #
+  # NOTE that this makes verify-flake-version.sh a tautology on branch runs —
+  # it is comparing flake.nix against itself. That check only means something on
+  # a tag, where the two sources are genuinely independent.
+  VERSION=$(sed -nE 's/^[[:space:]]*version = "([^"]+)";[[:space:]]*$/\1/p' flake.nix | head -1)
+  if [ -z "$VERSION" ]; then
+    echo "ERROR: no tag, and no version could be read from flake.nix." >&2
+    exit 1
+  fi
+  echo "No tag; dry run against the flake.nix version ${VERSION}" >&2
 fi
-VERSION="${SEMAPHORE_GIT_TAG_NAME#v}"
 
 # SemVer 2.0.0 transcribed into POSIX ERE (bash's `=~` has no non-capturing
 # groups), assembled from named pieces because the character classes have to be

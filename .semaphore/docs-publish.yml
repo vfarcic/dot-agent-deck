@@ -1,56 +1,78 @@
 # Semaphore port of .github/workflows/docs-publish.yml.
 #
-# Two entry points, mirroring the GHA file's two triggers:
+# THE IMAGE BUILDS. NOTHING IS PUSHED OR COMMITTED.
+#
+# The GHCR login, the `docker push`, the Chart.yaml/values.yaml bump and the
+# commit to `main` are all present but COMMENTED OUT, so adopting Semaphore is
+# an uncomment rather than a rewrite. `docker build` stays live, because that is
+# the step that can actually fail on a docs change.
+#
+# CAVEAT: nothing validates the commented blocks — not `sem-ai yaml validate`,
+# not any run. They will drift silently if the registry path or token names
+# change. Review them before uncommenting rather than trusting them.
+#
+# NOT REACHABLE TODAY. Both promotions that would lead here are commented out
+# (the auto one in release.yml, the manual one in semaphore.yml), because with
+# the publishing disabled this file duplicates the `Docs site` block in
+# semaphore.yml, which already builds the site and the image on every change to
+# `docs/**` or `site/**`. It is kept as the structural counterpart of the GHA
+# file so the mapping stays one-to-one.
+#
+# TWO ENTRY POINTS, mirroring the GHA file's two triggers:
 #
 #   * auto-promoted from release.yml  -> the `workflow_call` path. Publishes
 #     `v<version>` plus `:latest` and bumps Chart.yaml.
-#   * manually promoted from semaphore.yml ("Publish docs only") -> the
-#     `workflow_dispatch` path, i.e. the /publish-docs skill. Publishes
-#     `main-<sha>` and touches only values.yaml.
+#   * manually promoted from semaphore.yml -> the `workflow_dispatch` path,
+#     i.e. the /publish-docs skill. Publishes `main-<sha>`, values.yaml only.
 #
 # GHA distinguishes them with `inputs.image_tag` being set or empty. Semaphore
 # has no reusable-workflow inputs, so the discriminator is the tag on the
 # commit: a promoted release pipeline carries SEMAPHORE_GIT_TAG_NAME, a manual
 # promotion off a main build does not. Same two behaviors, same branch point.
 #
-# NOTE: this sidesteps the v0.35.9 failure mode by construction. There, the GHA
-# `docs` job called this workflow via `uses:` WITHOUT `secrets: inherit`, so
-# `secrets.RELEASE_TOKEN` was empty in the callee, checkout silently fell back
-# to `github.token`, and the push to main died on GH013 — after the image had
-# already been published. A Semaphore promotion binds its own secrets
+# NOTE: this shape sidesteps the v0.35.9 failure mode by construction. There,
+# the GHA `docs` job called this workflow via `uses:` WITHOUT `secrets: inherit`,
+# so `secrets.RELEASE_TOKEN` was empty in the callee, checkout silently fell
+# back to `github.token`, and the push to main died on GH013 — after the image
+# had already been published. A Semaphore promotion binds its own secrets
 # explicitly, so there is no inheritance to forget.
 version: v1.0
-name: Docs Publish
+name: Docs build (no publish)
 
 agent:
   machine:
     type: f1-standard-2
     os_image: ubuntu2404
 
-# GHA: `concurrency: {group: docs-publish, cancel-in-progress: false}`. This
-# pipeline pushes a commit to main, so two of them interleaving would race on
-# the chart bump.
-queue:
-  name: docs-publish
-  scope: project
-  processing: serialized
+# Uncomment together with the publishing steps below. This pipeline would push
+# a commit to main, so two of them interleaving would race on the chart bump.
+# GHA: `concurrency: {group: docs-publish, cancel-in-progress: false}`.
+#
+# queue:
+#   name: docs-publish
+#   scope: project
+#   processing: serialized
 
 global_job_config:
-  secrets:
-    - name: dot-agent-deck-release
+  # Uncomment together with the publishing steps below.
+  #
+  # secrets:
+  #   - name: dot-agent-deck-release
   prologue:
     commands:
       - checkout
 
 blocks:
-  - name: Publish
+  - name: Build
     dependencies: []
     task:
       jobs:
-        - name: build, push and bump chart
+        - name: build docs image
           commands:
             # Resolve the tag list and chart version. `main-<sha>` for a manual
-            # publish; `v<version>` plus `:latest` for a release.
+            # publish; `v<version>` plus `:latest` for a release. Kept live even
+            # though nothing is pushed, because this discriminator is itself a
+            # thing that can break.
             - |
               if [ -n "${SEMAPHORE_GIT_TAG_NAME:-}" ]; then
                 IMAGE_TAG="$SEMAPHORE_GIT_TAG_NAME"
@@ -66,50 +88,53 @@ blocks:
               export IMAGE_TAG CHART_VERSION PUSH_LATEST ORIGIN
               echo "image_tag=$IMAGE_TAG chart_version=${CHART_VERSION:-<none>} push_latest=$PUSH_LATEST origin=$ORIGIN"
 
-            # GHA equivalent: docker/login-action against ghcr.io. GHA uses the
-            # job's own GITHUB_TOKEN, which has `packages: write` from the
-            # workflow `permissions:` block; Semaphore has no such ambient
-            # identity, so the admin PAT in the release secret is what
-            # authenticates here too.
-            - echo "$RELEASE_TOKEN" | docker login ghcr.io -u vfarcic --password-stdin
-
             - docker build -f site/Dockerfile -t "ghcr.io/vfarcic/dot-agent-deck-docs:${IMAGE_TAG}" .
-            - docker push "ghcr.io/vfarcic/dot-agent-deck-docs:${IMAGE_TAG}"
-            - |
-              if [ "$PUSH_LATEST" = "true" ]; then
-                docker tag "ghcr.io/vfarcic/dot-agent-deck-docs:${IMAGE_TAG}" ghcr.io/vfarcic/dot-agent-deck-docs:latest
-                docker push ghcr.io/vfarcic/dot-agent-deck-docs:latest
-              fi
+            - 'echo "OK: image built as ghcr.io/vfarcic/dot-agent-deck-docs:${IMAGE_TAG}. Nothing was pushed."'
 
-            - sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.52.5/yq_linux_amd64
-            - sudo chmod +x /usr/local/bin/yq
-            - yq -i '.image.tag = strenv(IMAGE_TAG)' site/helm/values.yaml
-            - |
-              if [ -n "$CHART_VERSION" ]; then
-                yq -i '.version = strenv(CHART_VERSION)' site/helm/Chart.yaml
-                yq -i '.appVersion = "v" + strenv(CHART_VERSION)' site/helm/Chart.yaml
-              fi
-
-            # Same protected-main mechanics as release.yml's Prepare block.
-            - git config user.name "github-actions[bot]"
-            - git config user.email "github-actions[bot]@users.noreply.github.com"
-            - git remote set-url origin "https://x-access-token:${RELEASE_TOKEN}@github.com/vfarcic/dot-agent-deck.git"
-            - git stash --include-untracked || true
-            - git checkout main
-            # Sync before re-applying so the push fast-forwards even if main
-            # advanced in between — e.g. the changelog commit that release.yml's
-            # Prepare block pushed a few minutes earlier.
-            - git pull --rebase --autostash origin main
-            - git stash pop || true
-            - git add site/helm/Chart.yaml site/helm/values.yaml
-            - |
-              if git diff --cached --quiet; then
-                echo "No chart changes to commit"
-              else
-                if [ "$ORIGIN" = "manual" ]; then
-                  git commit -m "chore: publish docs image ${IMAGE_TAG} [skip ci]"
-                else
-                  git commit -m "chore: update docs chart to ${IMAGE_TAG} [skip ci]"
-                fi
-                git push origin main
-              fi
+            # === PUSHES TO GHCR AND main — COMMENTED OUT =================
+            # GHA equivalent of the login: docker/login-action against ghcr.io,
+            # using the job's ambient GITHUB_TOKEN with `packages: write` from
+            # the workflow `permissions:` block. Semaphore has no such ambient
+            # identity, so the admin PAT authenticates here instead — a real
+            # reduction in least-privilege, noted in docs/develop/semaphore-ci.md.
+            #
+            # - echo "$RELEASE_TOKEN" | docker login ghcr.io -u vfarcic --password-stdin
+            # - docker push "ghcr.io/vfarcic/dot-agent-deck-docs:${IMAGE_TAG}"
+            # - |
+            #   if [ "$PUSH_LATEST" = "true" ]; then
+            #     docker tag "ghcr.io/vfarcic/dot-agent-deck-docs:${IMAGE_TAG}" ghcr.io/vfarcic/dot-agent-deck-docs:latest
+            #     docker push ghcr.io/vfarcic/dot-agent-deck-docs:latest
+            #   fi
+            #
+            # - sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.52.5/yq_linux_amd64
+            # - sudo chmod +x /usr/local/bin/yq
+            # - yq -i '.image.tag = strenv(IMAGE_TAG)' site/helm/values.yaml
+            # - |
+            #   if [ -n "$CHART_VERSION" ]; then
+            #     yq -i '.version = strenv(CHART_VERSION)' site/helm/Chart.yaml
+            #     yq -i '.appVersion = "v" + strenv(CHART_VERSION)' site/helm/Chart.yaml
+            #   fi
+            #
+            # # Same protected-main mechanics as release.yml's Prepare block.
+            # - git config user.name "github-actions[bot]"
+            # - git config user.email "github-actions[bot]@users.noreply.github.com"
+            # - git remote set-url origin "https://x-access-token:${RELEASE_TOKEN}@github.com/vfarcic/dot-agent-deck.git"
+            # - git stash --include-untracked || true
+            # - git checkout main
+            # # Sync before re-applying so the push fast-forwards even if main
+            # # advanced — e.g. the changelog commit release.yml pushed earlier.
+            # - git pull --rebase --autostash origin main
+            # - git stash pop || true
+            # - git add site/helm/Chart.yaml site/helm/values.yaml
+            # - |
+            #   if git diff --cached --quiet; then
+            #     echo "No chart changes to commit"
+            #   else
+            #     if [ "$ORIGIN" = "manual" ]; then
+            #       git commit -m "chore: publish docs image ${IMAGE_TAG} [skip ci]"
+            #     else
+            #       git commit -m "chore: update docs chart to ${IMAGE_TAG} [skip ci]"
+            #     fi
+            #     git push origin main
+            #   fi
+            # =============================================================

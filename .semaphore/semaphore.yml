@@ -324,16 +324,30 @@ blocks:
 # this pipeline instead. Two consequences, both called out in
 # docs/develop/semaphore-ci.md:
 #
-#   * the full CI matrix now runs on the tag before anything is published,
+#   * the full CI matrix now runs on the tag before the release path does,
 #     which is stricter than today (`result = 'passed'` is what gates the
 #     promotion, so it has to);
-#   * `workflow_dispatch` with a version input becomes a MANUAL promotion — the
-#     "Publish docs only" entry below — since Semaphore has no dispatch trigger.
+#   * `workflow_dispatch` with a version input has no counterpart, since
+#     Semaphore has no dispatch trigger.
+#
+# NOTE: release.yml BUILDS but does not publish — its four publishing steps are
+# commented out inside that file. So this promotion is safe to leave on: an
+# auto-promoted tag compiles all four targets, verifies the version is baked in,
+# and generates the formula and manifest, without releasing anything.
+#
+# It is also promotable MANUALLY from any branch, which is how the release path
+# gets exercised without cutting a tag — resolve-version.sh falls back to the
+# version flake.nix pins when there is no tag.
 promotions:
-  - name: Release
+  - name: Release build
     pipeline_file: release.yml
     auto_promote:
       when: "result = 'passed' and tag =~ '^v.*'"
 
-  - name: Publish docs only
-    pipeline_file: docs-publish.yml
+  # Commented out because docs-publish.yml exists only to push an image to GHCR
+  # and commit the chart bump to main, and both are disabled. Its build half is
+  # already covered by the `Docs site` block above, which runs on every change
+  # to docs/** or site/**. Uncomment together with that file's publishing steps.
+  #
+  # - name: Publish docs only
+  #   pipeline_file: docs-publish.yml
