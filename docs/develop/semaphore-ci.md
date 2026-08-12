@@ -87,7 +87,7 @@ This was a deliberate choice: `change_in` is evaluated before an agent boots, so
 
 ## Setup required before any of this runs
 
-1. **Create the project.** `sem-ai project create` (or `sem-ai init`, which detects the existing `.github/workflows/` and offers to translate).
+1. ~~**Create the project.**~~ Already done — a `dot-agent-deck` project exists in org `dot`, connected over the GitHub App integration. (For reference, the command would have been `sem-ai project create`, or `sem-ai init`, which detects the existing `.github/workflows/` and offers to translate.)
 2. **Create the secret.** Both `release.yml` and `docs-publish.yml` bind one org-level secret named `dot-agent-deck-release`, carrying three env vars that mirror the GitHub repository secrets of the same names:
 
    ```
@@ -103,8 +103,20 @@ This was a deliberate choice: `change_in` is evaluated before an agent boots, so
 
 ## Verification status
 
-The pipelines parse as valid YAML and every `commands:` entry is confirmed to be a string — worth checking mechanically, because a plain YAML scalar containing `": "` silently parses as a *mapping* rather than a command, which is how `- echo "toolchain: $X"` becomes a key/value pair. Three such lines existed in the first draft and are now explicitly quoted.
+**All three pipelines pass `sem-ai yaml validate`** against the API (org `dot`).
 
-`resolve-version.sh` and `verify-flake-version.sh` were exercised against the real repository: the SemVer gate accepts `1.2.3` and `0.36.0-rc.1` and rejects `1.2`, `not-semver`, the full-width `１.２.３`, `1.2.3-é` and the empty string; the flake check accepts the real pinned `0.36.0` and rejects a mismatch.
+**But read what that check does and does not cover before trusting it.** It is a *structural* validation, not a resource one. Measured, by feeding it two deliberately broken pipelines:
 
-**Not yet verified against the Semaphore API**, and not yet executed on a real agent. In particular these are reasoned from documentation rather than observed: that the pinned Rust 1.97.1 installs cleanly on both agent images (the Ubuntu image ships 1.95.0, the macOS images ship no Rust at all), that `cross` works on the `f1` Docker-enabled machines, and that the Nix and devbox installers behave on the agent image.
+- a block whose `dependencies:` names a nonexistent block is **caught** — `{:malformed, {:unknown_block_name, "Nonexistent Block"}}`;
+- an `agent.machine.type` of `not-a-real-machine` is **reported valid**.
+
+So the API confirms the shape of these files is correct and says nothing about whether the machines they ask for exist or are available on this org's plan. The `a2-standard-4` / `macos-xcode16` macOS agent and the `f1-standard-4` sizing are therefore still unverified, and Semaphore exposes no way to enumerate cloud machine types — `sem-ai discover` surfaces `--machine` only as an input to `testbox warmup`. The way to actually settle it is to run something: either push the branch, or allocate a probe VM with `sem-ai testbox warmup --project dot-agent-deck --machine a2-standard-4 --os-image macos-xcode16`.
+
+Also confirmed against the live org:
+
+- A **`dot-agent-deck` project already exists** (`c45e9515-…`), wired to `git@github.com:vfarcic/dot-agent-deck.git` over the GitHub App integration, with prior workflow runs on `main` and on feature branches. So step 1 of the setup list below is already done, and pushing this branch would trigger a real pipeline.
+- `sem-ai agent types` returns `[]` — **no self-hosted agents are registered**, which confirms empirically that there is no Windows capacity in this org today, cloud or otherwise.
+
+Verified locally, independent of the API: the pipelines parse and every `commands:` entry is a string — worth checking mechanically, because a plain YAML scalar containing `": "` silently parses as a *mapping* rather than a command, which is how `- echo "toolchain: $X"` becomes a key/value pair. Three such lines existed in the first draft and are now explicitly quoted. `resolve-version.sh` and `verify-flake-version.sh` were exercised against the real repository: the SemVer gate accepts `1.2.3` and `0.36.0-rc.1` and rejects `1.2`, `not-semver`, the full-width `１.２.３`, `1.2.3-é` and the empty string; the flake check accepts the real pinned `0.36.0` and rejects a mismatch.
+
+**Still unobserved**, because nothing has run on an agent: that the pinned Rust 1.97.1 installs cleanly on both images (Ubuntu ships 1.95.0, macOS ships no Rust at all), that `cross` works on the `f1` Docker-enabled machines, and that the Nix and devbox installers behave on the agent image.
