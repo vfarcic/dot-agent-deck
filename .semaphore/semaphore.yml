@@ -245,8 +245,17 @@ blocks:
           # `nix run github:vfarcic/dot-agent-deck` on UPSTREAM Nix, so
           # verifying against Determinate's downstream distribution would
           # answer a different question.
-          - curl -fsSL https://install.determinate.systems/nix | sh -s -- install linux --no-confirm --init none --extra-conf "experimental-features = nix-command flakes"
+          # NO `--init none`. That was the first-run failure: without an init
+          # system the daemon is never started, so `nix flake check` died with
+          # `opening lock file "/nix/var/nix/db/big-lock": Permission denied`
+          # and the installer's own hint about the daemon having crashed. The
+          # agent is a full VM with systemd, so the default multi-user install
+          # is correct — GHA never hits this because
+          # DeterminateSystems/nix-installer-action starts the daemon for you,
+          # and there is no such action here.
+          - curl -fsSL https://install.determinate.systems/nix | sh -s -- install linux --no-confirm --extra-conf "experimental-features = nix-command flakes"
           - . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          - nix --version
       jobs:
         - name: nix flake check
           commands:
@@ -259,6 +268,18 @@ blocks:
   # ci.yml's `devbox` job. Ungated there and ungated here — it is the ONLY
   # check that resolves devbox.lock and runs a pinned tool, so a Renovate
   # devbox bump has to hit it.
+  #
+  # KNOWN SLOW — the weakest block in this port. GHA uses
+  # `jetify-com/devbox-install-action` with `enable-cache: true`, which caches
+  # the entire Nix store keyed on devbox.json; ci.yml's comment notes the
+  # `path:gcloud#google-cloud-sdk` flake builds the SDK from source and
+  # dominates a cold run. Semaphore has no equivalent action, so EVERY run here
+  # is cold: the first real run exceeded 25 minutes and was still going.
+  #
+  # Fixing it means caching /nix by hand — root-owned and multi-GB, so a
+  # `sudo tar` into a single `cache store` path. That is heavy and fragile
+  # enough to be worth doing deliberately rather than inline here. Until then
+  # this block is the pipeline's long pole by a wide margin.
   - name: Devbox smoke
     dependencies: []
     task:

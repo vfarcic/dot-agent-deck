@@ -106,6 +106,56 @@ This was a deliberate choice: `change_in` is evaluated before an agent boots, so
 
 **No test reporting.** Semaphore has a genuinely good `test-results publish` surface with a per-pipeline aggregated report, which GitHub Actions has no built-in answer for. It is not wired up here because enabling JUnit output from nextest means editing `.config/nextest.toml`, and this branch does not modify existing files. It is the most valuable thing left on the table.
 
+## Pros and cons, from this evaluation
+
+Everything below is something this port actually hit. It is not a feature comparison; it is what showed up while moving one real repository's CI.
+
+### In Semaphore's favour
+
+**`sem-ai` is the real product, and it delivers on its premise.** This entire evaluation — discovery, validation, machine-type probing, triggering, diagnosis — was driven from the CLI without opening the web console once. `discover` enumerates the surface so nothing has to be guessed, JSON is the default so nothing has to be scraped, and the embedded MCP server means the same surface drops into an agent config directly. GitHub's `gh` is a good CLI, but it was built for humans and retrofitted; this was built the other way round.
+
+**`testbox` is the standout feature and has no GitHub Actions equivalent.** It allocates a real CI VM you can SSH into. It found three things that documentation and the web console both got wrong — see the machine-type table and the missing Rust below — *before any pipeline ran*. For a project whose CI failures are historically platform-specific, being able to interrogate the runner directly is worth a lot.
+
+**`diagnose` collapses a debugging session into one call.** Failed blocks, failed jobs, log tails and commit context in a single structured response. Finding the same information in GitHub Actions means opening a run, expanding a job, and scrolling a log.
+
+**Manual triggering is more capable than `workflow_dispatch`.** A Task can run any branch against any pipeline file on demand. GitHub Actions requires the workflow to already exist on the default branch, which is a genuine obstacle when the thing you want to test is the workflow itself.
+
+**Conditions live next to the block they guard.** Three GHA workflow files collapsed into one pipeline because `change_in()` replaced per-file `on: paths:` triggers. Less indirection, and the whole CI graph is visible in one file.
+
+**The toolbox removes setup boilerplate.** `checkout`, `cache`, `artifact`, `sem-version`, `retry` and `test-results` are preinstalled, so most `uses: actions/...` steps collapse to nothing.
+
+**Promotions are a better deploy model than reusable workflows.** A promoted pipeline binds its own secrets, which structurally prevents the v0.35.9 failure — where `docs-publish.yml` was called via `uses:` without `secrets: inherit`, silently got an empty token, and died *after* publishing the image.
+
+**`test-results` has no GitHub Actions counterpart.** Per-pipeline aggregated test reporting is built in. Not wired up here, but it is the most valuable thing left on the table.
+
+### Against
+
+**No Windows agents, at all.** This is the one disqualifying gap. `build-windows` cannot move, and `sem-ai agent types` confirms no self-hosted capacity exists either. Retiring GitHub Actions would mean losing the native Windows coverage that PRD #42 M8 added precisely because platform-specific breaks were reaching releases.
+
+**The Free Plan gates every Linux machine above 2 vCPU** — `f1-standard-4`, `e1-standard-4` and `e1-standard-8` all fail to start. The heaviest block in the pipeline is the critical path and is stuck on 2 vCPU.
+
+**The web console lists machines it cannot run.** "Available Agents" showed all three of the machines above. Only `testbox` revealed the truth. A configuration surface that advertises unavailable options is worse than one that lists fewer.
+
+**The docs are wrong about the agent images.** They state Rust 1.95.0 ships on `ubuntu2404`. In reality `rustc` is command-not-found and `rustup` is absent on both `ubuntu2204` and `ubuntu2404`, and on macOS `sem-version` is not even on `PATH` in a testbox session. A pipeline written from the documentation would fail on its first command.
+
+**`sem-ai yaml validate` is structural only.** It catches a dependency on a nonexistent block but passes `type: not-a-real-machine`. A green validation says much less than it appears to.
+
+**No ambient job identity.** GitHub Actions grants a scoped `GITHUB_TOKEN` via `permissions:`. Semaphore has nothing equivalent, so the GHCR push that used a scoped token now needs the admin PAT — a real reduction in least-privilege, not a mechanical swap.
+
+**The conditions DSL has no PR-author variable**, so the Renovate-scoped skip in `ci.yml` cannot be reproduced faithfully.
+
+**No Rust-aware caching.** `Swatinem/rust-cache` prunes stale artifacts and keys on toolchain and target; the toolbox `cache` is a generic key/path store with a one-path-per-`store` footgun. Expect worse hit rates and larger entries.
+
+**Ecosystem gaps cost real time.** There is no `nix-installer-action` and no `devbox-install-action`, so both had to be driven by hand — one of them wrongly, and the other now runs uncached for 17+ minutes. Much of what makes a GitHub Actions workflow short is the Marketplace, and that does not travel.
+
+**The onboarding wizard can leave a project half-created and silently non-building**, with a stored config that looks correct from the API. That cost most of a debugging session.
+
+**Minor:** `diagnose` accepts a *workflow* id but 404s on a *pipeline* id, with no hint that the distinction is the problem.
+
+### Where it nets out
+
+For a Linux-and-macOS Rust project, the port is faithful and six of eight blocks passed on the first real run. The blockers are not about pipeline expressiveness — Semaphore's model is at least as good as GitHub Actions' and in places better. They are Windows, the plan's machine ceiling, and the Marketplace ecosystem that a mature GHA setup quietly depends on. `sem-ai` is genuinely ahead of anything GitHub ships for agent-driven CI, and is the strongest reason to keep watching this.
+
 ## Setup required before any of this runs
 
 1. ~~**Create the project.**~~ Already done — a `dot-agent-deck` project exists in org `dot`, connected over the GitHub App integration. (For reference, the command would have been `sem-ai project create`, or `sem-ai init`, which detects the existing `.github/workflows/` and offers to translate.)
@@ -166,7 +216,49 @@ One caveat on `testbox run`: it rsyncs the working directory before executing, s
 
 That `cross` works on the f1 machines, and that the Nix and devbox installers behave on the agent image.
 
-### The pipelines have not run end to end
+### First real end-to-end run
+
+Triggered 2026-08-12 against commit `53d33a3` on `semaphore-ci`. **Six of eight blocks passed on the first attempt.**
+
+| Block | Result |
+| --- | --- |
+| `Build (Linux)` — fmt, clippy `--all-targets --features e2e`, release build, 1705 nextest tests, linkage-check | **passed** |
+| `Windows cross-check` | **passed** |
+| `Build (macOS)` — `a2-standard-4` | **passed** |
+| `Security audit` — `cargo audit` | **passed** |
+| `Docs site` — `npm ci`, Docusaurus build, docker build | **passed** |
+| `aarch64 cross-build check` — `cross` + Docker | **passed** |
+| `Nix flake check` | **failed** — see below |
+| `Devbox smoke` | very slow — see below |
+
+That closes most of the "still unverified" list at once: `cross` genuinely works on the `f1` machines, the Rust toolchain pin holds on both Linux and macOS in a real job, and the whole fast tier passes on 2 vCPU.
+
+**`Nix flake check` failed on a bug in this pipeline, not in the flake.** The prologue passed `--init none` to the Determinate installer, so no daemon was ever started:
+
+```
+error: opening lock file "/nix/var/nix/db/big-lock": Permission denied
+… run as non-root in a single-user Nix installation, or the Nix daemon may have crashed
+```
+
+GitHub Actions never hits this because `DeterminateSystems/nix-installer-action` handles daemon setup; there is no such action on Semaphore, so the installer has to be driven correctly by hand.
+
+**`Devbox smoke` ran for over 17 minutes.** GHA's `jetify-com/devbox-install-action` sets `enable-cache: true`, which caches the whole Nix store keyed on `devbox.json` — and ci.yml's comment notes the `path:gcloud#google-cloud-sdk` flake builds the SDK from source and dominates a cold run. There is no equivalent action here, so every run is cold. This block needs a `cache store`/`cache restore` pair over the Nix store before it is usable.
+
+### Triggering a pipeline on a branch without a webhook
+
+Yes, this is possible, and it is how the run above happened — but **not** via `workflow run`, which only reschedules an existing workflow and returns `no workflows found to rerun` for a branch that has never built. The mechanism is a **Task**:
+
+```
+sem-ai task create semaphore-ci-manual --project dot-agent-deck \
+  --branch semaphore-ci --file .semaphore/semaphore.yml
+sem-ai task run <task-id> --branch semaphore-ci --pipeline-file .semaphore/semaphore.yml
+```
+
+Omitting `--cron` gives a manual-only task. `task run` then accepts `--branch` and `--pipeline-file` overrides, so one task can trigger *any* branch against *any* pipeline file on demand. The resulting workflow reports `triggered_by: MANUAL_RUN`.
+
+This is strictly more capable than GitHub Actions' `workflow_dispatch`, which requires the workflow file to already exist on the default branch. It also means the broken webhook is not actually blocking: pipelines can be exercised on a branch today.
+
+### The webhook itself
 
 **The project was never finished being created.** The Semaphore console shows it parked on step 3 of 4 of the onboarding wizard ("Select the environment"), having never reached "4. Setup workflow". Its last workflow was 2026-08-06, which is when that wizard was presumably started. Pushing the `semaphore-ci` branch produced no run at all (`no workflow found`).
 
