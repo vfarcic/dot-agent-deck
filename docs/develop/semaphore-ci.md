@@ -2,7 +2,28 @@
 
 This is an **evaluation**, not a migration. Every file under `.github/workflows/` is untouched and remains the authoritative CI. The pipelines under `.semaphore/` are a parallel implementation of the same gates, added so that Semaphore — and specifically its new AI-agent tooling, `sem-ai` — can be assessed against a real workload rather than a toy repo.
 
-Nothing here runs until a Semaphore project is created and pointed at this repo, so merging the branch is inert on its own.
+## Scope: everything builds, nothing publishes
+
+The rule these pipelines follow is: **do everything the GitHub Actions workflows do, except Windows and except publishing.**
+
+So every gate that can *fail* runs — all four release target builds, the issue #250 `DAD_VERSION` artifact assertion, the SemVer gate, the flake-pin check, changelog assembly, checksums, and generation of the Homebrew formula and Scoop manifest. What is switched off is anything with an effect outside the pipeline:
+
+| Step | Where | State |
+| --- | --- | --- |
+| changelog commit + `git push origin main` | `release.yml` → `Prepare` | commented out |
+| `gh release create` | `release.yml` → `Package` | commented out |
+| `task homebrew-publish` | `release.yml` → `Package` | commented out |
+| `task scoop-publish` | `release.yml` → `Package` | commented out |
+| GHCR `docker login` / `docker push` | `docs-publish.yml` | commented out |
+| chart bump + `git push origin main` | `docs-publish.yml` | commented out |
+
+They are **commented out rather than deleted**, together with the `secrets:` and `queue:` blocks they depend on, so adopting Semaphore is an uncomment rather than a rewrite.
+
+Two caveats. First, **nothing validates a commented block** — not `sem-ai yaml validate`, not any run — so they will drift silently if the Taskfile targets or token names change; review them before uncommenting rather than trusting them. Second, `artifact push` still appears in the per-target build script: that is Semaphore's *internal* block-to-block file handoff, the counterpart of GHA's `upload-artifact`/`download-artifact` pair, not publication to anywhere external.
+
+A useful consequence: as it stands the entire Semaphore setup requires **no secrets at all**, so it cannot affect anything outside itself even by accident.
+
+This is enforced mechanically, not by inspection — a scan of every live `commands:` entry across all three pipelines finds zero occurrences of `git push`, `docker push`, `docker login`, `gh release`, `homebrew-publish`, `scoop-publish`, `git commit` or `remote set-url`.
 
 ## Why Semaphore was worth evaluating: `sem-ai`
 
@@ -31,8 +52,8 @@ The translation guidance in this document follows Semaphore's own `gha-to-semaph
 | `ci.yml` → `changes` | `run.when: change_in(…)` on each block | Semantics differ — see below |
 | `docs.yml` → `docs-build` | `semaphore.yml` → `Docs site` | Full fidelity |
 | `aarch64-crossbuild-check.yml` | `semaphore.yml` → `aarch64 cross-build check` | Full fidelity, still via `cross` |
-| `release.yml` | `release.yml` (auto-promoted on tag) | See "Release" below |
-| `docs-publish.yml` | `docs-publish.yml` (promoted) | Two entry points preserved |
+| `release.yml` | `release.yml` (auto-promoted on tag) | Builds and packages; **publishing commented out** |
+| `docs-publish.yml` | `docs-publish.yml` | Image builds; **push and chart commit commented out** |
 | `labeler.yml` | **none** | GitHub-API automation, not CI |
 | `stale.yml` | **none** | Portable to a Semaphore scheduled task; not done |
 
@@ -117,6 +138,34 @@ Also confirmed against the live org:
 - A **`dot-agent-deck` project already exists** (`c45e9515-…`), wired to `git@github.com:vfarcic/dot-agent-deck.git` over the GitHub App integration, with prior workflow runs on `main` and on feature branches. So step 1 of the setup list below is already done, and pushing this branch would trigger a real pipeline.
 - `sem-ai agent types` returns `[]` — **no self-hosted agents are registered**, which confirms empirically that there is no Windows capacity in this org today, cloud or otherwise.
 
-Verified locally, independent of the API: the pipelines parse and every `commands:` entry is a string — worth checking mechanically, because a plain YAML scalar containing `": "` silently parses as a *mapping* rather than a command, which is how `- echo "toolchain: $X"` becomes a key/value pair. Three such lines existed in the first draft and are now explicitly quoted. `resolve-version.sh` and `verify-flake-version.sh` were exercised against the real repository: the SemVer gate accepts `1.2.3` and `0.36.0-rc.1` and rejects `1.2`, `not-semver`, the full-width `１.２.３`, `1.2.3-é` and the empty string; the flake check accepts the real pinned `0.36.0` and rejects a mismatch.
+### What real agents proved
 
-**Still unobserved**, because nothing has run on an agent: that the pinned Rust 1.97.1 installs cleanly on both images (Ubuntu ships 1.95.0, macOS ships no Rust at all), that `cross` works on the `f1` Docker-enabled machines, and that the Nix and devbox installers behave on the agent image.
+`sem-ai testbox` allocates a real CI VM and runs commands on it over SSH, which made it possible to verify the risky parts without the pipeline ever running. Three findings, all measured:
+
+**`f1-standard-4` is not available on this org.** Four `testbox warmup --machine f1-standard-4` attempts failed with `job finished before reaching RUNNING state`, across *both* `ubuntu2204` and `ubuntu2404`; `f1-standard-2` came up first try on both. Presumably a plan limit. Four blocks originally asked for the bigger machine — `Build (Linux)`, `Nix flake check`, `aarch64 cross-build check`, and the release pipeline default — and all are now pinned to `f1-standard-2` with a comment saying what to revert if the org is upgraded. The Linux build block is the pipeline's critical path, so this costs real wall-clock.
+
+**The agent images ship no Rust and no rustup**, contradicting the docs, which list Rust 1.95.0 for `ubuntu2404`. On both `ubuntu2204` and `ubuntu2404`, `rustc` is `command not found` and `rustup` is absent from `PATH` — Rust is reachable only through `sem-version`. This vindicates `setup-rust.sh` installing rustup from scratch rather than trusting the image, and it means a pipeline that assumed a preinstalled `cargo` would fail immediately.
+
+**`setup-rust.sh` works on a real agent.** On `ubuntu2404` it installed rustup from nothing, pinned exactly 1.97.1, added rustfmt and clippy, and fetched cargo-nextest 0.9.140 — in **8.3 seconds**. Verified after the fact: `rustc 1.97.1`, `rustfmt 1.9.0-stable`, `clippy 0.1.97`, `cargo-nextest 0.9.140`.
+
+The toolbox is present as documented — `checkout`, `cache`, `artifact`, `sem-version`, `retry` and `test-results` all resolve — and Docker is available (28.4.0), which is what the `aarch64 cross-build check` and the docs image build need.
+
+One caveat on `testbox run`: it rsyncs the working directory before executing, so running it from this repo hangs on the multi-GB `target/`. Run it from a small scratch directory, or SSH directly using the key and address `warmup` prints.
+
+### Still unverified
+
+The **macOS agent (`a2-standard-4` / `macos-xcode16`) has not been tested**, and given `f1-standard-4` turned out to be unavailable on this plan, there is a live risk that the Apple machines are too. `testbox` cannot check it — `--os-image` accepts only `ubuntu2204` and `ubuntu2404`. This is the largest remaining unknown, and it gates both the `Build (macOS)` block and half the release matrix.
+
+Also unobserved: that `cross` works on the f1 machines, and that the Nix and devbox installers behave on the agent image.
+
+### The pipelines have not run end to end
+
+**The Semaphore project stopped receiving webhooks.** Its last workflow was 2026-08-06; pushing the `semaphore-ci` branch produced no run at all (`no workflow found`). The project config is correct — `run_on: [tags, branches, draft_pull_requests]`, empty branch whitelist, `pipeline_file: .semaphore/semaphore.yml` — so this is the GitHub App connection, not the YAML.
+
+`sem-ai workflow run --branch semaphore-ci` cannot substitute: it *reruns* an existing workflow and returns `no workflows found to rerun` for a branch that has never built. Reconnecting the integration in the Semaphore UI is a manual step.
+
+### Verified locally
+
+The pipelines parse and every `commands:` entry is a string — worth checking mechanically, because a plain YAML scalar containing `": "` silently parses as a *mapping* rather than a command, which is how `- echo "toolchain: $X"` becomes a key/value pair. Three such lines existed in the first draft and are now explicitly quoted. `resolve-version.sh` and `verify-flake-version.sh` were exercised against the real repository: the SemVer gate accepts `1.2.3` and `0.36.0-rc.1` and rejects `1.2`, `not-semver`, the full-width `１.２.３`, `1.2.3-é` and the empty string; the flake check accepts the real pinned `0.36.0` and rejects a mismatch.
+
+`resolve-version.sh` falls back to the version `flake.nix` pins when there is no tag, so the release path can be dry-run by promoting `Release build` manually from any branch. That fallback makes `verify-flake-version.sh` a tautology on branch runs — it compares `flake.nix` against itself — and the check only means something on a tag, where the two sources are genuinely independent.
