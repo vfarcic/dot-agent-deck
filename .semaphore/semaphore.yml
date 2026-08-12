@@ -37,6 +37,20 @@ auto_cancel:
   queued:
     when: "branch = 'main'"
 
+# Raised from the 1-hour default ONLY so the `Devbox smoke` block can carry its
+# own 3-hour limit while it is being measured. A block limit may not exceed the
+# pipeline limit; violating that is rejected at RUN time, not by
+# `sem-ai yaml validate`, with:
+#
+#   Block on path '#/blocks/5' has an execution_time_limit of 3 hours which is
+#   longer than execution_time_limit of a whole pipeline which is 1 hour.
+#
+# Worth noting as one more case where a VALID verdict from the API did not mean
+# runnable — the validator does not check cross-field constraints. Drop both
+# this and the block-level limit back to the default once devbox is cached.
+execution_time_limit:
+  hours: 3
+
 global_job_config:
   prologue:
     commands:
