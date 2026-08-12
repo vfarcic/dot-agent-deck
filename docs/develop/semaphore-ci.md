@@ -238,6 +238,34 @@ The one thing lost is documented above: `change_in` has no PR-author dimension, 
 
 **The honest summary for this repo:** the compelling reasons are `sem-ai` and `testbox`, not speed or cost. Those are real, verified, and ahead of anything GitHub ships for agent-driven CI. They are not currently enough to outweigh losing native Windows coverage.
 
+### Was this harder than GitHub Actions would have been?
+
+Yes, and the answer is worth decomposing rather than asserting, because not all of the difficulty was Semaphore's fault and not all of it was avoidable.
+
+Roughly ten distinct failures occurred while building this port. They fall into four categories, and only one is platform-neutral.
+
+**1. Thin training-data presence.** The YAML `": "` mapping bug (three times), `task: machine:` instead of `task: agent: machine:` (twice), `artifact push` destination semantics, `diagnose` wanting a workflow id rather than a pipeline id, and the wrong conclusion that a branch pipeline could not be triggered. GitHub Actions' shapes are effectively memorised from the corpus; Semaphore's are not. **None of these would have happened in GitHub Actions.**
+
+**2. Ecosystem substitution.** Both Nix failures, the devbox timeout, and the `go-task` install location. In GHA each is a `uses:` one-liner that somebody else maintains and has already debugged. Reimplementing them by hand meant getting the details wrong — twice on the same block. **This is the largest category, and it is not about knowledge at all**: it is that GitHub Actions outsources this complexity to action authors and Semaphore does not.
+
+**3. Platform opacity.** `f1-standard-4` advertised in the console but unable to start; the artifacts `403` that nearly produced the wrong conclusion that the release pipeline was impossible here; a half-created project whose stored config looked correct through the API. GitHub Actions has its own opacity, but not these particular traps.
+
+**4. Genuine logic errors.** The `test -s` empty-changelog assertion — a dry-run-versus-tag semantics bug. **This one would have happened on GitHub Actions too.**
+
+So the honest answer is *materially less* difficulty on GitHub Actions, with three of the four categories being Semaphore-specific.
+
+**Two things make that comparison unfair, though.**
+
+First, this was a port *from* a mature system *to* a blank slate. The GHA workflows are heavily commented, and those comments record what it cost to get them there: a day of unbuildable `main`, `cargo test` flakes that appeared on exactly one runner, a macOS break that first surfaced at v0.34.0 release time, the issue #250 version-injection bug. That is months of accumulated incident response. Judging a one-day port against it flatters GitHub Actions. Written *from scratch*, a GHA version of this CI would still have had to solve cross-compilation, the `DAD_VERSION` passthrough across the container boundary, and the Windows cross-check — and this repo's own comments show each of those was learned the hard way there.
+
+Second, **the difficulty was visible only because everything was executed.** Writing the YAML, validating it, and stopping would have looked smooth — and nearly happened: a "6 of 8 blocks passing" status was reported at a point when `release.yml` and `docs-publish.yml` had never run a single time. Visible struggle is a function of verification depth, not only of platform difficulty.
+
+**Some of it was process, not platform.** Two of fifteen shipped skills were read before hitting problems those skills document; `sem-ai discover` answered in one call a question that was first attacked by grepping the CLI's Go source; and partial success was twice reported as if it were completion. None of that is Semaphore's doing.
+
+**The complication worth sitting with:** the platform that produced more errors also resolved them faster. Every failure was localised in roughly one `diagnose` call — the Nix daemon problem arrived with the exact error line attached. The GHA equivalent is a browser tab or scrolling `gh run view --log`. More errors, each much cheaper. Net wall-clock is genuinely unclear.
+
+**And the strategic point is larger than this repository.** Training-data presence is a moat that no feature ships past quickly, and it self-reinforces: more GHA usage produces more GHA in the corpus, which makes agents better at GHA, which produces more GHA usage. The `sem-ai` skills bundle is a deliberate attempt to break that loop by *shipping* context instead of depending on corpus presence — and it demonstrably worked where it was read and failed where it was not. For an agent, GitHub Actions is easier **today** for reasons that have little to do with which product is better designed, and much to do with what is in the corpus and the Marketplace.
+
 ### Where it nets out
 
 For a Linux-and-macOS Rust project, the port is faithful and six of eight blocks passed on the first real run. The blockers are not about pipeline expressiveness — Semaphore's model is at least as good as GitHub Actions' and in places better. They are Windows, the plan's machine ceiling, and the Marketplace ecosystem that a mature GHA setup quietly depends on. `sem-ai` is genuinely ahead of anything GitHub ships for agent-driven CI, and is the strongest reason to keep watching this.

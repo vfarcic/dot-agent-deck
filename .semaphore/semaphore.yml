@@ -298,21 +298,41 @@ blocks:
   # dominates a cold run. Semaphore has no equivalent action, so EVERY run here
   # is cold: the first real run exceeded 25 minutes and was still going.
   #
-  # Fixing it means caching /nix by hand — root-owned and multi-GB, so a
-  # `sudo tar` into a single `cache store` path. That is heavy and fragile
-  # enough to be worth doing deliberately rather than inline here. Until then
-  # this block is the pipeline's long pole by a wide margin.
+  # CURRENTLY INSTRUMENTED TO MEASURE, NOT YET FIXED. The default job limit is
+  # one hour and this block hit it, so ">60 min" is a TIMEOUT, not a
+  # measurement — the real cold cost could be 61 minutes or five hours, and the
+  # right fix differs. `execution_time_limit` is raised to 3h below purely so
+  # one run can produce two numbers:
+  #
+  #   * how long a cold `devbox run` actually takes, and
+  #   * `du -sh /nix`, which decides whether caching the store is even viable
+  #     against the project cache quota.
+  #
+  # Caching /nix by hand is the presumed fix, but it is fragile in a way worth
+  # respecting: the store is root-owned and multi-GB, so it needs a `sudo tar`,
+  # and a multi-user Nix also depends on state OUTSIDE /nix (the nixbld group,
+  # the daemon's systemd units, /etc/profile.d/nix.sh). Restoring the store
+  # alone may therefore not reconstitute a working Nix. Measuring first avoids
+  # engineering that blind.
   - name: Devbox smoke
     dependencies: []
+    execution_time_limit:
+      hours: 3
     task:
       jobs:
         - name: devbox run smoke
           commands:
+            - 'echo "phase: start $(date -u +%H:%M:%S)"'
             - curl -fsSL https://get.jetify.com/devbox | FORCE=1 bash
+            - 'echo "phase: devbox installed $(date -u +%H:%M:%S)"'
             # A FILE, not an inline `bash -c '…'`: devbox flattens its trailing
             # args into one string and re-parses them through a shell, so a
             # quoted multi-line argument is destroyed before bash sees it.
-            - devbox run -- bash scripts/devbox-smoke.sh
+            - time devbox run -- bash scripts/devbox-smoke.sh
+            - 'echo "phase: devbox run finished $(date -u +%H:%M:%S)"'
+            # The two numbers this run exists to produce.
+            - sudo du -sh /nix 2>/dev/null || du -sh /nix || true
+            - df -h / | tail -1
 
   # docs.yml's `docs-build` job. In GHA this is a separate workflow keyed on
   # `paths: [docs/**, site/**]`; here the same scoping is the `change_in` below.
