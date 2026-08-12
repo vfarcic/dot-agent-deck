@@ -57,17 +57,28 @@ blocks:
   # ci.yml's `build` job. The heaviest block in the file: it is the only place
   # `--features e2e` is type-checked, and it runs the full 1705-test fast tier.
   #
-  # WANTS f1-standard-4, RUNS ON f1-standard-2. This block compiles the
-  # workspace three times over (clippy with the e2e feature, a release build,
-  # then the test binaries), so 2 vCPU makes it the critical path for the whole
-  # pipeline and this is the obvious place to spend a bigger machine.
+  # WANTS 4+ vCPU, RUNS ON 2. This block compiles the workspace three times
+  # over (clippy with the e2e feature, a release build, then the test binaries),
+  # so it is the critical path for the whole pipeline and the obvious place to
+  # spend a bigger machine.
   #
-  # It is pinned down because f1-standard-4 IS NOT AVAILABLE on this org.
-  # Measured, not assumed: four `sem-ai testbox warmup --machine f1-standard-4`
-  # attempts failed with "job finished before reaching RUNNING state" across
-  # BOTH ubuntu2204 and ubuntu2404, while f1-standard-2 came up first try on
-  # both. Presumably a plan limit. If the org is upgraded, this and the two
-  # other blocks marked the same way should go back to f1-standard-4.
+  # EVERY LINUX MACHINE ABOVE 2 vCPU IS UNAVAILABLE ON THIS ORG'S FREE PLAN.
+  # Measured with `sem-ai testbox warmup`, not assumed — and note the UI lists
+  # several of these as "Available Agents" anyway, so the console is not a
+  # reliable guide:
+  #
+  #   READY   f1-standard-2, e1-standard-2, e2-standard-2, a2-standard-4 (macOS)
+  #   FAILED  f1-standard-4, e1-standard-4, e1-standard-8
+  #           ("job finished before reaching RUNNING state", 5 attempts,
+  #            across both ubuntu2204 and ubuntu2404)
+  #
+  # So this is not a choice between f1 and e1 — 2 vCPU is the ceiling, and
+  # f1-standard-2 is the current-generation option at that size (e1/e2 are
+  # legacy). macOS is evidently metered separately, since a2-standard-4 is
+  # 4 vCPU and comes up fine.
+  #
+  # If the plan is upgraded, this block and the two others marked the same way
+  # should go to f1-standard-4.
   - name: Build (Linux)
     dependencies: []
     # ci.yml's `changes` job, in one line. That job exists to skip the Rust

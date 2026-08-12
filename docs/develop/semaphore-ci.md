@@ -142,7 +142,15 @@ Also confirmed against the live org:
 
 `sem-ai testbox` allocates a real CI VM and runs commands on it over SSH, which made it possible to verify the risky parts without the pipeline ever running. Three findings, all measured:
 
-**`f1-standard-4` is not available on this org.** Four `testbox warmup --machine f1-standard-4` attempts failed with `job finished before reaching RUNNING state`, across *both* `ubuntu2204` and `ubuntu2404`; `f1-standard-2` came up first try on both. Presumably a plan limit. Four blocks originally asked for the bigger machine — `Build (Linux)`, `Nix flake check`, `aarch64 cross-build check`, and the release pipeline default — and all are now pinned to `f1-standard-2` with a comment saying what to revert if the org is upgraded. The Linux build block is the pipeline's critical path, so this costs real wall-clock.
+**Every Linux machine above 2 vCPU is unavailable on this org's Free Plan** — and the web console is not a reliable guide, because it lists several of them under "Available Agents" anyway.
+
+| Machine | `testbox warmup` |
+| --- | --- |
+| `f1-standard-2`, `e1-standard-2`, `e2-standard-2` | READY |
+| `a2-standard-4` (macOS) | READY |
+| `f1-standard-4`, `e1-standard-4`, `e1-standard-8` | FAILED — `job finished before reaching RUNNING state` (5 attempts, both images) |
+
+So 2 vCPU is the ceiling on Linux, and `f1-standard-2` is the current-generation option at that size (`e1`/`e2` are legacy). Four blocks originally asked for `f1-standard-4` — `Build (Linux)`, `Nix flake check`, `aarch64 cross-build check`, and the release pipeline default — and all are pinned down, with a comment recording what to revert on a paid plan. `Build (Linux)` is the critical path, so this costs real wall-clock. macOS is evidently metered separately, since `a2-standard-4` is 4 vCPU and comes up fine.
 
 **The agent images ship no Rust and no rustup**, contradicting the docs, which list Rust 1.95.0 for `ubuntu2404`. On both `ubuntu2204` and `ubuntu2404`, `rustc` is `command not found` and `rustup` is absent from `PATH` — Rust is reachable only through `sem-version`. This vindicates `setup-rust.sh` installing rustup from scratch rather than trusting the image, and it means a pipeline that assumed a preinstalled `cargo` would fail immediately.
 
@@ -152,17 +160,23 @@ The toolbox is present as documented — `checkout`, `cache`, `artifact`, `sem-v
 
 One caveat on `testbox run`: it rsyncs the working directory before executing, so running it from this repo hangs on the multi-GB `target/`. Run it from a small scratch directory, or SSH directly using the key and address `warmup` prints.
 
+**The macOS agent works, and `setup-rust.sh` works on it.** `a2-standard-4` / `macos-xcode16` came up as macOS 15.4.1. As on Linux there is no Rust and no rustup — and `sem-version` is not even on `PATH` in a testbox SSH session, which is why the toolbox docs tell you to `source ~/.toolbox/toolbox` there. The script installed 1.97.1 for `aarch64-apple-darwin`, added clippy and the `x86_64-apple-darwin` cross target, and fetched nextest 0.9.140. That validates both the `Build (macOS)` block and the macOS half of the release matrix. (`testbox warmup --os-image macos-xcode16` works even though `--help` documents only the Ubuntu images.)
+
 ### Still unverified
 
-The **macOS agent (`a2-standard-4` / `macos-xcode16`) has not been tested**, and given `f1-standard-4` turned out to be unavailable on this plan, there is a live risk that the Apple machines are too. `testbox` cannot check it — `--os-image` accepts only `ubuntu2204` and `ubuntu2404`. This is the largest remaining unknown, and it gates both the `Build (macOS)` block and half the release matrix.
-
-Also unobserved: that `cross` works on the f1 machines, and that the Nix and devbox installers behave on the agent image.
+That `cross` works on the f1 machines, and that the Nix and devbox installers behave on the agent image.
 
 ### The pipelines have not run end to end
 
-**The Semaphore project stopped receiving webhooks.** Its last workflow was 2026-08-06; pushing the `semaphore-ci` branch produced no run at all (`no workflow found`). The project config is correct — `run_on: [tags, branches, draft_pull_requests]`, empty branch whitelist, `pipeline_file: .semaphore/semaphore.yml` — so this is the GitHub App connection, not the YAML.
+**The project was never finished being created.** The Semaphore console shows it parked on step 3 of 4 of the onboarding wizard ("Select the environment"), having never reached "4. Setup workflow". Its last workflow was 2026-08-06, which is when that wizard was presumably started. Pushing the `semaphore-ci` branch produced no run at all (`no workflow found`).
 
-`sem-ai workflow run --branch semaphore-ci` cannot substitute: it *reruns* an existing workflow and returns `no workflows found to rerun` for a branch that has never built. Reconnecting the integration in the Semaphore UI is a manual step.
+The project's stored config is otherwise correct — `run_on: [tags, branches, draft_pull_requests]`, empty branch whitelist, `pipeline_file: .semaphore/semaphore.yml` — which is why this looked like a dead webhook from the API side.
+
+It is **not** a case of Semaphore wanting the pipeline file on the default branch: Semaphore reads `.semaphore/semaphore.yml` from the commit being built, so a file that exists only on a feature branch is fine. (That intuition comes from GitHub Actions, where `workflow_dispatch` really does require the workflow on the default branch.)
+
+`sem-ai workflow run --branch semaphore-ci` cannot substitute for finishing setup: it *reruns* an existing workflow and returns `no workflows found to rerun` for a branch that has never built.
+
+**When finishing the wizard, choose "skip onboarding" rather than letting it generate a starter workflow.** The final step offers to define build steps for you, and a generated `.semaphore/semaphore.yml` would either overwrite the one in this branch or be committed to the repository — neither of which is wanted, and the second violates the no-pushing rule these pipelines otherwise satisfy. The YAML already exists; the project only needs to be finalized so it starts building pushes.
 
 ### Verified locally
 
