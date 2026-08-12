@@ -135,7 +135,7 @@ Two constraints that are easy to get wrong, and belong in the docs: `working_dir
 
 **M2.0 decides the mechanism before anything here is built.** The milestones below are written in mechanism-neutral terms — *claim* and *release* rather than *assign* and *unassign* — because the argv builders, the stub arms, the release policy and the fixture teardown all differ between the two candidates. An earlier revision of this document asserted the assignee mechanism flatly in In Scope while simultaneously calling the label the leading candidate and sequencing the decision into Phase 3; an implementer following that order would have built M2.1, M2.2, M2.4 and M2.5 against assignment, reached M3.3, been told to settle the mechanism first, followed this document's own recommendation to the label, and discarded all of it. That inversion is the defect M2.0 exists to remove.
 
-A pure argv builder in `src/issue_dispatch.rs` (unit-testable, alongside `issue_list_argv` / `pr_list_for_issue_argv`, carrying the same `--` end-of-options guard), plus a `claim_issue` / `release_issue` pair in `src/issue_dispatch_run.rs` modelled on `ensure_worktrees_excluded`'s never-fatal discipline.
+A pure argv builder in `src/issue_dispatch.rs` (unit-testable, alongside `issue_list_argv` / `pr_list_for_issue_argv`, carrying the same `--` end-of-options guard), plus `claim_issue` in `src/issue_dispatch_run.rs` modelled on `ensure_worktrees_excluded`'s never-fatal discipline — **and a matching `release_issue` only if M2.2 chose to release.** Under "do not release" that function does not exist, and adding it for symmetry would put the destructive operation back in the tree with nothing calling it, which is the shape the policy was chosen to prevent. The artifact list here and in Key Files is conditional on that decision in exactly the way M2.1 is.
 
 Write ordering is the one thing that must not be got wrong: **claim only after `spawn` returns `Ok`** (`src/issue_dispatch_run.rs:448`), so a failed dispatch never leaves a claim. Release, if M2.2 chooses to release at all, goes in the existing close path (`src/daemon_protocol.rs:1501-1510`), beside `remove_worktree`.
 
@@ -237,7 +237,7 @@ Issue #421's closing observation is correct and worth acting on separately: **#1
 | --- | --- |
 | `.claude/skills/triage-issues/SKILL.md` | New — vocabulary + uncertainty rule (Phase 1). |
 | `src/issue_dispatch.rs` | Pure argv builders; `dispatch_decision` gains its third signal. |
-| `src/issue_dispatch_run.rs` | `claim_issue` / `release_issue`; claim written after the `spawn` at `:448`. |
+| `src/issue_dispatch_run.rs` | `claim_issue`, plus `release_issue` **only if M2.2 chose to release** (see Phase 2); claim written after the `spawn` at `:448`. |
 | `src/daemon_protocol.rs` | Release on close, beside `remove_worktree` (`:1501-1510`). |
 | `src/config.rs` | `IssueDispatchConfig` (`:586`) gains the TTL + kill switch. |
 | `src/scheduler.rs` | Skip-reason vocabulary + the failed-claim notification. |
