@@ -82,8 +82,34 @@ fi
 mkdir -p dist
 cp "$BIN" "dist/dot-agent-deck-${SUFFIX}"
 
-# GHA equivalent: actions/upload-artifact, later collected by `finalize` with
+# GHA equivalent: actions/upload-artifact, later collected by `Package` with
 # download-artifact + merge-multiple. `workflow` scope is the Semaphore
 # counterpart — it survives across blocks within this workflow.
-artifact push workflow "dist/dot-agent-deck-${SUFFIX}" --force
-echo "OK: pushed dist/dot-agent-deck-${SUFFIX}"
+#
+# `--destination` is EXPLICIT and FLAT. Without it the stored key is ambiguous:
+# `artifact pull workflow dist/dot-agent-deck-<suffix>` returned `hub returned
+# 404` for a push of that same path, so the default destination is evidently not
+# the path as given. Naming both sides removes the guesswork — the consumer in
+# release.yml pulls exactly this key and redirects it back under dist/.
+artifact push workflow "dist/dot-agent-deck-${SUFFIX}" --destination "dot-agent-deck-${SUFFIX}" --force
+echo "OK: pushed dot-agent-deck-${SUFFIX}"
+
+# Round-trip check, in the SAME job that pushed. This is deliberately here
+# rather than left to the consumer block: a push that reports success but is not
+# retrievable is indistinguishable, from the consumer's side, from a wrong path
+# — and `sem-ai artifact list` cannot arbitrate because the list API returns
+# HTTP 403 "artifacts api feature is not enabled for your organization" on this
+# plan. Proving retrievability at the source localises any future failure to the
+# cross-block handoff instead.
+rt_check="$(mktemp -d)/rt-${SUFFIX}"
+if artifact pull workflow "dot-agent-deck-${SUFFIX}" --destination "$rt_check" --force; then
+  if [ -s "$rt_check" ]; then
+    echo "OK: round-trip verified — dot-agent-deck-${SUFFIX} is retrievable ($(wc -c < "$rt_check") bytes)"
+  else
+    echo "ERROR: round-trip pulled dot-agent-deck-${SUFFIX} but the file is empty." >&2
+    exit 1
+  fi
+else
+  echo "ERROR: pushed dot-agent-deck-${SUFFIX} but could not pull it back in the same job. The artifact store is not usable on this plan." >&2
+  exit 1
+fi
