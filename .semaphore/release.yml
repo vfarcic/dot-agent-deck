@@ -209,9 +209,25 @@ blocks:
           - curl -sL https://taskfile.dev/install.sh | sh -s -- -b "$HOME/.local/bin" v3.48.0
           - export PATH="$HOME/.local/bin:$PATH"
           - task --version
+          # EXPLICIT PATHS, one per artifact — `artifact pull workflow dist`
+          # does NOT work and fails with `failed to generate signed URLs - hub
+          # returned 404`. The build jobs each push a single FILE
+          # (`dist/dot-agent-deck-<suffix>`), and the store is path-addressed
+          # with no prefix or glob semantics, so there is no `dist` object to
+          # pull even though four objects share that prefix.
+          #
+          # This is where GHA's download-artifact + `merge-multiple: true` does
+          # real work that has no toolbox equivalent: it merges N uploads into
+          # one directory in a single step. Here the consumer has to name every
+          # artifact, which means this list and the target matrix in the two
+          # Build blocks must be kept in sync by hand.
+          #
           # `--force` because checkout has already populated the working tree
           # and the toolbox refuses to overwrite an existing path otherwise.
-          - artifact pull workflow dist --force
+          - artifact pull workflow dist/dot-agent-deck-linux-amd64 --force
+          - artifact pull workflow dist/dot-agent-deck-linux-arm64 --force
+          - artifact pull workflow dist/dot-agent-deck-darwin-amd64 --force
+          - artifact pull workflow dist/dot-agent-deck-darwin-arm64 --force
           - artifact pull workflow release-notes.md --force
       jobs:
         - name: checksums, formula and manifest
