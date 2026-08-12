@@ -199,7 +199,16 @@ blocks:
       prologue:
         commands:
           # GHA equivalent: arduino/setup-task@v3.0.0.
-          - curl -sL https://taskfile.dev/install.sh | sh -s -- -b /usr/local/bin v3.48.0
+          #
+          # Installs into $HOME, not /usr/local/bin — the job user cannot write
+          # there and the installer fails with `install: cannot create regular
+          # file '/usr/local/bin/task': Permission denied` (measured; it is what
+          # broke the first Package run). `sudo` is available and would also
+          # work, but there is no reason to need root to put a binary on PATH.
+          - mkdir -p "$HOME/.local/bin"
+          - curl -sL https://taskfile.dev/install.sh | sh -s -- -b "$HOME/.local/bin" v3.48.0
+          - export PATH="$HOME/.local/bin:$PATH"
+          - task --version
           # `--force` because checkout has already populated the working tree
           # and the toolbox refuses to overwrite an existing path otherwise.
           - artifact pull workflow dist --force
