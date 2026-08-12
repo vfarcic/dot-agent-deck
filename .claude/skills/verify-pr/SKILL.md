@@ -12,13 +12,16 @@ Someone else's PR is open and a decision is needed on it. "Someone else" include
 
 Not this skill:
 
+- **Several PRs, or no PR named** → `/pr-review-queue`, which builds the queue of open PRs where the ball is in your court and dispatches one isolated unit per PR. *"Review the open PRs on this repo"* or *"what is waiting on me"* is that skill, not this one — it matches this description on every content word, so check for a number before assuming.
 - **Your own in-flight work** → `/prd-done` owns that path.
 - **A quick static read with no build** → the built-in `/review`.
 - **Your uncommitted working diff** → `/code-review`.
 
+Note the "someone else's" in the description above is about the *common* case, not a restriction: verifying your own PR is legitimate and `/pr-review-queue` queues own PRs as a first-class case. What you cannot do is *approve* your own — GitHub blocks that — so the verdict is a recommendation for the other maintainer.
+
 ## Arguments
 
-A PR number, `#number`, or PR URL. If none was given, ask — do not guess from `gh pr list`.
+A PR number, `#number`, or PR URL. If none was given, ask — do not guess from `gh pr list`. If the request named no PR because it was about the whole backlog rather than one PR, that is `/pr-review-queue`; say so instead of collapsing it into a single-PR question.
 
 ## Hard rules
 
