@@ -245,15 +245,37 @@ blocks:
           # `nix run github:vfarcic/dot-agent-deck` on UPSTREAM Nix, so
           # verifying against Determinate's downstream distribution would
           # answer a different question.
-          # NO `--init none`. That was the first-run failure: without an init
-          # system the daemon is never started, so `nix flake check` died with
-          # `opening lock file "/nix/var/nix/db/big-lock": Permission denied`
-          # and the installer's own hint about the daemon having crashed. The
-          # agent is a full VM with systemd, so the default multi-user install
-          # is correct — GHA never hits this because
-          # DeterminateSystems/nix-installer-action starts the daemon for you,
-          # and there is no such action here.
-          - curl -fsSL https://install.determinate.systems/nix | sh -s -- install linux --no-confirm --extra-conf "experimental-features = nix-command flakes"
+          # THIS BLOCK IS THE CLEAREST EVIDENCE THAT MARKETPLACE ACTIONS DO NOT
+          # TRAVEL. GHA does this in five lines of `uses:`; reproducing it by
+          # hand has now failed in two distinct ways.
+          #
+          # Failure 1 (first run): `--init none` meant no daemon was ever
+          # started, so `nix flake check` died on `opening lock file
+          # "/nix/var/nix/db/big-lock": Permission denied`. The agent is a full
+          # VM with systemd, so the flag was simply wrong. Fixed by dropping it.
+          #
+          # Failure 2 (second run): with the daemon up, `nix flake check
+          # --all-systems` now tries to BUILD the foreign-system outputs rather
+          # than merely evaluate them —
+          #   error: Cannot build '…-aho-corasick-1.1.5.drv'
+          #          Required system: 'aarch64-darwin'
+          #          Current system: 'x86_64-linux'
+          # ci.yml's comment states the opposite behavior ("it only *evaluates*
+          # the foreign-system outputs and still builds nothing but the native
+          # one, so it costs seconds"), and that is true there because
+          # nix-installer-action is pinned at @v22 AND passes
+          # `determinate: false`, which installs UPSTREAM Nix. The
+          # install.determinate.systems script defaults to Determinate Nix, a
+          # different distribution with different behavior.
+          #
+          # So this switches to the upstream installer, which is what
+          # `determinate: false` actually selects. Left un-pinned deliberately
+          # for now: pinning it correctly requires knowing which Nix version
+          # @v22 resolves to, which is precisely the kind of detail the action
+          # encodes and a hand-rolled install has to reverse-engineer.
+          - curl -L https://nixos.org/nix/install | sh -s -- --daemon --yes
+          - sudo mkdir -p /etc/nix
+          - echo "experimental-features = nix-command flakes" | sudo tee -a /etc/nix/nix.conf
           - . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
           - nix --version
       jobs:

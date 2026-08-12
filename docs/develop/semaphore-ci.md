@@ -158,11 +158,63 @@ Separating what this evaluation *verified*, what independent users report, and w
 
 **1. Agent-native CI, verified here.** `sem-ai` is the strongest reason and the hardest for GitHub to copy quickly. It is a deliberate design — JSON by default, `discover` for self-enumeration, an embedded MCP server, and compound diagnostics — rather than a CLI with a `--json` flag bolted on. If CI is increasingly driven by agents rather than humans clicking through a web UI, this is a structural advantage. `gh` is a fine tool built for humans first.
 
+**1a. The counter-argument: GitHub Actions' training-data dominance partly cancels this.** An agent needs two different things from a CI platform — *knowledge* to author the config, and an *interface* to operate it at runtime. `sem-ai` wins the second decisively. GitHub Actions wins the first decisively, and that asymmetry showed up as real defects in this very port:
+
+- **Three YAML mapping bugs.** `- echo "toolchain: $X"` parses as a *mapping*, not a command, because a plain scalar containing `": "` is a key/value pair. I would not have made this mistake in a GHA `run:` step, having effectively memorised that shape from the corpus. I caught these only by writing a mechanical checker that asserts every `commands:` entry is a string.
+- **`task: machine:` instead of `task: agent: machine:`**, twice — a pure Semaphore-schema error.
+- **`--init none` on the Nix installer**, which broke `Nix flake check`. I reached for a GHA-shaped mental model (`nix-installer-action` handles the daemon) and got the hand-rolled Semaphore equivalent wrong.
+- **I incorrectly concluded a branch pipeline could not be triggered**, until `sem-ai discover` showed me Tasks. A knowledge gap, not an interface gap.
+
+Every one of those is a thin-training-data error. So the honest framing is: **`sem-ai` made operating Semaphore excellent and did nothing to make authoring Semaphore YAML safe.** For a repo whose CI is as elaborate as this one, authoring is not a one-time cost — it is continuous.
+
+Two qualifications in both directions. Against Semaphore: `gh` is *also* heavily represented in training data, and most `gh` commands accept `--json` with `--jq`, so "JSON by default" is a narrower advantage than it first appears. In Semaphore's favour: the compound commands have no `gh` equivalent at all — `diagnose` replaces four or five chained `gh` calls plus scrolling `gh run view --log`, which emits the whole log rather than a targeted tail.
+
+And Semaphore clearly understands the problem: the shipped **skills bundle is a deliberate mitigation for thin training data** — it injects platform documentation into the agent's context. That is not marketing; for a non-dominant platform it is a substitute for corpus presence. It demonstrably worked where I read it (the `semaphore-toolbox` skill's one-path-per-`cache store` footgun saved me from a silent bug) and demonstrably failed where I did not (I skipped `debug-pipeline`, and spent a session diagnosing by hand).
+
 **2. `testbox`, verified here, and genuinely unique.** Being able to SSH into a real CI runner *before* pushing found three things that Semaphore's own docs and console got wrong. There is no GitHub Actions equivalent; the closest is `act` (a local Docker approximation, not the real runner) or push-and-pray.
+
+**3a. Measured head-to-head on this repo.** Both sides warm, same commit, same gates. Semaphore numbers are from the second run of `.semaphore/semaphore.yml`; GitHub Actions numbers are from run `31602207938`, a successful `push` to `main` of `ci.yml`.
+
+| Gate | Semaphore (`f1-standard-2`, 2 vCPU) | GitHub Actions (`ubuntu-latest`, 4 vCPU) | |
+| --- | --- | --- | --- |
+| Rust build — fmt, clippy `--features e2e`, release build, 1705 tests, linkage-check | 5.7m | 4.2m | GHA faster |
+| Windows cross-check | 0.8m | 1.0m | **Semaphore faster** |
+| macOS build | 3.7m | 3.9m | **Semaphore faster** |
+| `cargo audit` | 0.3m | 0.3m | tie |
+| Nix flake check | 0.5m (failing) | 2.2m | not comparable |
+| Devbox smoke | >60m (timeout) | 0.8m | GHA faster by orders of magnitude |
+
+**The read.** On the like-for-like compute gates, Semaphore is within noise of GitHub Actions *while running on half the cores* — and it wins outright on macOS and the Windows cross-check. The one gate GitHub wins on compute (the Rust build, 5.7m vs 4.2m) is exactly the one where it has 2× the vCPU; per-core, Semaphore is ahead. This repo is public, so `ubuntu-latest` is the 4 vCPU / 16 GB tier, while the Free Plan capped Semaphore at 2 vCPU / 8 GB. A paid Semaphore plan with `f1-standard-4` would make this a true like-for-like test, and on this evidence Semaphore would likely win it.
+
+**Cold vs warm matters enormously and is worth stating separately.** The Rust build took **10.6m cold and 5.7m warm** — the toolbox `cache` is doing real work. The first-run numbers should not be compared against GitHub's, whose caches were long since populated.
+
+**But the two gates that depend on a Marketplace action are catastrophic, and they dominate the outcome.** Devbox is >60m against GitHub's 0.8m — a 75×+ gap that is entirely about `devbox-install-action`'s store caching, not about Semaphore's compute. Nix fails outright. So while Semaphore's *compute* is competitive-to-better, this repo's actual wall clock on Semaphore is worse, and the whole difference is ecosystem rather than platform.
+
+This does not reproduce the vendor's "94% faster" claim in either direction — it suggests rough parity on compute, decided by tooling.
 
 **3. Speed and cost — but check who is measuring.** Semaphore's marketing claims GitHub Actions is [94% slower on the same workload](https://semaphore.io/best-ci-cd-tools-in-2026-performance-and-cost-compared) at $0.04/job. That is a **vendor-run benchmark against its own competitor** and should be treated as such. Independent review sites are more measured but directionally supportive: Capterra reviewers report test run times "halved" after switching, and G2 reviewers report cutting CI/CD costs 38–50% — though mostly **versus CircleCI and Travis, not versus GitHub Actions**. Our own run is not evidence either way, since the Free Plan capped us at 2 vCPU.
 
-**4. Monorepo and conditional execution, verified here.** `change_in()` is better than GitHub's per-workflow `on: paths:`, and it is why three GHA files collapsed into one pipeline. Independent comparisons single out monorepo support as a Semaphore strength.
+**4. Monorepo and conditional execution, verified here.** This is worth spelling out, because it is the clearest case where Semaphore's model is not just different but structurally better.
+
+GitHub Actions has path filtering **only at the trigger, and only per workflow file**. `on: pull_request: paths:` decides whether the *whole file* runs. There is no declarative way to say "run job X only if these paths changed" — so a repo that wants per-job scoping has exactly two options, and this repo uses both:
+
+- **Split into more files.** `docs.yml` and `aarch64-crossbuild-check.yml` exist as separate workflows *purely* to get a different `paths:` filter. Neither is conceptually a separate pipeline; the file boundary is an artifact of the trigger model. The cost is that the CI graph is scattered and check-run names must be kept globally unique — see the comment in `docs.yml` explaining why its job is named `docs-build` rather than `build`.
+- **Hand-roll a gating job.** `ci.yml`'s `changes` job is ~70 lines of bash that calls `gh api .../files`, walks the file list, sets two outputs, and includes a fail-safe for API errors — after which *every* downstream job repeats `if: needs.changes.outputs.devbox_only != 'true' && …`. That is a lot of machinery, and it burns a runner slot to compute it.
+
+Semaphore evaluates `change_in()` **per block, on the platform, before an agent boots**. So all of the above collapses to one expression per block:
+
+```yaml
+run:
+  when: "change_in('/', {exclude: ['/devbox.json', '/flake.lock'], default_branch: 'main'})"
+```
+
+Concretely in this port: **three workflow files became one pipeline, and the 70-line `changes` job disappeared entirely** — replaced by one `run.when:` line on each block that needed it. No extra runner, no `needs:` wiring, no output plumbing.
+
+It is also more expressive than a `paths:` list. `change_in` takes `exclude`, `default_branch`, `branch_range`, `default_range`, and `pipeline_file` tracking (so editing the pipeline itself counts as a change), and it defaults to `on_tags: true` — meaning a tag always builds everything, which is exactly what a release wants and which GHA path filters cannot express at all.
+
+For an actual monorepo the difference compounds: `change_in('/services/api')` on one block and `change_in('/services/web')` on another lets a single pipeline conditionally build N services, where GitHub Actions needs N workflow files or a `dorny/paths-filter` job feeding N `if:` conditions.
+
+The one thing lost is documented above: `change_in` has no PR-author dimension, so `ci.yml`'s Renovate-only scoping could not be reproduced.
 
 **5. Ephemeral VMs.** Every job gets a fresh VM, which removes the environment-drift class of flake. GitHub-hosted runners are also fresh, so this matters most against self-hosted setups.
 
