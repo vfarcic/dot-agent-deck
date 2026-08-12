@@ -21,6 +21,11 @@
 //!      The byte-identity diff against the on-disk `.md` is gone:
 //!      `.dot-agent-deck/` is gitignored dev-time state and would
 //!      not exist on a fresh clone.
+//!   8. No bare `tempfile` constructor — directory (`tempdir()`,
+//!      `TempDir::new()`) *or* file (`NamedTempFile::new()`,
+//!      `tempfile()`) — anywhere under `tests/`, or in the files on
+//!      [`EXTRA_TEMP_COVERED`]. Issue #322. See
+//!      [`BARE_TEMPDIR_RULE`].
 //!
 //!   Checks 1/2/4/6 bind each `#[spec("…")]` to its test function
 //!   through the SAME syn walker rule 7 uses
@@ -61,6 +66,127 @@ use regex::Regex;
 const CATALOG_PATH: &str = "tests/CATALOG.md";
 const ALLOWLIST_PATH: &str = "xtask/linkage-check/m2.allowlist";
 const TESTS_DIR: &str = "tests";
+
+/// Check 8 (issue #322): why a bare `tempfile` constructor is forbidden under
+/// `tests/`, spelled out here because the violation is invisible at the call
+/// site.
+///
+/// The harness redirects `tempfile`'s process-global default temp dir at its own
+/// per-process root — but it can only do that from inside
+/// `harness_temp_root()`'s lazy initialisation, i.e. the first time something
+/// asks the harness for a directory. nextest runs one process per test, so a
+/// bare `tempfile::tempdir()` that runs *before* any harness call in that test
+/// is the first allocation of the process and lands in the OS temp dir instead:
+/// commonly the RAM-backed `/tmp` this whole issue is about, at `tempfile`'s
+/// default mode rather than 0o700, outside the free-space pre-flight, and — the
+/// part that bites — left behind on SIGKILL under `.tmp*`, a name the reaper
+/// deliberately will not touch by default because it belongs to every Rust
+/// program on the machine.
+///
+/// This was not theoretical: `e2e_issue_dispatch` cloned whole repositories
+/// through exactly that ordering. Rather than depend on every call site
+/// happening to be preceded by a harness call, the suite calls
+/// `common::harness_tempdir()`, which initialises the root first and then
+/// allocates inside it. This rule is what keeps that true — the ordering
+/// argument is invisible in a diff, so it cannot be left to review.
+///
+/// **Files, not just directories.** The rule originally matched only the
+/// directory constructors, which left a hole inside the territory it claimed to
+/// cover: `tempfile::NamedTempFile::new()` allocates in the OS temp dir on
+/// exactly the same terms, and the Codex-auth pre-flight in `tests/common/`
+/// used one. Measured on `5e8e0ed` as four zero-byte `/tmp/.tmp*` files. The
+/// byte count is irrelevant — the rule's job is to keep the containment claim
+/// true, and a constructor it cannot see makes the claim false. The `…_in`
+/// forms (`tempdir_in`, `tempfile_in`, `new_in`) name their parent explicitly
+/// and are therefore fine; the no-argument forms are not.
+///
+/// **Scope: all of `tests/`**, plus [`EXTRA_TEMP_COVERED`] for the lib target.
+///
+/// It used to be an enumerated list — `tests/e2e_*.rs`, `tests/common/`, and
+/// two named files — because covering the rest of the fast tier was priced at
+/// pulling `tests/common/mod.rs` into six more binaries and duplicating its
+/// ~530 executions to contain small L1 `TempDir`s. That price was real when it
+/// was measured, and it is no longer what the choice costs: `src/test_temp.rs`
+/// is deliberately self-contained, so a fast-tier crate `#[path]`-includes it
+/// for **two** extra executions. Six crates, twelve executions, measured — so
+/// the enumeration outlived the measurement that justified it. A whole-
+/// directory rule is also the only version a *new* file under `tests/` inherits
+/// automatically; an enumerated one silently does not cover it.
+///
+/// The escape hatch is [`BARE_TEMPDIR_ALLOW`] on the same line, which the
+/// harness's own defence-in-depth regression test uses — the one test whose
+/// subject *is* the bare constructor.
+const BARE_TEMPDIR_RULE: &str = "bare tempfile constructor — use `common::harness_tempdir()` / \
+     `harness_tempfile()` (or `test_temp::tempdir()` outside the harness) so it \
+     lands under the harness temp root even when it is the process's FIRST \
+     allocation (issue #322)";
+
+/// Files outside `tests/` that check 8 also covers.
+///
+/// `src/dispatch.rs` — lib-target unit tests that build real git repos and
+/// worktrees. They do not link `tests/common/` at all and use
+/// `crate::test_temp::tempdir()`; one of them was measured holding a live
+/// 184 KiB `/tmp/.tmpYN3lNF` with a cloned repo in it during a recorded
+/// `cargo test-e2e`, so the rule is what stops a bare constructor coming back.
+///
+/// The **rest** of `src/`'s unit tests are deliberately not here — ~82 call
+/// sites across 22 files, a large mechanical diff that would move fast-tier
+/// churn onto `/var/tmp` for no measured benefit. That is the one remaining
+/// documented gap in `docs/develop/e2e-temp-dirs.md`; everything under
+/// `tests/` is covered by the directory rule above.
+///
+/// Paths are repo-relative and compared with the platform separator
+/// normalised, so this works on Windows too.
+const EXTRA_TEMP_COVERED: &[&str] = &["src/dispatch.rs"];
+
+/// Opt-out marker for check 8, on the offending line.
+const BARE_TEMPDIR_ALLOW: &str = "linkage-check:allow-bare-tempdir";
+
+/// The `tempfile` constructors that allocate in the **default** temp dir.
+///
+/// Directories: `tempfile::tempdir()`, `TempDir::new()`, `TempDir::with_prefix()`,
+/// `TempDir::with_suffix()`, and the builder's `.tempdir()`. Files:
+/// `NamedTempFile::new()`, `NamedTempFile::with_prefix()`,
+/// `NamedTempFile::with_suffix()`, `tempfile::tempfile()`,
+/// `spooled_tempfile()`, and the builder's `.tempfile()`. Every `…_in(parent)` /
+/// `…_new_in(parent)` form names its destination and is deliberately NOT matched
+/// — that is what the wrappers themselves call, and `…_in` sits between the name
+/// and the `(` so none of the patterns here can reach it.
+///
+/// Factored out of `main` so it can be unit-tested; the file half of it was
+/// missing for a while and nothing caught that.
+///
+/// **The `with_prefix` / `with_suffix` / `spooled` family was missing too**, and
+/// the same argument applies: they are ordinary safe-looking constructors that
+/// allocate in `std::env::temp_dir()`, verified present in the pinned
+/// `tempfile 3.27.0` (`src/dir/mod.rs:269`/`:294`, `src/file/mod.rs:630`/`:657`),
+/// and each has an `…_in` counterpart, so the rule is satisfiable. There was no
+/// live call site when this was added — the value is that the guard now matches
+/// the claim it makes in the module header ("no bare `tempfile` constructor …
+/// anywhere under `tests/`") instead of enumerating a subset of it. A rule that
+/// covers most of its stated territory is the shape that let
+/// `NamedTempFile::new()` sit inside its own scope undetected.
+fn bare_temp_ctor_re() -> Regex {
+    Regex::new(
+        r"tempfile::tempdir\s*\(|TempDir::new\s*\(|TempDir::with_prefix\s*\(|TempDir::with_suffix\s*\(|\.tempdir\s*\(\s*\)|NamedTempFile::new\s*\(|NamedTempFile::with_prefix\s*\(|NamedTempFile::with_suffix\s*\(|tempfile::tempfile\s*\(|spooled_tempfile\s*\(|\.tempfile\s*\(\s*\)",
+    )
+    .expect("bare temp constructor regex compiles")
+}
+
+/// Whether check 8 applies to `file`.
+///
+/// Everything under `tests/`, plus the explicit [`EXTRA_TEMP_COVERED`] list for
+/// the lib target. `is_e2e` is no longer consulted — an `e2e_` file is under
+/// `tests/` by construction — but stays in the signature because the caller has
+/// it and because dropping it would make the two scoping rules look unrelated.
+fn temp_ctor_rule_covers(file: &Path, root: &Path, tests_dir: &Path, _is_e2e: bool) -> bool {
+    if file.starts_with(tests_dir) {
+        return true;
+    }
+    EXTRA_TEMP_COVERED
+        .iter()
+        .any(|rel| file == root.join(rel).as_path())
+}
 
 fn main() -> ExitCode {
     // PRD #77 M4: route subcommands through this binary so the
@@ -136,6 +262,8 @@ fn main() -> ExitCode {
         Regex::new(r"(std::thread::sleep|tokio::time::sleep)\b").expect("sleep regex compiles");
     let polling_re =
         Regex::new(r"for\s+_\s+in\s+0\.\.\s*\d+\s*\{").expect("polling regex compiles");
+    let bare_tempdir_re = bare_temp_ctor_re();
+    let mut bare_tempdir_violations: Vec<String> = Vec::new();
 
     for file in &test_files {
         let text = match std::fs::read_to_string(file) {
@@ -168,6 +296,30 @@ fn main() -> ExitCode {
                 file: file.clone(),
                 line: line_no,
             });
+        }
+
+        // Check 8 (issue #322): all of `tests/`, plus `EXTRA_TEMP_COVERED` for
+        // the lib target. The e2e tier is where the allocations are whole cloned
+        // repositories, where nextest's `slow-timeout terminate-after` SIGKILLs
+        // a process before it can clean up, and where real agent credentials
+        // get seeded — but the fast tier is no longer excluded, because the
+        // exclusion was priced at pulling the PTY harness into six more
+        // binaries and the `#[path]`-included `src/test_temp.rs` costs two test
+        // executions per crate instead. Its files bind Unix domain sockets and,
+        // on SIGKILL, survive as untagged `.tmp*` the reaper will not remove by
+        // default. Run against the stripped view so a comment naming the
+        // constructor is not a violation, but report the raw line number.
+        if temp_ctor_rule_covers(file, &root, &tests_dir, is_e2e) {
+            for (idx, raw) in raw_lines.iter().enumerate() {
+                let stripped_line = stripped_lines.get(idx).copied().unwrap_or("");
+                if bare_tempdir_re.is_match(stripped_line) && !raw.contains(BARE_TEMPDIR_ALLOW) {
+                    bare_tempdir_violations.push(format!(
+                        "{}:{}: {BARE_TEMPDIR_RULE}",
+                        file.display(),
+                        idx + 1
+                    ));
+                }
+            }
         }
 
         if is_e2e {
@@ -285,6 +437,11 @@ fn main() -> ExitCode {
 
     failures.extend(e2e_violations);
     failures.extend(ignore_violations);
+    failures.extend(
+        bare_tempdir_violations
+            .into_iter()
+            .map(|v| format!("[8] {v}")),
+    );
 
     // Check 7 (PRD #77 Decision 30 / M4.3): every #[spec] test has
     // a `/// Scenario:` doc comment with a body AND
@@ -300,7 +457,7 @@ fn main() -> ExitCode {
 
     if failures.is_empty() {
         println!(
-            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 7 rules)",
+            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 8 rules)",
             catalog_ids.len(),
             discovered.len(),
             allowlist.len()
@@ -799,6 +956,111 @@ fn fn_name_matches_spec(id: &str, fname: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Check 8 must see the *file* constructors, not only the directory ones.
+    /// This is the hole that let the Codex-auth pre-flight's
+    /// `NamedTempFile::new()` sit inside the rule's own scope, measured live in
+    /// `/tmp` on `5e8e0ed`.
+    #[test]
+    fn bare_temp_ctor_re_matches_file_constructors() {
+        let re = bare_temp_ctor_re();
+        for line in [
+            "    let f = tempfile::NamedTempFile::new()",
+            "    let f = NamedTempFile::new().unwrap();",
+            "    let f = tempfile::tempfile().unwrap();",
+            "    let f = tempfile::Builder::new().tempfile()?;",
+        ] {
+            assert!(re.is_match(line), "should be a violation: {line}");
+        }
+    }
+
+    #[test]
+    fn bare_temp_ctor_re_still_matches_dir_constructors() {
+        let re = bare_temp_ctor_re();
+        for line in [
+            "    let d = tempfile::tempdir().unwrap();",
+            "    let d = TempDir::new().unwrap();",
+            "    let d = tempfile::Builder::new().tempdir()?;",
+        ] {
+            assert!(re.is_match(line), "should be a violation: {line}");
+        }
+    }
+
+    /// The `…_in` forms name their parent explicitly — they are what the
+    /// wrappers themselves call, so matching them would make the rule
+    /// unsatisfiable.
+    #[test]
+    fn bare_temp_ctor_re_allows_explicit_parent_forms() {
+        let re = bare_temp_ctor_re();
+        for line in [
+            "    tempfile::Builder::new().tempdir_in(harness_temp_root())",
+            "    tempfile::Builder::new().tempfile_in(harness_temp_root())",
+            "    NamedTempFile::new_in(parent)?",
+            "    TempDir::new_in(parent)?",
+            "    tempfile::tempfile_in(parent)?",
+            // The widened family's own `…_in` counterparts. `_in` sits between
+            // the name and the `(`, which is what keeps these out.
+            "    TempDir::with_prefix_in(\"codex-home-\", parent)?",
+            "    TempDir::with_suffix_in(\".git\", parent)?",
+            "    NamedTempFile::with_prefix_in(\"auth-\", parent)?",
+            "    NamedTempFile::with_suffix_in(\".json\", parent)?",
+            "    tempfile::spooled_tempfile_in(4096, parent)?",
+        ] {
+            assert!(!re.is_match(line), "should NOT be a violation: {line}");
+        }
+    }
+
+    /// The `with_prefix` / `with_suffix` / `spooled` family allocates in
+    /// `std::env::temp_dir()` exactly like `new()` does, and the rule claims to
+    /// cover every bare constructor under `tests/`. These had no live call site
+    /// when this test was written; it exists so the claim and the guard cannot
+    /// drift apart again, which is how `NamedTempFile::new()` went unmatched.
+    #[test]
+    fn bare_temp_ctor_re_matches_the_prefix_suffix_and_spooled_family() {
+        let re = bare_temp_ctor_re();
+        for line in [
+            "    let d = TempDir::with_prefix(\"codex-home-\").unwrap();",
+            "    let d = tempfile::TempDir::with_suffix(\"-repo\").unwrap();",
+            "    let f = NamedTempFile::with_prefix(\"auth-\").unwrap();",
+            "    let f = tempfile::NamedTempFile::with_suffix(\".json\").unwrap();",
+            "    let f = tempfile::spooled_tempfile(4096);",
+        ] {
+            assert!(re.is_match(line), "should be a violation: {line}");
+        }
+    }
+
+    /// Scope: **all** of `tests/` — the e2e tier, the harness, and the fast-tier
+    /// crates that used to be excluded — plus `src/dispatch.rs`. The rest of
+    /// `src/` stays out; that is the one remaining documented gap in
+    /// `docs/develop/e2e-temp-dirs.md`.
+    #[test]
+    fn temp_ctor_rule_covers_the_documented_scope() {
+        let root = Path::new("/repo");
+        let tests_dir = root.join("tests");
+        let covers = |rel: &str, is_e2e: bool| {
+            temp_ctor_rule_covers(&root.join(rel), root, &tests_dir, is_e2e)
+        };
+
+        assert!(covers("tests/e2e_handshake.rs", true));
+        assert!(covers("tests/common/mod.rs", false));
+        assert!(covers("tests/daemon_protocol.rs", false));
+        assert!(covers("src/dispatch.rs", false));
+
+        // The six converted in the same commit that widened this rule, and a
+        // name that does not exist yet — the whole point of a directory rule is
+        // that a new file under `tests/` inherits it without being listed.
+        assert!(covers("tests/rehydration.rs", false));
+        assert!(covers("tests/pane_close.rs", false));
+        assert!(covers("tests/codex_hooks_safety.rs", false));
+        assert!(covers("tests/features.rs", false));
+        assert!(covers("tests/devin_hook_ingestion.rs", false));
+        assert!(covers("tests/codex_hook_ingestion.rs", false));
+        assert!(covers("tests/some_future_suite.rs", false));
+
+        // Still outside: everything in `src/` except the one listed file.
+        assert!(!covers("src/config.rs", false));
+        assert!(!covers("src/test_temp.rs", false));
+    }
 
     #[test]
     fn sub_area_prefix_handles_plain_sub_area() {

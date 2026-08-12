@@ -573,6 +573,48 @@ pub fn force_kill_pid(pid: u32) -> std::io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Foreground process-group query (PRD #370 M1).
+// ---------------------------------------------------------------------------
+
+/// Always `None` on Windows: `portable_pty::MasterPty::process_group_leader`
+/// is `#[cfg(unix)]`-only on the trait itself (there is no Windows console
+/// analogue of a pty foreground process group — Windows pipes/conpty have no
+/// equivalent of `tcgetpgrp`), so the method does not exist to call here at
+/// all. See `unix.rs` for the real implementation. Callers must treat `None`
+/// as "no signal available" and fall back to whatever status they already
+/// have, never as "not busy".
+pub fn foreground_pgid(_master: &dyn portable_pty::MasterPty) -> Option<i32> {
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Process-table sample (PRD #386 M1).
+// ---------------------------------------------------------------------------
+
+/// Always `None` on Windows: PRD #386 scopes native Windows process walking
+/// out, exactly as [`foreground_pgid`] does today. There is also nothing for
+/// the discriminator to compare — the whole signal rests on POSIX sessions
+/// (`getsid(2)`), which Windows has no analogue of, so a `Toolhelp32Snapshot`
+/// walk would enumerate a tree it could not classify.
+///
+/// Callers must treat `None` as "no signal available" and leave whatever status
+/// they already have alone, never read it as "not busy". The cross-platform
+/// half — [`super::ProcessInfo`], [`super::descendants`] and
+/// [`super::descendant_shell_activity`] — still compiles and is still tested
+/// here, so a future Windows backend only has to supply this one function.
+pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
+    None
+}
+
+/// The async twin of [`process_table`], so the daemon's poll loop needs no
+/// `cfg` branch of its own (issue #429). Unconditionally `None` for the same
+/// reason, and it never awaits anything: there is no subprocess to bound, so the
+/// caller's timeout simply never fires here.
+pub async fn process_table_async() -> Option<Vec<super::ProcessInfo>> {
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Orphan watchdog (test-gated, OFF in production).
 // ---------------------------------------------------------------------------
 

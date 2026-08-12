@@ -113,6 +113,7 @@ fn selected_card_fixture() -> SessionState {
         pane_id: Some("pane-mode-card".to_string()),
         agent_id: None,
         display_name: None,
+        shell_synthetic_working: false,
     }
 }
 

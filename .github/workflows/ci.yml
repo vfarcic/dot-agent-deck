@@ -187,7 +187,18 @@ jobs:
       # Aligning the runners also makes a CI failure reproducible locally, which
       # neither of those was, and makes "green locally" mean the same thing as
       # "green in CI".
-      - run: cargo nextest run
+      #
+      # `--workspace` (issue #489, duplicate #470) — the test-side sibling of
+      # the same flag on the clippy step above, and it must stay in lockstep
+      # with the `test-fast` alias in .cargo/config.toml for the "green locally
+      # == green in CI" claim in the previous paragraph to hold. Cargo's
+      # default selection is the root package alone, so the tests in
+      # `xtask/linkage-check` and `xtask/docs` ran in NO gate anywhere: 1657
+      # tests without the flag, 1705 with it. Clippy's `--workspace` still
+      # BUILT those tests, which is why only their runtime assertions were
+      # inert and the gap survived #436. Costs nothing measurable: all 48 are
+      # under 40ms and the tier's wall clock is set by its slowest test.
+      - run: cargo nextest run --workspace
       # CLAUDE.md rule 7 has always SAID this runs in CI ("CI's linkage-check
       # rule 7 fails the build if the Scenario comment is missing or the
       # generator fails"), and the build-macos/build-windows comment says these
@@ -288,7 +299,20 @@ jobs:
       # test-fast tier only (CLAUDE.md #5): protocol/state + L1 render tests.
       # No `e2e` feature (needs real agents + LLM APIs) and no linkage-check /
       # `cargo xtask docs` steps — those stay on the Linux job.
-      - run: cargo nextest run
+      #
+      # `--workspace` (issue #489) — and note this does NOT mirror the clippy
+      # step above, which deliberately stays bare. That divergence is caused by
+      # `--all-targets --features e2e`, whose Unix-only L2 tier yields dozens of
+      # E0425s against the Windows target; `--workspace` is not part of it and
+      # has no such mechanism. The flag is here because `test-fast` in
+      # .cargo/config.toml carries it on EVERY platform: a Windows contributor
+      # typing `cargo test-fast` now runs the xtask tests, so this job has to
+      # run them too or a Windows-only break in them is invisible on PRs and
+      # surfaces only on that contributor's machine — the exact failure mode
+      # this job exists to prevent. The one xtask test with a platform
+      # dependency (`symlinks_named_like_owned_dirs_are_skipped`) is already
+      # `#[cfg(unix)]`; the rest are in-memory or tempdir-based.
+      - run: cargo nextest run --workspace
 
   # macOS (host = aarch64-apple-darwin) compile + clippy + unit-test gate,
   # mirroring build-windows. macOS is otherwise built ONLY in the release
@@ -321,7 +345,13 @@ jobs:
       # test-only lint can't fail macOS-only and be unreproducible on the Linux
       # pre-push gate.
       - run: cargo clippy -- -D warnings
-      - run: cargo nextest run
+      # `--workspace` (issue #489), for the reason spelled out on the
+      # build-windows step: the `test-fast` alias carries the flag on every
+      # platform, so this job must run the xtask tests to keep "green locally"
+      # and "green in CI" the same claim on macOS. Unlike the clippy step above
+      # there is nothing to match-and-narrow here — the clippy divergence is
+      # about `--all-targets --features e2e`, not about package selection.
+      - run: cargo nextest run --workspace
 
   # `cargo audit` reads Cargo.lock, which a devbox-only PR cannot touch.
   security:

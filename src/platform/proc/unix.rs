@@ -182,6 +182,132 @@ pub fn send_sigterm_to_child_group(
 }
 
 // ---------------------------------------------------------------------------
+// Foreground process-group query (PRD #370 M1).
+// ---------------------------------------------------------------------------
+
+/// The pty's current foreground process-group id (`tcgetpgrp` under the
+/// hood, via `portable_pty::MasterPty::process_group_leader`), or `None` if
+/// the backend can't report one (e.g. the master fd is already closed).
+///
+/// This is the Unix half of the [`foreground_pgid`] seam; see `windows.rs`
+/// for why the Windows half is an unconditional `None` rather than a
+/// best-effort implementation.
+pub fn foreground_pgid(master: &dyn portable_pty::MasterPty) -> Option<i32> {
+    master.process_group_leader()
+}
+
+// ---------------------------------------------------------------------------
+// Process-table sample (PRD #386 M1).
+// ---------------------------------------------------------------------------
+
+/// A process's POSIX session id, or a negative value if it could not be read
+/// (the usual cause being that the process exited between the `ps` sample and
+/// this call, giving `ESRCH`).
+///
+/// **This is deliberately not `ps -o sess=`**, which prints `0` for a non-root
+/// caller on macOS and is useless for the discriminator. `getsid(2)` is POSIX,
+/// behaves identically on macOS and Linux, works on any pid rather than only on
+/// children, and needs no `/proc` parsing on Linux either.
+fn getsid_or_negative(pid: i32) -> i32 {
+    // SAFETY: `getsid(2)` is async-signal-safe and has no side effects; it
+    // either reports the target's session id or returns -1 with `errno` set.
+    unsafe { libc::getsid(pid) }
+}
+
+/// The one `ps` invocation both samplers share, so the sync and async paths can
+/// never drift into asking `ps` for different columns.
+///
+/// `-w -w` disables `ps`'s width truncation on both macOS and Linux, so the argv
+/// column survives whole; the trailing `=` on every `-o` field suppresses the
+/// header line entirely.
+const PS_TABLE_ARGS: [&str; 5] = ["-A", "-w", "-w", "-o", "pid=,ppid=,tty=,args="];
+
+/// Turn a finished `ps` run into a table, or `None` when it said nothing usable.
+///
+/// Shared by [`process_table`] and [`process_table_async`]. The `getsid(2)` per
+/// row happens here: it is a pure kernel lookup with no I/O wait, which is why
+/// it is safe to leave on the caller's thread even in the async path (measured
+/// at ~1.4 ms for ~620 rows in a release build, against ~49 ms of wall time for
+/// the `ps` run itself).
+fn table_from_ps_output(success: bool, stdout: &[u8]) -> Option<Vec<super::ProcessInfo>> {
+    if !success {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(stdout);
+    let rows = super::scan::parse_ps_table(&stdout, &getsid_or_negative);
+    if rows.is_empty() { None } else { Some(rows) }
+}
+
+/// Sample every process on the machine into a [`super::ProcessInfo`] table
+/// (PRD #386 M1, Route A), or `None` if `ps` could not be run or produced
+/// nothing parseable.
+///
+/// One `ps -A` per call, parsed once and reusable for *every* pane in that
+/// poll, so the cost is one fork/exec per poll cycle rather than per pane. The
+/// session id of each row comes from [`getsid_or_negative`], not from `ps`.
+///
+/// **Synchronous and unbounded — never call this from an async task** (issue
+/// #429). It blocks the calling thread for the whole `ps` run, measured at
+/// ~49 ms on an idle 16-core Linux box with ~620 processes, and forever if `ps`
+/// wedges in D-state on a stuck filesystem. [`process_table_async`] is the
+/// variant for a Tokio context. This one remains for synchronous callers and
+/// tests.
+///
+/// Route B (native enumeration — `/proc/<pid>/{stat,cmdline}` on Linux,
+/// `sysctl(KERN_PROC_ALL)` on macOS) stays open behind PRD #386's M5
+/// measurement; it removes the subprocess at the cost of two platform-specific
+/// implementations, and is only worth taking if the measurement says so.
+pub fn process_table() -> Option<Vec<super::ProcessInfo>> {
+    let output = std::process::Command::new("ps")
+        .args(PS_TABLE_ARGS)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    table_from_ps_output(output.status.success(), &output.stdout)
+}
+
+/// [`process_table`] for an async caller: the same sample, but awaited instead
+/// of blocked on (issue #429).
+///
+/// Two properties the synchronous version cannot offer, both load-bearing for
+/// the daemon's 2 Hz shell-activity poll:
+///
+/// - **It does not occupy a Tokio worker thread.** The wait for `ps` to exit is
+///   a real `await` on the runtime's child reaper, so the worker goes back to
+///   the queue for the ~49 ms the sample takes instead of sitting in
+///   `waitpid`. That ~49 ms every 500 ms — ~10% of one worker, *even with zero
+///   panes open* — is what previously stalled hook ingestion, client requests
+///   and daemon shutdown behind this signal. `spawn_blocking` would only
+///   relocate that stall to the blocking pool; worse, `tokio::time::timeout`
+///   around a `spawn_blocking` handle does not cancel the thread, so a
+///   permanently-wedged `ps` at 2 Hz would leak one pool thread per tick until
+///   the 512-thread cap. Awaiting an async child is what actually fixes it.
+/// - **It is cancel-safe, so a timeout can genuinely bound it.** `kill_on_drop`
+///   means dropping this future — which is exactly what
+///   [`tokio::time::timeout`] does on expiry — kills the `ps` child and leaves
+///   it to the runtime's orphan reaper rather than abandoning it.
+///
+/// **Callers MUST wrap this in a timeout**; it has no internal deadline, and a
+/// `ps` wedged in D-state never returns. The deadline lives at the call site
+/// (see `run_shell_activity_monitor`) because the *interpretation* of a blown
+/// deadline is the caller's: a timed-out sample means "no opinion", never "not
+/// busy".
+pub async fn process_table_async() -> Option<Vec<super::ProcessInfo>> {
+    // `output()` forces `stdout`/`stderr` to pipes (tokio, unlike `std`, leaves
+    // `stdin` alone — hence the explicit null), and `wait_with_output` drains
+    // both concurrently, so the captured-and-discarded stderr cannot deadlock.
+    let output = tokio::process::Command::new("ps")
+        .args(PS_TABLE_ARGS)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    table_from_ps_output(output.status.success(), &output.stdout)
+}
+
+// ---------------------------------------------------------------------------
 // Daemon-stop termination by PID (lifted from build_version_handshake.rs).
 // ---------------------------------------------------------------------------
 

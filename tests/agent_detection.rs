@@ -135,7 +135,7 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 fn spawn_005_respawn_wraps_codex() {
     use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 
-    let fixture = tempfile::tempdir().expect("respawn recorder fixture");
+    let fixture = common::harness_tempdir().expect("respawn recorder fixture");
     let bin_dir = fixture.path().join("bin");
     let record = fixture.path().join("respawn.log");
     std::fs::create_dir(&bin_dir).expect("create respawn bin dir");
@@ -211,7 +211,7 @@ fn spawn_005_respawn_wraps_codex() {
 fn spawn_006_explicit_codex_identity_wraps_noninferable_launcher() {
     use dot_agent_deck::agent_pty::{AgentPtyRegistry, SpawnOptions};
 
-    let fixture = tempfile::tempdir().expect("explicit Codex identity fixture");
+    let fixture = common::harness_tempdir().expect("explicit Codex identity fixture");
     let bin_dir = fixture.path().join("bin");
     let record = fixture.path().join("spawn.log");
     std::fs::create_dir(&bin_dir).expect("create explicit identity bin dir");
@@ -279,7 +279,7 @@ fn spawn_006_explicit_codex_identity_wraps_noninferable_launcher() {
 fn spawn_007_hook_learned_badge_does_not_change_respawn_launch() {
     use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 
-    let fixture = tempfile::tempdir().expect("stable respawn fixture");
+    let fixture = common::harness_tempdir().expect("stable respawn fixture");
     let bin_dir = fixture.path().join("bin");
     let record = fixture.path().join("launch.log");
     std::fs::create_dir_all(&bin_dir).expect("create stable respawn bin dir");
@@ -362,7 +362,7 @@ fn spawn_007_hook_learned_badge_does_not_change_respawn_launch() {
 fn spawn_008_respawn_wrap_decision_follows_the_launched_command() {
     use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 
-    let fixture = tempfile::tempdir().expect("launch-shape coherence fixture");
+    let fixture = common::harness_tempdir().expect("launch-shape coherence fixture");
     let bin_dir = fixture.path().join("bin");
     let record = fixture.path().join("launch.log");
     std::fs::create_dir_all(&bin_dir).expect("create launch-shape bin dir");

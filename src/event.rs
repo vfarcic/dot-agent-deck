@@ -17,6 +17,25 @@ pub enum EventType {
     Error,
     SessionStart,
     SessionEnd,
+    /// PRD #370 M2: synthesized daemon-side (never sent by an agent's own
+    /// hooks/wrapper) when a pane's agent process has a transitive descendant
+    /// running in a POSIX session of its own — i.e. a shelled-out command is
+    /// actively running with no agent-emitted event to say so. See
+    /// [`crate::state::AppState::apply_event`]'s `ShellBusy`/`ShellIdle` arms
+    /// for the precedence rules against real, agent-emitted status.
+    ShellBusy,
+    /// PRD #370 M2: the paired synthesized event — the detached descendant is
+    /// gone, i.e. the previously-running foreground command has finished. See
+    /// [`ShellBusy`](Self::ShellBusy).
+    ShellIdle,
+    /// PRD #370 / precedent PRD #201 (`AgentType`'s identical retrofit):
+    /// forward-compat catch-all for a future/unknown `event_type` string on
+    /// the wire, so a build newer than THIS one can add further variants
+    /// without another `PROTOCOL_VERSION` bump. Deserialize-only — never
+    /// produced by this build. Treated as a no-op wherever `EventType` is
+    /// matched (never proof of agent activity, never changes `SessionStatus`).
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -993,13 +1012,52 @@ mod tests {
 
     #[test]
     fn reject_invalid_event_type() {
+        // PRD #370 (rule-12 wire safety, same class as PRD #201's `AgentType`
+        // precedent immediately below): `EventType` gained a `#[serde(other)]`
+        // catch-all alongside its new `ShellBusy`/`ShellIdle` variants, so an
+        // unrecognized `event_type` no longer fails the whole `AgentEvent`
+        // decode — it deserializes to `EventType::Unknown` instead. This test
+        // used to assert the OPPOSITE (a hard decode error); the change is
+        // deliberate forward-compat, not a regression — see
+        // `unknown_event_type_deserializes_to_the_catch_all` below for the
+        // dedicated coverage this rename hands off to.
         let json = r#"{
             "session_id": "abc-123",
             "agent_type": "claude_code",
             "event_type": "unknown_type",
             "timestamp": "2026-03-22T10:00:00Z"
         }"#;
-        assert!(serde_json::from_str::<AgentEvent>(json).is_err());
+        let event: AgentEvent = serde_json::from_str(json).expect("must decode, not error");
+        assert_eq!(event.event_type, EventType::Unknown);
+    }
+
+    // PRD #370 (rule-12 wire safety): `EventType` gained wire-serialized
+    // `ShellBusy`/`ShellIdle` variants (the daemon-synthesized "a foreground
+    // shell command is running" signal). Without a `#[serde(other)]`
+    // fallback, a NEWER daemon emitting one would break an OLDER reader's
+    // WHOLE-frame decode (the `KIND_EVENT` broadcast), stranding its event
+    // stream — the exact class of break PRD #201 fixed for `AgentType`
+    // above. The catch-all makes any unrecognized value — one of these two
+    // new variants at a pre-#370 reader, OR a future event type at today's
+    // build — deserialize to the neutral `Unknown` placeholder instead of
+    // erroring, so this class of break can never repeat for a future type.
+    #[test]
+    fn unknown_event_type_deserializes_to_the_catch_all() {
+        let ty: EventType = serde_json::from_str("\"some_future_event_type\"").unwrap();
+        assert_eq!(ty, EventType::Unknown);
+
+        // Deserialize-only: `Unknown` is never produced by this build, so it
+        // has no "own" wire name to round-trip through — unlike
+        // `AgentType::None`, which legitimately serializes as `"none"`.
+        // Confirm the REAL variants this build DOES produce still round-trip
+        // cleanly, so the catch-all didn't disturb ordinary encode/decode.
+        assert_eq!(
+            serde_json::from_str::<EventType>(
+                &serde_json::to_string(&EventType::ShellBusy).unwrap()
+            )
+            .unwrap(),
+            EventType::ShellBusy
+        );
     }
 
     // PRD #76 M2.13: pin the AgentType::from_command inference rules.

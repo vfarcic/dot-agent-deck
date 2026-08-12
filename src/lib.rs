@@ -46,7 +46,13 @@ pub mod state;
 pub mod tab;
 pub mod tab_layout;
 pub mod terminal_widget;
+// Issue #322: test-only, and never part of the shipped library. Unit tests in
+// this crate do not link `tests/common/`, so before this they allocated scratch
+// space in the OS temp dir — the RAM-backed `/tmp` the issue is about.
+#[cfg(test)]
+mod test_temp;
 pub mod ui;
 pub mod version;
 pub mod watch;
+pub mod worktree_reclaim;
 pub mod wrap;

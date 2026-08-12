@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, broadcast};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::platform::ipc::{IpcListener, IpcStream};
 
@@ -717,6 +717,18 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     });
 
+    // PRD #370 M2: unconditional, unlike the idle monitor above — every
+    // daemon needs this regardless of the idle-shutdown config, since it's
+    // the only signal source for a role's shelled-out foreground command.
+    let shell_activity_handle = {
+        let registry = pty_registry.clone();
+        let monitor_state = state.clone();
+        let monitor_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            run_shell_activity_monitor(registry, monitor_state, monitor_event_tx).await;
+        })
+    };
+
     let result = run_hook_loop(
         listener,
         state,
@@ -733,6 +745,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     if let Some(h) = idle_handle {
         h.abort();
     }
+    shell_activity_handle.abort();
     scheduler_handle.abort();
     if let Some(h) = orphan_handle {
         h.abort();
@@ -988,6 +1001,495 @@ async fn run_idle_monitor(
     }
 }
 
+/// PRD #386 (reviewer finding): ingest one event as a SINGLE ordered daemon
+/// operation — fan it out to attached clients and apply it to the daemon's
+/// own `AppState` under one write-lock acquisition, so every consumer
+/// observes events in the order the daemon applied them.
+///
+/// **Why it has to be one step.** Both producers — the shell-activity monitor
+/// above and the hook loop below — used to `send` and then *separately*
+/// `await` the state write lock, with the await sitting between the two. Two
+/// concurrent producers could therefore interleave: the monitor broadcasts
+/// `ShellBusy` and yields at `state.write().await`, a hook connection
+/// broadcasts `Idle` and wins the lock, and the daemon applies `Idle` then
+/// `ShellBusy` — ending at `Working` — while an attached TUI consumed
+/// `ShellBusy` then `Idle` and renders `Idle`. Nothing corrects it
+/// afterwards, which is what makes it worth fixing rather than tolerating:
+/// the monitor's level-aware re-emit (see `run_shell_activity_monitor`)
+/// tests the DAEMON's status, which is already `Working`, so no further
+/// event is ever synthesized and the pane the user is looking at stays wrong
+/// until the next unrelated edge. That is the same user-visible failure this
+/// PRD exists to repair, and the same shape as the mis-addressed synthesized
+/// event fixed in the monitor.
+///
+/// The non-atomicity is **pre-existing** — it is how the pipeline already
+/// handled any two concurrent events, including two real hooks arriving on
+/// separate connections. What #386 changes is how often the window is
+/// reachable, by adding a second, timer-driven producer that emits precisely
+/// when a real `Stop`-driven `Idle` is in flight.
+///
+/// Holding the guard across `send` is safe and adds no blocking:
+/// `broadcast::Sender::send` is synchronous, never waits on a receiver, and
+/// errs only when there are no subscribers (the expected standalone-daemon
+/// case). The property the old fan-out-before-apply comments protected —
+/// that the broadcast happens whether or not the local `apply_event` accepts
+/// the event, e.g. for an unmanaged pane id — is unchanged: both run under
+/// the same guard, unconditionally.
+async fn ingest_event(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    event: AgentEvent,
+) {
+    let mut state = state.write().await;
+    let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
+    state.apply_event(event);
+}
+
+/// PRD #370 M2 / PRD #386 M3: periodically scans every live pane's PTY child
+/// for a transitive descendant detached into a POSIX session of its own — see
+/// [`crate::agent_pty::RunningAgent::shell_foreground_busy`] — and
+/// synthesizes `ShellBusy`/`ShellIdle` events through the SAME pipeline real
+/// hook events use (`event_tx` broadcast + `AppState::apply_event`), so a
+/// pane running a foreground shell command (e.g. a role's `cargo build`)
+/// reads `Working` even when no agent-emitted hook/wrapper event fires in
+/// between. Per pane the trigger is edge-driven (a busy/idle transition) PLUS
+/// level-aware (PRD #386 M6b — the scan reads busy while the session's status
+/// has regressed to `Idle`/`Unknown`, as it does when Claude Code backgrounds
+/// a command at its 120s Bash cap and the resulting `Stop` hook lands as
+/// `Idle`), never every tick, so this never floods attached clients with
+/// redundant events; `apply_event`'s own precedence rules (see its
+/// `ShellBusy`/`ShellIdle` arms) are what keep it from ever clobbering a real
+/// status.
+///
+/// Skips any pane with no already-known session
+/// (`AppState::pane_hook_session_id` returns `None`) — a bare shell pane
+/// that has never emitted a single agent event has no `SessionState` to
+/// update at all. Documented M2 scope boundary (PRD #370), not a bug: this
+/// mechanism promotes an agent's OWN idle gaps, not a shell nobody's
+/// tracking. No internal shutdown signal — like `scheduler_handle`, this
+/// task is torn down by `.abort()` in `run_daemon_with`'s cleanup.
+async fn run_shell_activity_monitor(
+    pty_registry: Arc<AgentPtyRegistry>,
+    state: SharedState,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+) {
+    run_shell_activity_monitor_with(pty_registry, state, event_tx, || {
+        crate::platform::proc::process_table_async()
+    })
+    .await
+}
+
+/// [`run_shell_activity_monitor`] with the process-table sample injected, so the
+/// two decisions that are *about* sampling can be tested without a wedged
+/// filesystem or an empty machine (issues #493 and #429): that no sample is
+/// taken at all when there is no live pane, and that a sample which blows its
+/// deadline leaves every pane's status alone.
+///
+/// `sample` is deliberately **not** given the timeout — the deadline is applied
+/// here, around whatever the sampler returns, so a test sampler that never
+/// completes exercises the real timeout path rather than a stubbed one. That
+/// also lets a test count how many samples were *started*, which is what pins
+/// the one-child-at-a-time invariant described on `inflight` below.
+async fn run_shell_activity_monitor_with<S, F>(
+    pty_registry: Arc<AgentPtyRegistry>,
+    state: SharedState,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    sample: S,
+) where
+    S: Fn() -> F,
+    F: std::future::Future<Output = Option<Vec<crate::platform::proc::ProcessInfo>>>,
+{
+    // PRD #370 Open Question (poll cadence): 500ms is a first-cut balance
+    // between feeling responsive and negligible overhead (one registry lock
+    // + one `ps -A` sample per tick, reused across every live pane, plus a
+    // `getsid` per row). PRD #386 M5 is where that cost gets measured and the
+    // cadence confirmed or revised; left unchanged here deliberately, so M5
+    // measures the shape that actually shipped.
+    //
+    // Issue #493 measured the sample it pays for: ~49ms of wall time per `ps -A`
+    // on an idle 16-core Linux box with ~620 processes (release build), i.e.
+    // ~10% of one core at 2Hz — of which only ~1.4ms is this process's own CPU
+    // (the `getsid` loop plus parsing); the rest is the `ps` child and waiting
+    // on it. That is the number M5 wants for the Route A vs. Route B (native
+    // enumeration) question, and it is why skipping the sample when no pane
+    // needs it is worth the guard below rather than merely tidy.
+    const POLL_INTERVAL: Duration = Duration::from_millis(500);
+    // Issue #429: an upper bound on how long a tick WAITS for a sample —
+    // deliberately not a bound on how long the sample's child may live (see
+    // `inflight` below). Generous next to the ~49ms a healthy `ps -A` takes, so
+    // ordinary load never trips it.
+    const SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
+    let mut last_known: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    // The sample still in flight from an earlier tick, if any (#500 review, P1).
+    //
+    // This exists so a wedged `ps` cannot ACCUMULATE. The obvious shape —
+    // `timeout(d, sample())`, drop the future on expiry, start a fresh one next
+    // tick — is wrong for the exact case the timeout is for: a process in
+    // uninterruptible sleep does not act on the `SIGKILL` that `kill_on_drop`
+    // sends until it leaves D-state, so the abandoned `ps` stays on the process
+    // table. Retrying every 2.5s would then add one undead `ps` per cycle
+    // (~24/minute), consuming pids and table entries — turning a stalled signal
+    // into a resource leak.
+    //
+    // So the timeout bounds the WAIT, not the child: on expiry the in-flight
+    // future is retained here and re-awaited on the next tick, which keeps the
+    // hard invariant that **at most one `ps` child exists at a time**. A sample
+    // that answers `None` is dropped, so the next tick starts fresh.
+    //
+    // Retention is unconditional — including on a tick with no candidates, which
+    // does not poll it. Dropping it there would look tidier but reopens the
+    // accumulation path above through pane churn (close to zero, reopen, and a
+    // second `ps` joins the first undead one), and #493 already guarantees a
+    // paneless daemon starts no sample at all. The residual is one retained
+    // child, which is the same child we would be waiting on anyway.
+    //
+    // The `Instant` is the sample's START, and it is what makes retention safe
+    // (#500 review, round 2). A retained sample's table describes the machine as
+    // it was when `ps` began, so a sample that finally answers after an arbitrary
+    // gap — a wedge that outlasts every pane, then a new pane opening — would
+    // classify TODAY's pids against a table from before they existed. Almost
+    // always that is harmless (`descendant_shell_activity` returns `None` for a
+    // pid the table lacks, so the pane is skipped), but under pid reuse a new
+    // pane inherits a dead process's descendants and, because `last_known` has no
+    // entry for it yet, that wrong reading emits immediately. So a table older
+    // than `MAX_TABLE_AGE` is discarded rather than trusted.
+    // Carries the candidate set as it was when the sample STARTED alongside it,
+    // so a late answer can be checked against the panes it could actually have
+    // observed rather than against whatever is open when it lands — see the
+    // `was_resumed` branch below.
+    #[allow(clippy::type_complexity)]
+    let mut inflight: Option<(
+        tokio::time::Instant,
+        Vec<crate::agent_pty::ShellActivityCandidate>,
+        std::pin::Pin<Box<F>>,
+    )> = None;
+    // How old a sample's table may be and still be worth classifying against.
+    // A healthy sample answers in ~49ms and a heavily loaded one in a few
+    // hundred, so this never trips in normal operation; it exists purely to stop
+    // a long-overrunning sample's answer from being applied to a machine that has
+    // moved on. Discarding an ANSWERED sample is free — that child is already
+    // finished, so unlike abandoning an un-answered one it cannot accumulate.
+    const MAX_TABLE_AGE: Duration = Duration::from_secs(3);
+    // Whether the in-flight sample has already been reported as overrunning, so
+    // a permanently-wedged `ps` logs once rather than every 2.5s forever.
+    let mut inflight_reported = false;
+
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+
+        // PRD #386 M3: the CATALOG of measured shapes, not a set applied to
+        // every pane — `shell_activity_candidates` selects from it per pane by
+        // agent kind, so a Claude pane gets the one shape measured against
+        // Claude Code and an agent whose shell-tool shape has never been
+        // measured gets none (structural session-id test alone). Passing
+        // Claude's fingerprint to a Codex/OpenCode/Pi pane would veto a
+        // genuinely detached descendant and leave the pane silently reading
+        // `Idle`.
+        //
+        // Issue #493: resolve WHO there is to classify before sampling the
+        // machine. This lock-only pass is what makes the `ps` fork conditional
+        // — it used to be unconditional and first, so a daemon with zero panes
+        // forked `ps -A` twice a second to classify nobody, and the daemon's
+        // idle shutdown does not bound that (it needs no clients AND no agents,
+        // so a TUI attached with no panes polled forever). The candidates are
+        // owned, so the registry lock is already released here and the sample
+        // below still never runs under it.
+        let candidates = pty_registry
+            .shell_activity_candidates(crate::platform::proc::MEASURED_SHELL_TOOL_SHAPES);
+
+        let snapshot = if candidates.is_empty() {
+            // No pane, so no sample — and an empty reading rather than a
+            // skipped tick, because "there are no panes" is a fact we just
+            // established under the lock, not a failure to observe. Falling
+            // through with an empty snapshot lets the `retain` below clear
+            // `last_known`, which is what makes a later reuse of the same pane
+            // id start edge-detection from a clean slate.
+            Vec::new()
+        } else {
+            // Resume the sample already in flight, or start the tick's own. Only
+            // ever one of the two, which is what bounds the `ps` children to one
+            // — see `inflight`'s declaration.
+            let resumed = inflight.take();
+            let was_resumed = resumed.is_some();
+            let (started, at_start, mut pending) = match resumed {
+                Some(resumed) => resumed,
+                None => {
+                    inflight_reported = false;
+                    (
+                        tokio::time::Instant::now(),
+                        candidates.clone(),
+                        Box::pin(sample()),
+                    )
+                }
+            };
+            match tokio::time::timeout(SAMPLE_TIMEOUT, pending.as_mut()).await {
+                Ok(Some(table)) => {
+                    // See `MAX_TABLE_AGE`: a sample that answered this late
+                    // describes a machine that has since moved on. No opinion.
+                    let age = started.elapsed();
+                    if age > MAX_TABLE_AGE {
+                        warn!(
+                            age_ms = age.as_millis(),
+                            max_age_ms = MAX_TABLE_AGE.as_millis(),
+                            "shell-activity: discarding a process-table sample that answered too \
+                             late to trust; leaving every pane's status alone (classifying current \
+                             pids against a stale table can misattribute a reused pid)"
+                        );
+                        continue;
+                    }
+                    if was_resumed {
+                        // A retained sample's table was taken when `at_start`
+                        // was the truth, so a pid in it means what it meant
+                        // THEN. `MAX_TABLE_AGE` bounds how far back that is, but
+                        // a bound is not an identity check: a pane can be
+                        // replaced inside the window, and if its shell's pid is
+                        // reused the replacement would be classified by numeric
+                        // pid alone against the departed pane's descendants —
+                        // and since `last_known` has no entry for it, that wrong
+                        // reading emits at once (#500 review, round 3).
+                        //
+                        // So classify only panes whose IDENTITY is unchanged
+                        // since the sample began — same pane id AND same shell
+                        // pid. A respawn in the same slot keeps the pane id but
+                        // takes a new pid; a fresh pane brings a new pane id.
+                        // Either way the pair differs and the pane is left to
+                        // the next sample, which is the honest answer: this
+                        // table predates it and cannot describe it.
+                        //
+                        // Only on the resumed path. A sample started this tick
+                        // has `at_start == candidates` by construction, so the
+                        // filter would be a no-op — the common case pays
+                        // nothing.
+                        let unchanged: Vec<crate::agent_pty::ShellActivityCandidate> = candidates
+                            .iter()
+                            .filter(|current| {
+                                at_start.iter().any(|then| {
+                                    then.pane_id == current.pane_id
+                                        && then.shell_pid == current.shell_pid
+                                })
+                            })
+                            .cloned()
+                            .collect();
+                        AgentPtyRegistry::classify_shell_activity(&unchanged, &table)
+                    } else {
+                        AgentPtyRegistry::classify_shell_activity(&candidates, &table)
+                    }
+                }
+                // ── The load-bearing decision of issue #429 ──
+                //
+                // BOTH arms below mean "no opinion", and neither may become
+                // `Some(false)`.
+                //
+                // `descendant_shell_activity` draws that distinction on purpose
+                // and callers are documented to treat `None` as "leave the
+                // pane's status alone". A timed-out sample is a statement about
+                // `ps`, not about the pane: if a `ps` wedges in D-state on a
+                // stuck filesystem, every pane is still exactly as busy as it
+                // was a moment ago. Collapsing the timeout to "not busy" would
+                // synthesize a `ShellIdle` for every pane the deck is running
+                // and silently flip them all to `Idle` — which is precisely the
+                // stale-`Idle` bug PRD #386 exists to fix, reintroduced with a
+                // new trigger and no log line to find it by.
+                //
+                // So skip the whole tick: `last_known` is left untouched (a
+                // `retain` against an empty snapshot would make every pane look
+                // new next tick and re-emit a spurious edge for each one) and
+                // nothing is emitted. The reading simply resumes on the next
+                // sample that answers.
+                //
+                // The two arms differ only in what happens to the sample itself:
+                // an answered-but-failed sample is finished, so it is dropped and
+                // the next tick starts a fresh one; an overrunning sample is
+                // RETAINED, so the next tick waits on the same `ps` instead of
+                // spawning a second one.
+                Ok(None) => continue,
+                Err(_elapsed) => {
+                    if !inflight_reported {
+                        inflight_reported = true;
+                        warn!(
+                            timeout_ms = SAMPLE_TIMEOUT.as_millis(),
+                            panes = candidates.len(),
+                            "shell-activity: process-table sample overran its deadline; leaving \
+                             every pane's status alone and continuing to wait on the SAME sample \
+                             (a wedged `ps` says nothing about the panes, and starting another \
+                             would only pile up unkillable children)"
+                        );
+                    }
+                    inflight = Some((started, at_start, pending));
+                    continue;
+                }
+            }
+        };
+        let seen: std::collections::HashSet<&str> = snapshot
+            .iter()
+            .map(|(pane_id, _)| pane_id.as_str())
+            .collect();
+        // Drop panes that disappeared from the registry since the last poll
+        // (closed / respawned) so a later reuse of the same pane id starts
+        // edge-detection from a clean slate instead of inheriting a stale
+        // busy/idle reading.
+        last_known.retain(|pane_id, _| seen.contains(pane_id.as_str()));
+
+        for (pane_id, busy) in snapshot {
+            let changed = last_known.insert(pane_id.clone(), busy) != Some(busy);
+
+            // Cheap path, and the overwhelmingly common one: a pane whose scan
+            // reads idle and whose reading did not just change has nothing to
+            // report, so it never takes the state lock at all.
+            if !changed && !busy {
+                continue;
+            }
+
+            // PRD #386 M6b: the trigger is edge-driven PLUS level-aware. A
+            // purely edge-triggered monitor emits exactly one `ShellBusy` per
+            // busy window — at the rising edge — which is the whole reported
+            // bug: Claude Code's Bash tool backgrounds a command at its 120s
+            // cap, the agent ends its turn, the real `Stop` hook maps to
+            // `EventType::Idle` (`src/hook.rs`) and knocks the pane back to
+            // `Idle` while the command runs on. The scan still reads busy, but
+            // it read busy *before* `Stop` too, so there is no new edge and
+            // nothing ever re-promotes: measured at ~9.7 minutes of wrong
+            // badge for a ~700s command.
+            //
+            // So also re-emit when the scan reads busy AND the session's
+            // status has actually regressed to `Idle`/`Unknown`. That is a
+            // monitor-side correction only — it adds no precedence rule and
+            // changes no wire format; `apply_event`'s `ShellBusy` arm still
+            // decides what (if anything) to promote, and still promotes
+            // exactly `Idle`/`Unknown`, so a real `WaitingForInput`/`Error`/
+            // `Thinking`/`Working` is never overridden by this signal.
+            //
+            // It cannot spam the pipeline either: the re-emit is conditioned
+            // on the very status the emitted event corrects. One `ShellBusy`
+            // lands, `apply_event` moves the session to `Working`, and the
+            // next poll reads `Working` and sends nothing — a steady-state
+            // busy pane is silent until something knocks it back to `Idle`
+            // again.
+            let (session_id, agent_id, status_regressed) = {
+                let state = state.read().await;
+                let Some(session_id) = state.pane_hook_session_id(&pane_id) else {
+                    continue;
+                };
+                // PRD #386 M6b: the pane's CURRENT CARD —
+                // NOT `sessions[session_id]`. Both values read below describe
+                // the session this event will actually land on, and that is
+                // the card, not the hook generation.
+                //
+                // `pane_hook_session_id` is the pane's latest hook GENERATION
+                // and is the authoritative value for `AgentEvent.session_id`
+                // (it is what the daemon's send guard compares against); it is
+                // NOT a key into `sessions`. A same-agent `/clear` / thread
+                // restart rolls that generation forward while `apply_event`'s
+                // same-agent reuse guard deliberately keeps the CARD under its
+                // stable id (see `AppState::apply_event`'s "ORIGINAL hook
+                // session_id" comment and `Self::pane_hook_session_id`'s doc),
+                // so after a rollover the two diverge and a
+                // `sessions[generation]` lookup MISSES. The card is therefore
+                // resolved with the same newest-by-`last_activity` rule the
+                // rest of the daemon uses for "which session owns this pane"
+                // (`pane_session_id`, the resolution behind `pane_writable`),
+                // which returns a real card id — so the `sessions` lookup here
+                // is keyed correctly by construction.
+                let card = state
+                    .pane_session_id(&pane_id)
+                    .and_then(|card_id| state.sessions.get(&card_id));
+                // PRD #386 M6b: carry the pane's agent id. `apply_event`'s
+                // same-agent reuse guard matches an incoming event onto an
+                // existing card for the pane ONLY when the two `agent_id`s
+                // agree, and it is the client (not the daemon) where that
+                // matters: the DAEMON's card is keyed by the hook session id
+                // this event already carries, so it resolves either way, but
+                // an attached TUI mints its card at spawn time under a
+                // `pane-<id>` key with the spawn `agent_id` on it, and the
+                // real hook events are remapped onto THAT card. A synthesized
+                // event with `agent_id: None` failed the guard, missed the
+                // card, and created a SECOND, phantom session under the raw
+                // hook id — so the daemon read `Working` while the dashboard
+                // the user is looking at kept rendering the real card as
+                // `Idle` (plus a stray extra card). Measured directly: in a
+                // `006` run the TUI resolved every real event onto its card
+                // and ONLY `ShellBusy` onto a session of its own. A TUI that
+                // RECONNECTS reaches the same failure from the other
+                // direction: it keys the pane's card by the hydration-minted
+                // `pane-{pane_id}`, so the reuse guard is again the only
+                // thing that can remap the event onto it.
+                //
+                // Taken from the pane's own card rather than invented, so it
+                // is exactly the id that card was minted with; `None` when no
+                // card resolves yet, which is the pre-existing behaviour and
+                // no worse than it. Fails SAFE either way: emitting no agent
+                // id is only a missed remap, whereas emitting a WRONG one
+                // would route a live pane's shell status onto someone else's
+                // card.
+                let agent_id = card.and_then(|card| card.agent_id.clone());
+                // A pane with no card yet is left to the rising edge alone —
+                // there is no status to have regressed, and guessing one would
+                // emit on every tick until the session materializes.
+                let regressed = busy
+                    && card.is_some_and(|card| {
+                        matches!(
+                            card.status,
+                            crate::state::SessionStatus::Idle
+                                | crate::state::SessionStatus::Unknown
+                        )
+                    });
+                (session_id, agent_id, regressed)
+            };
+
+            if !changed && !status_regressed {
+                continue;
+            }
+
+            if !changed {
+                // Only ever the corrective re-emit — a transition logs
+                // nothing, and a steady-state busy pane reaches here at most
+                // once per regression, so this cannot become a per-tick line
+                // even at `RUST_LOG=debug`. It is the one place a "why is the
+                // badge still Idle?" investigation needs to look.
+                debug!(
+                    pane_id = %pane_id,
+                    "shell-activity: re-emitting ShellBusy — scan still reads busy while the \
+                     session fell back to Idle/Unknown"
+                );
+            }
+
+            let event = AgentEvent {
+                session_id,
+                // Deliberate: `AppState::apply_event` only ever UPGRADES a
+                // session's `agent_type` FROM `None`, never overwrites a
+                // known type with it — so this never regresses a real,
+                // hook-learned agent type.
+                agent_type: crate::event::AgentType::None,
+                event_type: if busy {
+                    crate::event::EventType::ShellBusy
+                } else {
+                    crate::event::EventType::ShellIdle
+                },
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata: std::collections::HashMap::new(),
+                pane_id: Some(pane_id),
+                // The pane's own agent id — see where it is read above. This
+                // is what lets an attached TUI resolve the event onto the
+                // card it already renders for this pane instead of minting a
+                // phantom session beside it.
+                agent_id,
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            };
+
+            // One ordered ingestion step (broadcast + apply under a single
+            // write-lock hold), exactly as the hook loop below does it — see
+            // `ingest_event` for the interleaving this closes.
+            ingest_event(&state, &event_tx, event).await;
+        }
+    }
+}
+
 async fn run_hook_loop(
     listener: IpcListener,
     state: SharedState,
@@ -1219,13 +1721,26 @@ async fn run_hook_loop(
                                 tool_detail = ?event.tool_detail,
                                 "Received event"
                             );
-                            // Fan out to subscribed attach connections
-                            // *before* mutating local state, so the broadcast
-                            // happens whether or not the local `apply_event`
-                            // accepts the event (e.g. an unmanaged pane id).
-                            // `send` returns Err only when there are no
-                            // subscribers — that's expected and ignored.
-                            let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
+                            // The `#[serde(other)]` catch-all on `EventType`
+                            // (PRD #386, precedent PRD #201's `AgentType`
+                            // retrofit) is a deliberate forward-compat win —
+                            // an unrecognized `event_type` no longer fails the
+                            // whole decode the way it did before. That also
+                            // means a genuine typo in a hand-written hook now
+                            // silently decodes to `Unknown` and changes
+                            // nothing visible, where it used to be reported as
+                            // a malformed event. Restore that diagnostic here,
+                            // at the one place the daemon still has the raw
+                            // line the unrecognized value came from.
+                            if event.event_type == crate::event::EventType::Unknown {
+                                warn!(
+                                    session_id = %event.session_id,
+                                    pane_id = ?event.pane_id,
+                                    raw_line = %line,
+                                    "Event carries an unrecognized event_type — decoded as \
+                                     Unknown and otherwise ignored; check the hook for a typo"
+                                );
+                            }
                             // Persist the agent type this hook revealed into
                             // the PTY registry (keyed by pane id), so a later
                             // `list_agents` — e.g. a fresh `dot-agent-deck
@@ -1269,7 +1784,24 @@ async fn run_hook_loop(
                                 }
                                 pty_registry.set_agent_type(pane_id, &event.agent_type);
                             }
-                            state.write().await.apply_event(event);
+                            // Fan out to subscribed attach connections and
+                            // apply locally as ONE ordered operation, so a
+                            // client can never observe two concurrent events
+                            // in a different order than the daemon applied
+                            // them (PRD #386 — see `ingest_event`). The
+                            // broadcast still happens whether or not the
+                            // local `apply_event` accepts the event (e.g. an
+                            // unmanaged pane id); `send` returns Err only
+                            // when there are no subscribers, which is
+                            // expected and ignored.
+                            //
+                            // The registry update above deliberately stays
+                            // *ahead* of the fan-out: it is daemon-local
+                            // bookkeeping read by `list_agents` on a
+                            // different connection, so doing it first only
+                            // means a client that reacts to the event by
+                            // listing agents sees the fresher answer.
+                            ingest_event(&state, &event_tx, event).await;
                         } else {
                             warn!("Malformed event: {line}");
                         }
@@ -1440,6 +1972,763 @@ mod hook_ingestion_tests {
         // racing `shutdown_all` against the still-live loop task.
         let _ = handle.await;
         registry.shutdown_all();
+    }
+
+    /// Scenario: PRD #370's whole point, end to end, **restimulated for PRD
+    /// #386 M3**. Spawn a real `/bin/sh` pane, seed it a known session the way
+    /// a real hook `SessionStart` would (so `AppState::pane_hook_session_id`
+    /// can resolve it), run the real `run_shell_activity_monitor` against it,
+    /// then type a command into the pane's PTY directly (no agent hooks
+    /// involved at all) that launches a genuinely `setsid`-detached child. The
+    /// monitored session's status must flip to `Working` while that child runs
+    /// and revert to `Idle` once it exits — proving the daemon-synthesized
+    /// `ShellBusy`/`ShellIdle` signal reaches `AppState` through the exact
+    /// pipeline this PRD reports missing.
+    ///
+    /// **What #386 changed here, and why the pipeline assertions are unchanged.**
+    /// This test used to type a plain `sleep 2`, which #370's `tcgetpgrp` body
+    /// read as busy. #386 replaced that body with a descendant scan that fires
+    /// on a descendant in a POSIX session of its own, and a job typed into the
+    /// pane's own PTY stays in the pane's session — deliberately not busy, since
+    /// counting it would also count every long-lived MCP/`caffeinate` child a
+    /// real agent pane carries and pin the pane at `Working` forever (see
+    /// `shell_foreground_busy_ignores_a_non_detached_foreground_child`). Only
+    /// the *stimulus* moved to the topology a real Claude Bash-tool call has;
+    /// what this test proves — pane → monitor → synthesized event → `AppState`
+    /// status — is exactly what it always proved.
+    #[tokio::test]
+    async fn shell_activity_monitor_reflects_a_real_detached_shell_command() {
+        use std::io::Write as _;
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-370".to_string())],
+                agent_type: None,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell agent");
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+
+        // Seed exactly as a real hook SessionStart would — this is what
+        // populates BOTH `AppState.sessions` and the `pane_hook_session_id`
+        // correlation the monitor depends on to resolve "which session does
+        // pane-370's shell activity belong to."
+        state.write().await.apply_event(AgentEvent {
+            session_id: "sess-370".to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: crate::event::EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some("pane-370".to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+        assert_eq!(
+            state.read().await.sessions["sess-370"].status,
+            crate::state::SessionStatus::Idle
+        );
+
+        let monitor_handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            async move { run_shell_activity_monitor(registry, state, event_tx).await }
+        });
+
+        // Type the command directly into the pane's PTY — no agent, no hook,
+        // nothing but the raw shell. It `fork`s, `setsid`s the child (detaching
+        // it from the pane's controlling terminal into a session of its own,
+        // exactly as Claude Code's Bash-tool child does) and `execv`s it into a
+        // 2-second `sleep`, then waits for it. The `fork` matters: an
+        // interactive `/bin/sh` has job control on and makes each foreground
+        // job its own process-group leader, and `setsid(2)` fails with EPERM
+        // for a process that already leads a group — so python must detach a
+        // *child*, not itself. The parent's `waitpid` keeps the pane occupied
+        // for the child's whole life, and the child exiting on its own is what
+        // drives the falling edge below.
+        {
+            let writer = registry
+                .agent_writer(&agent_id)
+                .expect("spawned agent must be in the registry");
+            let mut w = writer.lock().await;
+            w.write_all(
+                b"python3 -c \"import os; pid = os.fork(); \
+                  (os.setsid(), os.execv('/bin/sleep', ['sleep', '2'])) if pid == 0 \
+                  else os.waitpid(pid, 0)\"\n",
+            )
+            .expect("write detached-child command");
+            w.flush().expect("flush");
+        }
+
+        let status = |state: SharedState| async move {
+            state.read().await.sessions["sess-370"].status.clone()
+        };
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut current = status(state.clone()).await;
+        while current != crate::state::SessionStatus::Working
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            current = status(state.clone()).await;
+        }
+        assert_eq!(
+            current,
+            crate::state::SessionStatus::Working,
+            "the monitor must promote the session to Working while the detached \
+             child runs, with zero agent-emitted events involved"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        let mut current = status(state.clone()).await;
+        while current != crate::state::SessionStatus::Idle && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            current = status(state.clone()).await;
+        }
+        assert_eq!(
+            current,
+            crate::state::SessionStatus::Idle,
+            "the monitor must revert the session to Idle once the detached child \
+             exits and the pane has no out-of-session descendant left"
+        );
+
+        monitor_handle.abort();
+        let _ = monitor_handle.await;
+        registry.shutdown_all();
+    }
+
+    /// Scenario: PRD #386 M6b's agent-id stamping across a session rollover —
+    /// the EMITTED SHAPE rather than the local effect
+    /// (`shell_activity_monitor_reflects_a_real_detached_shell_command` above
+    /// covers that). Spawn a real `/bin/sh` pane owned by `agent-21`, seed it a hook
+    /// `SessionStart`, then seed a SECOND `SessionStart` under the SAME agent
+    /// with a NEW hook session id — a same-agent `/clear` / thread restart, so
+    /// the pane's hook generation rolls forward to `sess-21-gen2` while
+    /// `apply_event`'s reuse guard keeps the card under the stable
+    /// `sess-21-gen1`. Run the real `run_shell_activity_monitor`, subscribe to
+    /// its broadcast, and type a `setsid`-detached `sleep` into the PTY (the
+    /// topology PRD #386's descendant scan fires on). Every event
+    /// it broadcasts must report the CURRENT hook generation as its
+    /// `session_id` AND carry `agent_id: Some("agent-21")` resolved from the
+    /// pane's card — an unstamped event cannot be remapped onto a reconnected
+    /// TUI's hydrated card and mints a phantom session instead.
+    #[tokio::test]
+    async fn shell_activity_monitor_stamps_the_owning_agent_across_a_session_rollover() {
+        use std::io::Write as _;
+
+        const PANE: &str = "pane-21";
+        const AGENT: &str = "agent-21";
+        const GEN1: &str = "sess-21-gen1";
+        const GEN2: &str = "sess-21-gen2";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawned = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                agent_type: None,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell agent");
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, mut rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+
+        let session_start = |session_id: &str| AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: crate::event::EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some(PANE.to_string()),
+            agent_id: Some(AGENT.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        };
+
+        // Generation 1, then the same-agent restart that rolls the generation
+        // over. Both frames carry the SAME `agent_id`, which is exactly what
+        // makes `apply_event`'s reuse guard keep one stable card.
+        state.write().await.apply_event(session_start(GEN1));
+        state.write().await.apply_event(session_start(GEN2));
+        {
+            let guard = state.read().await;
+            assert_eq!(
+                guard.pane_hook_session_id(PANE).as_deref(),
+                Some(GEN2),
+                "precondition: the same-agent restart advances the pane's hook generation"
+            );
+            assert!(
+                guard.sessions.contains_key(GEN1) && !guard.sessions.contains_key(GEN2),
+                "precondition: the CARD stays under the stable id, so the hook \
+                 generation is NOT a key into `sessions` — this divergence is \
+                 what a `sessions[generation]` lookup silently misses"
+            );
+        }
+
+        let monitor_handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            async move { run_shell_activity_monitor(registry, state, event_tx).await }
+        });
+
+        // The stimulus is the one PRD #386's descendant scan actually fires on:
+        // `fork`, `setsid` the child into a POSIX session of its own (the
+        // topology a real Claude Bash-tool child has), `execv` it into a short
+        // `sleep`, and have the parent `waitpid` for it — see
+        // `shell_activity_monitor_reflects_a_real_detached_shell_command` above
+        // for the full rationale. A plain `sleep 2` typed into the pane's own
+        // PTY was busy under #370's `tcgetpgrp` body but is deliberately NOT
+        // busy under #386's scan, so it would never produce the `ShellBusy`
+        // this test needs to inspect.
+        {
+            let writer = registry
+                .agent_writer(&spawned)
+                .expect("spawned agent must be in the registry");
+            let mut w = writer.lock().await;
+            w.write_all(
+                b"python3 -c \"import os; pid = os.fork(); \
+                  (os.setsid(), os.execv('/bin/sleep', ['sleep', '2'])) if pid == 0 \
+                  else os.waitpid(pid, 0)\"\n",
+            )
+            .expect("write detached-child command");
+            w.flush().expect("flush");
+        }
+
+        // Read broadcasts until the busy transition arrives (the monitor also
+        // emits the pane's initial idle edge), asserting the stamped shape on
+        // EVERY event it publishes — a single unstamped one is enough to mint
+        // a phantom card on a reconnected TUI.
+        let mut saw_busy = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !saw_busy && tokio::time::Instant::now() < deadline {
+            let Ok(Ok(BroadcastMsg::Event(event))) =
+                tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            else {
+                continue;
+            };
+            assert_eq!(
+                event.session_id, GEN2,
+                "the synthesized event must report the pane's CURRENT hook \
+                 generation, which is what the daemon's send guard compares against"
+            );
+            assert_eq!(
+                event.agent_id.as_deref(),
+                Some(AGENT),
+                "the synthesized {:?} must carry the owning agent id resolved \
+                 from the pane's CARD; a `sessions[hook_generation]` lookup \
+                 misses after a same-agent restart and re-emits `None`, which \
+                 no hydrated TUI card can be remapped onto",
+                event.event_type
+            );
+            saw_busy = event.event_type == crate::event::EventType::ShellBusy;
+        }
+        assert!(
+            saw_busy,
+            "the monitor must broadcast a ShellBusy while the detached child runs"
+        );
+
+        monitor_handle.abort();
+        let _ = monitor_handle.await;
+        registry.shutdown_all();
+    }
+
+    /// Scenario: issue #493. Run the real shell-activity monitor against an
+    /// EMPTY registry — no panes at all, the state a daemon sits in whenever a
+    /// TUI is attached with nothing open — with the process-table sample
+    /// replaced by a counting stub, and let it tick several times. The sampler
+    /// must never be called: with nobody to classify there is nothing a process
+    /// table could say, so the `ps -A` fork (plus its `getsid` per row) must not
+    /// happen at all. Before the fix `process_table()` was the FIRST statement
+    /// of the snapshot, so this same run forked `ps` twice a second forever —
+    /// the daemon's idle shutdown does not bound it, since that requires no
+    /// clients *and* no agents.
+    #[tokio::test]
+    async fn shell_activity_monitor_never_samples_the_process_table_with_no_live_panes() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        assert_eq!(
+            registry.live_count(),
+            0,
+            "precondition: the registry must be empty, so there is no candidate pane"
+        );
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, mut rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+
+        let samples = Arc::new(AtomicUsize::new(0));
+        let monitor_handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            let samples = samples.clone();
+            async move {
+                run_shell_activity_monitor_with(registry, state, event_tx, move || {
+                    let samples = samples.clone();
+                    async move {
+                        samples.fetch_add(1, AtomicOrdering::SeqCst);
+                        None
+                    }
+                })
+                .await
+            }
+        });
+
+        // Comfortably more than four 500ms poll intervals, so a monitor that
+        // samples unconditionally would have done so several times over.
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+
+        assert_eq!(
+            samples.load(AtomicOrdering::SeqCst),
+            0,
+            "the monitor must not sample the process table when no live pane exists — \
+             every sample here is a `ps -A` fork spent classifying nobody"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "and with no panes there is nothing to emit either"
+        );
+
+        monitor_handle.abort();
+        let _ = monitor_handle.await;
+    }
+
+    /// Scenario: issue #429's load-bearing decision. Spawn a real `/bin/sh`
+    /// pane, seed it a hook session and drive that session to `Working`, then
+    /// run the real shell-activity monitor with a process-table sample that
+    /// NEVER completes — a `ps` wedged in D-state on a stuck filesystem. The
+    /// monitor's own timeout must fire and be treated as "no opinion": the
+    /// session stays `Working` and no event is broadcast at all. A timeout
+    /// collapsed to `Some(false)` would instead synthesize a `ShellIdle` for
+    /// every pane the deck is running and silently flip them all to `Idle` —
+    /// the exact stale-`Idle` bug PRD #386 exists to fix.
+    #[tokio::test]
+    async fn shell_activity_monitor_leaves_statuses_alone_when_the_sample_times_out() {
+        const PANE: &str = "pane-429";
+        const SESSION: &str = "sess-429";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                agent_type: None,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell agent");
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, mut rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+
+        let event = |event_type: crate::event::EventType| AgentEvent {
+            session_id: SESSION.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some(PANE.to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        };
+        // `SessionStart` creates the card (and the `pane_hook_session_id`
+        // correlation the monitor needs); `ShellBusy` promotes it to `Working`,
+        // which is the status a wrongly-collapsed timeout would knock down.
+        state
+            .write()
+            .await
+            .apply_event(event(crate::event::EventType::SessionStart));
+        state
+            .write()
+            .await
+            .apply_event(event(crate::event::EventType::ShellBusy));
+        assert_eq!(
+            state.read().await.sessions[SESSION].status,
+            crate::state::SessionStatus::Working,
+            "precondition: the pane must start out reading Working, so a spurious \
+             ShellIdle would be visible"
+        );
+
+        let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let monitor_handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            let samples = samples.clone();
+            async move {
+                run_shell_activity_monitor_with(registry, state, event_tx, move || {
+                    samples.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // The wedged `ps`: a sample that never answers. The
+                    // monitor's SAMPLE_TIMEOUT is what has to end this tick.
+                    std::future::pending::<Option<Vec<crate::platform::proc::ProcessInfo>>>()
+                })
+                .await
+            }
+        });
+
+        // Long enough for the 500ms interval + 2s deadline to elapse TWICE, so a
+        // monitor that abandoned the overrunning sample would have started a
+        // second one by now.
+        tokio::time::sleep(Duration::from_millis(5_600)).await;
+
+        assert_eq!(
+            state.read().await.sessions[SESSION].status,
+            crate::state::SessionStatus::Working,
+            "a timed-out process-table sample says nothing about the pane, so the \
+             status must be left exactly as it was — collapsing the timeout to \
+             \"not busy\" is what silently flips every busy pane to Idle"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "and no ShellIdle (or any other event) may be synthesized from a sample \
+             that never answered"
+        );
+        // PR #500 review (P1): the deadline bounds the WAIT, not the child. A
+        // `ps` wedged in uninterruptible sleep ignores the `SIGKILL` that
+        // dropping the future sends, so abandoning it per tick would leave one
+        // undead `ps` behind every 2.5s. The monitor must keep waiting on the
+        // SAME sample instead — exactly one sample started, however long it
+        // overruns.
+        assert_eq!(
+            samples.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an overrunning sample must be re-awaited, not abandoned and replaced — \
+             starting a fresh `ps` per tick piles up unkillable D-state children"
+        );
+
+        monitor_handle.abort();
+        let _ = monitor_handle.await;
+        registry.shutdown_all();
+    }
+
+    /// Scenario: PR #500 review, round 2. Because an overrunning sample is
+    /// retained rather than abandoned, it can answer arbitrarily late — after a
+    /// wedge that outlasted every pane, with a new pane since opened. Its table
+    /// then describes a machine that no longer exists, and under pid reuse a new
+    /// pane would inherit a dead process's descendants; since `last_known` has no
+    /// entry for a new pane, that wrong reading emits immediately.
+    ///
+    /// So: spawn a real `/bin/sh` pane whose session reads `Idle`, and hand the
+    /// monitor a sampler that answers only after 4s (past `MAX_TABLE_AGE`) with a
+    /// table that says this very pane is busy. The stale answer must be discarded
+    /// — the session stays `Idle` and nothing is broadcast. A monitor that trusted
+    /// it would promote the pane to `Working` off a table it should not believe.
+    #[tokio::test]
+    async fn shell_activity_monitor_discards_a_sample_that_answers_too_late_to_trust() {
+        const PANE: &str = "pane-500-stale";
+        const SESSION: &str = "sess-500-stale";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                agent_type: None,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn shell agent");
+        let shell_pid = registry
+            .child_pid(&agent_id)
+            .expect("spawned agent must expose a pid") as i32;
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, mut rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        state.write().await.apply_event(AgentEvent {
+            session_id: SESSION.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: crate::event::EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some(PANE.to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+        assert_eq!(
+            state.read().await.sessions[SESSION].status,
+            crate::state::SessionStatus::Idle,
+            "precondition: the pane starts Idle, so a wrongly-trusted busy table would show"
+        );
+
+        // A table that WOULD classify this pane as busy: the pane's own shell as
+        // session leader, plus a descendant in a session of its own. The pane
+        // carries no agent kind, so no argv shape applies and the structural test
+        // stands alone — this is unambiguously `Some(true)`.
+        let busy_table = vec![
+            crate::platform::proc::ProcessInfo {
+                pid: shell_pid,
+                ppid: 1,
+                session_id: shell_pid,
+                has_controlling_tty: true,
+                session_leader: true,
+                argv: "/bin/sh".to_string(),
+            },
+            crate::platform::proc::ProcessInfo {
+                pid: shell_pid + 1,
+                ppid: shell_pid,
+                session_id: shell_pid + 1,
+                has_controlling_tty: false,
+                session_leader: true,
+                argv: "detached-thing".to_string(),
+            },
+        ];
+
+        let monitor_handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            async move {
+                run_shell_activity_monitor_with(registry, state, event_tx, move || {
+                    let busy_table = busy_table.clone();
+                    async move {
+                        // Answers eventually, but far past MAX_TABLE_AGE — the
+                        // late-wedge-recovery shape, compressed.
+                        tokio::time::sleep(Duration::from_secs(4)).await;
+                        Some(busy_table)
+                    }
+                })
+                .await
+            }
+        });
+
+        // Past the 500ms interval + the sampler's 4s, with margin, so the stale
+        // answer has definitely been received and judged.
+        tokio::time::sleep(Duration::from_millis(5_200)).await;
+
+        assert_eq!(
+            state.read().await.sessions[SESSION].status,
+            crate::state::SessionStatus::Idle,
+            "a sample that answered past MAX_TABLE_AGE describes a machine that has \
+             moved on and must be discarded, not applied — trusting it attributes a \
+             stale table's descendants to today's pids"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "and nothing may be broadcast off a table that was not trusted"
+        );
+
+        monitor_handle.abort();
+        let _ = monitor_handle.await;
+        registry.shutdown_all();
+    }
+
+    /// Scenario: PR #500 review, round 3 — the residual inside `MAX_TABLE_AGE`.
+    /// A freshness bound is not an identity check: a pane can be replaced while a
+    /// retained sample is still in flight, and if the replacement's shell pid is a
+    /// reused one the table would classify it by numeric pid alone against the
+    /// DEPARTED pane's descendants.
+    ///
+    /// Real pid reuse cannot be forced in a test, so the same shape is built
+    /// directly: pane A is open when the sample starts, the sample overruns, and
+    /// pane B is spawned while it is still in flight. The table the sample
+    /// finally returns names **both** pids as busy — B's row standing in for what
+    /// a reused pid would look like. A (unchanged since the sample began) must be
+    /// promoted to `Working`; B (which did not exist then) must stay `Idle`.
+    ///
+    /// Asserting on A is what makes this test honest rather than merely green.
+    /// The sample lands ~2.5s old, inside `MAX_TABLE_AGE` — but if anything
+    /// slowed the run enough to push it past that bound, the freshness guard
+    /// would swallow the whole answer and B would stay `Idle` for a reason having
+    /// nothing to do with identity matching. A reaching `Working` proves the
+    /// answer was accepted, so B staying `Idle` can only be the identity filter.
+    /// (Measured while writing this: an earlier version closed pane A here, and
+    /// `close_agent`'s SIGTERM grace window — `/bin/sh` ignores SIGTERM — blocked
+    /// the current-thread runtime long enough that the sample landed at 3.4s and
+    /// the test passed entirely via the freshness guard.)
+    #[tokio::test]
+    async fn shell_activity_monitor_ignores_a_pane_that_appeared_after_the_sample_started() {
+        const PANE_A: &str = "pane-500-a";
+        const PANE_B: &str = "pane-500-b";
+        const SESSION_A: &str = "sess-500-a";
+        const SESSION_B: &str = "sess-500-b";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent_a = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_A.to_string())],
+                agent_type: None,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn pane A");
+        let pid_a = registry
+            .child_pid(&agent_a)
+            .expect("pane A must expose a pid") as i32;
+
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+
+        let session_start = |session_id: &str, pane_id: &str| AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: crate::event::EventType::SessionStart,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: std::collections::HashMap::new(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        };
+        state
+            .write()
+            .await
+            .apply_event(session_start(SESSION_A, PANE_A));
+
+        // The table the sample will eventually return, filled in only once pane B
+        // exists — so it can name B's real pid, which is what a reused pid would
+        // look like to the classifier.
+        let late_table: Arc<std::sync::Mutex<Vec<crate::platform::proc::ProcessInfo>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let monitor_handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            let late_table = late_table.clone();
+            async move {
+                run_shell_activity_monitor_with(registry, state, event_tx, move || {
+                    let late_table = late_table.clone();
+                    async move {
+                        // Longer than SAMPLE_TIMEOUT (2s) so the sample is
+                        // RETAINED rather than answered on its first tick, and
+                        // ready by the resumed tick — which lands it ~2.5s old,
+                        // inside MAX_TABLE_AGE (3s). That is the window where the
+                        // freshness bound alone would let it through, so it is
+                        // the window the identity filter has to cover.
+                        tokio::time::sleep(Duration::from_millis(2_100)).await;
+                        Some(late_table.lock().unwrap().clone())
+                    }
+                })
+                .await
+            }
+        });
+
+        // Let the first tick resolve candidates (pane A only) and start the
+        // sample, then add pane B while that sample is still in flight.
+        // Deliberately no `close_agent` — see this test's doc comment.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let agent_b = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_B.to_string())],
+                agent_type: None,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn pane B");
+        let pid_b = registry
+            .child_pid(&agent_b)
+            .expect("pane B must expose a pid") as i32;
+        state
+            .write()
+            .await
+            .apply_event(session_start(SESSION_B, PANE_B));
+
+        // Both panes read busy in the table: a shell as session leader plus a
+        // descendant in a session of its own. Neither pane carries an agent kind,
+        // so no argv shape applies and the structural test stands alone.
+        let busy_pair = |pid: i32| {
+            [
+                crate::platform::proc::ProcessInfo {
+                    pid,
+                    ppid: 1,
+                    session_id: pid,
+                    has_controlling_tty: true,
+                    session_leader: true,
+                    argv: "/bin/sh".to_string(),
+                },
+                crate::platform::proc::ProcessInfo {
+                    pid: pid + 100_000,
+                    ppid: pid,
+                    session_id: pid + 100_000,
+                    has_controlling_tty: false,
+                    session_leader: true,
+                    argv: "detached-thing".to_string(),
+                },
+            ]
+        };
+        *late_table.lock().unwrap() = busy_pair(pid_a)
+            .into_iter()
+            .chain(busy_pair(pid_b))
+            .collect();
+
+        {
+            let guard = state.read().await;
+            assert_eq!(
+                guard.sessions[SESSION_A].status,
+                crate::state::SessionStatus::Idle,
+                "precondition: both panes start Idle"
+            );
+            assert_eq!(
+                guard.sessions[SESSION_B].status,
+                crate::state::SessionStatus::Idle,
+                "precondition: both panes start Idle"
+            );
+        }
+
+        // Past the resumed tick that receives the late answer.
+        tokio::time::sleep(Duration::from_millis(2_800)).await;
+
+        let (status_a, status_b) = {
+            let guard = state.read().await;
+            (
+                guard.sessions[SESSION_A].status.clone(),
+                guard.sessions[SESSION_B].status.clone(),
+            )
+        };
+        monitor_handle.abort();
+        let _ = monitor_handle.await;
+        registry.shutdown_all();
+
+        assert_eq!(
+            status_a,
+            crate::state::SessionStatus::Working,
+            "pane A was already open when the sample started, so the sample's verdict \
+             about it is trustworthy and must be applied — this also proves the answer \
+             was ACCEPTED rather than swallowed by the freshness guard, without which \
+             pane B's assertion below would pass for the wrong reason"
+        );
+        assert_eq!(
+            status_b,
+            crate::state::SessionStatus::Idle,
+            "pane B did not exist when the sample started, so the pid naming it in that \
+             table cannot be known to be B's — which under pid reuse is exactly how a \
+             replacement pane inherits a departed one's descendants"
+        );
     }
 
     /// Scenario: PRD #201 native prompt delivery over the hook socket. Spawn a

@@ -117,8 +117,8 @@ fn trust_state_keys(home: &Path) -> Vec<String> {
 #[test]
 #[cfg(unix)]
 fn codex_hooks_002_script_launch_installs_exact_scoped_trust() {
-    let fixture = tempfile::tempdir().expect("create script launch fixture");
-    let home = tempfile::tempdir().expect("create isolated Codex home");
+    let fixture = common::harness_tempdir().expect("create script launch fixture");
+    let home = common::harness_tempdir().expect("create isolated Codex home");
     let bin_dir = fixture.path().join("bin");
     std::fs::create_dir(&bin_dir).expect("create fixture bin");
     let child_record = fixture.path().join("child.txt");
@@ -229,7 +229,7 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
                 .find(|candidate| candidate.is_file())
         })
         .expect("available Codex binary resolves on PATH");
-    let launcher_dir = tempfile::tempdir().expect("real Codex launcher directory");
+    let launcher_dir = common::harness_tempdir().expect("real Codex launcher directory");
     let launch_record = launcher_dir.path().join("codex-launches.txt");
     write_executable(
         &launcher_dir.path().join("codex"),
@@ -247,7 +247,7 @@ fn codex_hooks_001_real_interactive_turn_reaches_idle_without_exit() {
         "codex --model {} --sandbox workspace-write --ask-for-approval never -c 'sandbox_workspace_write.network_access=true' -c 'model_reasoning_effort=\"low\"'",
         common::codex_test_model(),
     );
-    let config_dir = tempfile::tempdir().expect("Codex hooks new-pane config");
+    let config_dir = common::harness_tempdir().expect("Codex hooks new-pane config");
     let config_path = config_dir.path().join("config.toml");
     std::fs::write(&config_path, format!("default_command = {command:?}\n"))
         .expect("write bare Codex hooks command");

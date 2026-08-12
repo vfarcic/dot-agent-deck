@@ -18,5 +18,11 @@ regex = "1"
 syn = { version = "3", features = ["full", "parsing"] }
 xtask-docs = { path = "../docs" }
 
+# `clean-e2e-tmp` scopes the harness's private `/var/tmp` parent to the
+# effective UID (issue #322), and `geteuid(2)` has no std equivalent. Unix-only:
+# the whole `/var/tmp` rung is `cfg(unix)`-gated, matching the harness.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

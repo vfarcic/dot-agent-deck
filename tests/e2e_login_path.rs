@@ -66,7 +66,7 @@ struct LoginFixture {
 /// The stub dir is deliberately NOT placed on the process PATH — it reaches the
 /// daemon ONLY through the login-shell capture.
 fn login_path_fixture(stub_name: &str) -> LoginFixture {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let base = scratch.path().to_path_buf();
 
     let stub_dir = base.join("stubbin");
@@ -245,7 +245,7 @@ fn login_path_003_schedule_authoring_resolves_login_shell_command() {
     // One fixture schedule so the manager has a row to edit. The task's OWN run
     // command (`cat`, on the normal PATH) is irrelevant here — the authoring
     // helper's command comes from `default_command` (the bare stub), not the task.
-    let sched_dir = tempfile::tempdir().expect("schedules tempdir");
+    let sched_dir = common::harness_tempdir().expect("schedules tempdir");
     let sched_path = sched_dir.path().join("schedules.toml");
     std::fs::write(
         &sched_path,

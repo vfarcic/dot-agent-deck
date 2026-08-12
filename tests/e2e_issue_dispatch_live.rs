@@ -109,7 +109,7 @@ struct GhStub {
 
 impl GhStub {
     fn new() -> Self {
-        let scratch = tempfile::tempdir().expect("gh stub scratch tempdir");
+        let scratch = common::harness_tempdir().expect("gh stub scratch tempdir");
         let base = scratch.path().to_path_buf();
         let dir = base.join("ghstub");
         let bindir = base.join("bin");
@@ -311,7 +311,7 @@ fn dispatch_011_card_surfaces_live_in_tui() {
 
     // Workspace root where the clone (`<work>/github-issues`) and its per-issue
     // worktree are provisioned. A scratch tempdir, kept alive for the test.
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();
@@ -319,14 +319,14 @@ fn dispatch_011_card_surfaces_live_in_tui() {
     // A single-agent dispatch resolves its command from `default_command`; point
     // it at `cat` (long-lived, so the surfaced card persists) via a scratch
     // config the daemon reads through `DOT_AGENT_DECK_CONFIG`.
-    let cfg_td = tempfile::tempdir().expect("config tempdir");
+    let cfg_td = common::harness_tempdir().expect("config tempdir");
     let cfg = cfg_td.path().join("config.toml");
     std::fs::write(&cfg, "default_command = \"cat\"\n").expect("write config.toml");
     let cfg_str = cfg.to_string_lossy().into_owned();
 
     // The schedule fixture the lazily-spawned daemon loads via
     // `DOT_AGENT_DECK_SCHEDULES` (inherited from the deck's env).
-    let sched_td = tempfile::tempdir().expect("schedules tempdir");
+    let sched_td = common::harness_tempdir().expect("schedules tempdir");
     let sched_path = sched_td.path().join("schedules.toml");
     std::fs::write(
         &sched_path,

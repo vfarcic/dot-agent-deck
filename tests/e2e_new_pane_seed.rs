@@ -164,7 +164,7 @@ fn new_pane_011_seed_from_last_command() {
 #[test]
 fn new_pane_012_default_command_precedence() {
     // A distinctive `default_command` we only ever pre-fill, never submit.
-    let cfg_dir = tempfile::tempdir().expect("config tempdir");
+    let cfg_dir = common::harness_tempdir().expect("config tempdir");
     let cfg_path = cfg_dir.path().join("config.toml");
     std::fs::write(&cfg_path, "default_command = \"configured-default-cmd\"\n")
         .expect("write config.toml");
@@ -311,7 +311,7 @@ fn new_pane_014_last_command_survives_restart() {
     // command from launch 1 into launch 2. Each launch still gets its own temp
     // working dir, sockets, and daemon — so this is a genuine restart, not a
     // warm hand-off.
-    let shared_home = tempfile::tempdir().expect("shared HOME tempdir");
+    let shared_home = common::harness_tempdir().expect("shared HOME tempdir");
     let home = shared_home.path().to_path_buf();
     let home_arg = home.to_string_lossy().to_string();
 

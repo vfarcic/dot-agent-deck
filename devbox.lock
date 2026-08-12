@@ -97,41 +97,41 @@
         }
       }
     },
-    "cargo-nextest@0.9.140": {
-      "last_modified": "2026-08-01T16:34:20Z",
-      "resolved": "github:NixOS/nixpkgs/a5cbcfe954791221bfffe2307f7d1a1bf61a871e#cargo-nextest",
+    "cargo-nextest@0.9.143": {
+      "last_modified": "2026-08-08T22:24:59Z",
+      "resolved": "github:NixOS/nixpkgs/fe6deff5fad4a42d0e08d2bab3f2d6c7c88f3fe5#cargo-nextest",
       "source": "devbox-search",
-      "version": "0.9.140",
+      "version": "0.9.143",
       "systems": {
         "aarch64-darwin": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/p1bhjgymarpn3l620922srrhari6yrcc-cargo-nextest-0.9.140",
+              "path": "/nix/store/wzrxcj26bki9v0k0skcrswcsjr4g155r-cargo-nextest-0.9.143",
               "default": true
             }
           ],
-          "store_path": "/nix/store/p1bhjgymarpn3l620922srrhari6yrcc-cargo-nextest-0.9.140"
+          "store_path": "/nix/store/wzrxcj26bki9v0k0skcrswcsjr4g155r-cargo-nextest-0.9.143"
         },
         "aarch64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/nkdvzbfkqln398j6fn4az04z8lmhdnhj-cargo-nextest-0.9.140",
+              "path": "/nix/store/6rmkab666yb3si0khczzxz5xry5pkd0j-cargo-nextest-0.9.143",
               "default": true
             }
           ],
-          "store_path": "/nix/store/nkdvzbfkqln398j6fn4az04z8lmhdnhj-cargo-nextest-0.9.140"
+          "store_path": "/nix/store/6rmkab666yb3si0khczzxz5xry5pkd0j-cargo-nextest-0.9.143"
         },
         "x86_64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/fl1azjgiqb4r6cy0881sqs56xs1a8cni-cargo-nextest-0.9.140",
+              "path": "/nix/store/c1pyy0vvbhqfyl73qf2g97a4pcdi5vym-cargo-nextest-0.9.143",
               "default": true
             }
           ],
-          "store_path": "/nix/store/fl1azjgiqb4r6cy0881sqs56xs1a8cni-cargo-nextest-0.9.140"
+          "store_path": "/nix/store/c1pyy0vvbhqfyl73qf2g97a4pcdi5vym-cargo-nextest-0.9.143"
         }
       }
     },

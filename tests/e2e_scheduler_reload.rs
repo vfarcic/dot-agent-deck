@@ -105,7 +105,7 @@ fn prompt_only_task(working_dir: &str, prompt: &str) -> String {
 #[test]
 fn reload_002_prompt_only_edit_delivers_new_prompt() {
     // A fresh working_dir with no `.dot-agent-deck.toml` → single-agent card.
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let work = scratch.path().join("work");
     std::fs::create_dir_all(&work).expect("create work dir");
     let work_str = work.to_string_lossy().into_owned();

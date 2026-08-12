@@ -129,7 +129,7 @@ fn modal_001_scheduler_delete_button_confirms() {
     // `[Close]`. Each button advertises its shortcut key, so Delete renders as
     // `[Delete d]` (commit 06d0388). This test covers Delete; click coverage
     // for add / edit / run-now lives in the scheduler manager suite.
-    let dir = tempfile::tempdir().expect("scratch tempdir");
+    let dir = common::harness_tempdir().expect("scratch tempdir");
     let sched_path = dir.path().join("schedules.toml");
     std::fs::write(
         &sched_path,

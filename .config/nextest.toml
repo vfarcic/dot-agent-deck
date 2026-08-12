@@ -80,6 +80,44 @@ slow-timeout = { period = "120s", terminate-after = 10 }
 filter = 'test(devin_live_001_real_interactive_turn_drives_the_card_live)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
+# PRD #386, PR #390 maintainer review (Finding 4): `status/shell-activity/006`
+# reproduces a real Claude Bash call crossing Claude Code's 120s default
+# tool-call cap, so its own declared waits already budget far past the
+# default kill window: the prompt-ready wait is 120s, the ToolStart wait is
+# 120s, and the Idle wait is 127s measured + 30s margin — up to 397s, more
+# than 2x the default 3 x 60s = 180s kill. Measured dying mid-wait in a
+# full-tier `cargo test-e2e` run even though it finishes in 129.3s standalone
+# on a quiet machine — the margin the declared waits carry is exactly what a
+# contended run uses. Being killed there costs the PRECONDITION-NOT-MET vs
+# BADGE-WRONG diagnostic distinction the test is built around (same reasoning
+# as the overrides above). Scoped by name; still bounded, so a wedged agent
+# cannot run forever.
+#
+# The filter tracks the TEST FUNCTION name, not the `#[spec]` id, so it must
+# be updated in lockstep with any rename — a stale filter matches nothing and
+# silently drops this test back to the 3 x 60s default, killing it mid-wait.
+[[profile.default.overrides]]
+filter = 'test(shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_working)'
+slow-timeout = { period = "60s", terminate-after = 8 }
+
+# PRD #386, PR #390 maintainer review (Finding 4, "worth considering for 005
+# too"): `status/shell-activity/005` stacks two 120s gating waits back to
+# back — the prompt-ready wait and the ToolStart wait — ahead of a 15s
+# ShellBusy wait, the 30s startup wait added for Finding 6, and a 30s soft
+# sentinel-echo wait, for a declared budget of up to 315s
+# (30 + 120 + 120 + 15 + 30), past the default 3 x 60s = 180s kill window on
+# its own — the 120s + 120s pair alone already clears it. Its happy path is
+# ~20-26s, so this only bites under contention or a slow boot, but it is the
+# same shape as 006's problem above. Scoped by name; still bounded, so a
+# wedged agent cannot run forever.
+#
+# The filter tracks the TEST FUNCTION name, not the `#[spec]` id, so it must
+# be updated in lockstep with any rename — a stale filter matches nothing and
+# silently drops this test back to the 3 x 60s default, killing it mid-wait.
+[[profile.default.overrides]]
+filter = 'test(shell_activity_005_real_claude_bash_child_trips_the_descendant_scan)'
+slow-timeout = { period = "60s", terminate-after = 6 }
+
 [profile.e2e]
 slow-timeout = { period = "120s", terminate-after = 2 }
 
@@ -95,6 +133,22 @@ slow-timeout = { period = "60s", terminate-after = 6 }
 [[profile.e2e.overrides]]
 filter = 'test(version_001_injected_build_env_reaches_the_binary)'
 slow-timeout = { period = "120s", terminate-after = 10 }
+
+# Same carve-out under the `e2e` profile, for runs that select it explicitly
+# (`cargo test-e2e` uses the default profile; `-P e2e` does not inherit the
+# override list above). See the `[[profile.default.overrides]]` entry above
+# for the full rationale.
+[[profile.e2e.overrides]]
+filter = 'test(shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_working)'
+slow-timeout = { period = "60s", terminate-after = 8 }
+
+# Same carve-out under the `e2e` profile, for runs that select it explicitly
+# (`cargo test-e2e` uses the default profile; `-P e2e` does not inherit the
+# override list above). See the `[[profile.default.overrides]]` entry above
+# for the full rationale.
+[[profile.e2e.overrides]]
+filter = 'test(shell_activity_005_real_claude_bash_child_trips_the_descendant_scan)'
+slow-timeout = { period = "60s", terminate-after = 6 }
 
 # Decision 28 + M4.3: recording dumps land under
 # `<workspace>/.dot-agent-deck/recordings/<test-name>/` (see

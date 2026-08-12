@@ -1,11 +1,16 @@
 default_job = "test-fast"
 
+# These two mirror the `test-fast` / `test-e2e` aliases in .cargo/config.toml
+# and must keep doing so — a watch loop that runs a narrower tier than the
+# per-task gate is worse than no watch loop. `--workspace` in particular
+# (issue #489): without it cargo selects the root package alone and the
+# `xtask/*` members' tests never run.
 [jobs.test-fast]
-command = ["cargo", "nextest", "run"]
+command = ["cargo", "nextest", "run", "--workspace"]
 need_stdout = true
 
 [jobs.test-e2e]
-command = ["cargo", "nextest", "run", "--features", "e2e"]
+command = ["cargo", "nextest", "run", "--workspace", "--features", "e2e"]
 need_stdout = true
 
 [jobs.clippy]

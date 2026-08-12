@@ -26,6 +26,7 @@ const CONTROL_ROWS: u16 = 40;
 #[derive(Debug)]
 struct CardSnapshot {
     rows: Vec<String>,
+    border: common::BorderWeight,
 }
 
 impl CardSnapshot {
@@ -45,6 +46,11 @@ impl CardSnapshot {
         self.rows[0].chars().count().saturating_sub(2)
     }
 
+    fn bottom_label_is_right_aligned(&self, label: &str) -> bool {
+        self.bottom()
+            .ends_with(&format!("{label} {}", self.border.bottom_right))
+    }
+
     fn row_of(&self, needle: &str) -> usize {
         self.rows
             .iter()
@@ -53,38 +59,130 @@ impl CardSnapshot {
     }
 }
 
-fn corner_segment(row: &str, left: char, right: char) -> Option<String> {
-    let start = row.chars().position(|ch| ch == left)?;
-    let after_start = row.chars().skip(start + 1).position(|ch| ch == right)?;
-    Some(row.chars().skip(start).take(after_start + 2).collect())
+#[derive(Debug)]
+struct BorderSegment {
+    start: usize,
+    end: usize,
+    text: String,
 }
 
+fn border_segments(row: &str, left: char, right: char) -> Vec<BorderSegment> {
+    // Segment indices count Unicode scalars, so fixtures must keep every prefix
+    // left of a card boundary to width-1 terminal cells.
+    let chars: Vec<char> = row.chars().collect();
+    chars
+        .iter()
+        .enumerate()
+        .filter(|(_, ch)| **ch == left)
+        .filter_map(|(start, _)| {
+            let end = chars
+                .iter()
+                .enumerate()
+                .skip(start + 1)
+                .find_map(|(index, ch)| (*ch == right).then_some(index))?;
+            Some(BorderSegment {
+                start,
+                end,
+                text: chars[start..=end].iter().collect(),
+            })
+        })
+        .collect()
+}
+
+/// The substring of `row` spanning exactly `start..=end`, provided the glyphs
+/// AT those two columns are `left` and `right`.
+///
+/// Indexes the two columns directly rather than searching [`border_segments`]
+/// for a matching pair. That matters when `left == right`, as it is for a card's
+/// verticals: pairing each `left` with the NEXT `right` yields only CONSECUTIVE
+/// pairs `(p0,p1), (p1,p2), …` and never `(p0,p2)`, so a content row carrying a
+/// stray `│` between the card's own edges would fail to extract — and fail in
+/// `first_card`'s panic, whose message points nowhere near the cause. Direct
+/// indexing removes that class. It gives up only the incidental "no other
+/// `right` in between" property, which no caller relied on, and keeps the
+/// same-weight same-column coherence that is the actual contract (review of
+/// #465, N4).
+fn border_segment_at(
+    row: &str,
+    left: char,
+    right: char,
+    start: usize,
+    end: usize,
+) -> Option<String> {
+    let chars: Vec<char> = row.chars().collect();
+    (start < end && *chars.get(start)? == left && *chars.get(end)? == right)
+        .then(|| chars[start..=end].iter().collect())
+}
+
+/// The leftmost, topmost complete same-weight card rectangle on `grid`.
+///
+/// Weight-agnostic by way of [`common::BORDER_WEIGHTS`] because `a861c8d`
+/// promoted the SELECTED card from a plain border to a thick one and this
+/// parser, pinned to `┌`/`┘`, went red on a product change that was correct —
+/// issue #460. Being weight-agnostic costs nothing here: a card still has to
+/// present one weight's corners at identical columns on its top row, EVERY
+/// middle row and its bottom row, so a plain top with a thick bottom is still
+/// rejected.
 fn try_first_card(grid: &str) -> Option<CardSnapshot> {
     let lines: Vec<&str> = grid.lines().collect();
-    let top = lines
-        .iter()
-        .position(|line| corner_segment(line, '┌', '┐').is_some())?;
-    let bottom = lines
-        .iter()
-        .enumerate()
-        .skip(top + 1)
-        .find_map(|(index, line)| corner_segment(line, '└', '┘').map(|_| index))?;
+    let mut leftmost: Option<(usize, usize, CardSnapshot)> = None;
+    for (top, line) in lines.iter().enumerate() {
+        for border in common::BORDER_WEIGHTS {
+            for top_segment in border_segments(line, border.top_left, border.top_right) {
+                for (bottom, bottom_line) in lines.iter().enumerate().skip(top + 1) {
+                    let Some(bottom_segment) = border_segment_at(
+                        bottom_line,
+                        border.bottom_left,
+                        border.bottom_right,
+                        top_segment.start,
+                        top_segment.end,
+                    ) else {
+                        continue;
+                    };
+                    let mut rows = Vec::with_capacity(bottom - top + 1);
+                    rows.push(top_segment.text.clone());
+                    let middle = lines[top + 1..bottom]
+                        .iter()
+                        .map(|line| {
+                            border_segment_at(
+                                line,
+                                border.vertical,
+                                border.vertical,
+                                top_segment.start,
+                                top_segment.end,
+                            )
+                        })
+                        .collect::<Option<Vec<_>>>();
+                    let Some(middle) = middle else {
+                        continue;
+                    };
+                    rows.extend(middle);
+                    rows.push(bottom_segment);
 
-    let rows = lines[top..=bottom]
-        .iter()
-        .enumerate()
-        .map(|(offset, line)| {
-            if offset == 0 {
-                corner_segment(line, '┌', '┐')
-            } else if top + offset == bottom {
-                corner_segment(line, '└', '┘')
-            } else {
-                corner_segment(line, '│', '│')
+                    let candidate = CardSnapshot { rows, border };
+                    let candidate_key = (top_segment.start, top);
+                    // compute_frame_layout puts dashboard cards left of panes in
+                    // every layout exercised here — `ActiveTabView::Dashboard`
+                    // and `Orchestration` both route through `split_cards_area`,
+                    // which returns `(dashboard_area, panes_area)` in that
+                    // order. `ActiveTabView::Mode` is the concrete
+                    // counterexample (`src/ui.rs`: "50/50 horizontal split:
+                    // agent pane left, side panes right"), so pointing this test
+                    // at a Mode tab would invalidate the leftmost-complete-
+                    // rectangle selection below (review of #465, N2).
+                    if leftmost
+                        .as_ref()
+                        .is_none_or(|(start, row, _)| candidate_key < (*start, *row))
+                    {
+                        leftmost = Some((top_segment.start, top, candidate));
+                    }
+                    break;
+                }
             }
-        })
-        .collect::<Option<Vec<_>>>()?;
+        }
+    }
 
-    Some(CardSnapshot { rows })
+    leftmost.map(|(_, _, card)| card)
 }
 
 fn first_card(grid: &str) -> CardSnapshot {
@@ -246,13 +344,10 @@ fn card_stats_005_real_agent_card_narrows_without_restructuring() {
     let wide = first_card(&deck.snapshot_grid());
     let tool_count = tools_from_full_label(wide.bottom());
     assert!(tool_count > 0, "wide card must retain the real tool count");
+    // Successful extraction from the raw grid already requires matching-weight
+    // bottom corners at the exact columns of this card's top corners.
     assert!(
-        wide.bottom().starts_with('└') && wide.bottom().ends_with('┘'),
-        "wide card must retain both bottom corners:\n{}",
-        wide.rows.join("\n")
-    );
-    assert!(
-        wide.bottom().ends_with(&format!(" Tools: {tool_count} ┘")),
+        wide.bottom_label_is_right_aligned(&format!(" Tools: {tool_count}")),
         "the full stats label must be right-aligned against the wide card's bottom-right corner:\n{}",
         wide.rows.join("\n")
     );
@@ -293,15 +388,10 @@ fn card_stats_005_real_agent_card_narrows_without_restructuring() {
     let narrow = narrowed_snapshot
         .into_inner()
         .expect("the successful narrowed-card predicate stores its complete snapshot");
+    // The successful try_first_card extraction is itself the raw-grid corner
+    // check: both matching-weight bottom corners had to align with the top span.
     assert!(
-        narrow.bottom().starts_with('└') && narrow.bottom().ends_with('┘'),
-        "narrow stats must preserve both bottom corners:\n{}",
-        narrow.rows.join("\n")
-    );
-    assert!(
-        narrow
-            .bottom()
-            .ends_with(&format!(" · {tool_count} tools ┘")),
+        narrow.bottom_label_is_right_aligned(&format!(" · {tool_count} tools")),
         "narrow card must right-align the shorter stats rung and retain the same tool count:\n{}",
         narrow.rows.join("\n")
     );

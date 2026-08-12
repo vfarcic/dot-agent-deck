@@ -61,7 +61,7 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 #[spec("scheduler/spawn/001")]
 #[test]
 fn spawn_001_mkdir_and_uncreatable_path() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let base = scratch.path();
 
     let missing_dir = base.join("created-on-fire");
@@ -139,7 +139,7 @@ fn spawn_001_mkdir_and_uncreatable_path() {
 #[spec("scheduler/spawn/002")]
 #[test]
 fn spawn_002_orchestration_vs_single_agent() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let base = scratch.path();
 
     // Orchestration target dir.
@@ -213,7 +213,7 @@ fn spawn_002_orchestration_vs_single_agent() {
 #[spec("scheduler/spawn/003")]
 #[test]
 fn spawn_003_command_is_honored() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let base = scratch.path();
 
     let cmd_dir = base.join("cmd");
@@ -247,7 +247,7 @@ fn spawn_003_command_is_honored() {
 #[spec("scheduler/spawn/004")]
 #[test]
 fn spawn_004_fires_spawn_exactly_once_and_delivers() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let work = scratch.path().join("work");
     std::fs::create_dir_all(&work).expect("create work dir");
 
@@ -284,7 +284,7 @@ fn spawn_004_fires_spawn_exactly_once_and_delivers() {
 #[spec("scheduler/spawn/005")]
 #[test]
 fn spawn_005_delivery_gated_on_session_start() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let work = scratch.path().join("gated");
     std::fs::create_dir_all(&work).expect("create work dir");
 
@@ -350,7 +350,7 @@ fn spawn_005_delivery_gated_on_session_start() {
 #[test]
 #[cfg(unix)]
 fn spawn_006_single_and_role_codex_commands_are_wrapped() {
-    let scratch = tempfile::tempdir().expect("scheduler wrapper scratch");
+    let scratch = common::harness_tempdir().expect("scheduler wrapper scratch");
     let bin_dir = scratch.path().join("bin");
     let single_dir = scratch.path().join("single");
     let orch_dir = scratch.path().join("orchestration");

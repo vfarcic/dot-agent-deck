@@ -29,7 +29,7 @@ fn write_executable(path: &Path, contents: &str) {
 /// is installed). PATH interception no longer reaches the rewrite; the deck needs
 /// `DOT_AGENT_DECK_WRAP_BIN` pointed at the recorder instead.
 fn recorder_path(record: &Path) -> (tempfile::TempDir, String, PathBuf) {
-    let dir = tempfile::tempdir().expect("recorder bin tempdir");
+    let dir = common::harness_tempdir().expect("recorder bin tempdir");
     write_executable(
         &dir.path().join("dot-agent-deck"),
         "#!/bin/sh\nprintf 'WRAPPED %s\\n' \"$*\" >> \"$CODEX_PATH_RECORD\"\nexec cat\n",
@@ -85,7 +85,7 @@ fn open_form(deck: &TuiDeck) {
 #[test]
 #[cfg(unix)]
 fn spawn_001_plain_restore_wraps_codex() {
-    let fixture = tempfile::tempdir().expect("plain restore record dir");
+    let fixture = common::harness_tempdir().expect("plain restore record dir");
     let record = fixture.path().join("plain-restore.log");
     let (_bin, path, wrap_bin) = recorder_path(&record);
     let _deck = TuiDeck::builder()
@@ -104,7 +104,7 @@ fn spawn_001_plain_restore_wraps_codex() {
 #[test]
 #[cfg(unix)]
 fn spawn_002_mode_pane_wraps_codex() {
-    let fixture = tempfile::tempdir().expect("mode record dir");
+    let fixture = common::harness_tempdir().expect("mode record dir");
     let record = fixture.path().join("mode.log");
     let (_bin, path, wrap_bin) = recorder_path(&record);
     let deck = TuiDeck::builder()
@@ -128,7 +128,7 @@ fn spawn_002_mode_pane_wraps_codex() {
 #[test]
 #[cfg(unix)]
 fn spawn_003_orchestration_role_wraps_codex() {
-    let fixture = tempfile::tempdir().expect("orchestration record dir");
+    let fixture = common::harness_tempdir().expect("orchestration record dir");
     let record: PathBuf = fixture.path().join("orchestration.log");
     let (_bin, path, wrap_bin) = recorder_path(&record);
     let deck = TuiDeck::builder()
@@ -151,7 +151,7 @@ fn spawn_003_orchestration_role_wraps_codex() {
 #[test]
 #[cfg(unix)]
 fn spawn_004_mode_restore_wraps_codex() {
-    let fixture = tempfile::tempdir().expect("mode restore record dir");
+    let fixture = common::harness_tempdir().expect("mode restore record dir");
     let record = fixture.path().join("mode-restore.log");
     let (_bin, path, wrap_bin) = recorder_path(&record);
     let _deck = TuiDeck::builder()

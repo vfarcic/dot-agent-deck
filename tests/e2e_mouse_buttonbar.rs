@@ -64,7 +64,7 @@ fn buttonbar_004_click_scheduled_tasks_opens_manager() {
     // label must START WITH `[Scheduled` (e.g. `[Scheduled Tasks s]`, mirroring
     // the inline-shortcut convention of `[New Pane Ctrl+N]` / `[Help ?]`), so
     // this black-box lookup finds it.
-    let dir = tempfile::tempdir().expect("scratch tempdir");
+    let dir = common::harness_tempdir().expect("scratch tempdir");
     let sched_path = dir.path().join("schedules.toml");
     std::fs::write(
         &sched_path,

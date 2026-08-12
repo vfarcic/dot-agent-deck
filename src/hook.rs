@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::BufRead as _;
 use std::io::Read as _;
 use std::io::Write as _;
 use std::process::ExitCode;
@@ -439,28 +438,150 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
 }
 
 pub fn send_to_socket(json: &str) -> Option<()> {
-    let path = socket_path();
-    let mut stream = crate::platform::ipc::IpcClient::connect(&path).ok()?;
+    send_to_socket_at(&socket_path(), json)
+}
+
+/// [`send_to_socket`] against an explicit endpoint, rather than one resolved
+/// from the environment. Lets the socket tests exercise "no daemon listening
+/// at this path" by passing a temp-dir path directly, instead of mutating the
+/// process-global `DOT_AGENT_DECK_SOCKET` env var that production
+/// `socket_path()` reads.
+fn send_to_socket_at(path: &std::path::Path, json: &str) -> Option<()> {
+    let mut stream = crate::platform::ipc::IpcClient::connect(path).ok()?;
     let msg = format!("{json}\n");
     stream.write_all(msg.as_bytes()).ok()?;
     stream.flush().ok()?;
     Some(())
 }
 
+/// A per-read/per-write **idle** timeout (`SO_RCVTIMEO`/`SO_SNDTIMEO` on
+/// Unix) applied to the socket used by [`request_from_socket`], bounding how
+/// long a single blocking read or write may sit with no bytes moving before
+/// failing. An idle timeout alone is not enough on its own, though: it resets
+/// on every byte moved, so a peer that keeps trickling single bytes without
+/// ever finishing the reply line could still make `get-seed` wait forever
+/// even though the socket was never actually silent for a whole read.
+/// [`request_from_socket_inner`]'s read loop therefore also re-arms this same
+/// duration as a **total-operation** deadline it counts down from, closing
+/// that gap.
+///
+/// 5s stays the right number for the total-operation deadline for the same
+/// reason it was right as a per-read one: the daemon's `GetSeed` handler
+/// never touches the `state` lock that `delegate`'s reply path contends on —
+/// it only reads/clears an in-memory entry in `pty_registry` — so it is
+/// strictly cheaper than the `delegate` reply already bounded at
+/// `DELEGATE_REPLY_TIMEOUT` (5s, `src/main.rs`). A caller waiting on
+/// `get-seed`'s socket has no reason to be given a longer overall budget than
+/// `delegate`'s own reply is allowed, and 5s is still comfortably above the
+/// 300ms reply delay `error/socket/004` exercises, so a merely slow (not
+/// wedged/adversarial) daemon is not mistaken for an absent one.
+const GET_SEED_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// PRD #201: send a line to the daemon hook socket and read ONE line of reply
 /// back on the same connection. Used by the read-only `get-seed` verb, the one
 /// hook-socket message that expects a response (the delegate / work-done /
 /// agent-event senders are fire-and-forget). Returns `None` if the socket is
-/// absent/unreadable — the caller (get-seed) treats that as "no seed", so an
-/// older daemon that never replies, or no daemon at all, degrades to the
-/// PTY-injection safety net rather than hanging or erroring. A blank reply
-/// line is returned as `Some(String::new())`.
+/// absent/unreadable, or if the daemon goes completely silent — or keeps
+/// dribbling bytes without ever finishing a reply line — for longer than
+/// [`GET_SEED_REQUEST_TIMEOUT`]. The caller (get-seed) treats all of these
+/// identically as "no seed", so an older
+/// daemon that never replies, a daemon that never even accepts the
+/// connection, one that accepts the connection and then stops sending bytes
+/// altogether, and one that never stops sending bytes but never completes a
+/// line either, all degrade to the PTY-injection safety net rather than
+/// hanging or erroring. A blank reply line is returned as
+/// `Some(String::new())`.
+///
+/// [`GET_SEED_REQUEST_TIMEOUT`] bounds the **whole exchange**, not just a
+/// single idle read: [`request_from_socket_inner`]'s read loop measures
+/// elapsed wall-clock time against it and shrinks each individual blocking
+/// read's own timeout to whatever is left, so a peer that keeps dribbling a
+/// byte at a time without ever completing the reply line can no longer keep
+/// the read alive indefinitely — a per-read/per-write idle timeout alone
+/// resets on every byte moved and therefore never fires against a peer that
+/// never goes idle for a whole read. This pass does not add a reply-size cap
+/// — a peer can still
+/// grow the in-progress `String` for up to the deadline before the read is
+/// abandoned, which is a materially smaller exposure than the previous
+/// unbounded one but is intentionally left for a follow-up with its own
+/// size-cap justification.
 pub fn request_from_socket(json: &str) -> Option<String> {
-    let path = socket_path();
-    let mut stream = crate::platform::ipc::IpcClient::connect(&path).ok()?;
+    match request_from_socket_inner(json, Some(GET_SEED_REQUEST_TIMEOUT)) {
+        SocketReply::Line(line) => Some(line),
+        SocketReply::NoReply | SocketReply::Unreachable => None,
+    }
+}
+
+/// Outcome of [`request_from_socket_inner`]/[`request_from_socket_at`] —
+/// richer than [`request_from_socket`]'s `Option<String>` because a caller
+/// that needs to tell "never even reached the daemon" apart from "reached
+/// it, but got no confirmation back" (as the not-yet-submitted `delegate`
+/// wiring will) can report each honestly instead of collapsing both to
+/// `None` the way [`request_from_socket`] does.
+#[derive(Debug)]
+pub enum SocketReply {
+    /// Connected, wrote the request, and read a reply line (possibly empty).
+    Line(String),
+    /// Connected and wrote the request, but no reply arrived before the
+    /// deadline — either the daemon closed without answering (an old daemon
+    /// that doesn't know this request type), an individual read timed out,
+    /// or the total-operation deadline elapsed while a peer kept dribbling
+    /// bytes without ever finishing the reply line. The request was still
+    /// sent.
+    NoReply,
+    /// Could not connect to the daemon, or failed while writing — the
+    /// request was never sent.
+    Unreachable,
+}
+
+fn request_from_socket_inner(json: &str, timeout: Option<std::time::Duration>) -> SocketReply {
+    request_from_socket_at(&socket_path(), json, timeout)
+}
+
+/// [`request_from_socket_inner`] against an explicit endpoint, rather than one
+/// resolved from the environment. Lets the socket tests point a request at a
+/// temp-dir stub-daemon socket without mutating the process-global
+/// `DOT_AGENT_DECK_SOCKET` env var that production `request_from_socket_inner`
+/// reads via `socket_path()` — `set_var`/`get_var` races on that var are
+/// unsound under a multithreaded test binary regardless of the project's own
+/// `STATE_DIR_ENV_LOCK` convention, since production `socket_path()` reads it
+/// without taking that lock.
+fn request_from_socket_at(
+    path: &std::path::Path,
+    json: &str,
+    timeout: Option<std::time::Duration>,
+) -> SocketReply {
+    // The total-operation deadline starts here, before connect, rather than
+    // being re-armed with a fresh full budget once the connection is
+    // established and the request written below. Connect and the write are
+    // usually fast on a local Unix/named-pipe socket, but a wedged/overloaded
+    // daemon can stall either one, and this is the only way the deadline
+    // actually bounds the *whole* exchange the way this function's/
+    // `request_from_socket`'s docs describe. The timeout value itself is
+    // unchanged — only when the clock starts.
+    let deadline = timeout.map(|budget| std::time::Instant::now() + budget);
+    let mut stream = match crate::platform::ipc::IpcClient::connect(path) {
+        Ok(stream) => stream,
+        Err(_) => return SocketReply::Unreachable,
+    };
+    if let Some(deadline) = deadline {
+        // Zero/negative remaining budget: do not hand the socket a zero
+        // timeout — on some platforms that means "block forever", the
+        // opposite of what an exhausted deadline should do (same guard
+        // `read_reply_line` applies per-read below). A deadline that expired
+        // during connect folds into `NoReply`, matching how the read loop
+        // treats a deadline that expires mid-operation.
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return SocketReply::NoReply;
+        };
+        if stream.set_timeouts(remaining).is_err() {
+            return SocketReply::Unreachable;
+        }
+    }
     let msg = format!("{json}\n");
-    stream.write_all(msg.as_bytes()).ok()?;
-    stream.flush().ok()?;
+    if stream.write_all(msg.as_bytes()).is_err() || stream.flush().is_err() {
+        return SocketReply::Unreachable;
+    }
     // Half-close our write side so the daemon's line reader sees EOF after our
     // single request and doesn't block waiting for more (it reads in a loop).
     // Best-effort: on a transport without a half-close primitive (Windows named
@@ -474,18 +595,89 @@ pub fn request_from_socket(json: &str) -> Option<String> {
     // tell it we are done while still wanting its reply. Stopping at the newline
     // is EOF-independent and returns the identical value on Unix (the daemon
     // writes exactly one JSON line). An absent/older daemon that never answers
-    // still terminates: it either closes (EOF → empty line) or hits the sync
-    // client's read deadline, and both fold into the caller's documented
-    // "no seed" → PTY-injection fallback.
-    let mut reader = std::io::BufReader::new(&mut stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    Some(line.trim_end_matches(['\n', '\r']).to_string())
+    // still terminates: it either closes without writing a byte (EOF) or hits
+    // the total-operation deadline below (when `timeout` is set), and both
+    // fold into `SocketReply::NoReply` here / the caller's documented "no
+    // seed" → PTY-injection fallback for `get-seed`.
+    match read_reply_line(&mut stream, deadline) {
+        Some(line) => SocketReply::Line(line),
+        None => SocketReply::NoReply,
+    }
+}
+
+/// Read one reply line off `stream`, bounded by a **total-operation**
+/// deadline rather than the per-read idle timeout the caller already puts on
+/// the socket via `IpcClient::set_timeouts`.
+///
+/// The previous implementation drove a `BufRead::read_line` directly against
+/// `stream`, which keeps issuing reads until it sees a newline, EOF, or an
+/// error — and every successful read resets the socket's idle timer, so a
+/// peer that dribbles one byte per interval, always comfortably under the
+/// per-read bound, could keep the read alive indefinitely even though the
+/// line never completed. This loop instead tracks wall-clock elapsed time
+/// against `deadline` and re-arms the socket's per-read timeout to whatever
+/// is left before each individual read, so the *operation as a whole* —
+/// regardless of how the peer paces its bytes — cannot run past `deadline`.
+/// Once the deadline has passed, any read fails, the peer closes before
+/// sending a single byte, or the line is not valid UTF-8, this returns
+/// `None`; the caller folds that into `SocketReply::NoReply` exactly as it
+/// already did for a timed-out read — see [`request_from_socket`]. A peer
+/// that closes *after* writing part of a line, but before the newline, is a
+/// distinct case: the partial line is still returned as `Some(partial)`, not
+/// folded into `None`.
+///
+/// `deadline` is computed once by the caller — [`request_from_socket_at`] —
+/// from a point **before** it connects, not re-derived here from a fresh
+/// `Instant::now()`: doing the latter would let connect and the request write
+/// each consume wall-clock time against nothing, so only the read phase would
+/// actually be bounded and the exchange as a whole could run past what the
+/// caller's `timeout` advertises.
+///
+/// `None` falls back to unbounded blocking reads with no re-arming, for
+/// callers that pass no deadline at all.
+fn read_reply_line(
+    stream: &mut crate::platform::ipc::IpcClient,
+    deadline: Option<std::time::Instant>,
+) -> Option<String> {
+    let mut buf = [0u8; 512];
+    let mut line = Vec::new();
+    loop {
+        if let Some(deadline) = deadline {
+            let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+            stream.set_timeouts(remaining).ok()?;
+        }
+        let n = stream.read(&mut buf).ok()?;
+        if n == 0 {
+            // EOF with nothing received at all: the daemon closed without
+            // answering — exactly the "old daemon that doesn't know this
+            // request type" case `SocketReply::NoReply`'s own doc comment
+            // already names, so this must fold into `None`/`NoReply`, not
+            // `Some(String::new())`/`Line("")` (an empty `Line` is meant to
+            // mean the daemon explicitly sent a blank reply line, which this
+            // is not). A *partial*, unterminated line — the daemon wrote some
+            // bytes then closed before the newline — is left as
+            // `Line(partial)` unchanged: that is a distinct scenario this fix
+            // does not touch.
+            if line.is_empty() {
+                return None;
+            }
+            break;
+        }
+        if let Some(newline_pos) = buf[..n].iter().position(|&b| b == b'\n') {
+            line.extend_from_slice(&buf[..newline_pos]);
+            break;
+        }
+        line.extend_from_slice(&buf[..n]);
+    }
+    String::from_utf8(line)
+        .ok()
+        .map(|s| s.trim_end_matches('\r').to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spec::spec;
 
     #[test]
     fn map_session_start() {
@@ -699,12 +891,264 @@ mod tests {
     #[test]
     fn send_to_missing_socket_returns_none() {
         // With no daemon running, send should silently fail
-        // SAFETY: This test runs single-threaded; no other thread reads this env var concurrently.
-        unsafe {
-            std::env::set_var("DOT_AGENT_DECK_SOCKET", "/tmp/nonexistent-test-socket.sock");
-        }
-        let result = send_to_socket(r#"{"test": true}"#);
+        let result = send_to_socket_at(
+            std::path::Path::new("/tmp/nonexistent-test-socket.sock"),
+            r#"{"test": true}"#,
+        );
+
         assert!(result.is_none());
+    }
+
+    /// Scenario: A stub daemon accepts one connection, reads the request
+    /// line, then deliberately holds the connection open forever without
+    /// replying and without closing — simulating a wedged daemon.
+    /// `request_from_socket` relies entirely on the daemon closing the
+    /// connection and has no read/write bound of its own, so against this
+    /// daemon it hangs forever. Run it on a worker thread and bound the wait
+    /// with `recv_timeout` well above the production timeout the fix will add
+    /// (5s), so a still-unbounded `request_from_socket` fails fast with a
+    /// clear panic instead of hanging the CI runner until nextest's own
+    /// timeout.
+    #[spec("error/socket/003")]
+    #[test]
+    #[cfg(unix)]
+    fn socket_003_unbounded_daemon_does_not_hang_forever() {
+        let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
+        let socket_path = _tmp.path().join("s.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
+
+        // Stub daemon: read the one request line, then go silent forever —
+        // never replies, never closes.
+        let _daemon_thread = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                drop(stream);
+            }
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = match request_from_socket_at(
+                &socket_path,
+                r#"{"type":"get-seed"}"#,
+                Some(GET_SEED_REQUEST_TIMEOUT),
+            ) {
+                SocketReply::Line(line) => Some(line),
+                SocketReply::NoReply | SocketReply::Unreachable => None,
+            };
+            let _ = tx.send(result);
+        });
+
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(15));
+
+        match outcome {
+            Ok(value) => assert_eq!(
+                value, None,
+                "request_from_socket must fold a timed-out/unbounded daemon into None \
+                 (\"no seed\"), identical to a daemon that replies with nothing — got {value:?}"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "request_from_socket did not return within 15s against a daemon that reads \
+                 the request and then never replies and never closes — it has no read/write \
+                 bound of its own"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "the worker thread running request_from_socket dropped its channel without \
+                 sending a result"
+            ),
+        }
+    }
+
+    /// Scenario: A stub daemon accepts the connection, reads the request
+    /// line, waits a short delay well inside the coming timeout bound, then
+    /// writes one JSON reply line. `request_from_socket` must still return
+    /// that line as `Some(...)`. This guards against the specific way the
+    /// idle-timeout fix could make things worse: a bound that fires too
+    /// eagerly would mistake a merely-slow daemon for an absent one and
+    /// silently fall back to PTY injection. This test is a correctness
+    /// control, not a timing measurement, and is expected to pass both before
+    /// and after the fix.
+    #[spec("error/socket/004")]
+    #[test]
+    #[cfg(unix)]
+    fn socket_004_slow_but_replying_daemon_still_returns_the_reply() {
+        let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
+        let socket_path = _tmp.path().join("s.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
+
+        // Stub daemon: read the request line, wait a short delay comfortably
+        // inside the 5s bound the fix will add, then reply with one line.
+        let daemon_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let _ = std::io::Write::write_all(&mut stream, br#"{"seed":"abc123"}"#);
+                let _ = std::io::Write::write_all(&mut stream, b"\n");
+                let _ = std::io::Write::flush(&mut stream);
+            }
+        });
+
+        let result = match request_from_socket_at(
+            &socket_path,
+            r#"{"type":"get-seed"}"#,
+            Some(GET_SEED_REQUEST_TIMEOUT),
+        ) {
+            SocketReply::Line(line) => Some(line),
+            SocketReply::NoReply | SocketReply::Unreachable => None,
+        };
+
+        let _ = daemon_thread.join();
+
+        assert_eq!(
+            result,
+            Some(r#"{"seed":"abc123"}"#.to_string()),
+            "a daemon that replies well inside the timeout bound must not be mistaken for \
+             an absent one"
+        );
+    }
+
+    /// Scenario: A stub daemon accepts the connection, reads the request
+    /// line, then dribbles a single non-newline byte at a fixed interval
+    /// forever — never sending the newline `read_line` is waiting for. The
+    /// per-read idle timeout added for `error/socket/003` resets on every
+    /// byte received, so each dribbled byte restarts it before it can fire,
+    /// and `request_from_socket` never returns even though the peer never
+    /// goes silent for as long as one read. Run it on a worker thread and
+    /// bound the wait with
+    /// `recv_timeout` at a ceiling generous enough to hold whatever
+    /// operation-level deadline the fix chooses, so a still-unbounded
+    /// `request_from_socket` fails with a clear panic instead of hanging the
+    /// CI runner.
+    #[spec("error/socket/005")]
+    #[test]
+    #[cfg(unix)]
+    fn socket_005_slow_drip_daemon_does_not_hang_forever() {
+        let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
+        let socket_path = _tmp.path().join("s.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
+
+        // 200ms is ~25x under the 5s per-read SO_RCVTIMEO bound, so every
+        // dribbled byte comfortably resets the timer well before it
+        // could fire even under CI scheduler jitter — this deterministically
+        // exercises the "resets on every read" gap rather than racing it.
+        // The daemon dribbles for DRIP_TOTAL (20s), safely longer than
+        // ASSERT_CEILING (15s) below, so the drip is still ongoing for the
+        // *entire* assertion wait — the failure can only come from the
+        // channel timing out, never from the peer going quiet on its own.
+        const DRIP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+        const DRIP_TOTAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+        let _daemon_thread = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+
+                let deadline = std::time::Instant::now() + DRIP_TOTAL;
+                while std::time::Instant::now() < deadline {
+                    std::thread::sleep(DRIP_INTERVAL);
+                    // A single non-newline byte: never completes the line
+                    // `read_line` is waiting for, but is enough on its own
+                    // to reset SO_RCVTIMEO on the reader side.
+                    if std::io::Write::write_all(&mut stream, b".").is_err() {
+                        break;
+                    }
+                    let _ = std::io::Write::flush(&mut stream);
+                }
+                drop(stream);
+            }
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = match request_from_socket_at(
+                &socket_path,
+                r#"{"type":"get-seed"}"#,
+                Some(GET_SEED_REQUEST_TIMEOUT),
+            ) {
+                SocketReply::Line(line) => Some(line),
+                SocketReply::NoReply | SocketReply::Unreachable => None,
+            };
+            let _ = tx.send(result);
+        });
+
+        // Deliberately generous relative to the 5s per-read timeout so
+        // this does not pin the exact operation-level deadline the fix has
+        // not chosen yet — it only needs to hold whatever sane deadline the
+        // fix picks, while still failing well before it would hang CI's own
+        // per-test timeout.
+        const ASSERT_CEILING: std::time::Duration = std::time::Duration::from_secs(15);
+        let outcome = rx.recv_timeout(ASSERT_CEILING);
+
+        match outcome {
+            // Any return within the ceiling proves the operation is bounded
+            // in total time — this test pins that property, not a specific
+            // reply shape (the peer never sends a valid reply line at all).
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "request_from_socket did not return within {ASSERT_CEILING:?} against a peer \
+                 that dribbles one non-newline byte every {DRIP_INTERVAL:?} — each byte resets \
+                 the per-read idle timeout before it can fire, so read_line() never sees a \
+                 newline, EOF, or an error and blocks indefinitely"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "the worker thread running request_from_socket dropped its channel without \
+                 sending a result"
+            ),
+        }
+    }
+
+    /// Scenario: A stub daemon accepts the connection, reads the request
+    /// line, then closes immediately without writing a single byte back —
+    /// simulating an old daemon that doesn't understand the request type at
+    /// all. `read_reply_line` used to fold this into `Some(String::new())` —
+    /// `SocketReply::Line("")` — even though `SocketReply::NoReply`'s own doc
+    /// comment already names exactly this scenario ("the daemon closed
+    /// without answering") as a `NoReply` case. Asserts the fixed behavior:
+    /// `request_from_socket_at` returns `SocketReply::NoReply`, not
+    /// `SocketReply::Line(String::new())`.
+    #[spec("error/socket/006")]
+    #[test]
+    #[cfg(unix)]
+    fn socket_006_silent_close_returns_no_reply_not_empty_line() {
+        let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
+        let socket_path = _tmp.path().join("s.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
+
+        // Stub daemon: read the one request line, then close without
+        // writing anything back at all.
+        let daemon_thread = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+                drop(stream);
+            }
+        });
+
+        let result = request_from_socket_at(
+            &socket_path,
+            r#"{"type":"get-seed"}"#,
+            Some(GET_SEED_REQUEST_TIMEOUT),
+        );
+
+        let _ = daemon_thread.join();
+
+        assert!(
+            matches!(result, SocketReply::NoReply),
+            "a daemon that closes without writing any bytes must fold into \
+             SocketReply::NoReply, matching its own doc comment's \"daemon closed without \
+             answering\" case, not SocketReply::Line(\"\") — got {result:?}"
+        );
     }
 
     #[test]

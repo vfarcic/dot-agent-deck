@@ -177,7 +177,10 @@ if wanted test-fast; then
   elif [ "$have_nextest" != true ]; then
     record test-fast BLOCKED 0 - "cargo-nextest missing: enter 'devbox shell' or 'cargo install cargo-nextest --locked'"
   else
-    run_step test-fast "cargo nextest run${test_filter}" "rule 5 fast tier" || true
+    # `--workspace` (issue #489) mirrors the `test-fast` alias and CI. Without
+    # it cargo selects the root package alone and the `xtask/*` members' tests
+    # never run, so a reviewer's gate would be narrower than the author's.
+    run_step test-fast "cargo nextest run --workspace${test_filter}" "rule 5 fast tier" || true
   fi
 else
   skip test-fast "not in --only"
@@ -237,19 +240,37 @@ else
   # NORMALLY, so nextest counts them as PASSED. Without this flag nextest
   # suppresses passing tests' output and those skips are invisible — a green
   # e2e run that proved nothing. See `REQUIRE_REAL_E2E_ENV` in tests/common/mod.rs.
-  run_step e2e "cargo nextest run --features e2e --success-output=final${test_filter}" "rule 5 e2e tier" || true
+  # `--workspace` (issue #489): same reason as the test-fast step above — keep
+  # this in lockstep with the `test-e2e` alias in .cargo/config.toml.
+  run_step e2e "cargo nextest run --workspace --features e2e --success-output=final${test_filter}" "rule 5 e2e tier" || true
 
   e2e_log="${logs}/e2e.log"
   if [ -f "$e2e_log" ]; then
+    # The leading `[[:space:]]*` is load-bearing, NOT defensive padding:
+    # nextest INDENTS captured test output by four spaces under
+    # `--success-output=final`, so a `^SKIP: ` anchored at column 0 matches
+    # nothing and this detector silently reports 0 on a run that really did
+    # skip. That is exactly what happened while verifying #391 and #467 —
+    # four real-agent tests skipped ("Codex could not reach model
+    # gpt-5.1-codex-mini …"), were counted as PASSED, and the ATTENTION row
+    # below never appeared (issues #452, #490). The same pattern appears at
+    # both match sites; keep them in sync, or the row's count will describe a
+    # different set of lines than the file it points at.
+    #
     # `|| true`, not `|| echo 0`: grep -c already PRINTS "0" when it matches
     # nothing and only then exits 1, so `|| echo 0` produces "0\n0" and the
     # numeric test below dies with "integer expression expected".
-    skips=$(grep -c '^SKIP: ' "$e2e_log" 2>/dev/null || true)
+    skips=$(grep -cE '^[[:space:]]*SKIP: ' "$e2e_log" 2>/dev/null || true)
     [[ "$skips" =~ ^[0-9]+$ ]] || skips=0
     printf 'E2E_RUNTIME_SKIPS=%s\n' "$skips" >>"${out}/env.txt"
     printf 'E2E_RUNTIME_SKIPS=%s\n' "$skips"
     if [ "$skips" -gt 0 ]; then
-      grep '^SKIP: ' "$e2e_log" | sort -u >"${out}/e2e-skips.txt"
+      # `sed` strips nextest's indent so the file reads as bare `SKIP: …`
+      # lines; it runs before `sort -u` so reasons that differ only by
+      # indentation still collapse to one entry. Note `sort -u` dedupes: N
+      # tests failing the same precondition report as N in the row above but
+      # one line here, which is the intended reading (occurrences vs reasons).
+      grep -E '^[[:space:]]*SKIP: ' "$e2e_log" | sed 's/^[[:space:]]*//' | sort -u >"${out}/e2e-skips.txt"
       record e2e-real-coverage ATTENTION 0 "${out}/e2e-skips.txt" \
         "${skips} real-agent test(s) skipped and still counted as PASSED. If any covers this PR's surface, rerun it with DOT_AGENT_DECK_REQUIRE_REAL_E2E=1 and treat 'cannot run' as UNVERIFIED, not green."
     fi

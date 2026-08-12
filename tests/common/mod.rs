@@ -416,7 +416,7 @@ impl TuiDeck {
         let test_name = current_test_name();
 
         // M2.1 auditor S1 + M3.1 auditor S4: create the per-test
-        // tempdir with mode 0o700 atomically. `tempfile::tempdir()`
+        // tempdir with mode 0o700 atomically. `harness_tempdir()`
         // followed by `set_permissions(0o700)` had a small umask-derived
         // 0o755 window between creation and chmod — closed here by
         // asking tempfile to apply 0o700 at creation.
@@ -1910,6 +1910,179 @@ pub fn joined_rows(buffer: &ratatui::buffer::Buffer) -> String {
         .join("\n")
 }
 
+// ---------------------------------------------------------------------------
+// Box-drawing grid helpers
+// ---------------------------------------------------------------------------
+//
+// Shared by every suite that reads a RENDERED grid (a vt100 PTY snapshot or a
+// `joined_rows` buffer) and has to find, crop or bound a drawn box. Kept here
+// as ONE copy because the alternative was measured and cost us: `a861c8d`
+// promoted the selected deck card from a plain to a thick border and `eff6256`
+// did the same to the focused pane, and each presentation change red-lined a
+// different test file that had hardcoded the old glyph — issue #460. Two files
+// had already grown near-identical copies of the pane-column scan below, which
+// would have made the next such change a two-site edit where only one site got
+// edited (review of #465, S1/S2).
+
+/// One border weight's corner and vertical glyphs — everything needed to find
+/// a box's span on a row and to recognise its verticals.
+#[derive(Clone, Copy, Debug)]
+pub struct BorderWeight {
+    pub top_left: char,
+    pub top_right: char,
+    pub vertical: char,
+    pub bottom_left: char,
+    pub bottom_right: char,
+}
+
+/// Every border weight a rendered box may use, in ratatui `BorderType` order.
+///
+/// The product paints only `Plain` and `Thick` today — `card_border_glyph`
+/// (`src/ui.rs`) and `TerminalWidget::render` (`src/terminal_widget.rs`) both
+/// return exactly those two, and `BorderType::Double` appears nowhere in
+/// `src/`. `Double` is listed ANYWAY, deliberately, because every consumer of
+/// this table is either a LOCATOR (find the box's column) or a
+/// weight-AGNOSTIC extractor (require the same weight top and bottom), and for
+/// both of those a weight they fail to recognise is a silent false negative,
+/// not a caught defect. That is not hypothetical: the pane-column scan below
+/// once pinned a single corner glyph and failed a mode switch that was working
+/// correctly. Listing an unreachable weight costs one table row and never
+/// weakens a same-weight coherence check — a card with a plain top and a thick
+/// bottom is still rejected.
+pub const BORDER_WEIGHTS: [BorderWeight; 3] = [
+    BorderWeight {
+        top_left: '┌',
+        top_right: '┐',
+        vertical: '│',
+        bottom_left: '└',
+        bottom_right: '┘',
+    },
+    BorderWeight {
+        top_left: '┏',
+        top_right: '┓',
+        vertical: '┃',
+        bottom_left: '┗',
+        bottom_right: '┛',
+    },
+    BorderWeight {
+        top_left: '╔',
+        top_right: '╗',
+        vertical: '║',
+        bottom_left: '╚',
+        bottom_right: '╝',
+    },
+];
+
+/// Whether `ch` is any border weight's vertical glyph — the characters a
+/// wrap-tolerant grid search has to drop, since a box's own left/right edges
+/// are interposed into every row of text it contains.
+pub fn is_box_vertical(ch: char) -> bool {
+    BORDER_WEIGHTS.iter().any(|weight| weight.vertical == ch)
+}
+
+/// Drop every whitespace run and box-drawing vertical from `text`, so a needle
+/// that WRAPPED across rows still matches once the rows are joined.
+///
+/// A long line rendered into a box breaks at whatever column the box happens to
+/// sit at, and each continuation row re-enters through the box's own left edge. A
+/// needle straddling that wrap column is therefore absent from the row-joined
+/// snapshot even though every character of it is on screen. Squeezing BOTH
+/// haystack and needle makes the match independent of where the wrap fell, and of
+/// whether the renderer re-flowed at a word boundary or hard-broke mid-token.
+///
+/// Squeezing alone is NOT sufficient on a split layout — see
+/// [`orchestration_pane_column`] for the sidebar-splicing trap it leaves open.
+pub fn squeeze_wrapped_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_whitespace() && !is_box_vertical(*ch))
+        .collect()
+}
+
+/// Whether `label` appears inside ONE box's top-border span on some row.
+///
+/// Stronger than `grid.lines().any(|l| l.contains('┌') && l.contains(label))`:
+/// on an Orchestration tab the sidebar's cards and the focused role's live
+/// terminal share rows, so a label printed by the AGENT, to the right of a
+/// card's own right corner, satisfied the loose form. Cropping to the span
+/// between one weight's matching corners is what makes this specific to a card
+/// TITLE. `tests/grid_box_helpers.rs` guards that in the fast tier.
+pub fn label_in_box_top_border(grid: &str, label: &str) -> bool {
+    grid.lines().any(|line| {
+        let chars: Vec<char> = line.chars().collect();
+        BORDER_WEIGHTS.iter().any(|weight| {
+            chars
+                .iter()
+                .enumerate()
+                .filter(|(_, ch)| **ch == weight.top_left)
+                .any(|(start, _)| {
+                    let Some(end) = chars
+                        .iter()
+                        .enumerate()
+                        .skip(start + 1)
+                        .find_map(|(index, ch)| (*ch == weight.top_right).then_some(index))
+                    else {
+                        return false;
+                    };
+                    chars[start..=end]
+                        .iter()
+                        .collect::<String>()
+                        .contains(label)
+                })
+        })
+    })
+}
+
+/// Column of the orchestration tab's pane-column LEFT edge, in Unicode
+/// scalars, or `None` when no expanded orchestrator box is drawn.
+///
+/// The role-pane box drawn for the fixture's `start = true` role fuses its
+/// title into the top border as `┌orchestrator───…`, so that corner's column
+/// is exactly `panes_area.x` — the sidebar/pane boundary that
+/// `orchestration_split_percents` controls. The sidebar's own truncated
+/// `orchestrat…` card label carries no corner, so there is no collision.
+///
+/// Two preconditions, both of which return `None` rather than a wrong column,
+/// and which callers must therefore report on separately (see the `Result`
+/// returned by `e2e_idle_worker_detector.rs`'s wait helper — review S4):
+///
+/// 1. The fixture's start role must be named literally `orchestrator`.
+/// 2. Its pane must render EXPANDED. A collapsed `Stacked` pane draws a
+///    `Block` with `Borders::TOP` and a padded title — no corner glyph at all
+///    (see `tests/e2e_orchestration_pane_column.rs`) — so there is no anchor.
+///
+/// The returned index counts scalars, which equals the terminal column only
+/// while every cell left of the boundary is width-1. Fixtures keep it so.
+pub fn orchestration_pane_left_edge(grid: &str) -> Option<usize> {
+    grid.lines().find_map(|line| {
+        BORDER_WEIGHTS
+            .iter()
+            .filter_map(|weight| {
+                let header = format!("{}orchestrator", weight.top_left);
+                line.find(&header)
+                    .map(|byte_index| line[..byte_index].chars().count())
+            })
+            .min()
+    })
+}
+
+/// Crop every row of `grid` to the orchestration pane column, dropping the
+/// sidebar to its left.
+///
+/// Needed because a needle that wraps across pane rows is only contiguous once
+/// the rows are joined, and joining the FULL grid splices the sidebar's
+/// role-card text between them: `card1·pane1·card2·pane2…` breaks a needle
+/// spanning `pane1`+`pane2`. Returns `None` on the same two preconditions as
+/// [`orchestration_pane_left_edge`].
+pub fn orchestration_pane_column(grid: &str) -> Option<String> {
+    let left_edge = orchestration_pane_left_edge(grid)?;
+    Some(
+        grid.lines()
+            .map(|line| line.chars().skip(left_edge).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 /// Poll `path` until its contents contain `needle`, or panic after the
 /// harness wait ceiling ([`WAIT_TIMEOUT`]). Lives in the harness (not an
 /// `e2e_*` test file) because it sleeps between reads — Decision 21 forbids
@@ -2136,10 +2309,45 @@ fn render_grid_to_svg(grid: &str, cols: u16, rows: u16) -> String {
 /// BOTH are spent is reported as unusable — see [`claude_oauth_usable`], which
 /// holds that half as a pure function so `tests/real_agent_preflight.rs` can
 /// assert every accepted and rejected credential shape.
+///
+/// PRD #386: the credential set is no longer necessarily a FILE. Claude Code
+/// 2.x on macOS keeps it in the login Keychain as the generic-password item
+/// `Claude Code-credentials`, and `~/.claude/.credentials.json` is simply
+/// absent on a migrated host — measured on this repo's dev machine on
+/// 2026-08-06 (no file at all, Keychain item present, `claude` 2.1.220
+/// working). The file check therefore falls back to a Keychain probe instead
+/// of reporting "not found". Without that fallback EVERY real-agent test in
+/// this suite silently self-skips on macOS and reports PASS — and that is
+/// exactly the tier CLAUDE.md rule 5 exception (a) says must be run locally
+/// BECAUSE CI has no credentials to run it, so both sides would be green while
+/// proving nothing.
 pub fn check_claude_available() -> Result<(), String> {
     if !cli_invocable("claude") {
         return Err("Claude Code CLI not installed (could not invoke `claude --version`)".into());
     }
+    match check_claude_credentials_file() {
+        Ok(()) => Ok(()),
+        // A usable file is authoritative; when it is absent OR unusable the
+        // Keychain may still hold a live credential set, so the fallback
+        // decides. This never weakens the gate into "always available" — a host
+        // with neither still skips, and now names both storage locations so the
+        // next person isn't sent hunting for a file this Claude Code version
+        // never writes.
+        Err(file_reason) => {
+            if claude_keychain_credentials_present() {
+                Ok(())
+            } else {
+                Err(format!("{file_reason}{CLAUDE_KEYCHAIN_HINT}"))
+            }
+        }
+    }
+}
+
+/// The file half of [`check_claude_available`]: `~/.claude/.credentials.json`
+/// exists as a regular file, parses, and carries a usable `claudeAiOauth`
+/// entry. Kept as the first-choice path — Linux and pre-2.x installs still
+/// store credentials here.
+fn check_claude_credentials_file() -> Result<(), String> {
     // M3.1 auditor S1: every message below surfaces the abstract path so it
     // doesn't leak whether the operator is on `/Users/<name>` vs `/root` vs
     // `/home/<name>`.
@@ -2164,11 +2372,167 @@ pub fn check_claude_available() -> Result<(), String> {
         "Claude Code credentials at ~/.claude/.credentials.json carry no `claudeAiOauth` \
          entry — log in with `claude login`",
     )?;
-    let now_ms = std::time::SystemTime::now()
+    claude_oauth_usable(oauth, now_epoch_ms())
+}
+
+/// Epoch milliseconds for the credential expiry checks, shared by the file and
+/// Keychain halves of the gate so the two cannot drift apart in how they read
+/// the clock. `0` on the impossible pre-epoch clock, which makes every expiry
+/// look live — the same fail-open-then-fail-loudly direction the rest of this
+/// gate takes.
+fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    claude_oauth_usable(oauth, now_ms)
+        .unwrap_or(0)
+}
+
+/// Would the gate accept this credential document? Parses the bytes, requires a
+/// `claudeAiOauth` entry, and applies [`claude_oauth_usable`] — the one place
+/// that question is answered, so the availability check, the Keychain probe and
+/// the import all judge a credential set by the same rule regardless of where
+/// it came from.
+///
+/// Takes bytes rather than a parsed value so callers holding a secret buffer
+/// can classify it and then zero it. The parse does put a second copy of the
+/// secret in the `serde_json::Value`, which cannot be zeroed the way a byte
+/// buffer can; it is local, dropped when this returns, and never read except
+/// through `claude_oauth_usable`.
+fn claude_credential_document_usable(raw: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(raw)
+        .ok()
+        .as_ref()
+        .and_then(|parsed| parsed.get("claudeAiOauth"))
+        .is_some_and(|oauth| claude_oauth_usable(oauth, now_epoch_ms()).is_ok())
+}
+
+/// Service name Claude Code 2.x files its OAuth credential set under in the
+/// macOS login Keychain.
+#[cfg(target_os = "macos")]
+const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+
+/// Appended to the file-side failure when the Keychain fallback also came up
+/// empty, so a genuinely credential-less host is told about BOTH locations.
+/// Empty off macOS, where there is no Keychain to have checked and the
+/// pre-existing message is still the whole truth.
+#[cfg(target_os = "macos")]
+const CLAUDE_KEYCHAIN_HINT: &str = " (and the macOS login Keychain holds no usable `Claude Code-credentials` item \
+     either — Claude Code 2.x stores the credential set there rather than in the \
+     file, and it is checked for the same `claudeAiOauth` shape and expiry as the \
+     file is)";
+#[cfg(not(target_os = "macos"))]
+const CLAUDE_KEYCHAIN_HINT: &str = "";
+
+/// Whether the macOS login Keychain holds a **usable** Claude Code credential
+/// set — the same question [`check_claude_credentials_file`] asks of the file,
+/// asked of the Keychain.
+///
+/// PRD #386 auditor finding: this used to answer only "`security` exited 0 with
+/// non-empty output", so the two halves of the gate disagreed — an expired or
+/// malformed Keychain item passed where byte-identical content in a file was
+/// rejected. It now parses the exported document and applies the identical
+/// `claudeAiOauth` + [`claude_oauth_usable`] test, so a host is judged the same
+/// way whichever store its credentials live in. The consequence of the old
+/// asymmetry was a test that ran and then failed loudly deep in a PTY wait
+/// (never a silent green — [`claude_keychain_credentials_export`] already
+/// refuses to seed a test HOME from anything that is not a `claudeAiOauth`
+/// document), which is why it was a correctness fix rather than a blocker.
+///
+/// PRIVACY, load-bearing and unchanged by that fix: this yields a BOOLEAN and
+/// nothing else. `-w` prints the password itself, so the secret is read into a
+/// local buffer purely to be classified; the buffer is zeroed before it drops,
+/// never returned, and never formatted into an error, a panic, a log line, a
+/// test artifact or a `.cast` recording. stderr is discarded for the same
+/// reason, and `claude_oauth_usable`'s `Err` string — which names only the
+/// abstract `~/.claude/.credentials.json` path, per the M3.1 auditor S1
+/// property — is collapsed to a bool here rather than propagated.
+///
+/// The parse does put a second copy of the secret on the heap inside the
+/// `serde_json::Value`, which cannot be zeroed the way the byte buffer can.
+/// That copy is local, dropped at the end of this function, and never read
+/// except through `claude_oauth_usable` — the same handling
+/// [`claude_keychain_credentials_export`] has always given its own parse of
+/// the same bytes.
+///
+/// `security` resolves the login keychain from `$HOME`, so the probe is pinned
+/// to [`host_home`]: under a relocated HOME it answers "keychain not found"
+/// (exit 44) no matter what the real user has.
+#[cfg(target_os = "macos")]
+fn claude_keychain_credentials_present() -> bool {
+    let probe = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"])
+        .env("HOME", host_home())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match probe {
+        Ok(mut out) => {
+            let usable = out.status.success() && claude_credential_document_usable(&out.stdout);
+            out.stdout.fill(0);
+            usable
+        }
+        Err(_) => false,
+    }
+}
+
+/// Non-macOS hosts keep the file-only behaviour unchanged: Linux Claude Code
+/// still writes `~/.claude/.credentials.json`, and CI — which has no
+/// credentials either way — must keep skipping.
+#[cfg(not(target_os = "macos"))]
+fn claude_keychain_credentials_present() -> bool {
+    false
+}
+
+/// Export Claude Code's credential set out of the macOS login Keychain, so
+/// [`import_claude_credentials`] can seed a per-test HOME that cannot reach the
+/// Keychain itself.
+///
+/// `None` when there is no such item, when `security` cannot be run, or when
+/// what came back is not a **usable** `claudeAiOauth` credential document (the
+/// same rule the gate applies — see [`claude_credential_document_usable`]) —
+/// the caller then reports its file-side error instead, so an unrelated,
+/// malformed or spent keychain item can never be written into a test HOME as
+/// if it were a login.
+///
+/// These bytes ARE the secret, unlike [`claude_keychain_credentials_present`]'s
+/// boolean. They are returned solely to be handed to
+/// [`write_credential_file_atomic_0o600`] — never logged, never formatted into
+/// an error, and never echoed to a terminal, so they cannot reach a `.cast`
+/// recording. That is the same handling the file-sourced bytes have always had.
+#[cfg(target_os = "macos")]
+fn claude_keychain_credentials_export() -> Option<Vec<u8>> {
+    let probe = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"])
+        .env("HOME", host_home())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !probe.status.success() {
+        return None;
+    }
+    // `security -w` terminates the password with a newline; truncate in place
+    // rather than copying, so the secret lives in exactly one buffer.
+    let mut bytes = probe.stdout;
+    while bytes.last().is_some_and(|b| b.is_ascii_whitespace()) {
+        bytes.pop();
+    }
+    // Same usability rule the gate applies (PRD #386 review): an expired or
+    // malformed Keychain item is not a source worth seeding a test HOME from,
+    // and returning it would hand the caller a credential set
+    // `check_claude_available` would have rejected.
+    if !claude_credential_document_usable(&bytes) {
+        bytes.fill(0);
+        return None;
+    }
+    Some(bytes)
+}
+
+/// Non-macOS hosts have no Keychain to export from; the file is the only
+/// source. See [`claude_keychain_credentials_present`].
+#[cfg(not(target_os = "macos"))]
+fn claude_keychain_credentials_export() -> Option<Vec<u8>> {
+    None
 }
 
 /// The credential-shape half of [`check_claude_available`], split out as a pure
@@ -2324,8 +2688,8 @@ pub fn check_codex_available() -> Result<(), String> {
         return Err("Codex is not authenticated — log in with `codex login`".into());
     }
 
-    let final_message = tempfile::NamedTempFile::new()
-        .map_err(|e| format!("could not create Codex probe output file: {e}"))?;
+    let final_message =
+        harness_tempfile().map_err(|e| format!("could not create Codex probe output file: {e}"))?;
     let probe = std::process::Command::new("codex")
         .args([
             "exec",
@@ -2584,13 +2948,38 @@ fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
     let dst_root = test_home.join(".claude");
     std::fs::create_dir_all(&dst_root)?;
 
+    // PRD #386: the SOURCE is not necessarily a file any more. Claude Code 2.x
+    // on macOS keeps the credential set in the login Keychain and writes no
+    // `~/.claude/.credentials.json` at all, so the read below is a hard
+    // NotFound on a migrated host — which is what turned this import into a
+    // launch-time panic the moment `check_claude_available` learned about the
+    // Keychain. The DESTINATION still has to be a file: `security` resolves the
+    // login keychain from `$HOME`, so a daemon-spawned `claude` running under
+    // the relocated per-test HOME cannot reach the real user's keychain (it
+    // answers "keychain not found", exit 44 — measured) and has nothing but
+    // this imported file to authenticate from.
+    //
+    // PRD #386 review (Greptile P1): the source is chosen by USABILITY, not by
+    // mere readability. `check_claude_available` accepts the host when EITHER
+    // source is usable, so a stale/expired/malformed but perfectly readable
+    // `~/.claude/.credentials.json` sitting beside a live Keychain item used to
+    // pass preflight (on the Keychain) and then seed the test HOME from the
+    // file — launching the isolated `claude` with credentials the gate had
+    // already rejected, and failing the real-agent test deep in a PTY wait on a
+    // host that is genuinely logged in. Same rule, same order, as the gate:
+    // a usable file wins, else the Keychain, else copy what we have and let it
+    // fail loudly rather than silently importing nothing.
     let src_creds = src_root.join(".credentials.json");
-    let creds_bytes = read_credential_file_no_symlink(
+    let creds_bytes = match read_credential_file_no_symlink(
         &src_creds,
-        "Claude Code credentials not found at ~/.claude/.credentials.json — \
-         log in with `claude login`",
+        "Claude Code credentials not found at ~/.claude/.credentials.json \
+         nor in the macOS login Keychain — log in with `claude login`",
         "~/.claude/.credentials.json",
-    )?;
+    ) {
+        Ok(bytes) if claude_credential_document_usable(&bytes) => bytes,
+        Ok(bytes) => claude_keychain_credentials_export().unwrap_or(bytes),
+        Err(file_err) => claude_keychain_credentials_export().ok_or(file_err)?,
+    };
     write_credential_file_atomic_0o600(&dst_root.join(".credentials.json"), &creds_bytes)?;
 
     // settings.json: copy if present, with `hooks` stripped. Claude's
@@ -3281,7 +3670,7 @@ pub fn lock_dir_path() -> Option<PathBuf> {
     LOCK_DIR.get().cloned()
 }
 
-/// Race-safe `tempfile::tempdir()` wrapper: re-applies 0o700 after
+/// Race-safe `harness_tempdir()` wrapper: re-applies 0o700 after
 /// creation so the per-test directory survives the daemon's
 /// `bind_socket` umask flip. Mirrors `src/daemon_attach.rs`'s
 /// same-named helper; promoted here so every legacy daemon-spawning
@@ -3293,11 +3682,56 @@ pub fn lock_dir_path() -> Option<PathBuf> {
 /// unchanged.
 #[allow(dead_code)]
 pub fn race_safe_tempdir() -> tempfile::TempDir {
-    let dir = tempfile::Builder::new()
-        .tempdir_in(harness_temp_root())
-        .expect("create tempdir");
+    harness_tempdir().expect("create tempdir")
+}
+
+/// Drop-in replacement for `harness_tempdir()` that is correct **whatever
+/// order a test does things in** — the whole point, and what the bare
+/// constructor cannot promise.
+///
+/// The harness redirects `tempfile`'s process-global default temp dir at its own
+/// per-process root, but it can only do so from inside [`harness_temp_root`]'s
+/// lazy initialisation. nextest runs one process per test, so a bare
+/// `harness_tempdir()` that happens to be the *first* allocation in that
+/// process runs before the redirect is installed and lands in the OS temp dir:
+/// the RAM-backed `/tmp` this issue is about, at `tempfile`'s default mode
+/// instead of 0o700, outside the free-space pre-flight, and left behind on
+/// SIGKILL under `.tmp*` — a prefix the reaper will not touch by default because
+/// it belongs to every Rust program on the machine. Measured on `a0b616c`:
+/// reversing the ordering put the dir at `/tmp/.tmpz5pszS` while the root was
+/// `/var/tmp/dad-e2e-1000/dad-tests-…`, in all 13 fast-tier binaries.
+///
+/// Retrofitting that with a lazy global was the mistake. This calls
+/// [`harness_temp_root`] *first* and then allocates inside the value it returns,
+/// so containment is by construction rather than by ordering. The redirect stays
+/// installed as defence in depth for allocations the suite does not make itself;
+/// `linkage-check` rule 8 is what keeps bare constructors from coming back.
+///
+/// Returns `io::Result` rather than panicking so it substitutes for
+/// `harness_tempdir()` at a call site without disturbing its `.expect(…)`.
+#[allow(dead_code)]
+pub fn harness_tempdir() -> std::io::Result<tempfile::TempDir> {
+    let dir = tempfile::Builder::new().tempdir_in(harness_temp_root())?;
     harden_dir_0700(dir.path());
-    dir
+    Ok(dir)
+}
+
+/// The single-*file* counterpart of [`harness_tempdir`], and correct for the
+/// same reason: it resolves [`harness_temp_root`] before it allocates.
+///
+/// `tempfile::NamedTempFile::new()` is a bare constructor exactly like
+/// `tempfile::tempdir()` — it lands in the OS temp dir when it is the process's
+/// first allocation — but rule 8 did not match it, so it sat inside the rule's
+/// own scope unnoticed. Measured on `5e8e0ed`: the Codex-auth pre-flight
+/// created four zero-byte `/tmp/.tmp*` files, because the pre-flight can run
+/// before anything has asked the harness for a directory. Zero bytes is not the
+/// point — an asserted guarantee that a measurement disproves is.
+///
+/// `NamedTempFile` already creates its file 0600, so there is no mode to
+/// re-apply the way [`harden_dir_0700`] does for a directory.
+#[allow(dead_code)]
+pub fn harness_tempfile() -> std::io::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new().tempfile_in(harness_temp_root())
 }
 
 /// Re-apply 0o700 to a harness-created directory.
@@ -3350,16 +3784,1163 @@ fn harden_dir_0700(path: &Path) {
 
 static HARNESS_TEMP_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
+// --- Where the root lives ---------------------------------------------------
+//
+// It used to be `std::env::temp_dir()`, i.e. `/tmp`. On this repo's dev box
+// `/tmp` is a 14 GB *tmpfs*, so every ~280 MB per-test root is resident RAM,
+// and a run that never reaches its cleanup hook holds that RAM until a human
+// notices: 280 leaked roots / 6.2 GB in four hours, with swap down to 5 MiB
+// free; reaping them handed back 3.8 GiB of swap. The visible symptom is not
+// "out of space" but dozens of unrelated-looking failures — `dispatch_013` went
+// 122s FAIL -> PASS in 8.9s with nothing changed but the temp location.
+//
+// The default is therefore `/var/tmp/dad-e2e-<uid>`. `/var/tmp` is short, and
+// the FHS requires it to survive reboots, so a compliant system does not back
+// it with a tmpfs.
+//
+// Two things this deliberately does NOT do.
+//
+// It does not put temp dirs under the repo's own `target/`. That was the first
+// attempt at this fix and it is worse than it looks: every fixture the harness
+// seeds would then be a *descendant of the real checkout*, which carries
+// `CLAUDE.md`, `AGENTS.md`, `.claude/` and `.agents/`. Real agents walk
+// ancestors and would discover genuine project instructions and skills; the
+// real Codex worker runs `workspace-write` from such a directory, so a test's
+// effective writable workspace could be the live repo. A nested `git init` does
+// not close that — a git root is not a filesystem boundary, and several
+// real-agent tests (`e2e_delegate_work_done_chain`, `e2e_pi_worker`,
+// `e2e_codex_worker`, `e2e_pi_orchestrator`) call `race_safe_tempdir()`
+// directly with no `git init` anywhere near them. Anyone who genuinely wants a
+// target-local base can point `DAD_E2E_TMPDIR` at one explicitly.
+//
+// It also does not put the roots directly in `/var/tmp`, which is mode 1777 —
+// world-writable, sticky, shared system-wide. Everything nests inside a 0700
+// parent scoped to the effective UID, so nothing under it can belong to another
+// user *by construction*. That is what lets the reaper decide what is safe to
+// delete without inspecting ownership per directory, and it bounds the exposure
+// of the real agent credentials the harness copies into seeded HOMEs (#358) to
+// this user even though `/var/tmp` survives a reboot.
+//
+// The one thing that can veto a candidate is *path length*. These directories
+// hold Unix domain sockets, and `sockaddr_un::sun_path` caps at 108 bytes on
+// Linux (104 on macOS/BSD). Where `/tmp` costs 4 characters, a
+// `<worktree>/target/tmp` cost 60+, and this repo's own worktree scheme
+// (`../<repo>-<suffix>`, used by `/worktree-prd` and `/verify-pr`) reaches that
+// easily — measured in `dot-agent-deck-dispatch-tmpfs-322`, an `attach.sock` at
+// the harness's usual depth is 115 bytes and `bind(2)` fails outright with
+// `AF_UNIX path too long`. `/var/tmp/dad-e2e-1000` is 21 bytes and leaves 34 to
+// spare against the budget below.
+
+/// Explicit override for the harness temp base. Wins over every other
+/// candidate, *including* the socket-length veto: pointing it somewhere too
+/// deep is your call, so it warns rather than silently relocating. It is still
+/// validated first — see [`validated_override_base`] — and a value that fails
+/// validation is fatal rather than ignored ([`refused_override_message`]).
+const TEMP_BASE_ENV: &str = "DAD_E2E_TMPDIR";
+
+/// The shared, world-writable directory the private parent is created in.
+/// Unix-only: `/var/tmp` is an FHS path and means nothing on Windows.
+const SHARED_VAR_TMP: &str = "/var/tmp";
+
+/// Name of the private, UID-scoped parent created inside [`SHARED_VAR_TMP`].
+///
+/// Deliberately short — it is charged against the socket budget below on every
+/// bind. `dad-e2e-1000` brings the base to 21 bytes; even a 10-digit UID only
+/// reaches 27, against a 55-byte allowance.
+fn private_parent_name(uid: u32) -> String {
+    format!("dad-e2e-{uid}")
+}
+
+/// Usable bytes in `sockaddr_un::sun_path`, excluding the NUL terminator.
+/// Linux allows 108 bytes (107 usable), macOS/BSD 104 (103). The smaller figure
+/// is used everywhere so a layout that binds on Linux cannot fail on a Mac.
+const SUN_PATH_USABLE: usize = 103;
+
+/// Worst case the harness appends to its base before **binding** a socket:
+///
+/// | segment | bytes | |
+/// |---|---|---|
+/// | `/dad-tests-<pid>-<rand6>` | 25 | 7-digit PID; Linux's default `pid_max` is 4194304 |
+/// | `/.tmp<rand6>` | 11 | the per-test dir `race_safe_tempdir` (and, since the redirect in [`harness_temp_root`], a bare `harness_tempdir()`) allocates |
+/// | `/attach.sock` | 12 | longest socket name the harness *binds* — `hook.sock` and the scripted `daemon.sock` are shorter |
+///
+/// **Bound endpoints only.** `tests/e2e_delegate_work_done_chain.rs` composes a
+/// `no-listener.sock` — 17 bytes with its separator, 5 over this budget — that
+/// is deliberately never bound and only ever sent to in the expectation that
+/// the send is a no-op, so an `AF_UNIX path too long` there is indistinguishable
+/// from the `ECONNREFUSED` the test is actually asserting. Any *new* endpoint
+/// that gets bound must fit this budget or the constant has to move with it;
+/// `socket_budget_*` below is what fails if it does not.
+const HARNESS_SOCKET_OVERHEAD: usize = 48;
+
+/// Longest base that still leaves room for a bound socket underneath it.
+const MAX_TEMP_BASE_LEN: usize = SUN_PATH_USABLE - HARNESS_SOCKET_OVERHEAD;
+
+/// Whether a Unix socket bound under `base` still fits in `sun_path`.
+fn fits_socket_budget(base: &Path) -> bool {
+    base.as_os_str().len() <= MAX_TEMP_BASE_LEN
+}
+
+/// The chosen temp base, plus any explanation of why a preferred candidate was
+/// passed over. Warnings are printed once per test process, never fatal.
+struct TempBaseChoice {
+    path: PathBuf,
+    warnings: Vec<String>,
+}
+
+/// Pure decision half of [`harness_temp_base`] — no filesystem access, so the
+/// precedence can be unit-tested with injected paths. Both candidates arrive
+/// already validated (the override) or already created and verified (the
+/// private parent); this function only orders them.
+///
+/// Precedence, highest first:
+///
+/// 1. `DAD_E2E_TMPDIR`, once validated. An explicit choice is not
+///    second-guessed on length — it warns and is honoured.
+/// 2. `/var/tmp/dad-e2e-<uid>` — the default. Short, disk-backed, and private
+///    to this user by construction. `None` when there is no such rung at all:
+///    a non-Unix platform, no `/var/tmp`, or a parent that genuinely could not
+///    be created. A parent that *exists* and fails verification never reaches
+///    here — that is fatal, see [`PrivateParentProblem`].
+/// 3. `std::env::temp_dir()` (i.e. `TMPDIR`, else `/tmp`) — last resort, and
+///    the one outcome that can put the suite back on a RAM-backed filesystem,
+///    so it always warns.
+fn choose_temp_base(
+    env_override: Option<&Path>,
+    private_parent: Option<&Path>,
+    system_tmp: &Path,
+) -> TempBaseChoice {
+    if let Some(explicit) = env_override {
+        let warnings = Vec::from_iter((!fits_socket_budget(explicit)).then(|| {
+            format!(
+                "{TEMP_BASE_ENV}={} leaves no room for a Unix socket path \
+                 (needs {} bytes, budget {SUN_PATH_USABLE}); expect \
+                 `AF_UNIX path too long`.",
+                explicit.display(),
+                explicit.as_os_str().len() + HARNESS_SOCKET_OVERHEAD,
+            )
+        }));
+        return TempBaseChoice {
+            path: explicit.to_path_buf(),
+            warnings,
+        };
+    }
+    let reason = match private_parent {
+        Some(parent) if fits_socket_budget(parent) => {
+            return TempBaseChoice {
+                path: parent.to_path_buf(),
+                warnings: Vec::new(),
+            };
+        }
+        Some(parent) => format!(
+            "{} would need {} bytes for a Unix socket path and the budget is \
+             {SUN_PATH_USABLE}",
+            parent.display(),
+            parent.as_os_str().len() + HARNESS_SOCKET_OVERHEAD,
+        ),
+        None => format!("no private parent under {SHARED_VAR_TMP} is available"),
+    };
+    TempBaseChoice {
+        path: system_tmp.to_path_buf(),
+        warnings: vec![format!(
+            "harness temp dirs fall back to {} — {reason}. If that is a tmpfs \
+             this is exactly what issue #322 is about: point {TEMP_BASE_ENV} at \
+             a short, disk-backed directory you own.",
+            system_tmp.display(),
+        )],
+    }
+}
+
+/// This process's effective UID — the identity every harness-created directory
+/// must be owned by.
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments, always succeeds, and cannot fail or
+    // touch memory this process owns.
+    unsafe { libc::geteuid() }
+}
+
+/// Create `path` (and any missing ancestor) owner-only.
+///
+/// `DirBuilder` applies the mode in the `mkdir(2)` that publishes each entry,
+/// and a umask can only clear bits and never add them, so no component is ever
+/// visible at the umask default even briefly — which is the window §3 of the
+/// audit is about. `recursive(true)` is a no-op on a component that already
+/// exists, so this is create-or-adopt; verifying an adopted directory is the
+/// caller's job.
+fn create_dir_private(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
+/// Why a directory the harness intends to own is not safe to adopt: it must be
+/// ours and **exactly** `0o700`. Pure, so the rule can be unit-tested without
+/// manufacturing foreign-owned directories.
+///
+/// The exactness is deliberate and was not always here. Testing only
+/// `mode & 0o077 == 0` — "no group or other bits" — accepts `0o500`, `0o300`,
+/// `0o000` and `0o1700` as well, while every diagnostic, the docs and
+/// [`refused_private_parent_message`] all say `0o700`. Confidentiality was never
+/// the gap (`mkdir(2)` applies the mode and a umask can only clear bits, so
+/// there is no group-visible window either way); the gap was that a pre-existing
+/// `0o500` parent sailed through the pre-flight whose entire job is to name the
+/// problem up front, and then failed later as a bare `Permission denied` from
+/// somewhere deep inside a test. So the check now enforces what it claims, and
+/// the message names the one *innocent* way a directory the harness created can
+/// land here — a umask clearing owner bits.
+#[cfg(unix)]
+fn private_dir_objection(uid: u32, mode: u32, euid: u32) -> Option<String> {
+    if uid != euid {
+        return Some(format!("owned by uid {uid}, not {euid}"));
+    }
+    if mode & 0o7777 != 0o700 {
+        return Some(format!(
+            "mode is 0o{mode:o}, not the 0o700 the harness requires: {}",
+            if mode & 0o077 != 0 {
+                "group/other bits would expose the real agent credentials seeded \
+                 under it — `chmod 700` it, or point DAD_E2E_TMPDIR elsewhere"
+            } else {
+                "the group/other bits are clear but the OWNER bits are not \
+                 rwx. If the harness created this directory, the cause is a \
+                 umask clearing owner bits (`umask 0200` yields 0o500) — check \
+                 `umask`, then `chmod 700` it"
+            },
+        ));
+    }
+    None
+}
+
+/// Why a directory on the way to an explicit override is not safe to traverse.
+///
+/// Laxer than [`private_dir_objection`] on purpose: `/`, `/home` and `/var` are
+/// root-owned and world-readable, so demanding sole ownership would reject every
+/// real path. What matters is that no *other* unprivileged user can rename or
+/// replace the component underneath us, which is what a world-writable
+/// directory without the sticky bit allows. Sticky 1777 directories (`/tmp`,
+/// `/var/tmp`) are accepted: the sticky bit is precisely the guarantee that only
+/// an entry's owner may remove or rename it, which closes the swap window.
+#[cfg(unix)]
+fn traversal_objection(uid: u32, mode: u32, euid: u32) -> Option<String> {
+    if uid != euid && uid != 0 {
+        return Some(format!("owned by uid {uid}, neither {euid} nor root"));
+    }
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Some(format!(
+            "mode is 0o{mode:o} — group/world-writable without the sticky bit"
+        ));
+    }
+    None
+}
+
+/// Which rule one directory in a candidate chain is judged by.
+///
+/// Ancestors of the base are ordinary system directories — `/`, `/var`, sticky
+/// `/var/tmp`, somebody's `$HOME` — so they are judged by
+/// [`traversal_objection`]: root-owned and sticky are normal, what matters is
+/// that no *other* unprivileged user can rename or replace them underneath us.
+/// The base itself, and every directory the harness creates or adopts on the way
+/// down to it, is where the harness puts its own credential-bearing state, so it
+/// is judged by [`private_dir_objection`] — ours, with no group or other bits at
+/// all, the same bar the default `/var/tmp/dad-e2e-<uid>` parent has to meet.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum ChainRole {
+    Ancestor,
+    Ours,
+}
+
+/// How every directory in the walk below is opened: one component at a time,
+/// relative to an already-open parent, never following a symlink at the end.
+///
+/// `O_PATH` where the platform has it, because it needs only *search* permission
+/// on the directory — exactly what the `stat` walk this replaces needed. An
+/// ancestor that is traversable but not readable (`/home` at 0711 is a real
+/// configuration) must not turn into a refusal just because the check got
+/// stricter about *when* it looks. Elsewhere `O_RDONLY` is the portable
+/// spelling.
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+const DIR_HANDLE_FLAGS: libc::c_int =
+    libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const DIR_HANDLE_FLAGS: libc::c_int =
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+/// One path component as a C string, for the `*at` calls below.
+#[cfg(unix)]
+fn component_name(name: &std::ffi::OsStr) -> Result<std::ffi::CString, String> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| format!("{} contains a NUL byte", Path::new(name).display()))
+}
+
+/// `openat(2)` a single component below `parent` — or an absolute path, when
+/// `parent` is `None` — without following a symlink at the end of it.
+///
+/// Returning the descriptor rather than the name is the whole point: a
+/// descriptor names an *inode*, so once it is open the entry it came from cannot
+/// be renamed or replaced underneath the next step, and the permission check
+/// runs against the very object the next `openat` resolves from. A `stat` of a
+/// path followed by a *use* of that same path is two lookups, and anything with
+/// write access to a component can swap what the second one finds.
+#[cfg(unix)]
+fn open_dir_nofollow(
+    parent: Option<&std::fs::File>,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::io::FromRawFd;
+    let dirfd = parent.map_or(libc::AT_FDCWD, |dir| dir.as_raw_fd());
+    // SAFETY: `name` is NUL-terminated and outlives the call, which only reads
+    // it; `dirfd` is either `AT_FDCWD` or a descriptor owned by the live `File`
+    // borrowed above.
+    let fd = unsafe { libc::openat(dirfd, name.as_ptr(), DIR_HANDLE_FLAGS) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh descriptor this call owns and hands over exactly
+    // once, so the `File` is its sole owner.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// `mkdirat(2)` a single component below `parent`, owner-only.
+///
+/// Deliberately *not* `create_dir_all` semantics: this fails with `EEXIST`
+/// rather than accepting whatever already occupies the name, which is what lets
+/// the caller judge an entry that appeared in the meantime instead of adopting
+/// it sight unseen. The mode is applied by `mkdir(2)` itself and a umask can
+/// only clear bits, so the directory is never visible at anything looser, even
+/// briefly.
+#[cfg(unix)]
+fn mkdir_owner_only_at(parent: &std::fs::File, name: &std::ffi::CStr) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: as in `open_dir_nofollow` — a live directory descriptor and a
+    // NUL-terminated name the call only reads.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Judge an already-open directory by `fstat(2)` **on its descriptor** — never
+/// by a second lookup of its name, which is exactly the window this avoids.
+#[cfg(unix)]
+fn open_dir_objection(dir: &std::fs::File, role: ChainRole, euid: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    let meta = match dir.metadata() {
+        Ok(meta) => meta,
+        Err(e) => return Some(format!("cannot be stat'ed: {e}")),
+    };
+    let mode = meta.permissions().mode() & 0o7777;
+    match role {
+        ChainRole::Ancestor => traversal_objection(meta.uid(), mode, euid),
+        ChainRole::Ours => private_dir_objection(meta.uid(), mode, euid),
+    }
+}
+
+/// Word an `openat` failure. The refusal has already happened — in the kernel,
+/// because `O_NOFOLLOW | O_DIRECTORY` would not open the entry — so the extra
+/// look this takes to distinguish a symlink from a plain file decides nothing
+/// but the message. (`O_NOFOLLOW` reports a symlink as `ELOOP`, except under
+/// `O_PATH`, where `O_DIRECTORY` rejects it as `ENOTDIR` instead.)
+#[cfg(unix)]
+fn unopenable_component_message(path: &Path, e: &std::io::Error) -> String {
+    let is_symlink =
+        || std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
+    match e.raw_os_error() {
+        Some(libc::ELOOP) => format!("{} is a symlink", path.display()),
+        Some(libc::ENOTDIR) if is_symlink() => format!("{} is a symlink", path.display()),
+        Some(libc::ENOTDIR) => format!("{} is not a directory", path.display()),
+        _ => format!("cannot open {}: {e}", path.display()),
+    }
+}
+
+/// Open one component below `parent` and judge what came back, appending it to
+/// `walked` so every message names the path as far as it got.
+#[cfg(unix)]
+fn descend_into(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    walked: &mut PathBuf,
+    role: ChainRole,
+    euid: u32,
+) -> Result<std::fs::File, String> {
+    let c_name = component_name(name)?;
+    walked.push(name);
+    let dir = open_dir_nofollow(Some(parent), &c_name)
+        .map_err(|e| unopenable_component_message(walked, &e))?;
+    match open_dir_objection(&dir, role, euid) {
+        Some(why) => Err(format!("{} — {why}", walked.display())),
+        None => Ok(dir),
+    }
+}
+
+/// Create one component of the base below `parent`, or adopt what is already
+/// there — and judge what was *actually* got, on its descriptor, either way.
+///
+/// This is the answer to the adoption race: a component that was missing when
+/// the path was resolved can be created by another local user before the harness
+/// reaches it, and a recursive create would then adopt their directory (or their
+/// symlink) without ever looking at it. `mkdirat(2)` fails with `EEXIST` instead,
+/// and `EEXIST` is not treated as success — it falls through to the same
+/// open-and-judge a freshly created directory gets, under the strict
+/// [`ChainRole::Ours`] rule. Whoever won the race, what the harness ends up
+/// holding is a directory it has validated at the moment it adopted it.
+#[cfg(unix)]
+fn create_or_adopt_component(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    walked: &mut PathBuf,
+    euid: u32,
+) -> Result<std::fs::File, String> {
+    let c_name = component_name(name)?;
+    match mkdir_owner_only_at(parent, &c_name) {
+        Ok(()) => {}
+        // Somebody got there first — us on an earlier run, or someone else.
+        // Which of those it was is decided by the judgement below, not here.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            walked.push(name);
+            return Err(format!("cannot create {}: {e}", walked.display()));
+        }
+    }
+    descend_into(parent, name, walked, ChainRole::Ours, euid)
+}
+
+/// Why a **symlink** on the way to the base must not be followed.
+///
+/// Pure, so the rule can be unit-tested with injected owners — the dangerous
+/// shape is a link owned by *another* user, and `chown` is privileged, so it
+/// cannot be built on disk by an unprivileged test.
+///
+/// A symlink is the one entry in the chain whose own permission bits decide
+/// nothing: Linux fixes them at 0o777 and never consults them. Its **owner** is
+/// the whole question, and it is only answerable at all because the parent this
+/// link was found in has already passed [`traversal_objection`] — no other
+/// unprivileged user could have replaced the parent itself.
+///
+/// Root is accepted because macOS's own `/var -> private/var` is exactly that,
+/// and refusing it would reject the platform. Anyone else is refused: in a
+/// sticky 1777 directory (`/tmp`, `/var/tmp`) another local user may *create*
+/// entries freely, and the sticky bit then works against us — it stops the
+/// victim removing or renaming the planted link. See
+/// [`walk_to_validated_base`].
+#[cfg(unix)]
+fn symlink_hop_objection(path: &Path, uid: u32, euid: u32) -> Option<String> {
+    (uid != euid && uid != 0).then(|| {
+        format!(
+            "{} is a symlink owned by uid {uid}, neither {euid} nor root — \
+             another local user could have planted it to redirect the harness",
+            path.display(),
+        )
+    })
+}
+
+/// Read a symlink's owner and target **relative to an already-open parent**,
+/// without following it. `None` when the entry is not a symlink at all.
+///
+/// `fstatat`/`readlinkat` against the parent descriptor rather than
+/// `symlink_metadata`/`read_link` of a path: the parent is pinned to an inode
+/// the walk has already judged, so nothing above this entry can be swapped
+/// between the judgement and the read.
+#[cfg(unix)]
+fn read_link_at(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<Option<(u32, PathBuf)>> {
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::io::AsRawFd;
+    let dirfd = parent.as_raw_fd();
+    // SAFETY: `st` is a correctly-sized, zeroed `stat` the call fills in;
+    // `name` is NUL-terminated and only read; `dirfd` is owned by the live
+    // `File` borrowed above.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFLNK {
+        return Ok(None);
+    }
+    // `st_size` is the target length for a symlink, but it is a hint, not a
+    // contract (procfs reports 0), so the buffer grows until the result is
+    // provably not truncated.
+    let mut cap = if st.st_size > 0 {
+        st.st_size as usize + 1
+    } else {
+        libc::PATH_MAX as usize
+    };
+    loop {
+        let mut buf = vec![0u8; cap];
+        // SAFETY: `buf` is `cap` writable bytes and the call writes at most
+        // that many; it never NUL-terminates, hence the truncation check.
+        let n = unsafe {
+            libc::readlinkat(
+                dirfd,
+                name.as_ptr(),
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                cap,
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let n = n as usize;
+        if n < cap {
+            buf.truncate(n);
+            return Ok(Some((
+                st.st_uid,
+                PathBuf::from(std::ffi::OsString::from_vec(buf)),
+            )));
+        }
+        cap *= 2;
+    }
+}
+
+/// How many symlinks the walk below will follow before giving up, mirroring the
+/// kernel's own `ELOOP` cap. A cycle of links the harness itself resolves would
+/// otherwise spin forever where `canonicalize` used to return `ELOOP`.
+#[cfg(unix)]
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// Structural objections to an override value, before anything is stat'ed.
+/// Pure — no filesystem access.
+///
+/// A relative value would resolve against whatever working directory the test
+/// binary happens to have, and `..` silently widens the scope of everything
+/// downstream (the reaper included), so both are refused rather than normalised.
+/// `.` and repeated separators are *not* refused: `Path::components` drops them,
+/// and [`validated_override_base`] returns that normalized form, so they cannot
+/// reach anything downstream in the first place.
+fn override_shape_objection(raw: &Path) -> Option<String> {
+    use std::path::Component;
+    if !raw.is_absolute() {
+        return Some(format!("{} is not an absolute path", raw.display()));
+    }
+    raw.components()
+        .any(|c| c == Component::ParentDir)
+        .then(|| format!("{} contains a `..` component", raw.display()))
+}
+
+/// Walk `raw` from `/` one component at a time, validating **before** resolving,
+/// and return the descriptor the walk finished on plus the resolved spelling.
+///
+/// The ordering is the whole point, and it is what the first cut of this got
+/// wrong. That version handed the value to `canonicalize` first and only then
+/// walked the *result* with descriptors — so a symlink somebody else had planted
+/// at a component was resolved away before its owner was ever looked at, and the
+/// checkout (or tmpfs) it pointed to was then walked as a chain of perfectly
+/// ordinary victim-owned ancestors and accepted. The sticky bit does not save
+/// you there: sticky stops another user *removing or renaming* an entry, so on
+/// `/var/tmp` it protects the attacker's pre-planted link from the person it
+/// redirects. Accepting a sticky 1777 directory is only sound when the entry
+/// found *below* it is judged, which is what this does.
+///
+/// So, per component:
+///
+/// - `openat(O_NOFOLLOW | O_DIRECTORY)` — a real directory is judged by `fstat`
+///   **on that descriptor**, never by a second lookup of its name, so nothing is
+///   adopted on the strength of an earlier `stat`. Ancestors must not be
+///   replaceable by another unprivileged user ([`traversal_objection`]); the
+///   base, and every component created on the way down to it, must be ours with
+///   no group or other bits ([`private_dir_objection`]).
+/// - Nothing there — `mkdirat`, which *fails* rather than adopting an entry that
+///   appeared in between; `EEXIST` is judged, not trusted
+///   ([`create_or_adopt_component`]).
+/// - A symlink — inspected without following: only a link owned by root or by us
+///   is resolved ([`symlink_hop_objection`]), and only then are its own
+///   components pushed onto the front of the walk and traversed through
+///   descriptors like any others. macOS's root-owned `/var -> private/var` still
+///   works; an attacker-owned link in a sticky directory does not.
+///
+/// A `..` inside a *link target* is refused rather than resolved. Walking one
+/// would mean stepping back above a component this function has already proved
+/// safe, and no real system link the harness needs (macOS's `/var` included)
+/// contains one.
+#[cfg(unix)]
+fn walk_to_validated_base(raw: &Path, euid: u32) -> Result<(std::fs::File, PathBuf), String> {
+    use std::collections::VecDeque;
+    use std::path::Component;
+
+    let root = component_name(std::ffi::OsStr::new("/"))?;
+    let mut walked = PathBuf::from("/");
+    let mut dir =
+        open_dir_nofollow(None, &root).map_err(|e| unopenable_component_message(&walked, &e))?;
+
+    // `override_shape_objection` has already refused `..`, and `components()`
+    // drops `.` and repeated separators, so what is left after the leading
+    // `RootDir` is nothing but `Normal`.
+    let mut pending: VecDeque<std::ffi::OsString> = raw
+        .components()
+        .skip(1)
+        .map(|c| c.as_os_str().to_os_string())
+        .collect();
+    let mut hops = 0usize;
+
+    while let Some(name) = pending.pop_front() {
+        // The base is whatever component the walk ends on — which a symlink
+        // expansion can move, so it is read off the queue rather than an index.
+        let is_base = pending.is_empty();
+        let role = if is_base {
+            ChainRole::Ours
+        } else {
+            ChainRole::Ancestor
+        };
+        let c_name = component_name(&name)?;
+        match open_dir_nofollow(Some(&dir), &c_name) {
+            // An ordinary directory.
+            Ok(opened) => {
+                walked.push(&name);
+                if let Some(why) = open_dir_objection(&opened, role, euid) {
+                    return Err(format!("{} — {why}", walked.display()));
+                }
+                dir = opened;
+            }
+            // Nothing there — the harness makes it, strictly, and everything
+            // below it likewise.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                dir = create_or_adopt_component(&dir, &name, &mut walked, euid)?;
+            }
+            // Something the kernel would not open no-follow. A symlink is the
+            // one shape that is not automatically fatal — it is judged, and if
+            // it is ours or root's it is expanded onto the walk.
+            Err(e) => {
+                let probed = walked.join(&name);
+                let link = read_link_at(&dir, &c_name)
+                    .map_err(|e| format!("cannot stat {}: {e}", probed.display()))?;
+                let Some((uid, target)) = link else {
+                    return Err(unopenable_component_message(&probed, &e));
+                };
+                if let Some(why) = symlink_hop_objection(&probed, uid, euid) {
+                    return Err(why);
+                }
+                hops += 1;
+                if hops > MAX_SYMLINK_HOPS {
+                    return Err(format!(
+                        "{} resolves through more than {MAX_SYMLINK_HOPS} symlinks",
+                        raw.display(),
+                    ));
+                }
+                if target.components().any(|c| c == Component::ParentDir) {
+                    return Err(format!(
+                        "{} is a symlink to {}, which contains a `..` component",
+                        probed.display(),
+                        target.display(),
+                    ));
+                }
+                // An absolute target restarts the walk at `/`; a relative one
+                // continues from the directory the link was found in. Either
+                // way the target's own components go through this same loop, so
+                // a link chain is validated hop by hop.
+                if target.is_absolute() {
+                    walked = PathBuf::from("/");
+                    dir = open_dir_nofollow(None, &root)
+                        .map_err(|e| unopenable_component_message(&walked, &e))?;
+                }
+                for component in target.components().rev() {
+                    if let Component::Normal(part) = component {
+                        pending.push_front(part.to_os_string());
+                    }
+                }
+                // A link to `/` alone leaves nothing to walk; the root
+                // descriptor is already open and is the answer.
+                if pending.is_empty() {
+                    return Ok((dir, walked));
+                }
+            }
+        }
+    }
+    Ok((dir, walked))
+}
+
+/// Validate `DAD_E2E_TMPDIR` and return the base to use.
+///
+/// Absolute and traversal-free (checked above), then walked from `/` by
+/// [`walk_to_validated_base`] — validating each component before resolving it,
+/// with descriptor-relative no-follow opens throughout.
+///
+/// Two things this deliberately does not claim. The descriptors are dropped when
+/// it returns, so what the caller gets is a *validated path*, not a pinned
+/// handle: every later use resolves the name again. What makes that safe is the
+/// property proved on the way down — every ancestor is owned by us or by root
+/// and is not writable by others except under the sticky bit, where only an
+/// entry's own owner may rename or remove it, and every symlink among them was
+/// owned by us or by root. And the returned path is the resolved one, so a
+/// symlink the operator pointed at is followed exactly once, here, and never
+/// again downstream.
+#[cfg(unix)]
+fn validated_override_base(raw: &Path) -> Result<PathBuf, String> {
+    if let Some(why) = override_shape_objection(raw) {
+        return Err(why);
+    }
+    let euid = effective_uid();
+    let (dir, walked) = walk_to_validated_base(raw, euid)?;
+    // The base itself, once the chain is complete — the check that has to hold
+    // at the moment of *use*, whether the directory was just created, was
+    // adopted, or was already there when the walk started. The loop already
+    // judged the final component under `ChainRole::Ours`; re-reading the same
+    // descriptor is what makes that true of the value being *returned*, not
+    // merely of a component that happened to be last.
+    if let Some(why) = open_dir_objection(&dir, ChainRole::Ours, euid) {
+        return Err(format!("{} — {why}", walked.display()));
+    }
+    Ok(walked)
+}
+
+/// Whether an entry carries the Windows reparse-point attribute at all.
+///
+/// Broader on purpose than `FileType::is_symlink`, which on Windows is true only
+/// for the two tags `std` classifies as links (`IO_REPARSE_TAG_SYMLINK` and
+/// `IO_REPARSE_TAG_MOUNT_POINT`, i.e. junctions). Other tags also redirect —
+/// cloud-file placeholders, `AppExecLink`, an app-execution alias — and the
+/// harness has no business writing credentials through any of them. The
+/// attribute bit itself is reachable from `std` via `MetadataExt`, so this costs
+/// no new dependency; the ACL half of the same question is not, and is #163/#164.
+#[cfg(windows)]
+fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    /// `FILE_ATTRIBUTE_REPARSE_POINT`, spelled out rather than pulled in from
+    /// `windows-sys` — one documented constant is not worth a dependency on a
+    /// platform whose e2e tier does not run yet.
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// Elsewhere there is no such attribute, and `is_symlink` already answers the
+/// whole question.
+#[cfg(not(windows))]
+fn is_reparse_point(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// Pure decision half of the by-name walk below: `Some(why)` when an entry with
+/// these observed properties must be refused, `None` when it is an ordinary
+/// directory the harness may walk through or use.
+///
+/// Taking the flags rather than a `Metadata` is what makes the reparse-point
+/// rule testable at all — that shape only exists on Windows, and the Windows
+/// arm cannot be exercised from the Unix host this suite runs on.
+fn chain_entry_verdict(
+    path: &Path,
+    is_symlink: bool,
+    is_reparse_point: bool,
+    is_dir: bool,
+) -> Option<String> {
+    if is_symlink {
+        return Some(format!("{} is a symlink", path.display()));
+    }
+    if is_reparse_point {
+        return Some(format!("{} is a reparse point", path.display()));
+    }
+    (!is_dir).then(|| format!("{} is not a directory", path.display()))
+}
+
+/// Judge one `symlink_metadata` reading through [`chain_entry_verdict`].
+fn chain_entry_verdict_for(path: &Path, meta: &std::fs::Metadata) -> Option<String> {
+    chain_entry_verdict(
+        path,
+        meta.file_type().is_symlink(),
+        is_reparse_point(meta),
+        meta.is_dir(),
+    )
+}
+
+/// Filesystem-facing adapter over [`chain_entry_verdict`]: stat `path` and judge
+/// what came back. A missing entry is a refusal too — every caller reaches this
+/// only for something that is supposed to be there by then.
+fn chain_entry_objection(path: &Path) -> Option<String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => chain_entry_verdict_for(path, &meta),
+        Err(e) => Some(format!("cannot stat {}: {e}", path.display())),
+    }
+}
+
+/// Create one component of a by-name chain, or judge what is already there —
+/// never adopt it sight unseen.
+///
+/// `create_dir` rather than `create_dir_all` is the whole point, and it is the
+/// portable half of what `mkdirat` does for [`create_or_adopt_component`]: it
+/// fails with `AlreadyExists` instead of accepting whatever occupies the name,
+/// so an entry another local user planted between the walk and this moment is
+/// *looked at* rather than used. Windows reports `ERROR_ALREADY_EXISTS` for a
+/// file, a directory, a junction and a symlink alike, so every shape an attacker
+/// could leave arrives here and is judged.
+fn create_or_refuse_component(path: &Path) -> Result<(), String> {
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        // Somebody got there first — an earlier run, or someone else. Which of
+        // those it was is not answerable by name alone; what *is* answerable is
+        // whether the entry redirects somewhere, and that is refused.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            chain_entry_objection(path).map_or(Ok(()), Err)
+        }
+        Err(e) => Err(format!("cannot create {}: {e}", path.display())),
+    }
+}
+
+/// The by-name equivalent of [`validated_override_base`]'s descriptor walk, for
+/// platforms where `std` offers no `openat`.
+///
+/// Kept free of `cfg` so it compiles — and is unit-tested — on the Unix host
+/// this suite actually runs on, even though only the `#[cfg(not(unix))]` arm
+/// calls it. The logic is plain `std::fs`, so what a Linux test observes here is
+/// what Windows executes; the two Windows-only pieces are the reparse-point
+/// attribute (pinned separately through [`chain_entry_verdict`]) and the exact
+/// error codes `CreateDirectoryW` returns.
+///
+/// **What this closes.** Nothing is adopted silently any more: every component,
+/// existing or created, is stat'ed with `symlink_metadata` and refused if it is
+/// a symlink, a junction, any other reparse point, or not a directory. That is
+/// the redirection Greptile's finding names — a pre-planted entry at a missing
+/// component aiming the credential-bearing harness tree at storage somebody else
+/// chose.
+///
+/// Unlike the Unix arm, a symlinked **ancestor** is refused rather than resolved
+/// — the behaviour this arm already had. Resolving is a concession the Unix side
+/// has to make because macOS's own `/var` is a symlink to `/private/var`, so
+/// refusing it rejected the platform; Windows has no such component on a healthy
+/// machine, and `canonicalize` there returns a `\\?\` verbatim path that would
+/// then be the spelling every downstream message and length budget used. Strict
+/// is both simpler and safer here.
+///
+/// **What it does not close, and cannot from `std`.** Three things, stated
+/// plainly rather than implied:
+///
+/// 1. The judgement is a **second lookup of the name**, not an `fstat` of the
+///    descriptor the entry was opened with. Between the `AlreadyExists` and the
+///    `symlink_metadata` — and again between that and every later use — the name
+///    can be swapped. The window is narrowed, not removed.
+/// 2. There is **no ownership check**. A plain directory another local user
+///    planted at a missing component is still adopted, because Windows ACLs are
+///    not reachable from `std` and there is no `uid` to compare. Redirection is
+///    refused; a co-located directory owned by somebody else is not detected.
+/// 3. Directories are created with **inherited ACLs**, not the 0700 equivalent
+///    `mkdir(2)` gives the Unix arm, so a permissive parent stays permissive.
+///
+/// All three are the ACL-and-handle work tracked by #163/#164. Deliberately not
+/// fixed here with `windows-sys`: that is a real dependency decision for a
+/// platform whose L2 tier does not run yet.
+fn override_base_by_name(raw: &Path) -> Result<PathBuf, String> {
+    if let Some(why) = override_shape_objection(raw) {
+        return Err(why);
+    }
+    // Normalized, so nothing downstream — the socket-length budget included —
+    // sees a spelling the filesystem does not.
+    let normalized: PathBuf = raw.components().collect();
+    let mut walked = PathBuf::new();
+    for component in normalized.components() {
+        walked.push(component);
+        // The anchor — `/`, a drive root, a UNC share — is not something the
+        // harness can create or could meaningfully judge, and `CreateDirectoryW`
+        // on a drive root reports access denied rather than "already exists", so
+        // trying would fail every Windows path. `components()` yields these
+        // first and nothing but `Normal` after, so the skip is exact.
+        if !matches!(component, std::path::Component::Normal(_)) {
+            continue;
+        }
+        let existing = match std::fs::symlink_metadata(&walked) {
+            Ok(meta) => Some(meta),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("cannot stat {}: {e}", walked.display())),
+        };
+        match existing {
+            // Already there: judged, never created over. Attempting a create on
+            // every existing ancestor would buy nothing and would make the walk
+            // depend on which of `EEXIST` and `EROFS`/`EACCES` a filesystem
+            // reports first.
+            Some(meta) => {
+                if let Some(why) = chain_entry_verdict_for(&walked, &meta) {
+                    return Err(why);
+                }
+            }
+            // Missing, so the harness makes it — and refuses to adopt whatever
+            // may have appeared between that stat and this create.
+            None => create_or_refuse_component(&walked)?,
+        }
+    }
+    // And the base itself, once the chain is complete — the check that has to
+    // hold at the moment of *use*, whether the directory was just created or was
+    // already there when the walk started.
+    if let Some(why) = chain_entry_objection(&normalized) {
+        return Err(why);
+    }
+    Ok(normalized)
+}
+
+/// Windows has neither POSIX ownership nor mode bits to judge a candidate by,
+/// and no `openat`-shaped API reachable from `std`, so the value gets the shape
+/// check and then the by-name walk above: created one component at a time, and
+/// refused rather than adopted where something is already there. See
+/// [`override_base_by_name`] for exactly what that does and does not buy; the
+/// ACL-based equivalent of the Unix walk is #163/#164.
+#[cfg(not(unix))]
+fn validated_override_base(raw: &Path) -> Result<PathBuf, String> {
+    override_base_by_name(raw)
+}
+
+/// Why the private `/var/tmp` parent could not be used — and, the load-bearing
+/// part, whether that is survivable.
+///
+/// Refusing a suspect directory is right, but *silently* dropping to
+/// `std::env::temp_dir()` afterwards is not: it converts a security refusal
+/// into the capacity problem the whole ladder exists to avoid, announced only
+/// by a stderr warning nextest interleaves across thousands of processes. The
+/// operator then gets issue #322's original symptom — a wall of misleading
+/// failures — with nothing pointing at the cause.
+#[derive(Debug)]
+enum PrivateParentProblem {
+    /// An ordinary environment difference: no `/var/tmp` rung at all (non-Unix),
+    /// no `/var/tmp` on this machine, or a parent that genuinely could not be
+    /// created with *nothing* sitting at the path. Warn and fall through.
+    Unavailable(String),
+    /// The parent is there and cannot be trusted — a symlink, not a directory,
+    /// foreign-owned, or carrying group/other bits. Carries the ready-made
+    /// fatal message; the harness stops instead of falling through.
+    Refused(String),
+}
+
+impl std::fmt::Display for PrivateParentProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(why) | Self::Refused(why) => f.write_str(why),
+        }
+    }
+}
+
+/// The hard-failure message for a private parent that exists but cannot be
+/// trusted. Pure and separate from the stat, so its wording can be asserted on
+/// without manufacturing a foreign-owned directory — which needs privileges the
+/// test process does not have.
+///
+/// Framed like [`insufficient_temp_space_message`] and for the same reason: by
+/// the time a wrong temp base surfaces in assertions it is indistinguishable
+/// from a product regression, so the message has to say what it is before it
+/// says anything else.
+#[cfg(unix)]
+fn refused_private_parent_message(path: &Path, observed: &str, euid: u32) -> String {
+    let path = path.display();
+    format!(
+        "HARNESS PRE-FLIGHT FAILURE — this is the test harness refusing to start, \
+         NOT a product regression.\n\n\
+         {path} exists and is {observed}; the harness requires a real directory \
+         owned by uid {euid} with mode 0o700 (no group or other bits).\n\n\
+         No test has run. That directory is the parent every harness temp dir is \
+         created under, and it is verified rather than repaired — chown'ing or \
+         chmod'ing a directory in world-writable {SHARED_VAR_TMP} that may not be \
+         yours is exactly what this check exists to prevent. The harness stops here \
+         rather than falling back to the system temp dir (`TMPDIR`, else `/tmp`), \
+         because that fallback is commonly a RAM-backed tmpfs and would turn this \
+         refusal straight back into issue #322 — dozens of unrelated-looking \
+         assertion failures with nothing pointing at the filesystem.\n\n\
+         Look at it, and if it is not something you care about, remove it:\n\n    \
+         ls -ld {path}\n    rm -rf {path}\n\n\
+         If you cannot remove it, set {TEMP_BASE_ENV} to a short, absolute, \
+         disk-backed directory you own and the harness will use that instead.",
+    )
+}
+
+/// Pure decision half of the private-parent check, mirroring
+/// [`temp_space_verdict`]: `Some(message)` when a parent with these stat fields
+/// must be refused outright, `None` when it is exactly what the harness needs.
+///
+/// Taking the fields rather than a `Metadata` is what makes the foreign-owned
+/// case testable at all — `chown` is privileged, so that shape cannot be built
+/// on disk by a test.
+#[cfg(unix)]
+fn private_parent_verdict(
+    path: &Path,
+    is_symlink: bool,
+    is_dir: bool,
+    uid: u32,
+    mode: u32,
+    euid: u32,
+) -> Option<String> {
+    let observed = if is_symlink {
+        "a symlink".to_string()
+    } else if !is_dir {
+        "not a directory".to_string()
+    } else if private_dir_objection(uid, mode, euid).is_some() {
+        format!("a directory owned by uid {uid} with mode 0o{mode:o}")
+    } else {
+        return None;
+    };
+    Some(refused_private_parent_message(path, &observed, euid))
+}
+
+/// Filesystem-facing adapter over [`private_parent_verdict`]: judge one
+/// `symlink_metadata` reading of `path`.
+#[cfg(unix)]
+fn private_parent_verdict_for(path: &Path, meta: &std::fs::Metadata, euid: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    private_parent_verdict(
+        path,
+        meta.file_type().is_symlink(),
+        meta.is_dir(),
+        meta.uid(),
+        meta.permissions().mode() & 0o7777,
+        euid,
+    )
+}
+
+/// The private, UID-scoped parent inside `shared`, created if absent and
+/// verified if not. `shared` and `euid` are parameters purely so the tests can
+/// drive every outcome against a scratch directory instead of the real
+/// `/var/tmp`; [`private_temp_parent`] is the one production caller.
+///
+/// Adopting an existing directory is the dangerous case — `/var/tmp` is mode
+/// 1777, so another user can own a plausibly-named directory there. It is
+/// verified rather than repaired: a directory that is not ours is left exactly
+/// as it is, and refusing it is `Refused`, not a fall-through.
+#[cfg(unix)]
+fn private_temp_parent_in(shared: &Path, euid: u32) -> Result<PathBuf, PrivateParentProblem> {
+    if !shared.is_dir() {
+        return Err(PrivateParentProblem::Unavailable(format!(
+            "{} is not a directory",
+            shared.display()
+        )));
+    }
+    let parent = shared.join(private_parent_name(euid));
+    if let Err(e) = create_dir_private(&parent) {
+        // Classified by what is actually at the path: an entry the harness will
+        // not touch is a refusal, nothing at all is an ordinary environment
+        // problem (a read-only or full filesystem).
+        let refusal = std::fs::symlink_metadata(&parent)
+            .ok()
+            .and_then(|meta| private_parent_verdict_for(&parent, &meta, euid));
+        return Err(match refusal {
+            Some(message) => PrivateParentProblem::Refused(message),
+            None => PrivateParentProblem::Unavailable(format!(
+                "cannot create {}: {e}",
+                parent.display()
+            )),
+        });
+    }
+    // `symlink_metadata`: a symlink planted at this name would otherwise be
+    // followed by both the creation above (which succeeds when the target is a
+    // directory) and everything after it.
+    let meta = match std::fs::symlink_metadata(&parent) {
+        Ok(meta) => meta,
+        Err(e) => {
+            return Err(PrivateParentProblem::Unavailable(format!(
+                "cannot stat {}: {e}",
+                parent.display()
+            )));
+        }
+    };
+    match private_parent_verdict_for(&parent, &meta, euid) {
+        Some(message) => Err(PrivateParentProblem::Refused(message)),
+        None => Ok(parent),
+    }
+}
+
+/// The private, UID-scoped parent inside `/var/tmp` for this process.
+#[cfg(unix)]
+fn private_temp_parent() -> Result<PathBuf, PrivateParentProblem> {
+    private_temp_parent_in(Path::new(SHARED_VAR_TMP), effective_uid())
+}
+
+/// Windows has no `/var/tmp` and no POSIX mode bits to scope one with, so the
+/// system temp dir is the only rung. That is an absence, never a refusal. The
+/// ACL-based equivalent is #163/#164.
+#[cfg(not(unix))]
+fn private_temp_parent() -> Result<PathBuf, PrivateParentProblem> {
+    Err(PrivateParentProblem::Unavailable(format!(
+        "{SHARED_VAR_TMP} private parents are Unix-only (Windows ACL hardening \
+         is tracked by #163/#164)"
+    )))
+}
+
+/// The hard-failure message for a `DAD_E2E_TMPDIR` that cannot be honoured.
+///
+/// Fatal for the same reason a refused private parent is, only more so: the
+/// operator *stated* where the harness temp dirs must go, so quietly putting
+/// them somewhere else — typically the RAM-backed system temp dir — is both a
+/// wrong answer and an unasked-for one. Every rejection reaches here, including
+/// "could not be created": there is no reading of an explicit value under which
+/// ignoring it is the helpful thing to do.
+fn refused_override_message(raw: &Path, why: &str) -> String {
+    format!(
+        "HARNESS PRE-FLIGHT FAILURE — this is the test harness refusing to start, \
+         NOT a product regression.\n\n\
+         {TEMP_BASE_ENV}={} cannot be used: {why}.\n\n\
+         No test has run. Setting {TEMP_BASE_ENV} states where every harness temp \
+         dir must go, so a value that cannot be honoured is refused outright rather \
+         than ignored: falling through would silently place them somewhere you did \
+         not ask for — usually the system temp dir, which is commonly a RAM-backed \
+         tmpfs and is exactly what issue #322 is about.\n\n\
+         Point {TEMP_BASE_ENV} at a short, absolute, disk-backed directory you own \
+         with no `..`, no component another unprivileged user could replace, and \
+         no group or other permission bits on the directory itself (`chmod 700` — \
+         the same bar the default parent has to meet, since this is where the \
+         harness seeds real agent credentials) — or unset it to use the default \
+         {SHARED_VAR_TMP}/dad-e2e-<uid>.",
+        raw.display(),
+    )
+}
+
+/// Resolve the temp base from the live environment. See [`choose_temp_base`]
+/// for the precedence; this half does the validating and the creating, and is
+/// where the two non-survivable outcomes stop the process.
+fn harness_temp_base() -> TempBaseChoice {
+    let mut warnings = Vec::new();
+    let env_override = std::env::var_os(TEMP_BASE_ENV)
+        .filter(|v| !v.is_empty())
+        .map(|raw| {
+            let raw = PathBuf::from(raw);
+            validated_override_base(&raw)
+                .unwrap_or_else(|why| panic!("{}", refused_override_message(&raw, &why)))
+        });
+    // Only attempted when it is actually going to be used: an explicit override
+    // should not leave a directory behind in `/var/tmp` that nothing writes to.
+    let private_parent = match env_override {
+        Some(_) => None,
+        None => match private_temp_parent() {
+            Ok(parent) => Some(parent),
+            Err(PrivateParentProblem::Unavailable(why)) => {
+                warnings.push(why);
+                None
+            }
+            Err(PrivateParentProblem::Refused(message)) => panic!("{message}"),
+        },
+    };
+    let mut choice = choose_temp_base(
+        env_override.as_deref(),
+        private_parent.as_deref(),
+        &std::env::temp_dir(),
+    );
+    warnings.append(&mut choice.warnings);
+    choice.warnings = warnings;
+    choice
+}
+
 /// Free space the e2e tier wants on the temp filesystem before it starts, in
-/// MB. Peak demand is what matters: each concurrent test wants a couple hundred
-/// MB for its seeded HOME and dozens run at once, so the suite needs GBs of
-/// headroom even though no single test does. Override with
-/// `DAD_E2E_MIN_FREE_MB`; `0` disables the check.
-#[cfg(all(unix, feature = "e2e"))]
+/// MB. Peak demand is what matters, not per-test demand: one seeded HOME was
+/// measured at 263-284 MB and nextest runs one process per core, so eight
+/// concurrent tests already want ~2.2 GB and the roots a killed run leaves
+/// behind are still occupying the same filesystem. 2 GB is deliberately below
+/// true peak — it is a "this run is doomed" floor, not a capacity guarantee,
+/// and set high enough to catch the exhausted-tmpfs case that produced a
+/// 103-test red wall while staying under what a modest CI runner offers.
+/// Override with `DAD_E2E_MIN_FREE_MB`; `0` disables the check.
+#[cfg(unix)]
 const E2E_MIN_FREE_MB: u64 = 2048;
 
+/// Escape hatch for the pre-flight threshold; `0` disables the check entirely.
+#[cfg(unix)]
+const MIN_FREE_ENV: &str = "DAD_E2E_MIN_FREE_MB";
+
 /// Space available to this user on the filesystem holding `path`.
-#[cfg(all(unix, feature = "e2e"))]
+#[cfg(unix)]
 fn free_bytes(path: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -3376,64 +4957,173 @@ fn free_bytes(path: &Path) -> Option<u64> {
 
 /// The explicit fail-fast message, kept separate from the `statvfs` call so it
 /// can be asserted on without depending on the machine's actual free space.
-#[cfg(all(unix, feature = "e2e"))]
+///
+/// It leads with "harness pre-flight" on purpose: the whole reason this check
+/// exists is that an exhausted temp filesystem is indistinguishable from a
+/// product regression by the time the assertions fail.
+#[cfg(unix)]
 fn insufficient_temp_space_message(free_mb: u64, need_mb: u64, path: &Path) -> String {
     format!(
-        "e2e needs ~{need_mb} MB free in {}; found {free_mb} MB.\n\n\
-         This is almost certainly why tests are failing: the harness cannot create \
-         its per-test temp dirs, which surfaces as unrelated-looking assertion \
-         failures (agents never becoming input-ready, `git init` failing, daemons \
-         never booting) rather than an out-of-space error.\n\n\
+        "HARNESS PRE-FLIGHT FAILURE — this is the test harness refusing to start, \
+         NOT a product regression.\n\n\
+         e2e needs ~{need_mb} MB free in {}; found {free_mb} MB.\n\n\
+         No test has run. The harness stopped here because it cannot create its \
+         per-test temp dirs, and an exhausted temp filesystem does not surface as \
+         an out-of-space error — it surfaces as dozens of unrelated-looking \
+         assertion failures (agents never becoming input-ready, `git init` \
+         failing, daemons never booting), which is exactly the misleading red wall \
+         this check exists to prevent.\n\n\
          Interrupted runs leave their temp roots behind — nextest SIGKILLs a test \
          that trips `slow-timeout terminate-after`, and a killed process never runs \
          its cleanup. Reclaim them with:\n\n    \
          cargo xtask clean-e2e-tmp --apply\n\n\
-         Set DAD_E2E_MIN_FREE_MB to change this threshold, or 0 to disable it.",
+         That reaps the STANDARD roots only. The path above is a standard root \
+         unless you set {TEMP_BASE_ENV}, in which case name it explicitly:\n\n    \
+         cargo xtask clean-e2e-tmp --root {} --apply\n\n\
+         Set {MIN_FREE_ENV} to change this threshold, or 0 to disable it; set \
+         {TEMP_BASE_ENV} to put the harness temp dirs on a different filesystem.",
+        path.display(),
         path.display(),
     )
 }
 
-/// Fail-fast pre-flight: `Some(message)` when the temp filesystem is too full
-/// for the e2e tier to run meaningfully. `None` when there is room, when the
-/// check is disabled, or when free space cannot be determined.
-#[cfg(all(unix, feature = "e2e"))]
-fn temp_space_problem(path: &Path) -> Option<String> {
-    let need_mb = std::env::var("DAD_E2E_MIN_FREE_MB")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(E2E_MIN_FREE_MB);
+/// Pure decision half of the pre-flight, separated from the `statvfs` call so
+/// it can be unit-tested with injected numbers instead of a real full disk.
+///
+/// `None` — meaning "no objection" — when there is room, when the check is
+/// disabled (`need_mb == 0`), or when free space could not be determined
+/// (`free_mb == None`). That last case is deliberate: a filesystem `statvfs`
+/// cannot answer for must never become a failure source of its own.
+#[cfg(unix)]
+fn temp_space_verdict(free_mb: Option<u64>, need_mb: u64, path: &Path) -> Option<String> {
     if need_mb == 0 {
         return None;
     }
-    let free_mb = free_bytes(path)? / (1024 * 1024);
+    let free_mb = free_mb?;
     (free_mb < need_mb).then(|| insufficient_temp_space_message(free_mb, need_mb, path))
+}
+
+/// The configured threshold in MB, from `DAD_E2E_MIN_FREE_MB` or the default.
+/// An unparseable value falls back to the default rather than failing.
+#[cfg(unix)]
+fn min_free_mb() -> u64 {
+    std::env::var(MIN_FREE_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(E2E_MIN_FREE_MB)
+}
+
+/// Fail-fast pre-flight: `Some(message)` when the temp filesystem is too full
+/// for the e2e tier to run meaningfully. One `statvfs` per test process, and
+/// none at all when the check is switched off.
+#[cfg(unix)]
+fn temp_space_problem(path: &Path) -> Option<String> {
+    let need_mb = min_free_mb();
+    if need_mb == 0 {
+        return None;
+    }
+    temp_space_verdict(free_bytes(path).map(|b| b / (1024 * 1024)), need_mb, path)
 }
 
 /// Per-process root owning every temp dir this test process creates.
 fn harness_temp_root() -> &'static Path {
     HARNESS_TEMP_ROOT
         .get_or_init(|| {
+            let choice = harness_temp_base();
+            for warning in &choice.warnings {
+                eprintln!("[harness] WARNING: {warning}");
+            }
+            let base = choice.path;
+            // Created before anything measures it: `std::env::temp_dir()`
+            // reports `TMPDIR` without creating it, so a base that is not there
+            // has to self-heal rather than fail every test on a missing
+            // directory. Doing it first also gives the space probe below a real
+            // directory to `statvfs` — on a path that does not exist the call
+            // fails and the check silently no-ops. Owner-only, one component at
+            // a time; a no-op when the base already exists.
+            create_dir_private(&base)
+                .unwrap_or_else(|e| panic!("create harness temp base {}: {e}", base.display()));
             // Checked here because this is the one choke point every harness
             // temp dir passes through, so no test can start doing real work
-            // against an exhausted filesystem without first seeing why.
+            // against an exhausted filesystem without first seeing why. It runs
+            // against whatever base was actually chosen above, not a hardcoded
+            // `/tmp`, and exactly once per test process.
             #[cfg(all(unix, feature = "e2e"))]
-            if let Some(msg) = temp_space_problem(&std::env::temp_dir()) {
+            if let Some(msg) = temp_space_problem(&base) {
                 panic!("{msg}");
             }
-            // `std::env::temp_dir()` reports `TMPDIR` without creating it, and
-            // a `TMPDIR` under `target/` vanishes on `cargo clean`. Create it
-            // so a cleaned checkout self-heals instead of failing every test on
-            // a missing directory.
-            let base = std::env::temp_dir();
-            std::fs::create_dir_all(&base)
-                .unwrap_or_else(|e| panic!("create temp base {}: {e}", base.display()));
-            let root = tempfile::Builder::new()
-                .prefix(&format!("dad-tests-{}-", std::process::id()))
-                .tempdir_in(&base)
-                .expect("create harness temp root")
-                .keep();
-            harden_dir_0700(&root);
+            let prefix = format!("dad-tests-{}-", std::process::id());
+            // 0o700 asked for at creation rather than chmod'ed afterwards. The
+            // base can be shared (`std::env::temp_dir()` on the last rung), and
+            // a root that is briefly 0o755 there is long enough for a local user
+            // to enter it and plant fixed descendants — `daemon-lock`, a
+            // pre-made socket path — that make later tests fail in ways nobody
+            // would think to blame on the filesystem. Same pattern as the
+            // per-test dir in `TuiDeck::try_launch_inner`.
+            let root = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    tempfile::Builder::new()
+                        .prefix(&prefix)
+                        .permissions(std::fs::Permissions::from_mode(0o700))
+                        .tempdir_in(&base)
+                }
+                #[cfg(not(unix))]
+                {
+                    tempfile::Builder::new().prefix(&prefix).tempdir_in(&base)
+                }
+            }
+            .unwrap_or_else(|e| panic!("create harness temp root in {}: {e}", base.display()))
+            .keep();
+            // Verified, not assumed: a future tempfile API rename would
+            // otherwise silently drop the permission application and leave the
+            // window above open again.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                use std::os::unix::fs::PermissionsExt;
+                let meta = std::fs::symlink_metadata(&root).expect("stat harness temp root");
+                let mode = meta.permissions().mode() & 0o7777;
+                if let Some(why) = private_dir_objection(meta.uid(), mode, effective_uid()) {
+                    panic!("harness temp root {} is {why}", root.display());
+                }
+            }
             register_temp_root_cleanup();
+            // Issue #322, defence in depth: point the `tempfile` crate's DEFAULT
+            // temp dir at the root, so an allocation the suite does not make
+            // itself — a dependency's, or a call site that slips past
+            // `linkage-check` rule 8 — lands inside it too.
+            //
+            // This is NOT what contains the suite's own allocations, and
+            // believing it was is what the late audit caught. The override is
+            // installed at the end of this lazy initialiser, so it is in force
+            // only from the first moment something asks the harness for a
+            // directory; a bare `harness_tempdir()` running before that is the
+            // process's first allocation and goes to the OS temp dir. Containment
+            // is the job of `common::harness_tempdir()`, which initialises the
+            // root before it allocates and is therefore ordering-independent.
+            //
+            // It is tempfile's own process-global override, NOT `TMPDIR`: no
+            // `set_var`, so nothing here is racy against other threads, and
+            // spawned agent subprocesses keep resolving temp the way the OS tells
+            // them to.
+            //
+            // `Err` means someone else already set the override, which no code in
+            // this repo does — so the root this initialiser just created and
+            // registered for cleanup is NOT where stray allocations will go, and
+            // the invariant this whole block exists to establish is broken.
+            // Discarding that (`let _ =`) hid exactly the kind of ordering bug
+            // above, so it fails loudly instead.
+            tempfile::env::override_temp_dir(&root).unwrap_or_else(|e| {
+                panic!(
+                    "tempfile's process-global temp-dir override was already set \
+                     when the harness tried to point it at {}: {e:?}. Nothing in \
+                     this repo sets it, so stray allocations are landing \
+                     somewhere this harness does not own and will not clean up.",
+                    root.display(),
+                )
+            });
             root
         })
         .as_path()
@@ -4137,6 +5827,34 @@ impl EventSub {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Like [`Self::wait_for`], but returns `None` instead of panicking when
+    /// `timeout` elapses with no match. For a caller that must distinguish
+    /// "the precondition this run needed was never met" (inconclusive) from
+    /// "the precondition landed and the assertion under it failed" (a real
+    /// regression) — a bare `wait_for` collapses both into the same panic.
+    pub fn try_wait_for(
+        &self,
+        pred: impl Fn(&dot_agent_deck::event::AgentEvent) -> bool,
+        timeout: Duration,
+    ) -> Option<dot_agent_deck::event::AgentEvent> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(ev) = self.events.lock().unwrap().iter().find(|e| pred(e)) {
+                return Some(ev.clone());
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Every broadcast `AgentEvent` collected so far, for building a
+    /// diagnostic message when [`Self::try_wait_for`] times out.
+    pub fn snapshot(&self) -> Vec<dot_agent_deck::event::AgentEvent> {
+        self.events.lock().unwrap().clone()
     }
 }
 
@@ -5123,7 +6841,7 @@ mod harness_unit_tests {
     /// The pre-flight message names the real cause and the one command that
     /// fixes it — the whole point is that a tmpfs-exhaustion run stops looking
     /// like a product regression.
-    #[cfg(all(unix, feature = "e2e"))]
+    #[cfg(unix)]
     #[test]
     fn insufficient_space_message_names_the_cause_and_the_remedy() {
         let msg = insufficient_temp_space_message(312, 2048, Path::new("/tmp"));
@@ -5134,41 +6852,1681 @@ mod harness_unit_tests {
             msg.contains("cargo xtask clean-e2e-tmp --apply"),
             "missing the remedy: {msg}",
         );
+        assert!(
+            msg.contains("NOT a product regression"),
+            "message must be impossible to mistake for a test defect: {msg}",
+        );
     }
 
     /// A zero threshold disables the check, so a contributor whose temp
     /// filesystem is small on purpose is never blocked by it.
-    #[cfg(all(unix, feature = "e2e"))]
+    #[cfg(unix)]
     #[test]
     fn zero_threshold_disables_the_preflight_check() {
         // SAFETY: single-threaded test process (nextest runs one test per
         // process); the var is restored before returning.
-        let prev = std::env::var_os("DAD_E2E_MIN_FREE_MB");
-        unsafe { std::env::set_var("DAD_E2E_MIN_FREE_MB", "0") };
+        let prev = std::env::var_os(MIN_FREE_ENV);
+        unsafe { std::env::set_var(MIN_FREE_ENV, "0") };
         let verdict = temp_space_problem(Path::new("/"));
+        let configured = min_free_mb();
         match prev {
-            Some(v) => unsafe { std::env::set_var("DAD_E2E_MIN_FREE_MB", v) },
-            None => unsafe { std::env::remove_var("DAD_E2E_MIN_FREE_MB") },
+            Some(v) => unsafe { std::env::set_var(MIN_FREE_ENV, v) },
+            None => unsafe { std::env::remove_var(MIN_FREE_ENV) },
         }
+        assert_eq!(configured, 0, "the bypass var must reach the threshold");
         assert!(verdict.is_none(), "zero threshold should disable the check");
     }
 
     /// An impossibly large threshold trips the check, proving it actually reads
     /// the filesystem rather than always returning `None`.
-    #[cfg(all(unix, feature = "e2e"))]
+    #[cfg(unix)]
     #[test]
     fn an_unmeetable_threshold_trips_the_preflight_check() {
-        let prev = std::env::var_os("DAD_E2E_MIN_FREE_MB");
+        let prev = std::env::var_os(MIN_FREE_ENV);
         // SAFETY: as above — single-threaded, restored before returning.
-        unsafe { std::env::set_var("DAD_E2E_MIN_FREE_MB", "1000000000") };
+        unsafe { std::env::set_var(MIN_FREE_ENV, "1000000000") };
         let verdict = temp_space_problem(&std::env::temp_dir());
         match prev {
-            Some(v) => unsafe { std::env::set_var("DAD_E2E_MIN_FREE_MB", v) },
-            None => unsafe { std::env::remove_var("DAD_E2E_MIN_FREE_MB") },
+            Some(v) => unsafe { std::env::set_var(MIN_FREE_ENV, v) },
+            None => unsafe { std::env::remove_var(MIN_FREE_ENV) },
         }
         assert!(
             verdict.is_some_and(|m| m.contains("clean-e2e-tmp")),
             "a 1 PB requirement should always trip the check",
+        );
+    }
+
+    /// Room to spare is a silent pass — the decision half is exercised with
+    /// injected numbers so this never depends on the machine's real disk.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_passes_when_free_space_is_above_the_threshold() {
+        assert!(temp_space_verdict(Some(4096), 2048, Path::new("/var/tmp/dad-e2e-1000")).is_none());
+        // Exactly at the threshold is still "enough": the comparison is `<`.
+        assert!(temp_space_verdict(Some(2048), 2048, Path::new("/var/tmp/dad-e2e-1000")).is_none());
+    }
+
+    /// Below the threshold the verdict names the path, the requirement and the
+    /// shortfall — the three facts a reader needs to tell a starved harness
+    /// apart from a broken product.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_fails_below_the_threshold_naming_path_required_and_found() {
+        let msg = temp_space_verdict(Some(97), 2048, Path::new("/var/tmp/dad-e2e-1000"))
+            .expect("97 MB is under a 2048 MB requirement");
+        assert!(
+            msg.contains("/var/tmp/dad-e2e-1000"),
+            "missing the path: {msg}"
+        );
+        assert!(msg.contains("2048 MB"), "missing the requirement: {msg}");
+        assert!(msg.contains("97 MB"), "missing what was found: {msg}");
+        assert!(
+            msg.contains("HARNESS PRE-FLIGHT FAILURE"),
+            "missing the not-a-regression framing: {msg}",
+        );
+    }
+
+    /// A filesystem whose free space cannot be queried must never fail the
+    /// suite — the check exists to remove a flaky failure mode, not add one.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_degrades_gracefully_when_free_space_is_unqueryable() {
+        assert!(
+            temp_space_verdict(None, 2048, Path::new("/var/tmp/dad-e2e-1000")).is_none(),
+            "an unqueryable filesystem must produce no verdict",
+        );
+        // And the query really does return `None` rather than panicking on a
+        // path that is not there, so the branch above is reachable.
+        assert!(
+            free_bytes(Path::new("/definitely/not/a/real/mount/point-322")).is_none(),
+            "statvfs on a missing path should report no answer",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #322 — the temp base lands on a short, private, disk-backed path
+    // -----------------------------------------------------------------------
+
+    /// The default is a private, UID-scoped parent under `/var/tmp` — short
+    /// enough for a socket, disk-backed by FHS convention, and owner-only so
+    /// nothing under it can belong to another user.
+    #[test]
+    fn temp_base_defaults_to_the_private_var_tmp_parent() {
+        let parent = PathBuf::from("/var/tmp/dad-e2e-1000");
+        let choice = choose_temp_base(None, Some(&parent), Path::new("/tmp"));
+        assert_eq!(choice.path, parent);
+        assert!(choice.warnings.is_empty(), "{:?}", choice.warnings);
+    }
+
+    /// An explicit `DAD_E2E_TMPDIR` outranks the private parent — that is the
+    /// documented escape hatch for anyone who wants a target-local or
+    /// otherwise unusual base.
+    #[test]
+    fn temp_base_env_override_wins_over_every_other_candidate() {
+        let choice = choose_temp_base(
+            Some(Path::new("/fast/scratch")),
+            Some(Path::new("/var/tmp/dad-e2e-1000")),
+            Path::new("/tmp"),
+        );
+        assert_eq!(choice.path, Path::new("/fast/scratch"));
+        assert!(choice.warnings.is_empty(), "{:?}", choice.warnings);
+    }
+
+    /// The override is honoured even when it is too deep to bind a socket
+    /// under — an explicit choice is not silently overruled — but it says so.
+    #[test]
+    fn an_over_long_env_override_is_honoured_with_a_warning() {
+        let deep = PathBuf::from(format!("/{}", "x".repeat(SUN_PATH_USABLE)));
+        let choice = choose_temp_base(
+            Some(&deep),
+            Some(Path::new("/var/tmp/dad-e2e-1000")),
+            Path::new("/tmp"),
+        );
+        assert_eq!(choice.path, deep);
+        let warning = choice.warnings.first().expect("an unusable override warns");
+        assert!(warning.contains(TEMP_BASE_ENV), "{warning}");
+        assert!(warning.contains("AF_UNIX path too long"), "{warning}");
+    }
+
+    /// With no usable private parent the system temp dir is the last resort —
+    /// and because that is the RAM-backed outcome issue #322 is about, it is
+    /// the one case that always warns.
+    #[test]
+    fn the_system_temp_dir_is_a_last_resort_and_says_so() {
+        let choice = choose_temp_base(None, None, Path::new("/tmp"));
+        assert_eq!(choice.path, Path::new("/tmp"));
+        let warning = choice.warnings.first().expect("falling back to /tmp warns");
+        assert!(warning.contains("#322"), "{warning}");
+        assert!(warning.contains(TEMP_BASE_ENV), "{warning}");
+    }
+
+    /// The length veto applies to the private parent too — an absurd UID (or a
+    /// future longer parent name) must degrade rather than produce a base no
+    /// socket can be bound under.
+    #[test]
+    fn an_over_long_private_parent_is_vetoed_like_any_other_candidate() {
+        let parent = PathBuf::from(format!("/var/tmp/{}", "u".repeat(MAX_TEMP_BASE_LEN)));
+        let choice = choose_temp_base(None, Some(&parent), Path::new("/tmp"));
+        assert_eq!(choice.path, Path::new("/tmp"));
+        let warning = choice.warnings.first().expect("a vetoed parent warns");
+        assert!(warning.contains(&parent.display().to_string()), "{warning}");
+    }
+
+    /// The real parent this machine would use is owner-only and ours. The
+    /// structural claim the whole `/var/tmp` rung rests on: `/var/tmp` is mode
+    /// 1777, so without a verified 0700 parent a `dad-tests-*` directory there
+    /// could belong to anybody.
+    #[cfg(unix)]
+    #[test]
+    fn the_private_parent_is_owner_only_and_owned_by_us() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let parent = match private_temp_parent() {
+            Ok(p) => p,
+            Err(why) => {
+                eprintln!("skipping: no private parent available here ({why})");
+                return;
+            }
+        };
+        assert_eq!(
+            parent.file_name().and_then(|n| n.to_str()),
+            Some(private_parent_name(effective_uid()).as_str()),
+            "the parent must be scoped to the effective UID",
+        );
+        let meta = std::fs::symlink_metadata(&parent).expect("stat private parent");
+        assert!(
+            !meta.file_type().is_symlink(),
+            "parent must not be a symlink"
+        );
+        let mode = meta.permissions().mode() & 0o7777;
+        assert_eq!(
+            private_dir_objection(meta.uid(), mode, effective_uid()),
+            None,
+            "{} is uid {} mode 0o{mode:o}",
+            parent.display(),
+            meta.uid(),
+        );
+    }
+
+    /// A parent that is not ours is refused, not repaired: chmod'ing or
+    /// chown'ing someone else's directory is exactly the behaviour that makes a
+    /// shared `/var/tmp` dangerous.
+    #[cfg(unix)]
+    #[test]
+    fn a_foreign_or_loose_private_parent_is_refused() {
+        assert!(
+            private_dir_objection(1001, 0o700, 1000).is_some(),
+            "a directory owned by another uid must be refused",
+        );
+        assert!(
+            private_dir_objection(1000, 0o750, 1000).is_some(),
+            "a group-readable directory must be refused",
+        );
+        assert!(
+            private_dir_objection(1000, 0o1777, 1000).is_some(),
+            "a world-writable directory must be refused",
+        );
+        assert_eq!(private_dir_objection(1000, 0o700, 1000), None);
+    }
+
+    /// The predicate enforces the **exact** 0o700 that the diagnostics, the
+    /// audit note and `docs/develop/e2e-temp-dirs.md` all claim.
+    ///
+    /// It used to test only `mode & 0o077 == 0`, which 0o500, 0o300, 0o000 and
+    /// 0o1700 also satisfy. Confidentiality was never the gap — `mkdir(2)`
+    /// applies the mode and a umask can only clear bits — but a pre-existing
+    /// 0o500 parent passed the pre-flight whose whole job is to name the problem
+    /// up front, and then failed much later as a bare `Permission denied` from
+    /// somewhere inside a test. So the check now matches the claim, and the
+    /// message has to name the innocent cause: a umask that clears owner bits.
+    #[cfg(unix)]
+    #[test]
+    fn the_private_dir_rule_requires_exactly_0o700_not_merely_owner_only() {
+        assert_eq!(private_dir_objection(1000, 0o700, 1000), None);
+
+        // Owner bits missing: no confidentiality problem, but not usable, and
+        // previously accepted.
+        for mode in [0o500, 0o300, 0o600, 0o000] {
+            let why = private_dir_objection(1000, mode, 1000)
+                .unwrap_or_else(|| panic!("0o{mode:o} must be refused"));
+            assert!(why.contains(&format!("mode is 0o{mode:o}")), "{why}");
+            assert!(
+                why.contains("umask"),
+                "0o{mode:o} must name the cause: {why}"
+            );
+        }
+
+        // Sticky-but-owner-only — 0o1700 — was accepted by the old mask too.
+        let why = private_dir_objection(1000, 0o1700, 1000).expect("0o1700 must be refused");
+        assert!(why.contains("mode is 0o1700"), "{why}");
+
+        // Group/other bits get the other half of the message: what is at risk.
+        let why = private_dir_objection(1000, 0o750, 1000).expect("0o750 must be refused");
+        assert!(why.contains("credentials"), "{why}");
+    }
+
+    /// Refusal must be **fatal**, not a warning. Refusing the directory and
+    /// then dropping to `std::env::temp_dir()` converts a security refusal into
+    /// issue #322's original capacity problem, and the only signal is a stderr
+    /// line nextest interleaves across thousands of processes.
+    ///
+    /// Asserted on the pure verdict, because the foreign-owned shape cannot be
+    /// built on disk without `chown`. Every claim the message has to make is
+    /// pinned: what it is, that nothing ran, the path, observed state, required
+    /// state, the remedy, and the escape hatch.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_private_parent_is_fatal_and_actionable() {
+        let path = Path::new("/var/tmp/dad-e2e-1000");
+        let msg = private_parent_verdict(path, false, true, 1001, 0o755, 1000)
+            .expect("a foreign-owned, group-readable parent must be refused");
+        for expected in [
+            "HARNESS PRE-FLIGHT FAILURE",
+            "NOT a product regression",
+            "No test has run.",
+            "/var/tmp/dad-e2e-1000 exists and is",
+            // observed …
+            "a directory owned by uid 1001 with mode 0o755",
+            // … versus required
+            "requires a real directory owned by uid 1000 with mode 0o700",
+            // why it is not falling back rather than just that it is not
+            "RAM-backed tmpfs",
+            "#322",
+            // the remedy, and the way out for someone who cannot take it
+            "ls -ld /var/tmp/dad-e2e-1000",
+            "rm -rf /var/tmp/dad-e2e-1000",
+            TEMP_BASE_ENV,
+        ] {
+            assert!(msg.contains(expected), "missing {expected:?} in:\n{msg}");
+        }
+    }
+
+    /// Each refusable shape produces a verdict naming what was seen, and a
+    /// parent that is exactly what the harness asks for produces none — so the
+    /// new hard failure cannot fire on a healthy machine.
+    #[cfg(unix)]
+    #[test]
+    fn every_untrustworthy_parent_shape_earns_a_verdict_and_a_good_one_does_not() {
+        let path = Path::new("/var/tmp/dad-e2e-1000");
+        let observed = |is_symlink, is_dir, uid, mode| {
+            private_parent_verdict(path, is_symlink, is_dir, uid, mode, 1000)
+        };
+        assert!(
+            observed(true, false, 1000, 0o700)
+                .is_some_and(|m| m.contains("exists and is a symlink")),
+            "a symlink at the parent's name must be refused",
+        );
+        assert!(
+            observed(false, false, 1000, 0o600)
+                .is_some_and(|m| m.contains("exists and is not a directory")),
+            "a plain file at the parent's name must be refused",
+        );
+        assert!(
+            observed(false, true, 1000, 0o750)
+                .is_some_and(|m| m.contains("owned by uid 1000 with mode 0o750")),
+            "group bits must be refused",
+        );
+        assert_eq!(
+            observed(false, true, 1000, 0o700),
+            None,
+            "the parent this machine actually has must not be refused",
+        );
+    }
+
+    /// Unwrap a [`private_temp_parent_in`] outcome that must be a hard refusal,
+    /// failing loudly on either of the two ways it could be wrong: adopting the
+    /// directory, or degrading to a warning and the next rung of the ladder.
+    #[cfg(unix)]
+    fn refusal_message(outcome: Result<PathBuf, PrivateParentProblem>) -> String {
+        match outcome {
+            Ok(p) => panic!("{} was adopted; it should have been refused", p.display()),
+            Err(PrivateParentProblem::Unavailable(why)) => {
+                panic!("degraded to a warning and fell through the ladder: {why}")
+            }
+            Err(PrivateParentProblem::Refused(message)) => message,
+        }
+    }
+
+    /// The classification is made against what is really on disk, not just in
+    /// the pure verdict. Three of the four refusable shapes can be built
+    /// without privileges — a symlink, a plain file, and a loosened mode — and
+    /// each must come back `Refused` rather than falling through.
+    #[cfg(unix)]
+    #[test]
+    fn a_present_but_untrustworthy_parent_is_refused_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+        let anchor = race_safe_tempdir();
+        let euid = effective_uid();
+        let name = private_parent_name(euid);
+        // Each shape gets its own stand-in for `/var/tmp`, since the parent's
+        // name inside it is fixed by the UID.
+        let shared = |kind: &str| {
+            let dir = anchor.path().join(kind);
+            std::fs::create_dir(&dir).expect("stand-in /var/tmp");
+            dir
+        };
+
+        let linked = shared("symlink");
+        let target = anchor.path().join("elsewhere");
+        std::fs::create_dir(&target).expect("link target");
+        std::os::unix::fs::symlink(&target, linked.join(&name)).expect("plant a symlink");
+        let msg = refusal_message(private_temp_parent_in(&linked, euid));
+        assert!(msg.contains("exists and is a symlink"), "{msg}");
+
+        let filed = shared("file");
+        std::fs::write(filed.join(&name), b"not a directory").expect("plant a file");
+        let msg = refusal_message(private_temp_parent_in(&filed, euid));
+        assert!(msg.contains("exists and is not a directory"), "{msg}");
+
+        // `set_permissions` rather than a creation mode: the umask can only
+        // clear bits, so a 0o755 asked for at `mkdir` time is not guaranteed.
+        let loose = shared("loose");
+        let parent = loose.join(&name);
+        std::fs::create_dir(&parent).expect("plant a directory");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))
+            .expect("loosen the mode");
+        let msg = refusal_message(private_temp_parent_in(&loose, euid));
+        assert!(
+            msg.contains(&format!("owned by uid {euid} with mode 0o755")),
+            "{msg}",
+        );
+        assert!(msg.contains(&parent.display().to_string()), "{msg}");
+
+        // Refused, not repaired: the offending directory is untouched.
+        let mode = std::fs::symlink_metadata(&parent)
+            .expect("stat the refused parent")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o755, "the refused parent was modified");
+    }
+
+    /// Making refusal fatal must not break a machine that simply has no
+    /// `/var/tmp`. An absent shared directory is an ordinary environment
+    /// difference, so it stays `Unavailable` and the ladder falls through to
+    /// the last resort with the warning it has always printed.
+    #[cfg(unix)]
+    #[test]
+    fn an_absent_shared_directory_still_falls_through_the_ladder() {
+        let anchor = race_safe_tempdir();
+        let missing = anchor.path().join("no-var-tmp-here");
+        match private_temp_parent_in(&missing, effective_uid()) {
+            Err(PrivateParentProblem::Unavailable(why)) => {
+                assert!(why.contains(&missing.display().to_string()), "{why}");
+            }
+            Ok(p) => panic!("{} does not exist and must not be created", p.display()),
+            Err(PrivateParentProblem::Refused(msg)) => {
+                panic!("an absent shared directory must never be fatal:\n{msg}")
+            }
+        }
+        // And that outcome is exactly the `None` the ladder already handles.
+        let choice = choose_temp_base(None, None, Path::new("/tmp"));
+        assert_eq!(choice.path, Path::new("/tmp"));
+        assert!(
+            choice.warnings.first().is_some_and(|w| w.contains("#322")),
+            "{:?}",
+            choice.warnings,
+        );
+    }
+
+    /// The ordinary path still works through the new seam: a fresh shared
+    /// directory gets an owner-only parent created under it, and a second call
+    /// adopts what the first created rather than objecting to it.
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_shared_directory_yields_an_owner_only_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let anchor = race_safe_tempdir();
+        let euid = effective_uid();
+        let parent = private_temp_parent_in(anchor.path(), euid).expect("a fresh parent");
+        assert_eq!(parent, anchor.path().join(private_parent_name(euid)));
+        let mode = std::fs::symlink_metadata(&parent)
+            .expect("stat the created parent")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o700, "{} is 0o{mode:o}", parent.display());
+        assert_eq!(
+            private_temp_parent_in(anchor.path(), euid).ok(),
+            Some(parent),
+            "adopting the parent it just created must not object",
+        );
+    }
+
+    /// macOS reaches `/var/tmp` through a symlink — `/var -> private/var` — so
+    /// the harness and `cargo xtask clean-e2e-tmp` end up holding two different
+    /// spellings of one directory. This pins which one the *harness* holds.
+    ///
+    /// [`private_temp_parent_in`] joins the parent's name onto the shared
+    /// directory it was handed and never canonicalises, so what the socket
+    /// budget is charged against, and what a later `bind(2)` actually sees, is
+    /// the short `/var/tmp/dad-e2e-<uid>`. The reaper resolves instead and scans
+    /// `/private/var/tmp/dad-e2e-<uid>`. The only thing that has to be true of
+    /// the pair is that they are one directory, which is asserted by inode
+    /// rather than by string.
+    #[cfg(unix)]
+    #[test]
+    fn the_private_parent_keeps_the_short_spelling_the_socket_budget_charges_for() {
+        use std::os::unix::fs::MetadataExt;
+        let anchor = race_safe_tempdir();
+        let euid = effective_uid();
+        // macOS's own layout in miniature: a real `private/var/tmp`, reached
+        // through a `var` symlink that `lstat` traverses because it is never the
+        // final component.
+        std::fs::create_dir_all(anchor.path().join("private/var/tmp"))
+            .expect("stand-in /private/var/tmp");
+        std::os::unix::fs::symlink("private/var", anchor.path().join("var")).expect("plant /var");
+        let shared = anchor.path().join("var/tmp");
+
+        let by_name = private_temp_parent_in(&shared, euid).expect("a parent below the link");
+        assert_eq!(by_name, shared.join(private_parent_name(euid)));
+
+        let resolved = by_name.canonicalize().expect("resolve the parent");
+        assert_ne!(
+            by_name, resolved,
+            "the fixture must really diverge, as macOS does",
+        );
+        assert!(
+            by_name.as_os_str().len() < resolved.as_os_str().len(),
+            "the harness must hold the shorter spelling: {} vs {}",
+            by_name.display(),
+            resolved.display(),
+        );
+        let named = std::fs::metadata(&by_name).expect("stat by name");
+        let followed = std::fs::metadata(&resolved).expect("stat resolved");
+        assert_eq!(
+            (named.dev(), named.ino()),
+            (followed.dev(), followed.ino()),
+            "the two spellings must be one directory",
+        );
+    }
+
+    /// The socket budget at a macOS UID, in both spellings the two halves use.
+    ///
+    /// [`SUN_PATH_USABLE`] is already macOS's 103, so the only open question is
+    /// whether a `501`-shaped parent composes inside it. Both do, with room:
+    /// `/var/tmp/dad-e2e-501` is 20 bytes and composes to 68;
+    /// `/private/var/tmp/dad-e2e-501` is 28 and composes to 76 — against a
+    /// 55-byte base allowance and a 103-byte socket path. The harness binds
+    /// under the first of those, and the veto is applied to that same value.
+    #[cfg(unix)]
+    #[test]
+    fn a_macos_uid_fits_the_socket_budget_in_both_spellings() {
+        let name = private_parent_name(501);
+        let by_name = PathBuf::from(SHARED_VAR_TMP).join(&name);
+        let resolved = PathBuf::from("/private")
+            .join(SHARED_VAR_TMP.trim_start_matches('/'))
+            .join(&name);
+        assert_eq!(by_name, Path::new("/var/tmp/dad-e2e-501"));
+        assert_eq!(resolved, Path::new("/private/var/tmp/dad-e2e-501"));
+
+        for (base, len) in [(&by_name, 20), (&resolved, 28)] {
+            assert_eq!(base.as_os_str().len(), len, "{}", base.display());
+            assert!(
+                fits_socket_budget(base),
+                "{} ({len} bytes) exceeds the {MAX_TEMP_BASE_LEN}-byte allowance",
+                base.display(),
+            );
+            assert!(
+                len + HARNESS_SOCKET_OVERHEAD <= SUN_PATH_USABLE,
+                "{} composes to {} bytes, past {SUN_PATH_USABLE}",
+                base.display(),
+                len + HARNESS_SOCKET_OVERHEAD,
+            );
+        }
+
+        // And the ladder picks the short one without complaint — the veto sees
+        // exactly the value that reaches `bind(2)`.
+        let choice = choose_temp_base(None, Some(&by_name), Path::new("/tmp"));
+        assert_eq!(choice.path, by_name);
+        assert!(choice.warnings.is_empty(), "{:?}", choice.warnings);
+    }
+
+    /// A refused `DAD_E2E_TMPDIR` is fatal too, and for a stronger reason than
+    /// the default: the operator stated where the temp dirs must go, so quietly
+    /// putting them somewhere else is both wrong and unasked-for.
+    #[test]
+    fn a_refused_env_override_is_fatal_rather_than_ignored() {
+        let raw = Path::new("scratch/e2e");
+        let why = override_shape_objection(raw).expect("a relative value is refused");
+        let msg = refused_override_message(raw, &why);
+        let named = format!("{TEMP_BASE_ENV}=scratch/e2e cannot be used");
+        let unset_default = format!("unset it to use the default {SHARED_VAR_TMP}/dad-e2e-<uid>");
+        for expected in [
+            "HARNESS PRE-FLIGHT FAILURE",
+            "NOT a product regression",
+            "No test has run.",
+            named.as_str(),
+            "is not an absolute path",
+            "RAM-backed tmpfs",
+            "#322",
+            unset_default.as_str(),
+        ] {
+            assert!(msg.contains(expected), "missing {expected:?} in:\n{msg}");
+        }
+    }
+
+    /// Traversal is judged by a laxer rule than ownership of the base itself:
+    /// `/`, `/home` and `/var` are root-owned, and sticky 1777 directories are
+    /// safe because only an entry's owner can rename or remove it.
+    #[cfg(unix)]
+    #[test]
+    fn override_ancestors_allow_root_owned_and_sticky_components() {
+        assert_eq!(traversal_objection(0, 0o755, 1000), None, "root-owned /usr");
+        assert_eq!(
+            traversal_objection(0, 0o1777, 1000),
+            None,
+            "sticky /var/tmp"
+        );
+        assert_eq!(traversal_objection(1000, 0o700, 1000), None, "our own dir");
+        assert!(
+            traversal_objection(0, 0o777, 1000).is_some(),
+            "world-writable without the sticky bit is the swappable case",
+        );
+        assert!(
+            traversal_objection(1001, 0o755, 1000).is_some(),
+            "a component owned by another unprivileged user must be refused",
+        );
+    }
+
+    /// A relative value, or one with `..` in it, is refused rather than
+    /// normalised: relative resolves against whatever working directory the
+    /// test binary happens to have, and `..` silently widens the scope of
+    /// everything downstream — including what the reaper would be pointed at.
+    /// A `.` is a different matter: it is not a widening, and `components()`
+    /// removes it before anything sees the path.
+    ///
+    /// What counts as absolute is a *platform* question, and the fixtures are
+    /// split accordingly: `/var/tmp/e2e` is absolute on Unix and is not on
+    /// Windows, where an absolute path needs a drive letter. The rule is one
+    /// rule — `Path::is_absolute` — asserted against each platform's own
+    /// spelling of it.
+    #[test]
+    fn an_override_that_is_relative_or_traversing_is_refused() {
+        // True everywhere: a bare relative path is absolute on no platform.
+        assert!(override_shape_objection(Path::new("scratch/e2e")).is_some());
+        assert!(override_shape_objection(Path::new("./scratch/e2e")).is_some());
+        #[cfg(unix)]
+        {
+            assert!(override_shape_objection(Path::new("/var/tmp/../../etc")).is_some());
+            assert_eq!(override_shape_objection(Path::new("/var/tmp/e2e")), None);
+            assert_eq!(override_shape_objection(Path::new("/var/tmp/./e2e")), None);
+        }
+        #[cfg(windows)]
+        {
+            // Rooted but not absolute: no drive letter, so it resolves against
+            // whatever drive is current — exactly the ambiguity being refused.
+            assert!(override_shape_objection(Path::new(r"\scratch\e2e")).is_some());
+            assert!(override_shape_objection(Path::new(r"C:\tmp\..\..\Windows")).is_some());
+            assert_eq!(override_shape_objection(Path::new(r"C:\tmp\e2e")), None);
+            assert_eq!(override_shape_objection(Path::new(r"C:\tmp\.\e2e")), None);
+        }
+    }
+
+    /// The directory a scratch anchor really lives at, with every symlink in it
+    /// resolved. On macOS `/var` is a symlink to `/private/var`, so the harness
+    /// roots these tests build under are reached through one on a completely
+    /// healthy machine — and [`validated_override_base`] returns the resolved
+    /// spelling, which is what the assertions below have to compare against.
+    #[cfg(unix)]
+    fn resolved(path: &Path) -> PathBuf {
+        path.canonicalize()
+            .unwrap_or_else(|e| panic!("canonicalize {}: {e}", path.display()))
+    }
+
+    /// The value is resolved exactly once, into a normalized, symlink-free path.
+    /// A spelling the filesystem does not use would otherwise be what the
+    /// socket-length budget is measured against, and what every later message
+    /// names.
+    #[cfg(unix)]
+    #[test]
+    fn a_validated_override_base_comes_back_normalized() {
+        let anchor = race_safe_tempdir();
+        let noisy = anchor.path().join(".").join("base");
+        let base = validated_override_base(&noisy).expect("a fresh base under our own dir");
+        assert_eq!(base, resolved(anchor.path()).join("base"));
+    }
+
+    /// A symlinked *ancestor* is resolved, not refused — and the resolved form
+    /// is what comes back, so nothing downstream ever walks the link again.
+    ///
+    /// This is the macOS case: `/var` is a symlink to `/private/var` there, so
+    /// `std::env::temp_dir()` and everything under `/var/tmp` has a symlinked
+    /// ancestor on a healthy machine, and refusing symlinked components outright
+    /// rejected the platform's own temp directory. A root-owned system symlink
+    /// is not the threat; a component an unprivileged attacker could plant or
+    /// swap is, and that is judged after resolution — see the two tests below.
+    #[cfg(unix)]
+    #[test]
+    fn an_override_reached_through_a_symlink_resolves_to_the_real_directory() {
+        use std::os::unix::fs::DirBuilderExt;
+        let anchor = race_safe_tempdir();
+        let real = anchor.path().join("real");
+        // Owner-only, because this ends up an *ancestor* of the base: a bare
+        // `create_dir` under `umask 002` is 0775, and a group-writable ancestor
+        // is refused on its own merits — a different rule from the one under
+        // test here.
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&real)
+            .expect("create real dir");
+        let link = anchor.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+        let base = validated_override_base(&link.join("base")).expect("a symlinked ancestor");
+        assert_eq!(base, resolved(&real).join("base"));
+        assert!(base.is_dir(), "{} was not created", base.display());
+        assert!(
+            !base.starts_with(&link),
+            "{} still names the link {}",
+            base.display(),
+            link.display(),
+        );
+    }
+
+    /// The blocker the first cut of this walk had: a symlink's **owner** is
+    /// checked before the link is followed, not after it has been resolved away.
+    ///
+    /// Driven through the pure decision because the dangerous shape needs
+    /// `chown` to build — the whole point is a link owned by *somebody else*.
+    /// The follow path itself is exercised on disk by the tests below.
+    ///
+    /// This is the case `canonicalize` silently ate. On a multi-user host the
+    /// victim asks for `DAD_E2E_TMPDIR=/var/tmp/my-dad/base`; before their first
+    /// run another user creates `/var/tmp/my-dad` as a symlink to the victim's
+    /// own checkout. `/var/tmp` is sticky, so the victim cannot remove or rename
+    /// that entry — sticky protects the *attacker's* planted link here — and
+    /// resolving first meant the checkout was then walked as a chain of
+    /// perfectly ordinary victim-owned ancestors and accepted, with `base`
+    /// created 0700 inside the live repository.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_owned_by_another_user_is_refused_before_it_is_followed() {
+        let path = Path::new("/var/tmp/my-dad");
+
+        // Ours: the operator naming their own directory through their own link.
+        assert_eq!(symlink_hop_objection(path, 1000, 1000), None);
+        // Root's: macOS's `/var -> private/var`, which refusing would reject the
+        // whole platform.
+        assert_eq!(symlink_hop_objection(path, 0, 1000), None);
+
+        let why = symlink_hop_objection(path, 1001, 1000).expect("a foreign link is refused");
+        assert!(why.contains("symlink owned by uid 1001"), "{why}");
+        assert!(why.contains("neither 1000 nor root"), "{why}");
+        assert!(why.contains("/var/tmp/my-dad"), "{why}");
+    }
+
+    /// The sticky-directory case end to end, with the shapes that *can* be built
+    /// unprivileged: a sticky 1777 stand-in for `/var/tmp` is traversed, and a
+    /// link inside it that we own is followed rather than refused.
+    ///
+    /// Together with the pure test above this pins both halves of the rule —
+    /// that a sticky ancestor is still accepted (it has to be: `/var/tmp` is
+    /// 1777 on every real machine), and that acceptance now depends on judging
+    /// the entry found *below* it rather than on the sticky bit alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_we_own_under_a_sticky_directory_is_followed() {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::PermissionsExt;
+        let anchor = race_safe_tempdir();
+        // The `/var/tmp` stand-in: world-writable, sticky. Another local user
+        // could create entries here; the sticky bit only stops them removing
+        // ours.
+        let shared = anchor.path().join("shared");
+        std::fs::create_dir(&shared).expect("create the sticky stand-in");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777))
+            .expect("chmod 1777");
+
+        let real = shared.join("real");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&real)
+            .expect("create the real target");
+        let link = shared.join("my-dad");
+        std::os::unix::fs::symlink(&real, &link).expect("plant a link we own");
+
+        let base = validated_override_base(&link.join("base")).expect("our own link is followed");
+        assert_eq!(base, resolved(&real).join("base"));
+        assert!(base.is_dir(), "{} was not created", base.display());
+    }
+
+    /// A **non-final** link is judged too, before the tail below it is created.
+    ///
+    /// The redirection in the finding is not a link at the base — it is a link
+    /// at an ancestor whose missing tail the harness would then happily create
+    /// on the far side of it. This walks that exact shape with a link we own
+    /// (the only owner a test can produce) and pins the two things that must be
+    /// true regardless: the link is resolved *hop by hop* through descriptors,
+    /// and the resolved spelling — never the link's own — is what comes back and
+    /// is therefore what every downstream message, length budget and reaper
+    /// hint sees.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_final_link_is_resolved_before_its_missing_tail_is_created() {
+        use std::os::unix::fs::PermissionsExt;
+        let anchor = race_safe_tempdir();
+        // A 0o755 stand-in for a checkout: ours, ordinary, and a perfectly legal
+        // *ancestor* — which is exactly why the link pointing at it has to be
+        // the thing that is judged.
+        let checkout = anchor.path().join("checkout");
+        std::fs::create_dir(&checkout).expect("create the checkout");
+        std::fs::set_permissions(&checkout, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 0755");
+        let link = anchor.path().join("link");
+        std::os::unix::fs::symlink(&checkout, &link).expect("plant the link");
+
+        let base = validated_override_base(&link.join("outer").join("inner"))
+            .expect("our own link is followed");
+        assert_eq!(
+            base,
+            resolved(&checkout).join("outer").join("inner"),
+            "the resolved spelling must come back, never the link's",
+        );
+        assert!(
+            !base.starts_with(&link),
+            "{} still names the link {}",
+            base.display(),
+            link.display(),
+        );
+        // The tail below the link is still created owner-only, one component at
+        // a time — a permissive directory on the far side does not relax it.
+        for component in [base.parent().expect("outer").to_path_buf(), base] {
+            let mode = std::fs::symlink_metadata(&component)
+                .expect("stat created component")
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                mode,
+                0o700,
+                "{} was created 0o{mode:o}",
+                component.display(),
+            );
+        }
+    }
+
+    /// A **dangling** link we own is followed and its target created, rather
+    /// than refused.
+    ///
+    /// This changed with the walk, so it is pinned rather than left implicit.
+    /// Before, `canonicalize` failed with `NotFound` on the dangling component,
+    /// the name went into the "missing" list, `mkdirat` came back `EEXIST` and
+    /// the value was rejected as "is a symlink". Now the link is judged on its
+    /// own merits first, and one owned by us or by root is resolved — so
+    /// pointing `DAD_E2E_TMPDIR` through a link whose target does not exist yet
+    /// creates the target, which is the same thing the harness does for any
+    /// other base that is not there yet. Safety is unchanged: the link's owner
+    /// gates the hop, and every component of the target is walked and judged.
+    ///
+    /// The one place a link is still refused outright is
+    /// [`create_or_adopt_component`] — a link that appears in a slot the walk
+    /// had just found *empty* is the adoption race, not an operator's choice.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_we_own_is_followed_and_its_target_created() {
+        use std::os::unix::fs::PermissionsExt;
+        let anchor = race_safe_tempdir();
+        let target = anchor.path().join("not-there-yet");
+        let link = anchor.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("plant a dangling link");
+
+        let base = validated_override_base(&link).expect("our own dangling link is followed");
+        assert_eq!(base, resolved(anchor.path()).join("not-there-yet"));
+        let mode = std::fs::symlink_metadata(&base)
+            .expect("stat the created target")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o700, "{} is 0o{mode:o}", base.display());
+    }
+
+    /// A link chain that loops is bounded rather than spun on. `canonicalize`
+    /// used to return `ELOOP` for this; now that the harness resolves links
+    /// itself, the cap has to be its own.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cycle_is_refused_rather_than_followed_forever() {
+        let anchor = race_safe_tempdir();
+        let a = anchor.path().join("a");
+        let b = anchor.path().join("b");
+        std::os::unix::fs::symlink(&b, &a).expect("a -> b");
+        std::os::unix::fs::symlink(&a, &b).expect("b -> a");
+        let err = validated_override_base(&a.join("base")).expect_err("a cycle is refused");
+        assert!(err.contains("more than 40 symlinks"), "{err}");
+    }
+
+    /// A `..` inside a link *target* would step back above a component the walk
+    /// has already proved safe, so it is refused rather than resolved. No system
+    /// link the harness needs contains one — macOS's `/var -> private/var` does
+    /// not.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_target_containing_a_parent_component_is_refused() {
+        use std::os::unix::fs::DirBuilderExt;
+        let anchor = race_safe_tempdir();
+        // Owner-only: this is an *ancestor* of the link, and a bare
+        // `create_dir` under `umask 002` is 0775 — group-writable, which is
+        // refused on its own merits, a different rule from the one under test.
+        let outer = anchor.path().join("outer");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&outer)
+            .expect("create outer");
+        let link = outer.join("up");
+        std::os::unix::fs::symlink("../sibling", &link).expect("plant a `..` link");
+        let err = validated_override_base(&link.join("base")).expect_err("`..` in a target");
+        assert!(err.contains("contains a `..` component"), "{err}");
+    }
+
+    /// Resolving a symlink does not lower the bar for what it resolves *to*: a
+    /// link is a fine way to name a directory and a terrible way to inherit
+    /// trust, so the target is judged exactly as if it had been named directly.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_target_is_judged_like_any_other_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let anchor = race_safe_tempdir();
+        let target = anchor.path().join("target");
+        std::fs::create_dir(&target).expect("create the target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .expect("loosen the target");
+        let link = anchor.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+        let err = validated_override_base(&link).expect_err("a group-readable target is refused");
+        assert!(err.contains("mode is 0o755"), "{err}");
+        assert!(
+            err.contains(&resolved(&target).display().to_string()),
+            "{err}"
+        );
+    }
+
+    /// A base that does not exist yet is created owner-only, one component at a
+    /// time, rather than `create_dir_all`-ed at the umask default.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_override_base_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let anchor = race_safe_tempdir();
+        let base = anchor.path().join("outer").join("inner");
+        let created = validated_override_base(&base).expect("a fresh base under our own dir");
+        assert_eq!(created, resolved(anchor.path()).join("outer").join("inner"));
+        for component in [created.parent().expect("outer").to_path_buf(), created] {
+            let mode = std::fs::metadata(&component)
+                .expect("stat created component")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode,
+                0o700,
+                "{} was created 0o{mode:o}, not owner-only",
+                component.display(),
+            );
+        }
+    }
+
+    /// The base is held to the same bar whether the harness created it or found
+    /// it: it is where real agent credentials get seeded, so ours-and-owner-only
+    /// is the point, and an ancestor's laxer rule does not apply to it. Refused,
+    /// never repaired — chmod'ing a directory the harness does not own is what
+    /// this whole check exists to avoid.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_override_base_must_still_be_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let anchor = race_safe_tempdir();
+        let base = anchor.path().join("base");
+        std::fs::create_dir(&base).expect("plant the base");
+        let mode_of = |p: &Path| {
+            std::fs::symlink_metadata(p)
+                .expect("stat the base")
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755))
+            .expect("loosen the base");
+        let err = validated_override_base(&base).expect_err("a group-readable base is refused");
+        assert!(err.contains("mode is 0o755"), "{err}");
+        assert!(
+            err.contains(&resolved(&base).display().to_string()),
+            "{err}"
+        );
+        assert_eq!(mode_of(&base), 0o755, "the refused base was modified");
+
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+            .expect("tighten the base");
+        assert_eq!(
+            validated_override_base(&base).expect("an owner-only base is adopted"),
+            resolved(&base),
+        );
+    }
+
+    /// The adoption race (Greptile P1). A component that was missing when the
+    /// path was resolved can be created by another local user before the harness
+    /// gets to it, and a recursive create would adopt whatever is there — their
+    /// directory, or their symlink — without ever looking at it.
+    ///
+    /// Winning a real race in a test is not practical, so what is pinned is the
+    /// *decision*: planting the entry before the call reproduces exactly the
+    /// state losing that race leaves behind. Each shape an attacker could leave
+    /// must be refused on the descriptor the harness actually opened, whatever
+    /// an earlier stat of the name said.
+    #[cfg(unix)]
+    #[test]
+    fn a_component_that_appears_before_creation_is_judged_not_adopted() {
+        use std::os::unix::fs::PermissionsExt;
+        let anchor = race_safe_tempdir();
+        let euid = effective_uid();
+        // Each shape needs its own parent, since they all plant the same name.
+        let parent_of = |kind: &str| -> (PathBuf, std::fs::File) {
+            let dir = anchor.path().join(kind);
+            std::fs::create_dir(&dir).expect("stand-in parent");
+            let handle = std::fs::File::open(&dir).expect("open the parent");
+            (dir, handle)
+        };
+        let adopt = |path: &Path, handle: &std::fs::File| {
+            let mut walked = path.to_path_buf();
+            create_or_adopt_component(handle, std::ffi::OsStr::new("base"), &mut walked, euid)
+                .map(|_| walked)
+        };
+
+        // Nothing there: created by `mkdirat` at 0o700 and accepted.
+        let (fresh, handle) = parent_of("fresh");
+        let made = adopt(&fresh, &handle).expect("a fresh component is created");
+        assert_eq!(made, fresh.join("base"));
+        let mode = std::fs::symlink_metadata(&made)
+            .expect("stat the created component")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o700, "{} is 0o{mode:o}", made.display());
+
+        // A directory that is ours but not owner-only — the shape a lost race
+        // leaves when the winner made it world-readable.
+        let (loose, handle) = parent_of("loose");
+        let planted = loose.join("base");
+        std::fs::create_dir(&planted).expect("plant a directory");
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755))
+            .expect("loosen it");
+        let err = adopt(&loose, &handle).expect_err("a loose directory is refused");
+        assert!(err.contains("mode is 0o755"), "{err}");
+        assert!(err.contains(&planted.display().to_string()), "{err}");
+
+        // A symlink at the name: `O_NOFOLLOW` refuses it, and — the part that
+        // matters — nothing is created at the far end of it.
+        let (linked, handle) = parent_of("symlink");
+        let target = anchor.path().join("symlink-target");
+        std::fs::create_dir(&target).expect("link target");
+        std::os::unix::fs::symlink(&target, linked.join("base")).expect("plant a symlink");
+        let err = adopt(&linked, &handle).expect_err("a symlink is refused");
+        assert!(err.contains("is a symlink"), "{err}");
+        assert_eq!(
+            std::fs::read_dir(&target)
+                .expect("read the link target")
+                .count(),
+            0,
+            "the symlink was followed and written through",
+        );
+
+        // A plain file at the name.
+        let (filed, handle) = parent_of("file");
+        std::fs::write(filed.join("base"), b"not a directory").expect("plant a file");
+        let err = adopt(&filed, &handle).expect_err("a file is refused");
+        assert!(err.contains("is not a directory"), "{err}");
+    }
+
+    /// The same adoption race in the `#[cfg(not(unix))]` arm (Greptile P1 on
+    /// #472), which used to hand the whole unchecked pathname to
+    /// `create_dir_all` and take whatever was there.
+    ///
+    /// [`override_base_by_name`] is what that arm now calls, and it is
+    /// deliberately `cfg`-free so this runs on the Unix host the suite actually
+    /// executes on: the logic is plain `std::fs`, so what is observed here is
+    /// what Windows executes. As on the Unix side, winning a real race in a test
+    /// is not practical, so what is pinned is the *decision* — planting the entry
+    /// before the call reproduces exactly the state losing that race leaves
+    /// behind.
+    ///
+    /// The last case pins a **limit, not a guarantee**: a plain directory
+    /// somebody else planted is still adopted, because `std` exposes no owner on
+    /// Windows. Asserting it keeps the residual honest rather than implied.
+    #[test]
+    fn a_by_name_override_component_is_created_or_refused_never_adopted() {
+        // Held for the whole test: dropping it removes the tree underneath.
+        let guard = race_safe_tempdir();
+        // Resolved, because this walk refuses a symlinked ancestor rather than
+        // following it (see [`override_base_by_name`]) and on macOS `/var` — the
+        // harness root's own parent — is a symlink to `/private/var`. That is a
+        // property of the *fixture path*, not of the rule under test.
+        let anchor = guard
+            .path()
+            .canonicalize()
+            .expect("resolve the scratch anchor");
+        // Each shape needs its own parent, since they all plant the same name.
+        let parent_of = |kind: &str| -> PathBuf {
+            let dir = anchor.join(kind);
+            std::fs::create_dir(&dir).expect("stand-in parent");
+            dir
+        };
+
+        // Nothing there: the ordinary path still works, through a component that
+        // does not exist either.
+        let fresh = parent_of("fresh").join("outer").join("base");
+        let made = override_base_by_name(&fresh).expect("a fresh base is created");
+        assert_eq!(made, fresh, "the value comes back as the normalized path");
+        assert!(made.is_dir(), "{} was not created", made.display());
+
+        // And a second call over the same path adopts it rather than failing —
+        // the concurrent-test-process case, which must not be a refusal.
+        assert_eq!(
+            override_base_by_name(&fresh).expect("an existing base is adopted"),
+            fresh,
+        );
+
+        // `.` noise is dropped, so nothing downstream sees a spelling the
+        // filesystem does not.
+        let noisy = parent_of("noisy").join(".").join("base");
+        let base = override_base_by_name(&noisy).expect("a fresh base under our own dir");
+        assert_eq!(base, anchor.join("noisy").join("base"));
+
+        // A plain file at a missing component.
+        let filed = parent_of("file");
+        std::fs::write(filed.join("base"), b"not a directory").expect("plant a file");
+        let err = override_base_by_name(&filed.join("base").join("deeper"))
+            .expect_err("a file is refused");
+        assert!(err.contains("is not a directory"), "{err}");
+
+        // A symlink at a missing component — the redirection the finding is
+        // about. Unix-only *as a fixture*: `std::os::windows::fs::symlink_dir`
+        // needs Developer Mode or `SeCreateSymbolicLinkPrivilege`, so the shape
+        // is planted where it can be, and the rule it exercises is the same one
+        // `chain_entry_verdict` states for every platform.
+        #[cfg(unix)]
+        {
+            let linked = parent_of("symlink");
+            let target = anchor.join("symlink-target");
+            std::fs::create_dir(&target).expect("link target");
+            std::os::unix::fs::symlink(&target, linked.join("base")).expect("plant a symlink");
+            let err =
+                override_base_by_name(&linked.join("base")).expect_err("a symlink is refused");
+            assert!(err.contains("is a symlink"), "{err}");
+            // The part that matters: nothing was created at the far end of it.
+            let err = override_base_by_name(&linked.join("base").join("deeper"))
+                .expect_err("a symlinked ancestor is refused too");
+            assert!(err.contains("is a symlink"), "{err}");
+            assert_eq!(
+                std::fs::read_dir(&target)
+                    .expect("read the link target")
+                    .count(),
+                0,
+                "the symlink was followed and written through",
+            );
+        }
+
+        // The residual, asserted so it cannot rot into an assumed guarantee: a
+        // plain pre-existing directory is adopted. On Unix that is safe because
+        // the arm above judges ownership and mode; here there is nothing to
+        // judge it by, and #163/#164 is what closes it.
+        let planted = parent_of("planted").join("base");
+        std::fs::create_dir(&planted).expect("plant a directory");
+        assert_eq!(
+            override_base_by_name(&planted).expect("a plain directory is adopted"),
+            planted,
+            "adoption of a plain directory is the documented residual",
+        );
+    }
+
+    /// The race branch on its own. The walk above stats before it creates, so a
+    /// pre-planted entry is caught by the stat; the branch that decides the
+    /// actual race is the one where `create_dir` comes back `AlreadyExists`
+    /// because the entry appeared *after* that stat.
+    ///
+    /// [`create_or_refuse_component`] is where that lands, and planting the entry
+    /// before calling it reproduces exactly the state losing the race leaves
+    /// behind. `AlreadyExists` must not be success — which is what
+    /// `create_dir_all` treated it as, and is the whole of Greptile's finding.
+    #[test]
+    fn a_by_name_component_that_appears_before_creation_is_judged_not_adopted() {
+        let guard = race_safe_tempdir();
+        let anchor = guard
+            .path()
+            .canonicalize()
+            .expect("resolve the scratch anchor");
+        // Each shape needs its own parent, since they all plant the same name.
+        let parent_of = |kind: &str| -> PathBuf {
+            let dir = anchor.join(kind);
+            std::fs::create_dir(&dir).expect("stand-in parent");
+            dir
+        };
+
+        // Nothing there: created, and accepted.
+        let made = parent_of("fresh").join("base");
+        create_or_refuse_component(&made).expect("a fresh component is created");
+        assert!(made.is_dir(), "{} was not created", made.display());
+
+        // A plain file at the name.
+        let filed = parent_of("file").join("base");
+        std::fs::write(&filed, b"not a directory").expect("plant a file");
+        let err = create_or_refuse_component(&filed).expect_err("a file is refused");
+        assert!(err.contains("is not a directory"), "{err}");
+
+        // A symlink at the name — Unix-only as a *fixture* (Windows needs
+        // Developer Mode to create one), same rule either way.
+        #[cfg(unix)]
+        {
+            let linked = parent_of("symlink").join("base");
+            let target = anchor.join("symlink-target");
+            std::fs::create_dir(&target).expect("link target");
+            std::os::unix::fs::symlink(&target, &linked).expect("plant a symlink");
+            let err = create_or_refuse_component(&linked).expect_err("a symlink is refused");
+            assert!(err.contains("is a symlink"), "{err}");
+            assert_eq!(
+                std::fs::read_dir(&target)
+                    .expect("read the link target")
+                    .count(),
+                0,
+                "the symlink was followed and written through",
+            );
+        }
+
+        // And the residual once more, at the level that decides it: a plain
+        // directory somebody else could have planted is adopted, because `std`
+        // exposes no owner on Windows to tell it from one of ours.
+        let planted = parent_of("planted").join("base");
+        std::fs::create_dir(&planted).expect("plant a directory");
+        create_or_refuse_component(&planted).expect("a plain directory is adopted");
+    }
+
+    /// The rule the by-name walk judges every component against, as a pure
+    /// function — which is the only way the **reparse-point** case can be
+    /// pinned at all: junctions, cloud-file placeholders and `AppExecLink`
+    /// entries exist only on Windows, and `FileType::is_symlink` covers just the
+    /// first two of the three. A redirection the harness would write agent
+    /// credentials through must be refused whichever tag it carries.
+    #[test]
+    fn a_chain_entry_verdict_refuses_every_kind_of_redirection() {
+        let path = Path::new("/anchor/base");
+        let named = |verdict: Option<String>| verdict.unwrap_or_default();
+
+        // A plain directory is the one shape that passes.
+        assert_eq!(chain_entry_verdict(path, false, false, true), None);
+
+        // A symlink or junction — what `std` classifies as a link.
+        assert!(named(chain_entry_verdict(path, true, true, true)).contains("is a symlink"));
+        // A reparse point `std` does not classify as a link. This is the case
+        // `is_symlink` alone misses.
+        assert!(
+            named(chain_entry_verdict(path, false, true, true)).contains("is a reparse point"),
+            "an unclassified reparse point must still be refused",
+        );
+        // A file, or anything else that is not a directory.
+        assert!(
+            named(chain_entry_verdict(path, false, false, false)).contains("is not a directory")
+        );
+
+        // Every refusal names the path, since the message is all the operator
+        // gets — `refused_override_message` wraps it verbatim.
+        for (link, reparse, dir) in [
+            (true, true, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            let why = named(chain_entry_verdict(path, link, reparse, dir));
+            assert!(why.contains("/anchor/base"), "{why}");
+        }
+    }
+
+    /// The by-name walk applies the same shape rule as the descriptor walk —
+    /// a relative value or one with `..` never reaches the filesystem at all.
+    #[test]
+    fn a_by_name_override_base_refuses_the_same_shapes() {
+        let err = override_base_by_name(Path::new("scratch/e2e")).expect_err("relative is refused");
+        assert!(err.contains("is not an absolute path"), "{err}");
+        #[cfg(unix)]
+        {
+            let err = override_base_by_name(Path::new("/var/tmp/../../etc"))
+                .expect_err("`..` is refused");
+            assert!(err.contains("contains a `..` component"), "{err}");
+        }
+    }
+
+    /// The `dad-tests-<pid>-*` name is load-bearing: `cargo xtask
+    /// clean-e2e-tmp` reaps by that prefix and issue #461 reaps by the PID
+    /// inside it. Moving the root off `/tmp` must not disturb either.
+    #[test]
+    fn the_harness_root_keeps_its_pid_tagged_name() {
+        let root = harness_temp_root();
+        let name = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("root has a UTF-8 name");
+        let prefix = format!("dad-tests-{}-", std::process::id());
+        assert!(
+            name.starts_with(&prefix),
+            "{name} does not start with {prefix}"
+        );
+        assert!(
+            name.len() > prefix.len(),
+            "{name} has no random suffix after {prefix}",
+        );
+        assert_eq!(
+            root.parent(),
+            Some(harness_temp_base().path.as_path()),
+            "root must sit directly in the resolved temp base",
+        );
+    }
+
+    /// The root is created 0o700 by `mkdir(2)` itself, not chmod'ed afterwards.
+    /// On a shared base the gap between the two is long enough for a local user
+    /// to enter a default-0o755 root and plant fixed descendants.
+    #[cfg(unix)]
+    #[test]
+    fn the_harness_root_is_owner_only_from_the_moment_it_exists() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let root = harness_temp_root();
+        let meta = std::fs::symlink_metadata(root).expect("stat harness root");
+        let mode = meta.permissions().mode() & 0o7777;
+        assert_eq!(
+            private_dir_objection(meta.uid(), mode, effective_uid()),
+            None,
+            "{} is uid {} mode 0o{mode:o}",
+            root.display(),
+            meta.uid(),
+        );
+    }
+
+    /// The exact mode the harness *claims* — `0o700`, read back off the disk —
+    /// for the root and, when the private `/var/tmp` rung is the one in use,
+    /// for its parent.
+    ///
+    /// [`the_harness_root_is_owner_only_from_the_moment_it_exists`] asserts the
+    /// weaker `mode & 0o077 == 0`, which `0o500` and `0o000` also satisfy. This
+    /// pins the value the audit note and `docs/develop/e2e-temp-dirs.md` both
+    /// state, and it reads `symlink_metadata` rather than trusting that a
+    /// permissions builder was called: leftover roots turn up at `0o775`
+    /// because an orphaned agent re-created the path after the exit sweep
+    /// removed the real one, and only an on-disk assertion distinguishes a
+    /// harness root from a re-creation.
+    #[cfg(unix)]
+    #[test]
+    fn the_harness_root_and_its_private_parent_are_exactly_0o700_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+        let on_disk = |p: &Path| -> u32 {
+            std::fs::symlink_metadata(p)
+                .unwrap_or_else(|e| panic!("stat {}: {e}", p.display()))
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+
+        let root = harness_temp_root();
+        let root_mode = on_disk(root);
+        assert_eq!(
+            root_mode,
+            0o700,
+            "{} is 0o{root_mode:o} on disk, not the 0o700 the harness claims",
+            root.display(),
+        );
+
+        // Only the `/var/tmp/dad-e2e-<uid>` rung is the harness's to hold at
+        // 0o700. The system-temp fallback is 1777 by design, and a
+        // `DAD_E2E_TMPDIR` base is the caller's directory, not ours.
+        let private = match private_temp_parent() {
+            Ok(p) => p,
+            Err(why) => {
+                eprintln!("skipping the parent half: no private parent here ({why})");
+                return;
+            }
+        };
+        if root.parent() != Some(private.as_path()) {
+            eprintln!(
+                "skipping the parent half: the base in use is not the private parent {}",
+                private.display(),
+            );
+            return;
+        }
+        let parent_mode = on_disk(&private);
+        assert_eq!(
+            parent_mode,
+            0o700,
+            "{} is 0o{parent_mode:o} on disk, not the 0o700 the harness claims",
+            private.display(),
+        );
+    }
+
+    /// The per-test dir construction from `TuiDeck::try_launch_inner` — a bare
+    /// `tempfile::Builder` with `.permissions(0o700)` and the default `.tmp`
+    /// prefix — lands 0o700 on disk, verified against a control that proves the
+    /// umask alone would not have produced it.
+    ///
+    /// `try_launch_inner`'s own assertion only runs inside a live launch, i.e.
+    /// under `--features e2e`. This exercises the same two lines in the fast
+    /// tier, so a `tempfile` upgrade that stopped honouring `permissions()` for
+    /// the `tempdir_in` path is named here instead of surfacing as a panic deep
+    /// inside a PTY test.
+    ///
+    /// The control comes first because the assertion is only meaningful under a
+    /// permissive umask: with `umask 077` a directory created with no explicit
+    /// permissions at all is already owner-only, and asserting 0o700 would pass
+    /// while proving nothing. Skipping then is honest; asserting is not.
+    #[cfg(unix)]
+    #[test]
+    fn the_per_test_tempdir_is_0o700_even_when_the_umask_alone_would_not_be() {
+        use std::os::unix::fs::PermissionsExt;
+        let on_disk = |p: &Path| -> u32 {
+            std::fs::symlink_metadata(p)
+                .unwrap_or_else(|e| panic!("stat {}: {e}", p.display()))
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        let root = harness_temp_root();
+
+        let control = tempfile::Builder::new()
+            .prefix("umask-control-")
+            .tempdir_in(root)
+            .expect("umask control dir");
+        let control_mode = on_disk(control.path());
+        if control_mode & 0o077 == 0 {
+            eprintln!(
+                "skipping: the umask here already yields 0o{control_mode:o} \
+                 without asking, so the 0o700 below would prove nothing"
+            );
+            return;
+        }
+
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(root)
+            .expect("per-test dir");
+        let mode = on_disk(dir.path());
+        assert_eq!(
+            mode,
+            0o700,
+            "{} is 0o{mode:o} on disk while a dir created the same way without \
+             `permissions()` is 0o{control_mode:o} — `tempfile` stopped applying \
+             the mode at creation",
+            dir.path().display(),
+        );
+    }
+
+    /// The harness root must never be a descendant of the real checkout. A
+    /// seeded fixture that sits inside this repository is one `..` away from
+    /// `CLAUDE.md`, `AGENTS.md`, `.claude/` and `.agents/` — and real agents
+    /// walk ancestors, with the Codex worker taking such a directory as its
+    /// writable workspace. Skipped when `DAD_E2E_TMPDIR` is set, since pointing
+    /// it into the repo is an explicit (and documented) choice.
+    #[test]
+    fn the_harness_root_is_never_inside_the_repository() {
+        if std::env::var_os(TEMP_BASE_ENV).is_some_and(|v| !v.is_empty()) {
+            eprintln!("skipping: {TEMP_BASE_ENV} is set, so placement is explicit");
+            return;
+        }
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = harness_temp_root();
+        assert!(
+            !root.starts_with(repo),
+            "{} is inside the checkout at {}",
+            root.display(),
+            repo.display(),
+        );
+    }
+
+    /// Marks the first allocation on stdout so the re-run below can capture it.
+    const FIRST_ALLOC_MARKER: &str = "harness-first-alloc=";
+
+    /// The `tempfile` process-global redirect, asserted for exactly what it is:
+    /// **defence in depth**, in force only once the harness root exists.
+    ///
+    /// The root is resolved first here on purpose — that is the precondition of
+    /// the claim, not an accident of test order — so this covers allocations the
+    /// suite does not make itself (a dependency's, a call site that slipped past
+    /// `linkage-check` rule 8) *after* something has asked the harness for a
+    /// directory. It says nothing about the first allocation of a process; that
+    /// is the test below, and conflating the two is what let issue #322's
+    /// biggest allocations keep landing on the tmpfs while a green test claimed
+    /// otherwise.
+    #[test]
+    fn the_tempfile_redirect_catches_a_bare_constructor_once_the_root_exists() {
+        let root = harness_temp_root();
+        // The bare constructor IS the thing under test here, so rule 8 is opted
+        // out of on this one line: linkage-check:allow-bare-tempdir
+        let stray = tempfile::tempdir().expect("bare tempdir"); // linkage-check:allow-bare-tempdir
+        assert!(
+            stray.path().starts_with(root),
+            "{} escaped the harness root {}",
+            stray.path().display(),
+            root.display(),
+        );
+    }
+
+    /// Issue #322: the suite's temp-dir constructor must contain its result
+    /// **whatever order a test does things in** — including when it is the very
+    /// first thing the process does.
+    ///
+    /// The ordering is the entire point, and asserting it the other way round
+    /// proves nothing. The predecessor of this test resolved the root and only
+    /// *then* allocated, so it exercised the one ordering that could not fail.
+    /// Reversed, and measured on `a0b616c`, the allocation went to
+    /// `/tmp/.tmpz5pszS` while the root was
+    /// `/var/tmp/dad-e2e-1000/dad-tests-1715819-eACfgW` — in all 13 fast-tier
+    /// binaries — because the redirect above is installed at the END of the lazy
+    /// initialiser and nothing had triggered it yet.
+    ///
+    /// [`harness_tempdir`] is ordering-independent by construction: it resolves
+    /// the root before it allocates. The call is kept as the *first statement*
+    /// deliberately — anything above it re-introduces the favourable ordering.
+    ///
+    /// Doubles as the child of
+    /// [`the_first_allocation_in_a_fresh_process_is_contained`], which re-runs
+    /// this test in its own process and reads both paths off the markers.
+    #[test]
+    fn a_harness_tempdir_lands_under_the_harness_root() {
+        let stray = harness_tempdir().expect("first allocation of the process");
+        let root = harness_temp_root();
+        println!("{FIRST_ALLOC_MARKER}{}", stray.path().display());
+        println!("{ROOT_MARKER}{}", root.display());
+        assert!(
+            stray.path().starts_with(root),
+            "{} escaped the harness root {}",
+            stray.path().display(),
+            root.display(),
+        );
+    }
+
+    /// The same claim in a genuinely fresh process, because only nextest
+    /// guarantees one process per test. Under plain `cargo test` some earlier
+    /// test in the same binary has already built the root, and the ordering the
+    /// test above exists to pin is silently no longer under test.
+    ///
+    /// Re-runs *this* binary against that single test and reads both paths off
+    /// its stdout, so containment is asserted against a process whose first
+    /// allocation provably is the one under test.
+    #[test]
+    fn the_first_allocation_in_a_fresh_process_is_contained() {
+        let exe = std::env::current_exe().expect("current exe");
+        // libtest test names omit the crate segment `module_path!()` carries.
+        let module = module_path!()
+            .split_once("::")
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| module_path!());
+        let child_test = format!("{module}::a_harness_tempdir_lands_under_the_harness_root");
+        let out = std::process::Command::new(&exe)
+            .arg(&child_test)
+            .args(["--exact", "--test-threads=1", "--nocapture"])
+            .output()
+            .expect("re-run this test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "child run of {child_test} failed: {}\n{stdout}{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr),
+        );
+        // `--nocapture` interleaves markers onto libtest's own `test <name> ...`
+        // line, so match anywhere in the line rather than at the start.
+        let field = |marker: &str| -> String {
+            stdout
+                .lines()
+                .find_map(|l| l.split_once(marker).map(|(_, rest)| rest.trim().to_string()))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "child never reported {marker} — did `{child_test}` match no tests?\n{stdout}"
+                    )
+                })
+        };
+        let first = field(FIRST_ALLOC_MARKER);
+        let root = field(ROOT_MARKER);
+        assert!(
+            Path::new(&first).starts_with(&root),
+            "the first allocation of a fresh process escaped the harness root:\n  \
+             allocated {first}\n  root      {root}",
+        );
+    }
+
+    /// Build a directory whose absolute path is *exactly* `len` bytes.
+    ///
+    /// Deliberately not under the harness root: the point is to control the
+    /// total length, and the harness root's own length is whatever this machine
+    /// makes it. The returned guard removes it. `None` when every short anchor
+    /// on this machine is already longer than `len`, in which case the caller
+    /// skips rather than asserting something it did not actually build.
+    #[cfg(unix)]
+    fn padded_base_of_len(len: usize) -> Option<tempfile::TempDir> {
+        // `tempfile` always appends exactly six random characters.
+        const RAND: usize = 6;
+        let anchor = [PathBuf::from(SHARED_VAR_TMP), std::env::temp_dir()]
+            .into_iter()
+            .filter(|p| p.is_dir())
+            .find(|p| p.as_os_str().len() + 1 + RAND <= len)?;
+        let pad = len - anchor.as_os_str().len() - 1 - RAND;
+        tempfile::Builder::new()
+            .prefix(&"p".repeat(pad))
+            .tempdir_in(&anchor)
+            .ok()
+    }
+
+    /// Reproduce the deepest path the harness ever *binds*, using the same
+    /// constructors it uses, with the worst-case PID width baked in (Linux's
+    /// default `pid_max` is 4194304 — seven digits). The two `TempDir` guards
+    /// must be held by the caller: dropping them removes the socket's parents.
+    #[cfg(unix)]
+    fn worst_case_socket_path(base: &Path) -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+        let root = tempfile::Builder::new()
+            .prefix("dad-tests-4194304-")
+            .tempdir_in(base)
+            .expect("worst-case harness root");
+        // Default `tempfile` prefix — what `race_safe_tempdir` and a bare
+        // `harness_tempdir()` both produce.
+        let inner = tempfile::Builder::new()
+            .tempdir_in(root.path())
+            .expect("worst-case per-test dir");
+        let sock = inner.path().join("attach.sock");
+        (root, inner, sock)
+    }
+
+    /// The boundary the veto actually claims: a base at exactly the maximum
+    /// accepted length composes to exactly `SUN_PATH_USABLE` bytes and binds.
+    ///
+    /// The equality is the part that matters — it is what makes
+    /// `HARNESS_SOCKET_OVERHEAD` unable to drift. If `tempfile`'s suffix grew,
+    /// or a longer socket name appeared, or the constant were trimmed, the
+    /// composed path would stop matching the budget and this fails.
+    #[cfg(unix)]
+    #[test]
+    fn socket_budget_binds_at_exactly_the_maximum_base_length() {
+        let Some(base) = padded_base_of_len(MAX_TEMP_BASE_LEN) else {
+            eprintln!("skipping: no anchor short enough for a {MAX_TEMP_BASE_LEN}-byte base");
+            return;
+        };
+        assert!(
+            fits_socket_budget(base.path()),
+            "{} ({} bytes) should be exactly at the limit",
+            base.path().display(),
+            base.path().as_os_str().len(),
+        );
+        let (_root, _inner, sock) = worst_case_socket_path(base.path());
+        assert_eq!(
+            sock.as_os_str().len(),
+            SUN_PATH_USABLE,
+            "composed {} — the real nesting no longer matches \
+             HARNESS_SOCKET_OVERHEAD ({HARNESS_SOCKET_OVERHEAD})",
+            sock.display(),
+        );
+        let listener = std::os::unix::net::UnixListener::bind(&sock);
+        assert!(
+            listener.is_ok(),
+            "cannot bind {} ({} bytes): {:?}",
+            sock.display(),
+            sock.as_os_str().len(),
+            listener.err(),
+        );
+    }
+
+    /// One byte over is refused by the veto, and that byte is real: the
+    /// composed path is one past `sun_path` on macOS/BSD, where 104 bytes is
+    /// the cap. Linux allows 108, so the bind itself would still succeed here —
+    /// the veto is calibrated to the smaller platform on purpose, which is why
+    /// this asserts the arithmetic rather than the syscall. That the cap is
+    /// real at all is proven by the test below.
+    #[cfg(unix)]
+    #[test]
+    fn socket_budget_refuses_one_byte_over_the_maximum_base_length() {
+        let over = MAX_TEMP_BASE_LEN + 1;
+        let Some(base) = padded_base_of_len(over) else {
+            eprintln!("skipping: no anchor short enough for an {over}-byte base");
+            return;
+        };
+        assert!(
+            !fits_socket_budget(base.path()),
+            "{} ({} bytes) should be one byte too long",
+            base.path().display(),
+            base.path().as_os_str().len(),
+        );
+        let (_root, _inner, sock) = worst_case_socket_path(base.path());
+        assert_eq!(sock.as_os_str().len(), SUN_PATH_USABLE + 1);
+    }
+
+    /// The cap is a real syscall failure, not a convention: past the kernel's
+    /// `sun_path` (108 on Linux, 104 on macOS/BSD) `bind(2)` refuses outright.
+    /// This is the failure the ladder exists to avoid, and the reason the whole
+    /// budget is not simply "use the longest path you like".
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_path_past_the_kernel_cap_cannot_be_bound() {
+        // 13 past the macOS-calibrated maximum is 116 composed bytes — over the
+        // cap on every platform this suite runs on.
+        let far_over = MAX_TEMP_BASE_LEN + 13;
+        let Some(base) = padded_base_of_len(far_over) else {
+            eprintln!("skipping: no anchor short enough for a {far_over}-byte base");
+            return;
+        };
+        let (_root, _inner, sock) = worst_case_socket_path(base.path());
+        let err = std::os::unix::net::UnixListener::bind(&sock)
+            .expect_err("a path past sun_path must not bind");
+        eprintln!(
+            "bind({} bytes) failed as expected: {err}",
+            sock.as_os_str().len()
+        );
+    }
+
+    /// The everyday case, at whatever depth this machine actually produces:
+    /// the harness's own nesting still binds.
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_still_binds_at_the_depth_the_harness_uses() {
+        let dir = race_safe_tempdir();
+        let sock = dir.path().join("attach.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock);
+        assert!(
+            listener.is_ok(),
+            "cannot bind {} ({} bytes): {:?}",
+            sock.display(),
+            sock.as_os_str().len(),
+            listener.err(),
         );
     }
 

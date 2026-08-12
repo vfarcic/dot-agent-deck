@@ -421,7 +421,7 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
     // tree → the sentinel name is unique by construction. Canonicalized so the
     // restore path's `project_path == saved_dir` guard passes and the claude
     // worker's pre-seeded project-trust key matches its actual cwd exactly.
-    let orch_root = tempfile::tempdir().expect("orchestration root tempdir");
+    let orch_root = common::harness_tempdir().expect("orchestration root tempdir");
     let project_dir = orch_root.path().join("project");
     std::fs::create_dir_all(&project_dir).expect("create orchestration project dir");
     let project_dir = project_dir

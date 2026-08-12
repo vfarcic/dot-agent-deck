@@ -561,6 +561,22 @@ fn orchestration_dispatch_001_tab_surfaces_with_role_cards() {
     );
 }
 
+fn card_label(role: &str) -> String {
+    format!("ClaudeCode · {role}")
+}
+
+/// Match a role label only within one same-weight card top-border span.
+///
+/// Matched on the CARD TITLE ROW, not anywhere on the grid: the tab's right half
+/// renders the focused role's live terminal, so a bare `grid.contains` could be
+/// satisfied by the agent's own output echoing the text back. Cropping to the
+/// span between one weight's matching corners is what makes this specific to a
+/// card title — the predicate itself lives in the harness so the fast tier can
+/// guard it (`tests/grid_box_helpers.rs`; review of #465, S2/S5).
+fn card_titled(grid: &str, role: &str) -> bool {
+    common::label_in_box_top_border(grid, &card_label(role))
+}
+
 /// Scenario: Launch the deck on the `dispatch-orch-real` fixture, whose `real-team`
 /// orchestration defines THREE roles that are all real interactive Claude Haiku
 /// agents, open one `cat` caller pane, and run the real `dot-agent-deck dispatch
@@ -726,15 +742,6 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
     // daemon knew every role name and the user could not see any of them.
     deck.send_keys(b"\x1b[6;5~"); // Ctrl+PageDown → the dispatched orchestration tab
     const CARD_WAIT: Duration = Duration::from_secs(60);
-    let card_label = |role: &str| format!("ClaudeCode · {role}");
-    // Matched on the CARD TITLE ROW, not anywhere on the grid: the tab's right
-    // half renders the focused role's live terminal, so a bare `grid.contains`
-    // could be satisfied by the agent's own output echoing the text back. A card
-    // title is the only row that carries the label AND the card's top-left corner.
-    let card_titled = |grid: &str, role: &str| {
-        grid.lines()
-            .any(|line| line.contains('┌') && line.contains(&card_label(role)))
-    };
     assert!(
         common::wait_until(CARD_WAIT, || {
             let grid = deck.snapshot_grid();

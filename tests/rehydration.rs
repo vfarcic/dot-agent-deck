@@ -26,6 +26,17 @@
 
 #![cfg(unix)]
 
+// Issue #322. This crate is fast-tier and deliberately does NOT link
+// `tests/common/mod.rs`; pulling the PTY harness in would duplicate its ~530
+// executions here. But its eight scratch dirs each hold an `attach.sock`, so
+// they were the largest single source of live `/tmp/.tmp*` directories during a
+// recorded `cargo test-e2e` — sampling attributed most of the 49 observed to
+// this file. Sharing the ~40-line crate-internal resolver by path costs one
+// module and two extra test executions instead. See
+// `docs/develop/e2e-temp-dirs.md`.
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -80,7 +91,7 @@ async fn start_real_server() -> Server {
     let registry = Arc::new(AgentPtyRegistry::new());
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = bind_attach_listener(&path).expect("bind attach listener");
         (dir, path, listener)
@@ -112,7 +123,7 @@ async fn start_server_with_state(
 ) -> (TempDir, PathBuf, JoinHandle<()>) {
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = bind_attach_listener(&path).expect("bind attach listener");
         (dir, path, listener)
@@ -199,7 +210,7 @@ async fn start_dummy_server_on(
 ) -> (TempDir, PathBuf, JoinHandle<()>) {
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = bind_attach_listener(&path).expect("bind attach listener");
         (dir, path, listener)
@@ -239,6 +250,7 @@ fn make_session(
         pane_id: Some(pane_id.to_string()),
         agent_id: Some(agent_id.to_string()),
         display_name: None,
+        shell_synthetic_working: false,
     }
 }
 
@@ -382,7 +394,7 @@ async fn hydrate_treats_list_agents_failure_as_empty() {
     // No daemon running at the configured path: list_agents will fail with
     // ECONNREFUSED / ENOENT. The TUI must not error out — log and treat as
     // empty so the user can reconnect.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_temp::tempdir().unwrap();
     let missing = dir.path().join("does-not-exist.sock");
 
     let ctrl = Arc::new(EmbeddedPaneController::new(
@@ -580,7 +592,7 @@ async fn hydrate_falls_back_to_allocated_id_for_legacy_daemon() {
     // matches the pre-fix behavior, but startup must not regress.
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = UnixListener::bind(&path).expect("bind mock attach socket");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -650,7 +662,7 @@ async fn hydrate_treats_list_agents_timeout_as_empty() {
     // user can see the dashboard and reconnect.
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = UnixListener::bind(&path).expect("bind mock attach socket");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -694,7 +706,7 @@ async fn hydrate_skips_agent_that_disappears_between_list_and_attach() {
     // whole rehydration.
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = UnixListener::bind(&path).expect("bind mock attach socket");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -2418,7 +2430,7 @@ fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot() {
 async fn live_007_list_agents_sanitizes_and_clamps_hostile_live_snapshot_inner() {
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = UnixListener::bind(&path).expect("bind mock attach socket");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -2533,6 +2545,7 @@ fn live_008_event_none_agent_type_falls_back_to_spawn_time() {
         pane_id: Some(pane.to_string()),
         agent_id: Some(agent_id.to_string()),
         display_name: None,
+        shell_synthetic_working: false,
     };
 
     // The fix lands here: an event-derived AgentType::None must snapshot as

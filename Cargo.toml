@@ -64,7 +64,7 @@ semver = "1"
 # 0.8.1 keeps the flag, and the whole problem, out of the tree.
 portable-pty = "=0.8.1"
 vt100 = "0.16"
-futures-util = "=0.3.33"
+futures-util = "=0.3.34"
 regex = "1"
 open = "5"
 unicode-width = "0.2"

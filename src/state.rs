@@ -312,6 +312,15 @@ pub struct SessionState {
     /// the live scheduler-spawn case, where the name would otherwise degrade
     /// to the truncated pane id. `None` for ordinary hook-driven sessions.
     pub display_name: Option<String>,
+    /// PRD #370 M2: `true` only when the CURRENT [`SessionStatus::Working`]
+    /// was set by a synthesized `ShellBusy` event (not a real agent-emitted
+    /// one). Lets the paired `ShellIdle` know it is safe to revert `status`
+    /// to `Idle` — reverting unconditionally would clobber a real
+    /// `Working`/`Thinking`/`WaitingForInput` the agent itself set after the
+    /// synthetic promotion. Cleared by ANY other event type, real or
+    /// synthetic (see the bottom of `apply_event`), so a real event always
+    /// wins the "what set this status" question.
+    pub shell_synthetic_working: bool,
 }
 
 impl SessionState {
@@ -1403,6 +1412,12 @@ fn worker_event_proves_delivery(event: &AgentEvent) -> bool {
         // Status that boot, onboarding, auth or a permission prompt can produce
         // just as well as a real turn — ambiguous, so not proof.
         EventType::Idle | EventType::Error | EventType::WaitingForInput => false,
+        // PRD #370: a daemon-synthesized OS-level signal, not agent-emitted —
+        // a foreground shell command proves the pane's shell is busy, not
+        // that the LLM ever saw a prompt (a human could type it by hand).
+        // `Unknown` is the forward-compat catch-all — never proof by
+        // construction, matching `SessionStatus::Unknown`'s neutral rendering.
+        EventType::ShellBusy | EventType::ShellIdle | EventType::Unknown => false,
         // A turn is underway: a submitted prompt, a tool, a subagent, a
         // compaction, or a permission request raised by a tool the agent chose.
         EventType::Thinking
@@ -2609,6 +2624,7 @@ impl AppState {
                 pane_id: Some(pane_id),
                 agent_id,
                 display_name: None,
+                shell_synthetic_working: false,
             },
         );
     }
@@ -3640,6 +3656,7 @@ impl AppState {
                 // recompute it from metadata here (reviewer LOW-2: it was a
                 // redundant duplicate of that block).
                 display_name: None,
+                shell_synthetic_working: false,
             });
 
         // PRD #127 finding #2, reworked for PRD #284 sub-problem (d): seed the
@@ -3779,8 +3796,58 @@ impl AppState {
                 session.status = SessionStatus::Error;
                 true
             }
+            EventType::ShellBusy => {
+                // PRD #370 M2: only promote a stale/no-opinion status — never
+                // clobber a real agent-emitted Thinking/Working/
+                // WaitingForInput/Compacting/Error. A foreground shell command
+                // is evidence the pane is busy, not evidence of what kind of
+                // busy, so it only fills the gap where nothing more specific
+                // is already known.
+                let asserted =
+                    matches!(session.status, SessionStatus::Idle | SessionStatus::Unknown);
+                if asserted {
+                    session.status = SessionStatus::Working;
+                    session.shell_synthetic_working = true;
+                }
+                asserted
+            }
+            EventType::ShellIdle => {
+                // PRD #370 M2: only revert a status THIS mechanism set — see
+                // `shell_synthetic_working`'s doc comment. If a real event
+                // already took over (marker false), the detached descendant
+                // going away is not proof the agent itself went idle.
+                let asserted = session.shell_synthetic_working;
+                if asserted {
+                    session.status = SessionStatus::Idle;
+                }
+                asserted
+            }
+            EventType::Unknown => {
+                // Forward-compat catch-all — informational at most, never
+                // produced by this build. No status change.
+                false
+            }
             EventType::SessionEnd => unreachable!(),
         };
+
+        // PRD #370 M2: any REAL event other than `ShellBusy` clears the
+        // synthetic marker — a real, agent-emitted event (or a completed
+        // `ShellIdle` revert) means the CURRENT status is no longer "the
+        // daemon guessed Working from the OS-level descendant scan alone," so a
+        // later out-of-order/duplicate `ShellIdle` must not revert a real
+        // status back to `Idle`.
+        //
+        // Greptile review: `Unknown` must be excluded from the clear, same
+        // as `ShellBusy` — it is the `#[serde(other)]` catch-all for a
+        // future event type THIS build can't recognize, not proof of real
+        // agent activity. Clearing on it would let a future informational
+        // event type land between a `ShellBusy` and its paired `ShellIdle`
+        // and permanently strand the session at `Working` (the `ShellIdle`
+        // would see the marker already false and become a no-op) — exactly
+        // the silent-break `#[serde(other)]` exists to prevent.
+        if !matches!(event.event_type, EventType::ShellBusy | EventType::Unknown) {
+            session.shell_synthetic_working = false;
+        }
 
         // PRD #20 blocker-2: keep the live-target durable across the bounded
         // journal. An event that omits `live_target` inherits the session's
@@ -4891,6 +4958,10 @@ mod tests {
             EventType::Idle,
             EventType::Error,
             EventType::WaitingForInput,
+            // PRD #370: daemon-synthesized OS-level signals, never agent-emitted.
+            EventType::ShellBusy,
+            EventType::ShellIdle,
+            EventType::Unknown,
         ] {
             assert!(
                 !worker_event_proves_delivery(&event(no_proof.clone())),
@@ -4912,6 +4983,93 @@ mod tests {
                 "{turn:?} requires a live turn, so it proves the pointer landed"
             );
         }
+    }
+
+    /// PRD #370 M2: the whole point of the feature — `ShellBusy` fills a
+    /// stale `Idle`/`Unknown` gap with `Working`, and the paired `ShellIdle`
+    /// reverts it, WITHOUT either one ever clobbering a real, agent-emitted
+    /// status. Covers both directions plus the "real event took over in the
+    /// meantime" precedence case that motivates `shell_synthetic_working`.
+    #[test]
+    fn shell_busy_idle_promote_and_revert_without_clobbering_real_status() {
+        fn event(session_id: &str, event_type: EventType, tool_name: Option<&str>) -> AgentEvent {
+            AgentEvent {
+                session_id: session_id.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type,
+                tool_name: tool_name.map(str::to_string),
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata: HashMap::new(),
+                pane_id: Some("worker".to_string()),
+                agent_id: Some("agent-1".to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+
+        // Case 1: ShellBusy promotes a stale Idle to Working, and the paired
+        // ShellIdle reverts it back — the ordinary "shell ran a foreground
+        // command with no agent event in between" path this PRD exists for.
+        let mut state = AppState::default();
+        state.apply_event(event("s1", EventType::SessionStart, None)); // -> Idle
+        assert_eq!(state.sessions["s1"].status, SessionStatus::Idle);
+        state.apply_event(event("s1", EventType::ShellBusy, None));
+        assert_eq!(
+            state.sessions["s1"].status,
+            SessionStatus::Working,
+            "ShellBusy must promote a stale Idle"
+        );
+        assert!(state.sessions["s1"].shell_synthetic_working);
+        state.apply_event(event("s1", EventType::ShellIdle, None));
+        assert_eq!(
+            state.sessions["s1"].status,
+            SessionStatus::Idle,
+            "the paired ShellIdle must revert its own synthetic promotion"
+        );
+        assert!(!state.sessions["s1"].shell_synthetic_working);
+
+        // Case 2: ShellBusy must NOT clobber a real WaitingForInput — a
+        // pending permission prompt is exactly the case a false "Working"
+        // would mislead the user about.
+        let mut state = AppState::default();
+        state.apply_event(event("s2", EventType::SessionStart, None));
+        state.apply_event(event("s2", EventType::WaitingForInput, None));
+        state.apply_event(event("s2", EventType::ShellBusy, None));
+        assert_eq!(
+            state.sessions["s2"].status,
+            SessionStatus::WaitingForInput,
+            "ShellBusy must not override a real WaitingForInput"
+        );
+        assert!(
+            !state.sessions["s2"].shell_synthetic_working,
+            "the marker must not arm when ShellBusy declined to act"
+        );
+
+        // Case 3: a real event taking over AFTER a synthetic promotion must
+        // make a later (possibly stale/duplicate) ShellIdle a no-op — the
+        // exact scenario `shell_synthetic_working` exists to prevent: the
+        // agent itself started a real tool call while the shell was still
+        // foreground-busy, and the foreground pgid clearing afterward must
+        // not revert the real status to Idle.
+        let mut state = AppState::default();
+        state.apply_event(event("s3", EventType::SessionStart, None));
+        state.apply_event(event("s3", EventType::ShellBusy, None));
+        assert_eq!(state.sessions["s3"].status, SessionStatus::Working);
+        state.apply_event(event("s3", EventType::ToolStart, Some("Bash")));
+        assert!(
+            !state.sessions["s3"].shell_synthetic_working,
+            "a real ToolStart must clear the synthetic marker"
+        );
+        state.apply_event(event("s3", EventType::ShellIdle, None));
+        assert_eq!(
+            state.sessions["s3"].status,
+            SessionStatus::Working,
+            "a stale ShellIdle must not revert a real, agent-emitted Working"
+        );
     }
 
     /// PRD #249 M3 + review finding B3: the silent-worker notice carries **fixed
@@ -5187,6 +5345,7 @@ mod tests {
                 pane_id: Some(UNTAGGED_PANE.to_string()),
                 agent_id: Some("some-other-agent".to_string()),
                 display_name: None,
+                shell_synthetic_working: false,
             },
         );
 

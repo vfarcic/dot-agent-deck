@@ -1,0 +1,22 @@
+# Routes every pull request to the maintainer who did not open it.
+#
+# GitHub omits the PR author when auto-requesting review from code owners, so a single
+# pathless rule listing the whole maintainer set requests the *other* maintainer on every
+# PR — without anyone having to remember `gh pr create --reviewer`, and including PRs
+# opened by an agent or by a future contributor.
+#
+# This is a ROUTER, not a second gate. The `main-protected` ruleset keeps
+# `require_code_owner_review: false`, so the one required approval is satisfied by any
+# maintainer, exactly as before this file existed.
+#
+# Deliberately pathless: a path list is the part of CODEOWNERS that goes stale silently
+# every time a source file is renamed or split, and stale code-owner paths do not error —
+# they just stop routing. With one shared maintainer set there is nothing to route by path.
+#
+# Read from the BASE branch, so a PR editing this file does not benefit from its own change.
+# After any edit, check `gh api repos/vfarcic/dot-agent-deck/codeowners/errors` — a
+# malformed entry disables routing without failing anything.
+#
+# Keep in sync with MAINTAINERS.md. Rationale: docs/develop/governance.md.
+
+* @vfarcic @prageethw

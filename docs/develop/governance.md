@@ -16,9 +16,32 @@ Two properties of that arrangement are worth stating plainly rather than discove
 
 GitHub counts an approving review only from an account with **write** or **admin** permission. The set of people who can satisfy "one approving review" is therefore exactly the collaborator list, which [`MAINTAINERS.md`](../../MAINTAINERS.md) documents so it is visible in the repository and not only in repository settings.
 
-There is deliberately **no `.github/CODEOWNERS`**. Code owners exist to route review to *different* people for *different* paths. With one shared maintainer set there is nothing to route: a path list would restate "a maintainer must approve", which the approval count already says, while adding a hardcoded set of source paths that goes stale silently every time a file is renamed or split. Stale code-owner paths do not error — they just stop gating, which is the worst failure mode a gate can have.
+[`.github/CODEOWNERS`](../../.github/CODEOWNERS) exists, but only as a **router** and only as a single pathless rule: `* @vfarcic @prageethw`. That distinction carries the whole decision, because the original choice here was to have no `CODEOWNERS` at all and the reasoning behind it still holds for the shape it rejected. What was rejected is *per-path* ownership: a path list restates "a maintainer must approve", which the approval count already says, while adding a hardcoded set of source paths that goes stale silently every time a file is renamed or split — and stale code-owner paths do not error, they simply stop routing, which is the worst failure mode a gate can have. A pathless `*` has no paths to go stale, so none of that argument reaches it.
+
+What the pathless rule buys is the one thing the ruleset cannot express: **routing**. GitHub omits the pull request's author when auto-requesting review from code owners, so `* @vfarcic @prageethw` requests the other maintainer on every pull request, with nobody having to remember a flag. That is not a hypothetical convenience — on 2026-08-09, the day approvals were raised to 1, seven open pull requests from the owner had no reviewer requested at all, so the maintainer whose approval they needed had no signal they existed.
+
+It stays a router rather than a second gate: `require_code_owner_review` remains `false`, so any maintainer's approval satisfies the single required review exactly as it did before the file existed. Three mechanics are worth knowing, and they share a failure mode: each one stops the routing without failing anything, so the only symptom is a pull request sitting with no reviewer. `CODEOWNERS` is read from the **base** branch, so a pull request that edits it does not benefit from its own change. A malformed entry disables routing entirely — check `gh api repos/vfarcic/dot-agent-deck/codeowners/errors` after editing it. And a **draft** pull request is not routed to code owners until it is marked ready for review, so `gh pr ready <n>` is what actually triggers the request on anything opened with `--draft`.
 
 A consequence worth accepting deliberately: the approval requirement is not path-scoped, so a documentation typo needs a review round trip exactly like a protocol change does. Rulesets condition on ref names rather than file paths, so there is no clean way to exempt `docs/` without giving up the gate. One review on a typo is the cheaper half of that trade.
+
+## How review is requested, and who merges
+
+Review is requested through the pull request's **reviewer** field — not by mentioning someone in a comment. A comment notifies, but it does not put the pull request into the reviewer's *Review requested* queue, does not show up in their `gh pr status`, and is not what the approval rule counts.
+
+```sh
+gh pr create --reviewer prageethw ...       # at creation
+gh pr edit 464 --add-reviewer prageethw     # afterwards
+```
+
+With `CODEOWNERS` in place this normally happens on its own. The commands are for what it misses: a pull request opened before the routing existed, an extra reviewer beyond the routed one, or a re-request after one was removed. They are also the manual route on a draft — a reviewer named with `--reviewer` is recorded on a draft, but code-owner routing does not run until `gh pr ready <n>`. Do **not** assign the other maintainer instead — an assignee is who is responsible for driving the pull request to done, which is normally the author.
+
+Three rules about sequencing, each of which exists because of a specific ruleset setting:
+
+- **Request review last, not first.** `dismiss_stale_reviews_on_push: true`, so any push after an approval silently voids it. Settle CI, read Greptile's inline comments, push the fixes, resolve the threads — *then* ask for review. Requesting earlier buys a guaranteed second round trip.
+- **Resolve every review thread.** `required_review_thread_resolution: true` is what turns "read Greptile's inline comments" from a habit into something the merge button enforces — see [What is gated](#what-is-gated).
+- **The author merges after approval.** Nothing in the ruleset constrains who presses the button (`require_last_push_approval` is `false`), and the approving maintainer is under no obligation to. Reviewer-merges is a Prow/Kubernetes convention in which a *bot* merges on `/lgtm`; the GitHub-native equivalent is auto-merge, queued by the author. Auto-merge is currently disabled on this repository; enabling it would let the author queue the merge before review lands and never return to the pull request.
+
+**Never merge your own unapproved pull request.** For the owner it will succeed — the admin bypass makes it silent rather than blocked — and that silence is precisely the decay this arrangement exists to prevent. Any automated flow whose last step is a merge (`/prd-done`, `/prd-full`) must stop at "green, reviewed, approved" and hand off.
 
 ## Why CI has to change first
 

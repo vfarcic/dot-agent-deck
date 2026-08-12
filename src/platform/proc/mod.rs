@@ -25,11 +25,29 @@
 //!
 //! Note: peer-credential PID *discovery* (`SO_PEERCRED`) lives in
 //! [`crate::platform::peercred`]; this module only owns kill/teardown.
+//!
+//! PRD #386 M1/M2 adds a second, read-only concern alongside teardown: the
+//! **descendant-process scan** the shell-activity signal is built on. Its
+//! cross-platform half — [`ProcessInfo`], [`descendants`] and the structural
+//! [`descendant_shell_activity`] discriminator — lives in `scan.rs` and
+//! compiles everywhere; only the act of sampling the machine is platform code
+//! (`ps` on Unix, an unconditional `None` on Windows, matching
+//! [`foreground_pgid`]'s existing contract). It comes in two flavours:
+//! [`process_table`], which blocks the calling thread, and
+//! [`process_table_async`], which the daemon's poll loop uses so a wedged `ps`
+//! cannot stall a Tokio worker and so a [`tokio::time::timeout`] can genuinely
+//! kill it (issue #429).
 
+mod scan;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
 mod windows;
+
+pub use scan::{
+    CLAUDE_BASH_TOOL_SHAPE, MEASURED_SHELL_TOOL_SHAPES, ProcessInfo, ShellToolShape,
+    descendant_shell_activity, descendants,
+};
 
 /// Result of delivering the daemon-stop graceful signal to a PID via
 /// [`terminate_pid`].
@@ -131,12 +149,14 @@ pub(crate) fn checked_target_pid(pid: u32) -> std::io::Result<u32> {
 #[cfg(unix)]
 pub use unix::{
     AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait, force_kill_pid,
-    pin_process, send_sigterm_to_child_group, terminate_child_with_grace_and_wait, terminate_pid,
+    foreground_pgid, pin_process, process_table, process_table_async, send_sigterm_to_child_group,
+    terminate_child_with_grace_and_wait, terminate_pid,
 };
 #[cfg(windows)]
 pub use windows::{
     AgentProcessGroup, PinnedProcess, current_ppid, force_kill_child_and_wait, force_kill_pid,
-    pin_process, send_sigterm_to_child_group, terminate_child_with_grace_and_wait, terminate_pid,
+    foreground_pgid, pin_process, process_table, process_table_async, send_sigterm_to_child_group,
+    terminate_child_with_grace_and_wait, terminate_pid,
 };
 
 /// A [`portable_pty::Child`] stand-in over a real [`std::process::Child`], so the

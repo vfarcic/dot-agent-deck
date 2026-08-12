@@ -1,6 +1,23 @@
 [alias]
-test-fast = "nextest run"
-test-e2e = "nextest run --features e2e"
+# `--workspace` (issue #489, duplicate #470): the workspace root is itself a
+# package and there is no `default-members`, so cargo's default target
+# selection is the root package ALONE. Without this flag every test in
+# `xtask/linkage-check` and `xtask/docs` executed in NO gate anywhere —
+# neither alias below, nor CI, which runs the same commands. Measured:
+# `cargo nextest run` = 1657 tests, `--workspace` = 1705.
+#
+# The sibling of #436, which added `--workspace` to clippy for the same
+# reason. Clippy's half kept the COMPILE-time guarantees alive (those tests
+# are built, so a type error or lint still fails), which is precisely why the
+# gap was easy to miss: only the runtime assertions were inert.
+#
+# Free warm: the 48 added tests run in ~0.07s wall and every one is under
+# 40ms, so they vanish into the existing parallelism. Measured back to back,
+# the full tier is 26.4-26.9s root-only and 25.3-26.7s with `--workspace` —
+# indistinguishable, because the tier's wall clock is set by its slowest test
+# (~20s), not by its count.
+test-fast = "nextest run --workspace"
+test-e2e = "nextest run --workspace --features e2e"
 # PRD #77 Decision 7: `cargo xtask linkage-check` enforces catalog↔test
 # linkage. Args after the alias pass through to the binary.
 xtask = "run --quiet --package xtask-linkage-check --"

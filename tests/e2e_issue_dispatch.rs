@@ -128,7 +128,7 @@ struct GhStub {
 
 impl GhStub {
     fn new() -> Self {
-        let scratch = tempfile::tempdir().expect("gh stub scratch tempdir");
+        let scratch = common::harness_tempdir().expect("gh stub scratch tempdir");
         let base = scratch.path().to_path_buf();
         let dir = base.join("ghstub");
         let bindir = base.join("bin");
@@ -396,7 +396,7 @@ fn dispatch_001_clone_worktree_spawn() {
     stub.add_repo(repo, true);
     stub.set_issues(repo, &[7]);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();
@@ -465,7 +465,7 @@ fn dispatch_002_idempotent_skip_existing_worktree() {
     stub.add_repo(repo, true);
     stub.set_issues(repo, &[7]);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();
@@ -546,7 +546,7 @@ fn dispatch_003_skip_open_pr() {
     stub.set_issues(repo, &[7, 8]);
     stub.set_open_pr(repo, 7);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();
@@ -617,13 +617,13 @@ fn dispatch_004_orchestration_vs_single_agent() {
     stub.set_issues(orch_repo, &[11]);
     stub.set_issues(plain_repo, &[22]);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();
 
     // A single-agent dispatch resolves its command from `default_command`.
-    let cfg_td = tempfile::tempdir().expect("config tempdir");
+    let cfg_td = common::harness_tempdir().expect("config tempdir");
     let cfg = cfg_td.path().join("config.toml");
     std::fs::write(&cfg, "default_command = \"codex\"\n").expect("write config.toml");
     let launch_record = cfg_td.path().join("dispatch-launch.log");
@@ -742,7 +742,7 @@ fn dispatch_005_respects_max_per_run() {
     stub.add_repo(repo, true);
     stub.set_issues(repo, &[1, 2, 3, 4, 5]);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();
@@ -802,7 +802,7 @@ fn dispatch_006_close_removes_worktree_preserves_clone() {
     stub.add_repo(repo, true);
     stub.set_issues(repo, &[7]);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();
@@ -868,7 +868,7 @@ fn dispatch_007_one_issue_fails_others_dispatch() {
     stub.set_issues(repo, &[10, 11]);
     stub.fail_pr(repo, 11);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();
@@ -942,7 +942,7 @@ fn dispatch_008_refire_after_close_redispatches() {
     stub.add_repo(repo, true);
     stub.set_issues(repo, &[7]);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();
@@ -1034,7 +1034,7 @@ fn dispatch_009_multirole_orchestration_cleanup_refcount() {
     stub.add_repo_multirole(repo);
     stub.set_issues(repo, &[7]);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();
@@ -1126,7 +1126,7 @@ fn dispatch_012_worktree_present_skips_without_pr_check() {
     stub.add_repo(repo, true);
     stub.set_issues(repo, &[7]);
 
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();

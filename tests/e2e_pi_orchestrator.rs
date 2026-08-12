@@ -518,7 +518,7 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
 fn scheduler_pi_001_scheduled_unattended_status_via_extension() {
     skip_unless!(check_pi_available());
 
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let work = scratch.path().join("pi-work");
     std::fs::create_dir_all(&work).expect("create pi working_dir");
 

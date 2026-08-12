@@ -71,7 +71,7 @@
 //! local tempdir clone and never pushes; the task is a list-files directive, so
 //! neither agent must push or open a PR. The test asserts (best-effort) that the
 //! fixture repo has no `agent/issue-1` branch after the run. All on-disk state
-//! (clone + worktree) lives under a `tempfile::tempdir()` removed on drop.
+//! (clone + worktree) lives under a `common::harness_tempdir()` removed on drop.
 //!
 //! Decision 23 cost: two short interactive Haiku turns (orchestrator delegates,
 //! worker lists a handful of files) — well under the <$0.05/run bound.
@@ -233,7 +233,7 @@ fn dispatch_013_orchestration_surfaces_and_delegates() {
     // (`<work>/github-issues`) and its per-issue worktree
     // (`<work>/github-issues/.worktrees/issue-1`). A scratch tempdir removed on
     // drop, so no clone/worktree leaks past the test.
-    let work_td = tempfile::tempdir().expect("workspace tempdir");
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
     let work = work_td.path().join("ws");
     std::fs::create_dir_all(&work).expect("create workspace root");
     let work_str = work.to_string_lossy().into_owned();
@@ -243,7 +243,7 @@ fn dispatch_013_orchestration_surfaces_and_delegates() {
     // `default_command` config here (unlike the single-agent `dispatch/011`): the
     // orchestration's role commands come from the CLONED repo's
     // `.dot-agent-deck.toml`, not from `default_command`.
-    let sched_td = tempfile::tempdir().expect("schedules tempdir");
+    let sched_td = common::harness_tempdir().expect("schedules tempdir");
     let sched_path = sched_td.path().join("schedules.toml");
     std::fs::write(&sched_path, dispatch_schedule_toml(&work_str)).expect("write schedules.toml");
 

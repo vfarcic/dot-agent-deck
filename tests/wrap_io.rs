@@ -94,7 +94,7 @@ fn read_pty(mut master: File) -> Vec<u8> {
 }
 
 fn run_with_stderr_redirected() -> (bool, Vec<u8>, Vec<u8>) {
-    let fixture = tempfile::tempdir().expect("create stderr-only redirect fixture");
+    let fixture = common::harness_tempdir().expect("create stderr-only redirect fixture");
     let stderr_path = fixture.path().join("stderr.log");
     let stderr_file = File::create(&stderr_path).expect("create redirected stderr");
     let (master, slave) = open_pty();
@@ -128,7 +128,7 @@ fn run_with_stderr_redirected() -> (bool, Vec<u8>, Vec<u8>) {
 }
 
 fn run_with_stdout_redirected() -> (bool, Vec<u8>) {
-    let fixture = tempfile::tempdir().expect("create stdout-only redirect fixture");
+    let fixture = common::harness_tempdir().expect("create stdout-only redirect fixture");
     let stdout_path = fixture.path().join("stdout.log");
     let stdout_file = File::create(&stdout_path).expect("create redirected stdout");
     let (master, slave) = open_pty();
@@ -203,7 +203,7 @@ fn collect_wrapper_events(listener: &UnixListener, expected: usize) -> Vec<Agent
 fn codex_wrap_003_each_descriptor_preserves_its_original_semantics() {
     let separate = run_wrap("printf 'out\\n'; printf 'err\\n' >&2", b"");
 
-    let pipe_dir = tempfile::tempdir().expect("create stdout-only pipe fixture");
+    let pipe_dir = common::harness_tempdir().expect("create stdout-only pipe fixture");
     let pipe_stderr_path = pipe_dir.path().join("stderr.log");
     let pipe_stderr = std::fs::File::create(&pipe_stderr_path).expect("create stderr capture");
     let pipe = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
@@ -230,7 +230,7 @@ fn codex_wrap_003_each_descriptor_preserves_its_original_semantics() {
         .expect("run wrapper with stdout-only pipe");
     let pipe_stderr = std::fs::read(&pipe_stderr_path).expect("read separate pipe stderr");
 
-    let binary_dir = tempfile::tempdir().expect("create binary stdin fixture");
+    let binary_dir = common::harness_tempdir().expect("create binary stdin fixture");
     let binary_record = binary_dir.path().join("stdin.bin");
     let binary_payload = b"\x04\x00A\nB";
     let mut binary_child = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
@@ -316,7 +316,7 @@ fn codex_wrap_003_each_descriptor_preserves_its_original_semantics() {
 #[spec("codex/wrap/005")]
 #[test]
 fn codex_wrap_005_standalone_sessions_have_unique_ids() {
-    let fixture = tempfile::tempdir().expect("create standalone wrapper fixture");
+    let fixture = common::harness_tempdir().expect("create standalone wrapper fixture");
     let socket = fixture.path().join("hook.sock");
     let start = fixture.path().join("start");
     let listener = UnixListener::bind(&socket).expect("bind standalone wrapper event socket");
@@ -373,7 +373,7 @@ fn codex_wrap_005_standalone_sessions_have_unique_ids() {
 /// SIGKILLs the wrapper is orphaned to init.
 #[test]
 fn wrap_escalates_to_sigkill_before_the_deck_kills_the_wrapper() {
-    let fixture = tempfile::tempdir().expect("create escalation fixture");
+    let fixture = common::harness_tempdir().expect("create escalation fixture");
     let pid_path = fixture.path().join("child.pid");
     let (master, slave) = open_pty();
     let mut wrapper = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
@@ -474,7 +474,7 @@ fn run_signal_case(
     signal_name: &'static str,
     interactive: bool,
 ) -> SignalOutcome {
-    let fixture = tempfile::tempdir().expect("create signal fixture");
+    let fixture = common::harness_tempdir().expect("create signal fixture");
     let pid_path = fixture.path().join("child.pid");
     let mut command = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
     command
@@ -618,7 +618,7 @@ fn codex_wrap_004_termination_signals_reap_children_on_every_path() {
 /// longer outlive its test (three such stubs once survived for three days).
 #[test]
 fn wrap_max_lifetime_backstop_ends_an_unsignalled_wrapper_and_its_child() {
-    let fixture = tempfile::tempdir().expect("create lifetime backstop fixture");
+    let fixture = common::harness_tempdir().expect("create lifetime backstop fixture");
     let pid_path = fixture.path().join("child.pid");
     // Held for the whole test: the wrapper's descriptors must stay valid while it
     // runs, and (see the KNOWN PLATFORM GAP note below) releasing it early made no

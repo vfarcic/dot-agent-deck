@@ -15,6 +15,20 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+// Issue #322. This crate is fast-tier and deliberately does NOT link
+// `tests/common/mod.rs` — doing so would pull the whole PTY harness into
+// another binary and duplicate its ~530 fast-tier executions. But it is also
+// the one file in that group that binds Unix domain sockets, and
+// `cargo test-e2e` runs it, so its scratch dirs were being created in the OS
+// temp dir *during the e2e tier*. Measured on `5e8e0ed`: a live
+// `/tmp/.tmpVtiW6e/attach.sock` held by this binary.
+//
+// The fix is to share the ~40-line crate-internal resolver by path rather than
+// the harness. It is self-contained (no `crate::` references), so including it
+// here costs one module and two extra test executions — not the harness.
+#[path = "../src/test_temp.rs"]
+mod test_temp;
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 
@@ -63,7 +77,7 @@ async fn start_server() -> Server {
 
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_temp::tempdir().unwrap();
         let path = dir.path().join("attach.sock");
         let listener = bind_attach_listener(&path).expect("bind attach listener");
         (dir, path, listener)

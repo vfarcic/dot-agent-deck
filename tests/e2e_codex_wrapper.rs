@@ -128,7 +128,7 @@ fn codex_live_001_real_interactive_new_pane_runs_and_reports_status() {
         "codex --model {} --sandbox workspace-write --ask-for-approval never -c 'model_reasoning_effort=\"low\"'",
         common::codex_test_model(),
     );
-    let config_dir = tempfile::tempdir().expect("Codex new-pane config");
+    let config_dir = common::harness_tempdir().expect("Codex new-pane config");
     let config_path = config_dir.path().join("config.toml");
     std::fs::write(&config_path, format!("default_command = {command:?}\n"))
         .expect("write bare Codex default command");

@@ -96,7 +96,7 @@ fn run_now(deck: &TuiDeck, name: &str) {
 #[spec("scheduler/live/001")]
 #[test]
 fn live_001_scheduled_card_surfaces_to_attached_tui() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     // working_dir basename == task name, so the card renders "livecard" whether
     // its title comes from the display name or the cwd basename.
     let work = scratch.path().join("livecard");
@@ -151,7 +151,7 @@ fn live_001_scheduled_card_surfaces_to_attached_tui() {
 #[spec("scheduler/live/002")]
 #[test]
 fn live_002_focusing_scheduled_card_does_not_delete_it() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let work = scratch.path().join("schedfocus");
     std::fs::create_dir_all(&work).expect("create work dir");
 
@@ -239,7 +239,7 @@ fn live_002_focusing_scheduled_card_does_not_delete_it() {
 #[spec("scheduler/live/003")]
 #[test]
 fn live_003_scheduled_card_title_shows_friendly_name() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     // The working-dir basename (`runbox`) is deliberately UNRELATED to the
     // schedule name. That is the whole point: the friendly name `morning-digest`
     // can then reach the rendered grid ONLY through the card TITLE — never via
@@ -341,7 +341,7 @@ fn live_003_scheduled_card_title_shows_friendly_name() {
 #[spec("scheduler/live/004")]
 #[test]
 fn live_004_real_hook_supersession_keeps_friendly_title() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     // Same trap as `scheduler/live/003`: the working-dir basename (`runbox`) is
     // deliberately UNRELATED to the schedule name, so `morning-digest` can reach
     // the rendered grid ONLY through the card TITLE — never via the Dir line's

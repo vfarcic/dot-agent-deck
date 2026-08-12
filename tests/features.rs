@@ -9,6 +9,17 @@
 //! for the gated surface live in `tests/experimental_flag.rs` and
 //! `tests/e2e_experimental_flag.rs` (tester-owned).
 
+// Issue #322. Fast-tier, does NOT link `tests/common/mod.rs`; the ~40-line
+// crate-internal resolver is `#[path]`-included instead, at two extra test
+// executions rather than the harness's ~530. The two scratch dirs here hold a
+// throwaway `.dot-agent-deck.toml`, so they are tiny — but a file with two
+// conventions invites the wrong one, and rule 8 now covers all of `tests/`.
+// This is the one file in the group that is not `#![cfg(unix)]`; the resolver's
+// non-Unix arm falls back to the OS temp dir, which is what this call site did
+// before. See `docs/develop/e2e-temp-dirs.md`.
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
 use std::sync::Mutex;
 
 use dot_agent_deck::config::{
@@ -169,7 +180,7 @@ fn env_override_precedence() {
 // warning via `tracing::warn!`). A missing file resets to the default.
 #[test]
 fn invalid_toml_reload_keeps_previous() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_temp::tempdir().unwrap();
     let path = dir.path().join(".dot-agent-deck.toml");
     let previous = Features::test_with(true);
 
@@ -205,7 +216,7 @@ fn reload_apply_path_updates_shared_features() {
     // Keep env unset so `resolve_features` defers to the file value.
     let _e = ExperimentalEnvGuard::set(None);
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_temp::tempdir().unwrap();
     let path = dir.path().join(".dot-agent-deck.toml");
 
     // Start OFF and install via the same apply path the watcher uses.

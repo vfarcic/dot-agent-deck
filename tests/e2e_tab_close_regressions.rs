@@ -44,7 +44,7 @@ struct ScriptedDaemon {
 
 impl ScriptedDaemon {
     fn spawn(records: Vec<AgentRecord>, stop_script: StopScript) -> Self {
-        let dir = tempfile::tempdir().expect("scripted daemon tempdir");
+        let dir = common::harness_tempdir().expect("scripted daemon tempdir");
         let socket_path = dir.path().join("daemon.sock");
         let listener = StdUnixListener::bind(&socket_path).expect("bind scripted daemon socket");
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))

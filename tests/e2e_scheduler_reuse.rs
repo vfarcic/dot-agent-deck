@@ -89,7 +89,7 @@ fn task_block(name: &str, working_dir: &str, command: &str, new_tab_per_fire: bo
 #[spec("scheduler/reuse/001")]
 #[test]
 fn reuse_001_default_reuses_one_tab() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let (work, record, command) = recorder_setup(scratch.path(), "reuse");
 
     let toml = task_block("reuse", &work.to_string_lossy(), &command, false);
@@ -122,7 +122,7 @@ fn reuse_001_default_reuses_one_tab() {
 #[spec("scheduler/reuse/002")]
 #[test]
 fn reuse_002_new_tab_per_fire_opens_distinct_tabs() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let (work, record, command) = recorder_setup(scratch.path(), "fresh");
 
     let toml = task_block("fresh", &work.to_string_lossy(), &command, true);
@@ -165,7 +165,7 @@ fn reuse_002_new_tab_per_fire_opens_distinct_tabs() {
 #[spec("scheduler/reuse/003")]
 #[test]
 fn reuse_003_deliver_on_idle_debounce() {
-    let scratch = tempfile::tempdir().expect("scratch tempdir");
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
     let (work, record, command) = recorder_setup(scratch.path(), "idle");
 
     let toml = task_block("idle", &work.to_string_lossy(), &command, false);

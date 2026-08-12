@@ -735,8 +735,8 @@ fn send_daemon_request_blocking_with_timeout(
     req: &crate::daemon_protocol::AttachRequest,
     timeout: std::time::Duration,
 ) -> std::io::Result<crate::daemon_protocol::AttachResponse> {
-    use crate::daemon_protocol::{KIND_REQ, KIND_RESP};
-    use std::io::{Read, Write};
+    use crate::daemon_protocol::KIND_REQ;
+    use std::io::Write;
 
     let path = config::attach_socket_path();
     let mut stream = crate::platform::ipc::IpcClient::connect(&path)?;
@@ -750,8 +750,35 @@ fn send_daemon_request_blocking_with_timeout(
     stream.write_all(&payload)?;
     stream.flush()?;
 
+    read_resp_frame_blocking(&mut stream)
+}
+
+/// Read one `KIND_RESP` frame off a synchronous reader and decode its body.
+///
+/// Split out of [`send_daemon_request_blocking_with_timeout`] so the framing
+/// can be exercised against a plain in-memory reader (issue #478) — the send
+/// path itself needs a live socket at [`config::attach_socket_path`].
+///
+/// The length prefix is checked against
+/// [`crate::daemon_protocol::MAX_FRAME_LEN`] BEFORE the body is allocated,
+/// mirroring [`crate::daemon_protocol::read_frame`] — same bound, same
+/// [`std::io::ErrorKind::InvalidData`], same message shape. Without it a
+/// 5-byte header claiming `u32::MAX` made this allocate ~4 GiB without the
+/// peer sending a single body byte, and this runs SYNCHRONOUSLY on the
+/// `Ctrl+n` new-pane key path (via [`live_orchestration_cwds`]), so the
+/// failure mode was the TUI ballooning or being OOM-killed on a keystroke.
+/// The socket is `0o600`, so the reachable case is a buggy or compromised
+/// same-uid daemon — exactly the "buggy peer" `MAX_FRAME_LEN` was written for.
+/// Every caller already treats `Err` as a failed request (best-effort hint,
+/// or a `Run-now failed: …` status line), so an over-long frame degrades
+/// instead of panicking.
+fn read_resp_frame_blocking<R: std::io::Read>(
+    r: &mut R,
+) -> std::io::Result<crate::daemon_protocol::AttachResponse> {
+    use crate::daemon_protocol::{KIND_RESP, MAX_FRAME_LEN};
+
     let mut resp_header = [0u8; 5];
-    stream.read_exact(&mut resp_header)?;
+    r.read_exact(&mut resp_header)?;
     if resp_header[0] != KIND_RESP {
         return Err(std::io::Error::other(format!(
             "expected RESP frame, got kind 0x{:02x}",
@@ -764,8 +791,14 @@ fn send_daemon_request_blocking_with_timeout(
         resp_header[3],
         resp_header[4],
     ]) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame length {len} exceeds {MAX_FRAME_LEN}"),
+        ));
+    }
     let mut body = vec![0u8; len];
-    stream.read_exact(&mut body)?;
+    r.read_exact(&mut body)?;
     serde_json::from_slice(&body).map_err(std::io::Error::other)
 }
 
@@ -20976,6 +21009,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            shell_synthetic_working: false,
         };
 
         let lines = recent_tool_lines(&session, 3);
@@ -23469,6 +23503,7 @@ mod tests {
             pane_id: Some(pane.to_string()),
             agent_id: None,
             display_name: None,
+            shell_synthetic_working: false,
         };
         let s0 = make("s0", "p0");
         let s1 = make("s1", "p1");
@@ -24389,6 +24424,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            shell_synthetic_working: false,
         }
     }
 
@@ -24609,6 +24645,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            shell_synthetic_working: false,
         };
 
         // Spacious: get all 3
@@ -24643,6 +24680,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            shell_synthetic_working: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -24668,6 +24706,7 @@ mod tests {
             pane_id: None,
             agent_id: None,
             display_name: None,
+            shell_synthetic_working: false,
         };
 
         let prompts = collect_recent_prompts(&session, 3);
@@ -29615,5 +29654,97 @@ mod tests {
                  got {other:?}"
             ),
         }
+    }
+
+    /// Issue #478: the synchronous client's response read is bounded by the
+    /// SAME `MAX_FRAME_LEN` the async `read_frame` enforces. A forged 5-byte
+    /// header is all a peer needs — the allocation used to happen before
+    /// `read_exact`, so no body bytes had to follow. Mirrors
+    /// `daemon_protocol::tests::frame_rejects_oversize`.
+    #[test]
+    fn resp_frame_rejects_oversize_before_allocating() {
+        use crate::daemon_protocol::{KIND_RESP, MAX_FRAME_LEN};
+
+        for len in [MAX_FRAME_LEN as u32 + 1, u32::MAX] {
+            // Header only: five bytes, no body. If the bound were missing,
+            // `vec![0u8; len]` would run for up to ~4 GiB right here.
+            let mut buf: Vec<u8> = vec![KIND_RESP];
+            buf.extend_from_slice(&len.to_be_bytes());
+            let mut cursor = std::io::Cursor::new(buf);
+
+            let err = read_resp_frame_blocking(&mut cursor)
+                .expect_err("expected Err for an over-long response frame");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidData,
+                "over-long frame must fail as InvalidData like read_frame does, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("exceeds"),
+                "error should name the bound it blew, got {err}"
+            );
+            // Nothing past the 5-byte header was consumed: the read bailed at
+            // the length check, so no body buffer was ever sized from `len`.
+            assert_eq!(
+                cursor.position(),
+                5,
+                "the body read must not be attempted once the length is rejected"
+            );
+        }
+    }
+
+    /// The bound is `>`, not `>=`: a frame of exactly `MAX_FRAME_LEN` is legal
+    /// and must reach the body read (which then fails as a truncated frame
+    /// here, since the test supplies no payload) rather than being rejected as
+    /// over-long. Guards the off-by-one between the two implementations.
+    #[test]
+    fn resp_frame_accepts_exactly_max_frame_len() {
+        use crate::daemon_protocol::{KIND_RESP, MAX_FRAME_LEN};
+
+        let mut buf: Vec<u8> = vec![KIND_RESP];
+        buf.extend_from_slice(&(MAX_FRAME_LEN as u32).to_be_bytes());
+        let mut cursor = std::io::Cursor::new(buf);
+
+        let err = read_resp_frame_blocking(&mut cursor)
+            .expect_err("no body supplied, so the read must still fail");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "at-limit frame must be truncated-body, not rejected as over-long, got {err:?}"
+        );
+    }
+
+    /// The happy path still decodes: a well-formed RESP frame round-trips
+    /// through the same helper the socket path now uses.
+    #[test]
+    fn resp_frame_decodes_well_formed_response() {
+        use crate::daemon_protocol::{AttachResponse, KIND_RESP};
+
+        let resp = AttachResponse {
+            ok: true,
+            ..Default::default()
+        };
+        let payload = serde_json::to_vec(&resp).unwrap();
+        let mut buf: Vec<u8> = vec![KIND_RESP];
+        buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&payload);
+        let mut cursor = std::io::Cursor::new(buf);
+
+        let decoded = read_resp_frame_blocking(&mut cursor).expect("well-formed frame must decode");
+        assert!(decoded.ok);
+    }
+
+    /// A non-RESP kind is still rejected up front — the bound was added
+    /// without disturbing the existing kind check.
+    #[test]
+    fn resp_frame_rejects_wrong_kind() {
+        use crate::daemon_protocol::KIND_STREAM_OUT;
+
+        let mut buf: Vec<u8> = vec![KIND_STREAM_OUT];
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        let mut cursor = std::io::Cursor::new(buf);
+
+        let err = read_resp_frame_blocking(&mut cursor).expect_err("expected Err for wrong kind");
+        assert!(err.to_string().contains("expected RESP frame"), "got {err}");
     }
 }

@@ -27,6 +27,12 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+/// Issue #322: linked purely for [`common::harness_tempdir`]. This file has no
+/// PTY or daemon of its own, but its temp HOMEs must still nest under the one
+/// per-process harness root — a bare `tempfile::tempdir()` here is the first
+/// allocation the process makes, so it lands in the OS temp dir instead.
+mod common;
+
 /// Path to the freshly-built binary under test (Cargo sets this at
 /// integration-test build time).
 fn bin() -> &'static str {
@@ -95,9 +101,9 @@ fn make_executable(_path: &Path) {}
 
 #[test]
 fn orchestrator_setup_pi_absent_prints_hint_and_fails() {
-    let home = tempfile::tempdir().unwrap();
+    let home = common::harness_tempdir().unwrap();
     // PATH points only at an empty dir → no `pi` discoverable.
-    let empty = tempfile::tempdir().unwrap();
+    let empty = common::harness_tempdir().unwrap();
 
     let (out, text) = run_setup(home.path(), &[empty.path()]);
 
@@ -118,13 +124,13 @@ fn orchestrator_setup_pi_absent_prints_hint_and_fails() {
 
 #[test]
 fn orchestrator_setup_pi_present_materializes_and_succeeds() {
-    let home = tempfile::tempdir().unwrap();
+    let home = common::harness_tempdir().unwrap();
     // A fake `pi` on PATH: detection checks for a regular *executable* file
     // named `pi` (it never runs it), so an empty file with the exec bit set is
     // enough to drive the present branch without a real Pi. The exec bit is
     // required since c8110eb (`is_executable_file`) — a non-executable candidate
     // takes the not-present branch.
-    let bin_dir = tempfile::tempdir().unwrap();
+    let bin_dir = common::harness_tempdir().unwrap();
     let pi = bin_dir.path().join("pi");
     std::fs::write(&pi, b"").unwrap();
     make_executable(&pi);
@@ -162,7 +168,7 @@ fn orchestrator_setup_pi_present_materializes_and_succeeds() {
 #[test]
 fn orchestrator_setup_home_unset_errors_without_materializing() {
     // A fake *present* `pi`, so the only reason to fail is the unset HOME.
-    let bin_dir = tempfile::tempdir().unwrap();
+    let bin_dir = common::harness_tempdir().unwrap();
     let pi = bin_dir.path().join("pi");
     std::fs::write(&pi, b"").unwrap();
     make_executable(&pi);
@@ -194,7 +200,7 @@ fn orchestrator_setup_home_unset_errors_without_materializing() {
 /// and never reporting success.
 #[test]
 fn orchestrator_setup_home_empty_errors_without_materializing() {
-    let bin_dir = tempfile::tempdir().unwrap();
+    let bin_dir = common::harness_tempdir().unwrap();
     let pi = bin_dir.path().join("pi");
     std::fs::write(&pi, b"").unwrap();
     make_executable(&pi);

@@ -2,6 +2,15 @@
 
 //! Fast safety coverage for Codex hook installation and wrapper trust scoping.
 
+// Issue #322. Fast-tier, does NOT link `tests/common/mod.rs`; the ~40-line
+// crate-internal resolver is `#[path]`-included instead, at two extra test
+// executions rather than the harness's ~530. The 14 scratch dirs here are
+// pinned Codex homes and wrapper fixtures — small, but they were landing in the
+// OS temp dir, which on this project's dev box is the RAM-backed `/tmp` the
+// issue is about. See `docs/develop/e2e-temp-dirs.md`.
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::process::{Command, Output, Stdio};
 
@@ -30,7 +39,7 @@ fn read_hooks(home: &std::path::Path) -> Value {
 }
 
 fn assert_incompatible_config_is_untouched(value: Value) {
-    let home = tempfile::tempdir().expect("create Codex home");
+    let home = test_temp::tempdir().expect("create Codex home");
     write_hooks(home.path(), &value);
     let original = std::fs::read(hooks_path(home.path())).expect("read original hooks");
 
@@ -218,7 +227,7 @@ fn run_fake_codex(
 /// Scenario: Install deck hooks into a Codex home containing an unrelated user hook whose command mentions dot-agent-deck as an audit argument. The user rule must remain present while exactly one deck-owned rule is installed.
 #[test]
 fn codex_hooks_install_001_substring_match_does_not_delete_user_hook() {
-    let home = tempfile::tempdir().expect("create Codex home");
+    let home = test_temp::tempdir().expect("create Codex home");
     let user_command = "/usr/local/bin/audit-wrapper --watch dot-agent-deck";
     write_hooks(
         home.path(),
@@ -249,7 +258,7 @@ fn codex_hooks_install_001_substring_match_does_not_delete_user_hook() {
 /// Scenario: Attempt installation over malformed hooks.json. Installation must either reject the file without changing it or preserve the original bytes in a backup before writing replacement content.
 #[test]
 fn codex_hooks_install_002_malformed_json_is_never_discarded() {
-    let home = tempfile::tempdir().expect("create Codex home");
+    let home = test_temp::tempdir().expect("create Codex home");
     let original = b"{\n  \"hooks\": [this is user data\n";
     std::fs::write(hooks_path(home.path()), original).expect("write malformed hooks fixture");
 
@@ -292,7 +301,7 @@ fn codex_hooks_install_005_non_array_event_is_untouched() {
 /// Scenario: Reinstall deck hooks over an existing valid file. The installer must publish through a same-directory replacement rather than truncating the destination inode in place.
 #[test]
 fn codex_hooks_install_006_write_is_atomic_replacement() {
-    let home = tempfile::tempdir().expect("create Codex home");
+    let home = test_temp::tempdir().expect("create Codex home");
     write_hooks(
         home.path(),
         &json!({
@@ -321,8 +330,8 @@ fn codex_hooks_install_006_write_is_atomic_replacement() {
 /// Scenario: Wrap a direct executable named codex while explicitly declaring the agent as Claude. The wrapper must neither install Codex hooks nor inject Codex's hook-trust bypass flag.
 #[test]
 fn codex_hooks_trust_001_direct_codex_requires_codex_identity() {
-    let fixture = tempfile::tempdir().expect("create wrapper fixture");
-    let home = tempfile::tempdir().expect("create Codex home");
+    let fixture = test_temp::tempdir().expect("create wrapper fixture");
+    let home = test_temp::tempdir().expect("create Codex home");
 
     let (output, args) = run_fake_codex("claude", home.path(), fixture.path());
 
@@ -342,8 +351,8 @@ fn codex_hooks_trust_001_direct_codex_requires_codex_identity() {
 #[test]
 fn codex_trust_002_only_pinned_unmanaged_deck_entries_are_trusted() {
     for launcher in [false, true] {
-        let fixture = tempfile::tempdir().expect("create wrapper fixture");
-        let home = tempfile::tempdir().expect("create Codex home");
+        let fixture = test_temp::tempdir().expect("create wrapper fixture");
+        let home = test_temp::tempdir().expect("create Codex home");
         let fake_codex = write_fake_codex(fixture.path());
         write_hooks(
             home.path(),
@@ -426,8 +435,8 @@ fn codex_trust_002_only_pinned_unmanaged_deck_entries_are_trusted() {
 #[test]
 fn codex_trust_001_no_program_form_receives_global_bypass() {
     for program_name in ["codex", "absolute-codex", "launcher.sh", "devbox"] {
-        let fixture = tempfile::tempdir().expect("create Codex launcher fixture");
-        let home = tempfile::tempdir().expect("create pinned Codex home");
+        let fixture = test_temp::tempdir().expect("create Codex launcher fixture");
+        let home = test_temp::tempdir().expect("create pinned Codex home");
         let fake_codex = write_fake_codex(fixture.path());
         let program = match program_name {
             "codex" => std::path::PathBuf::from("codex"),
@@ -470,8 +479,8 @@ fn codex_trust_001_no_program_form_receives_global_bypass() {
 #[spec("codex/trust/003")]
 #[test]
 fn codex_trust_003_config_edits_are_preserving_idempotent_and_scoped() {
-    let fixture = tempfile::tempdir().expect("create wrapper fixture");
-    let home = tempfile::tempdir().expect("create Codex home");
+    let fixture = test_temp::tempdir().expect("create wrapper fixture");
+    let home = test_temp::tempdir().expect("create Codex home");
     write_fake_codex(fixture.path());
     let original = "# user comment must survive\nmodel = \"gpt-user-choice\"\n\n[hooks.state.\"foreign-key\"]\nenabled = true\ntrusted_hash = \"sha256:foreign\"\n";
     std::fs::write(home.path().join("config.toml"), original).expect("seed Codex config");
@@ -541,8 +550,8 @@ fn codex_trust_003_config_edits_are_preserving_idempotent_and_scoped() {
 #[spec("codex/hooks/004")]
 #[test]
 fn codex_hooks_004_cli_install_succeeds() {
-    let fixture = tempfile::tempdir().expect("create CLI fixture");
-    let home = tempfile::tempdir().expect("create Codex home");
+    let fixture = test_temp::tempdir().expect("create CLI fixture");
+    let home = test_temp::tempdir().expect("create Codex home");
     write_fake_codex(fixture.path());
     let path = format!(
         "{}:{}",

@@ -14,6 +14,14 @@
 //!   extractor sharpens, falling back to the generic first-string branch when
 //!   the shape is not what we guessed.
 
+// Issue #322. Fast-tier, does NOT link `tests/common/mod.rs`; the ~40-line
+// crate-internal resolver is `#[path]`-included instead, at two extra test
+// executions rather than the harness's ~530. Every scratch dir here binds a
+// `hook.sock`, which is exactly the shape that kept `tests/daemon_protocol.rs`
+// out of the OS temp dir. See `docs/develop/e2e-temp-dirs.md`.
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
 use std::io::{Read as _, Write as _};
 use std::os::unix::net::UnixListener;
 use std::process::{Command, Stdio};
@@ -22,7 +30,7 @@ use std::time::{Duration, Instant};
 use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
 
 fn invoke_devin_hook(payload: &serde_json::Value) -> AgentEvent {
-    let temp = tempfile::tempdir().expect("create Devin hook socket directory");
+    let temp = test_temp::tempdir().expect("create Devin hook socket directory");
     let socket = temp.path().join("hook.sock");
     let listener = UnixListener::bind(&socket).expect("bind Devin hook socket");
     listener

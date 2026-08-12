@@ -7,6 +7,15 @@
 //! AttachStream, then returns a controlled StopAgent error so the observable
 //! local pane registry can prove whether teardown completed or was retained.
 
+// Issue #322. Fast-tier, does NOT link `tests/common/mod.rs` — the synthetic
+// daemon below binds a `daemon.sock` in its scratch dir, so live `/tmp`
+// sampling during a recorded `cargo test-e2e` caught five of this file's
+// directories holding a LISTENing socket. `#[path]`-including the ~40-line
+// crate-internal resolver costs one module and two extra test executions,
+// rather than the harness's ~530. See `docs/develop/e2e-temp-dirs.md`.
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -87,7 +96,7 @@ impl StopErrorDaemon {
     }
 
     fn spawn_with_plan(stop_plan: StopPlan) -> Self {
-        let dir = tempfile::tempdir().expect("synthetic daemon tempdir");
+        let dir = test_temp::tempdir().expect("synthetic daemon tempdir");
         let socket_path = dir.path().join("daemon.sock");
         let listener = StdUnixListener::bind(&socket_path).expect("bind synthetic daemon socket");
         listener

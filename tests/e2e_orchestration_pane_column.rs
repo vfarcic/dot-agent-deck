@@ -165,21 +165,18 @@ fn orchestration_006_stacked_pane_column_hides_collapsed_frames_while_agents_sta
 /// sidebar (role list) and the pane column that `orchestration_split_percents`
 /// controls. Distinct from the sidebar's own truncated `orchestrat…` card
 /// label, so there is no collision risk.
+///
+/// The corner glyph is NOT fixed: PRD #341 ("make UI modes unmistakable")
+/// renders the focused pane's border heavier in command mode, so the same box
+/// reads `┌orchestrator` in PaneInput and `┏orchestrator` in command mode.
+/// [`common::orchestration_pane_left_edge`] matches any weight — this helper is
+/// about the box's COLUMN, not its styling, and pinning one glyph made the test
+/// fail on a mode switch that was working correctly. That scan lives in the
+/// harness rather than here because `e2e_idle_worker_detector.rs` needs the same
+/// anchor to crop on, and two copies is one copy too many for a scan whose glyph
+/// set has already had to change once (review of #465, S1).
 fn orchestrator_box_edge(grid: &str) -> Option<u16> {
-    // The corner glyph is NOT fixed: PRD #341 ("make UI modes unmistakable")
-    // renders the focused pane's border heavier in command mode, so the same
-    // box reads `┌orchestrator` in PaneInput and `┏orchestrator` in command
-    // mode. Match any corner style — this helper is about the box's COLUMN,
-    // not its styling, and pinning one glyph made the test fail on a mode
-    // switch that was working correctly.
-    for line in grid.lines() {
-        for corner in ["┌orchestrator", "┏orchestrator", "╔orchestrator"] {
-            if let Some(byte_idx) = line.find(corner) {
-                return Some(line[..byte_idx].chars().count() as u16);
-            }
-        }
-    }
-    None
+    common::orchestration_pane_left_edge(grid).map(|column| column as u16)
 }
 
 /// Panicking form of [`orchestrator_box_edge`], for use outside a predicate

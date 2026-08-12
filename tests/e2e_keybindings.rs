@@ -274,7 +274,7 @@ fn scheduler_001_lowercase_s_opens_manager() {
     // registry with a default that accepts lowercase `s` (case-insensitive,
     // keeping `S`). This test drops NO keybindings.toml — it asserts the
     // *default* binding accepts lowercase `s`.
-    let dir = tempfile::tempdir().expect("scratch tempdir");
+    let dir = common::harness_tempdir().expect("scratch tempdir");
     let sched_path = dir.path().join("schedules.toml");
     std::fs::write(
         &sched_path,
