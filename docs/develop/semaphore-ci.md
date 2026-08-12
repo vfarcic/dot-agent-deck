@@ -152,6 +152,28 @@ Everything below is something this port actually hit. It is not a feature compar
 
 **Minor:** `diagnose` accepts a *workflow* id but 404s on a *pipeline* id, with no hint that the distinction is the problem.
 
+### Why a team would choose Semaphore over GitHub Actions
+
+Separating what this evaluation *verified*, what independent users report, and what is vendor marketing — because the three disagree in places.
+
+**1. Agent-native CI, verified here.** `sem-ai` is the strongest reason and the hardest for GitHub to copy quickly. It is a deliberate design — JSON by default, `discover` for self-enumeration, an embedded MCP server, and compound diagnostics — rather than a CLI with a `--json` flag bolted on. If CI is increasingly driven by agents rather than humans clicking through a web UI, this is a structural advantage. `gh` is a fine tool built for humans first.
+
+**2. `testbox`, verified here, and genuinely unique.** Being able to SSH into a real CI runner *before* pushing found three things that Semaphore's own docs and console got wrong. There is no GitHub Actions equivalent; the closest is `act` (a local Docker approximation, not the real runner) or push-and-pray.
+
+**3. Speed and cost — but check who is measuring.** Semaphore's marketing claims GitHub Actions is [94% slower on the same workload](https://semaphore.io/best-ci-cd-tools-in-2026-performance-and-cost-compared) at $0.04/job. That is a **vendor-run benchmark against its own competitor** and should be treated as such. Independent review sites are more measured but directionally supportive: Capterra reviewers report test run times "halved" after switching, and G2 reviewers report cutting CI/CD costs 38–50% — though mostly **versus CircleCI and Travis, not versus GitHub Actions**. Our own run is not evidence either way, since the Free Plan capped us at 2 vCPU.
+
+**4. Monorepo and conditional execution, verified here.** `change_in()` is better than GitHub's per-workflow `on: paths:`, and it is why three GHA files collapsed into one pipeline. Independent comparisons single out monorepo support as a Semaphore strength.
+
+**5. Ephemeral VMs.** Every job gets a fresh VM, which removes the environment-drift class of flake. GitHub-hosted runners are also fresh, so this matters most against self-hosted setups.
+
+**6. Support quality.** This is the most consistent theme across independent reviews on [G2](https://www.g2.com/products/semaphore/reviews) and [Capterra](https://www.capterra.com/p/171934/Semaphore/reviews/) — fast, human, willing to engage with unusual setups. GitHub Actions support at comparable spend is not a thing.
+
+**7. The promotion model**, verified here: a promoted pipeline binds its own secrets, which structurally prevents the class of bug that broke v0.35.9.
+
+**Reasons *not* to, which this evaluation weighted heavily:** no Windows agents; the Marketplace ecosystem does not travel (both blocks that failed or timed out are exactly the two that leaned on a GHA action); and independent reviewers additionally flag a cluttered/slow UI, limited repository-host support — one notes that leaving GitHub would mean leaving Semaphore too — and pricing that climbs with commit frequency and macOS usage.
+
+**The honest summary for this repo:** the compelling reasons are `sem-ai` and `testbox`, not speed or cost. Those are real, verified, and ahead of anything GitHub ships for agent-driven CI. They are not currently enough to outweigh losing native Windows coverage.
+
 ### Where it nets out
 
 For a Linux-and-macOS Rust project, the port is faithful and six of eight blocks passed on the first real run. The blockers are not about pipeline expressiveness — Semaphore's model is at least as good as GitHub Actions' and in places better. They are Windows, the plan's machine ceiling, and the Marketplace ecosystem that a mature GHA setup quietly depends on. `sem-ai` is genuinely ahead of anything GitHub ships for agent-driven CI, and is the strongest reason to keep watching this.
@@ -242,7 +264,9 @@ error: opening lock file "/nix/var/nix/db/big-lock": Permission denied
 
 GitHub Actions never hits this because `DeterminateSystems/nix-installer-action` handles daemon setup; there is no such action on Semaphore, so the installer has to be driven correctly by hand.
 
-**`Devbox smoke` ran for over 17 minutes.** GHA's `jetify-com/devbox-install-action` sets `enable-cache: true`, which caches the whole Nix store keyed on `devbox.json` — and ci.yml's comment notes the `path:gcloud#google-cloud-sdk` flake builds the SDK from source and dominates a cold run. There is no equivalent action here, so every run is cold. This block needs a `cache store`/`cache restore` pair over the Nix store before it is usable.
+**`Devbox smoke` hit the one-hour job timeout and took the whole pipeline with it** — final pipeline state `stopped`, `result_reason: timeout`. GHA's `jetify-com/devbox-install-action` sets `enable-cache: true`, caching the whole Nix store keyed on `devbox.json`, and ci.yml's comment notes the `path:gcloud#google-cloud-sdk` flake builds the SDK from source and dominates a cold run. There is no equivalent action here, so every run is cold — and cold is more than an hour. This block is **not merely slow, it is currently unusable**, and it needs a hand-rolled `sudo tar` of `/nix` into a `cache store`/`cache restore` pair before it can pass.
+
+Note the blast radius: one un-cacheable block failing on time turned an otherwise-green pipeline into a `stopped` one. Six blocks passing does not make the pipeline pass.
 
 ### Triggering a pipeline on a branch without a webhook
 
