@@ -88,9 +88,26 @@ blocks:
             - bash .semaphore/scripts/verify-flake-version.sh "$DAD_VERSION"
             - chmod +x scripts/assemble-changelog.sh
             - scripts/assemble-changelog.sh "$DAD_VERSION" > /tmp/release-notes.md
-            # Proving the notes are non-empty is the point — see the v0.24.3
-            # note in the header.
-            - test -s /tmp/release-notes.md
+            # Proving the notes are non-empty is the point on a TAG — see the
+            # v0.24.3 note in the header. But it is wrong on a dry run: right
+            # after a release, changelog.d/ holds nothing but .gitkeep, so
+            # assemble-changelog.sh correctly emits zero bytes and exits 0.
+            # An unconditional `test -s` therefore failed every branch run of
+            # this pipeline (measured — it is what broke the first one), which
+            # would have made the dry-run path useless exactly when it is most
+            # wanted: verifying the release before cutting the tag.
+            - |
+              if [ -n "${SEMAPHORE_GIT_TAG_NAME:-}" ]; then
+                if [ ! -s /tmp/release-notes.md ]; then
+                  echo "ERROR: releasing $DAD_VERSION but the assembled changelog is empty. Check changelog.d/ for fragments with unrecognized suffixes." >&2
+                  exit 1
+                fi
+                echo "OK: release notes assembled ($(wc -c < /tmp/release-notes.md) bytes)"
+              elif [ -s /tmp/release-notes.md ]; then
+                echo "OK: release notes assembled ($(wc -c < /tmp/release-notes.md) bytes)"
+              else
+                echo "NOTE: no changelog fragments in changelog.d/ — expected on a dry run just after a release. A real tag would fail here."
+              fi
             # GHA hands the changelog to the release action as a job output.
             # Semaphore blocks share no outputs, so it travels as a workflow
             # artifact and `Package` feeds it to `gh release create`.
