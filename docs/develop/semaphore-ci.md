@@ -2,6 +2,18 @@
 
 This is an **evaluation**, not a migration. Every file under `.github/workflows/` is untouched and remains the authoritative CI. The pipelines under `.semaphore/` are a parallel implementation of the same gates, added so that Semaphore — and specifically its new AI-agent tooling, `sem-ai` — can be assessed against a real workload rather than a toy repo.
 
+## Current status
+
+All three pipelines have now been run on a real agent. **Nine of ten blocks pass.**
+
+| Pipeline | Status |
+| --- | --- |
+| `semaphore.yml` (CI) | **7 of 8 blocks pass.** Only `Devbox smoke` fails — it exceeds the one-hour job limit. |
+| `release.yml` | **All 4 blocks pass.** Verified end to end: four target binaries built, artifacts handed between blocks, real sha256 checksums, and a Homebrew formula generated with correct per-target hashes for `v0.36.0`. Nothing published. |
+| `docs-publish.yml` | **Passes.** Docs image builds; nothing pushed. |
+
+The single outstanding failure is `Devbox smoke`, and it is an ecosystem gap rather than a mistake in the port — see the timeout analysis below. Everything else is green.
+
 ## Scope: everything builds, nothing publishes
 
 The rule these pipelines follow is: **do everything the GitHub Actions workflows do, except Windows and except publishing.**
@@ -307,7 +319,7 @@ Triggered 2026-08-12 against commit `53d33a3` on `semaphore-ci`. **Six of eight 
 
 That closes most of the "still unverified" list at once: `cross` genuinely works on the `f1` machines, the Rust toolchain pin holds on both Linux and macOS in a real job, and the whole fast tier passes on 2 vCPU.
 
-**`Nix flake check` failed on a bug in this pipeline, not in the flake.** The prologue passed `--init none` to the Determinate installer, so no daemon was ever started:
+**`Nix flake check` failed on a bug in this pipeline, not in the flake — since FIXED (it passes now, after two attempts; see the block comment in semaphore.yml).** The prologue passed `--init none` to the Determinate installer, so no daemon was ever started:
 
 ```
 error: opening lock file "/nix/var/nix/db/big-lock": Permission denied
@@ -319,6 +331,17 @@ GitHub Actions never hits this because `DeterminateSystems/nix-installer-action`
 **`Devbox smoke` hit the one-hour job timeout and took the whole pipeline with it** — final pipeline state `stopped`, `result_reason: timeout`. GHA's `jetify-com/devbox-install-action` sets `enable-cache: true`, caching the whole Nix store keyed on `devbox.json`, and ci.yml's comment notes the `path:gcloud#google-cloud-sdk` flake builds the SDK from source and dominates a cold run. There is no equivalent action here, so every run is cold — and cold is more than an hour. This block is **not merely slow, it is currently unusable**, and it needs a hand-rolled `sudo tar` of `/nix` into a `cache store`/`cache restore` pair before it can pass.
 
 Note the blast radius: one un-cacheable block failing on time turned an otherwise-green pipeline into a `stopped` one. Six blocks passing does not make the pipeline pass.
+
+### Getting `release.yml` green took five runs — and every bug needed a real run to find
+
+The release pipeline validated cleanly and looked correct on every read. It still failed four times for four unrelated reasons, none of which any static check could have caught. This is the single best piece of evidence in this document for the authoring-versus-operating split described above: `sem-ai diagnose` located each cause in one call, and none of them were findable without executing.
+
+1. **`test -s /tmp/release-notes.md` failed on the dry run.** Not a changelog bug — `v0.36.0` had just been cut, so `changelog.d/` held only `.gitkeep` and `assemble-changelog.sh` correctly emitted zero bytes with exit 0. The assertion is right on a tag and wrong on a branch, and as written it broke the dry-run path exactly when it is most useful. Now conditional on `SEMAPHORE_GIT_TAG_NAME`.
+2. **`install: cannot create regular file '/usr/local/bin/task': Permission denied`.** The job user cannot write there. Installs into `$HOME/.local/bin` instead — no reason to need root to put a binary on `PATH`.
+3. **`artifact pull workflow dist` returned `hub returned 404`.** The build jobs push individual *files*; the store is path-addressed with no prefix or glob semantics, so no `dist` object exists even though four objects share that prefix. This is where GHA's `download-artifact` with `merge-multiple: true` does real work that has no toolbox equivalent.
+4. **Pulling by the pushed path also 404'd.** The default `--destination` is not the path as given. Both sides are now explicit: push writes a flat key (`dot-agent-deck-<suffix>`), and the consumer pulls that key with an explicit `--destination` back under `dist/`.
+
+**A correction worth recording:** it was tempting to conclude from `sem-ai artifact list` returning `HTTP 403: The artifacts api feature is not enabled for your organization` that the artifact store was plan-disabled and the release pipeline simply could not work here. **That was wrong.** The 403 applies only to the separate list *API*; the artifact CLI used inside jobs works fine, and the pipeline now passes. The two failures were ordinary path bugs wearing a convincing disguise. What settled it was adding a round-trip pull in the *same job* that pushed — a push that reports success but is not retrievable is indistinguishable, from the consumer's side, from a wrong path, and the list API could not arbitrate. That check is still in `build-release-target.sh`.
 
 ### Triggering a pipeline on a branch without a webhook
 
