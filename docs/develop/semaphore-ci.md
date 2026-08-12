@@ -2,6 +2,31 @@
 
 This is an **evaluation**, not a migration. Every file under `.github/workflows/` is untouched and remains the authoritative CI. The pipelines under `.semaphore/` are a parallel implementation of the same gates, added so that Semaphore — and specifically its new AI-agent tooling, `sem-ai` — can be assessed against a real workload rather than a toy repo.
 
+## Resuming this work in a new session
+
+**Everything lives on the `semaphore-ci` branch and nothing is merged.** `main` has no `.semaphore/` directory, no copy of this document, and no mention of any of it in `CLAUDE.md` or `CONTRIBUTING.md`. A session that starts on `main` will find no trace of this work at all, so step one is always `git checkout semaphore-ci`.
+
+**Semaphore side.** Organization `dot`, at host `dot.semaphoreci.com`. Project `dot-agent-deck`, id `c45e9515-662e-4d0b-b336-1af666b38850`, connected to the repo over the GitHub App integration. Free Plan, which is what caps Linux agents at 2 vCPU.
+
+**The CLI.** `sem-ai` installs to `~/.local/bin/sem-ai` via `curl -fsSL https://raw.githubusercontent.com/semaphoreio/sem-ai/main/install.sh | sh`. Authenticate with `sem-ai signin` (browser device flow) or `sem-ai connect dot.semaphoreci.com <token>`. Config is shared with the legacy CLI at `~/.sem.yaml`; check state with `sem-ai context show`.
+
+**How to run a pipeline.** The webhook does not fire (see below), so runs are triggered through a manual Task that already exists — `semaphore-ci-manual`, id `e45a7292-c940-4781-a07f-58f95bd2e4b0`:
+
+```
+sem-ai task run e45a7292-c940-4781-a07f-58f95bd2e4b0 \
+  --branch semaphore-ci --pipeline-file .semaphore/semaphore.yml
+```
+
+Swap `--pipeline-file` for `.semaphore/release.yml` or `.semaphore/docs-publish.yml` to exercise those. Then `sem-ai workflow show <id>` for the pipeline id, `sem-ai pipeline show <pipeline-id>` for block states, and `sem-ai diagnose <WORKFLOW-id>` on any failure — note it takes the *workflow* id and 404s on a pipeline id.
+
+**Temporary state that must be reverted.** `semaphore.yml` currently carries `execution_time_limit: {hours: 3}` at **both** pipeline level and on the `Devbox smoke` block, purely so one run could measure the cold devbox cost. Both revert to the default once devbox is cached or abandoned. The `Devbox smoke` block is also instrumented with phase timestamps and a `du -sh /nix`; that instrumentation is measurement scaffolding, not a permanent feature.
+
+**Known-unresolved, carried forward.**
+
+- The project is parked on step 3 of 4 of Semaphore's onboarding wizard, which is why no push triggers a build. Finishing it requires choosing **skip onboarding** rather than letting the wizard generate a starter workflow — a generated `.semaphore/semaphore.yml` would clobber this branch's file or get committed to the repo.
+- `renovate.json`'s `customManagers` match only under `.github/workflows`, so `RUST_TOOLCHAIN` and `NEXTEST_VERSION` in `semaphore.yml` are untracked and will drift. Left alone deliberately — fixing it means editing an existing file, which was outside the brief.
+- `Devbox smoke` is the only failing block. See the timeout analysis below for what a fix would involve.
+
 ## Current status
 
 All three pipelines have now been run on a real agent. **Nine of ten blocks pass.**
