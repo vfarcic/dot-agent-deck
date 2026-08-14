@@ -1,6 +1,6 @@
 //! PRD #84 M1 — L1/unit reproducers for the `TerminalWidget` render path.
 //!
-//! These pin the render half of the PRD #84 contract (`prds/84-rendering-
+//! These pin the render half of the PRD #84 contract (`prds/done/84-rendering-
 //! layer-rework.md`): the widget must render the vt100 screen 1:1 against its
 //! inner area — no `min(area, screen)` col clamp, no cursor-anchored row
 //! window (the two heuristics removed in M5, `src/terminal_widget.rs:94-117`).
