@@ -150,6 +150,32 @@ fn os_string_from_bytes(bytes: &[u8]) -> OsString {
 struct ParsedWorktree {
     path: PathBuf,
     prunable_reason: Option<String>,
+    /// True when a line inside this entry's block matched none of the
+    /// attributes git emits — the signature of a path containing a literal
+    /// newline, which splits the `worktree <path>` line and leaves `path`
+    /// truncated. See [`is_known_attribute_line`].
+    path_maybe_truncated: bool,
+}
+
+/// Whether `line` is one of the attribute lines `git worktree list
+/// --porcelain` can emit inside an entry's block, or the blank separator.
+///
+/// Anything else is the tail of a path that contained a literal newline.
+/// The list is closed deliberately: treating an unrecognised line as "some
+/// attribute a future git added" would silently restore the fail-green this
+/// exists to catch, whereas treating a genuinely new attribute as a
+/// truncated path only costs one entry its existence check — the same
+/// fail-safe direction the rest of this module takes.
+fn is_known_attribute_line(line: &[u8]) -> bool {
+    line.is_empty()
+        || line == b"bare"
+        || line == b"detached"
+        || line == b"locked"
+        || line == b"prunable"
+        || line.starts_with(b"HEAD ")
+        || line.starts_with(b"branch ")
+        || line.starts_with(b"locked ")
+        || line.starts_with(b"prunable ")
 }
 
 /// Parse `git worktree list --porcelain` output into per-entry records, in
@@ -179,11 +205,24 @@ fn parse_worktree_entries(porcelain: &[u8]) -> Vec<ParsedWorktree> {
             current = Some(ParsedWorktree {
                 path: PathBuf::from(os_string_from_bytes(rest)),
                 prunable_reason: None,
+                path_maybe_truncated: false,
             });
         } else if let Some(rest) = line.strip_prefix(b"prunable ")
             && let Some(entry) = current.as_mut()
         {
             entry.prunable_reason = Some(String::from_utf8_lossy(rest).into_owned());
+        } else if !is_known_attribute_line(line)
+            && let Some(entry) = current.as_mut()
+        {
+            // A line matching none of the attributes git can emit is the
+            // tail of a path that contained a literal newline, so THIS
+            // entry's `path` is truncated. Recorded per-entry rather than
+            // globally: a sibling entry with an ordinary path is unaffected
+            // and must still get a normal existence check, or a genuinely
+            // stale worktree goes unreported (Greptile P1 on PR #558,
+            // against the first version of this fix, which suppressed drift
+            // for every entry at once).
+            entry.path_maybe_truncated = true;
         }
     }
     if let Some(entry) = current.take() {
@@ -374,17 +413,21 @@ fn collect(root: &Path) -> Result<RepoState, String> {
             // (it returns `false` on ANY error, permission denied
             // included).
             //
-            // `paths_degraded` gets the same treatment for the same reason.
-            // A newline in a git-reported path truncates the `path` field
-            // here exactly as it does in `rev-parse`, so `try_exists()`
-            // would be asking about a path that was never on disk and would
-            // report a live worktree as drifted. git's own `prunable`
-            // verdict is unaffected by the mangling — that is why drift
-            // keys off it — so when the path text cannot be trusted, trust
-            // only what git said.
+            // A truncated path gets the same treatment for the same reason:
+            // a newline in a git-reported path leaves `path` cut short, so
+            // `try_exists()` would be asking about a path that was never on
+            // disk and would report a live worktree as drifted. git's own
+            // `prunable` verdict is unaffected by the mangling — that is
+            // why drift keys off it — so where the path text cannot be
+            // trusted, trust only what git said.
+            //
+            // Gated per ENTRY, not on the whole run: an unrelated entry
+            // with an ordinary path still gets a real existence check, so a
+            // genuinely stale worktree is still reported even while a
+            // sibling entry's path is unreadable (Greptile P1 on PR #558).
             let exists = match &entry.prunable_reason {
                 Some(_) => false,
-                None if parsed.paths_degraded => true,
+                None if entry.path_maybe_truncated => true,
                 None => entry.path.try_exists().unwrap_or(true),
             };
             WorktreeEntry {
@@ -796,6 +839,66 @@ mod tests {
             entries[0].prunable_reason.as_deref(),
             Some("gitdir file points to non-existent location")
         );
+        assert!(
+            entries[0].path_maybe_truncated,
+            "the `junk` tail line must mark this entry's path untrustworthy"
+        );
+    }
+
+    /// **Greptile P1 regression test**, filed against the first version of
+    /// this fix: suppressing the existence check for the whole run whenever
+    /// ANY path was untrustworthy meant a separate, ordinary stale entry
+    /// went unreported, so `linkage-check` exited clean without ever
+    /// recommending `git worktree prune`. The suppression is now per-entry,
+    /// so the newline entry is spared the meaningless check while its
+    /// sibling is still tested normally.
+    ///
+    /// Reachable on any git that omits the `prunable` attribute for a stale
+    /// entry — git < 2.36, which predates it, and a **locked** worktree,
+    /// which git never marks prunable at any version.
+    #[test]
+    fn a_truncated_path_does_not_suppress_drift_for_an_unrelated_entry() {
+        let porcelain = "worktree /repo/newline/keep\n\
+                          junk\n\
+                          HEAD 1fb69e17f2d79d384969cdb648969ab3459524da\n\
+                          branch refs/heads/sneaky\n\
+                          \n\
+                          worktree /repo/ordinary-stale\n\
+                          HEAD 4e402c166433f702351f18e6e26c51205e19df1e\n\
+                          branch refs/heads/stale\n";
+        let entries = parse_worktree_entries(porcelain.as_bytes());
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert!(entries[0].path_maybe_truncated);
+        assert!(
+            !entries[1].path_maybe_truncated,
+            "an ordinary sibling entry must keep its real existence check"
+        );
+        assert_eq!(entries[1].prunable_reason, None);
+    }
+
+    /// Every attribute line git can emit inside an entry block must be
+    /// recognised, or it would be mistaken for the tail of a newline-split
+    /// path and cost that entry its existence check.
+    #[test]
+    fn known_attribute_lines_are_not_mistaken_for_a_truncated_path() {
+        for line in [
+            &b""[..],
+            b"bare",
+            b"detached",
+            b"locked",
+            b"locked because I am testing",
+            b"prunable",
+            b"prunable gitdir file points to non-existent location",
+            b"HEAD 9c131d5455485369f6b6b7c9ac8cdd9d5482241d",
+            b"branch refs/heads/main",
+        ] {
+            assert!(
+                is_known_attribute_line(line),
+                "{:?} must be recognised",
+                String::from_utf8_lossy(line)
+            );
+        }
+        assert!(!is_known_attribute_line(b"tail-of-a-split-path"));
     }
 
     /// The ordinary shape: shallow flag first, then the three path values.
