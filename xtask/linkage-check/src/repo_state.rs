@@ -144,6 +144,17 @@ fn os_string_from_bytes(bytes: &[u8]) -> OsString {
     }
 }
 
+/// Record terminator for `git worktree list --porcelain -z` (git ≥ 2.36).
+/// NUL cannot occur inside a path on any supported platform, so a newline
+/// in a worktree path is unambiguous here — which is the whole reason to
+/// prefer it.
+const RECORD_NUL: u8 = b'\0';
+
+/// Record terminator for plain `--porcelain`, the git < 2.36 fallback.
+/// A newline inside a path is indistinguishable from a record break in this
+/// form, which is what [`ParsedWorktree::path_maybe_truncated`] exists for.
+const RECORD_LF: u8 = b'\n';
+
 /// One `git worktree list --porcelain` entry as parsed, before the
 /// filesystem existence check ([`collect`] does that).
 #[derive(Debug)]
@@ -194,10 +205,15 @@ fn is_known_attribute_line(line: &[u8]) -> bool {
 /// recognised prefixes — including the tail end of a newline-split path —
 /// is silently skipped rather than treated as a new entry, since only a
 /// `worktree ` line ever starts one.
-fn parse_worktree_entries(porcelain: &[u8]) -> Vec<ParsedWorktree> {
+///
+/// `sep` is the record terminator: [`RECORD_NUL`] when [`collect`] got the
+/// `-z` output (git ≥ 2.36), where a newline inside a path cannot split a
+/// record at all and `path_maybe_truncated` is therefore never set;
+/// [`RECORD_LF`] on the older fallback, where it can and is.
+fn parse_worktree_entries(porcelain: &[u8], sep: u8) -> Vec<ParsedWorktree> {
     let mut out = Vec::new();
     let mut current: Option<ParsedWorktree> = None;
-    for line in porcelain.split(|&b| b == b'\n') {
+    for line in porcelain.split(|&b| b == sep) {
         if let Some(rest) = line.strip_prefix(b"worktree ") {
             if let Some(entry) = current.take() {
                 out.push(entry);
@@ -356,10 +372,25 @@ fn parse_rev_parse(stdout: &[u8]) -> Result<RevParse, String> {
     }
     let current_worktree = PathBuf::from(os_string_from_bytes(paths[0]));
     if paths.len() > 3 {
+        // A path field occupied more than one line, so `git_common_dir` and
+        // `git_dir` cannot be identified and `is_linked_worktree` is not
+        // answerable from this output. Report it as FALSE rather than true.
+        //
+        // Forcing `true` here looks like the fail-safe choice and is not:
+        // it turns the shallow assertion on for a shallow, single-worktree
+        // PRIMARY checkout that merely has a newline in its path, which is
+        // precisely the exemption issue #557 requires to hold structurally
+        // (Greptile P1 on PR #558, against the previous commit). The
+        // multi-worktree case does not need this term anyway —
+        // `should_assert_shallow` also fires on `worktrees.len() > 1`, and a
+        // linked worktree always implies at least two registry entries, so
+        // the count carries it. What is genuinely lost is only the
+        // belt-and-braces for a checkout that is BOTH linked AND has a
+        // registry too drifted to show two entries.
         return Ok(RevParse {
             is_shallow,
             current_worktree,
-            is_linked_worktree: true,
+            is_linked_worktree: false,
             paths_degraded: true,
         });
     }
@@ -398,13 +429,25 @@ fn collect(root: &Path) -> Result<RepoState, String> {
     let parsed = parse_rev_parse(&rev_parse)?;
     if parsed.paths_degraded {
         eprintln!(
-            "linkage-check: repository-state preflight: a git-reported path contains a newline; \
-             treating this checkout as a linked worktree so the shallow assertion still applies."
+            "linkage-check: repository-state preflight: a git-reported path contains a newline, \
+             so this checkout's linked-worktree status could not be determined; the shallow \
+             assertion still applies via the worktree count."
         );
     }
 
-    let porcelain = run_git(root, &["worktree", "list", "--porcelain"])?;
-    let worktrees = parse_worktree_entries(&porcelain)
+    // `-z` (git ≥ 2.36) terminates each record with NUL, so a newline inside
+    // a worktree path cannot split a record and every path arrives exact.
+    // That is what makes the truncation handling below dead code on any
+    // modern git rather than merely well-tested. Older git rejects the flag,
+    // so fall back to the newline form and accept its ambiguity there.
+    let (porcelain, sep) = match run_git(root, &["worktree", "list", "--porcelain", "-z"]) {
+        Ok(out) => (out, RECORD_NUL),
+        Err(_) => (
+            run_git(root, &["worktree", "list", "--porcelain"])?,
+            RECORD_LF,
+        ),
+    };
+    let worktrees = parse_worktree_entries(&porcelain, sep)
         .into_iter()
         .map(|entry| {
             // Unreadable (e.g. EACCES on a live worktree under an unreadable
@@ -756,7 +799,7 @@ mod tests {
                           worktree /repo/fix-123\n\
                           HEAD 4e402c166433f702351f18e6e26c51205e19df1e\n\
                           branch refs/heads/fix/123-something\n";
-        let paths: Vec<PathBuf> = parse_worktree_entries(porcelain.as_bytes())
+        let paths: Vec<PathBuf> = parse_worktree_entries(porcelain.as_bytes(), RECORD_LF)
             .into_iter()
             .map(|e| e.path)
             .collect();
@@ -777,7 +820,7 @@ mod tests {
                           worktree /repo/detached\n\
                           HEAD 9c131d5455485369f6b6b7c9ac8cdd9d5482241d\n\
                           detached\n";
-        let paths: Vec<PathBuf> = parse_worktree_entries(porcelain.as_bytes())
+        let paths: Vec<PathBuf> = parse_worktree_entries(porcelain.as_bytes(), RECORD_LF)
             .into_iter()
             .map(|e| e.path)
             .collect();
@@ -789,7 +832,7 @@ mod tests {
 
     #[test]
     fn parse_worktree_entries_on_empty_input_is_empty() {
-        assert!(parse_worktree_entries(b"").is_empty());
+        assert!(parse_worktree_entries(b"", RECORD_LF).is_empty());
     }
 
     /// git ≥ 2.36 reports drift itself; the `prunable` line attaches to the
@@ -805,7 +848,7 @@ mod tests {
                           HEAD 4e402c166433f702351f18e6e26c51205e19df1e\n\
                           branch refs/heads/gone\n\
                           prunable gitdir file points to non-existent location\n";
-        let entries = parse_worktree_entries(porcelain.as_bytes());
+        let entries = parse_worktree_entries(porcelain.as_bytes(), RECORD_LF);
         assert_eq!(entries.len(), 2, "{entries:?}");
         assert_eq!(entries[0].prunable_reason, None);
         assert_eq!(
@@ -832,7 +875,7 @@ mod tests {
                           HEAD 1fb69e17f2d79d384969cdb648969ab3459524da\n\
                           branch refs/heads/sneaky\n\
                           prunable gitdir file points to non-existent location\n";
-        let entries = parse_worktree_entries(porcelain.as_bytes());
+        let entries = parse_worktree_entries(porcelain.as_bytes(), RECORD_LF);
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0].path, PathBuf::from("/repo/green/keep"));
         assert_eq!(
@@ -866,7 +909,7 @@ mod tests {
                           worktree /repo/ordinary-stale\n\
                           HEAD 4e402c166433f702351f18e6e26c51205e19df1e\n\
                           branch refs/heads/stale\n";
-        let entries = parse_worktree_entries(porcelain.as_bytes());
+        let entries = parse_worktree_entries(porcelain.as_bytes(), RECORD_LF);
         assert_eq!(entries.len(), 2, "{entries:?}");
         assert!(entries[0].path_maybe_truncated);
         assert!(
@@ -874,6 +917,48 @@ mod tests {
             "an ordinary sibling entry must keep its real existence check"
         );
         assert_eq!(entries[1].prunable_reason, None);
+    }
+
+    /// **The structural fix for the newline class.** Byte-for-byte the
+    /// record layout real `git worktree list --porcelain -z` produces on
+    /// git 2.55.0 for a worktree whose path contains a literal newline:
+    /// records are NUL-terminated, so the newline sits harmlessly INSIDE
+    /// the `worktree ` record instead of splitting it. The path arrives
+    /// exact, nothing is truncated, and `path_maybe_truncated` — with it,
+    /// the whole "which entry can I not verify" question that produced two
+    /// Greptile P1s — is unreachable on any git ≥ 2.36.
+    #[test]
+    fn nul_terminated_records_keep_a_newline_path_intact() {
+        let porcelain = b"worktree /repo/wt\nnewline\0\
+                          HEAD 9c131d5455485369f6b6b7c9ac8cdd9d5482241d\0\
+                          branch refs/heads/sneaky\0\0\
+                          worktree /repo/ordinary\0\
+                          HEAD 4e402c166433f702351f18e6e26c51205e19df1e\0\0"
+            as &[u8];
+        let entries = parse_worktree_entries(porcelain, RECORD_NUL);
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0].path, PathBuf::from("/repo/wt\nnewline"));
+        assert!(
+            !entries[0].path_maybe_truncated,
+            "NUL records cannot truncate a path"
+        );
+        assert_eq!(entries[1].path, PathBuf::from("/repo/ordinary"));
+        assert!(!entries[1].path_maybe_truncated);
+    }
+
+    /// The same input read with the OLD newline terminator, to show what
+    /// `-z` actually buys: the path is truncated and the entry is flagged
+    /// unverifiable. This is the git < 2.36 fallback's behaviour, kept
+    /// honest rather than pretended away.
+    #[test]
+    fn the_lf_fallback_still_truncates_the_same_input() {
+        let porcelain = b"worktree /repo/wt\nnewline\n\
+                          HEAD 9c131d5455485369f6b6b7c9ac8cdd9d5482241d\n"
+            as &[u8];
+        let entries = parse_worktree_entries(porcelain, RECORD_LF);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].path, PathBuf::from("/repo/wt"));
+        assert!(entries[0].path_maybe_truncated);
     }
 
     /// Every attribute line git can emit inside an entry block must be
@@ -934,26 +1019,50 @@ mod tests {
     /// five lines instead of four. Before the reorder the shallow flag was
     /// last, absorbed the shift, landed on a path instead of
     /// `true`/`false`, and returned `Err` — which `failures_from` turns
-    /// into a silent skip of the WHOLE preflight. Now the flag is exact,
-    /// nothing returns `Err`, and the untrustworthy path comparison
-    /// degrades to the fail-safe `is_linked_worktree = true` instead of the
-    /// old fail-green.
+    /// into a silent skip of the WHOLE preflight. Now the flag is exact and
+    /// nothing returns `Err`; the unanswerable linked-worktree question
+    /// reports `false` and leaves the worktree count to carry the
+    /// multi-worktree case.
     #[test]
     fn parse_rev_parse_survives_a_newline_inside_a_path() {
         let out = b"false\n/probe/wt\nnewline\n/probe/origin/.git\n\
                     /probe/origin/.git/worktrees/wt-newline" as &[u8];
         let parsed = parse_rev_parse(out).expect("must NOT be an Err — Err means a silent skip");
         assert!(!parsed.is_shallow, "the shallow flag must still be exact");
-        assert!(
-            parsed.is_linked_worktree,
-            "must degrade to the fail-safe direction, not fail green"
-        );
         assert!(parsed.paths_degraded);
+        assert!(
+            !parsed.is_linked_worktree,
+            "an unanswerable question must not be answered `true` — that fires the shallow \
+             assertion on an exempt single-worktree primary checkout"
+        );
     }
 
-    /// The same shift, in a repository that IS shallow: the whole point of
-    /// the reorder is that this case now reports the shallow failure rather
-    /// than skipping silently.
+    /// **Greptile P1 regression test.** A shallow, single-worktree PRIMARY
+    /// checkout whose path contains a newline must stay EXEMPT. Forcing
+    /// `is_linked_worktree = true` on degradation broke exactly this: it
+    /// failed an otherwise-exempt `linkage-check`, which is the CI-breaking
+    /// direction issue #557 requires to be impossible by construction.
+    #[test]
+    fn a_newline_path_does_not_defeat_the_single_worktree_shallow_exemption() {
+        let out = b"true\n/probe/wt\nnewline\n/probe/.git\n/probe/.git" as &[u8];
+        let parsed = parse_rev_parse(out).expect("parses");
+        let s = state(
+            parsed.is_shallow,
+            vec![entry("/probe/wt", true)],
+            "/probe/wt",
+            parsed.is_linked_worktree,
+        );
+        assert!(
+            preflight_failures(&s).is_empty(),
+            "{:?}",
+            preflight_failures(&s)
+        );
+    }
+
+    /// The same shift in a repository that IS shallow AND has two registry
+    /// entries: the reorder means this now reports the shallow failure
+    /// rather than skipping silently, and the count — not the unanswerable
+    /// `is_linked_worktree` — is what carries it.
     #[test]
     fn a_shallow_repo_with_a_newline_path_still_reports_the_shallow_failure() {
         let out = b"true\n/probe/wt\nnewline\n/probe/origin/.git\n\
@@ -961,7 +1070,7 @@ mod tests {
         let parsed = parse_rev_parse(out).expect("parses");
         let s = state(
             parsed.is_shallow,
-            vec![entry("/probe/wt", true)],
+            vec![entry("/probe/origin", true), entry("/probe/wt", true)],
             "/probe/wt",
             parsed.is_linked_worktree,
         );
