@@ -34,12 +34,13 @@
 //! # Shape
 //!
 //! [`collect`] is the only part of this module that shells out to git; it
-//! turns three git invocations' worth of output into a plain [`RepoState`].
+//! turns two git invocations' worth of output into a plain [`RepoState`].
 //! Everything that decides pass/fail — [`should_assert_shallow`],
-//! [`preflight_failures`], [`is_linked_worktree`], [`parse_worktree_paths`]
+//! [`preflight_failures`], [`is_linked_worktree`], [`parse_worktree_entries`]
 //! — is a pure function over already-collected values, so it is unit-tested
 //! without building a real git repository.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -56,13 +57,21 @@ const SHALLOW_PROBE: &str = "git rev-list --max-parents=0 <ref>";
 /// Named verbatim in both worktree-drift failure messages.
 const PRUNE_REMEDY: &str = "git worktree prune";
 
-/// One `git worktree list --porcelain` entry: the registered path, and
-/// whether it still exists on disk. The existence check is done by the
-/// caller ([`collect`]) rather than inside the pure verdict functions below,
-/// so drift can be pinned by a test without touching the filesystem.
+/// One `git worktree list --porcelain` entry: the registered path, whether
+/// it still exists on disk, and git's own `prunable` reason when it already
+/// told us (see [`parse_worktree_entries`]). The existence check is done by
+/// the caller ([`collect`]) rather than inside the pure verdict functions
+/// below, so drift can be pinned by a test without touching the filesystem.
+#[derive(Debug)]
 struct WorktreeEntry {
     path: PathBuf,
     exists: bool,
+    /// `Some(reason)` when `git worktree list --porcelain` already reported
+    /// this entry `prunable <reason>` (git ≥ 2.36) — folded into the drift
+    /// message instead of composing our own explanation. `None` means
+    /// either a genuinely healthy entry or an older git that predates the
+    /// attribute; `exists` falls back to `Path::try_exists()` in that case.
+    prunable_reason: Option<String>,
 }
 
 /// Everything [`preflight_failures`] needs, already collected. Kept
@@ -81,14 +90,23 @@ struct RepoState {
 /// Whether `--git-common-dir` names a different directory than `--git-dir`
 /// — true only for a linked worktree.
 ///
-/// For the primary checkout the two are one directory: measured directly, a
-/// plain clone prints `.git` for both (or `../.git` for both, from a
-/// subdirectory — relative output tracks cwd identically for both flags, so
-/// the comparison still holds). A linked worktree's `--git-dir` is always a
-/// `worktrees/<name>` subdirectory of `--git-common-dir` by construction, so
-/// the two can never be equal there, and `--git-common-dir` is printed as an
-/// absolute path in that case regardless of cwd depth.
-fn is_linked_worktree(git_common_dir: &str, git_dir: &str) -> bool {
+/// This is sound BECAUSE [`collect`] always passes `--path-format=absolute`,
+/// not merely because it currently happens to be invoked from the git
+/// toplevel. Measured directly on git 2.55.0: WITHOUT `--path-format`, from
+/// a subdirectory of a primary checkout, `--git-common-dir` stays relative
+/// (`../../.git`) while `--git-dir` is printed absolute
+/// (`/abs/.../.git`) — the two compare unequal, so this function would
+/// wrongly return `true` for a primary checkout. That is the dangerous
+/// direction: it would turn the shallow assertion on for a fresh, shallow,
+/// single-worktree CI clone, which is exactly the outcome
+/// [`should_assert_shallow`]'s exemption exists to prevent. With
+/// `--path-format=absolute`, both flags are forced absolute regardless of
+/// cwd depth, and a linked worktree's `--git-dir` is always a
+/// `worktrees/<name>` subdirectory of `--git-common-dir` by construction —
+/// so the two are equal for the primary checkout and unequal for a linked
+/// one, always, not just when `collect`'s caller happens to invoke it from
+/// the toplevel.
+fn is_linked_worktree(git_common_dir: &Path, git_dir: &Path) -> bool {
     git_common_dir != git_dir
 }
 
@@ -103,16 +121,75 @@ fn should_assert_shallow(state: &RepoState) -> bool {
     state.worktrees.len() > 1 || state.is_linked_worktree
 }
 
-/// Parse `git worktree list --porcelain` output into the registered paths,
-/// in the order git reports them. Every entry block starts with a
-/// `worktree <path>` line; the `HEAD`, `branch`, `bare` and `detached` lines
-/// that can follow are not needed here.
-fn parse_worktree_paths(porcelain: &str) -> Vec<PathBuf> {
-    porcelain
-        .lines()
-        .filter_map(|line| line.strip_prefix("worktree "))
-        .map(PathBuf::from)
-        .collect()
+/// Builds an [`OsString`] from raw git output bytes without the hard UTF-8
+/// failure `String::from_utf8` would give: a single non-UTF-8 byte in one
+/// worktree's path (legal on Linux — ext4/xfs accept any byte but `/` and
+/// NUL) must degrade only that path, not the whole preflight, including the
+/// shallow assertion that has nothing to do with paths. Unix keeps the
+/// bytes exactly (`OsStrExt::from_bytes`), so equality comparisons
+/// ([`is_linked_worktree`], the degenerate-case match in
+/// [`preflight_failures`]) stay byte-exact instead of corrupted by a lossy
+/// round-trip; non-Unix falls back to lossy UTF-8 — this crate's existing
+/// idiom elsewhere (`list_tests.rs`) — which is moot in practice since
+/// `cargo xtask linkage-check` runs in CI on Linux only.
+fn os_string_from_bytes(bytes: &[u8]) -> OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::OsStr::from_bytes(bytes).to_os_string()
+    }
+    #[cfg(not(unix))]
+    {
+        OsString::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+/// One `git worktree list --porcelain` entry as parsed, before the
+/// filesystem existence check ([`collect`] does that).
+#[derive(Debug)]
+struct ParsedWorktree {
+    path: PathBuf,
+    prunable_reason: Option<String>,
+}
+
+/// Parse `git worktree list --porcelain` output into per-entry records, in
+/// the order git reports them. Every block starts with a `worktree <path>`
+/// line; `HEAD`, `branch`, `bare`, `detached` and `locked` lines are
+/// ignored, and a `prunable <reason>` line (git ≥ 2.36) attaches to the
+/// block it appears in — preferred over re-deriving drift with
+/// `Path::exists()`/`try_exists()` in [`collect`] because it survives a
+/// corrupted `path` field: git accepts a literal newline inside a worktree
+/// path and porcelain emits it unescaped, splitting one entry's block
+/// across two lines. `path` is truncated at the newline in that case, but
+/// the `prunable` line — several lines later in the SAME block — is
+/// unaffected, so keying off it instead of the mangled path is what makes a
+/// genuinely-removed worktree with a newline in its path still report as
+/// drift rather than fail green. Any line that starts none of the
+/// recognised prefixes — including the tail end of a newline-split path —
+/// is silently skipped rather than treated as a new entry, since only a
+/// `worktree ` line ever starts one.
+fn parse_worktree_entries(porcelain: &[u8]) -> Vec<ParsedWorktree> {
+    let mut out = Vec::new();
+    let mut current: Option<ParsedWorktree> = None;
+    for line in porcelain.split(|&b| b == b'\n') {
+        if let Some(rest) = line.strip_prefix(b"worktree ") {
+            if let Some(entry) = current.take() {
+                out.push(entry);
+            }
+            current = Some(ParsedWorktree {
+                path: PathBuf::from(os_string_from_bytes(rest)),
+                prunable_reason: None,
+            });
+        } else if let Some(rest) = line.strip_prefix(b"prunable ")
+            && let Some(entry) = current.as_mut()
+        {
+            entry.prunable_reason = Some(String::from_utf8_lossy(rest).into_owned());
+        }
+    }
+    if let Some(entry) = current.take() {
+        out.push(entry);
+    }
+    out
 }
 
 /// The pure verdict: every failure found against an already-collected
@@ -131,16 +208,18 @@ fn preflight_failures(state: &RepoState) -> Vec<String> {
         ));
     }
 
-    let missing: Vec<&Path> = state
-        .worktrees
-        .iter()
-        .filter(|w| !w.exists)
-        .map(|w| w.path.as_path())
-        .collect();
+    let missing: Vec<&WorktreeEntry> = state.worktrees.iter().filter(|w| !w.exists).collect();
     if !missing.is_empty() {
+        // `{:?}` rather than `.display()`: porcelain preserves control
+        // characters verbatim, and `Debug` for `Path` escapes them so a
+        // trailing-space, `\r` or ANSI-escape path is visible in the
+        // message instead of corrupting the terminal or CI log it lands in.
         let list = missing
             .iter()
-            .map(|p| p.display().to_string())
+            .map(|w| match &w.prunable_reason {
+                Some(reason) => format!("{:?} ({reason})", w.path),
+                None => format!("{:?}", w.path),
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let (does, is) = if missing.len() == 1 {
@@ -153,12 +232,12 @@ fn preflight_failures(state: &RepoState) -> Vec<String> {
              registered — a worktree was removed without pruning. Run `{PRUNE_REMEDY}`."
         ));
 
-        if missing.contains(&state.current_worktree.as_path()) {
+        if missing.iter().any(|w| w.path == state.current_worktree) {
             failures.push(format!(
-                "this checkout's own worktree, {}, is registered but no longer exists on disk \
+                "this checkout's own worktree, {:?}, is registered but no longer exists on disk \
                  — whatever runs next will fail with a confusing `no such file or directory` \
                  instead. Run `{PRUNE_REMEDY}`.",
-                state.current_worktree.display()
+                state.current_worktree
             ));
         }
     }
@@ -169,21 +248,24 @@ fn preflight_failures(state: &RepoState) -> Vec<String> {
 /// Shells out to git and turns the output into a [`RepoState`]. The only
 /// part of this module that is not a pure function.
 ///
-/// Three invocations, kept to that count deliberately (issue #557: "stay
+/// Two invocations, kept to that count deliberately (issue #557: "stay
 /// cheap"): one combined `rev-parse` for the toplevel, both git-dir flags
 /// and the shallow check, plus one `worktree list --porcelain`.
+/// `--path-format=absolute` is what makes [`is_linked_worktree`]'s
+/// comparison sound rather than incidental — see its doc comment.
 fn collect(root: &Path) -> Result<RepoState, String> {
     let rev_parse = run_git(
         root,
         &[
             "rev-parse",
+            "--path-format=absolute",
             "--show-toplevel",
             "--git-common-dir",
             "--git-dir",
             "--is-shallow-repository",
         ],
     )?;
-    let mut lines = rev_parse.lines();
+    let mut lines = rev_parse.split(|&b| b == b'\n');
     let show_toplevel = lines
         .next()
         .ok_or_else(|| "git rev-parse produced no output".to_string())?;
@@ -197,33 +279,52 @@ fn collect(root: &Path) -> Result<RepoState, String> {
         .next()
         .ok_or_else(|| "git rev-parse: missing --is-shallow-repository output".to_string())?;
     let is_shallow = match is_shallow_raw {
-        "true" => true,
-        "false" => false,
+        b"true" => true,
+        b"false" => false,
         other => {
             return Err(format!(
-                "unexpected --is-shallow-repository output {other:?}"
+                "unexpected --is-shallow-repository output {:?}",
+                String::from_utf8_lossy(other)
             ));
         }
     };
+    let git_common_dir = PathBuf::from(os_string_from_bytes(git_common_dir));
+    let git_dir = PathBuf::from(os_string_from_bytes(git_dir));
 
     let porcelain = run_git(root, &["worktree", "list", "--porcelain"])?;
-    let worktrees = parse_worktree_paths(&porcelain)
+    let worktrees = parse_worktree_entries(&porcelain)
         .into_iter()
-        .map(|path| {
-            let exists = path.exists();
-            WorktreeEntry { path, exists }
+        .map(|parsed| {
+            // Unreadable (e.g. EACCES on a live worktree under an unreadable
+            // parent) is not evidence of drift — degrade to "present"
+            // rather than the false positive `Path::exists()` gives here
+            // (it returns `false` on ANY error, permission denied
+            // included).
+            let exists = match &parsed.prunable_reason {
+                Some(_) => false,
+                None => parsed.path.try_exists().unwrap_or(true),
+            };
+            WorktreeEntry {
+                path: parsed.path,
+                exists,
+                prunable_reason: parsed.prunable_reason,
+            }
         })
         .collect();
 
     Ok(RepoState {
         is_shallow,
         worktrees,
-        current_worktree: PathBuf::from(show_toplevel),
-        is_linked_worktree: is_linked_worktree(git_common_dir, git_dir),
+        current_worktree: PathBuf::from(os_string_from_bytes(show_toplevel)),
+        is_linked_worktree: is_linked_worktree(&git_common_dir, &git_dir),
     })
 }
 
-fn run_git(root: &Path, args: &[&str]) -> Result<String, String> {
+/// Runs `git` and returns raw stdout bytes (trailing newline/carriage
+/// return trimmed). No UTF-8 validation here — see
+/// [`os_string_from_bytes`] for why a hard UTF-8 failure on one path must
+/// not disable the whole preflight.
+fn run_git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(root)
@@ -237,26 +338,50 @@ fn run_git(root: &Path, args: &[&str]) -> Result<String, String> {
             String::from_utf8_lossy(&output.stderr).trim(),
         ));
     }
-    String::from_utf8(output.stdout)
-        .map(|s| s.trim_end().to_string())
-        .map_err(|e| format!("`git {}` produced non-UTF-8 output: {e}", args.join(" ")))
+    let mut stdout = output.stdout;
+    while matches!(stdout.last(), Some(b'\n') | Some(b'\r')) {
+        stdout.pop();
+    }
+    Ok(stdout)
 }
 
 /// Maps a [`collect`] result to the failures the preflight reports.
 ///
-/// A git invocation that itself fails — not a repository at all, or git
-/// missing from `PATH` — is a deliberate PASS, not a failure: every other
-/// check in `linkage-check` already depends on the checkout being a working
-/// git repository just to read the catalog and the test sources, so a
-/// checkout broken badly enough to fail this preflight's git calls will not
-/// get further unnoticed. Crashing the whole build because this one
-/// preflight could not ask git a question would be worse than skipping it;
-/// the reason is still printed, not swallowed.
+/// A git invocation that itself fails is a deliberate PASS, not a failure —
+/// but the bucket routed here is wider than "not a repository, or git
+/// missing from `PATH`". It also covers: a **bare** repository
+/// (`--show-toplevel` fails outright there); `safe.directory` / "detected
+/// dubious ownership" refusals, which a container or CI runner executing as
+/// a different uid than the checkout's owner hits on an otherwise perfectly
+/// healthy repository — an ordinary state, not an exotic one; any other
+/// non-zero git exit; and an unrecognised `rev-parse` flag on an older git,
+/// which git echoes verbatim to stdout while exiting 0, failing the
+/// positional parse in [`collect`] and routing here too. `collect` now
+/// requires git ≥ 2.31 (`--path-format`, added that release) — the higher
+/// of the two floors in play, since `--is-shallow-repository` alone only
+/// needs ≥ 2.15; below 2.31 the whole preflight silently skips rather than
+/// announcing the version gap.
+///
+/// The reason to fail open: crashing the whole build because this one
+/// preflight could not ask git a question would be worse than skipping it.
+/// The reason is NOT — as this comment used to claim — that every other
+/// `linkage-check` rule already depends on git and would therefore catch a
+/// broken checkout anyway. It would not: every one of the eight catalog
+/// rules reads `tests/CATALOG.md` and the test sources off the filesystem,
+/// not through git, so a checkout where git fails but files are readable —
+/// exactly the `dubious ownership` case — runs the whole suite to a green
+/// exit with this preflight silently absent. The reason is still printed,
+/// not swallowed, in a `linkage-check:`-prefixed block shaped like the
+/// failure path's in `main.rs`, so a skip is not the one outcome with no
+/// machine-readable trace.
 fn failures_from(collected: Result<RepoState, String>) -> Vec<String> {
     match collected {
         Ok(state) => preflight_failures(&state),
         Err(reason) => {
-            eprintln!("xtask linkage-check: repository-state preflight skipped: {reason}");
+            eprintln!(
+                "linkage-check: repository-state preflight: skipped (git unavailable or not usable):"
+            );
+            eprintln!("  {reason}");
             Vec::new()
         }
     }
@@ -276,6 +401,7 @@ mod tests {
         WorktreeEntry {
             path: PathBuf::from(path),
             exists,
+            prunable_reason: None,
         }
     }
 
@@ -347,14 +473,6 @@ mod tests {
         );
     }
 
-    /// A shallow repository that is genuinely exempt AND has no drift stays
-    /// silent — the count/linked gate and the drift check are independent.
-    #[test]
-    fn a_shallow_single_worktree_repo_with_no_drift_is_silent() {
-        let s = state(true, vec![entry("/repo", true)], "/repo", false);
-        assert!(preflight_failures(&s).is_empty());
-    }
-
     /// Registry drift: an entry whose path is gone is reported with the
     /// path named and the prune remedy, even when the repository is not
     /// shallow at all.
@@ -412,6 +530,29 @@ mod tests {
         );
     }
 
+    /// git's own `prunable` reason, when present, is folded into the drift
+    /// message instead of a message we compose from scratch.
+    #[test]
+    fn registry_drift_message_includes_gits_own_reason_when_present() {
+        let s = state(
+            false,
+            vec![WorktreeEntry {
+                path: PathBuf::from("/repo/gone"),
+                exists: false,
+                prunable_reason: Some("gitdir file points to non-existent location".to_string()),
+            }],
+            "/repo/main",
+            false,
+        );
+        let failures = preflight_failures(&s);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains("gitdir file points to non-existent location"),
+            "{}",
+            failures[0]
+        );
+    }
+
     /// A healthy multi-worktree, non-shallow repository passes with no
     /// findings at all.
     #[test]
@@ -427,9 +568,10 @@ mod tests {
 
     /// Deliberate decision for the git-unavailable case (issue #557: "fail
     /// closed, carefully"): a `collect` failure — git missing, not a
-    /// repository at all — is treated as a PASS rather than crashing the
-    /// build, because every other `linkage-check` rule already assumes a
-    /// working git checkout to run at all.
+    /// repository at all, a bare repo, dubious ownership, an old git — is
+    /// treated as a PASS rather than crashing the build. See
+    /// [`failures_from`]'s doc comment for why, and for why that is NOT
+    /// because another `linkage-check` rule would catch the same breakage.
     #[test]
     fn a_git_invocation_failure_is_treated_as_a_pass_not_a_crash() {
         let failures = failures_from(Err("git not found on PATH".to_string()));
@@ -451,33 +593,36 @@ mod tests {
         assert_eq!(failures.len(), 1, "{failures:?}");
     }
 
-    /// The primary checkout: measured directly, `--git-common-dir` and
-    /// `--git-dir` print the identical string, whether relative (from a
-    /// subdirectory) or the historical `.git` form — never a linked
-    /// worktree.
+    /// The primary checkout: measured directly against git 2.55.0 with
+    /// `--path-format=absolute` (which [`collect`] always passes), both
+    /// dir flags print the identical absolute path — from the toplevel AND
+    /// from a subdirectory. Unlike before this fix, there is no
+    /// relative-form fixture here: with `--path-format=absolute` in play, a
+    /// relative pair is not a shape git can produce, so pinning one would
+    /// pin a fiction again (fork PR #558 review, F1/F2).
     #[test]
     fn is_linked_worktree_is_false_for_the_primary_checkout() {
-        assert!(!is_linked_worktree(".git", ".git"));
-        assert!(!is_linked_worktree("../.git", "../.git"));
         assert!(!is_linked_worktree(
-            "/Users/dev/repo/.git",
-            "/Users/dev/repo/.git"
+            Path::new("/Users/dev/repo/.git"),
+            Path::new("/Users/dev/repo/.git")
         ));
     }
 
     /// A linked worktree: measured directly, `--git-common-dir` is the
     /// common dir's absolute path and `--git-dir` is its
-    /// `worktrees/<name>` subdirectory — always unequal by construction.
+    /// `worktrees/<name>` subdirectory — always unequal by construction,
+    /// from the worktree's own toplevel AND from a subdirectory of it
+    /// (verified at both depths against real git 2.55.0).
     #[test]
     fn is_linked_worktree_is_true_for_a_linked_worktree() {
         assert!(is_linked_worktree(
-            "/Users/dev/repo/.git",
-            "/Users/dev/repo/.git/worktrees/repo-fix123"
+            Path::new("/Users/dev/repo/.git"),
+            Path::new("/Users/dev/repo/.git/worktrees/repo-fix123")
         ));
     }
 
     #[test]
-    fn parse_worktree_paths_extracts_only_the_worktree_lines() {
+    fn parse_worktree_entries_extracts_only_the_worktree_lines() {
         let porcelain = "worktree /repo/main\n\
                           HEAD 9c131d5455485369f6b6b7c9ac8cdd9d5482241d\n\
                           branch refs/heads/main\n\
@@ -485,8 +630,12 @@ mod tests {
                           worktree /repo/fix-123\n\
                           HEAD 4e402c166433f702351f18e6e26c51205e19df1e\n\
                           branch refs/heads/fix/123-something\n";
+        let paths: Vec<PathBuf> = parse_worktree_entries(porcelain.as_bytes())
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
         assert_eq!(
-            parse_worktree_paths(porcelain),
+            paths,
             vec![PathBuf::from("/repo/main"), PathBuf::from("/repo/fix-123")]
         );
     }
@@ -495,21 +644,92 @@ mod tests {
     /// `detached`; the parser only looks for the `worktree ` prefix, so
     /// these shapes cannot break it.
     #[test]
-    fn parse_worktree_paths_is_indifferent_to_bare_and_detached_entries() {
+    fn parse_worktree_entries_is_indifferent_to_bare_and_detached_entries() {
         let porcelain = "worktree /repo/bare\n\
                           bare\n\
                           \n\
                           worktree /repo/detached\n\
                           HEAD 9c131d5455485369f6b6b7c9ac8cdd9d5482241d\n\
                           detached\n";
+        let paths: Vec<PathBuf> = parse_worktree_entries(porcelain.as_bytes())
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
         assert_eq!(
-            parse_worktree_paths(porcelain),
+            paths,
             vec![PathBuf::from("/repo/bare"), PathBuf::from("/repo/detached")]
         );
     }
 
     #[test]
-    fn parse_worktree_paths_on_empty_input_is_empty() {
-        assert!(parse_worktree_paths("").is_empty());
+    fn parse_worktree_entries_on_empty_input_is_empty() {
+        assert!(parse_worktree_entries(b"").is_empty());
+    }
+
+    /// git ≥ 2.36 reports drift itself; the `prunable` line attaches to the
+    /// block it appears in, and an entry with none gets `None` (the
+    /// [`collect`] caller falls back to `Path::try_exists()` for those).
+    #[test]
+    fn parse_worktree_entries_attaches_prunable_reason_to_its_block() {
+        let porcelain = "worktree /repo/main\n\
+                          HEAD 9c131d5455485369f6b6b7c9ac8cdd9d5482241d\n\
+                          branch refs/heads/main\n\
+                          \n\
+                          worktree /repo/gone\n\
+                          HEAD 4e402c166433f702351f18e6e26c51205e19df1e\n\
+                          branch refs/heads/gone\n\
+                          prunable gitdir file points to non-existent location\n";
+        let entries = parse_worktree_entries(porcelain.as_bytes());
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0].prunable_reason, None);
+        assert_eq!(
+            entries[1].prunable_reason.as_deref(),
+            Some("gitdir file points to non-existent location")
+        );
+    }
+
+    /// Reproduces the fail-green case a security audit found in the first
+    /// version of this preflight (fork PR #558 review, auditor F1): git
+    /// accepts a literal newline inside a worktree path, and `--porcelain`
+    /// emits it unescaped, splitting one entry's block across two lines —
+    /// `junk` here is the tail of the real path, not a new entry, since it
+    /// does not start with `worktree `. The `path` field this parser
+    /// produces is therefore truncated and wrong, but the `prunable` line
+    /// several lines later is still correctly attached to the SAME block —
+    /// which is what lets [`collect`] report the drift correctly even
+    /// though the path used for display is mangled. Byte-for-byte against
+    /// real `git worktree list --porcelain` output.
+    #[test]
+    fn parse_worktree_entries_still_flags_drift_when_the_path_contains_a_newline() {
+        let porcelain = "worktree /repo/green/keep\n\
+                          junk\n\
+                          HEAD 1fb69e17f2d79d384969cdb648969ab3459524da\n\
+                          branch refs/heads/sneaky\n\
+                          prunable gitdir file points to non-existent location\n";
+        let entries = parse_worktree_entries(porcelain.as_bytes());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].path, PathBuf::from("/repo/green/keep"));
+        assert_eq!(
+            entries[0].prunable_reason.as_deref(),
+            Some("gitdir file points to non-existent location")
+        );
+    }
+
+    /// A single non-UTF-8 byte in a git-reported path (legal on Linux;
+    /// ext4/xfs accept any byte but `/` and NUL) must not corrupt the path
+    /// through a lossy round-trip — that would break the byte-exact equality
+    /// [`is_linked_worktree`] and the degenerate-case match in
+    /// [`preflight_failures`] depend on, and `String::from_utf8` would hard-
+    /// fail the whole preflight over one unrelated worktree's odd byte
+    /// (fork PR #558 review, auditor F4). Unix-only: [`os_string_from_bytes`]
+    /// falls back to lossy UTF-8 off Unix, where this preflight does not run
+    /// in CI anyway.
+    #[cfg(unix)]
+    #[test]
+    fn os_string_from_bytes_preserves_non_utf8_bytes_exactly() {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = [b'/', b'r', b'e', b'p', 0xFF, b'o'];
+        let os = os_string_from_bytes(&bytes);
+        assert_eq!(os.as_bytes(), &bytes[..]);
     }
 }
