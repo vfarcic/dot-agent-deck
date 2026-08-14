@@ -36,9 +36,9 @@
 //! [`collect`] is the only part of this module that shells out to git; it
 //! turns two git invocations' worth of output into a plain [`RepoState`].
 //! Everything that decides pass/fail — [`should_assert_shallow`],
-//! [`preflight_failures`], [`is_linked_worktree`], [`parse_worktree_entries`]
-//! — is a pure function over already-collected values, so it is unit-tested
-//! without building a real git repository.
+//! [`preflight_failures`], [`is_linked_worktree`], [`parse_worktree_entries`],
+//! [`parse_rev_parse`] — is a pure function over already-collected values, so
+//! it is unit-tested without building a real git repository.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -245,78 +245,161 @@ fn preflight_failures(state: &RepoState) -> Vec<String> {
     failures
 }
 
-/// Shells out to git and turns the output into a [`RepoState`]. The only
-/// part of this module that is not a pure function.
+/// What [`parse_rev_parse`] reads out of the combined `rev-parse` output.
+#[derive(Debug, PartialEq)]
+struct RevParse {
+    is_shallow: bool,
+    current_worktree: PathBuf,
+    is_linked_worktree: bool,
+    /// True when the path fields could not be trusted because one of them
+    /// contained a literal newline — see [`parse_rev_parse`]. `is_shallow`
+    /// is still exact; `is_linked_worktree` has been forced to the
+    /// fail-safe value.
+    paths_degraded: bool,
+}
+
+/// Positional parse of the combined `rev-parse` output.
 ///
-/// Two invocations, kept to that count deliberately (issue #557: "stay
-/// cheap"): one combined `rev-parse` for the toplevel, both git-dir flags
-/// and the shallow check, plus one `worktree list --porcelain`.
-/// `--path-format=absolute` is what makes [`is_linked_worktree`]'s
-/// comparison sound rather than incidental — see its doc comment.
-fn collect(root: &Path) -> Result<RepoState, String> {
-    let rev_parse = run_git(
-        root,
-        &[
-            "rev-parse",
-            "--path-format=absolute",
-            "--show-toplevel",
-            "--git-common-dir",
-            "--git-dir",
-            "--is-shallow-repository",
-        ],
-    )?;
-    let mut lines = rev_parse.split(|&b| b == b'\n');
-    let show_toplevel = lines
-        .next()
-        .ok_or_else(|| "git rev-parse produced no output".to_string())?;
-    let git_common_dir = lines
-        .next()
-        .ok_or_else(|| "git rev-parse: missing --git-common-dir output".to_string())?;
-    let git_dir = lines
-        .next()
-        .ok_or_else(|| "git rev-parse: missing --git-dir output".to_string())?;
-    let is_shallow_raw = lines
-        .next()
-        .ok_or_else(|| "git rev-parse: missing --is-shallow-repository output".to_string())?;
-    let is_shallow = match is_shallow_raw {
-        b"true" => true,
-        b"false" => false,
-        other => {
+/// **`--is-shallow-repository` is requested FIRST, and the order is
+/// load-bearing** (Greptile P1 on PR #558). git accepts a literal newline
+/// inside a worktree path, and `rev-parse` emits path values unescaped, so
+/// a newline in the current checkout's own path splits one value across two
+/// lines and shifts every field after it. When the shallow flag was
+/// requested last it absorbed that shift, landed on a path instead of
+/// `true`/`false`, and returned `Err` — which [`failures_from`] turns into
+/// a **silent skip of the entire preflight**, shallow assertion included.
+/// Measured against real git 2.55.0 in a worktree whose path contains a
+/// newline: five output lines, not four. That is a fail-green in exactly
+/// the configuration the preflight is supposed to be unconditionally active
+/// in — a linked worktree.
+///
+/// Asking for the fixed-shape value first makes it line 0, where no amount
+/// of path weirdness can displace it. The path fields can still shift, so
+/// when more of them arrive than were asked for, this reports
+/// `is_linked_worktree = true` rather than comparing two mismatched
+/// strings: that is the fail-SAFE direction (it only makes
+/// [`should_assert_shallow`] assert more), where the old behaviour failed
+/// green. This is the same principle the byte-level handling already
+/// follows — one odd path degrades that path, never the shallow assertion,
+/// which has nothing to do with paths.
+///
+/// A trailing `\r` is stripped per line: the previous `String`-based
+/// implementation went through `str::lines()`, which strips it, and the
+/// move to a byte split silently dropped that. Without it, CRLF output
+/// would leave every field with a trailing `\r` and make
+/// [`is_linked_worktree`] compare unequal for a primary checkout — the same
+/// false positive `--path-format=absolute` exists to prevent.
+fn parse_rev_parse(stdout: &[u8]) -> Result<RevParse, String> {
+    let lines: Vec<&[u8]> = stdout
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .collect();
+
+    let is_shallow = match lines.first().copied() {
+        None => return Err("git rev-parse produced no output".to_string()),
+        Some(b"true") => true,
+        Some(b"false") => false,
+        Some(other) => {
             return Err(format!(
                 "unexpected --is-shallow-repository output {:?}",
                 String::from_utf8_lossy(other)
             ));
         }
     };
-    let git_common_dir = PathBuf::from(os_string_from_bytes(git_common_dir));
-    let git_dir = PathBuf::from(os_string_from_bytes(git_dir));
+
+    // `--show-toplevel --git-common-dir --git-dir`, in that order.
+    let paths = &lines[1..];
+    if paths.len() < 3 {
+        return Err(format!(
+            "git rev-parse: expected 3 path values after --is-shallow-repository, got {}",
+            paths.len()
+        ));
+    }
+    let current_worktree = PathBuf::from(os_string_from_bytes(paths[0]));
+    if paths.len() > 3 {
+        return Ok(RevParse {
+            is_shallow,
+            current_worktree,
+            is_linked_worktree: true,
+            paths_degraded: true,
+        });
+    }
+    let git_common_dir = PathBuf::from(os_string_from_bytes(paths[1]));
+    let git_dir = PathBuf::from(os_string_from_bytes(paths[2]));
+    Ok(RevParse {
+        is_shallow,
+        current_worktree,
+        is_linked_worktree: is_linked_worktree(&git_common_dir, &git_dir),
+        paths_degraded: false,
+    })
+}
+
+/// Shells out to git and turns the output into a [`RepoState`]. The only
+/// part of this module that is not a pure function.
+///
+/// Two invocations, kept to that count deliberately (issue #557: "stay
+/// cheap"): one combined `rev-parse` for the shallow check, the toplevel
+/// and both git-dir flags, plus one `worktree list --porcelain`.
+/// `--path-format=absolute` is what makes [`is_linked_worktree`]'s
+/// comparison sound rather than incidental — see its doc comment — and the
+/// **argument order** is what keeps a newline in a path from disabling the
+/// whole preflight; see [`parse_rev_parse`].
+fn collect(root: &Path) -> Result<RepoState, String> {
+    let rev_parse = run_git(
+        root,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--is-shallow-repository",
+            "--show-toplevel",
+            "--git-common-dir",
+            "--git-dir",
+        ],
+    )?;
+    let parsed = parse_rev_parse(&rev_parse)?;
+    if parsed.paths_degraded {
+        eprintln!(
+            "linkage-check: repository-state preflight: a git-reported path contains a newline; \
+             treating this checkout as a linked worktree so the shallow assertion still applies."
+        );
+    }
 
     let porcelain = run_git(root, &["worktree", "list", "--porcelain"])?;
     let worktrees = parse_worktree_entries(&porcelain)
         .into_iter()
-        .map(|parsed| {
+        .map(|entry| {
             // Unreadable (e.g. EACCES on a live worktree under an unreadable
             // parent) is not evidence of drift — degrade to "present"
             // rather than the false positive `Path::exists()` gives here
             // (it returns `false` on ANY error, permission denied
             // included).
-            let exists = match &parsed.prunable_reason {
+            //
+            // `paths_degraded` gets the same treatment for the same reason.
+            // A newline in a git-reported path truncates the `path` field
+            // here exactly as it does in `rev-parse`, so `try_exists()`
+            // would be asking about a path that was never on disk and would
+            // report a live worktree as drifted. git's own `prunable`
+            // verdict is unaffected by the mangling — that is why drift
+            // keys off it — so when the path text cannot be trusted, trust
+            // only what git said.
+            let exists = match &entry.prunable_reason {
                 Some(_) => false,
-                None => parsed.path.try_exists().unwrap_or(true),
+                None if parsed.paths_degraded => true,
+                None => entry.path.try_exists().unwrap_or(true),
             };
             WorktreeEntry {
-                path: parsed.path,
+                path: entry.path,
                 exists,
-                prunable_reason: parsed.prunable_reason,
+                prunable_reason: entry.prunable_reason,
             }
         })
         .collect();
 
     Ok(RepoState {
-        is_shallow,
+        is_shallow: parsed.is_shallow,
         worktrees,
-        current_worktree: PathBuf::from(os_string_from_bytes(show_toplevel)),
-        is_linked_worktree: is_linked_worktree(&git_common_dir, &git_dir),
+        current_worktree: parsed.current_worktree,
+        is_linked_worktree: parsed.is_linked_worktree,
     })
 }
 
@@ -355,8 +438,8 @@ fn run_git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
 /// a different uid than the checkout's owner hits on an otherwise perfectly
 /// healthy repository — an ordinary state, not an exotic one; any other
 /// non-zero git exit; and an unrecognised `rev-parse` flag on an older git,
-/// which git echoes verbatim to stdout while exiting 0, failing the
-/// positional parse in [`collect`] and routing here too. `collect` now
+/// which git echoes verbatim to stdout while exiting 0, failing
+/// [`parse_rev_parse`] and routing here too. `collect` now
 /// requires git ≥ 2.31 (`--path-format`, added that release) — the higher
 /// of the two floors in play, since `--is-shallow-repository` alone only
 /// needs ≥ 2.15; below 2.31 the whole preflight silently skips rather than
@@ -713,6 +796,109 @@ mod tests {
             entries[0].prunable_reason.as_deref(),
             Some("gitdir file points to non-existent location")
         );
+    }
+
+    /// The ordinary shape: shallow flag first, then the three path values.
+    #[test]
+    fn parse_rev_parse_reads_the_primary_checkout() {
+        let out = b"false\n/repo\n/repo/.git\n/repo/.git" as &[u8];
+        let parsed = parse_rev_parse(out).expect("parses");
+        assert_eq!(
+            parsed,
+            RevParse {
+                is_shallow: false,
+                current_worktree: PathBuf::from("/repo"),
+                is_linked_worktree: false,
+                paths_degraded: false,
+            }
+        );
+    }
+
+    /// A linked worktree: `--git-dir` is the `worktrees/<name>`
+    /// subdirectory, so the two dir flags compare unequal.
+    #[test]
+    fn parse_rev_parse_reads_a_linked_worktree() {
+        let out = b"true\n/repo/wt\n/repo/.git\n/repo/.git/worktrees/wt" as &[u8];
+        let parsed = parse_rev_parse(out).expect("parses");
+        assert!(parsed.is_shallow);
+        assert!(parsed.is_linked_worktree);
+        assert!(!parsed.paths_degraded);
+    }
+
+    /// **The Greptile P1 regression test.** Byte-for-byte the output real
+    /// git 2.55.0 produced from a linked worktree whose path contains a
+    /// literal newline, with `--is-shallow-repository` requested FIRST:
+    /// five lines instead of four. Before the reorder the shallow flag was
+    /// last, absorbed the shift, landed on a path instead of
+    /// `true`/`false`, and returned `Err` — which `failures_from` turns
+    /// into a silent skip of the WHOLE preflight. Now the flag is exact,
+    /// nothing returns `Err`, and the untrustworthy path comparison
+    /// degrades to the fail-safe `is_linked_worktree = true` instead of the
+    /// old fail-green.
+    #[test]
+    fn parse_rev_parse_survives_a_newline_inside_a_path() {
+        let out = b"false\n/probe/wt\nnewline\n/probe/origin/.git\n\
+                    /probe/origin/.git/worktrees/wt-newline" as &[u8];
+        let parsed = parse_rev_parse(out).expect("must NOT be an Err — Err means a silent skip");
+        assert!(!parsed.is_shallow, "the shallow flag must still be exact");
+        assert!(
+            parsed.is_linked_worktree,
+            "must degrade to the fail-safe direction, not fail green"
+        );
+        assert!(parsed.paths_degraded);
+    }
+
+    /// The same shift, in a repository that IS shallow: the whole point of
+    /// the reorder is that this case now reports the shallow failure rather
+    /// than skipping silently.
+    #[test]
+    fn a_shallow_repo_with_a_newline_path_still_reports_the_shallow_failure() {
+        let out = b"true\n/probe/wt\nnewline\n/probe/origin/.git\n\
+                    /probe/origin/.git/worktrees/wt-newline" as &[u8];
+        let parsed = parse_rev_parse(out).expect("parses");
+        let s = state(
+            parsed.is_shallow,
+            vec![entry("/probe/wt", true)],
+            "/probe/wt",
+            parsed.is_linked_worktree,
+        );
+        let failures = preflight_failures(&s);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains("git fetch --unshallow"),
+            "{}",
+            failures[0]
+        );
+    }
+
+    /// A trailing `\r` per line is stripped. `str::lines()` used to do this
+    /// for free; the byte split does not, and without it CRLF output would
+    /// make the two dir flags compare unequal for a primary checkout — the
+    /// same false positive `--path-format=absolute` exists to prevent
+    /// (fork PR #558 review, R2-2).
+    #[test]
+    fn parse_rev_parse_strips_carriage_returns() {
+        let out = b"false\r\n/repo\r\n/repo/.git\r\n/repo/.git" as &[u8];
+        let parsed = parse_rev_parse(out).expect("parses");
+        assert_eq!(parsed.current_worktree, PathBuf::from("/repo"));
+        assert!(
+            !parsed.is_linked_worktree,
+            "a stray \\r must not read as a linked worktree"
+        );
+    }
+
+    /// An older git echoes an unrecognised flag verbatim to stdout while
+    /// exiting 0. That is not `true`/`false`, so it is an honest `Err` —
+    /// routed to the documented fail-open skip rather than guessed at.
+    #[test]
+    fn parse_rev_parse_rejects_output_that_is_not_the_shallow_flag() {
+        let out = b"--path-format=absolute\n/repo\n/repo/.git\n/repo/.git" as &[u8];
+        assert!(parse_rev_parse(out).is_err());
+    }
+
+    #[test]
+    fn parse_rev_parse_rejects_truncated_output() {
+        assert!(parse_rev_parse(b"false\n/repo").is_err());
     }
 
     /// A single non-UTF-8 byte in a git-reported path (legal on Linux;
