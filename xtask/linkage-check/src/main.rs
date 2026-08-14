@@ -4,8 +4,18 @@
 //! Invoked as `cargo xtask <subcommand>` (alias in `.cargo/config.toml`).
 //! Subcommands:
 //!
-//! - `linkage-check` (default) — performs the seven checks listed
-//!   in Decision 7 + Decision 30:
+//! - `linkage-check` (default) — first runs a repository-state preflight
+//!   (issue #557; see [`repo_state`]), then performs the eight checks
+//!   listed in Decision 7 + Decision 30:
+//!
+//!   The preflight is deliberately not a ninth numbered check: it answers
+//!   "is this repository sane to reason about", a different question from
+//!   "does the catalog match the tests", and it runs first so a repository
+//!   in a state that would misdiagnose the checks below is caught before
+//!   any of them run. It asserts that the object store is not unexpectedly
+//!   shallow and that the worktree registry has not drifted from what is on
+//!   disk — both gated so a legitimately shallow, single-worktree CI clone
+//!   is exempt by construction. See [`repo_state`] for the full reasoning.
 //!
 //!   1. Every catalog ID has at least one `#[spec("...")]` referencing
 //!      it OR is on the allowlist (`m2.allowlist`).
@@ -53,6 +63,7 @@
 
 mod clean_tmp;
 mod list_tests;
+mod repo_state;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -206,6 +217,24 @@ fn main() -> ExitCode {
     }
 
     let root = repo_root();
+
+    // Repository-state preflight (issue #557): a different question from
+    // the catalog↔test checks below, and one worth answering before any of
+    // them spend seconds parsing the catalog. Runs first and short-circuits
+    // on its own rather than joining `failures` below, so it stays a
+    // preflight rather than becoming a ninth catalog check.
+    let repo_state_failures = repo_state::run(&root);
+    if !repo_state_failures.is_empty() {
+        eprintln!(
+            "linkage-check: repository-state preflight: {} failure(s):",
+            repo_state_failures.len()
+        );
+        for f in &repo_state_failures {
+            eprintln!("  {f}");
+        }
+        return ExitCode::FAILURE;
+    }
+
     let catalog_path = root.join(CATALOG_PATH);
     let allowlist_path = root.join(ALLOWLIST_PATH);
     let tests_dir = root.join(TESTS_DIR);
