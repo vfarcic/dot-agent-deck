@@ -137,6 +137,6 @@ Per-milestone interactive validation is explicitly not required. M1 and M3 are v
 - `src/daemon_protocol.rs:885-917` — `handle_attach_stream` (sends scrollback snapshot; unchanged structurally — the snapshot it sends now has correct provenance)
 - `src/daemon_protocol.rs:215-310` — `AttachRequest`/`AttachResponse` (no protocol-version bump required; new field is optional)
 - `prds/76-remote-agent-environments.md` (done) — origin of the M2.15 placeholder this PRD fixes
-- `prds/84-rendering-layer-rework.md` — complementary rendering-contract work; does not overlap with this PRD
+- `prds/done/84-rendering-layer-rework.md` — complementary rendering-contract work; does not overlap with this PRD
 - `prds/77-tui-testing-harness.md` — testing harness used by M4 if it can drive detach/reattach
 - `feedback_validate_pre_pr.md` — single pre-PR validation pass policy

@@ -105,7 +105,7 @@ The contract is measured against the M1 failure-mode catalog under `tests/` (one
 
 ## References
 
-- PRD #84 — `prds/84-rendering-layer-rework.md` (Problem, Solution, Milestones).
+- PRD #84 — `prds/done/84-rendering-layer-rework.md` (Problem, Solution, Milestones).
 - `src/ui.rs` — `render_frame`, `render_mode_tab`, the resize helpers, and the `Event::Resize` handler.
 - `src/terminal_widget.rs` — `TerminalWidget::render` (the clamp + row window to be removed).
 - `src/embedded_pane.rs` — `resize_pane_pty` (the one resize primitive).

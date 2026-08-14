@@ -1863,7 +1863,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 ### Render contract (PRD #84)
 
-The rendering-contract reproducers for the PRD #84 (`prds/84-rendering-layer-rework.md`)
+The rendering-contract reproducers for the PRD #84 (`prds/done/84-rendering-layer-rework.md`)
 rework: one reproducer per known render-path defect, each the RED side of a TDD chain that
 goes GREEN at M4 (layout-driven PTY resize) or M5 (1:1 `TerminalWidget`). They target the
 `src/terminal_widget.rs` `min(area, screen)` col clamp + cursor-anchored row window (removed
