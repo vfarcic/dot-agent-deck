@@ -283,10 +283,10 @@ Issue #421's closing observation is correct and worth acting on separately: **#1
 | `.claude/skills/triage-issues/SKILL.md` | New — vocabulary + uncertainty rule (Phase 1). |
 | `src/issue_dispatch.rs` | Pure argv builders; `dispatch_decision` gains its third signal **and the own-vs-foreign axis Criterion 7 requires** (M3.2). |
 | `src/issue_dispatch_run.rs` | `claim_issue` and the claimant record it writes (task + host, edited not appended), plus the read that resolves own-vs-foreign at decision time; **no `release_issue`** — M2.2 chose expiry, so no release path is built (see Phase 2); claim written after the `spawn` at `:448`. |
-| `src/daemon_protocol.rs` | Release on close, beside `remove_worktree` (`:1501-1510`). |
+| `src/daemon_protocol.rs` | **Deliberately unchanged.** The close path (`:1501-1510`, beside `remove_worktree`) is where a release *would* have gone, and M2.2 chose expiry instead — so nothing is added here, and M2.3 asserts that closing a tab performs no release call at all. Listed because the absence is a decision, not an oversight. |
 | `src/config.rs` | `IssueDispatchConfig` (`:586`) gains the TTL + kill switch. |
 | `src/scheduler.rs` | Skip-reason vocabulary + the failed-claim notification. |
-| `tests/e2e_issue_dispatch.rs` | `gh` stub arms for the claim verb; claim/release assertions. |
+| `tests/e2e_issue_dispatch.rs` | `gh` stub arms for the claim verb; asserts the claim is written on dispatch and that **no release call is ever made** on close (M2.3), plus M3.3's three tests. |
 | `tests/e2e_issue_dispatch_real.rs` | `scheduler/dispatch/013` — live-fixture safety, and the acceptance test for Criterion 7 (two consecutive runs on a **read-only** token, no fixture write in the test). The test most likely to be broken by this PRD, and the one already broken by PR #471. |
 | `docs/scheduled-tasks.md` | Triage recipe; claim behaviour; TTL; kill switch. |
 
