@@ -13210,11 +13210,82 @@ pub fn run_tui(
     ratatui::restore();
 
     // Flush accumulated session warnings now that the terminal is restored.
-    for warning in &ui.session_warnings {
-        eprintln!("{warning}");
-    }
+    // Sanitised on the way out — see `flush_session_warnings` for why that
+    // happens HERE and not at the ~13 `session_warnings.push` sites.
+    flush_session_warnings(&ui.session_warnings, &mut std::io::stderr().lock());
 
     Ok(())
+}
+
+/// Issue #576: write each accumulated `session_warnings` entry to `out`, one
+/// line each, with every control character escaped first.
+///
+/// This runs AFTER [`ratatui::restore()`], so `out` is a real terminal with no
+/// widget layer in between. That is the whole problem: the in-session sink is
+/// affirmatively safe — `ratatui-core` filters `!symbol.contains(char::is_control)`
+/// in both `Buffer::set_stringn` and `Span::styled_graphemes`, so a control
+/// character in a rendered string cannot reach the tty — while this loop used to
+/// `eprintln!` the string verbatim. Several push sites interpolate values the
+/// deck does not control: a daemon-supplied `display_name` / `agent_id` arriving
+/// via a saved pane's name, and the saved pane's `dir`. A value carrying ANSI
+/// escapes can repaint the shell the user is dropped back into, a `\r` can
+/// overwrite the line just printed, and a `\n` can forge an additional line that
+/// reads as the deck's own output.
+///
+/// **Sanitising here rather than at each producer is the point.** There are
+/// ~13 push sites and they only grow — the most recent was added by following
+/// the established idiom exactly, which is the right thing for a contributor to
+/// do. Per-producer escaping means every future site must remember; one
+/// sanitisation point at the single consumer fixes them all by construction and
+/// cannot be forgotten by a later addition. Push sites therefore keep pushing
+/// plain, readable strings, and nothing about this is visible at the call site —
+/// which is exactly why it is documented at the seam that enforces it.
+///
+/// Errors are dropped rather than panicking the way `eprintln!` does: this is
+/// the last statement of a clean shutdown, and a closed stderr is not worth
+/// turning an orderly exit into a panic over.
+fn flush_session_warnings<W: std::io::Write>(warnings: &[String], out: &mut W) {
+    for warning in warnings {
+        let _ = writeln!(out, "{}", escape_control_chars(warning));
+    }
+}
+
+/// Escape every control character in `s`, borrowing unchanged when there are
+/// none (the overwhelmingly common case — a warning naming a well-behaved pane).
+///
+/// The predicate is [`char::is_control`], deliberately the SAME one
+/// `ratatui-core` filters on, so the exit flush is safe on exactly the terms the
+/// in-session path already is: Unicode category `Cc`, i.e. C0 (U+0000..=U+001F),
+/// DEL (U+007F) and C1 (U+0080..=U+009F) — the last of which some terminals do
+/// still act on.
+///
+/// Escaping, not stripping (issue #576 asks the question explicitly): this is a
+/// diagnostic surface, and a name that silently loses characters reads as a
+/// different name, whereas `\r` in the output preserves the evidence that
+/// something odd was in it. The spelling is Rust's own — `\n`/`\r`/`\t` for the
+/// three with conventional names, `\u{XX}` for the rest.
+///
+/// A literal backslash is deliberately NOT escaped. Doing so would make the
+/// encoding injective, which nothing here needs — this output is read by a
+/// human, never parsed back — and would cost real legibility on the push sites
+/// that interpolate a saved pane's `dir`, since every Windows path would come
+/// back doubled (`C:\\Users\\…`). The residual ambiguity is a warning that
+/// contained the six literal characters `\u{1b}` to begin with.
+fn escape_control_chars(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains(char::is_control) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:02x}}}", c as u32)),
+            other => out.push(other),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -33248,5 +33319,96 @@ mod tests {
 
         let err = read_resp_frame_blocking(&mut cursor).expect_err("expected Err for wrong kind");
         assert!(err.to_string().contains("expected RESP frame"), "got {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #576 — the post-`ratatui::restore()` session-warning flush.
+    // `session/restore/015` proves the property through the real binary on
+    // a real PTY; these pin the escape spelling and the per-warning framing
+    // in the fast tier, where a regression is cheap to catch.
+    // -----------------------------------------------------------------
+
+    /// A warning with nothing to escape is passed through verbatim — and
+    /// borrowed, not reallocated, since that is every ordinary warning.
+    #[test]
+    fn escape_control_chars_leaves_clean_text_borrowed() {
+        let clean = "Warning: skipping pane 'api-server' — directory /srv/app not found";
+        let out = escape_control_chars(clean);
+        assert_eq!(out, clean);
+        assert!(
+            matches!(out, std::borrow::Cow::Borrowed(_)),
+            "a warning with no control characters must borrow, not allocate"
+        );
+    }
+
+    /// The three control characters that actually matter on a terminal —
+    /// ESC (arbitrary SGR/OSC), CR (overwrite the printed line), LF (forge a
+    /// line) — come out escaped, and nothing raw survives.
+    #[test]
+    fn escape_control_chars_escapes_esc_cr_and_lf() {
+        let hostile = "name\u{1b}[31m\rSPOOFED\nWarning: everything is fine";
+        let out = escape_control_chars(hostile);
+        assert_eq!(out, r"name\u{1b}[31m\rSPOOFED\nWarning: everything is fine");
+        assert!(
+            !out.contains(char::is_control),
+            "no control character may survive: {out:?}"
+        );
+    }
+
+    /// The predicate is `char::is_control` — the same one `ratatui-core`
+    /// filters on for the in-session sink — so DEL and the C1 range are
+    /// covered too, while printable non-ASCII is left alone.
+    #[test]
+    fn escape_control_chars_covers_del_and_c1_but_not_printable_unicode() {
+        assert_eq!(escape_control_chars("a\u{7f}b"), r"a\u{7f}b");
+        assert_eq!(escape_control_chars("a\u{9b}b"), r"a\u{9b}b");
+        // Two-digit, zero-padded: every `Cc` codepoint fits in two hex digits.
+        assert_eq!(escape_control_chars("a\u{0}b"), r"a\u{00}b");
+        assert_eq!(escape_control_chars("a\tb"), r"a\tb");
+        // Printable Unicode is not a control character and must survive: pane
+        // names and directories legitimately carry it.
+        let printable = "pane 'café-🚀' — directory /srv/naïve not found";
+        assert_eq!(escape_control_chars(printable), printable);
+    }
+
+    /// A literal backslash is deliberately left alone, so a Windows path in a
+    /// warning stays readable instead of coming back doubled.
+    #[test]
+    fn escape_control_chars_does_not_double_backslashes() {
+        let win = r"Warning: no project config in C:\Users\dev\app, restoring as plain pane";
+        assert_eq!(escape_control_chars(win), win);
+    }
+
+    /// The flush loop is the single sanitisation point: whatever a push site
+    /// put in, exactly one line per warning reaches the terminal and no
+    /// control character does — so a hostile pane name can neither repaint
+    /// the shell nor forge an extra line of deck output.
+    #[test]
+    fn flush_session_warnings_emits_one_sanitised_line_per_warning() {
+        let warnings = vec![
+            "Warning: failed to save session: disk full".to_string(),
+            "Warning: skipping pane 'x\u{1b}[2J\rSPOOFED\nWarning: forged' — directory /d not found"
+                .to_string(),
+        ];
+        let mut out: Vec<u8> = Vec::new();
+        flush_session_warnings(&warnings, &mut out);
+        let text = String::from_utf8(out).expect("flush output is UTF-8");
+
+        assert_eq!(
+            text.lines().count(),
+            warnings.len(),
+            "one line per warning, however many newlines a hostile value smuggled in: {text:?}"
+        );
+        assert_eq!(
+            text,
+            "Warning: failed to save session: disk full\n\
+             Warning: skipping pane 'x\\u{1b}[2J\\rSPOOFED\\nWarning: forged' — directory /d not found\n"
+        );
+        // The separators the loop itself writes are the ONLY control
+        // characters in the output.
+        assert!(
+            !text.replace('\n', "").contains(char::is_control),
+            "no control character from a warning body may reach the terminal: {text:?}"
+        );
     }
 }

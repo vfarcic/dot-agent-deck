@@ -43,11 +43,32 @@ fn stage_session_snapshot(session_file: &Path, dir: &Path, panes: &[(&str, &str)
     std::fs::write(session_file, s).expect("write staged session.toml");
 }
 
-/// Minimal TOML basic-string escape for the values we embed (filesystem paths
-/// and short ASCII names) — backslash and double-quote only, which is all a
-/// Linux tempdir path or a `restored-*` name can contain here.
+/// TOML basic-string escape for the values we embed (filesystem paths and pane
+/// names). Backslash and double-quote were enough while every staged value was
+/// a Linux tempdir path or a `restored-*` name, but `session/restore/015`
+/// deliberately stages a pane name carrying an ESC, a CR and an LF — every one
+/// of which is *invalid* raw inside a TOML basic string, so the snapshot would
+/// not parse and the test would silently stage nothing. Follow TOML 1.0: the
+/// named escapes for `\b`/`\t`/`\n`/`\f`/`\r`/`\\`/`"`, and `\uXXXX` for the
+/// remaining C0 controls plus DEL. Mirrors the harness's private `toml_escape`.
 fn toml_basic_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\u{0008}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{000c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Hand-stage a `session.toml` describing a SINGLE saved pane that carries an
@@ -884,5 +905,152 @@ fn restore_014_recognized_agent_is_idle_before_first_hook() {
         "a restored command already recognized as OpenCode must render Idle before any hook \
          event, not No agent.\nFinal grid:\n{}",
         deck.snapshot_grid()
+    );
+}
+
+/// The first control character immediately following any occurrence of `mark`
+/// in `stream`, if any. `session/restore/015` stages one control character
+/// directly after each of its sentinels, so "is the next character still a
+/// control" is the exact property — and, unlike a literal `contains("MARK\n")`
+/// needle, it is immune to the PTY's ONLCR rewriting `\n` to `\r\n` on the way
+/// out, which would otherwise make the LF assertion silently unfalsifiable.
+fn first_control_after(stream: &str, mark: &str) -> Option<char> {
+    stream
+        .match_indices(mark)
+        .filter_map(|(idx, _)| stream[idx + mark.len()..].chars().next())
+        .find(|c| c.is_control())
+}
+
+/// Scenario: Hand-stage a `session.toml` whose single saved pane points at a
+/// directory that does not exist — so the restore loop pushes its "skipping
+/// pane … directory … not found" `session_warnings` entry, interpolating the
+/// saved pane NAME raw — and give that name an ANSI escape, a carriage return
+/// and a newline, each bracketed by a unique sentinel. Launch with no flag
+/// against an empty daemon, land on the empty dashboard, then Ctrl+C → Enter to
+/// detach-quit so the warnings are flushed AFTER `ratatui::restore()`, straight
+/// to the real terminal. Drain the process to exit and assert on the final byte
+/// stream: the sentinels are there (the warning really was flushed), but no raw
+/// ESC/CR/LF follows any of them, and the whole warning stays on ONE line — a
+/// name cannot repaint the terminal or forge an extra line of deck output.
+#[spec("session/restore/015")]
+#[test]
+fn restore_015_flushed_warning_escapes_control_characters_in_pane_name() {
+    // Unique sentinels so every assertion below names exactly the bytes this
+    // test staged — the deck writes plenty of legitimate escape sequences of
+    // its own, and a bare `contains("\x1b[31m")` would match those instead.
+    const ESC_MARK: &str = "DAD576-ESC>";
+    const CR_MARK: &str = "DAD576-CR>";
+    const LF_MARK: &str = "DAD576-LF>";
+    const END_MARK: &str = "<DAD576-END";
+
+    // The payload a daemon-supplied display name / agent id (or a saved dir)
+    // could carry: an SGR sequence that repaints the shell the user is dropped
+    // back into, a CR that overwrites the line just printed, and an LF that
+    // forges a whole additional line of deck output.
+    let hostile_name = format!(
+        "{ESC_MARK}\u{1b}[31m{CR_MARK}\rSPOOFED{LF_MARK}\nWarning: everything is fine{END_MARK}"
+    );
+
+    let session_dir = common::race_safe_tempdir();
+    // Deliberately NOT created: `stage_session_snapshot`'s contract is that the
+    // dir exists so panes restore, and this test wants the opposite branch —
+    // the dir-not-found skip, which is the cheapest push site that interpolates
+    // an attacker-influenced value into a warning.
+    let missing_dir = session_dir.path().join("vanished-project");
+    assert!(
+        !missing_dir.exists(),
+        "the staged pane dir must NOT exist so the restore loop takes the \
+         dir-not-found warning branch, but {missing_dir:?} is present"
+    );
+
+    let session_file = session_dir.path().join("session.toml");
+    stage_session_snapshot(
+        &session_file,
+        &missing_dir,
+        &[(hostile_name.as_str(), "sleep 600")],
+    );
+
+    // `mut` for `wait_for_exit_within` below, which reaps the child.
+    let mut deck = TuiDeck::builder()
+        .with_env(
+            "DOT_AGENT_DECK_SESSION",
+            session_file.to_str().expect("session path is UTF-8"),
+        )
+        .launch_with_fixture("minimal");
+
+    // The only saved pane was skipped, so the deck lands on the empty dashboard.
+    deck.wait_for_string("No active sessions");
+
+    // Detach-quit: the clean teardown path that reaches the post-`restore()`
+    // flush. A killed process never gets there, so the drain below is what
+    // makes the whole assertion meaningful.
+    deck.send_keys(b"\x03"); // Ctrl+C → quit-confirm modal
+    deck.wait_for_string("Quit dot-agent-deck?");
+    deck.send_keys(b"\r"); // Enter → Detach (default) → clean teardown + flush
+
+    let exited_cleanly = deck.wait_for_exit_within(Duration::from_secs(30));
+    assert_eq!(
+        exited_cleanly,
+        Some(true),
+        "the deck did not exit cleanly after the detach-quit ({exited_cleanly:?}; None = still \
+         running at the 30s ceiling). The warning flush only happens on an orderly exit, so \
+         the byte-stream assertions below are only trustworthy once the process is \
+         gone.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // The FINAL stream: the process is gone, so nothing more can be appended.
+    let stream = deck.stream_text();
+
+    // Guard against a vacuous pass: if the warning never reached the terminal
+    // at all, every "must not contain" below would trivially hold.
+    assert!(
+        stream.contains(ESC_MARK),
+        "the dir-not-found session warning naming the saved pane was never flushed to the \
+         terminal ({ESC_MARK:?} absent), so this test would pass vacuously. Check the \
+         staged snapshot parsed and the detach-quit reached the post-`restore()` \
+         flush.\nStream:\n{stream:?}"
+    );
+
+    // The defect (issue #576): `session_warnings` are flushed by an `eprintln!`
+    // loop that runs AFTER `ratatui::restore()`, with no widget layer in
+    // between — unlike the in-session sink, where ratatui-core drops every
+    // `char::is_control` before it can reach the tty.
+    //
+    // Checked as "the character right after each sentinel is not a control",
+    // not as a literal `contains("MARK\n")`: the PTY's ONLCR turns the deck's
+    // `\n` into `\r\n` on the wire, so a literal-LF needle can never match and
+    // that assertion would pass vacuously against the very byte it exists to
+    // catch. All three are collected and reported together so one RED run shows
+    // every control character that got through, rather than only the first.
+    let violations: Vec<String> = [
+        (ESC_MARK, "ESC", "emit arbitrary SGR/OSC sequences into the shell the user is dropped back into"),
+        (CR_MARK, "CR", "overwrite the warning line the deck just printed"),
+        (LF_MARK, "LF", "forge additional lines that read as the deck's own output"),
+    ]
+    .iter()
+    .filter_map(|(mark, name, harm)| {
+        let got = first_control_after(&stream, mark)?;
+        Some(format!("  {name} (staged after {mark:?}) reached the terminal as {got:?} — a saved pane name can {harm}"))
+    })
+    .collect();
+    assert!(
+        violations.is_empty(),
+        "issue #576: control characters from the saved pane name reached the real terminal in \
+         the post-`restore()` warning flush:\n{}\nStream:\n{stream:?}",
+        violations.join("\n")
+    );
+
+    // User altitude: one warning, one line. This is the assertion that survives
+    // whichever escape spelling the fix picks.
+    let warning_line = stream
+        .lines()
+        .find(|line| line.contains(ESC_MARK))
+        .expect("the flushed warning line, already proven present above");
+    assert!(
+        warning_line.contains(END_MARK),
+        "issue #576: the flushed warning was split across lines — the tail after the staged \
+         newline ({END_MARK:?}) is not on the same line as {ESC_MARK:?}, so the pane name \
+         forged an extra line of deck output.\nWarning line:\n{warning_line:?}\nStream:\n{stream:?}"
     );
 }

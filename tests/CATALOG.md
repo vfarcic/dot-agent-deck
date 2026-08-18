@@ -2767,6 +2767,13 @@ without depending on the config struct API.
 - **Does not assert:** OpenCode plugin delivery or later working/waiting transitions; restore fallback paths after a mode-tab failure.
 - **Platform coverage:** mac+linux.
 
+##### session/restore/015 — A `session_warnings` entry flushed after `ratatui::restore()` escapes control characters in the daemon-supplied value it interpolates (issue #576).
+- **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
+- **Agent:** none (the staged pane is skipped before anything spawns; no LLM).
+- **Asserts:** with a hand-staged `session.toml` whose single saved pane points at a directory that does not exist — the restore loop's "skipping pane … directory … not found" branch, which interpolates the saved pane NAME — and whose name carries an ANSI escape, a CR and an LF each bracketed by a unique sentinel, a clean detach-quit flushes that warning to the real terminal (post-`ratatui::restore()`, so no widget layer filters it) with the sentinels present but NO raw ESC/CR/LF following any of them, and with the whole warning on ONE line. Pins that the exit flush cannot be driven by an attacker-influenced pane name, orchestration `display_name` or `agent_id` to repaint the shell the user is dropped back into or forge an extra line of deck output — the property `ratatui-core`'s `!symbol.contains(char::is_control)` filter already gives the in-session sink.
+- **Does not assert:** the exact escape spelling (`\u{1b}` vs `\e` vs stripping — pinned by the `escape_control_chars` unit tests in `src/ui.rs`); that every one of the ~13 push sites is reachable (the fix is at the single flush loop, so one site proves the sanitisation point); non-control Unicode trickery (bidi overrides, homoglyphs), which the in-session sink does not filter either.
+- **Platform coverage:** mac+linux.
+
 ### Live session status on reconnect (PRD #162)
 
 These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must attach the live, event-derived session state (a `SessionSnapshot` on each `AgentRecord`) so reconnected cards show real status instead of `Idle`/"No agent". The data already exists in `AppState.sessions` (built by `apply_event`, unchanged); this PRD only exposes it. The wire field `live: Option<SessionSnapshot>` is additive/optional — no `PROTOCOL_VERSION` bump.
