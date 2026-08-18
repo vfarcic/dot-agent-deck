@@ -2185,6 +2185,13 @@ without depending on the config struct API.
 - **Does not assert:** the *partial*-line-then-EOF case (some bytes written, then closed before the newline) — that is deliberately left returning `Line(partial)`, unchanged by this fix; `SocketReply::Unreachable`; timing.
 - **Platform coverage:** mac+linux (Unix-domain socket).
 
+##### error/socket/007 — A `read(2)` interrupted by a signal (`EINTR`) is retried, not folded into "no daemon".
+- **Layer:** L1 (`src/hook.rs`'s `#[cfg(test)] mod tests`; same synthetic stub-daemon setup as `error/socket/003`/`004`/`005`/`006`).
+- **Agent:** none (a `std::thread` stub daemon that accepts one connection, reads the request line, sleeps 300ms, then writes one reply line — while the test `pthread_kill`s the *client* thread with `SIGUSR1` 25 times at 10ms intervals, under a handler installed without `SA_RESTART` so the interrupted read really does surface as `EINTR` rather than being restarted by the kernel).
+- **Asserts:** `request_from_socket_at` still returns `SocketReply::Line("{\"seed\":\"abc123\"}")`. Issue #564: `read_reply_line`'s `stream.read(&mut buf).ok()?` made *every* `io::Error` terminal, so a single signal on the reading thread ended an exchange that had ~4.7s of its 5s budget left and reported the daemon as absent. Verified to fail before the fix and pass after, with the same fast-fail signature (~0.31s of a 5s budget) as the two macOS CI occurrences.
+- **Does not assert:** the macOS failure itself (not reproducible off macOS — this pins the transient-read-error *class* the evidence points at, on any Unix); which errno macOS actually returned; the `WouldBlock`/`TimedOut` half of `is_transient_read_error`, which needs a deadline-vs-socket-clock divergence no portable stub can force; signal delivery during connect or write (the 50ms lead-in deliberately keeps signals out of that window).
+- **Platform coverage:** mac+linux (Unix-domain socket; `pthread_kill`/`sigaction`).
+
 #### error/config
 
 ##### error/config/001 — `.dot-agent-deck.toml` with an invalid regex makes the new-pane form refuse the mode and surface a status-line message.

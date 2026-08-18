@@ -3,8 +3,17 @@ retries = 0
 slow-timeout = { period = "60s", terminate-after = 3 }
 fail-fast = false
 
+# Issue #564: `path` is resolved RELATIVE TO the profile's store directory
+# (`target/nextest/<profile>/`), so the previous value of
+# "target/nextest/default/junit.xml" actually wrote
+# `target/nextest/default/target/nextest/default/junit.xml`. Nothing read the
+# file, so the doubling went unnoticed — and that is the point: this is the one
+# structured, per-test, machine-readable record of a run (per-test durations and
+# the full failure message), and CI now uploads it per run_attempt so that a
+# job-level re-run cannot erase a failing attempt's evidence the way it erased
+# the first `socket_004` occurrence.
 [profile.default.junit]
-path = "target/nextest/default/junit.xml"
+path = "junit.xml"
 
 # PRD #140 M5.1: `orchestration/route/001` boots SIX interactive Haiku panes
 # across two orchestration tabs and drives two concurrent

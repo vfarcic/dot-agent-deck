@@ -199,6 +199,17 @@ jobs:
       # inert and the gap survived #436. Costs nothing measurable: all 48 are
       # under 40ms and the tier's wall clock is set by its slowest test.
       - run: cargo nextest run --workspace
+      # Issue #564: keep this attempt's results after a job-level re-run
+      # overwrites the conclusion. Full rationale on the identical step in
+      # `build-macos` below — the masking is a property of re-running any job,
+      # not of macOS, so all three test jobs carry it.
+      - name: Preserve this attempt's test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-linux-attempt-${{ github.run_attempt }}
+          path: target/nextest/default/junit.xml
+          if-no-files-found: warn
       # CLAUDE.md rule 7 has always SAID this runs in CI ("CI's linkage-check
       # rule 7 fails the build if the Scenario comment is missing or the
       # generator fails"), and the build-macos/build-windows comment says these
@@ -349,6 +360,17 @@ jobs:
       # dependency (`symlinks_named_like_owned_dirs_are_skipped`) is already
       # `#[cfg(unix)]`; the rest are in-memory or tempdir-based.
       - run: cargo nextest run --workspace
+      # Issue #564: keep this attempt's results after a job-level re-run
+      # overwrites the conclusion. Full rationale on the identical step in
+      # `build-macos` below — the masking is a property of re-running any job,
+      # not of macOS, so all three test jobs carry it.
+      - name: Preserve this attempt's test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-windows-attempt-${{ github.run_attempt }}
+          path: target/nextest/default/junit.xml
+          if-no-files-found: warn
 
   # macOS (host = aarch64-apple-darwin) compile + clippy + unit-test gate,
   # mirroring build-windows. macOS is otherwise built ONLY in the release
@@ -388,6 +410,45 @@ jobs:
       # there is nothing to match-and-narrow here — the clippy divergence is
       # about `--all-targets --features e2e`, not about package selection.
       - run: cargo nextest run --workspace
+      # Issue #564: preserve THIS attempt's test results, so a job-level re-run
+      # cannot destroy the evidence from a failing one.
+      #
+      # A job-level re-run overwrites the job's conclusion in place. After
+      # re-running this job on the same commit, `gh run list` and the PR's
+      # check board both read `success`, and the failure that prompted the
+      # re-run survives only under `actions/runs/<id>/attempts/<n>`, whose logs
+      # age out. So the standard remedy for a one-off timing blip — and with
+      # `retries = 0` in .config/nextest.toml and every build job blocking, a
+      # re-run is the ONLY remedy on offer — is also the thing that erases the
+      # record of it, which makes the observed rate of such failures
+      # systematically under-counted. #564 nearly lost its first occurrence
+      # that way, and #402 recorded the same masking for `delegate_011`.
+      #
+      # `${{ github.run_attempt }}` in the artifact NAME is the load-bearing
+      # part, twice over: artifacts are scoped to the run rather than the
+      # attempt, and upload-artifact v4+ refuses to overwrite an existing name,
+      # so a fixed name would make the re-run's upload fail outright. With the
+      # attempt in the name, attempt 1's results sit alongside attempt 2's and
+      # the failing attempt stays readable after its conclusion is gone.
+      #
+      # The payload is nextest's JUnit XML — the only structured record of a
+      # run: per-test WALL CLOCK plus the full failure message. The duration is
+      # not incidental, it is what diagnosed #564. Both macOS failures of
+      # `socket_004` took ~0.4s against that test's 5s budget, which is what
+      # showed the deadline was never in play and a read error had ended the
+      # exchange instead. That number appears nowhere but this artifact and a
+      # nextest log line.
+      #
+      # `always()` so it runs on the failing path, which is the only path that
+      # matters here; `if-no-files-found: warn` because a job that dies before
+      # the test step has no results and must not fail on that.
+      - name: Preserve this attempt's test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-macos-attempt-${{ github.run_attempt }}
+          path: target/nextest/default/junit.xml
+          if-no-files-found: warn
 
   # `cargo audit` reads Cargo.lock, which a devbox-only PR cannot touch.
   security:
