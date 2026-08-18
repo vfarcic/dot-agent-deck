@@ -6,22 +6,43 @@ CHANGELOG_DIR="changelog.d"
 CHANGELOG_FILE="CHANGELOG.md"
 DATE=$(date +%Y-%m-%d)
 
-# Collect entries by type.
+# Map a fragment type to the changelog heading it is filed under.
 # Supports both Keep-a-Changelog names (added, changed, fixed, removed)
 # and semantic fragment names (feature, breaking, bugfix, doc, misc).
-declare -A TYPE_HEADERS=(
-  [added]="Added"
-  [feature]="Added"
-  [changed]="Changed"
-  [breaking]="Changed"
-  [fixed]="Fixed"
-  [bugfix]="Fixed"
-  [removed]="Removed"
-  [doc]="Documentation"
-  [misc]="Miscellaneous"
-)
+#
+# A `case` rather than the `declare -A TYPE_HEADERS` this used to be. `declare
+# -A` is bash 4, and macOS ships /bin/bash 3.2.57, where it is not merely
+# ignored: the assignment degrades to an ordinary *indexed* array assignment,
+# so `[added]` is evaluated as an ARITHMETIC subscript, `added` is read as an
+# unset variable, and `set -u` killed the script on that line before it did
+# anything at all (issue #593). The release job runs on ubuntu-latest, so this
+# never bit a release — it bit the first maintainer to run the assembler
+# locally on a Mac, and it made `tests/assemble_changelog.rs` unrunnable on the
+# `build-macos` job. `.claude/skills/verify-pr/scan.sh` was rewritten away from
+# `declare -A` for the same reason under issue #521; this is the same fix.
+#
+# LOCKSTEP with TYPES below: every type listed there must have an arm here.
+# The `*)` arm makes a mismatch a loud, named error rather than a silent empty
+# heading — the old associative array failed loudly too, via `set -u`, and that
+# property is deliberately preserved.
+type_header() {
+  case "$1" in
+    added|feature)    echo "Added" ;;
+    changed|breaking) echo "Changed" ;;
+    fixed|bugfix)     echo "Fixed" ;;
+    removed)          echo "Removed" ;;
+    doc)              echo "Documentation" ;;
+    misc)             echo "Miscellaneous" ;;
+    *)
+      echo "ERROR: no changelog heading is mapped for fragment type '$1'." >&2
+      echo "Add a matching arm to type_header() for its entry in TYPES." >&2
+      return 1
+      ;;
+  esac
+}
 
 # Ordered list of types to scan — earlier entries appear first in the changelog.
+# LOCKSTEP with type_header() above.
 TYPES=(breaking added feature changed fixed bugfix removed doc misc)
 
 # Fail loudly if changelog.d/ contains fragments with unrecognized suffixes,
@@ -78,7 +99,7 @@ for type in "${TYPES[@]}"; do
   done < <(find "$CHANGELOG_DIR" -name "*.$type.md" -print0 2>/dev/null | sort -z)
 
   if [ ${#fragments[@]} -gt 0 ]; then
-    header="${TYPE_HEADERS[$type]}"
+    header="$(type_header "$type")"
     # Deduplicate headers (e.g. added & feature both map to "Added")
     if [[ ! " ${seen_headers[*]:-} " =~ " ${header} " ]]; then
       section+="### ${header}"$'\n\n'

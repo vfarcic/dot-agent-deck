@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 //! Issue #582 — regression tests for `scripts/assemble-changelog.sh`, the
 //! release-time fragment assembler.
 //!
@@ -19,22 +19,21 @@
 //! tests only). They run in the fast tier: each one is a single `bash`
 //! invocation against a scratch directory, no network, no sleeps.
 //!
-//! `#![cfg(target_os = "linux")]` because that is where the subject actually
-//! runs: `release.yml` invokes this script on `ubuntu-latest`, and nothing else
-//! invokes it at all. The gate is deliberately narrower than `unix`, and it is
-//! not caution — an earlier `#![cfg(unix)]` turned `build-macos` red, with
-//! every case failing identically at `assemble-changelog.sh: line 12: added:
-//! unbound variable`. Line 12 is the `declare -A TYPE_HEADERS=(` block, which
-//! predates this file: macOS ships bash 3.2, which has no associative arrays,
-//! so `[added]="Added"` is parsed as an *arithmetic* subscript and `added` is
-//! an unset variable under the script's `set -u`. (Reproduced on bash 5 by
-//! dropping the `declare -A`: same message, same variable.) So the script has
-//! always required bash 4+, and these tests were simply the first thing ever to
-//! execute it on a macOS runner. Making it bash-3.2-clean is a real
-//! improvement, but it is a change to the highest-blast-radius script in the
-//! repo and belongs to its own issue rather than to the #582 fix — tracked in
-//! #593. Until then a test that runs where the script does not is a test whose
-//! red says nothing about the script's correctness.
+//! `#![cfg(unix)]`, which is where the subject can run. It was briefly
+//! `#![cfg(target_os = "linux")]`: gated `unix` it turned `build-macos` red,
+//! with every case failing identically at `assemble-changelog.sh: line 12:
+//! added: unbound variable`. Line 12 was a `declare -A TYPE_HEADERS=(` block
+//! that predated this file — macOS ships bash 3.2.57, which has no associative
+//! arrays, so `[added]="Added"` was parsed as an *arithmetic* subscript and
+//! `added` read as an unset variable under the script's `set -u`. The script
+//! had therefore always required bash 4+, and these tests were simply the first
+//! thing ever to execute it on a macOS runner. Narrowing to `linux` was the
+//! right call for the #582 bugfix — a test that runs where the script does not
+//! is a test whose red says nothing about the script's correctness — but it
+//! parked the portability defect rather than fixing it. Issue #593 replaced the
+//! associative array with a `case` function, so the script is now bash-3.2
+//! clean and the gate is back to `unix`, which is what makes `build-macos`
+//! prove that rather than leaving it resting on review.
 
 // Issue #322 / linkage-check check 8: `tests/` may not call a bare `tempfile`
 // constructor. This crate does not link the PTY harness, so it uses the
@@ -231,4 +230,78 @@ fn nested_fragment_with_a_recognized_suffix_is_rendered_then_deleted() {
          being consumed silently.\nstdout:\n{stdout}",
     );
     assert!(!exists(root, "nested/701.bugfix.md"));
+}
+
+/// Issue #593 — every recognized type maps to a heading, and every heading is
+/// emitted once, in the order `TYPES` declares.
+///
+/// Two things make this worth its own case. First, the mapping used to be a
+/// `declare -A TYPE_HEADERS` and is now a `type_header()` `case`, because
+/// `declare -A` is bash 4 and macOS ships bash 3.2.57 — the rewrite touched all
+/// nine arms while the tests above exercise only `feature` and `bugfix`, so
+/// seven of them had no coverage at all. Second, the two halves of the mapping
+/// are declared apart: a type listed in `TYPES` with no matching `case` arm
+/// would hit the `*)` arm and abort the release. Feeding one fragment of every
+/// declared type is what holds those two lists in lockstep — add a type to one
+/// and forget the other, and this goes red rather than a release going out
+/// short a section.
+#[test]
+fn every_recognized_type_maps_to_its_heading_in_declared_order() {
+    let scratch = test_temp::tempdir().expect("scratch dir");
+    let root = scratch.path();
+
+    write_fragment(root, ".gitkeep", "");
+    // Mirrors the script's `TYPES` array, which is also the scan order.
+    let types = [
+        "breaking", "added", "feature", "changed", "fixed", "bugfix", "removed", "doc", "misc",
+    ];
+    for (i, ty) in types.iter().enumerate() {
+        write_fragment(
+            root,
+            &format!("{}.{ty}.md", 700 + i),
+            &format!("## Entry for {ty}\n\nBody for {ty}.\n"),
+        );
+    }
+
+    let out = run(root, "9.9.9");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "a fragment of every declared type must assemble cleanly — a type in \
+         TYPES with no heading mapped for it aborts here.\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // Every fragment reaches the notes, so no arm silently drops its type.
+    for ty in types {
+        assert!(
+            stdout.contains(&format!("**Entry for {ty}**")),
+            "the '{ty}' fragment never reached the release notes.\n\
+             stdout:\n{stdout}",
+        );
+    }
+
+    // First appearance of each heading, in `TYPES` order: breaking→Changed,
+    // added→Added, fixed→Fixed, removed→Removed, doc→Documentation,
+    // misc→Miscellaneous. `feature`, `changed` and `bugfix` are aliases and
+    // must NOT open a second section of their own.
+    let expected = [
+        "### Changed",
+        "### Added",
+        "### Fixed",
+        "### Removed",
+        "### Documentation",
+        "### Miscellaneous",
+    ];
+    let headings: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.starts_with("### "))
+        .map(str::trim_end)
+        .collect();
+    assert_eq!(
+        headings, expected,
+        "headings must appear once each, in TYPES order — a duplicate means \
+         the alias dedup broke, a missing one means an arm stopped \
+         matching.\nstdout:\n{stdout}",
+    );
 }
