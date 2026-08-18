@@ -745,7 +745,13 @@ fn send_daemon_request_blocking_with_timeout(
     use std::io::Write;
 
     let path = config::attach_socket_path();
-    let mut stream = crate::platform::ipc::IpcClient::connect(&path)?;
+    // Issue #435: `timeout` is a per-operation deadline, and connect is one of
+    // the operations. Connecting through the bare `IpcClient::connect` left it
+    // outside the budget entirely — on Unix that call blocks uninterruptibly
+    // when the daemon's accept queue is full, so a wedged daemon could hang
+    // this synchronous TUI key path forever despite the deadline two lines
+    // below.
+    let mut stream = crate::platform::ipc::IpcClient::connect_timeout(&path, timeout)?;
     stream.set_timeouts(timeout)?;
 
     let payload = serde_json::to_vec(req).map_err(std::io::Error::other)?;

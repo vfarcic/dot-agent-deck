@@ -370,6 +370,27 @@ impl IpcClient {
     /// check — stated explicitly on the async side too
     /// ([`IpcStream::connect`]) rather than inherited from a `tokio` default.
     pub fn connect(endpoint: &Path) -> io::Result<Self> {
+        Self::connect_within(endpoint, CONNECT_RETRY_BUDGET)
+    }
+
+    /// Connect bounded by `timeout` — the Windows half of issue #435's
+    /// `connect_timeout` seam, so the two synchronous callers can state one
+    /// deadline that actually covers the connect step on both platforms.
+    ///
+    /// Windows was never able to hang here: a named-pipe connect either
+    /// succeeds, fails outright, or reports `ERROR_PIPE_BUSY` (all instances
+    /// taken, the next not yet created — the analogue of a momentarily-full
+    /// Unix accept queue), and that last case has always been bounded by
+    /// [`CONNECT_RETRY_BUDGET`]. What it could not do is honour a budget
+    /// *shorter* than that: the 250 ms hint path in
+    /// `ui::send_daemon_request_blocking_with_timeout` would still spend two
+    /// seconds retrying. Taking the smaller of the two therefore tightens this
+    /// path and can never loosen it.
+    pub fn connect_timeout(endpoint: &Path, timeout: Duration) -> io::Result<Self> {
+        Self::connect_within(endpoint, timeout.min(CONNECT_RETRY_BUDGET))
+    }
+
+    fn connect_within(endpoint: &Path, retry_budget: Duration) -> io::Result<Self> {
         let wide = wide_nul(endpoint.as_os_str());
         let mut waited = Duration::ZERO;
         let raw = loop {
@@ -392,8 +413,8 @@ impl IpcClient {
                 break handle;
             }
             let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) && waited < CONNECT_RETRY_BUDGET {
-                std::thread::sleep(CONNECT_RETRY_INTERVAL);
+            if err.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) && waited < retry_budget {
+                std::thread::sleep(CONNECT_RETRY_INTERVAL.min(retry_budget - waited));
                 waited += CONNECT_RETRY_INTERVAL;
                 continue;
             }

@@ -505,8 +505,8 @@ pub const DELEGATE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// connect/write/read. An earlier draft of this function was exactly that, and
 /// it carried no deadline; sharing the one implementation gives `delegate` the
 /// total-operation bound, the half-close, the read-exactly-one-line behaviour
-/// PRD #163 M4 needed for Windows, and any future fix to the connect phase
-/// (issue #435) for free.
+/// PRD #163 M4 needed for Windows, and — since issue #435 — a connect step that
+/// is inside the deadline rather than beside it, for free.
 pub fn send_and_await_reply(json: &str) -> SocketReply {
     request_from_socket_inner(json, Some(DELEGATE_REPLY_TIMEOUT))
 }
@@ -567,7 +567,10 @@ const GET_SEED_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// `Some(String::new())`.
 ///
 /// [`GET_SEED_REQUEST_TIMEOUT`] bounds the **whole exchange**, not just a
-/// single idle read: [`request_from_socket_inner`]'s read loop measures
+/// single idle read — and since issue #435 that is literally rather than
+/// approximately true, because the connect step goes through
+/// [`crate::platform::ipc::IpcClient::connect_timeout`] instead of a blocking
+/// `connect(2)` that no deadline reached. The read loop measures
 /// elapsed wall-clock time against it and shrinks each individual blocking
 /// read's own timeout to whatever is left, so a peer that keeps dribbling a
 /// byte at a time without ever completing the reply line can no longer keep
@@ -644,7 +647,19 @@ fn request_from_socket_at(
     // `request_from_socket`'s docs describe. The timeout value itself is
     // unchanged — only when the clock starts.
     let deadline = timeout.map(|budget| std::time::Instant::now() + budget);
-    let mut stream = match crate::platform::ipc::IpcClient::connect(path) {
+    // Issue #435: connect through the deadline-aware entry point, not the bare
+    // one. `IpcClient::connect` blocks uninterruptibly on Unix when the
+    // daemon's accept queue is full, so starting the clock above bounded the
+    // *rest* of the exchange while connect itself could still run past the
+    // budget indefinitely — the whole-exchange bound this function's docs
+    // promise was approximate rather than literal. A connect that blows the
+    // budget lands in `Unreachable`, which is the honest classification: the
+    // request was never sent.
+    let connected = match timeout {
+        Some(budget) => crate::platform::ipc::IpcClient::connect_timeout(path, budget),
+        None => crate::platform::ipc::IpcClient::connect(path),
+    };
+    let mut stream = match connected {
         Ok(stream) => stream,
         Err(_) => return SocketReply::Unreachable,
     };

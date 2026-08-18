@@ -28,6 +28,12 @@
 //!   stay compatible with both.
 //! - [`IpcClient`] — a blocking, single-shot connect handle (`std::io::Read +
 //!   Write`) for `hook::send_to_socket` and `ui::send_daemon_request_blocking`.
+//!   It has two connect entry points, and the distinction is load-bearing:
+//!   `connect` is unbounded, while `connect_timeout` honours a caller deadline
+//!   (issue #435). Any caller that advertises a budget must use the latter —
+//!   `connect` blocks uninterruptibly on Unix when the daemon's accept queue is
+//!   full, so a deadline applied only *after* connecting bounds every step of
+//!   the exchange except the one that can hang.
 //!
 //! Endpoint resolution lives in [`crate::platform::paths`] (a socket path on
 //! Unix, a `\\.\pipe\dot-agent-deck-{user}-{hook|attach}` name on Windows);
@@ -258,6 +264,59 @@ mod tests {
                 "round {round} did not round-trip"
             );
         }
+    }
+
+    /// The deadline-aware connect (issue #435) is a drop-in for the plain one
+    /// in the two cases every caller meets in practice: a live endpoint still
+    /// connects, and an absent one still fails with the same `NotFound` the
+    /// unbounded entry point produced — the kind `hook`/`ui` fold into "no
+    /// daemon". Neither of those is a timeout, which is exactly the point: the
+    /// budget must cost nothing when the daemon is healthy or plainly gone.
+    ///
+    /// Un-gated on purpose, so both backends' `connect_timeout` are asserted on
+    /// all three CI jobs. The *queue-full* case the deadline exists for is
+    /// necessarily platform-specific — it needs a listener with a saturated
+    /// `listen(2)` backlog — and lives beside the Unix backend in
+    /// `unix::tests`, which is where the defect was.
+    #[tokio::test]
+    async fn connect_timeout_is_a_drop_in_for_the_unbounded_connect() {
+        let endpoint = unique_endpoint("connect-timeout");
+        let listener = bind_for_test(&endpoint.path);
+
+        let path = endpoint.path.clone();
+        let client = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let mut client = IpcClient::connect_timeout(&path, Duration::from_secs(5))?;
+            client.write_all(b"bounded\n")?;
+            client.flush()
+        });
+        let mut stream = listener.accept().await.expect("accept the client");
+        let mut buf = vec![0u8; 32];
+        let read = stream
+            .read(&mut buf)
+            .await
+            .expect("read the client's frame");
+        client
+            .await
+            .expect("the client task must not panic")
+            .expect("a bounded connect to a live endpoint must succeed");
+        assert_eq!(&buf[..read], b"bounded\n");
+
+        let absent = unique_endpoint("connect-timeout-absent");
+        let started = Instant::now();
+        let err = IpcClient::connect_timeout(&absent.path, Duration::from_secs(5))
+            .err()
+            .map(|e| e.kind())
+            .expect("connecting to an endpoint nothing is serving must fail");
+        assert_eq!(
+            err,
+            std::io::ErrorKind::NotFound,
+            "an absent endpoint must keep reporting NotFound, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an absent endpoint must fail immediately, not burn the budget — took {:?}",
+            started.elapsed()
+        );
     }
 
     /// The stale-endpoint predicate keys off the *platform*, not the path shape:
