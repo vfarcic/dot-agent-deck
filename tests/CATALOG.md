@@ -637,11 +637,11 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** `--json` output shape (`daemon/status/002`); the no-daemon path (`daemon/status/003`); prompt/task redaction (`daemon/status/004`).
 - **Platform coverage:** mac+linux.
 
-##### daemon/status/002 — `dot-agent-deck daemon status --json` emits a machine-readable document carrying `schema_version` with an entry for the managed agent.
+##### daemon/status/002 — `dot-agent-deck daemon status --json` pins its schema-versioned public field names and live-status string value.
 - **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status --json` CLI as a subprocess + an in-process daemon attach socket + real `ListAgents`; no PTY attach, no LLM, no `e2e` feature gate).
-- **Agent:** none (synthetic — a `cat`-stub worker pane driven to `Thinking` over the daemon's hook socket).
-- **Asserts:** the subprocess exits successfully; its stdout parses as a JSON object; the parsed document carries a `schema_version` key; and the raw JSON text names the managed agent by its pane id. Deliberately does not pin any field name beyond `schema_version`, since the rest of the document shape is the coder's to choose (the design rationale).
-- **Does not assert:** the human-readable table (`daemon/status/001`); full field-by-field JSON shape.
+- **Agent:** none (synthetic — a `cat`-stub worker pane spawned through the TUI's real `StartAgent` attach path and driven by the REAL `dot-agent-deck agent-event --type running` CLI with the daemon-injected pane and agent ids).
+- **Asserts:** the subprocess exits successfully; stdout parses as a JSON object; schema version 1 has exactly the top-level fields `schema_version` and `agents`; the populated managed-agent entry has exactly `agent_id`, `pane_id`, `cwd`, and `status`; and the live status serializes as the exact public string `Thinking`.
+- **Does not assert:** the human-readable table (`daemon/status/001`); optional agent fields that are absent in this scenario; tool-detail privacy (`daemon/status/004`).
 - **Platform coverage:** mac+linux.
 
 ##### daemon/status/003 — `dot-agent-deck daemon status` against an unreachable daemon fails distinguishably from a crash and from clap's own unrecognized-subcommand error, and never brings a daemon into existence at the socket it queried.
@@ -651,11 +651,18 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the live-agent path (`daemon/status/001`/`002`); prompt redaction (`daemon/status/004`).
 - **Platform coverage:** mac+linux.
 
-##### daemon/status/004 — `dot-agent-deck daemon status` never prints prompt text into its output.
+##### daemon/status/004 — Neither human nor JSON daemon status output reveals prompt text or active-tool detail.
 - **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status` CLI as a subprocess + an in-process daemon attach socket + real `ListAgents`; no PTY attach, no LLM, no `e2e` feature gate).
-- **Agent:** none (synthetic — a `cat`-stub worker pane driven to `Thinking` over the daemon's hook socket with a distinctive sentinel seeded into `user_prompt`, landing in `SessionState::last_user_prompt`/`first_prompts`).
-- **Asserts:** the subprocess exits successfully and the seeded sentinel never appears anywhere in its combined stdout/stderr.
-- **Does not assert:** `--json` output (the design doc scopes the no-prompt-text requirement to the human view); task-file/delegate text (out of scope for `ListAgents`-derived data).
+- **Agent:** none (synthetic — a `cat`-stub worker pane driven into a live `Read` tool over the daemon's hook socket with distinctive sentinels seeded into `user_prompt` and `tool_detail`).
+- **Asserts:** both the human and `--json` subprocesses exit successfully; the event's prompt and active-tool-detail sentinels reach daemon live state as a test precondition; and neither sentinel appears anywhere in either command's combined stdout/stderr, keeping both output modes on the same privacy contract.
+- **Does not assert:** task-file/delegate text (out of scope for `ListAgents`-derived data); the exact non-sensitive tool-name representation.
+- **Platform coverage:** mac+linux.
+
+##### daemon/status/005 — A real `agent-event` CLI report joins to the TUI-spawned agent's live status.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck agent-event --type running` and `daemon status [--json]` CLIs as subprocesses + an in-process daemon's hook and attach sockets + real `StartAgent`/`ListAgents`; no PTY attach, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — two `cat`-stub panes spawned through the TUI's real attach request; the driven pane runs the CLI with the exact `DOT_AGENT_DECK_PANE_ID` and daemon-injected `DOT_AGENT_DECK_AGENT_ID`, while the second is an untouched control).
+- **Asserts:** the lifecycle subprocess exits successfully and the daemon broadcasts its raw `Thinking` event carrying the exact pane and agent ids; human status distinguishes the driven row from the identity-normalized control row; and the driven JSON entry carries a `status` key rather than omitting it as a placeholder.
+- **Does not assert:** exact human status wording or column layout; the exact JSON status string and schema field names (`daemon/status/002`); a literal TUI detach/reconnect (`session/live/011`).
 - **Platform coverage:** mac+linux.
 
 #### worktree/reclaim
@@ -2842,6 +2849,13 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Asserts:** reconnect snapshots carrying `history-only` and `none` live targets rebuild sessions with `Writable::HistoryOnly` and `Writable::None`, rather than reverting to Live.
 - **Does not assert:** real socket reconnect rendering; the snapshot-to-state seam is the capability-loss boundary.
 - **Platform coverage:** mac+linux+windows.
+
+##### session/live/011 — Reconnect restores the live status produced by the real `agent-event` CLI path.
+- **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck agent-event --type running` CLI + a full in-process daemon's hook and attach sockets + `EmbeddedPaneController::hydrate_from_daemon` and the production card-seeding seam; no PTY-attached TUI, no LLM, no `e2e` feature gate).
+- **Agent:** none (synthetic — a `cat`-stub pane spawned through the TUI's real `StartAgent` attach request, with the real lifecycle CLI receiving the exact daemon-injected pane and agent ids).
+- **Asserts:** the lifecycle subprocess reaches the daemon as a raw `Thinking` event carrying the expected pane and agent ids; a fresh controller hydrates that managed agent; and seeding the rebuilt card exactly as TUI startup does restores `Thinking` instead of the snapshot-absent `Idle` placeholder.
+- **Does not assert:** a rendered vt100 grid or literal detach keystroke; active-tool restoration; real LLM behavior.
+- **Platform coverage:** mac+linux.
 
 ### Session save (snapshot freshness, PRD #89 Phase 1)
 

@@ -1,26 +1,19 @@
-//! RED tests for this feature's `dot-agent-deck daemon status [--json]` — a
-//! read-only diagnostic over the existing `AttachRequest::ListAgents` (see
-//! `.dot-agent-deck/47-status-query-design.md` in the root checkout, and
-//! `tests/CATALOG.md`'s `daemon/status` section). There is today no `status`
-//! variant on `DaemonCmd` (`src/main.rs`) at all — every test below drives
-//! the REAL `dot-agent-deck` binary as a subprocess, so until the subcommand
-//! exists they fail via clap's own "unrecognized subcommand" error rather
-//! than any assertion the tests themselves make.
+//! Real-subprocess coverage for `dot-agent-deck daemon status [--json]`, a
+//! read-only diagnostic over `AttachRequest::ListAgents` (see
+//! `tests/CATALOG.md`'s `daemon/status` section).
 //!
-//! `daemon/status/001`/`002`/`004` bring up an in-process daemon
-//! (`common::spawn_inprocess_daemon`) and drive a live status for a
-//! `cat`-stub worker pane over the daemon's hook socket, exactly as
-//! `agent-event --type running` would (`agent_event_type_from_state("running")
-//! == EventType::Thinking`, `src/event.rs`) — except routed as a raw
-//! `AgentEvent` so `daemon/status/004` can additionally carry a `user_prompt`
-//! the `agent-event` CLI itself never sets. `daemon/status/003` queries a
-//! scratch attach-socket path with nothing listening.
+//! `daemon/status/001` and `/004` use raw `AgentEvent`s to seed fields the
+//! lifecycle CLI cannot carry. `/002` and `/005` exercise the real
+//! `agent-event --type running` subprocess with the pane/agent environment a
+//! daemon-managed spawn receives. `/003` queries a scratch attach-socket path
+//! with nothing listening.
 
 use std::path::Path;
 use std::time::Duration;
 
-use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
-use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
+use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
+use dot_agent_deck::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
 #[cfg(unix)]
 use spec::spec;
 
@@ -36,6 +29,12 @@ const JSON_PANE: &str = "status-json-pane-2b6e51";
 const LEAK_PANE: &str = "status-leak-pane-4d8f02";
 #[cfg(unix)]
 const PROMPT_SENTINEL: &str = "DAEMON-STATUS-PROMPT-LEAK-SENTINEL-9f2a1c";
+#[cfg(unix)]
+const TOOL_DETAIL_SENTINEL: &str = "DAEMON-STATUS-TOOL-DETAIL-SENTINEL-7c4b2e";
+#[cfg(unix)]
+const CLI_DRIVEN_PANE: &str = "status-cli-driven-pane-6a8d31";
+#[cfg(unix)]
+const CLI_CONTROL_PANE: &str = "status-cli-control-pane-8c2f47";
 
 /// Build the same raw `AgentEvent` the `agent-event --type running` CLI path
 /// sends (`agent_event_type_from_state("running") == EventType::Thinking`),
@@ -125,6 +124,110 @@ async fn run_daemon_status_cli(attach_socket: &Path, json: bool) -> CliStatusRes
     })
     .await
     .expect("daemon status CLI subprocess task did not panic")
+}
+
+/// Wait until the in-process daemon's attach endpoint accepts connections.
+/// `spawn_inprocess_daemon` proves hook-socket readiness, but the attach bind
+/// happens immediately afterward and a TUI-style `StartAgent` must not race it.
+#[cfg(unix)]
+async fn wait_for_attach_socket(attach_socket: &Path, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if tokio::net::UnixStream::connect(attach_socket).await.is_ok() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "in-process daemon attach socket {} was not accepting connections within {timeout:?}",
+            attach_socket.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Spawn a pane through the same attach request the TUI uses. The registry
+/// injects `DOT_AGENT_DECK_AGENT_ID`; the returned id is then replayed into the
+/// real `agent-event` subprocess exactly as it is inside the managed pane.
+#[cfg(unix)]
+async fn start_tui_managed_agent(
+    daemon: &common::InProcDaemon,
+    pane_id: &str,
+    cwd: &str,
+) -> String {
+    wait_for_attach_socket(&daemon.attach_path, Duration::from_secs(5)).await;
+    DaemonClient::new(daemon.attach_path.clone())
+        .start_agent(StartAgentOptions {
+            command: Some("cat".to_string()),
+            cwd: Some(cwd.to_string()),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+            agent_type: Some(AgentType::Pi),
+            ..StartAgentOptions::default()
+        })
+        .await
+        .expect("spawn TUI-managed agent through the daemon attach socket")
+}
+
+/// Invoke the REAL `agent-event` CLI and wait until the in-process daemon has
+/// received its raw `AgentEvent`. Observing the broadcast proves the
+/// fire-and-forget subprocess reached the daemon before status is queried.
+#[cfg(unix)]
+async fn run_agent_event_cli(
+    daemon: &common::InProcDaemon,
+    pane_id: &str,
+    agent_id: &str,
+    cwd: &Path,
+) -> AgentEvent {
+    let mut events = daemon.event_tx.subscribe();
+    let hook_path = daemon.hook_path.clone();
+    let pane_id_owned = pane_id.to_string();
+    let agent_id_owned = agent_id.to_string();
+    let cwd = cwd.to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+            .arg("agent-event")
+            .arg("--type")
+            .arg("running")
+            .current_dir(&cwd)
+            .env_clear()
+            .env("HOME", &cwd)
+            .env("DOT_AGENT_DECK_SOCKET", &hook_path)
+            .env(DOT_AGENT_DECK_PANE_ID, &pane_id_owned)
+            .env(DOT_AGENT_DECK_AGENT_ID, &agent_id_owned)
+            .output()
+            .expect("run the real `dot-agent-deck agent-event --type running` CLI")
+    })
+    .await
+    .expect("agent-event CLI subprocess task did not panic");
+    assert!(
+        output.status.success(),
+        "`agent-event --type running` must reach the in-process daemon; status={:?} stdout={:?} stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let observed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(BroadcastMsg::Event(event))
+                    if event.pane_id.as_deref() == Some(pane_id)
+                        && event.agent_id.as_deref() == Some(agent_id) =>
+                {
+                    break event;
+                }
+                Ok(_) => continue,
+                Err(error) => panic!("daemon event broadcast closed before CLI event: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("daemon did not broadcast the real CLI event within 5s");
+    assert_eq!(
+        observed.event_type,
+        EventType::Thinking,
+        "the real `running` CLI event must carry the Thinking lifecycle state"
+    );
+    observed
 }
 
 /// Scenario: Bring up an in-process daemon with two `cat`-stub worker panes registered as managed — one driven to a live `Thinking` status over the hook socket, the other left untouched as a same-daemon control. Run the REAL `dot-agent-deck daemon status` CLI as a subprocess against the daemon's attach socket. Assert it names both agents by pane id and that the driven agent's output line differs from the control agent's once the pane id itself is normalized out, proving the command surfaces the live status rather than an identical placeholder.
@@ -243,7 +346,7 @@ async fn daemon_status_001_reports_live_agent_status_inner() {
     daemon.registry.shutdown_all();
 }
 
-/// Scenario: Same in-process daemon and driven `Thinking` status as `daemon/status/001`, but invoke `dot-agent-deck daemon status --json`. Assert the CLI succeeds, its stdout parses as a JSON object, the parsed document carries a `schema_version` key, and the raw JSON text names the managed agent by pane id — without pinning any other field name.
+/// Scenario: Spawn a managed pane through the daemon attach API, drive it to `Thinking` through the real `agent-event --type running` CLI and invoke `dot-agent-deck daemon status --json`. Assert the document pins the public top-level and agent field names and serializes the live status as the exact string `Thinking`.
 #[spec("daemon/status/002")]
 #[test]
 #[cfg(unix)]
@@ -261,28 +364,10 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
     let daemon = common::spawn_inprocess_daemon().await;
     let cwd = common::race_safe_tempdir();
     let cwd_str = cwd.path().to_string_lossy().into_owned();
-
-    {
-        let mut state = daemon.state.write().await;
-        state.register_pane(JSON_PANE.to_string());
-    }
-    let agent_id = daemon
-        .registry
-        .spawn_agent(SpawnOptions {
-            command: Some("cat"),
-            cwd: Some(&cwd_str),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), JSON_PANE.to_string())],
-            ..SpawnOptions::default()
-        })
-        .expect("spawn JSON-test worker stub");
-
-    common::write_hook_line(
-        &daemon.hook_path,
-        &serde_json::to_string(&thinking_event(JSON_PANE, &agent_id, None))
-            .expect("serialize Thinking event"),
-    )
-    .expect("write Thinking event");
-    wait_for_live_session(&daemon, JSON_PANE, &agent_id, Duration::from_secs(5)).await;
+    let agent_id = start_tui_managed_agent(&daemon, JSON_PANE, &cwd_str).await;
+    let observed = run_agent_event_cli(&daemon, JSON_PANE, &agent_id, cwd.path()).await;
+    assert_eq!(observed.pane_id.as_deref(), Some(JSON_PANE));
+    assert_eq!(observed.agent_id.as_deref(), Some(agent_id.as_str()));
 
     let result = run_daemon_status_cli(&daemon.attach_path, true).await;
     assert!(
@@ -301,20 +386,39 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
                 result.stdout
             )
         });
-    assert!(
-        parsed.is_object(),
-        "`daemon status --json` must emit a top-level JSON object; got {parsed:?}"
+    let document = parsed
+        .as_object()
+        .unwrap_or_else(|| panic!("`daemon status --json` must emit an object; got {parsed:?}"));
+    let top_level_fields: std::collections::BTreeSet<&str> =
+        document.keys().map(String::as_str).collect();
+    assert_eq!(
+        top_level_fields,
+        std::collections::BTreeSet::from(["agents", "schema_version"]),
+        "schema version 1 must pin the top-level JSON field names; got {parsed:?}"
     );
-    assert!(
-        parsed.get("schema_version").is_some(),
-        "`daemon status --json` must carry a `schema_version` field (the design rationale); \
-         got {parsed:?}"
+    let agents = document
+        .get("agents")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("the pinned `agents` field must be an array; got {parsed:?}"));
+    let agent = agents
+        .iter()
+        .find(|entry| entry.get("pane_id").and_then(serde_json::Value::as_str) == Some(JSON_PANE))
+        .unwrap_or_else(|| panic!("no JSON agent entry named pane {JSON_PANE:?}; got {parsed:?}"));
+    let agent_fields: std::collections::BTreeSet<&str> = agent
+        .as_object()
+        .expect("each `agents` entry must be an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        agent_fields,
+        std::collections::BTreeSet::from(["agent_id", "cwd", "pane_id", "status"]),
+        "schema version 1 must pin the populated agent field names; got agent={agent:?}"
     );
-    assert!(
-        result.stdout.contains(JSON_PANE),
-        "`daemon status --json` output has no entry naming the managed agent's pane id \
-         {JSON_PANE:?}; stdout={:?}",
-        result.stdout
+    assert_eq!(
+        agent.get("status").and_then(serde_json::Value::as_str),
+        Some("Thinking"),
+        "schema version 1 must pin the live status string value as `Thinking`; got agent={agent:?}"
     );
 
     daemon.registry.shutdown_all();
@@ -394,21 +498,21 @@ async fn daemon_status_003_no_daemon_reports_unavailable_without_spawning_one_in
     );
 }
 
-/// Scenario: Drive a live status for a managed agent whose session carries a distinctive sentinel in `last_user_prompt`/`first_prompts` (seeded via a raw hook `AgentEvent`, since the `agent-event` CLI itself never sets `user_prompt`). Run the REAL `dot-agent-deck daemon status` CLI as a subprocess. Assert it succeeds and the sentinel never appears anywhere in its combined stdout/stderr.
+/// Scenario: Drive a managed agent into a live tool call whose event carries distinctive prompt and tool-detail sentinels, then run both forms of the real `dot-agent-deck daemon status` CLI. Assert neither the human table nor the JSON document reveals either private value.
 #[spec("daemon/status/004")]
 #[test]
 #[cfg(unix)]
-fn daemon_status_004_human_output_never_leaks_prompt_text() {
+fn daemon_status_004_outputs_never_leak_prompt_or_tool_detail() {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .expect("build prompt-leak status runtime")
-        .block_on(daemon_status_004_human_output_never_leaks_prompt_text_inner());
+        .block_on(daemon_status_004_outputs_never_leak_prompt_or_tool_detail_inner());
 }
 
 #[cfg(unix)]
-async fn daemon_status_004_human_output_never_leaks_prompt_text_inner() {
+async fn daemon_status_004_outputs_never_leak_prompt_or_tool_detail_inner() {
     let daemon = common::spawn_inprocess_daemon().await;
     let cwd = common::race_safe_tempdir();
     let cwd_str = cwd.path().to_string_lossy().into_owned();
@@ -427,40 +531,166 @@ async fn daemon_status_004_human_output_never_leaks_prompt_text_inner() {
         })
         .expect("spawn prompt-leak worker stub");
 
+    let mut event = thinking_event(LEAK_PANE, &agent_id, Some(PROMPT_SENTINEL));
+    event.event_type = EventType::ToolStart;
+    event.tool_name = Some("Read".to_string());
+    event.tool_detail = Some(TOOL_DETAIL_SENTINEL.to_string());
     common::write_hook_line(
         &daemon.hook_path,
-        &serde_json::to_string(&thinking_event(LEAK_PANE, &agent_id, Some(PROMPT_SENTINEL)))
-            .expect("serialize sentinel-carrying Thinking event"),
+        &serde_json::to_string(&event).expect("serialize sentinel-carrying ToolStart event"),
     )
-    .expect("write sentinel-carrying Thinking event");
+    .expect("write sentinel-carrying ToolStart event");
     wait_for_live_session(&daemon, LEAK_PANE, &agent_id, Duration::from_secs(5)).await;
     {
         let state = daemon.state.read().await;
         let seeded = state.sessions.values().any(|session| {
             session.agent_id.as_deref() == Some(agent_id.as_str())
                 && session.last_user_prompt.as_deref() == Some(PROMPT_SENTINEL)
+                && session
+                    .active_tool
+                    .as_ref()
+                    .and_then(|tool| tool.detail.as_deref())
+                    == Some(TOOL_DETAIL_SENTINEL)
         });
         assert!(
             seeded,
-            "test precondition: the sentinel never made it into `last_user_prompt`"
+            "test precondition: the prompt and tool-detail sentinels never reached live state"
         );
     }
 
-    let result = run_daemon_status_cli(&daemon.attach_path, false).await;
+    let human = run_daemon_status_cli(&daemon.attach_path, false).await;
     assert!(
-        result.status.success(),
+        human.status.success(),
         "`daemon status` must succeed against a live daemon with a managed agent; got \
          status={:?} stdout={:?} stderr={:?}",
-        result.status,
-        result.stdout,
-        result.stderr
+        human.status,
+        human.stdout,
+        human.stderr
     );
     assert!(
-        !result.stdout.contains(PROMPT_SENTINEL) && !result.stderr.contains(PROMPT_SENTINEL),
-        "`daemon status` output leaked prompt text (the design rationale: \"do not print prompt \
-         text in the human view\"); stdout={:?} stderr={:?}",
-        result.stdout,
-        result.stderr
+        !human.stdout.contains(PROMPT_SENTINEL)
+            && !human.stderr.contains(PROMPT_SENTINEL)
+            && !human.stdout.contains(TOOL_DETAIL_SENTINEL)
+            && !human.stderr.contains(TOOL_DETAIL_SENTINEL),
+        "human `daemon status` output leaked private prompt/tool detail; stdout={:?} stderr={:?}",
+        human.stdout,
+        human.stderr
+    );
+
+    let json = run_daemon_status_cli(&daemon.attach_path, true).await;
+    assert!(
+        json.status.success(),
+        "`daemon status --json` must succeed against a live daemon with a managed agent; got status={:?} stdout={:?} stderr={:?}",
+        json.status,
+        json.stdout,
+        json.stderr
+    );
+    assert!(
+        !json.stdout.contains(PROMPT_SENTINEL)
+            && !json.stderr.contains(PROMPT_SENTINEL)
+            && !json.stdout.contains(TOOL_DETAIL_SENTINEL)
+            && !json.stderr.contains(TOOL_DETAIL_SENTINEL),
+        "`daemon status --json` leaked private prompt/tool detail; prompt_sentinel_present={} tool_detail_sentinel_present={} stdout={:?} stderr={:?}",
+        json.stdout.contains(PROMPT_SENTINEL) || json.stderr.contains(PROMPT_SENTINEL),
+        json.stdout.contains(TOOL_DETAIL_SENTINEL) || json.stderr.contains(TOOL_DETAIL_SENTINEL),
+        json.stdout,
+        json.stderr
+    );
+
+    daemon.registry.shutdown_all();
+}
+
+/// Scenario: Spawn two managed panes through the same attach request the TUI uses, then run the real `agent-event --type running` CLI from one pane with the daemon-injected pane and agent ids. Assert the human and JSON status commands distinguish that live agent from the untouched control and carry a live status instead of the placeholder.
+#[spec("daemon/status/005")]
+#[test]
+#[cfg(unix)]
+fn daemon_status_005_real_agent_event_cli_joins_live_state() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build real-agent-event daemon-status runtime")
+        .block_on(daemon_status_005_real_agent_event_cli_joins_live_state_inner());
+}
+
+#[cfg(unix)]
+async fn daemon_status_005_real_agent_event_cli_joins_live_state_inner() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let cwd = common::race_safe_tempdir();
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    let driven_agent_id = start_tui_managed_agent(&daemon, CLI_DRIVEN_PANE, &cwd_str).await;
+    let control_agent_id = start_tui_managed_agent(&daemon, CLI_CONTROL_PANE, &cwd_str).await;
+
+    let observed =
+        run_agent_event_cli(&daemon, CLI_DRIVEN_PANE, &driven_agent_id, cwd.path()).await;
+
+    let human = run_daemon_status_cli(&daemon.attach_path, false).await;
+    assert!(
+        human.status.success(),
+        "`daemon status` failed after a real agent-event; status={:?} stdout={:?} stderr={:?}",
+        human.status,
+        human.stdout,
+        human.stderr
+    );
+    let driven_lines: Vec<&str> = human
+        .stdout
+        .lines()
+        .filter(|line| line.contains(CLI_DRIVEN_PANE))
+        .collect();
+    let control_lines: Vec<&str> = human
+        .stdout
+        .lines()
+        .filter(|line| line.contains(CLI_CONTROL_PANE))
+        .collect();
+    assert!(
+        !driven_lines.is_empty() && !control_lines.is_empty(),
+        "human status output must name both TUI-spawned panes; stdout={:?}",
+        human.stdout
+    );
+    let normalize_identity_fields = |lines: &[&str], pane_id: &str, agent_id: &str| {
+        lines
+            .iter()
+            .flat_map(|line| line.split_whitespace())
+            .filter(|field| *field != pane_id && *field != agent_id)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let driven_text = normalize_identity_fields(&driven_lines, CLI_DRIVEN_PANE, &driven_agent_id);
+    let control_text =
+        normalize_identity_fields(&control_lines, CLI_CONTROL_PANE, &control_agent_id);
+    let human_has_live_status = driven_text != control_text;
+
+    let json = run_daemon_status_cli(&daemon.attach_path, true).await;
+    assert!(
+        json.status.success(),
+        "`daemon status --json` failed after a real agent-event; status={:?} stdout={:?} stderr={:?}",
+        json.status,
+        json.stdout,
+        json.stderr
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(json.stdout.trim()).unwrap_or_else(|e| {
+            panic!(
+                "`daemon status --json` did not parse after a real agent-event: {e}; stdout={:?}",
+                json.stdout
+            )
+        });
+    let driven_json = document
+        .get("agents")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|agents| {
+            agents.iter().find(|agent| {
+                agent.get("pane_id").and_then(serde_json::Value::as_str) == Some(CLI_DRIVEN_PANE)
+            })
+        });
+    let json_has_live_status = driven_json.and_then(|agent| agent.get("status")).is_some();
+
+    assert!(
+        human_has_live_status && json_has_live_status,
+        "the real CLI event reached the daemon with matching ids but `ListAgents` did not join it to the TUI-spawned agent: human_live={human_has_live_status} json_status_present={json_has_live_status} observed_event={{pane_id:{:?}, agent_id:{:?}, event_type:{:?}}} driven_row={driven_text:?} control_row={control_text:?} driven_json={driven_json:?}",
+        observed.pane_id,
+        observed.agent_id,
+        observed.event_type
     );
 
     daemon.registry.shutdown_all();
