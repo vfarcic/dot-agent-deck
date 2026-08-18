@@ -130,10 +130,31 @@ fn signal_child_pgroup_or_fallback(
 /// implicit in the child's own pid.
 pub fn force_kill_child_and_wait(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    group: &AgentProcessGroup,
+) {
+    force_kill_child_group(child, group);
+    let _ = child.wait();
+}
+
+/// The SIGNAL half of [`force_kill_child_and_wait`]: `killpg(SIGKILL)` the
+/// child's whole process group and return **without reaping**.
+///
+/// Issue #581 — the two halves are separable because they starve each other
+/// when a caller holds several agents. The `wait()` above is unbounded (see the
+/// note in [`signal_child_pgroup_or_fallback`]): a child wedged in
+/// uninterruptible kernel I/O does not die on SIGKILL until that I/O completes,
+/// so a loop that signals-then-waits per agent parks in the first wedged
+/// agent's `wait()` and never signals the agents behind it. Splitting the
+/// signal out lets such a caller deliver every kill first and reap afterwards —
+/// see `AgentPtyRegistry::force_kill_and_reap_all`, the only caller.
+///
+/// `_group` is unused on Unix for the same reason as in
+/// [`force_kill_child_and_wait`].
+pub fn force_kill_child_group(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     _group: &AgentProcessGroup,
 ) {
     signal_child_pgroup_or_fallback(child, libc::SIGKILL, "force-kill");
-    let _ = child.wait();
 }
 
 /// SIGTERM-then-SIGKILL escalation used by the single-pane Ctrl+W path. Sends

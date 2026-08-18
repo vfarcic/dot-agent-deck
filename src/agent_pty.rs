@@ -5229,6 +5229,69 @@ impl AgentPtyRegistry {
             .map(|a| a.writer.clone())
     }
 
+    /// Issue #581 test-only seam: register a synthetic agent that owns `child`,
+    /// so the shutdown phases can be driven against a child whose *reap*
+    /// deliberately wedges — the stuck-NFS shape, which no real process can be
+    /// coaxed into reproducing (a real child always returns from `wait` once
+    /// SIGKILL lands).
+    ///
+    /// Everything other than `child` is inert filler: a freshly-opened PTY
+    /// nobody reads from and an empty bus, because the teardown paths touch
+    /// only `child` and `process_group`. `#[cfg(test)]` keeps it out of the
+    /// production API surface, like [`Self::agent_writer`] above.
+    #[cfg(test)]
+    pub(crate) fn insert_test_agent(
+        &self,
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+    ) -> String {
+        let pair = NativePtySystem::default()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty for a synthetic test agent");
+        let writer = pair
+            .master
+            .take_writer()
+            .expect("take_writer for a synthetic test agent");
+        let mut inner = self.inner.lock().unwrap();
+        inner.next_id += 1;
+        let id = format!("test-agent-{}", inner.next_id);
+        inner.agents.insert(
+            id.clone(),
+            RunningAgent {
+                child,
+                // `adopt(None)` is the portable "there is no group to hold"
+                // constructor: a no-op ZST on Unix, and an unassigned (jobless)
+                // handle on Windows, which is what makes both backends take
+                // their documented `Child::kill` fallback here.
+                process_group: crate::platform::proc::AgentProcessGroup::adopt(None),
+                master: pair.master,
+                writer: Arc::new(AsyncMutex::new(PaneWriter::new(
+                    writer,
+                    None,
+                    self.pane_input.clone(),
+                ))),
+                bus: Arc::new(AgentBus::new()),
+                pane_id_env: None,
+                display_name: None,
+                cwd: None,
+                tab_membership: None,
+                agent_type: None,
+                spawn_agent_type: None,
+                spawn_env: Vec::new(),
+                pty_rows: 24,
+                pty_cols: 80,
+                exited: Arc::new(AtomicBool::new(false)),
+                pending_seed: None,
+                seed_delivered_native: false,
+            },
+        );
+        id
+    }
+
     /// Update the per-agent display name and cwd captured in the registry
     /// (M2.11). Each value is validated independently — invalid display
     /// names are rejected and stored as `None`, invalid cwds likewise.
@@ -5436,18 +5499,59 @@ impl AgentPtyRegistry {
         self.shutting_down.load(Ordering::SeqCst)
     }
 
+    /// SIGKILL every agent in `agents` — the whole descendant tree of each —
+    /// and reap them all. Shared by [`Self::shutdown_all`] and phase 3 of
+    /// [`Self::shutdown_all_graceful`].
+    ///
+    /// **The kill pass and the reap pass are separate, and that is the whole
+    /// point** (issue #581). Both callers used to signal-then-wait inside one
+    /// loop iteration, which makes *signal delivery* hostage to *reap latency*:
+    /// a child wedged in uninterruptible kernel I/O does not die on SIGKILL
+    /// until that I/O completes (the stuck-NFS case), so the loop parks in that
+    /// agent's unbounded `wait()` and **every agent behind it in the vector is
+    /// never signalled at all**. It failed silently — the starved agents log
+    /// nothing, and every caller of these two methods is terminal, so nothing
+    /// ran later to notice the still-running agent processes left behind by a
+    /// shutdown that looked clean.
+    ///
+    /// So pass 1 signals everybody first, and only then does pass 2 reap. The
+    /// reap is a shared non-blocking poll rather than a per-agent blocking
+    /// `wait()`, so one wedged agent cannot hold its siblings' *reaps* hostage
+    /// either — the same shape as `shutdown_all_graceful`'s own grace poll and
+    /// as the wrapper's reap loop (see the "finding #12" comment in
+    /// [`crate::wrap`]). The 50 ms cadence matches both, and costs at most one
+    /// tick: a shutdown whose agents already exited during the grace window
+    /// clears the whole vector on the first `try_wait` pass and never sleeps.
+    ///
+    /// **The reap is never dropped.** An agent leaves the vector only once its
+    /// `try_wait` reported an exit status, or reported an error (meaning there
+    /// is no status left to collect) — so this cannot trade the leaked-process
+    /// bug for a leaked-zombie one. A genuinely wedged child therefore still
+    /// holds this function until the kernel lets its `wait` complete, exactly as
+    /// before; what changed is that it no longer takes its siblings with it.
+    fn force_kill_and_reap_all(mut agents: Vec<RunningAgent>) {
+        // Pass 1: signal only.
+        for agent in &mut agents {
+            crate::platform::proc::force_kill_child_group(&mut agent.child, &agent.process_group);
+        }
+
+        // Pass 2: reap, dropping each agent as its status is collected.
+        while !agents.is_empty() {
+            agents.retain_mut(|agent| matches!(agent.child.try_wait(), Ok(None)));
+            if agents.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// SIGKILL every agent and drain the registry. Idempotent.
     pub fn shutdown_all(&self) {
         let agents: Vec<RunningAgent> = {
             let mut inner = self.inner.lock().unwrap();
             inner.agents.drain().map(|(_, a)| a).collect()
         };
-        for mut agent in agents {
-            crate::platform::proc::force_kill_child_and_wait(
-                &mut agent.child,
-                &agent.process_group,
-            );
-        }
+        Self::force_kill_and_reap_all(agents);
         // Wake the idle monitor if it's parked on `change_notify` — the
         // registry just emptied, so the next gate check should see
         // live_count == 0.
@@ -5515,18 +5619,15 @@ impl AgentPtyRegistry {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        // Phase 3: SIGKILL any survivor and reap. `force_kill_child_and_wait`
-        // is no-op-safe on an already-exited child (ESRCH is logged-but-
-        // ignored and `wait` returns the cached status), so this loop is
-        // safe to run unconditionally. On Windows this is where the
-        // `TerminateJobObject` backstop for each agent's descendant tree runs
-        // (PRD #163 M3) — phase 1's `CTRL_BREAK_EVENT` is best-effort only.
-        for mut agent in agents {
-            crate::platform::proc::force_kill_child_and_wait(
-                &mut agent.child,
-                &agent.process_group,
-            );
-        }
+        // Phase 3: SIGKILL any survivor and reap. The kill is no-op-safe on an
+        // already-exited child (ESRCH is logged-but-ignored), so it runs
+        // unconditionally. On Windows this is where the `TerminateJobObject`
+        // backstop for each agent's descendant tree runs (PRD #163 M3) —
+        // phase 1's `CTRL_BREAK_EVENT` is best-effort only.
+        //
+        // Issue #581: the kill pass and the reap pass are SEPARATE, and
+        // [`Self::force_kill_and_reap_all`] documents why.
+        Self::force_kill_and_reap_all(agents);
 
         self.change_notify.notify_one();
     }
@@ -8754,5 +8855,388 @@ mod spawn_tests {
         assert_eq!(reg.pane_orchestration("some-other-pane"), None);
         reg.close_agent(&id).expect("close the orchestrator stub");
         assert_eq!(reg.pane_orchestration("orch-pane"), None);
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #581 — one wedged agent's reap must not starve its siblings of
+    // their phase-3 SIGKILL.
+    // ---------------------------------------------------------------------
+
+    /// A latch the test flips to let a deliberately-wedged reap finally
+    /// complete, so the shutdown thread can always be joined.
+    #[derive(Debug, Default)]
+    struct WedgeGate {
+        released: Mutex<bool>,
+        wake: std::sync::Condvar,
+    }
+
+    impl WedgeGate {
+        fn is_released(&self) -> bool {
+            *self.released.lock().unwrap()
+        }
+
+        fn block_until_released(&self) {
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.wake.wait(released).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.wake.notify_all();
+        }
+    }
+
+    /// A [`portable_pty::Child`] whose *reap* is under the test's control while
+    /// its *kill* is real.
+    ///
+    /// No real process can be coaxed into the shape issue #581 is about — a
+    /// child wedged in uninterruptible kernel I/O, which SIGKILL cannot
+    /// dislodge until the I/O completes — because a real child always returns
+    /// from `wait` once SIGKILL lands. So the wedge is modelled here and only
+    /// here: everything the teardown path *does* (the signal it sends, the pid
+    /// it sends it to) stays production code running against a real process
+    /// group in the Unix test below.
+    #[derive(Debug)]
+    struct WedgedChild {
+        /// Reported to the teardown path as this child's pid. `Some` makes the
+        /// production `killpg(SIGKILL)` land on a real process group; `None`
+        /// drives the documented pid-unavailable fallback, which is
+        /// `Child::kill` on both backends and therefore observable on Windows
+        /// too.
+        pid: Option<u32>,
+        /// How many times the teardown path issued a kill through that
+        /// fallback. A count, not a flag: phase 1's SIGTERM ask reaches the
+        /// same fallback, so only a kill *beyond* [`PHASE_ONE_FALLBACK_KILLS`]
+        /// is phase 3's. (The first draft asserted a flag and passed on the
+        /// unfixed code — phase 1 had already set it for every agent.)
+        kills: Arc<std::sync::atomic::AtomicUsize>,
+        /// Set when the child was actually reaped (by either `wait` or a
+        /// `try_wait` that reported an exit). The fix must not buy signal
+        /// independence by dropping the reap.
+        reaped: Arc<AtomicBool>,
+        /// Until released, `wait` blocks forever and `try_wait` keeps saying
+        /// "still running".
+        gate: Arc<WedgeGate>,
+        /// When set, the blocking `wait` never returns *at all*, however the
+        /// gate stands — the unbounded-`wait` half of the same wedge, which
+        /// only a `try_wait`-based reap can get past.
+        wait_never_returns: bool,
+    }
+
+    impl WedgedChild {
+        fn new(pid: Option<u32>, gate: Arc<WedgeGate>) -> Self {
+            Self {
+                pid,
+                kills: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                reaped: Arc::new(AtomicBool::new(false)),
+                gate,
+                wait_never_returns: false,
+            }
+        }
+    }
+
+    impl portable_pty::ChildKiller for WedgedChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.kills.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            unreachable!("no teardown path clones a killer")
+        }
+    }
+
+    impl portable_pty::Child for WedgedChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            if !self.gate.is_released() {
+                return Ok(None);
+            }
+            self.reaped.store(true, Ordering::SeqCst);
+            Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            if self.wait_never_returns {
+                // `park` may wake spuriously, so loop: this call must never
+                // return, which is the whole point of the flag.
+                loop {
+                    std::thread::park();
+                }
+            }
+            self.gate.block_until_released();
+            self.reaped.store(true, Ordering::SeqCst);
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            self.pid
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    /// Poll `done` until it holds or `budget` elapses. Returns what it last saw.
+    fn holds_within(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        done()
+    }
+
+    /// How long a phase-3 kill is given to reach every agent before the test
+    /// calls it starved. Generous — it is only ever paid on failure.
+    const WEDGE_TEST_BUDGET: Duration = Duration::from_secs(10);
+
+    /// Kills that phase 1's SIGTERM *ask* contributes per agent for a pid-less
+    /// child, before phase 3 is reached at all: on Unix `killpg` needs a pid and
+    /// so takes the `Child::kill` fallback, while on Windows
+    /// `GenerateConsoleCtrlEvent` skips a pid-less child outright. Phase 3's
+    /// force-kill is the one *on top of* this baseline, so it is the only thing
+    /// a strictly-greater count can be.
+    const PHASE_ONE_FALLBACK_KILLS: usize = if cfg!(unix) { 1 } else { 0 };
+
+    /// Issue #581 (regression): phase 3 must force-kill *every* surviving
+    /// agent, even when the first one it touches never finishes being reaped.
+    ///
+    /// Both agents are wedged, so the pre-fix serial loop
+    /// (`for mut agent in agents { force_kill_child_and_wait(…) }`) issues
+    /// exactly one kill whichever order `drain()` yields the map in, and then
+    /// blocks forever inside that agent's `wait()`. Requiring *both* kills is
+    /// therefore deterministically red on the old code and green on the new one,
+    /// with no dependence on `HashMap` iteration order. This is the portable
+    /// half — `pid: None` takes the documented pid-unavailable fallback, which
+    /// is `Child::kill` on the Unix *and* the Windows backend.
+    #[test]
+    fn shutdown_all_graceful_force_kills_every_agent_even_when_a_reap_wedges() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let gates: Vec<Arc<WedgeGate>> = (0..2).map(|_| Arc::new(WedgeGate::default())).collect();
+        let mut kills = Vec::new();
+        let mut reaped = Vec::new();
+        for gate in &gates {
+            let child = WedgedChild::new(None, gate.clone());
+            kills.push(child.kills.clone());
+            reaped.push(child.reaped.clone());
+            registry.insert_test_agent(Box::new(child));
+        }
+
+        let force_killed = |k: &Arc<std::sync::atomic::AtomicUsize>| {
+            k.load(Ordering::SeqCst) > PHASE_ONE_FALLBACK_KILLS
+        };
+        let shutting_down = registry.clone();
+        let shutdown = std::thread::spawn(move || {
+            shutting_down.shutdown_all_graceful(Duration::from_millis(0));
+        });
+
+        let all_killed = holds_within(WEDGE_TEST_BUDGET, || kills.iter().all(force_killed));
+        // Counted *before* the release below: letting the wedge go lets the old
+        // serial loop finish delivering, so a count taken afterwards reads zero
+        // even when the starvation happened.
+        let starved = kills.iter().filter(|k| !force_killed(k)).count();
+
+        // Release before asserting so the shutdown thread is always joinable,
+        // failure or not.
+        for gate in &gates {
+            gate.release();
+        }
+        shutdown.join().expect("the shutdown thread must not panic");
+
+        assert!(
+            all_killed,
+            "every agent must be force-killed in phase 3; a wedged sibling's reap \
+             starved {} of {} agents of their kill",
+            starved,
+            kills.len()
+        );
+        assert!(
+            reaped.iter().all(|r| r.load(Ordering::SeqCst)),
+            "signal independence must not be bought by dropping the reap — a \
+             child that is signalled and never waited on is a zombie"
+        );
+    }
+
+    /// Control for the wedged tests: with nothing wedged, the very same two
+    /// agents are force-killed *and* reaped, and `shutdown_all_graceful`
+    /// returns on its own.
+    ///
+    /// Without it, "both agents were killed" could not distinguish *the wedge*
+    /// starving a sibling from this whole path being broken — the pre-fix code
+    /// passes this one.
+    #[test]
+    fn shutdown_all_graceful_force_kills_and_reaps_every_agent_when_nothing_wedges() {
+        let registry = AgentPtyRegistry::new();
+        let mut kills = Vec::new();
+        let mut reaped = Vec::new();
+        for _ in 0..2 {
+            let gate = Arc::new(WedgeGate::default());
+            gate.release();
+            let child = WedgedChild::new(None, gate);
+            kills.push(child.kills.clone());
+            reaped.push(child.reaped.clone());
+            registry.insert_test_agent(Box::new(child));
+        }
+
+        registry.shutdown_all_graceful(Duration::from_millis(0));
+
+        assert!(
+            kills
+                .iter()
+                .all(|k| k.load(Ordering::SeqCst) > PHASE_ONE_FALLBACK_KILLS),
+            "with no wedge anywhere, every agent is force-killed"
+        );
+        assert!(
+            reaped.iter().all(|r| r.load(Ordering::SeqCst)),
+            "with no wedge anywhere, every agent is reaped"
+        );
+        assert!(
+            registry.is_empty(),
+            "the registry is drained by the shutdown"
+        );
+    }
+
+    /// A real process in a process group of its own that **ignores SIGTERM**,
+    /// plus a channel that fires when it dies.
+    ///
+    /// `trap ""` sets `SIG_IGN`, which `exec` preserves, so only phase 3's
+    /// `killpg(SIGKILL)` can end this process — the shape phase 3 exists for,
+    /// and the behaviour of any interactive shell. Death is observed through the
+    /// EOF its inherited stdout pipe gets once the last holder of the write end
+    /// is gone; a `kill(pid, 0)` liveness probe could not, because a killed
+    /// child answers it right up until we reap the zombie.
+    #[cfg(unix)]
+    fn spawn_sigterm_proof_stand_in() -> (std::process::Child, std::sync::mpsc::Receiver<()>) {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut proc = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"trap "" TERM; printf r; exec sleep 300"#)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            // Its own process group, so the production `killpg` reaches this
+            // process and nothing else — the test runner included.
+            .process_group(0)
+            .spawn()
+            .expect("spawn the stand-in agent process");
+        let mut stdout = proc.stdout.take().expect("piped stdout");
+        // Block until the shell confirms the trap is installed. Without this
+        // handshake the test races `sh`'s startup against phase 1's SIGTERM and
+        // the stand-in intermittently dies before it is SIGTERM-proof, which
+        // makes the whole assertion pass vacuously (measured: both stand-ins
+        // gone ~1 ms after spawn, no phase 3 involved).
+        let mut ready = [0u8; 1];
+        stdout
+            .read_exact(&mut ready)
+            .expect("stand-in readiness byte");
+        assert_eq!(&ready, b"r", "unexpected readiness byte from the stand-in");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = stdout.read_to_end(&mut sink);
+            let _ = tx.send(());
+        });
+        (proc, rx)
+    }
+
+    /// Issue #581 at the altitude an operator sees it: a real agent process left
+    /// **alive** by a shutdown that looked clean.
+    ///
+    /// Same deterministic setup as the portable test — both agents wedged, so
+    /// exactly one kill escapes the pre-fix loop regardless of drain order — but
+    /// the pid handed to the teardown path is a real one, so the SIGKILL that
+    /// does or does not arrive is the production `killpg` landing on a real
+    /// process group, and the assertion is that no agent process outlived the
+    /// shutdown.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_all_graceful_kills_every_real_agent_process_even_when_a_reap_wedges() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let gates: Vec<Arc<WedgeGate>> = (0..2).map(|_| Arc::new(WedgeGate::default())).collect();
+        let mut stand_ins = Vec::new();
+        for gate in &gates {
+            let (proc, died) = spawn_sigterm_proof_stand_in();
+            registry.insert_test_agent(Box::new(WedgedChild::new(Some(proc.id()), gate.clone())));
+            stand_ins.push((proc, died));
+        }
+
+        let shutting_down = registry.clone();
+        let shutdown = std::thread::spawn(move || {
+            shutting_down.shutdown_all_graceful(Duration::from_millis(0));
+        });
+
+        let died: Vec<bool> = stand_ins
+            .iter()
+            .map(|(_, died)| died.recv_timeout(WEDGE_TEST_BUDGET).is_ok())
+            .collect();
+
+        // Release before asserting so the shutdown thread is always joinable,
+        // and reap the stand-ins whatever the outcome.
+        for gate in &gates {
+            gate.release();
+        }
+        shutdown.join().expect("the shutdown thread must not panic");
+        for (mut proc, _) in stand_ins {
+            let _ = proc.kill();
+            let _ = proc.wait();
+        }
+
+        assert!(
+            died.iter().all(|d| *d),
+            "every agent process must receive phase 3's SIGKILL regardless of where \
+             a wedged sibling sits in the drain order; per-agent died? = {died:?}"
+        );
+    }
+
+    /// Issue #581, the other half of the same starvation: phase 3's *reap* must
+    /// not sit behind another agent's unbounded `Child::wait` either.
+    ///
+    /// Both children here report their exit through `try_wait` the moment they
+    /// are asked, but their blocking `wait` never returns — the shape the
+    /// issue's "reap through a bounded, guaranteed-reaping helper rather than a
+    /// bare `child.wait()`" recommendation is about. A reap done through a
+    /// shared non-blocking poll collects both statuses and the shutdown
+    /// finishes; a reap done through `wait` parks forever on whichever agent it
+    /// touches first and never reaps the other.
+    #[test]
+    fn shutdown_all_graceful_reaps_without_parking_in_an_unbounded_wait() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let mut reaped = Vec::new();
+        for _ in 0..2 {
+            let gate = Arc::new(WedgeGate::default());
+            gate.release();
+            let mut child = WedgedChild::new(None, gate);
+            child.wait_never_returns = true;
+            reaped.push(child.reaped.clone());
+            registry.insert_test_agent(Box::new(child));
+        }
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let shutting_down = registry.clone();
+        let done = finished.clone();
+        // Deliberately never joined: on a regression this thread is parked in
+        // `Child::wait` forever, which is precisely what is being reported.
+        std::thread::spawn(move || {
+            shutting_down.shutdown_all_graceful(Duration::from_millis(0));
+            done.store(true, Ordering::SeqCst);
+        });
+
+        assert!(
+            holds_within(WEDGE_TEST_BUDGET, || finished.load(Ordering::SeqCst)),
+            "the shutdown never finished — it is parked in a bare `Child::wait` \
+             that this child never returns from, so no later agent is reaped"
+        );
+        assert!(
+            reaped.iter().all(|r| r.load(Ordering::SeqCst)),
+            "every agent must still be reaped, not merely signalled"
+        );
     }
 }

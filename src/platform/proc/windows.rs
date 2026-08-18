@@ -363,8 +363,25 @@ pub fn force_kill_child_and_wait(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     group: &AgentProcessGroup,
 ) {
-    reap_tree_or_fallback(child, group, "force-kill");
+    force_kill_child_group(child, group);
     let _ = child.wait();
+}
+
+/// The TERMINATE half of [`force_kill_child_and_wait`]: run the Job-Object
+/// backstop over the agent's whole tree and return **without reaping** the
+/// direct child.
+///
+/// Issue #581 — see the Unix twin for why a caller holding several agents must
+/// be able to terminate them all before waiting on any one of them. The Windows
+/// hazard is the same shape: `Child::wait` blocks until the direct child's
+/// handle signals, and a caller that interleaves terminate-then-wait per agent
+/// leaves every later agent's job un-terminated for as long as one child takes
+/// to go away.
+pub fn force_kill_child_group(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    group: &AgentProcessGroup,
+) {
+    reap_tree_or_fallback(child, group, "force-kill");
 }
 
 /// Best-effort-graceful-then-force teardown used by the single-pane Ctrl+W path:
