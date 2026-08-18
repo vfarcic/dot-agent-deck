@@ -5536,6 +5536,14 @@ impl AgentPtyRegistry {
         }
 
         // Pass 2: reap, dropping each agent as its status is collected.
+        //
+        // Termination depends on `try_wait` staying `Some` once it has reported
+        // an exit: phase 2 above may already have collected a child's status, and
+        // this loop asks again. Both backends hold that — Unix `Child` is
+        // `std::process::Child`, which caches the status and short-circuits, and
+        // `WinChild::try_wait` re-reads `GetExitCodeProcess` on a handle it still
+        // owns. A `Child` impl that answered `None` after reporting an exit would
+        // pin its agent here forever.
         while !agents.is_empty() {
             agents.retain_mut(|agent| matches!(agent.child.try_wait(), Ok(None)));
             if agents.is_empty() {
