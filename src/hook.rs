@@ -833,6 +833,16 @@ fn read_reply_line(
             // that still had seconds left. Consult the deadline instead: while
             // budget remains, go back and read again; once it is gone, the
             // loop head above returns `DeadlineExpired`.
+            //
+            // This cannot spin. A `WouldBlock` from a `SO_RCVTIMEO` armed at
+            // `remaining` has by definition just consumed `remaining`, so the
+            // loop head finds no budget and ends the operation on the very
+            // next pass — the ordinary case costs exactly one extra trip round
+            // the loop. The retry earns its keep only when a fire is EARLY,
+            // which is the case that has no other defence, and even a fire
+            // that were somehow instant is bounded by the same deadline rather
+            // than by a retry count. `socket_003`/`socket_005` pin that end of
+            // it: both still return at ~5.01s, unchanged by this.
             Err(err) if is_transient_read_error(&err, deadline) => continue,
             Err(err) => return Err(ReplyReadError::Io(err)),
         };
@@ -1489,8 +1499,9 @@ mod tests {
         }
 
         let outcome = result_rx.recv_timeout(ASSERT_CEILING);
+        // Safe to release now: the signalling loop above has finished, so no
+        // further `pthread_kill` can race the thread's exit.
         let _ = release_tx.send(());
-        let _ = client_thread.join();
         let daemon_report = daemon_thread
             .join()
             .unwrap_or_else(|_| "the stub daemon thread panicked".to_string());
@@ -1511,6 +1522,13 @@ mod tests {
              during connect/write instead of during the read, which the {SIGNAL_LEAD_IN:?} \
              lead-in is sized to prevent."
         );
+
+        // Joined last, deliberately. If the client thread ever failed to
+        // return within the ceiling the assertions above are the only thing
+        // that can say so, and joining a wedged thread first would hang the
+        // test until nextest killed it — losing exactly the diagnostic the
+        // failure exists to produce.
+        let _ = client_thread.join();
     }
 
     #[test]
