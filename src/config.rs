@@ -1151,6 +1151,15 @@ pub fn features_config_path(project_dir: &Path) -> PathBuf {
 /// that matters: an attacker cannot create a file owned by *us*. It fails
 /// closed, so an ancestor we cannot vouch for is skipped and the walk
 /// continues past it rather than adopting it.
+/// `cfg_attr` rather than a `#[cfg(unix)]` on the function: the rule is
+/// platform-independent and its test runs everywhere, but the only production
+/// caller is inside `config_candidate_is_trusted`'s `#[cfg(unix)]` arm, so on
+/// Windows this is dead code to a build that does not compile the tests —
+/// which `build-windows` is, since it runs bare `cargo clippy -- -D warnings`
+/// without `--all-targets` (CLAUDE.md rule 2). Same shape, mirror-image
+/// platform, as `fsperm::endpoint_owner_is_trusted`'s
+/// `#[cfg_attr(not(windows), allow(dead_code))]`.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn config_owner_is_trusted(file_uid: u32, our_uid: u32) -> bool {
     file_uid == our_uid
 }
