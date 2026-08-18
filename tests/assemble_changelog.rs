@@ -232,30 +232,137 @@ fn nested_fragment_with_a_recognized_suffix_is_rendered_then_deleted() {
     assert!(!exists(root, "nested/701.bugfix.md"));
 }
 
-/// Issue #593 — every recognized type maps to a heading, and every heading is
-/// emitted once, in the order `TYPES` declares.
+// ---------------------------------------------------------------------------
+// Issue #593 — the type/heading mapping.
+//
+// The mapping used to be a `declare -A TYPE_HEADERS`, which is bash 4 and so
+// died on macOS's bash 3.2.57 before the script did anything. It is now a
+// `type_header()` `case`. That rewrite touched all nine arms while the tests
+// above exercise only `feature` and `bugfix`, so the rest had no coverage.
+//
+// The mapping is declared in two places that must agree: the `TYPES` array
+// (scan order) and `type_header()`'s arms (heading per type). Both lists are
+// therefore READ OUT OF THE SCRIPT rather than mirrored here. A mirrored copy
+// would have made these tests describe a lockstep they did not enforce — add a
+// tenth type to the script and a hardcoded list simply never feeds it, so it
+// goes untested while the test still claims to have checked it.
+
+/// The script's `TYPES=(…)` array — the authoritative list, in scan order.
+fn declared_types(script: &str) -> Vec<String> {
+    let line = script
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("TYPES=("))
+        .expect("the script declares a single-line TYPES=(…) array");
+    line.trim_start_matches("TYPES=(")
+        .split(')')
+        .next()
+        .expect("TYPES=(…) closes on its own line")
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `type_header()`'s `case` arms as `(aliases, heading)`, in source order. The
+/// `*)` catch-all is the mismatch guard rather than a mapping, so it is left
+/// out.
+fn mapped_headings(script: &str) -> Vec<(Vec<String>, String)> {
+    let body = script
+        .split_once("type_header() {")
+        .expect("the script defines type_header()")
+        .1;
+    let body = body
+        .split_once("\n}")
+        .expect("type_header() has a closing brace")
+        .0;
+
+    body.lines()
+        .filter_map(|line| {
+            let (labels, rest) = line.trim().split_once(')')?;
+            // Arm labels are lowercase names joined by `|`. Anything else on a
+            // line that happens to contain `)` — the `*)` catch-all, or the
+            // error text mentioning `type_header()` — is not a mapping.
+            if labels.is_empty() || !labels.chars().all(|c| c.is_ascii_lowercase() || c == '|') {
+                return None;
+            }
+            let heading = rest
+                .split('"')
+                .nth(1)
+                .expect("a mapping arm echoes a quoted heading");
+            Some((
+                labels.split('|').map(str::to_owned).collect(),
+                heading.to_owned(),
+            ))
+        })
+        .collect()
+}
+
+fn heading_for(map: &[(Vec<String>, String)], ty: &str) -> Option<String> {
+    map.iter()
+        .find(|(aliases, _)| aliases.iter().any(|a| a == ty))
+        .map(|(_, heading)| heading.clone())
+}
+
+/// The lockstep itself, checked statically against the script text: every type
+/// the script scans for has an arm that maps it to a heading, and no arm maps a
+/// type the script never scans for.
 ///
-/// Two things make this worth its own case. First, the mapping used to be a
-/// `declare -A TYPE_HEADERS` and is now a `type_header()` `case`, because
-/// `declare -A` is bash 4 and macOS ships bash 3.2.57 — the rewrite touched all
-/// nine arms while the tests above exercise only `feature` and `bugfix`, so
-/// seven of them had no coverage at all. Second, the two halves of the mapping
-/// are declared apart: a type listed in `TYPES` with no matching `case` arm
-/// would hit the `*)` arm and abort the release. Feeding one fragment of every
-/// declared type is what holds those two lists in lockstep — add a type to one
-/// and forget the other, and this goes red rather than a release going out
-/// short a section.
+/// A type in `TYPES` with no arm falls through to `*)` and aborts the release
+/// — the failure this catches is a release going out short a section, and it
+/// catches it without spawning a shell.
 #[test]
-fn every_recognized_type_maps_to_its_heading_in_declared_order() {
+fn every_declared_type_has_a_heading_arm_and_vice_versa() {
+    let script = fs::read_to_string(script_path()).expect("the assembler script is readable");
+    let declared = declared_types(&script);
+    let map = mapped_headings(&script);
+
+    assert!(
+        !declared.is_empty() && !map.is_empty(),
+        "the parsers found nothing — the script's shape changed and these \
+         tests are no longer reading it.\nTYPES: {declared:?}\narms: {map:?}",
+    );
+
+    let unmapped: Vec<&String> = declared
+        .iter()
+        .filter(|ty| heading_for(&map, ty).is_none())
+        .collect();
+    assert!(
+        unmapped.is_empty(),
+        "these types are in TYPES but have no type_header() arm, so the \
+         script aborts the moment a fragment of one shows up: {unmapped:?}",
+    );
+
+    let orphaned: Vec<&String> = map
+        .iter()
+        .flat_map(|(aliases, _)| aliases)
+        .filter(|alias| !declared.contains(alias))
+        .collect();
+    assert!(
+        orphaned.is_empty(),
+        "these types have a type_header() arm but are not in TYPES, so no \
+         fragment of them is ever scanned for: {orphaned:?}",
+    );
+}
+
+/// One fragment of every type the script declares is rendered, under the
+/// heading the script's own arms map it to, with aliases collapsing into a
+/// single section.
+///
+/// Both the input types and the expected headings come from the script, so a
+/// type added later is exercised automatically rather than silently skipped.
+/// What is asserted is that the script's *runtime* behaviour matches its own
+/// *declarations* — every fragment reaches the notes, each heading is opened
+/// exactly once, and the sections come out in `TYPES` order.
+#[test]
+fn every_declared_type_renders_under_its_mapped_heading() {
+    let script = fs::read_to_string(script_path()).expect("the assembler script is readable");
+    let declared = declared_types(&script);
+    let map = mapped_headings(&script);
+
     let scratch = test_temp::tempdir().expect("scratch dir");
     let root = scratch.path();
-
     write_fragment(root, ".gitkeep", "");
-    // Mirrors the script's `TYPES` array, which is also the scan order.
-    let types = [
-        "breaking", "added", "feature", "changed", "fixed", "bugfix", "removed", "doc", "misc",
-    ];
-    for (i, ty) in types.iter().enumerate() {
+    for (i, ty) in declared.iter().enumerate() {
         write_fragment(
             root,
             &format!("{}.{ty}.md", 700 + i),
@@ -267,13 +374,11 @@ fn every_recognized_type_maps_to_its_heading_in_declared_order() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
-        "a fragment of every declared type must assemble cleanly — a type in \
-         TYPES with no heading mapped for it aborts here.\nstderr:\n{}",
+        "a fragment of every declared type must assemble cleanly.\nstderr:\n{}",
         String::from_utf8_lossy(&out.stderr),
     );
 
-    // Every fragment reaches the notes, so no arm silently drops its type.
-    for ty in types {
+    for ty in &declared {
         assert!(
             stdout.contains(&format!("**Entry for {ty}**")),
             "the '{ty}' fragment never reached the release notes.\n\
@@ -281,27 +386,30 @@ fn every_recognized_type_maps_to_its_heading_in_declared_order() {
         );
     }
 
-    // First appearance of each heading, in `TYPES` order: breaking→Changed,
-    // added→Added, fixed→Fixed, removed→Removed, doc→Documentation,
-    // misc→Miscellaneous. `feature`, `changed` and `bugfix` are aliases and
-    // must NOT open a second section of their own.
-    let expected = [
-        "### Changed",
-        "### Added",
-        "### Fixed",
-        "### Removed",
-        "### Documentation",
-        "### Miscellaneous",
-    ];
-    let headings: Vec<&str> = stdout
+    // First appearance of each mapped heading, walking TYPES in order — this
+    // is what the aliasing is *for*, so `feature` must not open a section of
+    // its own next to `added`.
+    let mut expected: Vec<String> = Vec::new();
+    for ty in &declared {
+        let heading = format!(
+            "### {}",
+            heading_for(&map, ty).expect("checked by the lockstep test above"),
+        );
+        if !expected.contains(&heading) {
+            expected.push(heading);
+        }
+    }
+
+    let actual: Vec<&str> = stdout
         .lines()
-        .filter(|l| l.starts_with("### "))
         .map(str::trim_end)
+        .filter(|l| l.starts_with("### "))
         .collect();
     assert_eq!(
-        headings, expected,
-        "headings must appear once each, in TYPES order — a duplicate means \
-         the alias dedup broke, a missing one means an arm stopped \
-         matching.\nstdout:\n{stdout}",
+        actual, expected,
+        "the rendered sections must match what the script's own TYPES order \
+         and type_header() arms imply — a repeat means the alias dedup broke, \
+         a missing one means an arm stopped matching at runtime.\n\
+         stdout:\n{stdout}",
     );
 }
