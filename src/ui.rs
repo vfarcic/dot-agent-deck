@@ -13211,7 +13211,7 @@ pub fn run_tui(
 
     // Flush accumulated session warnings now that the terminal is restored.
     // Sanitised on the way out — see `flush_session_warnings` for why that
-    // happens HERE and not at the ~13 `session_warnings.push` sites.
+    // happens HERE and not at the fifteen `session_warnings.push` sites.
     flush_session_warnings(&ui.session_warnings, &mut std::io::stderr().lock());
 
     Ok(())
@@ -13233,13 +13233,14 @@ pub fn run_tui(
 /// reads as the deck's own output.
 ///
 /// **Sanitising here rather than at each producer is the point.** There are
-/// ~13 push sites and they only grow — the most recent was added by following
-/// the established idiom exactly, which is the right thing for a contributor to
-/// do. Per-producer escaping means every future site must remember; one
-/// sanitisation point at the single consumer fixes them all by construction and
-/// cannot be forgotten by a later addition. Push sites therefore keep pushing
-/// plain, readable strings, and nothing about this is visible at the call site —
-/// which is exactly why it is documented at the seam that enforces it.
+/// fifteen push sites today and they only grow — the most recent was added by
+/// following the established idiom exactly, which is the right thing for a
+/// contributor to do. Per-producer escaping means every future site must
+/// remember; one sanitisation point at the single consumer fixes them all by
+/// construction and cannot be forgotten by a later addition. Push sites
+/// therefore keep pushing plain, readable strings, and nothing about this is
+/// visible at the call site — which is exactly why it is documented at the seam
+/// that enforces it.
 ///
 /// Errors are dropped rather than panicking the way `eprintln!` does: this is
 /// the last statement of a clean shutdown, and a closed stderr is not worth
