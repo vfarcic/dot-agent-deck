@@ -124,24 +124,35 @@ pub fn show_command_entry_lock() -> bool {
 /// no-op rather than leaking a duplicate poll thread.
 static INIT: Once = Once::new();
 
-/// Initialize the process-global `Features` from the project
-/// `.dot-agent-deck.toml` `[features]` table (env override wins), log the
-/// startup state (PRD #139 M1.3 / OQ4), and spawn the periodic re-read
-/// watcher (PRD #139 M2.1). Called once at startup by BOTH the TUI and the
-/// daemon so each process evaluates the flag from the same file. Idempotent:
-/// the body runs at most once per process, so a second call cannot spawn a
-/// duplicate watcher thread.
-pub fn init_and_watch() {
+/// Initialize the process-global `Features` from the `[features]` table of
+/// the `.dot-agent-deck.toml` in `project_dir` (env override wins), log the
+/// startup state and the file it came from (PRD #139 M1.3 / OQ4), and spawn
+/// the periodic re-read watcher (PRD #139 M2.1). Called once at startup by
+/// BOTH the TUI and the daemon so each process evaluates the flag from the
+/// same file. Idempotent: the body runs at most once per process, so a second
+/// call cannot spawn a duplicate watcher thread.
+///
+/// `project_dir` is passed in rather than derived here (issue #577): the
+/// caller decides which project the flag belongs to, exactly as every other
+/// config read takes the directory it was handed
+/// ([`crate::project_config::load_project_config`]).
+pub fn init_and_watch(project_dir: &std::path::Path) {
     INIT.call_once(|| {
-        let path = crate::config::features_config_path();
+        let path = crate::config::features_config_path(project_dir);
         let resolved = crate::config::resolve_features(crate::config::load_features_file(
             &path,
             Features::default(),
         ));
         install(resolved);
+        // Name the file the value came from (issue #577): when the flag
+        // resolves OFF because the deck is reading a `.dot-agent-deck.toml`
+        // that isn't the one the operator edited — or one that does not exist
+        // — the symptom is otherwise indistinguishable from the gated feature
+        // having been removed, with nothing in the log to tell them apart.
         tracing::info!(
-            "experimental flag: {}",
-            if resolved.experimental { "ON" } else { "OFF" }
+            "experimental flag: {} (from {})",
+            if resolved.experimental { "ON" } else { "OFF" },
+            path.display()
         );
         spawn_watcher(path);
     });

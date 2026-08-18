@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -1111,17 +1111,28 @@ pub fn resolve_features(file: crate::features::Features) -> crate::features::Fea
 }
 
 /// Path of the `.dot-agent-deck.toml` whose `[features]` table backs the
-/// flag — the file in the current working directory, so the TUI and daemon
-/// (launched in the same dir) read the same source of truth.
-/// `DOT_AGENT_DECK_FEATURES_CONFIG` is an explicit override so tests never
-/// touch the real cwd.
-pub fn features_config_path() -> PathBuf {
+/// flag: the file in `project_dir`, the directory the CALLER has decided is
+/// the project.
+///
+/// Issue #577: this used to join [`std::env::current_dir`] unconditionally,
+/// making it the only config read in the deck keyed to the process's own
+/// working directory rather than to a directory it was handed — every other
+/// one goes through [`crate::project_config::load_project_config`] with an
+/// explicit dir. A deck launched anywhere but its project therefore read the
+/// `[features]` table from the launch directory's file (usually one that does
+/// not exist), so every experimental surface silently resolved OFF and the
+/// symptom was indistinguishable from the feature having been removed. The
+/// cwd read now happens once at the entry point (`launch_project_dir` in
+/// `main.rs`), where it is a deliberate choice rather than a hidden default.
+///
+/// `DOT_AGENT_DECK_FEATURES_CONFIG` names the file outright and still wins
+/// over `project_dir`, so tests — and an operator pointing the flag at one
+/// specific file — depend on no directory at all.
+pub fn features_config_path(project_dir: &Path) -> PathBuf {
     if let Ok(p) = std::env::var("DOT_AGENT_DECK_FEATURES_CONFIG") {
         return PathBuf::from(p);
     }
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(crate::project_config::CONFIG_FILE_NAME)
+    project_dir.join(crate::project_config::CONFIG_FILE_NAME)
 }
 
 /// Upper bound on the `.dot-agent-deck.toml` the feature-flag loader will

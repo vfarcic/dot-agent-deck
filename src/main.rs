@@ -1374,6 +1374,30 @@ fn main() -> ExitCode {
     }
 }
 
+/// The deck's project directory for the process-global config reads that have
+/// no narrower directory to key off — today just the `[features]` table
+/// (issue #577).
+///
+/// It is the directory the deck was launched in, which is the documented
+/// contract for the experimental flag (`docs/develop/experimental-flag.md`:
+/// "the `.dot-agent-deck.toml` in the directory where you launch the deck").
+/// The point of resolving it here is that it is resolved ONCE, at the entry
+/// point, and handed to `features::init_and_watch` as an explicit directory —
+/// the same shape as `examine_worktrees(&cwd)` and `run_reclaim(&cwd, …)`
+/// below, and as `load_project_config(dir)` everywhere else. `features_config_path`
+/// no longer reaches for the process cwd itself, so nothing downstream of this
+/// call silently depends on where the process happens to be running.
+fn launch_project_dir() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|e| {
+        // Not fatal: `.` preserves the pre-#577 fallback, and a deck that
+        // cannot resolve its own cwd still starts with the flag OFF.
+        tracing::warn!(
+            "failed to resolve the launch directory ({e}); reading [features] relative to \".\""
+        );
+        std::path::PathBuf::from(".")
+    })
+}
+
 #[tokio::main]
 async fn run_dashboard() -> ExitCode {
     init_logging_from_env();
@@ -1435,8 +1459,10 @@ async fn run_tui_session() -> ExitCode {
     // `.dot-agent-deck.toml` `[features]` (env override wins) and start the
     // live re-read watcher. The startup state is recorded via a single
     // `tracing::info!` line, which surfaces only when file logging is enabled
-    // (`DOT_AGENT_DECK_LOG`); it is never printed to the terminal.
-    dot_agent_deck::features::init_and_watch();
+    // (`DOT_AGENT_DECK_LOG`); it is never printed to the terminal. The project
+    // directory is resolved HERE, at the entry point, and passed down (issue
+    // #577) — see `launch_project_dir`.
+    dot_agent_deck::features::init_and_watch(&launch_project_dir());
 
     let state = Arc::new(RwLock::new(AppState::default()));
     let attach_path = attach_socket_path();
@@ -1949,8 +1975,11 @@ async fn run_daemon_serve_cli() -> ExitCode {
     // `tracing` global-default init would panic).
     // PRD #139 M1.2/M2.1: the daemon reads the experimental flag from the same
     // `.dot-agent-deck.toml` source of truth and watches it independently of
-    // the TUI (the file is the contract; no cross-process sync).
-    dot_agent_deck::features::init_and_watch();
+    // the TUI (the file is the contract; no cross-process sync). The detached
+    // spawn in `platform::detach` sets no `current_dir`, so the daemon
+    // inherits the launching TUI's directory and the two agree on the file by
+    // construction.
+    dot_agent_deck::features::init_and_watch(&launch_project_dir());
     let state = Arc::new(RwLock::new(AppState::default()));
     let path = socket_path();
     let attach_path = attach_socket_path();

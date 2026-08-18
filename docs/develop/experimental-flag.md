@@ -35,6 +35,14 @@ The value is case-insensitive: `1` or `true` enables the flag; any other value (
 
 > **Environment overrides the file.** When `DOT_AGENT_DECK_EXPERIMENTAL` is set, it decides the flag's state and edits to `[features] experimental` in `.dot-agent-deck.toml` are ignored until you unset the variable. Set the variable to `1`/`true` to force the experimental surfaces on regardless of the file, or to `0`/`false` to force them off.
 
+## Which file is read
+
+The launch directory is the contract, and it is now taken literally: the deck resolves it **once**, at its entry point, and hands that directory to the flag loader as an explicit path — the same shape as every other config read, which takes the directory it was given (`load_project_config(dir)`). Before issue #577 the loader reached for `std::env::current_dir()` itself, which made it the only config read in the deck keyed to the process's own working directory. That is why a deck started from somewhere other than its project — with its panes pointed at the project — read the `[features]` table from the launch directory's file, usually one that does not exist, and every experimental surface silently resolved off with no way to tell that apart from the feature having been removed.
+
+If you routinely launch the deck outside the project whose flags you want, set **`DOT_AGENT_DECK_FEATURES_CONFIG`** to the full path of the `.dot-agent-deck.toml` to read. It names the file outright and wins over the launch directory (the `DOT_AGENT_DECK_EXPERIMENTAL` env var still wins over both, since it decides the value rather than the file). This is also how the test suite keeps the flag off the real working directory.
+
+The startup log line names the file it read (below), so "which `.dot-agent-deck.toml` did this deck actually load?" is answerable from the log rather than by inference.
+
 ## Default and precedence
 
 | Source | Value | Result |
@@ -44,7 +52,7 @@ The value is case-insensitive: `1` or `true` enables the flag; any other value (
 | `DOT_AGENT_DECK_EXPERIMENTAL=1` (or `true`) | env | On — wins over the file |
 | `DOT_AGENT_DECK_EXPERIMENTAL=0` (or `false`/other) | env | Off — wins over the file |
 
-Both the TUI and the background daemon read the flag independently from the same `.dot-agent-deck.toml`, so the two stay consistent — the file is the contract. On startup each process logs a single line — `experimental flag: ON` or `experimental flag: OFF` — when file logging is enabled (`DOT_AGENT_DECK_LOG`).
+Both the TUI and the background daemon read the flag independently from the same `.dot-agent-deck.toml`, so the two stay consistent — the file is the contract. On startup each process logs a single line — `experimental flag: ON (from /path/to/.dot-agent-deck.toml)` or the same with `OFF` — when file logging is enabled (`DOT_AGENT_DECK_LOG`). The path is the file the value came from, so a flag that resolves off because the wrong file was read is distinguishable from one that is simply set to false.
 
 > **One flag for everything.** There is exactly one experimental toggle. If two unrelated experimental surfaces are in flight at once, they are shown or hidden together — there are no per-feature toggles.
 
