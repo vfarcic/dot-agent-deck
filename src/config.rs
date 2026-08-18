@@ -1135,6 +1135,105 @@ pub fn features_config_path(project_dir: &Path) -> PathBuf {
     project_dir.join(crate::project_config::CONFIG_FILE_NAME)
 }
 
+/// Decide whether a candidate `.dot-agent-deck.toml` found by the ancestor
+/// walk may be trusted, given the uid that owns it and the uid we are running
+/// as (issue #577).
+///
+/// The pure-data core of the walk's trust check, split out so its rules are
+/// unit-testable on every platform — the same shape as
+/// [`crate::platform::fsperm::endpoint_owner_is_trusted`], and for the same
+/// reason: a decision this small should not need a foreign-owned file (or
+/// root) to exercise.
+///
+/// Walking upward means considering directories the operator did not name and
+/// may not own — `/tmp/project` sits under a world-writable `/tmp`, where any
+/// local user can create `/tmp/.dot-agent-deck.toml`. Ownership is the check
+/// that matters: an attacker cannot create a file owned by *us*. It fails
+/// closed, so an ancestor we cannot vouch for is skipped and the walk
+/// continues past it rather than adopting it.
+pub(crate) fn config_owner_is_trusted(file_uid: u32, our_uid: u32) -> bool {
+    file_uid == our_uid
+}
+
+/// The project directory the deck's process-global config reads key off:
+/// `start` if it holds a trusted `.dot-agent-deck.toml`, else the nearest
+/// ancestor that does, else `start` unchanged.
+///
+/// Issue #577: the deck used to key the `[features]` table to its own working
+/// directory, so running it from anywhere below the project root — `repo/src`,
+/// `repo/docs`, a nested crate — read a `.dot-agent-deck.toml` that is not
+/// there and silently resolved every experimental surface OFF. Walking up is
+/// how a project-scoped config is normally found, and it makes the flag depend
+/// on which PROJECT you are in rather than on which of its directories you
+/// happened to be standing in.
+///
+/// Two deliberate limits:
+///
+/// - A candidate must be a regular file owned by the current uid
+///   ([`config_owner_is_trusted`]); anything else is skipped and the walk
+///   continues. `metadata` follows symlinks, so the ownership answer is about
+///   the resolved target, matching [`load_features_file`]'s own `is_file()`
+///   check.
+/// - When nothing qualifies the result is `start` itself, so the resulting
+///   path is byte-identical to the pre-#577 behaviour and a deck launched
+///   outside any project reads exactly what it read before.
+///
+/// This does NOT make the flag per-project — it stays one process-global
+/// toggle (CLAUDE.md rule 9). A deck launched entirely outside its project,
+/// with panes pointed into it, still reads the launch directory's file;
+/// `DOT_AGENT_DECK_FEATURES_CONFIG` is the escape hatch there.
+pub fn resolve_project_dir(start: &Path) -> PathBuf {
+    // `ancestors()` yields `start` first, so a project whose config sits in
+    // the launch directory itself resolves without walking anywhere and keeps
+    // exactly its pre-#577 behaviour. It is lexical rather than symlink-
+    // resolving, which is what we want: `current_dir()` already hands us the
+    // physical path on Unix, and re-resolving would report a project root the
+    // operator never typed.
+    for dir in start.ancestors() {
+        if config_candidate_is_trusted(&dir.join(crate::project_config::CONFIG_FILE_NAME)) {
+            return dir.to_path_buf();
+        }
+    }
+    start.to_path_buf()
+}
+
+/// Whether `path` is a `.dot-agent-deck.toml` the ancestor walk may stop at:
+/// a regular file owned by the current user. Anything else — absent, a
+/// directory, a foreign-owned file — is skipped so the walk continues past it.
+///
+/// `metadata` follows symlinks, so a symlink to a foreign-owned file is judged
+/// by its target, and a dangling one is simply absent. This is the same
+/// stat-then-read shape [`load_features_file`] already uses; it is not a
+/// TOCTOU guarantee and does not need to be, because the loader re-validates
+/// (regular file, size cap, parse) before it trusts a byte of the content.
+/// This check decides only WHICH directory is the project.
+fn config_candidate_is_trusted(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        config_owner_is_trusted(metadata.uid(), crate::platform::paths::current_uid())
+    }
+    // Windows has no uid, and the file analogue of the SID check in
+    // `platform::fsperm` takes a kernel HANDLE rather than a path — it is
+    // built for the named pipe and the spawn mutex, not for stat-ing a config.
+    // The exposure it would close is also structurally smaller here: the walk
+    // climbs through the per-user profile (`C:\Users\<me>\…`), which is
+    // ACL'd to that user, before reaching `C:\`, which is admin-writable by
+    // default — there is no world-writable `/tmp` equivalent on the way up.
+    // So Windows accepts any regular file, and the property that differs is
+    // recorded here rather than left to be inferred from the `cfg`.
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// Upper bound on the `.dot-agent-deck.toml` the feature-flag loader will
 /// read. A `[features]` table is a handful of bytes; this cap stops a
 /// pathological `DOT_AGENT_DECK_FEATURES_CONFIG` target (a huge regular file)
@@ -1234,6 +1333,31 @@ pub fn load_features_file(
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// The pure trust rule the ancestor walk stops on (issue #577). Split out
+    /// of the filesystem check so the deletion-unsafe direction — adopting an
+    /// ancestor config we do not own — is exercised without needing a
+    /// foreign-owned file or root, mirroring how
+    /// `platform::fsperm::endpoint_owner_is_trusted` is tested. Ownership is
+    /// the check that matters when walking upward: `/tmp/project` sits under a
+    /// world-writable `/tmp` where any local user can drop a
+    /// `/tmp/.dot-agent-deck.toml`, and an attacker cannot create a file owned
+    /// by us.
+    #[test]
+    fn ancestor_config_is_trusted_only_when_we_own_it() {
+        assert!(
+            config_owner_is_trusted(1000, 1000),
+            "our own file is trusted"
+        );
+        assert!(
+            !config_owner_is_trusted(0, 1000),
+            "a root-owned config planted above us is not adopted"
+        );
+        assert!(
+            !config_owner_is_trusted(1001, 1000),
+            "another local user's config planted above us is not adopted"
+        );
+    }
 
     /// Scenario: Drive a `SnapshotCoalescer` (interval 500ms) synchronously with
     /// a 50-change burst all observed at the same instant — after each

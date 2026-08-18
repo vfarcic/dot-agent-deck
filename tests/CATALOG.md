@@ -4103,6 +4103,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the TOML-file enable path or env-vs-file precedence (covered by `features/reload/001` and the unit suite); the footer's absolute grid coordinates.
 - **Platform coverage:** mac+linux.
 
+##### features/gating/004 — The `[features]` table is found by walking up when the deck is launched from a subdirectory of its project (issue #577).
+- **Layer:** L2 (real TUI driven via PTY; observed on the rendered vt100 grid). No env var is used — the flag comes from the fixture's project-root `.dot-agent-deck.toml`, which is the only path issue #577 concerns. The deck's cwd is moved below the fixture root with `with_launch_subdir("nested/deep")`.
+- **Agent:** none (`features-experimental-on` fixture; empty dashboard).
+- **Asserts:** launched two levels below the project root, the deck resolves the project's `[features] experimental = true` and the rendered grid shows the `experimental: on` footer once the dashboard is up; a control launch at the project root shows the same footer, so the first result is attributable to the launch directory rather than to the fixture or the footer.
+- **Does not assert:** the env-override path (`features/gating/003`); the ownership trust check on a candidate config, or the nearest-ancestor-wins ordering (both unit-covered in `tests/features.rs`); behaviour when the deck is launched entirely OUTSIDE any project — that remains the launch directory's own file, and is the residual of issue #577 the walk does not address.
+- **Platform coverage:** mac+linux.
+
 #### features/reload
 
 ##### features/reload/001 — A live `[features]` flip from OFF to ON re-surfaces the footer on the next render, no restart.

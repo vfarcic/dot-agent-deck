@@ -122,6 +122,7 @@ pub struct TuiDeckBuilder {
     claude_trust_paths: Vec<String>,
     claude_trust_workdir: bool,
     suppress_success_recording: bool,
+    launch_subdir: Option<PathBuf>,
 }
 
 impl TuiDeckBuilder {
@@ -130,6 +131,20 @@ impl TuiDeckBuilder {
     /// value than Decision 20's pinned default (e.g. `NO_COLOR=1`).
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.extra_env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Launch the deck from `subdir` *inside* the fixture instead of at the
+    /// fixture root, creating it if absent. The fixture still lands at the
+    /// tempdir root, so the project's `.dot-agent-deck.toml` sits one or more
+    /// levels ABOVE the deck's working directory — which is the shape issue
+    /// #577 is about: a deck started somewhere below its project root.
+    ///
+    /// Everything else is unchanged; in particular `HOME`, both sockets and
+    /// the state dir still point at the per-test tempdir, so a test using this
+    /// is no less isolated than one launching at the root.
+    pub fn with_launch_subdir(mut self, subdir: impl Into<PathBuf>) -> Self {
+        self.launch_subdir = Some(subdir.into());
         self
     }
 
@@ -409,6 +424,7 @@ impl TuiDeck {
             claude_trust_paths: Vec::new(),
             claude_trust_workdir: false,
             suppress_success_recording: false,
+            launch_subdir: None,
         }
     }
 
@@ -581,7 +597,17 @@ impl TuiDeck {
         // (debug vs. release matches the test's profile).
         let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
         let mut cmd = CommandBuilder::new(bin);
-        cmd.cwd(&work);
+        // Default: launch at the fixture root. `with_launch_subdir` moves the
+        // deck's cwd below it without moving the fixture (issue #577).
+        let launch_dir = match &builder.launch_subdir {
+            Some(sub) => {
+                let dir = work.join(sub);
+                std::fs::create_dir_all(&dir).expect("create launch subdir");
+                dir
+            }
+            None => work.clone(),
+        };
+        cmd.cwd(&launch_dir);
         // PRD #89: the `--continue` flag was removed — auto-restore is now the
         // default. A staged saved session (pointed at by `DOT_AGENT_DECK_SESSION`
         // below) is restored unconditionally on launch when the daemon is empty,

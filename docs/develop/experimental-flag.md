@@ -16,7 +16,7 @@ There are two ways to turn it on. **The environment variable wins over the file*
 
 **1. Config file (`.dot-agent-deck.toml`)**
 
-Add a `[features]` table to the `.dot-agent-deck.toml` in the directory where you launch the deck:
+Add a `[features]` table to your project's `.dot-agent-deck.toml` — the deck finds it from anywhere inside the project, not only at the top (see [Which file is read](#which-file-is-read)):
 
 ```toml
 [features]
@@ -37,9 +37,16 @@ The value is case-insensitive: `1` or `true` enables the flag; any other value (
 
 ## Which file is read
 
-The launch directory is the contract, and it is now taken literally: the deck resolves it **once**, at its entry point, and hands that directory to the flag loader as an explicit path — the same shape as every other config read, which takes the directory it was given (`load_project_config(dir)`). Before issue #577 the loader reached for `std::env::current_dir()` itself, which made it the only config read in the deck keyed to the process's own working directory. That is why a deck started from somewhere other than its project — with its panes pointed at the project — read the `[features]` table from the launch directory's file, usually one that does not exist, and every experimental surface silently resolved off with no way to tell that apart from the feature having been removed.
+The deck starts at its launch directory and **walks up to the nearest ancestor holding a `.dot-agent-deck.toml`**, and that directory is the project. So launching from `repo/src`, `repo/crates/app`, or any other directory inside the project finds `repo`'s flags — the flag depends on which *project* you are in, not on which of its directories you happened to be standing in. The nearest config wins, so a nested project (a crate with its own config, a worktree checked out inside a repo) overrides the one above it.
 
-If you routinely launch the deck outside the project whose flags you want, set **`DOT_AGENT_DECK_FEATURES_CONFIG`** to the full path of the `.dot-agent-deck.toml` to read. It names the file outright and wins over the launch directory (the `DOT_AGENT_DECK_EXPERIMENTAL` env var still wins over both, since it decides the value rather than the file). This is also how the test suite keeps the flag off the real working directory.
+Before issue #577 there was no walk and no explicit directory at all: the loader reached for `std::env::current_dir()` itself, which made it the only config read in the deck keyed to the process's own working directory rather than to one it was handed. Launching one level down from the project root was enough to read a `.dot-agent-deck.toml` that is not there, and every experimental surface silently resolved off with no way to tell that apart from the feature having been removed.
+
+Two limits are deliberate:
+
+- **A candidate must be a regular file you own.** Walking upward means considering directories you did not name and may not own — `/tmp/project` sits under a world-writable `/tmp`, where any local user can create `/tmp/.dot-agent-deck.toml`. An ancestor config owned by anyone else is skipped and the walk continues past it. (On Windows there is no uid, and the walk climbs through your ACL-protected user profile before reaching an admin-writable `C:\`, so any regular file is accepted there; the divergence is recorded at the check itself.)
+- **If nothing is found at or above the launch directory, that directory is the answer** — byte-identical to the pre-#577 path. A deck launched entirely outside any project reads exactly what it read before.
+
+That last point is the **residual**: a deck launched somewhere with no project above it — `$HOME`, say — with its panes pointed into a project elsewhere still does not pick up that project's flags. The `[features]` table is one process-global toggle (see "One flag for everything" below), and some gated surfaces — the dashboard footer, for one — belong to no project at all, so there is no per-pane answer to give. For that case set **`DOT_AGENT_DECK_FEATURES_CONFIG`** to the full path of the `.dot-agent-deck.toml` to read: it names the file outright and wins over the walk (the `DOT_AGENT_DECK_EXPERIMENTAL` env var still wins over both, since it decides the value rather than the file). This is also how the test suite keeps the flag off the real working directory.
 
 The startup log line names the file it read (below), so "which `.dot-agent-deck.toml` did this deck actually load?" is answerable from the log rather than by inference.
 

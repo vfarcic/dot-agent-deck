@@ -1,0 +1,8 @@
+# Fixture for the feature-flag project-directory resolution tests (issue #577).
+# The `[features]` table lives in the PROJECT ROOT; the tests launch the deck
+# from a subdirectory of it, which is the case that used to lose the flag.
+# No modes / orchestrations, so the dashboard starts empty exactly as with the
+# `minimal` fixture.
+
+[features]
+experimental = true

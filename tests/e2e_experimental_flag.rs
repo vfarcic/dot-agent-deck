@@ -74,3 +74,40 @@ fn gating_003_env_var_toggles_footer_e2e() {
         off.snapshot_grid()
     );
 }
+
+/// Scenario: Launch the deck twice against the `features-experimental-on`
+/// fixture, whose PROJECT ROOT `.dot-agent-deck.toml` carries
+/// `[features] experimental = true` and which sets no env var at all. The
+/// first launch starts the deck from `nested/deep/`, two levels BELOW that
+/// root — the shape of issue #577, an operator running the deck from
+/// somewhere inside their project rather than at its top. Once the dashboard
+/// is up (`No active sessions`), the grid must show the `experimental: on`
+/// footer: the flag is found by walking up to the project root. The second
+/// (control) launch is identical but starts at the project root, where the
+/// config sits in the launch directory itself, and must show the same footer
+/// — proving the fixture's file and the footer plumbing are sound, so a
+/// failure of the first launch is attributable to WHERE the deck was started.
+#[spec("features/gating/004")]
+#[test]
+fn gating_004_flag_found_from_a_subdirectory_of_the_project() {
+    // Issue #577. RED before the ancestor walk: launched from `nested/deep/`
+    // the deck joined its own cwd, read a `.dot-agent-deck.toml` that does not
+    // exist there, and the footer never appeared — indistinguishable from the
+    // feature having been removed. The env override is deliberately NOT used
+    // here; `features/gating/003` covers that path. This one is about the
+    // FILE, which is the only path the issue is about.
+
+    // The reported case: deck started below the project root.
+    let nested = TuiDeck::builder()
+        .with_launch_subdir("nested/deep")
+        .launch_with_fixture("features-experimental-on");
+    nested.wait_for_string("No active sessions");
+    nested.wait_for_string(EXPERIMENTAL_FOOTER_TEXT);
+
+    // Control: same fixture, same config file, launched AT the project root —
+    // the case that always worked. If this one ever fails, the fixture or the
+    // footer is broken and the assertion above proves nothing about the walk.
+    let at_root = TuiDeck::launch_with_fixture("features-experimental-on");
+    at_root.wait_for_string("No active sessions");
+    at_root.wait_for_string(EXPERIMENTAL_FOOTER_TEXT);
+}

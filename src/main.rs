@@ -1378,24 +1378,29 @@ fn main() -> ExitCode {
 /// no narrower directory to key off — today just the `[features]` table
 /// (issue #577).
 ///
-/// It is the directory the deck was launched in, which is the documented
-/// contract for the experimental flag (`docs/develop/experimental-flag.md`:
-/// "the `.dot-agent-deck.toml` in the directory where you launch the deck").
-/// The point of resolving it here is that it is resolved ONCE, at the entry
-/// point, and handed to `features::init_and_watch` as an explicit directory —
-/// the same shape as `examine_worktrees(&cwd)` and `run_reclaim(&cwd, …)`
-/// below, and as `load_project_config(dir)` everywhere else. `features_config_path`
-/// no longer reaches for the process cwd itself, so nothing downstream of this
+/// Resolved ONCE here, at the entry point, and handed to
+/// `features::init_and_watch` as an explicit directory — the same shape as
+/// `examine_worktrees(&cwd)` and `run_reclaim(&cwd, …)` below, and as
+/// `load_project_config(dir)` everywhere else. `features_config_path` no
+/// longer reaches for the process cwd itself, so nothing downstream of this
 /// call silently depends on where the process happens to be running.
+///
+/// The launch directory is where the search STARTS, not where it ends:
+/// `resolve_project_dir` walks up to the nearest ancestor holding a trusted
+/// `.dot-agent-deck.toml`, so a deck started at `repo/src` finds `repo`'s
+/// flags instead of silently finding none. With no config at or above the
+/// launch directory it returns that directory unchanged, which is the
+/// pre-#577 path exactly.
 fn launch_project_dir() -> std::path::PathBuf {
-    std::env::current_dir().unwrap_or_else(|e| {
+    let start = std::env::current_dir().unwrap_or_else(|e| {
         // Not fatal: `.` preserves the pre-#577 fallback, and a deck that
         // cannot resolve its own cwd still starts with the flag OFF.
         tracing::warn!(
             "failed to resolve the launch directory ({e}); reading [features] relative to \".\""
         );
         std::path::PathBuf::from(".")
-    })
+    });
+    dot_agent_deck::config::resolve_project_dir(&start)
 }
 
 #[tokio::main]
