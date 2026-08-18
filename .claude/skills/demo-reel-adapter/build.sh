@@ -374,7 +374,16 @@ case "$cmd" in
     ;;
 
   reel)
-    mapfile -t scope < <(select_ids)
+    # A read loop rather than `mapfile -t scope`, which is bash 4: macOS ships
+    # /bin/bash 3.2.57, where `mapfile` is not a builtin at all and this died
+    # with `mapfile: command not found` (exit 127) before selecting anything
+    # (issue #593, the same portability class as the release assembler's
+    # `declare -A`). Equivalent here because `select_ids` terminates every id
+    # with a newline, so no unterminated final line can be dropped.
+    scope=()
+    while IFS= read -r id; do
+      scope+=("$id")
+    done < <(select_ids)
     if [[ ${#scope[@]} -eq 0 ]]; then
       echo "$SKIP_MSG"
       exit 0
