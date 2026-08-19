@@ -1328,6 +1328,61 @@ async fn handle_connection(
                             crate::agent_pty::seed_fallback_grace(),
                         );
                     }
+                    // Issue #454: tell the daemon's OWN `AppState` that it
+                    // owns this pane, for EVERY successfully spawned pane —
+                    // not just the orchestration ones the role-map block
+                    // below covers.
+                    //
+                    // `AppState::apply_event` admits a non-`SessionStart`
+                    // event only for a pane in `managed_pane_ids` (admission
+                    // control: an arbitrary same-user process must not be
+                    // able to drive daemon session state for a pane the
+                    // daemon does not own). Until this line, the ONLY things
+                    // that put a pane in the daemon's set were
+                    // `register_orchestration_role` and `apply_event`'s own
+                    // auto-register-on-`SessionStart` branch — so an ordinary
+                    // dashboard pane existed in `AgentPtyRegistry` but not in
+                    // `AppState`, and the real `dot-agent-deck agent-event`
+                    // CLI (which emits `Thinking`/`Idle`/`Working`, never
+                    // `SessionStart`) had every one of its reports dropped.
+                    // `ListAgents` then joined `live = None` onto the record,
+                    // so `daemon status` printed `STATUS=- TOOL=-` and a TUI
+                    // reconnect rebuilt the card as `Idle` (PRD #162).
+                    //
+                    // THE INVARIANT, stated explicitly because this is the
+                    // guard's new load-bearing seam: the daemon's
+                    // `managed_pane_ids` is now exactly
+                    //
+                    //   { pane_id_env of every agent this daemon spawned via
+                    //     `AttachRequest::StartAgent` (or `crate::spawn`) and
+                    //     has not yet stopped }
+                    //
+                    // i.e. it agrees with `AgentPtyRegistry` ownership rather
+                    // than being a strict, accidental subset of it. It is
+                    // still NOT "any pane id an event names":
+                    //   * `pane_id_env` was already filtered through
+                    //     `is_valid_pane_id_env` above, and it comes from the
+                    //     spawn request the daemon itself just acted on — the
+                    //     pane provably exists as a child of this daemon;
+                    //   * a pane id nobody spawned is still absent, so a
+                    //     forged `agent-event` for it is still rejected;
+                    //   * `StopAgent` calls `AppState::unregister_pane` on
+                    //     the same `pane_id_env`, so the set shrinks back the
+                    //     moment the daemon stops owning the pane;
+                    //   * the synthetic `__dead-slot__-…` id format is
+                    //     excluded, mirroring the same exclusion in
+                    //     `apply_event`'s `SessionStart` auto-register branch
+                    //     (auditor finding #1 follow-up). Production never
+                    //     sets one as `DOT_AGENT_DECK_PANE_ID`, but
+                    //     `is_valid_pane_id_env` admits the shape on its own,
+                    //     and a dead slot is by definition a role with no
+                    //     live pane.
+                    if let Some(pane_id) = pane_id_env
+                        .as_deref()
+                        .filter(|p| !crate::ui::is_dead_slot_pane_id(p))
+                    {
+                        state.write().await.register_pane(pane_id.to_string());
+                    }
                     // PRD #93 round-5: populate daemon-side role maps so
                     // `handle_delegate` / `handle_work_done` can resolve
                     // the worker pane and orchestrator pane purely from
@@ -2266,6 +2321,105 @@ async fn handle_attach_stream(
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// Issue #454, the root cause pinned at its own seam: a `StartAgent` for an
+    /// ORDINARY dashboard pane — no `tab_membership`, so none of the
+    /// orchestration role-map machinery runs — must still leave the daemon's
+    /// `AppState` knowing it owns that pane.
+    ///
+    /// Until the fix, `managed_pane_ids` was populated only by
+    /// `register_orchestration_role` and by `apply_event`'s
+    /// auto-register-on-`SessionStart` branch, so this pane lived in
+    /// `AgentPtyRegistry` and nowhere else. `AppState::apply_event` then
+    /// rejected every non-`SessionStart` report the pane made — which is every
+    /// report the real `dot-agent-deck agent-event` CLI sends — and
+    /// `ListAgents` had no live session to join onto the record.
+    ///
+    /// The second half is just as load-bearing: registering the pane must NOT
+    /// make a dashboard pane look like an orchestration role, or `handle_delegate`
+    /// would start resolving panes that never joined an orchestration.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_agent_registers_an_ordinary_pane_in_daemon_state() {
+        use crate::daemon_client::{DaemonClient, StartAgentOptions};
+
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+
+        let server = {
+            let sock = sock.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        // The bind happens inside the task, so wait for it to accept.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let pane_id = "dashboard-pane-454";
+        let agent_id = DaemonClient::new(sock.clone())
+            .start_agent(StartAgentOptions {
+                command: Some("cat".to_string()),
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                // Deliberately no `tab_membership`: this is a plain dashboard
+                // pane, the case the old code registered nowhere.
+                ..StartAgentOptions::default()
+            })
+            .await
+            .expect("spawn an ordinary pane through the attach socket");
+
+        {
+            let guard = state.read().await;
+            assert!(
+                guard.managed_pane_ids.contains(pane_id),
+                "a pane this daemon just spawned must be owned by its `AppState`, \
+                 or `apply_event` drops every lifecycle report the pane makes; \
+                 managed={:?}",
+                guard.managed_pane_ids
+            );
+            assert!(
+                !guard.pane_role_map.contains_key(pane_id),
+                "owning a dashboard pane must not give it an orchestration ROLE"
+            );
+            assert!(
+                !guard.orchestrator_pane_ids.contains(pane_id),
+                "owning a dashboard pane must not make it an orchestrator"
+            );
+        }
+        // The registry agrees the pane exists — the two views of ownership are
+        // what the fix keeps in agreement.
+        assert!(
+            registry
+                .agent_records()
+                .iter()
+                .any(|r| r.id == agent_id && r.pane_id_env.as_deref() == Some(pane_id)),
+            "precondition: the registry owns the spawned pane"
+        );
+
+        registry.shutdown_all();
+        server.abort();
+    }
 
     /// PRD #20 Greptile finding #6 (coder-authored): the per-attach STREAM_IN
     /// rejection channel must be BOUNDED so a client flooding a history-only /

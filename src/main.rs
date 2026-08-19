@@ -1805,8 +1805,13 @@ fn run_daemon_hello_cli() -> ExitCode {
 /// `dot-agent-deck daemon status [--json]`. Read-only CLI
 /// consumer of the existing `AttachRequest::ListAgents`
 /// ([`dot_agent_deck::daemon_client::DaemonClient::list_agents`]) — no new
-/// attach request type, no `PROTOCOL_VERSION` bump (see
-/// `.dot-agent-deck/47-status-query-design.md` in the root checkout). Row
+/// attach request type, and therefore no `PROTOCOL_VERSION` bump: this command
+/// puts nothing new on the wire, so an older daemon answers a newer CLI's
+/// status query exactly as it always did (issue #459 — this rationale used to
+/// cite a design note under the gitignored `.dot-agent-deck/`, which no reader
+/// of the merged source could open). The `--json` document has its own,
+/// separate [`dot_agent_deck::daemon_status::SCHEMA_VERSION`]; that is what
+/// moves when the document shape changes. Row
 /// shaping lives in [`dot_agent_deck::daemon_status`]; this wrapper only
 /// bounds the round trip with [`dot_agent_deck::daemon_status::STATUS_REQUEST_TIMEOUT`]
 /// and translates the outcome into stdout/stderr text and an exit code.

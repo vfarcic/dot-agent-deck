@@ -395,9 +395,12 @@ pub fn orchestrator_role_index(roles: &[RoleSpawn]) -> usize {
 /// `state` is the daemon's [`AppState`](crate::state::AppState). It is what makes
 /// a daemon-spawned ORCHESTRATION able to delegate: the role → pane maps
 /// `handle_delegate` routes on are populated from here, exactly as the
-/// `AttachRequest::StartAgent` handler populates them for a `Ctrl+N` one. `None`
+/// `AttachRequest::StartAgent` handler populates them for a `Ctrl+N` one. It is
+/// ALSO what makes a daemon-spawned pane's live status visible at all (issue
+/// #454): every spawned pane is registered in `managed_pane_ids`, without which
+/// `AppState::apply_event` drops the pane's lifecycle reports as unowned. `None`
 /// (tests, and any caller with no daemon state) spawns as before and simply
-/// registers nothing — a single-agent spawn has no roles to register either way.
+/// registers nothing.
 pub async fn spawn(
     req: SpawnRequest,
     registry: &Arc<AgentPtyRegistry>,
@@ -462,6 +465,21 @@ pub async fn spawn(
                 pin_sh,
                 notifier,
             )?;
+            // Issue #454: the daemon-internal counterpart of the
+            // `AttachRequest::StartAgent` registration — see the invariant
+            // spelled out there. The ORCHESTRATION branch below already tells
+            // the daemon's `AppState` it owns its role panes (via
+            // `register_orchestration_role`); a single-agent spawn had no such
+            // step, so `apply_event` dropped every non-`SessionStart` report
+            // from a scheduled / dispatched pane and its `daemon status` row
+            // showed `STATUS=- TOOL=-` exactly like the dashboard-pane bug.
+            // The `surface_spawned_pane` broadcast below is NOT that step: it
+            // publishes a synthetic `SessionStart` straight onto `event_tx` for
+            // attached TUIs and never passes through `daemon::ingest_event`, so
+            // the daemon's own `AppState` never sees it.
+            if let Some(state) = state {
+                state.write().await.register_pane(pane_id.clone());
+            }
             // PRD #127 finding #2: surface this single-agent card LIVE to any
             // already-attached TUI (the daemon otherwise only hydrates its
             // agents at TUI startup). Reuses the existing hook-event broadcast

@@ -1,22 +1,29 @@
 //! `dot-agent-deck daemon status [--json]`.
 //!
 //! Read-only diagnostic snapshot of the daemon's managed agents. A pure CLI
-//! consumer of the existing `AttachRequest::ListAgents`: no new attach
-//! request variant, no `PROTOCOL_VERSION` bump (see
-//! `.dot-agent-deck/47-status-query-design.md` in the root checkout). This
+//! consumer of the existing `AttachRequest::ListAgents`: no new attach request
+//! variant, and therefore no `PROTOCOL_VERSION` bump — the command adds nothing
+//! to the TUI↔daemon wire, so an older daemon serves a newer CLI's status query
+//! unchanged. (Issue #459: that rationale used to be a citation of a design note
+//! under `.dot-agent-deck/`, which `.gitignore` excludes, so nobody reading the
+//! merged source could follow it. The reasoning is inlined here instead.) This
 //! module only reshapes `ListAgents`' `Vec<AgentRecord>` into the CLI's own
 //! documented fields — it touches no daemon-side locking, since the existing
 //! `ListAgents` handler (`daemon_protocol.rs`) already bounds itself to a
 //! short `AppState` read lock released before any I/O await.
 //!
 //! Deliberately excluded from both the human table and the JSON document:
-//! `last_user_prompt` / `first_prompts` (a status query must never surface
-//! prompt text — see `daemon/status/004`) and `hook_session_id` /
-//! `last_activity` (the design doc's proposed shape includes them, but
-//! neither field currently exists on `SessionSnapshot`; adding them would
-//! mean updating every existing `SessionSnapshot` struct literal across the
-//! crate, including fixtures in `tests/rehydration.rs` this task must not
-//! touch. Left as a deliberate follow-up rather than folded in here).
+//!
+//! * `last_user_prompt` / `first_prompts`. A status query is a diagnostic, run
+//!   by anyone who can reach the socket and routinely pasted into a bug report
+//!   or a terminal someone else is watching; prompt text is the user's private
+//!   content and has no diagnostic value that the status/tool columns do not
+//!   already carry. Pinned by `daemon/status/004`. The same reasoning is why
+//!   [`StatusTool`] carries the tool NAME without its `detail` (issue #455).
+//! * `hook_session_id` / `last_activity`. Wanted, but neither field exists on
+//!   `SessionSnapshot` today; adding them means updating every
+//!   `SessionSnapshot` struct literal across the crate. Left as a deliberate
+//!   follow-up rather than folded in here.
 
 use std::time::Duration;
 
@@ -28,15 +35,53 @@ use crate::state::{ActiveTool, SessionStatus};
 /// Version of the `--json` document shape. Bump on a field removal or a
 /// meaning change; additive fields don't need a bump — consumers should
 /// tolerate unknown keys.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// `2` (issue #455): `active_tool.detail` was REMOVED. Version 1 serialized the
+/// internal [`ActiveTool`] whole, so the JSON document carried the tool's
+/// `detail` — the first line of the command being run, the file path being
+/// read/written, the search pattern, the subagent description (see
+/// `crate::hook`) — while the human table had always printed the tool NAME
+/// only. Both modes now honour the same privacy contract, so a consumer that
+/// read `active_tool.detail` gets nothing rather than something subtly
+/// different: a field removal, which this constant exists to announce.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Deadline for the whole connect+request round trip against the attach
-/// socket (the design rationale: "cap the CLI's connect/request round trip
-/// with a deadline ... [a timeout] must never retry in a loop or cause lazy
-/// daemon startup"). This is one-shot, local Unix-socket IPC, so 3s
-/// comfortably covers a live daemon under load without leaving a caller
-/// stuck waiting on a wedged one.
+/// socket. This is one-shot, local Unix-socket IPC, so 3s comfortably covers a
+/// live daemon under load without leaving a caller stuck waiting on a wedged
+/// one.
+///
+/// Expiry ABANDONS the query — it must never retry in a loop, and must never
+/// cause lazy daemon startup. Both halves are load-bearing for a diagnostic
+/// (issue #459 — inlined here rather than left as a citation of a note under
+/// the gitignored `.dot-agent-deck/`): the command's whole job is to report the
+/// daemon's condition without perturbing it, so a retry loop against a wedged
+/// daemon would add load to the exact failure being diagnosed, and spawning a
+/// daemon to answer "is a daemon running?" would make the question
+/// unanswerable — the honest answer for an unreachable daemon is the
+/// `unavailable` failure exit, not a freshly-minted empty one.
 pub const STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The public projection of a live [`ActiveTool`]: the tool's NAME, and
+/// nothing else.
+///
+/// Issue #455: this type exists so the privacy contract is enforced by the
+/// type system rather than by remembering. `StatusAgent` used to carry
+/// `Option<ActiveTool>` — the internal state type — so every field ever added
+/// to `ActiveTool` rode into the `--json` document for free, which is exactly
+/// how `detail` (a command line, a file path, a search pattern — see
+/// `crate::hook`) leaked out of a command documented as never printing prompt
+/// text. Adding a field to `ActiveTool` can no longer widen this document; it
+/// takes a deliberate edit here, and that edit owes a [`SCHEMA_VERSION`] bump.
+///
+/// Kept as an object with a `name` key rather than flattened to a bare string
+/// so the change is a pure field REMOVAL: a v1 consumer reading
+/// `active_tool.name` still reads it under v2, and only `active_tool.detail`
+/// disappears.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusTool {
+    pub name: String,
+}
 
 /// One row of the status output — the CLI's own documented shape, not a raw
 /// re-export of `AgentRecord`/`SessionSnapshot`.
@@ -54,7 +99,7 @@ pub struct StatusAgent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<SessionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub active_tool: Option<ActiveTool>,
+    pub active_tool: Option<StatusTool>,
 }
 
 /// Top-level `--json` document (the design rationale's proposed shape, minus
@@ -113,7 +158,12 @@ pub fn build_status_agents(records: Vec<AgentRecord>) -> Vec<StatusAgent> {
                 cwd: record.cwd,
                 role: role_of(&record.tab_membership),
                 status: live.as_ref().map(|s| s.status.clone()),
-                active_tool: live.and_then(|s| s.active_tool),
+                // Issue #455: project down to the NAME here, at the one place
+                // that crosses from internal state into the CLI's document —
+                // `detail` never leaves this function.
+                active_tool: live
+                    .and_then(|s| s.active_tool)
+                    .map(|tool: ActiveTool| StatusTool { name: tool.name }),
             }
         })
         .collect()
@@ -126,8 +176,9 @@ fn cell(value: &Option<String>) -> &str {
 }
 
 /// Render the concise, one-row-per-agent human table. Never includes prompt
-/// text or scrollback (the design rationale) — only the diagnostic fields on
-/// [`StatusAgent`] are candidates for a column here.
+/// text or scrollback (see the module docs for why) — only the diagnostic
+/// fields on [`StatusAgent`] are candidates for a column here, and the TOOL
+/// column deliberately shows the tool's name without its `detail`.
 pub fn format_human(agents: &[StatusAgent]) -> String {
     if agents.is_empty() {
         return "no managed agents\n".to_string();
@@ -235,12 +286,51 @@ mod tests {
         assert!(!json.contains("SENTINEL-PROMPT-TEXT"));
     }
 
+    /// Scenario: a status row built from a live snapshot whose `active_tool`
+    /// carries a `detail` must publish the tool's NAME and drop the detail —
+    /// in the human table (which always did) and in the JSON document (which
+    /// serialized `ActiveTool` whole until issue #455). The pure-function core
+    /// of `daemon/status/004`'s `--json` half.
+    #[test]
+    fn active_tool_publishes_the_name_and_never_the_detail() {
+        let mut snap = snapshot(SessionStatus::Working);
+        snap.active_tool = Some(ActiveTool {
+            name: "Read".to_string(),
+            detail: Some("SENTINEL-TOOL-DETAIL".to_string()),
+        });
+        let agents = build_status_agents(vec![record("agent-1", "tool-pane", Some(snap))]);
+
+        let table = format_human(&agents);
+        assert!(
+            table.contains("Read"),
+            "table must name the tool: {table:?}"
+        );
+        assert!(!table.contains("SENTINEL-TOOL-DETAIL"));
+
+        let json = serde_json::to_string(&StatusDocument::new(agents)).unwrap();
+        assert!(
+            !json.contains("SENTINEL-TOOL-DETAIL"),
+            "json leaked: {json}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let tool = &parsed["agents"][0]["active_tool"];
+        assert_eq!(tool["name"], "Read");
+        assert!(
+            tool.get("detail").is_none(),
+            "`active_tool.detail` must be gone from the document, not merely \
+             empty; got {tool:?}"
+        );
+    }
+
     #[test]
     fn json_document_carries_schema_version_and_pane_id() {
         let agents = build_status_agents(vec![record("agent-1", "json-pane", None)]);
         let json = serde_json::to_string(&StatusDocument::new(agents)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["schema_version"], 1);
+        // Version 2 (issue #455): `active_tool.detail` was removed from the
+        // document, and `SCHEMA_VERSION`'s contract is to announce exactly
+        // that.
+        assert_eq!(parsed["schema_version"], 2);
         assert!(json.contains("json-pane"));
     }
 }

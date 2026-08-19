@@ -3888,6 +3888,20 @@ impl AppState {
         // Events without a pane_id (external agents) are rejected when we have
         // managed panes. Events with an unknown pane_id are rejected unless it
         // is a SessionStart (which may arrive before register_pane during startup).
+        //
+        // Issue #454: this is ADMISSION CONTROL, and it stayed exactly as
+        // strict — what changed is who is in `managed_pane_ids` on the DAEMON's
+        // copy of `AppState`. The TUI's copy has always registered every pane it
+        // creates; the daemon's registered only orchestration role panes, so an
+        // ordinary daemon-spawned pane was owned by `AgentPtyRegistry` and
+        // unknown here, and every `dot-agent-deck agent-event` report it made
+        // (`Thinking`/`Working`/`Idle` — never `SessionStart`) fell into the
+        // `return` below. `AttachRequest::StartAgent` and `crate::spawn` now
+        // register each pane they actually spawn, so the set means "panes this
+        // process owns" on both sides. It still admits NO pane that nobody
+        // spawned, and `StopAgent`'s `unregister_pane` still takes ownership
+        // back — see the invariant comment at the `StartAgent` seam in
+        // `crate::daemon_protocol`.
         if let Some(ref pane_id) = event.pane_id {
             if !self.managed_pane_ids.contains(pane_id) {
                 if event.event_type == EventType::SessionStart {
@@ -6928,6 +6942,98 @@ mod tests {
         assert!(
             state.untagged_status_panes.contains(UNTAGGED_PANE),
             "a status-less frame must not clear a mark it did not earn"
+        );
+    }
+
+    // ---- Issue #454: the `managed_pane_ids` admission rule, and the join keys
+    // it decides. -----------------------------------------------------------
+    //
+    // The live-status bug was NOT in the `ListAgents` equality join: it was here.
+    // The real `dot-agent-deck agent-event` CLI emits `Thinking`/`Working`/
+    // `Idle` — never `SessionStart` — so its report is admitted only for a pane
+    // already in `managed_pane_ids`. The daemon's copy of `AppState` registered
+    // orchestration role panes and nothing else, so an ordinary daemon-spawned
+    // pane's reports were dropped and `ListAgents` had no session to join. The
+    // fix registers the pane at the spawn seams (`AttachRequest::StartAgent`
+    // and `crate::spawn`); these two tests pin both halves of what that seam
+    // now has to keep true.
+
+    const CLI_PANE: &str = "cli-pane-454";
+    const CLI_AGENT_ID: &str = "agent-454";
+
+    /// The exact payload `dot-agent-deck agent-event --type running` puts on
+    /// the hook socket (`Commands::AgentEvent` in `main.rs`): a bare
+    /// `AgentEvent`, `EventType::Thinking`, a pane-derived session id, and the
+    /// `DOT_AGENT_DECK_PANE_ID` / `DOT_AGENT_DECK_AGENT_ID` pair the daemon
+    /// injected into the spawned pane.
+    fn agent_event_cli_payload(pane_id: &str, agent_id: &str) -> AgentEvent {
+        AgentEvent {
+            session_id: format!("{pane_id}-session"),
+            agent_type: AgentType::Pi,
+            event_type: EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(pane_id.to_string()),
+            agent_id: Some(agent_id.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        }
+    }
+
+    /// The positive half: once the spawn seam has registered the pane, a
+    /// lifecycle report from the real CLI is ADMITTED and the session it
+    /// creates carries both keys `ListAgents` joins on — `agent_id` (matched
+    /// against the registry record's id) and `pane_id` (matched against the
+    /// record's `pane_id_env`). A session admitted without those keys would
+    /// still leave `daemon status` printing `STATUS=-`.
+    #[test]
+    fn agent_event_report_for_a_daemon_spawned_pane_is_admitted_with_the_join_keys() {
+        let mut state = AppState::default();
+        // What `AttachRequest::StartAgent` / `crate::spawn` now do after a
+        // successful spawn.
+        state.register_pane(CLI_PANE.to_string());
+
+        state.apply_event(agent_event_cli_payload(CLI_PANE, CLI_AGENT_ID));
+
+        let session = state
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some(CLI_PANE))
+            .expect("a `Thinking` report for a registered pane must be admitted");
+        assert_eq!(
+            session.agent_id.as_deref(),
+            Some(CLI_AGENT_ID),
+            "the session must carry the agent id `ListAgents` joins on"
+        );
+        assert_eq!(session.status, SessionStatus::Thinking);
+    }
+
+    /// The negative half, and the reason the fix registers panes at the spawn
+    /// seam rather than relaxing the check: a lifecycle report for a pane this
+    /// process does NOT own is still rejected outright. This is admission
+    /// control — any same-user process can reach the hook socket, and without
+    /// it one could drive the status, agent type and active tool of a card the
+    /// deck never spawned (or forge a card that has no pane at all).
+    #[test]
+    fn agent_event_report_for_an_unowned_pane_is_still_rejected() {
+        let mut state = AppState::default();
+        state.register_pane(CLI_PANE.to_string());
+
+        state.apply_event(agent_event_cli_payload("not-our-pane-454", "agent-forged"));
+
+        assert!(
+            state
+                .sessions
+                .values()
+                .all(|s| s.pane_id.as_deref() != Some("not-our-pane-454")),
+            "a non-SessionStart event naming an unowned pane must create no \
+             session; sessions={:?}",
+            state.sessions.keys().collect::<Vec<_>>()
         );
     }
 }
