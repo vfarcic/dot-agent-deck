@@ -11,9 +11,12 @@
 use std::path::Path;
 use std::time::Duration;
 
-use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+use dot_agent_deck::agent_pty::{
+    DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID, SpawnOptions, TabMembership,
+};
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
 use dot_agent_deck::event::{AgentEvent, AgentType, BroadcastMsg, EventType};
+use dot_agent_deck::state::SessionStatus;
 #[cfg(unix)]
 use spec::spec;
 
@@ -25,6 +28,12 @@ const DRIVEN_PANE: &str = "status-driven-pane-7f3a1c";
 const CONTROL_PANE: &str = "status-control-pane-9c1e4d";
 #[cfg(unix)]
 const JSON_PANE: &str = "status-json-pane-2b6e51";
+#[cfg(unix)]
+const JSON_LABEL: &str = "status-json-label-4c8f7a";
+#[cfg(unix)]
+const JSON_MODE: &str = "status-json-mode-5d9a2b";
+#[cfg(unix)]
+const JSON_TOOL: &str = "Read";
 #[cfg(unix)]
 const LEAK_PANE: &str = "status-leak-pane-4d8f02";
 #[cfg(unix)]
@@ -322,9 +331,8 @@ async fn daemon_status_001_reports_live_agent_status_inner() {
 
     // Normalize out BOTH identity fields (pane id and registry agent id —
     // the latter differs per spawn regardless of live status) so any
-    // remaining textual difference is attributable to the status-derived
-    // fields the the design rationale scopes `record.live` to (hook-session
-    // id, status, active tool, last activity), not merely to two agents
+    // remaining textual difference must come from the documented live
+    // diagnostic columns (status and active tool), not merely from two agents
     // having distinct identities.
     let driven_text = driven_lines
         .join("\n")
@@ -346,7 +354,7 @@ async fn daemon_status_001_reports_live_agent_status_inner() {
     daemon.registry.shutdown_all();
 }
 
-/// Scenario: Spawn a managed pane through the daemon attach API, drive it to `Thinking` through the real `agent-event --type running` CLI and invoke `dot-agent-deck daemon status --json`. Assert the document pins the exact current schema version, public top-level and agent field names, and live status string.
+/// Scenario: Spawn a fully described managed pane through the daemon attach API, drive it through the real `agent-event --type running` CLI and into an active tool, then invoke `dot-agent-deck daemon status --json`. Assert the document pins the exact current schema version, every public field in a populated agent row, and all six supported live-status strings.
 #[spec("daemon/status/002")]
 #[test]
 #[cfg(unix)]
@@ -364,10 +372,57 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
     let daemon = common::spawn_inprocess_daemon().await;
     let cwd = common::race_safe_tempdir();
     let cwd_str = cwd.path().to_string_lossy().into_owned();
-    let agent_id = start_tui_managed_agent(&daemon, JSON_PANE, &cwd_str).await;
+    wait_for_attach_socket(&daemon.attach_path, Duration::from_secs(5)).await;
+    let agent_id = DaemonClient::new(daemon.attach_path.clone())
+        .start_agent(StartAgentOptions {
+            command: Some("cat".to_string()),
+            cwd: Some(cwd_str.clone()),
+            display_name: Some(JSON_LABEL.to_string()),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), JSON_PANE.to_string())],
+            tab_membership: Some(TabMembership::Mode {
+                name: JSON_MODE.to_string(),
+            }),
+            agent_type: Some(AgentType::Pi),
+            ..StartAgentOptions::default()
+        })
+        .await
+        .expect("spawn fully described pane through the TUI's StartAgent attach path");
     let observed = run_agent_event_cli(&daemon, JSON_PANE, &agent_id, cwd.path()).await;
     assert_eq!(observed.pane_id.as_deref(), Some(JSON_PANE));
     assert_eq!(observed.agent_id.as_deref(), Some(agent_id.as_str()));
+
+    let mut tool_event = thinking_event(JSON_PANE, &agent_id, None);
+    tool_event.session_id = format!("{JSON_PANE}-session");
+    tool_event.event_type = EventType::ToolStart;
+    tool_event.tool_name = Some(JSON_TOOL.to_string());
+    common::write_hook_line(
+        &daemon.hook_path,
+        &serde_json::to_string(&tool_event).expect("serialize populated schema-row ToolStart"),
+    )
+    .expect("write populated schema-row ToolStart to the daemon hook socket");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let populated = {
+            let state = daemon.state.read().await;
+            state.sessions.values().any(|session| {
+                session.agent_id.as_deref() == Some(agent_id.as_str())
+                    && session.pane_id.as_deref() == Some(JSON_PANE)
+                    && session.status == SessionStatus::Working
+                    && session
+                        .active_tool
+                        .as_ref()
+                        .is_some_and(|tool| tool.name == JSON_TOOL)
+            })
+        };
+        if populated {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the representative schema row never reached Working with active tool {JSON_TOOL:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     let result = run_daemon_status_cli(&daemon.attach_path, true).await;
     assert!(
@@ -419,14 +474,45 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
         .collect();
     assert_eq!(
         agent_fields,
-        std::collections::BTreeSet::from(["agent_id", "cwd", "pane_id", "status"]),
-        "the current schema version must pin the populated agent field names; got agent={agent:?}"
+        std::collections::BTreeSet::from([
+            "active_tool",
+            "agent_id",
+            "cwd",
+            "label",
+            "pane_id",
+            "role",
+            "status",
+        ]),
+        "the current schema version must pin every public field name on a fully populated agent row; got agent={agent:?}"
     );
     assert_eq!(
-        agent.get("status").and_then(serde_json::Value::as_str),
-        Some("Thinking"),
-        "the current schema version must pin the live status string value as `Thinking`; got agent={agent:?}"
+        agent,
+        &serde_json::json!({
+            "active_tool": { "name": JSON_TOOL },
+            "agent_id": agent_id,
+            "cwd": cwd_str,
+            "label": JSON_LABEL,
+            "pane_id": JSON_PANE,
+            "role": format!("mode:{JSON_MODE}"),
+            "status": "Working",
+        }),
+        "the representative row must pin the value and shape of every public field"
     );
+
+    for (status, expected) in [
+        (SessionStatus::Thinking, "Thinking"),
+        (SessionStatus::Working, "Working"),
+        (SessionStatus::Compacting, "Compacting"),
+        (SessionStatus::WaitingForInput, "WaitingForInput"),
+        (SessionStatus::Idle, "Idle"),
+        (SessionStatus::Error, "Error"),
+    ] {
+        assert_eq!(
+            serde_json::to_value(status).expect("serialize supported public status"),
+            serde_json::Value::String(expected.to_string()),
+            "the public schema must keep the exact status string {expected:?}"
+        );
+    }
 
     daemon.registry.shutdown_all();
 }
@@ -499,8 +585,7 @@ async fn daemon_status_003_no_daemon_reports_unavailable_without_spawning_one_in
     assert!(
         !attach_path.exists(),
         "a diagnostic query must never itself bring a daemon into existence at the socket path \
-         it queried (the design rationale's non-perturbation contract); the socket now exists \
-         at {}",
+         it queried; the socket now exists at {}",
         attach_path.display()
     );
 }

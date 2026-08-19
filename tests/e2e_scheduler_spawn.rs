@@ -20,6 +20,7 @@ mod common;
 use std::time::Duration;
 
 use dot_agent_deck::agent_pty::TabMembership;
+use dot_agent_deck::state::SessionStatus;
 use spec::spec;
 
 const PROMPT_MARKER: &str = "SCHEDPROMPTMARKER";
@@ -430,5 +431,55 @@ fn spawn_006_single_and_role_codex_commands_are_wrapped() {
         ],
         "scheduled single-agent and role spawns must both cross the Wrapper strategy exactly once; observed:\n{}",
         launches.join("\n")
+    );
+}
+
+/// Scenario: Fire a plain scheduled task through the real daemon `RunNow` callback so it reaches `spawn_or_reuse`, then report `running` from the spawned pane through the real non-`SessionStart` `agent-event` CLI. Assert `ListAgents` joins the resulting `Thinking` lifecycle snapshot to that scheduler-created registry record instead of leaving its live status empty.
+#[spec("scheduler/spawn/007")]
+#[test]
+fn spawn_007_scheduler_agent_event_joins_registry_record() {
+    let scratch = common::harness_tempdir().expect("scheduler status-join scratch");
+    let work = scratch.path().join("status-join");
+    std::fs::create_dir_all(&work).expect("create scheduled status-join working dir");
+    let schedules = task_block("status-join", &work.to_string_lossy(), Some("cat"));
+    let daemon = common::spawn_daemon_serve(Some(&schedules), "0");
+
+    daemon
+        .run_now("status-join")
+        .expect("fire scheduled status-join task through RunNow");
+    let records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
+    let record = records
+        .first()
+        .unwrap_or_else(|| panic!("scheduled spawn never registered an agent: {records:?}"));
+    let agent_id = record.id.clone();
+    let pane_id = record
+        .pane_id_env
+        .clone()
+        .expect("scheduler-created pane must carry its generated pane id");
+
+    let output = daemon.run_agent_event(&pane_id, Some(&agent_id), "running");
+    assert!(
+        output.status.success(),
+        "the real non-SessionStart `agent-event --type running` CLI failed for the scheduled pane: status={:?} stdout={:?} stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let joined = daemon.wait_for_agent_where(
+        |candidate| {
+            candidate.id == agent_id
+                && candidate.pane_id_env.as_deref() == Some(pane_id.as_str())
+                && candidate
+                    .live
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.status == SessionStatus::Thinking)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        joined.is_some(),
+        "the scheduler's spawn_or_reuse pane must be admitted into daemon state so its real lifecycle report joins the registry record; expected agent={agent_id:?} pane={pane_id:?}, got {:?}",
+        daemon.agent_records()
     );
 }

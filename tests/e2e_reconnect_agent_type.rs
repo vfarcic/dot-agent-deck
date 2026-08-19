@@ -262,3 +262,72 @@ fn live_006_fresh_tui_renders_live_working_status_on_reconnect() {
          grid was:\n{grid}"
     );
 }
+
+/// Scenario: Start an ordinary pane through the real daemon `StartAgent` path, attach a real TUI, and drive the visible card to `Thinking` with the real non-`SessionStart` `agent-event --type running` CLI. Disconnect that TUI, launch a fresh PTY-attached TUI against the same daemon, and assert the rebuilt card still renders `Thinking` rather than the snapshot-absent `Idle` placeholder.
+#[spec("session/live/012")]
+#[test]
+fn live_012_agent_event_status_survives_real_tui_reconnect() {
+    const PANE_ID: &str = "pane-agent-event-reconnect";
+    const LABEL: &str = "agent-event-reconnect-42";
+
+    let daemon = spawn_daemon_serve(None, "0");
+    let response = daemon
+        .send_attach_request(&AttachRequest::StartAgent {
+            command: Some("sh -c 'sleep 600'".into()),
+            cwd: None,
+            rows: 24,
+            cols: 80,
+            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), PANE_ID.into())],
+            display_name: Some(LABEL.into()),
+            tab_membership: None,
+            agent_type: Some(AgentType::Pi),
+            seed: None,
+        })
+        .expect("StartAgent ordinary pane over the real daemon attach socket");
+    assert!(
+        response.error.is_none(),
+        "StartAgent should succeed, got error: {:?}",
+        response.error
+    );
+    let records = daemon.wait_for_agent_count(1, Duration::from_secs(5));
+    let agent_id = records
+        .first()
+        .unwrap_or_else(|| panic!("ordinary StartAgent pane never registered: {records:?}"))
+        .id
+        .clone();
+
+    let first_tui = launch_tui_against(&daemon);
+    first_tui.wait_for_string(LABEL);
+
+    let output = daemon.run_agent_event(PANE_ID, Some(&agent_id), "running");
+    assert!(
+        output.status.success(),
+        "the real non-SessionStart `agent-event --type running` CLI failed: status={:?} stdout={:?} stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    first_tui.wait_until_grid("live card shows Thinking from agent-event", |grid| {
+        grid.lines()
+            .any(|line| line.contains(LABEL) && line.contains("Thinking"))
+    });
+    drop(first_tui);
+
+    let reconnected_tui = launch_tui_against(&daemon);
+    reconnected_tui.wait_until_grid(
+        "reconnected card restores agent-event Thinking instead of Idle",
+        |grid| {
+            grid.lines()
+                .any(|line| line.contains(LABEL) && line.contains("Thinking"))
+        },
+    );
+    let grid = reconnected_tui.snapshot_grid();
+    let header = grid
+        .lines()
+        .find(|line| line.contains(LABEL))
+        .unwrap_or_else(|| panic!("reconnected grid lost the managed card {LABEL:?}:\n{grid}"));
+    assert!(
+        !header.contains("Idle"),
+        "the reconnected card must preserve Thinking rather than fall back to Idle; header={header:?}\nGrid:\n{grid}"
+    );
+}
