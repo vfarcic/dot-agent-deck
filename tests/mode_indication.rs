@@ -1467,7 +1467,7 @@ fn mode_scroll_004_pane_input_without_focus_settles_in_command_mode_once() {
     );
 }
 
-/// Scenario: Attempt failed scrolls across the notice's width boundaries, while the command banner is live, and before moving focus between two panes, then exercise its TTL, refresh, and next-key lifecycle. The notice must choose only a fitting tier without crossing the pane frame, replace the banner cleanly, remain on the pane that armed it, and dismiss without consuming the next action.
+/// Scenario: Attempt failed scrolls across the notice's width boundaries, while compact and roomy command banners are live, and before moving focus between two panes, then exercise its TTL, refresh, and next-key lifecycle. The notice must choose only a fitting tier without crossing the pane frame, replace either banner cleanly while preserving command-mode dimming, remain on the pane that armed it, and dismiss without consuming the next action.
 #[spec("mode/scroll/005")]
 #[test]
 fn mode_scroll_005_cannot_scroll_notice_renders_refreshes_and_dismisses_without_consuming_keys() {
@@ -1645,6 +1645,40 @@ fn mode_scroll_005_cannot_scroll_notice_renders_refreshes_and_dismisses_without_
             1,
         )),
         "the final frame must contain only the notice's reversed run, with no banner remnants"
+    );
+
+    let block_precedence = &observed.banner_precedence.block_render;
+    let block_precedence_text = buffer_to_text(block_precedence);
+    assert_eq!(
+        command_banner_tier(80, 7),
+        BannerTier::BlockCommandModeWithSubtitle,
+        "the roomy precedence fixture must exercise the richest block-banner tier"
+    );
+    assert_eq!(
+        block_precedence_text.matches(SCROLL_NOTICE_TEXT).count(),
+        1,
+        "at the block tier, the complete notice must render exactly once:\n{block_precedence_text}"
+    );
+    assert!(
+        !block_precedence_text.contains("COMMAND")
+            && !block_precedence_text.contains("Ctrl+D to type"),
+        "no textual block-banner remnant may survive anywhere around the notice:\n{block_precedence_text}"
+    );
+    let (block_notice_x, block_notice_y) = find_ascii_text(block_precedence, SCROLL_NOTICE_TEXT)
+        .expect("the block-tier notice must be present as one intact sentence");
+    assert_eq!(
+        modifier_bounds(block_precedence, Modifier::REVERSED),
+        Some(Rect::new(
+            block_notice_x,
+            block_notice_y,
+            full_boundary_inner_width,
+            1,
+        )),
+        "the block-tier frame's only reversed run must be the notice, with no block-letter rows surviving above or below it"
+    );
+    assert_command_inner_area_is_dimmed(
+        block_precedence,
+        "focused command pane behind the block-tier notice",
     );
 
     let affinity = &observed.pane_affinity;

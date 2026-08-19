@@ -19367,11 +19367,13 @@ pub fn observe_focused_agent_without_scroll(pane_output: &[u8]) -> FocusedPaneSc
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct ScrollNoticeRenderTierObservation {
-    /// The exact 80-column inner width where the full sentence first fits.
+    /// The exact inner width, derived from the full production sentence, where
+    /// that tier first fits.
     pub full_boundary_render: ratatui::buffer::Buffer,
     /// One column below the full sentence, where the short tier must take over.
     pub below_full_boundary_render: ratatui::buffer::Buffer,
-    /// The exact 41-column inner width where the short tier still fits.
+    /// The exact inner width, derived from the short production sentence, where
+    /// that tier still fits.
     pub short_boundary_render: ratatui::buffer::Buffer,
     /// One column below the short tier, with guard columns after the pane.
     pub below_short_boundary_render: ratatui::buffer::Buffer,
@@ -19380,11 +19382,16 @@ pub struct ScrollNoticeRenderTierObservation {
     pub below_short_control_render: ratatui::buffer::Buffer,
 }
 
-/// The frame where the command banner and cannot-scroll notice are both live.
+/// Compact and roomy frames where the command banner and cannot-scroll notice
+/// are both live.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct ScrollNoticeBannerPrecedenceObservation {
+    /// Two inner rows, where the command banner uses a single reversed line.
     pub render: ratatui::buffer::Buffer,
+    /// Seven inner rows, where the command banner would use five block-letter
+    /// rows plus its `Ctrl+D to type` subtitle.
+    pub block_render: ratatui::buffer::Buffer,
 }
 
 /// A two-pane frame after focus has moved away from the pane that armed the
@@ -19491,6 +19498,15 @@ fn observe_scroll_notice_banner_precedence(
     ScrollNoticeBannerPrecedenceObservation {
         render: scroll_notice_fixture_render(
             2,
+            80,
+            0,
+            UiMode::Normal,
+            CommandBannerVisibility::Expanded,
+            now,
+            true,
+        ),
+        block_render: scroll_notice_fixture_render(
+            7,
             80,
             0,
             UiMode::Normal,
