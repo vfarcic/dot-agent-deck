@@ -19004,10 +19004,33 @@ fn scroll_seam_pane(
     crate::embedded_pane::SeamChildInput,
     usize,
 ) {
-    let (ctrl, mut child_input) = EmbeddedPaneController::for_scroll_seam_with_focused_pane(
-        SCROLL_SEAM_PANE_ID,
+    scroll_seam_pane_with_size(
+        mouse_mode_enabled,
+        initial_scrollback,
+        pane_output,
         SCROLL_SEAM_ROWS,
         SCROLL_SEAM_COLS,
+    )
+}
+
+/// Width/height-parametric form of [`scroll_seam_pane`] for notice render-tier
+/// coverage. The ordinary routing seams retain the fixed 96x6 fixture above;
+/// only tests that need to exercise a clipping boundary vary these dimensions.
+fn scroll_seam_pane_with_size(
+    mouse_mode_enabled: bool,
+    initial_scrollback: usize,
+    pane_output: &[u8],
+    rows: u16,
+    cols: u16,
+) -> (
+    EmbeddedPaneController,
+    crate::embedded_pane::SeamChildInput,
+    usize,
+) {
+    let (ctrl, mut child_input) = EmbeddedPaneController::for_scroll_seam_with_focused_pane(
+        SCROLL_SEAM_PANE_ID,
+        rows,
+        cols,
         pane_output,
         mouse_mode_enabled,
     );
@@ -19088,13 +19111,42 @@ fn render_scroll_seam_pane_to_buffer(
     mode: UiMode,
     now: std::time::Instant,
 ) -> ratatui::buffer::Buffer {
+    render_sized_scroll_seam_pane_to_buffer(
+        ctrl,
+        mode,
+        CommandBannerVisibility::Hidden,
+        now,
+        SCROLL_SEAM_ROWS,
+        SCROLL_SEAM_COLS,
+        0,
+    )
+}
+
+/// Geometry-parametric form of [`render_scroll_seam_pane_to_buffer`].
+///
+/// `trailing_guard_cols` deliberately leaves visible buffer cells beyond the
+/// pane's right border. Narrow-tier coverage uses them to prove an overlong
+/// notice did not merely disappear from string matching while still bleeding
+/// through the frame and into an adjacent pane.
+#[allow(clippy::too_many_arguments)]
+fn render_sized_scroll_seam_pane_to_buffer(
+    ctrl: &EmbeddedPaneController,
+    mode: UiMode,
+    banner: CommandBannerVisibility,
+    now: std::time::Instant,
+    rows: u16,
+    cols: u16,
+    trailing_guard_cols: u16,
+) -> ratatui::buffer::Buffer {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    let backend = TestBackend::new(SCROLL_SEAM_COLS + 2, SCROLL_SEAM_ROWS + 2);
+    let pane_rect = Rect::new(0, 0, cols + 2, rows + 2);
+    let backend = TestBackend::new(pane_rect.width + trailing_guard_cols, pane_rect.height);
     let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
     terminal
         .draw(|frame| {
+            let pane_rects = [pane_rect];
             render_terminal_panes(
                 frame,
                 Some(ctrl),
@@ -19106,8 +19158,8 @@ fn render_scroll_seam_pane_to_buffer(
                 &None,
                 Some(SCROLL_SEAM_PANE_ID),
                 mode,
-                CommandBannerVisibility::Hidden,
-                None,
+                banner,
+                Some(&pane_rects),
                 now,
             );
         })
@@ -19245,9 +19297,46 @@ pub fn observe_focused_agent_without_scroll(pane_output: &[u8]) -> FocusedPaneSc
 /// checkpoints and the normal outcomes of both an unbound and a bound key.
 #[doc(hidden)]
 #[derive(Debug)]
+pub struct ScrollNoticeRenderTierObservation {
+    /// The exact 80-column inner width where the full sentence first fits.
+    pub full_boundary_render: ratatui::buffer::Buffer,
+    /// One column below the full sentence, where the short tier must take over.
+    pub below_full_boundary_render: ratatui::buffer::Buffer,
+    /// The exact 41-column inner width where the short tier still fits.
+    pub short_boundary_render: ratatui::buffer::Buffer,
+    /// One column below the short tier, with guard columns after the pane.
+    pub below_short_boundary_render: ratatui::buffer::Buffer,
+    /// The same narrow frame without an armed notice, used to prove the border
+    /// and guard cells were not touched by an overlong draw.
+    pub below_short_control_render: ratatui::buffer::Buffer,
+}
+
+/// The frame where the command banner and cannot-scroll notice are both live.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ScrollNoticeBannerPrecedenceObservation {
+    pub render: ratatui::buffer::Buffer,
+}
+
+/// A two-pane frame after focus has moved away from the pane that armed the
+/// cannot-scroll notice.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ScrollNoticePaneAffinityObservation {
+    pub render: ratatui::buffer::Buffer,
+    pub first_pane_rect: Rect,
+    pub second_pane_rect: Rect,
+}
+
+/// Observable lifecycle and rendering variants of one failed-scroll notice.
+#[doc(hidden)]
+#[derive(Debug)]
 pub struct ScrollNoticeLifecycleObservation {
     pub first_render: ratatui::buffer::Buffer,
     pub repeated_render: ratatui::buffer::Buffer,
+    pub render_tiers: ScrollNoticeRenderTierObservation,
+    pub banner_precedence: ScrollNoticeBannerPrecedenceObservation,
+    pub pane_affinity: ScrollNoticePaneAffinityObservation,
     pub visible_after_first_scroll: bool,
     pub visible_just_before_expiry: bool,
     pub visible_at_expiry: bool,
@@ -19263,6 +19352,143 @@ pub struct ScrollNoticeLifecycleObservation {
     pub visible_after_bound_key: bool,
     pub bound_key_forwarded_bytes: Vec<u8>,
     pub bound_mode_after_key: UiMode,
+}
+
+fn scroll_notice_fixture_render(
+    rows: u16,
+    cols: u16,
+    trailing_guard_cols: u16,
+    mode: UiMode,
+    banner: CommandBannerVisibility,
+    now: std::time::Instant,
+    arm_notice: bool,
+) -> ratatui::buffer::Buffer {
+    let pane_output = synthetic_decstbm_repaint_stream(rows, cols);
+    let (ctrl, _child_input, _) = scroll_seam_pane_with_size(false, 0, &pane_output, rows, cols);
+    if arm_notice {
+        scroll_focused_agent_pane(&ctrl, SCROLL_SEAM_PANE_ID, mode, true, 3, 1, now);
+    }
+    render_sized_scroll_seam_pane_to_buffer(
+        &ctrl,
+        mode,
+        banner,
+        now,
+        rows,
+        cols,
+        trailing_guard_cols,
+    )
+}
+
+fn observe_scroll_notice_render_tiers(
+    now: std::time::Instant,
+) -> ScrollNoticeRenderTierObservation {
+    const FULL_BOUNDARY_COLS: u16 = 80;
+    const SHORT_BOUNDARY_COLS: u16 = 41;
+    const BELOW_SHORT_GUARD_COLS: u16 = FULL_BOUNDARY_COLS - SHORT_BOUNDARY_COLS + 1;
+
+    let render = |cols, guard, arm_notice| {
+        scroll_notice_fixture_render(
+            SCROLL_SEAM_ROWS,
+            cols,
+            guard,
+            UiMode::PaneInput,
+            CommandBannerVisibility::Hidden,
+            now,
+            arm_notice,
+        )
+    };
+    ScrollNoticeRenderTierObservation {
+        full_boundary_render: render(FULL_BOUNDARY_COLS, 0, true),
+        below_full_boundary_render: render(FULL_BOUNDARY_COLS - 1, 0, true),
+        short_boundary_render: render(SHORT_BOUNDARY_COLS, 0, true),
+        below_short_boundary_render: render(SHORT_BOUNDARY_COLS - 1, BELOW_SHORT_GUARD_COLS, true),
+        below_short_control_render: render(SHORT_BOUNDARY_COLS - 1, BELOW_SHORT_GUARD_COLS, false),
+    }
+}
+
+fn observe_scroll_notice_banner_precedence(
+    now: std::time::Instant,
+) -> ScrollNoticeBannerPrecedenceObservation {
+    // Two inner rows select the command banner's single-line tier, putting both
+    // announcements on exactly the same row. The notice is wider, so drawing it
+    // last must replace the banner completely rather than leave interleaved text.
+    ScrollNoticeBannerPrecedenceObservation {
+        render: scroll_notice_fixture_render(
+            2,
+            80,
+            0,
+            UiMode::Normal,
+            CommandBannerVisibility::Expanded,
+            now,
+            true,
+        ),
+    }
+}
+
+fn observe_scroll_notice_pane_affinity(
+    now: std::time::Instant,
+) -> ScrollNoticePaneAffinityObservation {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    const COLS: u16 = 80;
+    let pane_output = synthetic_decstbm_repaint_stream(SCROLL_SEAM_ROWS, COLS);
+    let (ctrl, _first_child_input, _) =
+        scroll_seam_pane_with_size(false, 0, &pane_output, SCROLL_SEAM_ROWS, COLS);
+    let _second_child_input = ctrl.add_scroll_seam_pane(
+        RECONCILE_SEAM_SECOND_PANE_ID,
+        SCROLL_SEAM_ROWS,
+        COLS,
+        &pane_output,
+    );
+    scroll_focused_agent_pane(
+        &ctrl,
+        SCROLL_SEAM_PANE_ID,
+        UiMode::PaneInput,
+        true,
+        3,
+        1,
+        now,
+    );
+    focus_reconcile_seam_pane(&ctrl, ReconcileSeamPane::Second);
+    assert_eq!(
+        ctrl.focused_pane_id().as_deref(),
+        Some(RECONCILE_SEAM_SECOND_PANE_ID),
+        "the affinity seam must move production focus to its second pane"
+    );
+
+    let pane_width = COLS + 2;
+    let pane_height = SCROLL_SEAM_ROWS + 2;
+    let backend = TestBackend::new(pane_width, pane_height * 2);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            render_terminal_panes(
+                frame,
+                Some(&ctrl),
+                frame.area(),
+                &[
+                    SCROLL_SEAM_PANE_ID.to_string(),
+                    RECONCILE_SEAM_SECOND_PANE_ID.to_string(),
+                ],
+                PaneLayout::Tiled,
+                &HashMap::new(),
+                &HashMap::new(),
+                &None,
+                None,
+                UiMode::PaneInput,
+                CommandBannerVisibility::Hidden,
+                None,
+                now,
+            );
+        })
+        .expect("TestBackend draw should succeed");
+
+    ScrollNoticePaneAffinityObservation {
+        render: terminal.backend().buffer().clone(),
+        first_pane_rect: Rect::new(0, 0, pane_width, pane_height),
+        second_pane_rect: Rect::new(0, pane_height, pane_width, pane_height),
+    }
 }
 
 fn observe_scroll_notice_key(key: KeyEvent) -> (bool, bool, Vec<u8>, UiMode) {
@@ -19401,10 +19627,16 @@ pub fn observe_scroll_notice_lifecycle(
         bound_key_forwarded_bytes,
         bound_mode_after_key,
     ) = observe_scroll_notice_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    let render_tiers = observe_scroll_notice_render_tiers(epoch);
+    let banner_precedence = observe_scroll_notice_banner_precedence(epoch);
+    let pane_affinity = observe_scroll_notice_pane_affinity(epoch);
 
     ScrollNoticeLifecycleObservation {
         first_render,
         repeated_render,
+        render_tiers,
+        banner_precedence,
+        pane_affinity,
         visible_after_first_scroll,
         visible_just_before_expiry,
         visible_at_expiry,

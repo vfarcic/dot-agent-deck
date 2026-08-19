@@ -40,10 +40,14 @@ const TYPING_CHIP: &str = " TYPING ";
 
 fn buffer_to_text(buffer: &Buffer) -> String {
     let area = buffer.area();
-    (0..area.height)
-        .map(|y| {
-            (0..area.width)
-                .map(|x| buffer[(x, y)].symbol())
+    rect_to_text(buffer, *area)
+}
+
+fn rect_to_text(buffer: &Buffer, rect: Rect) -> String {
+    (0..rect.height)
+        .map(|row| {
+            (0..rect.width)
+                .map(|col| buffer[(rect.x + col, rect.y + row)].symbol())
                 .collect::<String>()
                 .trim_end()
                 .to_string()
@@ -1463,10 +1467,14 @@ fn mode_scroll_004_pane_input_without_focus_settles_in_command_mode_once() {
     );
 }
 
-/// Scenario: Attempt a wheel scroll on a mature cursor-repainting pane, render around the shared banner TTL, repeat the failed scroll midway, and then try an unbound printable key and a bound mode key from freshly armed panes. The notice must be a single reversed line, expire and refresh exactly, and every next key must dismiss it without losing that key's normal forwarding or mode transition.
+/// Scenario: Attempt failed scrolls across the notice's width boundaries, while the command banner is live, and before moving focus between two panes, then exercise its TTL, refresh, and next-key lifecycle. The notice must choose only a fitting tier without crossing the pane frame, replace the banner cleanly, remain on the pane that armed it, and dismiss without consuming the next action.
 #[spec("mode/scroll/005")]
 #[test]
 fn mode_scroll_005_cannot_scroll_notice_renders_refreshes_and_dismisses_without_consuming_keys() {
+    const SHORT_NOTICE: &str = "Nothing to scroll — this agent keeps none";
+    const FULL_BOUNDARY_INNER_WIDTH: u16 = 80;
+    const SHORT_BOUNDARY_INNER_WIDTH: u16 = 41;
+
     let observed = observe_scroll_notice_lifecycle(Instant::now());
     assert!(
         observed.visible_after_first_scroll,
@@ -1517,6 +1525,133 @@ fn mode_scroll_005_cannot_scroll_notice_renders_refreshes_and_dismisses_without_
             .height,
         1,
         "the cannot-scroll notice must render on one line"
+    );
+
+    assert_eq!(
+        SCROLL_NOTICE_TEXT.chars().count() as u16,
+        FULL_BOUNDARY_INNER_WIDTH,
+        "the full-tier boundary must stay tied to the complete production sentence"
+    );
+    assert_eq!(
+        SHORT_NOTICE.chars().count() as u16,
+        SHORT_BOUNDARY_INNER_WIDTH,
+        "the short-tier boundary must stay tied to its complete sentence"
+    );
+    let tiers = &observed.render_tiers;
+    let full_boundary_text = buffer_to_text(&tiers.full_boundary_render);
+    assert_eq!(
+        full_boundary_text.matches(SCROLL_NOTICE_TEXT).count(),
+        1,
+        "an 80-column inner pane must render the full tier exactly once:\n{full_boundary_text}"
+    );
+    assert_eq!(
+        find_ascii_text(&tiers.full_boundary_render, SCROLL_NOTICE_TEXT),
+        Some((1, 3)),
+        "the full sentence must fit exactly between the pane borders at its width boundary"
+    );
+
+    let below_full_text = buffer_to_text(&tiers.below_full_boundary_render);
+    assert!(
+        !below_full_text.contains(SCROLL_NOTICE_TEXT),
+        "one column below the full boundary must not draw the overlong tier:\n{below_full_text}"
+    );
+    assert_eq!(
+        below_full_text.matches(SHORT_NOTICE).count(),
+        1,
+        "a 79-column inner pane must fall back to the short tier exactly once:\n{below_full_text}"
+    );
+    assert_eq!(
+        find_ascii_text(&tiers.below_full_boundary_render, SHORT_NOTICE),
+        Some((20, 3)),
+        "the short fallback must remain centred one column below the full-tier boundary"
+    );
+
+    let short_boundary_text = buffer_to_text(&tiers.short_boundary_render);
+    assert_eq!(
+        short_boundary_text.matches(SHORT_NOTICE).count(),
+        1,
+        "a 41-column inner pane must still render the complete short tier:\n{short_boundary_text}"
+    );
+    assert_eq!(
+        find_ascii_text(&tiers.short_boundary_render, SHORT_NOTICE),
+        Some((1, 3)),
+        "the short sentence must fit exactly between the borders at its width boundary"
+    );
+    let short_lower = SHORT_NOTICE.to_ascii_lowercase();
+    assert!(
+        !short_lower.contains("pageup") && !short_lower.contains("page up"),
+        "the narrow tier must not offer PageUp on the same zero-depth pane"
+    );
+
+    let below_short_text = buffer_to_text(&tiers.below_short_boundary_render);
+    assert!(
+        !below_short_text.contains(SCROLL_NOTICE_TEXT) && !below_short_text.contains(SHORT_NOTICE),
+        "a 40-column inner pane must omit both notice tiers:\n{below_short_text}"
+    );
+    assert!(
+        modifier_bounds(&tiers.below_short_boundary_render, Modifier::REVERSED).is_none(),
+        "the omitted tier must not leave even a clipped reversed run in the frame"
+    );
+    let omitted_notice_row = 3;
+    let omitted_right_border = SHORT_BOUNDARY_INNER_WIDTH;
+    for x in [0, omitted_right_border] {
+        assert_eq!(
+            tiers.below_short_boundary_render[(x, omitted_notice_row)],
+            tiers.below_short_control_render[(x, omitted_notice_row)],
+            "omitting the notice must leave border cell ({x}, {omitted_notice_row}) untouched"
+        );
+    }
+    for x in omitted_right_border + 1..tiers.below_short_boundary_render.area().width {
+        assert_eq!(
+            tiers.below_short_boundary_render[(x, omitted_notice_row)],
+            tiers.below_short_control_render[(x, omitted_notice_row)],
+            "omitting the notice must not spill into guard column {x} beyond the pane frame"
+        );
+    }
+
+    let precedence = &observed.banner_precedence.render;
+    let precedence_text = buffer_to_text(precedence);
+    assert_eq!(
+        precedence_text.matches(SCROLL_NOTICE_TEXT).count(),
+        1,
+        "when both transient messages are live, the complete notice must win:\n{precedence_text}"
+    );
+    assert!(
+        !precedence_text.contains("COMMAND") && !precedence_text.contains("Ctrl+D to type"),
+        "the notice must replace the single-line command banner rather than interleave with it:\n{precedence_text}"
+    );
+    let (precedence_x, precedence_y) = find_ascii_text(precedence, SCROLL_NOTICE_TEXT)
+        .expect("the winning notice must be present as one intact sentence");
+    assert_eq!(
+        modifier_bounds(precedence, Modifier::REVERSED),
+        Some(Rect::new(
+            precedence_x,
+            precedence_y,
+            FULL_BOUNDARY_INNER_WIDTH,
+            1,
+        )),
+        "the final frame must contain only the notice's reversed run, with no banner remnants"
+    );
+
+    let affinity = &observed.pane_affinity;
+    let first_pane_text = rect_to_text(&affinity.render, affinity.first_pane_rect);
+    let second_pane_text = rect_to_text(&affinity.render, affinity.second_pane_rect);
+    assert_eq!(
+        first_pane_text.matches(SCROLL_NOTICE_TEXT).count(),
+        1,
+        "after focus moves away, the notice must remain on the pane that armed it:\n{first_pane_text}"
+    );
+    assert_eq!(
+        second_pane_text.matches(SCROLL_NOTICE_TEXT).count(),
+        0,
+        "the newly focused pane must not inherit another pane's notice:\n{second_pane_text}"
+    );
+    assert_eq!(
+        buffer_to_text(&affinity.render)
+            .matches(SCROLL_NOTICE_TEXT)
+            .count(),
+        1,
+        "the two-pane frame must contain exactly one notice, on its arming pane"
     );
 
     assert!(
