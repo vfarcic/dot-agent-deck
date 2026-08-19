@@ -6032,6 +6032,11 @@ impl AgentPtyRegistry {
                 pty_rows: 24,
                 pty_cols: 80,
                 exited: Arc::new(AtomicBool::new(false)),
+                // Issue #454: `false` is the birth value — the flag latches to
+                // `true` only when a *successor* takes this record's pane, and
+                // this synthetic agent holds no pane at all (`pane_id_env:
+                // None`), so nothing can ever hand one over.
+                pane_handed_over: false,
                 pending_seed: None,
                 seed_delivered_native: false,
             },
