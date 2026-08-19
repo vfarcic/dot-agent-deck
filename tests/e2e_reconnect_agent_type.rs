@@ -308,8 +308,10 @@ fn live_012_agent_event_status_survives_real_tui_reconnect() {
         String::from_utf8_lossy(&output.stderr)
     );
     first_tui.wait_until_grid("live card shows Thinking from agent-event", |grid| {
-        grid.lines()
-            .any(|line| line.contains(LABEL) && line.contains("Thinking"))
+        grid.contains(LABEL)
+            && grid
+                .lines()
+                .any(|line| line.contains("Pi") && line.contains("Thinking"))
     });
     drop(first_tui);
 
@@ -317,14 +319,16 @@ fn live_012_agent_event_status_survives_real_tui_reconnect() {
     reconnected_tui.wait_until_grid(
         "reconnected card restores agent-event Thinking instead of Idle",
         |grid| {
-            grid.lines()
-                .any(|line| line.contains(LABEL) && line.contains("Thinking"))
+            grid.contains(LABEL)
+                && grid
+                    .lines()
+                    .any(|line| line.contains("Pi") && line.contains("Thinking"))
         },
     );
     let grid = reconnected_tui.snapshot_grid();
     let header = grid
         .lines()
-        .find(|line| line.contains(LABEL))
+        .find(|line| line.contains("Pi") && line.contains("Thinking"))
         .unwrap_or_else(|| panic!("reconnected grid lost the managed card {LABEL:?}:\n{grid}"));
     assert!(
         !header.contains("Idle"),
