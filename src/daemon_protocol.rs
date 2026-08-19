@@ -818,10 +818,18 @@ pub async fn serve_attach_with_counter(
     // `AppState::apply_event` falls back to the pane set alone and every
     // lifecycle report from an ordinary daemon-spawned pane is dropped as
     // unowned. Idempotent — `run_daemon_with` installs the same registry.
-    state
-        .write()
-        .await
-        .set_agent_ownership(registry.clone() as Arc<dyn crate::state::AgentOwnership>);
+    //
+    // Weakly — see the same call in `crate::daemon::run_daemon_with` for the
+    // reference cycle a strong reference closes. `registry` is this function's
+    // own argument and outlives the loop below, so the oracle stays answerable
+    // for as long as the server runs.
+    {
+        let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+        state
+            .write()
+            .await
+            .set_agent_ownership(Arc::downgrade(&ownership));
+    }
     // PRD #93 round-2 reviewer REV-1: the same Notify the registry uses for
     // spawn/close/exit transitions also fires on every attach-counter
     // transition. The daemon's edge-triggered idle monitor waits on it, so
@@ -1368,20 +1376,37 @@ async fn handle_connection(
                     // `crate::state::AgentOwnership` once at startup and the
                     // registry answers each question as it is asked — from
                     // before the child exists (the spawn reservation) until
-                    // the moment it dies. See `AgentPtyRegistry::owns_pane`.
+                    // its record is reaped. See
+                    // `AgentPtyRegistry::owns_generation`.
                     //
                     // WHAT IS ACTUALLY GUARANTEED, stated narrowly because the
-                    // wider claim this comment used to make was false: a
-                    // NON-`SessionStart` event is admitted only for an agent
-                    // this daemon spawned and still owns, or for a pane
-                    // explicitly registered by this process (an orchestration
-                    // role below, or the auto-registration in the next line).
+                    // wider claim this comment used to make was false. A
+                    // NON-`SessionStart` event is admitted only when one of
+                    // these holds:
+                    //
+                    // * it names an `agent_id`, and that GENERATION holds the
+                    //   pane it names — live, or retired with the pane not yet
+                    //   claimed by anyone else (round 2: pane-scoped was not
+                    //   enough, because a pane id is a reusable slot);
+                    // * it names NO `agent_id` and some generation holds the
+                    //   pane. There is nothing to bind such an event to, and
+                    //   PRD #110 / issue #398 keep the shape working
+                    //   deliberately, so a same-uid process that omits the id
+                    //   can still drive a card on a pane this daemon owns.
+                    //   Unchanged by round 2 and stated because it is the
+                    //   residual;
+                    // * the pane was explicitly registered by this process (an
+                    //   orchestration role below, or the auto-registration in
+                    //   the next line). Registration is pane-scoped by design —
+                    //   the registrant is asserting the pane, not a generation.
+                    //
                     // A `SessionStart` is weaker on purpose — `apply_event`
-                    // auto-registers any pane id it names except the synthetic
-                    // `__dead-slot__-…` shape, to cover the TUI startup race
-                    // where the hook beats `register_pane` — so a same-uid
-                    // process CAN mint a card for a pane nobody spawned by
-                    // forging one. That is pre-existing, it is not a
+                    // auto-registers a pane id it names, unless the id is the
+                    // synthetic `__dead-slot__-…` shape or the registry already
+                    // holds a generation for that pane — to cover the TUI
+                    // startup race where the hook beats `register_pane`. So a
+                    // same-uid process CAN mint a card for a pane NOBODY
+                    // spawned by forging one. That is pre-existing, it is not a
                     // cross-user escalation (both sockets are owner-only and
                     // an attach peer can already write to agents directly),
                     // and closing it is tracked separately; it is stated here
@@ -1481,8 +1506,51 @@ async fn handle_connection(
             // `unregister_pane` and the dispatched-worktree cleanup. And it was
             // skipped permanently — `close_agent` drops the entry in this same
             // handler, so no later call could repair it.
+            //
+            // Round-2 audit (blocker C): reading a DEAD agent's pane back is
+            // what makes the cleanup below reachable at all, and it is also
+            // what makes it dangerous — because every step after this lookup is
+            // PANE-scoped while the agent being stopped is not. The registry
+            // deliberately lets a live agent B reuse the pane a dead agent A
+            // left; a `StopAgent(A)` arriving after that (a stale client, or
+            // just ordinary lifecycle ordering) would then mark B's pane
+            // closing, cancel B's prompt confirmation and every delegation
+            // touching it, and `unregister_pane` B's role, cwd, orchestrator
+            // marker and routing identity. That is strictly worse than the leak
+            // it replaced: before the round-1 fix the filtered lookup found
+            // nothing for A and cleanup was skipped, so stale state lingered but
+            // no LIVE agent's state was deleted.
+            //
+            // So the pane travels into the cleanup only while it is still A's to
+            // give up: nobody live holds it, or A itself still does. Anything
+            // else and A owes the pane nothing — its successor owns it, and
+            // owns the cleanup of it too. `close_agent(&id)` below is keyed by
+            // registry id and is unaffected either way; it is only the
+            // pane-scoped work that is gated. The dispatched-worktree cleanup
+            // keeps reading the record directly: it is guarded by its own
+            // `worktree_still_in_use` sweep over the live records, which is the
+            // same "is anyone else using this?" question asked of a worktree
+            // instead of a pane.
             let stopping_record = registry.agent_record_any(&id);
-            let pane_id_env = stopping_record.as_ref().and_then(|r| r.pane_id_env.clone());
+            let pane_id_env = stopping_record
+                .as_ref()
+                .and_then(|r| r.pane_id_env.clone())
+                .filter(|pane| match registry.pane_current_agent_id(pane) {
+                    Some(current) => {
+                        let ours = current == id;
+                        if !ours {
+                            tracing::debug!(
+                                pane_id = %pane,
+                                stopping = %id,
+                                current = %current,
+                                "StopAgent: skipping pane-scoped cleanup; the pane \
+                                 has already been taken over by a live agent"
+                            );
+                        }
+                        ours
+                    }
+                    None => true,
+                });
             let dispatched_worktree = stopping_record
                 .as_ref()
                 .and_then(crate::issue_dispatch_run::worktree_of_record);
@@ -2565,12 +2633,19 @@ mod tests {
         }
 
         // Half one — natural exit WITHOUT a stop. The role registration still
-        // stands (nothing has taken it back yet), but a paneless agent's events
-        // are no longer collateral damage and, once the role entry is gone
-        // below, the dead id admits nothing at all.
+        // stands (nothing has taken it back yet), and the retired generation
+        // still owns its OWN pane, because its final report can still be in
+        // flight (round-2 reviewer blocker B). What it does NOT do is speak for
+        // anyone else's id, and once the role entry AND the registry record are
+        // gone below, the dead pane admits nothing at all.
         assert!(
-            !registry.owns_pane(pane_id),
-            "the registry must stop owning a pane whose child has exited"
+            registry.owns_generation(Some(pane_id), Some(&agent_id)),
+            "a retired generation still owns its own pane until something \
+             claims or reaps it"
+        );
+        assert!(
+            !registry.owns_generation(Some(pane_id), Some("some-other-id-454")),
+            "but it does not make the pane a bearer token for any other id"
         );
 
         // Half two — the later `StopAgent` still finds the metadata it needs.
@@ -2597,6 +2672,173 @@ mod tests {
                 guard.sessions.is_empty(),
                 "a report naming the dead pane must be refused; sessions={:?}",
                 guard.sessions.keys().collect::<Vec<_>>()
+            );
+        }
+
+        registry.shutdown_all();
+        server.abort();
+    }
+
+    /// Round-2 audit, blocker C — and a regression the round-1 fix INTRODUCED,
+    /// which is why it is worth a test of its own rather than a clause in the
+    /// one above.
+    ///
+    /// `agent_record_any` deliberately resolves a dead agent's pane so that
+    /// `StopAgent` can clean up after a child that died on its own. But every
+    /// cleanup step downstream of that lookup is PANE-scoped while the agent
+    /// being stopped is not, and the registry explicitly permits a live agent to
+    /// reuse a dead one's pane id. So: A dies, B takes pane P, a stale
+    /// `StopAgent(A)` arrives — and the handler marked P closing, cancelled
+    /// every delegation touching it, and `unregister_pane`d B's role, cwd,
+    /// orchestrator marker and routing identity. Reachable through ordinary
+    /// lifecycle ordering, not only a malicious client.
+    ///
+    /// On `main` this could not happen for the opposite reason: the filtered
+    /// lookup found nothing for A, so cleanup was skipped entirely. Stale state
+    /// leaked, but no LIVE agent's state was ever deleted. The fix has to keep
+    /// the first behaviour without buying the second, so the pane travels into
+    /// the cleanup only while it is still A's to give up.
+    ///
+    /// The ORDER is the finding: A exits, B claims the pane, and only then is A
+    /// stopped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_a_retired_agent_leaves_its_panes_new_occupant_alone() {
+        use crate::daemon_client::{DaemonClient, StartAgentOptions};
+
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+
+        let server = {
+            let sock = sock.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let pane_id = "handover-pane-454";
+        let client = DaemonClient::new(sock.clone());
+        let role_spawn = |command: &str, role: &str| {
+            let dir_path = dir.path().to_string_lossy().into_owned();
+            StartAgentOptions {
+                command: Some(command.to_string()),
+                cwd: Some(dir_path.clone()),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                tab_membership: Some(crate::agent_pty::TabMembership::Orchestration {
+                    name: "handover-orch-454".to_string(),
+                    role_index: 0,
+                    role_name: role.to_string(),
+                    is_start_role: false,
+                    orchestration_cwd: Some(dir_path),
+                    display_title: None,
+                    orchestration_id: Some("orch-handover-454".to_string()),
+                }),
+                ..StartAgentOptions::default()
+            }
+        };
+
+        // Generation A takes the pane and immediately dies.
+        let old_id = client
+            .start_agent(role_spawn("/usr/bin/true", "worker-a"))
+            .await
+            .expect("spawn the first role pane");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first child never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Generation B takes the pane over — which the registry allows and the
+        // daemon re-registers under B's own role.
+        let new_id = client
+            .start_agent(role_spawn("/bin/sh", "worker-b"))
+            .await
+            .expect("the pane must be reusable once its child is gone");
+        assert_eq!(
+            registry.pane_current_agent_id(pane_id).as_deref(),
+            Some(new_id.as_str()),
+            "precondition: the live agent on the pane is the second generation"
+        );
+
+        // B has work outstanding against it, which is what the pane-scoped
+        // cleanup would sweep.
+        let armed = registry
+            .arm_outstanding_delegation(
+                pane_id,
+                "worker-b",
+                "orchestrator-pane-454",
+                "orchestrator-agent-454",
+                None,
+            )
+            .expect("precondition: arming a delegation on the live pane must succeed");
+
+        // Only now does the stale stop for the RETIRED generation arrive.
+        client
+            .stop_agent(&old_id)
+            .await
+            .expect("stop the already-dead first generation");
+
+        assert_eq!(
+            registry.pane_current_agent_id(pane_id).as_deref(),
+            Some(new_id.as_str()),
+            "stopping a retired generation must not touch the live agent that \
+             took its pane"
+        );
+        assert!(
+            registry
+                .take_outstanding_delegation_if(pane_id, armed.seq)
+                .is_some(),
+            "the live agent's outstanding delegation must survive — the \
+             pane-scoped `begin_pane_close` sweep would have cancelled it, \
+             silently dropping in-flight orchestration work"
+        );
+        assert!(
+            !registry.is_pane_closing(pane_id),
+            "the live agent's pane must not be left marked closing"
+        );
+
+        {
+            let guard = state.read().await;
+            assert!(
+                guard.managed_pane_ids.contains(pane_id),
+                "the live agent's pane must stay registered; managed={:?}",
+                guard.managed_pane_ids
+            );
+            assert_eq!(
+                guard.pane_role_map.get(pane_id).map(String::as_str),
+                Some("worker-b"),
+                "the live agent's ROLE must survive — losing it means every \
+                 later delegate to `worker-b` resolves nothing"
+            );
+            assert!(guard.pane_cwd_map.contains_key(pane_id), "…and its cwd");
+            assert!(
+                guard.pane_orchestration_map.contains_key(pane_id),
+                "…and its routing identity"
             );
         }
 

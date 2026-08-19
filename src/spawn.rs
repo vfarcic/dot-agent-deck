@@ -395,12 +395,23 @@ pub fn orchestrator_role_index(roles: &[RoleSpawn]) -> usize {
 /// `state` is the daemon's [`AppState`](crate::state::AppState). It is what makes
 /// a daemon-spawned ORCHESTRATION able to delegate: the role → pane maps
 /// `handle_delegate` routes on are populated from here, exactly as the
-/// `AttachRequest::StartAgent` handler populates them for a `Ctrl+N` one. It is
-/// ALSO what makes a daemon-spawned pane's live status visible at all (issue
-/// #454): every spawned pane is registered in `managed_pane_ids`, without which
-/// `AppState::apply_event` drops the pane's lifecycle reports as unowned. `None`
+/// `AttachRequest::StartAgent` handler populates them for a `Ctrl+N` one. `None`
 /// (tests, and any caller with no daemon state) spawns as before and simply
 /// registers nothing.
+///
+/// It is NOT what makes a spawned pane's live status visible — issue #454 round
+/// 1 briefly made it so, by registering every spawned pane in
+/// `managed_pane_ids`, and that is the model this doc used to describe. It was
+/// replaced (round 2, reviewer nit F is this paragraph): registration is
+/// permanent and pane-scoped, so it survived the child's death, admitted
+/// forged reports for a pane with no process behind it, and grew by one entry
+/// per short-lived pane. Admission now asks
+/// [`AgentPtyRegistry`](crate::agent_pty::AgentPtyRegistry) which GENERATION
+/// owns the pane, from before the child is forked until its record is reaped
+/// (`crate::state::AgentOwnership`), so a single-agent pane is registered
+/// NOWHERE here and needs to be. Only ORCHESTRATION roles still register — that
+/// registration exists for role → pane routing, not for admission, and
+/// `unregister_pane` on close is what takes it back.
 pub async fn spawn(
     req: SpawnRequest,
     registry: &Arc<AgentPtyRegistry>,

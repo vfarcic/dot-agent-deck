@@ -546,10 +546,24 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // Installed here so a HOOK-ONLY daemon (no attach server, `Daemon::new`)
     // gets it too; `serve_attach_with_counter` installs the same registry again
     // for the harnesses that serve the attach protocol without this function.
-    state
-        .write()
-        .await
-        .set_agent_ownership(pty_registry.clone() as Arc<dyn crate::state::AgentOwnership>);
+    //
+    // WEAKLY, and that is load-bearing (round-2 reviewer blocker A): the
+    // registry owns the delivery-notice sink installed a few lines below, whose
+    // closure holds a strong `SharedState`. A strong reference from `AppState`
+    // back to the registry closes the cycle
+    // `AppState -> AgentPtyRegistry -> sink -> SharedState -> AppState`, and the
+    // `drop(pty_registry)` at the end of this function then releases nothing —
+    // so `AgentPtyRegistry::drop`, the RAII teardown that kills this daemon's
+    // PTYs when the task is aborted or an accept loop errors out, never runs.
+    // `pty_registry` below is the strong reference that keeps the oracle
+    // answerable, and it lives exactly as long as this daemon does.
+    {
+        let ownership: Arc<dyn crate::state::AgentOwnership> = pty_registry.clone();
+        state
+            .write()
+            .await
+            .set_agent_ownership(Arc::downgrade(&ownership));
+    }
     let event_tx = daemon.event_tx;
     // Issue #424: give the spawn-time delivery path a way to REPORT a failed
     // delivery as state on the pane's card instead of typing a diagnostic line
@@ -3128,5 +3142,127 @@ mod hook_ingestion_tests {
         handle.abort();
         let _ = handle.await;
         registry.shutdown_all();
+    }
+
+    /// Is `pid` gone? Mirrors `agent_pty::spawn_tests::pid_is_dead`, which is
+    /// private to that module. Unix-only, like this whole block.
+    fn pid_is_dead(pid: u32) -> bool {
+        let r = unsafe { libc::kill(pid as i32, 0) };
+        if r == 0 {
+            return false;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    /// Round-2 reviewer, blocker A: the daemon's two back-references must not
+    /// close a cycle, because `AgentPtyRegistry::drop` is what kills this
+    /// daemon's PTYs.
+    ///
+    /// `run_daemon_with` builds exactly this shape: the registry owns the
+    /// delivery-notice sink, whose installed closure holds a strong
+    /// `SharedState`; and `AppState` holds the registry as its ownership oracle.
+    /// With a strong `Arc` on the second edge the loop closes —
+    /// `AppState -> AgentPtyRegistry -> sink -> SharedState -> AppState` — and
+    /// the explicit `drop(pty_registry)` at the end of `run_daemon_with`
+    /// releases one reference out of a set that keeps each other alive. The
+    /// registry's documented RAII guarantee ("dropping or aborting the daemon
+    /// kills its PTYs") then silently does not hold, and the whole daemon state
+    /// is retained for the process's lifetime. Signal and protocol shutdown
+    /// drain explicitly and are unaffected; an ABORTED task or an accept loop
+    /// that returns an error — which the contract explicitly covers — is not.
+    ///
+    /// So the teardown is observed rather than argued: after the last reference
+    /// a daemon would hold goes away, the registry is really gone AND the child
+    /// it owned is really dead. The oracle is exercised first, so a test that
+    /// "passes" by never having wired the thing up cannot happen.
+    #[tokio::test]
+    async fn dropping_the_daemons_registry_still_reaps_its_children() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, _rx) = broadcast::channel(16);
+
+        const PANE_ID: &str = "teardown-pane-454";
+        let agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE_ID.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a long-lived child");
+        let pid = registry
+            .child_pid(&agent_id)
+            .expect("the child must expose a pid");
+
+        // The two back-references, installed exactly as `run_daemon_with`
+        // installs them.
+        install_delivery_notice_sink(&registry, state.clone(), event_tx.clone());
+        {
+            let ownership: Arc<dyn crate::state::AgentOwnership> = registry.clone();
+            state
+                .write()
+                .await
+                .set_agent_ownership(Arc::downgrade(&ownership));
+        }
+
+        // Precondition: the oracle actually answers through that edge. Without
+        // this the assertions below would also pass on a daemon that never
+        // installed one.
+        {
+            let mut guard = state.write().await;
+            guard.apply_event(AgentEvent {
+                session_id: format!("{PANE_ID}-session"),
+                agent_type: AgentType::Pi,
+                event_type: crate::event::EventType::Thinking,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some(PANE_ID.to_string()),
+                agent_id: Some(agent_id.clone()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            });
+            assert!(
+                guard
+                    .sessions
+                    .values()
+                    .any(|s| s.pane_id.as_deref() == Some(PANE_ID)),
+                "precondition: the installed oracle must admit the spawned \
+                 pane's own report"
+            );
+        }
+
+        // Everything a daemon would drop when its task is aborted.
+        let weak = Arc::downgrade(&registry);
+        drop(registry);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "the registry must be dropped once the daemon lets go of it — a \
+             strong reference from AppState back to it closes a cycle through \
+             the delivery-notice sink, and `AgentPtyRegistry::drop` then never \
+             runs at all"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !pid_is_dead(pid) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "pid {pid} is still alive after the registry was dropped; the \
+                 RAII teardown that kills this daemon's PTYs did not run"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The state outlives the registry, and its oracle now answers "not
+        // owned" instead of dangling.
+        assert!(
+            state.read().await.sessions.len() == 1,
+            "the daemon state itself is unaffected by the registry going away"
+        );
     }
 }

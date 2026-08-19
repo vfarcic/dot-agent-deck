@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{RwLock, broadcast};
@@ -446,19 +446,80 @@ impl OrchestrationIdentity {
 /// this oracle and the question is answered from the registry each time it is
 /// asked. A process with no registry (the TUI, and every unit test that builds a
 /// bare [`AppState`]) installs none and keeps the historical pane-set rule.
+///
+/// # The question is about a GENERATION, not about a pane
+///
+/// Round-2 review + audit: the first version of this trait asked "does anyone
+/// own pane P?" and both reviewers, from different angles, found the same hole.
+/// A pane outlives the agents that occupy it — a pane id is deliberately
+/// REUSABLE once its child is gone — so a pane-keyed answer says nothing about
+/// WHICH occupant an event belongs to. Two failures followed from that one gap:
+/// a late event from a retired generation was admitted against the live one that
+/// had since taken the pane over, and (the mirror image) a retired generation's
+/// own final report was refused because `exited` was read as instantaneous loss
+/// of ownership. So the query takes BOTH keys an event carries and answers about
+/// the pair.
+///
+/// # The rule
+///
+/// A **generation** is one spawn: a registry id, from the moment its spawn is
+/// reserved (before the child is forked) until its record is reaped. It is
+/// *live* while its child runs and *retired* once the child has exited but its
+/// record still stands. Registry ids are never reused.
+///
+/// | event `(pane_id, agent_id)` | admitted when |
+/// |---|---|
+/// | `(Some(P), Some(A))` | generation `A` claims pane `P`, **and** `A` is live, or `A` is retired and no other generation claims `P` |
+/// | `(Some(P), None)` | some generation claims `P` — the producer named none, so the pane is all there is to go on |
+/// | `(None, Some(A))` | `A` is a genuinely pane-less generation (live or retired) |
+/// | `(None, None)` | never — [`AppState`] falls back to its historical rule |
+///
+/// The second clause of the first row is the "how long does an exited generation
+/// still own its own in-flight events" rule, and it is deliberately stated
+/// without a clock. The hook transport is fire-and-forget: a child can write its
+/// final `Idle`/`SessionEnd`, exit, and have its PTY EOF observed before the
+/// queued bytes are read off the socket. Retirement therefore cannot mean
+/// instant disownership or that report is lost — and losing a `SessionEnd`
+/// leaks the pane's [`SessionState`] forever. But it must end the moment the
+/// pane changes hands, or the retired generation writes over its successor. "No
+/// other generation claims `P`" is exactly that boundary, and it needs no timer,
+/// no bookkeeping and no wall clock to evaluate.
 pub trait AgentOwnership: Send + Sync {
-    /// Is there a live agent, owned by this process, whose spawn-time
-    /// `DOT_AGENT_DECK_PANE_ID` is `pane_id`?
-    fn owns_pane(&self, pane_id: &str) -> bool;
-    /// Is there a live agent, owned by this process, with registry id
-    /// `agent_id` and no pane id at all?
-    fn owns_paneless_agent(&self, agent_id: &str) -> bool;
+    /// Does this process own the generation that an event naming
+    /// `(pane_id, agent_id)` comes from? See the table above.
+    fn owns_generation(&self, pane_id: Option<&str>, agent_id: Option<&str>) -> bool;
 }
 
 /// Newtype so [`AppState`] can keep deriving `Debug` (a `dyn` trait object
 /// cannot) while still holding an [`AgentOwnership`].
+///
+/// # Why this is a `Weak`
+///
+/// Round-2 reviewer blocker A. The daemon's ownership authority is its
+/// `AgentPtyRegistry`, and the registry owns the delivery-notice sink, whose
+/// installed closure holds a strong [`SharedState`] — which owns this
+/// `AppState`. A strong `Arc` here would close the loop
+/// `AppState → AgentPtyRegistry → sink → SharedState → AppState`, and a
+/// reference cycle is not a leak in the abstract here: `AgentPtyRegistry::drop`
+/// is what kills the daemon's PTYs, so a cycle means an aborted or errored
+/// `run_daemon_with` leaves every child, PTY and reader thread running with its
+/// `drop(pty_registry)` releasing nothing. Signal and protocol shutdown drain
+/// explicitly and were never affected; cancellation and error teardown — which
+/// the registry's contract explicitly covers — were.
+///
+/// The registry is kept alive by the daemon that built it, for exactly as long
+/// as that daemon runs. If it is gone, this answers "not owned", which is the
+/// fail-closed direction: no registry, no ownership.
 #[derive(Clone)]
-pub struct AgentOwnershipOracle(Arc<dyn AgentOwnership>);
+pub struct AgentOwnershipOracle(Weak<dyn AgentOwnership>);
+
+impl AgentOwnershipOracle {
+    fn owns_generation(&self, pane_id: Option<&str>, agent_id: Option<&str>) -> bool {
+        self.0
+            .upgrade()
+            .is_some_and(|o| o.owns_generation(pane_id, agent_id))
+    }
+}
 
 impl std::fmt::Debug for AgentOwnershipOracle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3206,29 +3267,32 @@ impl AppState {
     /// and `crate::daemon_protocol::serve_attach_with_counter`. Idempotent and
     /// last-writer-wins: a daemon has exactly one registry for its lifetime, so
     /// a second call carries the same one.
-    pub fn set_agent_ownership(&mut self, ownership: Arc<dyn AgentOwnership>) {
+    ///
+    /// Takes a [`Weak`] on purpose, and the call sites must keep their own
+    /// strong reference for as long as the daemon runs. See
+    /// [`AgentOwnershipOracle`] for the reference cycle a strong one would
+    /// close, and what that cycle costs.
+    pub fn set_agent_ownership(&mut self, ownership: Weak<dyn AgentOwnership>) {
         self.agent_ownership = Some(AgentOwnershipOracle(ownership));
     }
 
-    /// Issue #454: does this process own the pane `pane_id`?
+    /// Issue #454: may an event naming `(pane_id, agent_id)` drive this state?
     ///
     /// Two independent grounds, because two different kinds of process ask:
     ///
     /// * **explicitly registered** — [`Self::register_pane`], i.e. the TUI's own
     ///   panes, the daemon's orchestration role panes, and the
     ///   `SessionStart` auto-registration below. This is the historical rule and
-    ///   is unchanged;
-    /// * **owned by the registry** — a live agent this daemon spawned with that
-    ///   `DOT_AGENT_DECK_PANE_ID`, including one whose spawn is still in flight.
-    ///   This is what makes an ordinary daemon-spawned pane's lifecycle reports
-    ///   land, and it needs no registration step to be added, kept current, or
-    ///   taken back.
-    fn owns_pane(&self, pane_id: &str) -> bool {
-        self.managed_pane_ids.contains(pane_id)
-            || self
-                .agent_ownership
-                .as_ref()
-                .is_some_and(|o| o.0.owns_pane(pane_id))
+    ///   is unchanged, and it is deliberately still PANE-scoped: a process that
+    ///   registers a pane by hand is asserting the pane is its own, and has no
+    ///   generation to name;
+    /// * **owned by the registry** — the daemon's answer, which IS
+    ///   generation-scoped. See [`AgentOwnership`] for the exact rule; the short
+    ///   version is that a tagged event has to come from the generation that
+    ///   holds the pane, and a retired generation holds its pane only until
+    ///   another one claims it.
+    fn owns_pane_event(&self, pane_id: &str, agent_id: Option<&str>) -> bool {
+        self.managed_pane_ids.contains(pane_id) || self.oracle_owns(Some(pane_id), agent_id)
     }
 
     /// Issue #454: may an event that names NO pane drive this state?
@@ -3245,12 +3309,17 @@ impl AppState {
     /// all is watching EXTERNAL agents and takes their pane-less events; one
     /// that manages panes is not, and rejects them.
     fn admits_paneless_event(&self, agent_id: Option<&str>) -> bool {
-        if let (Some(oracle), Some(agent_id)) = (self.agent_ownership.as_ref(), agent_id)
-            && oracle.0.owns_paneless_agent(agent_id)
-        {
-            return true;
-        }
-        self.managed_pane_ids.is_empty()
+        self.oracle_owns(None, agent_id) || self.managed_pane_ids.is_empty()
+    }
+
+    /// The registry-backed half of both questions above. `false` whenever there
+    /// is no oracle (the TUI and every bare-[`AppState`] test), whenever the
+    /// registry behind it is gone, and whenever the registry itself cannot
+    /// answer — every "don't know" is a denial.
+    fn oracle_owns(&self, pane_id: Option<&str>, agent_id: Option<&str>) -> bool {
+        self.agent_ownership
+            .as_ref()
+            .is_some_and(|o| o.owns_generation(pane_id, agent_id))
     }
 
     /// PRD #120: record a daemon-spawned orchestration for the render loop to
@@ -4002,10 +4071,16 @@ impl AppState {
         // other (a child that simply dies notifies nothing, so the id would be
         // admitted forever and the set would grow with every short-lived pane).
         // The daemon installs [`AgentOwnership`] instead and the question is put
-        // to the registry every time it is asked — see [`Self::owns_pane`] and
-        // [`Self::admits_paneless_event`] for exactly what each answers.
+        // to the registry every time it is asked — see [`Self::owns_pane_event`]
+        // and [`Self::admits_paneless_event`] for exactly what each answers.
+        //
+        // Round 2 (review + audit): the question is asked about the GENERATION
+        // the event names, not about its pane. `event.agent_id` is passed
+        // through, and the daemon's answer binds it to `event.pane_id` — a pane
+        // is a reusable slot, so "someone owns P" was never evidence that THIS
+        // report belongs to P's current occupant. See [`AgentOwnership`].
         if let Some(ref pane_id) = event.pane_id {
-            if !self.owns_pane(pane_id) {
+            if !self.owns_pane_event(pane_id, event.agent_id.as_deref()) {
                 if event.event_type == EventType::SessionStart {
                     // Defense in depth (auditor finding #1 follow-up):
                     // reject the synthetic dead-slot id format from the
@@ -4016,6 +4091,25 @@ impl AppState {
                     // admits the format on its own (it only checks for
                     // `[A-Za-z0-9_-]`).
                     if crate::ui::is_dead_slot_pane_id(pane_id) {
+                        return;
+                    }
+                    // Round 2, and the reason this is NOT a widening of the
+                    // pre-existing `SessionStart` escape hatch (#601, out of
+                    // scope): auto-registration exists for the STARTUP RACE, a
+                    // hook that fires before `register_pane` is called for a
+                    // pane this process is about to own. A pane the registry
+                    // ALREADY has a generation for is not in that race — the
+                    // generation-scoped check just above has looked and found
+                    // one, under a different id. Registering it here would be
+                    // strictly worse than doing nothing: `managed_pane_ids` is
+                    // permanent and pane-scoped, so one forged `SessionStart`
+                    // would turn a generation-checked pane into a bearer-token
+                    // one for the rest of the daemon's life. Deny instead.
+                    //
+                    // A pane the registry has never heard of keeps the
+                    // historical behaviour verbatim, so #601 is neither fixed
+                    // nor made worse here.
+                    if self.oracle_owns(Some(pane_id.as_str()), None) {
                         return;
                     }
                     // Auto-register the pane to handle the startup race where
@@ -7060,21 +7154,58 @@ mod tests {
 
     /// A stand-in for `AgentPtyRegistry` in the ownership role, so these tests
     /// state the ADMISSION rule without dragging a PTY into the fast tier. The
-    /// registry's own half — that these answers start before the child exists
-    /// and stop when it dies — is pinned in `crate::agent_pty`'s tests.
+    /// registry's own half — that these answers start before the child exists,
+    /// survive the child's death exactly as long as the pane stays its own, and
+    /// are keyed by generation throughout — is pinned in `crate::agent_pty`'s
+    /// tests, and the two are joined end to end by
+    /// `a_final_report_written_before_exit_lands_after_the_pty_eof` below, which
+    /// drives a REAL registry.
+    ///
+    /// `panes` maps a pane id to the generation that owns it, mirroring the
+    /// registry's "at most one generation claims a pane" invariant.
     #[derive(Default)]
     struct StubOwnership {
-        panes: HashSet<String>,
+        panes: HashMap<String, String>,
         paneless_agents: HashSet<String>,
     }
 
+    impl StubOwnership {
+        fn owning(pane_id: &str, agent_id: &str) -> Self {
+            Self {
+                panes: [(pane_id.to_string(), agent_id.to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Self::default()
+            }
+        }
+    }
+
     impl AgentOwnership for StubOwnership {
-        fn owns_pane(&self, pane_id: &str) -> bool {
-            self.panes.contains(pane_id)
+        fn owns_generation(&self, pane_id: Option<&str>, agent_id: Option<&str>) -> bool {
+            match (pane_id, agent_id) {
+                (Some(pane), Some(agent)) => {
+                    self.panes.get(pane).is_some_and(|owner| owner == agent)
+                }
+                (Some(pane), None) => self.panes.contains_key(pane),
+                (None, Some(agent)) => self.paneless_agents.contains(agent),
+                (None, None) => false,
+            }
         }
-        fn owns_paneless_agent(&self, agent_id: &str) -> bool {
-            self.paneless_agents.contains(agent_id)
-        }
+    }
+
+    /// Install `ownership` on `state` and hand back the strong reference the
+    /// caller must keep alive — [`AppState`] holds only a [`Weak`], so an
+    /// inlined `Arc::new(...)` would be dropped before the first query and every
+    /// answer would silently be "not owned". See [`AgentOwnershipOracle`] for
+    /// why the daemon's edge is weak.
+    #[must_use = "AppState holds only a Weak; dropping this disables the oracle"]
+    fn install_ownership(
+        state: &mut AppState,
+        ownership: StubOwnership,
+    ) -> Arc<dyn AgentOwnership> {
+        let ownership: Arc<dyn AgentOwnership> = Arc::new(ownership);
+        state.set_agent_ownership(Arc::downgrade(&ownership));
+        ownership
     }
 
     const CLI_PANE: &str = "cli-pane-454";
@@ -7119,10 +7250,8 @@ mod tests {
     #[test]
     fn agent_event_report_for_a_daemon_spawned_pane_is_admitted_with_the_join_keys() {
         let mut state = AppState::default();
-        state.set_agent_ownership(Arc::new(StubOwnership {
-            panes: [CLI_PANE.to_string()].into_iter().collect(),
-            ..StubOwnership::default()
-        }));
+        let _ownership =
+            install_ownership(&mut state, StubOwnership::owning(CLI_PANE, CLI_AGENT_ID));
         assert!(
             state.managed_pane_ids.is_empty(),
             "precondition: nothing registered this pane — the registry owns it"
@@ -7152,10 +7281,8 @@ mod tests {
     #[test]
     fn agent_event_report_for_an_unowned_pane_is_still_rejected() {
         let mut state = AppState::default();
-        state.set_agent_ownership(Arc::new(StubOwnership {
-            panes: [CLI_PANE.to_string()].into_iter().collect(),
-            ..StubOwnership::default()
-        }));
+        let _ownership =
+            install_ownership(&mut state, StubOwnership::owning(CLI_PANE, CLI_AGENT_ID));
 
         state.apply_event(agent_event_cli_payload("not-our-pane-454", "agent-forged"));
 
@@ -7192,12 +7319,17 @@ mod tests {
     #[test]
     fn a_paneless_agents_declaration_survives_an_ordinary_pane_being_spawned() {
         let mut state = AppState::default();
-        state.set_agent_ownership(Arc::new(StubOwnership {
-            // An ordinary dashboard pane the daemon spawned…
-            panes: [CLI_PANE.to_string()].into_iter().collect(),
-            // …alongside a paneless agent it also spawned.
-            paneless_agents: ["paneless-454".to_string()].into_iter().collect(),
-        }));
+        let _ownership = install_ownership(
+            &mut state,
+            StubOwnership {
+                // An ordinary dashboard pane the daemon spawned…
+                panes: [(CLI_PANE.to_string(), CLI_AGENT_ID.to_string())]
+                    .into_iter()
+                    .collect(),
+                // …alongside a paneless agent it also spawned.
+                paneless_agents: ["paneless-454".to_string()].into_iter().collect(),
+            },
+        );
         // …and an orchestration role pane, so the historical
         // "this process manages panes" condition is true by the registered
         // route as well as the registry one.
@@ -7234,10 +7366,15 @@ mod tests {
     #[test]
     fn a_paneless_event_from_an_unowned_agent_is_still_rejected() {
         let mut state = AppState::default();
-        state.set_agent_ownership(Arc::new(StubOwnership {
-            panes: [CLI_PANE.to_string()].into_iter().collect(),
-            paneless_agents: ["paneless-454".to_string()].into_iter().collect(),
-        }));
+        let _ownership = install_ownership(
+            &mut state,
+            StubOwnership {
+                panes: [(CLI_PANE.to_string(), CLI_AGENT_ID.to_string())]
+                    .into_iter()
+                    .collect(),
+                paneless_agents: ["paneless-454".to_string()].into_iter().collect(),
+            },
+        );
         state.register_pane("role-pane-454".to_string());
 
         let mut foreign = agent_event_cli_payload(CLI_PANE, "someone-elses-agent");
@@ -7267,14 +7404,13 @@ mod tests {
     #[test]
     fn a_dead_panes_id_admits_nothing() {
         let mut state = AppState::default();
-        // The registry has already stopped owning the pane — its child exited.
-        // Nothing else ever knew about it, so there is nothing to revoke.
-        state.set_agent_ownership(Arc::new(StubOwnership {
-            panes: ["some-other-live-pane-454".to_string()]
-                .into_iter()
-                .collect(),
-            ..StubOwnership::default()
-        }));
+        // The registry has already stopped owning the pane — its child exited
+        // AND its record was reaped. Nothing else ever knew about it, so there
+        // is nothing to revoke.
+        let _ownership = install_ownership(
+            &mut state,
+            StubOwnership::owning("some-other-live-pane-454", "some-other-agent-454"),
+        );
 
         state.apply_event(agent_event_cli_payload("dead-pane-454", "ghost-454"));
 
@@ -7283,6 +7419,231 @@ mod tests {
             "a report naming a pane whose child is gone must be refused; \
              sessions={:?}",
             state.sessions.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ---- Issue #454 round 2: the two ORDERINGS the pane-scoped rule got
+    // wrong, driven against a REAL `AgentPtyRegistry` because both findings are
+    // about a sequence and not about an end state. ----
+
+    /// One generation's report, keyed the way a real daemon-spawned agent keys
+    /// it: a per-generation hook session, so the two generations below are
+    /// distinct producers rather than one card changing hands (that path has its
+    /// own tests around `supersedes_generation`).
+    fn report_454(pane_id: &str, agent_id: &str, event_type: EventType) -> AgentEvent {
+        let mut event = agent_event_cli_payload(pane_id, agent_id);
+        event.session_id = format!("{agent_id}-session");
+        event.event_type = event_type;
+        event
+    }
+
+    /// Round-2 reviewer, blocker B. The hook/`agent-event` transport is
+    /// fire-and-forget: the producer writes, flushes, returns and exits. A child
+    /// can therefore emit its final `SessionEnd`, exit, have `pump_reader`
+    /// observe the PTY EOF — and only THEN have the already-queued frame read
+    /// off the socket and applied.
+    ///
+    /// Round 1 read `exited` as instantaneous loss of ownership, so that frame
+    /// was refused. And an ordinary daemon-spawned pane has no fallback left,
+    /// precisely because of the round-1 fix: while it is owned, `apply_event`
+    /// skips the `SessionStart` auto-register branch, so the pane never earns a
+    /// `managed_pane_ids` entry. A lost `SessionEnd` therefore never removes its
+    /// `SessionState`, and repeated short-lived agents accumulate it — while the
+    /// attached TUIs, which see the broadcast before local admission, show the
+    /// pane correctly gone. That is the daemon/TUI disagreement this issue
+    /// exists to remove, reintroduced from the other end.
+    ///
+    /// The ORDER is the finding, so it is the order the test pins: the event is
+    /// built while the child is alive, the EOF is waited for, and the event is
+    /// applied afterwards.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_final_report_written_before_exit_lands_after_the_pty_eof() {
+        let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+        let pane = "farewell-pane-454";
+        let agent_id = registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )],
+                ..Default::default()
+            })
+            .expect("spawn a short-lived agent onto the pane");
+
+        let mut state = AppState::default();
+        let ownership: Arc<dyn AgentOwnership> = registry.clone();
+        state.set_agent_ownership(Arc::downgrade(&ownership));
+
+        // The agent's session, opened while its child is still running.
+        state.apply_event(report_454(pane, &agent_id, EventType::SessionStart));
+        assert_eq!(
+            state.sessions.len(),
+            1,
+            "precondition: the agent's own SessionStart must be admitted"
+        );
+        assert!(
+            state.managed_pane_ids.is_empty(),
+            "precondition: an OWNED pane skips the SessionStart auto-register \
+             branch, so there is no pane-set fallback — this is what makes a \
+             refused terminal frame unrecoverable"
+        );
+
+        // The child writes its terminal frame and exits. The frame exists now,
+        // before the exit; nothing has read it yet.
+        let farewell = report_454(pane, &agent_id, EventType::SessionEnd);
+
+        // The daemon observes the PTY EOF first.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child never exited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // …and only then reads the queued frame off the socket.
+        state.apply_event(farewell);
+
+        assert!(
+            state.sessions.is_empty(),
+            "a generation's own final report, written before it exited, must \
+             still be admitted after its PTY EOF — otherwise the SessionEnd is \
+             dropped, the pane's session state is never removed, and every \
+             short-lived agent leaves one behind; sessions={:?}",
+            state.sessions.keys().collect::<Vec<_>>()
+        );
+        registry.shutdown_all();
+    }
+
+    /// Round-2 audit, blocker D, and the boundary that keeps the grace above
+    /// from being a hole. A pane id is a REUSABLE slot: the registry explicitly
+    /// lets a live agent take over a dead one's pane. A pane-scoped oracle
+    /// answers "someone owns P" for the successor and thereby admits the
+    /// PREDECESSOR's delayed report — which lands as a rival session on a pane
+    /// that already has one, under an identity `ListAgents`, the send guard and
+    /// `pane_writable` all resolve on.
+    ///
+    /// Again the sequence is the finding: A's report is written while A is
+    /// alive, A exits, B takes the pane, and only then is the report applied.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_retired_generations_delayed_report_never_reaches_its_successor() {
+        let registry = Arc::new(crate::agent_pty::AgentPtyRegistry::new());
+        let pane = "handover-pane-454";
+        let opts = |command| crate::agent_pty::SpawnOptions {
+            command: Some(command),
+            env: vec![(
+                crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                pane.to_string(),
+            )],
+            ..Default::default()
+        };
+        let old = registry
+            .spawn_agent(opts("/usr/bin/true"))
+            .expect("spawn the first generation");
+
+        let mut state = AppState::default();
+        let ownership: Arc<dyn AgentOwnership> = registry.clone();
+        state.set_agent_ownership(Arc::downgrade(&ownership));
+
+        // Written while the first generation is alive.
+        let delayed = report_454(pane, &old, EventType::Thinking);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first child never exited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The pane changes hands.
+        let new = registry
+            .spawn_agent(opts("/bin/sh"))
+            .expect("the pane must be reusable once its child is gone");
+        state.apply_event(report_454(pane, &new, EventType::SessionStart));
+        assert_eq!(
+            state.sessions.len(),
+            1,
+            "precondition: the successor's own SessionStart must be admitted"
+        );
+
+        // Only now does the predecessor's report arrive.
+        state.apply_event(delayed);
+
+        let owners: Vec<Option<&str>> = state
+            .sessions
+            .values()
+            .map(|s| s.agent_id.as_deref())
+            .collect();
+        assert_eq!(
+            owners,
+            vec![Some(new.as_str())],
+            "the pane must carry the successor's session and nothing else — a \
+             retired generation stops owning its pane the moment another one \
+             claims it"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Binding admission to the generation opens a door that has to be shut in
+    /// the same change: an event whose `agent_id` does not match now FAILS the
+    /// ownership check, and a `SessionStart` that fails it lands in the
+    /// auto-register branch — which would insert the pane into
+    /// `managed_pane_ids`, permanently and pane-scoped, and hand the whole
+    /// generation check back for that pane.
+    ///
+    /// That branch is for the STARTUP RACE (a hook firing before
+    /// `register_pane`), and a pane the registry already holds a generation for
+    /// is by definition not in it. A pane the registry has never heard of keeps
+    /// the historical behaviour, so the pre-existing `SessionStart` escape hatch
+    /// (#601, out of scope) is neither fixed nor widened.
+    #[test]
+    fn a_forged_session_start_cannot_register_a_pane_the_registry_already_owns() {
+        let mut state = AppState::default();
+        let _ownership =
+            install_ownership(&mut state, StubOwnership::owning(CLI_PANE, CLI_AGENT_ID));
+
+        let mut forged = agent_event_cli_payload(CLI_PANE, "stranger-454");
+        forged.session_id = "stranger-session-454".to_string();
+        forged.event_type = EventType::SessionStart;
+        state.apply_event(forged);
+
+        assert!(
+            state.managed_pane_ids.is_empty(),
+            "a SessionStart naming an owned pane under an unrecognised id must \
+             not register that pane; managed={:?}",
+            state.managed_pane_ids
+        );
+        assert!(
+            state.sessions.is_empty(),
+            "…and must not mint a session on it either; sessions={:?}",
+            state.sessions.keys().collect::<Vec<_>>()
+        );
+
+        // The pane's real occupant is still admitted, so the denial above is a
+        // denial of the stranger and not of the pane.
+        state.apply_event(agent_event_cli_payload(CLI_PANE, CLI_AGENT_ID));
+        assert_eq!(
+            state.sessions.len(),
+            1,
+            "the generation that actually owns the pane must still be admitted"
+        );
+
+        // And an UNCLAIMED pane keeps the historical escape hatch verbatim.
+        let mut startup_race = agent_event_cli_payload("unclaimed-pane-454", "tui-agent-454");
+        startup_race.session_id = "startup-race-session-454".to_string();
+        startup_race.event_type = EventType::SessionStart;
+        state.apply_event(startup_race);
+        assert!(
+            state.managed_pane_ids.contains("unclaimed-pane-454"),
+            "a pane the registry has never heard of still auto-registers — that \
+             is the TUI startup race, and narrowing it is #601's job, not this \
+             change's"
         );
     }
 }
