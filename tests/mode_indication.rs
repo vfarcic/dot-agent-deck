@@ -19,8 +19,8 @@ use dot_agent_deck::state::{SessionState, SessionStatus};
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
     BannerTier, COMMAND_BANNER_TTL, CardDensityKind, CommandBannerSignal, CommandBannerState,
-    CommandBannerVisibility, ReconcileSeamPane, SCROLL_NOTICE_MIN_SCREENFULS, SCROLL_NOTICE_TEXT,
-    SCROLL_SEAM_COLS, SCROLL_SEAM_ROWS, UiMode, command_banner_tier,
+    CommandBannerVisibility, ReconcileSeamPane, SCROLL_NOTICE_MIN_SCREENFULS, SCROLL_NOTICE_SHORT,
+    SCROLL_NOTICE_TEXT, SCROLL_SEAM_COLS, SCROLL_SEAM_ROWS, UiMode, command_banner_tier,
     observe_command_banner_key_burst, observe_focused_agent_key_scroll,
     observe_focused_agent_mouse_scroll, observe_focused_agent_without_scroll,
     observe_pane_input_scrollback_reconcile, observe_pane_input_without_focused_pane,
@@ -1471,9 +1471,15 @@ fn mode_scroll_004_pane_input_without_focus_settles_in_command_mode_once() {
 #[spec("mode/scroll/005")]
 #[test]
 fn mode_scroll_005_cannot_scroll_notice_renders_refreshes_and_dismisses_without_consuming_keys() {
-    const SHORT_NOTICE: &str = "Nothing to scroll — this agent keeps none";
-    const FULL_BOUNDARY_INNER_WIDTH: u16 = 80;
-    const SHORT_BOUNDARY_INNER_WIDTH: u16 = 41;
+    // PRD #611 (audit finding 2): DERIVED from the production strings rather
+    // than transcribed from them. These were hardcoded 80/79/41/40 columns taken
+    // from the then-current wording, so a reword moved the real boundary while
+    // the assertions kept naming the old one — the boundary would have gone
+    // silently unpinned, which is the single thing a boundary test exists to
+    // prevent. The seam probes the same derived widths.
+    const SHORT_NOTICE: &str = SCROLL_NOTICE_SHORT;
+    let full_boundary_inner_width = SCROLL_NOTICE_TEXT.chars().count() as u16;
+    let short_boundary_inner_width = SHORT_NOTICE.chars().count() as u16;
 
     let observed = observe_scroll_notice_lifecycle(Instant::now());
     assert!(
@@ -1489,12 +1495,23 @@ fn mode_scroll_005_cannot_scroll_notice_renders_refreshes_and_dismisses_without_
     );
     let lower = SCROLL_NOTICE_TEXT.to_ascii_lowercase();
     assert!(
-        lower.contains("redraw") && lower.contains("scrollback") && lower.contains("nothing"),
-        "the notice must explain in-place redraws, absent scrollback, and that there is nothing to scroll"
+        lower.contains("nothing to scroll") && lower.contains("scrollback"),
+        "the notice must say what was actually observed: this pane has no scrollback and there is nothing to scroll"
     );
     assert!(
         !lower.contains("pageup") && !lower.contains("page up"),
         "the notice must not recommend PageUp because it fails on the same zero-depth buffer"
+    );
+    // PRD #611 (audit finding 2): the trigger counts bytes handed to the parser
+    // before anything parses them, so `8 * rows * cols` of NULs, of cursor
+    // control, or of a chunk the parser panicked on reaches the same state. Byte
+    // volume cannot establish how an agent renders — and the bytes need not even
+    // be the agent's own (it may be relaying a file or a web response), so an
+    // asserted rendering model is a falsehood a third party can author in the
+    // deck's own voice.
+    assert!(
+        !lower.contains("redraw") && !lower.contains("this agent"),
+        "the notice must not assert the agent's rendering model as measured fact: {SCROLL_NOTICE_TEXT}"
     );
     let (notice_x, notice_y) = find_ascii_text(&observed.first_render, SCROLL_NOTICE_TEXT)
         .expect("the visible notice must be discoverable in the rendered pane");
@@ -1527,22 +1544,16 @@ fn mode_scroll_005_cannot_scroll_notice_renders_refreshes_and_dismisses_without_
         "the cannot-scroll notice must render on one line"
     );
 
-    assert_eq!(
-        SCROLL_NOTICE_TEXT.chars().count() as u16,
-        FULL_BOUNDARY_INNER_WIDTH,
-        "the full-tier boundary must stay tied to the complete production sentence"
-    );
-    assert_eq!(
-        SHORT_NOTICE.chars().count() as u16,
-        SHORT_BOUNDARY_INNER_WIDTH,
-        "the short-tier boundary must stay tied to its complete sentence"
+    assert!(
+        short_boundary_inner_width < full_boundary_inner_width,
+        "the narrow tier must actually be narrower than the sentence it stands in for"
     );
     let tiers = &observed.render_tiers;
     let full_boundary_text = buffer_to_text(&tiers.full_boundary_render);
     assert_eq!(
         full_boundary_text.matches(SCROLL_NOTICE_TEXT).count(),
         1,
-        "an 80-column inner pane must render the full tier exactly once:\n{full_boundary_text}"
+        "an inner pane exactly as wide as the sentence ({full_boundary_inner_width} columns) must render the full tier exactly once:\n{full_boundary_text}"
     );
     assert_eq!(
         find_ascii_text(&tiers.full_boundary_render, SCROLL_NOTICE_TEXT),
@@ -1558,11 +1569,14 @@ fn mode_scroll_005_cannot_scroll_notice_renders_refreshes_and_dismisses_without_
     assert_eq!(
         below_full_text.matches(SHORT_NOTICE).count(),
         1,
-        "a 79-column inner pane must fall back to the short tier exactly once:\n{below_full_text}"
+        "one column below it must fall back to the short tier exactly once:\n{below_full_text}"
     );
     assert_eq!(
         find_ascii_text(&tiers.below_full_boundary_render, SHORT_NOTICE),
-        Some((20, 3)),
+        Some((
+            1 + (full_boundary_inner_width - 1 - short_boundary_inner_width) / 2,
+            3
+        )),
         "the short fallback must remain centred one column below the full-tier boundary"
     );
 
@@ -1570,7 +1584,7 @@ fn mode_scroll_005_cannot_scroll_notice_renders_refreshes_and_dismisses_without_
     assert_eq!(
         short_boundary_text.matches(SHORT_NOTICE).count(),
         1,
-        "a 41-column inner pane must still render the complete short tier:\n{short_boundary_text}"
+        "an inner pane exactly as wide as the short sentence ({short_boundary_inner_width} columns) must still render it complete:\n{short_boundary_text}"
     );
     assert_eq!(
         find_ascii_text(&tiers.short_boundary_render, SHORT_NOTICE),
@@ -1586,14 +1600,14 @@ fn mode_scroll_005_cannot_scroll_notice_renders_refreshes_and_dismisses_without_
     let below_short_text = buffer_to_text(&tiers.below_short_boundary_render);
     assert!(
         !below_short_text.contains(SCROLL_NOTICE_TEXT) && !below_short_text.contains(SHORT_NOTICE),
-        "a 40-column inner pane must omit both notice tiers:\n{below_short_text}"
+        "one column below the short boundary must omit both notice tiers:\n{below_short_text}"
     );
     assert!(
         modifier_bounds(&tiers.below_short_boundary_render, Modifier::REVERSED).is_none(),
         "the omitted tier must not leave even a clipped reversed run in the frame"
     );
     let omitted_notice_row = 3;
-    let omitted_right_border = SHORT_BOUNDARY_INNER_WIDTH;
+    let omitted_right_border = short_boundary_inner_width;
     for x in [0, omitted_right_border] {
         assert_eq!(
             tiers.below_short_boundary_render[(x, omitted_notice_row)],
@@ -1627,7 +1641,7 @@ fn mode_scroll_005_cannot_scroll_notice_renders_refreshes_and_dismisses_without_
         Some(Rect::new(
             precedence_x,
             precedence_y,
-            FULL_BOUNDARY_INNER_WIDTH,
+            full_boundary_inner_width,
             1,
         )),
         "the final frame must contain only the notice's reversed run, with no banner remnants"

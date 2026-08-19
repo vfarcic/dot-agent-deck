@@ -1627,8 +1627,22 @@ pub const SCROLL_NOTICE_MIN_SCREENFULS: u64 = 8;
 /// The single-line explanation rendered after a mature pane cannot scroll.
 /// Kept named so the L1 observation seam can identify the production message
 /// without duplicating its wording.
+///
+/// **It claims only what was observed** (PRD #611, audit finding 2). An earlier
+/// wording asserted that *"this agent redraws in place and keeps no
+/// scrollback"*, which is a claim about the agent's rendering model — and the
+/// evidence behind the trigger cannot establish one. The trigger counts bytes
+/// handed to the parser before anything parses them, so a pane fed
+/// `8 * rows * cols` NUL bytes, or cursor-control noise, or a chunk the parser
+/// panicked on, arrives at the same "lots of output, no retained lines" state
+/// with no rendering model implied. Worse, the bytes need not be the agent's
+/// own: an agent that `cat`s an untrusted file or prints a web response is
+/// relaying content it did not author, so a third party could make the deck
+/// state a falsehood in the deck's own voice. What the deck genuinely knows is
+/// that THIS pane has nothing to scroll, so that is all it says; the per-agent
+/// explanation lives in `docs/keyboard-shortcuts.md`, which M1 rewrote for it.
 pub const SCROLL_NOTICE_TEXT: &str =
-    "This agent redraws in place and keeps no scrollback — there is nothing to scroll";
+    "Nothing to scroll — this pane has no scrollback to move through";
 
 /// PRD #76 M2.20 — minimum gap between the last forwarded keystroke and an
 /// Enter keystroke that follows it on the human-typing path. Agent TUIs like
@@ -12382,6 +12396,33 @@ pub fn run_tui(
             // clobber the feedback nor leak into command mode.
             let is_input_event = matches!(&ev, Event::Paste(_))
                 || matches!(&ev, Event::Key(k) if k.kind == crossterm::event::KeyEventKind::Press);
+
+            // PRD #611 (review finding 4a): dismiss the cannot-scroll notice
+            // HERE, at the event seam, rather than only at the top of
+            // `handle_key_event`.
+            //
+            // `handle_key_event` is the funnel for keys that reach it, but it is
+            // not the only path an input event can take: the non-live intercept
+            // directly below returns before it, changes mode and drains the rest
+            // of the burst, so a key aimed at a pane that has just gone
+            // non-writable used to leave the notice up while the user had
+            // demonstrably moved on. Clearing on the raw event makes "the next
+            // input clears it" hold on EVERY path, including any added later.
+            //
+            // Still non-consuming, for the same structural reason it was at the
+            // top of the funnel: there is no `return` and no branch on what the
+            // event turned out to be, so the event goes on to be handled exactly
+            // as it would have been with no notice on screen. `clear_scroll_notices`
+            // is O(1) unless something is actually armed, so this costs a single
+            // relaxed atomic read per keystroke. The call inside
+            // `handle_key_event` stays: it is idempotent, and it is what the L1
+            // dismissal seam drives.
+            if is_input_event
+                && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+            {
+                embedded.clear_scroll_notices();
+            }
+
             if ui.mode == UiMode::PaneInput
                 && is_input_event
                 && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
@@ -14852,8 +14893,13 @@ const BANNER_WORD_LINE: &str = " COMMAND ";
 /// ordinary terminal is already narrower than the full sentence, which is the
 /// common case rather than the exotic one. Says less and promises nothing extra
 /// — in particular it still does not offer PageUp, which fails on exactly the
-/// same empty buffer the wheel does.
-const SCROLL_NOTICE_SHORT: &str = "Nothing to scroll — this agent keeps none";
+/// same empty buffer the wheel does, and it no longer says *"this agent keeps
+/// none"*, which was the same unearned claim about the agent's rendering model
+/// that [`SCROLL_NOTICE_TEXT`] documents dropping.
+///
+/// `pub` for the same reason as the full form: the L1 tier seam derives its
+/// width boundary from this string's length rather than from a copy of it.
+pub const SCROLL_NOTICE_SHORT: &str = "Nothing to scroll — no scrollback";
 
 /// Draw one reversed line centred in `inner`.
 fn draw_centred_banner_line(buf: &mut Buffer, inner: Rect, text: &str) {
@@ -15201,6 +15247,29 @@ fn render_terminal_panes(
     // BEFORE the selection highlight (so an active text selection stays crisp
     // rather than being dimmed along with everything else).
     if command_mode && let Some(rect) = focused_pane_rect {
+        // PRD #611 (review finding 5): a live cannot-scroll notice on THIS pane
+        // suppresses the banner outright, rather than being drawn on top of it.
+        //
+        // The notice is one line and the banner is not: from 5 inner rows up it
+        // selects a block-letter tier (`BannerTier::BlockCommand` at 40x5,
+        // `BlockCommandModeWithSubtitle` at 60x7), so drawing one line over it
+        // replaces the middle row and leaves block-letter rows above and below —
+        // and, at the richest tier, a stray `Ctrl+D to type` underneath. That is
+        // not "the notice wins", it is two messages interleaved. Only the
+        // single-line tiers were ever fully replaced, which is why the pane
+        // geometry the first precedence test happened to use hid this.
+        //
+        // Dimming is deliberately untouched: it is gated on mode and focus
+        // alone and tells the user typing does not reach the agent, which stays
+        // true while the notice is up.
+        let banner = if focused_id
+            .as_deref()
+            .is_some_and(|id| scroll_notice_visible(ctrl, id, now))
+        {
+            CommandBannerVisibility::Collapsed
+        } else {
+            banner
+        };
         render_command_mode_overlay(frame.buffer_mut(), rect, banner);
     }
 
@@ -19382,9 +19451,16 @@ fn scroll_notice_fixture_render(
 fn observe_scroll_notice_render_tiers(
     now: std::time::Instant,
 ) -> ScrollNoticeRenderTierObservation {
-    const FULL_BOUNDARY_COLS: u16 = 80;
-    const SHORT_BOUNDARY_COLS: u16 = 41;
-    const BELOW_SHORT_GUARD_COLS: u16 = FULL_BOUNDARY_COLS - SHORT_BOUNDARY_COLS + 1;
+    // PRD #611 (audit finding 2): DERIVED from the production strings, never
+    // transcribed from them. These were three hardcoded numbers matching the
+    // then-current wording, so a reword would have moved the real boundary while
+    // the seam kept probing the old one — the boundary would have gone unpinned
+    // silently, which is the one failure a boundary test exists to prevent.
+    let full_boundary_cols = SCROLL_NOTICE_TEXT.chars().count() as u16;
+    let short_boundary_cols = SCROLL_NOTICE_SHORT.chars().count() as u16;
+    // Enough guard columns beyond the pane frame that an overlong tier drawn at
+    // the widest probed geometry would have to spill into them to be seen.
+    let below_short_guard_cols = full_boundary_cols - short_boundary_cols + 1;
 
     let render = |cols, guard, arm_notice| {
         scroll_notice_fixture_render(
@@ -19398,11 +19474,11 @@ fn observe_scroll_notice_render_tiers(
         )
     };
     ScrollNoticeRenderTierObservation {
-        full_boundary_render: render(FULL_BOUNDARY_COLS, 0, true),
-        below_full_boundary_render: render(FULL_BOUNDARY_COLS - 1, 0, true),
-        short_boundary_render: render(SHORT_BOUNDARY_COLS, 0, true),
-        below_short_boundary_render: render(SHORT_BOUNDARY_COLS - 1, BELOW_SHORT_GUARD_COLS, true),
-        below_short_control_render: render(SHORT_BOUNDARY_COLS - 1, BELOW_SHORT_GUARD_COLS, false),
+        full_boundary_render: render(full_boundary_cols, 0, true),
+        below_full_boundary_render: render(full_boundary_cols - 1, 0, true),
+        short_boundary_render: render(short_boundary_cols, 0, true),
+        below_short_boundary_render: render(short_boundary_cols - 1, below_short_guard_cols, true),
+        below_short_control_render: render(short_boundary_cols - 1, below_short_guard_cols, false),
     }
 }
 
