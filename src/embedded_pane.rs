@@ -2385,6 +2385,10 @@ async fn run_pane_io_task(
             // F12 context) and cap retries.
             let reader = async {
                 let mut osc8 = Osc8Filter::new();
+                // PRD #611 M3: per-stream, alongside `osc8` and for the same
+                // reason — both hold the tail of a sequence a PTY read boundary
+                // cut in half, and neither means anything to a different stream.
+                let mut mouse_scan = MouseModeScanner::default();
                 loop {
                     match crate::daemon_protocol::read_frame(&mut rd).await {
                         Ok(None) => break,
@@ -2396,6 +2400,7 @@ async fn run_pane_io_task(
                                     &mut osc8,
                                     &parser,
                                     &mouse_mode,
+                                    &mut mouse_scan,
                                     &hyperlinks,
                                     &bytes_since_spawn,
                                 );
@@ -2837,42 +2842,170 @@ async fn resize_worker(
     }
 }
 
-/// Scan PTY output bytes for mouse mode enable/disable escape sequences.
-/// Sets the atomic flag when the child app requests mouse reporting.
-fn scan_mouse_mode(data: &[u8], flag: &AtomicBool) {
-    // Mouse mode sequences: \x1b[?{mode}h (enable) or \x1b[?{mode}l (disable)
-    // Modes: 1000 (basic), 1002 (button-motion), 1003 (any-motion), 1006 (SGR extended)
-    let enable_patterns: &[&[u8]] = &[
-        b"\x1b[?1000h",
-        b"\x1b[?1002h",
-        b"\x1b[?1003h",
-        b"\x1b[?1006h",
-    ];
-    let disable_patterns: &[&[u8]] = &[
-        b"\x1b[?1000l",
-        b"\x1b[?1002l",
-        b"\x1b[?1003l",
-        b"\x1b[?1006l",
-    ];
-    for pat in enable_patterns {
-        if contains_bytes(data, pat) {
-            flag.store(true, Ordering::Relaxed);
-            return;
-        }
-    }
-    for pat in disable_patterns {
-        if contains_bytes(data, pat) {
-            flag.store(false, Ordering::Relaxed);
-            return;
-        }
-    }
+/// The DEC private modes whose latch state decides whether the child is
+/// actually receiving mouse reports: 1000 (basic), 1002 (button-motion),
+/// 1003 (any-motion) and 1006 (SGR extended encoding). 1004 — focus reporting
+/// — is deliberately absent: an agent that sets only `1004h` (codex does
+/// exactly that, PRD #611) has requested no mouse events at all.
+const MOUSE_TRACKING_MODES: [u32; 4] = [1000, 1002, 1003, 1006];
+
+/// Upper bound on the bytes [`MouseModeScanner`] carries between chunks. A
+/// real private-mode sequence is a handful of bytes — `ESC[?1000;1002;1003;1006h`,
+/// the longest shape any of these agents emits, is 24 — so 64 leaves room for
+/// roughly a dozen parameters while keeping the ceiling nowhere near a PTY read.
+/// It exists because the carry is driven by the child: without it, a stream that
+/// opens `ESC[?` and never terminates it would grow the buffer for as long as
+/// the agent kept talking.
+const MOUSE_SCAN_CARRY_MAX: usize = 64;
+
+/// Cross-chunk state for [`scan_mouse_mode`] (PRD #611 M3). Lives beside the
+/// stream's [`Osc8Filter`] and for the same reason: both hold the tail of a
+/// sequence a PTY read boundary cut in half, and neither means anything to a
+/// different stream.
+#[derive(Debug, Default)]
+struct MouseModeScanner {
+    /// The trailing bytes of the previous chunk that could still be the prefix
+    /// of a private-mode sequence — never more than [`MOUSE_SCAN_CARRY_MAX`].
+    carry: Vec<u8>,
+    /// One latch per [`MOUSE_TRACKING_MODES`] entry, same order. The flag the
+    /// deck reads is `any()` over these, not the most recent directive.
+    modes: [bool; 4],
 }
 
-/// Simple byte pattern search.
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
+/// Derive `mouse_mode_enabled` from a chunk of PTY output (PRD #611 M3).
+///
+/// Scans `state`'s carry-over followed by `data` for DEC private-mode
+/// sequences — `ESC [ ? <params> h` (set) and `ESC [ ? <params> l` (reset) —
+/// and applies every directive naming a [`MOUSE_TRACKING_MODES`] entry, **in
+/// byte order**. `flag` is written only when the chunk carried at least one
+/// such directive, and holds "is any tracked mode still set?".
+///
+/// Three things this replaced a substring search over four fixed patterns to
+/// get right, each of which produced the same user-visible symptom — a pane
+/// the deck refuses to scroll for an agent that would have scrolled fine:
+///
+/// 1. The **combined** form. `ESC[?1000;1002;1006h` contains none of
+///    `ESC[?1000h`, `ESC[?1002h`, `ESC[?1003h` or `ESC[?1006h` as a substring,
+///    so an app that sets its modes in one sequence went entirely undetected.
+///    Parameters are parsed as whole numbers, so `ESC[?11000h` still does not
+///    match 1000, and 1004 — focus reporting — never counts.
+/// 2. **Order.** The old scan tested every enable pattern before it considered
+///    any disable, so an enable anywhere in a chunk outranked a disable later
+///    in the same chunk. Position in the byte stream decides now.
+/// 3. **Split sequences.** A PTY read boundary falls wherever the kernel had
+///    bytes ready, so `ESC[?100` + `2h` is an ordinary pair of reads and was
+///    invisible to a scan with no memory. The trailing bytes that could still
+///    open a sequence are carried into the next chunk.
+fn scan_mouse_mode(data: &[u8], flag: &AtomicBool, state: &mut MouseModeScanner) {
+    const ESC: u8 = 0x1b;
+
+    // Taken rather than borrowed so `state` stays free for the latch writes
+    // below; a new carry is stored at the end.
+    let carry = std::mem::take(&mut state.carry);
+    let joined: Vec<u8>;
+    let buf: &[u8] = if carry.is_empty() {
+        // The overwhelmingly common case, and the hot path: no copy at all.
+        data
+    } else {
+        let mut v = Vec::with_capacity(carry.len() + data.len());
+        v.extend_from_slice(&carry);
+        v.extend_from_slice(data);
+        joined = v;
+        &joined
+    };
+
+    let mut touched = false;
+    // Where a sequence that is still open when the buffer runs out began. Only
+    // that suffix is worth carrying — everything before it has been decided.
+    let mut partial_from: Option<usize> = None;
+    let mut i = 0usize;
+
+    while i < buf.len() {
+        if buf[i] != ESC {
+            i += 1;
+            continue;
+        }
+        let seq_start = i;
+        // `ESC [ ?` — the private-mode introducer. Running out mid-introducer
+        // is a partial, not a miss; anything else here is some other escape
+        // sequence, so resume scanning after the ESC.
+        if i + 1 >= buf.len() {
+            partial_from = Some(seq_start);
+            break;
+        }
+        if buf[i + 1] != b'[' {
+            i += 1;
+            continue;
+        }
+        if i + 2 >= buf.len() {
+            partial_from = Some(seq_start);
+            break;
+        }
+        if buf[i + 2] != b'?' {
+            i += 1;
+            continue;
+        }
+
+        // Parameter list: `;`-separated decimal numbers, then a final byte.
+        let params_start = i + 3;
+        let mut j = params_start;
+        while j < buf.len() && (buf[j].is_ascii_digit() || buf[j] == b';') {
+            j += 1;
+        }
+        if j >= buf.len() {
+            partial_from = Some(seq_start);
+            break;
+        }
+        if buf[j] == ESC {
+            // A fresh introducer aborted this one (malformed output). Resync ON
+            // it rather than consuming it, so a run of truncated sequences does
+            // not swallow every other one.
+            i = j;
+            continue;
+        }
+
+        let set = match buf[j] {
+            b'h' => Some(true),
+            b'l' => Some(false),
+            // Some other final byte: a private mode we do not care about, or a
+            // request/report (`ESC[?1000$p`). Skip past it.
+            _ => None,
+        };
+        if let Some(set) = set {
+            for param in buf[params_start..j].split(|&b| b == b';') {
+                // All-digit by construction; an empty or absurdly long
+                // parameter simply names no mode we track.
+                let mode = std::str::from_utf8(param)
+                    .ok()
+                    .and_then(|text| text.parse::<u32>().ok());
+                let Some(mode) = mode else { continue };
+                if let Some(slot) = MOUSE_TRACKING_MODES.iter().position(|&m| m == mode) {
+                    state.modes[slot] = set;
+                    touched = true;
+                }
+            }
+        }
+        i = j + 1;
+    }
+
+    if let Some(from) = partial_from {
+        let tail = &buf[from..];
+        if tail.len() <= MOUSE_SCAN_CARRY_MAX {
+            state.carry = tail.to_vec();
+        }
+        // Over the cap the carry is simply dropped. No real private-mode
+        // sequence is anywhere near this long, so what is open is malformed or
+        // hostile, and refusing it costs at most one missed directive — never a
+        // mouse mode invented from bytes that were never seen whole.
+    }
+
+    if touched {
+        // Each private mode is an independent latch in a real terminal, and the
+        // question this flag answers is "will a forwarded wheel event reach the
+        // child?" — true while ANY tracking mode is still set. Withdrawing one
+        // of four therefore must not read as withdrawing mouse reporting.
+        flag.store(state.modes.iter().any(|&on| on), Ordering::Relaxed);
+    }
 }
 
 /// Scrollback depth (lines) for a pane's local vt100 parser. Used both when a
@@ -2955,9 +3088,15 @@ fn feed_segment(p: &mut vt100::Parser, segment: &Osc8Segment) -> (u16, Option<(u
 }
 
 /// Feed a chunk of agent-output bytes through the OSC 8 filter, the vt100
-/// parser, and the hyperlink map. Shared between the local-PTY reader thread
-/// and the stream-backed I/O task so both backends produce identical render
-/// state from identical bytes.
+/// parser, the mouse-mode scanner and the hyperlink map. Shared between the
+/// local-PTY reader thread and the stream-backed I/O task so both backends
+/// produce identical render state from identical bytes.
+///
+/// `mouse_scan` carries whatever a PTY read boundary cut in half, and lives
+/// here rather than on the pane for exactly the reason this function is shared
+/// at all (PRD #611 M3): parked on the pane it would have to be remembered
+/// separately by each backend, and the one that forgot would silently
+/// reintroduce the split-sequence defect.
 ///
 /// The vt100 feed is wrapped in [`guarded_parser_feed`]: `vt100` 0.16.2 can
 /// panic on malformed/edge-case output (e.g. wide characters in a 1-row pane),
@@ -2969,6 +3108,7 @@ fn process_agent_output_chunk(
     osc8: &mut Osc8Filter,
     parser: &Mutex<vt100::Parser>,
     mouse_mode: &AtomicBool,
+    mouse_scan: &mut MouseModeScanner,
     hyperlinks: &Mutex<HyperlinkMap>,
     bytes_since_spawn: &AtomicU64,
 ) {
@@ -2981,7 +3121,7 @@ fn process_agent_output_chunk(
     // output and no retained lines, which is honestly nothing to scroll.
     bytes_since_spawn.fetch_add(data.len() as u64, Ordering::Relaxed);
 
-    scan_mouse_mode(data, mouse_mode);
+    scan_mouse_mode(data, mouse_mode, mouse_scan);
 
     let segments = osc8.process(data);
     let mut new_links: Vec<(u16, String)> = Vec::new();
@@ -3906,6 +4046,7 @@ mod tests {
         let parser = Mutex::new(vt100::Parser::new(1, 10, 1000));
         let mut osc8 = Osc8Filter::new();
         let mouse = AtomicBool::new(false);
+        let mut mouse_scan = MouseModeScanner::default();
         let links = Mutex::new(HyperlinkMap::new());
         let bytes_since_spawn = AtomicU64::new(0);
 
@@ -3915,6 +4056,7 @@ mod tests {
             &mut osc8,
             &parser,
             &mouse,
+            &mut mouse_scan,
             &links,
             &bytes_since_spawn,
         );
@@ -3934,6 +4076,7 @@ mod tests {
             &mut osc8,
             &parser,
             &mouse,
+            &mut mouse_scan,
             &links,
             &bytes_since_spawn,
         );
@@ -3979,5 +4122,359 @@ mod tests {
         assert_eq!(parser_init_dims(PTY_RESIZE_DIM_MAX + 1, 40), (24, 80));
         assert_eq!(parser_init_dims(40, PTY_RESIZE_DIM_MAX + 1), (24, 80));
         assert_eq!(parser_init_dims(u16::MAX, u16::MAX), (24, 80));
+    }
+
+    // ---- PRD #611 M3: `scan_mouse_mode` -----------------------------------
+    //
+    // This function derives `mouse_mode_enabled`, which is the exact input to
+    // the branch `scroll_focused_agent_pane` takes — and, since M2, to the
+    // on-screen notice that explains a scroll that cannot land. Mis-deriving it
+    // makes the deck take the scrollback branch for an agent that would have
+    // scrolled perfectly well, and then explain that outcome with a sentence
+    // that is not true of that agent. It had no tests at all before these.
+
+    /// Feed one chunk through the scanner and read the flag back. The scanner
+    /// is the caller's, so a sequence cut in half by a chunk boundary is seen
+    /// the way it is on the real stream.
+    fn feed_mouse(chunk: &[u8], flag: &AtomicBool, state: &mut MouseModeScanner) -> bool {
+        scan_mouse_mode(chunk, flag, state);
+        flag.load(Ordering::Relaxed)
+    }
+
+    /// Fresh scanner over a flag seeded the way the real spawn path seeds it.
+    fn mouse_scanner() -> (AtomicBool, MouseModeScanner) {
+        (AtomicBool::new(false), MouseModeScanner::default())
+    }
+
+    #[test]
+    fn scan_mouse_mode_detects_each_single_mode_enable_form() {
+        for form in [
+            b"\x1b[?1000h".as_slice(),
+            b"\x1b[?1002h".as_slice(),
+            b"\x1b[?1003h".as_slice(),
+            b"\x1b[?1006h".as_slice(),
+        ] {
+            let (flag, mut state) = mouse_scanner();
+            assert!(
+                feed_mouse(form, &flag, &mut state),
+                "{:?} requests mouse reporting and must enable the flag",
+                String::from_utf8_lossy(form)
+            );
+        }
+    }
+
+    #[test]
+    fn scan_mouse_mode_detects_each_single_mode_disable_form() {
+        for form in [
+            b"\x1b[?1000l".as_slice(),
+            b"\x1b[?1002l".as_slice(),
+            b"\x1b[?1003l".as_slice(),
+            b"\x1b[?1006l".as_slice(),
+        ] {
+            let (flag, mut state) = mouse_scanner();
+            // Enable through the same mode first: a disable can only be
+            // observed against something that was on.
+            let enable = [&form[..form.len() - 1], b"h".as_slice()].concat();
+            assert!(feed_mouse(&enable, &flag, &mut state));
+            assert!(
+                !feed_mouse(form, &flag, &mut state),
+                "{:?} withdraws mouse reporting and must clear the flag",
+                String::from_utf8_lossy(form)
+            );
+        }
+    }
+
+    /// Defect 1. Apps routinely set several private modes in one sequence, and
+    /// none of the four single-mode patterns the old scanner looked for is a
+    /// substring of the combined form — so mouse mode went entirely undetected
+    /// for an agent that emits it.
+    #[test]
+    fn scan_mouse_mode_detects_the_combined_set_form() {
+        let (flag, mut state) = mouse_scanner();
+        assert!(
+            feed_mouse(b"\x1b[?1000;1002;1006h", &flag, &mut state),
+            "a combined SET must enable — the modes are in the parameter list"
+        );
+    }
+
+    #[test]
+    fn scan_mouse_mode_detects_the_combined_reset_form() {
+        let (flag, mut state) = mouse_scanner();
+        assert!(feed_mouse(b"\x1b[?1000;1002;1006h", &flag, &mut state));
+        assert!(
+            !feed_mouse(b"\x1b[?1000;1002;1006l", &flag, &mut state),
+            "a combined RESET must clear every mode it names"
+        );
+    }
+
+    /// A parameter list may mix tracked and untracked modes. One tracked mode
+    /// anywhere in it is enough.
+    #[test]
+    fn scan_mouse_mode_enables_on_a_combined_form_mixing_tracked_and_untracked_modes() {
+        let (flag, mut state) = mouse_scanner();
+        assert!(
+            feed_mouse(b"\x1b[?1004;1002h", &flag, &mut state),
+            "1002 is button-motion tracking; 1004 alongside it changes nothing"
+        );
+    }
+
+    /// The codex case, and the one a careless "does the parameter list contain
+    /// 100…?" check breaks: 1004 is focus reporting, not mouse reporting. An
+    /// agent that sets only 1004 receives no mouse events, so forwarding the
+    /// wheel to it is exactly the dead end PRD #611 exists to explain.
+    #[test]
+    fn scan_mouse_mode_ignores_focus_reporting_on_its_own() {
+        let (flag, mut state) = mouse_scanner();
+        assert!(
+            !feed_mouse(b"\x1b[?1004h", &flag, &mut state),
+            "1004 is focus reporting — it must not read as mouse reporting"
+        );
+    }
+
+    /// Neighbouring mode numbers must not be matched by digit adjacency, and
+    /// the private modes an app sets for other reasons must not count either.
+    #[test]
+    fn scan_mouse_mode_matches_whole_parameters_not_digit_substrings() {
+        let (flag, mut state) = mouse_scanner();
+        assert!(!feed_mouse(b"\x1b[?11000h", &flag, &mut state));
+        assert!(!feed_mouse(b"\x1b[?10006h", &flag, &mut state));
+        assert!(!feed_mouse(b"\x1b[?1049h\x1b[?2004h", &flag, &mut state));
+    }
+
+    /// Defect 2, one direction. The old scanner checked every enable pattern
+    /// before it considered any disable, so an enable anywhere in a chunk beat
+    /// a disable that came after it — a child switching reporting off stayed
+    /// flagged on until some later chunk happened to contain no enable.
+    #[test]
+    fn scan_mouse_mode_lets_a_later_disable_beat_an_earlier_enable_in_one_chunk() {
+        let (flag, mut state) = mouse_scanner();
+        assert!(
+            !feed_mouse(b"\x1b[?1000h\x1b[?1000l", &flag, &mut state),
+            "the disable is later in the byte stream, so it is what holds"
+        );
+    }
+
+    /// Defect 2, the other direction: byte position decides, so the same two
+    /// directives in the opposite order settle the other way.
+    #[test]
+    fn scan_mouse_mode_lets_a_later_enable_beat_an_earlier_disable_in_one_chunk() {
+        let (flag, mut state) = mouse_scanner();
+        assert!(
+            feed_mouse(b"\x1b[?1000l\x1b[?1000h", &flag, &mut state),
+            "the enable is later in the byte stream, so it is what holds"
+        );
+    }
+
+    /// Each private mode is an independent latch in a real terminal, and the
+    /// deck's question is "will a forwarded wheel event reach this child?" —
+    /// which is true while *any* tracking mode is still set. Withdrawing one of
+    /// four therefore must not read as withdrawing mouse reporting.
+    #[test]
+    fn scan_mouse_mode_keeps_the_flag_while_any_other_tracked_mode_is_still_set() {
+        let (flag, mut state) = mouse_scanner();
+        assert!(feed_mouse(b"\x1b[?1000;1002;1003;1006h", &flag, &mut state));
+        assert!(
+            feed_mouse(b"\x1b[?1003l", &flag, &mut state),
+            "any-motion off still leaves basic, button-motion and SGR on"
+        );
+        assert!(
+            !feed_mouse(b"\x1b[?1000;1002;1006l", &flag, &mut state),
+            "with the last of them withdrawn there is nothing left reporting"
+        );
+    }
+
+    /// Defect 3. A PTY read boundary falls wherever the kernel had bytes ready,
+    /// so any sequence can arrive in two pieces. Split the same sequence at
+    /// every interior offset: every one of them must still be seen.
+    #[test]
+    fn scan_mouse_mode_sees_a_sequence_split_at_any_offset() {
+        let seq = b"\x1b[?1002h";
+        for split in 1..seq.len() {
+            let (flag, mut state) = mouse_scanner();
+            assert!(
+                !feed_mouse(&seq[..split], &flag, &mut state),
+                "the first half alone decides nothing (split at {split})"
+            );
+            assert!(
+                feed_mouse(&seq[split..], &flag, &mut state),
+                "the sequence completes across the boundary (split at {split})"
+            );
+        }
+    }
+
+    /// The two splits PRD #611 M3 calls out by name: mid-parameter, and
+    /// mid-parameter-list.
+    #[test]
+    fn scan_mouse_mode_sees_a_split_mid_parameter_and_mid_parameter_list() {
+        let (flag, mut state) = mouse_scanner();
+        assert!(!feed_mouse(b"\x1b[?100", &flag, &mut state));
+        assert!(
+            feed_mouse(b"2h", &flag, &mut state),
+            "mid-parameter split: `ESC[?100` + `2h` is `ESC[?1002h`"
+        );
+
+        let (flag, mut state) = mouse_scanner();
+        assert!(!feed_mouse(b"\x1b[?1000;10", &flag, &mut state));
+        assert!(
+            feed_mouse(b"02h", &flag, &mut state),
+            "mid-parameter-list split: `ESC[?1000;10` + `02h`"
+        );
+    }
+
+    /// A sequence may be cut into more than two pieces, including ones that
+    /// contribute a single byte.
+    #[test]
+    fn scan_mouse_mode_sees_a_sequence_split_across_four_chunks() {
+        let (flag, mut state) = mouse_scanner();
+        for piece in [b"\x1b".as_slice(), b"[?10".as_slice(), b"06".as_slice()] {
+            assert!(!feed_mouse(piece, &flag, &mut state));
+        }
+        assert!(feed_mouse(b"h", &flag, &mut state));
+    }
+
+    /// A partial that never completes must leave the flag exactly where it was
+    /// and must not grow the carry: the carry is only ever the shortest suffix
+    /// that could still open a valid sequence.
+    #[test]
+    fn scan_mouse_mode_holds_an_incomplete_partial_without_deciding_anything() {
+        let (flag, mut state) = mouse_scanner();
+        assert!(feed_mouse(b"\x1b[?1000h", &flag, &mut state));
+        assert!(
+            feed_mouse(b"\x1b[?1000", &flag, &mut state),
+            "an unterminated sequence decides nothing, so the flag is untouched"
+        );
+        assert_eq!(
+            state.carry.as_slice(),
+            b"\x1b[?1000".as_slice(),
+            "only the open sequence is carried"
+        );
+
+        // Ordinary output after it resolves nothing and clears the carry: the
+        // partial turned out not to be a private-mode sequence at all.
+        assert!(feed_mouse(b"; hello world\r\n", &flag, &mut state));
+        assert!(state.carry.is_empty(), "nothing left that could still open");
+    }
+
+    /// The cap. A malformed or hostile stream can open a private-mode sequence
+    /// and never terminate it; the carry must stay bounded whatever it does.
+    #[test]
+    fn scan_mouse_mode_caps_the_carry_against_an_unterminated_parameter_run() {
+        let (flag, mut state) = mouse_scanner();
+        let mut fed = 0usize;
+        assert!(!feed_mouse(b"\x1b[?", &flag, &mut state));
+        for _ in 0..512 {
+            assert!(!feed_mouse(b"1;", &flag, &mut state));
+            fed += 2;
+            assert!(
+                state.carry.len() <= MOUSE_SCAN_CARRY_MAX,
+                "carry grew to {} after {fed} bytes of open parameter list",
+                state.carry.len()
+            );
+        }
+    }
+
+    /// The other unterminated shape: introducers with nothing after them. Each
+    /// aborts the one before it, so the carry never holds more than the last.
+    #[test]
+    fn scan_mouse_mode_caps_the_carry_against_a_run_of_bare_introducers() {
+        let (flag, mut state) = mouse_scanner();
+        for _ in 0..512 {
+            assert!(!feed_mouse(b"\x1b[?", &flag, &mut state));
+            assert!(
+                state.carry.len() <= MOUSE_SCAN_CARRY_MAX,
+                "carry grew to {}",
+                state.carry.len()
+            );
+        }
+    }
+
+    /// Once the cap is blown the scanner refuses the sequence rather than
+    /// completing it from a truncated prefix: the one thing it must never do is
+    /// invent an enable out of bytes it did not see whole.
+    #[test]
+    fn scan_mouse_mode_does_not_enable_from_a_carry_it_had_to_drop() {
+        let (flag, mut state) = mouse_scanner();
+        let mut overlong = b"\x1b[?".to_vec();
+        overlong.extend_from_slice(&b"1;".repeat(MOUSE_SCAN_CARRY_MAX));
+        assert!(!feed_mouse(&overlong, &flag, &mut state));
+        assert!(state.carry.is_empty(), "an over-cap partial is dropped");
+        assert!(
+            !feed_mouse(b"1002h", &flag, &mut state),
+            "the tail of a dropped sequence must not complete one on its own"
+        );
+    }
+
+    /// A claude-shaped stream: all four modes, in both the separate and the
+    /// combined form, then withdrawn on exit. PRD #611 names this agent as the
+    /// one most exposed to a mis-derivation here.
+    #[test]
+    fn scan_mouse_mode_follows_an_app_managed_agent_through_enable_and_teardown() {
+        let (flag, mut state) = mouse_scanner();
+        assert!(
+            !feed_mouse(b"\x1b[?1049h", &flag, &mut state),
+            "the alternate screen on its own is not mouse reporting"
+        );
+        assert!(feed_mouse(b"\x1b[?1000h\x1b[?1002h", &flag, &mut state));
+        assert!(feed_mouse(b"\x1b[?1003h\x1b[?1006h", &flag, &mut state));
+        assert!(feed_mouse(b"prompt> \x1b[1;1H", &flag, &mut state));
+        assert!(
+            !feed_mouse(
+                b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l",
+                &flag,
+                &mut state
+            ),
+            "crossterm's DisableMouseCapture shape must land as disabled"
+        );
+        assert!(feed_mouse(b"\x1b[?1000;1002;1003;1006h", &flag, &mut state));
+    }
+
+    /// The terminal-managed shape PRD #611 measured: exact-height DECSTBM
+    /// regions plus whole-region cursor-positioned repaints, and no mouse mode
+    /// anywhere in it. Shares the fixture with the `mode/scroll` family rather
+    /// than carrying a second copy — and stands in for the real captured codex
+    /// session, which holds conversation content and is never committed.
+    #[test]
+    fn scan_mouse_mode_enables_nothing_on_a_terminal_managed_repaint_stream() {
+        let (flag, mut state) = mouse_scanner();
+        let stream = crate::ui::synthetic_decstbm_repaint_stream(51, 120);
+        // In pieces, so its sequences straddle boundaries the way they do on a
+        // real PTY.
+        for piece in stream.chunks(997) {
+            assert!(
+                !feed_mouse(piece, &flag, &mut state),
+                "a repainting agent requests no mouse reporting"
+            );
+        }
+        // Plus the one private mode codex does set, on its own.
+        assert!(!feed_mouse(b"\x1b[?1004h", &flag, &mut state));
+    }
+
+    /// The scanner is reached through the shared chunk path, so both backends
+    /// derive the same flag from the same bytes — including across a boundary.
+    #[test]
+    fn scan_mouse_mode_is_wired_through_the_shared_chunk_path() {
+        let parser = Mutex::new(vt100::Parser::new(24, 80, 100));
+        let mut osc8 = Osc8Filter::new();
+        let mouse = AtomicBool::new(false);
+        let mut mouse_scan = MouseModeScanner::default();
+        let links = Mutex::new(HyperlinkMap::new());
+        let bytes_since_spawn = AtomicU64::new(0);
+
+        for piece in [b"hello \x1b[?1000;10".as_slice(), b"02h world".as_slice()] {
+            process_agent_output_chunk(
+                piece,
+                &mut osc8,
+                &parser,
+                &mouse,
+                &mut mouse_scan,
+                &links,
+                &bytes_since_spawn,
+            );
+        }
+        assert!(
+            mouse.load(Ordering::Relaxed),
+            "a sequence split across two chunks must still be seen by a caller \
+             that only ever sees `process_agent_output_chunk`"
+        );
     }
 }
