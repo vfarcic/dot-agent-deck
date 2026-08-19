@@ -481,9 +481,14 @@ pub async fn spawn(
             // reports are admitted because the daemon's admission check asks
             // `AgentPtyRegistry` who it owns (`crate::state::AgentOwnership`),
             // and `spawn_one` has just put this pane there — from before the
-            // child existed, via the spawn reservation, until it dies. Before
-            // that, `apply_event` dropped every non-`SessionStart` report from
-            // a scheduled / dispatched pane and its `daemon status` row showed
+            // child existed, via the spawn reservation, until the pane changes
+            // hands or the generation's record is reaped. (Issue #454 round 3:
+            // a generation whose child has died keeps answering for its OWN
+            // pane until one of those two happens, so a `SessionEnd` written in
+            // the same breath as the exit is still admitted; see
+            // `crate::state::AgentOwnership`.) Before that, `apply_event`
+            // dropped every non-`SessionStart` report from a scheduled /
+            // dispatched pane and its `daemon status` row showed
             // `STATUS=- TOOL=-` exactly like the dashboard-pane bug.
             //
             // The `surface_spawned_pane` broadcast below is unrelated: it

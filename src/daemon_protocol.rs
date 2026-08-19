@@ -1522,7 +1522,7 @@ async fn handle_connection(
             // no LIVE agent's state was deleted.
             //
             // So the pane travels into the cleanup only while it is still A's to
-            // give up: nobody live holds it, or A itself still does. Anything
+            // give up: nobody else holds it, or A itself still does. Anything
             // else and A owes the pane nothing — its successor owns it, and
             // owns the cleanup of it too. `close_agent(&id)` below is keyed by
             // registry id and is unaffected either way; it is only the
@@ -1531,26 +1531,28 @@ async fn handle_connection(
             // `worktree_still_in_use` sweep over the live records, which is the
             // same "is anyone else using this?" question asked of a worktree
             // instead of a pane.
+            //
+            // Round-3 review (blocker 1): that gate is now taken from the
+            // registry as a HOLD rather than as a boolean read, for two reasons
+            // the first version got wrong. It was asked of
+            // `pane_current_agent_id`, which sees only published, non-exited
+            // agents — so a successor that had RESERVED the pane and not
+            // published yet came back `None` and was read as "nobody holds it".
+            // And it was check-then-act: decided here, before a `close_agent`
+            // that can spend the full three-second termination grace, and acted
+            // on afterwards in `unregister_pane`, so a successor could reserve,
+            // spawn, publish and register its whole identity inside the gap only
+            // for this handler to delete it. The hold answers both — it sees
+            // reservations, and nothing may claim the pane until it is dropped
+            // at the end of this arm. See `AgentPtyRegistry::hold_pane_for_cleanup`.
             let stopping_record = registry.agent_record_any(&id);
-            let pane_id_env = stopping_record
+            let pane_cleanup_hold = stopping_record
                 .as_ref()
-                .and_then(|r| r.pane_id_env.clone())
-                .filter(|pane| match registry.pane_current_agent_id(pane) {
-                    Some(current) => {
-                        let ours = current == id;
-                        if !ours {
-                            tracing::debug!(
-                                pane_id = %pane,
-                                stopping = %id,
-                                current = %current,
-                                "StopAgent: skipping pane-scoped cleanup; the pane \
-                                 has already been taken over by a live agent"
-                            );
-                        }
-                        ours
-                    }
-                    None => true,
-                });
+                .and_then(|r| r.pane_id_env.as_deref())
+                .and_then(|pane| registry.hold_pane_for_cleanup(pane, &id));
+            let pane_id_env = pane_cleanup_hold
+                .as_ref()
+                .map(|hold| hold.pane_id().to_string());
             let dispatched_worktree = stopping_record
                 .as_ref()
                 .and_then(crate::issue_dispatch_run::worktree_of_record);
@@ -1689,7 +1691,12 @@ async fn handle_connection(
                     }
                     write_resp(&mut stream, &AttachResponse::err(msg)).await?
                 }
-            }
+            };
+            // Issue #454 round 3: released HERE and not one line earlier —
+            // everything from the authorisation above through `unregister_pane`
+            // and `finish_pane_close` is the pane-scoped cleanup the hold exists
+            // to keep valid. Every `?` above releases it too, via `Drop`.
+            drop(pane_cleanup_hold);
         }
         AttachRequest::SetAgentLabel {
             id,
@@ -2639,12 +2646,14 @@ mod tests {
         // anyone else's id, and once the role entry AND the registry record are
         // gone below, the dead pane admits nothing at all.
         assert!(
-            registry.owns_generation(Some(pane_id), Some(&agent_id)),
+            registry.generation_ownership(Some(pane_id), Some(&agent_id))
+                == crate::state::Ownership::Owned,
             "a retired generation still owns its own pane until something \
              claims or reaps it"
         );
         assert!(
-            !registry.owns_generation(Some(pane_id), Some("some-other-id-454")),
+            registry.generation_ownership(Some(pane_id), Some("some-other-id-454"))
+                == crate::state::Ownership::Unclaimed,
             "but it does not make the pane a bearer token for any other id"
         );
 
@@ -2839,6 +2848,164 @@ mod tests {
             assert!(
                 guard.pane_orchestration_map.contains_key(pane_id),
                 "…and its routing identity"
+            );
+        }
+
+        registry.shutdown_all();
+        server.abort();
+    }
+
+    /// Round-3 review, blocker 1 — the same finding as the test above, one
+    /// ordering earlier, which is the ordering the fix for it MISSED.
+    ///
+    /// The gate that decided whether the stopping agent still owed its pane any
+    /// cleanup asked `pane_current_agent_id`, and that lookup sees only
+    /// PUBLISHED, non-exited agents. A successor that has RESERVED the pane and
+    /// not published yet — the window `spawn_agent` occupies between taking its
+    /// reservation and inserting its record, which every spawn passes through —
+    /// therefore came back `None`, and `None` was read as "nobody holds this
+    /// pane, so it is still mine to give up". The handler then marked the pane
+    /// closing, cancelled every delegation touching it, and `unregister_pane`d
+    /// the pane's role, cwd, orchestrator marker and routing identity, all of
+    /// which the successor was in the middle of claiming.
+    ///
+    /// The sibling above places the successor fully LIVE before the stop, so it
+    /// catches neither this ordering nor the check-then-act one (the successor
+    /// reserving after the gate but before `unregister_pane`, across a
+    /// `close_agent` that can spend the full three-second termination grace).
+    /// Both are answered the same way, by the durable hold whose own two
+    /// properties are pinned in `crate::agent_pty`'s tests; this one pins that
+    /// the HANDLER actually takes it.
+    ///
+    /// What survives here is the predecessor's own registration, because the
+    /// successor has not published yet — and that is the correct outcome, not a
+    /// leak: the pane is the successor's, so the successor's `StartAgent`
+    /// overwrites every one of these entries the moment it publishes, and its
+    /// own close is what takes them back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_a_retired_agent_leaves_a_pane_its_successor_has_reserved_alone() {
+        use crate::daemon_client::{DaemonClient, StartAgentOptions};
+
+        let dir = tempfile::tempdir().expect("tempdir for the attach socket");
+        let sock = dir.path().join("attach.sock");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+
+        let server = {
+            let sock = sock.clone();
+            let registry = registry.clone();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = run_attach_server_with_counter(
+                    &sock,
+                    registry,
+                    event_tx,
+                    Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    state,
+                )
+                .await;
+            })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::net::UnixStream::connect(&sock).await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attach socket never came up at {}",
+                sock.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let pane_id = "reserved-handover-pane-454";
+        let client = DaemonClient::new(sock.clone());
+        let dir_path = dir.path().to_string_lossy().into_owned();
+        let old_id = client
+            .start_agent(StartAgentOptions {
+                command: Some("/usr/bin/true".to_string()),
+                cwd: Some(dir_path.clone()),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                tab_membership: Some(crate::agent_pty::TabMembership::Orchestration {
+                    name: "reserved-orch-454".to_string(),
+                    role_index: 0,
+                    role_name: "worker-a".to_string(),
+                    is_start_role: false,
+                    orchestration_cwd: Some(dir_path),
+                    display_title: None,
+                    orchestration_id: Some("orch-reserved-454".to_string()),
+                }),
+                ..StartAgentOptions::default()
+            })
+            .await
+            .expect("spawn the first role pane");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first child never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The successor is mid-spawn: it holds the pane's reservation and has
+        // not published a record yet.
+        registry.reserve_pane_for_test("successor-454", pane_id);
+        assert!(
+            registry.pane_current_agent_id(pane_id).is_none(),
+            "precondition: the old gate's question answers None in exactly this \
+             state, which is why it authorised the cleanup"
+        );
+
+        // Work outstanding against the pane — what the pane-scoped
+        // `begin_pane_close` sweep would silently drop.
+        let armed = registry
+            .arm_outstanding_delegation(
+                pane_id,
+                "worker-a",
+                "orchestrator-pane-454",
+                "orchestrator-agent-454",
+                None,
+            )
+            .expect("precondition: arming a delegation on the pane must succeed");
+
+        client
+            .stop_agent(&old_id)
+            .await
+            .expect("stop the already-dead first generation");
+
+        assert!(
+            registry
+                .take_outstanding_delegation_if(pane_id, armed.seq)
+                .is_some(),
+            "the pane's outstanding delegation must survive — `begin_pane_close` \
+             would have cancelled it on behalf of an agent that no longer owns \
+             the pane"
+        );
+        assert!(
+            !registry.is_pane_closing(pane_id),
+            "the successor's pane must not be left marked closing"
+        );
+        {
+            let guard = state.read().await;
+            assert!(
+                guard.managed_pane_ids.contains(pane_id),
+                "a pane a successor has already reserved must not be \
+                 unregistered by its predecessor's close; managed={:?}",
+                guard.managed_pane_ids
+            );
+            assert_eq!(
+                guard.pane_role_map.get(pane_id).map(String::as_str),
+                Some("worker-a"),
+                "…nor may its ROLE be taken back: the successor's `StartAgent` \
+                 is about to overwrite this entry, and deleting it afterwards \
+                 leaves every delegate to that role resolving nothing"
+            );
+            assert!(guard.pane_cwd_map.contains_key(pane_id), "…nor its cwd");
+            assert!(
+                guard.pane_orchestration_map.contains_key(pane_id),
+                "…nor its routing identity"
             );
         }
 
