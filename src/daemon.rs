@@ -540,6 +540,16 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // inherited environment when it emits. See `DOT_AGENT_DECK_SOCKET`.
     pty_registry.set_hook_socket(socket_path.to_path_buf());
     let state = daemon.state;
+    // Issue #454: teach this daemon's `AppState` to resolve "do I own the agent
+    // this event names?" against the registry rather than against a set it
+    // would have to maintain by hand — see `crate::state::AgentOwnership`.
+    // Installed here so a HOOK-ONLY daemon (no attach server, `Daemon::new`)
+    // gets it too; `serve_attach_with_counter` installs the same registry again
+    // for the harnesses that serve the attach protocol without this function.
+    state
+        .write()
+        .await
+        .set_agent_ownership(pty_registry.clone() as Arc<dyn crate::state::AgentOwnership>);
     let event_tx = daemon.event_tx;
     // Issue #424: give the spawn-time delivery path a way to REPORT a failed
     // delivery as state on the pane's card instead of typing a diagnostic line

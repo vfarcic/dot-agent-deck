@@ -465,21 +465,20 @@ pub async fn spawn(
                 pin_sh,
                 notifier,
             )?;
-            // Issue #454: the daemon-internal counterpart of the
-            // `AttachRequest::StartAgent` registration — see the invariant
-            // spelled out there. The ORCHESTRATION branch below already tells
-            // the daemon's `AppState` it owns its role panes (via
-            // `register_orchestration_role`); a single-agent spawn had no such
-            // step, so `apply_event` dropped every non-`SessionStart` report
-            // from a scheduled / dispatched pane and its `daemon status` row
-            // showed `STATUS=- TOOL=-` exactly like the dashboard-pane bug.
-            // The `surface_spawned_pane` broadcast below is NOT that step: it
+            // Issue #454: a single-agent spawn registers NOTHING in the
+            // daemon's `AppState`, and does not need to. Its pane's lifecycle
+            // reports are admitted because the daemon's admission check asks
+            // `AgentPtyRegistry` who it owns (`crate::state::AgentOwnership`),
+            // and `spawn_one` has just put this pane there — from before the
+            // child existed, via the spawn reservation, until it dies. Before
+            // that, `apply_event` dropped every non-`SessionStart` report from
+            // a scheduled / dispatched pane and its `daemon status` row showed
+            // `STATUS=- TOOL=-` exactly like the dashboard-pane bug.
+            //
+            // The `surface_spawned_pane` broadcast below is unrelated: it
             // publishes a synthetic `SessionStart` straight onto `event_tx` for
             // attached TUIs and never passes through `daemon::ingest_event`, so
             // the daemon's own `AppState` never sees it.
-            if let Some(state) = state {
-                state.write().await.register_pane(pane_id.clone());
-            }
             // PRD #127 finding #2: surface this single-agent card LIVE to any
             // already-attached TUI (the daemon otherwise only hydrates its
             // agents at TUI startup). Reuses the existing hook-event broadcast
@@ -536,7 +535,17 @@ pub async fn spawn(
             // orchestration in the same working dir are then two distinct
             // routing groups instead of one ambiguous `(name, cwd)` identity.
             let orchestration_id = crate::agent_pty::mint_orchestration_id();
-            for role in &roles {
+            // The same `Instance` identity `StartAgent` derives from the
+            // membership these panes are spawned with, so a dispatched
+            // orchestration and a `Ctrl+N` one are scoped by exactly the same
+            // rule and `delegate_targets`' identity equality behaves identically
+            // for both (PRD #140 M2.0). Minted once, before the loop, because
+            // every role of one orchestration shares it.
+            let identity = crate::state::OrchestrationIdentity::Instance {
+                id: orchestration_id.clone(),
+                name: name.clone(),
+            };
+            for (idx, role) in roles.iter().enumerate() {
                 let pane_id = next_pane_id(&req.task_name, Some(role.role_index));
                 let membership = TabMembership::Orchestration {
                     name: name.clone(),
@@ -563,40 +572,63 @@ pub async fn spawn(
                     false,
                     notifier,
                 )?;
-                agents.push(SpawnedAgent {
-                    id,
-                    pane_id,
-                    role_name: Some(role.role_name.clone()),
-                });
-            }
-            // Tell the DAEMON's AppState who these panes are, so the orchestrator
-            // we are about to hand a delegation protocol to can actually use it.
-            //
-            // Without this a dispatched / scheduled orchestration came up
-            // complete and inert: `handle_delegate` looks the sender up in
-            // `pane_role_map`, which only the `StartAgent` handler was filling,
-            // so every `dot-agent-deck delegate` from one of these orchestrators
-            // was dropped with `delegate from unknown pane` and no worker ever
-            // received a task (`orchestration/dispatch/001`).
-            //
-            // Done HERE — synchronously, before `spawn` returns and before the
-            // orchestrator's prompt is delivered below — rather than off the
-            // `OrchestrationSurface` broadcast, so there is no window in which a
-            // fast orchestrator's first delegate can beat its own registration.
-            if let Some(state) = state {
-                // The same `Instance` identity `StartAgent` derives from the
-                // membership these panes were spawned with, so a dispatched
-                // orchestration and a `Ctrl+N` one are scoped by exactly the same
-                // rule and `delegate_targets`' identity equality behaves
-                // identically for both (PRD #140 M2.0).
-                let identity = crate::state::OrchestrationIdentity::Instance {
-                    id: orchestration_id.clone(),
-                    name: name.clone(),
-                };
-                let mut st = state.write().await;
-                for (idx, (role, agent)) in roles.iter().zip(agents.iter()).enumerate() {
-                    st.register_orchestration_role(
-                        &agent.pane_id,
+                // Tell the DAEMON's AppState who this pane is, so the
+                // orchestrator we are about to hand a delegation protocol to can
+                // actually use it.
+                //
+                // Without this a dispatched / scheduled orchestration came up
+                // complete and inert: `handle_delegate` looks the sender up in
+                // `pane_role_map`, which only the `StartAgent` handler was
+                // filling, so every `dot-agent-deck delegate` from one of these
+                // orchestrators was dropped with `delegate from unknown pane`
+                // and no worker ever received a task
+                // (`orchestration/dispatch/001`).
+                //
+                // Done HERE — synchronously, inside the loop, as each role's
+                // spawn lands — rather than after the loop or off the
+                // `OrchestrationSurface` broadcast. Off the broadcast there is a
+                // window in which a fast orchestrator's first delegate beats its
+                // own registration. After the loop there is a second problem
+                // (PR review, issue #454 item 4): the loop `?`s out on the first
+                // role that fails to spawn, so a failure at role N left roles
+                // 0..N already launched and registered NOWHERE, with the daemon
+                // holding live children it had no routing entry for. Registering
+                // per role keeps state consistent with whatever subset actually
+                // started.
+                //
+                // (The already-spawned roles are still not torn down on that
+                // early return, and the caller gets no `SpawnHandle` for them so
+                // it cannot close them either. That is `spawn`'s pre-existing
+                // error semantics, tracked separately — not something this
+                // registration ordering can or should decide.)
+                //
+                // Issue #454 review, item 5: gated on the SAME validation the
+                // `AttachRequest::StartAgent` seam applies. There it is implicit
+                // — an id `is_valid_pane_id_env` rejects leaves `pane_id_env`
+                // as `None` and the role registration below it never runs — and
+                // this seam had no equivalent, so it could register an id the
+                // registry itself had refused to retain. `next_pane_id` now
+                // honours the cap that makes that unreachable; the check stays
+                // as the seam-level agreement rather than as a second place
+                // where the rule is stated differently. Registering an
+                // unretainable id would be strictly worse than skipping: the
+                // registry stores `pane_id_env = None` for it, so
+                // `write_to_pane_and_submit` could never route to the pane the
+                // role map claimed to have.
+                if let Some(state) = state.filter(|_| {
+                    crate::agent_pty::is_valid_pane_id_env(&pane_id) || {
+                        tracing::warn!(
+                            pane_id_len = pane_id.len(),
+                            role = %role.role_name,
+                            "spawn: refusing to register an orchestration role under a \
+                             pane id the registry cannot retain — delegation to this \
+                             role will not route"
+                        );
+                        false
+                    }
+                }) {
+                    state.write().await.register_orchestration_role(
+                        &pane_id,
                         &role.role_name,
                         // `orch_idx`, NOT `role.is_start_role`. `orch_idx` is
                         // already this path's authority on which role is the
@@ -632,6 +664,11 @@ pub async fn spawn(
                         Some(req.working_dir.as_str()),
                     );
                 }
+                agents.push(SpawnedAgent {
+                    id,
+                    pane_id,
+                    role_name: Some(role.role_name.clone()),
+                });
             }
             // PRD #120: surface this orchestration LIVE to any already-attached
             // TUI. Unlike the single-agent card above (a synthetic
@@ -1953,6 +1990,23 @@ fn surface_spawned_orchestration(
 /// A fresh, valid `DOT_AGENT_DECK_PANE_ID` for a spawned pane. Sanitizes the
 /// task name to the allowed charset and appends a monotonic counter (+ role
 /// index for orchestration panes) so concurrent fires never collide.
+///
+/// "Valid" means [`crate::agent_pty::is_valid_pane_id_env`] accepts it, and that
+/// includes the [`PANE_ID_ENV_MAX_LEN`] byte cap — which this function used to
+/// claim and not honour (issue #454). Schedule and dispatch task names have no
+/// length bound of their own, so a long one produced an over-long id that
+/// `AgentPtyRegistry::spawn_agent` refused to retain: the registry stored
+/// `pane_id_env = None` while the child was launched with the full value, and
+/// `ListAgents` could then never join the pane's live session onto its record.
+/// That is issue #454's exact symptom (`daemon status` showing `STATUS=- TOOL=-`
+/// and reconnect restoring `Idle`) surviving #454's fix, for every task whose
+/// name is long enough. `StopAgent` could not recover the id either, so each
+/// fire also leaked its per-pane daemon state.
+///
+/// The counter and role suffix carry the uniqueness, so it is the SANITIZED NAME
+/// that gets truncated — never the suffix. Two long task names sharing a prefix
+/// therefore produce ids that differ only in the counter, which is exactly what
+/// the counter is for.
 fn next_pane_id(task_name: &str, role_index: Option<usize>) -> String {
     let n = PANE_COUNTER.fetch_add(1, Ordering::SeqCst);
     let sanitized: String = task_name
@@ -1965,10 +2019,28 @@ fn next_pane_id(task_name: &str, role_index: Option<usize>) -> String {
             }
         })
         .collect();
-    match role_index {
-        Some(idx) => format!("{SCHEDULE_PANE_ID_PREFIX}{sanitized}-{n}-r{idx}"),
-        None => format!("{SCHEDULE_PANE_ID_PREFIX}{sanitized}-{n}"),
-    }
+    let suffix = match role_index {
+        Some(idx) => format!("-{n}-r{idx}"),
+        None => format!("-{n}"),
+    };
+    // Every byte here is ASCII (the prefix is a literal, the counter and role
+    // index are decimal, and the sanitizer maps every non-`[A-Za-z0-9_-]` char
+    // to `-`), so a byte budget is also a char budget and truncating on it
+    // cannot split a code point.
+    let budget = crate::agent_pty::PANE_ID_ENV_MAX_LEN
+        .saturating_sub(SCHEDULE_PANE_ID_PREFIX.len() + suffix.len());
+    let sanitized = &sanitized[..sanitized.len().min(budget)];
+    let pane_id = format!("{SCHEDULE_PANE_ID_PREFIX}{sanitized}{suffix}");
+    // The budget can only underflow to zero if the fixed parts alone overflow
+    // the cap, which needs a ~50-digit counter — unreachable for a `u64` this
+    // process increments once per spawned pane. Asserted rather than truncated
+    // because truncating the SUFFIX is the one repair that would be worse than
+    // the problem: it is what makes two concurrent fires distinct.
+    debug_assert!(
+        crate::agent_pty::is_valid_pane_id_env(&pane_id),
+        "next_pane_id must produce a valid DOT_AGENT_DECK_PANE_ID: {pane_id:?}"
+    );
+    pane_id
 }
 
 // ---------------------------------------------------------------------------
@@ -3781,6 +3853,142 @@ mod tests {
         assert!(is_valid_pane_id_env(&r));
         assert_ne!(a, b, "pane ids must be unique across calls");
         assert!(r.ends_with("-r2"));
+    }
+
+    /// Issue #454 review, item 4: each role is registered in the daemon's
+    /// `AppState` AS ITS SPAWN LANDS, not after the whole loop.
+    ///
+    /// The loop `?`s out of `spawn_one`, so a role that fails to spawn abandons
+    /// the orchestration — and with the registration sitting after the loop, the
+    /// roles that had already started were left running with no `pane_role_map`
+    /// / `pane_orchestration_map` entry anywhere. A `dot-agent-deck delegate`
+    /// from such a survivor is rejected with "delegate from unknown pane", which
+    /// is the same inert-orchestration failure the post-loop registration was
+    /// added to fix, reached by a different route.
+    ///
+    /// Role 1 is a command that cannot be exec'd, so the failure is the loop's
+    /// real early return rather than a simulated one. Note what this test does
+    /// NOT assert: role 0's child is still running afterwards and the caller
+    /// gets no handle with which to close it. That is `spawn`'s pre-existing
+    /// error semantics — orphan-on-partial-failure — and is tracked separately;
+    /// registration ordering neither causes nor cures it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn each_orchestration_role_is_registered_as_its_spawn_lands() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+
+        struct SilentNotifier;
+        impl Notifier for SilentNotifier {
+            fn notify(&self, _event: NotifyEvent) {}
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir for the orchestration cwd");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+
+        let role = |idx: usize, name: &str, command: &str| RoleSpawn {
+            role_index: idx,
+            role_name: name.to_string(),
+            command: command.to_string(),
+            is_start_role: idx == 0,
+        };
+        let req = SpawnRequest {
+            task_name: "partial-454".to_string(),
+            working_dir: dir.path().to_string_lossy().into_owned(),
+            command: None,
+            prompt: "unused — the spawn fails before delivery".to_string(),
+            resolved_target: Some(SpawnTarget::Orchestration {
+                name: "partial-454".to_string(),
+                roles: vec![
+                    role(0, "orchestrator", "/bin/sh"),
+                    role(1, "worker", "/nonexistent/dot-agent-deck-454"),
+                ],
+                config: Box::new(OrchestrationConfig {
+                    name: "partial-454".to_string(),
+                    roles: vec![OrchestrationRoleConfig {
+                        name: "orchestrator".to_string(),
+                        command: "/bin/sh".to_string(),
+                        start: true,
+                        description: None,
+                        prompt_template: None,
+                        clear: true,
+                    }],
+                }),
+            }),
+            compose_orchestrator_context: false,
+        };
+
+        let result = spawn(req, &registry, &SilentNotifier, None, false, Some(&state)).await;
+        assert!(
+            result.is_err(),
+            "precondition: role 1 must fail to spawn, aborting the orchestration"
+        );
+
+        let guard = state.read().await;
+        let registered: Vec<&String> = guard.pane_role_map.keys().collect();
+        assert_eq!(
+            registered.len(),
+            1,
+            "the role that DID spawn must be registered even though a later one \
+             failed; pane_role_map={:?}",
+            guard.pane_role_map
+        );
+        let pane_id = registered[0];
+        assert_eq!(
+            guard.pane_role_map.get(pane_id).map(String::as_str),
+            Some("orchestrator")
+        );
+        assert!(
+            guard.orchestrator_pane_ids.contains(pane_id),
+            "the surviving start role must still be registered as the orchestrator"
+        );
+        assert!(
+            guard.pane_orchestration_map.contains_key(pane_id),
+            "…and must carry the orchestration identity `handle_delegate` routes on"
+        );
+        drop(guard);
+
+        registry.shutdown_all();
+    }
+
+    /// Issue #454 review, item 5: the "valid" in this function's contract
+    /// includes the byte cap, and a schedule / dispatch task name has no length
+    /// bound of its own.
+    ///
+    /// An over-long id is not cosmetic. `AgentPtyRegistry::spawn_agent` refuses
+    /// to RETAIN one — it stores `pane_id_env = None` while launching the child
+    /// with the full value — so the pane exists but the registry cannot name it:
+    /// `ListAgents` has nothing to join the live session onto and `StopAgent`
+    /// can never recover the id to clean up with. That is issue #454's own
+    /// symptom (`STATUS=- TOOL=-`, reconnect restoring `Idle`) surviving #454's
+    /// fix, for every task whose name is long enough, plus a leak per fire.
+    #[test]
+    fn next_pane_id_stays_valid_for_an_unbounded_task_name() {
+        use crate::agent_pty::{PANE_ID_ENV_MAX_LEN, is_valid_pane_id_env};
+        let long = "a-very-long-scheduled-task-name".repeat(20);
+        let single = next_pane_id(&long, None);
+        let role = next_pane_id(&long, Some(7));
+        for id in [&single, &role] {
+            assert!(
+                is_valid_pane_id_env(id),
+                "an unbounded task name must still yield a retainable pane id \
+                 (len={}, cap={PANE_ID_ENV_MAX_LEN}): {id}",
+                id.len()
+            );
+            assert!(id.starts_with(SCHEDULE_PANE_ID_PREFIX));
+        }
+        // The uniqueness-bearing tail is what must never be truncated: two
+        // fires of the same long name differ only by the counter.
+        assert!(
+            role.ends_with("-r7"),
+            "the role suffix must survive: {role}"
+        );
+        assert_ne!(
+            next_pane_id(&long, None),
+            single,
+            "truncation must not collapse two fires of one long name onto one id"
+        );
     }
 
     #[test]

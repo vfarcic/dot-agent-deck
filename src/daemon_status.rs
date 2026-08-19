@@ -102,8 +102,15 @@ pub struct StatusAgent {
     pub active_tool: Option<StatusTool>,
 }
 
-/// Top-level `--json` document (the design rationale's proposed shape, minus
-/// the fields explained in the module doc comment above).
+/// Top-level `--json` document: a [`SCHEMA_VERSION`] and the `agents` array,
+/// each entry a [`StatusAgent`].
+///
+/// Issue #459 follow-through: this used to defer to "the design rationale",
+/// which was a note under the gitignored `.dot-agent-deck/` — no reader of the
+/// merged source could follow it. The shape is stated here instead, and what is
+/// deliberately absent from it (`last_user_prompt` / `first_prompts`,
+/// `hook_session_id` / `last_activity`) is stated in the module doc comment
+/// above, with the reason for each.
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusDocument {
     pub schema_version: u32,

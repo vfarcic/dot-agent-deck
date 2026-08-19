@@ -2685,6 +2685,61 @@ pub enum SilenceWatchRetirement {
 struct RegistryInner {
     next_id: u64,
     agents: HashMap<String, RunningAgent>,
+    /// Issue #454: spawns that have been ADMITTED but whose `RunningAgent` is
+    /// not in `agents` yet — keyed by the pre-allocated agent id, valued by the
+    /// spawn's validated `pane_id_env` (`None` for a paneless agent).
+    ///
+    /// [`AgentPtyRegistry::spawn_agent`] launches the child BEFORE it can take
+    /// this lock to publish the agent, so between those two points the daemon
+    /// owns a running child it cannot yet recognise. That gap is not
+    /// theoretical: the child's very first action can be
+    /// `dot-agent-deck agent-event --type running`, and the daemon's admission
+    /// check ([`crate::state::AppState::apply_event`]) would drop the report as
+    /// coming from a pane nobody owns — leaving `daemon status` and reconnect at
+    /// `live = None` with no later event to repair it, which is issue #454 all
+    /// over again for a wrapper that never emits `SessionStart`.
+    ///
+    /// The reservation is taken BEFORE the child exists and released under the
+    /// SAME lock acquisition that inserts into `agents`, so ownership is
+    /// continuously observable: every path that answers "do we own this?" sees
+    /// either the reservation or the agent, never neither. It is released on
+    /// every failure path too (see [`SpawnReservation`]), including a panic
+    /// inside the spawn itself.
+    pending_spawns: HashMap<String, Option<String>>,
+}
+
+/// Issue #454: RAII holder for a [`RegistryInner::pending_spawns`] entry.
+///
+/// `Drop` releases it by taking the registry lock, which is correct for every
+/// path that is NOT already holding it. The success path *is* — `spawn_agent`
+/// holds `inner` from the post-spawn acquisition through `agents.insert` — so it
+/// calls [`Self::release_locked`] instead, which consumes the guard and disarms
+/// `Drop` (a second lock acquisition on a `std::sync::Mutex` would deadlock).
+struct SpawnReservation<'a> {
+    registry: &'a AgentPtyRegistry,
+    id: Option<String>,
+}
+
+impl<'a> SpawnReservation<'a> {
+    /// Release the reservation while the caller already holds the registry lock.
+    fn release_locked(mut self, inner: &mut RegistryInner) {
+        if let Some(id) = self.id.take() {
+            inner.pending_spawns.remove(&id);
+        }
+    }
+}
+
+impl Drop for SpawnReservation<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            // A poisoned lock means some other thread panicked mid-mutation;
+            // there is nothing useful to do here and panicking in `Drop` would
+            // abort. The stale entry is bounded by one per panicking spawn.
+            if let Ok(mut inner) = self.registry.inner.lock() {
+                inner.pending_spawns.remove(&id);
+            }
+        }
+    }
 }
 
 /// Issue #424 (reviewer blocker 3 / auditor MEDIUM): one daemon-authored report
@@ -2759,12 +2814,27 @@ impl Default for AgentPtyRegistry {
     }
 }
 
+/// Issue #454: the registry IS the daemon's ownership authority — see
+/// [`crate::state::AgentOwnership`] for why the daemon cannot keep an accurate
+/// copy of this by hand, and [`AgentPtyRegistry::owns_pane`] for the three
+/// properties that make asking here correct.
+impl crate::state::AgentOwnership for AgentPtyRegistry {
+    fn owns_pane(&self, pane_id: &str) -> bool {
+        AgentPtyRegistry::owns_pane(self, pane_id)
+    }
+
+    fn owns_paneless_agent(&self, agent_id: &str) -> bool {
+        AgentPtyRegistry::owns_paneless_agent(self, agent_id)
+    }
+}
+
 impl AgentPtyRegistry {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(RegistryInner {
                 next_id: 1,
                 agents: HashMap::new(),
+                pending_spawns: HashMap::new(),
             }),
             dispatch_mutexes: Mutex::new(HashMap::new()),
             detach_count: AtomicU64::new(0),
@@ -3758,11 +3828,23 @@ impl AgentPtyRegistry {
         // the OLD agent's `spawn_env` (which carries its id), and an
         // untrimmed replay would tag the NEW agent's hooks with the
         // OLD id — defeating the whole point of the filter.
+        //
+        // Issue #454: the same acquisition RESERVES the spawn. The child is
+        // launched below, before we can take this lock again to publish the
+        // agent, so without the reservation there is a window in which the
+        // daemon owns a running child that nothing can recognise — and a
+        // wrapper whose first act is `dot-agent-deck agent-event --type running`
+        // lands squarely in it. See [`RegistryInner::pending_spawns`].
         let preallocated_id = {
             let mut inner = self.inner.lock().unwrap();
             let id = inner.next_id.to_string();
             inner.next_id += 1;
+            inner.pending_spawns.insert(id.clone(), pane_id_env.clone());
             id
+        };
+        let reservation = SpawnReservation {
+            registry: self,
+            id: Some(preallocated_id.clone()),
         };
         opts.env.retain(|(k, _)| k != DOT_AGENT_DECK_AGENT_ID);
         opts.env
@@ -3814,6 +3896,12 @@ impl AgentPtyRegistry {
         // (`AgentPty` has no `Drop`).
         let guard = PtyGuard::new(spawn(opts)?);
         let mut inner = self.inner.lock().unwrap();
+        // Issue #454: hand ownership over from the reservation to `agents`
+        // WITHOUT releasing the lock in between — every early return below has
+        // already given up on this spawn, and the success path inserts under
+        // this very acquisition. Released here rather than via `Drop` because
+        // `Drop` would try to take a lock this scope already holds.
+        reservation.release_locked(&mut inner);
 
         // CodeRabbit MAJOR (PRD #92 PR #105): Guard B — re-check the
         // shutdown latch *inside* the inner lock, so the check + insert
@@ -5042,6 +5130,87 @@ impl AgentPtyRegistry {
     /// All currently-owned agent ids, sorted ascending.
     pub fn agent_ids(&self) -> Vec<String> {
         self.agent_records().into_iter().map(|r| r.id).collect()
+    }
+
+    /// Issue #454: the agent recorded under `id`, INCLUDING one whose child has
+    /// already exited.
+    ///
+    /// [`Self::agent_records`] filters exited entries because it is the
+    /// hydration source and a dead entry there materialises a ghost pane. The
+    /// CLEANUP paths need the opposite: `StopAgent` reads the stopping agent's
+    /// `pane_id_env` so it can take the pane's role-map entries and daemon-state
+    /// registration back, and reading that through the filtered list meant a
+    /// naturally-exited child produced `pane_id_env == None` and every cleanup
+    /// step was skipped — permanently, since the registry entry is removed by
+    /// the same handler. Cleanup is exactly the case where a dead entry is the
+    /// thing you are looking for.
+    pub fn agent_record_any(&self, id: &str) -> Option<AgentRecord> {
+        let inner = self.inner.lock().unwrap();
+        inner.agents.get(id).map(|agent| AgentRecord {
+            id: id.to_string(),
+            pane_id_env: agent.pane_id_env.clone(),
+            display_name: agent.display_name.clone(),
+            cwd: agent.cwd.clone(),
+            tab_membership: agent.tab_membership.clone(),
+            agent_type: agent.agent_type.clone(),
+            rows: agent.pty_rows,
+            cols: agent.pty_cols,
+            live: None,
+        })
+    }
+
+    /// Issue #454: does this registry own a LIVE agent whose spawn-time
+    /// `DOT_AGENT_DECK_PANE_ID` is `pane_id`?
+    ///
+    /// This is the daemon's answer to "may an event naming this pane drive my
+    /// session state?" — see [`crate::state::AgentOwnership`]. Three properties
+    /// make it the right authority, and each is one the set-of-registered-ids it
+    /// replaces could not hold:
+    ///
+    /// * it is true from BEFORE the child exists (the spawn reservation), so a
+    ///   child that reports faster than its spawner returns is still owned;
+    /// * it stops being true the moment the child dies, because the same
+    ///   `exited` filter every other operational lookup applies is applied here
+    ///   — no separate revocation step has to run, and none can be missed;
+    /// * it cannot be grown by anything but a spawn, so repeated short-lived
+    ///   panes leave nothing behind.
+    pub fn owns_pane(&self, pane_id: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .agents
+            .values()
+            .any(|a| a.pane_id_env.as_deref() == Some(pane_id) && !a.exited.load(Ordering::SeqCst))
+            || inner
+                .pending_spawns
+                .values()
+                .any(|p| p.as_deref() == Some(pane_id))
+    }
+
+    /// Issue #454: does this registry own a LIVE agent with registry id
+    /// `agent_id` that carries NO pane id?
+    ///
+    /// A daemon-side agent spawned without `DOT_AGENT_DECK_PANE_ID` is a
+    /// supported shape — its writability is resolved by agent identity
+    /// throughout the guarded-send and attach-input paths
+    /// (`AppState::agent_writable`), which only works if the session it
+    /// declares is admitted in the first place. Its events carry
+    /// `pane_id: None`, so pane-keyed ownership can never speak for them and
+    /// this is the query that does.
+    ///
+    /// Deliberately restricted to agents that are genuinely paneless: an event
+    /// that dropped its `DOT_AGENT_DECK_PANE_ID` but kept its agent id belongs
+    /// to a pane-carrying agent, and admitting it would mint a second,
+    /// pane-less session card beside the pane's own.
+    pub fn owns_paneless_agent(&self, agent_id: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .agents
+            .get(agent_id)
+            .is_some_and(|a| a.pane_id_env.is_none() && !a.exited.load(Ordering::SeqCst))
+            || inner
+                .pending_spawns
+                .get(agent_id)
+                .is_some_and(|p| p.is_none())
     }
 
     /// All currently-owned *live* agents as `(id, pane_id_env)`
@@ -6733,6 +6902,155 @@ mod spawn_tests {
             .expect("reuse of an exited agent's pane_id_env must succeed");
         assert_ne!(id1, id2);
 
+        registry.shutdown_all();
+    }
+
+    // ---- Issue #454: the registry as the daemon's OWNERSHIP AUTHORITY. ----
+    //
+    // `AppState::apply_event` admits an event only for an agent this process
+    // owns. On the daemon that question is answered here, and these four tests
+    // pin the three properties that made asking here the fix rather than
+    // maintaining a second copy of the answer: ownership starts BEFORE the child
+    // exists, ends the moment it dies, and the reservation that provides the
+    // first is released on every path.
+
+    /// The startup-race half. A spawn is owned from the moment it is RESERVED —
+    /// before `spawn()` forks the child — so a wrapper whose very first act is
+    /// `dot-agent-deck agent-event --type running` is already recognised when
+    /// its report lands. Registering ownership after `spawn_agent` returned left
+    /// that report to be dropped with nothing later to repair it, which is issue
+    /// #454's symptom for any producer that never emits `SessionStart`.
+    ///
+    /// Asserted against the reservation directly because the window it covers is
+    /// microseconds of lock-held work inside `spawn_agent` and cannot be paused
+    /// from outside.
+    #[test]
+    fn a_reserved_spawn_is_owned_before_its_agent_is_published() {
+        let registry = AgentPtyRegistry::new();
+        {
+            let mut inner = registry.inner.lock().unwrap();
+            inner
+                .pending_spawns
+                .insert("77".to_string(), Some("in-flight-pane-454".to_string()));
+            inner.pending_spawns.insert("78".to_string(), None);
+        }
+        assert!(
+            registry.owns_pane("in-flight-pane-454"),
+            "a pane whose spawn is in flight must already be owned"
+        );
+        assert!(
+            registry.owns_paneless_agent("78"),
+            "a paneless agent whose spawn is in flight must already be owned"
+        );
+        assert!(
+            !registry.owns_pane("never-spawned-454"),
+            "a pane nobody spawned is owned by nobody"
+        );
+        assert!(
+            !registry.owns_paneless_agent("77"),
+            "an agent that carries a pane must not answer the PANELESS query —              admitting it would mint a second, pane-less card beside its own"
+        );
+    }
+
+    /// A successful spawn hands ownership from the reservation to the published
+    /// agent under one lock acquisition, leaving no reservation behind. If it
+    /// leaked, the id would keep admitting events forever — the failure mode the
+    /// hand-maintained set had, reproduced inside the fix.
+    #[tokio::test]
+    async fn a_successful_spawn_releases_its_reservation() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "reserved-ok-454".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn /bin/sh");
+        assert!(
+            registry.inner.lock().unwrap().pending_spawns.is_empty(),
+            "a published agent must not also hold a reservation"
+        );
+        assert!(registry.owns_pane("reserved-ok-454"));
+        assert!(
+            !registry.owns_paneless_agent(&id),
+            "an agent with a pane id is not a paneless agent"
+        );
+        registry.shutdown_all();
+    }
+
+    /// And a REJECTED spawn releases it too. The duplicate-pane-id rejection is
+    /// the deterministic version of this: it returns from inside the post-spawn
+    /// lock, the same acquisition the success path releases under, so it is the
+    /// early return most likely to be missed.
+    #[tokio::test]
+    async fn a_rejected_spawn_releases_its_reservation() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let opts = || SpawnOptions {
+            command: Some("/bin/sh"),
+            env: vec![(
+                DOT_AGENT_DECK_PANE_ID.to_string(),
+                "reserved-dup-454".to_string(),
+            )],
+            ..SpawnOptions::default()
+        };
+        let _first = registry.spawn_agent(opts()).expect("first spawn");
+        let second = registry.spawn_agent(opts());
+        assert!(
+            matches!(second, Err(AgentPtyError::DuplicatePaneId(_))),
+            "precondition: the second spawn must be rejected; got {second:?}"
+        );
+        assert!(
+            registry.inner.lock().unwrap().pending_spawns.is_empty(),
+            "a rejected spawn must not leave a reservation admitting events for              a child that was killed"
+        );
+        registry.shutdown_all();
+    }
+
+    /// The natural-death half, and the one no hand-maintained set could hold:
+    /// nothing reports a child's own exit to the daemon's session state, so
+    /// ownership has to STOP being true by itself. It does, because this query
+    /// applies the same `exited` filter every other operational lookup applies.
+    ///
+    /// `agent_record_any` is the deliberate exception — cleanup needs the dead
+    /// record precisely because it is dead (see `StopAgent`).
+    #[tokio::test]
+    async fn a_naturally_exited_agent_is_no_longer_owned() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    "dead-pane-454".to_string(),
+                )],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn /usr/bin/true");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.live_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child never exited"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            !registry.owns_pane("dead-pane-454"),
+            "a pane whose child is gone must stop being owned — otherwise its id              keeps admitting forged reports and every short-lived pane leaks one"
+        );
+        assert_eq!(
+            registry
+                .agent_record_any(&id)
+                .and_then(|r| r.pane_id_env)
+                .as_deref(),
+            Some("dead-pane-454"),
+            "cleanup still has to be able to read a dead agent's pane id —              `agent_records` filters it out and `StopAgent` then skipped every              cleanup step, permanently"
+        );
         registry.shutdown_all();
     }
 
