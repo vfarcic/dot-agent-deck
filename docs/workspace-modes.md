@@ -159,6 +159,8 @@ The border is not the only signal: a chip at the left of the bottom bar names th
 
 Command mode is the safe resting state — the one mode in which a stray keystroke cannot reach an agent — and you can read in it. Pane content stays fully readable (dimmed, never blanked), and the focused agent pane scrolls there, by wheel and by `PageUp` / `PageDown`, just as side panes do in any mode. The wheel is never forwarded to the agent's mouse protocol in command mode, so a full-screen TUI running in the pane cannot scroll under you while you read.
 
+How far back a pane scrolls is decided by the agent running in it, not by the mode: an agent that repaints its transcript in place rather than letting lines scroll off the top leaves nothing to scroll back through, in command mode or any other. See [How far back you can scroll depends on the agent](keyboard-shortcuts.md#how-far-back-you-can-scroll-depends-on-the-agent).
+
 ### Typing Into a Pane
 
 Press `Enter` on a selected side pane to type directly into the pane's shell — run commands, send input, interact with running processes. `Ctrl+c` sends SIGINT to the pane's process, and `Ctrl+d` returns you to command mode. If no side pane is selected, `Enter` focuses the agent pane instead.
