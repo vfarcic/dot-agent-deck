@@ -1,6 +1,6 @@
 # PRD #611: Pane scrolling is per-agent, and the deck should say so
 
-**Status**: In progress
+**Status**: Implementation complete (M1-M3); PR pending
 **Issue**: [#611](https://github.com/vfarcic/dot-agent-deck/issues/611)
 **Builds on**: [#341](https://github.com/vfarcic/dot-agent-deck/issues/341) (the focused-pane scroll routing and the command-mode banner this PRD's notice is modelled on)
 **Interacts with**: [#362](https://github.com/vfarcic/dot-agent-deck/issues/362) (wheel events routed by focus rather than by pointer), [#385](https://github.com/vfarcic/dot-agent-deck/issues/385) (which also extends the `mode/scroll` family)
