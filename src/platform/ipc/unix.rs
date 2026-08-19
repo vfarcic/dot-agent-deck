@@ -564,6 +564,23 @@ mod tests {
     #[test]
     fn connect_retries_until_the_listener_drains_its_queue() {
         let listener = SaturatedListener::new();
+        if listener.behaviour == QueueFull::Refuses {
+            // There is no retry to observe on the BSDs: the kernel answers a
+            // full queue with `ECONNREFUSED`, which is a FINAL answer that
+            // `connect_timeout` must propagate rather than retry — a stale
+            // socket inode reports the same errno, and the daemon's
+            // stale-endpoint probe depends on seeing it immediately. What
+            // replaces this test there is asserted directly by
+            // `connect_against_a_saturated_listener_returns_within_the_deadline`
+            // (queue-full is `ConnectionRefused`) and by
+            // `connect_does_not_retry_a_stale_socket_inode` (that errno is not
+            // retried anywhere).
+            eprintln!(
+                "skipped: this platform refuses a full accept queue rather than parking on it, \
+                 so connect_timeout's retry loop is unreachable here"
+            );
+            return;
+        }
         // Non-blocking so the drain loop below can poll for a queued connection
         // without parking once the queue is empty.
         listener
@@ -607,6 +624,40 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "the successful connect must land inside the budget, took {elapsed:?}"
+        );
+    }
+
+    /// The retry loop must not swallow a FINAL answer. A socket inode with no
+    /// listener behind it — what a crashed daemon leaves — reports
+    /// `ECONNREFUSED`, the same errno the BSDs use for a full accept queue, and
+    /// `daemon.rs`'s stale-endpoint dance keys off seeing it *promptly*: it is
+    /// the probe that decides whether to unlink the leftover and rebind. Adding
+    /// `ECONNREFUSED` to the retryable set — the obvious way to "fix" a BSD
+    /// running the test above — would leave that classification intact while
+    /// making every stale-socket probe cost the caller's whole budget, so this
+    /// pins the timing as well as the kind.
+    #[test]
+    fn connect_does_not_retry_a_stale_socket_inode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("stale.sock");
+        // Bind and drop: the stdlib does not unlink on drop, so the inode
+        // outlives the listener exactly as a crashed daemon's does.
+        drop(UnixListener::bind(&path).expect("bind"));
+        assert!(path.exists(), "the stale inode must survive the listener");
+
+        let started = Instant::now();
+        let Err(err) = IpcClient::connect_timeout(&path, Duration::from_secs(5)) else {
+            panic!("a socket with no listener must not connect");
+        };
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::ConnectionRefused,
+            "the stale-inode classification the daemon probes for must survive, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < CONNECT_BUDGET,
+            "a final answer must be returned at once, not retried to the deadline — took {:?}",
+            started.elapsed()
         );
     }
 
