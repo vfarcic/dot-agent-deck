@@ -640,7 +640,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### daemon/status/002 — `dot-agent-deck daemon status --json` pins its schema-versioned public field names and live-status string value.
 - **Layer:** fast synthetic real-binary-subprocess integration (the REAL `dot-agent-deck daemon status --json` CLI as a subprocess + an in-process daemon attach socket + real `ListAgents`; no PTY attach, no LLM, no `e2e` feature gate).
 - **Agent:** none (synthetic — a `cat`-stub worker pane spawned through the TUI's real `StartAgent` attach path and driven by the REAL `dot-agent-deck agent-event --type running` CLI with the daemon-injected pane and agent ids).
-- **Asserts:** the subprocess exits successfully; stdout parses as a JSON object; schema version 1 has exactly the top-level fields `schema_version` and `agents`; the populated managed-agent entry has exactly `agent_id`, `pane_id`, `cwd`, and `status`; and the live status serializes as the exact public string `Thinking`.
+- **Asserts:** the subprocess exits successfully; stdout parses as a JSON object; `schema_version` equals the exact current public version; that schema has exactly the top-level fields `schema_version` and `agents`; the populated managed-agent entry has exactly `agent_id`, `pane_id`, `cwd`, and `status`; and the live status serializes as the exact public string `Thinking`.
 - **Does not assert:** the human-readable table (`daemon/status/001`); optional agent fields that are absent in this scenario; tool-detail privacy (`daemon/status/004`).
 - **Platform coverage:** mac+linux.
 

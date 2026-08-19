@@ -346,7 +346,7 @@ async fn daemon_status_001_reports_live_agent_status_inner() {
     daemon.registry.shutdown_all();
 }
 
-/// Scenario: Spawn a managed pane through the daemon attach API, drive it to `Thinking` through the real `agent-event --type running` CLI and invoke `dot-agent-deck daemon status --json`. Assert the document pins the public top-level and agent field names and serializes the live status as the exact string `Thinking`.
+/// Scenario: Spawn a managed pane through the daemon attach API, drive it to `Thinking` through the real `agent-event --type running` CLI and invoke `dot-agent-deck daemon status --json`. Assert the document pins the exact current schema version, public top-level and agent field names, and live status string.
 #[spec("daemon/status/002")]
 #[test]
 #[cfg(unix)]
@@ -389,12 +389,19 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
     let document = parsed
         .as_object()
         .unwrap_or_else(|| panic!("`daemon status --json` must emit an object; got {parsed:?}"));
+    assert_eq!(
+        document
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64),
+        Some(2),
+        "the document must publish the expected current schema version; got {parsed:?}"
+    );
     let top_level_fields: std::collections::BTreeSet<&str> =
         document.keys().map(String::as_str).collect();
     assert_eq!(
         top_level_fields,
         std::collections::BTreeSet::from(["agents", "schema_version"]),
-        "schema version 1 must pin the top-level JSON field names; got {parsed:?}"
+        "the current schema version must pin the top-level JSON field names; got {parsed:?}"
     );
     let agents = document
         .get("agents")
@@ -413,12 +420,12 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
     assert_eq!(
         agent_fields,
         std::collections::BTreeSet::from(["agent_id", "cwd", "pane_id", "status"]),
-        "schema version 1 must pin the populated agent field names; got agent={agent:?}"
+        "the current schema version must pin the populated agent field names; got agent={agent:?}"
     );
     assert_eq!(
         agent.get("status").and_then(serde_json::Value::as_str),
         Some("Thinking"),
-        "schema version 1 must pin the live status string value as `Thinking`; got agent={agent:?}"
+        "the current schema version must pin the live status string value as `Thinking`; got agent={agent:?}"
     );
 
     daemon.registry.shutdown_all();
