@@ -153,7 +153,7 @@ A **thicker border** (`┃` rather than `│`) marks the currently focused pane.
 
 The focused pane's border **turns cyan only while you are typing into it**. In command mode every border — focused pane included — shows its agent's status color instead: green for working, blue for thinking, yellow for waiting on you, red for an error, gray for idle. So the border's *weight* tells you which pane `Enter` / `Ctrl+d` will drop you into, and its *color* tells you whether your keystrokes are reaching it yet.
 
-The border is not the only signal: a chip at the left of the bottom bar names the current mode — ` COMMAND ` or ` TYPING ` — in the same place on every tab, the focused pane carries a cursor only while you are typing into it, and entering command mode dims that pane and briefly overlays a `COMMAND MODE · Ctrl+D to type` banner. See [Which mode you're in](keyboard-shortcuts.md#which-mode-youre-in).
+The border is not the only signal: a chip at the left of the bottom bar names the current mode — ` COMMAND ` or ` TYPING ` — in the same place on every tab, the focused pane carries a cursor only while you are typing into it, and entering command mode dims that pane and briefly overlays a `COMMAND MODE — Ctrl+D to type` banner. See [Which mode you're in](keyboard-shortcuts.md#which-mode-youre-in).
 
 ### Reading a Pane in Command Mode
 

@@ -2,9 +2,9 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::any::Any;
 
@@ -282,10 +282,47 @@ struct Pane {
     mouse_mode: Arc<AtomicBool>,
     /// Hyperlink URLs extracted from OSC 8 escape sequences, keyed by screen row.
     hyperlinks: Arc<Mutex<HyperlinkMap>>,
+    /// PRD #611 M2 — every agent-output byte this pane's parser has been handed
+    /// since the pane was created. Shared with the per-pane I/O task, which is
+    /// the only thing that feeds the parser once the pane is live.
+    ///
+    /// The "has this agent actually been running?" half of the cannot-scroll
+    /// trigger: a pane holding no retained lines means nothing on its own —
+    /// a claude pane one second after spawn holds none either — so the notice
+    /// needs a second signal that separates "nothing yet" from "never any".
+    bytes_since_spawn: Arc<AtomicU64>,
+    /// PRD #611 M2 — when a scroll attempt on this pane last found nothing to
+    /// move, or `None` if no such attempt has happened (or the notice has since
+    /// been dismissed by a keystroke).
+    ///
+    /// The expiry policy is deliberately NOT here: `ui.rs` owns the TTL it
+    /// shares with the command banner, so this records only the arming instant
+    /// and the renderer decides whether it is still worth drawing.
+    scroll_notice_armed_at: Option<Instant>,
 }
 
 /// Thread-safe pane registry.
 type PaneRegistry = Arc<Mutex<HashMap<String, Pane>>>;
+
+/// PRD #611 M2 — the facts a scroll attempt needs about one pane, sampled
+/// together by [`EmbeddedPaneController::scroll_facts`].
+///
+/// Grouped into one read because the cannot-scroll trigger is a conjunction:
+/// "holds no retained lines" is meaningless without "and has been running long
+/// enough to have some", and sampling those separately would let a pane look
+/// mature at one instant and empty at another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneScrollFacts {
+    /// Lines the parser actually retains right now, measured by asking vt100 to
+    /// clamp an impossible offset — never the configured scrollback capacity.
+    pub scrollback_depth: usize,
+    /// Agent-output bytes handed to this pane's parser since the pane was made.
+    pub bytes_since_spawn: u64,
+    /// The parser's live geometry, which is what one "screenful" means here.
+    pub rows: u16,
+    /// See [`Self::rows`].
+    pub cols: u16,
+}
 
 /// Resolve the (rows, cols) the local vt100 parser should be initialised
 /// at on hydration (PRD #104 M2).
@@ -639,6 +676,12 @@ impl EmbeddedPaneController {
             cwd: None,
             mouse_mode: Arc::new(AtomicBool::new(mouse_mode_enabled)),
             hyperlinks: Arc::new(Mutex::new(HyperlinkMap::new())),
+            // The seam feeds `bytes` straight into the parser above rather than
+            // through `process_agent_output_chunk`, so the counter is seeded
+            // here — otherwise a seam pane would look freshly spawned no matter
+            // how much output it had consumed.
+            bytes_since_spawn: Arc::new(AtomicU64::new(bytes.len() as u64)),
+            scroll_notice_armed_at: None,
         };
         (pane, input_rx)
     }
@@ -756,6 +799,71 @@ impl EmbeddedPaneController {
             parser.screen_mut().set_size(rows, cols);
         }
         Ok(())
+    }
+
+    /// PRD #611 M2 — everything a scroll attempt needs to know about whether
+    /// this pane has anything to scroll, read in one pass under the registry
+    /// lock so the three numbers cannot disagree about the same instant.
+    ///
+    /// `None` for an unknown pane, or for one whose parser mutex is poisoned —
+    /// neither is a state the notice should guess about.
+    pub fn scroll_facts(&self, pane_id: &str) -> Option<PaneScrollFacts> {
+        let panes = self.panes.lock().unwrap();
+        let pane = panes.get(pane_id)?;
+        let bytes_since_spawn = pane.bytes_since_spawn.load(Ordering::Relaxed);
+        let mut parser = pane.screen.lock().ok()?;
+        let (rows, cols) = parser.screen().size();
+        // vt100 0.16 clamps a requested offset to the lines it actually holds,
+        // so asking for an impossible one and reading it back IS the depth.
+        // Deliberately not `PANE_SCROLLBACK_LINES`: that is the capacity the
+        // parser was built with, which every pane shares and which says nothing
+        // about whether this one retained a single line. Restored immediately so
+        // the measurement cannot move the view the user is looking at.
+        let view = parser.screen().scrollback();
+        parser.screen_mut().set_scrollback(usize::MAX);
+        let scrollback_depth = parser.screen().scrollback();
+        parser.screen_mut().set_scrollback(view);
+        Some(PaneScrollFacts {
+            scrollback_depth,
+            bytes_since_spawn,
+            rows,
+            cols,
+        })
+    }
+
+    /// PRD #611 M2 — record that a scroll attempt on this pane found nothing to
+    /// move, at `at`.
+    ///
+    /// Idempotent by construction: re-arming an already-armed pane overwrites
+    /// the instant and nothing else, so a user swiping repeatedly at an
+    /// unscrollable pane refreshes one notice rather than stacking or blinking
+    /// several.
+    pub fn arm_scroll_notice(&self, pane_id: &str, at: Instant) {
+        let mut panes = self.panes.lock().unwrap();
+        if let Some(pane) = panes.get_mut(pane_id) {
+            pane.scroll_notice_armed_at = Some(at);
+        }
+    }
+
+    /// PRD #611 M2 — when this pane's cannot-scroll notice was armed, if it is
+    /// armed at all. The caller owns the expiry policy.
+    pub fn scroll_notice_armed_at(&self, pane_id: &str) -> Option<Instant> {
+        let panes = self.panes.lock().unwrap();
+        panes.get(pane_id)?.scroll_notice_armed_at
+    }
+
+    /// PRD #611 M2 — disarm every pane's cannot-scroll notice.
+    ///
+    /// Called on the way IN to key handling, before the key is resolved, so
+    /// dismissal can never depend on what the key turned out to mean and can
+    /// never swallow it. Every pane rather than the focused one because focus
+    /// may have moved since the notice was armed, and a notice that outlives
+    /// the keystroke that was meant to clear it is the bug users report.
+    pub fn clear_scroll_notices(&self) {
+        let mut panes = self.panes.lock().unwrap();
+        for pane in panes.values_mut() {
+            pane.scroll_notice_armed_at = None;
+        }
     }
 
     /// Check if a pane's child app has enabled mouse reporting.
@@ -1003,6 +1111,12 @@ impl EmbeddedPaneController {
         )));
         let mouse_mode = Arc::new(AtomicBool::new(false));
         let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
+        // PRD #611 M2: born at zero even on the hydration path. The daemon
+        // replays its scrollback snapshot as ordinary `KIND_STREAM_OUT` before
+        // live bytes, so a rehydrated pane counts exactly what its parser
+        // consumed — which is the honest answer to "has this agent produced
+        // substantial output into this parser?".
+        let bytes_since_spawn = Arc::new(AtomicU64::new(0));
 
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<StreamCmd>();
         let (resize_tx, resize_rx) = tokio::sync::watch::channel::<Option<(u16, u16)>>(None);
@@ -1029,6 +1143,7 @@ impl EmbeddedPaneController {
         let parser_for_task = Arc::clone(&parser);
         let mouse_mode_for_task = Arc::clone(&mouse_mode);
         let hyperlinks_for_task = Arc::clone(&hyperlinks);
+        let bytes_for_task = Arc::clone(&bytes_since_spawn);
         let agent_id_for_task = Arc::clone(&shared_agent_id);
         let client_for_task = self.client.clone();
         let pane_id_for_task = pane_id.clone();
@@ -1060,6 +1175,7 @@ impl EmbeddedPaneController {
                 parser_for_task,
                 mouse_mode_for_task,
                 hyperlinks_for_task,
+                bytes_for_task,
                 rejections_for_task,
                 io_state_for_task,
                 lost_for_task,
@@ -1092,6 +1208,8 @@ impl EmbeddedPaneController {
             cwd,
             mouse_mode,
             hyperlinks,
+            bytes_since_spawn,
+            scroll_notice_armed_at: None,
         };
 
         self.panes.lock().unwrap().insert(pane_id, pane);
@@ -2244,6 +2362,7 @@ async fn run_pane_io_task(
     parser: Arc<Mutex<vt100::Parser>>,
     mouse_mode: Arc<AtomicBool>,
     hyperlinks: Arc<Mutex<HyperlinkMap>>,
+    bytes_since_spawn: Arc<AtomicU64>,
     stream_rejections: Arc<Mutex<Vec<(String, String)>>>,
     io_state: Arc<AtomicU8>,
     lost: Arc<Mutex<Option<PaneLostReason>>>,
@@ -2278,6 +2397,7 @@ async fn run_pane_io_task(
                                     &parser,
                                     &mouse_mode,
                                     &hyperlinks,
+                                    &bytes_since_spawn,
                                 );
                             }
                             crate::daemon_protocol::KIND_STREAM_END => break,
@@ -2850,7 +2970,17 @@ fn process_agent_output_chunk(
     parser: &Mutex<vt100::Parser>,
     mouse_mode: &AtomicBool,
     hyperlinks: &Mutex<HyperlinkMap>,
+    bytes_since_spawn: &AtomicU64,
 ) {
+    // PRD #611 M2: counted here rather than at the caller for the same reason
+    // this function is shared at all — both backends must derive identical
+    // state from identical bytes, and "how much output has this agent produced
+    // into this parser?" is exactly such a derivation. Counted before the feed,
+    // and unconditionally: a chunk the parser panics on was still produced by
+    // the agent, and the rebuild that follows leaves a pane with plenty of
+    // output and no retained lines, which is honestly nothing to scroll.
+    bytes_since_spawn.fetch_add(data.len() as u64, Ordering::Relaxed);
+
     scan_mouse_mode(data, mouse_mode);
 
     let segments = osc8.process(data);
@@ -3177,6 +3307,11 @@ impl PaneController for EmbeddedPaneController {
                     cwd: pane.cwd,
                     mouse_mode: pane.mouse_mode,
                     hyperlinks: pane.hyperlinks,
+                    // Restored, not reset: this is the SAME pane and the same
+                    // agent behind it, so its output history and any notice it
+                    // was showing survive a close that failed.
+                    bytes_since_spawn: pane.bytes_since_spawn,
+                    scroll_notice_armed_at: pane.scroll_notice_armed_at,
                 };
                 self.panes
                     .lock()
@@ -3206,6 +3341,11 @@ impl PaneController for EmbeddedPaneController {
                     cwd: pane.cwd,
                     mouse_mode: pane.mouse_mode,
                     hyperlinks: pane.hyperlinks,
+                    // Restored, not reset: this is the SAME pane and the same
+                    // agent behind it, so its output history and any notice it
+                    // was showing survive a close that failed.
+                    bytes_since_spawn: pane.bytes_since_spawn,
+                    scroll_notice_armed_at: pane.scroll_notice_armed_at,
                 };
                 self.panes
                     .lock()
@@ -3767,9 +3907,17 @@ mod tests {
         let mut osc8 = Osc8Filter::new();
         let mouse = AtomicBool::new(false);
         let links = Mutex::new(HyperlinkMap::new());
+        let bytes_since_spawn = AtomicU64::new(0);
 
         // The real path must NOT panic on the crashing chunk.
-        process_agent_output_chunk(crasher, &mut osc8, &parser, &mouse, &links);
+        process_agent_output_chunk(
+            crasher,
+            &mut osc8,
+            &parser,
+            &mouse,
+            &links,
+            &bytes_since_spawn,
+        );
 
         assert!(
             !in_guarded_parser_feed(),
@@ -3781,8 +3929,21 @@ mod tests {
         );
 
         // A subsequent chunk still flows through the same parser.
-        process_agent_output_chunk(b"plain ascii\r\n", &mut osc8, &parser, &mouse, &links);
+        process_agent_output_chunk(
+            b"plain ascii\r\n",
+            &mut osc8,
+            &parser,
+            &mouse,
+            &links,
+            &bytes_since_spawn,
+        );
         assert!(parser.lock().is_ok());
+        assert_eq!(
+            bytes_since_spawn.load(Ordering::Relaxed),
+            (crasher.len() + b"plain ascii\r\n".len()) as u64,
+            "PRD #611: the since-spawn counter must count a chunk the parser \
+             panicked on — the agent still produced it"
+        );
     }
 
     // PRD #104 M2: hydration sizes the local vt100 parser from the
