@@ -441,7 +441,7 @@ mod tests {
     struct SaturatedListener {
         _dir: tempfile::TempDir,
         path: std::path::PathBuf,
-        _listener: UnixListener,
+        listener: UnixListener,
         /// Connections already sitting in the accept queue. Held so they are
         /// not closed, and so the queue stays full for the whole test.
         _queued: Vec<UnixStream>,
@@ -497,7 +497,7 @@ mod tests {
                 return Self {
                     _dir: dir,
                     path,
-                    _listener: listener,
+                    listener,
                     _queued: queued,
                     behaviour,
                 };
@@ -552,6 +552,61 @@ mod tests {
         assert!(
             elapsed < CONNECT_BUDGET * 8,
             "connect must return within its budget, took {elapsed:?}"
+        );
+    }
+
+    /// The retry loop must be able to *succeed*, not merely to give up on time.
+    /// Once the listener drains its queue, a connect that was refused a
+    /// millisecond earlier has to complete inside the budget — otherwise a
+    /// `connect_timeout` that could never connect at all would still satisfy the
+    /// saturated-listener test above, and the deck would simply stop talking to
+    /// a busy daemon instead of hanging on one.
+    #[test]
+    fn connect_retries_until_the_listener_drains_its_queue() {
+        let listener = SaturatedListener::new();
+        // Non-blocking so the drain loop below can poll for a queued connection
+        // without parking once the queue is empty.
+        listener
+            .listener
+            .set_nonblocking(true)
+            .expect("make the listener non-blocking");
+
+        let path = listener.path.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = IpcClient::connect_timeout(&path, Duration::from_secs(5));
+            let _ = tx.send((started.elapsed(), result));
+        });
+
+        // Drain one connection at a time until the client gets in. Accepting
+        // once is not enough: the filling connect that `SaturatedListener`
+        // left parked is queued as well and may take the first freed slot.
+        let mut drained = Vec::new();
+        let mut outcome = None;
+        for _ in 0..64 {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(v) => {
+                    outcome = Some(v);
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Ok((stream, _)) = listener.listener.accept() {
+                        drained.push(stream);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        let (elapsed, result) =
+            outcome.expect("the connect never returned while the queue drained");
+        if let Err(err) = result {
+            panic!("a connect must succeed once the queue drains, got {err:?} after {elapsed:?}");
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the successful connect must land inside the budget, took {elapsed:?}"
         );
     }
 
