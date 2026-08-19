@@ -2,9 +2,9 @@
   "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.16.0/.schema/devbox.schema.json",
   "packages": [
     "vals@0.45.0",
-    "go-task@3.48.0",
+    "go-task@3.52.0",
     "git@2.55.0",
-    "upcloud-cli@3.29.0",
+    "upcloud-cli@3.36.0",
     "gh@2.97.0",
     "asciinema@3.2.1",
     "cargo-nextest@0.9.143",

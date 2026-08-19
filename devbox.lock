@@ -556,51 +556,41 @@
       "last_modified": "2026-08-01T16:34:20Z",
       "resolved": "github:NixOS/nixpkgs/a5cbcfe954791221bfffe2307f7d1a1bf61a871e?lastModified=1785602060&narHash=sha256-z7D96eESRM4CPV%2FXtwpwFn8IDdfLAmxz6lVWrGYXvR4%3D"
     },
-    "go-task@3.48.0": {
-      "last_modified": "2026-08-01T16:34:20Z",
-      "resolved": "github:NixOS/nixpkgs/a5cbcfe954791221bfffe2307f7d1a1bf61a871e#go-task",
+    "go-task@3.52.0": {
+      "last_modified": "2026-08-16T22:25:34Z",
+      "resolved": "github:NixOS/nixpkgs/21e032ff95225fb81164a2b2b696c5f6841fcb62#go-task",
       "source": "devbox-search",
-      "version": "3.48.0",
+      "version": "3.52.0",
       "systems": {
         "aarch64-darwin": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/wz6jrv59c01rqzaij5qri7ml7xw69jhh-go-task-3.48.0",
+              "path": "/nix/store/cai65hxx8nfq0pcy1jsi9bpf9rdkgm8d-go-task-3.52.0",
               "default": true
             }
           ],
-          "store_path": "/nix/store/wz6jrv59c01rqzaij5qri7ml7xw69jhh-go-task-3.48.0"
+          "store_path": "/nix/store/cai65hxx8nfq0pcy1jsi9bpf9rdkgm8d-go-task-3.52.0"
         },
         "aarch64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/9sra1gbcfli5hy0as8wwp13c1gi5prw6-go-task-3.48.0",
+              "path": "/nix/store/viya59rc1708vqi0g67kzmsnvn4ql3gn-go-task-3.52.0",
               "default": true
             }
           ],
-          "store_path": "/nix/store/9sra1gbcfli5hy0as8wwp13c1gi5prw6-go-task-3.48.0"
-        },
-        "x86_64-darwin": {
-          "outputs": [
-            {
-              "name": "out",
-              "path": "/nix/store/q7mxf9b9kcphb3lxrzn4mqazb9nrvlnz-go-task-3.48.0",
-              "default": true
-            }
-          ],
-          "store_path": "/nix/store/q7mxf9b9kcphb3lxrzn4mqazb9nrvlnz-go-task-3.48.0"
+          "store_path": "/nix/store/viya59rc1708vqi0g67kzmsnvn4ql3gn-go-task-3.52.0"
         },
         "x86_64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/72lkcbkm5ki6af8dwy95nxqyv4g4lw2b-go-task-3.48.0",
+              "path": "/nix/store/x9x07fj5xhwp1riqms54b75izn59xdch-go-task-3.52.0",
               "default": true
             }
           ],
-          "store_path": "/nix/store/72lkcbkm5ki6af8dwy95nxqyv4g4lw2b-go-task-3.48.0"
+          "store_path": "/nix/store/x9x07fj5xhwp1riqms54b75izn59xdch-go-task-3.52.0"
         }
       }
     },
@@ -899,51 +889,41 @@
         }
       }
     },
-    "upcloud-cli@3.29.0": {
-      "last_modified": "2026-08-01T16:34:20Z",
-      "resolved": "github:NixOS/nixpkgs/a5cbcfe954791221bfffe2307f7d1a1bf61a871e#upcloud-cli",
+    "upcloud-cli@3.36.0": {
+      "last_modified": "2026-08-16T22:25:34Z",
+      "resolved": "github:NixOS/nixpkgs/21e032ff95225fb81164a2b2b696c5f6841fcb62#upcloud-cli",
       "source": "devbox-search",
-      "version": "3.29.0",
+      "version": "3.36.0",
       "systems": {
         "aarch64-darwin": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/5pwhm7fyb6r5nl26ajdvfn3gfa2fmybi-upcloud-cli-3.29.0",
+              "path": "/nix/store/f9ffsy3bnhv8fr8wyb8bgbla2n48n1jy-upcloud-cli-3.36.0",
               "default": true
             }
           ],
-          "store_path": "/nix/store/5pwhm7fyb6r5nl26ajdvfn3gfa2fmybi-upcloud-cli-3.29.0"
+          "store_path": "/nix/store/f9ffsy3bnhv8fr8wyb8bgbla2n48n1jy-upcloud-cli-3.36.0"
         },
         "aarch64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/b9z0yp3la2zqdfgvjvwv9ynark05xpzv-upcloud-cli-3.29.0",
+              "path": "/nix/store/1gjs4wl892j9a64w8r843iyxhqy5w39d-upcloud-cli-3.36.0",
               "default": true
             }
           ],
-          "store_path": "/nix/store/b9z0yp3la2zqdfgvjvwv9ynark05xpzv-upcloud-cli-3.29.0"
-        },
-        "x86_64-darwin": {
-          "outputs": [
-            {
-              "name": "out",
-              "path": "/nix/store/0lgr38ij34dn7zqa20yxm9ylr2rxz1ic-upcloud-cli-3.29.0",
-              "default": true
-            }
-          ],
-          "store_path": "/nix/store/0lgr38ij34dn7zqa20yxm9ylr2rxz1ic-upcloud-cli-3.29.0"
+          "store_path": "/nix/store/1gjs4wl892j9a64w8r843iyxhqy5w39d-upcloud-cli-3.36.0"
         },
         "x86_64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/kmsvqsgssyr23xkca0j7yfzbj6dwjjz6-upcloud-cli-3.29.0",
+              "path": "/nix/store/067nf2r7dpic9w2x07pb7rax7si2kdns-upcloud-cli-3.36.0",
               "default": true
             }
           ],
-          "store_path": "/nix/store/kmsvqsgssyr23xkca0j7yfzbj6dwjjz6-upcloud-cli-3.29.0"
+          "store_path": "/nix/store/067nf2r7dpic9w2x07pb7rax7si2kdns-upcloud-cli-3.36.0"
         }
       }
     },
