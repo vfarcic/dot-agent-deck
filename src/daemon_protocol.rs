@@ -488,11 +488,13 @@ struct WriteAndSubmitExtras {
     /// owns the pane, the daemon returns `stale` WITHOUT writing (R20-003).
     ///
     /// Issue #608: absent is allowed, but no longer unconditionally. On a paned
-    /// target that is ATTACHED and already carries a current hook session,
+    /// target that already carries a current hook session — attached or not —
     /// declining to name that generation IS the mismatch — the daemon knows a
     /// conversation the caller did not name — and the answer is `stale`. An
     /// agent that never emits a session generation carries neither side of the
-    /// comparison and still delivers.
+    /// comparison and still delivers; that carve-out cannot tell such an agent
+    /// apart from a conversation that has just ENDED, which is a known hole
+    /// documented at the arm that implements it.
     #[serde(default)]
     expected_session_id: Option<String>,
     /// A stable idempotency key. The daemon caches the first result for a
@@ -983,16 +985,28 @@ pub async fn run_attach_server_with_counter(
 /// Live branch) and fails closed; the Live branch never trusts it — the closure
 /// re-checks writability post-lock.
 ///
+/// Issue #608 audit (finding 5): "sampled inside the closure" is not "sampled
+/// TOGETHER". Writability and the hook-session generation share ONE `AppState`
+/// read guard in there; live-attachment is read from the registry just before
+/// that guard is awaited, and nothing the guarded send holds prevents a
+/// subscription landing in between — so attachment alone can be one lock
+/// acquisition stale, in the PERMISSIVE direction. The closure documents that
+/// window and what would close it; the issue #608 arm is written so it does not
+/// consult the value at all.
+///
 /// Issue #608: BOTH arms fail closed on an ABSENT identity, where the paned one
 /// used to be permissive. A request that names no agent resolves to
 /// `Writable::None` → [`crate::event::SendResult::NoLiveTarget`] before any
 /// write is attempted, so reaching the `Live` arm implies `expected_agent_id` is
 /// `Some`. The paned re-validation closure additionally refuses a request that
-/// names NO session when the pane is ATTACHED and already carries a current
-/// hook session: the daemon knows a conversation the caller did not name, which
-/// is the state-race / split-view shape, and `Stale` sends the caller back for a
-/// fresh generation. A pane that has no current hook session either (an agent
-/// that never emits one) still delivers with no session named.
+/// names NO session when the pane already carries a current hook session,
+/// attached or not: the daemon knows a conversation the caller did not name,
+/// which is the state-race / split-view shape, and `Stale` sends the caller back
+/// for a fresh generation. A pane that has no current hook session either (an
+/// agent that never emits one) still delivers with no session named — a
+/// deliberate carve-out that CANNOT distinguish such an agent from a
+/// conversation that has just ended, which is a known hole spelled out at the
+/// arm that implements it.
 async fn compute_write_and_submit_outcome(
     registry: &AgentPtyRegistry,
     state: &SharedState,
@@ -1070,21 +1084,44 @@ async fn compute_write_and_submit_outcome(
                 registry
                     .write_and_submit_guarded(pane_id, text, Some(&agent_id), move || async move {
                         // PRD #20 Greptile P1 (daemon_protocol.rs:988) + the
-                        // stale-pre-lock-snapshot CLASS close: this closure is
-                        // the SINGLE delivery-time authorization snapshot. It
-                        // runs UNDER the held target writer, immediately before
-                        // the write, so EVERY authorization input it consults is
-                        // sampled HERE, post-lock — no value captured before the
-                        // writer lock is trusted after it. `has_live_attach` used
-                        // to be read BEFORE `write_and_submit_guarded` acquired
-                        // the writer and consulted here (stale): a pane that
-                        // became attached WHILE the send waited for the writer
-                        // was still seen as unattached, letting a stale prompt
-                        // slip into the freshly-attached conversation. Reading it
-                        // here (and `pane_writable` / `pane_hook_session_id`
-                        // alongside it under one snapshot) samples attachment at
-                        // DELIVERY time. Sampled before taking the state read
-                        // lock so no lock is held across the `inner` mutex.
+                        // stale-pre-lock-snapshot CLASS close: this closure runs
+                        // UNDER the held target writer, immediately before the
+                        // write, and re-reads its authorization inputs HERE
+                        // rather than trusting values captured before the guarded
+                        // send went looking for the writer. That is why
+                        // `has_live_attach` moved in: it used to be read BEFORE
+                        // `write_and_submit_guarded` acquired the writer and
+                        // consulted here (stale), so a pane that became attached
+                        // WHILE the send waited for the writer was still seen as
+                        // unattached, letting a stale prompt slip into the
+                        // freshly-attached conversation.
+                        //
+                        // Issue #608 audit, finding 5 — WHAT SHARES A SNAPSHOT
+                        // AND WHAT DOES NOT. This comment used to call the
+                        // closure the SINGLE delivery-time authorization snapshot
+                        // in which EVERY input it consults is sampled here,
+                        // post-lock. That holds for `pane_writable` and
+                        // `pane_hook_session_id`: both are read below under ONE
+                        // `AppState` read guard, so they are mutually consistent
+                        // and both post-writer-lock. It does NOT hold for
+                        // attachment. `has_live_attach` is read from the REGISTRY
+                        // first, deliberately before `st.read()` is awaited so no
+                        // state lock is held across the registry `inner` mutex —
+                        // and `AgentPtyRegistry::subscribe` builds its receiver
+                        // under the registry/bus locks WITHOUT ever acquiring the
+                        // target writer, so holding that writer fences nothing
+                        // out. A pane can therefore become attached between this
+                        // sample and the state guard below, and the closure then
+                        // authorizes on a stale `false`. The residual window is
+                        // one lock acquisition rather than the unbounded
+                        // wait-for-writer the move above closed, but it is a real
+                        // window and it fails PERMISSIVE. Closing it means making
+                        // subscription participate in the writer-held barrier — a
+                        // registry change, deferred to the follow-up issue that
+                        // carries the sibling call sites, not done here. The
+                        // issue #608 arm below is written so it never depends on
+                        // this value; only the pre-existing named-session arm
+                        // does.
                         let has_live_attach = registry.pane_has_live_attach(&pane_for_check);
                         let guard = st.read().await;
                         if guard.pane_writable(&pane_for_check) != Writable::Live {
@@ -1098,7 +1135,10 @@ async fn compute_write_and_submit_outcome(
                         // headless (unattached) delivery whose agent identity is
                         // confirmed proceeds. In the real deck the TUI is always
                         // attached to a pane it drives, so this is the strict
-                        // guard for every real delivery.
+                        // guard for every real delivery. It scopes the
+                        // NAMED-session arm only, and is the sole consumer of
+                        // `has_live_attach` here — the issue #608 arm for an
+                        // UNNAMED session deliberately does not read it.
                         //
                         // When the caller named a session, require an EXACT match
                         // against the pane's CURRENT daemon-authoritative
@@ -1111,12 +1151,12 @@ async fn compute_write_and_submit_outcome(
                         // Issue #608: and when the caller named NO session, the
                         // silent accept is closed on the SAME evidence, which is
                         // what the paragraph above always claimed and the code
-                        // did not do. An ATTACHED pane that HAS a current hook
-                        // session is a conversation the daemon knows about and
-                        // the caller did not name — the state-race / split-view
-                        // shape — so the write is refused rather than landing in
-                        // a generation nobody bound it to. Every in-tree caller
-                        // that CAN know a generation supplies one
+                        // did not do. A pane that HAS a current hook session is a
+                        // conversation the daemon knows about and the caller did
+                        // not name — the state-race / split-view shape — so the
+                        // write is refused rather than landing in a generation
+                        // nobody bound it to. Every in-tree caller that CAN know
+                        // a generation supplies one
                         // (`process_pending_seed_prompts` captures the
                         // snapshot's current generation,
                         // `deliver_orchestrator_prompt` calls
@@ -1124,12 +1164,59 @@ async fn compute_write_and_submit_outcome(
                         // both call `bind_generation_before_retry` before a retry
                         // enters a late generation), so an absent expectation
                         // against a known generation is a mismatch, not a caller
-                        // that has nothing to say. Agents that never emit a
-                        // session generation legitimately carry neither side:
-                        // `(expected None, current None)` still delivers.
-                        // `Stale` is the right vocabulary — both TUI delivery
-                        // paths already classify it as retryable, so the next
-                        // snapshot rebinds the generation and the retry names it.
+                        // that has nothing to say. `Stale` is the right
+                        // vocabulary — both TUI delivery paths already classify
+                        // it as retryable, so the next snapshot rebinds the
+                        // generation and the retry names it.
+                        //
+                        // Issue #608 audit, finding 5(b): this arm refuses on the
+                        // SESSION evidence alone, with no `has_live_attach`
+                        // conjunct. Attachment is the one input this closure
+                        // cannot sample under the state guard (see the block
+                        // above), and gating a NEW refusal on the one value that
+                        // can be stale in the permissive direction would import
+                        // that hole straight into it. Refusing regardless of
+                        // attachment is a strict superset — it can only reject
+                        // more — and `Stale` is retryable, so an unattached
+                        // caller that does know a generation names it on the next
+                        // attempt. Measured before adopting: across the whole
+                        // fast tier the ONLY paned send that reaches this arm
+                        // against a current generation is an ATTACHED one, which
+                        // both rules refuse identically.
+                        //
+                        // Issue #608 audit, finding 4 — WHAT THIS CARVE-OUT
+                        // CANNOT SEE. `(expected None, current None)` still
+                        // delivers, because an agent that never emits a
+                        // generation legitimately carries neither side of the
+                        // comparison. But a `None` CURRENT generation is not
+                        // proof that that is what this is. A matching, current
+                        // `SessionEnd` REMOVES the pane's `pane_hook_session`
+                        // entry (`AppState::apply_event`) while the registry
+                        // agent and the attached pane stay alive, so a
+                        // conversation that has just ENDED reads here exactly
+                        // like an agent that never had one. During a `/clear` or
+                        // a thread restart the successor's `SessionStart` has not
+                        // landed yet, and a caller that knows the stable agent id
+                        // but names no session can land a write in that gap —
+                        // into a pane that has demonstrably just closed a logical
+                        // conversation. This arm ACCEPTS that write. It is a
+                        // deliberate carve-out with a known hole, not an airtight
+                        // guard, and issue #608 exists precisely because a
+                        // comment in this closure once promised more than the
+                        // code delivered.
+                        //
+                        // Closing it needs evidence this closure does not have:
+                        // an AGENT-scoped ended-generation tombstone, or an
+                        // `ever_had_generation` witness. The daemon already
+                        // records distinguishing evidence in
+                        // `AppState::pane_generation_closures` — but keyed BY
+                        // PANE, and pane ids are recycled, so a genuinely
+                        // sessionless successor must not inherit its
+                        // predecessor's policy. That is new daemon state with its
+                        // own lifetime and reuse semantics; it is deferred to the
+                        // follow-up issue rather than bolted on here, where
+                        // getting it wrong would refuse exactly the sessionless
+                        // agents this carve-out exists to protect.
                         match expected_session.as_deref() {
                             Some(expected) => match guard.pane_hook_session_id(&pane_for_check) {
                                 Some(current) if current != expected => return false,
@@ -1138,9 +1225,7 @@ async fn compute_write_and_submit_outcome(
                                 None => {}
                             },
                             None => {
-                                if has_live_attach
-                                    && guard.pane_hook_session_id(&pane_for_check).is_some()
-                                {
+                                if guard.pane_hook_session_id(&pane_for_check).is_some() {
                                     return false;
                                 }
                             }
