@@ -174,6 +174,106 @@ See [Troubleshooting › Delegate prompts silently no-op after staying on an old
 
 So while in `0.x` the minor digit signals **"compatibility broke"**, not "has new features". A bump from `0.31.x` to `0.32.0` is the cue to align both sides (see [Recycling the local daemon](#recycling-the-local-daemon) locally, or `dot-agent-deck remote upgrade` for a [remote](remote-environments.md)); a patch bump is always safe to mix.
 
+## Inspecting the local daemon
+
+`dot-agent-deck daemon status` prints a read-only snapshot of the agents the local daemon is managing. It is a diagnostic: it never starts, stops, attaches to, or writes to anything, so it is safe to run at any time — including from a script, a `watch`, or while the TUI is open in another terminal.
+
+```bash
+dot-agent-deck daemon status
+```
+
+```text
+PANE	AGENT	ROLE	STATUS	TOOL	LABEL	CWD
+1	1	mode:review	Thinking	-	api	/home/you/src/api
+2	2	-	Working	Bash	api	/home/you/src/api
+```
+
+The columns are tab-separated, so pipe the output through `column -t -s $'\t'` if you want it aligned in a terminal. A `-` means the daemon has no value for that cell yet.
+
+| Column | What it holds |
+|---|---|
+| `PANE` | The pane id, the same value a managed agent sees as `DOT_AGENT_DECK_PANE_ID`. |
+| `AGENT` | The daemon's own id for the agent. |
+| `ROLE` | `mode:<name>` for a pane launched into a [mode](configuration.md), the role name for an [orchestration](orchestration.md) pane (suffixed `(orchestrator)` for the start role), `-` for a plain dashboard pane. |
+| `STATUS` | The live status: one of `Thinking`, `Working`, `Compacting`, `WaitingForInput`, `Idle`, `Error`. |
+| `TOOL` | The name of the tool the agent is running right now — the name only, never its arguments. |
+| `LABEL` | The pane's display name. |
+| `CWD` | The directory the agent was launched in. |
+
+When no agents are managed, the command prints `no managed agents` and still exits 0 — an empty deck is a successful answer, not a failure.
+
+### JSON for scripts
+
+`--json` emits a versioned document instead of the table. This is the form to parse; the human table's columns are not a stable interface. The command prints it on a single line — the example below is reformatted for readability.
+
+```bash
+dot-agent-deck daemon status --json
+```
+
+```json
+{
+  "schema_version": 2,
+  "agents": [
+    {
+      "agent_id": "1",
+      "pane_id": "1",
+      "label": "api",
+      "cwd": "/home/you/src/api",
+      "role": "mode:review",
+      "status": "Thinking"
+    },
+    {
+      "agent_id": "2",
+      "pane_id": "2",
+      "label": "api",
+      "cwd": "/home/you/src/api",
+      "status": "Working",
+      "active_tool": { "name": "Bash" }
+    }
+  ]
+}
+```
+
+`schema_version` is the contract. It is bumped when a field is **removed** or changes meaning; new fields can appear without a bump, so parse tolerantly and ignore keys you do not recognise. Version `2` removed `active_tool.detail`, which version `1` carried — a script written against v1 that read the tool's arguments gets nothing under v2 rather than something subtly different.
+
+Every field except `agent_id` is optional and is **omitted entirely** when the daemon has no value for it, which is what the table renders as `-`. In the document above, agent `2` has no `role` key and agent `1` has no `active_tool` key. Read them with a fallback rather than assuming they are present:
+
+```bash
+dot-agent-deck daemon status --json | jq --raw-output '.agents[] | "\(.pane_id)\t\(.status // "unknown")\t\(.active_tool.name // "-")"'
+```
+
+```text
+1	Thinking	-
+2	Working	Bash
+```
+
+With no agents managed the document is `{"schema_version":2,"agents":[]}` and the exit code is still 0, so a filter like the one above simply produces no lines.
+
+Both forms deliberately omit your prompt text and the tool's arguments. A pane whose card reads `Bash — cargo test --package billing -- --nocapture` in the TUI appears as the bare tool name `Bash` in the table and as `{"name": "Bash"}` in the JSON. A status snapshot is routinely pasted into a bug report or run in a terminal someone else is watching, so it carries diagnostics and nothing private.
+
+### When the daemon is unreachable
+
+If the query gets no answer, the command writes a one-line reason to **stderr**, prints nothing to stdout, and exits **1**. Unlike `daemon stop`, this is not treated as a benign no-op: a status query that got no answer learned nothing about the daemon, so reporting success would be a lie.
+
+```text
+# no daemon has ever run for this user
+daemon status: unavailable (I/O error talking to daemon: No such file or directory (os error 2))
+
+# a daemon ran and has since exited, leaving its socket behind
+daemon status: unavailable (I/O error talking to daemon: Connection refused (os error 111))
+
+# a daemon is listening but wedged
+daemon status: unavailable (no response within 3s)
+```
+
+The whole round trip is bounded at 3 seconds. On expiry the command **abandons** the query rather than retrying — a retry loop would add load to the exact daemon you are trying to diagnose.
+
+Exit 1 is reserved for "the daemon did not answer". A malformed invocation exits **2** instead, so a script can tell an unreachable daemon apart from a binary that is too old to understand the subcommand at all.
+
+**Status inspection never starts a daemon.** Launching the TUI lazy-spawns one (see [How it runs](#how-it-runs) above); `daemon status` never does, in either output form. Spawning a daemon to answer "is a daemon running?" would make the question unanswerable, so an absent daemon is reported as the failure above and the socket is left exactly as it was found.
+
+> Like `daemon stop`, this reports on the daemon on **this machine** only. Each remote attach has its own per-host daemon, covered in [Remote Environments](remote-environments.md).
+
 ## Recycling the local daemon
 
 `dot-agent-deck daemon stop` shuts down the running daemon gracefully. Use it after a binary upgrade or any time you want to start a fresh daemon process.
@@ -183,7 +283,7 @@ dot-agent-deck daemon stop
 ```
 
 - **Idempotent.** If no daemon is running, the command prints `no daemon running` and exits 0.
-- **Data-loss guard.** If managed agents are still alive, the command refuses with a list of agent IDs and exits non-zero — terminating the daemon would kill their PTYs. Detach the agents first (close their panes, or quit the TUI to detach the deck while keeping the agents running), or pass `--force`.
+- **Data-loss guard.** If managed agents are still alive, the command refuses with a list of agent IDs and exits non-zero — terminating the daemon would kill their PTYs. Detach the agents first (close their panes, or quit the TUI to detach the deck while keeping the agents running), or pass `--force`. Run [`daemon status`](#inspecting-the-local-daemon) first if you want to see what is running before you decide.
 - **Grace window.** Sends `SIGTERM` and polls for the socket to disappear for up to 5 seconds. With `--force`, escalates to `SIGKILL` after that window. A `SIGTERM` timeout without `--force` exits non-zero so you can re-run with `--force` consciously.
 
 ```bash
