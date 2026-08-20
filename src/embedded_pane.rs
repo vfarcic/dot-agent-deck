@@ -3394,11 +3394,37 @@ impl PaneController for EmbeddedPaneController {
         pane_id: &str,
         text: &str,
     ) -> Result<crate::event::SendResult, PaneError> {
+        // Issue #608: the daemon now REFUSES a paned write that names no agent
+        // (`no-live-target`, nothing written) — a pane id is a recycled handle,
+        // so "deliver to whoever holds this pane now" is the accidental
+        // mis-delivery the guarded-send machinery exists to prevent. This
+        // controller is the one non-mock implementor of this identity-less
+        // door, and it already knows which agent occupies the pane, so it names
+        // it instead of sending a shape the daemon declines. The SESSION
+        // generation is daemon-side state this controller does not track; a
+        // caller that knows one calls
+        // [`Self::write_and_submit_to_pane_with_identity`] directly, which both
+        // production UI delivery paths do.
+        //
+        // The daemon client is called directly rather than through the trait
+        // sibling so this can never recurse through `PaneController`'s default
+        // `write_and_submit_to_pane_with_identity` (which forwards back here).
+        let expected_agent_id = self.pane_agent_id(pane_id).filter(|id| !id.is_empty());
         let client = self.client.clone();
         let pane_id = pane_id.to_string();
         let text = text.to_string();
         self.runtime
-            .block_on(async move { client.write_and_submit(&pane_id, &text).await })
+            .block_on(async move {
+                client
+                    .write_and_submit_with_identity(
+                        &pane_id,
+                        &text,
+                        expected_agent_id.as_deref(),
+                        None,
+                        None,
+                    )
+                    .await
+            })
             .map_err(|e| PaneError::CommandFailed(format!("write_and_submit: {e}")))
     }
 

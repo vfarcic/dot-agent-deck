@@ -469,6 +469,13 @@ pub trait PaneController: Send + Sync {
     /// (which always target a live pane and don't talk to a daemon). The
     /// daemon-backed `EmbeddedPaneController` overrides it to carry the identity
     /// over the wire via `DaemonClient::write_and_submit_with_identity`.
+    ///
+    /// Issue #608: a daemon-backed caller must reach a real pane through THIS
+    /// method. The daemon refuses a paned write that names no agent, so the
+    /// identity-less sibling is no longer a delivery path for one — see
+    /// `EmbeddedPaneController::write_and_submit_to_pane`, which supplies the
+    /// pane's owning agent id rather than sending the shape the daemon
+    /// declines.
     fn write_and_submit_to_pane_with_identity(
         &self,
         pane_id: &str,

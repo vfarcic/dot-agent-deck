@@ -437,6 +437,12 @@ impl DaemonClient {
     /// input; a pre-PRD-20 daemon omits the field, which we read as
     /// [`SendResult::Applied`] (the legacy fire-and-forget assumption). A
     /// transport/`ok=false` failure still surfaces as `Err`.
+    ///
+    /// Issue #608: a PANED write through this identity-less door is refused by a
+    /// current daemon (`no-live-target`, nothing written) — an absent
+    /// `expected_agent_id` no longer degrades to pane-only authorization. Kept
+    /// for pane-less callers and for talking to a pre-PRD-20 daemon; a caller
+    /// targeting a real pane wants [`Self::write_and_submit_with_identity`].
     pub async fn write_and_submit(
         &self,
         pane_id: &str,

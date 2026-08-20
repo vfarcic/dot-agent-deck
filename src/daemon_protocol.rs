@@ -465,18 +465,34 @@ fn default_cols() -> u16 {
 /// call sites (older tests, the Codex-wrapper path), and widening the variant
 /// would break those literals. Instead the handler re-parses the SAME request
 /// payload into this struct — every field `#[serde(default)]`, so an older
-/// client that omits them decodes to all-`None` and the daemon degrades to
-/// pane-only authorization (current behavior). Unknown keys on the base variant
-/// are ignored by serde, so the two parses of one payload never conflict.
+/// client that omits them still decodes to all-`None`. Unknown keys on the base
+/// variant are ignored by serde, so the two parses of one payload never conflict.
+///
+/// Issue #608: decoding cleanly to all-`None` is no longer the same thing as
+/// being AUTHORIZED. `expected_agent_id` is REQUIRED for delivery on the paned
+/// arm as well as the pane-less one — absent, the daemon answers
+/// `no-live-target` and writes nothing. The wire is untouched; what changed is
+/// that an absent identity now means "refuse", not "authorize by pane id alone".
 #[derive(Debug, Default, Deserialize)]
 struct WriteAndSubmitExtras {
     /// The registry id of the agent the prompt was queued for. On a mismatch
     /// with the live target that currently owns the pane, the daemon returns
     /// `wrong-session` WITHOUT writing (R20-003).
+    ///
+    /// Issue #608: REQUIRED. An absent id is not a licence to authorize by pane
+    /// id alone — it resolves to `Writable::None` → `no-live-target` before any
+    /// write is attempted, on the paned and the pane-less arm alike.
     #[serde(default)]
     expected_agent_id: Option<String>,
     /// The session id the prompt was queued for. If a DIFFERENT live session now
     /// owns the pane, the daemon returns `stale` WITHOUT writing (R20-003).
+    ///
+    /// Issue #608: absent is allowed, but no longer unconditionally. On a paned
+    /// target that is ATTACHED and already carries a current hook session,
+    /// declining to name that generation IS the mismatch — the daemon knows a
+    /// conversation the caller did not name — and the answer is `stale`. An
+    /// agent that never emits a session generation carries neither side of the
+    /// comparison and still delivers.
     #[serde(default)]
     expected_session_id: Option<String>,
     /// A stable idempotency key. The daemon caches the first result for a
@@ -966,6 +982,17 @@ pub async fn run_attach_server_with_counter(
 /// `pane_writable` read below is routing-only (it picks the HistoryOnly / None /
 /// Live branch) and fails closed; the Live branch never trusts it — the closure
 /// re-checks writability post-lock.
+///
+/// Issue #608: BOTH arms fail closed on an ABSENT identity, where the paned one
+/// used to be permissive. A request that names no agent resolves to
+/// `Writable::None` → [`crate::event::SendResult::NoLiveTarget`] before any
+/// write is attempted, so reaching the `Live` arm implies `expected_agent_id` is
+/// `Some`. The paned re-validation closure additionally refuses a request that
+/// names NO session when the pane is ATTACHED and already carries a current
+/// hook session: the daemon knows a conversation the caller did not name, which
+/// is the state-race / split-view shape, and `Stale` sends the caller back for a
+/// fresh generation. A pane that has no current hook session either (an agent
+/// that never emits one) still delivers with no session named.
 async fn compute_write_and_submit_outcome(
     registry: &AgentPtyRegistry,
     state: &SharedState,
@@ -981,19 +1008,32 @@ async fn compute_write_and_submit_outcome(
     // `pane_id == None`), so it falls through to the `Live` default — letting a
     // history-only / view-only paneless target pass the liveness gate. Resolve a
     // paneless target's writability by AGENT identity instead, mirroring the
-    // attach STREAM_IN input loop. A paneless request that carries no agent
-    // identity cannot be routed by identity, so it fails closed (`None` → no
-    // delivery attempted). Paned targets keep the pane-keyed resolution.
+    // attach STREAM_IN input loop. Paned targets keep the pane-keyed resolution.
+    //
+    // Issue #608: a request that carries NO agent identity cannot be routed by
+    // identity on EITHER arm, so it fails closed here — `Writable::None` → no
+    // delivery attempted. The pane-less arm always worked this way; the paned
+    // arm used to hand a possibly-`None` identity to `write_and_submit_guarded`,
+    // which then wrote keyed only by `pane_id` — i.e. into whichever agent holds
+    // that pane right now, which is not necessarily the one the caller meant.
+    // A pane id is a recycled handle, so that is precisely the accidental
+    // mis-delivery this machinery exists to prevent everywhere else.
+    //
+    // Gated HERE, in the routing resolution, rather than inside the post-lock
+    // closure: it makes the invariant STRUCTURAL. Reaching `Writable::Live`
+    // below now implies `expected_agent_id` is `Some` on both arms, so the
+    // guarded call passes a concrete id instead of an `Option` that merely
+    // happens never to be `None`.
     let is_paneless = pane_id == "<no-pane>";
-    let writable = {
-        let guard = state.read().await;
-        if is_paneless {
-            match extras.expected_agent_id.as_deref() {
-                Some(agent_id) => guard.agent_writable(agent_id),
-                None => Writable::None,
+    let writable = match extras.expected_agent_id.as_deref() {
+        None => Writable::None,
+        Some(agent_id) => {
+            let guard = state.read().await;
+            if is_paneless {
+                guard.agent_writable(agent_id)
+            } else {
+                guard.pane_writable(pane_id)
             }
-        } else {
-            guard.pane_writable(pane_id)
         }
     };
     match writable {
@@ -1004,16 +1044,20 @@ async fn compute_write_and_submit_outcome(
             // `write_and_submit_guarded`), immediately before the write, against
             // the authoritative session state.
             let st = state.clone();
+            // Issue #608: `Live` implies `expected_agent_id` is `Some` on BOTH
+            // arms — the resolution block above refuses an identity-less request
+            // outright — so every guarded call below binds to a concrete id
+            // rather than forwarding an `Option`.
+            let agent_id = extras
+                .expected_agent_id
+                .clone()
+                .expect("a Live target implies an expected agent id");
             let guarded = if is_paneless {
                 // A paneless target is re-validated by agent identity (mirroring
                 // STREAM_IN). `<no-pane>` has no pane→hook-session mapping, so the
                 // pane-keyed session-generation guard (finding #4) does not apply
                 // — STREAM_IN likewise performs no session check on a paneless
-                // target. `Live` above implies `expected_agent_id` is `Some`.
-                let agent_id = extras
-                    .expected_agent_id
-                    .clone()
-                    .expect("paneless Live target implies an expected agent id");
+                // target.
                 let agent_for_check = agent_id.clone();
                 registry
                     .write_and_submit_guarded(pane_id, text, Some(&agent_id), move || async move {
@@ -1024,60 +1068,85 @@ async fn compute_write_and_submit_outcome(
                 let pane_for_check = pane_id.to_string();
                 let expected_session = extras.expected_session_id.clone();
                 registry
-                    .write_and_submit_guarded(
-                        pane_id,
-                        text,
-                        extras.expected_agent_id.as_deref(),
-                        move || async move {
-                            // PRD #20 Greptile P1 (daemon_protocol.rs:988) + the
-                            // stale-pre-lock-snapshot CLASS close: this closure is
-                            // the SINGLE delivery-time authorization snapshot. It
-                            // runs UNDER the held target writer, immediately before
-                            // the write, so EVERY authorization input it consults is
-                            // sampled HERE, post-lock — no value captured before the
-                            // writer lock is trusted after it. `has_live_attach` used
-                            // to be read BEFORE `write_and_submit_guarded` acquired
-                            // the writer and consulted here (stale): a pane that
-                            // became attached WHILE the send waited for the writer
-                            // was still seen as unattached, letting a stale prompt
-                            // slip into the freshly-attached conversation. Reading it
-                            // here (and `pane_writable` / `pane_hook_session_id`
-                            // alongside it under one snapshot) samples attachment at
-                            // DELIVERY time. Sampled before taking the state read
-                            // lock so no lock is held across the `inner` mutex.
-                            let has_live_attach = registry.pane_has_live_attach(&pane_for_check);
-                            let guard = st.read().await;
-                            if guard.pane_writable(&pane_for_check) != Writable::Live {
-                                return false;
-                            }
-                            // PRD #20 R20-003 (finding #4): is a deck client actively
-                            // driving this pane? The strict "reject a None
-                            // current-session" rule applies to a LIVE INTERACTIVE
-                            // (attached) pane — finding #4's threat is a stale prompt
-                            // surfacing in the conversation the user is watching. A
-                            // headless (unattached) delivery whose agent identity is
-                            // confirmed proceeds. In the real deck the TUI is always
-                            // attached to a pane it drives, so this is the strict
-                            // guard for every real delivery.
-                            //
-                            // When the caller named a session, require an EXACT match
-                            // against the pane's CURRENT daemon-authoritative
-                            // hook-session generation. A same-agent `/clear` / thread
-                            // restart rolls the generation over → mismatch → reject
-                            // (always). A `None` current-session (the session ended,
-                            // or none was recorded) is refused too on an attached,
-                            // live-interactive pane — never a silent accept.
-                            if let Some(expected) = expected_session.as_deref() {
-                                match guard.pane_hook_session_id(&pane_for_check) {
-                                    Some(current) if current != expected => return false,
-                                    Some(_) => {}
-                                    None if has_live_attach => return false,
-                                    None => {}
+                    .write_and_submit_guarded(pane_id, text, Some(&agent_id), move || async move {
+                        // PRD #20 Greptile P1 (daemon_protocol.rs:988) + the
+                        // stale-pre-lock-snapshot CLASS close: this closure is
+                        // the SINGLE delivery-time authorization snapshot. It
+                        // runs UNDER the held target writer, immediately before
+                        // the write, so EVERY authorization input it consults is
+                        // sampled HERE, post-lock — no value captured before the
+                        // writer lock is trusted after it. `has_live_attach` used
+                        // to be read BEFORE `write_and_submit_guarded` acquired
+                        // the writer and consulted here (stale): a pane that
+                        // became attached WHILE the send waited for the writer
+                        // was still seen as unattached, letting a stale prompt
+                        // slip into the freshly-attached conversation. Reading it
+                        // here (and `pane_writable` / `pane_hook_session_id`
+                        // alongside it under one snapshot) samples attachment at
+                        // DELIVERY time. Sampled before taking the state read
+                        // lock so no lock is held across the `inner` mutex.
+                        let has_live_attach = registry.pane_has_live_attach(&pane_for_check);
+                        let guard = st.read().await;
+                        if guard.pane_writable(&pane_for_check) != Writable::Live {
+                            return false;
+                        }
+                        // PRD #20 R20-003 (finding #4): is a deck client actively
+                        // driving this pane? The strict "reject a None
+                        // current-session" rule applies to a LIVE INTERACTIVE
+                        // (attached) pane — finding #4's threat is a stale prompt
+                        // surfacing in the conversation the user is watching. A
+                        // headless (unattached) delivery whose agent identity is
+                        // confirmed proceeds. In the real deck the TUI is always
+                        // attached to a pane it drives, so this is the strict
+                        // guard for every real delivery.
+                        //
+                        // When the caller named a session, require an EXACT match
+                        // against the pane's CURRENT daemon-authoritative
+                        // hook-session generation. A same-agent `/clear` / thread
+                        // restart rolls the generation over → mismatch → reject
+                        // (always). A `None` current-session (the session ended,
+                        // or none was recorded) is refused too on an attached,
+                        // live-interactive pane — never a silent accept.
+                        //
+                        // Issue #608: and when the caller named NO session, the
+                        // silent accept is closed on the SAME evidence, which is
+                        // what the paragraph above always claimed and the code
+                        // did not do. An ATTACHED pane that HAS a current hook
+                        // session is a conversation the daemon knows about and
+                        // the caller did not name — the state-race / split-view
+                        // shape — so the write is refused rather than landing in
+                        // a generation nobody bound it to. Every in-tree caller
+                        // that CAN know a generation supplies one
+                        // (`process_pending_seed_prompts` captures the
+                        // snapshot's current generation,
+                        // `deliver_orchestrator_prompt` calls
+                        // `bind_delivery_generation` before its first write, and
+                        // both call `bind_generation_before_retry` before a retry
+                        // enters a late generation), so an absent expectation
+                        // against a known generation is a mismatch, not a caller
+                        // that has nothing to say. Agents that never emit a
+                        // session generation legitimately carry neither side:
+                        // `(expected None, current None)` still delivers.
+                        // `Stale` is the right vocabulary — both TUI delivery
+                        // paths already classify it as retryable, so the next
+                        // snapshot rebinds the generation and the retry names it.
+                        match expected_session.as_deref() {
+                            Some(expected) => match guard.pane_hook_session_id(&pane_for_check) {
+                                Some(current) if current != expected => return false,
+                                Some(_) => {}
+                                None if has_live_attach => return false,
+                                None => {}
+                            },
+                            None => {
+                                if has_live_attach
+                                    && guard.pane_hook_session_id(&pane_for_check).is_some()
+                                {
+                                    return false;
                                 }
                             }
-                            true
-                        },
-                    )
+                        }
+                        true
+                    })
                     .await
             };
             match guarded {
@@ -1762,13 +1831,29 @@ async fn handle_connection(
             // guarded-send identity key (`expected_agent_id` / `expected_session_id`
             // / `delivery_id`) that is PRESENT but has the wrong JSON type (every
             // field is `Option<String>` with `#[serde(default)]`, and unknown keys
-            // are ignored). An ABSENT guard set (a legacy / non-guarded client)
-            // still decodes cleanly to all-`None` and degrades to pane-only
-            // authorization — the cross-version fail-safe is preserved. A
-            // present-but-malformed guard must REJECT and write nothing, rather
-            // than silently dropping every identity check via `unwrap_or_default`
-            // and proceeding UNGUARDED (which could reach a rebound pane or
-            // double-submit).
+            // are ignored). A present-but-malformed guard must REJECT and write
+            // nothing, rather than silently dropping every identity check via
+            // `unwrap_or_default` and proceeding UNGUARDED (which could reach a
+            // rebound pane or double-submit).
+            //
+            // Issue #608: an ABSENT guard set (a legacy / non-guarded client)
+            // still DECODES cleanly to all-`None` — that half is unchanged — but
+            // it no longer DEGRADES to pane-only authorization. A paned write
+            // that names no agent is now refused with `no-live-target` and
+            // writes nothing; see `compute_write_and_submit_outcome`. This
+            // comment used to call that degrade "the cross-version fail-safe",
+            // which had it backwards: a pane id is a recycled handle, so
+            // "deliver to whoever holds this pane now" is exactly the accidental
+            // mis-delivery the guarded-send machinery prevents in every other
+            // case. The trade is deliberate. What is given up is delivery for an
+            // OLD, identity-less client talking to a NEW daemon — and it is
+            // given up VISIBLY (`no-live-target`, nothing written) rather than
+            // silently into a stranger's conversation. The wire SHAPE is
+            // untouched (every field stays `Option<String>` with
+            // `#[serde(default)]`, no field added or removed, no new frame
+            // kind), so this is a SEMANTIC break behind a stable wire: no
+            // `PROTOCOL_VERSION` bump, but a `changelog.d/608.breaking.md`
+            // fragment (rule 12 / `docs/develop/versioning.md`).
             let extras: WriteAndSubmitExtras = match serde_json::from_slice(&frame.1) {
                 Ok(extras) => extras,
                 Err(e) => {

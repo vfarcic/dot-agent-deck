@@ -825,7 +825,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### prompt/pane-input/004 — A history-only send returns an honest result and surfaces feedback instead of silently dropping input (PRD #20 M3/M4).
 - **Layer:** L2 (real spawned TUI + daemon in the PTY/vt100 harness; synthetic pane and hook event, no LLM).
 - **Agent:** synthetic wrapped Codex session backed by `cat`, declared `writable = history-only` through `AgentEvent.live_target`.
-- **Asserts:** `WriteAndSubmit` returns `send_result = history-only`; attempting to enter the card renders `History-only session cannot accept live input`; the rejected send does not remove the Codex card.
+- **Asserts:** an unidentified paned `WriteAndSubmit` returns `send_result = no-live-target`, the same target with explicit agent/session identity returns `history-only`, attempting to enter the card renders `History-only session cannot accept live input`, and the rejected send does not remove the Codex card.
 - **Does not assert:** real Codex execution or wrapper stdout classification (covered by `codex/live/001` and `codex/wrap/001`).
 - **Platform coverage:** mac+linux.
 
@@ -860,7 +860,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### prompt/pane-input/009 — A queued prompt cannot cross an agent or logical-session generation (PRD #20 finding #4).
 - **Layer:** L1 protocol integration with an in-process daemon and real PTY-backed shells.
 - **Agent:** synthetic Codex identities bound sequentially to the same pane.
-- **Asserts:** requests queued for an original agent, a same-agent pre-`/clear` session, or a session missing on the target return `wrong-session`/`stale` and write no marker.
+- **Asserts:** paned requests with no expected agent return `no-live-target`, and requests with no expected session against an attached pane's current hook session return `stale`; both write no marker. Requests queued for an original agent, a same-agent pre-`/clear` session, or a session missing on the target also fail closed, while a matching agent/session and an identified agent with no hook session still deliver.
 - **Does not assert:** UI feedback for the returned result (covered by `prompt/pane-input/006`).
 - **Platform coverage:** mac+linux.
 
@@ -937,7 +937,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### prompt/pane-input/020 — Guarded sends resolve pane-less writability and routing by agent identity (PRD #20 Greptile P1).
 - **Layer:** L1 protocol integration with an in-process Unix-domain socket daemon, held writer mutex, and real PTY-backed shells.
 - **Agent:** synthetic Codex live and history-only events bound by agent identity to pane-less `/bin/sh` targets.
-- **Asserts:** pre-lock history-only sends return `history-only` without bytes, a live-to-history transition while waiting for the writer is rejected after the lock, and a live pane-less target still receives its guarded prompt.
+- **Asserts:** a pane-less send with no expected agent returns `no-live-target` without bytes, pre-lock history-only sends return `history-only` without bytes, a live-to-history transition while waiting for the writer is rejected after the lock, and an identified live pane-less target still receives its guarded prompt.
 - **Does not assert:** visible TUI feedback for the returned result.
 - **Platform coverage:** mac+linux.
 
