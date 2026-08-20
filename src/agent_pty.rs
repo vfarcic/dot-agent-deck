@@ -6034,6 +6034,7 @@ impl AgentPtyRegistry {
                 exited: Arc::new(AtomicBool::new(false)),
                 pending_seed: None,
                 seed_delivered_native: false,
+                pane_handed_over: false,
             },
         );
         id
