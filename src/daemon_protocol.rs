@@ -1166,8 +1166,38 @@ async fn compute_write_and_submit_outcome(
                         // against a known generation is a mismatch, not a caller
                         // that has nothing to say. `Stale` is the right
                         // vocabulary — both TUI delivery paths already classify
-                        // it as retryable, so the next snapshot rebinds the
-                        // generation and the retry names it.
+                        // it as retryable, so the next snapshot that OBSERVES the
+                        // generation binds it and the retry names it.
+                        //
+                        // Issue #608 audit, finding 6 — HOW FAR THAT RECOVERS.
+                        // In the ordinary race it recovers fully, and this
+                        // comment used to stop there. A session that lands after
+                        // the caller's snapshot costs exactly one safe `Stale`:
+                        // the refusal writes nothing and does not bump
+                        // `attempts`, so `crate::ui`'s `bind_delivery_generation`
+                        // binds the generation on the next render pass that sees
+                        // it (`bind_generation_before_retry` does the same for a
+                        // delivery that already wrote), and the retry names it.
+                        // Binding once rather than every frame is also what keeps
+                        // this from looping.
+                        //
+                        // It is NOT a general guarantee. `Stale` does not carry
+                        // the daemon's current generation, so a refused caller's
+                        // ONLY route to it is its own event stream — and
+                        // `spawn_event_subscriber` (`main.rs`) resubscribes after
+                        // a lagged or errored stream WITHOUT replaying what it
+                        // missed. A `SessionStart` dropped in that window is
+                        // never applied to the client `AppState`, so its
+                        // `pane_hook_session_id` for the pane stays `None`
+                        // indefinitely: every retry goes out unnamed, every one
+                        // is refused here, and at
+                        // `crate::prompt_delivery::AUTOMATIC_PROMPT_DEADLINE`
+                        // (60 s) the delivery is ABANDONED with the prompt never
+                        // delivered. Bounded and logged rather than silent or
+                        // mis-delivered — but lost. Closing it means
+                        // resynchronizing state after a reconnect, or returning
+                        // the daemon's current generation on `Stale`; both are
+                        // design changes outside this branch.
                         //
                         // Issue #608 audit, finding 5(b): this arm refuses on the
                         // SESSION evidence alone, with no `has_live_attach`
@@ -1178,8 +1208,10 @@ async fn compute_write_and_submit_outcome(
                         // that hole straight into it. Refusing regardless of
                         // attachment is a strict superset — it can only reject
                         // more — and `Stale` is retryable, so an unattached
-                        // caller that does know a generation names it on the next
-                        // attempt. Measured before adopting: across the whole
+                        // caller whose snapshot HAS the generation names it on
+                        // the next attempt (one whose snapshot never observes it
+                        // retries unnamed until the deadline — see finding 6
+                        // above). Measured before adopting: across the whole
                         // fast tier the ONLY paned send that reaches this arm
                         // against a current generation is an ATTACHED one, which
                         // both rules refuse identically.

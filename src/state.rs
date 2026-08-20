@@ -3590,12 +3590,17 @@ impl AppState {
     /// `pane_id` (same newest-by-`last_activity` resolution as
     /// [`Self::pane_writable`]), or `None` when the pane carries no session.
     ///
-    /// The daemon's atomic write-and-submit guard compares this against the
-    /// session id the prompt was queued for: if a DIFFERENT session now owns the
-    /// pane (a `/clear` restart or respawn replaced it), the prompt is stale and
-    /// must not be delivered to the replacement. `None` means "no session
-    /// declared" — the guard treats that as a match (the legacy native-PTY
-    /// default, consistent with `pane_writable` defaulting to `Live`).
+    /// Issue #608 audit, finding 5: this is the pane's CARD id, and the atomic
+    /// write-and-submit guard does NOT consult it. This doc used to say the
+    /// guard compares a caller's expected session against this value and treats
+    /// a `None` as a match. It compares against [`Self::pane_hook_session_id`]
+    /// instead, and has done since finding #4 — deliberately, because
+    /// [`Self::apply_event`]'s same-agent reuse guard keeps the card id STABLE
+    /// across a `/clear` for UI continuity, so a card id cannot tell one
+    /// conversation apart from its successor. What still reads this value is the
+    /// daemon's `ShellBusy` re-emit, which needs the pane's CARD to key a
+    /// `sessions` lookup: after a generation rollover the hook id is not a key
+    /// into that map at all.
     pub fn pane_session_id(&self, pane_id: &str) -> Option<String> {
         self.sessions
             .values()
@@ -3613,10 +3618,41 @@ impl AppState {
     /// continuity — this reflects the LATEST hook `session_id` the pane's agent
     /// actually reported (see [`AppState::pane_hook_session`]). The atomic
     /// write-and-submit guard compares a caller's `expected_session_id` against
-    /// THIS value and requires an EXACT match: a same-agent `/clear` / thread
-    /// restart rolls the generation over, so an old queued prompt is refused.
-    /// A `None` here with an expected session supplied is a REJECTION, not a
-    /// silent accept — the queued generation no longer exists.
+    /// THIS value.
+    ///
+    /// Issue #608 audit, finding 5: that comparison is NOT the universal "EXACT
+    /// match" this doc used to claim — two of the four `(expected, current)`
+    /// combinations authorize the write without one. The paned re-validation
+    /// closure in `crate::daemon_protocol`'s `compute_write_and_submit_outcome`
+    /// is what decides, and it decides like this. (Writability is checked first
+    /// and separately, so every case below is reached only on a `Live` pane;
+    /// "authorized" means the session comparison does not veto the write.)
+    ///
+    /// * `(Some(e), Some(c))` — authorized iff `e == c`. This is the exact-match
+    ///   case, and the only one. A same-agent `/clear` / thread restart rolls the
+    ///   generation over, so an old queued prompt is refused (`Stale`) instead of
+    ///   being typed into its successor.
+    /// * `(Some(e), None)` — the named generation is gone (it ended, or none was
+    ///   ever recorded). REFUSED while a deck is attached to the pane, because
+    ///   finding #4's threat is a stale prompt surfacing in the conversation the
+    ///   user is watching; AUTHORIZED when unattached, where an
+    ///   agent-identity-confirmed headless delivery has no live conversation to
+    ///   intrude on. This is the one arm that still reads live-attachment, and it
+    ///   predates the issue #608 work rather than arriving with it.
+    /// * `(None, Some(c))` — the daemon knows a conversation the caller declined
+    ///   to name: the state-race / split-view shape. REFUSED (`Stale`) on the
+    ///   session evidence alone, attached or not. Attachment is deliberately not
+    ///   consulted here: it is the one input that closure cannot sample under its
+    ///   `AppState` guard, and it goes stale in the PERMISSIVE direction. Before
+    ///   `659fc0c` this arm refused only while attached.
+    /// * `(None, None)` — AUTHORIZED. An agent that never emits a generation
+    ///   carries neither side of the comparison and would otherwise never receive
+    ///   an automatic prompt at all. A deliberate carve-out with a known hole: a
+    ///   conversation that has JUST ENDED reads here exactly like an agent that
+    ///   never had one, because `SessionEnd` removes the pane's entry from
+    ///   [`AppState::pane_hook_session`] while the agent and pane stay alive. The
+    ///   arm that implements it spells out why closing that needs daemon state
+    ///   the closure does not have.
     pub fn pane_hook_session_id(&self, pane_id: &str) -> Option<String> {
         self.pane_hook_session
             .get(pane_id)
