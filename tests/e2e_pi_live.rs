@@ -56,15 +56,15 @@
 //!   is touched — a Pi pane is hook-safe by construction.
 //!
 //! ## Credentials (Design Decision #5, harness caveat)
-//! pi authenticates to OpenRouter via `OPENROUTER_API_KEY`. The harness scrubs
-//! the spawned deck's env to a pinned set, so the key + the freshly-built
+//! pi authenticates to Anthropic via `ANTHROPIC_API_KEY`. The harness scrubs the
+//! spawned deck's env to a pinned set, so the key + the freshly-built
 //! binary dir on PATH are threaded in explicitly via `with_env`; the deck's
 //! lazy-spawned daemon inherits them, and so does the pi child. The key is NEVER
 //! printed (only checked non-empty for the runtime-skip).
 //!
 //! Tier: e2e (`#[cfg(feature = "e2e")]`) — spawns a real agent, hits a real
 //! model. Flaky-tolerant pre-PR tier (real LLM), run once, not looped (rule
-//! 4/5). Runtime-skipped (Decision 26) when `pi` / `OPENROUTER_API_KEY` is
+//! 4/5). Runtime-skipped (Decision 26) when `pi` / `ANTHROPIC_API_KEY` is
 //! absent.
 
 use std::process::Stdio;
@@ -76,9 +76,13 @@ use common::TuiDeck;
 use dot_agent_deck::config;
 use spec::spec;
 
-/// Cheapest GPT-5.x tier on OpenRouter that reliably runs a directive turn
-/// (same model `chain-smoke/pi/001` / `scheduler/pi/001` pin).
-const PI_MODEL: &str = "openai/gpt-5-nano";
+/// Cheapest tier in pi's Anthropic catalog, and enough to run a directive
+/// turn (same model `chain-smoke/pi/001` / `scheduler/pi/001` pin).
+///
+/// TEMPORARY: the pi tier runs on Anthropic Haiku while the GPT accounts are
+/// without credit. The tier itself is provider-agnostic — moving it back is
+/// this constant plus the `--provider` flag and the key name below.
+const PI_MODEL: &str = "claude-haiku-4-5";
 /// The sentinel the pi pane is directed to create. Distinctive + lands in the
 /// per-test fixture cwd, so it is unique by construction — a concrete
 /// secondary signal that the real model actually ran the directed work (the
@@ -87,7 +91,7 @@ const PI_MODEL: &str = "openai/gpt-5-nano";
 const SENTINEL_NAME: &str = "pi_live_sentinel_4b1a.txt";
 const SENTINEL_CONTENT: &str = "PI_LIVE_SENTINEL_OK";
 
-/// `pi` on PATH AND a non-empty `OPENROUTER_API_KEY`. The key is only checked
+/// `pi` on PATH AND a non-empty `ANTHROPIC_API_KEY`. The key is only checked
 /// for presence — never printed or logged (it is a secret). Mirrors
 /// `e2e_pi_orchestrator.rs::check_pi_available`.
 fn check_pi_available() -> Result<(), String> {
@@ -102,9 +106,9 @@ fn check_pi_available() -> Result<(), String> {
     if !ok {
         return Err("pi CLI not installed (could not invoke `pi --version`)".into());
     }
-    match std::env::var("OPENROUTER_API_KEY") {
+    match std::env::var("ANTHROPIC_API_KEY") {
         Ok(k) if !k.trim().is_empty() => Ok(()),
-        _ => Err("OPENROUTER_API_KEY not set — real-pi live-pane e2e needs OpenRouter auth".into()),
+        _ => Err("ANTHROPIC_API_KEY not set — real-pi live-pane e2e needs Anthropic auth".into()),
     }
 }
 
@@ -128,9 +132,9 @@ fn path_with_binary_dir() -> String {
 /// WITHOUT the extension and the deck's daemon-startup auto-materialize (the real
 /// `daemon serve` entry the lazy-spawned daemon runs) puts the bundled Pi
 /// orchestrator extension into that HOME before pi boots. The pane runs `pi`
-/// (`--provider openrouter --model openai/gpt-5-nano --approve`) with a
-/// directive initial prompt to create the uniquely-named sentinel
-/// `pi_live_sentinel_4b1a.txt`. The `OPENROUTER_API_KEY` + the built-binary PATH
+/// (`--provider anthropic --model claude-haiku-4-5 --approve`) with a directive initial
+/// prompt to create the uniquely-named sentinel
+/// `pi_live_sentinel_4b1a.txt`. The `ANTHROPIC_API_KEY` + the built-binary PATH
 /// are threaded into the deck (inherited by the lazy-spawned daemon and the pi
 /// child). The pane auto-focuses on restore (the cast captures pi booting +
 /// working live in the pane); detach to the dashboard with Ctrl+D so the Pi
@@ -162,7 +166,7 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
          whose entire contents are exactly the text {SENTINEL_CONTENT}. Do that one task, then \
          stop."
     );
-    let pi_command = format!("pi --provider openrouter --model {PI_MODEL} --approve '{directive}'");
+    let pi_command = format!("pi --provider anthropic --model {PI_MODEL} --approve '{directive}'");
 
     let deck = TuiDeck::builder()
         // 200 cols so the dashboard renders the card (left) AND the live pi pane
@@ -171,11 +175,11 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
         .with_pty_size(200, 50)
         // Gate ON so the first-class Pi identity renders (features::show_pi_agent).
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
-        // pi authenticates to OpenRouter with this (never printed); the deck's
+        // pi authenticates to Anthropic with this (never printed); the deck's
         // daemon and the pi child inherit it.
         .with_env(
-            "OPENROUTER_API_KEY",
-            std::env::var("OPENROUTER_API_KEY").expect("checked non-empty by check_pi_available"),
+            "ANTHROPIC_API_KEY",
+            std::env::var("ANTHROPIC_API_KEY").expect("checked non-empty by check_pi_available"),
         )
         // Put the freshly-built binary's dir on PATH so the extension resolves
         // `dot-agent-deck agent-event`; preserves the host PATH so `pi` still
@@ -378,8 +382,8 @@ fn orchestration_session_toml(project_dir: &str, pi_command: &str, directive: &s
 
 /// Scenario: Stage a two-role orchestration (`.dot-agent-deck.toml`: an
 /// `orchestrator` START role running a REAL idle `pi`
-/// (`--provider openrouter --model openai/gpt-5-nano --approve`, NO CLI-arg
-/// prompt) + a `coder` role running a REAL idle `claude` Haiku worker) and a
+/// (`--provider anthropic --model claude-haiku-4-5 --approve`, NO CLI-arg prompt) + a
+/// `coder` role running a REAL idle `claude` Haiku worker) and a
 /// `session.toml` whose `OrchestrationSnapshot.orchestrator_prompt` is a
 /// directive telling pi to call the native `delegate` tool once, handing the
 /// `coder` role a task to create the uniquely-named sentinel
@@ -388,7 +392,7 @@ fn orchestration_session_toml(project_dir: &str, pi_command: &str, directive: &s
 /// per-test HOME starts WITHOUT the extension — the deck's daemon-startup
 /// auto-materialize puts the bundled Pi extension there before pi boots),
 /// imported Claude credentials + project-trust for the orchestration cwd,
-/// `OPENROUTER_API_KEY` + the built-binary PATH threaded in (the key is never
+/// `ANTHROPIC_API_KEY` + the built-binary PATH threaded in (the key is never
 /// printed), and `DOT_AGENT_DECK_SEED_FALLBACK_SECS=600` so the daemon's
 /// PTY-injection safety net can't fire in-window. On the daemon-empty restore the
 /// deck spawns both role panes IDLE and delivers the directive to the pi START
@@ -442,7 +446,7 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
     // The idle role commands — NO CLI-arg prompt on the orchestrator (the whole
     // point: pi is seeded ONLY by injection). Same real-agent tiers as
     // `chain-smoke/pi/001`.
-    let pi_command = format!("pi --provider openrouter --model {PI_MODEL} --approve");
+    let pi_command = format!("pi --provider anthropic --model {PI_MODEL} --approve");
     let worker_command = format!("claude --model {WORKER_MODEL} --allowedTools Bash Read Write");
 
     // The injected seed. Single line (the injection encodes single-line text +
@@ -477,11 +481,11 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
         .with_pty_size(200, 50)
         // Gate ON so the Pi first-class identity renders (features::show_pi_agent).
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
-        // pi authenticates to OpenRouter with this (never printed); the deck's
+        // pi authenticates to Anthropic with this (never printed); the deck's
         // daemon and the pi child inherit it.
         .with_env(
-            "OPENROUTER_API_KEY",
-            std::env::var("OPENROUTER_API_KEY").expect("checked non-empty by check_pi_available"),
+            "ANTHROPIC_API_KEY",
+            std::env::var("ANTHROPIC_API_KEY").expect("checked non-empty by check_pi_available"),
         )
         // Put the freshly-built binary's dir on PATH so the pi extension resolves
         // `dot-agent-deck agent-event`/`delegate`/`get-seed` and the claude worker

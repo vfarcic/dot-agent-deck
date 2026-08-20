@@ -38,13 +38,15 @@
 //! `#[tokio::test] async fn` would misbind — same pattern as `session/live/007`).
 //!
 //! ## pi model + worker agent
-//! - **Orchestrator:** real `pi` (0.80.6) via `--provider openrouter --model
-//!   openai/gpt-5-nano` — the cheapest GPT-5.x tier that reliably tool-calls;
-//!   `--approve` clears pi's project-local trust so the `delegate` tool executes
-//!   without a permission prompt (pi is YOLO/no-permission by default). Confirmed
-//!   out-of-band that gpt-5-nano loads the extension and calls `delegate` within
-//!   ~10s. (`--thinking off` is rejected by this endpoint — "Reasoning is
-//!   mandatory" — so thinking is left at the model default.)
+//! - **Orchestrator:** real `pi` (0.80.6) via `--provider anthropic --model
+//!   claude-haiku-4-5` — the cheapest tier in pi's Anthropic catalog, and it
+//!   tool-calls; `--approve` clears pi's project-local trust so the `delegate`
+//!   tool executes without a permission prompt (pi is YOLO/no-permission by
+//!   default). Confirmed out-of-band that claude-haiku-4-5 loads the extension
+//!   and calls `delegate`. No `--thinking` flag is passed, so thinking stays at
+//!   the model default. TEMPORARY: this tier is on Anthropic Haiku while the GPT
+//!   accounts are without credit — the tier is provider-agnostic and the model is
+//!   a one-line change (`PI_MODEL` + the `--provider` flag + the key name).
 //! - **Worker:** real `claude` Haiku (`claude-haiku-4-5-20251001`) — the proven
 //!   chain-test worker; directive-following and cheap. Chosen over OpenCode
 //!   because OpenCode's tool-permission sandbox gates `.dot-agent-deck` reads /
@@ -52,16 +54,16 @@
 //!   which would block the full work-done loop for reasons orthogonal to M4.1.
 //!
 //! ## Credentials (Design Decision #5, harness caveat)
-//! pi authenticates to OpenRouter via `OPENROUTER_API_KEY` (vals-sourced in the
-//! devbox shell). `AgentPtyRegistry::spawn_agent` inherits the parent env and
-//! overlays `opts.env`; M4.1 EXPLICITLY propagates `OPENROUTER_API_KEY` + `HOME`
+//! pi authenticates to Anthropic via `ANTHROPIC_API_KEY` (vals-sourced in the devbox
+//! shell). `AgentPtyRegistry::spawn_agent` inherits the parent env and
+//! overlays `opts.env`; M4.1 EXPLICITLY propagates `ANTHROPIC_API_KEY` + `HOME`
 //! (+ the pane/socket/PATH vars) into the pi child's `opts.env`, and M4.2 passes
 //! them into the daemon (which the scheduler-spawned pi inherits) — so pi starts
 //! with the key regardless of how the runner scrubs the environment. The key is
 //! NEVER printed (only checked non-empty for the runtime-skip).
 //!
 //! Tier: e2e (`#[cfg(feature = "e2e")]`) — spawns real agents, hits a real model.
-//! Runtime-skipped (Decision 26) when `pi`/`claude`/credentials/`OPENROUTER_API_KEY`
+//! Runtime-skipped (Decision 26) when `pi`/`claude`/credentials/`ANTHROPIC_API_KEY`
 //! are absent.
 
 use std::path::Path;
@@ -81,9 +83,13 @@ const ORCH_PANE: &str = "pi-orchestrator-pane";
 const WORKER_PANE: &str = "worker-pane";
 const WORKER_ROLE: &str = "coder";
 const PINNED_CLAUDE_MODEL: &str = "claude-haiku-4-5-20251001";
-/// Cheapest GPT-5.x tier on OpenRouter that reliably tool-calls (verified
-/// out-of-band: loads the extension + calls `delegate` in ~10s).
-const PI_MODEL: &str = "openai/gpt-5-nano";
+/// Cheapest tier in pi's Anthropic catalog, and it tool-calls (verified
+/// out-of-band: loads the extension + calls `delegate`).
+///
+/// TEMPORARY: the pi tier runs on Anthropic Haiku while the GPT accounts are
+/// without credit. The tier itself is provider-agnostic — moving it back is
+/// this constant plus the `--provider` flag and the key name below.
+const PI_MODEL: &str = "claude-haiku-4-5";
 /// The sentinel the worker must create. Distinctive + lands in a fresh tempdir
 /// cwd, so it is unique by construction and unambiguous on the worker pane.
 const SENTINEL_NAME: &str = "pi_orch_sentinel_7c3f.txt";
@@ -93,7 +99,7 @@ const SENTINEL_CONTENT: &str = "PI_ORCH_SENTINEL_OK";
 // Non-polling helpers (kept in-file; all sleeping/polling is in `common`).
 // ---------------------------------------------------------------------------
 
-/// `pi` on PATH AND a non-empty `OPENROUTER_API_KEY`. The key is only checked
+/// `pi` on PATH AND a non-empty `ANTHROPIC_API_KEY`. The key is only checked
 /// for presence — never printed or logged (it is a secret; the auto-mode
 /// classifier blocks any substring of it).
 fn check_pi_available() -> Result<(), String> {
@@ -108,11 +114,11 @@ fn check_pi_available() -> Result<(), String> {
     if !ok {
         return Err("pi CLI not installed (could not invoke `pi --version`)".into());
     }
-    match std::env::var("OPENROUTER_API_KEY") {
+    match std::env::var("ANTHROPIC_API_KEY") {
         Ok(k) if !k.trim().is_empty() => Ok(()),
-        _ => Err(
-            "OPENROUTER_API_KEY not set — real-pi orchestrator e2e needs OpenRouter auth".into(),
-        ),
+        _ => {
+            Err("ANTHROPIC_API_KEY not set — real-pi orchestrator e2e needs Anthropic auth".into())
+        }
     }
 }
 
@@ -170,7 +176,7 @@ fn pi_schedule_toml(working_dir: &str) -> String {
          name = \"pi-unattended\"\n\
          cron = \"0 0 1 1 *\"\n\
          working_dir = \"{working_dir}\"\n\
-         command = \"pi --provider openrouter --model {PI_MODEL} --approve -p ready\"\n\
+         command = \"pi --provider anthropic --model {PI_MODEL} --approve -p ready\"\n\
          prompt = \"ready\"\n\
          enabled = true\n\n"
     )
@@ -197,7 +203,7 @@ fn path_with_binary_dir() -> String {
 /// input-ready, then spawn a REAL `pi` orchestrator pane IDLE (no CLI-arg
 /// prompt) whose HOME carries the bundled extension, staged (as the
 /// daemon-startup seam would) into the location pi resolves from that HOME before
-/// pi boots — and whose env explicitly propagates `OPENROUTER_API_KEY` + `HOME`.
+/// pi boots — and whose env explicitly propagates `ANTHROPIC_API_KEY` + `HOME`.
 /// Deliver pi's directive NATIVELY (PRD #201): stash it in the daemon seed store
 /// (`set_pending_seed`), and pi's extension pulls it on `session_start` via
 /// `dot-agent-deck get-seed` → `pi.sendUserMessage` (NOT a CLI arg, NOT PTY
@@ -322,10 +328,10 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
     // session_start (→ finished/Idle) status report can't be missed.
     let event_log = common::BroadcastEventLog::start(&daemon.event_tx);
 
-    // CRITICAL (harness caveat): explicitly propagate OPENROUTER_API_KEY + HOME
+    // CRITICAL (harness caveat): explicitly propagate ANTHROPIC_API_KEY + HOME
     // (+ pane/socket/PATH) into the pi child. Never print the key.
-    let openrouter_key =
-        std::env::var("OPENROUTER_API_KEY").expect("checked non-empty by check_pi_available");
+    let anthropic_key =
+        std::env::var("ANTHROPIC_API_KEY").expect("checked non-empty by check_pi_available");
     let pi_env = vec![
         (DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string()),
         (
@@ -341,7 +347,7 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
             "HOME".to_string(),
             pi_home.path().to_str().expect("pi home UTF-8").to_string(),
         ),
-        ("OPENROUTER_API_KEY".to_string(), openrouter_key),
+        ("ANTHROPIC_API_KEY".to_string(), anthropic_key),
     ];
 
     // Directive prompt: instruct pi to call `delegate` ONCE with role `coder` and
@@ -363,7 +369,7 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
     // pi is the native `get-seed` pull, so a successful delegate PROVES native
     // delivery (there is no injection fallback armed on this direct-registry
     // spawn path).
-    let pi_command = format!("pi --provider openrouter --model {PI_MODEL} --approve");
+    let pi_command = format!("pi --provider anthropic --model {PI_MODEL} --approve");
 
     let orch_agent_id = daemon
         .registry
@@ -504,7 +510,7 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
 
 /// Scenario: Start the real `daemon serve` headlessly (no TUI client attached)
 /// with a CLEAN HOME and register one enabled schedule whose command is a REAL
-/// `pi` (cheap `-p`, cheap GPT-5.x). Propagate `OPENROUTER_API_KEY` + the
+/// `pi` (cheap `-p`, cheap Haiku turn). Propagate `ANTHROPIC_API_KEY` + the
 /// built-binary PATH into the daemon (which the scheduler-spawned pi inherits,
 /// along with `HOME` + `DOT_AGENT_DECK_SOCKET`); the daemon-startup
 /// auto-materialize puts the bundled extension into that HOME as the daemon
@@ -524,19 +530,19 @@ fn scheduler_pi_001_scheduled_unattended_status_via_extension() {
 
     let toml = pi_schedule_toml(&work.to_string_lossy());
 
-    // The scheduler-spawned pi inherits the daemon's env: propagate the OpenRouter
+    // The scheduler-spawned pi inherits the daemon's env: propagate the Anthropic
     // key (never printed) and prepend the freshly-built binary dir to PATH so pi's
     // extension resolves `dot-agent-deck agent-event`. HOME + DOT_AGENT_DECK_SOCKET
     // are set by the daemon-serve harness and inherited by the child.
-    let openrouter_key =
-        std::env::var("OPENROUTER_API_KEY").expect("checked non-empty by check_pi_available");
+    let anthropic_key =
+        std::env::var("ANTHROPIC_API_KEY").expect("checked non-empty by check_pi_available");
     let path_env = path_with_binary_dir();
 
     let daemon = common::spawn_daemon_serve_with_env(
         Some(&toml),
         "0",
         &[
-            ("OPENROUTER_API_KEY", openrouter_key.as_str()),
+            ("ANTHROPIC_API_KEY", anthropic_key.as_str()),
             ("PATH", path_env.as_str()),
         ],
     );
