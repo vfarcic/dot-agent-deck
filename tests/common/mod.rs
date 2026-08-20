@@ -5933,6 +5933,28 @@ impl EventSub {
         }
     }
 
+    /// Wait for the genuine `SessionStart` that names one daemon-managed pane
+    /// and agent, then return the conversation generation it announced.
+    /// Launcher/wrapper-fork starts are boot evidence rather than a conversation
+    /// and therefore cannot authorize a guarded prompt delivery.
+    pub fn wait_for_session_start_on_pane(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        timeout: Duration,
+    ) -> String {
+        self.wait_for(
+            |event| {
+                event.event_type == dot_agent_deck::event::EventType::SessionStart
+                    && event.pane_id.as_deref() == Some(pane_id)
+                    && event.agent_id.as_deref() == Some(agent_id)
+                    && !event.is_wrapper_fork_session_start()
+            },
+            timeout,
+        )
+        .session_id
+    }
+
     /// Like [`Self::wait_for`], but returns `None` instead of panicking when
     /// `timeout` elapses with no match. For a caller that must distinguish
     /// "the precondition this run needed was never met" (inconclusive) from
@@ -6059,6 +6081,42 @@ pub fn attach_request_on(
     socket: &Path,
     req: &dot_agent_deck::daemon_protocol::AttachRequest,
 ) -> std::io::Result<dot_agent_deck::daemon_protocol::AttachResponse> {
+    let payload = serde_json::to_value(req).expect("serialize AttachRequest");
+    attach_json_request_on(socket, &payload)
+}
+
+/// Send a guarded `WriteAndSubmit` request over a daemon attach socket.
+///
+/// The identity fields are additive JSON keys rather than fields on
+/// `AttachRequest`, so E2E clients use this helper when they need to model the
+/// production seed/orchestrator prompt-delivery RPC.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn write_and_submit_with_identity_on(
+    socket: &Path,
+    pane_id: &str,
+    text: &str,
+    expected_agent_id: &str,
+    expected_session_id: Option<&str>,
+) -> std::io::Result<dot_agent_deck::daemon_protocol::AttachResponse> {
+    let mut request = serde_json::json!({
+        "op": "write-and-submit",
+        "pane_id": pane_id,
+        "text": text,
+        "expected_agent_id": expected_agent_id,
+    });
+    if let Some(session_id) = expected_session_id {
+        request["expected_session_id"] = serde_json::Value::String(session_id.to_string());
+    }
+    attach_json_request_on(socket, &request)
+}
+
+/// Send one JSON request over a daemon attach socket and read its response.
+#[cfg(unix)]
+fn attach_json_request_on(
+    socket: &Path,
+    req: &serde_json::Value,
+) -> std::io::Result<dot_agent_deck::daemon_protocol::AttachResponse> {
     use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP};
     use std::io::{Read, Write};
 
@@ -6066,7 +6124,7 @@ pub fn attach_request_on(
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
 
-    let payload = serde_json::to_vec(req).expect("serialize AttachRequest");
+    let payload = serde_json::to_vec(req).expect("serialize attach request JSON");
     let mut header = [0u8; 5];
     header[0] = KIND_REQ;
     header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());

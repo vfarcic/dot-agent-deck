@@ -9,7 +9,6 @@ mod common;
 use std::time::Duration;
 
 use common::TuiDeck;
-use dot_agent_deck::daemon_protocol::AttachRequest;
 use dot_agent_deck::event::{
     AGENT_EVENT_SCHEMA_VERSION, AgentType, EventType, LiveTarget, SendResult, TargetKind, Writable,
 };
@@ -66,12 +65,16 @@ fn codex_wrap_001_synthetic_jsonl_reaches_dashboard() {
         .pane_id
         .as_deref()
         .expect("managed wrapper event carries its pane id");
-    let response = common::attach_request_on(
+    let agent_id = working
+        .agent_id
+        .as_deref()
+        .expect("managed wrapper event carries its agent id");
+    let response = common::write_and_submit_with_identity_on(
         deck.attach_socket_path(),
-        &AttachRequest::WriteAndSubmit {
-            pane_id: pane_id.to_string(),
-            text: "MANAGED-WRAPPER-WRITE".to_string(),
-        },
+        pane_id,
+        "MANAGED-WRAPPER-WRITE",
+        agent_id,
+        Some(&working.session_id),
     )
     .expect("write through managed wrapper pane");
     assert_eq!(
