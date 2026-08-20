@@ -187,3 +187,17 @@ DOT_AGENT_DECK_LOG=/tmp/my-debug.log dot-agent-deck
 ```
 
 The log file captures session events, hook activity, mode-tab restoration, and any errors logged by the daemon. Attach the relevant excerpt when filing an issue. See [Configuration › Environment Variables](configuration.md#environment-variables) for the full list of variables.
+
+### Turning the verbosity up
+
+The log is written at `info` for the deck itself and `error` for its dependencies. `RUST_LOG` overrides that, using the standard [`tracing` filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html):
+
+```bash
+# Everything the deck logs, at debug
+RUST_LOG=dot_agent_deck=debug DOT_AGENT_DECK_LOG=1 dot-agent-deck
+
+# Just one subsystem, to keep the file readable
+RUST_LOG=dot_agent_deck::daemon=debug DOT_AGENT_DECK_LOG=1 dot-agent-deck
+```
+
+`RUST_LOG` on its own does nothing — it selects *what* is logged, while `DOT_AGENT_DECK_LOG` decides *whether* there is a log file at all, so the two go together. A directive naming the `dot_agent_deck` target replaces the built-in default; anything else (a bare level such as `RUST_LOG=debug`, or a different crate) is layered alongside it, so the deck stays at `info` unless you name it.

@@ -1433,10 +1433,7 @@ fn init_logging_from_env() {
         {
             Ok(log_file) => {
                 tracing_subscriber::fmt()
-                    .with_env_filter(
-                        tracing_subscriber::EnvFilter::from_default_env()
-                            .add_directive("dot_agent_deck=info".parse().unwrap()),
-                    )
+                    .with_env_filter(dot_agent_deck::logging::env_filter_from_env())
                     .with_writer(log_file)
                     .with_ansi(false)
                     .init();
