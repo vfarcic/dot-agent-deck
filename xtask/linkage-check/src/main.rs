@@ -5,10 +5,10 @@
 //! Subcommands:
 //!
 //! - `linkage-check` (default) — first runs a repository-state preflight
-//!   (issue #557; see [`repo_state`]), then performs the eight checks
+//!   (issue #557; see [`repo_state`]), then performs the nine checks
 //!   listed in Decision 7 + Decision 30:
 //!
-//!   The preflight is deliberately not a ninth numbered check: it answers
+//!   The preflight is deliberately not one of the numbered checks: it answers
 //!   "is this repository sane to reason about", a different question from
 //!   "does the catalog match the tests", and it runs first so a repository
 //!   in a state that would misdiagnose the checks below is caught before
@@ -36,6 +36,10 @@
 //!      `tempfile()`) — anywhere under `tests/`, or in the files on
 //!      [`EXTRA_TEMP_COVERED`]. Issue #322. See
 //!      [`BARE_TEMPDIR_RULE`].
+//!   9. No `crate::` path in `src/test_temp.rs`, which is
+//!      `#[path]`-included by the lib target AND by every
+//!      integration-test crate that needs a disk-backed scratch dir.
+//!      Issue #474. See [`SELF_CONTAINED_RULE`].
 //!
 //!   Checks 1/2/4/6 bind each `#[spec("…")]` to its test function
 //!   through the SAME syn walker rule 7 uses
@@ -203,6 +207,111 @@ fn temp_ctor_rule_covers(file: &Path, root: &Path, tests_dir: &Path, _is_e2e: bo
     EXTRA_TEMP_COVERED
         .iter()
         .any(|rel| file == root.join(rel).as_path())
+}
+
+/// Check 9 (issue #474): the one file in this repository that may not name its
+/// own crate, spelled out here because nothing at the offending line says so.
+///
+/// `src/test_temp.rs` is compiled twice over: as an ordinary `mod test_temp` in
+/// the lib target, and again inside every integration-test crate that pulls it
+/// in with `#[path = "../src/test_temp.rs"] mod test_temp;` — ten of them when
+/// this rule was written. In those crates `crate::` is the *test* binary's own
+/// root, where nothing this repository defines is in scope, so one added
+/// `crate::` path breaks every consumer at once.
+///
+/// **The self-containment is load-bearing economics, not style.** Containing
+/// those fast-tier crates with `mod common;` instead was priced at pulling the
+/// PTY harness into six more binaries and duplicating roughly **530** fast-tier
+/// executions. The `#[path]` route cost **12** — measured, `cargo nextest list`
+/// went 2,315 → 2,327, two per crate. The whole difference between those two
+/// numbers rests on this one file staying free of `crate::`, and until this rule
+/// that property was enforced by a comment.
+///
+/// It usually fails loudly, and the two ways that is not enough are the case for
+/// a mechanical check. It fails as N identical `E0433`s that explain nothing
+/// about why the file is unusual, so the obvious "fix" is to unpick the
+/// arrangement rather than to drop the reference. And whether it fails at all
+/// depends on which names the *consumer* happens to have at its own root:
+/// measured with a `crate::features::experimental_enabled()` probe added to the
+/// module, nine of the ten crates failed with `cannot find features in crate`
+/// and `tests/features.rs` compiled clean, because its own
+/// `use dot_agent_deck::features::{self, Features};` puts a `features` at that
+/// test crate's root. So a `crate::` path can land green on the author's
+/// `cargo test-fast` filter and break the next consumer to include the file.
+///
+/// **`super::` is deliberately not matched.** Inside the module's own
+/// `mod tests` it names the module itself, which is both correct and used; at
+/// file scope it would name the *including* crate's root and be exactly as
+/// non-portable as `crate::`. Telling those two apart needs a parser rather than
+/// a line scan, and no file-scope `super::` exists here — so this stays the
+/// narrow guard issue #474 asked for rather than a second syn walker.
+///
+/// Scanned over the **comment-stripped** view, so the file's own header note can
+/// point at this rule by name. A `crate::` inside a string literal is not exempt
+/// ([`strip_rust_comments`] deliberately preserves literals); nothing in a
+/// 40-line temp-dir resolver has needed one, and the diagnostic says which line
+/// it is.
+const SELF_CONTAINED_RULE: &str = "`crate::` path in a `#[path]`-shared file — this module is \
+     compiled into the lib target AND into every integration-test crate that \
+     `#[path]`-includes it, where `crate::` is that TEST crate's own root and \
+     nothing the library defines is in scope. Keep it self-contained (`std`, \
+     `libc`, `tempfile`, `super::`); anything it needs from the library has to \
+     arrive as an argument instead. Sharing it this way is what costs 12 extra \
+     fast-tier executions rather than the ~530 `mod common;` would (issue #474)";
+
+/// The file check 9 guards. Repo-relative, joined onto the workspace root, so
+/// the platform separator is whatever `Path::join` produces.
+const SELF_CONTAINED_PATH: &str = "src/test_temp.rs";
+
+/// The `crate::` paths check 9 forbids.
+///
+/// The leading `\b` is what keeps `some_crate::x` out: `_` is a word character,
+/// so no boundary falls in front of that `crate`. `$crate::` from a
+/// `macro_rules!` body IS matched, deliberately — it expands to the *defining*
+/// crate's root and is non-portable for exactly the same reason. The optional
+/// whitespace covers `crate ::`, which the compiler accepts.
+///
+/// Factored out so it can be unit-tested without a checkout, the same way
+/// [`bare_temp_ctor_re`] is.
+fn crate_path_re() -> Regex {
+    Regex::new(r"\bcrate\s*::").expect("crate path regex compiles")
+}
+
+/// Every `crate::` path in `text`, formatted as `<display>:<line>: <rule>`.
+///
+/// Takes the contents rather than a path so its tests can feed synthetic
+/// sources. A rule whose only coverage is the live checkout tests nothing
+/// whenever that checkout is clean — which is its normal state, and would be
+/// its state on the day the rule silently stopped matching.
+fn self_contained_violations(display: &str, text: &str) -> Vec<String> {
+    let re = crate_path_re();
+    // Line endings are preserved 1-for-1 by the stripper, so these indices are
+    // the raw source's line numbers.
+    strip_rust_comments(text)
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| re.is_match(line))
+        .map(|(idx, _)| format!("{display}:{}: {SELF_CONTAINED_RULE}", idx + 1))
+        .collect()
+}
+
+/// Run check 9 against a workspace root.
+///
+/// An unreadable file is itself a failure. The guard's entire job is to outlive
+/// edits to the arrangement it protects, and a rename that left this constant
+/// behind would otherwise turn the rule into a no-op that still prints `ok` —
+/// the same shape of silence the rule exists to end.
+fn check_self_contained(root: &Path) -> Vec<String> {
+    let path = root.join(SELF_CONTAINED_PATH);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => self_contained_violations(&path.display().to_string(), &text),
+        Err(e) => vec![format!(
+            "{}: cannot read the file check 9 guards ({e}) — if it moved, point \
+             `SELF_CONTAINED_PATH` at its new home; if the `#[path]` sharing is \
+             gone, delete the rule (issue #474)",
+            path.display()
+        )],
+    }
 }
 
 fn main() -> ExitCode {
@@ -478,6 +587,15 @@ fn main() -> ExitCode {
             .map(|v| format!("[8] {v}")),
     );
 
+    // Check 9 (issue #474): `src/test_temp.rs` names no crate of its own. It is
+    // read directly rather than folded into the scan above, so that the file
+    // going missing is reported instead of quietly emptying the rule.
+    failures.extend(
+        check_self_contained(&root)
+            .into_iter()
+            .map(|v| format!("[9] {v}")),
+    );
+
     // Check 7 (PRD #77 Decision 30 / M4.3): every #[spec] test has
     // a `/// Scenario:` doc comment with a body AND
     // `cargo xtask docs --tests` succeeds against the current source
@@ -492,7 +610,7 @@ fn main() -> ExitCode {
 
     if failures.is_empty() {
         println!(
-            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 8 rules)",
+            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 9 rules)",
             catalog_ids.len(),
             discovered.len(),
             allowlist.len()
@@ -1095,6 +1213,127 @@ mod tests {
         // Still outside: everything in `src/` except the one listed file.
         assert!(!covers("src/config.rs", false));
         assert!(!covers("src/test_temp.rs", false));
+    }
+
+    /// Check 9 rejects a `crate::` path wherever it sits — a `use`, a call —
+    /// and reports each at its own raw line number.
+    #[test]
+    fn self_contained_violations_rejects_crate_paths() {
+        let src = concat!(
+            "use std::io;\n",                           // 1
+            "use crate::config::Config;\n",             // 2
+            "\n",                                       // 3
+            "pub fn tempdir() -> io::Result<()> {\n",   // 4
+            "    let _ = crate::paths::state_dir();\n", // 5
+            "    Ok(())\n",                             // 6
+            "}\n",                                      // 7
+        );
+
+        let found = self_contained_violations("src/test_temp.rs", src);
+
+        assert_eq!(found.len(), 2, "{found:#?}");
+        assert!(found[0].starts_with("src/test_temp.rs:2: "), "{}", found[0]);
+        assert!(found[1].starts_with("src/test_temp.rs:5: "), "{}", found[1]);
+        // The diagnostic has to explain itself — N compile errors that do not
+        // is the situation this rule exists to replace.
+        assert!(found[0].contains("issue #474"), "{}", found[0]);
+    }
+
+    /// The two shapes that are easy to write without noticing: `macro_rules!`'s
+    /// `$crate::`, which expands to the *defining* crate's root and is
+    /// non-portable for the same reason, and the spaced `crate ::` the compiler
+    /// accepts.
+    #[test]
+    fn crate_path_re_matches_the_macro_and_spaced_forms() {
+        let re = crate_path_re();
+        for line in [
+            "        $crate::test_temp::PREFIX",
+            "    let _ = crate :: features::experimental_enabled();",
+        ] {
+            assert!(re.is_match(line), "should be a violation: {line}");
+        }
+    }
+
+    /// Ordinary self-contained content stays accepted: `std`, `libc`,
+    /// `tempfile`, `super::` from the module's own `mod tests`, a crate whose
+    /// name merely ENDS in `crate`, and — the part that has to keep working —
+    /// comments that name the forbidden path, because the file's header note
+    /// points at this rule and this rule's message quotes the path back.
+    #[test]
+    fn self_contained_violations_accepts_a_self_contained_module() {
+        let src = concat!(
+            "//! Enforced by linkage-check rule 9: no `crate::` path may appear\n",
+            "//! below, because several test crates `#[path]`-include this file.\n",
+            "use std::io;\n",
+            "use std::path::PathBuf;\n",
+            "use some_crate::helper;\n",
+            "\n",
+            "const PREFIX: &str = \"dad-unit-\";\n",
+            "\n",
+            "pub fn tempdir() -> io::Result<tempfile::TempDir> {\n",
+            "    // Nothing below may reach for crate::something.\n",
+            "    let uid = unsafe { libc::geteuid() };\n",
+            "    let _ = (uid, PathBuf::new(), PREFIX, helper);\n",
+            "    tempfile::Builder::new().prefix(PREFIX).tempdir()\n",
+            "}\n",
+            "\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    #[test]\n",
+            "    fn allocates() {\n",
+            "        let dir = super::tempdir().expect(\"allocate\");\n",
+            "        assert!(dir.path().is_dir());\n",
+            "    }\n",
+            "}\n",
+        );
+
+        assert_eq!(
+            self_contained_violations("src/test_temp.rs", src),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The wrapper reads the guarded path under whatever root it is handed. A
+    /// synthetic root, deliberately — the live checkout's copy is clean by
+    /// construction, so pointing this at it would pass for a reason that has
+    /// nothing to do with the rule working.
+    #[test]
+    fn check_self_contained_reads_the_guarded_file() {
+        let root = tempfile::tempdir().expect("synthetic workspace root");
+        std::fs::create_dir_all(root.path().join("src")).expect("create src/");
+        let file = root.path().join("src").join("test_temp.rs");
+
+        std::fs::write(
+            &file,
+            "use std::io;\npub fn tempdir() -> io::Result<()> {\n    Ok(())\n}\n",
+        )
+        .expect("write a self-contained module");
+        assert_eq!(check_self_contained(root.path()), Vec::<String>::new());
+
+        std::fs::write(&file, "use std::io;\nuse crate::config::Config;\n")
+            .expect("write a violating module");
+        let found = check_self_contained(root.path());
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(found[0].contains("test_temp.rs:2: "), "{}", found[0]);
+    }
+
+    /// A rename that leaves `SELF_CONTAINED_PATH` behind fails loudly instead of
+    /// passing vacuously. A guard that silently matches nothing while still
+    /// printing `ok` is the same shape of invisible constraint issue #474 is
+    /// about.
+    #[test]
+    fn check_self_contained_reports_the_guarded_file_going_missing() {
+        let root = tempfile::tempdir().expect("synthetic workspace root");
+
+        let found = check_self_contained(root.path());
+
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(
+            found[0].contains("cannot read the file check 9 guards"),
+            "{}",
+            found[0]
+        );
+        assert!(found[0].contains("issue #474"), "{}", found[0]);
     }
 
     #[test]
