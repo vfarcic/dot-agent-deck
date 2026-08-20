@@ -17,6 +17,12 @@
 # indistinguishable, because the tier's wall clock is set by its slowest test
 # (~20s), not by its count.
 test-fast = "nextest run --workspace"
+# Issue #494: `--features e2e` names the CARGO FEATURE `e2e`, NOT a nextest
+# profile. There is no `-P` / `--profile` here, so this — like `test-fast`
+# above, and like every `cargo nextest run` in `.github/workflows/` — runs
+# under nextest's `default` profile, the only profile `.config/nextest.toml`
+# declares. Timeout carve-outs therefore belong under
+# `[[profile.default.overrides]]`.
 test-e2e = "nextest run --workspace --features e2e"
 # PRD #77 Decision 7: `cargo xtask linkage-check` enforces catalog↔test
 # linkage. Args after the alias pass through to the binary.
