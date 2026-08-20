@@ -1428,6 +1428,32 @@ mod tests {
         }
     }
 
+    /// Issue #563: the safe-set predicate works on BYTES while a path is UTF-8,
+    /// so every byte of a multi-byte character is >= 0x80 and therefore outside
+    /// the set — a non-ASCII path always quotes. Worth its own case because the
+    /// ASCII sweep above cannot reach these bytes, and because quoting must
+    /// splice around whole characters rather than cutting one in half.
+    #[test]
+    fn shell_quote_if_needed_quotes_a_non_ascii_path_without_mangling_it() {
+        for input in [
+            "/home/josé/bin/dot-agent-deck",
+            "/srv/项目/bin/dot-agent-deck",
+            "/tmp/naïve café/dot-agent-deck",
+        ] {
+            let quoted = shell_quote_if_needed(input);
+            assert_eq!(
+                quoted,
+                format!("'{input}'"),
+                "a non-ASCII path is outside the byte-wise safe set, so it must be quoted"
+            );
+            assert_eq!(
+                parse_as_one_shell_word(&quoted).as_deref(),
+                Some(input),
+                "quoting must leave every multi-byte character intact"
+            );
+        }
+    }
+
     /// Issue #563 records the CURRENT treatment of backslashes, not a desired
     /// one: `\` is absent from the safe set, so every Windows-style path takes
     /// the single-quoted branch. That is the property issue #561 is about —
