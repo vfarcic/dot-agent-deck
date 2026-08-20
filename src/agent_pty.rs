@@ -6032,6 +6032,7 @@ impl AgentPtyRegistry {
                 pty_rows: 24,
                 pty_cols: 80,
                 exited: Arc::new(AtomicBool::new(false)),
+                pane_handed_over: false,
                 pending_seed: None,
                 seed_delivered_native: false,
             },
