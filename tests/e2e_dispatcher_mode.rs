@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::TabMembership;
+use dot_agent_deck::event::SendResult;
 use dot_agent_deck::state::SessionStatus;
 use spec::spec;
 
@@ -1223,11 +1224,13 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
         Some(&orchestrator_session_id),
     )
     .expect("WriteAndSubmit to the dispatched orchestrator pane over the attach socket");
-    assert!(
-        resp.ok,
+    assert_eq!(
+        resp.send_result,
+        Some(SendResult::Applied),
         "the daemon refused to deliver the delegate directive to the dispatched \
          orchestrator pane {orchestrator_pane}: error={:?}, send_result={:?}",
-        resp.error, resp.send_result
+        resp.error,
+        resp.send_result
     );
 
     // Generous: an orchestrator turn, a `clear = false` worker's delivery, and a

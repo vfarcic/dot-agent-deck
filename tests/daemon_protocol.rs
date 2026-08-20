@@ -1312,6 +1312,59 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
         server.registry.close_agent(&agent_id).unwrap();
 
         let server = start_server().await;
+        let pane_id = "pane-unattached-current-session-requires-expected-session";
+        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        {
+            let mut state = server.state.write().await;
+            state.register_pane(pane_id.to_string());
+            state.apply_event(AgentEvent {
+                session_id: "unattached-current-session".to_string(),
+                agent_type: AgentType::Codex,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some(pane_id.to_string()),
+                agent_id: Some(agent_id.clone()),
+                agent_version: None,
+                schema_version: None,
+                live_target: Some(LiveTarget {
+                    kind: TargetKind::Pty,
+                    writable: Writable::Live,
+                }),
+            });
+        }
+        assert_eq!(
+            server.registry.receiver_count(&agent_id),
+            Some(0),
+            "the unattached regression case must have no attach subscriber"
+        );
+        let unattached_response = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'UNATTACHED-MISSING-EXPECTED-SESSION-LEAKED\n'",
+                "expected_agent_id": agent_id,
+                "delivery_id": "unattached-missing-expected-session-009"
+            }),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        let unattached_scrollback = server.registry.snapshot(&agent_id).unwrap();
+        let unattached_marker = b"UNATTACHED-MISSING-EXPECTED-SESSION-LEAKED";
+        let unattached_session_guard_observation = (
+            unattached_response.send_result,
+            unattached_scrollback
+                .windows(unattached_marker.len())
+                .any(|window| window == unattached_marker),
+        );
+        server.registry.close_agent(&agent_id).unwrap();
+
+        let server = start_server().await;
         let pane_id = "pane-legitimately-sessionless";
         let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
         server.state.write().await.register_pane(pane_id.to_string());
@@ -1347,8 +1400,9 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
                         Some(SendResult::Applied),
                         true,
                     )
+                && unattached_session_guard_observation == (Some(SendResult::Stale), false)
                 && sessionless_observation == (Some(SendResult::Applied), true),
-            "guarded paned delivery must fail closed on absent identity without weakening valid sends; same_agent_restart=(result={:?}, leaked={old_prompt_reached_new_session}), missing_current=(result={:?}, leaked={prompt_reached_sessionless_target}), missing_agent={missing_agent_observation:?}, session_guard={session_guard_observation:?}, sessionless={sessionless_observation:?}",
+            "guarded paned delivery must fail closed on absent identity without weakening valid sends; same_agent_restart=(result={:?}, leaked={old_prompt_reached_new_session}), missing_current=(result={:?}, leaked={prompt_reached_sessionless_target}), missing_agent={missing_agent_observation:?}, session_guard={session_guard_observation:?}, unattached_session_guard={unattached_session_guard_observation:?}, sessionless={sessionless_observation:?}",
             same_agent_result,
             missing_session_result
         );

@@ -32,6 +32,7 @@ fn path_with_binary_dir() -> String {
 /// and turn-completed records. Subscribe to the real daemon event stream and
 /// detach to the dashboard; events must carry the Codex identity and schema
 /// version while the visible card moves Thinking → Idle and reads `Codex`.
+/// Send identity-bound input and require it to reach the wrapped child exactly once.
 #[spec("codex/wrap/001")]
 #[test]
 fn codex_wrap_001_synthetic_jsonl_reaches_dashboard() {

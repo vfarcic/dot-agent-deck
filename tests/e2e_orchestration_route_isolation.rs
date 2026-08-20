@@ -61,6 +61,7 @@ use std::time::Duration;
 
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::TabMembership;
+use dot_agent_deck::event::SendResult;
 use spec::spec;
 
 /// The fixture's `[[orchestrations]] name` — the label BOTH tabs render with in
@@ -287,11 +288,14 @@ fn ask_orchestrator_to_delegate(
         Some(session_id),
     )
     .expect("WriteAndSubmit to the orchestrator pane over the attach socket");
-    assert!(
-        resp.ok,
+    assert_eq!(
+        resp.send_result,
+        Some(SendResult::Applied),
         "the daemon refused to deliver the directive to orchestrator pane {}: error={:?}, \
          send_result={:?}",
-        orchestrator.pane_id, resp.error, resp.send_result
+        orchestrator.pane_id,
+        resp.error,
+        resp.send_result
     );
 }
 

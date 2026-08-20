@@ -860,7 +860,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### prompt/pane-input/009 — A queued prompt cannot cross an agent or logical-session generation (PRD #20 finding #4).
 - **Layer:** L1 protocol integration with an in-process daemon and real PTY-backed shells.
 - **Agent:** synthetic Codex identities bound sequentially to the same pane.
-- **Asserts:** paned requests with no expected agent return `no-live-target`, and requests with no expected session against an attached pane's current hook session return `stale`; both write no marker. Requests queued for an original agent, a same-agent pre-`/clear` session, or a session missing on the target also fail closed, while a matching agent/session and an identified agent with no hook session still deliver.
+- **Asserts:** paned requests with no expected agent return `no-live-target`, and requests with no expected session against either an attached or unattached pane's current hook session return `stale`; all write no marker. Requests queued for an original agent, a same-agent pre-`/clear` session, or a session missing on the target also fail closed, while a matching agent/session and an identified agent with no hook session still deliver.
 - **Does not assert:** UI feedback for the returned result (covered by `prompt/pane-input/006`).
 - **Platform coverage:** mac+linux.
 

@@ -5933,26 +5933,52 @@ impl EventSub {
         }
     }
 
-    /// Wait for the genuine `SessionStart` that names one daemon-managed pane
-    /// and agent, then return the conversation generation it announced.
-    /// Launcher/wrapper-fork starts are boot evidence rather than a conversation
-    /// and therefore cannot authorize a guarded prompt delivery.
+    /// Wait for the latest still-live genuine `SessionStart` that names one
+    /// daemon-managed pane and agent, then return its conversation generation.
+    /// Matching `SessionEnd`s clear a generation; launcher/wrapper-fork starts
+    /// are boot evidence rather than a conversation and therefore cannot
+    /// authorize a guarded prompt delivery.
     pub fn wait_for_session_start_on_pane(
         &self,
         pane_id: &str,
         agent_id: &str,
         timeout: Duration,
     ) -> String {
-        self.wait_for(
-            |event| {
-                event.event_type == dot_agent_deck::event::EventType::SessionStart
-                    && event.pane_id.as_deref() == Some(pane_id)
+        use dot_agent_deck::event::EventType;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            let events = self.events.lock().unwrap();
+            let mut current_session_id: Option<String> = None;
+            for event in events.iter().filter(|event| {
+                event.pane_id.as_deref() == Some(pane_id)
                     && event.agent_id.as_deref() == Some(agent_id)
-                    && !event.is_wrapper_fork_session_start()
-            },
-            timeout,
-        )
-        .session_id
+            }) {
+                match event.event_type {
+                    EventType::SessionStart if !event.is_wrapper_fork_session_start() => {
+                        current_session_id = Some(event.session_id.clone());
+                    }
+                    EventType::SessionEnd
+                        if current_session_id.as_deref() == Some(event.session_id.as_str()) =>
+                    {
+                        current_session_id = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(session_id) = current_session_id {
+                return session_id;
+            }
+            if Instant::now() >= deadline {
+                let seen = events.clone();
+                panic!(
+                    "no still-live genuine SessionStart for pane {pane_id:?} and agent \
+                     {agent_id:?} appeared within {timeout:?}; observed events: {seen:#?}"
+                );
+            }
+            drop(events);
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Like [`Self::wait_for`], but returns `None` instead of panicking when
