@@ -1074,13 +1074,25 @@ struct NewPaneFormState {
     /// opened — set by the two text-edit key arms in
     /// `handle_new_pane_form_key` (`FormField::Name` only), never by the
     /// basename pre-fill `transition_after_dir_pick` applies. While `false`,
-    /// [`Self::suggest_name_if_orchestration_selected`] is free to overwrite
+    /// [`Self::resuggest_name_for_selection`] is free to overwrite
     /// `name` with the generated suggestion; once `true`, that fn leaves the
     /// field alone — a generated default may replace a generated default,
     /// never a human edit. Guards re-clicking the selected chip, arrowing
     /// between orchestrations, and arrowing off and back onto one, all of
     /// which land on the same call.
     name_touched: bool,
+    /// The Name the form opened with — the directory basename
+    /// `transition_after_dir_pick` pre-fills. Kept so that cycling AWAY from an
+    /// orchestration can put it back: the `-orchestrator-N` suggestion belongs
+    /// to the orchestration selection, and a plain pane, a workload mode or the
+    /// built-in `schedule`/`dispatcher` options must not inherit it. Without
+    /// this, the suggestion was a one-way overwrite — and since the cycler
+    /// orders orchestrations BEFORE `schedule`/`dispatcher`, merely passing
+    /// over one on the way to them left every such pane named
+    /// `<folder>-orchestrator-N`. Only ever consulted while
+    /// [`Self::name_touched`] is `false`, so it can never overwrite a human
+    /// edit.
+    name_prefill: String,
 }
 
 impl NewPaneFormState {
@@ -1118,6 +1130,9 @@ impl NewPaneFormState {
             reactive_panes: 0,
         };
         let dispatcher_authoring = build_dispatcher_mode(&dir);
+        // Remembered so leaving an orchestration can restore it — see
+        // `name_prefill`.
+        let name_prefill = name.clone();
         Self {
             dir,
             name,
@@ -1156,6 +1171,7 @@ impl NewPaneFormState {
             // A freshly opened form has no human edit yet — the basename
             // pre-fill below is not one.
             name_touched: false,
+            name_prefill,
         }
     }
 
@@ -1210,22 +1226,38 @@ impl NewPaneFormState {
         }
     }
 
-    /// Overwrite the Name field with the next free suggested name whenever
-    /// the selection LANDS on an orchestration — called from every path that
-    /// can change `selection_index` (arrow keys, click). A no-op when the
-    /// current selection isn't an orchestration (a plain mode/card/authoring
-    /// option keeps whatever the user already typed), and a no-op once
-    /// [`Self::name_touched`] is set — a generated default may replace a
-    /// generated default, never a human edit. Without this guard, re-clicking
-    /// the already-selected chip, arrowing between two orchestrations, or
-    /// arrowing off one and back all silently clobber whatever the user typed.
-    fn suggest_name_if_orchestration_selected(&mut self) {
+    /// Re-derive the Name field for the CURRENT selection — called from every
+    /// path that can change `selection_index` (arrow keys, click).
+    ///
+    /// Landing on an orchestration suggests the next free
+    /// `<folder>-orchestrator-N`; landing on anything else (No mode, a
+    /// workload mode, the built-in `schedule` / `schedule: issues` /
+    /// `dispatcher` options) restores [`Self::name_prefill`], the directory
+    /// basename the form opened with.
+    ///
+    /// **Both directions matter.** This used to apply the suggestion and
+    /// return early otherwise, which made it a one-way overwrite: the name
+    /// survived the selection that generated it. Because the cycler orders the
+    /// orchestrations BEFORE the built-in `schedule`/`dispatcher` options,
+    /// reaching those from "No mode" means passing over an orchestration — so
+    /// a plain pane, a `dev`-mode pane and a scheduled task could all end up
+    /// named `<folder>-orchestrator-N` without the user ever selecting an
+    /// orchestration.
+    ///
+    /// Still a no-op once [`Self::name_touched`] is set — a generated default
+    /// may replace a generated default, never a human edit. Without that
+    /// guard, re-clicking the already-selected chip, arrowing between two
+    /// orchestrations, or arrowing off one and back all silently clobber
+    /// whatever the user typed.
+    fn resuggest_name_for_selection(&mut self) {
         if self.name_touched {
             return;
         }
-        if self.selected_orchestration().is_some() {
-            self.name = self.suggest_orchestration_name();
-        }
+        self.name = if self.selected_orchestration().is_some() {
+            self.suggest_orchestration_name()
+        } else {
+            self.name_prefill.clone()
+        };
     }
 
     /// The title this submission will ACTUALLY take: the typed Name when it
@@ -1334,6 +1366,9 @@ impl NewPaneFormState {
             // The Name field is hidden and fixed to `SCHEDULE_MODE_NAME` on
             // this form, so there is nothing to touch.
             name_touched: false,
+            // No cycler and no orchestration on this form, so nothing ever
+            // reverts to it.
+            name_prefill: SCHEDULE_MODE_NAME.to_string(),
         };
         // Lock the selection onto the built-in schedule option (index 1 with no
         // modes/orchestrations) so the existing schedule spawn branch fires.
@@ -1407,7 +1442,7 @@ impl NewPaneFormState {
             self.selection_index += 1;
             // Selecting an orchestration suggests the next free name in
             // place of whatever was in the field.
-            self.suggest_name_if_orchestration_selected();
+            self.resuggest_name_for_selection();
         }
     }
 
@@ -1415,7 +1450,7 @@ impl NewPaneFormState {
         self.selection_index = self.selection_index.saturating_sub(1);
         // Symmetric to `select_next_mode` — cycling backward onto an
         // orchestration suggests the next free name too.
-        self.suggest_name_if_orchestration_selected();
+        self.resuggest_name_for_selection();
     }
 
     fn selected_mode(&self) -> Option<&ModeConfig> {
@@ -9946,7 +9981,7 @@ fn dispatch_action(
                 // Clicking a chip lands on the selection the same way the
                 // arrow keys do — suggest a name if it landed on an
                 // orchestration.
-                form.suggest_name_if_orchestration_selected();
+                form.resuggest_name_for_selection();
             }
         }
         // [Submit] → spawn the pane from the form values (== Enter on the final
@@ -29633,6 +29668,92 @@ mod tests {
             ),
             other => panic!("expected SpawnPane, got {other:?}"),
         }
+    }
+
+    /// Scenario: Open the new-pane form the way `Ctrl+n` does — Name
+    /// pre-filled with the bare directory basename `myproj` — then cycle the
+    /// Mode field RIGHT onto the orchestration (which suggests
+    /// `myproj-orchestrator-1`) and back LEFT to "No mode". The Name field
+    /// must read `myproj` again, and submitting must spawn a plain pane
+    /// called `myproj`: a pane with no mode is not an orchestrator, and a
+    /// generated suggestion must not outlive the selection that generated it.
+    /// Same for cycling FORWARD off the orchestration onto the built-in
+    /// `schedule` option — which is how the user reaches `schedule` /
+    /// `dispatcher` at all, since the cycler puts the orchestrations in
+    /// between.
+    #[spec("orchestration/identity/006")]
+    #[test]
+    fn identity_006_leaving_the_orchestration_restores_the_basename() {
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        // --- back to "No mode" (index 0) ---
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            "myproj".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        ));
+
+        handle_new_pane_form_key(right, &mut ui); // land on the orchestration
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "myproj-orchestrator-1",
+            "control: landing on the orchestration still suggests N=1"
+        );
+
+        handle_new_pane_form_key(left, &mut ui); // back to "No mode"
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().selection_index,
+            0,
+            "precondition: Left from the orchestration lands on \"No mode\""
+        );
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "myproj",
+            "leaving the orchestration must restore the basename pre-fill — a \
+             plain pane must not be named `-orchestrator-N`"
+        );
+
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+        handle_new_pane_form_key(enter, &mut ui); // Name -> Command
+        let result = handle_new_pane_form_key(enter, &mut ui);
+        match result {
+            Action::SpawnPane(req) => assert_eq!(
+                req.name, "myproj",
+                "the plain pane must submit under the basename, not the stale \
+                 orchestrator suggestion"
+            ),
+            other => panic!("expected SpawnPane, got {other:?}"),
+        }
+
+        // --- forward off the orchestration onto `schedule` ---
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            "myproj".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        ));
+
+        handle_new_pane_form_key(right, &mut ui); // orchestration
+        handle_new_pane_form_key(right, &mut ui); // `schedule`
+        let form = ui.new_pane_form.as_ref().unwrap();
+        assert!(
+            form.is_schedule_selected(),
+            "precondition: two Rights land on the built-in `schedule` option"
+        );
+        assert_eq!(
+            form.name, "myproj",
+            "cycling PAST the orchestration to reach `schedule` must not leave \
+             the orchestrator suggestion behind"
+        );
     }
 
     /// Scenario: With `myproj-orchestrator-1` already live (a name a running

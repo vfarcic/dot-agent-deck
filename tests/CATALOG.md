@@ -2458,6 +2458,13 @@ without depending on the config struct API.
 - **Does not assert:** the daemon-side authoritative check deferred to a follow-up issue (form-time uniqueness stays advisory); a real-binary/PTY-attached end-to-end pass.
 - **Platform coverage:** mac+linux+windows.
 
+##### orchestration/identity/006 — Cycling AWAY from the orchestration restores the directory-basename pre-fill, so a plain pane, a workload-mode pane or a `schedule`/`dispatcher` card is never left holding the `<folder>-orchestrator-N` suggestion (issue #638).
+- **Layer:** L1 (`src/ui.rs`'s own `#[cfg(test)] mod tests` — the real `handle_new_pane_form_key` arrow-key path against a `NewPaneFormState` built with the bare-basename pre-fill `transition_after_dir_pick` produces; no daemon, no PTY).
+- **Agent:** none.
+- **Asserts:** a form built with Name `"myproj"` and one orchestration, after Right selects the orchestration (control: `form.name == "myproj-orchestrator-1"`, so the failure below is attributable to the leave path and not to the whole suggestion), Left back to "No mode" restores `form.name == "myproj"` and submitting yields `Action::SpawnPane` with `req.name == "myproj"`; separately, two Rights landing on the built-in `schedule` option — the cycler orders orchestrations BEFORE it, so reaching it means passing over one — also leaves `form.name == "myproj"`.
+- **Does not assert:** that a name the user TYPED survives the same cycling (that is `orchestration/identity/004`, whose `name_touched` guard this shares and does not change); the render of the Name field's literal text; the daemon round-trip that learns live orchestration names.
+- **Platform coverage:** mac+linux+windows.
+
 #### orchestration/guard
 
 ##### orchestration/guard/001 — Opening an orchestration in a cwd that already hosts a live orchestration shows a non-blocking shared-resource warning pointing at worktrees (PRD #140).
