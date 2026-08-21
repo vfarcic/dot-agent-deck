@@ -61,7 +61,7 @@ use std::time::Duration;
 
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::TabMembership;
-use dot_agent_deck::daemon_protocol::AttachRequest;
+use dot_agent_deck::event::SendResult;
 use spec::spec;
 
 /// The fixture's `[[orchestrations]] name` — the label BOTH tabs render with in
@@ -265,27 +265,37 @@ fn open_orchestration_tab(deck: &TuiDeck, expect_same_cwd_warning: bool) {
 }
 
 /// Ask a real orchestrator pane to delegate `task` to `role`, by writing the
-/// directive into its PTY through the daemon's production
-/// `WriteAndSubmit` RPC — the same atomic write-then-submit a user's keystrokes
-/// go through. What the orchestrator does with it (shell `dot-agent-deck
-/// delegate`) is the agent's own doing.
-fn ask_orchestrator_to_delegate(deck: &TuiDeck, orchestrator: &RolePane, role: &str, task: &str) {
+/// directive into its PTY through the daemon's production prompt-delivery RPC —
+/// the same guarded write-and-submit the deck uses for a seed or orchestrator
+/// prompt. What the orchestrator does with it (shell `dot-agent-deck delegate`)
+/// is the agent's own doing.
+fn ask_orchestrator_to_delegate(
+    deck: &TuiDeck,
+    orchestrator: &RolePane,
+    session_id: &str,
+    role: &str,
+    task: &str,
+) {
     let directive = format!(
         "Use the Bash tool to run exactly this one command, then stop and say nothing else: \
          dot-agent-deck delegate --to {role} --task \"{task}\""
     );
-    let resp = common::attach_request_on(
+    let resp = common::write_and_submit_with_identity_on(
         deck.attach_socket_path(),
-        &AttachRequest::WriteAndSubmit {
-            pane_id: orchestrator.pane_id.clone(),
-            text: directive,
-        },
+        &orchestrator.pane_id,
+        &directive,
+        &orchestrator.agent_id,
+        Some(session_id),
     )
     .expect("WriteAndSubmit to the orchestrator pane over the attach socket");
-    assert!(
-        resp.ok,
-        "the daemon refused to deliver the directive to orchestrator pane {}: {:?}",
-        orchestrator.pane_id, resp.error
+    assert_eq!(
+        resp.send_result,
+        Some(SendResult::Applied),
+        "the daemon refused to deliver the directive to orchestrator pane {}: error={:?}, \
+         send_result={:?}",
+        orchestrator.pane_id,
+        resp.error,
+        resp.send_result
     );
 }
 
@@ -319,6 +329,7 @@ fn route_001_two_tabs_same_cwd_do_not_cross_deliver() {
 
     let socket = deck.attach_socket_path().to_path_buf();
     let cwd = deck.workdir().to_path_buf();
+    let events = deck.subscribe_events();
 
     // Pre-trust the orchestration cwd for the six interactive `claude` panes so
     // their first-run onboarding + per-folder trust dialogs never appear and the
@@ -399,6 +410,16 @@ fn route_001_two_tabs_same_cwd_do_not_cross_deliver() {
         // diagnosable.
         eprintln!("warning: not every role pane settled within 180s; proceeding anyway");
     }
+    let orch_a_session_id = events.wait_for_session_start_on_pane(
+        &orch_a.pane_id,
+        &orch_a.agent_id,
+        Duration::from_secs(10),
+    );
+    let orch_b_session_id = events.wait_for_session_start_on_pane(
+        &orch_b.pane_id,
+        &orch_b.agent_id,
+        Duration::from_secs(10),
+    );
 
     // ===== Both tabs are given a task, CONCURRENTLY — the reported repro ======
     // Issue 140's report is "open the same orchestration in two tabs, start a
@@ -411,6 +432,7 @@ fn route_001_two_tabs_same_cwd_do_not_cross_deliver() {
     ask_orchestrator_to_delegate(
         &deck,
         &orch_a,
+        &orch_a_session_id,
         "coder",
         &format!(
             "Create a file named {SENTINEL_A} in the current directory with the exact \
@@ -420,6 +442,7 @@ fn route_001_two_tabs_same_cwd_do_not_cross_deliver() {
     ask_orchestrator_to_delegate(
         &deck,
         &orch_b,
+        &orch_b_session_id,
         "reviewer",
         &format!(
             "Create a file named {SENTINEL_B} in the current directory with the exact \

@@ -1218,4 +1218,277 @@ mod tests {
             }
         }
     }
+
+    /// The safe punctuation set [`shell_quote_if_needed`] documents, re-declared
+    /// here **independently of the production predicate** (issue #563). A test
+    /// that reused `is_safe` would agree with whatever the helper currently
+    /// does rather than pin what it is supposed to do; spelling the set out a
+    /// second time is what makes a future narrowing *or* widening of it fail an
+    /// assertion instead of silently changing every generated command line.
+    const EXPECTED_SAFE_PUNCTUATION: &[char] = &['/', '.', '_', '-', '+', '=', ':', '@', '%', ','];
+
+    /// Alphanumerics plus [`EXPECTED_SAFE_PUNCTUATION`] — the bytes that must
+    /// survive [`shell_quote_if_needed`] unquoted.
+    fn is_expected_safe(c: char) -> bool {
+        c.is_ascii_alphanumeric() || EXPECTED_SAFE_PUNCTUATION.contains(&c)
+    }
+
+    /// Minimal POSIX word reader used to prove a quoted result is still ONE
+    /// shell word whose literal value is the original path. Returns `None` when
+    /// the input would split into more than one word, ends inside an
+    /// unterminated quote, or leaves a byte unquoted that a real shell would
+    /// treat as anything other than a literal.
+    ///
+    /// Deliberately narrow: it understands exactly the two constructs
+    /// [`shell_quote_if_needed`] can emit — bare safe bytes, and single-quoted
+    /// runs spliced together with `'\''` — so anything else is reported as
+    /// unsafe rather than quietly accepted. Pure data: no shell is spawned.
+    fn parse_as_one_shell_word(s: &str) -> Option<String> {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                // Single-quoted run: every byte up to the next `'` is literal,
+                // and no escape is recognized inside it (POSIX 2.2.2).
+                '\'' => loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(inner) => out.push(inner),
+                        // Unterminated quote — the shell would keep reading.
+                        None => return None,
+                    }
+                },
+                // Outside quotes a backslash escapes exactly the next byte;
+                // this is the `\'` in the middle of the `'\''` splice.
+                '\\' => out.push(chars.next()?),
+                c if is_expected_safe(c) => out.push(c),
+                // A word separator, or an unquoted metacharacter the shell
+                // would expand or act on rather than pass through literally.
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
+    /// Issue #563: a path built only from safe bytes comes back BYTE-FOR-BYTE
+    /// unchanged. The no-gratuitous-quotes half is worth pinning because all
+    /// three call sites write the result into text a user reads and an agent
+    /// runs — the two hook installers' generated config among it — so starting
+    /// to quote paths that never needed it would rewrite every one of those
+    /// lines. That should be a deliberate edit, not a side effect.
+    #[test]
+    fn shell_quote_if_needed_returns_a_safe_path_unchanged() {
+        for input in [
+            "/usr/local/bin/dot-agent-deck",
+            "dot-agent-deck",
+            "/home/somebody/.cargo/bin/dot-agent-deck",
+            // Every safe punctuation byte at once, in a plausible path shape.
+            "/opt/a+b=c:d@e%f,g/bin/x_1-2.3",
+            // Backslash-free Windows-style path: the drive colon and the
+            // forward slashes are all in the safe set, so this one does NOT
+            // quote — see the backslash test below for the contrast.
+            "C:/Users/somebody/bin/dot-agent-deck.exe",
+        ] {
+            assert_eq!(
+                shell_quote_if_needed(input),
+                input,
+                "a path of only safe bytes must be returned unchanged, not quoted"
+            );
+        }
+    }
+
+    /// Issue #563: a path containing a space is single-quoted, and the quoted
+    /// form still reads as a single shell word rather than two.
+    #[test]
+    fn shell_quote_if_needed_single_quotes_a_path_containing_a_space() {
+        for input in [
+            "/Applications/My App/bin/dot-agent-deck",
+            " leading",
+            "trailing ",
+        ] {
+            let quoted = shell_quote_if_needed(input);
+            assert_eq!(
+                quoted,
+                format!("'{input}'"),
+                "a space must force the single-quoted form"
+            );
+            assert_eq!(
+                parse_as_one_shell_word(&quoted).as_deref(),
+                Some(input),
+                "the quoted form must still be one word with the original value"
+            );
+        }
+    }
+
+    /// Issue #563: an embedded single quote is escaped as `'\''` — close the
+    /// run, emit an escaped quote, reopen — and the result still parses as ONE
+    /// shell word whose value is the original path. This is the one input where
+    /// a naive `format!("'{path}'")` would produce a *syntactically broken*
+    /// command rather than merely an ugly one.
+    #[test]
+    fn shell_quote_if_needed_escapes_an_embedded_single_quote_into_one_word() {
+        assert_eq!(
+            shell_quote_if_needed("/home/o'brien/bin/dot-agent-deck"),
+            r"'/home/o'\''brien/bin/dot-agent-deck'",
+            "an embedded single quote must be spliced as '\\'', not passed through"
+        );
+
+        for input in [
+            "/home/o'brien/bin/dot-agent-deck",
+            "'",
+            "''",
+            "'leading",
+            "trailing'",
+            "a'b'c",
+            // The nastiest realistic shape: a quote next to a space, so the
+            // splice and the reason for quoting are different bytes.
+            "/tmp/it's here/dot-agent-deck",
+        ] {
+            let quoted = shell_quote_if_needed(input);
+            assert_eq!(
+                parse_as_one_shell_word(&quoted).as_deref(),
+                Some(input),
+                "{quoted:?} must parse back to exactly one word equal to {input:?}"
+            );
+        }
+    }
+
+    /// Issue #563: the empty string is quoted (`''`) rather than returned bare.
+    /// The `!path.is_empty()` guard in the helper already makes this true;
+    /// nothing asserted it. It matters more than its size suggests — a bare
+    /// empty string interpolated into command text expands to *nothing*, so the
+    /// next word silently becomes the command, which is precisely the class of
+    /// failure the shell-safety work exists to prevent.
+    #[test]
+    fn shell_quote_if_needed_quotes_the_empty_string_rather_than_returning_it_bare() {
+        assert_eq!(
+            shell_quote_if_needed(""),
+            "''",
+            "the empty string must survive as an explicit empty word"
+        );
+    }
+
+    /// Issue #563: every byte of the documented safe set — alphanumerics plus
+    /// `/ . _ - + = : @ % ,` — stays unquoted, both on its own and inside a
+    /// path. Narrowing the set (dropping, say, `%` or `,`) would otherwise add
+    /// quotes to a large share of generated paths with no test noticing.
+    #[test]
+    fn shell_quote_if_needed_leaves_every_byte_of_the_safe_set_unquoted() {
+        let alphanumerics = ['a', 'z', 'A', 'Z', '0', '9'];
+        for c in EXPECTED_SAFE_PUNCTUATION.iter().chain(alphanumerics.iter()) {
+            let alone = c.to_string();
+            assert_eq!(
+                shell_quote_if_needed(&alone),
+                alone,
+                "{c:?} is in the safe set, so it must not be quoted on its own"
+            );
+
+            let in_path = format!("/bin/dot{c}agent{c}deck");
+            assert_eq!(
+                shell_quote_if_needed(&in_path),
+                in_path,
+                "{c:?} is in the safe set, so a path containing it must not be quoted"
+            );
+        }
+    }
+
+    /// Issue #563, the other direction: sweep the whole ASCII range and assert
+    /// the safe/unsafe split matches the documented set exactly. Widening the
+    /// set is the more dangerous edit of the two — letting `$`, `` ` ``, `;` or
+    /// a space through unquoted turns an interpolated path into shell syntax —
+    /// and a per-byte allowlist test alone would not catch it.
+    #[test]
+    fn shell_quote_if_needed_quotes_every_ascii_byte_outside_the_safe_set() {
+        for byte in 0u8..=0x7f {
+            let c = byte as char;
+            let input = c.to_string();
+            let quoted = shell_quote_if_needed(&input);
+
+            if is_expected_safe(c) {
+                assert_eq!(
+                    quoted, input,
+                    "byte {byte:#04x} ({c:?}) is in the documented safe set and must stay unquoted"
+                );
+                continue;
+            }
+
+            assert_ne!(
+                quoted, input,
+                "byte {byte:#04x} ({c:?}) is outside the documented safe set and must be quoted"
+            );
+            assert!(
+                quoted.starts_with('\'') && quoted.ends_with('\''),
+                "byte {byte:#04x} ({c:?}) must produce the single-quoted form, got {quoted:?}"
+            );
+            assert_eq!(
+                parse_as_one_shell_word(&quoted).as_deref(),
+                Some(input.as_str()),
+                "byte {byte:#04x} ({c:?}) must survive quoting as one word with its original value"
+            );
+        }
+    }
+
+    /// Issue #563: the safe-set predicate works on BYTES while a path is UTF-8,
+    /// so every byte of a multi-byte character is >= 0x80 and therefore outside
+    /// the set — a non-ASCII path always quotes. Worth its own case because the
+    /// ASCII sweep above cannot reach these bytes, and because quoting must
+    /// splice around whole characters rather than cutting one in half.
+    #[test]
+    fn shell_quote_if_needed_quotes_a_non_ascii_path_without_mangling_it() {
+        for input in [
+            "/home/josé/bin/dot-agent-deck",
+            "/srv/项目/bin/dot-agent-deck",
+            "/tmp/naïve café/dot-agent-deck",
+        ] {
+            let quoted = shell_quote_if_needed(input);
+            assert_eq!(
+                quoted,
+                format!("'{input}'"),
+                "a non-ASCII path is outside the byte-wise safe set, so it must be quoted"
+            );
+            assert_eq!(
+                parse_as_one_shell_word(&quoted).as_deref(),
+                Some(input),
+                "quoting must leave every multi-byte character intact"
+            );
+        }
+    }
+
+    /// Issue #563 records the CURRENT treatment of backslashes, not a desired
+    /// one: `\` is absent from the safe set, so every Windows-style path takes
+    /// the single-quoted branch. That is the property issue #561 is about —
+    /// POSIX single-quoting is meaningless to `cmd.exe` and PowerShell — and
+    /// #561 is deliberately NOT resolved here. Pinning the observed behavior is
+    /// the point: whichever way #561 lands, the change has to show up as a
+    /// deliberate edit to this test rather than passing silently.
+    #[test]
+    fn shell_quote_if_needed_currently_quotes_backslashes_observed_behavior_for_issue_561() {
+        assert_eq!(
+            shell_quote_if_needed(r"\"),
+            r"'\'",
+            "backslash is not in the safe set today, so it is quoted"
+        );
+        assert_eq!(
+            shell_quote_if_needed(r"C:\Users\somebody\bin\dot-agent-deck.exe"),
+            r"'C:\Users\somebody\bin\dot-agent-deck.exe'",
+            "a Windows path is POSIX-single-quoted today (issue #561)"
+        );
+        assert_eq!(
+            shell_quote_if_needed(r"\\server\share\dot-agent-deck.exe"),
+            r"'\\server\share\dot-agent-deck.exe'",
+            "a UNC path is POSIX-single-quoted today (issue #561)"
+        );
+
+        // The quoting is POSIX-correct even though POSIX is arguably the wrong
+        // dialect here: a single-quoted run takes no escapes, so each backslash
+        // survives literally rather than being consumed as one.
+        assert_eq!(
+            parse_as_one_shell_word(&shell_quote_if_needed(
+                r"C:\Users\somebody\bin\dot-agent-deck.exe"
+            ))
+            .as_deref(),
+            Some(r"C:\Users\somebody\bin\dot-agent-deck.exe"),
+            "under POSIX rules the quoted Windows path is one word with its backslashes intact"
+        );
+    }
 }

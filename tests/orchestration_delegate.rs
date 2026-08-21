@@ -60,7 +60,7 @@ async fn wait_for_needle(
 
 /// Spawn a `cat`-backed worker pane in `cwd` under `pane_env`, returning its
 /// registry agent id. The PTY echoes injected bytes for snapshot assertions.
-fn spawn_worker_stub(registry: &AgentPtyRegistry, cwd: &str, pane_env: &str) -> String {
+fn spawn_worker_stub(registry: &Arc<AgentPtyRegistry>, cwd: &str, pane_env: &str) -> String {
     registry
         .spawn_agent(SpawnOptions {
             command: Some("cat"),

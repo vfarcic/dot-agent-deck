@@ -1618,6 +1618,32 @@ const STATUS_MESSAGE_TTL: std::time::Duration = std::time::Duration::from_secs(1
 /// because it is the same kind of knob: one named place to tune a decay.
 pub const COMMAND_BANNER_TTL: std::time::Duration = std::time::Duration::from_millis(2500);
 
+/// How much output an empty pane must have consumed before a failed scroll can
+/// be treated as evidence that the agent keeps no terminal scrollback. Measured
+/// in live pane screenfuls (`rows * cols`), never against the parser's configured
+/// scrollback capacity.
+pub const SCROLL_NOTICE_MIN_SCREENFULS: u64 = 8;
+
+/// The single-line explanation rendered after a mature pane cannot scroll.
+/// Kept named so the L1 observation seam can identify the production message
+/// without duplicating its wording.
+///
+/// **It claims only what was observed** (PRD #611, audit finding 2). An earlier
+/// wording asserted that *"this agent redraws in place and keeps no
+/// scrollback"*, which is a claim about the agent's rendering model — and the
+/// evidence behind the trigger cannot establish one. The trigger counts bytes
+/// handed to the parser before anything parses them, so a pane fed
+/// `8 * rows * cols` NUL bytes, or cursor-control noise, or a chunk the parser
+/// panicked on, arrives at the same "lots of output, no retained lines" state
+/// with no rendering model implied. Worse, the bytes need not be the agent's
+/// own: an agent that `cat`s an untrusted file or prints a web response is
+/// relaying content it did not author, so a third party could make the deck
+/// state a falsehood in the deck's own voice. What the deck genuinely knows is
+/// that THIS pane has nothing to scroll, so that is all it says; the per-agent
+/// explanation lives in `docs/keyboard-shortcuts.md`, which M1 rewrote for it.
+pub const SCROLL_NOTICE_TEXT: &str =
+    "Nothing to scroll — this pane has no scrollback to move through";
+
 /// PRD #76 M2.20 — minimum gap between the last forwarded keystroke and an
 /// Enter keystroke that follows it on the human-typing path. Agent TUIs like
 /// claude treat a CR fused to preceding bytes as newline-in-input, not submit;
@@ -10436,6 +10462,29 @@ fn handle_key_event(
     frame_area: Rect,
 ) -> Flow {
     observe_command_mode_edge(ui, std::time::Instant::now());
+    // PRD #611 M2 (Decision "the notice must not swallow the keystroke"):
+    // dismissal happens HERE, at the top of the funnel, before the key has been
+    // classified and before any handler can return — so it is structurally
+    // impossible for it to consume anything. There is no `return`, no `Action`,
+    // and no branch on what the key is: every key that reaches this function
+    // goes on to be resolved and dispatched exactly as it would have been with
+    // no notice on screen.
+    //
+    // This is where the notice deliberately diverges from the command banner,
+    // which stays up on an UNBOUND key. That rule earns its keep there because
+    // an unbound key is the moment you most likely thought you were talking to
+    // the agent — which is precisely the state the banner exists to correct.
+    // The reasoning does not transfer: this notice answers a question the user
+    // just asked by scrolling, and once they have moved on to typing, holding
+    // the answer on screen is clutter rather than help.
+    //
+    // Ordered BEFORE `handle_focused_pane_scroll_key` below on purpose: a
+    // second PageUp clears the notice here and then re-arms it there with a
+    // fresh instant, which is the refresh Decision 5 asks for. No frame is
+    // rendered in between, so there is no hide-then-reshow edge to see.
+    if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+        embedded.clear_scroll_notices();
+    }
     // How many cards this tab is showing — what the per-mode handlers clamp their
     // selection against. Derived here rather than passed in so it cannot disagree
     // with the `filtered` list the same call resolves against.
@@ -10515,7 +10564,10 @@ fn handle_key_event(
     // equivalent of the wheel, so command mode is a real read-only inspect
     // mode. The scroll is applied in place; `Action::Continue` stops the
     // key falling through to `dispatch_normal_mode_key`.
-    if action.is_none() && !is_ctrl_c && handle_focused_pane_scroll_key(&kb, ui.mode, &key, pane) {
+    if action.is_none()
+        && !is_ctrl_c
+        && handle_focused_pane_scroll_key(&kb, ui.mode, &key, pane, std::time::Instant::now())
+    {
         action = Some(Action::Continue);
     }
 
@@ -12344,6 +12396,33 @@ pub fn run_tui(
             // clobber the feedback nor leak into command mode.
             let is_input_event = matches!(&ev, Event::Paste(_))
                 || matches!(&ev, Event::Key(k) if k.kind == crossterm::event::KeyEventKind::Press);
+
+            // PRD #611 (review finding 4a): dismiss the cannot-scroll notice
+            // HERE, at the event seam, rather than only at the top of
+            // `handle_key_event`.
+            //
+            // `handle_key_event` is the funnel for keys that reach it, but it is
+            // not the only path an input event can take: the non-live intercept
+            // directly below returns before it, changes mode and drains the rest
+            // of the burst, so a key aimed at a pane that has just gone
+            // non-writable used to leave the notice up while the user had
+            // demonstrably moved on. Clearing on the raw event makes "the next
+            // input clears it" hold on EVERY path, including any added later.
+            //
+            // Still non-consuming, for the same structural reason it was at the
+            // top of the funnel: there is no `return` and no branch on what the
+            // event turned out to be, so the event goes on to be handled exactly
+            // as it would have been with no notice on screen. `clear_scroll_notices`
+            // is O(1) unless something is actually armed, so this costs a single
+            // relaxed atomic read per keystroke. The call inside
+            // `handle_key_event` stays: it is idempotent, and it is what the L1
+            // dismissal seam drives.
+            if is_input_event
+                && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+            {
+                embedded.clear_scroll_notices();
+            }
+
             if ui.mode == UiMode::PaneInput
                 && is_input_event
                 && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
@@ -12877,7 +12956,15 @@ pub fn run_tui(
                                 mouse.row,
                                 &ui.focused_pane_rect,
                             );
-                            scroll_focused_agent_pane(embedded, &pane_id, ui.mode, up, col, row);
+                            scroll_focused_agent_pane(
+                                embedded,
+                                &pane_id,
+                                ui.mode,
+                                up,
+                                col,
+                                row,
+                                std::time::Instant::now(),
+                            );
                         }
                         crossterm::event::MouseEventKind::Down(
                             crossterm::event::MouseButton::Left,
@@ -14058,6 +14145,7 @@ fn render_frame(
                 focused_pane_id.as_deref(),
                 &pane_status,
                 banner_visibility,
+                now,
             );
             return;
         }
@@ -14107,6 +14195,7 @@ fn render_frame(
                 ui.mode,
                 banner_visibility,
                 Some(&pane_outer_rects),
+                now,
             );
         }
 
@@ -14187,6 +14276,7 @@ fn render_frame(
                 ui.mode,
                 banner_visibility,
                 Some(&pane_outer_rects),
+                now,
             );
         }
         render_overlays(frame, ui, active_mode_name);
@@ -14307,6 +14397,7 @@ fn render_frame(
             ui.mode,
             banner_visibility,
             Some(&pane_outer_rects),
+            now,
         );
     }
 
@@ -14793,6 +14884,23 @@ const BANNER_LINE: &str = " COMMAND MODE — Ctrl+D to type ";
 /// bottom-bar chip so the two read as one vocabulary.
 const BANNER_WORD_LINE: &str = " COMMAND ";
 
+/// PRD #611 M2 — the cannot-scroll notice's narrow tier, for a pane too slim to
+/// carry [`SCROLL_NOTICE_TEXT`].
+///
+/// The banner above degrades rather than disappearing, and the same reasoning
+/// applies here with more force: the whole point of this notice is that silence
+/// on a pane that will not scroll reads as a bug. A tiled two-column split on an
+/// ordinary terminal is already narrower than the full sentence, which is the
+/// common case rather than the exotic one. Says less and promises nothing extra
+/// — in particular it still does not offer PageUp, which fails on exactly the
+/// same empty buffer the wheel does, and it no longer says *"this agent keeps
+/// none"*, which was the same unearned claim about the agent's rendering model
+/// that [`SCROLL_NOTICE_TEXT`] documents dropping.
+///
+/// `pub` for the same reason as the full form: the L1 tier seam derives its
+/// width boundary from this string's length rather than from a copy of it.
+pub const SCROLL_NOTICE_SHORT: &str = "Nothing to scroll — no scrollback";
+
 /// Draw one reversed line centred in `inner`.
 fn draw_centred_banner_line(buf: &mut Buffer, inner: Rect, text: &str) {
     let width = text.chars().count() as u16;
@@ -14883,6 +14991,52 @@ fn render_command_mode_overlay(
     }
 }
 
+/// PRD #611 M2 — draw the cannot-scroll notice over ONE pane, in the
+/// command banner's idiom: a single reversed line, centred in the pane's inner
+/// area, through the same [`draw_centred_banner_line`] the banner's own
+/// single-line tiers use.
+///
+/// Two tiers and then nothing, mirroring [`command_banner_tier`]: whatever fits
+/// gets drawn, and a pane too narrow even for the short form is left alone
+/// rather than having text spill across its border into its neighbour.
+fn render_cannot_scroll_notice(buf: &mut Buffer, pane_rect: Rect) {
+    let inner = Rect {
+        x: pane_rect.x.saturating_add(1),
+        y: pane_rect.y.saturating_add(1),
+        width: pane_rect.width.saturating_sub(2),
+        height: pane_rect.height.saturating_sub(2),
+    }
+    .intersection(*buf.area());
+    if inner.is_empty() {
+        return;
+    }
+    let fits = |text: &str| text.chars().count() as u16 <= inner.width;
+    let text = if fits(SCROLL_NOTICE_TEXT) {
+        SCROLL_NOTICE_TEXT
+    } else if fits(SCROLL_NOTICE_SHORT) {
+        SCROLL_NOTICE_SHORT
+    } else {
+        return;
+    };
+    draw_centred_banner_line(buf, inner, text);
+}
+
+/// PRD #611 M2 — is this pane's cannot-scroll notice still worth drawing at
+/// `now`?
+///
+/// Shares [`COMMAND_BANNER_TTL`] rather than owning a second timeout. The two
+/// are the same kind of thing — a brief explanation that fades on its own — and
+/// a user who has learned how long one of them lingers has learned both. A
+/// separate knob would be two numbers to keep in agreement for no gain.
+fn scroll_notice_visible(
+    ctrl: &EmbeddedPaneController,
+    pane_id: &str,
+    now: std::time::Instant,
+) -> bool {
+    ctrl.scroll_notice_armed_at(pane_id)
+        .is_some_and(|armed| now.saturating_duration_since(armed) < COMMAND_BANNER_TTL)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_terminal_panes(
     frame: &mut Frame,
@@ -14925,6 +15079,9 @@ fn render_terminal_panes(
     // via `pane_stack_rects` (used by callers without a `FrameLayout` rect list,
     // e.g. the mode-tab agent / side panes).
     precomputed_rects: Option<&[Rect]>,
+    // Injected by L1 notice-lifecycle coverage; live frames pass the same `now`
+    // used for every other transient render state in that frame.
+    now: std::time::Instant,
 ) -> Option<Rect> {
     let ctrl = embedded?;
     if pane_ids.is_empty() {
@@ -14961,6 +15118,13 @@ fn render_terminal_panes(
     // Track the focused pane's rect and screen for hardware cursor positioning.
     let mut focused_pane_rect: Option<Rect> = None;
     let mut focused_screen: Option<std::sync::Arc<std::sync::Mutex<vt100::Parser>>> = None;
+    // PRD #611 M2: outer rects of panes whose cannot-scroll notice is still
+    // live, collected per pane as they are drawn. Keyed by the pane that armed
+    // it rather than by focus — this is the ONE shared path the dashboard, the
+    // orchestrator pane and the mode tabs all render through, so no tab-type or
+    // agent-name branch is needed to scope it (PRD #611: worker panes need no
+    // exclusion because a pane nobody scrolls never arms one).
+    let mut notice_rects: Vec<Rect> = Vec::new();
 
     // PRD #84: the per-pane OUTER rects are the single source of truth shared
     // with `resize_panes_to_layout`. When the caller threads in the exact
@@ -15005,6 +15169,9 @@ fn render_terminal_panes(
                         focused_pane_rect = Some(chunks[i]);
                         focused_screen = Some(screen);
                     }
+                    if scroll_notice_visible(ctrl, pane_id, now) {
+                        notice_rects.push(chunks[i]);
+                    }
                     frame.render_widget(widget, chunks[i]);
                 }
             }
@@ -15032,6 +15199,9 @@ fn render_terminal_panes(
                     if is_focused {
                         focused_pane_rect = Some(chunks[i]);
                         focused_screen = Some(screen);
+                    }
+                    if scroll_notice_visible(ctrl, pane_id, now) {
+                        notice_rects.push(chunks[i]);
                     }
                     frame.render_widget(widget, chunks[i]);
                 }
@@ -15077,7 +15247,41 @@ fn render_terminal_panes(
     // BEFORE the selection highlight (so an active text selection stays crisp
     // rather than being dimmed along with everything else).
     if command_mode && let Some(rect) = focused_pane_rect {
+        // PRD #611 (review finding 5): a live cannot-scroll notice on THIS pane
+        // suppresses the banner outright, rather than being drawn on top of it.
+        //
+        // The notice is one line and the banner is not: from 5 inner rows up it
+        // selects a block-letter tier (`BannerTier::BlockCommand` at 40x5,
+        // `BlockCommandModeWithSubtitle` at 60x7), so drawing one line over it
+        // replaces the middle row and leaves block-letter rows above and below —
+        // and, at the richest tier, a stray `Ctrl+D to type` underneath. That is
+        // not "the notice wins", it is two messages interleaved. Only the
+        // single-line tiers were ever fully replaced, which is why the pane
+        // geometry the first precedence test happened to use hid this.
+        //
+        // Dimming is deliberately untouched: it is gated on mode and focus
+        // alone and tells the user typing does not reach the agent, which stays
+        // true while the notice is up.
+        let banner = if focused_id
+            .as_deref()
+            .is_some_and(|id| scroll_notice_visible(ctrl, id, now))
+        {
+            CommandBannerVisibility::Collapsed
+        } else {
+            banner
+        };
         render_command_mode_overlay(frame.buffer_mut(), rect, banner);
+    }
+
+    // PRD #611 M2: the cannot-scroll notice, drawn AFTER the command-mode
+    // overlay for the same reason that overlay is drawn after the panes — it
+    // has to land on top of what it is explaining. The ordering also settles
+    // the one frame where both could appear: a scroll attempted while the
+    // COMMAND MODE banner is still up. The notice wins, because it answers a
+    // question the user asked a moment ago while the banner announces a state
+    // they can already see in the border and the bottom bar.
+    for rect in &notice_rects {
+        render_cannot_scroll_notice(frame.buffer_mut(), *rect);
     }
 
     // Render selection highlight over the focused pane.
@@ -15148,6 +15352,7 @@ fn render_mode_tab(
     // frame, forwarded rather than re-derived so a Mode tab and a Dashboard pane
     // cannot disagree about whether the banner is up.
     banner: CommandBannerVisibility,
+    now: std::time::Instant,
 ) {
     // PRD #83: `focused_pane_id` is keyed by stable pane id. `None` (or an
     // id that isn't one of this tab's side panes) means the agent pane is
@@ -15182,6 +15387,7 @@ fn render_mode_tab(
             // Mode-tab panes recompute their rects (out of the Cards finding's
             // scope); the agent pane is a single Stacked pane filling agent_area.
             None,
+            now,
         );
         if rect.is_some() {
             ui.focused_pane_rect = rect;
@@ -15205,6 +15411,7 @@ fn render_mode_tab(
             // Mode side panes recompute via pane_stack_rects (Tiled) — same
             // split as the `side_pane_rects` above; out of the Cards finding's scope.
             None,
+            now,
         );
         // Use side pane rect when a side pane is visually focused, or as fallback.
         if side_visual_focus.is_some() || ui.focused_pane_rect.is_none() {
@@ -17689,13 +17896,65 @@ const FOCUSED_PANE_SCROLL_LINES: isize = 3;
 /// ([`scroll_focused_agent_pane`]) and the `scroll_pane_up` / `scroll_pane_down`
 /// bindings ([`handle_focused_pane_scroll_key`]). Nothing here can reach the
 /// child — it only sets a vt100 scrollback offset.
-fn scroll_focused_pane_scrollback(embedded: &EmbeddedPaneController, pane_id: &str, up: bool) {
+fn scroll_focused_pane_scrollback(
+    embedded: &EmbeddedPaneController,
+    pane_id: &str,
+    up: bool,
+    now: std::time::Instant,
+) {
     let delta = if up {
         FOCUSED_PANE_SCROLL_LINES
     } else {
         -FOCUSED_PANE_SCROLL_LINES
     };
     embedded.scroll_pane(pane_id, delta);
+    // PRD #611 M2 (Decision "reactive, not proactive"): this is the ONLY place
+    // the notice is armed, and it is inside the scroll operation itself — so it
+    // can only ever fire on an attempt that was actually made. Focusing a pane,
+    // spawning one, or merely rendering one reaches nothing here, and neither
+    // does the wheel when it forwards into the child's own pager.
+    if pane_has_nothing_to_scroll(embedded, pane_id) {
+        embedded.arm_scroll_notice(pane_id, now);
+    }
+}
+
+/// PRD #611 M2 — is this pane one the deck genuinely has nothing to scroll for?
+///
+/// A conjunction, because neither half is evidence on its own. **No retained
+/// lines** describes a claude pane one second after spawn just as well as it
+/// describes a terminal-managed agent that will never retain any. **Substantial
+/// output** describes every busy pane, including the ones that scroll perfectly.
+/// Together they say something the deck can only learn by watching: this agent
+/// has been running long enough to have filled the buffer several times over,
+/// and the buffer is still empty — so it is repainting in place and the deck has
+/// nothing to show, which is what the notice explains.
+///
+/// Deliberately says nothing about WHICH agent (PRD #611: "detect the condition,
+/// not the agent name"). A registry entry naming codex would go stale the moment
+/// either that agent or another one changed its rendering model, and it would
+/// under-report silently rather than fail loudly. Nothing here reads an agent
+/// name, an agent type, or a mode fingerprint.
+///
+/// The threshold is measured against the pane's LIVE geometry, never against
+/// the parser's configured scrollback capacity: every pane is constructed with
+/// the same 10,000-line capacity, so a threshold derived from it would say the
+/// identical thing about every pane regardless of how big that pane is.
+fn pane_has_nothing_to_scroll(embedded: &EmbeddedPaneController, pane_id: &str) -> bool {
+    let Some(facts) = embedded.scroll_facts(pane_id) else {
+        return false;
+    };
+    if facts.scrollback_depth > 0 {
+        return false;
+    }
+    let screenful = u64::from(facts.rows) * u64::from(facts.cols);
+    // A pane with no area has no screenful to compare against, and the
+    // threshold would collapse to zero — which would arm the notice on a pane
+    // that has produced nothing at all. Say nothing instead; a pane that thin
+    // has no room to render the notice either.
+    if screenful == 0 {
+        return false;
+    }
+    facts.bytes_since_spawn >= SCROLL_NOTICE_MIN_SCREENFULS * screenful
 }
 
 /// PRD #341 M5 — the ONE decision a wheel event over the focused agent pane
@@ -17723,11 +17982,12 @@ fn scroll_focused_agent_pane(
     up: bool,
     pane_col: u16,
     pane_row: u16,
+    now: std::time::Instant,
 ) {
     if mode == UiMode::PaneInput && embedded.mouse_mode_enabled(pane_id) {
         let _ = embedded.forward_mouse_scroll(pane_id, up, pane_col, pane_row);
     } else {
-        scroll_focused_pane_scrollback(embedded, pane_id, up);
+        scroll_focused_pane_scrollback(embedded, pane_id, up, now);
     }
 }
 
@@ -17751,6 +18011,7 @@ fn handle_focused_pane_scroll_key(
     mode: UiMode,
     key: &KeyEvent,
     pane: &dyn PaneController,
+    now: std::time::Instant,
 ) -> bool {
     if mode != UiMode::Normal {
         return false;
@@ -17765,7 +18026,7 @@ fn handle_focused_pane_scroll_key(
     if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
         && let Some(pane_id) = embedded.focused_pane_id()
     {
-        scroll_focused_pane_scrollback(embedded, &pane_id, up);
+        scroll_focused_pane_scrollback(embedded, &pane_id, up, now);
     }
     true
 }
@@ -18676,6 +18937,7 @@ pub fn render_focused_pane_cursor_for_mode_to_position(
                 // been in command mode carries.
                 CommandBannerVisibility::Hidden,
                 None,
+                std::time::Instant::now(),
             );
         })
         .expect("TestBackend draw should succeed");
@@ -18752,21 +19014,15 @@ pub fn render_command_banner_pane_to_buffer(
                 mode,
                 visibility,
                 None,
+                std::time::Instant::now(),
             );
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
 }
 
-/// PRD #341 M5 — what one scroll input did to the focused agent pane: where our
-/// own scrollback stood before and after, and every byte the pane queued for the
-/// child while handling it.
-///
-/// The two numbers and the byte log are the whole M5 contract. "Command mode
-/// scrolls our scrollback" is `scrollback_after != scrollback_before`; "command
-/// mode never reaches the agent's mouse protocol" is `forwarded_bytes.is_empty()`.
-/// Recording the bytes rather than asserting on a flag is deliberate — a flag can
-/// be right while the write still happens.
+/// What one scroll input did to the focused agent pane, including the observable
+/// notice rendered by the same production pane path as the live app.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct FocusedPaneScrollObservation {
@@ -18774,17 +19030,27 @@ pub struct FocusedPaneScrollObservation {
     pub scrollback_before: usize,
     /// Our vt100 scrollback offset after the input.
     pub scrollback_after: usize,
+    /// The parser's actual retained-line depth, measured by asking vt100 to clamp
+    /// an unbounded offset and then restoring the live view. This is deliberately
+    /// not the parser's configured 10,000-line capacity.
+    pub scrollback_depth: usize,
+    /// Bytes the seam fed into the real parser at construction, matching the
+    /// production counter's since-spawn unit.
+    pub bytes_fed_since_spawn: u64,
     /// Every byte the pane queued for the child, flattened in order. Empty means
     /// the agent saw nothing at all.
     pub forwarded_bytes: Vec<u8>,
+    /// Whether the completed production pane render contains the named notice.
+    pub notice_visible: bool,
 }
 
-/// Rows/cols and history for the M5 scroll seams. The screen is small and the
-/// history generous so a 3-line scroll always has somewhere to go — vt100 clamps
-/// the offset to the real scrollback size, so a short history would make a
-/// correctly-scrolling path look like a no-op.
-const SCROLL_SEAM_ROWS: u16 = 6;
-const SCROLL_SEAM_COLS: u16 = 20;
+/// Rows/cols and history for the focused-pane scroll seams. The width admits the
+/// complete single-line notice while the history is generous enough that a
+/// 3-line scroll always has somewhere to go.
+#[doc(hidden)]
+pub const SCROLL_SEAM_ROWS: u16 = 6;
+#[doc(hidden)]
+pub const SCROLL_SEAM_COLS: u16 = 96;
 const SCROLL_SEAM_HISTORY_LINES: usize = 60;
 const SCROLL_SEAM_PANE_ID: &str = "1";
 
@@ -18801,17 +19067,40 @@ fn scroll_seam_history() -> String {
 fn scroll_seam_pane(
     mouse_mode_enabled: bool,
     initial_scrollback: usize,
+    pane_output: &[u8],
 ) -> (
     EmbeddedPaneController,
     crate::embedded_pane::SeamChildInput,
     usize,
 ) {
-    let history = scroll_seam_history();
-    let (ctrl, mut child_input) = EmbeddedPaneController::for_scroll_seam_with_focused_pane(
-        SCROLL_SEAM_PANE_ID,
+    scroll_seam_pane_with_size(
+        mouse_mode_enabled,
+        initial_scrollback,
+        pane_output,
         SCROLL_SEAM_ROWS,
         SCROLL_SEAM_COLS,
-        history.as_bytes(),
+    )
+}
+
+/// Width/height-parametric form of [`scroll_seam_pane`] for notice render-tier
+/// coverage. The ordinary routing seams retain the fixed 96x6 fixture above;
+/// only tests that need to exercise a clipping boundary vary these dimensions.
+fn scroll_seam_pane_with_size(
+    mouse_mode_enabled: bool,
+    initial_scrollback: usize,
+    pane_output: &[u8],
+    rows: u16,
+    cols: u16,
+) -> (
+    EmbeddedPaneController,
+    crate::embedded_pane::SeamChildInput,
+    usize,
+) {
+    let (ctrl, mut child_input) = EmbeddedPaneController::for_scroll_seam_with_focused_pane(
+        SCROLL_SEAM_PANE_ID,
+        rows,
+        cols,
+        pane_output,
         mouse_mode_enabled,
     );
     // Park the view where the caller wants it, through the production scroll
@@ -18837,6 +19126,145 @@ fn scroll_seam_scrollback(ctrl: &EmbeddedPaneController, pane_id: &str) -> usize
         .expect("the seam's panes always have a screen")
 }
 
+/// Measure the real retained-line depth without confusing it with either the
+/// current view offset or the configured scrollback capacity. vt100 clamps an
+/// oversized requested offset to the live buffer depth.
+fn scroll_seam_scrollback_depth(ctrl: &EmbeddedPaneController, pane_id: &str) -> usize {
+    ctrl.get_screen(pane_id)
+        .and_then(|screen| {
+            screen.lock().ok().map(|mut parser| {
+                let current = parser.screen().scrollback();
+                parser.screen_mut().set_scrollback(usize::MAX);
+                let depth = parser.screen().scrollback();
+                parser.screen_mut().set_scrollback(current);
+                depth
+            })
+        })
+        .expect("the seam's panes always have a screen")
+}
+
+/// Build the terminal-managed rendering shape measured in the issue diagnosis:
+/// exact-height DECSTBM regions followed by whole-region cursor-positioned
+/// repaints, with no newline-driven output. Repositioning overwrites live cells
+/// instead of scrolling a line off the top, so a correctly-sized vt100 parser
+/// retains zero scrollback even after many screenfuls of bytes.
+#[doc(hidden)]
+pub fn synthetic_decstbm_repaint_stream(rows: u16, cols: u16) -> Vec<u8> {
+    assert!(
+        rows >= 2 && cols >= 2,
+        "the repaint fixture needs a real region"
+    );
+    let target_bytes = SCROLL_NOTICE_MIN_SCREENFULS * u64::from(rows) * u64::from(cols);
+    let mut bytes = Vec::with_capacity(target_bytes as usize + usize::from(rows * cols));
+    let mut frame = 0_u16;
+    while (bytes.len() as u64) < target_bytes {
+        bytes.extend_from_slice(format!("\x1b[1;{rows}r").as_bytes());
+        let alternating_top = 2 + frame % rows.saturating_sub(1);
+        bytes.extend_from_slice(format!("\x1b[{alternating_top};{rows}r").as_bytes());
+        for row in 1..=rows {
+            bytes.extend_from_slice(format!("\x1b[{row};1H").as_bytes());
+            bytes.extend(std::iter::repeat_n(
+                b'a' + (frame % 26) as u8,
+                usize::from(cols - 1),
+            ));
+        }
+        frame = frame.wrapping_add(1);
+    }
+    bytes
+}
+
+/// Render the seam pane through [`render_terminal_panes`], with the frame clock
+/// injectable for exact transient-notice edges.
+fn render_scroll_seam_pane_to_buffer(
+    ctrl: &EmbeddedPaneController,
+    mode: UiMode,
+    now: std::time::Instant,
+) -> ratatui::buffer::Buffer {
+    render_sized_scroll_seam_pane_to_buffer(
+        ctrl,
+        mode,
+        CommandBannerVisibility::Hidden,
+        now,
+        SCROLL_SEAM_ROWS,
+        SCROLL_SEAM_COLS,
+        0,
+    )
+}
+
+/// Geometry-parametric form of [`render_scroll_seam_pane_to_buffer`].
+///
+/// `trailing_guard_cols` deliberately leaves visible buffer cells beyond the
+/// pane's right border. Narrow-tier coverage uses them to prove an overlong
+/// notice did not merely disappear from string matching while still bleeding
+/// through the frame and into an adjacent pane.
+#[allow(clippy::too_many_arguments)]
+fn render_sized_scroll_seam_pane_to_buffer(
+    ctrl: &EmbeddedPaneController,
+    mode: UiMode,
+    banner: CommandBannerVisibility,
+    now: std::time::Instant,
+    rows: u16,
+    cols: u16,
+    trailing_guard_cols: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let pane_rect = Rect::new(0, 0, cols + 2, rows + 2);
+    let backend = TestBackend::new(pane_rect.width + trailing_guard_cols, pane_rect.height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            let pane_rects = [pane_rect];
+            render_terminal_panes(
+                frame,
+                Some(ctrl),
+                frame.area(),
+                &[SCROLL_SEAM_PANE_ID.to_string()],
+                PaneLayout::Stacked,
+                &HashMap::new(),
+                &HashMap::new(),
+                &None,
+                Some(SCROLL_SEAM_PANE_ID),
+                mode,
+                banner,
+                Some(&pane_rects),
+                now,
+            );
+        })
+        .expect("TestBackend draw should succeed");
+    terminal.backend().buffer().clone()
+}
+
+fn buffer_contains_scroll_notice(buffer: &ratatui::buffer::Buffer) -> bool {
+    let area = buffer.area();
+    (area.y..area.y + area.height).any(|y| {
+        let line = (area.x..area.x + area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>();
+        line.contains(SCROLL_NOTICE_TEXT)
+    })
+}
+
+fn focused_scroll_observation(
+    ctrl: &EmbeddedPaneController,
+    child_input: &mut crate::embedded_pane::SeamChildInput,
+    mode: UiMode,
+    pane_output: &[u8],
+    scrollback_before: usize,
+    now: std::time::Instant,
+) -> FocusedPaneScrollObservation {
+    let rendered = render_scroll_seam_pane_to_buffer(ctrl, mode, now);
+    FocusedPaneScrollObservation {
+        scrollback_before,
+        scrollback_after: scroll_seam_scrollback(ctrl, SCROLL_SEAM_PANE_ID),
+        scrollback_depth: scroll_seam_scrollback_depth(ctrl, SCROLL_SEAM_PANE_ID),
+        bytes_fed_since_spawn: pane_output.len() as u64,
+        forwarded_bytes: child_input.drain_bytes(),
+        notice_visible: buffer_contains_scroll_notice(&rendered),
+    }
+}
+
 /// PRD #341 M5 L1 seam: send ONE wheel event over the focused agent pane and
 /// report what it did.
 ///
@@ -18850,20 +19278,33 @@ pub fn observe_focused_agent_mouse_scroll(
     mode: UiMode,
     mouse_mode_enabled: bool,
     up: bool,
+    pane_output: &[u8],
     initial_scrollback: usize,
     pane_col: u16,
     pane_row: u16,
 ) -> FocusedPaneScrollObservation {
     let (ctrl, mut child_input, scrollback_before) =
-        scroll_seam_pane(mouse_mode_enabled, initial_scrollback);
+        scroll_seam_pane(mouse_mode_enabled, initial_scrollback, pane_output);
+    let now = std::time::Instant::now();
 
-    scroll_focused_agent_pane(&ctrl, SCROLL_SEAM_PANE_ID, mode, up, pane_col, pane_row);
+    scroll_focused_agent_pane(
+        &ctrl,
+        SCROLL_SEAM_PANE_ID,
+        mode,
+        up,
+        pane_col,
+        pane_row,
+        now,
+    );
 
-    FocusedPaneScrollObservation {
+    focused_scroll_observation(
+        &ctrl,
+        &mut child_input,
+        mode,
+        pane_output,
         scrollback_before,
-        scrollback_after: scroll_seam_scrollback(&ctrl, SCROLL_SEAM_PANE_ID),
-        forwarded_bytes: child_input.drain_bytes(),
-    }
+        now,
+    )
 }
 
 /// PRD #341 M5 L1 seam: press ONE key against the focused agent pane and report
@@ -18878,19 +19319,431 @@ pub fn observe_focused_agent_key_scroll(
     keybindings: &KeybindingConfig,
     mode: UiMode,
     key: KeyEvent,
+    pane_output: &[u8],
     initial_scrollback: usize,
 ) -> FocusedPaneScrollObservation {
     // Child mouse reporting is irrelevant to a keystroke; leaving it ON is the
     // stricter setup — a keyboard path that leaked into the child's mouse protocol
     // would be caught rather than masked.
-    let (ctrl, mut child_input, scrollback_before) = scroll_seam_pane(true, initial_scrollback);
+    let (ctrl, mut child_input, scrollback_before) =
+        scroll_seam_pane(true, initial_scrollback, pane_output);
+    let now = std::time::Instant::now();
 
-    handle_focused_pane_scroll_key(keybindings, mode, &key, &ctrl);
+    handle_focused_pane_scroll_key(keybindings, mode, &key, &ctrl, now);
 
-    FocusedPaneScrollObservation {
+    focused_scroll_observation(
+        &ctrl,
+        &mut child_input,
+        mode,
+        pane_output,
         scrollback_before,
-        scrollback_after: scroll_seam_scrollback(&ctrl, SCROLL_SEAM_PANE_ID),
-        forwarded_bytes: child_input.drain_bytes(),
+        now,
+    )
+}
+
+/// Reconcile and render two focused-pane frames without sending any scroll or
+/// key input, proving that substantial output alone cannot proactively arm the
+/// notice.
+#[doc(hidden)]
+pub fn observe_focused_agent_without_scroll(pane_output: &[u8]) -> FocusedPaneScrollObservation {
+    let (ctrl, mut child_input, scrollback_before) = scroll_seam_pane(false, 0, pane_output);
+    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+    ui.mode = UiMode::PaneInput;
+    reconcile_pane_input_scrollback(&mut ui, &ctrl);
+    reconcile_pane_input_scrollback(&mut ui, &ctrl);
+    let now = std::time::Instant::now();
+    focused_scroll_observation(
+        &ctrl,
+        &mut child_input,
+        ui.mode,
+        pane_output,
+        scrollback_before,
+        now,
+    )
+}
+
+/// Observable lifecycle of one failed-scroll notice, including its two render
+/// checkpoints and the normal outcomes of both an unbound and a bound key.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ScrollNoticeRenderTierObservation {
+    /// The exact inner width, derived from the full production sentence, where
+    /// that tier first fits.
+    pub full_boundary_render: ratatui::buffer::Buffer,
+    /// One column below the full sentence, where the short tier must take over.
+    pub below_full_boundary_render: ratatui::buffer::Buffer,
+    /// The exact inner width, derived from the short production sentence, where
+    /// that tier still fits.
+    pub short_boundary_render: ratatui::buffer::Buffer,
+    /// One column below the short tier, with guard columns after the pane.
+    pub below_short_boundary_render: ratatui::buffer::Buffer,
+    /// The same narrow frame without an armed notice, used to prove the border
+    /// and guard cells were not touched by an overlong draw.
+    pub below_short_control_render: ratatui::buffer::Buffer,
+}
+
+/// Compact and roomy frames where the command banner and cannot-scroll notice
+/// are both live.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ScrollNoticeBannerPrecedenceObservation {
+    /// Two inner rows, where the command banner uses a single reversed line.
+    pub render: ratatui::buffer::Buffer,
+    /// Seven inner rows, where the command banner would use five block-letter
+    /// rows plus its `Ctrl+D to type` subtitle.
+    pub block_render: ratatui::buffer::Buffer,
+}
+
+/// A two-pane frame after focus has moved away from the pane that armed the
+/// cannot-scroll notice.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ScrollNoticePaneAffinityObservation {
+    pub render: ratatui::buffer::Buffer,
+    pub first_pane_rect: Rect,
+    pub second_pane_rect: Rect,
+}
+
+/// Observable lifecycle and rendering variants of one failed-scroll notice.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ScrollNoticeLifecycleObservation {
+    pub first_render: ratatui::buffer::Buffer,
+    pub repeated_render: ratatui::buffer::Buffer,
+    pub render_tiers: ScrollNoticeRenderTierObservation,
+    pub banner_precedence: ScrollNoticeBannerPrecedenceObservation,
+    pub pane_affinity: ScrollNoticePaneAffinityObservation,
+    pub visible_after_first_scroll: bool,
+    pub visible_just_before_expiry: bool,
+    pub visible_at_expiry: bool,
+    pub visible_before_repeat: bool,
+    pub visible_after_repeat: bool,
+    pub visible_at_original_expiry: bool,
+    pub visible_at_refreshed_expiry: bool,
+    pub visible_before_unbound_key: bool,
+    pub visible_after_unbound_key: bool,
+    pub unbound_key_forwarded_bytes: Vec<u8>,
+    pub unbound_mode_after_key: UiMode,
+    pub visible_before_bound_key: bool,
+    pub visible_after_bound_key: bool,
+    pub bound_key_forwarded_bytes: Vec<u8>,
+    pub bound_mode_after_key: UiMode,
+}
+
+fn scroll_notice_fixture_render(
+    rows: u16,
+    cols: u16,
+    trailing_guard_cols: u16,
+    mode: UiMode,
+    banner: CommandBannerVisibility,
+    now: std::time::Instant,
+    arm_notice: bool,
+) -> ratatui::buffer::Buffer {
+    let pane_output = synthetic_decstbm_repaint_stream(rows, cols);
+    let (ctrl, _child_input, _) = scroll_seam_pane_with_size(false, 0, &pane_output, rows, cols);
+    if arm_notice {
+        scroll_focused_agent_pane(&ctrl, SCROLL_SEAM_PANE_ID, mode, true, 3, 1, now);
+    }
+    render_sized_scroll_seam_pane_to_buffer(
+        &ctrl,
+        mode,
+        banner,
+        now,
+        rows,
+        cols,
+        trailing_guard_cols,
+    )
+}
+
+fn observe_scroll_notice_render_tiers(
+    now: std::time::Instant,
+) -> ScrollNoticeRenderTierObservation {
+    // PRD #611 (audit finding 2): DERIVED from the production strings, never
+    // transcribed from them. These were three hardcoded numbers matching the
+    // then-current wording, so a reword would have moved the real boundary while
+    // the seam kept probing the old one — the boundary would have gone unpinned
+    // silently, which is the one failure a boundary test exists to prevent.
+    let full_boundary_cols = SCROLL_NOTICE_TEXT.chars().count() as u16;
+    let short_boundary_cols = SCROLL_NOTICE_SHORT.chars().count() as u16;
+    // Enough guard columns beyond the pane frame that an overlong tier drawn at
+    // the widest probed geometry would have to spill into them to be seen.
+    let below_short_guard_cols = full_boundary_cols - short_boundary_cols + 1;
+
+    let render = |cols, guard, arm_notice| {
+        scroll_notice_fixture_render(
+            SCROLL_SEAM_ROWS,
+            cols,
+            guard,
+            UiMode::PaneInput,
+            CommandBannerVisibility::Hidden,
+            now,
+            arm_notice,
+        )
+    };
+    ScrollNoticeRenderTierObservation {
+        full_boundary_render: render(full_boundary_cols, 0, true),
+        below_full_boundary_render: render(full_boundary_cols - 1, 0, true),
+        short_boundary_render: render(short_boundary_cols, 0, true),
+        below_short_boundary_render: render(short_boundary_cols - 1, below_short_guard_cols, true),
+        below_short_control_render: render(short_boundary_cols - 1, below_short_guard_cols, false),
+    }
+}
+
+fn observe_scroll_notice_banner_precedence(
+    now: std::time::Instant,
+) -> ScrollNoticeBannerPrecedenceObservation {
+    // Two inner rows select the command banner's single-line tier, putting both
+    // announcements on exactly the same row. The notice is wider, so drawing it
+    // last must replace the banner completely rather than leave interleaved text.
+    ScrollNoticeBannerPrecedenceObservation {
+        render: scroll_notice_fixture_render(
+            2,
+            80,
+            0,
+            UiMode::Normal,
+            CommandBannerVisibility::Expanded,
+            now,
+            true,
+        ),
+        block_render: scroll_notice_fixture_render(
+            7,
+            80,
+            0,
+            UiMode::Normal,
+            CommandBannerVisibility::Expanded,
+            now,
+            true,
+        ),
+    }
+}
+
+fn observe_scroll_notice_pane_affinity(
+    now: std::time::Instant,
+) -> ScrollNoticePaneAffinityObservation {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    const COLS: u16 = 80;
+    let pane_output = synthetic_decstbm_repaint_stream(SCROLL_SEAM_ROWS, COLS);
+    let (ctrl, _first_child_input, _) =
+        scroll_seam_pane_with_size(false, 0, &pane_output, SCROLL_SEAM_ROWS, COLS);
+    let _second_child_input = ctrl.add_scroll_seam_pane(
+        RECONCILE_SEAM_SECOND_PANE_ID,
+        SCROLL_SEAM_ROWS,
+        COLS,
+        &pane_output,
+    );
+    scroll_focused_agent_pane(
+        &ctrl,
+        SCROLL_SEAM_PANE_ID,
+        UiMode::PaneInput,
+        true,
+        3,
+        1,
+        now,
+    );
+    focus_reconcile_seam_pane(&ctrl, ReconcileSeamPane::Second);
+    assert_eq!(
+        ctrl.focused_pane_id().as_deref(),
+        Some(RECONCILE_SEAM_SECOND_PANE_ID),
+        "the affinity seam must move production focus to its second pane"
+    );
+
+    let pane_width = COLS + 2;
+    let pane_height = SCROLL_SEAM_ROWS + 2;
+    let backend = TestBackend::new(pane_width, pane_height * 2);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            render_terminal_panes(
+                frame,
+                Some(&ctrl),
+                frame.area(),
+                &[
+                    SCROLL_SEAM_PANE_ID.to_string(),
+                    RECONCILE_SEAM_SECOND_PANE_ID.to_string(),
+                ],
+                PaneLayout::Tiled,
+                &HashMap::new(),
+                &HashMap::new(),
+                &None,
+                None,
+                UiMode::PaneInput,
+                CommandBannerVisibility::Hidden,
+                None,
+                now,
+            );
+        })
+        .expect("TestBackend draw should succeed");
+
+    ScrollNoticePaneAffinityObservation {
+        render: terminal.backend().buffer().clone(),
+        first_pane_rect: Rect::new(0, 0, pane_width, pane_height),
+        second_pane_rect: Rect::new(0, pane_height, pane_width, pane_height),
+    }
+}
+
+fn observe_scroll_notice_key(key: KeyEvent) -> (bool, bool, Vec<u8>, UiMode) {
+    let pane_output = synthetic_decstbm_repaint_stream(SCROLL_SEAM_ROWS, SCROLL_SEAM_COLS);
+    let (ctrl, mut child_input, _) = scroll_seam_pane(false, 0, &pane_output);
+    let ctrl = Arc::new(ctrl);
+    let now = std::time::Instant::now();
+    scroll_focused_agent_pane(
+        &ctrl,
+        SCROLL_SEAM_PANE_ID,
+        UiMode::PaneInput,
+        true,
+        3,
+        2,
+        now,
+    );
+    let visible_before = buffer_contains_scroll_notice(&render_scroll_seam_pane_to_buffer(
+        &ctrl,
+        UiMode::PaneInput,
+        now,
+    ));
+
+    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+    ui.mode = UiMode::PaneInput;
+    let mut tab_manager = TabManager::new(ctrl.clone() as Arc<dyn PaneController>);
+    let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+    let snapshot = AppState::default();
+    let filtered: Vec<(&String, &SessionState)> = Vec::new();
+    let _ = handle_key_event(
+        key,
+        &mut ui,
+        &*ctrl,
+        &state,
+        &mut tab_manager,
+        &snapshot,
+        &filtered,
+        Rect::new(0, 0, SCROLL_SEAM_COLS + 2, SCROLL_SEAM_ROWS + 2),
+    );
+    let after_key = std::time::Instant::now();
+    let visible_after = buffer_contains_scroll_notice(&render_scroll_seam_pane_to_buffer(
+        &ctrl, ui.mode, after_key,
+    ));
+    (
+        visible_before,
+        visible_after,
+        child_input.drain_bytes(),
+        ui.mode,
+    )
+}
+
+/// Drive the production wheel, pane renderer, and complete key dispatcher while
+/// injecting frame instants at both expiry edges. No notice state is reproduced
+/// in this seam: every visibility observation reads the real production
+/// renderer's output, so a seam that quietly stopped exercising the feature
+/// would report it missing rather than pass against a reimplementation of it.
+#[doc(hidden)]
+pub fn observe_scroll_notice_lifecycle(
+    epoch: std::time::Instant,
+) -> ScrollNoticeLifecycleObservation {
+    let pane_output = synthetic_decstbm_repaint_stream(SCROLL_SEAM_ROWS, SCROLL_SEAM_COLS);
+    let (ctrl, _child_input, _) = scroll_seam_pane(false, 0, &pane_output);
+
+    scroll_focused_agent_pane(
+        &ctrl,
+        SCROLL_SEAM_PANE_ID,
+        UiMode::PaneInput,
+        true,
+        3,
+        2,
+        epoch,
+    );
+    let first_render = render_scroll_seam_pane_to_buffer(&ctrl, UiMode::PaneInput, epoch);
+    let visible_after_first_scroll = buffer_contains_scroll_notice(&first_render);
+    let visible_just_before_expiry =
+        buffer_contains_scroll_notice(&render_scroll_seam_pane_to_buffer(
+            &ctrl,
+            UiMode::PaneInput,
+            epoch + COMMAND_BANNER_TTL - std::time::Duration::from_nanos(1),
+        ));
+    let visible_at_expiry = buffer_contains_scroll_notice(&render_scroll_seam_pane_to_buffer(
+        &ctrl,
+        UiMode::PaneInput,
+        epoch + COMMAND_BANNER_TTL,
+    ));
+
+    let (repeat_ctrl, _repeat_child_input, _) = scroll_seam_pane(false, 0, &pane_output);
+    scroll_focused_agent_pane(
+        &repeat_ctrl,
+        SCROLL_SEAM_PANE_ID,
+        UiMode::PaneInput,
+        true,
+        3,
+        2,
+        epoch,
+    );
+    let repeat_at = epoch + COMMAND_BANNER_TTL / 2;
+    let visible_before_repeat = buffer_contains_scroll_notice(&render_scroll_seam_pane_to_buffer(
+        &repeat_ctrl,
+        UiMode::PaneInput,
+        repeat_at,
+    ));
+    scroll_focused_agent_pane(
+        &repeat_ctrl,
+        SCROLL_SEAM_PANE_ID,
+        UiMode::PaneInput,
+        true,
+        3,
+        2,
+        repeat_at,
+    );
+    let repeated_render =
+        render_scroll_seam_pane_to_buffer(&repeat_ctrl, UiMode::PaneInput, repeat_at);
+    let visible_after_repeat = buffer_contains_scroll_notice(&repeated_render);
+    let visible_at_original_expiry =
+        buffer_contains_scroll_notice(&render_scroll_seam_pane_to_buffer(
+            &repeat_ctrl,
+            UiMode::PaneInput,
+            epoch + COMMAND_BANNER_TTL,
+        ));
+    let visible_at_refreshed_expiry =
+        buffer_contains_scroll_notice(&render_scroll_seam_pane_to_buffer(
+            &repeat_ctrl,
+            UiMode::PaneInput,
+            repeat_at + COMMAND_BANNER_TTL,
+        ));
+
+    let (
+        visible_before_unbound_key,
+        visible_after_unbound_key,
+        unbound_key_forwarded_bytes,
+        unbound_mode_after_key,
+    ) = observe_scroll_notice_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    let (
+        visible_before_bound_key,
+        visible_after_bound_key,
+        bound_key_forwarded_bytes,
+        bound_mode_after_key,
+    ) = observe_scroll_notice_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    let render_tiers = observe_scroll_notice_render_tiers(epoch);
+    let banner_precedence = observe_scroll_notice_banner_precedence(epoch);
+    let pane_affinity = observe_scroll_notice_pane_affinity(epoch);
+
+    ScrollNoticeLifecycleObservation {
+        first_render,
+        repeated_render,
+        render_tiers,
+        banner_precedence,
+        pane_affinity,
+        visible_after_first_scroll,
+        visible_just_before_expiry,
+        visible_at_expiry,
+        visible_before_repeat,
+        visible_after_repeat,
+        visible_at_original_expiry,
+        visible_at_refreshed_expiry,
+        visible_before_unbound_key,
+        visible_after_unbound_key,
+        unbound_key_forwarded_bytes,
+        unbound_mode_after_key,
+        visible_before_bound_key,
+        visible_after_bound_key,
+        bound_key_forwarded_bytes,
+        bound_mode_after_key,
     }
 }
 
@@ -18982,7 +19835,8 @@ pub fn observe_pane_input_scrollback_reconcile(
 ) -> PaneInputScrollbackObservation {
     // Pane one is the M5 fixture verbatim — same history, same inert backend, parked
     // at live output. Pane two is the same fixture pane, added unfocused.
-    let (ctrl, _first_child_input, _) = scroll_seam_pane(false, 0);
+    let history = scroll_seam_history();
+    let (ctrl, _first_child_input, _) = scroll_seam_pane(false, 0, history.as_bytes());
     let _second_child_input = ctrl.add_scroll_seam_pane(
         RECONCILE_SEAM_SECOND_PANE_ID,
         SCROLL_SEAM_ROWS,

@@ -1,3 +1,26 @@
+# ONE profile lives here, `default`, and BOTH `cargo test-fast` and
+# `cargo test-e2e` (aliases in `.cargo/config.toml`) run under it. On
+# `cargo test-e2e`, `--features e2e` selects the CARGO FEATURE named `e2e`;
+# it has nothing to do with a nextest PROFILE of the same name. A nextest
+# profile takes effect only when something passes `-P <name>` /
+# `--profile <name>`, and nothing in this repo does — not the aliases, not
+# `.github/workflows/`. If that ever needs re-deriving: nextest's store
+# directory is `target/nextest/<profile>/`, and a `cargo test-e2e` run
+# creates `target/nextest/default/`, not `target/nextest/e2e/`.
+#
+# Issue #494: a `[profile.e2e]` used to sit at the bottom of this file with
+# its own `120s x 2` window and four `[[profile.e2e.overrides]]`, and nothing
+# ever selected it, so every line of it was dead — a contributor who added a
+# carve-out there believed a long test was protected from the default kill
+# and it was not. Deleted rather than wired up, because wiring it up was the
+# option that would have changed real behaviour: its four overrides were
+# value-identical duplicates of `[[profile.default.overrides]]` entries below,
+# so nothing unique was lost, while selecting it would have MOVED the three
+# carve-outs that had no `e2e` counterpart (`route_001`, `new_pane_016`,
+# `orchestration_dispatch_002`) down from their widened windows to that
+# profile's 240s. So: put every timeout carve-out under `[profile.default]`,
+# and do not add a second profile without also adding the `-P` that selects it.
+
 [profile.default]
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 3 }
@@ -124,38 +147,6 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 # be updated in lockstep with any rename — a stale filter matches nothing and
 # silently drops this test back to the 3 x 60s default, killing it mid-wait.
 [[profile.default.overrides]]
-filter = 'test(shell_activity_005_real_claude_bash_child_trips_the_descendant_scan)'
-slow-timeout = { period = "60s", terminate-after = 6 }
-
-[profile.e2e]
-slow-timeout = { period = "120s", terminate-after = 2 }
-
-# Same carve-out under the `e2e` profile (see the note below on why the default
-# profile's override list is not inherited).
-[[profile.e2e.overrides]]
-filter = 'test(devin_live_001_real_interactive_turn_drives_the_card_live)'
-slow-timeout = { period = "60s", terminate-after = 6 }
-
-# Same carve-out under the `e2e` profile, for runs that select it explicitly
-# (`cargo test-e2e` uses the default profile; `-P e2e` does not inherit the
-# override list above).
-[[profile.e2e.overrides]]
-filter = 'test(version_001_injected_build_env_reaches_the_binary)'
-slow-timeout = { period = "120s", terminate-after = 10 }
-
-# Same carve-out under the `e2e` profile, for runs that select it explicitly
-# (`cargo test-e2e` uses the default profile; `-P e2e` does not inherit the
-# override list above). See the `[[profile.default.overrides]]` entry above
-# for the full rationale.
-[[profile.e2e.overrides]]
-filter = 'test(shell_activity_006_real_claude_bash_call_crossing_the_cap_keeps_the_badge_working)'
-slow-timeout = { period = "60s", terminate-after = 8 }
-
-# Same carve-out under the `e2e` profile, for runs that select it explicitly
-# (`cargo test-e2e` uses the default profile; `-P e2e` does not inherit the
-# override list above). See the `[[profile.default.overrides]]` entry above
-# for the full rationale.
-[[profile.e2e.overrides]]
 filter = 'test(shell_activity_005_real_claude_bash_child_trips_the_descendant_scan)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 

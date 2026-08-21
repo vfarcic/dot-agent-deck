@@ -26,6 +26,7 @@ pub mod init;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;
 pub mod keybindings;
+pub mod logging;
 pub mod login_shell;
 pub mod mode_manager;
 pub mod opencode_manage;

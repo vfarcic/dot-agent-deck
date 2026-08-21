@@ -1,6 +1,13 @@
 //! Disk-backed scratch directories for tests that do **not** link the e2e
 //! harness — issue #322.
 //!
+//! **This file must stay free of `crate::` paths.** It is `#[path]`-included by
+//! every integration-test crate that needs a disk-backed scratch dir, and there
+//! `crate::` resolves to *that* crate's root rather than the library's, so a
+//! single such path breaks all of them at once. `linkage-check` rule 9 enforces
+//! it mechanically (issue #474); the note above `mod tests` below has the
+//! measurement that makes the arrangement worth keeping.
+//!
 //! `tests/common/mod.rs` holds the real machinery: the candidate ladder,
 //! `DAD_E2E_TMPDIR`, the free-space pre-flight, the descriptor-relative
 //! validation walk, the per-process root and its `atexit` sweep. Two kinds of
@@ -113,15 +120,19 @@ fn private_base() -> Option<PathBuf> {
     None
 }
 
-// These two run once more in every crate that `#[path]`-includes this file:
-// `tests/daemon_protocol.rs`, `tests/rehydration.rs`, `tests/pane_close.rs`,
-// `tests/codex_hooks_safety.rs`, `tests/features.rs`,
-// `tests/devin_hook_ingestion.rs` and `tests/codex_hook_ingestion.rs`. That is
-// the whole cost of sharing the module this way — two extra fast-tier
-// executions per crate, against the ~530 that pulling `tests/common/mod.rs` in
-// would have duplicated. Measured across the six added at once: 2,315 → 2,327.
+// These two run once more in every crate that `#[path]`-includes this file —
+// `tests/assemble_changelog.rs`, `tests/codex_hook_ingestion.rs`,
+// `tests/codex_hooks_safety.rs`, `tests/daemon_protocol.rs`,
+// `tests/devin_hook_ingestion.rs`, `tests/features.rs`,
+// `tests/hook_rule_identification.rs`, `tests/pane_close.rs`,
+// `tests/rehydration.rs` and `tests/worktree_reclaim.rs`, ten of them as of
+// #474. That is the whole cost of sharing the module this way — two extra
+// fast-tier executions per crate, against the ~530 that pulling
+// `tests/common/mod.rs` in would have duplicated. Measured across the six added
+// at once: 2,315 → 2,327.
 // Keeping it self-contained is what makes that price available, so a `crate::`
-// reference added here would silently take it away.
+// reference added here would take it away — which is why `linkage-check` rule 9
+// now refuses one instead of leaving the constraint to this comment (#474).
 #[cfg(test)]
 mod tests {
     /// A scratch dir comes back, and it really is a directory on disk —

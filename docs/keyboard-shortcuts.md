@@ -9,7 +9,9 @@ title: Keyboard Shortcuts
 
 Every keyboard action below is also reachable with the mouse — the dashboard is fully clickable, and every clickable control carries its keyboard shortcut inline, so the on-screen controls double as a legend and clicking one does exactly what its shortcut does. Two things the labels cannot tell you: a single click on a dashboard card selects it while a double click focuses its pane, and the button bar along the bottom wraps onto more rows on a narrow terminal rather than dropping any of its commands.
 
-A mode tab's side panes scroll when the pointer is over them; anywhere else the wheel scrolls the focused pane. In command mode it always moves Agent Deck's own scrollback and is never forwarded to the agent, so a full-screen TUI running in a pane cannot move under you while you read. While you are typing in a pane, the wheel goes to the agent whenever the agent has mouse reporting enabled.
+A mode tab's side panes scroll when the pointer is over them; anywhere else the wheel scrolls the focused pane. In command mode it is always routed to Agent Deck's own scrollback and is never forwarded to the agent, so a full-screen TUI running in a pane cannot move under you while you read. While you are typing in a pane, the wheel goes to the agent whenever the agent has mouse reporting enabled.
+
+**Whether anything actually moves depends on the agent**, and for some agents the answer is nothing — see [Scrolling back through a pane](#scrolling-back-through-a-pane).
 
 ## Global Shortcuts
 
@@ -29,7 +31,7 @@ A mode tab's side panes scroll when the pointer is over them; anywhere else the 
 Three other things follow the mode:
 
 - **The cursor.** The focused pane shows a cursor only while you are typing into it. A cursor means, without exception, that what you type lands in that pane.
-- **The focused pane dims, with a banner.** Entering command mode dims the focused pane's content — still perfectly readable, just visibly inert — and overlays a `COMMAND MODE · Ctrl+D to type` banner. The banner clears itself after a moment, or immediately when you press a command-mode key or click a bottom-bar button; a key that isn't bound to anything keeps it up, because that is the moment you most likely thought you were talking to the agent. The dimming stays for as long as you are in command mode.
+- **The focused pane dims, with a banner.** Entering command mode dims the focused pane's content — still perfectly readable, just visibly inert — and overlays a `COMMAND MODE — Ctrl+D to type` banner. The banner clears itself after a moment, or immediately when you press a command-mode key or click a bottom-bar button; a key that isn't bound to anything keeps it up, because that is the moment you most likely thought you were talking to the agent. The dimming stays for as long as you are in command mode.
 - **The selected dashboard card.** It keeps its `▸ ` marker in both modes so you never lose track of the selection, but its highlight is de-emphasised while you are typing in a pane — the deck looks inert exactly when the pane looks live.
 
 ### `Ctrl+W` closes only from command mode
@@ -111,6 +113,20 @@ These shortcuts work in **command mode**. If you're typing in an agent pane, pre
 `PageUp` / `PageDown` scroll the focused pane's output back and forward — the keyboard equivalent of the scroll wheel. They are the `scroll_pane_up` and `scroll_pane_down` actions and are remappable like any other binding (see [Actions and defaults](#actions-and-defaults)).
 
 They work in **command mode only**. While you are typing in a pane they are sent straight through to whatever is running there as `ESC[5~` / `ESC[6~`, so a pager, an editor, or the agent's own scrollback keeps them; press `Ctrl+D` first and the same keys scroll the deck's view of the pane instead. `Ctrl+PageUp` / `Ctrl+PageDown` are separate chords and stay on tab navigation.
+
+#### How far back you can scroll depends on the agent
+
+Agent Deck routes the wheel and the scroll keys the same way for every pane, but **what there is to scroll is decided by the agent running in it**, and terminal applications split into two camps here.
+
+**App-managed agents keep their own transcript and scroll it themselves.** They ask the terminal for mouse tracking so they can receive your wheel events directly — `claude` requests all four mouse modes — and they redraw their conversation at whatever position you scroll to. While you are typing in the pane, Agent Deck forwards the wheel straight to the agent, and the agent scrolls. This works, and the history you reach is the agent's own, as long as it chooses to keep it.
+
+**Terminal-managed agents expect the terminal to hold the history, while contributing none of it.** `codex` is the current example: it requests no mouse events at all (only focus reporting, which is not the same thing), it does not switch to the alternate screen, and it sizes its drawing region to the exact height of the pane and repaints its whole transcript in place. Because it repaints rather than emitting new lines, **no line ever scrolls off the top**, so nothing is ever handed to the terminal to keep. Measured against a real session at the height it rendered for, the retained buffer is **zero lines**.
+
+**For an agent like that, Agent Deck has nothing to scroll — by wheel or by key, in any mode.** This is not a setting you can change and there is no alternative chord that reaches further back: `PageUp` does nothing for the same reason the wheel does. Rather than doing nothing silently, the deck says so: a scroll that cannot land briefly overlays the pane with `Nothing to scroll — this pane has no scrollback to move through`, in the same reversed single-line style as the command-mode banner. It clears itself after a moment or on your next keystroke, and that keystroke is not swallowed — it reaches the agent, or runs its shortcut, exactly as it would have. A pane too narrow for the full sentence gets the short form, `Nothing to scroll — no scrollback`. You will only ever see it on a pane you actually tried to scroll; it never appears on its own. The message reports what the deck observed about that pane and stops there — *why* a particular pane has no scrollback is the per-agent distinction this section explains, and the deck cannot establish it from the pane's output alone.
+
+It is worth knowing why this can look like "scrolling works fine outside Agent Deck". Scrolling up during a long `codex` session in an ordinary terminal reaches whatever was on your screen *before* codex started — your shell prompt, the command you typed — and never an earlier part of the conversation. Codex does not use the alternate screen, so that earlier content simply stays in your terminal's own scrollback above it. A pane Agent Deck spawns for the agent starts empty, so there is no such content and nothing moves at all.
+
+Making a terminal-managed agent's transcript scrollable is something only that agent can do, by using the alternate screen, enabling mouse tracking, or binding a scroll key of its own.
 
 ## Directory Picker
 

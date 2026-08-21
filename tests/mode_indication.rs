@@ -19,13 +19,15 @@ use dot_agent_deck::state::{SessionState, SessionStatus};
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
     BannerTier, COMMAND_BANNER_TTL, CardDensityKind, CommandBannerSignal, CommandBannerState,
-    CommandBannerVisibility, ReconcileSeamPane, UiMode, command_banner_tier,
+    CommandBannerVisibility, ReconcileSeamPane, SCROLL_NOTICE_MIN_SCREENFULS, SCROLL_NOTICE_SHORT,
+    SCROLL_NOTICE_TEXT, SCROLL_SEAM_COLS, SCROLL_SEAM_ROWS, UiMode, command_banner_tier,
     observe_command_banner_key_burst, observe_focused_agent_key_scroll,
-    observe_focused_agent_mouse_scroll, observe_pane_input_scrollback_reconcile,
-    observe_pane_input_without_focused_pane, render_button_bar_for_mode_to_buffer,
+    observe_focused_agent_mouse_scroll, observe_focused_agent_without_scroll,
+    observe_pane_input_scrollback_reconcile, observe_pane_input_without_focused_pane,
+    observe_scroll_notice_lifecycle, render_button_bar_for_mode_to_buffer,
     render_button_bar_to_buffer, render_button_bar_with_bindings_to_buffer,
     render_card_for_mode_to_buffer, render_card_to_buffer, render_command_banner_pane_to_buffer,
-    render_focused_pane_cursor_for_mode_to_position,
+    render_focused_pane_cursor_for_mode_to_position, synthetic_decstbm_repaint_stream,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -38,10 +40,14 @@ const TYPING_CHIP: &str = " TYPING ";
 
 fn buffer_to_text(buffer: &Buffer) -> String {
     let area = buffer.area();
-    (0..area.height)
-        .map(|y| {
-            (0..area.width)
-                .map(|x| buffer[(x, y)].symbol())
+    rect_to_text(buffer, *area)
+}
+
+fn rect_to_text(buffer: &Buffer, rect: Rect) -> String {
+    (0..rect.height)
+        .map(|row| {
+            (0..rect.width)
+                .map(|col| buffer[(rect.x + col, rect.y + row)].symbol())
                 .collect::<String>()
                 .trim_end()
                 .to_string()
@@ -78,6 +84,18 @@ fn buffer_to_styled_text(buffer: &Buffer) -> String {
         out.push('\n');
     }
     out
+}
+
+fn plainly_streamed_scroll_fixture() -> Vec<u8> {
+    let minimum =
+        SCROLL_NOTICE_MIN_SCREENFULS * u64::from(SCROLL_SEAM_ROWS) * u64::from(SCROLL_SEAM_COLS);
+    let mut output = String::new();
+    let mut line = 0_u64;
+    while (output.len() as u64) < minimum {
+        let _ = write!(&mut output, "plain streamed line {line:04}\r\n");
+        line += 1;
+    }
+    output.into_bytes()
 }
 
 fn nonblank_rows(buffer: &Buffer) -> usize {
@@ -1078,10 +1096,18 @@ fn mode_deck_001_selected_card_accent_tracks_mode() {
     );
 }
 
-/// Scenario: Send one wheel-up event over the focused agent pane in all four combinations of command/PaneInput mode and child mouse reporting on/off. PaneInput may forward only when reporting is enabled; command mode must always move dot-agent-deck's scrollback and must never emit mouse-protocol bytes to the child.
+/// Scenario: Feed focused panes either substantial cursor-positioned repaint output, trivial fresh output, or ordinary streamed history, then send wheel-up across the command/PaneInput × child-mouse matrix or render without scrolling. A failed deck-owned scroll on a mature zero-depth pane must explain itself reactively, while child-owned scrolling, fresh panes, successful scrollback, and no-attempt frames remain notice-free.
 #[spec("mode/scroll/001")]
 #[test]
 fn mode_scroll_001_mouse_wheel_routes_by_mode_and_child_mouse_state() {
+    let repaint = synthetic_decstbm_repaint_stream(SCROLL_SEAM_ROWS, SCROLL_SEAM_COLS);
+    let minimum =
+        SCROLL_NOTICE_MIN_SCREENFULS * u64::from(SCROLL_SEAM_ROWS) * u64::from(SCROLL_SEAM_COLS);
+    assert!(
+        repaint.len() as u64 >= minimum,
+        "the DECSTBM repaint fixture must feed at least eight live pane screenfuls"
+    );
+
     for (mode, mouse_mode_enabled, should_forward, context) in [
         (
             UiMode::PaneInput,
@@ -1108,7 +1134,16 @@ fn mode_scroll_001_mouse_wheel_routes_by_mode_and_child_mouse_state() {
             "command mode without child mouse reporting",
         ),
     ] {
-        let observed = observe_focused_agent_mouse_scroll(mode, mouse_mode_enabled, true, 0, 3, 2);
+        let observed =
+            observe_focused_agent_mouse_scroll(mode, mouse_mode_enabled, true, &repaint, 0, 3, 2);
+        assert_eq!(
+            observed.scrollback_depth, 0,
+            "{context}: the cursor-positioned repaint must leave the live vt100 depth empty, not merely leave the view at offset zero: {observed:?}"
+        );
+        assert!(
+            observed.bytes_fed_since_spawn >= minimum,
+            "{context}: the mature-pane half of the trigger must use bytes since spawn: {observed:?}"
+        );
         if should_forward {
             assert_eq!(
                 observed.forwarded_bytes, b"\x1b[<64;4;3M",
@@ -1118,28 +1153,78 @@ fn mode_scroll_001_mouse_wheel_routes_by_mode_and_child_mouse_state() {
                 observed.scrollback_after, observed.scrollback_before,
                 "{context} must leave dot-agent-deck's scrollback at live output"
             );
-        } else {
             assert!(
-                observed.scrollback_after > observed.scrollback_before,
-                "{context} must scroll dot-agent-deck's own scrollback: {observed:?}"
+                !observed.notice_visible,
+                "{context} gives transcript ownership to the child and must not arm the deck's notice: {observed:?}"
+            );
+        } else {
+            assert_eq!(
+                observed.scrollback_after, observed.scrollback_before,
+                "{context} must remain at live output when the real buffer depth is zero: {observed:?}"
             );
             assert!(
                 observed.forwarded_bytes.is_empty(),
                 "{context} must not emit mouse-protocol bytes to the child: {observed:?}"
             );
+            assert!(
+                observed.notice_visible,
+                "{context} must arm the cannot-scroll notice after a deck-owned scroll finds zero live depth despite substantial output: {observed:?}"
+            );
         }
     }
+
+    let fresh = observe_focused_agent_mouse_scroll(UiMode::Normal, false, true, b"ready", 0, 3, 2);
+    assert_eq!(fresh.scrollback_depth, 0, "fresh output has no history");
+    assert!(
+        fresh.bytes_fed_since_spawn < minimum,
+        "the fresh-pane control must stay below the eight-screenful threshold"
+    );
+    assert!(
+        !fresh.notice_visible,
+        "a newly spawned pane with trivial output must not be accused of keeping no scrollback: {fresh:?}"
+    );
+
+    let streamed = plainly_streamed_scroll_fixture();
+    let scrolled =
+        observe_focused_agent_mouse_scroll(UiMode::Normal, false, true, &streamed, 0, 3, 2);
+    assert!(
+        scrolled.scrollback_depth > 0,
+        "plain CRLF output must create real live parser history: {scrolled:?}"
+    );
+    assert!(
+        scrolled.scrollback_after > scrolled.scrollback_before,
+        "a non-empty buffer must scroll normally: {scrolled:?}"
+    );
+    assert!(
+        !scrolled.notice_visible,
+        "a scroll that lands must not arm the cannot-scroll notice: {scrolled:?}"
+    );
+
+    let no_attempt = observe_focused_agent_without_scroll(&repaint);
+    assert_eq!(
+        no_attempt.scrollback_depth, 0,
+        "the no-attempt control must preserve the repaint fixture's zero live depth"
+    );
+    assert!(
+        no_attempt.bytes_fed_since_spawn >= minimum,
+        "the no-attempt control must still be a mature pane"
+    );
+    assert!(
+        !no_attempt.notice_visible,
+        "focusing and reconciling a mature zero-depth pane must not show a proactive notice: {no_attempt:?}"
+    );
 }
 
-/// Scenario: In command mode, press the configured focused-pane scroll-up and scroll-down keys against a pane with synthetic history. The PageUp/PageDown defaults and custom `[dashboard]` remaps must move dot-agent-deck's scrollback in the expected direction without emitting bytes to the child, while each remap disables its former default.
+/// Scenario: In command mode, press default PageUp/PageDown and custom `[dashboard]` scroll bindings against panes with ordinary history and against a mature DECSTBM repaint stream with zero live depth. Successful keys still move only deck scrollback, while every claimed key that cannot land arms the same notice without writing to the child and retired defaults remain inert.
 #[spec("mode/scroll/002")]
 #[test]
 fn mode_scroll_002_keyboard_scroll_is_semantic_and_remappable() {
     let default = KeybindingConfig::default();
     let page_up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
     let page_down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+    let streamed = plainly_streamed_scroll_fixture();
 
-    let up = observe_focused_agent_key_scroll(&default, UiMode::Normal, page_up, 0);
+    let up = observe_focused_agent_key_scroll(&default, UiMode::Normal, page_up, &streamed, 0);
     assert!(
         up.scrollback_after > up.scrollback_before,
         "default PageUp must scroll back through the focused agent pane: {up:?}"
@@ -1149,7 +1234,7 @@ fn mode_scroll_002_keyboard_scroll_is_semantic_and_remappable() {
         "command-mode PageUp must not emit bytes to the child: {up:?}"
     );
 
-    let down = observe_focused_agent_key_scroll(&default, UiMode::Normal, page_down, 6);
+    let down = observe_focused_agent_key_scroll(&default, UiMode::Normal, page_down, &streamed, 6);
     assert!(
         down.scrollback_after < down.scrollback_before,
         "default PageDown must scroll toward live output in the focused agent pane: {down:?}"
@@ -1168,7 +1253,7 @@ fn mode_scroll_002_keyboard_scroll_is_semantic_and_remappable() {
         "focused-pane scroll keys must be registered semantic actions: {warnings:?}"
     );
 
-    let old_up = observe_focused_agent_key_scroll(&remapped, UiMode::Normal, page_up, 0);
+    let old_up = observe_focused_agent_key_scroll(&remapped, UiMode::Normal, page_up, &streamed, 0);
     assert_eq!(
         old_up.scrollback_after, old_up.scrollback_before,
         "remapping scroll_pane_up must disable its PageUp default"
@@ -1177,6 +1262,7 @@ fn mode_scroll_002_keyboard_scroll_is_semantic_and_remappable() {
         &remapped,
         UiMode::Normal,
         KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+        &streamed,
         0,
     );
     assert!(
@@ -1184,7 +1270,8 @@ fn mode_scroll_002_keyboard_scroll_is_semantic_and_remappable() {
         "the custom scroll_pane_up binding must scroll the focused pane: {remapped_up:?}"
     );
 
-    let old_down = observe_focused_agent_key_scroll(&remapped, UiMode::Normal, page_down, 6);
+    let old_down =
+        observe_focused_agent_key_scroll(&remapped, UiMode::Normal, page_down, &streamed, 6);
     assert_eq!(
         old_down.scrollback_after, old_down.scrollback_before,
         "remapping scroll_pane_down must disable its PageDown default"
@@ -1193,6 +1280,7 @@ fn mode_scroll_002_keyboard_scroll_is_semantic_and_remappable() {
         &remapped,
         UiMode::Normal,
         KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT),
+        &streamed,
         6,
     );
     assert!(
@@ -1202,6 +1290,41 @@ fn mode_scroll_002_keyboard_scroll_is_semantic_and_remappable() {
     assert!(
         remapped_up.forwarded_bytes.is_empty() && remapped_down.forwarded_bytes.is_empty(),
         "command-mode keyboard scrolling must never write to the child"
+    );
+
+    let repaint = synthetic_decstbm_repaint_stream(SCROLL_SEAM_ROWS, SCROLL_SEAM_COLS);
+    for (bindings, key, context) in [
+        (&default, page_up, "default PageUp"),
+        (&default, page_down, "default PageDown"),
+        (
+            &remapped,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::ALT),
+            "remapped scroll_pane_up",
+        ),
+    ] {
+        let observed = observe_focused_agent_key_scroll(bindings, UiMode::Normal, key, &repaint, 0);
+        assert_eq!(
+            observed.scrollback_depth, 0,
+            "{context} must see the repaint fixture's live zero-depth buffer: {observed:?}"
+        );
+        assert_eq!(
+            observed.scrollback_after, observed.scrollback_before,
+            "{context} cannot move an empty live buffer: {observed:?}"
+        );
+        assert!(
+            observed.forwarded_bytes.is_empty(),
+            "{context} must remain a deck-owned semantic action: {observed:?}"
+        );
+        assert!(
+            observed.notice_visible,
+            "{context} must arm the same cannot-scroll notice as the wheel path: {observed:?}"
+        );
+    }
+
+    let retired = observe_focused_agent_key_scroll(&remapped, UiMode::Normal, page_up, &repaint, 0);
+    assert!(
+        !retired.notice_visible,
+        "an old default retired by remapping did not attempt a scroll and must not arm the notice: {retired:?}"
     );
 }
 
@@ -1341,5 +1464,296 @@ fn mode_scroll_004_pane_input_without_focus_settles_in_command_mode_once() {
             settled.banner_after_second_frame,
         ),
         "reconciling an already-Normal no-focus state must be idempotent"
+    );
+}
+
+/// Scenario: Attempt failed scrolls across the notice's width boundaries, while compact and roomy command banners are live, and before moving focus between two panes, then exercise its TTL, refresh, and next-key lifecycle. The notice must choose only a fitting tier without crossing the pane frame, replace either banner cleanly while preserving command-mode dimming, remain on the pane that armed it, and dismiss without consuming the next action.
+#[spec("mode/scroll/005")]
+#[test]
+fn mode_scroll_005_cannot_scroll_notice_renders_refreshes_and_dismisses_without_consuming_keys() {
+    // PRD #611 (audit finding 2): DERIVED from the production strings rather
+    // than transcribed from them. These were hardcoded 80/79/41/40 columns taken
+    // from the then-current wording, so a reword moved the real boundary while
+    // the assertions kept naming the old one — the boundary would have gone
+    // silently unpinned, which is the single thing a boundary test exists to
+    // prevent. The seam probes the same derived widths.
+    const SHORT_NOTICE: &str = SCROLL_NOTICE_SHORT;
+    let full_boundary_inner_width = SCROLL_NOTICE_TEXT.chars().count() as u16;
+    let short_boundary_inner_width = SHORT_NOTICE.chars().count() as u16;
+
+    let observed = observe_scroll_notice_lifecycle(Instant::now());
+    assert!(
+        observed.visible_after_first_scroll,
+        "a failed scroll on a mature zero-depth pane must render the notice immediately: {observed:?}"
+    );
+
+    let text = buffer_to_text(&observed.first_render);
+    assert_eq!(
+        text.matches(SCROLL_NOTICE_TEXT).count(),
+        1,
+        "the exact notice may appear only once in the pane:\n{text}"
+    );
+    let lower = SCROLL_NOTICE_TEXT.to_ascii_lowercase();
+    assert!(
+        lower.contains("nothing to scroll") && lower.contains("scrollback"),
+        "the notice must say what was actually observed: this pane has no scrollback and there is nothing to scroll"
+    );
+    assert!(
+        !lower.contains("pageup") && !lower.contains("page up"),
+        "the notice must not recommend PageUp because it fails on the same zero-depth buffer"
+    );
+    // PRD #611 (audit finding 2): the trigger counts bytes handed to the parser
+    // before anything parses them, so `8 * rows * cols` of NULs, of cursor
+    // control, or of a chunk the parser panicked on reaches the same state. Byte
+    // volume cannot establish how an agent renders — and the bytes need not even
+    // be the agent's own (it may be relaying a file or a web response), so an
+    // asserted rendering model is a falsehood a third party can author in the
+    // deck's own voice.
+    assert!(
+        !lower.contains("redraw") && !lower.contains("this agent"),
+        "the notice must not assert the agent's rendering model as measured fact: {SCROLL_NOTICE_TEXT}"
+    );
+    let (notice_x, notice_y) = find_ascii_text(&observed.first_render, SCROLL_NOTICE_TEXT)
+        .expect("the visible notice must be discoverable in the rendered pane");
+    let inner = inner_rect(&observed.first_render);
+    assert_eq!(
+        (notice_x, notice_y),
+        (
+            inner.x
+                + inner
+                    .width
+                    .saturating_sub(SCROLL_NOTICE_TEXT.chars().count() as u16)
+                    / 2,
+            inner.y + inner.height.saturating_sub(1) / 2,
+        ),
+        "the notice must use the command-banner centring idiom"
+    );
+    for offset in 0..SCROLL_NOTICE_TEXT.chars().count() as u16 {
+        assert!(
+            observed.first_render[(notice_x + offset, notice_y)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "notice cell {offset} must use the command-banner REVERSED idiom"
+        );
+    }
+    assert_eq!(
+        modifier_bounds(&observed.first_render, Modifier::REVERSED)
+            .expect("the notice must create a reversed banner run")
+            .height,
+        1,
+        "the cannot-scroll notice must render on one line"
+    );
+
+    assert!(
+        short_boundary_inner_width < full_boundary_inner_width,
+        "the narrow tier must actually be narrower than the sentence it stands in for"
+    );
+    let tiers = &observed.render_tiers;
+    let full_boundary_text = buffer_to_text(&tiers.full_boundary_render);
+    assert_eq!(
+        full_boundary_text.matches(SCROLL_NOTICE_TEXT).count(),
+        1,
+        "an inner pane exactly as wide as the sentence ({full_boundary_inner_width} columns) must render the full tier exactly once:\n{full_boundary_text}"
+    );
+    assert_eq!(
+        find_ascii_text(&tiers.full_boundary_render, SCROLL_NOTICE_TEXT),
+        Some((1, 3)),
+        "the full sentence must fit exactly between the pane borders at its width boundary"
+    );
+
+    let below_full_text = buffer_to_text(&tiers.below_full_boundary_render);
+    assert!(
+        !below_full_text.contains(SCROLL_NOTICE_TEXT),
+        "one column below the full boundary must not draw the overlong tier:\n{below_full_text}"
+    );
+    assert_eq!(
+        below_full_text.matches(SHORT_NOTICE).count(),
+        1,
+        "one column below it must fall back to the short tier exactly once:\n{below_full_text}"
+    );
+    assert_eq!(
+        find_ascii_text(&tiers.below_full_boundary_render, SHORT_NOTICE),
+        Some((
+            1 + (full_boundary_inner_width - 1 - short_boundary_inner_width) / 2,
+            3
+        )),
+        "the short fallback must remain centred one column below the full-tier boundary"
+    );
+
+    let short_boundary_text = buffer_to_text(&tiers.short_boundary_render);
+    assert_eq!(
+        short_boundary_text.matches(SHORT_NOTICE).count(),
+        1,
+        "an inner pane exactly as wide as the short sentence ({short_boundary_inner_width} columns) must still render it complete:\n{short_boundary_text}"
+    );
+    assert_eq!(
+        find_ascii_text(&tiers.short_boundary_render, SHORT_NOTICE),
+        Some((1, 3)),
+        "the short sentence must fit exactly between the borders at its width boundary"
+    );
+    let short_lower = SHORT_NOTICE.to_ascii_lowercase();
+    assert!(
+        !short_lower.contains("pageup") && !short_lower.contains("page up"),
+        "the narrow tier must not offer PageUp on the same zero-depth pane"
+    );
+
+    let below_short_text = buffer_to_text(&tiers.below_short_boundary_render);
+    assert!(
+        !below_short_text.contains(SCROLL_NOTICE_TEXT) && !below_short_text.contains(SHORT_NOTICE),
+        "one column below the short boundary must omit both notice tiers:\n{below_short_text}"
+    );
+    assert!(
+        modifier_bounds(&tiers.below_short_boundary_render, Modifier::REVERSED).is_none(),
+        "the omitted tier must not leave even a clipped reversed run in the frame"
+    );
+    let omitted_notice_row = 3;
+    let omitted_right_border = short_boundary_inner_width;
+    for x in [0, omitted_right_border] {
+        assert_eq!(
+            tiers.below_short_boundary_render[(x, omitted_notice_row)],
+            tiers.below_short_control_render[(x, omitted_notice_row)],
+            "omitting the notice must leave border cell ({x}, {omitted_notice_row}) untouched"
+        );
+    }
+    for x in omitted_right_border + 1..tiers.below_short_boundary_render.area().width {
+        assert_eq!(
+            tiers.below_short_boundary_render[(x, omitted_notice_row)],
+            tiers.below_short_control_render[(x, omitted_notice_row)],
+            "omitting the notice must not spill into guard column {x} beyond the pane frame"
+        );
+    }
+
+    let precedence = &observed.banner_precedence.render;
+    let precedence_text = buffer_to_text(precedence);
+    assert_eq!(
+        precedence_text.matches(SCROLL_NOTICE_TEXT).count(),
+        1,
+        "when both transient messages are live, the complete notice must win:\n{precedence_text}"
+    );
+    assert!(
+        !precedence_text.contains("COMMAND") && !precedence_text.contains("Ctrl+D to type"),
+        "the notice must replace the single-line command banner rather than interleave with it:\n{precedence_text}"
+    );
+    let (precedence_x, precedence_y) = find_ascii_text(precedence, SCROLL_NOTICE_TEXT)
+        .expect("the winning notice must be present as one intact sentence");
+    assert_eq!(
+        modifier_bounds(precedence, Modifier::REVERSED),
+        Some(Rect::new(
+            precedence_x,
+            precedence_y,
+            full_boundary_inner_width,
+            1,
+        )),
+        "the final frame must contain only the notice's reversed run, with no banner remnants"
+    );
+
+    let block_precedence = &observed.banner_precedence.block_render;
+    let block_precedence_text = buffer_to_text(block_precedence);
+    assert_eq!(
+        command_banner_tier(80, 7),
+        BannerTier::BlockCommandModeWithSubtitle,
+        "the roomy precedence fixture must exercise the richest block-banner tier"
+    );
+    assert_eq!(
+        block_precedence_text.matches(SCROLL_NOTICE_TEXT).count(),
+        1,
+        "at the block tier, the complete notice must render exactly once:\n{block_precedence_text}"
+    );
+    assert!(
+        !block_precedence_text.contains("COMMAND")
+            && !block_precedence_text.contains("Ctrl+D to type"),
+        "no textual block-banner remnant may survive anywhere around the notice:\n{block_precedence_text}"
+    );
+    let (block_notice_x, block_notice_y) = find_ascii_text(block_precedence, SCROLL_NOTICE_TEXT)
+        .expect("the block-tier notice must be present as one intact sentence");
+    assert_eq!(
+        modifier_bounds(block_precedence, Modifier::REVERSED),
+        Some(Rect::new(
+            block_notice_x,
+            block_notice_y,
+            full_boundary_inner_width,
+            1,
+        )),
+        "the block-tier frame's only reversed run must be the notice, with no block-letter rows surviving above or below it"
+    );
+    assert_command_inner_area_is_dimmed(
+        block_precedence,
+        "focused command pane behind the block-tier notice",
+    );
+
+    let affinity = &observed.pane_affinity;
+    let first_pane_text = rect_to_text(&affinity.render, affinity.first_pane_rect);
+    let second_pane_text = rect_to_text(&affinity.render, affinity.second_pane_rect);
+    assert_eq!(
+        first_pane_text.matches(SCROLL_NOTICE_TEXT).count(),
+        1,
+        "after focus moves away, the notice must remain on the pane that armed it:\n{first_pane_text}"
+    );
+    assert_eq!(
+        second_pane_text.matches(SCROLL_NOTICE_TEXT).count(),
+        0,
+        "the newly focused pane must not inherit another pane's notice:\n{second_pane_text}"
+    );
+    assert_eq!(
+        buffer_to_text(&affinity.render)
+            .matches(SCROLL_NOTICE_TEXT)
+            .count(),
+        1,
+        "the two-pane frame must contain exactly one notice, on its arming pane"
+    );
+
+    assert!(
+        observed.visible_just_before_expiry,
+        "the notice must remain visible immediately before the shared command-banner TTL"
+    );
+    assert!(
+        !observed.visible_at_expiry,
+        "the notice must clear exactly at COMMAND_BANNER_TTL ({COMMAND_BANNER_TTL:?})"
+    );
+    assert!(
+        observed.visible_before_repeat && observed.visible_after_repeat,
+        "a repeated failed scroll must refresh in place without a hide/reshow edge: {observed:?}"
+    );
+    assert_eq!(
+        buffer_to_text(&observed.repeated_render)
+            .matches(SCROLL_NOTICE_TEXT)
+            .count(),
+        1,
+        "refreshing must not stack a second notice"
+    );
+    assert!(
+        observed.visible_at_original_expiry,
+        "refreshing halfway through must keep the notice visible past the original expiry"
+    );
+    assert!(
+        !observed.visible_at_refreshed_expiry,
+        "the refreshed notice must clear exactly one shared TTL after the repeat"
+    );
+
+    assert!(
+        observed.visible_before_unbound_key && !observed.visible_after_unbound_key,
+        "an unbound printable key must dismiss an armed notice: {observed:?}"
+    );
+    assert_eq!(
+        observed.unbound_key_forwarded_bytes, b"x",
+        "dismissing the notice must not consume the character meant for the focused agent"
+    );
+    assert_eq!(
+        observed.unbound_mode_after_key,
+        UiMode::PaneInput,
+        "the ordinary character must follow the normal PaneInput handler"
+    );
+    assert!(
+        observed.visible_before_bound_key && !observed.visible_after_bound_key,
+        "a bound key must dismiss an armed notice too: {observed:?}"
+    );
+    assert!(
+        observed.bound_key_forwarded_bytes.is_empty(),
+        "the Ctrl+D binding normally changes deck mode rather than writing to the child"
+    );
+    assert_eq!(
+        observed.bound_mode_after_key,
+        UiMode::Normal,
+        "the dismissing Ctrl+D must still reach its normal mode-transition handler"
     );
 }

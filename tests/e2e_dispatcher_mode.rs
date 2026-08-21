@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::TabMembership;
-use dot_agent_deck::daemon_protocol::AttachRequest;
+use dot_agent_deck::event::SendResult;
 use dot_agent_deck::state::SessionStatus;
 use spec::spec;
 
@@ -1015,6 +1015,7 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
     // The pane the dispatch is attributed to. `cat` is fine HERE — it is the
     // caller, not the thing under test.
     let caller_pane = open_cat_caller_pane(&deck);
+    let events = deck.subscribe_events();
 
     // Armed before the dispatch, so the sibling is reclaimed even on failure.
     let _guard = SiblingWorktreeGuard(expected_worktree.clone());
@@ -1197,27 +1198,39 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
         eprintln!("warning: not every role pane settled within 180s; proceeding anyway");
     }
 
-    // Delivered through the daemon's production `WriteAndSubmit` — the same atomic
-    // write-then-submit a user's keystrokes take. What the orchestrator does with
-    // it (shell `dot-agent-deck delegate`) is the AGENT's own doing, which is the
-    // point: this is the decision path, not a test-issued CLI call.
+    // Delivered through the daemon's production prompt-delivery RPC — the same
+    // guarded write-and-submit the deck uses for a seed or orchestrator prompt.
+    // What the orchestrator does with it (shell `dot-agent-deck delegate`) is the
+    // AGENT's own doing, which is the point: this is the decision path, not a
+    // test-issued CLI call.
     let directive = format!(
         "Use the Bash tool to run exactly this one command, then stop and say nothing \
          else: dot-agent-deck delegate --to coder --task \"{worker_task}\""
     );
-    let resp = common::attach_request_on(
+    let orchestrator_agent_id = role_states(deck.attach_socket_path(), ORCH)
+        .remove("orchestrator")
+        .expect("the dispatched orchestration has an `orchestrator` role state")
+        .agent_id;
+    let orchestrator_session_id = events.wait_for_session_start_on_pane(
+        &orchestrator_pane,
+        &orchestrator_agent_id,
+        Duration::from_secs(10),
+    );
+    let resp = common::write_and_submit_with_identity_on(
         deck.attach_socket_path(),
-        &AttachRequest::WriteAndSubmit {
-            pane_id: orchestrator_pane.clone(),
-            text: directive,
-        },
+        &orchestrator_pane,
+        &directive,
+        &orchestrator_agent_id,
+        Some(&orchestrator_session_id),
     )
     .expect("WriteAndSubmit to the dispatched orchestrator pane over the attach socket");
-    assert!(
-        resp.ok,
+    assert_eq!(
+        resp.send_result,
+        Some(SendResult::Applied),
         "the daemon refused to deliver the delegate directive to the dispatched \
-         orchestrator pane {orchestrator_pane}: {:?}",
-        resp.error
+         orchestrator pane {orchestrator_pane}: error={:?}, send_result={:?}",
+        resp.error,
+        resp.send_result
     );
 
     // Generous: an orchestrator turn, a `clear = false` worker's delivery, and a

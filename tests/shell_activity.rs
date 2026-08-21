@@ -33,6 +33,8 @@ use std::os::unix::process::CommandExt as _;
 #[cfg(unix)]
 use std::process::{Child, Command, Stdio};
 #[cfg(unix)]
+use std::sync::Arc;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -539,7 +541,7 @@ fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child
         ready = ready_marker.display(),
     );
 
-    let registry = AgentPtyRegistry::new();
+    let registry = Arc::new(AgentPtyRegistry::new());
     let id = registry
         .spawn_agent(SpawnOptions {
             command: Some(&command),

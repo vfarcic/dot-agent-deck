@@ -80,6 +80,46 @@ const WORKER_COMMAND: &str = "cat";
 /// consumed as a wrapper choice and never exported into the child).
 const TERM_RESISTANT_WORKER_COMMAND: &str = "trap '' TERM; exec cat";
 
+/// A worker that stays alive just long enough to receive its
+/// delegated task pointer, then ENDS ITS OWN PROCESS — no SIGTERM, no
+/// `StopAgent`, no explicit close of any kind. This is the whole scenario the
+/// EOF-triggered sweep exists for: a worker that genuinely finished (its
+/// session simply ended) without ever calling `work-done`, so the daemon's
+/// only signal that anything happened is `pump_reader` observing PTY EOF.
+///
+/// The fixed sleep's margin does NOT measure the delegate's guarded write
+/// landing — the property the EOF-triggered sweep actually depends on is
+/// earlier and cheaper than that: `dispatch_one_owned` calls
+/// `AgentPtyRegistry::bind_delegation_worker_agent_id` before it ever
+/// attempts the write, and it is the BIND, not the write, that lets the
+/// sweep's worker-side identity match find this record at all (an unbound
+/// record is left for its own timer instead — see
+/// `OutstandingDelegation::worker_agent_id`'s doc comment). If the worker
+/// exits before the bind lands, the test does not fail loudly at the delegate
+/// — it fails later at the notice-appears assertion, which reads as a
+/// product regression rather than a harness timing loss. This sleep is sized
+/// well above the ordinary poll-latency-plus-task-scheduling cost of the bind
+/// as a safety margin against a loaded CI runner; it is not a signal-driven
+/// wait because nothing in the current registry API lets a test observe the
+/// bind directly without a source change out of this fix's scope.
+const WORKER_EXITS_ON_ITS_OWN_COMMAND: &str =
+    "stty -echo -icanon -icrnl -opost min 1 time 0 && printf WORKER-READY && sleep 2.0";
+
+/// The daemon-authored opening clause of `compose_worker_exited_notice` — the
+/// EOF-triggered notice, distinct from both
+/// `IDLE_NEEDLE` (the timeout-based idle prompt) and the delegate-possibly-
+/// not-delivered silence notice. Spelled out here, not imported from `src/`,
+/// so a silent rewording of the notice fails this test instead of following
+/// it.
+const WORKER_EXITED_NEEDLE: &str =
+    "delegated worker exited without work-done (dot-agent-deck daemon report)";
+
+/// The daemon-authored opening clause of `compose_delegate_silence_notice` —
+/// the OLDER, timeout-based "possibly not delivered" notice the EOF-triggered
+/// sweep must also retire promptly rather than leaving it to run out its own
+/// window.
+const SILENCE_NEEDLE: &str = "delegate possibly not delivered (dot-agent-deck daemon report)";
+
 /// File the [`OrchestratorStub::ExitsOnFlag`] stub polls for. Its appearance in
 /// the harness cwd is the test's remote control for a NATURAL orchestrator exit.
 const NATURAL_EXIT_FLAG: &str = "orchestrator-exit.flag";
@@ -430,7 +470,7 @@ async fn start_attach_server(harness: &IdleHarness) -> AttachServer {
 /// into that pane appears exactly once in the agent's scrollback and nothing
 /// else does, so "no bytes were submitted" is directly observable.
 fn spawn_raw_cat_observer(
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     pane_id: &str,
     marker: &str,
     cwd: &str,
@@ -447,7 +487,7 @@ fn spawn_raw_cat_observer(
 /// keeping it absent is what leaves the `write_and_submit_guarded` agent-id gate
 /// as the only guard in `008`/`014`.
 fn spawn_raw_cat_observer_with_membership(
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     pane_id: &str,
     marker: &str,
     cwd: &str,
@@ -496,7 +536,7 @@ fn orchestrator_membership(cwd: &str) -> TabMembership {
 /// pane is never an observation target: the successor that inherits its pane id
 /// is.
 fn spawn_exit_on_flag_observer(
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     pane_id: &str,
     marker: &str,
     cwd: &str,
@@ -1027,6 +1067,104 @@ fn idle_worker_014_natural_orchestrator_exit_pane_id_reuse_receives_nothing() {
             !snapshot.contains("orphaned-worker"),
             "no fragment of the dead orchestration's delegation may reach the successor; \
              snapshot = {snapshot:?}"
+        );
+    });
+}
+
+/// Scenario: Delegate to a worker, let it receive the task pointer and then end its own process on its own — no SIGTERM, no StopAgent, no explicit close of any kind. The daemon's new EOF-triggered notice must appear in the orchestrator's pane well within the (much longer) idle-timeout and silence-window, with neither of the two OLDER timeout-based notices firing instead.
+#[spec("scheduler/idle-worker/016")]
+#[test]
+fn idle_worker_016_natural_worker_exit_retires_records_and_reports_promptly() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    // Both timeout watches resolve from this: the idle-timeout window is set
+    // directly, and the silence window is `min(this, 30s)` — 30s here. Both
+    // are far longer than the few hundred ms this test actually takes, so a
+    // notice appearing before either elapses can only have come from the
+    // EOF-triggered sweep, never from either timer running out.
+    let _env = EnvGuard::set(Some("60000"));
+    runtime().block_on(async {
+        let harness = IdleHarness::with_workers(
+            &[("vanishing-worker", WORKER_EXITS_ON_ITS_OWN_COMMAND)],
+            None,
+        )
+        .await;
+
+        let worker_pane_id = worker_pane("vanishing-worker");
+        let worker_agent_id = harness.worker_agent_ids["vanishing-worker"].clone();
+
+        // Wait for the worker's own readiness marker before delegating — the
+        // same precondition every other harness test in this file relies on
+        // (a delegate landing before termios is raw could be swallowed).
+        let ready = harness
+            .wait_for_snapshot_of(
+                &worker_agent_id,
+                |snapshot| snapshot.contains("WORKER-READY"),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            ready.contains("WORKER-READY"),
+            "the vanishing-worker stub never became ready; snapshot = {ready:?}"
+        );
+
+        harness.delegate(&["vanishing-worker"]).await;
+
+        // The worker's own script exits on its own shortly after — no
+        // StopAgent, no explicit close of any kind. Wait until the registry
+        // genuinely has no live owner for its pane, mirroring
+        // `end_orchestrator_process`'s freed-pane wait.
+        let freed = tokio::time::timeout(Duration::from_secs(5), async {
+            while harness
+                .registry
+                .pane_current_agent_id(&worker_pane_id)
+                .is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            freed.is_ok(),
+            "the vanishing-worker stub never exited on its own, so the scenario under test \
+             could not occur"
+        );
+        assert!(
+            !harness.registry.is_pane_closing(&worker_pane_id),
+            "the worker pane is in a CLOSE transition, so a deliberate close's own record sweep \
+             — not the EOF-triggered sweep — would be what retired the records, and this test \
+             would stop covering the natural-exit path"
+        );
+
+        // The notice must land promptly — well before either timeout watch's
+        // (60s / 30s) window could have fired it instead.
+        let snapshot = harness
+            .wait_for_snapshot(
+                |snapshot| snapshot.contains(WORKER_EXITED_NEEDLE),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            snapshot.contains(WORKER_EXITED_NEEDLE),
+            "no EOF-triggered 'worker exited without work-done' notice appeared in the \
+             orchestrator's pane within 5s of the worker's natural exit; snapshot = {snapshot:?}"
+        );
+        assert!(
+            snapshot.contains(&worker_pane_id),
+            "the notice must name the exited worker's pane so the orchestrator knows which \
+             worker to check; snapshot = {snapshot:?}"
+        );
+        assert_eq!(
+            idle_count(&snapshot),
+            0,
+            "the OLDER timeout-based idle prompt fired instead of (or alongside) the new \
+             EOF-triggered notice, meaning the sweep did not retire the OutstandingDelegation \
+             record before its own timer ran out; snapshot = {snapshot:?}"
+        );
+        assert!(
+            !snapshot.contains(SILENCE_NEEDLE),
+            "the OLDER timeout-based silence notice fired instead of (or alongside) the new \
+             EOF-triggered notice, meaning the sweep did not retire the SilenceWatchRecord \
+             before its own timer ran out; snapshot = {snapshot:?}"
         );
     });
 }

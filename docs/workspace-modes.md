@@ -153,11 +153,13 @@ A **thicker border** (`┃` rather than `│`) marks the currently focused pane.
 
 The focused pane's border **turns cyan only while you are typing into it**. In command mode every border — focused pane included — shows its agent's status color instead: green for working, blue for thinking, yellow for waiting on you, red for an error, gray for idle. So the border's *weight* tells you which pane `Enter` / `Ctrl+d` will drop you into, and its *color* tells you whether your keystrokes are reaching it yet.
 
-The border is not the only signal: a chip at the left of the bottom bar names the current mode — ` COMMAND ` or ` TYPING ` — in the same place on every tab, the focused pane carries a cursor only while you are typing into it, and entering command mode dims that pane and briefly overlays a `COMMAND MODE · Ctrl+D to type` banner. See [Which mode you're in](keyboard-shortcuts.md#which-mode-youre-in).
+The border is not the only signal: a chip at the left of the bottom bar names the current mode — ` COMMAND ` or ` TYPING ` — in the same place on every tab, the focused pane carries a cursor only while you are typing into it, and entering command mode dims that pane and briefly overlays a `COMMAND MODE — Ctrl+D to type` banner. See [Which mode you're in](keyboard-shortcuts.md#which-mode-youre-in).
 
 ### Reading a Pane in Command Mode
 
 Command mode is the safe resting state — the one mode in which a stray keystroke cannot reach an agent — and you can read in it. Pane content stays fully readable (dimmed, never blanked), and the focused agent pane scrolls there, by wheel and by `PageUp` / `PageDown`, just as side panes do in any mode. The wheel is never forwarded to the agent's mouse protocol in command mode, so a full-screen TUI running in the pane cannot scroll under you while you read.
+
+How far back a pane scrolls is decided by the agent running in it, not by the mode: an agent that repaints its transcript in place rather than letting lines scroll off the top leaves nothing to scroll back through, in command mode or any other. See [How far back you can scroll depends on the agent](keyboard-shortcuts.md#how-far-back-you-can-scroll-depends-on-the-agent).
 
 ### Typing Into a Pane
 

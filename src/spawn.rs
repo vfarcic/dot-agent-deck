@@ -781,7 +781,7 @@ pub async fn spawn(
 /// `membership`. Surfaces a spawn failure via the notifier.
 #[allow(clippy::too_many_arguments)]
 fn spawn_one(
-    registry: &AgentPtyRegistry,
+    registry: &Arc<AgentPtyRegistry>,
     command: Option<&str>,
     cwd: &str,
     pane_id: &str,
@@ -2316,7 +2316,7 @@ mod tests {
         }
     }
 
-    fn spawn_shell_target(registry: &AgentPtyRegistry, pane_id: &str) -> String {
+    fn spawn_shell_target(registry: &Arc<AgentPtyRegistry>, pane_id: &str) -> String {
         let command = crate::platform::shell::fixed_command_shell("/bin/sh");
         registry
             .spawn_agent(SpawnOptions {
@@ -2327,7 +2327,7 @@ mod tests {
             .expect("spawn shell observation target")
     }
 
-    fn spawn_byte_target(registry: &AgentPtyRegistry, pane_id: &str) -> String {
+    fn spawn_byte_target(registry: &Arc<AgentPtyRegistry>, pane_id: &str) -> String {
         spawn_typed_byte_target(registry, pane_id, None)
     }
 
@@ -2338,7 +2338,7 @@ mod tests {
     /// dispatch the deck exec'd on purpose. The PTY is a byte sink either way,
     /// so the two differ in exactly the input under test.
     fn spawn_typed_byte_target(
-        registry: &AgentPtyRegistry,
+        registry: &Arc<AgentPtyRegistry>,
         pane_id: &str,
         agent_type: Option<AgentType>,
     ) -> String {

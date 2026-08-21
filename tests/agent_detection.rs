@@ -134,6 +134,7 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 #[cfg(unix)]
 fn spawn_005_respawn_wraps_codex() {
     use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use std::sync::Arc;
 
     let fixture = common::harness_tempdir().expect("respawn recorder fixture");
     let bin_dir = fixture.path().join("bin");
@@ -166,7 +167,7 @@ fn spawn_005_respawn_wraps_codex() {
         .build()
         .expect("build respawn runtime");
     runtime.block_on(async {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         registry
             .spawn_agent(SpawnOptions {
                 command: Some("cat"),
@@ -210,6 +211,7 @@ fn spawn_005_respawn_wraps_codex() {
 #[cfg(unix)]
 fn spawn_006_explicit_codex_identity_wraps_noninferable_launcher() {
     use dot_agent_deck::agent_pty::{AgentPtyRegistry, SpawnOptions};
+    use std::sync::Arc;
 
     let fixture = common::harness_tempdir().expect("explicit Codex identity fixture");
     let bin_dir = fixture.path().join("bin");
@@ -234,7 +236,7 @@ fn spawn_006_explicit_codex_identity_wraps_noninferable_launcher() {
     // fake `dot-agent-deck` on the child's PATH is no longer what runs —
     // this override is the seam for observing it.
     let _wrap_bin = WrapBinOverride::pointing_at(&bin_dir.join("dot-agent-deck"));
-    let registry = AgentPtyRegistry::new();
+    let registry = Arc::new(AgentPtyRegistry::new());
     registry
         .spawn_agent(SpawnOptions {
             command: Some("devbox run codex-big"),
@@ -278,6 +280,7 @@ fn spawn_006_explicit_codex_identity_wraps_noninferable_launcher() {
 #[cfg(unix)]
 fn spawn_007_hook_learned_badge_does_not_change_respawn_launch() {
     use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use std::sync::Arc;
 
     let fixture = common::harness_tempdir().expect("stable respawn fixture");
     let bin_dir = fixture.path().join("bin");
@@ -312,7 +315,7 @@ fn spawn_007_hook_learned_badge_does_not_change_respawn_launch() {
         .build()
         .expect("build stable respawn runtime");
     runtime.block_on(async {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         registry
             .spawn_agent(SpawnOptions {
                 command: Some("devbox run codex-big"),
@@ -361,6 +364,7 @@ fn spawn_007_hook_learned_badge_does_not_change_respawn_launch() {
 #[cfg(unix)]
 fn spawn_008_respawn_wrap_decision_follows_the_launched_command() {
     use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use std::sync::Arc;
 
     let fixture = common::harness_tempdir().expect("launch-shape coherence fixture");
     let bin_dir = fixture.path().join("bin");
@@ -398,7 +402,7 @@ fn spawn_008_respawn_wrap_decision_follows_the_launched_command() {
         .build()
         .expect("build launch-shape coherence runtime");
     runtime.block_on(async {
-        let registry = AgentPtyRegistry::new();
+        let registry = Arc::new(AgentPtyRegistry::new());
         registry
             .spawn_agent(SpawnOptions {
                 command: Some("devbox run codex-big"),

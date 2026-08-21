@@ -61,8 +61,8 @@
 //! `work-done` over the socket and re-broadcasts), and a REAL `pi` worker PTY whose
 //! HOME carries the bundled extension, staged into the location pi resolves from
 //! that HOME (production materializes it at daemon startup; this in-process daemon
-//! bypasses that entry, so the test stages it) — spawned with `--provider openrouter --model
-//! openai/gpt-5-nano --approve`. `OPENROUTER_API_KEY` + `HOME` (+ the pane/socket/
+//! bypasses that entry, so the test stages it) — spawned with `--provider anthropic
+//! --model claude-haiku-4-5 --approve`. `ANTHROPIC_API_KEY` + `HOME` (+ the pane/socket/
 //! PATH vars) are explicitly propagated into the pi child's `opts.env`; the key is
 //! NEVER printed (only checked non-empty for the runtime-skip). HEADLESS — a
 //! functional proof, not a reel clip (the reel already showcases pi-as-orchestrator
@@ -75,7 +75,7 @@
 //!
 //! Tier: e2e (`#[cfg(feature = "e2e")]`) — spawns a real agent, hits a real model.
 //! Flaky-tolerant pre-PR tier (real LLM), run once, never looped. Runtime-skipped
-//! (Decision 26) when `pi` / `OPENROUTER_API_KEY` is absent.
+//! (Decision 26) when `pi` / `ANTHROPIC_API_KEY` is absent.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -95,9 +95,13 @@ use spec::spec;
 const ORCH_PANE: &str = "synthetic-orchestrator-pane";
 const WORKER_PANE: &str = "pi-worker-pane";
 const WORKER_ROLE: &str = "coder";
-/// Cheapest GPT-5.x tier on OpenRouter that reliably runs a directive turn (the
-/// same model `chain-smoke/pi/001` / `pi/live/002` pin).
-const PI_MODEL: &str = "openai/gpt-5-nano";
+/// Cheapest tier in pi's Anthropic catalog, and enough to run a directive
+/// turn (the same model `chain-smoke/pi/001` / `pi/live/002` pin).
+///
+/// TEMPORARY: the pi tier runs on Anthropic Haiku while the GPT accounts are
+/// without credit. The tier itself is provider-agnostic — moving it back is
+/// this constant plus the `--provider` flag and the key name below.
+const PI_MODEL: &str = "claude-haiku-4-5";
 /// The sentinel the pi worker must create. Distinctive + lands in a fresh tempdir
 /// cwd, so it is unique by construction and unambiguous. DISTINCT from the
 /// `chain-smoke/pi/001` (`7c3f`), `pi/live/001` (`4b1a`), and `pi/live/002`
@@ -109,7 +113,7 @@ const SENTINEL_CONTENT: &str = "PI_WORKER_SENTINEL_OK";
 // Non-polling helpers (kept in-file; all sleeping/polling is in `common`).
 // ---------------------------------------------------------------------------
 
-/// `pi` on PATH AND a non-empty `OPENROUTER_API_KEY`. The key is only checked for
+/// `pi` on PATH AND a non-empty `ANTHROPIC_API_KEY`. The key is only checked for
 /// presence — never printed or logged (it is a secret). Mirrors
 /// `e2e_pi_orchestrator.rs::check_pi_available`.
 fn check_pi_available() -> Result<(), String> {
@@ -124,9 +128,9 @@ fn check_pi_available() -> Result<(), String> {
     if !ok {
         return Err("pi CLI not installed (could not invoke `pi --version`)".into());
     }
-    match std::env::var("OPENROUTER_API_KEY") {
+    match std::env::var("ANTHROPIC_API_KEY") {
         Ok(k) if !k.trim().is_empty() => Ok(()),
-        _ => Err("OPENROUTER_API_KEY not set — real-pi worker e2e needs OpenRouter auth".into()),
+        _ => Err("ANTHROPIC_API_KEY not set — real-pi worker e2e needs Anthropic auth".into()),
     }
 }
 
@@ -231,7 +235,7 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
              start = true\n\n\
              [[orchestrations.roles]]\n\
              name = \"{WORKER_ROLE}\"\n\
-             command = \"pi --provider openrouter --model {PI_MODEL} --approve\"\n\
+             command = \"pi --provider anthropic --model {PI_MODEL} --approve\"\n\
              clear = true\n"
         ),
     )
@@ -252,15 +256,15 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
     )
     .expect("stage the bundled pi extension into the worker HOME");
 
-    // CRITICAL (harness caveat): explicitly propagate OPENROUTER_API_KEY + HOME
+    // CRITICAL (harness caveat): explicitly propagate ANTHROPIC_API_KEY + HOME
     // (+ pane/socket/PATH) into the pi child. Never print the key. The pi worker
     // runs `dot-agent-deck work-done` from its task-file footer (or the extension's
     // `work_done` tool), so it needs the built binary on PATH and the hook socket
     // via DOT_AGENT_DECK_SOCKET; DOT_AGENT_DECK_PANE_ID tags its work-done signal
     // with this worker pane (this is the minimal env the proven `claude` worker in
-    // `e2e_delegate_work_done_chain.rs` uses, plus pi's HOME + OpenRouter key).
-    let openrouter_key =
-        std::env::var("OPENROUTER_API_KEY").expect("checked non-empty by check_pi_available");
+    // `e2e_delegate_work_done_chain.rs` uses, plus pi's HOME + Anthropic key).
+    let anthropic_key =
+        std::env::var("ANTHROPIC_API_KEY").expect("checked non-empty by check_pi_available");
     let pi_env = vec![
         (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
         (
@@ -272,13 +276,13 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
             "HOME".to_string(),
             pi_home.path().to_str().expect("pi home UTF-8").to_string(),
         ),
-        ("OPENROUTER_API_KEY".to_string(), openrouter_key),
+        ("ANTHROPIC_API_KEY".to_string(), anthropic_key),
     ];
 
     // Spawn a cheap placeholder (`cat`, blocks on stdin) as the worker pane, NOT
     // pi. The `clear = true` delegate below RESPAWNS this pane into the REAL pi
     // (the toml `coder` role's command), reusing THIS spawn's captured env
-    // (OPENROUTER_API_KEY + HOME etc.) — so the respawned pi is the one under
+    // (ANTHROPIC_API_KEY + HOME etc.) — so the respawned pi is the one under
     // test and we pay for exactly one pi boot. The placeholder exists only to
     // give `respawn_agent_for_pane` a live target for `pane_id_env`.
     // The returned agent id is intentionally unused: the `clear = true` respawn

@@ -469,6 +469,19 @@ pub trait PaneController: Send + Sync {
     /// (which always target a live pane and don't talk to a daemon). The
     /// daemon-backed `EmbeddedPaneController` overrides it to carry the identity
     /// over the wire via `DaemonClient::write_and_submit_with_identity`.
+    ///
+    /// Issue #608 audit, finding 5: what the daemon refuses is the identity-less
+    /// WIRE SHAPE — a paned `write-and-submit` carrying no `expected_agent_id`
+    /// answers `no-live-target` with nothing written. It does not follow that the
+    /// identity-less METHOD is dead, and this comment used to say a daemon-backed
+    /// caller "must" come through here. It does not have to.
+    /// `EmbeddedPaneController`'s override of [`Self::write_and_submit_to_pane`]
+    /// deliberately remains a working fallback: it resolves the pane's current
+    /// owner itself and puts that agent id on the wire, so what it sends is a
+    /// shape the daemon accepts. What that override cannot supply is the SESSION
+    /// generation — daemon-side state the controller does not track — so a caller
+    /// that knows one (both production prompt-delivery paths in `ui.rs`) should
+    /// use THIS method, which can name the conversation as well as the agent.
     fn write_and_submit_to_pane_with_identity(
         &self,
         pane_id: &str,

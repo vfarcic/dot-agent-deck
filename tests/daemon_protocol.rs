@@ -1082,9 +1082,9 @@ fn pane_input_005_stream_rejects_key_and_paste_after_live_transition() {
     runtime.block_on(pane_input_005_stream_rejects_key_and_paste_after_live_transition_inner());
 }
 
-/// Scenario: Queue prompts for an agent and logical session, then replace either
-/// the agent or the same agent's conversation before delivery. The daemon must
-/// reject stale generations, including an expected session with no current match.
+/// Scenario: Queue prompts for paned agents, then omit or replace their agent or
+/// logical-session identity before delivery. The daemon must fail closed without
+/// writing, while exact identities and genuinely sessionless agents still deliver.
 #[spec("prompt/pane-input/009")]
 #[test]
 fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
@@ -1217,9 +1217,192 @@ fn pane_input_009_stale_prompt_does_not_reach_replacement_agent() {
         let missing_session_result = response.send_result;
         server.registry.close_agent(&agent_id).unwrap();
 
+        let server = start_server().await;
+        let pane_id = "pane-missing-expected-agent";
+        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        server.state.write().await.register_pane(pane_id.to_string());
+        let mut attached = connect_attach(&server, &agent_id).await;
+        let response = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'MISSING-EXPECTED-AGENT-LEAKED\n'",
+                "delivery_id": "missing-expected-agent-009"
+            }),
+        )
+        .await;
+        let missing_agent_leaked = stream_contains_within(
+            &mut attached,
+            b"MISSING-EXPECTED-AGENT-LEAKED",
+            Duration::from_millis(750),
+        )
+        .await;
+        let missing_agent_observation = (response.send_result, missing_agent_leaked);
+        server.registry.close_agent(&agent_id).unwrap();
+
+        let server = start_server().await;
+        let pane_id = "pane-current-session-requires-expected-session";
+        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        {
+            let mut state = server.state.write().await;
+            state.register_pane(pane_id.to_string());
+            state.apply_event(AgentEvent {
+                session_id: "current-required-session".to_string(),
+                agent_type: AgentType::Codex,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some(pane_id.to_string()),
+                agent_id: Some(agent_id.clone()),
+                agent_version: None,
+                schema_version: None,
+                live_target: Some(LiveTarget {
+                    kind: TargetKind::Pty,
+                    writable: Writable::Live,
+                }),
+            });
+        }
+        let mut attached = connect_attach(&server, &agent_id).await;
+        let unnamed_response = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'MISSING-EXPECTED-SESSION-LEAKED\n'",
+                "expected_agent_id": agent_id,
+                "delivery_id": "missing-expected-session-009"
+            }),
+        )
+        .await;
+        let unnamed_session_leaked = stream_contains_within(
+            &mut attached,
+            b"MISSING-EXPECTED-SESSION-LEAKED",
+            Duration::from_millis(750),
+        )
+        .await;
+        let matching_response = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'MATCHING-IDENTITY-DELIVERED\n'",
+                "expected_agent_id": agent_id,
+                "expected_session_id": "current-required-session",
+                "delivery_id": "matching-identity-009"
+            }),
+        )
+        .await;
+        let matching_identity_reached = stream_contains_within(
+            &mut attached,
+            b"MATCHING-IDENTITY-DELIVERED",
+            Duration::from_millis(750),
+        )
+        .await;
+        let session_guard_observation = (
+            unnamed_response.send_result,
+            unnamed_session_leaked,
+            matching_response.send_result,
+            matching_identity_reached,
+        );
+        server.registry.close_agent(&agent_id).unwrap();
+
+        let server = start_server().await;
+        let pane_id = "pane-unattached-current-session-requires-expected-session";
+        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        {
+            let mut state = server.state.write().await;
+            state.register_pane(pane_id.to_string());
+            state.apply_event(AgentEvent {
+                session_id: "unattached-current-session".to_string(),
+                agent_type: AgentType::Codex,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some(pane_id.to_string()),
+                agent_id: Some(agent_id.clone()),
+                agent_version: None,
+                schema_version: None,
+                live_target: Some(LiveTarget {
+                    kind: TargetKind::Pty,
+                    writable: Writable::Live,
+                }),
+            });
+        }
+        assert_eq!(
+            server.registry.receiver_count(&agent_id),
+            Some(0),
+            "the unattached regression case must have no attach subscriber"
+        );
+        let unattached_response = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'UNATTACHED-MISSING-EXPECTED-SESSION-LEAKED\n'",
+                "expected_agent_id": agent_id,
+                "delivery_id": "unattached-missing-expected-session-009"
+            }),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        let unattached_scrollback = server.registry.snapshot(&agent_id).unwrap();
+        let unattached_marker = b"UNATTACHED-MISSING-EXPECTED-SESSION-LEAKED";
+        let unattached_session_guard_observation = (
+            unattached_response.send_result,
+            unattached_scrollback
+                .windows(unattached_marker.len())
+                .any(|window| window == unattached_marker),
+        );
+        server.registry.close_agent(&agent_id).unwrap();
+
+        let server = start_server().await;
+        let pane_id = "pane-legitimately-sessionless";
+        let agent_id = start_plain_agent_for_pane(&server, "/bin/sh", pane_id).await;
+        server.state.write().await.register_pane(pane_id.to_string());
+        let mut attached = connect_attach(&server, &agent_id).await;
+        let response = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": pane_id,
+                "text": "printf 'SESSIONLESS-AGENT-DELIVERED\n'",
+                "expected_agent_id": agent_id,
+                "delivery_id": "sessionless-agent-009"
+            }),
+        )
+        .await;
+        let sessionless_reached = stream_contains_within(
+            &mut attached,
+            b"SESSIONLESS-AGENT-DELIVERED",
+            Duration::from_millis(750),
+        )
+        .await;
+        let sessionless_observation = (response.send_result, sessionless_reached);
+        server.registry.close_agent(&agent_id).unwrap();
+
         assert!(
-            same_agent_restart_rejected && missing_session_rejected,
-            "logical-session authorization must require an exact match; same_agent_restart=(result={:?}, leaked={old_prompt_reached_new_session}), missing_current=(result={:?}, leaked={prompt_reached_sessionless_target})",
+            same_agent_restart_rejected
+                && missing_session_rejected
+                && missing_agent_observation == (Some(SendResult::NoLiveTarget), false)
+                && session_guard_observation
+                    == (
+                        Some(SendResult::Stale),
+                        false,
+                        Some(SendResult::Applied),
+                        true,
+                    )
+                && unattached_session_guard_observation == (Some(SendResult::Stale), false)
+                && sessionless_observation == (Some(SendResult::Applied), true),
+            "guarded paned delivery must fail closed on absent identity without weakening valid sends; same_agent_restart=(result={:?}, leaked={old_prompt_reached_new_session}), missing_current=(result={:?}, leaked={prompt_reached_sessionless_target}), missing_agent={missing_agent_observation:?}, session_guard={session_guard_observation:?}, unattached_session_guard={unattached_session_guard_observation:?}, sessionless={sessionless_observation:?}",
             same_agent_result,
             missing_session_result
         );
@@ -1547,7 +1730,7 @@ fn pane_input_019_late_events_cannot_regress_or_clear_generation() {
     });
 }
 
-/// Scenario: Send guarded prompts to pane-less agents through the no-pane sentinel. A declared history-only target must reject both before and after the writer lock without receiving bytes, while a declared live target must still receive its prompt.
+/// Scenario: Send guarded prompts to pane-less agents through the no-pane sentinel. A missing agent identity and declared history-only targets must reject without bytes, including after the writer lock, while an identified live target still receives its prompt.
 #[spec("prompt/pane-input/020")]
 #[test]
 fn pane_input_020_paneless_guarded_send_resolves_writability_by_agent() {
@@ -1580,6 +1763,28 @@ fn pane_input_020_paneless_guarded_send_resolves_writability_by_agent() {
                 writable,
             }),
         };
+
+        let server = start_server().await;
+        let agent_id = start_agent(&server, "/bin/sh").await;
+        let mut attached = connect_attach(&server, &agent_id).await;
+        let unidentified_response = issue_json_request(
+            &server,
+            serde_json::json!({
+                "op": "write-and-submit",
+                "pane_id": "<no-pane>",
+                "text": "printf 'PANELESS-UNIDENTIFIED-LEAKED\n'",
+                "delivery_id": "paneless-unidentified-020"
+            }),
+        )
+        .await;
+        let unidentified_leaked = stream_contains_within(
+            &mut attached,
+            b"PANELESS-UNIDENTIFIED-LEAKED",
+            Duration::from_millis(500),
+        )
+        .await;
+        let unidentified_observation = (unidentified_response.send_result, unidentified_leaked);
+        server.registry.close_agent(&agent_id).unwrap();
 
         let server = start_server().await;
         let agent_id = start_agent(&server, "/bin/sh").await;
@@ -1700,7 +1905,8 @@ fn pane_input_020_paneless_guarded_send_resolves_writability_by_agent() {
         server.registry.close_agent(&agent_id).unwrap();
 
         assert!(
-            history_observation == (Some(SendResult::HistoryOnly), false)
+            unidentified_observation == (Some(SendResult::NoLiveTarget), false)
+                && history_observation == (Some(SendResult::HistoryOnly), false)
                 && post_lock_observation.0
                 && !matches!(
                     post_lock_observation.1,
@@ -1708,7 +1914,7 @@ fn pane_input_020_paneless_guarded_send_resolves_writability_by_agent() {
                 )
                 && !post_lock_observation.2
                 && live_observation == (Some(SendResult::Applied), true),
-            "guarded sends must resolve pane-less writability and routing by agent identity; pre_lock={history_observation:?}, post_lock={post_lock_observation:?}, live={live_observation:?}"
+            "guarded sends must resolve pane-less writability and routing by agent identity; unidentified={unidentified_observation:?}, pre_lock={history_observation:?}, post_lock={post_lock_observation:?}, live={live_observation:?}"
         );
     });
 }

@@ -7,7 +7,9 @@ mod common;
 use std::time::Duration;
 
 use common::TuiDeck;
+use dot_agent_deck::daemon_client::DaemonClient;
 use dot_agent_deck::daemon_protocol::AttachRequest;
+use dot_agent_deck::event::SendResult;
 use serde_json::json;
 use spec::spec;
 
@@ -22,8 +24,8 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 
 /// Scenario: Launch a real dashboard with a long-lived synthetic pane, then
 /// identify its Codex session as history-only through a synthetic hook event.
-/// An atomic send must report `history-only`, and attempting to enter that card
-/// from the dashboard must retain the card and visibly explain why input was not sent.
+/// An unidentified atomic send must fail closed, while an identified send and
+/// dashboard entry still report and visibly explain the history-only target.
 #[spec("prompt/pane-input/004")]
 #[test]
 fn pane_input_004_history_only_send_reports_result_and_feedback() {
@@ -60,7 +62,7 @@ fn pane_input_004_history_only_send_reports_result_and_feedback() {
         .expect("inject history-only Codex SessionStart");
     deck.wait_for_absence("No agent");
 
-    let response = common::attach_request_on(
+    let unidentified_response = common::attach_request_on(
         deck.attach_socket_path(),
         &AttachRequest::WriteAndSubmit {
             pane_id: pane_id.clone(),
@@ -68,8 +70,22 @@ fn pane_input_004_history_only_send_reports_result_and_feedback() {
         },
     )
     .expect("send input request");
-    let response_json = serde_json::to_value(response).expect("serialize send response");
-    let send_result = response_json.get("send_result").cloned();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build identity-bearing send runtime");
+    let identified_result = runtime
+        .block_on(
+            DaemonClient::new(deck.attach_socket_path().to_path_buf())
+                .write_and_submit_with_identity(
+                    &pane_id,
+                    "this identified send must not reach a history-only target",
+                    Some(&agent_id),
+                    Some("history-codex-session"),
+                    Some("history-only-identified-004"),
+                ),
+        )
+        .expect("send identified input request");
 
     deck.send_keys(b"1");
     let feedback = "History-only session cannot accept live input";
@@ -77,9 +93,14 @@ fn pane_input_004_history_only_send_reports_result_and_feedback() {
     let grid = deck.snapshot_grid();
 
     assert_eq!(
-        send_result,
-        Some(json!("history-only")),
-        "the daemon must return the honest history-only SendResult; feedback_visible={feedback_visible}\nFinal grid:\n{grid}"
+        unidentified_response.send_result,
+        Some(SendResult::NoLiveTarget),
+        "an unidentified paned send must fail closed as no-live-target; feedback_visible={feedback_visible}\nFinal grid:\n{grid}"
+    );
+    assert_eq!(
+        identified_result,
+        SendResult::HistoryOnly,
+        "an identified send must preserve the honest history-only result; feedback_visible={feedback_visible}\nFinal grid:\n{grid}"
     );
     assert!(
         feedback_visible,
