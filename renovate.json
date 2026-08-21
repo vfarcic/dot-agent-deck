@@ -22,7 +22,7 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "The Rust toolchain pinned in every workflow (`toolchain: 1.97.1`, matching devbox.json). The github-actions manager cannot see this: it reads the `uses:` ref, and dtolnay/rust-toolchain publishes toolchain versions as BRANCHES with only a `v1` tag, so pinning the ref instead (`@1.97.1`) would be a version Renovate could never bump. Pinning the action at `@v1` and passing the toolchain as an input splits the two concerns — the github-actions rule bumps the action, this manager bumps the toolchain. Without it the pin would silently rot, which is the failure mode that made floating `@stable` attractive in the first place.",
+      "description": "The Rust toolchain pinned in every workflow (`toolchain: 1.97.1`, matching devbox.json). dtolnay/rust-toolchain publishes toolchain versions as BRANCHES with only a `v1` tag, so pinning the ref instead (`@1.97.1`) would be a version Renovate could never bump; the action stays at `@v1` and the toolchain rides an input, which splits the two concerns — the github-actions rule bumps the action, this manager bumps the toolchain. Without it the pin would silently rot, which is the failure mode that made floating `@stable` attractive in the first place. CORRECTION (2026-08-21): this description used to open 'The github-actions manager cannot see this: it reads the `uses:` ref.' That is FALSE now and the falsehood had teeth. Renovate's github-actions manager carries a registry of community actions whose version lives in an INPUT rather than the ref (`lib/modules/manager/github-actions/community.ts`), and `dtolnay/rust-toolchain` is in it: it reads the same `toolchain:` string this manager matches and emits it as depName `rust`, depType `uses-with`, datasource `rust-version`. So the toolchain now arrives down TWO lanes, and until the `uses-with` packageRule below was added the second one landed in the automerging `GitHub Actions` group — PR #623 (`renovate/github-actions`, automerge enabled, no `manual-review` label) and PR #624 (this manager's lane, held) proposed byte-identical 1.97.1 -> 1.98.0 diffs on the same day. Only an unrelated red CI kept #623 from merging itself. The duplicate PR is now deliberate and is NOT suppressed: both lanes are held for a human, and two independent detectors on a pin whose named failure mode is SILENT ROT are worth one redundant PR per Rust release. They self-resolve — the lanes edit the same lines, so merging either makes the other conflict and `rebaseWhen: conflicted` autocloses it.",
       "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
       "matchStrings": ["toolchain:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
       "datasourceTemplate": "github-releases",
@@ -31,7 +31,7 @@
     },
     {
       "customType": "regex",
-      "description": "The cargo-nextest version pinned in every workflow (`tool: cargo-nextest@0.9.140`, matching devbox.json). Same reasoning as the toolchain manager above: taiki-e/install-action is pinned at `@v2` and the tool version rides an input, so only a custom manager can see it.",
+      "description": "The cargo-nextest version pinned in every workflow (`tool: cargo-nextest@0.9.140`, matching devbox.json). Same reasoning as the toolchain manager above: taiki-e/install-action is pinned at `@v2` and the tool version rides an input. `taiki-e/install-action` is NOT in Renovate's community-actions registry today (checked 2026-08-21), so this manager is currently the only lane that sees the pin — but that is exactly what was true of `dtolnay/rust-toolchain` until it was added, so the claim is written as an expiry date rather than a property. The `uses-with` rule below holds this pin the day the registry grows an entry for it, WITHOUT anyone having to notice.",
       "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
       "matchStrings": ["tool:\\s*cargo-nextest@(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
       "datasourceTemplate": "crate",
@@ -84,17 +84,26 @@
     },
     {
       "matchManagers": ["github-actions"],
+      "matchDepTypes": ["action"],
       "matchUpdateTypes": ["digest", "pin", "patch", "minor"],
       "groupName": "GitHub Actions",
       "automerge": true,
-      "automergeType": "pr"
+      "automergeType": "pr",
+      "description": "Automerge covers ACTION REFS ONLY — `uses: owner/repo@ref`, which is depType `action`. This is a WHITELIST on purpose, and `matchDepTypes` is the load-bearing line in it. The github-actions manager emits six depTypes (`action`, `docker`, `container`, `service`, `github-runner`, `uses-with`), and this rule used to match the manager with no depType filter at all, so it automerged every one of them — including tool versions read out of an action's INPUTS. That is how the Rust toolchain pin acquired an automerging lane (see the customManager description above and the `uses-with` rule below). Whitelisting rather than excluding the one dep name observed misbehaving is the point: Renovate's input-detection registry is a list that GROWS, so a blacklist is only ever correct until the next release, whereas anything this manager learns to detect tomorrow falls OUTSIDE this rule and is held by default. The cost of being wrong in this direction is a PR someone has to click; in the other direction it is an unreviewed toolchain change on main."
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "matchDepTypes": ["uses-with", "docker", "container", "service", "github-runner"],
+      "automerge": false,
+      "labels": ["dependencies", "manual-review"],
+      "description": "Everything the github-actions manager extracts that is NOT an action ref is held for a human and labelled. Stated as its own rule rather than left to Renovate's automerge default, matching the convention of the 0.x-minor rule above: a hold that exists only as an absence is invisible on the PR page and impossible to grep for. `uses-with` is the one that matters here — it is a version string embedded in an action's inputs, which for this repo means the Rust toolchain (`dtolnay/rust-toolchain`'s `toolchain:`) and the docs site's Node (`actions/setup-node`'s `node-version:`), i.e. two TOOLCHAINS wearing a GitHub Actions costume. A toolchain bump is not an action bump: it changes what compiles, it is where new deny-by-default rustc lints and clippy lints arrive, and in this repo it must move in lockstep with devbox.json by hand. Worse, before this rule the toolchain rode the `GitHub Actions` GROUP, so a Rust bump could arrive bundled inside a PR titled 'update GitHub Actions' alongside a handful of ordinary `@v7` bumps and automerge without ever being read on its own. The remaining depTypes (container/service/docker images, `runs-on:` runner versions) are listed for completeness — this repo has none today, and if it grows one, a base image or runner change is also not something to land unread."
     },
     {
       "matchManagers": ["custom.regex"],
       "matchDepNames": ["rust-lang/rust", "cargo-nextest"],
       "automerge": false,
       "labels": ["dependencies", "manual-review"],
-      "description": "The workflow toolchain pins are held for a human even on a patch. They must stay in lockstep with devbox.json's rustc/cargo/clippy/rustfmt and cargo-nextest pins — that lockstep is the whole point of pinning them, and nothing enforces it automatically — so each PR needs the matching devbox bump alongside it. A Rust patch release is also exactly where a new clippy lint appears, which is a `-D warnings` failure to read rather than automerge."
+      "description": "The workflow toolchain pins are held for a human even on a patch. They must stay in lockstep with devbox.json's rustc/cargo/clippy/rustfmt and cargo-nextest pins — that lockstep is the whole point of pinning them, and nothing enforces it automatically — so each PR needs the matching devbox bump alongside it. A Rust patch release is also exactly where a new clippy lint appears, which is a `-D warnings` failure to read rather than automerge. This rule is scoped to a MANAGER and a set of dep NAMES, so it only ever covered the lane this repo's customManagers create. It is no longer the only hold on these pins and must not be read as one: the same `toolchain:` string is also seen by the github-actions manager under a different dep name, and the depType rules above are what close that lane and any future one. Keep both — this one says WHY the pin is held, those say WHERE ELSE it can be reached from."
     },
     {
       "matchManagers": ["npm"],
