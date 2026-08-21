@@ -68,6 +68,11 @@
 //! Exits 0 on success, 1 on any failure with a per-finding summary.
 
 mod clean_tmp;
+/// Issue #603: the adaptive issue labeler's post-agent memory validator. Tests
+/// only — the rule lives in the agentic workflow, and these drive the real
+/// script under `node`.
+#[cfg(test)]
+mod issue_labeler_memory;
 mod list_tests;
 mod repo_state;
 /// Issue #521: the `/verify-pr` scripts' `KEY=value` output contract. Tests
