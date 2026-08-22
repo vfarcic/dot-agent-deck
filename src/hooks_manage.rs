@@ -163,9 +163,11 @@ fn refuse_symlinked_destination(path: &Path) -> io::Result<()> {
 /// temp beside it.
 ///
 /// Mode is taken from the destination, or 0600 when the file is new. This is
-/// the fix #382 records for `codex_hooks_manage::write_atomic` and #360 already
-/// applied to `devin_hooks_manage` (`:342-375`), and it is load-bearing
-/// precisely BECAUSE this switches to a rename: `File::create` applies
+/// the same fix #360 applied to the Devin adapter and #382 then applied to the
+/// Codex one — both now share it via [`crate::agent_hook_config::write_atomic`],
+/// which this deliberately does not use (see that module's header: only this
+/// copy publishes through `create_new`). It is load-bearing precisely BECAUSE
+/// this switches to a rename: `File::create` applies
 /// `0666 & !umask` — 0644 under a typical 022 umask, 0664 under 002 — and the
 /// rename would then replace the destination with that wider file. An in-place
 /// `std::fs::write` never had that exposure, so publishing atomically without

@@ -1072,11 +1072,11 @@ fn hook_rule_identification_022_concurrent_installs_never_tear_or_lose_updates()
 /// This is the guard for the specific hazard a temp-file+rename publish
 /// introduces and an in-place `std::fs::write` does not have: `File::create`
 /// applies `0666 & !umask` — 0644 under a typical 022 umask, 0664 under 002 —
-/// and the `rename` then replaces the destination with that wider file. #382
-/// records the same defect in `codex_hooks_manage::write_atomic`, and #360
-/// fixed it in `devin_hooks_manage` where a real install ships the config at
-/// 0600; this pins it for Claude's adapter at the moment the publish switches
-/// to a rename, so the fix for #534 cannot introduce #382's bug here.
+/// and the `rename` then replaces the destination with that wider file. #360
+/// fixed it in the Devin adapter, where a real install ships the config at
+/// 0600, and #382 fixed it in the Codex one and moved both onto a shared
+/// helper; this pins it for Claude's adapter at the moment the publish switches
+/// to a rename, so the fix for #534 cannot reintroduce that bug here.
 #[cfg(unix)]
 #[test]
 fn hook_rule_identification_023_install_never_widens_settings_permissions() {

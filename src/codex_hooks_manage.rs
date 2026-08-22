@@ -153,19 +153,6 @@ fn rule_is_dot_agent_deck(rule: &Value) -> bool {
         })
 }
 
-/// Build the deck's hook command for `binary_path`, robustly quoting the
-/// executable path so a path containing whitespace or shell metacharacters still
-/// produces a valid command that Codex parses to the intended argv (finding #14 /
-/// L-1). A "safe" path (only path-typical characters) is emitted verbatim so the
-/// common case stays human-readable and stable; anything else is single-quoted
-/// with embedded single quotes escaped.
-fn build_command(binary_path: &str) -> String {
-    format!(
-        "{} {HOOK_COMMAND_SUFFIX}",
-        crate::platform::paths::shell_quote_if_needed(binary_path)
-    )
-}
-
 /// Merge the deck's command hooks for `command` into an existing `hooks.json`
 /// value (or `{}`), preserving any user-authored hooks and refreshing (not
 /// duplicating) prior deck entries.
@@ -236,34 +223,6 @@ fn validate_structure(root: &Value) -> io::Result<()> {
     Ok(())
 }
 
-/// Atomically publish `bytes` to `dest` by writing a temp file in the SAME
-/// directory (so `rename(2)` stays on one filesystem and is atomic) and renaming
-/// over `dest`. A crash mid-write leaves either the old file or the temp file
-/// intact — never a truncated `dest` (finding #1/M-2).
-///
-/// The temp name is derived from `dest`'s file name (`.<name>.tmp.<pid>`) so the
-/// same publish discipline covers both `hooks.json` and — for scoped trust
-/// (§4.1.2) — the user's `config.toml`, without two files racing on one temp path.
-fn write_atomic(dir: &Path, dest: &Path, bytes: &[u8]) -> io::Result<()> {
-    let name = dest
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("hooks.json");
-    let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
-    {
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    match std::fs::rename(&tmp, dest) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
-}
-
 /// Testable core: merge the deck's hooks into `<codex_home>/hooks.json`, writing
 /// the file atomically (creating the home dir if needed). `binary_path` is the
 /// absolute `dot-agent-deck` path the hook command should invoke.
@@ -303,10 +262,10 @@ pub fn install_to(codex_home: &Path, binary_path: &str) -> std::io::Result<()> {
 
     validate_structure(&root)?;
 
-    let command = build_command(binary_path);
+    let command = crate::agent_hook_config::build_command(binary_path, HOOK_COMMAND_SUFFIX);
     install_impl(&mut root, &command);
     let contents = serde_json::to_string_pretty(&root)?;
-    write_atomic(codex_home, &path, contents.as_bytes())
+    crate::agent_hook_config::write_atomic(codex_home, &path, contents.as_bytes())
 }
 
 /// Whether the active `CODEX_HOME`'s `hooks.json` declares any command hook NOT
@@ -437,7 +396,7 @@ pub fn uninstall_from(codex_home: &Path) -> std::io::Result<()> {
         hooks.retain(|_, value| !value.as_array().is_some_and(|arr| arr.is_empty()));
     }
     let contents = serde_json::to_string_pretty(&root)?;
-    write_atomic(codex_home, &path, contents.as_bytes())
+    crate::agent_hook_config::write_atomic(codex_home, &path, contents.as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -811,7 +770,7 @@ fn edit_trust_state(home: &Path, edit: impl FnOnce(&mut toml_edit::Table)) -> st
 
     edit(state);
 
-    write_atomic(home, &path, doc.to_string().as_bytes())
+    crate::agent_hook_config::write_atomic(home, &path, doc.to_string().as_bytes())
 }
 
 /// Insert or refresh one `[hooks.state."<key>"] { enabled, trusted_hash }` record.
@@ -980,6 +939,91 @@ mod tests {
         assert_eq!(
             deck_rules, 1,
             "deck hook present exactly once after re-install"
+        );
+    }
+
+    /// The atomic publish must never widen the files it rewrites. `hooks.json`
+    /// carries the deck's own hook commands, but `config.toml` is the user's
+    /// real Codex config — model choice, auth references, hook-trust records and
+    /// anything they hand-wrote — so a `File::create` default of 0644 (under a
+    /// typical 022 umask) or 0664 (under 002) would expose it to every local
+    /// account the first time the deck installed or trusted its hooks. Mirrors
+    /// `devin_hooks_manage::tests::install_never_widens_config_permissions`
+    /// (#360), for the copy that kept the bug (#382).
+    #[cfg(unix)]
+    #[test]
+    fn install_and_trust_never_widen_config_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode_of = |path: &Path| {
+            std::fs::metadata(path)
+                .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let restrict = |path: &Path| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict fixture to 0600");
+        };
+        let trust = |home: &Path| {
+            edit_trust_state(home, |state| {
+                upsert_trust_record(state, "deck-hook", "abc123");
+            })
+            .expect("record trust");
+        };
+
+        // Files the deck creates itself are owner-only, not umask-dependent.
+        let fresh = crate::test_temp::tempdir().expect("codex home tempdir");
+        install_to(fresh.path(), "/abs/dot-agent-deck").expect("install");
+        trust(fresh.path());
+        assert_eq!(
+            mode_of(&fresh.path().join("hooks.json")),
+            0o600,
+            "a deck-created hooks.json must be owner-only"
+        );
+        assert_eq!(
+            mode_of(&fresh.path().join(CONFIG_TOML)),
+            0o600,
+            "a deck-created config.toml must be owner-only"
+        );
+
+        // An existing owner-only Codex home stays owner-only across install,
+        // trust and uninstall — all three go through the same atomic publish.
+        let existing = crate::test_temp::tempdir().expect("codex home tempdir");
+        let hooks = existing.path().join("hooks.json");
+        let config = existing.path().join(CONFIG_TOML);
+        std::fs::write(&hooks, b"{}").unwrap();
+        std::fs::write(&config, b"model = \"gpt-5\"\n").unwrap();
+        restrict(&hooks);
+        restrict(&config);
+
+        install_to(existing.path(), "/abs/dot-agent-deck").expect("install");
+        trust(existing.path());
+        assert_eq!(
+            mode_of(&hooks),
+            0o600,
+            "install must not widen an owner-only hooks.json"
+        );
+        assert_eq!(
+            mode_of(&config),
+            0o600,
+            "recording trust must not widen an owner-only config.toml"
+        );
+
+        uninstall_from(existing.path()).expect("uninstall");
+        assert_eq!(
+            mode_of(&hooks),
+            0o600,
+            "uninstall must not widen an owner-only hooks.json"
+        );
+
+        // The user's own config bytes survive the trust edit that preserved the
+        // mode, so the assertion above is not passing over a clobbered file.
+        let contents = std::fs::read_to_string(&config).expect("read config.toml");
+        assert!(
+            contents.contains("model = \"gpt-5\""),
+            "trust edit must preserve unrelated config; got {contents}"
         );
     }
 }
