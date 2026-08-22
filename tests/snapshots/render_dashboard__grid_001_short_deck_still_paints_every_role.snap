@@ -1,0 +1,25 @@
+---
+source: tests/render_dashboard.rs
+expression: rendered
+---
+ dot-agent-deck — 7 session(s)                                                            
+┏ ▸ 1 ClaudeCode · orchestrator ━━━━ ● Idle ┓┌ 2 ClaudeCode · developer ───────── ● Idle ┐
+┃Dir:  dot-agent-deck                       ┃│Dir:  dot-agent-deck                       │
+┃                                           ┃│                                           │
+┃                                           ┃│                                           │
+┗━━━━━━━━━━━━━━━━━━━━━━━ Last: 0s  Tools: 0 ┛└─────────────────────── Last: 0s  Tools: 0 ┘
+┌ 3 ClaudeCode · tester ──────────── ● Idle ┐┌ 4 ClaudeCode · reviewer ────────── ● Idle ┐
+│Dir:  dot-agent-deck                       ││Dir:  dot-agent-deck                       │
+│                                           ││                                           │
+│                                           ││                                           │
+└─────────────────────── Last: 0s  Tools: 0 ┘└─────────────────────── Last: 0s  Tools: 0 ┘
+┌ 5 ClaudeCode · releaser ────────── ● Idle ┐┌ 6 ClaudeCode · researcher ──────── ● Idle ┐
+│Dir:  dot-agent-deck                       ││Dir:  dot-agent-deck                       │
+│                                           ││                                           │
+│                                           ││                                           │
+└─────────────────────── Last: 0s  Tools: 0 ┘└─────────────────────── Last: 0s  Tools: 0 ┘
+┌ 7 ClaudeCode · documenter ──────── ● Idle ┐                                             
+│Dir:  dot-agent-deck                       │                                             
+│                                           │                                             
+│                                           │                                             
+└─────────────────────── Last: 0s  Tools: 0 ┘

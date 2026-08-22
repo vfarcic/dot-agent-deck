@@ -15,9 +15,9 @@ use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
     CardDensityKind, UiMode, card_stats_border_label, render_card_for_mode_to_buffer,
-    render_card_to_buffer, render_config_gen_prompt_to_buffer, render_dashboard_cards_to_buffer,
-    render_quit_confirm_to_buffer, render_star_prompt_to_buffer, render_stats_bar_to_buffer,
-    render_stop_confirm_to_buffer, sync_and_derive_selection,
+    render_card_grid_to_buffer, render_card_to_buffer, render_config_gen_prompt_to_buffer,
+    render_dashboard_cards_to_buffer, render_quit_confirm_to_buffer, render_star_prompt_to_buffer,
+    render_stats_bar_to_buffer, render_stop_confirm_to_buffer, sync_and_derive_selection,
 };
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
@@ -2292,4 +2292,229 @@ fn pane_011_multibyte_session_id_renders_the_whole_deck() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// dashboard/grid — the card grid's joint column/density layout (issue #588)
+// ---------------------------------------------------------------------------
+
+/// The seven roles of the orchestration that reported issue #588, in the order
+/// its `.dot-agent-deck.toml` listed them. Positions 6 and 7 — `researcher` and
+/// `documenter` — are the two that were never painted.
+const REPORTED_ROLES: [&str; 7] = [
+    "orchestrator",
+    "developer",
+    "tester",
+    "reviewer",
+    "releaser",
+    "researcher",
+    "documenter",
+];
+
+/// One live role card. `last_activity` is nudged 30s into the future for the
+/// reason `pane_004_card_title_row` documents: `Last:` is computed from
+/// `Utc::now()` at render time, so an equal timestamp sits on the `0s`/`1s`
+/// boundary and tips snapshots under parallel test load.
+fn role_session(index: usize, role: &str) -> SessionState {
+    let now = chrono::Utc::now();
+    SessionState {
+        session_id: format!("sess-role-{index:02}"),
+        agent_type: AgentType::ClaudeCode,
+        cwd: Some("/home/dev/dot-agent-deck".to_string()),
+        status: SessionStatus::Idle,
+        active_tool: None,
+        started_at: now,
+        last_activity: now + chrono::Duration::seconds(30),
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: None,
+        first_prompts: Vec::new(),
+        pane_id: Some(format!("pane-role-{index:02}")),
+        agent_id: Some(format!("agent-role-{index:02}")),
+        display_name: Some(role.to_string()),
+        shell_synthetic_working: false,
+    }
+}
+
+fn reported_role_sessions() -> Vec<SessionState> {
+    REPORTED_ROLES
+        .iter()
+        .enumerate()
+        .map(|(i, role)| role_session(i, role))
+        .collect()
+}
+
+fn as_cards(sessions: &[SessionState]) -> Vec<(&SessionState, Option<&str>)> {
+    sessions
+        .iter()
+        .map(|s| (s, s.display_name.as_deref()))
+        .collect()
+}
+
+/// How many card columns the buffer actually shows, counted from the top border
+/// row of the first card row: each card contributes exactly one `┌` (or `┏` when
+/// selected). Derived from what was drawn rather than from the layout code, so
+/// this is an independent witness of the column count.
+fn drawn_columns(rendered: &str) -> usize {
+    rendered
+        .lines()
+        .map(|line| line.matches('┌').count() + line.matches('┏').count())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Scenario: Render the reported seven-role orchestration into a 90x27 deck —
+/// too short for seven single-column cards at any density — and assert every one
+/// of the seven role names is on screen. A 90x60 control deck, which already
+/// fitted them before the fix, renders the same seven.
+#[spec("dashboard/grid/001")]
+#[test]
+fn grid_001_short_deck_still_paints_every_role() {
+    let sessions = reported_role_sessions();
+    let cards = as_cards(&sessions);
+
+    // The reported geometry. 27 rows less the title and stats-bar rows leaves
+    // 25 for cards; seven single-column Compact cards need 7*5 = 35, so the old
+    // width-only column choice sliced to the five rows that fit and painted
+    // `orchestrator … releaser`, dropping `researcher` and `documenter`. Two
+    // columns need only 7.div_ceil(2) * 5 = 20 rows, and 90 columns is two cards
+    // of 45 — comfortably past MIN_CARD_W.
+    let (buffer, probe) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 27);
+    let rendered = buffer_to_text(&buffer);
+
+    for role in REPORTED_ROLES {
+        assert!(
+            rendered.contains(role),
+            "every role of a seven-role orchestration must be painted on a 90x27 deck; \
+             `{role}` is missing:\n{rendered}"
+        );
+    }
+    assert_eq!(
+        probe.visible_rows, probe.total_rows,
+        "no card row may be sliced off when a layout exists that fits them all:\n{rendered}"
+    );
+    assert_eq!(
+        drawn_columns(&rendered),
+        2,
+        "fitting seven cards in 25 rows takes a second column:\n{rendered}"
+    );
+    insta::assert_snapshot!(rendered);
+
+    // Control: the same seven roles on a deck tall enough that one column always
+    // fitted them. If this one failed too, the fixture — not the height — would
+    // be what the assertion above is really measuring.
+    let (tall_buffer, tall_probe) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 60);
+    let tall = buffer_to_text(&tall_buffer);
+    for role in REPORTED_ROLES {
+        assert!(
+            tall.contains(role),
+            "control: a tall deck must still paint `{role}`:\n{tall}"
+        );
+    }
+    assert_eq!(
+        drawn_columns(&tall),
+        1,
+        "control: a deck that already fits one column must keep one column — \
+         widening is only ever spent on completeness:\n{tall}"
+    );
+    assert_eq!(tall_probe.visible_rows, tall_probe.total_rows);
+}
+
+/// Scenario: Sweep deck geometries from one column to an escalated two, and for
+/// each compare `UiState::columns` — the value left/right card navigation reads
+/// — against the number of card columns actually drawn in the buffer. Selection
+/// movement and the rendered grid must never disagree about the column count.
+#[spec("dashboard/grid/002")]
+#[test]
+fn grid_002_nav_columns_match_the_drawn_grid() {
+    let sessions = reported_role_sessions();
+
+    // (cards, width, height, what the case exercises)
+    let cases: [(usize, u16, u16, &str); 6] = [
+        (3, 90, 40, "narrow deck, everything fits in one column"),
+        (
+            7,
+            90,
+            60,
+            "narrow deck, tall enough for seven single-column cards",
+        ),
+        (
+            7,
+            90,
+            27,
+            "narrow deck escalated to two columns to fit all seven",
+        ),
+        (7, 120, 27, "wide deck already at two columns"),
+        (7, 200, 20, "three columns from width alone"),
+        (
+            7,
+            90,
+            12,
+            "nothing fits — the grid stays sliced at one column",
+        ),
+    ];
+
+    for (count, width, height, what) in cases {
+        let cards = as_cards(&sessions[..count]);
+        let (buffer, probe) = render_card_grid_to_buffer(&cards, Some(0), 0, width, height);
+        let rendered = buffer_to_text(&buffer);
+        assert_eq!(
+            probe.nav_columns,
+            drawn_columns(&rendered),
+            "{what}: card navigation reads {} columns while {} were drawn at {width}x{height} \
+             — arrow-key movement would step somewhere the user is not looking:\n{rendered}",
+            probe.nav_columns,
+            drawn_columns(&rendered),
+        );
+    }
+}
+
+/// Scenario: Render seven roles into a 90x12 deck, too small for them at any
+/// column count the width allows, and assert the two cards that do fit are
+/// accompanied by a `(↓5)` marker in the title. A hidden role must never be
+/// silently indistinguishable from a role that failed to start.
+#[spec("dashboard/grid/003")]
+#[test]
+fn grid_003_unavoidable_overflow_is_signalled() {
+    let sessions = reported_role_sessions();
+    let cards = as_cards(&sessions);
+
+    // 12 rows less title and stats bar leaves 10: two Compact cards. Two columns
+    // would need 7.div_ceil(2) * 5 = 20, so no layout 90 columns allows fits.
+    let (buffer, probe) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 12);
+    let rendered = buffer_to_text(&buffer);
+    let title = rendered.lines().next().expect("a rendered title row");
+
+    assert!(
+        probe.visible_rows < probe.total_rows,
+        "fixture must genuinely overflow, or this test proves nothing:\n{rendered}"
+    );
+    assert!(
+        title.contains("(↓5)"),
+        "a sliced grid must count the cards it is not showing in its title:\n{title}"
+    );
+    assert!(
+        title.contains("7 session(s)"),
+        "the title must still name the full role count:\n{title}"
+    );
+    assert_eq!(
+        drawn_columns(&rendered),
+        1,
+        "when no layout fits, the deck keeps the columns it has always had — \
+         narrowing every card buys nothing once completeness is out of reach:\n{rendered}"
+    );
+    insta::assert_snapshot!(rendered);
+
+    // Scrolled to the bottom: the marker must flip to counting what is above.
+    let (scrolled, _) = render_card_grid_to_buffer(&cards, Some(6), 0, 90, 12);
+    let scrolled_title = buffer_to_text(&scrolled)
+        .lines()
+        .next()
+        .expect("a rendered title row")
+        .to_string();
+    assert!(
+        scrolled_title.contains("(↑5)"),
+        "selecting the last card scrolls five cards above the window, and the \
+         title must say so:\n{scrolled_title}"
+    );
 }

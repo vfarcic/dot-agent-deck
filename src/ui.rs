@@ -132,19 +132,153 @@ impl CardDensity {
     }
 }
 
-fn choose_density(total_cards: usize, cols: usize, available_height: u16) -> CardDensity {
-    let total_card_rows = total_cards.div_ceil(cols);
-    for density in [
+/// The richest density that renders `total_cards` cards in `cols` columns
+/// within `available_height` rows, or `None` when not even [`CardDensity::Compact`]
+/// fits them all.
+///
+/// The `None` is the whole point (issue #588). The predecessor of this function
+/// — `choose_density` — returned `Compact` both when Compact fit and when
+/// nothing fit, so its one caller could not tell a layout that works from one
+/// that is about to hide cards, and silently sliced in the second case.
+/// [`choose_grid_layout`] needs that distinction to decide whether to spend a
+/// column on completeness.
+fn fitting_density(total_cards: usize, cols: usize, available_height: u16) -> Option<CardDensity> {
+    let total_card_rows = total_cards.div_ceil(cols) as u64;
+    [
         CardDensity::Spacious,
         CardDensity::Normal,
         CardDensity::Compact,
-    ] {
-        let needed = total_card_rows as u16 * density.card_height();
-        if needed <= available_height {
-            return density;
+    ]
+    .into_iter()
+    .find(|density| {
+        total_card_rows * u64::from(density.card_height()) <= u64::from(available_height)
+    })
+}
+
+/// How many card columns `width` comfortably carries — the deck's historical
+/// step function, and still the column count any deck that already fits gets.
+///
+/// The thresholds encode ~50 columns per card at two columns and ~60 at three:
+/// a *comfortable* card, not the narrowest useful one. [`MIN_CARD_W`] names the
+/// other end of that range, and [`choose_grid_layout`] is what may reach for it.
+fn grid_columns(width: u16) -> usize {
+    if width >= 180 {
+        3
+    } else if width >= 100 {
+        2
+    } else {
+        1
+    }
+}
+
+/// The narrowest card the grid will ever lay out, in terminal columns.
+///
+/// Issue #588 is what naming this explicitly buys. [`grid_columns`] encoded a
+/// minimum card width *implicitly* and generously (50 columns per card at two
+/// columns, 60 at three), so a sub-100-column deck was pinned to one column no
+/// matter how many cards it had to show — a 7-role orchestration could not fit
+/// seven cards at any density and silently painted five.
+///
+/// 40 is measured against the rendered card, not guessed. A role card's title is
+/// `` ` <n> <AgentType> · <role> ` `` sharing the top border with the
+/// ` ● Thinking ` status badge, inside two border columns. At 40 that leaves ten
+/// columns of role name (`ClaudeCode · documente…`), the full-width `Dir:` row
+/// and the widest `` ` Last: 0s  Tools: 14 ` `` bottom-border rung; by 30 the
+/// role name has vanished entirely (`ClaudeCode ·…`), which would defeat the
+/// point of painting the card at all.
+///
+/// It is a floor that only ever buys completeness: [`choose_grid_layout`] goes
+/// below `grid_columns`'s comfortable widths **only** when the narrower card is
+/// what makes every card fit. A deck that already fits keeps exactly the columns
+/// it has always had.
+const MIN_CARD_W: u16 = 40;
+
+/// The most columns `width` can hold at [`MIN_CARD_W`] each.
+///
+/// This is the CEILING on [`choose_grid_layout`]'s search, never the value it
+/// returns. Floored at 1 so a terminal narrower than a single card still draws
+/// one (clipped) column rather than dividing by zero.
+fn max_columns_for_width(width: u16) -> usize {
+    ((width / MIN_CARD_W) as usize).max(1)
+}
+
+/// Both axes of the card grid, decided together by [`choose_grid_layout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GridLayout {
+    cols: usize,
+    density: CardDensity,
+}
+
+/// Choose columns and density TOGETHER: the first pair that renders **all**
+/// `total_cards` cards in `available_height` rows.
+///
+/// Issue #588: these two axes used to be decided independently — columns from
+/// width alone, density from height alone — so neither could compensate for the
+/// other. Seven roles on a 90-column, 27-row deck got `cols = 1` (width < 100);
+/// no density fit seven single-column cards in the 25 rows left after the title
+/// and stats bar (`7 * 5 = 35` at the densest tier), the density chooser
+/// returned `Compact` anyway, and the render path sliced to the five rows that
+/// fit. Two roles were never painted, and on screen a hidden role is
+/// indistinguishable from one that failed to start. The information needed to
+/// fit all seven — a second column needs only `7.div_ceil(2) * 5 = 20` of those
+/// 25 rows — was available at render time; the algorithm never looked.
+///
+/// The search starts at [`grid_columns`] and widens only as far as
+/// [`max_columns_for_width`] allows, so:
+///
+/// * a deck that already fits is **untouched** — the first `cols` tried is the
+///   one the deck has always used, and Compact fits there in every case that
+///   isn't already overflowing;
+/// * a deck that does not fit spends columns, cheapest resource first, to become
+///   complete. Within each column count the richest density wins, which answers
+///   the issue's open question ("more columns at a richer density" over "fewer
+///   columns with smaller cards") the way it suggests: prompt and tool lines are
+///   the card's actual content, horizontal space is the cheaper sacrifice.
+///
+/// When nothing fits, the layout the deck has always used is returned rather
+/// than the widest one, and the caller is left to signal the overflow. Narrowing
+/// every card is a real cost, paid here only for completeness; if completeness
+/// is out of reach the trade buys nothing, and the overflow indicator — not a
+/// squeezed grid — is what resolves the ambiguity that made this a bug.
+fn choose_grid_layout(total_cards: usize, width: u16, available_height: u16) -> GridLayout {
+    let preferred_cols = grid_columns(width);
+    // `max` guards the invariant asserted by `max_columns_for_width_never_below_grid_columns`:
+    // the ceiling can never sit below the historical count, so no deck loses a
+    // column it has today.
+    let max_cols = max_columns_for_width(width).max(preferred_cols);
+
+    for cols in preferred_cols..=max_cols {
+        if let Some(density) = fitting_density(total_cards, cols, available_height) {
+            return GridLayout { cols, density };
         }
     }
-    CardDensity::Compact
+
+    GridLayout {
+        cols: preferred_cols,
+        density: CardDensity::Compact,
+    }
+}
+
+/// The `  (↑12 ↓34)` indicator a scrollable list appends to its header when
+/// rows are hidden above and/or below the viewport, or an empty string when
+/// everything is on screen.
+///
+/// Shared by the scheduled-tasks modal and the deck's card grid. Issue #588
+/// found the two disagreeing in the way that matters: the modal signalled its
+/// hidden rows while the card grid rendered its title plain, so a role card cut
+/// off the bottom of a short deck read as a role that never started. One
+/// formatter means neither surface can drift from the other's shape.
+///
+/// The two leading spaces are part of the indicator — every caller appends it
+/// directly to a header string, and separating it there would be one more thing
+/// to keep in sync.
+fn scroll_indicator(hidden_above: usize, hidden_below: usize) -> String {
+    match (hidden_above, hidden_below) {
+        (0, 0) => String::new(),
+        (a, 0) => format!("  (\u{2191}{a})"),
+        (0, b) => format!("  (\u{2193}{b})"),
+        (a, b) => format!("  (\u{2191}{a} \u{2193}{b})"),
+    }
 }
 
 /// Clamp a (possibly stale) vertical scroll offset to the largest value that
@@ -11983,18 +12117,16 @@ pub fn run_tui(
         // cursorless history.
         reconcile_pane_input_scrollback(&mut ui, &*pane);
 
-        let term_width = terminal.get_frame().area().width;
-        let has_embedded_panes = pane
-            .as_any()
-            .downcast_ref::<EmbeddedPaneController>()
-            .map(|e| !e.pane_ids().is_empty())
-            .unwrap_or(false);
-        let dashboard_width = if has_embedded_panes {
-            term_width * 33 / 100
-        } else {
-            term_width
-        };
-        ui.columns = grid_columns(dashboard_width);
+        // Issue #588: `ui.columns` used to be computed HERE too, by a second
+        // `grid_columns` call against a `dashboard_width` re-derived from a
+        // hardcoded 33% (the orchestration split is 34%, or 25% when narrow) —
+        // a different number from the `dashboard_area.width` the cards were
+        // actually laid out in. Two independent answers to one question, and
+        // the navigation half was the one nobody could see was wrong. The value
+        // now has exactly one writer, `render_card_grid`, which assigns the
+        // column count it just drew with. It runs inside this loop's
+        // `terminal.draw` below, i.e. before any key is handled, so navigation
+        // never reads a value from before the first frame.
 
         let has_pane_control = pane.is_available();
         let pane_layout = ui.pane_layout;
@@ -14001,6 +14133,185 @@ pub(crate) fn build_pane_status_for_gate(state: &AppState) -> HashMap<&str, Sess
         .collect()
 }
 
+/// The deck's title row: the product name, the session count, and — when the
+/// grid could not paint every card — the `  (↑a ↓b)` overflow indicator from
+/// [`scroll_indicator`].
+///
+/// Split out of [`render_frame`] because two call sites build it (the card grid
+/// and the everything-filtered-out branch) and only one of them can overflow.
+fn deck_title_line(showing: usize, total_sessions: usize, scroll_hint: &str) -> Line<'static> {
+    let title_text = if showing < total_sessions {
+        format!("— {showing}/{total_sessions} session(s)")
+    } else {
+        format!("— {total_sessions} session(s)")
+    };
+    let mut spans = vec![
+        Span::styled(
+            " dot-agent-deck ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(title_text, text_primary()),
+    ];
+    if !scroll_hint.is_empty() {
+        // Yellow + bold, not the title's own dim primary: this is the one piece
+        // of the row that says "what you are looking at is incomplete", and
+        // issue #588 is a report of that fact being invisible. It must not read
+        // as chrome.
+        spans.push(Span::styled(
+            scroll_hint.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Lay out and draw the deck's card grid into `area` — the title row, every card
+/// row that fits, and the filler above the stats bar — and return the stats-bar
+/// rect for the caller to draw into.
+///
+/// Extracted from [`render_frame`] by issue #588 so the layout decision has one
+/// home and an L1 seam ([`render_card_grid_to_buffer`]) can drive the real thing
+/// rather than a re-implementation of it.
+///
+/// Two invariants live here:
+///
+/// * **`ui.columns` is written here and nowhere else.** It is what left/right
+///   card navigation reads, so a column count computed independently of the one
+///   the cards were laid out with desyncs selection movement from what is on
+///   screen — silently, since both look correct in isolation. It used to be
+///   computed by a second [`grid_columns`] call in the main loop, from a width
+///   that was recomputed rather than the `area` actually handed to the grid.
+///   Now it can only be the value that drew this frame.
+/// * **A sliced grid says so.** `visible_rows` may still be short of
+///   `total_rows` on a genuinely tiny deck; when it is, the title carries the
+///   `(↑a ↓b)` indicator counting the CARDS (not rows) off each end. Silence
+///   there was the bug: an unpainted role is indistinguishable from a role that
+///   failed to start, which sent two separate investigations after a hydration
+///   defect that was not there.
+fn render_card_grid(
+    frame: &mut Frame,
+    area: Rect,
+    ui: &mut UiState,
+    sessions: &[&SessionState],
+    session_ids: &[&String],
+    total_sessions: usize,
+    tick: u64,
+) -> Rect {
+    // 1 row for the title + 1 row for the stats bar at the bottom of the deck.
+    let available_for_cards = area.height.saturating_sub(2);
+    let GridLayout { cols, density } =
+        choose_grid_layout(sessions.len(), area.width, available_for_cards);
+    let card_height = density.card_height();
+    // Single writer — see this function's docs.
+    ui.columns = cols;
+
+    let all_rows: Vec<&[&SessionState]> = sessions.chunks(cols).collect();
+    let all_row_ids: Vec<&[&String]> = session_ids.chunks(cols).collect();
+    let total_rows = all_rows.len();
+
+    // Calculate how many rows fit in the available area
+    let visible_rows = (available_for_cards / card_height).max(1) as usize;
+
+    // Adjust scroll offset to keep selected row visible. PRD #113: only when a
+    // card is actively highlighted — an inactive selection (`None`) leaves the
+    // scroll position alone.
+    if let Some(sel) = ui.selected_index {
+        let selected_row = sel / cols;
+        if selected_row < ui.scroll_offset {
+            ui.scroll_offset = selected_row;
+        } else if selected_row >= ui.scroll_offset + visible_rows {
+            ui.scroll_offset = selected_row + 1 - visible_rows;
+        }
+    }
+
+    // Re-clamp after a resize may have grown `visible_rows`: an offset left over
+    // from a previous overflow state must shrink so the last card row still sits
+    // at the bottom (no scrolled-off top / blank tail). Only reduces an
+    // over-large offset; legitimate scrolling is unchanged.
+    ui.scroll_offset = clamp_scroll_offset(ui.scroll_offset, total_rows, visible_rows);
+
+    let end = (ui.scroll_offset + visible_rows).min(total_rows);
+    let rows = &all_rows[ui.scroll_offset..end];
+    let row_ids = &all_row_ids[ui.scroll_offset..end];
+
+    // Counted in CARDS, off the slice that is actually about to be painted —
+    // ground truth, rather than a second opinion from `choose_grid_layout`.
+    // Every row above the window is full, so `scroll_offset * cols` cards sit
+    // above; the tail row may be partial, hence the `min`.
+    let hidden_above = ui.scroll_offset * cols;
+    let hidden_below = sessions
+        .len()
+        .saturating_sub((end * cols).min(sessions.len()));
+    let title = Paragraph::new(deck_title_line(
+        sessions.len(),
+        total_sessions,
+        &scroll_indicator(hidden_above, hidden_below),
+    ));
+
+    let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // title
+    for _ in rows {
+        constraints.push(Constraint::Length(card_height));
+    }
+    constraints.push(Constraint::Min(0)); // filler
+    constraints.push(Constraint::Length(1)); // stats bar
+
+    let row_chunks = Layout::vertical(constraints).split(area);
+
+    frame.render_widget(title, row_chunks[0]);
+
+    for (vi, (row, ids)) in rows.iter().zip(row_ids.iter()).enumerate() {
+        let col_constraints: Vec<Constraint> = (0..cols)
+            .map(|_| Constraint::Ratio(1, cols as u32))
+            .collect();
+        let col_chunks = Layout::horizontal(col_constraints).split(row_chunks[vi + 1]);
+
+        for (col_idx, session) in row.iter().enumerate() {
+            let flat_index = (ui.scroll_offset + vi) * cols + col_idx;
+            let is_selected = ui.selected_index == Some(flat_index);
+            // PRD #127 finding #2: `ui.display_names` is populated by hydration
+            // and explicit renames; a live scheduler-spawned card has no entry
+            // there, so fall back to the friendly name the synthetic
+            // `SessionStart` carried onto `SessionState.display_name`. Without
+            // this the live card degraded to the truncated pane id while a
+            // reconnect (which reads the daemon registry's display_name into
+            // `ui.display_names`) titled it correctly.
+            let display_name = ids
+                .get(col_idx)
+                .and_then(|id| ui.display_names.get(*id))
+                .or(session.display_name.as_ref());
+            let card_number = {
+                let n = flat_index + 1;
+                if n <= 9 { Some(n as u8) } else { None }
+            };
+            let card_area = col_chunks[col_idx];
+            render_session_card(
+                frame,
+                card_area,
+                session,
+                tick,
+                is_selected,
+                display_name,
+                card_number,
+                density,
+                // PRD #341 M4: the live deck's mode, so the seam that pins the
+                // selection accent and the running app cannot disagree.
+                ui.mode,
+            );
+            // PRD #80 M4: record this card's screen rect (paired with its flat
+            // selection index) for the mouse hit-test. Safe to mutate `ui` here
+            // — `display_name` was the only live `ui` borrow and its last use
+            // was the `render_session_card` call above.
+            ui.card_rects.push((flat_index, card_area));
+        }
+    }
+
+    row_chunks[row_chunks.len() - 1]
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_frame(
     frame: &mut Frame,
@@ -14206,34 +14517,14 @@ fn render_frame(
     let sessions: Vec<&SessionState> = filtered.iter().map(|(_, s)| *s).collect();
     let session_ids: Vec<&String> = filtered.iter().map(|(id, _)| *id).collect();
 
-    let cols = grid_columns(dashboard_area.width);
-
-    // Choose card density based on available vertical space
-    // 1 row for title + 1 row for stats bar at bottom of dashboard
-    let available_for_density = dashboard_area.height.saturating_sub(2);
-    let density = choose_density(sessions.len(), cols, available_for_density);
-    let card_height = density.card_height();
-
     // Title bar
     let total_sessions = state.sessions.len();
     let showing = sessions.len();
-    let title_text = if showing < total_sessions {
-        format!("— {}/{} session(s)", showing, total_sessions)
-    } else {
-        format!("— {} session(s)", total_sessions)
-    };
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " dot-agent-deck ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(title_text, text_primary()),
-    ]));
 
     if sessions.is_empty() {
-        // All filtered out
+        // All filtered out. Nothing is drawn, so nothing can be hidden — no
+        // overflow indicator on this title.
+        let title = Paragraph::new(deck_title_line(showing, total_sessions, ""));
         let vertical = Layout::vertical([
             Constraint::Length(1),
             Constraint::Fill(1),
@@ -14283,94 +14574,15 @@ fn render_frame(
         return;
     }
 
-    let all_rows: Vec<&[&SessionState]> = sessions.chunks(cols).collect();
-    let all_row_ids: Vec<&[&String]> = session_ids.chunks(cols).collect();
-    let total_rows = all_rows.len();
-
-    // Calculate how many rows fit in the available area
-    let visible_rows = (available_for_density / card_height).max(1) as usize;
-
-    // Adjust scroll offset to keep selected row visible. PRD #113: only when a
-    // card is actively highlighted — an inactive selection (`None`) leaves the
-    // scroll position alone.
-    if let Some(sel) = ui.selected_index {
-        let selected_row = sel / cols;
-        if selected_row < ui.scroll_offset {
-            ui.scroll_offset = selected_row;
-        } else if selected_row >= ui.scroll_offset + visible_rows {
-            ui.scroll_offset = selected_row + 1 - visible_rows;
-        }
-    }
-
-    // Re-clamp after a resize may have grown `visible_rows`: an offset left over
-    // from a previous overflow state must shrink so the last card row still sits
-    // at the bottom (no scrolled-off top / blank tail). Only reduces an
-    // over-large offset; legitimate scrolling is unchanged.
-    ui.scroll_offset = clamp_scroll_offset(ui.scroll_offset, total_rows, visible_rows);
-
-    let end = (ui.scroll_offset + visible_rows).min(total_rows);
-    let rows = &all_rows[ui.scroll_offset..end];
-    let row_ids = &all_row_ids[ui.scroll_offset..end];
-
-    let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // title
-    for _ in rows {
-        constraints.push(Constraint::Length(card_height));
-    }
-    constraints.push(Constraint::Min(0)); // filler
-    constraints.push(Constraint::Length(1)); // stats bar
-
-    let row_chunks = Layout::vertical(constraints).split(dashboard_area);
-
-    frame.render_widget(title, row_chunks[0]);
-
-    for (vi, (row, ids)) in rows.iter().zip(row_ids.iter()).enumerate() {
-        let col_constraints: Vec<Constraint> = (0..cols)
-            .map(|_| Constraint::Ratio(1, cols as u32))
-            .collect();
-        let col_chunks = Layout::horizontal(col_constraints).split(row_chunks[vi + 1]);
-
-        for (col_idx, session) in row.iter().enumerate() {
-            let flat_index = (ui.scroll_offset + vi) * cols + col_idx;
-            let is_selected = ui.selected_index == Some(flat_index);
-            // PRD #127 finding #2: `ui.display_names` is populated by hydration
-            // and explicit renames; a live scheduler-spawned card has no entry
-            // there, so fall back to the friendly name the synthetic
-            // `SessionStart` carried onto `SessionState.display_name`. Without
-            // this the live card degraded to the truncated pane id while a
-            // reconnect (which reads the daemon registry's display_name into
-            // `ui.display_names`) titled it correctly.
-            let display_name = ids
-                .get(col_idx)
-                .and_then(|id| ui.display_names.get(*id))
-                .or(session.display_name.as_ref());
-            let card_number = {
-                let n = flat_index + 1;
-                if n <= 9 { Some(n as u8) } else { None }
-            };
-            let card_area = col_chunks[col_idx];
-            render_session_card(
-                frame,
-                card_area,
-                session,
-                tick,
-                is_selected,
-                display_name,
-                card_number,
-                density,
-                // PRD #341 M4: the live deck's mode, so the seam that pins the
-                // selection accent and the running app cannot disagree.
-                ui.mode,
-            );
-            // PRD #80 M4: record this card's screen rect (paired with its flat
-            // selection index) for the mouse hit-test. Safe to mutate `ui` here
-            // — `display_name` was the only live `ui` borrow and its last use
-            // was the `render_session_card` call above.
-            ui.card_rects.push((flat_index, card_area));
-        }
-    }
-
-    // Stats bar at bottom of dashboard area
-    let stats_area = row_chunks[row_chunks.len() - 1];
+    let stats_area = render_card_grid(
+        frame,
+        dashboard_area,
+        ui,
+        &sessions,
+        &session_ids,
+        total_sessions,
+        tick,
+    );
     render_stats_bar(
         frame,
         &state.aggregate_stats(),
@@ -17267,12 +17479,7 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
         // Column header, with a scroll indicator when rows are hidden.
         let hidden_above = win_start;
         let hidden_below = ui.scheduled_tasks.len().saturating_sub(win_end);
-        let scroll_hint = match (hidden_above, hidden_below) {
-            (0, 0) => String::new(),
-            (a, 0) => format!("  (\u{2191}{a})"),
-            (0, b) => format!("  (\u{2193}{b})"),
-            (a, b) => format!("  (\u{2191}{a} \u{2193}{b})"),
-        };
+        let scroll_hint = scroll_indicator(hidden_above, hidden_below);
         lines.push(Line::styled(
             format!(
                 "  {:<name_col$}{:<status_col$}{}{}",
@@ -18043,16 +18250,6 @@ fn pane_relative_coords(screen_col: u16, screen_row: u16, pane_rect: &Option<Rec
     }
 }
 
-fn grid_columns(width: u16) -> usize {
-    if width >= 180 {
-        3
-    } else if width >= 100 {
-        2
-    } else {
-        1
-    }
-}
-
 /// Issue #442 — the *glyph and emphasis* half of how a deck card's border
 /// encodes selection. The colour half lives in [`render_session_card`], which
 /// pairs every state below with [`palette::SELECTED`] when selected and the
@@ -18436,7 +18633,7 @@ fn format_elapsed(last_activity: DateTime<Utc>) -> String {
 // `pub(crate)`-gated.
 
 /// Card density tier picked by the dashboard's adaptive layout
-/// (`choose_density`). Hidden-public so L1 snapshot tests can pin a
+/// (`choose_grid_layout`). Hidden-public so L1 snapshot tests can pin a
 /// specific tier rather than depending on the runtime calculation.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18770,6 +18967,103 @@ pub fn render_dashboard_cards_to_buffer(
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
+}
+
+/// What the deck's card grid decided, reported back to an L1 test alongside the
+/// buffer it drew (issue #588).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CardGridProbe {
+    /// `UiState::columns` **after** the render — the field left/right card
+    /// navigation reads. Compare it against the columns visible in the buffer:
+    /// the two disagreeing is the desync that made this seam worth having, and
+    /// it is invisible in a snapshot on its own.
+    pub nav_columns: usize,
+    /// The density tier the grid settled on.
+    pub density: CardDensityKind,
+    /// Card rows that fit the viewport, and how many there are in total. When
+    /// these differ the grid is sliced and the title must say so.
+    pub visible_rows: usize,
+    pub total_rows: usize,
+}
+
+/// L1 seam for the whole deck card grid — the real [`render_card_grid`], not a
+/// re-implementation of it: title row, adaptive column/density choice, the card
+/// rows that fit, and the overflow indicator.
+///
+/// Issue #588 added it because every pre-existing dashboard seam renders cards
+/// the caller has already laid out ([`render_dashboard_cards_to_buffer`] stacks
+/// them one per row at a density the test names), so the layout decision itself
+/// — the thing that was dropping cards — had no L1 coverage at all.
+///
+/// `cards` is `(session, display_name)` in deck order; `width` × `height` is the
+/// deck area, including the title and stats-bar rows it reserves.
+#[doc(hidden)]
+pub fn render_card_grid_to_buffer(
+    cards: &[(&SessionState, Option<&str>)],
+    selected: Option<usize>,
+    scroll_offset: usize,
+    width: u16,
+    height: u16,
+) -> (ratatui::buffer::Buffer, CardGridProbe) {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+    ui.selected_index = selected;
+    ui.scroll_offset = scroll_offset;
+
+    // `render_card_grid` reads display names out of `ui.display_names` keyed by
+    // session id, falling back to `SessionState.display_name`. Feed the caller's
+    // names through the map so the seam exercises the same lookup the deck does.
+    let ids: Vec<String> = cards
+        .iter()
+        .map(|(session, _)| session.session_id.clone())
+        .collect();
+    for ((_, name), id) in cards.iter().zip(ids.iter()) {
+        if let Some(name) = name {
+            ui.display_names.insert(id.clone(), (*name).to_string());
+        }
+    }
+    let sessions: Vec<&SessionState> = cards.iter().map(|(session, _)| *session).collect();
+    let id_refs: Vec<&String> = ids.iter().collect();
+
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            render_card_grid(
+                frame,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                },
+                &mut ui,
+                &sessions,
+                &id_refs,
+                sessions.len(),
+                0,
+            );
+        })
+        .expect("TestBackend draw should succeed");
+
+    let GridLayout { cols, density } =
+        choose_grid_layout(sessions.len(), width, height.saturating_sub(2));
+    let card_height = density.card_height();
+    let probe = CardGridProbe {
+        nav_columns: ui.columns,
+        density: match density {
+            CardDensity::Compact => CardDensityKind::Compact,
+            CardDensity::Normal => CardDensityKind::Normal,
+            CardDensity::Spacious => CardDensityKind::Spacious,
+        },
+        visible_rows: ((height.saturating_sub(2) / card_height).max(1) as usize)
+            .min(sessions.len().div_ceil(cols)),
+        total_rows: sessions.len().div_ceil(cols),
+    };
+    (terminal.backend().buffer().clone(), probe)
 }
 
 /// PRD #80 M2: render the persistent global button bar into a one-row
@@ -26700,47 +26994,173 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn test_choose_density() {
-        // Spacious=10, Normal=8, Compact=5
+    fn choose_grid_layout_density_ladder() {
+        // Spacious=10, Normal=8, Compact=5. Widths pick the starting column
+        // count: <100 -> 1, >=100 -> 2 (see `grid_columns`).
 
-        // 1 session, 1 col, plenty of height -> Spacious
-        assert_eq!(choose_density(1, 1, 20), CardDensity::Spacious);
+        // 1 card, 1 col, plenty of height -> Spacious
+        assert_eq!(
+            choose_grid_layout(1, 90, 20),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Spacious
+            }
+        );
 
-        // 2 sessions, 2 cols = 1 row, height 10 -> Spacious (1*10=10)
-        assert_eq!(choose_density(2, 2, 10), CardDensity::Spacious);
+        // 2 cards, 2 cols = 1 row, height 10 -> Spacious (1*10=10)
+        assert_eq!(
+            choose_grid_layout(2, 100, 10),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Spacious
+            }
+        );
 
-        // 2 sessions, 2 cols = 1 row, height 9 -> Normal (1*8=8 fits)
-        assert_eq!(choose_density(2, 2, 9), CardDensity::Normal);
+        // 2 cards, 2 cols = 1 row, height 9 -> Normal (1*8=8 fits)
+        assert_eq!(
+            choose_grid_layout(2, 100, 9),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Normal
+            }
+        );
 
-        // 4 sessions, 2 cols = 2 rows, height 16 -> Normal (2*8=16)
-        assert_eq!(choose_density(4, 2, 16), CardDensity::Normal);
+        // 4 cards, 2 cols = 2 rows, height 16 -> Normal (2*8=16)
+        assert_eq!(
+            choose_grid_layout(4, 100, 16),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Normal
+            }
+        );
 
-        // 4 sessions, 2 cols = 2 rows, height 15 -> Compact (2*5=10 fits)
-        assert_eq!(choose_density(4, 2, 15), CardDensity::Compact);
+        // 4 cards, 2 cols = 2 rows, height 15 -> Compact (2*5=10 fits)
+        assert_eq!(
+            choose_grid_layout(4, 100, 15),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Compact
+            }
+        );
 
-        // Many sessions, small screen -> Compact
-        assert_eq!(choose_density(10, 1, 20), CardDensity::Compact);
-
-        // Edge: 0 sessions -> Spacious (0 rows needed)
-        assert_eq!(choose_density(0, 1, 10), CardDensity::Spacious);
+        // Edge: 0 cards -> Spacious (0 rows needed)
+        assert_eq!(
+            choose_grid_layout(0, 90, 10),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Spacious
+            }
+        );
     }
 
     #[test]
-    fn test_choose_density_boundaries() {
-        // Density is a function of card count, columns, and height only.
-        // Spacious=10, Normal=8, Compact=5.
+    fn choose_grid_layout_density_boundaries() {
+        // Density is a function of card count, columns, and height only once the
+        // column count is settled. Spacious=10, Normal=8, Compact=5.
 
-        // 1 session, height 11 -> Spacious (1*10=10)
-        assert_eq!(choose_density(1, 1, 11), CardDensity::Spacious);
+        // 1 card, height 11 -> Spacious (1*10=10)
+        assert_eq!(choose_grid_layout(1, 90, 11).density, CardDensity::Spacious);
 
-        // 1 session, height 10 -> Spacious (1*10=10)
-        assert_eq!(choose_density(1, 1, 10), CardDensity::Spacious);
+        // 1 card, height 10 -> Spacious (1*10=10)
+        assert_eq!(choose_grid_layout(1, 90, 10).density, CardDensity::Spacious);
 
-        // 2 sessions, 1 col, height 18 -> Normal (2*8=16)
-        assert_eq!(choose_density(2, 1, 18), CardDensity::Normal);
+        // 2 cards, 1 col, height 18 -> Normal (2*8=16)
+        assert_eq!(choose_grid_layout(2, 90, 18).density, CardDensity::Normal);
 
-        // 2 sessions, 1 col, height 17 -> Normal (2*8=16)
-        assert_eq!(choose_density(2, 1, 17), CardDensity::Normal);
+        // 2 cards, 1 col, height 17 -> Normal (2*8=16)
+        assert_eq!(choose_grid_layout(2, 90, 17).density, CardDensity::Normal);
+    }
+
+    /// Issue #588: `MIN_CARD_W` may only ever *widen* the search. If the ceiling
+    /// it derives ever fell below `grid_columns`, a deck that fits today would
+    /// lose a column — the fix would have become a regression. Swept rather than
+    /// spot-checked because the two functions have unrelated shapes (a step
+    /// function against integer division) and cross wherever they like.
+    #[test]
+    fn max_columns_for_width_never_below_grid_columns() {
+        for width in 0u16..=400 {
+            assert!(
+                max_columns_for_width(width) >= grid_columns(width),
+                "width {width}: ceiling {} is below the historical column count {}",
+                max_columns_for_width(width),
+                grid_columns(width),
+            );
+        }
+    }
+
+    /// Issue #588's reported case and its neighbours. Seven roles on a
+    /// 90-column deck: one column needs 7*5 = 35 rows at the densest tier, two
+    /// columns need 7.div_ceil(2)*5 = 20.
+    #[test]
+    fn choose_grid_layout_widens_only_to_fit_every_card() {
+        // 35 rows available: one column already fits all seven, so nothing is
+        // spent. This is the property that keeps every existing layout intact.
+        assert_eq!(choose_grid_layout(7, 90, 35).cols, 1);
+
+        // 25 rows — the reported geometry. One column fits five of seven at
+        // Compact; a second column fits all seven with room to spare.
+        assert_eq!(
+            choose_grid_layout(7, 90, 25),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Compact
+            }
+        );
+
+        // 34 rows: one column misses Compact by a single row. The second column
+        // buys back enough height for Normal — the issue's open question
+        // answered as it suggests, richer cards over a narrower grid.
+        assert_eq!(
+            choose_grid_layout(7, 90, 34),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Normal
+            }
+        );
+
+        // 10 rows: two columns still need 20, and 90 columns allows no third at
+        // MIN_CARD_W. Nothing fits, so the deck keeps the column count it has
+        // always had and the caller signals the overflow instead.
+        assert_eq!(
+            choose_grid_layout(7, 90, 10),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Compact
+            }
+        );
+    }
+
+    /// A card is never narrowed past [`MIN_CARD_W`] in pursuit of completeness:
+    /// widening is only allowed while each resulting card still clears the floor.
+    /// The historical count is exempt — a terminal narrower than one whole card
+    /// still gets its single column.
+    #[test]
+    fn choose_grid_layout_respects_the_minimum_card_width() {
+        for width in [10u16, 39, 40, 79, 80, 90, 99, 100, 120, 179, 180, 240] {
+            // A card count no layout can fit, so the search runs to its ceiling.
+            let cols = choose_grid_layout(40, width, 12).cols;
+            assert!(
+                cols == grid_columns(width) || (cols as u16) * MIN_CARD_W <= width,
+                "width {width}: {cols} columns leaves each card under {MIN_CARD_W} columns",
+            );
+            // And the same for a count that fits only after widening.
+            let cols = choose_grid_layout(7, width, 25).cols;
+            assert!(
+                cols == grid_columns(width) || (cols as u16) * MIN_CARD_W <= width,
+                "width {width}: {cols} columns leaves each card under {MIN_CARD_W} columns",
+            );
+        }
+    }
+
+    /// The `(↑a ↓b)` indicator shared by the scheduled-tasks modal and the deck
+    /// title (issue #588). Silence means "everything is on screen" — the one
+    /// output that must not appear when anything is hidden.
+    #[test]
+    fn scroll_indicator_reports_only_what_is_hidden() {
+        assert_eq!(scroll_indicator(0, 0), "");
+        assert_eq!(scroll_indicator(12, 0), "  (\u{2191}12)");
+        assert_eq!(scroll_indicator(0, 34), "  (\u{2193}34)");
+        assert_eq!(scroll_indicator(12, 34), "  (\u{2191}12 \u{2193}34)");
     }
 
     /// Acceptance criterion 1: `card_height` is derived from rendered content,
