@@ -2937,6 +2937,14 @@ pub struct PaneRecreateIdentity {
     /// Extra environment for the fresh child. The caller MUST include
     /// `DOT_AGENT_DECK_PANE_ID`; without it the new agent is not bound to the
     /// pane and nothing can route to it.
+    ///
+    /// A respawn replays the previous child's whole `spawn_env`; a re-creation
+    /// has no previous child to read one from, so anything not listed here is
+    /// gone. That costs nothing today — every producer of an orchestration role
+    /// pane (`spawn::spawn`'s `pane_env`, and the TUI's `create_stream_pane`)
+    /// passes the pane id and nothing else, and `spawn_agent` injects the
+    /// registry's own hook socket and agent id itself — but a producer that
+    /// starts supplying role env has to supply it here too.
     pub env: Vec<(String, String)>,
 }
 
@@ -5986,7 +5994,15 @@ impl AgentPtyRegistry {
             Err(other) => return Err(other),
         }
 
-        let waited_from = std::time::Instant::now();
+        // `tokio::time::Instant`, not `std::time::Instant`, so the clock the
+        // deadline is measured against is the same one the sleep below obeys.
+        // The delegate path that calls this is exercised under
+        // `tokio::time::pause` (`orchestration/delegate/011`), where a std
+        // `Instant` never advances while the paused sleep does — an unreachable
+        // combination today, because a paused-clock test's respawn finds a
+        // record and never gets here, but a spin-forever loop is not a trap to
+        // leave lying in a recovery path.
+        let waited_from = tokio::time::Instant::now();
         while self.pane_close_in_flight(pane_id_env)
             && waited_from.elapsed() < PANE_CLOSE_SETTLE_TIMEOUT
         {
