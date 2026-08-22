@@ -1409,35 +1409,55 @@ mod tests {
         );
     }
 
-    /// Scenario: A stub daemon accepts the connection, reads the request line,
-    /// waits 300ms and then replies — while the test hammers the *client*
-    /// thread with `SIGUSR1`, whose handler is installed deliberately without
-    /// `SA_RESTART` so that every signal landing while the client sits in
-    /// `read(2)` surfaces as `EINTR`. The reply must still come back intact:
-    /// a signal on the reading thread says nothing about the peer and nothing
-    /// about the clock, so it must not be mistaken for an absent daemon.
+    /// Scenario: A stub daemon accepts the connection and reads the request
+    /// line, then holds its reply back until the test says the signalling is
+    /// over — while the test hammers the *client* thread with `SIGUSR1`,
+    /// whose handler is installed deliberately without `SA_RESTART` so that
+    /// every signal landing while the client sits in `read(2)` surfaces as
+    /// `EINTR`. The handler counts its own deliveries, and the test keeps
+    /// signalling until it has seen enough of them, so "a signal really did
+    /// land inside the read" is something the test observes rather than
+    /// something it hopes a sleep arranged. The reply must still come back
+    /// intact: a signal on the reading thread says nothing about the peer and
+    /// nothing about the clock, so it must not be mistaken for an absent
+    /// daemon.
     #[spec("error/socket/007")]
     #[test]
     #[cfg(unix)]
     fn socket_007_signal_interrupted_read_still_returns_the_reply() {
-        /// Long enough that the client is parked in `read(2)` for the whole
-        /// signalling window below, and still ~16x inside the 5s budget.
-        const REPLY_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
-        /// Let connect + write + `shutdown_write` finish before the first
-        /// signal. Those are sub-millisecond on an already-bound local socket,
-        /// so this is a ~50x margin; it matters because `UnixStream::connect`
-        /// does not retry `EINTR` and a signal landing there would fail the
-        /// test as `Unreachable` for an unrelated reason (called out in the
-        /// assertion message so that case is not mysterious).
-        const SIGNAL_LEAD_IN: std::time::Duration = std::time::Duration::from_millis(50);
-        const SIGNAL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
-        const SIGNAL_ROUNDS: usize = 25;
+        /// How many `SIGUSR1` deliveries the handler must have COUNTED before
+        /// the daemon is released to reply. Every one of them lands in the
+        /// window between "the daemon has read our request line" and "the
+        /// daemon has been told it may answer", during which the client has
+        /// nothing left to do but sit in `read(2)` — so this is a floor on
+        /// the number of `EINTR`s the code under test had to retry through,
+        /// not a guess about when a sleep lines up with a read.
+        const REQUIRED_DELIVERIES: usize = 20;
+        /// Pace between `pthread_kill`s. `SIGUSR1` is not queued, so a signal
+        /// sent while one is already pending merges into it; spacing the
+        /// sends lets each be taken before the next arrives, which is what
+        /// makes the delivery count reach its floor promptly instead of
+        /// asymptotically.
+        const SIGNAL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
+        /// Backstop on the signalling loop only, so a machine that cannot
+        /// deliver 20 signals fails HERE, naming that, instead of letting the
+        /// client's own 5s budget expire and reporting the confusing
+        /// `DeadlineExpired` that would follow. Nominal cost of the loop is
+        /// ~40-60ms, so this is a ~40x margin and pins no timing.
+        const SIGNAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
         /// Generous: the operation itself is bounded at 5s, so this only has
         /// to fail before nextest's own kill window rather than pin any
         /// timing.
         const ASSERT_CEILING: std::time::Duration = std::time::Duration::from_secs(15);
 
-        extern "C" fn noop_signal_handler(_signum: libc::c_int) {}
+        /// Counted by the handler itself. A relaxed `fetch_add` is the whole
+        /// body, which keeps the handler async-signal-safe (a lock-free
+        /// atomic add on every target this crate builds for).
+        static DELIVERIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+        extern "C" fn counting_signal_handler(_signum: libc::c_int) {
+            DELIVERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
         let socket_path = _tmp.path().join("s.sock");
@@ -1453,7 +1473,7 @@ mod tests {
         let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = noop_signal_handler as *const () as libc::sighandler_t;
+            action.sa_sigaction = counting_signal_handler as *const () as libc::sighandler_t;
             libc::sigemptyset(&mut action.sa_mask);
             action.sa_flags = 0;
             assert_eq!(
@@ -1463,6 +1483,16 @@ mod tests {
             );
         }
 
+        // Issue #642: the two edges of the signalling window are HANDSHAKES,
+        // not sleeps. `request_read_tx` fires once the daemon has the
+        // client's request line, which is proof that connect and the write
+        // are already behind us — the thing the old 50ms lead-in could only
+        // make likely — and `reply_now_rx` holds the reply until the last
+        // signal has been sent, so the reply can never race the storm. On a
+        // loaded macOS runner both of those wall-clock bets came up wrong,
+        // and the test hard-reds four required checks when they do.
+        let (request_read_tx, request_read_rx) = std::sync::mpsc::channel::<()>();
+        let (reply_now_tx, reply_now_rx) = std::sync::mpsc::channel::<()>();
         let daemon_thread = std::thread::spawn(move || match listener.accept() {
             Err(err) => format!("accept failed: {err}"),
             Ok((mut stream, _)) => {
@@ -1471,7 +1501,13 @@ mod tests {
                 if let Err(err) = std::io::BufRead::read_line(&mut reader, &mut line) {
                     return format!("reading the request line failed: {err}");
                 }
-                std::thread::sleep(REPLY_DELAY);
+                if request_read_tx.send(()).is_err() {
+                    return "the test hung up before the request line was reported".to_string();
+                }
+                if reply_now_rx.recv_timeout(ASSERT_CEILING).is_err() {
+                    return "never released to reply — the signalling loop did not finish"
+                        .to_string();
+                }
                 let written = std::io::Write::write_all(&mut stream, br#"{"seed":"abc123"}"#)
                     .and_then(|()| std::io::Write::write_all(&mut stream, b"\n"))
                     .and_then(|()| std::io::Write::flush(&mut stream));
@@ -1506,12 +1542,31 @@ mod tests {
         let client_thread_id = thread_rx
             .recv_timeout(ASSERT_CEILING)
             .expect("the client thread must report its thread id");
+        request_read_rx.recv_timeout(ASSERT_CEILING).expect(
+            "the stub daemon must report having read the request line — until it has, the \
+             client may still be in connect or write, and a signal landing there would fail \
+             this test for an unrelated reason",
+        );
 
-        std::thread::sleep(SIGNAL_LEAD_IN);
-        for _ in 0..SIGNAL_ROUNDS {
+        let signalling_started = std::time::Instant::now();
+        let mut sent = 0usize;
+        while DELIVERIES.load(std::sync::atomic::Ordering::Relaxed) < REQUIRED_DELIVERIES {
+            assert!(
+                signalling_started.elapsed() < SIGNAL_BUDGET,
+                "only {} of {REQUIRED_DELIVERIES} SIGUSR1 deliveries were counted after \
+                 {sent} sends in {SIGNAL_BUDGET:?} — the test never got to exercise the \
+                 EINTR retry, so its result would say nothing either way",
+                DELIVERIES.load(std::sync::atomic::Ordering::Relaxed)
+            );
             unsafe { libc::pthread_kill(client_thread_id as libc::pthread_t, libc::SIGUSR1) };
+            sent += 1;
             std::thread::sleep(SIGNAL_INTERVAL);
         }
+        let delivered = DELIVERIES.load(std::sync::atomic::Ordering::Relaxed);
+        // Released only now: the loop above has finished, so no further
+        // `pthread_kill` can race the reply, and the client has spent the
+        // whole storm parked in `read(2)` with nothing to return to it.
+        let _ = reply_now_tx.send(());
 
         let outcome = result_rx.recv_timeout(ASSERT_CEILING);
         // Safe to release now: the signalling loop above has finished, so no
@@ -1532,10 +1587,9 @@ mod tests {
         assert!(
             matches!(&reply, SocketReply::Line(line) if line == r#"{"seed":"abc123"}"#),
             "a read interrupted by a signal must be retried, not mistaken for an absent \
-             daemon — got {reply:?} (read error: {read_error:?}); the stub daemon reports: \
-             {daemon_report}. `SocketReply::Unreachable` here would mean a signal landed \
-             during connect/write instead of during the read, which the {SIGNAL_LEAD_IN:?} \
-             lead-in is sized to prevent."
+             daemon — got {reply:?} (read error: {read_error:?}) after {delivered} counted \
+             SIGUSR1 deliveries from {sent} sends, every one of them while the client had \
+             nothing to do but sit in read(2); the stub daemon reports: {daemon_report}."
         );
 
         // Joined last, deliberately. If the client thread ever failed to
@@ -1544,6 +1598,63 @@ mod tests {
         // test until nextest killed it — losing exactly the diagnostic the
         // failure exists to produce.
         let _ = client_thread.join();
+    }
+
+    /// Scenario: A stub daemon writes its one reply line and closes at once —
+    /// so by the time the client's read loop arms its per-read timeout the
+    /// socket is already half-closed by us and closed by the peer. The
+    /// buffered reply must still come back: on macOS every `setsockopt` on a
+    /// socket in that state fails with `EINVAL`, and a per-read timeout that
+    /// cannot be re-armed is no evidence that there is nothing left to read.
+    #[spec("error/socket/008")]
+    #[test]
+    #[cfg(unix)]
+    fn socket_008_reply_survives_a_peer_that_closed_before_the_read_re_armed() {
+        const REPLY: &str = r#"{"seed":"abc123"}"#;
+
+        let _tmp = tempfile::tempdir().expect("create temp dir for stub daemon socket");
+        let socket_path = _tmp.path().join("s.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stub daemon socket");
+
+        // Both ends in hand before a byte moves: connect, then accept. Every
+        // step below is ordered by this one thread, so nothing here depends
+        // on a sleep or on which thread the scheduler picks — which is the
+        // point, since the condition being pinned is a RACE in the flaky
+        // sibling `error/socket/007` and a certainty in production.
+        let mut client = crate::platform::ipc::IpcClient::connect(&socket_path)
+            .expect("connect to the stub daemon socket");
+        let (mut server, _) = listener.accept().expect("accept the client connection");
+
+        // Mirror the production prelude exactly:
+        // `request_from_socket_at_detailed` arms the socket before it writes,
+        // and half-closes its write side before it reads. That half-close is
+        // what leaves `SS_CANTSENDMORE` set here, so the peer's close below
+        // completes the `SS_CANTRCVMORE | SS_CANTSENDMORE` pair that makes
+        // XNU refuse every subsequent `setsockopt` with `EINVAL`.
+        client
+            .set_timeouts(GET_SEED_REQUEST_TIMEOUT)
+            .expect("arm the socket the way the production prelude does");
+        std::io::Write::write_all(&mut server, REPLY.as_bytes()).expect("write the reply");
+        std::io::Write::write_all(&mut server, b"\n").expect("write the reply terminator");
+        std::io::Write::flush(&mut server).expect("flush the reply");
+        let _ = client.shutdown_write();
+        // The daemon's hook loop closes the moment it reads EOF from our
+        // half-close, which is its very next pass after answering — so "the
+        // peer is already gone when the read loop starts" is the ORDINARY
+        // ending of a `get-seed`, not a corner case.
+        drop(server);
+
+        let deadline = std::time::Instant::now() + GET_SEED_REQUEST_TIMEOUT;
+        let outcome = read_reply_line(&mut client, Some(deadline));
+
+        assert!(
+            matches!(&outcome, Ok(line) if line == REPLY),
+            "a reply already buffered by the kernel must survive a per-read timeout that \
+             can no longer be re-armed — got {outcome:?}. `Io(Os {{ code: 22 }})` here is \
+             macOS refusing `setsockopt` on a fully shut-down socket, which says nothing \
+             about whether there is a reply waiting, and there is one."
+        );
     }
 
     #[test]
