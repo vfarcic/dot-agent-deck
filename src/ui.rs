@@ -23219,8 +23219,11 @@ mod tests {
     fn test_status_style() {
         // PRD #155: status colors now resolve through the centralized palette
         // (single source of truth). LOCKED mapping: Working=Green,
-        // Thinking=Blue, WaitingForInput=Yellow, Error=Red, Idle=DarkGray, with
-        // Compacting sharing the thinking/Blue role.
+        // Thinking=Blue, WaitingForInput=Magenta, Error=Red, Idle=DarkGray, with
+        // Compacting sharing the thinking/Blue role. Waiting left Yellow in
+        // issue #579 — 1.70:1 against a white terminal background, and 1.07:1
+        // once the BOLD below is rendered as the bright variant. The ratios
+        // themselves are asserted by `theme/contrast/002`.
         let (label, style) = status_style(&SessionStatus::Thinking);
         assert_eq!(label, "Thinking");
         assert_eq!(style.fg, Some(Color::Blue));
@@ -23231,7 +23234,7 @@ mod tests {
 
         let (label, style) = status_style(&SessionStatus::WaitingForInput);
         assert_eq!(label, "Needs Input");
-        assert_eq!(style.fg, Some(Color::Yellow));
+        assert_eq!(style.fg, Some(Color::Magenta));
 
         let (label, style) = status_style(&SessionStatus::Idle);
         assert_eq!(label, "Idle");

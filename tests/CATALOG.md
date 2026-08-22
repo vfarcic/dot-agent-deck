@@ -3500,6 +3500,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** accent/status colors (Cyan/Green/Yellow/Red/Blue/Magenta), which are named ANSI and remain by design; popup geometry beyond what the buffer captures.
 - **Platform coverage:** mac+linux+windows.
 
+##### theme/contrast/002 — The `WaitingForInput` status colour is legible on light and dark terminals (WCAG contrast, not colour identity).
+- **Layer:** L1 (pure computation over `palette::STATUS_WAITING`; no rendering).
+- **Agent:** none.
+- **Asserts:** `palette::STATUS_WAITING`, resolved through the reference xterm ANSI palette into its base and bold-as-bright renderings, clears WCAG AA for text (4.5:1) on the two theme-matched pairings — the base slot on a white background, the bright slot on a black one — and WCAG AA for non-text UI components (3:1) on the two mismatched pairings (bright-on-white, base-on-black); and that the role stays a distinct colour from every other palette role. A paired non-spec unit-guard pins the helpers against the 21:1/1:1 endpoints and reproduces issue #579's reported 1.70:1 and 1.07:1 yellow measurements, then proves the floors still reject `Color::Yellow`.
+- **Does not assert:** which colour the role holds (deliberately — `theme/palette/001-002` own the identity, and asserting identity here is what let an unreadable colour ship); contrast of the other status/accent roles (green 2.16:1 and cyan 1.98:1 on white have the same weakness and are a separate colour decision); how any specific terminal emulator actually resolves the slot.
+- **Platform coverage:** mac+linux+windows.
+
 #### theme/guard
 
 ##### theme/guard/001 — No absolute background on any cheaply-seamable surface; command-mode selection is cued by the terminal's own foreground plus a thickened border, not an absolute fill.

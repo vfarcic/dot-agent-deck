@@ -974,8 +974,9 @@ fn pane_009_history_only_card_marks_and_dims_input_affordance() {
 
 // ---------------------------------------------------------------------------
 // PRD #155 — centralized color palette (Option A). Border encodes STATUS in
-// BOTH deck cards and embedded panes; the dedicated `selected` (Magenta) and
-// `focused` (Cyan) accent roles never reuse a status color. These tests read
+// BOTH deck cards and embedded panes; the dedicated `selected` (`Color::Reset`
+// since issue #442) and `focused` (Cyan) accent roles never reuse a status
+// color. These tests read
 // the resolved border color out of the rendered buffer (the observable
 // end-state) so they survive the palette module's exact API — except
 // `theme/guard/003`, which is a deliberate source lint.
@@ -1102,9 +1103,17 @@ fn border_glyph_at_mid(buffer: &ratatui::buffer::Buffer) -> String {
 
 /// The six status roles in the centralized palette and the named-ANSI color each
 /// must resolve to (PRD #155 locked plan): working=Green, thinking=Blue,
-/// compacting=Blue (shares the thinking role), waiting=Yellow, error=Red,
+/// compacting=Blue (shares the thinking role), waiting=Magenta, error=Red,
 /// idle=DarkGray. The single source of truth shared by the deck-card (T1) and
 /// embedded-pane (T2) assertions.
+///
+/// Waiting left Yellow in issue #579: yellow measured 1.70:1 against a white
+/// terminal background (1.07:1 when a terminal renders the badge's BOLD as the
+/// bright variant), far under WCAG AA. Magenta was free — issue #442 had already
+/// retired it as the selection accent — and is the only unclaimed slot that
+/// clears AA on a light *and* a dark terminal. `theme/contrast/002` asserts the
+/// ratios; these tests keep asserting identity, which is what makes the two
+/// complementary rather than redundant.
 fn status_role_colors() -> [(SessionStatus, Color); 6] {
     [
         (SessionStatus::Working, Color::Green),
@@ -1114,7 +1123,7 @@ fn status_role_colors() -> [(SessionStatus, Color); 6] {
         // introducing a sixth status color — so it must render Blue in both the
         // deck card and the embedded pane, never an accent (Magenta/Cyan).
         (SessionStatus::Compacting, Color::Blue),
-        (SessionStatus::WaitingForInput, Color::Yellow),
+        (SessionStatus::WaitingForInput, Color::Magenta),
         (SessionStatus::Error, Color::Red),
         (SessionStatus::Idle, Color::DarkGray),
     ]
@@ -1124,8 +1133,8 @@ fn status_role_colors() -> [(SessionStatus, Color); 6] {
 /// (working/thinking/compacting/waiting/error/idle), none selected or focused,
 /// and assert the card's border color is the matching centralized status role —
 /// working=Green, thinking=Blue, compacting=Blue (it shares the thinking role),
-/// waiting=Yellow, error=Red, idle=DarkGray. Also assert each status border is a
-/// status role and never an accent role (Magenta=selected, Cyan=focused), so a
+/// waiting=Magenta, error=Red, idle=DarkGray. Also assert each status border is a
+/// status role and never an accent role (Reset=selected, Cyan=focused), so a
 /// status can never collide with selection/focus. This pins PRD #155 Option A:
 /// the deck-card border encodes status via the centralized palette roles.
 #[spec("theme/palette/001")]
@@ -1138,13 +1147,14 @@ fn palette_001_deck_card_border_is_status_role() {
             "deck card border for {status:?} must use the centralized status role color \
              {role:?}, got {fg:?}"
         );
-        // A status role must never collide with an accent role: Magenta is
-        // `selected`, Cyan is `focused` (PRD #155 criterion #3). This catches a
-        // status (notably Compacting) drifting onto an accent color.
+        // A status role must never collide with an accent role: `Color::Reset`
+        // (the terminal's own foreground) is `selected` since issue #442, Cyan
+        // is `focused` (PRD #155 criterion #3). This catches a status (notably
+        // Compacting) drifting onto an accent color.
         assert_ne!(
             fg,
-            Color::Magenta,
-            "status {status:?} border must not reuse the `selected` accent (Magenta)"
+            Color::Reset,
+            "status {status:?} border must not reuse the `selected` accent (Color::Reset)"
         );
         assert_ne!(
             fg,
@@ -1184,7 +1194,8 @@ fn palette_002_pane_border_matches_deck_status_color() {
 /// (`Color::Reset`) rather than the working-status Green, carried together with
 /// a thick `┃` glyph, `Modifier::BOLD` and the `▸ ` title marker — three cues,
 /// none of which can be dimmed or camouflaged away. Also assert the border is
-/// neither of the retired accents (Magenta) nor the focused-pane Cyan. This pins
+/// neither the waiting-status Magenta (which is what the retired selection
+/// accent became in issue #579) nor the focused-pane Cyan. This pins
 /// the issue #442 rule that a selected card must be visible whatever its agent
 /// is doing (`mode/deck/001` owns the PaneInput half of the recipe).
 #[spec("theme/palette/003")]
@@ -1234,7 +1245,8 @@ fn palette_003_selected_card_border_is_terminal_fg_thick_marker() {
     assert_ne!(
         fg,
         Color::Magenta,
-        "selection must no longer spend the retired Magenta accent"
+        "selection must not reuse Magenta — issue #442 retired it as the selection \
+         accent, and issue #579 reassigned it to the waiting status"
     );
     assert_ne!(
         fg,
@@ -1250,9 +1262,10 @@ fn palette_003_selected_card_border_is_terminal_fg_thick_marker() {
 /// Scenario: Render a FOCUSED, LIVE (`UiMode::PaneInput`) embedded pane and
 /// assert its border is the dedicated `focused` accent role — Color::Cyan — and
 /// that this color is distinct from every status role
-/// (green/blue/yellow/red/dark-gray) and from the `selected` accent (magenta).
-/// This pins the Option-A split that keeps focus on Cyan while selection moves
-/// to Magenta, so status/selection/focus are provably distinct. Then render a
+/// (green/blue/magenta/red/dark-gray) and from the `selected` accent
+/// (`Color::Reset`, the terminal's own foreground). This pins the Option-A split
+/// that keeps focus on its own accent, so status/selection/focus are provably
+/// distinct. Then render a
 /// pane that is focused AND live AND carries a real `Working` status and assert
 /// its border is still Cyan (the focused accent), NOT Green (the Working status
 /// color) — locking the precedence invariant that focus OVERRIDES a present
@@ -1270,10 +1283,10 @@ fn palette_004_focused_pane_border_is_cyan_distinct() {
     for collide in [
         Color::Green,
         Color::Blue,
-        Color::Yellow,
+        Color::Magenta,
         Color::Red,
         Color::DarkGray,
-        Color::Magenta,
+        Color::Reset,
     ] {
         assert_ne!(
             fg, collide,
