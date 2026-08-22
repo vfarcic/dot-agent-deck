@@ -1,0 +1,15 @@
+---
+source: tests/render_dashboard.rs
+expression: rendered
+---
+ dot-agent-deck — 7 session(s)  (↓5)                                                      
+┏ ▸ 1 ClaudeCode · orchestrator ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ● Idle ┓
+┃Dir:  dot-agent-deck                                                                    ┃
+┃                                                                                        ┃
+┃                                                                                        ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Last: 0s  Tools: 0 ┛
+┌ 2 ClaudeCode · developer ────────────────────────────────────────────────────── ● Idle ┐
+│Dir:  dot-agent-deck                                                                    │
+│                                                                                        │
+│                                                                                        │
+└──────────────────────────────────────────────────────────────────── Last: 0s  Tools: 0 ┘
