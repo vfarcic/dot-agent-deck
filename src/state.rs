@@ -3305,18 +3305,54 @@ async fn dispatch_one_owned(
                          agent; surfacing a notice in the orchestrator pane and skipping the \
                          task pointer write"
                     );
+                    // A GUARDED notice, unlike the respawn-error arm below.
+                    // That arm reports a failure it learned about immediately,
+                    // while this one has just spent up to
+                    // `SESSION_START_WAIT_TIMEOUT` waiting — long enough for the
+                    // ORCHESTRATOR's pane to change hands, at which point an
+                    // unguarded write puts one orchestration's diagnostics into a
+                    // stranger's scrollback (PRD #249 finding B3's reasoning,
+                    // pinned by `scheduler/idle-worker/008` and `/014`). Resolved
+                    // immediately before the call, so the guard's real work is the
+                    // post-lock re-validation.
                     let notice = compose_respawn_no_live_worker_notice(&pane_id);
-                    if let Err(write_err) = registry
-                        .write_to_pane_notice(&orchestrator_pane_id, &notice)
+                    let notice_registry = Arc::clone(&registry);
+                    let notice_pane = orchestrator_pane_id.clone();
+                    let notice_orchestration = orchestration.clone();
+                    match registry
+                        .write_notice_guarded(
+                            &orchestrator_pane_id,
+                            &notice,
+                            registry
+                                .pane_current_agent_id(&orchestrator_pane_id)
+                                .as_deref(),
+                            || async move {
+                                if notice_registry.is_pane_closing(&notice_pane) {
+                                    return false;
+                                }
+                                orchestration_still_matches(
+                                    notice_orchestration.as_ref(),
+                                    notice_registry.pane_orchestration(&notice_pane).as_ref(),
+                                )
+                            },
+                        )
                         .await
                     {
-                        warn!(
+                        Ok(crate::agent_pty::GuardedSend::Applied) => {}
+                        Ok(refused) => warn!(
+                            pane_id = %orchestrator_pane_id,
+                            role = %target_role,
+                            outcome = ?refused,
+                            "delegate: the dead-replacement notice was refused; the failure \
+                             stays in this log only"
+                        ),
+                        Err(write_err) => warn!(
                             pane_id = %orchestrator_pane_id,
                             role = %target_role,
                             error = %write_err,
                             "delegate: failed to surface the dead-replacement notice in the \
                              orchestrator pane scrollback"
-                        );
+                        ),
                     }
                     // Commission audit exit 3: nothing was delivered and the
                     // worker is gone, so the debt has to go with it — otherwise
