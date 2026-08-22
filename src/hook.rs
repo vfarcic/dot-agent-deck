@@ -746,9 +746,11 @@ enum ReplyReadError {
     /// The peer closed without writing a single byte: an older daemon that
     /// does not know this verb. See [`SocketReply::NoReply`].
     ClosedWithoutReply,
-    /// A read, or the per-read timeout re-arm, failed for a reason that is
-    /// not transient — transient ones are retried, see
-    /// [`is_transient_read_error`].
+    /// A read failed for a reason that is not transient — transient ones
+    /// are retried, see [`is_transient_read_error`]. A failed per-read
+    /// timeout *re-arm* used to land here too and no longer does (issue
+    /// #642): it is logged and the read is attempted anyway, for the reasons
+    /// at that call site.
     Io(std::io::Error),
     /// A reply line arrived but was not valid UTF-8.
     InvalidUtf8,
@@ -795,6 +797,12 @@ impl std::fmt::Display for ReplyReadError {
 /// regardless is what let a daemon replying 300ms into a 5s budget be
 /// reported as an absent one on macOS CI.
 ///
+/// The same narrowing applies to the re-arm itself (issue #642): a
+/// `set_timeouts` that fails is logged and the read attempted anyway, because
+/// on macOS the ordinary "daemon answered, then closed" ending makes every
+/// later `setsockopt` on this socket fail with `EINVAL` while the reply is
+/// already buffered and waiting. See the call site.
+///
 /// `deadline` is computed once by the caller — [`request_from_socket_at`] —
 /// from a point **before** it connects, not re-derived here from a fresh
 /// `Instant::now()`: doing the latter would let connect and the request write
@@ -820,7 +828,42 @@ fn read_reply_line(
                 Some(remaining) if !remaining.is_zero() => remaining,
                 _ => return Err(ReplyReadError::DeadlineExpired),
             };
-            stream.set_timeouts(remaining).map_err(ReplyReadError::Io)?;
+            // Issue #642: a re-arm that FAILS is not on its own evidence that
+            // the exchange is over either — and on macOS it is routinely not.
+            //
+            // XNU's `sosetoptlock` refuses EVERY `setsockopt` with `EINVAL`
+            // once a socket carries both `SS_CANTSENDMORE` and
+            // `SS_CANTRCVMORE`: "the socket has been shutdown, no more
+            // sockopt's". This path sets the first of those itself — the
+            // caller half-closes its write side before reading — and the peer
+            // sets the second the instant it closes. The daemon's hook loop
+            // does exactly that: it writes the `get-seed` reply, reads EOF
+            // from our half-close on its very next pass, and drops the
+            // connection. So on macOS a second trip round this loop after the
+            // daemon has answered finds the re-arm failing with `EINVAL`
+            // (`InvalidInput`) while the reply itself is already sitting,
+            // complete, in our receive buffer — and treating that as fatal
+            // threw the reply away and reported the daemon as absent. Linux's
+            // `sock_setsockopt` has no such rule, which is why this only ever
+            // showed up on macOS.
+            //
+            // Reading anyway is safe rather than merely hopeful, on two
+            // counts. A socket in the state that produces this error cannot
+            // block in `read(2)` at all: `SS_CANTRCVMORE` means the next read
+            // returns the buffered bytes or EOF immediately. And more
+            // generally, the re-arm only ever TIGHTENS a bound that is
+            // already in place — `request_from_socket_at_detailed` arms the
+            // socket before it writes — so a failed one leaves the previous,
+            // never-larger-than-the-budget timeout standing rather than
+            // leaving the read unbounded, and the loop head above still ends
+            // the operation with `DeadlineExpired` the moment the budget is
+            // gone.
+            if let Err(err) = stream.set_timeouts(remaining) {
+                tracing::debug!(
+                    reason = %err,
+                    "hook socket reply read could not re-arm its per-read timeout; reading anyway"
+                );
+            }
         }
         let n = match stream.read(&mut buf) {
             Ok(n) => n,
