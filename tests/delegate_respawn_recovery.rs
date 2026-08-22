@@ -319,17 +319,13 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
         "the role must still route after the recovery, or the NEXT delegate is rejected with \
          `reached no worker for role(s)` — the permanent breakage #606 reports"
     );
-    assert!(
-        !fx.cwd.is_empty(),
-        "fixture cwd is only read to keep the tempdir alive for the assertions above"
-    );
 }
 
-/// Scenario: the `clear = true` worker command starts once and then refuses to
-/// start again (it exits immediately on its second invocation). Delegating
-/// respawns it, the replacement dies before it can announce itself, and the
-/// orchestrator must be TOLD — promptly, in its own pane — instead of being left
-/// to wait for a `work-done` that can never arrive.
+/// Scenario: start an orchestration whose `clear = true` worker refuses to start
+/// while a marker file sits beside it, drop that marker once the first worker is
+/// confirmed up, then delegate. The replacement dies before it can announce
+/// itself, and the orchestrator must be TOLD — promptly, in its own pane —
+/// instead of being left to wait for a `work-done` that can never arrive.
 #[tokio::test(flavor = "multi_thread")]
 #[spec("orchestration/delegate/023")]
 async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() {
