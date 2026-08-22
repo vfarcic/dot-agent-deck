@@ -148,7 +148,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/grid/001 — A deck too short for its cards in one column widens to a second rather than painting a subset (issue #588).
 - **Layer:** L1 (ratatui `TestBackend` + `insta`).
 - **Agent:** none (seven synthetic idle role-card fixtures, named for the roles in the report).
-- **Asserts:** the reported geometry — seven roles on a 90x27 deck, whose 25 usable rows cannot hold seven single-column Compact cards (7x5 = 35) — paints all seven role names, slices no card row (`visible_rows == total_rows`), and does so in two columns. Control: the same seven on a 90x60 deck, which one column always fitted, still paints all seven **in one column** — widening is spent only on completeness, never gratuitously.
+- **Asserts:** the reported geometry — seven roles on a 90x27 deck, whose 25 usable rows cannot hold seven single-column Compact cards (7x5 = 35) — paints all seven role names, draws all seven cards (corner glyphs counted in the buffer, so the count is of what reached the screen), and does so in two columns. Control: the same seven on a 90x60 deck, which one column always fitted, still paints all seven **in one column** — widening is spent only on completeness, never gratuitously.
 - **Does not assert:** the `(↑a ↓b)` overflow indicator (covered by `dashboard/grid/003`); the `UiState::columns` navigation agreement (`dashboard/grid/002`); the density ladder's own thresholds (`dashboard/density/*` and the `choose_grid_layout_density_*` unit tests); the stats-bar row the grid reserves but does not draw.
 - **Platform coverage:** mac+linux+windows.
 
@@ -162,7 +162,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/grid/003 — When no layout fits, the deck title counts the cards it is not showing (issue #588).
 - **Layer:** L1 (ratatui `TestBackend` + `insta`).
 - **Agent:** none.
-- **Asserts:** seven roles on a 90x12 deck, too small at every column count 90 columns allows, genuinely overflows (`visible_rows < total_rows`) and carries `(↓5)` in a title that still names all `7 session(s)`; the column count is **not** escalated, since narrowing every card buys nothing once completeness is out of reach. Selecting the last card scrolls the window down and flips the marker to `(↑5)`. Closes the asymmetry the issue names — the scheduled-tasks header signalled its hidden rows while the card grid rendered its title plain.
+- **Asserts:** seven roles on a 90x12 deck, too small at every column count 90 columns allows, genuinely overflows (two of seven cards drawn) and carries `(↓5)` in a title that still names all `7 session(s)`; the column count is **not** escalated, since narrowing every card buys nothing once completeness is out of reach. Selecting the last card scrolls the window down and flips the marker to `(↑5)`. Closes the asymmetry the issue names — the scheduled-tasks header signalled its hidden rows while the card grid rendered its title plain.
 - **Does not assert:** which key scrolls the grid (selection movement does, via `dashboard/selection/*`); the indicator's format, pinned by the `scroll_indicator_reports_only_what_is_hidden` unit test shared with the scheduled-tasks modal.
 - **Platform coverage:** mac+linux+windows.
 

@@ -18971,20 +18971,20 @@ pub fn render_dashboard_cards_to_buffer(
 
 /// What the deck's card grid decided, reported back to an L1 test alongside the
 /// buffer it drew (issue #588).
+///
+/// Deliberately one field. Everything else a test wants to know — how many cards
+/// were painted, in how many columns, whether the title carries an overflow
+/// marker — is legible in the buffer itself, and reading it there keeps the
+/// assertions on what was actually drawn instead of on a second copy of the
+/// layout arithmetic. `nav_columns` is the exception because it is not drawable:
+/// it is UI *state*, and a render that draws the grid correctly while leaving
+/// that state wrong is exactly the desync this seam exists to catch.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CardGridProbe {
     /// `UiState::columns` **after** the render — the field left/right card
-    /// navigation reads. Compare it against the columns visible in the buffer:
-    /// the two disagreeing is the desync that made this seam worth having, and
-    /// it is invisible in a snapshot on its own.
+    /// navigation reads.
     pub nav_columns: usize,
-    /// The density tier the grid settled on.
-    pub density: CardDensityKind,
-    /// Card rows that fit the viewport, and how many there are in total. When
-    /// these differ the grid is sliced and the title must say so.
-    pub visible_rows: usize,
-    pub total_rows: usize,
 }
 
 /// L1 seam for the whole deck card grid — the real [`render_card_grid`], not a
@@ -19049,19 +19049,8 @@ pub fn render_card_grid_to_buffer(
         })
         .expect("TestBackend draw should succeed");
 
-    let GridLayout { cols, density } =
-        choose_grid_layout(sessions.len(), width, height.saturating_sub(2));
-    let card_height = density.card_height();
     let probe = CardGridProbe {
         nav_columns: ui.columns,
-        density: match density {
-            CardDensity::Compact => CardDensityKind::Compact,
-            CardDensity::Normal => CardDensityKind::Normal,
-            CardDensity::Spacious => CardDensityKind::Spacious,
-        },
-        visible_rows: ((height.saturating_sub(2) / card_height).max(1) as usize)
-            .min(sessions.len().div_ceil(cols)),
-        total_rows: sessions.len().div_ceil(cols),
     };
     (terminal.backend().buffer().clone(), probe)
 }

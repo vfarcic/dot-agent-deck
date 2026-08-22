@@ -2351,10 +2351,20 @@ fn as_cards(sessions: &[SessionState]) -> Vec<(&SessionState, Option<&str>)> {
         .collect()
 }
 
-/// How many card columns the buffer actually shows, counted from the top border
-/// row of the first card row: each card contributes exactly one `┌` (or `┏` when
-/// selected). Derived from what was drawn rather than from the layout code, so
-/// this is an independent witness of the column count.
+/// How many cards the buffer actually shows: each card contributes exactly one
+/// top-left corner — `┌`, or `┏` when it is selected and drawn thick.
+///
+/// Counted from the drawn cells rather than asked of the layout code, so every
+/// assertion built on it is a statement about what reached the screen.
+fn drawn_cards(rendered: &str) -> usize {
+    rendered
+        .lines()
+        .map(|line| line.matches('┌').count() + line.matches('┏').count())
+        .sum()
+}
+
+/// How many card columns the buffer shows, from the widest card row. Same
+/// corner-counting witness as [`drawn_cards`], per row instead of in total.
 fn drawn_columns(rendered: &str) -> usize {
     rendered
         .lines()
@@ -2379,7 +2389,7 @@ fn grid_001_short_deck_still_paints_every_role() {
     // `orchestrator … releaser`, dropping `researcher` and `documenter`. Two
     // columns need only 7.div_ceil(2) * 5 = 20 rows, and 90 columns is two cards
     // of 45 — comfortably past MIN_CARD_W.
-    let (buffer, probe) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 27);
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 27);
     let rendered = buffer_to_text(&buffer);
 
     for role in REPORTED_ROLES {
@@ -2390,8 +2400,9 @@ fn grid_001_short_deck_still_paints_every_role() {
         );
     }
     assert_eq!(
-        probe.visible_rows, probe.total_rows,
-        "no card row may be sliced off when a layout exists that fits them all:\n{rendered}"
+        drawn_cards(&rendered),
+        REPORTED_ROLES.len(),
+        "no card may be sliced off when a layout exists that fits them all:\n{rendered}"
     );
     assert_eq!(
         drawn_columns(&rendered),
@@ -2403,7 +2414,7 @@ fn grid_001_short_deck_still_paints_every_role() {
     // Control: the same seven roles on a deck tall enough that one column always
     // fitted them. If this one failed too, the fixture — not the height — would
     // be what the assertion above is really measuring.
-    let (tall_buffer, tall_probe) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 60);
+    let (tall_buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 60);
     let tall = buffer_to_text(&tall_buffer);
     for role in REPORTED_ROLES {
         assert!(
@@ -2417,7 +2428,7 @@ fn grid_001_short_deck_still_paints_every_role() {
         "control: a deck that already fits one column must keep one column — \
          widening is only ever spent on completeness:\n{tall}"
     );
-    assert_eq!(tall_probe.visible_rows, tall_probe.total_rows);
+    assert_eq!(drawn_cards(&tall), REPORTED_ROLES.len());
 }
 
 /// Scenario: Sweep deck geometries from one column to an escalated two, and for
@@ -2481,13 +2492,15 @@ fn grid_003_unavoidable_overflow_is_signalled() {
 
     // 12 rows less title and stats bar leaves 10: two Compact cards. Two columns
     // would need 7.div_ceil(2) * 5 = 20, so no layout 90 columns allows fits.
-    let (buffer, probe) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 12);
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 90, 12);
     let rendered = buffer_to_text(&buffer);
     let title = rendered.lines().next().expect("a rendered title row");
 
-    assert!(
-        probe.visible_rows < probe.total_rows,
-        "fixture must genuinely overflow, or this test proves nothing:\n{rendered}"
+    assert_eq!(
+        drawn_cards(&rendered),
+        2,
+        "fixture must genuinely overflow — five of the seven cards unpainted — \
+         or this test proves nothing:\n{rendered}"
     );
     assert!(
         title.contains("(↓5)"),
