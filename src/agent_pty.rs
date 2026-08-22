@@ -1334,6 +1334,13 @@ fn pump_reader(
     }
     exited.store(true, Ordering::SeqCst);
     change_notify.notify_one();
+    // Issue #584: release anyone waiting on THIS agent's liveness before the
+    // delegation sweep below, so a delegate parked on its replacement's
+    // readiness learns the replacement is gone at EOF rather than at the end of
+    // a fixed 30 s window. A dropped registry leaves nothing to wake.
+    if let Some(registry) = registry.upgrade() {
+        registry.signal_agent_exit(&agent_id);
+    }
     if let Some(pane_id) = pane_id_env.as_deref()
         && let Some(registry) = registry.upgrade()
         && registry.is_agent_still_registered(&agent_id)
@@ -2911,6 +2918,58 @@ pub enum SilenceWatchRetirement {
     },
 }
 
+/// Everything a pane needs in order to be created from NOTHING — the case where
+/// [`AgentPtyRegistry::respawn_or_recreate_agent_for_pane`] finds no record to
+/// lift an identity out of.
+///
+/// A respawn normally captures all of this from the record it replaces. When
+/// that record is gone — a `StopAgent` removed it mid-close (issue #606), or the
+/// pane's previous agent died and was reaped — only the CALLER knows what the
+/// pane is for, so the caller supplies it. The delegate path fills it from the
+/// role's `.dot-agent-deck.toml` entry plus the pane's known cwd and
+/// orchestration membership.
+#[derive(Debug, Clone, Default)]
+pub struct PaneRecreateIdentity {
+    pub cwd: Option<String>,
+    pub display_name: Option<String>,
+    pub tab_membership: Option<TabMembership>,
+    pub agent_type: Option<AgentType>,
+    /// Extra environment for the fresh child. The caller MUST include
+    /// `DOT_AGENT_DECK_PANE_ID`; without it the new agent is not bound to the
+    /// pane and nothing can route to it.
+    pub env: Vec<(String, String)>,
+}
+
+/// What [`AgentPtyRegistry::respawn_or_recreate_agent_for_pane`] did.
+#[derive(Debug, Clone)]
+pub struct PaneRespawn {
+    /// The registry id now occupying the pane.
+    pub agent_id: String,
+    /// `true` when the pane had no record left and a fresh agent was created
+    /// from [`PaneRecreateIdentity`] instead of being respawned from one. The
+    /// delegate path uses this to restore the daemon-side role registration a
+    /// completed close took with it.
+    pub recreated: bool,
+}
+
+/// How long [`AgentPtyRegistry::respawn_or_recreate_agent_for_pane`] waits for
+/// an in-flight `StopAgent` to release the pane before deciding the pane is
+/// genuinely free.
+///
+/// Twice [`AGENT_TERMINATE_GRACE`], because that grace is only the child-kill
+/// half of a close: the handler also unregisters the pane and drops its hold
+/// afterwards, and on a loaded host those steps sit behind the same runtime the
+/// grace just occupied. Over-waiting costs a delayed delegate; under-waiting
+/// puts us back at issue #606, where the pane is re-created while its
+/// predecessor's cleanup is still running and the cleanup then deletes the
+/// newcomer's state.
+const PANE_CLOSE_SETTLE_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Poll cadence for [`PANE_CLOSE_SETTLE_TIMEOUT`]. Matches the 50 ms cadence
+/// `terminate_child_with_grace_and_wait` polls `try_wait` at, so the wait
+/// resolves within one tick of the close it is waiting on.
+const PANE_CLOSE_SETTLE_POLL: Duration = Duration::from_millis(50);
+
 struct RegistryInner {
     next_id: u64,
     agents: HashMap<String, RunningAgent>,
@@ -2965,6 +3024,23 @@ struct RegistryInner {
     /// exclusion is the short tail between a dead child and its record being
     /// dropped by `close_agent`.
     cleanup_holds: HashSet<String>,
+    /// Issue #584: one-shot waiters for "this AGENT's PTY reached EOF", keyed by
+    /// registry id.
+    ///
+    /// The sibling of [`DelegationTracker::close_waiters`], and it exists for the
+    /// same reason: a wait that is really about a target's liveness must not be
+    /// expressed as a poll. The delegate's post-respawn readiness wait sat on a
+    /// fixed 30 s deadline, so a replacement worker that died two seconds into
+    /// its boot still cost the full window — and the pointer was then refused by
+    /// the identity gate with `NoLiveTarget` and dropped in silence. Resolved by
+    /// [`AgentPtyRegistry::signal_agent_exit`], which `pump_reader` calls in the
+    /// same breath as setting `exited`.
+    ///
+    /// A `oneshot` rather than a poll loop deliberately: the delegate path is
+    /// exercised on a PAUSED Tokio clock by `orchestration/delegate/011`, and a
+    /// polling task's `sleep` would let the runtime's auto-advance move that
+    /// clock underneath the test.
+    exit_waiters: HashMap<String, Vec<oneshot::Sender<()>>>,
 }
 
 /// Issue #454: RAII holder for a [`RegistryInner::pending_spawns`] entry.
@@ -3128,6 +3204,7 @@ impl AgentPtyRegistry {
                 agents: HashMap::new(),
                 pending_spawns: HashMap::new(),
                 cleanup_holds: HashSet::new(),
+                exit_waiters: HashMap::new(),
             }),
             dispatch_mutexes: Mutex::new(HashMap::new()),
             detach_count: AtomicU64::new(0),
@@ -3719,6 +3796,73 @@ impl AgentPtyRegistry {
         waiters.retain(|waiter| !waiter.is_closed());
         waiters.push(tx);
         rx
+    }
+
+    /// Issue #584: a future that resolves when `agent_id`'s PTY reaches EOF —
+    /// i.e. when its child is gone.
+    ///
+    /// The agent-scoped sibling of [`Self::pane_close_signal`]. Resolves
+    /// IMMEDIATELY when the agent is already absent or already flagged `exited`,
+    /// so a caller can never park on a corpse it registered for too late.
+    ///
+    /// Waiters are keyed by registry id, which is generation-scoped and never
+    /// reused, so this can never be satisfied by a successor on the same pane.
+    pub fn agent_exit_signal(&self, agent_id: &str) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        let mut inner = self.inner.lock().unwrap();
+        let live = inner
+            .agents
+            .get(agent_id)
+            .is_some_and(|a| !a.exited.load(Ordering::SeqCst));
+        if !live {
+            // Dropping `tx` here resolves `rx` immediately.
+            return rx;
+        }
+        let waiters = inner.exit_waiters.entry(agent_id.to_string()).or_default();
+        waiters.retain(|waiter| !waiter.is_closed());
+        waiters.push(tx);
+        rx
+    }
+
+    /// Resolve every [`Self::agent_exit_signal`] waiter for `agent_id`, by
+    /// dropping their senders. Called by `pump_reader` at EOF.
+    fn signal_agent_exit(&self, agent_id: &str) {
+        let Ok(mut inner) = self.inner.lock() else {
+            // A poisoned registry lock means the daemon is already in trouble;
+            // the waiters' own timeouts still bound them, so this degrades to
+            // the pre-#584 behaviour rather than failing anything.
+            return;
+        };
+        drop(inner.exit_waiters.remove(agent_id));
+    }
+
+    /// Issue #606: is a `StopAgent` currently taking this pane apart?
+    ///
+    /// True from the moment the close is authorised (`hold_pane_for_cleanup`)
+    /// or the pane is marked closing (`begin_pane_close`) until BOTH are
+    /// released. Either alone is insufficient: the hold is taken first and
+    /// dropped last, while `closing_panes` is what a failed close rolls back, so
+    /// a caller that consults only one of them sees a pane that looks free while
+    /// the other half of the teardown is still running.
+    ///
+    /// This is the question [`Self::respawn_or_recreate_agent_for_pane`] asks
+    /// when it finds no entry to respawn from: a pane with no agent because a
+    /// close is mid-flight is a pane to WAIT for, not a hard failure.
+    pub fn pane_close_in_flight(&self, pane_id: &str) -> bool {
+        // The two locks are taken SEQUENTIALLY, never nested: `inner` is
+        // released before `is_pane_closing` reaches for `delegations`. Nothing
+        // in this file holds `delegations` while taking `inner`, and this keeps
+        // it that way from the other direction too.
+        let held_for_cleanup = {
+            let Ok(inner) = self.inner.lock() else {
+                // A poisoned registry lock is not evidence that the pane is
+                // free; fall through to the closing mark rather than inventing
+                // an answer that would let a spawn race a live teardown.
+                return true;
+            };
+            inner.cleanup_holds.contains(pane_id)
+        };
+        held_for_cleanup || self.is_pane_closing(pane_id)
     }
 
     /// Remove every record that names `pane_id` as its worker key or as its
@@ -5793,6 +5937,113 @@ impl AgentPtyRegistry {
             self.set_agent_type(pane_id_env, &observed);
         }
         Ok(new_agent_id)
+    }
+
+    /// [`Self::respawn_agent_for_pane`], but a pane with no record left is
+    /// re-created rather than reported as a hard `NotFound` — issue #606.
+    ///
+    /// `respawn_agent_for_pane` lifts the pane's identity out of the record it
+    /// is replacing, so it can only replace a record that exists. That is not
+    /// the same thing as "the pane exists": [`Self::close_agent`] removes the
+    /// entry BEFORE spending its termination grace, so for up to
+    /// [`AGENT_TERMINATE_GRACE`] a pane that is being closed has no record at
+    /// all. A `clear = true` delegate landing in that window got `NotFound`,
+    /// surfaced "respawn failed" into the orchestrator pane, and left the role
+    /// unreachable for the rest of the session.
+    ///
+    /// The ordering here is what makes the recovery safe rather than merely
+    /// optimistic:
+    ///
+    /// 1. Try the ordinary respawn. The overwhelmingly common case has a record
+    ///    and never reaches any of the rest of this.
+    /// 2. On `NotFound`, WAIT for any in-flight close to release the pane
+    ///    ([`Self::pane_close_in_flight`]). Creating an agent underneath a
+    ///    running `StopAgent` is not merely racy — the close holds the pane
+    ///    exactly so that its own `unregister_pane` cannot delete a newcomer's
+    ///    state, and `spawn_agent` refuses a held pane outright.
+    /// 3. Retry the respawn once. The pane may have acquired a record while we
+    ///    waited (a concurrent spawn, or a close that failed and rolled back),
+    ///    and replacing that record is more correct than spawning beside it.
+    /// 4. Only then create a fresh agent from `identity`.
+    ///
+    /// Errors other than `NotFound` are returned untouched: a spawn that failed
+    /// to exec, a shutting-down registry or a validation refusal are all real
+    /// failures, and retrying them would just fail twice.
+    pub async fn respawn_or_recreate_agent_for_pane(
+        self: &Arc<Self>,
+        pane_id_env: &str,
+        command: &str,
+        identity: &PaneRecreateIdentity,
+    ) -> Result<PaneRespawn, AgentPtyError> {
+        match self.respawn_agent_for_pane(pane_id_env, command).await {
+            Ok(agent_id) => {
+                return Ok(PaneRespawn {
+                    agent_id,
+                    recreated: false,
+                });
+            }
+            Err(AgentPtyError::NotFound(_)) => {}
+            Err(other) => return Err(other),
+        }
+
+        let waited_from = std::time::Instant::now();
+        while self.pane_close_in_flight(pane_id_env)
+            && waited_from.elapsed() < PANE_CLOSE_SETTLE_TIMEOUT
+        {
+            tokio::time::sleep(PANE_CLOSE_SETTLE_POLL).await;
+        }
+        if self.pane_close_in_flight(pane_id_env) {
+            tracing::warn!(
+                pane_id = %pane_id_env,
+                waited_secs = PANE_CLOSE_SETTLE_TIMEOUT.as_secs(),
+                "respawn: a close of this pane is still in flight after the settle timeout; \
+                 attempting the fresh spawn anyway"
+            );
+        }
+
+        match self.respawn_agent_for_pane(pane_id_env, command).await {
+            Ok(agent_id) => {
+                return Ok(PaneRespawn {
+                    agent_id,
+                    recreated: false,
+                });
+            }
+            Err(AgentPtyError::NotFound(_)) => {}
+            Err(other) => return Err(other),
+        }
+
+        let mut env = identity.env.clone();
+        if !env.iter().any(|(k, _)| k == DOT_AGENT_DECK_PANE_ID) {
+            env.push((DOT_AGENT_DECK_PANE_ID.to_string(), pane_id_env.to_string()));
+        }
+        // The launch shape follows the command actually being launched, with the
+        // caller's declared identity as the fallback — the same rule
+        // `respawn_agent_for_pane` states as its launch-shape invariant, so a
+        // re-created pane and a respawned one exec identically.
+        let agent_type =
+            AgentType::from_command(Some(command)).or_else(|| identity.agent_type.clone());
+        let agent_id = self.spawn_agent(SpawnOptions {
+            command: Some(command),
+            cwd: identity.cwd.as_deref(),
+            display_name: identity.display_name.as_deref(),
+            // No prior record means no last-known geometry; the default the
+            // daemon-side spawn primitive uses, corrected by the TUI's next
+            // resize exactly as a freshly dispatched pane is.
+            rows: 24,
+            cols: 80,
+            env,
+            tab_membership: identity.tab_membership.clone(),
+            agent_type,
+        })?;
+        tracing::info!(
+            pane_id = %pane_id_env,
+            agent_id = %agent_id,
+            "respawn: the pane had no agent left to replace, so a fresh one was created for it"
+        );
+        Ok(PaneRespawn {
+            agent_id,
+            recreated: true,
+        })
     }
 
     /// Subscribe to an agent's live output and take its scrollback snapshot

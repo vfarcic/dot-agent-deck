@@ -21,10 +21,18 @@ name = "orchestrator"
 command = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash"
 start = true
 
+# `clear = true` on the WORKER is load-bearing, not incidental (issue #584).
+# A dispatched orchestration's delegate goes through
+# `respawn_agent_for_pane` — the previous worker is killed and a fresh one
+# spawned before the task pointer is written — and that respawn is where #584's
+# failure lives. With `clear = false` this test delegated to an ALREADY-RUNNING
+# worker and never touched the respawn at all, so the dispatch path's `clear =
+# true` delegate had no real-agent coverage anywhere in the suite. It costs one
+# extra Haiku cold boot on the coder.
 [[orchestrations.roles]]
 name = "coder"
 command = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write"
-clear = false
+clear = true
 
 [[orchestrations.roles]]
 name = "reviewer"

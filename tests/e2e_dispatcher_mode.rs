@@ -1233,9 +1233,11 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
         resp.send_result
     );
 
-    // Generous: an orchestrator turn, a `clear = false` worker's delivery, and a
-    // worker turn — three real Haiku round trips on a machine already running
-    // three agents. A slow chain must not read as a broken one.
+    // Generous: an orchestrator turn, a `clear = true` worker RESPAWN (issue
+    // #584 — a fresh Haiku cold boot, its `SessionStart`, and the readiness
+    // buffer) and then a worker turn — three real Haiku round trips plus a cold
+    // start, on a machine already running three agents. A slow chain must not
+    // read as a broken one.
     const WORK_WAIT: Duration = Duration::from_secs(300);
     let sentinel_path = expected_worktree.join(SENTINEL);
     assert!(
