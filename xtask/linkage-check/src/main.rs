@@ -69,6 +69,11 @@
 
 mod clean_tmp;
 mod list_tests;
+/// Issue #648: the toolchain pins duplicated between `devbox.json` and
+/// `.github/workflows/`. Tests only, and Unix only — the rule itself lives in
+/// `scripts/check-pin-lockstep.sh`, which CI's `devbox` job also runs directly.
+#[cfg(all(test, unix))]
+mod pin_lockstep;
 mod repo_state;
 /// Issue #521: the `/verify-pr` scripts' `KEY=value` output contract. Tests
 /// only — there is no runtime rule here, the scripts enforce themselves.
