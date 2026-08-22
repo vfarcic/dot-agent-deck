@@ -145,6 +145,8 @@ With `clear = false` the agent is left running. The task is typed straight into 
 
 With `clear = true` — the default — every delegation is a cold start. The deck terminates the worker's agent (SIGTERM, escalating to SIGKILL if it does not go), launches the role's `command` again in the same pane, and delivers the task to the replacement. The role card stays where it is and keeps its name; the process underneath is new and the previous conversation is gone. That is the point: workers get a clean context per task instead of accumulating one long, drifting session.
 
+There does not have to be a worker there to begin with. If the role's pane is empty — you closed it, or its agent died — the delegation creates a fresh one from the role's `command` instead of failing, so a role stays reachable for as long as the orchestration is running. If the replacement cannot be started at all, the deck says so in your orchestrator's pane rather than dropping the task silently; see [A delegated worker never came up](#a-delegated-worker-never-came-up).
+
 The delivery cost of that restart is timing. A freshly launched agent announces that its session has started well **before** its input box is ready to accept a line of text and treat Enter as "submit", so a task written the instant that signal arrives can land in a pane that is not listening yet. Where the write falls on the agent's startup decides what you see: the task text sitting in the worker's input box unsubmitted until a human presses Enter, or nothing at all — no text, no activity, a worker that looks healthy and idle while the orchestrator waits for a `work-done` that will never come.
 
 The deck therefore holds a `clear = true` task for a short **readiness buffer** after the replacement signals its session start (and after the fallback wait expires, for agents that never signal at all). The default is 1000 ms: the spawn-time path's 500 ms, which was tuned for a warm pane, doubled because a respawn is a cold start. Nothing about this is configured per role; the only effect you should notice is that a `clear = true` delegation takes about a second longer to appear in the worker's pane than a `clear = false` one.
@@ -453,6 +455,20 @@ Only the role with `start = true` can call `dot-agent-deck delegate`. If a worke
 
 The role name in `--to` must match the `name` field in the config exactly (case-sensitive). Check for typos. Also verify the worker's pane is part of the same orchestration tab — you cannot delegate across tabs.
 
+### A delegated worker never came up
+
+A `clear = true` delegation terminates the worker before it has a replacement, so if the replacement never starts, the pane is left with no agent and the task has nowhere to go. When that happens the deck writes `⚠ delegated worker never came up (dot-agent-deck daemon report)` into your orchestrator's pane and stops: nothing was delivered, and no `work-done` can arrive for that delegation. The notice names the worker's pane; the daemon log names the role and carries the underlying error.
+
+The usual cause is the role's `command` — a launcher that fails in that directory, a binary that is not on the daemon's `PATH`, or an agent that exits immediately on start. Jump into the worker's pane and look at its scrollback: whatever the replacement printed before it died is still there. Running the role's `command` by hand in the worker's directory reproduces most of these in one step.
+
+Before this notice existed the deck waited out its full 30-second readiness window, wrote into the empty pane, had the write refused, and dropped the task with only a line in the daemon log — so the orchestrator was told nothing was wrong and waited for a completion that could never arrive.
+
+### Closing a worker's pane and then delegating to it
+
+The role comes back. Closing a pane takes a few seconds to finish, and a `clear = true` delegation that arrives during it waits for the close to complete and then creates a fresh worker for the role — which is what `clear = true` means in the first place. The same recovery applies to a worker whose agent simply died: the next delegation to that role starts a new one rather than failing.
+
+If you want a role to stay gone, remove it from `.dot-agent-deck.toml` (or close the whole orchestration tab); closing one worker's pane is not a way to take a role out of an orchestration that is still running.
+
 ### Orchestrator receives no work-done feedback
 
 The daemon writes feedback to the orchestrator pane via the PTY. If the orchestrator's pane is closed, the feedback write fails silently. The `.dot-agent-deck/work-done-<role>.md` file is written first, so for a delegated task it can still be read manually — unless the daemon could not write it, in which case the daemon log carries a `failed to write work-done summary` warning and any file at that path belongs to an **earlier** delegation (or is a partial write).
@@ -463,7 +479,7 @@ The daemon records every delegation it dispatches, and a `work-done` that answer
 
 Nothing is dropped — the report still arrives, framed as information rather than as delivered work — and `.dot-agent-deck/work-done-<role>.md` is deliberately left untouched, so an uncommissioned report cannot overwrite the last one the orchestrator did commission. If you want a completion to be reported as delegated work, delegate it: task the worker through the orchestrator rather than typing into its pane.
 
-Two consequences of "untouched" are worth knowing before you go looking for a file. An **orchestrator** running `dot-agent-deck work-done` on itself without `--done` counts as uncommissioned too — nobody delegates to the orchestrator — so no `work-done-<orchestrator-role>.md` is written for it; use `--done` to close out the orchestration, or delegate the work to a role. And a delegate that never actually **reached** its worker — the identity gate refused the write, or a `clear = true` respawn failed and left the notice `⚠ respawn failed for role '<role>'` in your orchestrator pane — commissions nothing, so a completion arriving from that worker afterwards is uncommissioned by the same rule. That is deliberate: the alternative is a stale commission that quietly relabels some later, unrelated completion as delegated work.
+Two consequences of "untouched" are worth knowing before you go looking for a file. An **orchestrator** running `dot-agent-deck work-done` on itself without `--done` counts as uncommissioned too — nobody delegates to the orchestrator — so no `work-done-<orchestrator-role>.md` is written for it; use `--done` to close out the orchestration, or delegate the work to a role. And a delegate that never actually **reached** its worker — the identity gate refused the write, a `clear = true` respawn failed and left the notice `⚠ respawn failed for role '<role>'` in your orchestrator pane, or the replacement never came up and left `⚠ delegated worker never came up` there — commissions nothing, so a completion arriving from that worker afterwards is uncommissioned by the same rule. That is deliberate: the alternative is a stale commission that quietly relabels some later, unrelated completion as delegated work.
 
 ### The summary file could not be written
 

@@ -1471,8 +1471,8 @@ fn record_delegation_commission(
 /// Routed through one helper rather than inlined at each site so the invariant is
 /// checkable by grep instead of by reading 300 lines of `dispatch_one_owned`: the
 /// release sites are exactly the callers of this function. The audit of
-/// `dispatch_one_owned`'s four exits, and why the other two are already correct,
-/// is recorded at the top of that function.
+/// `dispatch_one_owned`'s five exits, and why the two that release nothing are
+/// already correct, is recorded at the top of that function.
 fn release_undelivered_commission(
     registry: &AgentPtyRegistry,
     worker_pane_id: &str,
@@ -1858,6 +1858,32 @@ pub(crate) fn compose_worker_exited_notice(worker_pane_id: &str) -> String {
     ))
 }
 
+/// The single-line notice written into the ORCHESTRATOR's pane when a
+/// `clear = true` delegate's replacement worker never became live — issue #584.
+///
+/// This is the gap the issue is actually about. `respawn_agent_for_pane`
+/// disposes of the previous worker BEFORE the replacement exists, so once the
+/// replacement fails to come up the pane has no agent at all — and the identity
+/// gate then refused the task pointer with `NoLiveTarget`, logged one `warn!`,
+/// and stopped. The `delegate` CLI had already exited 0, so the orchestrator was
+/// told nothing was wrong and waited for a `work-done` that could never arrive.
+///
+/// Composition follows [`compose_worker_exited_notice`]'s precedent exactly, for
+/// the same reasons: fixed daemon-authored text, single line, and the WORKER's
+/// `pane_id_env` as the only interpolation — that value has been through
+/// [`crate::agent_pty::is_valid_pane_id_env`]'s `[A-Za-z0-9_-]` scrub, whereas
+/// the role name is caller-supplied config text and PRD #249's finding B3
+/// removed it from this notice family on purpose. Role, command and the
+/// underlying error stay in the accompanying `warn!`.
+pub(crate) fn compose_respawn_no_live_worker_notice(worker_pane_id: &str) -> String {
+    compose_delegate_prompt(&format!(
+        "⚠ delegated worker never came up (dot-agent-deck daemon report): the clear=true respawn \
+         for pane {worker_pane_id} left no live agent on it, so the task pointer was NOT \
+         delivered and no work-done can arrive for it. Check that pane's scrollback; the daemon \
+         log names the role."
+    ))
+}
+
 /// PRD #249 M3: does this event prove the delegated agent actually *consumed the
 /// task pointer* — i.e. that a turn began?
 ///
@@ -2205,16 +2231,22 @@ pub fn compose_worker_task_file(prompt_template: Option<&str>, task: &str, role:
 
 /// Look up the role config for `role_name` inside the orchestration
 /// named `orchestration_name`, by parsing the project config file at
-/// `cwd`. Returns `None` when any layer is missing (no project config,
+/// `cwd`, together with the role's INDEX within that orchestration.
+/// Returns `None` when any layer is missing (no project config,
 /// no matching orchestration, no matching role) — the caller treats
 /// "no config" as "no template, no clear" and falls through to the
 /// default behavior. Centralizing the lookup here keeps
 /// `handle_delegate` from juggling three layers of `Option` inline.
-fn lookup_orchestration_role(
+///
+/// Issue #606: the index is carried because a `TabMembership::Orchestration`
+/// needs one, and the delegate path needs one of those whenever it has to
+/// re-create a worker pane from nothing — the card would otherwise land outside
+/// the orchestration's tab, or in the wrong column of it.
+fn lookup_orchestration_role_indexed(
     cwd: &str,
     orchestration_name: &str,
     role_name: &str,
-) -> Option<OrchestrationRoleConfig> {
+) -> Option<(usize, OrchestrationRoleConfig)> {
     let cfg = load_project_config(std::path::Path::new(cwd))
         .ok()
         .flatten()?;
@@ -2222,7 +2254,10 @@ fn lookup_orchestration_role(
         .orchestrations
         .into_iter()
         .find(|o| o.name == orchestration_name)?;
-    orch.roles.into_iter().find(|r| r.name == role_name)
+    orch.roles
+        .into_iter()
+        .enumerate()
+        .find(|(_, r)| r.name == role_name)
 }
 
 /// PRD #225 M3: does this `SessionStart` mean "the agent can accept input", or
@@ -2959,9 +2994,9 @@ fn write_work_done_summary(
 /// caller, *before* this function's first poll, so **every exit that leaves
 /// without the worker receiving a task pointer owes a release** — see
 /// [`release_undelivered_commission`], which states the rule and names the
-/// consequence of breaking it. This function has four exits, audited here so the
+/// consequence of breaking it. This function has five exits, audited here so the
 /// two that deliberately release nothing read as checked absences rather than as
-/// the two that were simply missed:
+/// the ones that were simply missed:
 ///
 /// 1. **The pi-native `clear = true` return** — releases nothing, correctly. The
 ///    pointer IS handed over: it is stashed as the respawned pi's seed for the
@@ -2970,7 +3005,12 @@ fn write_work_done_summary(
 ///    injection, not a no-delivery path.
 /// 2. **The respawn-error return** — releases. The previous child is already
 ///    disposed of and the replacement never came up, so nothing can be delivered.
-/// 3. **The readiness-buffer close return** — releases nothing, correctly, and
+/// 3. **The dead-replacement return** (issue #584) — releases, for the same
+///    reason 2 does and reached by the same road: the respawn SUCCEEDED, but the
+///    replacement was gone by the time the readiness wait ended, so the pane has
+///    no live agent and the pointer cannot reach one. The distinction from 2 is
+///    only where the failure became knowable, never whether a debt is owed.
+/// 4. **The readiness-buffer close return** — releases nothing, correctly, and
 ///    this one is the subtle entry. `begin_pane_close` is what resolves the
 ///    future this arm selects on, and it drains every commission touching the
 ///    pane under the *same* `delegations` lock hold that drops the close waiter.
@@ -2982,7 +3022,7 @@ fn write_work_done_summary(
 ///    refusal to restore on a FAILED close is right for a still-live worker that
 ///    did have a genuine delegation outstanding is a separate question, tracked
 ///    as issue #505.
-/// 4. **The tail, after the guarded send** — releases whenever the send did not
+/// 5. **The tail, after the guarded send** — releases whenever the send did not
 ///    deliver (`WrongSession`, `Stale`, `NoLiveTarget`, `Err`). `Ambiguous` counts
 ///    as delivered on purpose: some bytes reached the authorized worker, so a
 ///    completion may genuinely be owed and keeping the commission is the
@@ -2999,6 +3039,11 @@ async fn dispatch_one_owned(
     cwd: Option<String>,
     silence_watch: Option<SilenceWatch>,
     delegation_seq: Option<u64>,
+    // Issue #606: the daemon's own state, when the caller has one, so a worker
+    // pane that had to be RE-CREATED can have its orchestration role registered
+    // again. `None` for callers with no daemon state (unit fixtures): the
+    // delivery still happens, only the re-registration is skipped.
+    state: Option<SharedState>,
 ) {
     let dispatch_mutex = registry.pane_dispatch_lock(&pane_id);
     let _dispatch_guard = dispatch_mutex.lock().await;
@@ -3012,10 +3057,17 @@ async fn dispatch_one_owned(
     // PRD #140 M2.0: the identity is no longer a `(name, cwd)` tuple, but the
     // lookup still needs the orchestration's CONFIG name — hence
     // `OrchestrationIdentity::name()`, which both variants answer.
-    let role_config = match (cwd.as_deref(), orchestration.as_ref()) {
-        (Some(c), Some(identity)) => lookup_orchestration_role(c, identity.name(), &target_role),
+    // Issue #606: the role's INDEX comes back too, so that a `clear = true`
+    // respawn which has to re-create the pane from nothing can rebuild the
+    // pane's `TabMembership` and keep the card on its orchestration's tab.
+    let role_config_indexed = match (cwd.as_deref(), orchestration.as_ref()) {
+        (Some(c), Some(identity)) => {
+            lookup_orchestration_role_indexed(c, identity.name(), &target_role)
+        }
         _ => None,
     };
+    let role_index = role_config_indexed.as_ref().map(|(index, _)| *index);
+    let role_config = role_config_indexed.map(|(_, role)| role);
     // When we have an orchestration context (cwd + orchestration
     // name) but the role lookup returned None, the operator's
     // intended `clear = true` is silently dropped — the role
@@ -3095,11 +3147,65 @@ async fn dispatch_one_owned(
         // event sent after `event_tx.subscribe()` — including the
         // new agent's first `SessionStart`.
         let mut event_rx = event_tx.subscribe();
+        // Issue #606: what the pane should come back as if there is no record
+        // left to respawn from — a `StopAgent` that removed the entry before
+        // spending its termination grace, or a worker that simply died and was
+        // reaped. `clear = true` means "a fresh worker for the next task", so a
+        // missing predecessor is a reason to make one, not to fail.
+        let recreate_identity = crate::agent_pty::PaneRecreateIdentity {
+            cwd: cwd.clone(),
+            display_name: Some(target_role.clone()),
+            tab_membership: role_index.map(|index| {
+                crate::agent_pty::TabMembership::Orchestration {
+                    name: orchestration
+                        .as_ref()
+                        .map(|identity| identity.name().to_string())
+                        .unwrap_or_default(),
+                    role_index: index,
+                    role_name: target_role.clone(),
+                    // A worker, by construction: `handle_delegate` refuses a
+                    // delegate whose target pane is the orchestrator's own.
+                    is_start_role: false,
+                    orchestration_cwd: cwd.clone(),
+                    display_title: None,
+                    orchestration_id: match orchestration.as_ref() {
+                        Some(OrchestrationIdentity::Instance { id, .. }) => Some(id.clone()),
+                        _ => None,
+                    },
+                }
+            }),
+            agent_type: AgentType::from_command(Some(&role.command)),
+            env: vec![(
+                crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                pane_id.clone(),
+            )],
+        };
         match registry
-            .respawn_agent_for_pane(&pane_id, &role.command)
+            .respawn_or_recreate_agent_for_pane(&pane_id, &role.command, &recreate_identity)
             .await
         {
-            Ok(new_agent_id) => {
+            Ok(crate::agent_pty::PaneRespawn {
+                agent_id: new_agent_id,
+                recreated,
+            }) => {
+                if recreated {
+                    // The pane was re-created rather than replaced, so a
+                    // completed close has already taken this role's daemon-side
+                    // registration with it (`unregister_pane`). Without putting
+                    // it back the delivery below still lands, but the NEXT
+                    // delegate to this role resolves no pane at all and is
+                    // rejected with `reached no worker for role(s)` — the
+                    // permanent breakage issue #606 reports.
+                    if let (Some(state), Some(identity)) = (state.as_ref(), orchestration.clone()) {
+                        state.write().await.register_orchestration_role(
+                            &pane_id,
+                            &target_role,
+                            false,
+                            identity,
+                            cwd.as_deref(),
+                        );
+                    }
+                }
                 if is_pi_native {
                     // PRD #201: NATIVE delivery — stash the pointer as the
                     // respawned pi's seed and arm the PTY-injection safety net.
@@ -3140,14 +3246,30 @@ async fn dispatch_one_owned(
                 // `DOT_AGENT_DECK_AGENT_ID` at its own spawn time)
                 // can't be mis-accepted as the NEW agent's
                 // readiness signal.
-                let observed = wait_for_session_start(
-                    &mut event_rx,
-                    &pane_id,
-                    &new_agent_id,
-                    SESSION_START_WAIT_TIMEOUT,
-                )
-                .await
-                .ready;
+                //
+                // Issue #584: the wait ALSO ends the moment the replacement's
+                // own PTY reaches EOF. Before this it was a fixed deadline and
+                // nothing else, so a replacement that died two seconds into its
+                // boot still cost the whole 30 s window — after which the
+                // fallback below wrote into a pane with no agent on it, the
+                // identity gate refused with `NoLiveTarget`, and the pointer was
+                // dropped with one `warn!` and nothing anywhere the orchestrator
+                // could see. `biased` so a corpse always beats a readiness event
+                // that raced it, and a `oneshot` rather than a poll because this
+                // path is exercised on a paused Tokio clock
+                // (`orchestration/delegate/011`), where a polling sleep would let
+                // auto-advance move the clock underneath the test.
+                let replacement_exited = registry.agent_exit_signal(&new_agent_id);
+                let observed = tokio::select! {
+                    biased;
+                    _ = replacement_exited => false,
+                    wait = wait_for_session_start(
+                        &mut event_rx,
+                        &pane_id,
+                        &new_agent_id,
+                        SESSION_START_WAIT_TIMEOUT,
+                    ) => wait.ready,
+                };
                 if !observed {
                     tracing::debug!(
                         role = %target_role,
@@ -3156,6 +3278,93 @@ async fn dispatch_one_owned(
                         "delegate: SessionStart wait timed out; \
                          writing prompt via fallback path"
                     );
+                }
+                // Issue #584: the replacement has to be ALIVE for anything below
+                // to mean anything. `respawn_agent_for_pane` has already disposed
+                // of the previous worker, so a replacement that died leaves the
+                // pane with no agent at all — and every downstream step then
+                // degrades silently: the readiness buffer sleeps for nothing, the
+                // guarded send comes back `NoLiveTarget`, and the pointer is
+                // discarded with a `warn!` the orchestrator never sees. Reported
+                // here, at the point it becomes knowable, with the same treatment
+                // the respawn-error arm below already gives a failure it CAN see.
+                //
+                // Compared against the pane's current live owner rather than
+                // against `exited` alone, so a successor that took the pane while
+                // we waited is caught by the same check: either way the agent this
+                // dispatch was composed for is not there to receive it.
+                if registry.pane_current_agent_id(&pane_id).as_deref()
+                    != Some(new_agent_id.as_str())
+                {
+                    warn!(
+                        role = %target_role,
+                        pane_id = %pane_id,
+                        new_agent_id = %new_agent_id,
+                        observed,
+                        "delegate: the clear=true replacement worker is no longer the pane's live \
+                         agent; surfacing a notice in the orchestrator pane and skipping the \
+                         task pointer write"
+                    );
+                    // A GUARDED notice, unlike the respawn-error arm below.
+                    // That arm reports a failure it learned about immediately,
+                    // while this one has just spent up to
+                    // `SESSION_START_WAIT_TIMEOUT` waiting — long enough for the
+                    // ORCHESTRATOR's pane to change hands, at which point an
+                    // unguarded write puts one orchestration's diagnostics into a
+                    // stranger's scrollback (PRD #249 finding B3's reasoning,
+                    // pinned by `scheduler/idle-worker/008` and `/014`). Resolved
+                    // immediately before the call, so the guard's real work is the
+                    // post-lock re-validation.
+                    let notice = compose_respawn_no_live_worker_notice(&pane_id);
+                    let notice_registry = Arc::clone(&registry);
+                    let notice_pane = orchestrator_pane_id.clone();
+                    let notice_orchestration = orchestration.clone();
+                    match registry
+                        .write_notice_guarded(
+                            &orchestrator_pane_id,
+                            &notice,
+                            registry
+                                .pane_current_agent_id(&orchestrator_pane_id)
+                                .as_deref(),
+                            || async move {
+                                if notice_registry.is_pane_closing(&notice_pane) {
+                                    return false;
+                                }
+                                orchestration_still_matches(
+                                    notice_orchestration.as_ref(),
+                                    notice_registry.pane_orchestration(&notice_pane).as_ref(),
+                                )
+                            },
+                        )
+                        .await
+                    {
+                        Ok(crate::agent_pty::GuardedSend::Applied) => {}
+                        Ok(refused) => warn!(
+                            pane_id = %orchestrator_pane_id,
+                            role = %target_role,
+                            outcome = ?refused,
+                            "delegate: the dead-replacement notice was refused; the failure \
+                             stays in this log only"
+                        ),
+                        Err(write_err) => warn!(
+                            pane_id = %orchestrator_pane_id,
+                            role = %target_role,
+                            error = %write_err,
+                            "delegate: failed to surface the dead-replacement notice in the \
+                             orchestrator pane scrollback"
+                        ),
+                    }
+                    // Commission audit exit 3: nothing was delivered and the
+                    // worker is gone, so the debt has to go with it — otherwise
+                    // the next completion on this pane id is laundered into a
+                    // solicited one. See this function's no-delivery invariant.
+                    release_undelivered_commission(
+                        &registry,
+                        &pane_id,
+                        &target_role,
+                        "the clear=true replacement worker never became live",
+                    );
+                    return;
                 }
                 // PRD #249 M1: the readiness gate. Sitting AFTER the
                 // `if !observed` block, it covers BOTH branches by
@@ -3232,7 +3441,7 @@ async fn dispatch_one_owned(
                                  readiness buffer; abandoning the dispatch \
                                  without writing the task pointer"
                             );
-                            // Commission audit exit 3: nothing is delivered,
+                            // Commission audit exit 4: nothing is delivered,
                             // and nothing is released either — `begin_pane_close`
                             // drained this pane's commissions under the same lock
                             // hold that dropped the waiter this arm just woke on.
@@ -3526,7 +3735,7 @@ async fn dispatch_one_owned(
     if delivered {
         registry.note_payload_settled(&pane_id, &one_liner);
     }
-    // Commission audit exit 4 (issue #448 review, finding 1): the delegate never
+    // Commission audit exit 5 (issue #448 review, finding 1): the delegate never
     // reached the worker, so the orchestrator is owed no completion from it — see
     // [`release_undelivered_commission`] for what an unreleased debt costs.
     //
@@ -4310,6 +4519,29 @@ impl AppState {
         registry: &Arc<AgentPtyRegistry>,
         event_tx: &broadcast::Sender<BroadcastMsg>,
     ) -> crate::event::DelegateResponse {
+        self.handle_delegate_with_state(signal, registry, event_tx, None)
+            .await
+    }
+
+    /// [`Self::handle_delegate`] with a handle on the daemon's own shared state.
+    ///
+    /// Issue #606: a `clear = true` delegate can now RE-CREATE a worker pane
+    /// whose record a concurrent close removed, and a re-created pane needs its
+    /// orchestration role registered again or the next delegate to that role
+    /// resolves nothing. `&self` is a read guard on that same state, so the
+    /// re-registration cannot happen here — it happens inside the detached
+    /// per-target task, after this function has returned and the guard is gone.
+    ///
+    /// The daemon passes `Some`. `None` — every fixture that builds a bare
+    /// [`AppState`] — keeps the delivery behaviour and skips only the
+    /// re-registration, so no existing caller changes shape.
+    pub async fn handle_delegate_with_state(
+        &self,
+        signal: DelegateSignal,
+        registry: &Arc<AgentPtyRegistry>,
+        event_tx: &broadcast::Sender<BroadcastMsg>,
+        state: Option<&SharedState>,
+    ) -> crate::event::DelegateResponse {
         use crate::event::DelegateResponse;
         if !self.pane_role_map.contains_key(&signal.pane_id) {
             warn!(pane_id = %signal.pane_id, "delegate from unknown pane");
@@ -4409,6 +4641,7 @@ impl AppState {
         for (target_role, pane_id) in targets {
             let registry = Arc::clone(registry);
             let event_tx = event_tx.clone();
+            let state_for_dispatch = state.cloned();
             let orchestration = orchestration.clone();
             let orchestrator_pane_id = signal.pane_id.clone();
             let task = signal.task.clone();
@@ -4474,6 +4707,7 @@ impl AppState {
                     cwd,
                     silence_watch,
                     delegation_seq,
+                    state_for_dispatch,
                 )
                 .await;
             });
@@ -7676,6 +7910,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -7724,6 +7959,7 @@ mod tests {
                     orchestration: None,
                 },
             }),
+            None,
             None,
         )
         .await;

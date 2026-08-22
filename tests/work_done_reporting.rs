@@ -221,28 +221,6 @@ impl WorkDoneHarness {
         self.cwd.path().join(".dot-agent-deck/work-done-coder.md")
     }
 
-    /// Take the live agent off the worker pane, leaving the pane registered in
-    /// the role maps with nothing running on it.
-    ///
-    /// This is how `work_done_005` makes a `clear = true` respawn fail
-    /// DETERMINISTICALLY: `respawn_agent_for_pane` locates the pane's current
-    /// agent before it spawns anything, so with no agent to find it returns
-    /// `AgentPtyError::NotFound` without depending on an exec failure, a timing
-    /// window, or a scheduler race.
-    fn evict_worker_agent(&self) {
-        let agent_id = self
-            .registry
-            .pane_current_agent_id(WORKER_PANE)
-            .expect("the worker stub is live before it is evicted");
-        self.registry
-            .close_agent(&agent_id)
-            .expect("close the worker stub");
-        assert!(
-            self.registry.pane_current_agent_id(WORKER_PANE).is_none(),
-            "the worker pane must have no live agent for the respawn to fail"
-        );
-    }
-
     fn orchestrator_snapshot(&self) -> String {
         String::from_utf8_lossy(
             &self
@@ -428,7 +406,7 @@ fn work_done_003_failed_summary_write_inlines_the_report_instead_of_pointing_at_
 /// reached that arm and the test never has to guess at timing.
 const RESPAWN_FAILED_NEEDLE: &str = "respawn failed for role 'coder'";
 
-/// Scenario: On a project whose `coder` role sets `clear = true` and whose idle detector is switched off, evict the worker's live agent so the delegate's respawn fails, then have that same worker report `work-done` — the case of a person tasking it directly afterwards. The orchestrator pane must be told the respawn failed and must then report the completion as one it never commissioned, never pointing at a summary file.
+/// Scenario: On a project whose `coder` role sets `clear = true`, points at a binary that does not exist, and whose idle detector is switched off, delegate so the respawn kills the live worker and then fails to replace it, then have that same worker pane report `work-done` — the case of a person tasking it directly afterwards. The orchestrator pane must be told the respawn failed and must then report the completion as one it never commissioned, never pointing at a summary file.
 #[spec("orchestration/work-done/005")]
 #[test]
 fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
@@ -438,18 +416,27 @@ fn work_done_005_failed_respawn_does_not_leave_a_phantom_commission() {
         // test as much as the respawn is: with no watch armed, the release under
         // audit is the ONLY thing that can discharge the commission, so a fix that
         // leaned on either detector would fail here.
+        // The role command names a binary that does not exist, so the respawn
+        // disposes of the live `cat` on the worker pane and then FAILS to bring
+        // the replacement up — the production hazard this test is about, stated
+        // literally. A single word with no shell metacharacters is exec'd
+        // directly rather than through `$SHELL -c`, so the missing binary is an
+        // `AgentPtyError::Spawn` from `spawn_agent` and not a shell exiting 127
+        // (which would be a successful spawn of a child that then dies).
+        //
+        // Until issue #606 this test instead EVICTED the worker's agent and let
+        // the respawn fail `NotFound`. That is no longer a failure: a
+        // `clear = true` delegate to a pane whose agent is simply gone now
+        // re-creates the worker rather than leaving the role unreachable, which
+        // is exactly what #606 asked for. The commission-release behaviour under
+        // audit here is unchanged; only the way the respawn is made to fail is.
         let harness = WorkDoneHarness::new(Some(&format!(
             "worker_response_timeout_minutes = 0\n\n\
              [[orchestrations]]\nname = \"{ORCHESTRATION}\"\n\n\
-             [[orchestrations.roles]]\nname = \"{WORKER_ROLE}\"\ncommand = \"cat\"\nclear = true\n"
+             [[orchestrations.roles]]\nname = \"{WORKER_ROLE}\"\n\
+             command = \"/nonexistent-dot-agent-deck-respawn-target\"\nclear = true\n"
         )))
         .await;
-
-        // With no live agent on the worker pane, `respawn_agent_for_pane` cannot
-        // find one to replace and fails before spawning — the deterministic form
-        // of the production hazard, where the respawn disposes of the previous
-        // child and then cannot bring the replacement up.
-        harness.evict_worker_agent();
 
         harness.delegate().await;
         let after_delegate = harness
