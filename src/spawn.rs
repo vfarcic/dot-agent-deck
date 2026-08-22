@@ -587,7 +587,36 @@ pub async fn spawn(
                     Some(role.role_name.as_str()),
                     false,
                     notifier,
-                )?;
+                );
+                // Issue #600: an orchestration spawn is ALL-OR-NOTHING. This used
+                // to be a bare `?`, which returned the error while every role
+                // already launched stayed live in the registry — with no
+                // `SpawnHandle` returned, the caller had nothing to close them
+                // with and no tab was ever surfaced, so those children were
+                // unreachable by any close path the user has. Tear them down here
+                // instead, so `Err` from this function means "nothing is running".
+                //
+                // Chosen over returning a PARTIAL handle because a half-spawned
+                // orchestration is not a usable product: the orchestrator has been
+                // handed a context file naming roles that do not exist, its
+                // delegations to them cannot route, and the caller
+                // (`handle_dispatch`, `issue_dispatch_run`) has no way to surface
+                // a tab for it — the `OrchestrationSurface` broadcast below is
+                // never reached. See the issue and the PR for the full argument.
+                let id = match id {
+                    Ok(id) => id,
+                    Err(e) => {
+                        roll_back_partial_orchestration(
+                            registry,
+                            state,
+                            &agents,
+                            &name,
+                            &role.role_name,
+                        )
+                        .await;
+                        return Err(e);
+                    }
+                };
                 // Tell the DAEMON's AppState who this pane is, so the
                 // orchestrator we are about to hand a delegation protocol to can
                 // actually use it.
@@ -612,11 +641,14 @@ pub async fn spawn(
                 // per role keeps state consistent with whatever subset actually
                 // started.
                 //
-                // (The already-spawned roles are still not torn down on that
-                // early return, and the caller gets no `SpawnHandle` for them so
-                // it cannot close them either. That is `spawn`'s pre-existing
-                // error semantics, tracked separately — not something this
-                // registration ordering can or should decide.)
+                // (Issue #600 has since decided the other half: the loop no
+                // longer just `?`s out — it rolls the already-spawned roles back,
+                // so `Err` from this function means nothing is left running. This
+                // registration is what the rollback UNDOES, and it still has to
+                // happen here rather than after the loop: the rollback tears down
+                // a role only after that role's `close_agent` has removed its
+                // child, so between the two a live child must never be missing its
+                // routing entry.)
                 //
                 // Issue #454 review, item 5: gated on the SAME validation the
                 // `AttachRequest::StartAgent` seam applies. There it is implicit
@@ -773,6 +805,106 @@ pub async fn spawn(
                 on_tab_closed: None,
             })
         }
+    }
+}
+
+/// Issue #600: tear down the roles an orchestration spawn had already started
+/// when a LATER role failed, so [`spawn`]'s `Err` means "nothing is running".
+///
+/// Before this, the role loop `?`d straight out: roles `0..N` stayed live in
+/// `AgentPtyRegistry` as PTY children, no `SpawnHandle` came back so the caller
+/// had nothing to close them with, and the `OrchestrationSurface` broadcast that
+/// would have given the user a tab is never reached on the failure path — so the
+/// children were unreachable by every close path that exists. It also left
+/// `handle_dispatch`'s rollback force-removing the worktree those children were
+/// rooted in (issue #575); with the teardown in place that rollback runs against
+/// a tree nothing occupies, which is the state its comment always claimed.
+///
+/// Best-effort by construction, and it never reports failure upwards: the caller
+/// is already returning the ORIGINAL spawn error, which is what the user needs to
+/// see. A role that somehow survives is caught downstream instead — the dispatch
+/// rollback re-asks `worktree_still_in_use` before it removes anything.
+///
+/// Uses the same close protocol as the `AttachRequest::StopAgent` handler
+/// (`begin_pane_close` → `close_agent` → `unregister_pane` → `finish_pane_close`)
+/// rather than a bare `close_agent`, because the roles that DID start are already
+/// registered in `pane_role_map` and a fast orchestrator could in principle have
+/// armed a delegation against one of them before the failing role was reached.
+async fn roll_back_partial_orchestration(
+    registry: &Arc<AgentPtyRegistry>,
+    state: Option<&crate::state::SharedState>,
+    started: &[SpawnedAgent],
+    orchestration: &str,
+    failed_role: &str,
+) {
+    if started.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        orchestration = %orchestration,
+        failed_role = %failed_role,
+        rolling_back = started.len(),
+        "spawn: a later orchestration role failed; tearing down the roles that already started"
+    );
+
+    // Refuse new delegations to every one of these panes BEFORE the first child
+    // is terminated, so the teardown cannot race one in against a pane whose
+    // agent is mid-SIGTERM.
+    for agent in started {
+        registry.begin_pane_close(&agent.pane_id);
+    }
+
+    // `close_agent` runs the synchronous SIGTERM-with-grace loop
+    // (`terminate_child_with_grace_and_wait`, up to `AGENT_TERMINATE_GRACE` per
+    // child), so it must not run on a Tokio worker thread — same reasoning as the
+    // `StopAgent` handler's `spawn_blocking` hop.
+    let registry_for_close = registry.clone();
+    let ids: Vec<String> = started.iter().map(|a| a.id.clone()).collect();
+    let closed = tokio::task::spawn_blocking(move || {
+        ids.into_iter()
+            .map(|id| {
+                let outcome = registry_for_close.close_agent(&id);
+                (id, outcome)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await;
+    match closed {
+        Ok(outcomes) => {
+            for (id, outcome) in outcomes {
+                if let Err(e) = outcome {
+                    // `NotFound` is ordinary here — the child may have exited on
+                    // its own between spawning and the failure of a later role.
+                    tracing::warn!(
+                        agent_id = %id,
+                        error = %e,
+                        "spawn rollback: could not close an already-started role"
+                    );
+                }
+            }
+        }
+        Err(join_err) => {
+            tracing::warn!(
+                error = %join_err,
+                orchestration = %orchestration,
+                "spawn rollback: the close task panicked or was cancelled; \
+                 already-started roles may still be running"
+            );
+        }
+    }
+
+    // Drop the routing identity these panes were given as each spawn landed
+    // (`register_orchestration_role`, above). Done AFTER the children are gone so
+    // a live child is never missing its `pane_role_map` entry — the inverse
+    // ordering is exactly the inconsistency issue #454 closed.
+    if let Some(state) = state {
+        let mut guard = state.write().await;
+        for agent in started {
+            guard.unregister_pane(&agent.pane_id);
+        }
+    }
+    for agent in started {
+        registry.finish_pane_close(&agent.pane_id, true);
     }
 }
 
@@ -3871,26 +4003,35 @@ mod tests {
         assert!(r.ends_with("-r2"));
     }
 
-    /// Issue #454 review, item 4: each role is registered in the daemon's
-    /// `AppState` AS ITS SPAWN LANDS, not after the whole loop.
-    ///
-    /// The loop `?`s out of `spawn_one`, so a role that fails to spawn abandons
-    /// the orchestration — and with the registration sitting after the loop, the
-    /// roles that had already started were left running with no `pane_role_map`
-    /// / `pane_orchestration_map` entry anywhere. A `dot-agent-deck delegate`
-    /// from such a survivor is rejected with "delegate from unknown pane", which
-    /// is the same inert-orchestration failure the post-loop registration was
-    /// added to fix, reached by a different route.
+    /// Issue #600: an orchestration spawn is ALL-OR-NOTHING — an `Err` from
+    /// `spawn` means nothing it started is still running, and nothing it
+    /// registered is still registered.
     ///
     /// Role 1 is a command that cannot be exec'd, so the failure is the loop's
-    /// real early return rather than a simulated one. Note what this test does
-    /// NOT assert: role 0's child is still running afterwards and the caller
-    /// gets no handle with which to close it. That is `spawn`'s pre-existing
-    /// error semantics — orphan-on-partial-failure — and is tracked separately;
-    /// registration ordering neither causes nor cures it.
+    /// real early return rather than a simulated one.
+    ///
+    /// **This test's assertion is the INVERSE of the one it carried for issue
+    /// #454, and deliberately so.** #454 moved role registration from after the
+    /// loop to inside it, and pinned that by asserting the surviving role of a
+    /// partial failure was still in `pane_role_map`. It said in as many words
+    /// what it did not assert: "role 0's child is still running afterwards and
+    /// the caller gets no handle with which to close it … tracked separately."
+    /// #600 is that separate track, and it decided the orphan is the defect: the
+    /// loop now tears down what it started, which unregisters those same panes.
+    /// So the end state flips from "one role registered" to "none", and the
+    /// property under test flips from *ordering* to *atomicity*.
+    ///
+    /// #454's ordering is still load-bearing and is still stated where it lives
+    /// (the comment on the `register_orchestration_role` call): the rollback
+    /// unregisters a role only after that role's child is closed, so a live child
+    /// is never missing its routing entry. What is no longer OBSERVABLE from
+    /// here is the distinction between registering inside the loop and after it —
+    /// under atomicity both end with an empty map. The success-path consequence
+    /// of that ordering keeps its own coverage in `orchestration/dispatch/001`
+    /// (a dispatched orchestrator's `delegate` actually routes).
     #[cfg(unix)]
     #[tokio::test]
-    async fn each_orchestration_role_is_registered_as_its_spawn_lands() {
+    async fn a_partial_orchestration_spawn_leaves_nothing_running_or_registered() {
         use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
 
         struct SilentNotifier;
@@ -3941,27 +4082,34 @@ mod tests {
             "precondition: role 1 must fail to spawn, aborting the orchestration"
         );
 
+        // No `SpawnHandle` came back and no orchestration tab was ever surfaced
+        // (the broadcast sits past the early return), so anything still live here
+        // is unreachable by every close path the user has.
+        let live = registry.agent_records();
+        assert!(
+            live.is_empty(),
+            "role 0 spawned before role 1 failed; it must be torn down, not orphaned. \
+             Still live: {:?}",
+            live.iter()
+                .map(|r| r.display_name.clone())
+                .collect::<Vec<_>>()
+        );
+
         let guard = state.read().await;
-        let registered: Vec<&String> = guard.pane_role_map.keys().collect();
-        assert_eq!(
-            registered.len(),
-            1,
-            "the role that DID spawn must be registered even though a later one \
-             failed; pane_role_map={:?}",
+        assert!(
+            guard.pane_role_map.is_empty(),
+            "the rolled-back role must leave no role-map entry: {:?}",
             guard.pane_role_map
         );
-        let pane_id = registered[0];
-        assert_eq!(
-            guard.pane_role_map.get(pane_id).map(String::as_str),
-            Some("orchestrator")
+        assert!(
+            guard.orchestrator_pane_ids.is_empty(),
+            "…nor an orchestrator marker: {:?}",
+            guard.orchestrator_pane_ids
         );
         assert!(
-            guard.orchestrator_pane_ids.contains(pane_id),
-            "the surviving start role must still be registered as the orchestrator"
-        );
-        assert!(
-            guard.pane_orchestration_map.contains_key(pane_id),
-            "…and must carry the orchestration identity `handle_delegate` routes on"
+            guard.pane_orchestration_map.is_empty(),
+            "…nor a routing identity: {:?}",
+            guard.pane_orchestration_map
         );
         drop(guard);
 

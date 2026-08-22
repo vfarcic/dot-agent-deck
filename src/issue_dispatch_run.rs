@@ -172,9 +172,21 @@ pub fn take_worktree(worktrees: &WorktreeRegistry, worktree_dir: &Path) -> Optio
 /// the just-closed agent was the LAST one in the worktree and it is safe to
 /// remove. While a sibling role is still live the shared worktree must survive.
 pub fn worktree_still_in_use(records: &[AgentRecord], worktree_dir: &Path) -> bool {
+    agents_rooted_in_worktree(records, worktree_dir) > 0
+}
+
+/// How many live agents in `records` are rooted in `worktree_dir` — the counting
+/// form of [`worktree_still_in_use`], which is defined in terms of it so the two
+/// can never disagree about what "rooted in" means.
+///
+/// Issue #575: the dispatch spawn-failure rollback reports the number back to the
+/// caller, because "2 agents are still running in it" tells the user what to close
+/// and a bare "still in use" does not.
+pub fn agents_rooted_in_worktree(records: &[AgentRecord], worktree_dir: &Path) -> usize {
     records
         .iter()
-        .any(|r| worktree_of_record(r).as_deref() == Some(worktree_dir))
+        .filter(|r| worktree_of_record(r).as_deref() == Some(worktree_dir))
+        .count()
 }
 
 /// Remove a dispatched worktree from its clone (`git -C <clone> worktree remove
