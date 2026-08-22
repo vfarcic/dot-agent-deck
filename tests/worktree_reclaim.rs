@@ -824,3 +824,114 @@ fn worktree_reclaim_008_non_utf8_path_is_reclaimed() {
         text
     );
 }
+
+/// Scenario: Two clean, MERGED, *foreign* worktrees sit side by side, whose
+/// directory names differ only in one raw byte that is not valid UTF-8
+/// (`candidate-\xff` and `candidate-\xfe`). A bare `worktree reclaim` keeps
+/// both and lists them as a pending decision. Because `to_string_lossy`
+/// collapses every invalid sequence to `U+FFFD`, both bullets render as the
+/// same line — so the operator reading the list cannot tell which of the two
+/// directories the follow-up `--yes` would remove, even though the removal
+/// acts on the distinct byte-exact paths. Asserts the two rendered bullets
+/// differ from each other.
+#[spec("worktree/reclaim/009")]
+#[test]
+#[cfg(target_os = "linux")]
+fn worktree_reclaim_009_pending_bullets_never_alias_two_distinct_paths() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let fx = Fixture::new();
+    let name_ff = OsStr::from_bytes(b"candidate-\xff");
+    let name_fe = OsStr::from_bytes(b"candidate-\xfe");
+    let wt_ff = fx.add_worktree_with_commit_raw(name_ff, "feat/cand-ff");
+    let wt_fe = fx.add_worktree_with_commit_raw(name_fe, "feat/cand-fe");
+    fx.set_pr_state("feat/cand-ff", "MERGED");
+    fx.set_pr_state("feat/cand-fe", "MERGED");
+    // Deliberately NOT marked owned, so both land on the `ask` surface --
+    // the pending list, which is the surface whose entire purpose is to let
+    // the operator decide what a following `--yes` will delete.
+
+    // Fixture precondition, as in `008`: both directories must exist on disk
+    // with the EXACT bytes intended. A filesystem that normalised or rejected
+    // either name would leave one candidate (or two identical ones), and the
+    // "two bullets differ" assertion below would then pass or fail for a
+    // reason that has nothing to do with the rendering under test.
+    let entries: Vec<_> = std::fs::read_dir(fx._scratch.path())
+        .expect("read scratch dir")
+        .map(|e| e.expect("dir entry").file_name())
+        .collect();
+    for name in [name_ff, name_fe] {
+        assert!(
+            entries.iter().any(|e| e.as_bytes() == name.as_bytes()),
+            "fixture precondition: the scratch dir must contain an entry whose raw bytes \
+             exactly match {name:?} -- the filesystem may have normalised or rejected the \
+             non-UTF-8 name; got entries: {entries:?}"
+        );
+    }
+    assert_ne!(
+        name_ff.as_bytes(),
+        name_fe.as_bytes(),
+        "fixture precondition: the two candidate names must genuinely differ in their raw \
+         bytes, or there is no aliasing to detect"
+    );
+
+    let out = fx.run(&["worktree", "reclaim"]);
+    // As in `003`/`004`/`005`/`008`: rule out clap's own usage/parse-error
+    // exit code first, so a rejected subcommand (which prints no pending
+    // section at all) cannot be mistaken for a correctly-rendered one.
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "exit code 2 is clap's own generic usage/parse-error code; status={:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        !combined(&out).contains("Usage:"),
+        "stderr still carries clap's own subcommand-usage banner, meaning `worktree reclaim` \
+         was not recognized as a real subcommand rather than being handled and raising a \
+         pending decision; out={}",
+        combined(&out)
+    );
+
+    // Control: a bare `reclaim` must KEEP both foreign worktrees. Without
+    // this, "two bullets" could be read off a report about directories that
+    // were already gone -- the pending list is a decision still to be made,
+    // not a post-mortem.
+    assert!(
+        wt_ff.exists() && wt_fe.exists(),
+        "a bare `worktree reclaim` must keep both foreign worktrees pending, not remove them; \
+         ff exists={} fe exists={}\n{}",
+        wt_ff.exists(),
+        wt_fe.exists(),
+        combined(&out)
+    );
+
+    // Compare RAW BYTES, never `String::from_utf8_lossy`. `combined()` would
+    // apply the very lossy conversion under test, so two byte-distinct
+    // bullets could be reported as colliding purely because the harness
+    // collapsed them.
+    let bullets: Vec<&[u8]> = out
+        .stdout
+        .split(|&b| b == b'\n')
+        .filter(|l| l.starts_with(b"  - "))
+        .collect();
+    let text = combined(&out);
+    assert_eq!(
+        bullets.len(),
+        2,
+        "both foreign worktrees must appear as their own pending bullet -- got {} bullet \
+         line(s); full output:\n{text}",
+        bullets.len()
+    );
+    assert_ne!(
+        bullets[0],
+        bullets[1],
+        "the pending list exists so the operator can decide what `--yes` will delete, and the \
+         removal acts on the distinct byte-exact paths -- so two directories that differ in \
+         their raw bytes must never render as the same line. Got two identical bullets \
+         {:?}; full output:\n{text}",
+        String::from_utf8_lossy(bullets[0])
+    );
+}

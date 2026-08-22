@@ -146,6 +146,14 @@ pub fn decide(pr_state: &PrState, clean: &Cleanliness, ownership: Ownership) -> 
 /// Serialize a `PathBuf` as its lossy string rendering, so a worktree path
 /// containing non-UTF-8 bytes still produces valid JSON instead of failing
 /// the whole document — `PathBuf`'s stock `Serialize` errors on those bytes.
+///
+/// This IS still lossy, and so still aliases two byte-distinct paths onto one
+/// string, exactly as [`display_path`] describes. It is left that way
+/// deliberately: `worktree list --json` is a machine surface with a versioned
+/// `SCHEMA_VERSION` shape, `reclaim` (the delete decision) has no `--json` at
+/// all, and a consumer that needs byte-exactness wants the bytes rather than
+/// a human escape — so the right answer here is an additive field and a
+/// schema decision, not a silent change to what this one means.
 fn serialize_path_lossy<S: serde::Serializer>(
     path: &Path,
     serializer: S,
@@ -513,6 +521,39 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
     Ok(reports)
 }
 
+/// Render a worktree path for human output as an **injective** escape: two
+/// paths whose bytes differ can never produce the same string.
+///
+/// `Path::to_string_lossy` cannot be used for this. It collapses every
+/// invalid UTF-8 sequence to `U+FFFD`, so `candidate-\xff` and
+/// `candidate-\xfe` — two different directories on disk — print as one
+/// identical line, while the removal acts on the distinct byte-exact values.
+/// At a surface whose entire purpose is a delete decision, that leaves the
+/// operator reading one line while the command acts on another directory
+/// (issue #578).
+///
+/// `Path`'s own `Debug` is exactly the escape wanted, and it is std's rather
+/// than hand-rolled: an invalid byte becomes `\xNN`, and — the half a
+/// hand-rolled `\xNN` escape usually forgets — a literal backslash becomes
+/// `\\`, so a directory genuinely *named* `candidate-\xFF` cannot alias the
+/// one holding raw byte `0xFF`. Without that second half the collision is
+/// merely relocated. It is also platform-uniform: the same call escapes
+/// Windows's unpaired surrogates, so there is no `cfg` split here to drift
+/// out of step with `path_from_bytes`'s.
+///
+/// The surrounding quotes are load-bearing, not cosmetic: they delimit the
+/// path, so leading or trailing whitespace in a name is visible at the point
+/// of deciding to delete it rather than invisible.
+///
+/// Note that `escape_debug` also escapes control characters. That is an
+/// incidental property of the escape chosen for injectivity, NOT this
+/// function's purpose, and it does not close the separate question of
+/// terminal-rewriting characters in this output — a different mechanism
+/// (bytes that pass through and rewrite the display) needing its own answer.
+fn display_path(path: &Path) -> String {
+    format!("{path:?}")
+}
+
 const DASH: &str = "-";
 
 fn cell(value: &Option<String>) -> &str {
@@ -528,7 +569,7 @@ pub fn format_list_human(reports: &[WorktreeReport]) -> String {
     let mut out = String::new();
     out.push_str("PATH\tBRANCH\tPR\tCLEAN\tOWNED\tVERDICT\tREASON\n");
     for r in reports {
-        let path = r.path.to_string_lossy();
+        let path = display_path(&r.path);
         out.push_str(&format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             path,
@@ -626,7 +667,7 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
             outcome.pending.len()
         ));
         for r in &outcome.pending {
-            out.push_str(&format!("  - {}\n", r.path.to_string_lossy()));
+            out.push_str(&format!("  - {}\n", display_path(&r.path)));
         }
         out.push_str("Run `dot-agent-deck worktree reclaim --yes` to remove them.\n\n");
     }
@@ -634,7 +675,7 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
     if !outcome.removed.is_empty() {
         out.push_str("Removed:\n");
         for r in &outcome.removed {
-            out.push_str(&format!("  - {}\n", r.path.to_string_lossy()));
+            out.push_str(&format!("  - {}\n", display_path(&r.path)));
         }
     } else {
         out.push_str("Removed: none\n");
@@ -645,7 +686,7 @@ pub fn format_reclaim_human(outcome: &ReclaimOutcome) -> String {
         for r in &outcome.kept {
             out.push_str(&format!(
                 "  - {} ({})\n",
-                r.path.to_string_lossy(),
+                display_path(&r.path),
                 r.reason.as_deref().unwrap_or("no reason recorded")
             ));
         }
@@ -770,5 +811,152 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["schema_version"], 1);
         assert!(json.contains("wt-a"));
+    }
+
+    /// Build a pending-verdict report for `path`, the shape `format_reclaim_human`
+    /// puts in its ask section. `cfg(unix)` because every user is: constructing
+    /// a path whose bytes are not valid UTF-8 needs `OsStrExt`, and on Windows
+    /// these helpers would be dead code.
+    #[cfg(unix)]
+    fn pending_report(path: PathBuf) -> WorktreeReport {
+        WorktreeReport {
+            path,
+            branch: Some("feat/x".to_string()),
+            clean: true,
+            owned: false,
+            pr_state: "merged".to_string(),
+            verdict: "ask".to_string(),
+            reason: Some("reclaimable".to_string()),
+        }
+    }
+
+    #[cfg(unix)]
+    fn pending_bullets(outcome: &ReclaimOutcome) -> Vec<String> {
+        format_reclaim_human(outcome)
+            .lines()
+            .filter(|l| l.starts_with("  - "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The half of injectivity a hand-rolled `\xNN` escape usually forgets, and
+    /// which `worktree/reclaim/009` cannot cheaply reach: a directory whose name
+    /// literally contains the four ASCII characters `\`, `x`, `F`, `F` must not
+    /// render the same as one holding the single raw byte `0xFF`. Escaping only
+    /// the invalid bytes and leaving a literal backslash alone relocates the
+    /// collision rather than fixing it, and the resulting output looks exactly as
+    /// correct as the real fix.
+    #[cfg(unix)]
+    #[test]
+    fn display_path_does_not_alias_a_raw_byte_with_its_literal_escape_text() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let raw_byte = PathBuf::from(OsStr::from_bytes(b"/repo/candidate-\xff"));
+        let literal_text = PathBuf::from(r"/repo/candidate-\xFF");
+        assert_ne!(
+            raw_byte, literal_text,
+            "fixture precondition: these must be two genuinely different paths"
+        );
+        assert_ne!(
+            display_path(&raw_byte),
+            display_path(&literal_text),
+            "a path holding raw byte 0xFF and a path literally named `candidate-\\xFF` are two \
+             different directories and must never render alike; got {:?} for both",
+            display_path(&raw_byte)
+        );
+    }
+
+    /// The issue's own reproduction at the unit level: two paths differing in a
+    /// single invalid byte must produce two different pending bullets, because
+    /// the `--yes` that follows acts on the byte-exact values.
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_pending_bullets_distinguish_paths_differing_only_in_an_invalid_byte() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let outcome = ReclaimOutcome {
+            removed: Vec::new(),
+            pending: vec![
+                pending_report(PathBuf::from(OsStr::from_bytes(b"/repo/candidate-\xff"))),
+                pending_report(PathBuf::from(OsStr::from_bytes(b"/repo/candidate-\xfe"))),
+            ],
+            kept: Vec::new(),
+        };
+        let bullets = pending_bullets(&outcome);
+        assert_eq!(bullets.len(), 2, "got bullets {bullets:?}");
+        assert_ne!(
+            bullets[0], bullets[1],
+            "two byte-distinct worktrees rendered as one identical pending line, so the \
+             operator cannot tell which directory `--yes` would remove; got {:?}",
+            bullets[0]
+        );
+    }
+
+    /// The `Removed:` and `Kept:` sections of the same report render through the
+    /// same helper, so a path that survives a failed removal is as attributable
+    /// as a pending one. Without this, only the ask section would be fixed and
+    /// the after-the-fact record would still alias.
+    #[cfg(unix)]
+    #[test]
+    fn reclaim_removed_and_kept_sections_also_distinguish_invalid_byte_paths() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let a = PathBuf::from(OsStr::from_bytes(b"/repo/candidate-\xff"));
+        let b = PathBuf::from(OsStr::from_bytes(b"/repo/candidate-\xfe"));
+        let outcome = ReclaimOutcome {
+            removed: vec![pending_report(a.clone()), pending_report(b.clone())],
+            pending: Vec::new(),
+            kept: vec![pending_report(a), pending_report(b)],
+        };
+        let text = format_reclaim_human(&outcome);
+        let bullets: Vec<&str> = text.lines().filter(|l| l.starts_with("  - ")).collect();
+        assert_eq!(bullets.len(), 4, "got bullets {bullets:?} from:\n{text}");
+        assert_ne!(bullets[0], bullets[1], "Removed: section aliased\n{text}");
+        assert_ne!(bullets[2], bullets[3], "Kept: section aliased\n{text}");
+    }
+
+    /// `worktree list` is where the operator reads the verdicts before running
+    /// `reclaim`, so its PATH column must be as attributable as the ask surface's
+    /// -- otherwise the two halves of the same decision cannot be matched up.
+    /// Also pins that escaping adds no tab, so the row stays seven fields.
+    #[cfg(unix)]
+    #[test]
+    fn list_human_path_column_distinguishes_invalid_byte_paths_and_stays_one_field() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let reports = vec![
+            pending_report(PathBuf::from(OsStr::from_bytes(b"/repo/candidate-\xff"))),
+            pending_report(PathBuf::from(OsStr::from_bytes(b"/repo/candidate-\xfe"))),
+        ];
+        let text = format_list_human(&reports);
+        let rows: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(rows.len(), 2, "got rows {rows:?} from:\n{text}");
+        for row in &rows {
+            assert_eq!(
+                row.split('\t').count(),
+                7,
+                "the escaped path must stay a single tab-separated field; got {row:?}"
+            );
+        }
+        assert_ne!(
+            rows[0].split('\t').next(),
+            rows[1].split('\t').next(),
+            "the PATH column aliased two byte-distinct worktrees\n{text}"
+        );
+    }
+
+    /// A path that is ordinary valid UTF-8 must still read as itself, escapes
+    /// notwithstanding -- the fix must not make the common case unrecognisable.
+    #[test]
+    fn display_path_keeps_an_ordinary_path_readable() {
+        let rendered = display_path(&PathBuf::from("/home/me/code/repo-feature"));
+        assert!(
+            rendered.contains("/home/me/code/repo-feature"),
+            "an all-ASCII path must appear verbatim inside its rendering; got {rendered:?}"
+        );
     }
 }
