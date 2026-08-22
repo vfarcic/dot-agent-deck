@@ -390,44 +390,29 @@ pub async fn handle_dispatch(
             },
         },
         Err(e) => {
-            // `Force` on the rollback path, unlike the tab-close path: we created
-            // this worktree seconds ago and the agent never started, so there is
-            // no user work to protect — and it MUST actually go, or the leftover
-            // dir and branch wedge this name for every later dispatch.
-            remove_worktree(&paths.worktree_dir, &clone_dir, RemovalPolicy::Force).await;
-            // Also delete the branch: `git worktree remove` never deletes it,
-            // but on this rollback path the agent never ran so there is no
-            // committed work to protect — leaving the branch would wedge this
-            // name for every later dispatch.
-            let branch_cleanup_failed = run_status(
-                "git",
-                &[
-                    "-C",
-                    &clone_dir.to_string_lossy(),
-                    "branch",
-                    "-D",
-                    &paths.branch,
-                ],
+            let cleanup_note = match rollback_dispatched_worktree(
+                &ctx.registry,
+                &ctx.worktrees,
+                &paths.worktree_dir,
+                &clone_dir,
+                &paths.branch,
             )
             .await
-            .is_err();
-
-            if branch_cleanup_failed {
-                tracing::warn!(
-                    branch = %paths.branch,
-                    "spawn rollback: failed to delete branch — name may be wedged for future dispatches"
-                );
-            }
-
             {
-                let mut wts = ctx.worktrees.lock().unwrap_or_else(|e| e.into_inner());
-                wts.remove(&paths.worktree_dir);
-            }
-
-            let cleanup_note = if branch_cleanup_failed {
-                " (cleanup failed: branch may still exist — name may be wedged)"
-            } else {
-                ""
+                RollbackOutcome::Reclaimed {
+                    branch_cleanup_failed: false,
+                } => String::new(),
+                RollbackOutcome::Reclaimed {
+                    branch_cleanup_failed: true,
+                } => " (cleanup failed: branch may still exist — name may be wedged)".to_string(),
+                RollbackOutcome::Retained { live } => format!(
+                    " (the worktree {wt} was LEFT IN PLACE: {live} agent(s) are still running \
+                     in it, and removing it would delete their working directory underneath \
+                     them. Close them to release it. Branch {branch} is retained too, so this \
+                     dispatch name stays wedged until then.)",
+                    wt = paths.worktree_dir.display(),
+                    branch = paths.branch,
+                ),
             };
 
             DispatchResult {
@@ -436,6 +421,107 @@ pub async fn handle_dispatch(
                 message: format!("dispatch: spawn failed: {e}{cleanup_note}"),
             }
         }
+    }
+}
+
+/// What [`rollback_dispatched_worktree`] did.
+#[derive(Debug, PartialEq, Eq)]
+enum RollbackOutcome {
+    /// Nothing was rooted in the tree, so the worktree and its branch are gone
+    /// and the dispatch name is free again. `branch_cleanup_failed` is the
+    /// pre-existing "the dir went but `git branch -D` did not" case.
+    Reclaimed { branch_cleanup_failed: bool },
+    /// `live` agents are still rooted in the tree, so it was left in place along
+    /// with its branch and its worktree-registry entry.
+    Retained { live: usize },
+}
+
+/// Undo a dispatch whose spawn failed — but never at the cost of deleting a
+/// directory that live agents are working in.
+///
+/// **Issue #575.** This used to be an unconditional
+/// `remove_worktree(.., RemovalPolicy::Force)` justified by the claim that "the
+/// agent never started, so there is no user work to protect". That claim is true
+/// for a single-agent dispatch and FALSE for a multi-role orchestration: `spawn`
+/// launches roles in a loop, so a failure at role 2 leaves roles 0 and 1 as live
+/// PTY children whose cwd is exactly this tree, and the force removal deleted it
+/// out from under them. Issue #600's teardown in
+/// [`crate::spawn`] now makes that the unreachable case rather than the ordinary
+/// one — `spawn` returns `Err` only after tearing its partial roles down — but the
+/// guard stays, because the invariant this function needs ("nothing is rooted
+/// here") is cheap to verify and catastrophic to assume. A role whose child
+/// somehow outlived its teardown must cost a retained directory, not a deleted
+/// working directory.
+///
+/// The guard is
+/// [`agents_rooted_in_worktree`](crate::issue_dispatch_run::agents_rooted_in_worktree),
+/// the counting form of the
+/// [`worktree_still_in_use`](crate::issue_dispatch_run::worktree_still_in_use)
+/// predicate the tab-close path in `daemon_protocol` asks before its own removal
+/// — one is defined in terms of the other, so the two call sites cannot drift on
+/// what "rooted in" means, and the count is what lets the message name how many
+/// agents the user has to close. Note the hazard here differs in kind from #236's (the
+/// tab-close path's "never force-remove a dirty tree"): this is about live
+/// processes, not uncommitted content, which is why `Force` is still correct once
+/// the tree is genuinely empty of agents.
+///
+/// On `Retained` NOTHING is cleaned up — not the tree, not the branch, and not the
+/// worktree-registry entry. Dropping the entry would be the worse half of the bug
+/// it replaces: the surviving agents' eventual tab close is what triggers cleanup,
+/// and it finds the tree by that entry, so removing it here would strand the
+/// directory forever. Retaining the branch follows for free — `git branch -D`
+/// refuses a branch that is checked out in a live worktree anyway.
+async fn rollback_dispatched_worktree(
+    registry: &Arc<AgentPtyRegistry>,
+    worktrees: &WorktreeRegistry,
+    worktree_dir: &Path,
+    clone_dir: &Path,
+    branch: &str,
+) -> RollbackOutcome {
+    let live = crate::issue_dispatch_run::agents_rooted_in_worktree(
+        &registry.agent_records(),
+        worktree_dir,
+    );
+    if live > 0 {
+        tracing::warn!(
+            worktree = %worktree_dir.display(),
+            live,
+            branch = %branch,
+            "dispatch rollback: agents are still rooted in this worktree; leaving it \
+             (and its branch) in place rather than deleting their working directory"
+        );
+        return RollbackOutcome::Retained { live };
+    }
+
+    // `Force` is correct now that the guard above has established nothing is
+    // rooted here: this worktree was created seconds ago for an agent that is not
+    // running, so there is no user work to protect — and it MUST actually go, or
+    // the leftover dir and branch wedge this name for every later dispatch.
+    remove_worktree(worktree_dir, clone_dir, RemovalPolicy::Force).await;
+    // Also delete the branch: `git worktree remove` never deletes it, but on this
+    // rollback path no agent is running so there is no committed work to protect —
+    // leaving the branch would wedge this name for every later dispatch.
+    let branch_cleanup_failed = run_status(
+        "git",
+        &["-C", &clone_dir.to_string_lossy(), "branch", "-D", branch],
+    )
+    .await
+    .is_err();
+
+    if branch_cleanup_failed {
+        tracing::warn!(
+            branch = %branch,
+            "spawn rollback: failed to delete branch — name may be wedged for future dispatches"
+        );
+    }
+
+    worktrees
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(worktree_dir);
+
+    RollbackOutcome::Reclaimed {
+        branch_cleanup_failed,
     }
 }
 
@@ -901,6 +987,302 @@ mod tests {
             content.contains("## Your task") && content.contains("Verify PR #232"),
             "the caller's task must ride inside the context file:\n{content}"
         );
+    }
+
+    /// Issues #575 and #600 — the partial-orchestration dispatch, at the altitude
+    /// the user meets it: one role's command is wrong, the dispatch reports
+    /// failure, and the roles that DID start are left running as orphans in a
+    /// directory the rollback then deletes underneath them.
+    ///
+    /// Roles 0 and 1 run `cat` (alive on stdin, no LLM tokens); role 2 is an
+    /// unresolvable absolute path, which is the cheapest way to make exactly one
+    /// later role fail. Three roles rather than two so the failure is genuinely
+    /// "a later role", with more than one survivor behind it.
+    ///
+    /// Pre-fix RED on the orphan assertions: `spawn` `?`s out of its role loop, so
+    /// the two `cat` children stay live in the registry with no `SpawnHandle` for
+    /// the caller to close them with (#600), while `handle_dispatch`'s rollback
+    /// force-removes the worktree those children are rooted in (#575).
+    // `cat` as the stand-in role, and POSIX spawn/termination semantics: the
+    // fast tier runs on Windows CI too, where a bare `cat` fails to exec and
+    // would turn "a LATER role failed" into "the first role failed" — the test
+    // would still pass, for none of the reasons it exists.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_partial_orchestration_dispatch_leaves_no_orphans_and_no_deleted_cwd() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        std::fs::write(
+            repo.join(".dot-agent-deck.toml"),
+            "[[orchestrations]]\nname = \"partial-orch\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"worker-one\"\ncommand = \"cat\"\n\n\
+             [[orchestrations.roles]]\nname = \"worker-two\"\n\
+             command = \"/nonexistent/dot-agent-deck-575\"\n",
+        )
+        .unwrap();
+        // The shape is resolved from the CALLER's repo, but the roles run in a HEAD
+        // checkout, so the config has to be committed.
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("git available");
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "add orchestration"]);
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: None,
+            state: Some(state.clone()),
+        };
+
+        let result = handle_dispatch(
+            &ctx,
+            "partial-unit",
+            "Verify the partial-spawn rollback.",
+            Some(&crate::event::DispatchShape::Orchestration { name: None }),
+        )
+        .await;
+
+        // Reclaim the sibling worktree regardless of the assertions below.
+        struct Guard(std::path::PathBuf, Arc<AgentPtyRegistry>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.1.shutdown_all();
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Guard(result.worktree_dir.clone(), ctx.registry.clone());
+
+        assert!(
+            !result.success,
+            "precondition: role 2 cannot be exec'd, so the dispatch must fail: {}",
+            result.message
+        );
+
+        // #600: nothing the failed dispatch started may outlive it. The caller got
+        // no `SpawnHandle`, so anything still live here is unreachable by any
+        // close path the user has.
+        let live = ctx.registry.agent_records();
+        assert!(
+            live.is_empty(),
+            "a failed dispatch must leave no live agents behind; found {} orphan(s): {:?}",
+            live.len(),
+            live.iter()
+                .map(|r| (r.display_name.clone(), r.cwd.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        // …and no routing state for panes that no longer exist.
+        let guard = state.read().await;
+        assert!(
+            guard.pane_role_map.is_empty(),
+            "the rolled-back roles must leave no role-map entries: {:?}",
+            guard.pane_role_map
+        );
+        assert!(
+            guard.orchestrator_pane_ids.is_empty(),
+            "…nor an orchestrator marker: {:?}",
+            guard.orchestrator_pane_ids
+        );
+        drop(guard);
+
+        // #575: the rollback may only reclaim the tree once nothing is rooted in
+        // it — which, after the teardown above, is the case, so the slot is freed
+        // exactly as it was for a spawn that never started an agent at all.
+        assert!(
+            !crate::issue_dispatch_run::worktree_still_in_use(
+                &ctx.registry.agent_records(),
+                &result.worktree_dir
+            ),
+            "no agent may still be rooted in the dispatched worktree"
+        );
+        assert!(
+            !result.worktree_dir.exists(),
+            "with nothing live in it, the worktree must still be reclaimed"
+        );
+        assert!(
+            !branch_exists(&repo, "agent/dispatch-partial-unit"),
+            "…and its branch deleted, so the name is not wedged"
+        );
+    }
+
+    /// Control for the test above (issue #575): the same rollback, on the case its
+    /// original comment described CORRECTLY — the FIRST role fails, so no agent
+    /// ever started and nothing is rooted in the tree. The worktree and its branch
+    /// must still be reclaimed, exactly as before the guard existed.
+    ///
+    /// Without this, "the tree survived" would be indistinguishable from "the
+    /// guard fires on every rollback", which would wedge every dispatch name after
+    /// a typo'd command.
+    // Unix for the same reason as its sibling above: on Windows the `cat` role
+    // would fail too, so "nothing started" would hold by accident.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rollback_with_nothing_started_still_reclaims_the_worktree_and_branch() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        std::fs::write(
+            repo.join(".dot-agent-deck.toml"),
+            "[[orchestrations]]\nname = \"doomed-orch\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\n\
+             command = \"/nonexistent/dot-agent-deck-575-first\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"cat\"\n",
+        )
+        .unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("git available");
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "add orchestration"]);
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: None,
+            state: None,
+        };
+
+        let result = handle_dispatch(
+            &ctx,
+            "doomed-unit",
+            "This one never starts an agent at all.",
+            Some(&crate::event::DispatchShape::Orchestration { name: None }),
+        )
+        .await;
+
+        assert!(!result.success, "precondition: role 0 cannot be exec'd");
+        assert!(
+            ctx.registry.agent_records().is_empty(),
+            "precondition: no role started, so nothing can be rooted in the tree"
+        );
+        assert!(
+            !result.worktree_dir.exists(),
+            "a rollback with nothing rooted in the tree must still remove it: {}",
+            result.message
+        );
+        assert!(
+            !branch_exists(&repo, "agent/dispatch-doomed-unit"),
+            "…and delete its branch, so the name is reusable"
+        );
+        assert!(
+            !result.message.contains("LEFT IN PLACE"),
+            "the retention note must not fire when nothing is rooted in the tree: {}",
+            result.message
+        );
+    }
+
+    /// Issue #575 proper: the rollback guard, exercised with a LIVE agent actually
+    /// rooted in the tree.
+    ///
+    /// Issue #600's teardown makes that state unreachable through `handle_dispatch`
+    /// (the test above proves the partial spawn now tears itself down), so this
+    /// pins the guard at its own seam — a survivor must cost a retained directory,
+    /// never a deleted working directory. `cat` stands in for an agent: it holds
+    /// the cwd open on stdin and costs no LLM tokens.
+    // `cat` as the stand-in role, and POSIX spawn/termination semantics: the
+    // fast tier runs on Windows CI too, where a bare `cat` fails to exec and
+    // would turn "a LATER role failed" into "the first role failed" — the test
+    // would still pass, for none of the reasons it exists.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_rollback_leaves_a_worktree_that_a_live_agent_is_rooted_in() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let worktree_dir = repo.parent().unwrap().join("repo-dispatch-survivor");
+        create_worktree(&repo, &worktree_dir, "agent/dispatch-survivor", false)
+            .await
+            .unwrap();
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let worktrees = new_worktree_registry();
+        record_worktree(&worktrees, &worktree_dir, &repo, RemovalPolicy::KeepIfDirty);
+
+        // A live PTY child whose cwd IS the dispatched worktree — the role that
+        // spawned before a later one failed.
+        registry
+            .spawn_agent(crate::agent_pty::SpawnOptions {
+                command: Some("cat"),
+                cwd: Some(&worktree_dir.to_string_lossy()),
+                display_name: Some("orchestrator"),
+                ..Default::default()
+            })
+            .expect("spawn the surviving role");
+        struct Guard(Arc<AgentPtyRegistry>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.shutdown_all();
+            }
+        }
+        let _guard = Guard(registry.clone());
+
+        let outcome = rollback_dispatched_worktree(
+            &registry,
+            &worktrees,
+            &worktree_dir,
+            &repo,
+            "agent/dispatch-survivor",
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            RollbackOutcome::Retained { live: 1 },
+            "a tree a live agent is rooted in must be retained, and the count reported"
+        );
+        assert!(
+            worktree_dir.exists(),
+            "the rollback must not delete the working directory of a live agent"
+        );
+        assert!(
+            branch_exists(&repo, "agent/dispatch-survivor"),
+            "the branch is checked out in the retained tree, so it stays too"
+        );
+        // The registry entry is what the surviving agent's eventual tab close
+        // finds the tree by. Dropping it here would strand the directory forever.
+        assert!(
+            worktrees.lock().unwrap().contains_key(&worktree_dir),
+            "the worktree registry entry must survive so tab-close cleanup can still reclaim it"
+        );
+
+        // Control: once that agent is gone, the very same call reclaims the tree.
+        registry.shutdown_all();
+        let outcome = rollback_dispatched_worktree(
+            &registry,
+            &worktrees,
+            &worktree_dir,
+            &repo,
+            "agent/dispatch-survivor",
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            RollbackOutcome::Reclaimed {
+                branch_cleanup_failed: false
+            },
+            "with the agent gone the guard must stop firing"
+        );
+        assert!(!worktree_dir.exists());
+        assert!(!branch_exists(&repo, "agent/dispatch-survivor"));
     }
 
     /// A shape the repo cannot satisfy must be refused BEFORE any git work, so a
