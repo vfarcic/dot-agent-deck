@@ -836,6 +836,16 @@ const CHILD_GROUP_BACKSTOP_MAX_FD: libc::c_int = 1024;
 /// It is itself bounded by deadline + grace and holds no descriptor, so it can
 /// never become the leak it exists to prevent.
 ///
+/// **Telling a reaper apart from the leak it hunts.** It is a `fork` of this
+/// wrapper, so it keeps the wrapper's argv and shows up in `ps` looking like a
+/// second `dot-agent-deck wrap --agent … -- …` at `ppid=1`. Given #657 is partly
+/// a story about stale processes producing misleading evidence, the two
+/// discriminators are worth knowing, and both were measured on a live pair:
+/// a reaper has an **empty** `/proc/<pid>/fd` (it closed everything) where a real
+/// wrapper holds ~9, and its `pgid == sid != its own pid` (it inherited the
+/// intermediate's session) where a stranded wrapper or agent child has
+/// `pgid == sid == its own pid`.
+///
 /// Env-gated on `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` exactly like
 /// [`arm_wrap_self_defense`], and for the same reason: a production wrapper never
 /// sets it, forks nothing, and behaves precisely as before.
