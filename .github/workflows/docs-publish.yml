@@ -126,10 +126,65 @@ jobs:
           push: true
           tags: ${{ steps.tags.outputs.list }}
 
+      # yq is pinned by CONTENT, not just by tag. A GitHub release asset is
+      # mutable -- a tag can be re-pointed and the binary re-uploaded -- so the
+      # version in the URL guarantees nothing on its own. That matters here
+      # because this job holds the admin PAT: `yq` runs after the checkout and
+      # two steps before `git push origin main`, so the blast radius of a
+      # substituted binary is a commit of the attacker's choosing on a
+      # ruleset-protected branch under an admin identity.
+      #
+      # The digest is committed HERE rather than fetched from the release's own
+      # `checksums` asset, which is what issue #515 first proposed. That file is
+      # an asset of the same mutable release and is signed by nothing, so
+      # downloading it would verify the transfer but NOT the content: whoever
+      # can re-upload the binary can re-upload its checksum alongside it. Only a
+      # digest committed to this repo pins the bytes.
+      #
+      # THE VERSION AND THE DIGEST MUST MOVE TOGETHER, BY HAND. Nothing bumps
+      # either one today -- Renovate has no manager that reads a URL out of a
+      # `run:` block, and none of the customManagers in renovate.json matches
+      # this -- and a regex manager taught to bump only the version would
+      # produce a PR that fails the check below. To refresh both:
+      #
+      #   curl -fsSLO https://github.com/mikefarah/yq/releases/download/<ver>/yq_linux_amd64
+      #   sha256sum yq_linux_amd64
+      #
+      # For a second source, cross-check that against the release's `checksums`
+      # asset: each row is `<file> <hash> <hash> ...` and the column order is
+      # listed in `checksums_hashes_order`, where SHA-256 is line 18 -- i.e.
+      # field 19 of the row, counting the filename as field 1.
+      #
+      # No `sudo`, and no download straight into a system path: curl writes to a
+      # job-local temp file, the digest is checked, and only then is the binary
+      # installed into a directory added to PATH via $GITHUB_PATH. An unverified
+      # download therefore never reaches a root-owned location, and `--fail`
+      # plus `--show-error` (replacing wget's `-q`) make a 404 or an HTML error
+      # page fail at the download, printing why, instead of leaving a bad file
+      # to fail later at `yq -i`.
+      #
+      # `--retry` is not a flourish: it preserves behaviour, because wget
+      # retries by default (`--tries` defaults to 20) and bare curl does not.
+      # This step runs AFTER "Build and push docs image", so a transient blip
+      # here strands the job in the half-done state this file's other comments
+      # keep warning about -- image already in GHCR, `main`'s chart pointer
+      # stale. curl retries transient failures (5xx/408/429, plus a refused
+      # connection) and does NOT retry a 404, which stays fatal as it should.
       - name: Install yq
+        env:
+          YQ_VERSION: v4.52.5
+          YQ_SHA256: 75d893a0d5940d1019cb7cdc60001d9e876623852c31cfc6267047bc31149fa9
         run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.52.5/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bin"
+          curl --fail --location --silent --show-error \
+            --retry 3 --retry-delay 2 --retry-connrefused \
+            -o "${RUNNER_TEMP}/yq" \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          echo "${YQ_SHA256}  ${RUNNER_TEMP}/yq" | sha256sum --check --strict -
+          install -m 0755 "${RUNNER_TEMP}/yq" "${RUNNER_TEMP}/bin/yq"
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/bin/yq" --version
 
       - name: Update Helm values
         env:
