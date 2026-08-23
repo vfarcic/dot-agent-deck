@@ -167,6 +167,38 @@ fn delivery_diagnostics(deck: &TuiDeck, cases: &[(&str, &str)]) -> String {
     out
 }
 
+/// Every delivery-lifecycle line the daemon logged, verbatim and in order.
+///
+/// Issue #664: `scheduler/dispatch/015`'s failure used to read only as
+/// `confirmed_exact=None`, which is indistinguishable between "the retry path
+/// is broken" (the regression the test exists to catch) and "the daemon
+/// ABANDONED this delivery because nothing confirmed it inside the 60 s
+/// production `AUTOMATIC_PROMPT_DEADLINE`" (a starved machine, or budget spent
+/// somewhere it could not be recovered from).
+/// Those need different responses and the panic could not tell them apart, so
+/// the lines that name the difference — `abandoning`, `not re-submitting`, and
+/// the per-attempt trail leading to them, each carrying its own `delivery_id`
+/// and attempt count — are printed with the assertion instead of having to be
+/// reconstructed afterwards.
+fn delivery_log_evidence(log: &str) -> String {
+    const MARKERS: [&str; 5] = [
+        "prompt written to pane; provisional",
+        "prompt delivery unconfirmed; re-submitting",
+        "prompt delivery confirmed by the agent",
+        "prompt delivery unconfirmed at the deadline; abandoning",
+        "prompt delivery stopped without confirmation",
+    ];
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|line| MARKERS.iter().any(|marker| line.contains(marker)))
+        .collect();
+    if lines.is_empty() {
+        "<no delivery lifecycle lines in the deck log>".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
 fn delivery_log_states(log: &str) -> HashMap<String, BTreeSet<&'static str>> {
     let mut states: HashMap<String, BTreeSet<&'static str>> = HashMap::new();
     for line in log.lines() {
@@ -381,7 +413,7 @@ fn write_bootstrap_swallowing_real_claude(workdir: &Path) -> PathBuf {
     wrapper
 }
 
-/// Scenario: Launch an attached deck with isolated Claude credentials and a bootstrap launcher that identifies its SessionStart as launcher-origin, consumes the first seed during boot, then execs real interactive Haiku Claude in each of three predicted dispatch worktrees. Every first write must be recorded as swallowed, each real pane must later submit its distinct sentinel-bearing retry through Claude's native UserPromptSubmit hook, and any failure must print each pane's exact confirmation and attempt evidence.
+/// Scenario: Launch an attached deck with isolated Claude credentials and a bootstrap launcher that identifies its SessionStart as launcher-origin, consumes the first seed during boot, then execs real interactive Haiku Claude in each of three predicted dispatch worktrees. Every first write must be recorded as swallowed, each real pane must later submit its distinct sentinel-bearing retry through Claude's native UserPromptSubmit hook, and any failure must print each pane's exact confirmation and attempt evidence plus the daemon's own delivery-lifecycle log lines.
 #[spec("scheduler/dispatch/015")]
 #[test]
 fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
@@ -390,10 +422,34 @@ fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
     let staging = common::harness_tempdir().expect("real-Claude bootstrap staging dir");
     let launcher = write_bootstrap_swallowing_real_claude(staging.path());
     let config = write_default_command_config(&launcher.to_string_lossy());
+    let log_name = "prompt-delivery.log";
     let deck = TuiDeck::builder()
         .with_env(
             "DOT_AGENT_DECK_CONFIG",
             config.path().join("config.toml").to_string_lossy(),
+        )
+        // Issue #664: without a log the failure cannot say WHY a pane never
+        // confirmed. `dispatch/014` above has always captured this; /015 —
+        // the one whose panes race a real 60 s deadline — did not, so its
+        // abandonment was invisible. See [`delivery_log_evidence`].
+        .with_env("DOT_AGENT_DECK_LOG", log_name)
+        // Issue #664: this scenario can NEVER satisfy the readiness gate before
+        // the write, so leaving it at the production 30 s spent half the
+        // delivery budget on a wait with no possible outcome. The gate skips a
+        // `wrapper_fork`-origin `SessionStart` and holds out for the agent's
+        // NATIVE one (`state::wait_for_session_start`), but the bootstrap
+        // launcher only `exec`s Claude after the write it is blocked reading —
+        // so Claude cannot emit that native event until the gate has already
+        // given up. Measured: the gate timed out at 30.1 s and the whole
+        // delivery was abandoned 29.9 s later, the two halves of one 60 s
+        // `AUTOMATIC_PROMPT_DEADLINE` captured before the wait. Pinning it here
+        // — exactly as `dispatch/014` does, and to the same constant — returns
+        // that half to the retry window the real agent actually gets, which is
+        // what production spends it on when a native `SessionStart` releases
+        // the gate in milliseconds. It changes no deadline and no assertion.
+        .with_env(
+            "DOT_AGENT_DECK_SESSION_START_WAIT_MS",
+            READINESS_GATE_MS.to_string(),
         )
         .with_env("PATH", path_with_binary_dir())
         .with_imported_claude_credentials()
@@ -467,10 +523,12 @@ fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
     let all_first_attempts_swallowed = cases
         .iter()
         .all(|(name, prompt)| first_submission_was_swallowed(&deck, name, prompt));
+    let log = std::fs::read_to_string(deck.workdir().join(log_name)).unwrap_or_default();
     assert!(
         all_first_attempts_swallowed && all_confirmed,
-        "every bootstrap launcher must swallow its first PTY submission and every real interactive Claude pane must genuinely submit a retried sentinel-bearing seed; a healthy Idle pane with no matching UserPromptSubmit is an undelivered seed. all_first_attempts_swallowed={all_first_attempts_swallowed}, all_confirmed={all_confirmed}{}\nFinal grid:\n{}",
+        "every bootstrap launcher must swallow its first PTY submission and every real interactive Claude pane must genuinely submit a retried sentinel-bearing seed; a healthy Idle pane with no matching UserPromptSubmit is an undelivered seed. all_first_attempts_swallowed={all_first_attempts_swallowed}, all_confirmed={all_confirmed}{}\nDelivery log:\n{}\nFinal grid:\n{}",
         delivery_diagnostics(&deck, &cases),
+        delivery_log_evidence(&log),
         deck.snapshot_grid()
     );
 }
