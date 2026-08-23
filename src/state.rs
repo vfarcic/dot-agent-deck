@@ -4194,20 +4194,25 @@ impl AppState {
     /// in `apply_event` (the dying session's `agent_id`). Pass `None`
     /// only for backward-compat callers / pre-F9 hook scripts that don't
     /// emit `agent_id`.
+    ///
+    /// Returns the minted session id, so a caller that has to touch the
+    /// placeholder it just created (the `SessionEnd` restorer re-applies the
+    /// dying session's friendly name — issue #663) does not have to restate this
+    /// function's key format and risk drifting from it.
     pub fn insert_placeholder_session(
         &mut self,
         pane_id: String,
         cwd: Option<String>,
         agent_type: Option<AgentType>,
         agent_id: Option<String>,
-    ) {
+    ) -> String {
         let session_id = format!("pane-{}", pane_id);
         let now = Utc::now();
         let started_at = self.pane_started_at.get(&pane_id).copied().unwrap_or(now);
         self.sessions.insert(
             session_id.clone(),
             SessionState {
-                session_id,
+                session_id: session_id.clone(),
                 agent_type: agent_type.unwrap_or(AgentType::None),
                 cwd,
                 status: SessionStatus::Idle,
@@ -4224,6 +4229,7 @@ impl AppState {
                 shell_synthetic_working: false,
             },
         );
+        session_id
     }
 
     /// PRD #162: seed a hydrated pane's session from the daemon's live
@@ -5475,23 +5481,53 @@ impl AppState {
             // placeholder next to a fresh card. A DIFFERENT agent
             // (F9 clear=true respawn) still produces a fresh card because
             // the agent_ids no longer match.
-            let pane_id_cwd_and_agent_id =
-                self.sessions.get(&event.session_id).and_then(|session| {
-                    session.pane_id.as_ref().map(|pid| {
-                        self.pane_started_at.insert(pid.clone(), session.started_at);
-                        (pid.clone(), session.cwd.clone(), session.agent_id.clone())
-                    })
-                });
+            //
+            // Issue #663: and capture the dying session's FRIENDLY NAME for the
+            // same reason PRD #127 finding #2 captures it on the supersession
+            // path — the name describes the PANE (its role, its scheduled task),
+            // not the conversation that just ended, so a conversation ending must
+            // not cost the card its label. Without this the placeholder is born
+            // nameless and the name is gone for good: the next `SessionStart` is
+            // a fresh generation whose `inherited_display_name` can only ever
+            // reach back to this placeholder, so it inherits the `None`.
+            //
+            // The visible failure is a `clear = true` delegate. The respawn
+            // SIGTERMs the worker, its `SessionEnd` lands here, and the
+            // replacement's `SessionStart` then titles the card with the new
+            // agent's session UUID (`ClaudeCode · c70493f1-13…`) instead of its
+            // role. Every orchestration path EXCEPT the dispatched one masked
+            // this, because they also seed the TUI-side `ui.pane_display_names`
+            // mirror, which `render_dashboard` falls back to; the live
+            // orchestration surface (`ui::surface_one_orchestration`, the tab a
+            // `dot-agent-deck dispatch --orchestration` builds) does not, so
+            // there a dispatched worker lost its role name on its first
+            // delegation.
+            let restored = self.sessions.get(&event.session_id).and_then(|session| {
+                session.pane_id.as_ref().map(|pid| {
+                    self.pane_started_at.insert(pid.clone(), session.started_at);
+                    (
+                        pid.clone(),
+                        session.cwd.clone(),
+                        session.agent_id.clone(),
+                        session.display_name.clone(),
+                    )
+                })
+            });
             self.sessions.remove(&event.session_id);
             // Restore a placeholder card so the pane remains visible on the dashboard.
-            if let Some((pane_id, cwd, agent_id)) = pane_id_cwd_and_agent_id
+            if let Some((pane_id, cwd, agent_id, display_name)) = restored
                 && self.managed_pane_ids.contains(&pane_id)
             {
                 // M2.13: a SessionEnd restoration creates a fresh
                 // placeholder; `agent_type` is unknown post-end and gets
                 // re-populated when the next `SessionStart` hook arrives
                 // for this pane. Same default behavior as before M2.13.
-                self.insert_placeholder_session(pane_id, cwd, None, agent_id);
+                let placeholder_id = self.insert_placeholder_session(pane_id, cwd, None, agent_id);
+                if let Some(name) = display_name
+                    && let Some(placeholder) = self.sessions.get_mut(&placeholder_id)
+                {
+                    placeholder.display_name = Some(name);
+                }
             }
             return;
         }
