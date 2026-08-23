@@ -2722,8 +2722,8 @@ pub fn check_opencode_available() -> Result<(), String> {
 }
 
 /// Compiled-in default cheap model for Codex availability probes and real-agent
-/// e2e coverage. Correct for a ChatGPT-subscription (oauth) `~/.codex/auth.json`,
-/// which is what most dev boxes here log in with.
+/// e2e coverage. Reachable by an **API-key** `~/.codex/auth.json`; a
+/// ChatGPT-subscription (oauth) host must override it — see [`codex_test_model`].
 const CODEX_TEST_MODEL_DEFAULT: &str = "gpt-5.1-codex-mini";
 
 /// Env var that overrides [`codex_test_model`] on a host whose Codex credentials
@@ -2734,16 +2734,39 @@ pub const CODEX_TEST_MODEL_ENV: &str = "DOT_AGENT_DECK_CODEX_TEST_MODEL";
 /// [`CODEX_TEST_MODEL_DEFAULT`] unless `DOT_AGENT_DECK_CODEX_TEST_MODEL` is set
 /// to a non-empty value, which wins.
 ///
-/// The override exists because the `codex-*` model family is served only to
-/// ChatGPT-subscription (oauth) credentials. With an **API-key**
+/// The override exists because no single model id is reachable by both Codex
+/// auth modes, so whichever one the default targets, the other needs an escape
+/// hatch.
+///
+/// The `codex-*` family is **API-key only**. On a ChatGPT-subscription (oauth)
 /// `~/.codex/auth.json`, `codex exec --model gpt-5.1-codex-mini` answers
-/// `404 Not Found: Model not found gpt-5.1-codex-mini` from
-/// `https://api.openai.com/v1/responses`, so [`check_codex_available`] fails its
-/// probe and every real-agent Codex test SKIPS — a silent no-coverage outcome
-/// that reads as a pass. Such a host exports e.g.
-/// `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5-nano` (an equally cheap model an API
-/// key *can* reach). The default is deliberately left alone so subscription-auth
-/// environments keep running codex-mini.
+/// `400 invalid_request_error: The 'gpt-5.1-codex-mini' model is not supported
+/// when using Codex with a ChatGPT account` (measured 2026-08-23), so
+/// [`check_codex_available`] fails its probe and every real-agent Codex test
+/// SKIPS — a silent no-coverage outcome that reads as a pass.
+///
+/// A subscription host therefore exports a plain `gpt-5.*` model it *can* reach,
+/// e.g. `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5.4-mini` (verified 2026-08-23).
+///
+/// **Setting it makes the tests run, not pass.** They then fail on an unrelated
+/// defect: Codex 0.149.0 does not execute the deck's trusted command hooks in
+/// **interactive TUI** mode, so no hook-sourced event ever reaches the deck and
+/// assertions wanting a `Thinking` carrying `user_prompt` time out. Measured
+/// 2026-08-23 against one `CODEX_HOME` with identical `hooks.json`, identical
+/// trust records and an identical socket: `codex exec` delivered `session_start`,
+/// `thinking` (with `user_prompt`) and `idle`; the same home driven interactively
+/// delivered nothing, while the turn itself ran (the deck still saw `ShellBusy`
+/// from the stdout classifier). `docs/develop/agent-adapters.md` records
+/// interactive hooks working on 0.145.0, so this is a regression in that range,
+/// and it is auth-mode independent — an API-key host on 0.149.0 fails the same
+/// way. The default is left on the API-key model so those tests SKIP rather than
+/// fail while that is outstanding.
+///
+/// (Before 2026-08-23 this comment asserted the reverse of the first paragraph —
+/// that `codex-*` was oauth-only and the override was for API-key hosts. That was
+/// wrong and cost a debugging session: the probe failed on a freshly
+/// authenticated subscription and the error text sent the reader looking for an
+/// API key that was not there.)
 ///
 /// Single source of truth: [`check_codex_available`] probes the model this
 /// returns, so the availability gate and the model the tests actually launch can
@@ -2756,6 +2779,46 @@ pub fn codex_test_model() -> &'static str {
             .map(|raw| raw.trim().to_string())
             .filter(|model| !model.is_empty())
             .unwrap_or_else(|| CODEX_TEST_MODEL_DEFAULT.to_string())
+    })
+}
+
+/// Compiled-in default cheap model for real-agent OpenCode e2e coverage.
+///
+/// OpenCode model ids are provider-qualified (`provider/model`); a bare
+/// `gpt-4o-mini` is rejected as "Invalid model format". This default is on the
+/// `openai` provider so it resolves against whatever `opencode auth` holds for
+/// OpenAI — including a **ChatGPT-subscription (oauth)** credential, which is
+/// how the dev boxes here are logged in and which costs nothing per call.
+///
+/// This deliberately does *not* route through OpenRouter. It used to: both call
+/// sites hardcoded `openrouter/openai/gpt-4o-mini`, which billed metered
+/// OpenRouter credit for coverage the subscription already pays for, and made
+/// two OpenCode tests skip whenever that balance ran dry — with a skip reason
+/// naming missing *credentials*, which were present the whole time.
+const OPENCODE_TEST_MODEL_DEFAULT: &str = "openai/gpt-5.4-mini";
+
+/// Env var that overrides [`opencode_test_model`] on a host whose OpenCode
+/// credentials cannot reach the default — e.g. one authenticated to OpenRouter
+/// but not OpenAI, which exports
+/// `DOT_AGENT_DECK_OPENCODE_TEST_MODEL=openrouter/openai/gpt-4o-mini`.
+pub const OPENCODE_TEST_MODEL_ENV: &str = "DOT_AGENT_DECK_OPENCODE_TEST_MODEL";
+
+/// Cheap provider-qualified model used by real-agent OpenCode e2e coverage —
+/// [`OPENCODE_TEST_MODEL_DEFAULT`] unless `DOT_AGENT_DECK_OPENCODE_TEST_MODEL`
+/// is set to a non-empty value, which wins.
+///
+/// Mirrors [`codex_test_model`]. Note the gates are not symmetric:
+/// [`check_opencode_available`] only checks that an `auth.json` exists and does
+/// **not** probe the model, so an unreachable model id here surfaces as a test
+/// failure rather than a skip.
+pub fn opencode_test_model() -> &'static str {
+    static MODEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODEL.get_or_init(|| {
+        std::env::var(OPENCODE_TEST_MODEL_ENV)
+            .ok()
+            .map(|raw| raw.trim().to_string())
+            .filter(|model| !model.is_empty())
+            .unwrap_or_else(|| OPENCODE_TEST_MODEL_DEFAULT.to_string())
     })
 }
 
@@ -2834,9 +2897,10 @@ pub fn check_codex_available() -> Result<(), String> {
         .any(|marker| lower.contains(marker))
     {
         return Err(format!(
-            "Codex could not reach model {} with the current authentication — if this host's \
-             ~/.codex/auth.json is an API key rather than a ChatGPT subscription, set {} to a \
-             model the key can reach (e.g. gpt-5-nano)",
+            "Codex could not reach model {} with the current authentication — the two auth \
+             modes reach different model families, so set {} to one these credentials can \
+             reach (API key: e.g. gpt-5-nano or gpt-5.1-codex-mini; ChatGPT subscription: \
+             e.g. gpt-5.4-mini). Run `codex login status` to see which mode is in use",
             codex_test_model(),
             CODEX_TEST_MODEL_ENV,
         ));

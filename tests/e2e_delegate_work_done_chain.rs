@@ -306,12 +306,15 @@ async fn opencode_auto_submits_daemon_injected_prompt() {
     // sibling Claude arm pins its own socket for the same reason, and a test
     // that spawns a real agent should never depend on ambient environment.
     let dead_hook_socket = cwd.path().join("no-listener.sock");
+    // OpenCode model ids are provider-qualified (`provider/model`); a bare
+    // `gpt-4o-mini` is rejected as "Invalid model format". A small model is
+    // plenty for a one-line arithmetic reply. Shared with the other real-agent
+    // OpenCode test through `common::opencode_test_model` so both move together
+    // and both honour `DOT_AGENT_DECK_OPENCODE_TEST_MODEL`.
+    let worker_command = format!("opencode --model {}", common::opencode_test_model());
     let worker_agent_id = registry
         .spawn_agent(SpawnOptions {
-            // OpenCode model ids are provider-qualified (`provider/model`); a
-            // bare `gpt-4o-mini` is rejected as "Invalid model format". A small
-            // model is plenty for a one-line arithmetic reply.
-            command: Some("opencode --model openrouter/openai/gpt-4o-mini"),
+            command: Some(worker_command.as_str()),
             cwd: Some(cwd_str.as_str()),
             rows: 40,
             cols: 120,
