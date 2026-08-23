@@ -719,3 +719,156 @@ fn wrap_max_lifetime_backstop_ends_an_unsignalled_wrapper_and_its_child() {
          ignores. This is the three-day leak the backstop exists to prevent."
     );
 }
+
+/// The pids a `sigkilled_wrapper_case` probe leaves behind, plus whether the
+/// backstop took each of them down.
+#[derive(Debug)]
+struct StrandedChildOutcome {
+    path: &'static str,
+    child_gone: bool,
+    grandchild_gone: bool,
+}
+
+/// Issue #657: drive one path (PTY or pipes) of the child-group backstop.
+///
+/// Spawns a wrapper whose child ignores SIGTERM, forks a grandchild into the
+/// child's process group that ignores it too, and then **SIGKILLs the wrapper**
+/// — the one signal `SignalGuard` cannot catch, so no reap loop ever runs and
+/// the wrapper's own max-lifetime backstop never fires either. The child was
+/// `setsid`'d into its own session at spawn, so from this moment nothing above
+/// it can signal its group. Only a bound the child owns independently can end
+/// it.
+fn sigkilled_wrapper_case(interactive: bool) -> StrandedChildOutcome {
+    let fixture = common::harness_tempdir().expect("create stranded-child fixture");
+    let child_pid_path = fixture.path().join("child.pid");
+    let grandchild_pid_path = fixture.path().join("grandchild.pid");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    command
+        .args([
+            "wrap",
+            "--agent",
+            "codex",
+            "--",
+            "/bin/sh",
+            "-c",
+            // The grandchild is the half that matters: the real leak was a
+            // `node …/codex` with a native `codex-linux-x64/vendor/…` child
+            // under it, and killing only the direct child reparents that one to
+            // init instead of reaping it. Both ignore TERM so passing requires
+            // the full forward-then-escalate path, not a polite request.
+            "trap '' TERM; \
+             /bin/sh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" > \
+             \"$WRAP_GRANDCHILD_PID_FILE\"; while :; do sleep 1; done' & \
+             printf '%s\\n' \"$$\" > \"$WRAP_CHILD_PID_FILE\"; \
+             while :; do sleep 1; done",
+        ])
+        .env("WRAP_CHILD_PID_FILE", &child_pid_path)
+        .env("WRAP_GRANDCHILD_PID_FILE", &grandchild_pid_path)
+        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        // The behaviour under test: the shortest cap the parser accepts, so the
+        // whole probe finishes in cap + WRAP_TERMINATE_GRACE rather than the
+        // 300s the e2e harness pins.
+        .env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "1")
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID");
+
+    // Held for the whole case on the interactive path: the wrapper's descriptors
+    // must stay valid while it runs.
+    let _master = if interactive {
+        let (master, slave) = open_pty();
+        command
+            .stdin(Stdio::from(
+                slave.try_clone().expect("clone PTY slave for stdin"),
+            ))
+            .stdout(Stdio::from(
+                slave.try_clone().expect("clone PTY slave for stdout"),
+            ))
+            .stderr(Stdio::from(slave));
+        Some(master)
+    } else {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        None
+    };
+
+    let mut wrapper = command.spawn().expect("spawn stranded-child probe");
+    let read_pid = |path: &std::path::Path| -> Option<libc::pid_t> {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| contents.trim().parse().ok())
+    };
+    let recorded = common::wait_until(Duration::from_secs(10), || {
+        read_pid(&child_pid_path).is_some() && read_pid(&grandchild_pid_path).is_some()
+    });
+    if !recorded {
+        terminate(&mut wrapper);
+        panic!(
+            "{} wrapper never recorded both probe pids",
+            if interactive { "PTY" } else { "pipe" }
+        );
+    }
+    let child_pid = read_pid(&child_pid_path).expect("child pid recorded");
+    let grandchild_pid = read_pid(&grandchild_pid_path).expect("grandchild pid recorded");
+
+    // SIGKILL, not SIGTERM: the point is that the wrapper gets NO chance to reap.
+    // SAFETY: the wrapper pid came from this test's live `Child`; ending it
+    // uncleanly is the behavior under test.
+    let wrapper_pid = wrapper.id() as libc::pid_t;
+    assert_eq!(
+        unsafe { libc::kill(wrapper_pid, libc::SIGKILL) },
+        0,
+        "deliver SIGKILL to wrapper pid {wrapper_pid}"
+    );
+    let _ = wrapper.wait();
+
+    // Bounded by the 1 s cap + one 250 ms poll + WRAP_TERMINATE_GRACE (1.5 s).
+    // 30 s is loose headroom for a loaded host, not an expected duration.
+    let deadline = Duration::from_secs(30);
+    let child_gone = common::wait_until(deadline, || !common::process_running(child_pid));
+    let grandchild_gone = common::wait_until(deadline, || !common::process_running(grandchild_pid));
+
+    // Never leak this test's own probes, whatever the outcome above — otherwise a
+    // regression in the code under test would itself mint the orphans #657 is
+    // about.
+    for pid in [child_pid, grandchild_pid] {
+        if common::process_running(pid) {
+            // SAFETY: best-effort cleanup of pids this test created.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+
+    StrandedChildOutcome {
+        path: if interactive { "pty" } else { "pipe" },
+        child_gone,
+        grandchild_gone,
+    }
+}
+
+/// Scenario: Start a wrapper on each path whose child and grandchild both ignore
+/// SIGTERM, then SIGKILL the wrapper so it never runs a reap loop. The child was
+/// `setsid`'d into its own session, so nothing above it can signal its group any
+/// more. Assert both the child and the grandchild are gone within seconds —
+/// the bound has to live with the child, not with the wrapper.
+#[test]
+fn wrap_child_group_backstop_reaps_a_child_stranded_by_a_sigkilled_wrapper() {
+    let outcomes = [sigkilled_wrapper_case(true), sigkilled_wrapper_case(false)];
+    assert!(
+        outcomes.iter().all(|o| o.child_gone && o.grandchild_gone),
+        "a SIGKILL'd wrapper stranded its `setsid`'d agent child (or a descendant \
+         of it) with no bound of its own — exactly the orphan that pins an e2e \
+         temp root against `clean-e2e-tmp` forever (issue #657); outcomes: \
+         {outcomes:#?}"
+    );
+    assert!(
+        ["pty", "pipe"]
+            .into_iter()
+            .all(|path| outcomes.iter().any(|o| o.path == path)),
+        "both wrap paths must be covered; outcomes: {outcomes:#?}"
+    );
+}

@@ -777,6 +777,213 @@ fn arm_wrap_self_defense() {
     });
 }
 
+/// Poll cadence of the forked child-group backstop below.
+///
+/// Also the width of its pid-reuse window: the reaper signals ONLY at its
+/// deadline and only after re-checking that the group is still there, so for it
+/// to ever hit a recycled pgid the original group would have to die and the
+/// kernel hand the same number back out inside one tick. At 250 ms that needs
+/// the whole pid space to wrap in a quarter of a second — >130k forks/second
+/// even on a host pinned to the 32768 default. See also `docs/develop/e2e-temp-dirs.md`
+/// on why this codebase refuses to *infer* pid reuse; this bounds the window
+/// instead of guessing at it.
+#[cfg(unix)]
+const CHILD_GROUP_BACKSTOP_POLL: Duration = Duration::from_millis(250);
+
+/// Highest descriptor the forked reaper closes. A wrapper holds well under a
+/// dozen (the inner PTY master, the redirected-descriptor pipes, the std fds),
+/// so this covers every one; `close(2)` on an already-closed descriptor is a
+/// harmless `EBADF`. A fixed bound rather than `sysconf(_SC_OPEN_MAX)` because
+/// `sysconf` is not on POSIX's async-signal-safe list and the code below runs
+/// after `fork` in a threaded process.
+#[cfg(unix)]
+const CHILD_GROUP_BACKSTOP_MAX_FD: libc::c_int = 1024;
+
+/// Issue #657: a test-only hard bound on the WRAPPED CHILD's process group that
+/// deliberately does NOT depend on this wrapper staying alive.
+///
+/// [`arm_wrap_self_defense`] bounds the *wrapper*. The child is bounded only
+/// transitively — by a reap loop calling [`kill_pid_group`], which requires the
+/// wrapper to still be running to call it. Every path that ends a wrapper
+/// *without* letting it reap therefore strands the child: an uncatchable
+/// `SIGKILL` (the deck's own escalation past [`AGENT_TERMINATE_GRACE`], a
+/// registry `force_kill_and_wait`, an OOM kill, a nextest timeout) is not
+/// something [`SignalGuard`] can convert into a tidy teardown. And the child is
+/// [`child_pre_exec`]'d into its own session, so once the wrapper is gone
+/// *nothing above it can signal that group at all* — not the daemon, not the
+/// deck, not the test harness's `killpg` of its own group.
+///
+/// Measured on 2026-08-23: four such Codex children alive at 21–29 minutes with
+/// `ppid=1` and `pgrp == sid == own pid`, and historically one at 8 days. Each
+/// pinned its e2e temp root permanently, because `cargo xtask clean-e2e-tmp`
+/// never reaps a root whose owning pid is live, at any age, by design (#461).
+/// 385 directories / 14.2 GB had accrued that way.
+///
+/// So fork a reaper that outlives us. It:
+/// - `setsid`s out of the wrapper's process group FIRST — the deck tears a
+///   wrapper down with `killpg(wrapper_pgid, …)`, which would otherwise take the
+///   reaper down alongside the very wrapper whose death it exists to survive;
+/// - closes every inherited descriptor, so it cannot hold the inner PTY master
+///   or the child's stdin pipe open and suppress the EOF/`SIGHUP` that would
+///   otherwise end the child on its own;
+/// - polls the child's group and exits the moment it is gone — the normal case,
+///   within one [`CHILD_GROUP_BACKSTOP_POLL`] of any clean teardown;
+/// - and, if the group is still alive at the deadline, walks the same
+///   `SIGTERM` → [`crate::agent_pty::WRAP_TERMINATE_GRACE`] → `SIGKILL` path the
+///   reap loop walks.
+///
+/// It is itself bounded by deadline + grace and holds no descriptor, so it can
+/// never become the leak it exists to prevent.
+///
+/// Env-gated on `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` exactly like
+/// [`arm_wrap_self_defense`], and for the same reason: a production wrapper sets
+/// neither var, forks nothing, and behaves precisely as before.
+///
+/// Deliberately NOT a substitute for the `setsid` in [`child_pre_exec`]: the
+/// wrapper needs the child in its own group so `killpg` targets the child and
+/// its descendants and nothing else. This adds a second, independent holder of
+/// that same kill rather than trading the grouping away.
+#[cfg(unix)]
+fn arm_child_group_backstop(child_pid: libc::pid_t) {
+    use crate::agent_pty::DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS;
+    use crate::daemon::parse_max_lifetime_secs;
+
+    if child_pid <= 0 {
+        return;
+    }
+    let Some(max_lifetime) = std::env::var(DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS)
+        .ok()
+        .and_then(|v| parse_max_lifetime_secs(&v))
+    else {
+        return;
+    };
+
+    // SAFETY: `fork` from a threaded process is defined as long as the child
+    // touches nothing but async-signal-safe libc calls before `_exit` — which is
+    // all either child arm below does. No allocation, no locks, no `tracing`, no
+    // Rust destructor runs on those paths.
+    let forked = unsafe { libc::fork() };
+    match forked {
+        -1 => {
+            // Non-fatal: the wrapper's own backstop is unaffected, and this net
+            // only exists under test. Say so rather than failing the launch.
+            tracing::warn!(
+                "could not fork the wrapped-child lifetime backstop; a SIGKILL'd \
+                 wrapper may strand its agent child"
+            );
+        }
+        // SAFETY (both child arms): see the note on the `fork` above.
+        0 => unsafe {
+            // Intermediate: escape the wrapper's group, then fork the reaper and
+            // exit at once so the reaper is reparented to init instead of
+            // lingering as a zombie under a wrapper that never waits for it.
+            libc::setsid();
+            if libc::fork() == 0 {
+                child_group_backstop_main(child_pid, max_lifetime);
+            }
+            libc::_exit(0);
+        },
+        intermediate => {
+            // Reap the intermediate immediately; all it does is `setsid`, fork
+            // and `_exit`, and targeting its pid cannot steal the wrapped child's
+            // status from the reap loop.
+            let mut status: libc::c_int = 0;
+            // SAFETY: `intermediate` is this process's own child, just forked.
+            unsafe {
+                libc::waitpid(intermediate, &mut status, 0);
+            }
+        }
+    }
+}
+
+/// Body of the forked reaper described on [`arm_child_group_backstop`]. Runs in
+/// a fresh single-threaded process and so restricts itself to async-signal-safe
+/// libc calls (`signal`, `close`, `clock_gettime`, `nanosleep`, `killpg`,
+/// `_exit`). Never returns.
+#[cfg(unix)]
+fn child_group_backstop_main(child_pid: libc::pid_t, max_lifetime: Duration) -> ! {
+    // SAFETY: every call here is async-signal-safe, as required after `fork` in
+    // a threaded process. `child_pid` is the wrapper's own child, `setsid`'d in
+    // its pre-exec, so it is also its group id.
+    unsafe {
+        // A forked copy inherits `SignalGuard`'s handlers, and a reaper that
+        // swallows SIGTERM is its own leak.
+        for signo in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+            libc::signal(signo, libc::SIG_DFL);
+        }
+        for fd in 0..CHILD_GROUP_BACKSTOP_MAX_FD {
+            libc::close(fd);
+        }
+
+        let deadline = monotonic_millis().saturating_add(max_lifetime.as_millis() as i64);
+        while monotonic_millis() < deadline {
+            if !pid_group_alive(child_pid) {
+                libc::_exit(0);
+            }
+            sleep_millis(CHILD_GROUP_BACKSTOP_POLL.as_millis() as i64);
+        }
+        if !pid_group_alive(child_pid) {
+            libc::_exit(0);
+        }
+        libc::killpg(child_pid, libc::SIGTERM);
+
+        let escalate = monotonic_millis()
+            .saturating_add(crate::agent_pty::WRAP_TERMINATE_GRACE.as_millis() as i64);
+        while monotonic_millis() < escalate {
+            if !pid_group_alive(child_pid) {
+                libc::_exit(0);
+            }
+            sleep_millis(50);
+        }
+        libc::killpg(child_pid, libc::SIGKILL);
+        libc::_exit(0);
+    }
+}
+
+/// `CLOCK_MONOTONIC` in milliseconds. Async-signal-safe (`clock_gettime` is on
+/// POSIX's list), unlike anything that would allocate or lock — which is why the
+/// reaper carries its own clock instead of using [`Instant`].
+#[cfg(unix)]
+fn monotonic_millis() -> i64 {
+    // SAFETY: `clock_gettime` fills the `timespec` it is handed and touches
+    // nothing else.
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    (ts.tv_sec as i64)
+        .saturating_mul(1000)
+        .saturating_add((ts.tv_nsec as i64) / 1_000_000)
+}
+
+/// Async-signal-safe sleep for the forked reaper. A short sleep cut off by a
+/// signal simply shortens one poll tick; both loops re-check their deadline
+/// against the clock rather than counting ticks, so an early return cannot move
+/// a deadline.
+#[cfg(unix)]
+fn sleep_millis(millis: i64) {
+    let ts = libc::timespec {
+        tv_sec: (millis / 1000) as libc::time_t,
+        tv_nsec: ((millis % 1000) * 1_000_000) as _,
+    };
+    // SAFETY: `nanosleep` reads one `timespec` and writes nothing through the
+    // null remainder pointer.
+    unsafe {
+        libc::nanosleep(&ts, std::ptr::null_mut());
+    }
+}
+
+/// Whether any process still belongs to process group `pgid`. A failed
+/// `killpg(pgid, 0)` means `ESRCH` here — the reaper and the group share a uid,
+/// so `EPERM` is not reachable — i.e. the group is gone and there is nothing
+/// left to bound.
+#[cfg(unix)]
+fn pid_group_alive(pgid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 performs the existence/permission check only; it delivers
+    // nothing.
+    unsafe { libc::killpg(pgid, 0) == 0 }
+}
+
 /// PRD #20 finding #12: a RESTORABLE guard that installs async handlers for
 /// `SIGTERM` / `SIGHUP` / `SIGINT` and restores the previous dispositions on
 /// drop. It is installed BEFORE the child is spawned so a signal arriving in the
@@ -1220,6 +1427,10 @@ fn run_wrap_pty(
     drop(slave);
 
     let child_pid = child.id() as libc::pid_t;
+    // Issue #657: armed AFTER the slave copies are dropped and before the reap
+    // loop can be interrupted, so the child's group has a bound of its own even
+    // if this wrapper is SIGKILL'd a moment from now. No-op outside tests.
+    arm_child_group_backstop(child_pid);
 
     // Take the pipe ends for any redirected descriptor.
     let pipe_in = if stdin_tty { None } else { child.stdin.take() };
@@ -1470,6 +1681,8 @@ fn run_wrap_pipe(
         }
     };
     let child_pid = child.id() as libc::pid_t;
+    // Issue #657: same independent bound on the child's group as the PTY path.
+    arm_child_group_backstop(child_pid);
 
     // PRD #225 M3: same fork-time card-surfacing event as the PTY path, and the
     // same marker — it says "a session exists", not "the agent is ready".
