@@ -806,7 +806,8 @@ const CHILD_GROUP_BACKSTOP_MAX_FD: libc::c_int = 1024;
 /// transitively — by a reap loop calling [`kill_pid_group`], which requires the
 /// wrapper to still be running to call it. Every path that ends a wrapper
 /// *without* letting it reap therefore strands the child: an uncatchable
-/// `SIGKILL` (the deck's own escalation past [`AGENT_TERMINATE_GRACE`], a
+/// `SIGKILL` (the deck's own escalation past
+/// [`crate::agent_pty::AGENT_TERMINATE_GRACE`], a
 /// registry `force_kill_and_wait`, an OOM kill, a nextest timeout) is not
 /// something [`SignalGuard`] can convert into a tidy teardown. And the child is
 /// [`child_pre_exec`]'d into its own session, so once the wrapper is gone
@@ -836,8 +837,8 @@ const CHILD_GROUP_BACKSTOP_MAX_FD: libc::c_int = 1024;
 /// never become the leak it exists to prevent.
 ///
 /// Env-gated on `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` exactly like
-/// [`arm_wrap_self_defense`], and for the same reason: a production wrapper sets
-/// neither var, forks nothing, and behaves precisely as before.
+/// [`arm_wrap_self_defense`], and for the same reason: a production wrapper never
+/// sets it, forks nothing, and behaves precisely as before.
 ///
 /// Deliberately NOT a substitute for the `setsid` in [`child_pre_exec`]: the
 /// wrapper needs the child in its own group so `killpg` targets the child and
@@ -885,12 +886,20 @@ fn arm_child_group_backstop(child_pid: libc::pid_t) {
         },
         intermediate => {
             // Reap the intermediate immediately; all it does is `setsid`, fork
-            // and `_exit`, and targeting its pid cannot steal the wrapped child's
-            // status from the reap loop.
+            // and `_exit`, so this cannot block, and targeting its pid cannot
+            // steal the wrapped child's status from the reap loop. `SignalGuard`
+            // is installed by now and deliberately does not set `SA_RESTART`, so
+            // a signal landing in this window would `EINTR` the wait and leave a
+            // zombie behind — retry rather than leak one.
             let mut status: libc::c_int = 0;
-            // SAFETY: `intermediate` is this process's own child, just forked.
-            unsafe {
-                libc::waitpid(intermediate, &mut status, 0);
+            loop {
+                // SAFETY: `intermediate` is this process's own child, just forked.
+                let reaped = unsafe { libc::waitpid(intermediate, &mut status, 0) };
+                if reaped >= 0
+                    || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                {
+                    break;
+                }
             }
         }
     }
