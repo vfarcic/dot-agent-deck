@@ -17339,19 +17339,32 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) -> PickerCl
 /// single navigable field (Command), so the generic "Tab: switch field" hint is
 /// misleading — `schedule_locked` shows a Command-only `Enter: confirm  Esc:
 /// cancel` instead.
+///
+/// Issue #589: `submit_refused` is [`NewPaneFormState::name_collision`] — the
+/// SAME predicate the Enter guard returns `Action::Continue` on and the same
+/// one that drops `[Submit]` from the action row. When it holds, the hint drops
+/// the `Enter:` clause entirely rather than naming a key the guard will
+/// silently refuse, matching how the button row handles it (removed, not
+/// dimmed). The caller passes the one `form.name_collision()` it already
+/// computed for the button row, so the two cannot drift apart the way the
+/// old `name_submits`-alone wording did — that boolean cannot see a collision.
+/// Only the `has_mode_field` arm consults it: a collision requires a selected
+/// orchestration, and the arms below are reachable only from the mode-locked
+/// schedule form, which offers none.
 fn new_pane_form_footer_hint(
     has_mode_field: bool,
     name_submits: bool,
+    submit_refused: bool,
     schedule_locked: bool,
 ) -> &'static str {
     if schedule_locked {
         return "  Enter: confirm  Esc: cancel";
     }
     if has_mode_field {
-        if name_submits {
-            "  Tab: switch  \u{25c0}\u{25b6}: mode  Enter: submit  Esc: cancel"
-        } else {
-            "  Tab: switch  \u{25c0}\u{25b6}: mode  Enter: next  Esc: cancel"
+        match (name_submits, submit_refused) {
+            (true, true) => "  Tab: switch  \u{25c0}\u{25b6}: mode  Esc: cancel",
+            (true, false) => "  Tab: switch  \u{25c0}\u{25b6}: mode  Enter: submit  Esc: cancel",
+            (false, _) => "  Tab: switch  \u{25c0}\u{25b6}: mode  Enter: next  Esc: cancel",
         }
     } else {
         "  Tab: switch field  Enter: next/confirm  Esc: cancel"
@@ -17944,7 +17957,15 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // PRD #170: pass `show_mode` (false when locked) so the locked footer drops
     // the `◀▶: mode` hint; unlocked it equals the old `has_mode_field`. Finding 6:
     // `schedule_locked` selects the Command-only `Enter: confirm  Esc: cancel`.
-    let footer = new_pane_form_footer_hint(show_mode, name_submits, form.schedule_locked);
+    // Issue #589: reuse the SAME `name_collision` that dropped `[Submit]` from
+    // the action row above, so the footer and the button row can never disagree
+    // about whether Enter is available.
+    let footer = new_pane_form_footer_hint(
+        show_mode,
+        name_submits,
+        name_collision,
+        form.schedule_locked,
+    );
     lines.push(Line::styled(footer, text_primary()));
 
     // PRD #170: the locked schedule form retitles the modal by action; otherwise
@@ -29422,23 +29443,46 @@ mod tests {
     }
 
     #[test]
-    fn footer_hint_switches_to_submit_when_name_focused_with_orchestration() {
+    fn footer_hint_names_only_the_enter_action_the_form_will_honour() {
         // PRD #106 follow-up: when the Command field is hidden and focus is
         // on Name, Enter submits — the footer must say so.
-        let submit_hint = new_pane_form_footer_hint(true, true, false);
+        let submit_hint = new_pane_form_footer_hint(true, true, false, false);
         assert!(
             submit_hint.contains("Enter: submit"),
             "expected submit hint, got {submit_hint:?}"
         );
 
+        // Issue #589: the one state where that promise is false — the name
+        // collides, so the Enter guard returns `Action::Continue` and nothing
+        // happens. The hint drops the `Enter:` clause entirely rather than
+        // naming a refused key, matching the action row dropping `[Submit]`.
+        let refused_hint = new_pane_form_footer_hint(true, true, true, false);
+        assert!(
+            !refused_hint.contains("Enter"),
+            "a refused submit must advertise no Enter action at all, got {refused_hint:?}"
+        );
+        assert!(
+            refused_hint.contains("Tab: switch") && refused_hint.contains("Esc: cancel"),
+            "the keys that DO still work must survive the refusal, got {refused_hint:?}"
+        );
+
         // Sanity checks: every other focus/visibility combination keeps the
         // legacy 'Enter: next' wording.
-        let next_hint = new_pane_form_footer_hint(true, false, false);
+        let next_hint = new_pane_form_footer_hint(true, false, false, false);
         assert!(
             next_hint.contains("Enter: next") && !next_hint.contains("submit"),
             "expected next hint, got {next_hint:?}"
         );
-        let no_mode_hint = new_pane_form_footer_hint(false, false, false);
+        // Issue #589 control: a collision must NOT mute Enter where Enter only
+        // moves focus. Off the Name field the guard is unreachable, so
+        // `Enter: next` stays honest and the hint is unchanged by the collision
+        // — the refusal above is attributable to the submitting field alone.
+        assert_eq!(
+            new_pane_form_footer_hint(true, false, true, false),
+            next_hint,
+            "a collision must not change the hint on a field where Enter advances focus"
+        );
+        let no_mode_hint = new_pane_form_footer_hint(false, false, false, false);
         assert!(
             no_mode_hint.contains("Enter: next/confirm"),
             "expected next/confirm hint when there's no mode field, got {no_mode_hint:?}"
@@ -29447,7 +29491,7 @@ mod tests {
         // PRD #170 finding 6: the mode-locked schedule form has a single
         // navigable field (Command), so it drops the misleading "Tab: switch
         // field" wording for a Command-only confirm/cancel hint.
-        let locked_hint = new_pane_form_footer_hint(false, false, true);
+        let locked_hint = new_pane_form_footer_hint(false, false, false, true);
         assert!(
             locked_hint.contains("Enter: confirm")
                 && locked_hint.contains("Esc: cancel")
@@ -30323,10 +30367,10 @@ mod tests {
     /// orchestration, and clear the Name field to empty through real
     /// `KeyCode::Backspace` events. Submitting must be REFUSED — an empty
     /// field is not "no title", it resolves to the same canonical
-    /// `tdd-cycle` and would produce a second, indistinguishable tab. Also
-    /// render the form through the dedicated collision seam and assert
-    /// `[Submit]` is gone from the action row — the refusal's most
-    /// user-visible behaviour, pinned by nothing until now.
+    /// `tdd-cycle` and would produce a second, indistinguishable tab. The
+    /// refused state must also LOOK refused: `[Submit]` is gone from the
+    /// action row, and the footer beneath it stops advertising `Enter:
+    /// submit` (issue #589) — while typing a free name restores both.
     #[spec("orchestration/identity/005")]
     #[test]
     fn identity_005_an_empty_name_is_checked_against_its_resolved_title() {
@@ -30390,6 +30434,49 @@ mod tests {
             !rendered.contains("[Submit]"),
             "an empty Name that resolves to a taken title must drop [Submit] \
              from the action row, got:\n{rendered}"
+        );
+
+        // Issue #589: the FOOTER must keep the same promise the action row
+        // does. Rendered from the form these keystrokes actually produced —
+        // not the seam above, which opens focused on Mode where `Enter: next`
+        // is honest. Focus is on Name here, the one state where Enter reaches
+        // the refusal.
+        let collided = {
+            let form = ui.new_pane_form.as_ref().expect("form still open");
+            buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
+                render_new_pane_form(frame, form);
+            }))
+        };
+        assert!(
+            !collided.contains("Enter: submit"),
+            "the collision guard refuses Enter, so the footer must not \
+             advertise `Enter: submit`, got:\n{collided}"
+        );
+
+        // Control: one keystroke away from the collision. Typing a free name
+        // restores BOTH [Submit] and the `Enter: submit` promise, so the
+        // assertion above is attributable to the collision state and not to
+        // the hint having been dropped wholesale.
+        for ch in "review-2".chars() {
+            handle_new_pane_form_key(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &mut ui,
+            );
+        }
+        let free = {
+            let form = ui.new_pane_form.as_ref().expect("form still open");
+            assert!(
+                !form.name_collision(),
+                "control setup: `review-2` must not collide with the live `review`"
+            );
+            buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
+                render_new_pane_form(frame, form);
+            }))
+        };
+        assert!(
+            free.contains("[Submit]") && free.contains("Enter: submit"),
+            "a free name must restore both the [Submit] button and the \
+             `Enter: submit` footer promise, got:\n{free}"
         );
     }
 
