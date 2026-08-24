@@ -216,6 +216,8 @@ Three answers are legitimate and all three are the runner's to pick:
 
 **Say what you found even when the answer is "nothing".** A checkout already level with `origin/main` is worth one line, because the runner cannot tell "checked, current" apart from "never checked".
 
+**`dispatch` names the base itself, and that does not replace this step.** Since issue #674 its success line ends `…, cut from main at c701932`, which step 9 quotes — but that is a record written *after* the worktree exists. This step runs before, and it is the only thing that can still change the answer.
+
 ## Step 6 — Claim, then name
 
 **Assign the runner to every issue being dispatched.** This is a hard step, not a courtesy — it is what stops the other maintainer from starting the same work, and the whole point of dispatching is that nobody is watching the issue while the unit runs.
@@ -333,5 +335,5 @@ Give the runner, per unit: issue number, worktree path as `dispatch` reported it
 
 - **Nothing reports back to this pane.** `dispatch` is fire-and-forget with no return edge. Point at the worktree paths and the units' own tabs; never say results will arrive here.
 - **Anything you excluded, and why** — especially in-flight collisions, duplicates, and any candidate abandoned at step 6 or 8 over an assignee collision or a refused dispatch.
-- **The base every unit was cut from** — the branch `HEAD` was on and its distance from `origin/main` when you dispatched, plus what the runner chose to do about it (step 5b). Report it when it was already current, too: nothing else distinguishes a base that was checked from one that was never looked at.
+- **The base every unit was cut from.** `dispatch` names it in its own success line (`…, cut from main at c701932`), so **quote what it reported** rather than recomputing it, and pair it with the distance and the runner's answer from step 5b. Report it when the base was already current, too: nothing else distinguishes a base that was checked from one that was never looked at. **A success line carrying no `cut from` clause means the probe failed, not that the base is fine** — it is deliberately best-effort so a failed probe cannot fail a dispatch that already succeeded. Say the base is unreported rather than dropping the line.
 - **Anything you could not verify**, including a stale local checkout you chose not to move, and any list you could not confirm was untruncated.

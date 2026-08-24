@@ -137,6 +137,8 @@ That is not a theoretical churn rate. Measured over the 30 days to 2026-08-24: *
 
 Three answers are the runner's to pick — dispatch anyway, update the branch first, or defer the batch — and if they update, **re-read `HEAD` and dispatch the whole batch after the move**. Resolving this between two dispatches splits one batch across two bases. Report which of the three happened in step 8, including "already current": nothing else distinguishes a base that was checked from one that was never looked at.
 
+**`dispatch` names the base itself, and that does not replace this step.** Since issue #674 its success line ends `…, cut from main at c701932`, which step 8 quotes — but that is a record written *after* the worktree exists. This step runs before, and it is the only thing that can still change the answer.
+
 ## Step 2c — Establish the shape, by asking
 
 A unit starts either as **one agent** or as a **multi-role orchestration**. Which one the runner wants is theirs to choose — **ask, never infer.**
@@ -500,7 +502,7 @@ That is why step 6 defaults to a new name instead of removing anything, and why 
 
 Report, per dispatched unit: the PR number and title, the unit name, the worktree path `../<repo>-dispatch-<name>`, and what that unit is expected to do — verify, address feedback, or both. Then point the user at **each unit's own tab on the deck**; that tab is where the outcome will appear.
 
-Report the base too: the branch `HEAD` was on and its distance from `origin/main` when you dispatched, and what the runner chose to do about it (step 2b) — including when it was already current, since nothing else distinguishes a checked base from an unchecked one.
+Report the base too. `dispatch` names it in its own success line (`…, cut from main at c701932`), so **quote what it reported** rather than recomputing it, and pair it with the distance and the runner's answer from step 2b — including when the base was already current, since nothing else distinguishes a checked base from an unchecked one. **A success line carrying no `cut from` clause means the probe failed, not that the base is fine**: it is deliberately best-effort so a failed probe cannot fail a dispatch that already succeeded. Say the base is unreported rather than dropping the line.
 
 Also report, plainly: every PR skipped and why — closed since listing, become someone else's homework, or already under a live unit (name that unit) — every PR excluded at step 1, and the number dispatched against the number the user asked for if they differ.
 
