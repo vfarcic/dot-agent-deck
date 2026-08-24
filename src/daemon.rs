@@ -1701,6 +1701,71 @@ async fn run_shell_activity_monitor_with<S, F>(
     }
 }
 
+/// Issue #319 (audit finding 9): how many raw hook payloads ONE connection may
+/// put in the daemon log before it is cut off with a single summary line.
+///
+/// Five is enough to diagnose a misconfigured hook (which repeats the *same*
+/// malformed payload) and far too few to be an amplifier for a peer looping
+/// distinct ones. Paired with [`crate::hook_ingest::MAX_LOGGED_HOOK_LINE_BYTES`],
+/// which bounds each individual line, this caps one connection's contribution
+/// to the log at a few KiB instead of unbounded 64 KiB records.
+const MAX_RAW_PAYLOAD_LOGS_PER_CONNECTION: u32 = 5;
+
+/// Write one JSON reply line on a hook connection, under
+/// [`crate::hook_ingest::HOOK_REPLY_WRITE_TIMEOUT`].
+///
+/// Returns `false` when the connection should be abandoned — the deadline
+/// expired, or the write failed. Issue #319 (audit finding 2): these writes had
+/// no deadline, so a peer that issued a reply-bearing verb and then simply
+/// stopped reading pinned its `MAX_HOOK_CONNECTIONS` permit for the daemon's
+/// lifetime once its receive buffer filled. That is the same denial an idle
+/// reader achieves, arriving from the other direction, so it needs the same
+/// answer.
+///
+/// A failed reply also has to CLOSE the connection rather than carry on: the
+/// old code ignored the error and looped back to reading, which on a
+/// half-dead peer meant holding the permit for another full read deadline for
+/// no possible benefit.
+async fn write_hook_reply<W, T>(write_half: &mut W, resp: &T, verb: &str) -> bool
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    T: serde::Serialize,
+{
+    let Ok(json) = serde_json::to_string(resp) else {
+        // Unreachable for the three concrete reply types, all plain data. Not
+        // an `unwrap`, because a serialization panic inside the per-connection
+        // task would take the reply path down for a diagnostic that is worth
+        // strictly less than the connection.
+        warn!(verb, "hook reply could not be serialized");
+        return false;
+    };
+    let line = format!("{json}\n");
+    let budget = crate::hook_ingest::hook_reply_write_timeout();
+    match tokio::time::timeout(budget, async {
+        write_half.write_all(line.as_bytes()).await?;
+        write_half.flush().await
+    })
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            // An ordinary peer that has already gone away (an older CLI, which
+            // never reads) lands here; `debug` because it is expected traffic.
+            debug!(verb, error = %e, "hook reply write failed; closing the connection");
+            false
+        }
+        Err(_) => {
+            warn!(
+                verb,
+                timeout = ?budget,
+                "hook reply write timed out — the peer stopped reading; closing the \
+                 connection so its slot returns to the cap"
+            );
+            false
+        }
+    }
+}
+
 async fn run_hook_loop(
     listener: IpcListener,
     state: SharedState,
@@ -1720,6 +1785,16 @@ async fn run_hook_loop(
     let connections = Arc::new(tokio::sync::Semaphore::new(
         crate::hook_ingest::MAX_HOOK_CONNECTIONS,
     ));
+    // Issue #319 (audit finding 9): the refusal below used to warn once per
+    // EXCESS CONNECTION, so a tight connect loop against a saturated cap grew
+    // the daemon log without bound — the slowloris got noisier the longer it
+    // ran, which is the wrong direction. Rate-limited to one line per
+    // `SATURATION_LOG_INTERVAL`, carrying the count of everything suppressed
+    // since the last one, so the signal is preserved and the volume is not.
+    // Local to this single-threaded accept loop, so no synchronisation.
+    const SATURATION_LOG_INTERVAL: Duration = Duration::from_secs(10);
+    let mut saturation_last_logged: Option<std::time::Instant> = None;
+    let mut saturation_suppressed: u64 = 0;
     loop {
         tokio::select! {
             // PRD #93 M1.2: a notified shutdown wins over a fresh `accept` —
@@ -1746,11 +1821,22 @@ async fn run_hook_loop(
                         // leak of long-lived connections, and both are worth
                         // seeing in a post-mortem; the daemon keeps serving every
                         // connection already inside the cap.
-                        warn!(
-                            cap = crate::hook_ingest::MAX_HOOK_CONNECTIONS,
-                            "hook socket at its concurrent-connection cap — closing the excess \
-                             connection"
-                        );
+                        let due = saturation_last_logged
+                            .is_none_or(|at| at.elapsed() >= SATURATION_LOG_INTERVAL);
+                        if due {
+                            warn!(
+                                cap = crate::hook_ingest::MAX_HOOK_CONNECTIONS,
+                                suppressed = saturation_suppressed,
+                                idle_timeout = ?crate::hook_ingest::hook_line_timeout(),
+                                "hook socket at its concurrent-connection cap — closing the \
+                                 excess connection. Connections idle past the timeout are \
+                                 reclaimed, so a saturated cap recovers on its own"
+                            );
+                            saturation_last_logged = Some(std::time::Instant::now());
+                            saturation_suppressed = 0;
+                        } else {
+                            saturation_suppressed = saturation_suppressed.saturating_add(1);
+                        }
                         drop(stream);
                         continue;
                     }
@@ -1777,9 +1863,24 @@ async fn run_hook_loop(
                     // let a peer smuggle a short valid event in behind megabytes
                     // of padding.
                     let mut lines = crate::hook_ingest::BoundedLines::new(read_half);
+                    // Issue #319 (audit finding 9): how many raw-payload log
+                    // lines this ONE connection may still produce. A peer
+                    // looping malformed lines otherwise wrote up to
+                    // `MAX_HOOK_LINE_BYTES` to the log per line, for as long as
+                    // it cared to; after the budget it gets one summary line and
+                    // silence. Per-connection rather than global so a single
+                    // misconfigured hook is still fully diagnosable.
+                    let mut raw_log_budget: u32 = MAX_RAW_PAYLOAD_LOGS_PER_CONNECTION;
 
                     loop {
-                        let line = match lines.next_line().await {
+                        // Issue #319 (audit finding 2): the deadline is what
+                        // makes the connection cap a bound on damage rather than
+                        // a bound on service. Without it a peer that connects and
+                        // says nothing holds its permit for the daemon's lifetime.
+                        let line = match lines
+                            .next_line_within(crate::hook_ingest::hook_line_timeout())
+                            .await
+                        {
                             Ok(Some(line)) => line,
                             Ok(None) => break,
                             Err(e) => {
@@ -1834,10 +1935,10 @@ async fn run_hook_loop(
                                     // a caller that has already gone away (an
                                     // older CLI, which never reads) just makes
                                     // this a no-op.
-                                    if let Ok(json) = serde_json::to_string(&resp) {
-                                        let line = format!("{json}\n");
-                                        let _ = write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                    if !write_hook_reply(&mut write_half, &resp, "delegate")
+                                        .await
+                                    {
+                                        break;
                                     }
                                 }
                                 DaemonMessage::Dispatch(signal) => {
@@ -1945,11 +2046,10 @@ async fn run_hook_loop(
                                     );
                                     let resp =
                                         crate::event::GetSeedResponse { seed };
-                                    if let Ok(json) = serde_json::to_string(&resp) {
-                                        let line = format!("{json}\n");
-                                        let _ =
-                                            write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                    if !write_hook_reply(&mut write_half, &resp, "get-seed")
+                                        .await
+                                    {
+                                        break;
                                     }
                                 }
                                 DaemonMessage::ListTargets(req) => {
@@ -1976,11 +2076,14 @@ async fn run_hook_loop(
                                     let resp = crate::dispatch::list_targets_response(
                                         cwd.as_deref().map(std::path::Path::new),
                                     );
-                                    if let Ok(json) = serde_json::to_string(&resp) {
-                                        let line = format!("{json}\n");
-                                        let _ =
-                                            write_half.write_all(line.as_bytes()).await;
-                                        let _ = write_half.flush().await;
+                                    if !write_hook_reply(
+                                        &mut write_half,
+                                        &resp,
+                                        "list-targets",
+                                    )
+                                    .await
+                                    {
+                                        break;
                                     }
                                 }
                             }
@@ -2054,11 +2157,24 @@ async fn run_hook_loop(
                             // a malformed event. Restore that diagnostic here,
                             // at the one place the daemon still has the raw
                             // line the unrecognized value came from.
-                            if event.event_type == crate::event::EventType::Unknown {
+                            if event.event_type == crate::event::EventType::Unknown
+                                && raw_log_budget > 0
+                            {
+                                raw_log_budget -= 1;
+                                // Issue #318 (audit finding 6): `line` is the
+                                // ORIGINAL payload, so it still carries the
+                                // capability token that `admit` stripped from
+                                // the typed event a few lines above — the one
+                                // path by which a live capability reached the
+                                // disk, defeating `AgentToken`'s redacted
+                                // `Debug` entirely. Redacted and bounded here;
+                                // the diagnostic (which unrecognized value
+                                // arrived) survives, because it is in the head
+                                // of the line.
                                 warn!(
                                     session_id = %event.session_id,
                                     pane_id = ?event.pane_id,
-                                    raw_line = %line,
+                                    raw_line = %crate::hook_ingest::redact_for_log(line),
                                     "Event carries an unrecognized event_type — decoded as \
                                      Unknown and otherwise ignored; check the hook for a typo"
                                 );
@@ -2124,8 +2240,27 @@ async fn run_hook_loop(
                             // means a client that reacts to the event by
                             // listing agents sees the fresher answer.
                             ingest_event(&state, &event_tx, event).await;
-                        } else {
-                            warn!("Malformed event: {line}");
+                        } else if raw_log_budget > 0 {
+                            raw_log_budget -= 1;
+                            // Same two reasons as the unknown-`event_type`
+                            // branch above: the raw line may carry a live
+                            // capability (audit finding 6) and, unbounded, a
+                            // peer looping malformed lines wrote 64 KiB to the
+                            // log per line (finding 9). `redact_for_log` is
+                            // textual rather than serde-shaped precisely so it
+                            // still works HERE, on a line that by definition did
+                            // not parse.
+                            warn!(
+                                payload = %crate::hook_ingest::redact_for_log(line),
+                                "Malformed event"
+                            );
+                            if raw_log_budget == 0 {
+                                warn!(
+                                    logged = MAX_RAW_PAYLOAD_LOGS_PER_CONNECTION,
+                                    "further malformed or unrecognized payloads on this hook \
+                                     connection will not be logged"
+                                );
+                            }
                         }
                     }
                 });

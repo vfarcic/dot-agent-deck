@@ -514,6 +514,23 @@ pub trait AgentOwnership: Send + Sync {
     /// Does this process own the generation that an event naming
     /// `(pane_id, agent_id)` comes from? See the table above.
     fn generation_ownership(&self, pane_id: Option<&str>, agent_id: Option<&str>) -> Ownership;
+
+    /// Issue #318 (audit finding 7): does this process manage **any** pane at
+    /// all — i.e. is it a deck that runs agents, or one that only watches
+    /// external ones?
+    ///
+    /// [`AppState::admits_paneless_event`] used to answer this from
+    /// `managed_pane_ids.is_empty()`, and that set is not the same question: an
+    /// ordinary daemon `StartAgent` deliberately does NOT put its pane in it
+    /// (ownership comes from this oracle instead), so a daemon running a whole
+    /// fleet could still read as "manages no panes" and take a pane-less,
+    /// token-less event on nothing but a guessed `session_id`. Asking the
+    /// registry directly makes the sentence mean what it says.
+    ///
+    /// [`Ownership::Owned`] = it holds at least one pane; [`Ownership::Unclaimed`]
+    /// = it genuinely holds none; [`Ownership::Unknown`] = it could not be
+    /// asked, which the caller must treat as fail-closed rather than as "none".
+    fn manages_any_pane(&self) -> Ownership;
 }
 
 /// Issue #454 round 3: the answer to an [`AgentOwnership`] question.
@@ -563,6 +580,15 @@ impl AgentOwnershipOracle {
         // answered "no" — same ambiguity the poisoned lock had, same fix.
         match self.0.upgrade() {
             Some(o) => o.generation_ownership(pane_id, agent_id),
+            None => Ownership::Unknown,
+        }
+    }
+
+    /// Issue #318 (audit finding 7). Same `Weak`-upgrade discipline as
+    /// [`Self::ownership`]: a registry that is gone answered nothing.
+    fn manages_any_pane(&self) -> Ownership {
+        match self.0.upgrade() {
+            Some(o) => o.manages_any_pane(),
             None => Ownership::Unknown,
         }
     }
@@ -4132,11 +4158,51 @@ impl AppState {
     /// Otherwise the historical rule stands: a process that manages no panes at
     /// all is watching EXTERNAL agents and takes their pane-less events; one
     /// that manages panes is not, and rejects them.
+    ///
+    /// # Issue #318 (audit finding 7): where "manages no panes" comes from
+    ///
+    /// That sentence used to be evaluated as `managed_pane_ids.is_empty()`, and
+    /// the two are not the same claim. `managed_pane_ids` is the *historical*
+    /// pane set, populated by explicit registration and by the foreign-agent
+    /// compat path — an ordinary daemon `StartAgent` deliberately does **not**
+    /// add to it, relying on the registry oracle instead. So a daemon running a
+    /// whole fleet of managed panes still had an empty set, read as "I watch
+    /// external agents", and admitted a pane-less, token-less event on nothing
+    /// more than a `session_id` — which is discoverable from the daemon's own
+    /// `Received event` log line or an attach `SubscribeEvents` stream. Since
+    /// provenance classifies every pane-less event as `Foreign`, that was a
+    /// direct route back to #318's card-driving impact with the guard in place.
+    ///
+    /// The registry is now the authority, and the pane set is the fallback for
+    /// the processes that have no registry at all (the TUI, every bare
+    /// [`AppState`] test) — exactly the split
+    /// [`Self::owns_pane_event`]/[`Self::registration_admits`] already use.
+    /// [`Ownership::Unknown`] denies: this is a branch where the ABSENCE of a
+    /// claim grants something, which is the one place the trait's three states
+    /// exist to separate.
     fn admits_paneless_event(&self, agent_id: Option<&str>) -> bool {
-        matches!(
+        // An owned pane-less agent, admitted by identity (issue #454).
+        if matches!(
             self.oracle_ownership(None, agent_id),
             Some(Ownership::Owned)
-        ) || self.managed_pane_ids.is_empty()
+        ) {
+            return true;
+        }
+        match self.agent_ownership.as_ref().map(|o| o.manages_any_pane()) {
+            // A registry holding at least one pane: this process runs agents,
+            // so it is not the external-watcher the fallback describes.
+            Some(Ownership::Owned) => false,
+            // A registry that holds none. The historical pane set still has a
+            // veto — a foreign card registered through the compat path is a
+            // pane this process is tracking, and the old rule rejected
+            // pane-less events once any was.
+            Some(Ownership::Unclaimed) => self.managed_pane_ids.is_empty(),
+            // Could not be asked. Absence of evidence, and this branch grants.
+            Some(Ownership::Unknown) => false,
+            // No oracle installed at all: the TUI and bare-`AppState` tests,
+            // where the pane set IS the whole truth.
+            None => self.managed_pane_ids.is_empty(),
+        }
     }
 
     /// The registry-backed half of both questions above. `None` when this
@@ -8612,6 +8678,17 @@ mod tests {
     }
 
     impl AgentOwnership for StubOwnership {
+        fn manages_any_pane(&self) -> Ownership {
+            if self.mute {
+                return Ownership::Unknown;
+            }
+            if self.panes.is_empty() {
+                Ownership::Unclaimed
+            } else {
+                Ownership::Owned
+            }
+        }
+
         fn generation_ownership(&self, pane_id: Option<&str>, agent_id: Option<&str>) -> Ownership {
             if self.mute {
                 return Ownership::Unknown;
@@ -8829,6 +8906,99 @@ mod tests {
             "a pane-less event from an agent this process does not own must \
              create no session; sessions={:?}",
             state.sessions.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Issue #318, audit finding 7: `managed_pane_ids.is_empty()` is NOT the
+    /// same claim as "this process manages no panes", and the gap was a route
+    /// straight back to #318's card-driving impact with the provenance guard in
+    /// place.
+    ///
+    /// An ordinary daemon `StartAgent` deliberately does not register its pane
+    /// in `managed_pane_ids` (that is the previous test's whole point), so a
+    /// daemon running a fleet still had an empty set. Since every pane-LESS
+    /// event is classified `Foreign` at provenance admission, a same-user
+    /// process could then drive a managed session's status with a token-less,
+    /// pane-less event plus a `session_id` — and session ids are discoverable
+    /// from the daemon's own `Received event` log line or an unauthenticated
+    /// attach `SubscribeEvents` stream.
+    ///
+    /// The registry oracle is now the authority, so the sentence means what it
+    /// says. Note what the previous test pins remains true: the OWNED pane-less
+    /// agent is still admitted by identity — this closes the fallback, not the
+    /// exemption.
+    #[test]
+    fn a_registry_holding_panes_refuses_a_paneless_event_it_does_not_own() {
+        let mut state = AppState::default();
+        let _ownership = install_ownership(
+            &mut state,
+            StubOwnership {
+                // A daemon-spawned pane, registered ONLY with the registry —
+                // exactly what `StartAgent` produces.
+                panes: [(CLI_PANE.to_string(), CLI_AGENT_ID.to_string())]
+                    .into_iter()
+                    .collect(),
+                ..StubOwnership::default()
+            },
+        );
+        assert!(
+            state.managed_pane_ids.is_empty(),
+            "precondition: this is the topology the old rule got wrong — a \
+             daemon that manages a pane with an EMPTY historical pane set"
+        );
+
+        let mut forged = agent_event_cli_payload(CLI_PANE, "someone-elses-agent");
+        forged.pane_id = None;
+        forged.agent_id = None;
+        forged.event_type = EventType::SessionStart;
+        state.apply_event(forged);
+
+        assert!(
+            state.sessions.is_empty(),
+            "a daemon that manages panes must refuse a pane-less event it does \
+             not own, whatever the historical pane set says; sessions={:?}",
+            state.sessions.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The other side of finding 7's fix: a process that genuinely manages no
+    /// panes is a dashboard WATCHING external agents, and taking their pane-less
+    /// events is its whole job. Tightening the rule must not have closed that.
+    #[test]
+    fn a_registry_holding_no_panes_still_takes_an_external_paneless_event() {
+        let mut state = AppState::default();
+        let _ownership = install_ownership(&mut state, StubOwnership::default());
+
+        let mut external = agent_event_cli_payload(CLI_PANE, "external-agent");
+        external.pane_id = None;
+        external.agent_id = None;
+        external.event_type = EventType::SessionStart;
+        state.apply_event(external);
+
+        assert!(
+            !state.sessions.is_empty(),
+            "a deck with no panes of its own must still watch external agents"
+        );
+    }
+
+    /// A registry that cannot be asked answers `Unknown`, and this is a branch
+    /// where the ABSENCE of a claim would GRANT — the one case the trait's three
+    /// states exist to separate. It must deny.
+    #[test]
+    fn a_silent_registry_refuses_a_paneless_event() {
+        let mut state = AppState::default();
+        let _ownership = install_ownership(&mut state, StubOwnership::mute());
+
+        let mut external = agent_event_cli_payload(CLI_PANE, "external-agent");
+        external.pane_id = None;
+        external.agent_id = None;
+        external.event_type = EventType::SessionStart;
+        state.apply_event(external);
+
+        assert!(
+            state.sessions.is_empty(),
+            "a poisoned or dropped registry is the absence of evidence, never \
+             evidence that this process manages nothing"
         );
     }
 

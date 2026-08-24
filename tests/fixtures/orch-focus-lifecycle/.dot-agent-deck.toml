@@ -14,9 +14,14 @@ name = "orchestrator"
 command = "printf 'ORCH_ROLE_SENTINEL\\n'; sleep 600"
 start = true
 
+# Issue #318: `alpha` is the role `e2e_orchestration_focus.rs` drives with
+# synthetic status events, and the daemon now refuses a token-less event naming
+# a pane it manages. So the pane publishes the capability token injected into it
+# and the test reads it back — see `common::token_publishing_command`, which is
+# the same line for panes whose command a test supplies directly.
 [[orchestrations.roles]]
 name = "alpha"
-command = "printf 'ALPHA_ROLE_SENTINEL\\n'; sleep 600"
+command = 'printf %s "$DOT_AGENT_DECK_AGENT_TOKEN" > "$HOME/.dad-agent-token.$DOT_AGENT_DECK_PANE_ID.part" && mv "$HOME/.dad-agent-token.$DOT_AGENT_DECK_PANE_ID.part" "$HOME/.dad-agent-token.$DOT_AGENT_DECK_PANE_ID"; printf "ALPHA_ROLE_SENTINEL\\n"; sleep 600'
 
 [[orchestrations.roles]]
 name = "beta"

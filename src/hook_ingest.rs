@@ -63,6 +63,7 @@
 //! strengthening tracked under #543, not a substitute for this.
 
 use std::fmt;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -139,6 +140,210 @@ const _: () = {
     );
 };
 
+/// How long the daemon will wait for ONE complete hook line before closing the
+/// connection.
+///
+/// **30 seconds**, and this is the other half of [`MAX_HOOK_CONNECTIONS`]
+/// rather than a separate idea. A cap without a deadline converts a
+/// memory-exhaustion bug into a function-denial bug: the permit is held for the
+/// whole connection, so 128 peers that connect and send *nothing* — or trickle
+/// bytes forever under the line cap — deny every later hook, `GetSeed`,
+/// `Delegate`, `Dispatch`, `WorkDone` and `ListTargets` connection, with no
+/// memory pressure and no natural recovery. The cap alone does not close issue
+/// #319; the pair does.
+///
+/// The deadline is on the WHOLE call, not on one `read`. A per-read idle
+/// timeout resets on every byte moved, so it never fires against a peer that
+/// dribbles one byte every 29 seconds — the exact shape the line cap already
+/// refuses to be beaten by, and it would be odd for the two bounds to disagree
+/// about what "slow" means. [`crate::hook::request_from_socket`] measures its
+/// own client-side budget the same way, for the same reason.
+///
+/// **Why 30 s and not less.** Every legitimate producer writes its line in a
+/// single `write_all` immediately after `connect` and then half-closes: the
+/// `hook` and `agent-event` CLIs, `wrap`, and the reply-bearing verbs alike.
+/// The genuinely long-lived case is a `Dispatch` that holds its connection
+/// across a `git worktree` add plus a spawn — but that time is spent inside the
+/// daemon's own handler, *not* waiting for a line, so it is not measured here
+/// at all. 30 s is therefore some three orders of magnitude above the only
+/// legitimate wait there is (a local `connect`-to-`write` latency), which
+/// leaves ample room for a loaded machine while bounding a wedged permit to
+/// half a minute instead of forever.
+///
+/// **Why not less still.** The deadline's job is to guarantee recovery, not to
+/// be tight: an attacker who reconnects every 30 s can still hold the cap, and
+/// no achievable value changes that (they can hold it by sending valid events
+/// too). What the deadline buys is that the wedge cannot outlive the attacker,
+/// and a legitimate peer is never cut off mid-line.
+pub const HOOK_LINE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the daemon will spend writing ONE reply on a hook connection before
+/// giving up and closing it.
+///
+/// **10 seconds.** The reply-bearing verbs (`Delegate`, `GetSeed`,
+/// `ListTargets`) write a few hundred bytes to a local socket, which completes
+/// in microseconds unless the peer has stopped reading — and a peer that has
+/// stopped reading can otherwise pin a permit indefinitely once its receive
+/// buffer fills, which is [`HOOK_LINE_TIMEOUT`]'s denial with the direction
+/// reversed. Shorter than the read deadline because there is even less
+/// legitimate reason to be slow here: the daemon already has the bytes.
+pub const HOOK_REPLY_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Test-only knob that SHORTENS [`HOOK_LINE_TIMEOUT`] and
+/// [`HOOK_REPLY_WRITE_TIMEOUT`], in milliseconds.
+///
+/// Same shape as [`crate::agent_pty::DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`]:
+/// read from the daemon's own environment, absent in production. It exists so
+/// an L2 test can prove that a wedged connection cap genuinely RECOVERS at the
+/// real socket, which a 30-second default makes untestable in the tier.
+///
+/// **It can only shorten.** [`hook_line_timeout`] clamps the override to the
+/// production constant, so no environment can relax a bound — the knob makes
+/// the daemon stricter or does nothing, and there is no value of it that
+/// reintroduces the denial these deadlines close.
+pub const DOT_AGENT_DECK_TEST_HOOK_TIMEOUT_MS: &str = "DOT_AGENT_DECK_TEST_HOOK_TIMEOUT_MS";
+
+fn test_timeout_override() -> Option<Duration> {
+    std::env::var(DOT_AGENT_DECK_TEST_HOOK_TIMEOUT_MS)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_millis)
+}
+
+/// The effective read deadline: [`HOOK_LINE_TIMEOUT`], or a shorter test
+/// override. Never longer — see [`DOT_AGENT_DECK_TEST_HOOK_TIMEOUT_MS`].
+pub fn hook_line_timeout() -> Duration {
+    test_timeout_override()
+        .map(|o| o.min(HOOK_LINE_TIMEOUT))
+        .unwrap_or(HOOK_LINE_TIMEOUT)
+}
+
+/// The effective reply-write deadline. Same clamp as [`hook_line_timeout`].
+pub fn hook_reply_write_timeout() -> Duration {
+    test_timeout_override()
+        .map(|o| o.min(HOOK_REPLY_WRITE_TIMEOUT))
+        .unwrap_or(HOOK_REPLY_WRITE_TIMEOUT)
+}
+
+/// Hard cap on how much of a raw hook line the daemon will ever put in its log.
+///
+/// **512 bytes.** Audit finding 9: every malformed line was logged verbatim, up
+/// to the full [`MAX_HOOK_LINE_BYTES`], so a peer looping malformed lines grew
+/// `~/.local/state/dot-agent-deck/deck.log` at 64 KiB a line. 512 bytes is past
+/// a whole ordinary event (300–900 bytes is the measured range, and the head of
+/// one is where the diagnostic value is), and 128x cheaper in the pathological
+/// case.
+pub const MAX_LOGGED_HOOK_LINE_BYTES: usize = 512;
+
+/// Prepare a raw hook line for the daemon log: **strip any capability token**,
+/// then bound the length.
+///
+/// Audit finding 6. Two branches in [`crate::daemon`] log the original line —
+/// the unknown-`event_type` diagnostic and the malformed-event warning — and
+/// both ran *after* [`admit`] had stripped the typed token, so they were the
+/// one place a live capability could still reach the disk. That defeats
+/// [`AgentToken`]'s redacted [`fmt::Debug`] entirely, and a log file is a
+/// longer-lived and easier source than `/proc/<pid>/environ`: it outlives the
+/// agent process, it is plain text, and it is exactly what gets attached to a
+/// bug report.
+///
+/// Textual rather than "parse, remove the field, re-serialize" on purpose. The
+/// malformed branch is reached *because* the line did not parse, so a
+/// serde-shaped redaction would cover the branch that needs it least and skip
+/// the one that needs it most. This scans for the field name and blanks its
+/// value whatever surrounds it, which degrades gracefully on a truncated or
+/// almost-JSON line.
+pub fn redact_for_log(line: &str) -> String {
+    let mut out = String::with_capacity(line.len().min(MAX_LOGGED_HOOK_LINE_BYTES) + 32);
+    let mut rest = line;
+    // `"agent_token"` as it appears on the wire; the field is `#[serde(rename)]`-free
+    // so the Rust name IS the JSON name.
+    const FIELD: &str = "\"agent_token\"";
+    while let Some(at) = rest.find(FIELD) {
+        let (before, from_field) = rest.split_at(at);
+        out.push_str(before);
+        out.push_str(FIELD);
+        let after_field = &from_field[FIELD.len()..];
+        match redact_json_string_value(after_field) {
+            Some(consumed) => {
+                out.push_str(":\"<redacted>\"");
+                rest = &after_field[consumed..];
+            }
+            None => {
+                // No `: "…"` follows — the field name appeared in some other
+                // position (inside a string, or the line is truncated right
+                // after it). Nothing to redact; keep scanning past it.
+                rest = after_field;
+            }
+        }
+    }
+    out.push_str(rest);
+    truncate_for_log(out)
+}
+
+/// From just past a `"agent_token"` field name, how many bytes make up
+/// `: "<value>"`, or `None` when that is not what follows.
+fn redact_json_string_value(after_field: &str) -> Option<usize> {
+    let mut bytes = after_field.char_indices();
+    let mut idx = loop {
+        let (i, c) = bytes.next()?;
+        match c {
+            c if c.is_whitespace() => continue,
+            ':' => break i + 1,
+            _ => return None,
+        }
+    };
+    // Skip whitespace between the colon and the opening quote.
+    let opened = loop {
+        let c = after_field[idx..].chars().next()?;
+        if c.is_whitespace() {
+            idx += c.len_utf8();
+            continue;
+        }
+        if c != '"' {
+            return None;
+        }
+        break idx + 1;
+    };
+    // Find the closing quote, honouring backslash escapes so a token containing
+    // an escaped quote cannot end the span early. Tokens are hex today, but the
+    // field is `Option<String>` from the wire and takes whatever a peer sends.
+    let mut i = opened;
+    let mut escaped = false;
+    for c in after_field[opened..].chars() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            return Some(i + 1);
+        }
+        i += c.len_utf8();
+    }
+    // Unterminated string: the rest of the line IS the value, so consume it all
+    // rather than leaving a live token in the tail.
+    Some(after_field.len())
+}
+
+/// Bound a log fragment to [`MAX_LOGGED_HOOK_LINE_BYTES`] on a char boundary,
+/// saying how much was dropped so a reader is never misled into thinking they
+/// are looking at the whole line.
+fn truncate_for_log(mut s: String) -> String {
+    if s.len() <= MAX_LOGGED_HOOK_LINE_BYTES {
+        return s;
+    }
+    let total = s.len();
+    let mut cut = MAX_LOGGED_HOOK_LINE_BYTES;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+    s.push_str(&format!("…[truncated, {total} bytes total]"));
+    s
+}
+
 /// Why [`BoundedLines::next_line`] gave up on a connection.
 #[derive(Debug)]
 pub enum HookLineError {
@@ -151,6 +356,14 @@ pub enum HookLineError {
     /// The bytes before the newline were not valid UTF-8, or the socket read
     /// failed. Same outcome — the connection is closed.
     Io(std::io::Error),
+    /// No complete line arrived within [`HOOK_LINE_TIMEOUT`] — the peer
+    /// connected and sent nothing, or trickled under the cap without ever
+    /// completing a line. Same outcome again, and it is what stops a permit
+    /// being held forever.
+    Idle {
+        /// The deadline that expired, for the log line.
+        after: Duration,
+    },
 }
 
 impl fmt::Display for HookLineError {
@@ -160,6 +373,9 @@ impl fmt::Display for HookLineError {
                 write!(f, "hook line exceeded {limit} bytes with no newline")
             }
             Self::Io(e) => write!(f, "hook read failed: {e}"),
+            Self::Idle { after } => {
+                write!(f, "no complete hook line within {after:?}")
+            }
         }
     }
 }
@@ -206,6 +422,30 @@ impl<R: AsyncRead + Unpin> BoundedLines<R> {
             scanned: 0,
             limit,
             eof: false,
+        }
+    }
+
+    /// [`Self::next_line`] with a deadline on the WHOLE call — the production
+    /// entry point.
+    ///
+    /// Issue #319 / audit finding 2: the byte cap bounds what one line may
+    /// weigh, and this bounds how long the connection may take to produce one.
+    /// Without it a peer that never writes a newline (or never writes at all)
+    /// holds its [`MAX_HOOK_CONNECTIONS`] permit until the daemon dies, so 128
+    /// such peers deny the hook socket entirely — a function-denial with no
+    /// memory pressure and no natural recovery. See [`HOOK_LINE_TIMEOUT`] for
+    /// why the deadline covers the whole call rather than one `read`.
+    ///
+    /// Cancelling mid-read discards whatever partial line had accumulated,
+    /// which is correct: the caller closes the connection, and a partial line
+    /// was never going to be parsed.
+    pub async fn next_line_within(
+        &mut self,
+        budget: Duration,
+    ) -> Result<Option<String>, HookLineError> {
+        match tokio::time::timeout(budget, self.next_line()).await {
+            Ok(result) => result,
+            Err(_) => Err(HookLineError::Idle { after: budget }),
         }
     }
 
@@ -580,6 +820,195 @@ mod tests {
     async fn invalid_utf8_closes_the_connection_rather_than_being_parsed() {
         let mut lines = BoundedLines::with_limit(&[0xff, 0xfe, b'\n'][..], 16);
         assert!(matches!(lines.next_line().await, Err(HookLineError::Io(_))));
+    }
+
+    // -----------------------------------------------------------------
+    // Deadlines (#319, audit finding 2)
+    // -----------------------------------------------------------------
+
+    /// The denial the connection cap alone does NOT close: a peer that connects
+    /// and simply says nothing. Its permit was held for the daemon's lifetime,
+    /// so 128 of these wedged hook ingestion permanently — no memory pressure,
+    /// no natural recovery.
+    ///
+    /// `start_paused` runs it on the virtual clock: the 30-second production
+    /// deadline is asserted exactly, in microseconds, with no sleep and no
+    /// flake.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_never_writes_is_cut_off_at_the_deadline() {
+        // The peer half is held open for the whole test, so the reader never
+        // sees EOF — a closed peer would end the stream cleanly and prove
+        // nothing.
+        let (_peer, daemon_side) = tokio::io::duplex(64);
+        let mut lines = BoundedLines::new(daemon_side);
+        let started = tokio::time::Instant::now();
+        let outcome = lines.next_line_within(HOOK_LINE_TIMEOUT).await;
+        assert!(
+            matches!(outcome, Err(HookLineError::Idle { .. })),
+            "an idle peer must be cut off, got {outcome:?}"
+        );
+        assert_eq!(
+            started.elapsed(),
+            HOOK_LINE_TIMEOUT,
+            "the deadline must be the one the constant documents"
+        );
+    }
+
+    /// The variant a per-READ idle timeout would miss, and the reason the
+    /// deadline covers the whole call: a peer that keeps moving bytes but never
+    /// completes a line resets a per-read timer forever, while staying under
+    /// `MAX_HOOK_LINE_BYTES` so the byte cap never fires either.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_trickles_without_ever_completing_a_line_is_cut_off() {
+        let (mut peer, daemon_side) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            loop {
+                if peer.write_all(b"x").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        let mut lines = BoundedLines::new(daemon_side);
+        assert!(
+            matches!(
+                lines.next_line_within(HOOK_LINE_TIMEOUT).await,
+                Err(HookLineError::Idle { .. })
+            ),
+            "bytes without a newline must not keep the connection alive"
+        );
+    }
+
+    /// The deadline must not cost an ordinary peer anything.
+    #[tokio::test(start_paused = true)]
+    async fn a_prompt_peer_is_unaffected_by_the_deadline() {
+        let mut lines = BoundedLines::new(&b"{\"ok\":true}\n"[..]);
+        assert_eq!(
+            lines.next_line_within(HOOK_LINE_TIMEOUT).await.unwrap(),
+            Some("{\"ok\":true}".to_string())
+        );
+    }
+
+    /// The test knob can only make the daemon STRICTER. A value above the
+    /// production constant is clamped down to it, so no environment can relax a
+    /// bound — see `DOT_AGENT_DECK_TEST_HOOK_TIMEOUT_MS`.
+    ///
+    /// Reads the process environment, so it asserts the clamp arithmetic
+    /// directly rather than by setting a variable (`set_var` is unsound with
+    /// concurrent tests, and nextest's per-test processes would not share it
+    /// anyway).
+    #[test]
+    fn the_test_timeout_knob_can_only_shorten() {
+        let longer = HOOK_LINE_TIMEOUT + Duration::from_secs(600);
+        assert_eq!(longer.min(HOOK_LINE_TIMEOUT), HOOK_LINE_TIMEOUT);
+        let shorter = Duration::from_millis(50);
+        assert_eq!(shorter.min(HOOK_LINE_TIMEOUT), shorter);
+        // With nothing set, the production values are what the daemon uses.
+        assert_eq!(hook_line_timeout(), HOOK_LINE_TIMEOUT);
+        assert_eq!(hook_reply_write_timeout(), HOOK_REPLY_WRITE_TIMEOUT);
+    }
+
+    // -----------------------------------------------------------------
+    // Log hygiene (#318 audit finding 6, #319 audit finding 9)
+    // -----------------------------------------------------------------
+
+    /// The two daemon branches that log a RAW hook line run after `admit` has
+    /// stripped the typed token — so the raw line was the one path by which a
+    /// live capability reached the disk, defeating `AgentToken`'s redacted
+    /// `Debug` entirely.
+    #[test]
+    fn a_token_never_survives_into_a_log_line() {
+        let token = AgentToken::mint().expect("mint");
+        let line = format!(
+            "{{\"session_id\":\"s\",\"agent_token\":\"{}\",\"event_type\":\"nonsense\"}}",
+            token.as_str()
+        );
+        let redacted = redact_for_log(&line);
+        assert!(
+            !redacted.contains(token.as_str()),
+            "the raw token must not reach the log: {redacted}"
+        );
+        assert!(
+            redacted.contains("<redacted>"),
+            "the redaction must be visible rather than silent: {redacted}"
+        );
+        assert!(
+            redacted.contains("nonsense"),
+            "the diagnostic the branch exists for must survive: {redacted}"
+        );
+    }
+
+    /// The case a serde-shaped redaction would miss, and the reason this is
+    /// textual: the malformed-event branch is reached BECAUSE the line did not
+    /// parse.
+    #[test]
+    fn a_token_is_redacted_even_out_of_an_unparseable_line() {
+        let token = AgentToken::mint().expect("mint");
+        for shape in [
+            // Truncated mid-object.
+            format!("{{\"agent_token\": \"{}\", \"pane", token.as_str()),
+            // Trailing comma, which serde refuses outright.
+            format!(
+                "{{\"pane_id\":\"p\",,\"agent_token\":\"{}\"}}",
+                token.as_str()
+            ),
+            // Unterminated value: the token runs to the end of the line.
+            format!("{{\"agent_token\":\"{}", token.as_str()),
+        ] {
+            let redacted = redact_for_log(&shape);
+            assert!(
+                !redacted.contains(token.as_str()),
+                "a token must not survive a malformed line either: {redacted}"
+            );
+        }
+    }
+
+    /// A token containing an escaped quote must not end the redacted span
+    /// early. The field is `Option<String>` off the wire, so its value is
+    /// whatever a peer sends, not necessarily the hex the daemon mints.
+    #[test]
+    fn an_escaped_quote_inside_a_token_does_not_truncate_the_redaction() {
+        let line = r#"{"agent_token":"aa\"bb-secret","event_type":"x"}"#;
+        let redacted = redact_for_log(line);
+        assert!(!redacted.contains("secret"), "{redacted}");
+        assert!(redacted.contains(r#""event_type":"x""#), "{redacted}");
+    }
+
+    /// A line with no token is passed through unchanged (below the length cap),
+    /// so ordinary diagnostics are not degraded by the redaction.
+    #[test]
+    fn a_line_without_a_token_is_untouched() {
+        let line = r#"{"session_id":"s","event_type":"typo"}"#;
+        assert_eq!(redact_for_log(line), line);
+    }
+
+    /// Audit finding 9: a peer looping malformed lines wrote up to
+    /// `MAX_HOOK_LINE_BYTES` to the daemon log PER LINE. The cap bounds each
+    /// one, and says how much it dropped so a reader is never misled into
+    /// thinking they have the whole payload.
+    #[test]
+    fn an_oversized_line_is_bounded_and_says_so() {
+        let line = "z".repeat(MAX_HOOK_LINE_BYTES);
+        let redacted = redact_for_log(&line);
+        assert!(
+            redacted.len() < MAX_LOGGED_HOOK_LINE_BYTES + 64,
+            "a log line must stay bounded, got {} bytes",
+            redacted.len()
+        );
+        assert!(
+            redacted.contains(&format!("{} bytes total", MAX_HOOK_LINE_BYTES)),
+            "the reader must be told the payload was truncated: {redacted}"
+        );
+    }
+
+    /// Truncation must not split a multi-byte character — a panic inside the
+    /// daemon's per-connection task is a worse outcome than a long log line.
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        let line = "é".repeat(MAX_HOOK_LINE_BYTES);
+        let redacted = redact_for_log(&line);
+        assert!(redacted.contains("bytes total"));
     }
 
     // -----------------------------------------------------------------

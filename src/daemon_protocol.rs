@@ -204,30 +204,38 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// (mirroring `AgentType`'s retrofit), so future event-type additions need
 /// no further bump.
 ///
-/// Issue #318 bumped 7 → 8: a NEW [`AttachRequest`] variant,
-/// [`AttachRequest::GetAgentToken`]. `AttachRequest` is an internally-tagged
-/// enum with no `#[serde(other)]` catch-all, so a daemon predating this variant
-/// fails to decode `{"op":"get-agent-token",…}` outright — the module's bump
-/// policy at the top of this file names "new [`AttachRequest`] variants"
-/// explicitly, and this is that case.
-///
-/// Note what did NOT force the bump, because the distinction is the whole of
-/// Rule 12's wire-shape half. The capability token itself rides
+/// Issue #318 deliberately did NOT move it, and the reasoning is the whole of
+/// Rule 12's wire-shape half. The capability token rides
 /// [`crate::event::AgentEvent::agent_token`] and
 /// [`AttachResponse::agent_token`], both additive
 /// `#[serde(default, skip_serializing_if = "Option::is_none")]` fields of
 /// exactly the shape `agent_version` / `schema_version` / `guarded_send`
 /// already use: an older peer ignores them, a newer peer tolerates their
-/// absence, and a producer with no token emits byte-identical JSON. On those
-/// two fields alone the version would have stayed at 7. It is the retrieval
-/// verb — needed so an attach peer can speak for a pane it did not itself spawn
-/// — that moves the shape.
+/// absence, and a producer with no token emits byte-identical JSON. No new
+/// [`AttachRequest`] variant, no retyped field, no new frame kind — so the
+/// shape did not move and the number does not either.
+///
+/// An intermediate revision of #318 DID add a `GetAgentToken` retrieval verb
+/// (which would have forced 7 → 8, `AttachRequest` being internally tagged with
+/// no `#[serde(other)]`) so the test harness could speak for panes the deck
+/// spawned. The security audit rejected it: an unauthenticated `ListAgents` on
+/// the same owner-only socket enumerates every agent id, so the verb turned the
+/// token from evidence of WHICH process sent an event into a value any
+/// same-user process could ask for — defeating the mechanism this issue exists
+/// to build, not merely widening its impact. It was removed; tests now surface
+/// each pane's own injected token from that pane's environment, which is both
+/// safe and a strictly more faithful reproduction of what a real hook does.
 ///
 /// The SEMANTIC half of Rule 12 is separate and is not carried by this number
 /// at all: an event that used to be accepted (a hook naming a managed pane with
 /// no token) is now refused behind an unchanged event wire. That is recorded as
-/// a compatibility break in `changelog.d/318.breaking.md`.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// a compatibility break in `changelog.d/318.breaking.md`. Note the consequence
+/// of NOT bumping — an older client and a newer daemon still pair up, so the
+/// break is not announced by a handshake refusal and is only visible in the
+/// daemon log's refusal line. That is the honest trade: a bump would announce
+/// it, but at the cost of forcing every user of an unaffected pairing through a
+/// daemon recycle for a wire that did not change.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -387,30 +395,6 @@ pub enum AttachRequest {
         seed: Option<String>,
     },
     StopAgent {
-        id: String,
-    },
-    /// Issue #318: hand the caller the hook capability token of an agent this
-    /// daemon already manages.
-    ///
-    /// **Why this is not a new exposure.** The trust boundary is the one
-    /// [`AttachRequest::StartAgent`] documents above: the attach socket is
-    /// owner-only and any peer reaching it can already spawn arbitrary commands
-    /// as this user and write directly into any agent's PTY (issue #601 states
-    /// that explicitly). A capability to *report status* for a pane is strictly
-    /// weaker than the capability to *type into* it, which that peer has
-    /// unconditionally — so this hands out nothing it did not already hold.
-    ///
-    /// **Why it is a separate verb rather than a field on `ListAgents`.** A
-    /// listing is echoed into TUI state, cached across reconnects, rendered,
-    /// logged and persisted; a capability riding one would end up in all of
-    /// those. `AgentRecord` therefore never carries the token, and asking for it
-    /// is an explicit act by a peer that means to speak for the pane. That is
-    /// also why the reply's [`AttachResponse::agent_token`] is populated on this
-    /// request and on `StartAgent` alone.
-    ///
-    /// Replies `ok: false` for an unknown id rather than `ok: true` with a null
-    /// token, so a caller cannot read "no token" as "this agent has none".
-    GetAgentToken {
         id: String,
     },
     AttachStream {
@@ -677,15 +661,27 @@ pub struct AttachResponse {
     /// daemon's `Hello` handler sets it via [`AttachResponse::with_guarded_send`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guarded_send: Option<bool>,
-    /// Issue #318: the agent's hook capability token, populated ONLY in reply to
-    /// [`AttachRequest::StartAgent`] (for the peer that spawned it) and
-    /// [`AttachRequest::GetAgentToken`] (for a peer that means to speak for it).
-    /// `None` on every other response, and never on a listing — see
-    /// `GetAgentToken`'s docs for why a routine query must not carry it.
+    /// Issue #318: the agent's hook capability token, populated on **exactly
+    /// one** response — the reply to [`AttachRequest::StartAgent`], handed to
+    /// the peer that just spawned the agent. `None` on every other response,
+    /// and never on a listing: a listing is echoed into TUI state, cached
+    /// across reconnects, rendered, logged and persisted, and a capability has
+    /// no business riding a routine query
+    /// (`list_agents_never_carries_the_token` pins that).
+    ///
+    /// **There is deliberately no way to ask for it afterwards.** An earlier
+    /// revision added a `GetAgentToken` verb so a peer could speak for a pane it
+    /// did not spawn; the security audit rejected it, because `ListAgents` is
+    /// unauthenticated on this same socket and the pair turned the token into a
+    /// value any same-user process could request for any pane. The spawn reply
+    /// and the child's own environment are the only two places a token appears
+    /// — which is the limit the approved design stated, and the one the
+    /// provenance claim rests on.
     ///
     /// Additive + optional: an older daemon omits it and an older client ignores
-    /// it, so the FIELD needs no version bump. The new request variant beside it
-    /// does, and that is what moved `PROTOCOL_VERSION` to 8.
+    /// it, so the field needs no `PROTOCOL_VERSION` bump — and with the
+    /// retrieval verb gone, nothing else in this change moves the wire shape
+    /// either.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_token: Option<crate::hook_ingest::AgentToken>,
 }
@@ -740,14 +736,6 @@ impl AttachResponse {
             ok: true,
             id: Some(id),
             agent_token: token,
-            ..Default::default()
-        }
-    }
-    /// Issue #318: the reply to [`AttachRequest::GetAgentToken`].
-    pub fn with_agent_token(token: crate::hook_ingest::AgentToken) -> Self {
-        Self {
-            ok: true,
-            agent_token: Some(token),
             ..Default::default()
         }
     }
@@ -1754,18 +1742,6 @@ async fn handle_connection(
                 Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
             }
         }
-        AttachRequest::GetAgentToken { id } => match registry.agent_hook_token(&id) {
-            Some(token) => {
-                write_resp(&mut stream, &AttachResponse::with_agent_token(token)).await?
-            }
-            None => {
-                write_resp(
-                    &mut stream,
-                    &AttachResponse::err(format!("get-agent-token: unknown agent {id}")),
-                )
-                .await?
-            }
-        },
         AttachRequest::StopAgent { id } => {
             // PRD #93 round-5: capture the agent's `pane_id_env` BEFORE
             // close_agent removes the registry entry, so we can clean up

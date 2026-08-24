@@ -307,6 +307,14 @@ fn live_012_agent_event_status_survives_real_tui_reconnect() {
         "StartAgent should succeed, got error: {:?}",
         response.error
     );
+    // Issue #318: the spawn reply is the ONE place a token is handed out, and
+    // this test IS the spawning peer, so it reads the token straight off the
+    // reply — no retrieval verb, and nothing the harness knows that a real
+    // attach peer would not.
+    let token = response
+        .agent_token
+        .clone()
+        .expect("StartAgent must hand the spawning peer the agent's capability token");
     let records = daemon.wait_for_agent_count(1, Duration::from_secs(5));
     let agent_id = records
         .first()
@@ -317,7 +325,7 @@ fn live_012_agent_event_status_survives_real_tui_reconnect() {
     let first_tui = launch_tui_against(&daemon);
     first_tui.wait_for_string(LABEL);
 
-    let output = daemon.run_agent_event(PANE_ID, Some(&agent_id), "running");
+    let output = daemon.run_agent_event(PANE_ID, Some(&agent_id), Some(&token), "running");
     assert!(
         output.status.success(),
         "the real non-SessionStart `agent-event --type running` CLI failed: status={:?} stdout={:?} stderr={:?}",

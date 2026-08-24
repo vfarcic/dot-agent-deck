@@ -1641,6 +1641,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** fairness among admitted peers; the chosen numeric connection cap (the test reads `MAX_HOOK_CONNECTIONS`).
 - **Platform coverage:** mac+linux.
 
+##### hooks/delivery/010 — Idle hook peers holding every connection slot stop wedging the socket: the daemon reclaims their slots at the read deadline and a legitimate event lands again.
+- **Layer:** L2 synthetic (the real `dot-agent-deck` binary and hook socket through the PTY-attached `TuiDeck` harness; no LLM).
+- **Agent:** none (silent Unix-socket peers saturate the cap; a synthetic `SessionStart` is the legitimate traffic).
+- **Asserts:** with every slot held by a peer that sends nothing, a further connection is refused and a well-formed event does NOT register its card; with no peer closing and no daemon restart, the same event then registers once the daemon reclaims the idle slots at its read deadline.
+- **Does not assert:** the production 30-second deadline (the test shortens it through `DOT_AGENT_DECK_TEST_HOOK_TIMEOUT_MS`, which can only shorten); fairness among admitted peers; the numeric connection cap (the test reads `MAX_HOOK_CONNECTIONS`).
+- **Platform coverage:** mac+linux.
+
 #### hooks/provenance
 
 ##### hooks/provenance/001 — A valid token binds a hook to its own pane instead of the pane and agent ids the payload claims.

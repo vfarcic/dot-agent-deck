@@ -136,10 +136,12 @@ fn inject_role_status(
     };
     let line = serde_json::to_string(&event).expect("serialize synthetic AgentEvent");
     // Issue #318: the role pane is daemon-managed, so the synthetic event has to
-    // carry the capability token the daemon injected into that role's agent —
-    // fetched over the attach socket, the legitimate route for a peer that means
-    // to speak for a pane the deck spawned.
-    let token = common::agent_token_on(socket, agent_id);
+    // carry the capability token the daemon injected into that role's agent. The
+    // DECK spawned this pane, so the spawn reply's token went to the deck — and
+    // there is deliberately no request that fetches one afterwards. The fixture's
+    // `alpha` role therefore publishes its own injected token (see its
+    // `.dot-agent-deck.toml`), which also proves the injection reached the child.
+    let token = common::published_pane_token(deck.home_dir(), pane_id, Duration::from_secs(10));
     common::write_hook_line(deck.hook_socket_path(), &line, Some(&token))
         .expect("inject synthetic AgentEvent over hook socket");
 

@@ -29,8 +29,15 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 #[spec("prompt/pane-input/004")]
 #[test]
 fn pane_input_004_history_only_send_reports_result_and_feedback() {
+    // Issue #318: the restored pane is daemon-managed, so the synthetic Codex
+    // SessionStart below has to carry that pane's capability token. The token
+    // reaches exactly two places — the `StartAgent` reply and the child's own
+    // environment — and this pane is spawned by the DECK's restore path, not by
+    // this test, so the child publishing its own injected token is the only
+    // honest way to obtain it (and it doubles as proof the injection reached the
+    // child at all).
     let deck = TuiDeck::builder()
-        .with_continue_session("history-codex", "cat")
+        .with_continue_session("history-codex", common::token_publishing_command("cat"))
         .launch_with_fixture("minimal");
     deck.wait_for_string("[Command Mode Ctrl+D]");
     deck.send_keys(b"\x04");
@@ -58,9 +65,7 @@ fn pane_input_004_history_only_send_reports_result_and_feedback() {
             "writable": "history-only"
         }
     });
-    // Issue #318: the restored pane is daemon-managed, so the synthetic Codex
-    // SessionStart carries its capability token.
-    let token = common::agent_token_on(deck.attach_socket_path(), &agent_id);
+    let token = common::published_pane_token(deck.home_dir(), &pane_id, Duration::from_secs(10));
     common::write_hook_line(deck.hook_socket_path(), &event.to_string(), Some(&token))
         .expect("inject history-only Codex SessionStart");
     deck.wait_for_absence("No agent");
@@ -126,8 +131,14 @@ fn pane_input_008_stream_rejection_surfaces_feedback_and_exits_input_mode() {
         ("key", b"rejected-key".as_slice()),
         ("paste", b"\x1b[200~rejected-paste\x1b[201~".as_slice()),
     ] {
+        // Issue #318: same as `pane_input_004` above — a deck-restored pane
+        // publishes its own injected token, because the spawn reply went to the
+        // deck and no request exists to fetch one afterwards.
         let deck = TuiDeck::builder()
-            .with_continue_session(format!("stream-rejection-{input_kind}"), "cat")
+            .with_continue_session(
+                format!("stream-rejection-{input_kind}"),
+                common::token_publishing_command("cat"),
+            )
             .launch_with_fixture("minimal");
         deck.wait_for_string("[Command Mode Ctrl+D]");
 
@@ -150,7 +161,8 @@ fn pane_input_008_stream_rejection_surfaces_feedback_and_exits_input_mode() {
                 "writable": "history-only"
             }
         });
-        let token = common::agent_token_on(deck.attach_socket_path(), &record.id);
+        let token =
+            common::published_pane_token(deck.home_dir(), &pane_id, Duration::from_secs(10));
         common::write_hook_line(deck.hook_socket_path(), &event.to_string(), Some(&token))
             .expect("make focused synthetic session history-only");
         deck.wait_for_absence("No agent");

@@ -3713,10 +3713,11 @@ fn toml_escape(s: &str) -> String {
 /// Issue #318: `token` is the capability the daemon minted for the pane the
 /// event names, and it is a REQUIRED argument rather than an optional one on
 /// purpose — every call site now has to say, in code, whether it is speaking for
-/// a pane the daemon manages. Pass `Some(&token)` (fetched with
-/// [`agent_token_on`], or taken from the `StartAgent` reply) for a managed pane;
-/// pass `None` only for a pane the daemon does not manage, which is the
-/// foreign-agent compatibility path and still works exactly as before.
+/// a pane the daemon manages. Pass `Some(&token)` — taken from the pane's own
+/// `StartAgent` reply when the test spawned it, or read back with
+/// [`published_pane_token`] when the DECK did — for a managed pane; pass `None`
+/// only for a pane the daemon does not manage, which is the foreign-agent
+/// compatibility path and still works exactly as before.
 ///
 /// There is deliberately **no bypass** here: the token is injected into the JSON
 /// as the ordinary `agent_token` field, which is precisely what a real hook
@@ -5903,10 +5904,21 @@ impl DaemonProc {
     /// Replays the daemon's env (so `HOME` + `DOT_AGENT_DECK_SOCKET` match) and
     /// layers the pane-injected `DOT_AGENT_DECK_PANE_ID` / (optional)
     /// `DOT_AGENT_DECK_AGENT_ID`. Returns the captured process output.
+    ///
+    /// Issue #318: `token` models the daemon's spawn-time env injection. A real
+    /// `agent-event` runs INSIDE a daemon-spawned pane and therefore inherits
+    /// that agent's `DOT_AGENT_DECK_AGENT_TOKEN`; `env_clear()` below means the
+    /// harness has to put it back, or the daemon refuses the event for any pane
+    /// it manages. Required rather than defaulted, exactly like
+    /// [`write_hook_line`]'s, so every call site states in code whether it is
+    /// claiming a capability — `None` is the honest answer for a SYNTHETIC pane
+    /// or agent id the daemon never spawned, which is the token-less
+    /// foreign-agent case several of these tests exist to exercise.
     pub fn run_agent_event(
         &self,
         pane_id: &str,
         agent_id: Option<&str>,
+        token: Option<&dot_agent_deck::hook_ingest::AgentToken>,
         state: &str,
     ) -> std::process::Output {
         let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
@@ -5920,27 +5932,12 @@ impl DaemonProc {
         cmd.env("DOT_AGENT_DECK_PANE_ID", pane_id);
         if let Some(id) = agent_id {
             cmd.env("DOT_AGENT_DECK_AGENT_ID", id);
-            // Issue #318: model the daemon's spawn-time env injection. A real
-            // `agent-event` runs INSIDE a daemon-spawned pane and therefore
-            // inherits that agent's capability token; `env_clear()` above means
-            // the harness has to put it back, or the daemon refuses the event for
-            // any pane it manages. Looked up through the real
-            // `AttachRequest::GetAgentToken` verb, so this is the production
-            // path and not a harness back door — and silently absent for a
-            // SYNTHETIC agent id the daemon never spawned, which is exactly the
-            // token-less foreign-agent case those tests exercise.
-            if let Ok(resp) = attach_request_on(
-                &self.attach_socket,
-                &dot_agent_deck::daemon_protocol::AttachRequest::GetAgentToken {
-                    id: id.to_string(),
-                },
-            ) && let Some(token) = resp.agent_token
-            {
-                cmd.env(
-                    dot_agent_deck::hook_ingest::DOT_AGENT_DECK_AGENT_TOKEN,
-                    token.as_str(),
-                );
-            }
+        }
+        if let Some(token) = token {
+            cmd.env(
+                dot_agent_deck::hook_ingest::DOT_AGENT_DECK_AGENT_TOKEN,
+                token.as_str(),
+            );
         }
         cmd.output()
             .expect("run `dot-agent-deck agent-event` subprocess")
@@ -6295,42 +6292,85 @@ fn attach_json_request_on(
     serde_json::from_slice(&body).map_err(std::io::Error::other)
 }
 
-/// Issue #318: fetch an agent's hook capability token over the attach socket.
+/// Issue #318: wrap `inner` so the pane PUBLISHES the capability token the
+/// daemon injected into it, then runs `inner` as it always did.
 ///
-/// The legitimate way for a test to speak for a pane the DECK spawned (a fixture
-/// role pane, a scheduled pane) rather than one the test started itself. Goes
-/// through the real `AttachRequest::GetAgentToken` verb — the same one any
-/// attach peer would use — so nothing here is a test-only path into the daemon.
+/// # Why a test needs this at all
+///
+/// A token reaches exactly two places: the `StartAgent` reply, and the spawned
+/// child's environment. A test that starts its own agent over the attach socket
+/// reads the reply and is done. A test that drives a pane the **deck** spawned
+/// — a fixture role, a scheduled agent, a restored session — is not the
+/// spawning peer and has no reply to read.
+///
+/// An earlier revision of #318 solved that with a `GetAgentToken` request. The
+/// security audit rejected it: `ListAgents` is unauthenticated on the same
+/// owner-only socket, so the pair let ANY same-user process obtain ANY pane's
+/// token, which makes the token evidence of nothing and defeats the mechanism
+/// #318 exists to build. **Do not reintroduce a retrieval verb, a debug-only
+/// variant of one, or any other harness back door — all three reopen the hole.**
+///
+/// This is the replacement, and it is strictly better as a test: the pane
+/// surfaces the token from *its own environment*, so the assertion that follows
+/// also proves the daemon's spawn-time injection genuinely reached the child.
+/// `pane_input_007`'s in-pane python stand-in already does exactly this with
+/// `os.environ["DOT_AGENT_DECK_AGENT_TOKEN"]`; this is the shell form of the
+/// same idea, for panes whose command is a stub rather than a script.
+///
+/// Written to a temporary name and renamed, so a reader never sees a
+/// half-written value. `exec`s `inner` so the pane's final process — and
+/// therefore its process tree, which several tests observe — is exactly what it
+/// would have been without the wrapper.
 #[cfg(unix)]
 #[allow(dead_code)]
-pub fn agent_token_on(socket: &Path, agent_id: &str) -> dot_agent_deck::hook_ingest::AgentToken {
-    let resp = attach_request_on(
-        socket,
-        &dot_agent_deck::daemon_protocol::AttachRequest::GetAgentToken {
-            id: agent_id.to_string(),
-        },
+pub fn token_publishing_command(inner: &str) -> String {
+    // Deliberately free of single quotes: this string is embedded into TOML
+    // (`.dot-agent-deck.toml` fixtures, scheduled-task blocks) as a LITERAL
+    // string, which is the only quoting that survives the double quotes the
+    // shell needs.
+    format!(
+        "printf %s \"${{DOT_AGENT_DECK_AGENT_TOKEN:-}}\" > \"$HOME/{PUBLISHED_TOKEN_PREFIX}$DOT_AGENT_DECK_PANE_ID.part\" \
+         && mv \"$HOME/{PUBLISHED_TOKEN_PREFIX}$DOT_AGENT_DECK_PANE_ID.part\" \
+         \"$HOME/{PUBLISHED_TOKEN_PREFIX}$DOT_AGENT_DECK_PANE_ID\"; exec {inner}"
     )
-    .unwrap_or_else(|e| panic!("get-agent-token for agent {agent_id}: {e}"));
-    resp.agent_token.unwrap_or_else(|| {
-        panic!(
-            "daemon returned no capability token for agent {agent_id}: ok={} error={:?}",
-            resp.ok, resp.error
-        )
-    })
 }
 
-/// Issue #318: the capability token of the agent occupying `pane_id`.
-///
-/// Convenience over [`agent_token_on`] for the common shape — a test that knows
-/// the pane it wants to speak for and has to find the agent id first.
+/// Filename prefix [`token_publishing_command`] writes under the pane's `HOME`.
 #[cfg(unix)]
 #[allow(dead_code)]
-pub fn pane_token_on(socket: &Path, pane_id: &str) -> dot_agent_deck::hook_ingest::AgentToken {
-    let record = agent_records_on(socket)
-        .into_iter()
-        .find(|r| r.pane_id_env.as_deref() == Some(pane_id))
-        .unwrap_or_else(|| panic!("no daemon-managed agent holds pane {pane_id}"));
-    agent_token_on(socket, &record.id)
+pub const PUBLISHED_TOKEN_PREFIX: &str = ".dad-agent-token.";
+
+/// Issue #318: read back the token a pane published via
+/// [`token_publishing_command`], waiting for the pane's first line of shell to
+/// run.
+///
+/// Panics if nothing appears — an empty or missing file means the daemon did
+/// not inject `DOT_AGENT_DECK_AGENT_TOKEN` into the child, which is a real
+/// failure of the feature and not a harness timing problem worth papering over.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn published_pane_token(
+    home: &Path,
+    pane_id: &str,
+    timeout: Duration,
+) -> dot_agent_deck::hook_ingest::AgentToken {
+    let path = home.join(format!("{PUBLISHED_TOKEN_PREFIX}{pane_id}"));
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(value) = std::fs::read_to_string(&path)
+            && !value.trim().is_empty()
+        {
+            return dot_agent_deck::hook_ingest::AgentToken::from_wire(value.trim());
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "pane {pane_id} never published its capability token at {}: the daemon must \
+                 inject DOT_AGENT_DECK_AGENT_TOKEN into every agent it spawns",
+                path.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// Snapshot a daemon's live agent registry via `ListAgents` over `socket`.

@@ -11,7 +11,9 @@
 mod common;
 
 use common::{TuiDeck, write_hook_line};
-use dot_agent_deck::hook_ingest::{MAX_HOOK_CONNECTIONS, MAX_HOOK_LINE_BYTES};
+use dot_agent_deck::hook_ingest::{
+    DOT_AGENT_DECK_TEST_HOOK_TIMEOUT_MS, MAX_HOOK_CONNECTIONS, MAX_HOOK_LINE_BYTES,
+};
 use spec::spec;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -257,4 +259,88 @@ fn delivery_009_excess_hook_connection_is_closed() {
         "the daemon kept a hook connection open beyond MAX_HOOK_CONNECTIONS={MAX_HOOK_CONNECTIONS}; final grid:\n{}",
         deck.snapshot_grid()
     );
+}
+
+/// Scenario: Shorten the daemon's hook read deadline, then open every slot of the concurrent-connection cap with peers that connect and send nothing, and confirm a legitimate event cannot land while they hold it. After the deadline passes the daemon reclaims those slots on its own, and the same event registers its card — the cap recovers without any peer closing, and without restarting the daemon.
+#[spec("hooks/delivery/010")]
+#[test]
+fn delivery_010_idle_hook_peers_stop_wedging_the_connection_cap() {
+    const SESSION_ID: &str = "idlecap";
+    const PANE_ID: &str = "idle-timeout-foreign-pane";
+    // Long enough that the wedge below is unambiguous (the "still wedged" hold
+    // is a third of it), short enough that the test costs seconds. The knob can
+    // only SHORTEN the production 30 s deadline — `hook_line_timeout` clamps it
+    // — so nothing here can make the daemon more permissive than it ships.
+    const DEADLINE_MS: u64 = 3_000;
+
+    let deck = TuiDeck::builder()
+        .with_env(DOT_AGENT_DECK_TEST_HOOK_TIMEOUT_MS, DEADLINE_MS.to_string())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    let session_start = serde_json::json!({
+        "session_id": SESSION_ID,
+        "agent_type": "claude_code",
+        "event_type": "session_start",
+        "timestamp": "2026-08-24T12:00:00Z",
+        "pane_id": PANE_ID,
+    });
+
+    // Every slot held by a peer that connects and says nothing. This is the
+    // attack the connection cap alone does NOT stop: it bounds memory, and
+    // converts the exhaustion into a permanent denial of the hook socket's
+    // FUNCTION — no memory pressure, and (before the deadline) no recovery
+    // short of restarting the daemon.
+    let _idle: Vec<UnixStream> = (0..MAX_HOOK_CONNECTIONS)
+        .map(|index| {
+            UnixStream::connect(deck.hook_socket_path()).unwrap_or_else(|error| {
+                panic!("connect idle hook peer {index}/{MAX_HOOK_CONNECTIONS}: {error}")
+            })
+        })
+        .collect();
+
+    let mut excess = UnixStream::connect(deck.hook_socket_path())
+        .expect("connect one hook peer beyond the saturated cap");
+    assert!(
+        hook_peer_closed(&mut excess),
+        "precondition: with every slot held by an idle peer, a further connection \
+         must be refused — otherwise this test proves nothing about recovery"
+    );
+
+    // A legitimate event cannot land while the cap is wedged, because a real
+    // hook CLI opens a NEW connection and is refused at saturation. The hold is
+    // a third of the deadline, so it cannot be satisfied by the reclaim it is
+    // supposed to run before.
+    write_hook_line(deck.hook_socket_path(), &session_start.to_string(), None)
+        .expect("write the wedged-state probe event");
+    let landed_while_wedged =
+        deck.wait_for_grid_string_within(SESSION_ID, Duration::from_millis(DEADLINE_MS / 3));
+    assert!(
+        !landed_while_wedged,
+        "precondition: a saturated cap must actually deny a fresh hook \
+         connection; final grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Nothing is closed, nothing is restarted, and no peer cooperates: the
+    // daemon reclaims the slots itself once each idle connection passes its read
+    // deadline. Retried because the reclaim releases slots asynchronously and
+    // the event that was written into the wedge was dropped with its connection.
+    let recovered = common::wait_until(Duration::from_secs(20), || {
+        let _ = write_hook_line(deck.hook_socket_path(), &session_start.to_string(), None);
+        deck.snapshot_grid().contains(SESSION_ID)
+    });
+    assert!(
+        recovered,
+        "the daemon never reclaimed a slot from the idle peers, so the hook \
+         socket stayed wedged — a connection cap without a read deadline turns \
+         an exhaustion bug into a permanent denial of service; final grid:\n{}",
+        deck.snapshot_grid()
+    );
+    deck.wait_until_grid("the recovered card renders", |grid| {
+        grid.contains(SESSION_ID)
+            && grid
+                .lines()
+                .any(|line| line.contains("ClaudeCode") && line.contains("Idle"))
+    });
 }

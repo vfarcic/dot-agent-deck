@@ -10,7 +10,7 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-use common::{DaemonProc, TuiDeck, agent_token_on, spawn_daemon_serve, write_hook_line};
+use common::{DaemonProc, TuiDeck, spawn_daemon_serve, write_hook_line};
 use dot_agent_deck::daemon_protocol::AttachRequest;
 use dot_agent_deck::event::AgentType;
 use spec::spec;
@@ -54,6 +54,14 @@ fn provenance_001_token_binding_overrides_claimed_pane_and_agent() {
     const SESSION_ID: &str = "tokenbound";
 
     let daemon = spawn_daemon_serve(None, "0");
+    // Issue #318: this test IS the spawning peer, so each pane's capability
+    // token comes straight off its own `StartAgent` reply — the one place the
+    // daemon ever hands a token to a peer. There is deliberately no request that
+    // fetches a token afterwards (an earlier revision had one; the security
+    // audit rejected it, because unauthenticated `ListAgents` on the same socket
+    // would then have made every pane's token available to any same-user
+    // process).
+    let mut tokens = std::collections::HashMap::new();
     for (pane_id, label, agent_type) in [
         (PANE_A, LABEL_A, AgentType::Pi),
         (PANE_B, LABEL_B, AgentType::Devin),
@@ -76,6 +84,10 @@ fn provenance_001_token_binding_overrides_claimed_pane_and_agent() {
             "StartAgent for {pane_id} should succeed, got error: {:?}",
             response.error
         );
+        let token = response.agent_token.clone().unwrap_or_else(|| {
+            panic!("StartAgent for {pane_id} must return that agent's capability token")
+        });
+        tokens.insert(pane_id, token);
     }
 
     let records = daemon.wait_for_agent_count(2, Duration::from_secs(5));
@@ -89,7 +101,9 @@ fn provenance_001_token_binding_overrides_claimed_pane_and_agent() {
     };
     let agent_a = agent_id(PANE_A);
     let agent_b = agent_id(PANE_B);
-    let token_a = agent_token_on(&daemon.attach_socket, &agent_a);
+    let token_a = tokens
+        .remove(PANE_A)
+        .expect("pane A's token was captured from its StartAgent reply");
 
     // One card per row keeps each type/status pair on its own rendered line,
     // so the two cards cannot satisfy each other's status assertions.
