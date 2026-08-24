@@ -3805,8 +3805,15 @@ fn detach_from_any_live_deck() {
             );
         }
         for var in DECK_ENDPOINT_VARS {
-            // SAFETY: called before the harness spawns any thread or child, via
-            // a `OnceLock` so it happens exactly once per test process.
+            // SAFETY: a stated residual, not a proof — issue #678. The
+            // `OnceLock` makes this happen exactly once per test process and
+            // excludes nothing else, and "before the harness spawns any thread"
+            // is not established: `init_test_env()` is reached from inside
+            // multi-threaded Tokio runtimes whose workers already exist
+            // (`spawn_inprocess_daemon`, and `delegate_prompt_injection.rs`'s
+            // `#[tokio::test(flavor = "multi_thread")]` body). What is true is
+            // that these are idempotent setup-time writes of values no library
+            // thread in this process reads, before anything is spawned.
             unsafe { std::env::remove_var(var) };
         }
     });
@@ -3817,7 +3824,13 @@ fn detach_from_any_live_deck() {
 /// `#[path]`-include on their own. `init_test_env` below calls the same
 /// [`child_lifetime_bound::arm`], so there is one implementation and one SAFETY
 /// argument rather than one per spawn-owning crate.
-mod child_lifetime_bound;
+///
+/// `pub` so `tests/agent_lifetime_bound.rs` can unit-test
+/// [`child_lifetime_bound::clamped`] in ONE crate. The alternative — a
+/// `#[cfg(test)] mod tests` in the file itself — would run those pure-function
+/// cases once per including crate, i.e. ~88 times, which is the multiplication
+/// `src/test_temp.rs`'s header already reasons about avoiding.
+pub mod child_lifetime_bound;
 
 /// Idempotent setup hook for legacy daemon-spawning tests. Creates the
 /// per-process lock dir on first call; subsequent calls are no-ops.

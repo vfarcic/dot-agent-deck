@@ -54,6 +54,12 @@ const MAX_LIFETIME_VAR: &str = "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS";
 /// a value that can never be confused with a parsed cap.
 const UNSET_MARKER: &str = "<unset>";
 
+/// The largest cap a child may carry, mirroring
+/// `child_lifetime_bound::CHILD_MAX_LIFETIME_SECS`. `cargo xtask clean-e2e-tmp`
+/// reaps a dead owner's root at 10 minutes and picks that as 2x this number, so
+/// this is a deletion-safety invariant rather than a preference.
+const MAX_LIFETIME_CEILING_SECS: u64 = 300;
+
 fn write_executable(path: &std::path::Path, contents: &str) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -145,6 +151,70 @@ fn in_process_registry_spawn_arms_the_wrapped_child_lifetime_bound() {
          into its own session where nothing above it can signal its group \
          (issue #668)."
     );
+    // The UPPER bound, which is the half `cargo xtask clean-e2e-tmp` depends on
+    // and which "is it positive?" cannot see. That reaper deletes a root whose
+    // owning test process is dead once the root is 10 minutes old, and picks 10
+    // minutes as 2x this cap — so a descendant entitled to keep writing for
+    // longer than 300 s turns the reaper's margin into a deficit. An ambient
+    // `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS=3600` in a developer's shell
+    // reached the child unchallenged before `clamped()` existed, and this run
+    // proves it no longer does.
+    assert!(
+        parsed.is_some_and(|secs| secs <= MAX_LIFETIME_CEILING_SECS),
+        "a wrapped agent spawned through the in-process registry carries \
+         {MAX_LIFETIME_VAR}={recorded:?}, above the {MAX_LIFETIME_CEILING_SECS} s \
+         ceiling `docs/develop/e2e-temp-dirs.md` sets `clean-e2e-tmp`'s 10-minute \
+         dead-owner floor at 2x. An `--apply` can then delete a root out from \
+         under this child while it is still nominally entitled to write there \
+         (issue #668)."
+    );
+}
+
+/// Scenario: Feed `child_lifetime_bound::clamped` each shape of ambient value a
+/// developer's shell can supply — absent, shorter, exactly at the ceiling, over
+/// it, zero, and not a number — and assert which ones it lets stand.
+///
+/// Issue #668: the table that says the ceiling is enforced rather than merely
+/// defaulted. The end-to-end assertion above can only observe whatever this
+/// process happens to have inherited, so it cannot cover the over-ceiling case
+/// without an ambient value no test can portably arrange; this can, and it costs
+/// microseconds. Lives here rather than in a `#[cfg(test)] mod tests` beside the
+/// function because that file is `#[path]`-included into ~88 test crates and
+/// would run these cases once per crate.
+#[test]
+fn ambient_lifetime_caps_are_clamped_to_the_reapers_ceiling() {
+    use common::child_lifetime_bound::clamped;
+
+    let ceiling = MAX_LIFETIME_CEILING_SECS.to_string();
+    // Absent: pin the default.
+    assert_eq!(clamped(None).as_deref(), Some(ceiling.as_str()));
+    // Shorter wins, and is left byte-identical — `wrap_io.rs` pins 120 and the
+    // fd-table probe pins 10 precisely so nothing they mint outlives the case.
+    assert_eq!(clamped(Some("120")), None, "a shorter ambient cap must win");
+    assert_eq!(clamped(Some("1")), None, "the shortest legal cap must win");
+    assert_eq!(
+        clamped(Some(" 30 ")),
+        None,
+        "surrounding space must not matter"
+    );
+    // Exactly at the ceiling is in range, so it stands.
+    assert_eq!(clamped(Some("300")), None, "the ceiling itself is in range");
+    // Over it does not — this is the measured 3600 that made the reaper unsafe.
+    assert_eq!(clamped(Some("3600")).as_deref(), Some(ceiling.as_str()));
+    assert_eq!(clamped(Some("301")).as_deref(), Some(ceiling.as_str()));
+    assert_eq!(
+        clamped(Some(&u64::MAX.to_string())).as_deref(),
+        Some(ceiling.as_str()),
+        "a value that would overflow the consumers' deadline arithmetic must \
+         not reach them"
+    );
+    // Zero and garbage both parse to "no cap" at every consumer
+    // (`daemon::parse_max_lifetime_secs` returns `None`), which is the unbounded
+    // case this mechanism exists to remove — so they are overwritten, not kept.
+    assert_eq!(clamped(Some("0")).as_deref(), Some(ceiling.as_str()));
+    assert_eq!(clamped(Some("")).as_deref(), Some(ceiling.as_str()));
+    assert_eq!(clamped(Some("later")).as_deref(), Some(ceiling.as_str()));
+    assert_eq!(clamped(Some("-1")).as_deref(), Some(ceiling.as_str()));
 }
 
 /// Drive one `trap`-armoured probe under a wrapper that is then SIGKILL'd, and
@@ -221,7 +291,11 @@ fn term_and_hup_resistant_child_survives(cap: Option<&str>, budget: Duration) ->
     // regression in the code under test would itself mint the orphans #668 is
     // about.
     if common::process_running(child_pid) {
-        // SAFETY: best-effort cleanup of a pid this test created.
+        // SAFETY: best-effort cleanup of a pid this test created. Same
+        // check-then-act residual as the sites above: between
+        // `process_running` and the signal the pid could be reaped and
+        // reissued, so this is bounded same-UID exposure, not an impossibility.
+        // A strict guarantee needs an OS-owned container, not a numeric pid.
         unsafe {
             libc::kill(-child_pid, libc::SIGKILL);
             libc::kill(child_pid, libc::SIGKILL);
@@ -246,6 +320,14 @@ fn term_and_hup_resistant_child_survives(cap: Option<&str>, budget: Duration) ->
 fn a_term_resistant_wrapped_child_is_still_bounded_by_the_cap() {
     // Control: nothing armed, so nothing can end it. Kept deliberately short —
     // it is asserting survival, so every second is spent proving a negative.
+    //
+    // 5 s is the FLOOR, not a round number: it has to exceed the armed half's
+    // own deadline below (1 s cap + one 250 ms backstop poll + the 1.5 s
+    // `WRAP_TERMINATE_GRACE` ≈ 2.75 s), or a child that merely happened to die
+    // on schedule would look like one nothing could end, and the assertion
+    // underneath would pass for a reason other than the cap. Anything shorter
+    // weakens the precondition; anything longer just buys idle seconds on every
+    // fast-tier run, on all three CI platforms.
     assert!(
         term_and_hup_resistant_child_survives(None, Duration::from_secs(5)),
         "precondition failed: a TERM/HUP-ignoring wrapped child that reads \
@@ -257,7 +339,10 @@ fn a_term_resistant_wrapped_child_is_still_bounded_by_the_cap() {
     assert!(
         !term_and_hup_resistant_child_survives(Some("1"), Duration::from_secs(30)),
         "a SIGKILL'd wrapper stranded a TERM/HUP-ignoring child that no hangup \
-         can reach, with the lifetime cap armed — this is the orphan that pins \
-         its e2e temp root against `clean-e2e-tmp` forever (issues #657, #668)"
+         can reach, with the lifetime cap armed — this is the orphan that runs \
+         unkillable for days, holding a working directory that has already been \
+         deleted (issues #657, #668). It does NOT hold its e2e temp root \
+         against `clean-e2e-tmp`: that tool keys on the TEST process's pid in \
+         the root's name, not on this child."
     );
 }

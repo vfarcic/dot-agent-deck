@@ -82,10 +82,21 @@ fn open_pty() -> (File, File) {
     // but leaking it made `wrap_child_holds_no_descriptor_of_the_inner_pty_master`
     // report a handed-down master on every run.
     //
-    // The MASTER only: the slave is deliberately left inheritable, exactly as
-    // `wrap` leaves its own. Every site below hands `Stdio` a clone of it, and
-    // `dup2` onto 0/1/2 clears the flag anyway — so setting it would change
-    // nothing except the one thing this helper is measured on.
+    // The MASTER only. Note this no longer mirrors `wrap`, which since the audit
+    // marks BOTH ends (`open_inner_pty`): the difference is that `wrap` keeps
+    // its original slave alive across the spawn while every site below moves
+    // this one straight into `Stdio`, so std's `dup2` onto 0/1/2 — which clears
+    // `FD_CLOEXEC` on the copy — is the only route it ever takes and there is no
+    // spare original left to close at exec. Marking it would change nothing.
+    //
+    // **This helper's BEHAVIOUR changed in `573cec0`, even though the file's
+    // diff was additive.** Every wrapper spawned in this file now inherits a
+    // close-on-exec outer master where it used to inherit a live one. Verified
+    // harmless — all `wrap_io` tests pass, and #661's
+    // `wrap_child_group_backstop_reaps_a_child_stranded_by_a_sigkilled_wrapper`
+    // rescues its probe through the forked SIGNAL reaper rather than a hangup,
+    // so the outer master is orthogonal to it — but do not read "the tests were
+    // only added to" as "the helper is untouched."
     //
     // SAFETY: `master` is a live descriptor this process owns; `F_SETFD` takes
     // and returns an int, no pointers.
@@ -725,7 +736,13 @@ fn wrap_max_lifetime_backstop_ends_an_unsignalled_wrapper_and_its_child() {
     // Never leak this test's own probes, whatever the outcome above.
     for pid in [child_pid, wrapper_pid] {
         if common::process_running(pid) {
-            // SAFETY: best-effort cleanup of pids this test created.
+            // SAFETY: best-effort cleanup of pids this test created. A
+            // `process_running` check followed by a signal is check-then-act:
+            // between the two the pid could in principle be reaped and reissued,
+            // so this is a bounded same-UID residual rather than a guarantee it
+            // only ever reaches its own probes. Unix permission checks rule out
+            // touching another user; closing the window entirely would need an
+            // OS-owned container (a cgroup), not a revalidated number.
             unsafe {
                 libc::kill(pid, libc::SIGKILL);
             }
@@ -905,6 +922,14 @@ fn wrap_child_group_backstop_reaps_a_child_stranded_by_a_sigkilled_wrapper() {
 /// helper leaks its outer master exactly that way, where the real harness's
 /// `portable_pty` sets `FD_CLOEXEC` and does not); it is recorded so a failure
 /// message stays legible, but it is not `wrap`'s to close.
+///
+/// The SLAVE side is counted too, and by a different test: the child is supposed
+/// to have exactly the three the wrapper routed onto 0/1/2, so anything ABOVE
+/// fd 2 pointing at its own terminal is a spare the original `openpty` handed
+/// down. That spare cannot pin the terminal the way a master can — every slave
+/// descriptor hangs up together when the last master closes — but it is a
+/// read/write terminal capability that outlives the child closing or
+/// redirecting its standard streams, so it is not the child's to keep either.
 #[derive(Debug)]
 struct InheritedMasterFds {
     path: &'static str,
@@ -914,6 +939,9 @@ struct InheritedMasterFds {
     inner_masters: Vec<String>,
     /// Masters of some *other* terminal, inherited from above the wrapper.
     other_masters: Vec<String>,
+    /// Descriptors ABOVE fd 2 pointing at the child's own terminal — the spare
+    /// slaves. Must be empty; 0/1/2 are the intended ones and are excluded.
+    extra_slaves: Vec<String>,
 }
 
 /// Issue #668: start a wrapper on one path with a child that outlives the
@@ -1015,12 +1043,25 @@ fn inherited_master_fds(interactive: bool) -> InheritedMasterFds {
 
     let mut inner_masters = Vec::new();
     let mut other_masters = Vec::new();
+    let mut extra_slaves = Vec::new();
     if let Ok(entries) = std::fs::read_dir(format!("/proc/{child_pid}/fd")) {
         for entry in entries.flatten() {
             let fd = entry.file_name().to_string_lossy().into_owned();
             let Ok(target) = std::fs::read_link(entry.path()) else {
                 continue;
             };
+            // The child's own SLAVE, anywhere but the three the wrapper routed.
+            // `own_terminal` is read off fd 0, so comparing against it is the
+            // same identity test the master side makes through `tty-index`.
+            if own_terminal
+                .as_deref()
+                .is_some_and(|own| target == std::path::Path::new(own))
+            {
+                if fd.parse::<i32>().is_ok_and(|n| n > libc::STDERR_FILENO) {
+                    extra_slaves.push(format!("fd {fd} -> {}", target.display()));
+                }
+                continue;
+            }
             if target != std::path::Path::new("/dev/ptmx") {
                 continue;
             }
@@ -1041,12 +1082,15 @@ fn inherited_master_fds(interactive: bool) -> InheritedMasterFds {
     }
     inner_masters.sort();
     other_masters.sort();
+    extra_slaves.sort();
 
     // Never leak this test's own probes, whatever the outcome above.
     let wrapper_pid = wrapper.id() as libc::pid_t;
     for pid in [child_pid, wrapper_pid] {
         if common::process_running(pid) {
-            // SAFETY: best-effort cleanup of pids this test created.
+            // SAFETY: best-effort cleanup of pids this test created. Same
+            // bounded check-then-act residual as the identical site above:
+            // a revalidated pid is a number, not an identity.
             unsafe {
                 libc::kill(-pid, libc::SIGKILL);
                 libc::kill(pid, libc::SIGKILL);
@@ -1060,13 +1104,14 @@ fn inherited_master_fds(interactive: bool) -> InheritedMasterFds {
         own_terminal,
         inner_masters,
         other_masters,
+        extra_slaves,
     }
 }
 
 /// Scenario: Start a wrapper on each path over a probe that records its own pid
 /// and then sleeps, and read that child's `/proc/<pid>/fd` table. Assert it holds
-/// no descriptor of a pty master — the child needs its slave (which it has on
-/// 0/1/2), never the master of the terminal it is sitting on.
+/// no descriptor of a pty master, and no descriptor of its own slave beyond the
+/// three the wrapper routed onto 0/1/2.
 ///
 /// Issue #668: this is the direct, non-timing statement of the defect. A child
 /// holding the master of its own controlling terminal keeps that terminal's
@@ -1074,6 +1119,13 @@ fn inherited_master_fds(interactive: bool) -> InheritedMasterFds {
 /// hangs up and the child blocks on `read` forever — measured at 9.4 days in the
 /// field. `wrap_child_dies_when_its_sigkilled_wrapper_takes_the_last_master_reference`
 /// asserts the consequence; this one asserts the cause, and fails fastest.
+///
+/// The spare-slave half is a smaller claim deliberately kept in the same test,
+/// because it is measured off the same table: a fourth `/dev/pts/<n>` entry sat
+/// at fd 4 beside the intended three until `open_inner_pty` marked the slave
+/// close-on-exec too. It cannot pin the terminal — slaves all hang up together
+/// — but it is a read/write terminal capability that survives the child
+/// redirecting its own standard streams.
 #[cfg(target_os = "linux")]
 #[test]
 fn wrap_child_holds_no_descriptor_of_the_inner_pty_master() {
@@ -1112,6 +1164,16 @@ fn wrap_child_holds_no_descriptor_of_the_inner_pty_master() {
          self-pins (issue #668). Masters of OTHER terminals, which came from \
          above the wrapper and are not part of this defect: {handed_down:?}. \
          Outcomes: {outcomes:#?}"
+    );
+    assert!(
+        outcomes.iter().all(|o| o.extra_slaves.is_empty()),
+        "a wrapped child inherited a SPARE descriptor for its own inner \
+         pseudo-terminal, above the three the wrapper routed onto 0/1/2. That \
+         is not the self-pinning defect — every slave hangs up together when \
+         the last master closes — but it is a read/write terminal capability \
+         the child was never handed deliberately, and it outlives the child or \
+         any descendant closing or redirecting its standard streams (issue \
+         #668). Outcomes: {outcomes:#?}"
     );
 }
 
@@ -1201,7 +1263,11 @@ fn wrap_child_dies_when_its_sigkilled_wrapper_takes_the_last_master_reference() 
 
     // Never leak this test's own probe, whatever the outcome above.
     if common::process_running(child_pid) {
-        // SAFETY: best-effort cleanup of a pid this test created.
+        // SAFETY: best-effort cleanup of a pid this test created. Same
+        // check-then-act residual as the sites above: between
+        // `process_running` and the signal the pid could be reaped and
+        // reissued, so this is bounded same-UID exposure, not an impossibility.
+        // A strict guarantee needs an OS-owned container, not a numeric pid.
         unsafe {
             libc::kill(-child_pid, libc::SIGKILL);
             libc::kill(child_pid, libc::SIGKILL);
@@ -1213,7 +1279,9 @@ fn wrap_child_dies_when_its_sigkilled_wrapper_takes_the_last_master_reference() 
         "a SIGKILL'd wrapper left its child blocked on a terminal that can never \
          hang up, because the child itself holds that terminal's master (issue \
          #668). Nothing above it can signal it and nothing below it will EOF — \
-         this is the process that runs for days and pins its e2e temp root \
-         against `clean-e2e-tmp` forever."
+         this is the process that runs for days, unkillable, holding a working \
+         directory that has already been deleted and polluting every later \
+         diagnosis. (Not a root that `clean-e2e-tmp` cannot reap: that tool \
+         keys on the TEST process's pid in the root's name, not on this child.)"
     );
 }
