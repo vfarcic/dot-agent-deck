@@ -1153,6 +1153,32 @@ fn child_pre_exec(ctty_fd: RawFd) -> std::io::Result<()> {
 
 /// Open a fresh inner pseudo-terminal sized to `(rows, cols)`, returning the
 /// owned master and slave descriptors.
+///
+/// Issue #668: the **master** is marked `FD_CLOEXEC` before it can be inherited
+/// by anything. `openpty` hands back a plain descriptor, so without this the
+/// wrapped child inherits the master of the very terminal it is sitting on —
+/// measured on a live stand-in as `fd 3 -> /dev/ptmx` whose `fdinfo`
+/// `tty-index` is its own slave. That keeps the master's reference count off
+/// zero for as long as the child lives, so when the wrapper dies the slave never
+/// hangs up, the child's `read` never returns, and it blocks forever: 221 such
+/// orphans were censused on one dev box, the oldest alive 9.4 days, each
+/// pinning an e2e temp root `live-pid` against `cargo xtask clean-e2e-tmp`.
+/// `portable_pty` — the crate every *unwrapped* pane is spawned through, and
+/// whose panes were measured leaking 0 times in 39 trials — does exactly this at
+/// its `unix.rs:57`, which is why the leak is wrapper-shaped.
+///
+/// This is structural rather than env-gated, so unlike
+/// [`arm_child_group_backstop`] it holds on a Ctrl-C'd developer run, an OOM
+/// kill, a panic-abort and the deck's own `killpg(SIGKILL)` escalation alike. It
+/// is not inert in production, deliberately: a wrapped agent whose wrapper is
+/// `SIGKILL`ed now exits with its terminal instead of surviving as an unkillable
+/// process holding a dead one.
+///
+/// The **slave** is deliberately left as it is. `route` hands clones of it to
+/// `Stdio`, and `dup2` clears `FD_CLOEXEC` when `std` puts them on 0/1/2, so the
+/// child keeps its terminal and (via `TIOCSCTTY` in [`child_pre_exec`]) its
+/// controlling terminal either way — but the child needs the slave and never
+/// needed the master.
 #[cfg(unix)]
 fn open_inner_pty(rows: u16, cols: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
     let mut master: RawFd = -1;
@@ -1180,7 +1206,34 @@ fn open_inner_pty(rows: u16, cols: u16) -> std::io::Result<(OwnedFd, OwnedFd)> {
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) })
+    // SAFETY: `openpty` returned two fresh, valid descriptors; each becomes an
+    // `OwnedFd` exactly once here, so close-on-drop is unambiguous from now on.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    // Owned first, then flagged: if this fails, both descriptors are already
+    // owned and close on the early return instead of leaking (the ordering
+    // `portable_pty` uses at `unix.rs:52-58`, and for the same reason).
+    set_cloexec(&master)?;
+    Ok((master, slave))
+}
+
+/// Mark `fd` close-on-exec, preserving any other descriptor flags.
+///
+/// Read-modify-write rather than a bare `F_SETFD`: `FD_CLOEXEC` is the only
+/// descriptor flag POSIX defines today, but clobbering the word would be a
+/// silent trap for anything a future platform adds there.
+#[cfg(unix)]
+fn set_cloexec(fd: &OwnedFd) -> std::io::Result<()> {
+    // SAFETY: `fd` is a live descriptor this process owns; `F_GETFD`/`F_SETFD`
+    // take and return an int, no pointers.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Resize an open PTY master, which sends `SIGWINCH` to its foreground process

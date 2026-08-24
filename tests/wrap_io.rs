@@ -872,3 +872,327 @@ fn wrap_child_group_backstop_reaps_a_child_stranded_by_a_sigkilled_wrapper() {
         "both wrap paths must be covered; outcomes: {outcomes:#?}"
     );
 }
+
+/// What a wrapped child was left holding of the inner pseudo-terminal on one
+/// wrap path.
+///
+/// A pty master carries no name of its own, so it is tied to a terminal through
+/// `fdinfo`'s `tty-index`: a master whose index is the number of the child's own
+/// `/dev/pts/<n>` — the terminal on its stdin/stdout/stderr — is the INNER master
+/// `wrap` opened for it, and is the leak. Any other master is something the
+/// process that started the wrapper handed down (this file's own `open_pty`
+/// helper leaks its outer master exactly that way, where the real harness's
+/// `portable_pty` sets `FD_CLOEXEC` and does not); it is recorded so a failure
+/// message stays legible, but it is not `wrap`'s to close.
+#[derive(Debug)]
+struct InheritedMasterFds {
+    path: &'static str,
+    /// The child's own terminal, e.g. `Some("/dev/pts/22")`.
+    own_terminal: Option<String>,
+    /// Masters of that terminal — must be empty.
+    inner_masters: Vec<String>,
+    /// Masters of some *other* terminal, inherited from above the wrapper.
+    other_masters: Vec<String>,
+}
+
+/// Issue #668: start a wrapper on one path with a child that outlives the
+/// measurement, and report which pty-master descriptors that child inherited.
+///
+/// Linux-only, and deliberately so: `/proc/<pid>/fd` is the only portable-enough
+/// way to see *another* process's descriptor table, and the field population
+/// this guards (issue #668's 221 orphans, and #657's before it) is a Linux dev
+/// box and Linux CI. On this platform a pty master reads back as `/dev/ptmx`
+/// while its slave reads back as `/dev/pts/<n>`, so the two are distinguishable
+/// by the symlink target alone; `fdinfo`'s `tty-index` is folded into the report
+/// because it is what ties a master to *which* terminal it controls — fd 3
+/// carrying the index of the child's own slave is the exact signature measured
+/// on a live stand-in.
+///
+/// The probe `exec`s `sleep` rather than `cat`: it has to stay alive on BOTH
+/// paths, and on the pipe path the wrapper's input pump closes the child's stdin
+/// as soon as the wrapper's own stdin EOFs, which ends an EOF-sensitive child at
+/// once. `exec` (rather than a shell loop) keeps the inherited fd table exactly
+/// as `wrap` handed it over.
+#[cfg(target_os = "linux")]
+fn inherited_master_fds(interactive: bool) -> InheritedMasterFds {
+    let fixture = common::harness_tempdir().expect("create inherited-fd fixture");
+    let pid_path = fixture.path().join("child.pid");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    command
+        .args([
+            "wrap",
+            "--agent",
+            "codex",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '%s\\n' \"$$\" > \"$WRAP_CHILD_PID_FILE\"; exec sleep 30",
+        ])
+        .env("WRAP_CHILD_PID_FILE", &pid_path)
+        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        // Hygiene only, and short: this test reads a table and leaves, so nothing
+        // here should be able to outlive it even if an assertion below panics.
+        .env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "10")
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID");
+
+    // Held for the whole case on the interactive path: the wrapper's descriptors
+    // must stay valid while it runs.
+    let _master = if interactive {
+        let (master, slave) = open_pty();
+        command
+            .stdin(Stdio::from(
+                slave.try_clone().expect("clone PTY slave for stdin"),
+            ))
+            .stdout(Stdio::from(
+                slave.try_clone().expect("clone PTY slave for stdout"),
+            ))
+            .stderr(Stdio::from(slave));
+        Some(master)
+    } else {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        None
+    };
+
+    let mut wrapper = command.spawn().expect("spawn inherited-fd probe");
+    let read_pid = |path: &std::path::Path| -> Option<libc::pid_t> {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| contents.trim().parse().ok())
+    };
+    let recorded = common::wait_until(Duration::from_secs(10), || read_pid(&pid_path).is_some());
+    if !recorded {
+        terminate(&mut wrapper);
+        panic!(
+            "{} wrapper never recorded its child's pid",
+            if interactive { "PTY" } else { "pipe" }
+        );
+    }
+    let child_pid = read_pid(&pid_path).expect("child pid recorded");
+
+    // The pid file is written by the shell *before* it `exec`s, so give the
+    // exec a moment to land — the table is read from the exec'd probe, which is
+    // the process that would go on to strand itself.
+    let _ = common::wait_until(Duration::from_secs(5), || {
+        std::fs::read_dir(format!("/proc/{child_pid}/fd")).is_ok()
+    });
+
+    // The terminal the child is actually sitting on, and therefore the index a
+    // leaked INNER master carries.
+    let own_terminal = std::fs::read_link(format!("/proc/{child_pid}/fd/0"))
+        .ok()
+        .map(|p| p.display().to_string())
+        .filter(|p| p.starts_with("/dev/pts/"));
+    let own_index = own_terminal
+        .as_deref()
+        .and_then(|p| p.rsplit('/').next())
+        .and_then(|n| n.parse::<u32>().ok());
+
+    let mut inner_masters = Vec::new();
+    let mut other_masters = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(format!("/proc/{child_pid}/fd")) {
+        for entry in entries.flatten() {
+            let fd = entry.file_name().to_string_lossy().into_owned();
+            let Ok(target) = std::fs::read_link(entry.path()) else {
+                continue;
+            };
+            if target != std::path::Path::new("/dev/ptmx") {
+                continue;
+            }
+            let index = std::fs::read_to_string(format!("/proc/{child_pid}/fdinfo/{fd}"))
+                .ok()
+                .and_then(|info| {
+                    info.lines()
+                        .find_map(|l| l.strip_prefix("tty-index:"))
+                        .and_then(|v| v.trim().parse::<u32>().ok())
+                });
+            let described = format!("fd {fd} -> /dev/ptmx (tty-index {index:?})");
+            if index.is_some() && index == own_index {
+                inner_masters.push(described);
+            } else {
+                other_masters.push(described);
+            }
+        }
+    }
+    inner_masters.sort();
+    other_masters.sort();
+
+    // Never leak this test's own probes, whatever the outcome above.
+    let wrapper_pid = wrapper.id() as libc::pid_t;
+    for pid in [child_pid, wrapper_pid] {
+        if common::process_running(pid) {
+            // SAFETY: best-effort cleanup of pids this test created.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = wrapper.wait();
+
+    InheritedMasterFds {
+        path: if interactive { "pty" } else { "pipe" },
+        own_terminal,
+        inner_masters,
+        other_masters,
+    }
+}
+
+/// Scenario: Start a wrapper on each path over a probe that records its own pid
+/// and then sleeps, and read that child's `/proc/<pid>/fd` table. Assert it holds
+/// no descriptor of a pty master — the child needs its slave (which it has on
+/// 0/1/2), never the master of the terminal it is sitting on.
+///
+/// Issue #668: this is the direct, non-timing statement of the defect. A child
+/// holding the master of its own controlling terminal keeps that terminal's
+/// reference count off zero, so when everything above it dies the slave never
+/// hangs up and the child blocks on `read` forever — measured at 9.4 days in the
+/// field. `wrap_child_dies_when_its_sigkilled_wrapper_takes_the_last_master_reference`
+/// asserts the consequence; this one asserts the cause, and fails fastest.
+#[cfg(target_os = "linux")]
+#[test]
+fn wrap_child_holds_no_descriptor_of_the_inner_pty_master() {
+    let outcomes = [inherited_master_fds(true), inherited_master_fds(false)];
+    assert!(
+        ["pty", "pipe"]
+            .into_iter()
+            .all(|path| outcomes.iter().any(|o| o.path == path)),
+        "both wrap paths must be covered; outcomes: {outcomes:#?}"
+    );
+    // Precondition, so that an empty `inner_masters` below cannot pass
+    // vacuously: on the PTY path the child MUST be sitting on a terminal. A
+    // regression that stopped giving it one would otherwise read as a clean
+    // descriptor table.
+    assert!(
+        outcomes
+            .iter()
+            .filter(|o| o.path == "pty")
+            .all(|o| o.own_terminal.is_some()),
+        "the PTY path's probe was not on a terminal at all, so there was no \
+         inner master to hold and this assertion would prove nothing; \
+         outcomes: {outcomes:#?}"
+    );
+    // Read out on purpose rather than left to the `Debug` dump: these are
+    // masters of some *other* terminal, handed down from whatever started the
+    // wrapper, and they are not `wrap`'s to close. Naming them keeps a failure
+    // from being read as this defect when it is the caller's fd hygiene.
+    let handed_down: Vec<&String> = outcomes
+        .iter()
+        .flat_map(|o| o.other_masters.iter())
+        .collect();
+    assert!(
+        outcomes.iter().all(|o| o.inner_masters.is_empty()),
+        "a wrapped child inherited the master of its own inner pseudo-terminal, \
+         so nothing above it can ever hang that terminal up and the child \
+         self-pins (issue #668). Masters of OTHER terminals, which came from \
+         above the wrapper and are not part of this defect: {handed_down:?}. \
+         Outcomes: {outcomes:#?}"
+    );
+}
+
+/// Scenario: Start a wrapper on the PTY path over a plain `cat` — a child that
+/// ignores nothing — then SIGKILL the wrapper so no reap loop and no
+/// max-lifetime backstop can run, with `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`
+/// explicitly removed so #661's forked reaper is provably not what is being
+/// measured. Assert the child is gone within seconds: the wrapper held the last
+/// reference to the inner PTY master, so its death must hang the child's
+/// terminal up and end it.
+///
+/// Issue #668, the behavioural half. Deliberately unlike #661's probes, which
+/// ignore SIGTERM and are rescued by a *signal*: this child is rescued by
+/// nothing but the hangup the operating system already provides, which is the
+/// property the fd fix restores. The pipe path is not driven here because it
+/// opens no inner PTY at all — there is no master to hold, and a child there
+/// ends on its stdin closing, a different mechanism with its own coverage.
+#[test]
+fn wrap_child_dies_when_its_sigkilled_wrapper_takes_the_last_master_reference() {
+    let fixture = common::harness_tempdir().expect("create hangup fixture");
+    let pid_path = fixture.path().join("child.pid");
+
+    let (master, slave) = open_pty();
+    let mut wrapper = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args([
+            "wrap",
+            "--agent",
+            "codex",
+            "--",
+            "/bin/sh",
+            "-c",
+            // `exec cat` so the recorded pid IS the blocked reader, and so the
+            // fd table it blocks on is exactly what `wrap` handed over.
+            "printf '%s\\n' \"$$\" > \"$WRAP_CHILD_PID_FILE\"; exec cat",
+        ])
+        .env("WRAP_CHILD_PID_FILE", &pid_path)
+        .env("DOT_AGENT_DECK_SOCKET", UNREACHABLE_HOOK_SOCKET)
+        // The point of the test: NO lifetime cap and NO orphan exit, so neither
+        // `arm_wrap_self_defense` nor #661's `arm_child_group_backstop` is armed
+        // and the only thing that can end this child is its terminal hanging up.
+        .env_remove("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS")
+        .env_remove("DOT_AGENT_DECK_EXIT_WHEN_ORPHANED")
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID")
+        .stdin(Stdio::from(
+            slave.try_clone().expect("clone PTY slave for stdin"),
+        ))
+        .stdout(Stdio::from(
+            slave.try_clone().expect("clone PTY slave for stdout"),
+        ))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .expect("spawn hangup probe");
+
+    let read_pid = |path: &std::path::Path| -> Option<libc::pid_t> {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| contents.trim().parse().ok())
+    };
+    let recorded = common::wait_until(Duration::from_secs(10), || read_pid(&pid_path).is_some());
+    if !recorded {
+        terminate(&mut wrapper);
+        panic!("wrapper never recorded its child's pid");
+    }
+    let child_pid = read_pid(&pid_path).expect("child pid recorded");
+
+    // SIGKILL, not SIGTERM: the wrapper gets no chance to reap, so the child's
+    // survival is decided by descriptors alone.
+    let wrapper_pid = wrapper.id() as libc::pid_t;
+    // SAFETY: the wrapper pid came from this test's live `Child`; ending it
+    // uncleanly is the behavior under test.
+    assert_eq!(
+        unsafe { libc::kill(wrapper_pid, libc::SIGKILL) },
+        0,
+        "deliver SIGKILL to wrapper pid {wrapper_pid}"
+    );
+    let _ = wrapper.wait();
+
+    // The OUTER terminal stays open for the whole wait: the child must die of
+    // its own inner terminal hanging up, not because the test's terminal went
+    // away. 10 s is headroom for a loaded host, not an expected duration — the
+    // hangup is immediate.
+    let child_gone = common::wait_until(Duration::from_secs(10), || {
+        !common::process_running(child_pid)
+    });
+    drop(master);
+
+    // Never leak this test's own probe, whatever the outcome above.
+    if common::process_running(child_pid) {
+        // SAFETY: best-effort cleanup of a pid this test created.
+        unsafe {
+            libc::kill(-child_pid, libc::SIGKILL);
+            libc::kill(child_pid, libc::SIGKILL);
+        }
+    }
+
+    assert!(
+        child_gone,
+        "a SIGKILL'd wrapper left its child blocked on a terminal that can never \
+         hang up, because the child itself holds that terminal's master (issue \
+         #668). Nothing above it can signal it and nothing below it will EOF — \
+         this is the process that runs for days and pins its e2e temp root \
+         against `clean-e2e-tmp` forever."
+    );
+}
