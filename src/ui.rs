@@ -3611,7 +3611,7 @@ fn process_pending_seed_prompts(
             // binds it, and the real start then reads as a rollover and abandons
             // the seed. Arming a write that no longer exists fixes nothing. See
             // issue #684.
-            let writes_payload = attempt_writes_payload(attempt, AgentStartRearm::default(), now);
+            let writes_payload = attempt_writes_payload(attempt, &AgentStartRearm::default(), now);
             let wire_delivery_id = wire_attempt_id(&delivery_id, epoch, attempt, !writes_payload);
             // Reviewer blocker 2: from here on, a request under this wire id may
             // be recorded in the daemon's ledger, so a later identity change has
@@ -4666,7 +4666,7 @@ fn deliver_orchestrator_prompt(
     // Issue #666: disarmed here for the same reason as the seed path's twin — the
     // armed third payload ships on the daemon path only. See that call site, and
     // issue #684.
-    let writes_payload = attempt_writes_payload(attempt, AgentStartRearm::default(), now);
+    let writes_payload = attempt_writes_payload(attempt, &AgentStartRearm::default(), now);
     // Issue #424: the logical delivery keeps ONE identity; every ATTEMPT rides
     // its own wire id, or the daemon's ledger replays the first `Applied` and a
     // retry never reaches the PTY at all. See [`attempt_delivery_id`].

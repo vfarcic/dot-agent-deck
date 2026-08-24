@@ -1222,8 +1222,14 @@ async fn deliver(
     // handoff licenses is accepting the successor WHEN IT ANNOUNCES ITSELF, so
     // the payload goes in exactly when the agent is there to receive it. See
     // [`crate::state::SessionStartWait::launcher_handoff`].
-    if observed.launcher_handoff {
-        registry.note_launcher_handoff(agent_id);
+    //
+    // Issue #666: the DECLARED TYPE goes with it. It is the pane's believed type
+    // for the `devbox`-shaped population whose command resolves to no agent type
+    // at all, so without it that population has no belief for a post-write
+    // declaration to agree with — see
+    // [`crate::agent_pty::AgentPtyRegistry::pre_write_believed_agent_type`].
+    if let Some(declared) = observed.launcher_handoff.clone() {
+        registry.note_launcher_handoff(agent_id, declared);
     }
     match event_rx {
         Some(rx) => {
@@ -1550,15 +1556,23 @@ async fn confirm_prompt_delivery(
     let accepts_late_producer = registry.agent_declared_launcher_handoff(&agent_id)
         || registry.agent_spawned_as_reporting_agent(&agent_id);
     // Issue #666: the ONE extra payload-carrying attempt this delivery may earn.
-    // Standing is exactly `accepts_late_producer` — the same pre-write fact #424
-    // F4 / #570 already require before a post-write producer claim may arm
-    // anything, reused rather than re-derived so the two cannot drift.
+    //
+    // Standing here is the same PRE-WRITE fact `accepts_late_producer` above is
+    // built from — but as a TYPE, not a bool, and that difference is the whole
+    // of #424 F4. `accepts_late_producer` only has to answer "may a post-write
+    // producer arm the retry SCHEDULE", and a schedule of submit-only probes
+    // cannot duplicate anything. The rearm authorizes a PAYLOAD WRITE, so it must
+    // also answer "is the thing announcing itself the thing we believed was
+    // there" — otherwise a pane the deck exec'd as Codex is armed by an event
+    // that merely claims to be Claude Code, and the declared type has GRANTED
+    // privilege rather than withheld it. `scheduler/dispatch/016` cases G and H
+    // are exactly that, and they are the reciprocals of case C.
     //
     // `generation` is still the PRE-WRITE latch here: `deliver` captures it, runs
     // the drain, writes attempt 1 and hands it over untouched, and nothing below
     // has run yet. So `generation.is_none()` IS fact U for the first payload
     // write, with no separate `ConfirmationTask` field to keep in step with it.
-    let mut rearm = AgentStartRearm::new(accepts_late_producer);
+    let mut rearm = AgentStartRearm::new(registry.pre_write_believed_agent_type(&agent_id));
     rearm.note_payload_write(generation.is_none());
     let mut refused_claim_logged = false;
     loop {
@@ -1744,8 +1758,8 @@ async fn confirm_prompt_delivery(
         // per logical delivery, ever. See
         // [`crate::prompt_delivery::AgentStartRearm`].
         let now = Instant::now();
-        let writes_payload = crate::prompt_delivery::attempt_writes_payload(attempt, rearm, now);
-        let spends_rearm = crate::prompt_delivery::attempt_spends_rearm(attempt, rearm, now);
+        let writes_payload = crate::prompt_delivery::attempt_writes_payload(attempt, &rearm, now);
+        let spends_rearm = crate::prompt_delivery::attempt_spends_rearm(attempt, &rearm, now);
         // Issue #424 F1 (auditor HIGH): a probe submits whatever the target is
         // holding, so it is only meaningful while that is still OUR payload. The
         // registry refuses it outright once the user has typed since the last
@@ -2605,6 +2619,10 @@ mod tests {
         replay_was_terminal: bool,
     }
 
+    /// Block until the pane's byte target has produced anything beyond
+    /// `baseline_len`. Returns as soon as the FIRST new byte lands — settling is
+    /// [`wait_for_detached_write_to_settle`]'s job, because the two answer
+    /// different questions and the caller needs them at different moments.
     async fn wait_for_detached_snapshot_growth(
         registry: &AgentPtyRegistry,
         agent_id: &str,
@@ -2615,13 +2633,7 @@ mod tests {
         loop {
             let snapshot = registry.snapshot(agent_id).expect("byte target snapshot");
             if snapshot.len() > baseline_len {
-                // The payload bytes precede the delayed submit CR. Let that
-                // tail and `/bin/cat`'s echo settle before calling the write
-                // complete or emitting the post-write SessionStart.
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                return registry
-                    .snapshot(agent_id)
-                    .expect("settled byte target snapshot");
+                return snapshot;
             }
             assert!(
                 Instant::now() < deadline,
@@ -2629,6 +2641,60 @@ mod tests {
                 String::from_utf8_lossy(&snapshot)
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Block until one attempt's ENTIRE output has arrived, so the next
+    /// attempt's delta ([`snapshot_delta`]) is that attempt's bytes and nothing
+    /// else.
+    ///
+    /// A fixed pause cannot do this, and a fixed 250 ms one is what made
+    /// `scheduler/dispatch/016`'s issue #666 cases flake under a loaded machine:
+    /// one payload write reaches the target in several pieces — the payload's
+    /// own echo, then the delayed submit CR's echo `SUBMIT_DELAY` later, then the
+    /// child's copy of the line — and a pane spawned as `AgentType::Codex` adds
+    /// another hop, because `spawn_agent` applies the Wrapper strategy and
+    /// launches `dot-agent-deck wrap -- /bin/cat` rather than `/bin/cat`. When
+    /// the tail of attempt 2 lands after the pause, it is charged to attempt 3
+    /// and a case that correctly PROBED reads as one that wrote a payload.
+    ///
+    /// So: wait for the output to go QUIET instead. `MIN_QUIET` must exceed
+    /// `SUBMIT_DELAY`, or the gap the delayed CR leaves in the middle of a single
+    /// write reads as the end of it; the trailing line terminator is a second,
+    /// independent check on the same thing. `CAP` keeps a pathological wait from
+    /// running into the NEXT attempt, whose bytes would poison the baseline in
+    /// the other direction — it is well inside the 1 s that
+    /// `unconfirmed_retry_delay` leaves between attempt 2 and attempt 3.
+    async fn wait_for_detached_write_to_settle(
+        registry: &AgentPtyRegistry,
+        agent_id: &str,
+    ) -> Vec<u8> {
+        const POLL: Duration = Duration::from_millis(20);
+        const MIN_QUIET: Duration = Duration::from_millis(250);
+        const MIN_ELAPSED: Duration = Duration::from_millis(400);
+        const CAP: Duration = Duration::from_millis(800);
+
+        let started = Instant::now();
+        let mut last = registry.snapshot(agent_id).expect("byte target snapshot");
+        let mut quiet_since = Instant::now();
+        loop {
+            tokio::time::sleep(POLL).await;
+            let snapshot = registry.snapshot(agent_id).expect("byte target snapshot");
+            if snapshot.len() != last.len() {
+                last = snapshot;
+                quiet_since = Instant::now();
+                continue;
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= CAP {
+                return snapshot;
+            }
+            if elapsed >= MIN_ELAPSED
+                && quiet_since.elapsed() >= MIN_QUIET
+                && snapshot.ends_with(b"\r\n")
+            {
+                return snapshot;
+            }
         }
     }
 
@@ -2686,11 +2752,19 @@ mod tests {
                 Duration::from_millis(20),
             )
             .await;
-            assert!(
-                !observed.ready && observed.launcher_handoff,
-                "the wrapper_fork start must establish standing without satisfying readiness: {observed:?}"
+            assert_eq!(
+                (observed.ready, observed.launcher_handoff.as_ref()),
+                (false, Some(&AgentType::ClaudeCode)),
+                "the wrapper_fork start must establish standing — carrying the type it \
+                 DECLARED, issue #666 — without satisfying readiness: {observed:?}"
             );
-            registry.note_launcher_handoff(&agent_id);
+            registry.note_launcher_handoff(
+                &agent_id,
+                observed
+                    .launcher_handoff
+                    .clone()
+                    .expect("the pre-write declaration names a type"),
+            );
         }
 
         let (event_tx, event_rx) = broadcast::channel(16);
@@ -2711,8 +2785,14 @@ mod tests {
             },
         ));
 
-        let after_attempt_two =
-            wait_for_detached_snapshot_growth(&registry, &agent_id, 0, "attempt 2").await;
+        // Attempt 2's payload write has reached the target. Announce the genuine
+        // post-write `SessionStart` HERE, on the write's first byte rather than
+        // after it settles: the bytes are already out, so the event is post-write
+        // by construction, and sending it now keeps `REARM_READINESS_BUFFER`'s
+        // 500 ms margin against attempt 3 independent of how long this pane's
+        // output takes to arrive — which for the wrapped `AgentType::Codex` case
+        // is a whole extra process.
+        wait_for_detached_snapshot_growth(&registry, &agent_id, 0, "attempt 2").await;
         event_tx
             .send(BroadcastMsg::Event(typed_prompt_watch_event(
                 &pane_id,
@@ -2723,26 +2803,29 @@ mod tests {
                 false,
             )))
             .expect("send genuine post-write SessionStart");
-        let after_attempt_three = wait_for_detached_snapshot_growth(
+        let after_attempt_two = wait_for_detached_write_to_settle(&registry, &agent_id).await;
+        wait_for_detached_snapshot_growth(
             &registry,
             &agent_id,
             after_attempt_two.len(),
             "attempt 3",
         )
         .await;
+        let after_attempt_three = wait_for_detached_write_to_settle(&registry, &agent_id).await;
         let attempt_three = snapshot_delta(&after_attempt_two, &after_attempt_three);
 
         let mut attempt_four = None;
         let mut after_replay = None;
         let mut replay_was_terminal = false;
         if observe_fourth {
-            let after_attempt_four = wait_for_detached_snapshot_growth(
+            wait_for_detached_snapshot_growth(
                 &registry,
                 &agent_id,
                 after_attempt_three.len(),
                 "attempt 4",
             )
             .await;
+            let after_attempt_four = wait_for_detached_write_to_settle(&registry, &agent_id).await;
             attempt_four = Some(snapshot_delta(&after_attempt_three, &after_attempt_four));
         } else if replay {
             event_tx

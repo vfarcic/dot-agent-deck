@@ -174,25 +174,56 @@ pub const REARM_READINESS_BUFFER: std::time::Duration = std::time::Duration::fro
 ///
 /// | # | fact | held by |
 /// |---|---|---|
-/// | S | **Standing** — before the write, something the deck can vouch for said what occupies this pane | [`Self::standing`], from the caller |
+/// | S | **Standing** — before the write, something the deck can vouch for said WHICH AGENT TYPE occupies this pane | [`Self::believed_agent_type`], from the caller |
 /// | U | **Unbound at the write** — the delivery had no bound hook generation when it last wrote its payload | [`Self::unbound_at_last_payload_write`], via [`Self::note_payload_write`] |
 /// | G | **Genuine start** — a `SessionStart` NOT carrying wrapper-fork boot provenance | the caller, before it calls [`Self::observe_agent_start`] |
 /// | I | **Identity** — same pane, exact non-optional `agent_id` match | the caller (already enforced by every observation site) |
 /// | W | **After the write** — strictly after this delivery's ordering watermark / pre-write drain | the caller, plus [`Self::note_payload_write`] clearing stale observations |
-/// | T | **The producer's start precedes its first prompt** | [`agent_start_precedes_first_prompt`] |
+/// | T | **The producer's start precedes its first prompt** | [`agent_start_precedes_first_prompt`], asked of the BELIEVED type |
 ///
 /// G, I and W are the caller's because each delivery path observes producer
 /// evidence through a different substrate (a broadcast receiver in the daemon, a
 /// snapshot journal in the TUI) and each already enforces them at that point.
 /// S, U and T are here, so the conjunction cannot drift between paths.
 ///
-/// `Copy` and `Default`-disarmed on purpose: a value that was never given
-/// standing can never arm, so forgetting to thread it is a no-op rather than a
-/// privilege.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// # Why S carries a TYPE and not a bool (issue #424 F4, the rule this restores)
+///
+/// **A declared `AgentType` may only ever WITHHOLD privilege, never grant it.**
+/// The type on the arming `SessionStart` is an unauthenticated producer
+/// assertion: the hook socket accepts raw `AgentEvent` JSON from any same-uid
+/// process, so "I am Claude Code" is a claim, not a fact.
+///
+/// This type first shipped with S collapsed to a `bool` — "the deck vouched for
+/// *something* here" — and T then asked of the DECLARED type alone. That is
+/// exactly the grant #424 F4 forbids, and it was demonstrable rather than
+/// theoretical: a pane the deck itself spawned as **Codex** (T false, because
+/// codex-cli's start is a TURN fact) was armed by an event that merely *claimed*
+/// to be Claude Code (T true). `scheduler/dispatch/016` cases **G** and **H** are
+/// that hole, and they are the reciprocals of case **C**.
+///
+/// The fix is not "evaluate T against the trusted type instead" — that breaks C
+/// in the other direction, arming a genuinely-Claude pane on a Codex-declaring
+/// event. The rule is a CONJUNCTION: the declared type must MATCH what the deck
+/// already believed about the pane, and that believed type must satisfy T. So a
+/// declaration can only ever agree with a belief the deck already held, i.e.
+/// withhold on disagreement, which is F4 restated.
+///
+/// | case | believed | declared | outcome |
+/// |---|---|---|---|
+/// | A | `ClaudeCode` (deck-spawn record) | `ClaudeCode` | match, T → **arm** |
+/// | C | `ClaudeCode` (deck-spawn record) | `Codex` | mismatch → refuse |
+/// | G | `Codex` (deck-spawn record) | `ClaudeCode` | mismatch → refuse |
+/// | H | `OpenCode` (deck-spawn record) | `ClaudeCode` | mismatch → refuse |
+/// | D | `ClaudeCode` (pre-write launcher declaration) | `ClaudeCode` | match, T → **arm** |
+///
+/// `Default`-disarmed on purpose: a value that was never given a believed type
+/// can never arm, so forgetting to thread it is a no-op rather than a privilege.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AgentStartRearm {
-    /// Fact S. The deck vouched for this pane BEFORE the payload write.
-    standing: bool,
+    /// Fact S. WHICH AGENT TYPE the deck believed occupied this pane BEFORE the
+    /// payload write, from a source the deck can vouch for. `None` — no belief —
+    /// disarms permanently.
+    believed_agent_type: Option<AgentType>,
     /// Fact U, as of the delivery's most recent payload write.
     unbound_at_last_payload_write: bool,
     /// Facts G ∧ I ∧ W ∧ T, observed since that write. `None` until then.
@@ -202,20 +233,43 @@ pub struct AgentStartRearm {
 }
 
 impl AgentStartRearm {
-    /// `standing` is fact S — a statement about this pane made before a byte of
-    /// the prompt was written, from a source the deck can vouch for. `false`
-    /// disarms permanently.
+    /// `believed` is fact S — a statement about WHAT OCCUPIES this pane, made
+    /// before a byte of the prompt was written, from a source the deck can vouch
+    /// for. `None` disarms permanently.
     ///
-    /// On the daemon path that is `agent_declared_launcher_handoff ||
-    /// agent_spawned_as_reporting_agent`: a launcher declaration the pane made
-    /// before the write, or the deck's own frozen record of the agent type it
-    /// exec'd. Neither is producer-assertable, which is what keeps a same-user
-    /// process from buying a payload rewrite by posting a `SessionStart` on a
-    /// pane the deck knows nothing about — the refusal `scheduler/dispatch/016`
-    /// pins.
-    pub fn new(standing: bool) -> Self {
+    /// On the daemon path it is
+    /// [`crate::agent_pty::AgentPtyRegistry::pre_write_believed_agent_type`]:
+    /// the deck's own frozen record of the agent type it exec'd, else the
+    /// launcher declaration the pane made before the write.
+    ///
+    /// # The two halves of S are NOT equally strong
+    ///
+    /// * **The deck-spawn half is not producer-assertable.** It reads
+    ///   [`crate::agent_pty::RunningAgent::spawn_agent_type`], the frozen
+    ///   launch-shape identity the SPAWN SITE supplied; the learn-from-hook
+    ///   upgrade (`AgentPtyRegistry::set_agent_type`) deliberately does not touch
+    ///   it and no hook path writes it. A producer cannot manufacture this.
+    /// * **The launcher-handoff half IS producer-assertable, and this is the
+    ///   correction to a claim that was once made here.** It is set from nothing
+    ///   but a received `wrapper_fork`-origin `SessionStart` whose pane and agent
+    ///   ids match ([`crate::state::wait_for_session_start`]); nothing
+    ///   authenticates its producer. What it establishes is that the declaration
+    ///   was **not post hoc** — it was observed before our bytes went out — which
+    ///   is an ORDERING property, not producer authentication. Requiring the
+    ///   post-write declaration to match it therefore closes the MISMATCH hole
+    ///   only; it does not make the belief unforgeable. Forging it is **#543**'s
+    ///   ("Standing is not authentication"), and it buys strictly less than the
+    ///   attach socket's `KIND_STREAM_IN` already grants the same uid: one write,
+    ///   once, carrying the deck's own prompt text rather than bytes of the
+    ///   forger's choosing.
+    ///
+    /// The launcher half cannot be dropped in the name of strength: it is the
+    /// `devbox run claude …`-shaped population issue #666 is actually about,
+    /// whose command does not resolve to an agent type and so has no deck-spawn
+    /// record at all. `scheduler/dispatch/016` case D pins it.
+    pub fn new(believed: Option<AgentType>) -> Self {
         Self {
-            standing,
+            believed_agent_type: believed,
             unbound_at_last_payload_write: false,
             observed_at: None,
             spent: false,
@@ -242,17 +296,36 @@ impl AgentStartRearm {
     /// [`REARM_READINESS_BUFFER`] is measured from the signal rather than from
     /// the caller's polling cadence.
     ///
-    /// `declared` is the [`AgentType`] on the event; it is used ONLY to WITHHOLD
-    /// (issue #424 F4's rule for a declared type), never as proof — proof of
-    /// standing is [`Self::standing`], established before the write.
+    /// `declared` is the [`AgentType`] on the event. It is used ONLY to WITHHOLD
+    /// (issue #424 F4), never as proof: it must AGREE with the belief the deck
+    /// already held ([`Self::believed_agent_type`]), and T is then asked of that
+    /// belief. A declaration that disagrees refuses; a declaration that agrees
+    /// adds nothing the belief did not already carry. See the type-level table
+    /// for the cases this decides.
     pub fn observe_agent_start(&mut self, at: std::time::Instant, declared: &AgentType) {
         if self.spent || self.observed_at.is_some() {
             return;
         }
-        if !self.standing || !self.unbound_at_last_payload_write {
+        if !self.unbound_at_last_payload_write {
             return;
         }
-        if !agent_start_precedes_first_prompt(declared) {
+        // Fact S: no pre-write belief, nothing to agree with, no arming. This is
+        // the refusal `scheduler/dispatch/016` case B pins — a post-write claim
+        // about a pane the deck cannot vouch for.
+        let Some(believed) = self.believed_agent_type.as_ref() else {
+            return;
+        };
+        // Issue #424 F4: withhold on disagreement. The declared type never
+        // upgrades the belief, so a Codex-spawned pane is not armed by an event
+        // claiming Claude (case G/H) and a Claude-spawned pane is not armed by
+        // one claiming Codex (case C).
+        if believed != declared {
+            return;
+        }
+        // Fact T, asked of the BELIEVED type. Identical to asking it of
+        // `declared` at this point — they are equal — and written this way
+        // because the belief is the trusted half of the pair.
+        if !agent_start_precedes_first_prompt(believed) {
             return;
         }
         self.observed_at = Some(at);
@@ -307,7 +380,7 @@ fn blind_payload(attempt: u32) -> bool {
 /// `AgentPtyRegistry::write_and_submit_guarded`). No protocol change is involved.
 pub fn attempt_writes_payload(
     attempt: u32,
-    rearm: AgentStartRearm,
+    rearm: &AgentStartRearm,
     now: std::time::Instant,
 ) -> bool {
     blind_payload(attempt) || rearm.is_available(now)
@@ -321,7 +394,11 @@ pub fn attempt_writes_payload(
 /// because the two are consulted at different instants: the decision is made
 /// before the write, the spend is recorded in the arm that records the attempt.
 /// Both read the same `rearm` and `now`, so they cannot disagree.
-pub fn attempt_spends_rearm(attempt: u32, rearm: AgentStartRearm, now: std::time::Instant) -> bool {
+pub fn attempt_spends_rearm(
+    attempt: u32,
+    rearm: &AgentStartRearm,
+    now: std::time::Instant,
+) -> bool {
     !blind_payload(attempt) && rearm.is_available(now)
 }
 
@@ -993,31 +1070,32 @@ mod tests {
         let now = Instant::now();
         let disarmed = AgentStartRearm::default();
         assert!(
-            attempt_writes_payload(1, disarmed, now),
+            attempt_writes_payload(1, &disarmed, now),
             "attempt 1 IS the delivery's payload"
         );
         assert!(
-            attempt_writes_payload(2, disarmed, now),
+            attempt_writes_payload(2, &disarmed, now),
             "one bounded replacement payload, because /015's launcher consumes the first"
         );
         for attempt in 3..=12 {
             assert!(
-                !attempt_writes_payload(attempt, disarmed, now),
+                !attempt_writes_payload(attempt, &disarmed, now),
                 "attempt {attempt} must probe submit rather than append another copy"
             );
             // ...and a disarmed delivery has nothing to spend at any attempt,
             // so the probe cannot be mistaken for a consumed rearm.
             assert!(
-                !attempt_spends_rearm(attempt, disarmed, now),
+                !attempt_spends_rearm(attempt, &disarmed, now),
                 "attempt {attempt} of a disarmed delivery consumes nothing"
             );
         }
     }
 
-    /// Build the fully-armed rearm of issue #666: pre-write standing, unbound at
-    /// the last payload write, and a qualifying genuine start observed at `t0`.
+    /// Build the fully-armed rearm of issue #666: a pre-write BELIEF about what
+    /// occupies the pane, unbound at the last payload write, and a qualifying
+    /// genuine start observed at `t0` that AGREES with that belief.
     fn armed_at(t0: Instant) -> AgentStartRearm {
-        let mut rearm = AgentStartRearm::new(true);
+        let mut rearm = AgentStartRearm::new(Some(AgentType::ClaudeCode));
         rearm.note_payload_write(true);
         rearm.observe_agent_start(t0, &AgentType::ClaudeCode);
         rearm
@@ -1037,30 +1115,30 @@ mod tests {
         let rearm = armed_at(t0);
 
         assert!(
-            !attempt_writes_payload(3, rearm, t0),
+            !attempt_writes_payload(3, &rearm, t0),
             "a payload written the instant the arming start lands can be flushed by the \
              raw-mode transition that armed it"
         );
         assert!(
-            !attempt_writes_payload(3, rearm, t0 + Duration::from_millis(499)),
+            !attempt_writes_payload(3, &rearm, t0 + Duration::from_millis(499)),
             "REARM_READINESS_BUFFER is 500 ms and it is a floor, not a target"
         );
         assert!(
-            !attempt_spends_rearm(3, rearm, t0 + Duration::from_millis(499)),
+            !attempt_spends_rearm(3, &rearm, t0 + Duration::from_millis(499)),
             "an attempt that fell back to the probe must not consume the arming"
         );
 
         assert!(
-            attempt_writes_payload(3, rearm, t0 + REARM_READINESS_BUFFER),
+            attempt_writes_payload(3, &rearm, t0 + REARM_READINESS_BUFFER),
             "issue #666 alpha: attempts 1 and 2 were destroyed by the launcher and the \
              agent came up afterwards, so attempt 3 carries the payload into a live box"
         );
         assert!(
-            attempt_spends_rearm(3, rearm, t0 + REARM_READINESS_BUFFER),
+            attempt_spends_rearm(3, &rearm, t0 + REARM_READINESS_BUFFER),
             "the armed attempt is the one that must consume the arming"
         );
         assert!(
-            attempt_writes_payload(7, rearm, t0 + Duration::from_secs(30)),
+            attempt_writes_payload(7, &rearm, t0 + Duration::from_secs(30)),
             "the arming is not tied to an attempt NUMBER — a delivery armed late \
              spends it at whatever attempt comes next"
         );
@@ -1080,7 +1158,7 @@ mod tests {
         let t0 = Instant::now();
         let mut rearm = armed_at(t0);
         let armed_now = t0 + REARM_READINESS_BUFFER;
-        assert!(attempt_spends_rearm(3, rearm, armed_now));
+        assert!(attempt_spends_rearm(3, &rearm, armed_now));
 
         rearm.spend();
 
@@ -1088,10 +1166,10 @@ mod tests {
             for extra_secs in [0u64, 1, 30, 3600] {
                 let now = armed_now + Duration::from_secs(extra_secs);
                 assert!(
-                    !attempt_writes_payload(attempt, rearm, now),
+                    !attempt_writes_payload(attempt, &rearm, now),
                     "attempt {attempt} at +{extra_secs}s must probe: the rearm is spent"
                 );
-                assert!(!attempt_spends_rearm(attempt, rearm, now));
+                assert!(!attempt_spends_rearm(attempt, &rearm, now));
             }
         }
 
@@ -1099,7 +1177,7 @@ mod tests {
         rearm.observe_agent_start(armed_now, &AgentType::ClaudeCode);
         assert!(!attempt_writes_payload(
             3,
-            rearm,
+            &rearm,
             armed_now + REARM_READINESS_BUFFER
         ));
     }
@@ -1113,9 +1191,9 @@ mod tests {
         let rearm = armed_at(t0);
         let now = t0 + REARM_READINESS_BUFFER;
         for attempt in [1, 2] {
-            assert!(attempt_writes_payload(attempt, rearm, now));
+            assert!(attempt_writes_payload(attempt, &rearm, now));
             assert!(
-                !attempt_spends_rearm(attempt, rearm, now),
+                !attempt_spends_rearm(attempt, &rearm, now),
                 "attempt {attempt} writes its payload blindly and owes the rearm nothing"
             );
         }
@@ -1135,31 +1213,35 @@ mod tests {
         let t0 = Instant::now();
         let armed_now = t0 + REARM_READINESS_BUFFER;
 
-        // S — the deck vouched for nothing before the write. An unauthenticated
-        // post-write producer claim on a pane the deck cannot vouch for buys
-        // nothing, which is the refusal `scheduler/dispatch/016` case B pins.
-        let mut no_standing = AgentStartRearm::new(false);
+        // S — the deck believed nothing about this pane before the write. An
+        // unauthenticated post-write producer claim on a pane the deck cannot
+        // vouch for buys nothing, which is the refusal `scheduler/dispatch/016`
+        // case B pins.
+        let mut no_standing = AgentStartRearm::new(None);
         no_standing.note_payload_write(true);
         no_standing.observe_agent_start(t0, &AgentType::ClaudeCode);
         assert!(
-            !attempt_writes_payload(3, no_standing, armed_now),
+            !attempt_writes_payload(3, &no_standing, armed_now),
             "S: a pane the deck cannot vouch for may not authorize a payload rewrite"
         );
 
         // U — a conversation had already announced itself when we wrote, so the
         // agent was up and our bytes are sitting in its box. This is the healthy
         // fast path and it must never arm.
-        let mut bound_at_write = AgentStartRearm::new(true);
+        let mut bound_at_write = AgentStartRearm::new(Some(AgentType::ClaudeCode));
         bound_at_write.note_payload_write(false);
         bound_at_write.observe_agent_start(t0, &AgentType::ClaudeCode);
         assert!(
-            !attempt_writes_payload(3, bound_at_write, armed_now),
+            !attempt_writes_payload(3, &bound_at_write, armed_now),
             "U: a delivery whose agent had already announced a conversation when we wrote \
              would be APPENDING, not recovering"
         );
 
         // T — the producer's native start does not precede its first prompt, so a
         // post-write start is a consequence of the prompt we already delivered.
+        // The belief AGREES with the declaration in every one of these, so the
+        // mismatch rule is out of the way and T alone decides: a pane the deck
+        // genuinely spawned as Codex, announcing itself as Codex, still refuses.
         for declared in [
             AgentType::Codex,
             AgentType::OpenCode,
@@ -1167,28 +1249,78 @@ mod tests {
             AgentType::Pi,
             AgentType::None,
         ] {
-            let mut wrong_producer = AgentStartRearm::new(true);
+            let mut wrong_producer = AgentStartRearm::new(Some(declared.clone()));
             wrong_producer.note_payload_write(true);
             wrong_producer.observe_agent_start(t0, &declared);
             assert!(
-                !attempt_writes_payload(3, wrong_producer, armed_now),
+                !attempt_writes_payload(3, &wrong_producer, armed_now),
                 "T: {declared:?}'s post-write start is caused by our own delivery, so arming \
                  on it would write a THIRD copy of a task the agent has already accepted"
             );
         }
 
         // W/I/G, the observation itself — nothing qualifying was ever seen.
-        let mut never_observed = AgentStartRearm::new(true);
+        let mut never_observed = AgentStartRearm::new(Some(AgentType::ClaudeCode));
         never_observed.note_payload_write(true);
         assert!(
-            !attempt_writes_payload(3, never_observed, armed_now),
+            !attempt_writes_payload(3, &never_observed, armed_now),
             "standing and an unbound write are pre-write facts; without post-write \
              evidence they authorize nothing"
         );
 
         // ...and the full conjunction does arm, so the five negatives above are
         // each the ONLY difference.
-        assert!(attempt_writes_payload(3, armed_at(t0), armed_now));
+        assert!(attempt_writes_payload(3, &armed_at(t0), armed_now));
+    }
+
+    /// Issue #666 / #424 F4: a declared `AgentType` may only ever WITHHOLD
+    /// privilege, never GRANT it.
+    ///
+    /// The rearm first shipped with fact S collapsed to a `bool` and T asked of
+    /// the DECLARED type alone, so a pane the deck itself exec'd as Codex was
+    /// armed by an event that merely CLAIMED to be Claude Code — the declaration
+    /// granting a privilege the pane's real occupant does not have.
+    /// `scheduler/dispatch/016` cases G and H are that hole end to end; this is
+    /// the same contract as pure data, including the two directions of it that
+    /// have to hold at once.
+    ///
+    /// Note what is NOT the fix: evaluating T against the trusted type alone.
+    /// That breaks the reciprocal (case C) — a genuinely-Claude pane would arm on
+    /// a Codex-declaring event, because the trusted half says Claude. Both
+    /// directions are refusals, so the rule is the CONJUNCTION: agree, then
+    /// satisfy T.
+    #[test]
+    fn a_declared_type_may_only_withhold_the_rearm_never_grant_it() {
+        let t0 = Instant::now();
+        let armed_now = t0 + REARM_READINESS_BUFFER;
+        let observed = |believed: Option<AgentType>, declared: &AgentType| {
+            let mut rearm = AgentStartRearm::new(believed);
+            rearm.note_payload_write(true);
+            rearm.observe_agent_start(t0, declared);
+            attempt_writes_payload(3, &rearm, armed_now)
+        };
+
+        // G/H: the trusted belief fails T, and a declaration that passes it must
+        // not upgrade the pane. This is the direction that shipped broken.
+        for believed in [AgentType::Codex, AgentType::OpenCode] {
+            assert!(
+                !observed(Some(believed.clone()), &AgentType::ClaudeCode),
+                "a pane the deck spawned as {believed:?} may not be armed by an event                  claiming to be Claude Code: the declared type would be GRANTING privilege"
+            );
+        }
+
+        // C: the reciprocal, and the reason the fix is not "trust the spawn type
+        // and ignore the declaration".
+        assert!(
+            !observed(Some(AgentType::ClaudeCode), &AgentType::Codex),
+            "a Claude Code pane announcing itself as Codex is a disagreement, and a              disagreement refuses in BOTH directions"
+        );
+
+        // A/D: agreement, on a type that satisfies T, is the only thing that arms.
+        assert!(
+            observed(Some(AgentType::ClaudeCode), &AgentType::ClaudeCode),
+            "the belief and the declaration agree on a producer whose start precedes              its first prompt — the one shape #666 recovers"
+        );
     }
 
     /// Issue #666: the evidence must postdate the bytes it is evidence about.
@@ -1201,12 +1333,12 @@ mod tests {
     #[test]
     fn a_start_observed_before_the_newest_payload_write_arms_nothing() {
         let t0 = Instant::now();
-        let mut rearm = AgentStartRearm::new(true);
+        let mut rearm = AgentStartRearm::new(Some(AgentType::ClaudeCode));
         rearm.note_payload_write(true);
         rearm.observe_agent_start(t0, &AgentType::ClaudeCode);
         assert!(attempt_writes_payload(
             3,
-            rearm,
+            &rearm,
             t0 + REARM_READINESS_BUFFER
         ));
 
@@ -1215,7 +1347,7 @@ mod tests {
         rearm.note_payload_write(true);
         for extra_secs in [0u64, 1, 30, 3600] {
             assert!(
-                !attempt_writes_payload(3, rearm, t0 + Duration::from_secs(extra_secs)),
+                !attempt_writes_payload(3, &rearm, t0 + Duration::from_secs(extra_secs)),
                 "an arming observed before the newest payload write must not survive it"
             );
         }

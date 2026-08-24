@@ -2366,11 +2366,20 @@ pub(crate) struct SessionStartWait {
     /// `scheduler/dispatch/015`'s bootstrap launcher declares itself, holds the
     /// gate open until the fallback writes, eats that write, and only then execs
     /// the real agent.
-    pub(crate) launcher_handoff: bool,
+    ///
+    /// Issue #666: the DECLARED TYPE is carried, not just the fact — `Some(ty)`
+    /// is the old `true`. A bare bool cannot answer "does the post-write
+    /// declaration AGREE with what we already believed", and answering that is
+    /// what keeps a declared type from GRANTING privilege (#424 F4). FIRST
+    /// declaration wins, for the same reason: a producer that can post one must
+    /// not be able to walk the belief to whatever it needs matched. See
+    /// [`crate::prompt_delivery::AgentStartRearm`] and
+    /// [`crate::agent_pty::AgentPtyRegistry::pre_write_believed_agent_type`].
+    pub(crate) launcher_handoff: Option<AgentType>,
 }
 
 impl SessionStartWait {
-    fn unready(launcher_handoff: bool) -> Self {
+    fn unready(launcher_handoff: Option<AgentType>) -> Self {
         Self {
             ready: false,
             generation: None,
@@ -2440,7 +2449,7 @@ pub(crate) async fn wait_for_session_start(
     // Issue #424 F4: see [`SessionStartWait::launcher_handoff`]. Carried across
     // every exit from this loop, including the timeout, because the launcher
     // case is exactly the one that times out.
-    let mut launcher_handoff = false;
+    let mut launcher_handoff: Option<AgentType> = None;
     loop {
         let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
             return SessionStartWait::unready(launcher_handoff);
@@ -2457,9 +2466,17 @@ pub(crate) async fn wait_for_session_start(
                         // launcher, so a start arriving after our write is the
                         // ONE authorized successor rather than an unrelated
                         // claim. The declared type can only withhold it.
-                        launcher_handoff |= crate::prompt_delivery::agent_reports_submitted_prompt(
-                            &event.agent_type,
-                        );
+                        // Issue #666: record WHICH type was declared, and keep
+                        // the FIRST one — a later `wrapper_fork` start naming a
+                        // different type must not revise the belief the
+                        // post-write declaration will have to match.
+                        if launcher_handoff.is_none()
+                            && crate::prompt_delivery::agent_reports_submitted_prompt(
+                                &event.agent_type,
+                            )
+                        {
+                            launcher_handoff = Some(event.agent_type.clone());
+                        }
                         tracing::debug!(
                             pane_id,
                             agent_id,
