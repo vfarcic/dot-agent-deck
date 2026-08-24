@@ -86,10 +86,205 @@ const MAX_REPEATED_SUBMISSION_COPIES: u32 = 16;
 ///   bootstrap wrapper reads the bytes itself and the agent that starts behind it
 ///   never sees them — so a delivery that only ever probed submit after attempt 1
 ///   could never deliver in that case at all;
-/// * every attempt after that probes. By then a payload may be sitting unsubmitted
-///   in the agent's input box, and appending the whole prompt again is what
-///   produced the observed `seedseed` accumulation.
+/// * every attempt after that probes BLINDLY. By then a payload may be sitting
+///   unsubmitted in the agent's input box, and appending the whole prompt again
+///   is what produced the observed `seedseed` accumulation;
+/// * issue #666: a delivery that accumulates positive evidence its payload was
+///   DESTROYED may make ONE further payload write beyond this cap
+///   ([`AgentStartRearm`]). That is evidence, not patience — a third BLIND
+///   rewrite is still refused forever, at every attempt number, and the total is
+///   still hard-capped at three.
 const MAX_PAYLOAD_SUBMISSIONS: u32 = 2;
+
+/// Issue #666: whether this producer's native `SessionStart` is emitted BEFORE
+/// it can accept its first prompt — i.e. whether the start is a STARTUP fact or
+/// a TURN fact.
+///
+/// This is NOT [`agent_reports_submitted_prompt`] and must not be collapsed onto
+/// it: Codex and OpenCode both report submitted prompt text (so they arm
+/// retries) while their `SessionStart` arrives only once a prompt has been
+/// accepted, so for them a post-write start is a CONSEQUENCE of our own delivery
+/// rather than evidence the agent booted after it.
+///
+/// * Claude Code — native hook engine, `SessionStart` at session initialization,
+///   before any turn. Measured throughout `scheduler/dispatch/014` and `/015`.
+/// * Codex — codex-cli 0.145.0 posts its native `SessionStart` when the first
+///   TURN starts (#243, measured: T+29.999 s start, T+30.004 s the injected
+///   prompt's own `UserPromptSubmit`).
+/// * OpenCode — `session.created` fires when the prompt is ACCEPTED, ~16 ms
+///   after submission; a 35 s idle cold boot emits nothing (#146).
+/// * Devin — ships a Claude-Code-compatible hooks engine, so it is LIKELY true,
+///   and is answered `false` because nobody has measured it. An unverified
+///   `true` is the unsafe direction: it would authorize re-writing a dispatch
+///   task the agent has already accepted. Flip it when measured, in this one
+///   place.
+/// * Pi — never arms anything ([`ConfirmationCapability::CannotReport`]).
+/// * [`AgentType::None`] — the `#[serde(other)]` forward-compat landing pad; an
+///   unknown producer has proved nothing.
+///
+/// Exhaustive on purpose: a new agent type must answer this rather than inherit
+/// a default. Issue #243 half 2 proposes exactly this predicate as an explicit
+/// `AgentSpec` field; when that lands, this function's body becomes a registry
+/// lookup and its call sites do not move.
+pub fn agent_start_precedes_first_prompt(agent_type: &AgentType) -> bool {
+    match agent_type {
+        AgentType::ClaudeCode => true,
+        AgentType::Codex
+        | AgentType::OpenCode
+        | AgentType::Devin
+        | AgentType::Pi
+        | AgentType::None => false,
+    }
+}
+
+/// Issue #666: how long after the ARMING agent start the armed payload attempt
+/// must wait before it may carry the payload.
+///
+/// The `crate::ui::SPAWN_TIME_READINESS_BUFFER` of the rearm, and for its
+/// reason: a `SessionStart` means a session exists, not that the TUI interprets
+/// `\r` as submit. Without it this fix would reproduce its own bug one level up
+/// — an armed payload written the instant the start lands can be flushed by the
+/// same raw-mode `tcsetattr(TCSAFLUSH)` it is recovering from.
+///
+/// Deliberately a SEPARATE constant from the 10 s-fallback buffer #529 is about:
+/// that one guards a FIRST write against a gate timeout, this one guards an
+/// ARMED rewrite against the start that armed it. They answer different
+/// questions and must not be merged.
+pub const REARM_READINESS_BUFFER: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Issue #666: the ONE extra payload-carrying attempt a delivery may earn, and
+/// all the state the arming decision reads.
+///
+/// # What it is for
+///
+/// The two blind payload writes ([`MAX_PAYLOAD_SUBMISSIONS`]) are written into a
+/// pane whose agent may not exist yet. When a launcher consumes both — it reads
+/// the bytes itself and only then `exec`s the real agent, or the agent's own
+/// raw-mode transition flushes the tty — the delivery has spent every payload it
+/// is allowed and every remaining attempt is a submit-only probe with nothing to
+/// submit. That is issue #666's measured `alpha`: written at 23.5 s and 25.2 s,
+/// probed at 26.2/28.3/32.5/…/70.9 s, abandoned at `attempts=8`.
+///
+/// A *blind* third rewrite stays refused forever — it is what produced the
+/// `seedseed` accumulation of #424/#570. What this type adds is a third write
+/// authorized by EVIDENCE: positive evidence that our bytes are NOT sitting in
+/// the agent's input box.
+///
+/// # The six facts, all necessary
+///
+/// | # | fact | held by |
+/// |---|---|---|
+/// | S | **Standing** — before the write, something the deck can vouch for said what occupies this pane | [`Self::standing`], from the caller |
+/// | U | **Unbound at the write** — the delivery had no bound hook generation when it last wrote its payload | [`Self::unbound_at_last_payload_write`], via [`Self::note_payload_write`] |
+/// | G | **Genuine start** — a `SessionStart` NOT carrying wrapper-fork boot provenance | the caller, before it calls [`Self::observe_agent_start`] |
+/// | I | **Identity** — same pane, exact non-optional `agent_id` match | the caller (already enforced by every observation site) |
+/// | W | **After the write** — strictly after this delivery's ordering watermark / pre-write drain | the caller, plus [`Self::note_payload_write`] clearing stale observations |
+/// | T | **The producer's start precedes its first prompt** | [`agent_start_precedes_first_prompt`] |
+///
+/// G, I and W are the caller's because each delivery path observes producer
+/// evidence through a different substrate (a broadcast receiver in the daemon, a
+/// snapshot journal in the TUI) and each already enforces them at that point.
+/// S, U and T are here, so the conjunction cannot drift between paths.
+///
+/// `Copy` and `Default`-disarmed on purpose: a value that was never given
+/// standing can never arm, so forgetting to thread it is a no-op rather than a
+/// privilege.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AgentStartRearm {
+    /// Fact S. The deck vouched for this pane BEFORE the payload write.
+    standing: bool,
+    /// Fact U, as of the delivery's most recent payload write.
+    unbound_at_last_payload_write: bool,
+    /// Facts G ∧ I ∧ W ∧ T, observed since that write. `None` until then.
+    observed_at: Option<std::time::Instant>,
+    /// The one armed payload attempt has been spent.
+    spent: bool,
+}
+
+impl AgentStartRearm {
+    /// `standing` is fact S — a statement about this pane made before a byte of
+    /// the prompt was written, from a source the deck can vouch for. `false`
+    /// disarms permanently.
+    ///
+    /// On the daemon path that is `agent_declared_launcher_handoff ||
+    /// agent_spawned_as_reporting_agent`: a launcher declaration the pane made
+    /// before the write, or the deck's own frozen record of the agent type it
+    /// exec'd. Neither is producer-assertable, which is what keeps a same-user
+    /// process from buying a payload rewrite by posting a `SessionStart` on a
+    /// pane the deck knows nothing about — the refusal `scheduler/dispatch/016`
+    /// pins.
+    pub fn new(standing: bool) -> Self {
+        Self {
+            standing,
+            unbound_at_last_payload_write: false,
+            observed_at: None,
+            spent: false,
+        }
+    }
+
+    /// Called in the SAME arm that records an attempt, for every PAYLOAD write.
+    ///
+    /// Clears any earlier observation: a start seen BEFORE this write says
+    /// nothing about THIS write's bytes. The evidence must postdate the bytes it
+    /// is evidence about, which is fact W held across writes rather than only
+    /// within one window.
+    pub fn note_payload_write(&mut self, unbound_at_write: bool) {
+        self.unbound_at_last_payload_write = unbound_at_write;
+        self.observed_at = None;
+    }
+
+    /// Called wherever the path already observes post-write producer evidence,
+    /// once per qualifying event.
+    ///
+    /// The caller has already established G ∧ I ∧ W; this adds T and the S ∧ U
+    /// conjunction, and latches the FIRST qualifying instant — `at` is when the
+    /// arming start was OBSERVED, not when the window carrying it expired, so
+    /// [`REARM_READINESS_BUFFER`] is measured from the signal rather than from
+    /// the caller's polling cadence.
+    ///
+    /// `declared` is the [`AgentType`] on the event; it is used ONLY to WITHHOLD
+    /// (issue #424 F4's rule for a declared type), never as proof — proof of
+    /// standing is [`Self::standing`], established before the write.
+    pub fn observe_agent_start(&mut self, at: std::time::Instant, declared: &AgentType) {
+        if self.spent || self.observed_at.is_some() {
+            return;
+        }
+        if !self.standing || !self.unbound_at_last_payload_write {
+            return;
+        }
+        if !agent_start_precedes_first_prompt(declared) {
+            return;
+        }
+        self.observed_at = Some(at);
+    }
+
+    /// Whether the rearm may authorize a payload write at `now` — observed,
+    /// unspent, and [`REARM_READINESS_BUFFER`] elapsed since the arming start.
+    pub fn is_available(&self, now: std::time::Instant) -> bool {
+        !self.spent
+            && self
+                .observed_at
+                .is_some_and(|at| now.saturating_duration_since(at) >= REARM_READINESS_BUFFER)
+    }
+
+    /// Consume it. Called in the same arm that RECORDS the attempt, not where
+    /// the decision is made: a retryable send outcome does not advance the
+    /// attempt counter on the TUI paths, so it must not burn the rearm either.
+    ///
+    /// One-shot by two independent mechanisms — this flag, and the structural
+    /// one: the arming event is a GENUINE `SessionStart`, and a second genuine
+    /// start naming a different generation is already TERMINAL
+    /// (`crate::state::latch_generation`), so a producer trying to replay the
+    /// arming signal ends the delivery instead of re-arming it.
+    pub fn spend(&mut self) {
+        self.spent = true;
+    }
+}
+
+/// Private, so the two public answers below cannot drift.
+fn blind_payload(attempt: u32) -> bool {
+    attempt <= MAX_PAYLOAD_SUBMISSIONS
+}
 
 /// Whether attempt `attempt` (1-based) of a delivery writes the prompt PAYLOAD,
 /// or only probes submission.
@@ -110,8 +305,24 @@ const MAX_PAYLOAD_SUBMISSIONS: u32 = 2;
 /// the encoder emits no bytes and the target receives just the delayed submit CR
 /// ([`crate::pane_input::encode_pane_payload`],
 /// `AgentPtyRegistry::write_and_submit_guarded`). No protocol change is involved.
-pub fn attempt_writes_payload(attempt: u32) -> bool {
-    attempt <= MAX_PAYLOAD_SUBMISSIONS
+pub fn attempt_writes_payload(
+    attempt: u32,
+    rearm: AgentStartRearm,
+    now: std::time::Instant,
+) -> bool {
+    blind_payload(attempt) || rearm.is_available(now)
+}
+
+/// Issue #666: whether this attempt's payload write is the one the REARM
+/// authorized — i.e. whether it must CONSUME it. Never true for the two blind
+/// attempts, so a delivery that confirms normally never spends anything.
+///
+/// Asked separately from [`attempt_writes_payload`] rather than inferred from it
+/// because the two are consulted at different instants: the decision is made
+/// before the write, the spend is recorded in the arm that records the attempt.
+/// Both read the same `rearm` and `now`, so they cannot disagree.
+pub fn attempt_spends_rearm(attempt: u32, rearm: AgentStartRearm, now: std::time::Instant) -> bool {
+    !blind_payload(attempt) && rearm.is_available(now)
 }
 
 /// Truncate `s` to at most `max` BYTES, appending `…` when anything was cut.
@@ -655,6 +866,7 @@ pub fn log_prompt_abandoned(path: &str, pane_id: &str, delivery_id: &str, attemp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn short_prompt_matches_verbatim() {
@@ -770,22 +982,287 @@ mod tests {
     }
 
     /// D5: the retry schedule writes the payload twice and probes thereafter.
+    ///
+    /// Issue #666 restates it against an explicitly DISARMED rearm, which is the
+    /// state every delivery is in unless it earns otherwise. This is the BLIND
+    /// refusal contract — the thing that stops the `seedseed` accumulation of
+    /// #424/#570 — and nothing in #666 softens it: without evidence, attempt 3
+    /// and every attempt after it probes, forever.
     #[test]
     fn only_the_first_two_attempts_write_the_payload() {
+        let now = Instant::now();
+        let disarmed = AgentStartRearm::default();
         assert!(
-            attempt_writes_payload(1),
+            attempt_writes_payload(1, disarmed, now),
             "attempt 1 IS the delivery's payload"
         );
         assert!(
-            attempt_writes_payload(2),
+            attempt_writes_payload(2, disarmed, now),
             "one bounded replacement payload, because /015's launcher consumes the first"
         );
         for attempt in 3..=12 {
             assert!(
-                !attempt_writes_payload(attempt),
+                !attempt_writes_payload(attempt, disarmed, now),
                 "attempt {attempt} must probe submit rather than append another copy"
             );
+            // ...and a disarmed delivery has nothing to spend at any attempt,
+            // so the probe cannot be mistaken for a consumed rearm.
+            assert!(
+                !attempt_spends_rearm(attempt, disarmed, now),
+                "attempt {attempt} of a disarmed delivery consumes nothing"
+            );
         }
+    }
+
+    /// Build the fully-armed rearm of issue #666: pre-write standing, unbound at
+    /// the last payload write, and a qualifying genuine start observed at `t0`.
+    fn armed_at(t0: Instant) -> AgentStartRearm {
+        let mut rearm = AgentStartRearm::new(true);
+        rearm.note_payload_write(true);
+        rearm.observe_agent_start(t0, &AgentType::ClaudeCode);
+        rearm
+    }
+
+    /// Issue #666: the one armed payload attempt, and the buffer in front of it.
+    ///
+    /// The buffer exists for the same reason `SPAWN_TIME_READINESS_BUFFER` does —
+    /// a `SessionStart` means a session exists, not that the TUI interprets `\r`
+    /// as submit — and without it the fix reproduces its own bug one level up: a
+    /// payload written the instant the start lands is flushed by the same
+    /// `tcsetattr(TCSAFLUSH)` it is recovering from. Being early costs nothing:
+    /// the attempt falls back to the ordinary probe and the arming is RETAINED.
+    #[test]
+    fn an_armed_delivery_writes_one_more_payload_once_the_buffer_elapses() {
+        let t0 = Instant::now();
+        let rearm = armed_at(t0);
+
+        assert!(
+            !attempt_writes_payload(3, rearm, t0),
+            "a payload written the instant the arming start lands can be flushed by the \
+             raw-mode transition that armed it"
+        );
+        assert!(
+            !attempt_writes_payload(3, rearm, t0 + Duration::from_millis(499)),
+            "REARM_READINESS_BUFFER is 500 ms and it is a floor, not a target"
+        );
+        assert!(
+            !attempt_spends_rearm(3, rearm, t0 + Duration::from_millis(499)),
+            "an attempt that fell back to the probe must not consume the arming"
+        );
+
+        assert!(
+            attempt_writes_payload(3, rearm, t0 + REARM_READINESS_BUFFER),
+            "issue #666 alpha: attempts 1 and 2 were destroyed by the launcher and the \
+             agent came up afterwards, so attempt 3 carries the payload into a live box"
+        );
+        assert!(
+            attempt_spends_rearm(3, rearm, t0 + REARM_READINESS_BUFFER),
+            "the armed attempt is the one that must consume the arming"
+        );
+        assert!(
+            attempt_writes_payload(7, rearm, t0 + Duration::from_secs(30)),
+            "the arming is not tied to an attempt NUMBER — a delivery armed late \
+             spends it at whatever attempt comes next"
+        );
+    }
+
+    /// Issue #666: ONE payload write per logical delivery may ever be authorized
+    /// by the rearm, so the total is hard-capped at three.
+    ///
+    /// The explicit flag is only half of it — the other half is structural, and
+    /// stronger: the arming event is a GENUINE `SessionStart`, and a second one
+    /// naming a different generation is already terminal
+    /// (`crate::state::latch_generation`), so a producer replaying the arming
+    /// signal ends the delivery rather than re-arming it. `scheduler/dispatch/016`
+    /// case F pins that half.
+    #[test]
+    fn the_armed_payload_attempt_is_one_shot() {
+        let t0 = Instant::now();
+        let mut rearm = armed_at(t0);
+        let armed_now = t0 + REARM_READINESS_BUFFER;
+        assert!(attempt_spends_rearm(3, rearm, armed_now));
+
+        rearm.spend();
+
+        for attempt in 3..=12 {
+            for extra_secs in [0u64, 1, 30, 3600] {
+                let now = armed_now + Duration::from_secs(extra_secs);
+                assert!(
+                    !attempt_writes_payload(attempt, rearm, now),
+                    "attempt {attempt} at +{extra_secs}s must probe: the rearm is spent"
+                );
+                assert!(!attempt_spends_rearm(attempt, rearm, now));
+            }
+        }
+
+        // A spent rearm cannot be re-armed by a later qualifying start either.
+        rearm.observe_agent_start(armed_now, &AgentType::ClaudeCode);
+        assert!(!attempt_writes_payload(
+            3,
+            rearm,
+            armed_now + REARM_READINESS_BUFFER
+        ));
+    }
+
+    /// Issue #666: the two BLIND payload attempts write for their own reasons
+    /// (the delivery itself, and the one bounded replacement), so neither may
+    /// burn the one armed write a delivery might still need.
+    #[test]
+    fn the_two_blind_payload_attempts_never_consume_the_rearm() {
+        let t0 = Instant::now();
+        let rearm = armed_at(t0);
+        let now = t0 + REARM_READINESS_BUFFER;
+        for attempt in [1, 2] {
+            assert!(attempt_writes_payload(attempt, rearm, now));
+            assert!(
+                !attempt_spends_rearm(attempt, rearm, now),
+                "attempt {attempt} writes its payload blindly and owes the rearm nothing"
+            );
+        }
+    }
+
+    /// Issue #666: all six arming facts are necessary — no five of them suffice.
+    ///
+    /// Five are exercised here by flipping exactly one input away from the armed
+    /// case. The sixth, **G** (the start must not carry wrapper-fork boot
+    /// provenance), is a CALLER-side filter by construction: the rearm is handed
+    /// an instant and a declared type, never an event, because each delivery path
+    /// observes producer evidence through a different substrate. It is pinned
+    /// where that filter lives — `crate::spawn`'s
+    /// `a_wrapper_fork_start_is_not_arming_evidence_for_the_rearm`.
+    #[test]
+    fn every_one_of_the_rearm_facts_is_necessary() {
+        let t0 = Instant::now();
+        let armed_now = t0 + REARM_READINESS_BUFFER;
+
+        // S — the deck vouched for nothing before the write. An unauthenticated
+        // post-write producer claim on a pane the deck cannot vouch for buys
+        // nothing, which is the refusal `scheduler/dispatch/016` case B pins.
+        let mut no_standing = AgentStartRearm::new(false);
+        no_standing.note_payload_write(true);
+        no_standing.observe_agent_start(t0, &AgentType::ClaudeCode);
+        assert!(
+            !attempt_writes_payload(3, no_standing, armed_now),
+            "S: a pane the deck cannot vouch for may not authorize a payload rewrite"
+        );
+
+        // U — a conversation had already announced itself when we wrote, so the
+        // agent was up and our bytes are sitting in its box. This is the healthy
+        // fast path and it must never arm.
+        let mut bound_at_write = AgentStartRearm::new(true);
+        bound_at_write.note_payload_write(false);
+        bound_at_write.observe_agent_start(t0, &AgentType::ClaudeCode);
+        assert!(
+            !attempt_writes_payload(3, bound_at_write, armed_now),
+            "U: a delivery whose agent had already announced a conversation when we wrote \
+             would be APPENDING, not recovering"
+        );
+
+        // T — the producer's native start does not precede its first prompt, so a
+        // post-write start is a consequence of the prompt we already delivered.
+        for declared in [
+            AgentType::Codex,
+            AgentType::OpenCode,
+            AgentType::Devin,
+            AgentType::Pi,
+            AgentType::None,
+        ] {
+            let mut wrong_producer = AgentStartRearm::new(true);
+            wrong_producer.note_payload_write(true);
+            wrong_producer.observe_agent_start(t0, &declared);
+            assert!(
+                !attempt_writes_payload(3, wrong_producer, armed_now),
+                "T: {declared:?}'s post-write start is caused by our own delivery, so arming \
+                 on it would write a THIRD copy of a task the agent has already accepted"
+            );
+        }
+
+        // W/I/G, the observation itself — nothing qualifying was ever seen.
+        let mut never_observed = AgentStartRearm::new(true);
+        never_observed.note_payload_write(true);
+        assert!(
+            !attempt_writes_payload(3, never_observed, armed_now),
+            "standing and an unbound write are pre-write facts; without post-write \
+             evidence they authorize nothing"
+        );
+
+        // ...and the full conjunction does arm, so the five negatives above are
+        // each the ONLY difference.
+        assert!(attempt_writes_payload(3, armed_at(t0), armed_now));
+    }
+
+    /// Issue #666: the evidence must postdate the bytes it is evidence about.
+    ///
+    /// A start seen before payload write *N* says nothing about write *N*'s
+    /// bytes, so every payload write clears the observation. Without this, the
+    /// replacement payload (attempt 2) could inherit an arming produced before
+    /// it and immediately authorize a third — a blind third rewrite wearing an
+    /// evidence badge.
+    #[test]
+    fn a_start_observed_before_the_newest_payload_write_arms_nothing() {
+        let t0 = Instant::now();
+        let mut rearm = AgentStartRearm::new(true);
+        rearm.note_payload_write(true);
+        rearm.observe_agent_start(t0, &AgentType::ClaudeCode);
+        assert!(attempt_writes_payload(
+            3,
+            rearm,
+            t0 + REARM_READINESS_BUFFER
+        ));
+
+        // The replacement payload goes out. Whatever that start proved, it did
+        // not prove anything about THESE bytes.
+        rearm.note_payload_write(true);
+        for extra_secs in [0u64, 1, 30, 3600] {
+            assert!(
+                !attempt_writes_payload(3, rearm, t0 + Duration::from_secs(extra_secs)),
+                "an arming observed before the newest payload write must not survive it"
+            );
+        }
+    }
+
+    /// Issue #666, fact T. This is NOT `agent_reports_submitted_prompt` and must
+    /// never be collapsed onto it: Codex and OpenCode both report submitted
+    /// prompt text, so they arm the ordinary retry schedule, while their
+    /// `SessionStart` arrives only once a prompt has been accepted.
+    ///
+    /// The measurements are in the assert messages on purpose — a future
+    /// contributor flipping one of these has to argue with the evidence rather
+    /// than with a taste.
+    #[test]
+    fn only_producers_whose_start_precedes_their_first_prompt_may_arm_a_rewrite() {
+        assert!(
+            agent_start_precedes_first_prompt(&AgentType::ClaudeCode),
+            "Claude Code's native hook engine posts SessionStart at session \
+             initialization, before any turn (measured throughout \
+             scheduler/dispatch/014 and /015)"
+        );
+        assert!(
+            !agent_start_precedes_first_prompt(&AgentType::Codex),
+            "#243, measured on codex-cli 0.145.0: the native SessionStart fires when the \
+             first TURN starts — T+29.999 s start against T+30.004 s for the injected \
+             prompt's own UserPromptSubmit — so a post-write start is CAUSED by our delivery"
+        );
+        assert!(
+            !agent_start_precedes_first_prompt(&AgentType::OpenCode),
+            "#146, measured on 1.18.16: session.created fires when the prompt is ACCEPTED, \
+             ~16 ms after submission, and a 35 s idle cold boot emits nothing at all"
+        );
+        assert!(
+            !agent_start_precedes_first_prompt(&AgentType::Devin),
+            "Devin ships a Claude-Code-compatible hooks engine so this is LIKELY true, and \
+             is answered false because nobody has measured it — an unverified true would \
+             authorize re-writing a dispatch task the agent has already accepted"
+        );
+        assert!(
+            !agent_start_precedes_first_prompt(&AgentType::Pi),
+            "Pi is ConfirmationCapability::CannotReport and arms nothing, ever"
+        );
+        assert!(
+            !agent_start_precedes_first_prompt(&AgentType::None),
+            "the #[serde(other)] forward-compat landing pad: an unknown producer has \
+             proved nothing"
+        );
     }
 
     /// Reviewer finding B4: reporting a lifecycle and reporting submitted

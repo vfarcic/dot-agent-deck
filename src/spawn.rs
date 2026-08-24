@@ -52,9 +52,9 @@ use crate::agent_pty::{
 use crate::event::{AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, EventType};
 use crate::project_config::{ProjectConfig, load_project_config, resolve_orchestration_name};
 use crate::prompt_delivery::{
-    AUTOMATIC_PROMPT_DEADLINE, log_prompt_abandoned, log_prompt_confirmed, log_prompt_stopped,
-    log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written, mint_delivery_id,
-    unconfirmed_retry_delay,
+    AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, log_prompt_abandoned, log_prompt_confirmed,
+    log_prompt_stopped, log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written,
+    mint_delivery_id, unconfirmed_retry_delay,
 };
 use crate::scheduler::{Notifier, NotifyEvent};
 
@@ -1138,6 +1138,10 @@ async fn deliver(
     // design; see `crate::state::SessionStartWait::generation`.
     let mut generation: Option<(String, DateTime<Utc>)> = observed.generation.clone();
     let mut drained_capability = false;
+    // Issue #666: discarded on purpose. A start observed BEFORE the write says
+    // nothing about bytes that do not exist yet, so the pre-write drain feeds the
+    // rearm nothing. See [`crate::prompt_delivery::AgentStartRearm`], fact W.
+    let mut pre_write_agent_start = None;
     if let Some(rx) = event_rx.as_mut()
         && let Some(reason) = drain_pre_write_events(
             rx,
@@ -1145,6 +1149,7 @@ async fn deliver(
             agent_id,
             &mut generation,
             &mut drained_capability,
+            &mut pre_write_agent_start,
         )
     {
         log_prompt_stopped(DELIVERY_LOG_PATH, pane_id, &delivery_id, reason);
@@ -1369,6 +1374,7 @@ fn drain_pre_write_events(
     agent_id: &str,
     generation: &mut Option<(String, DateTime<Utc>)>,
     can_report_prompts: &mut bool,
+    agent_start: &mut Option<(Instant, AgentType)>,
 ) -> Option<&'static str> {
     loop {
         match rx.try_recv() {
@@ -1383,6 +1389,18 @@ fn drain_pre_write_events(
                 }
                 if crate::prompt_delivery::agent_reports_submitted_prompt(&event.agent_type) {
                     *can_report_prompts = true;
+                }
+                // Issue #666, facts G ∧ I ∧ W for the GAP call. Identity is
+                // enforced above; G is the wrapper-fork discriminator; W holds
+                // only because the gap drain runs after a write. The PRE-write
+                // call passes a sink it discards — a pre-write drain is pre-write
+                // by construction, so nothing it sees can be evidence about bytes
+                // that do not exist yet.
+                if agent_start.is_none()
+                    && event.event_type == EventType::SessionStart
+                    && !event.is_wrapper_fork_session_start()
+                {
+                    *agent_start = Some((Instant::now(), event.agent_type.clone()));
                 }
                 if let Some(crate::state::PromptWatch::TargetChanged { reason }) =
                     crate::state::latch_generation(generation, &event)
@@ -1531,6 +1549,17 @@ async fn confirm_prompt_delivery(
     // sitting in a fresh tab having been asked nothing.
     let accepts_late_producer = registry.agent_declared_launcher_handoff(&agent_id)
         || registry.agent_spawned_as_reporting_agent(&agent_id);
+    // Issue #666: the ONE extra payload-carrying attempt this delivery may earn.
+    // Standing is exactly `accepts_late_producer` — the same pre-write fact #424
+    // F4 / #570 already require before a post-write producer claim may arm
+    // anything, reused rather than re-derived so the two cannot drift.
+    //
+    // `generation` is still the PRE-WRITE latch here: `deliver` captures it, runs
+    // the drain, writes attempt 1 and hands it over untouched, and nothing below
+    // has run yet. So `generation.is_none()` IS fact U for the first payload
+    // write, with no separate `ConfirmationTask` field to keep in step with it.
+    let mut rearm = AgentStartRearm::new(accepts_late_producer);
+    rearm.note_payload_write(generation.is_none());
     let mut refused_claim_logged = false;
     loop {
         let remaining = remaining_before(deadline);
@@ -1595,8 +1624,19 @@ async fn confirm_prompt_delivery(
             // spawned a known agent there. See `accepts_late_producer` above.
             // Refusals are logged once, so a delivery that then holds to its
             // deadline is diagnosable rather than mysterious.
-            PromptWatch::Elapsed { can_report_prompts } => {
+            PromptWatch::Elapsed {
+                can_report_prompts,
+                agent_start,
+            } => {
                 armed |= can_report_prompts && accepts_late_producer;
+                // Issue #666: the watch window saw a genuine, identity-matching,
+                // post-write `SessionStart`. That is facts G ∧ I ∧ W; the rearm
+                // adds S (standing, above), U (unbound at the last payload write)
+                // and T (this producer's start precedes its first prompt), and
+                // refuses unless all six hold.
+                if let Some((observed_at, declared)) = agent_start {
+                    rearm.observe_agent_start(observed_at, &declared);
+                }
                 if can_report_prompts && !armed && !refused_claim_logged {
                     refused_claim_logged = true;
                     log_prompt_unconfirmable(
@@ -1670,17 +1710,26 @@ async fn confirm_prompt_delivery(
         // Issue #424 F4: the gap drain's capability observation is post-write
         // too, so it needs the same standing the window's does.
         let mut gap_capability = false;
+        let mut gap_agent_start = None;
         if let Some(reason) = drain_pre_write_events(
             &mut rx,
             &pane_id,
             &agent_id,
             &mut generation,
             &mut gap_capability,
+            &mut gap_agent_start,
         ) {
             log_prompt_stopped(DELIVERY_LOG_PATH, &pane_id, &delivery_id, reason);
             return;
         }
         armed |= gap_capability && accepts_late_producer;
+        // Issue #666: the gap between a window expiring and the write below is
+        // post-write too, so a start landing in it is the same evidence the
+        // window's is. Observed under the same rule rather than waiting a whole
+        // backoff step for the next window to see it.
+        if let Some((observed_at, declared)) = gap_agent_start {
+            rearm.observe_agent_start(observed_at, &declared);
+        }
         log_prompt_unconfirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
         attempt = attempt.saturating_add(1);
         // Issue #424 D5: after the one bounded replacement payload, later
@@ -1689,7 +1738,14 @@ async fn confirm_prompt_delivery(
         // partial-write classification, only an empty payload so the target
         // receives just the delayed submit CR. See
         // [`crate::prompt_delivery::attempt_writes_payload`].
-        let writes_payload = crate::prompt_delivery::attempt_writes_payload(attempt);
+        //
+        // Issue #666: unless this delivery has ARMED — six facts, all of them
+        // pre-write standing or post-write producer evidence, one payload write
+        // per logical delivery, ever. See
+        // [`crate::prompt_delivery::AgentStartRearm`].
+        let now = Instant::now();
+        let writes_payload = crate::prompt_delivery::attempt_writes_payload(attempt, rearm, now);
+        let spends_rearm = crate::prompt_delivery::attempt_spends_rearm(attempt, rearm, now);
         // Issue #424 F1 (auditor HIGH): a probe submits whatever the target is
         // holding, so it is only meaningful while that is still OUR payload. The
         // registry refuses it outright once the user has typed since the last
@@ -1746,17 +1802,36 @@ async fn confirm_prompt_delivery(
             return;
         }
         let payload = if writes_payload { prompt.as_str() } else { "" };
+        // Issue #666, fact U for THIS write: read immediately before the write,
+        // so a generation the watch window latched since the last one is already
+        // reflected. A delivery whose agent had announced a conversation by the
+        // time we wrote had its bytes land in a live input box, and a later start
+        // must not authorize appending to them.
+        let unbound_at_write = generation.is_none();
         match guarded_submit(&registry, &pane_id, &agent_id, payload, deadline).await {
             GuardedOutcome::Written if writes_payload => {
                 // Issue #424 S2: the replacement left a SECOND record of these
                 // bytes on the pane. Take a holder for it here, at the write
                 // that created it, so this delivery releases exactly what it
                 // wrote and leaves nothing behind to refuse a later one.
+                //
+                // Issue #666: the ARMED write takes one too, in this same arm and
+                // for the same reason — it is a payload write like any other, and
+                // omitting it is #547 recreated on a new path (the record would
+                // outlive the task and refuse a later delivery of the same text
+                // until its TTL).
                 payload_records.push(PayloadRecordRelease {
                     registry: &registry,
                     pane_id: &pane_id,
                     prompt: &prompt,
                 });
+                // Issue #666: recorded on the WRITE, not on the decision. This
+                // also clears any observation that armed it — evidence must
+                // postdate the bytes it is evidence about.
+                rearm.note_payload_write(unbound_at_write);
+                if spends_rearm {
+                    rearm.spend();
+                }
                 log_prompt_written(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt)
             }
             GuardedOutcome::Written => crate::prompt_delivery::log_prompt_probe_submitted(
@@ -2814,7 +2889,14 @@ mod tests {
         let mut generation = Some(("original-generation".to_string(), Utc::now()));
         let mut capability = false;
         assert_eq!(
-            drain_pre_write_events(&mut rx, PANE_ID, AGENT_ID, &mut generation, &mut capability),
+            drain_pre_write_events(
+                &mut rx,
+                PANE_ID,
+                AGENT_ID,
+                &mut generation,
+                &mut capability,
+                &mut None,
+            ),
             Some("lagged-event-stream"),
             "dropped frames may have carried the end/start this delivery needed to see"
         );
@@ -2831,10 +2913,95 @@ mod tests {
         let mut generation = Some(("original-generation".to_string(), Utc::now()));
         let mut capability = false;
         assert_eq!(
-            drain_pre_write_events(&mut rx, PANE_ID, AGENT_ID, &mut generation, &mut capability),
+            drain_pre_write_events(
+                &mut rx,
+                PANE_ID,
+                AGENT_ID,
+                &mut generation,
+                &mut capability,
+                &mut None,
+            ),
             None
         );
         assert!(capability, "an identified Claude frame proves the channel");
+    }
+
+    /// Issue #666, fact G: a `wrapper_fork`-origin `SessionStart` is NOT arming
+    /// evidence.
+    ///
+    /// The rearm is handed an instant and a declared type, never an event —
+    /// each delivery path observes producer evidence through a different
+    /// substrate — so G is filtered at the observation site. This pins the
+    /// daemon's gap-drain half of that filter; the watch-window half is pinned
+    /// end to end by `scheduler/dispatch/016` case D, whose pane declares a
+    /// launcher handoff and still needs a genuine start before it may arm.
+    ///
+    /// It matters because a launcher's boot-provenance start is emitted BEFORE
+    /// the agent exists by construction. Reading it as "the agent came up after
+    /// our bytes" would arm a rewrite on the very event that says the opposite.
+    #[test]
+    fn a_wrapper_fork_start_is_not_arming_evidence_for_the_rearm() {
+        const PANE_ID: &str = "rearm-fact-g-pane";
+        const AGENT_ID: &str = "rearm-fact-g-agent";
+
+        let (tx, mut rx) = broadcast::channel(8);
+        let _ = tx.send(BroadcastMsg::Event(typed_prompt_watch_event(
+            PANE_ID,
+            AGENT_ID,
+            "launcher-boot",
+            EventType::SessionStart,
+            AgentType::ClaudeCode,
+            true,
+        )));
+        let mut generation = None;
+        let mut capability = false;
+        let mut agent_start = None;
+        assert_eq!(
+            drain_pre_write_events(
+                &mut rx,
+                PANE_ID,
+                AGENT_ID,
+                &mut generation,
+                &mut capability,
+                &mut agent_start,
+            ),
+            None
+        );
+        assert!(
+            agent_start.is_none(),
+            "boot provenance says the real agent has NOT started; arming on it would \
+             authorize a rewrite on the one event that proves nothing about readiness"
+        );
+        assert!(
+            generation.is_none(),
+            "and it must not bind a generation either — that is the single handoff \
+             `latch_generation` permits"
+        );
+
+        // The genuine start that follows it IS the evidence, and it is the one
+        // the launcher-handoff population (`scheduler/dispatch/016` case D) waits
+        // for.
+        let _ = tx.send(BroadcastMsg::Event(typed_prompt_watch_event(
+            PANE_ID,
+            AGENT_ID,
+            "native-session",
+            EventType::SessionStart,
+            AgentType::ClaudeCode,
+            false,
+        )));
+        assert_eq!(
+            drain_pre_write_events(
+                &mut rx,
+                PANE_ID,
+                AGENT_ID,
+                &mut generation,
+                &mut capability,
+                &mut agent_start,
+            ),
+            None
+        );
+        let (_, declared) = agent_start.expect("a genuine start is arming evidence");
+        assert_eq!(declared, AgentType::ClaudeCode);
     }
 
     /// Scenario: Hold detached spawn prompts in confirmation backoff while their target or evidence disappears, and verify every terminal, cancelled, or unauthenticated-capability watch finishes without stale retry bytes. Then vary deck-spawn standing, launcher-handoff standing, producer type, attempt count, and generation replay around a genuine post-write start: only the two vouched-for Claude cases may carry one additional payload, while controls receive bare submit probes or stop terminally.
