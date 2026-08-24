@@ -3709,8 +3709,41 @@ fn toml_escape(s: &str) -> String {
 /// socket. Connects, writes the line + newline, and drops the
 /// connection. Synthetic-event tests use this to inject events
 /// without going through the `hook` subcommand.
+///
+/// Issue #318: `token` is the capability the daemon minted for the pane the
+/// event names, and it is a REQUIRED argument rather than an optional one on
+/// purpose — every call site now has to say, in code, whether it is speaking for
+/// a pane the daemon manages. Pass `Some(&token)` (fetched with
+/// [`agent_token_on`], or taken from the `StartAgent` reply) for a managed pane;
+/// pass `None` only for a pane the daemon does not manage, which is the
+/// foreign-agent compatibility path and still works exactly as before.
+///
+/// There is deliberately **no bypass** here: the token is injected into the JSON
+/// as the ordinary `agent_token` field, which is precisely what a real hook
+/// script does. A test-only escape hatch in the daemon would make the whole
+/// guard ceremonial.
 #[cfg(unix)]
-pub fn write_hook_line(socket: &Path, json_line: &str) -> std::io::Result<()> {
+pub fn write_hook_line(
+    socket: &Path,
+    json_line: &str,
+    token: Option<&dot_agent_deck::hook_ingest::AgentToken>,
+) -> std::io::Result<()> {
+    let json_line = match token {
+        None => json_line.to_string(),
+        Some(token) => {
+            let mut value: serde_json::Value = serde_json::from_str(json_line.trim_end())
+                .map_err(|e| std::io::Error::other(format!("hook line is not JSON: {e}")))?;
+            let obj = value
+                .as_object_mut()
+                .ok_or_else(|| std::io::Error::other("hook line is not a JSON object"))?;
+            obj.insert(
+                "agent_token".to_string(),
+                serde_json::Value::String(token.as_str().to_string()),
+            );
+            value.to_string()
+        }
+    };
+    let json_line = json_line.as_str();
     let deadline = Instant::now() + Duration::from_secs(5);
     // The daemon binds the hook socket asynchronously after the TUI
     // is up; retry briefly if it is not yet present.
@@ -5887,6 +5920,27 @@ impl DaemonProc {
         cmd.env("DOT_AGENT_DECK_PANE_ID", pane_id);
         if let Some(id) = agent_id {
             cmd.env("DOT_AGENT_DECK_AGENT_ID", id);
+            // Issue #318: model the daemon's spawn-time env injection. A real
+            // `agent-event` runs INSIDE a daemon-spawned pane and therefore
+            // inherits that agent's capability token; `env_clear()` above means
+            // the harness has to put it back, or the daemon refuses the event for
+            // any pane it manages. Looked up through the real
+            // `AttachRequest::GetAgentToken` verb, so this is the production
+            // path and not a harness back door — and silently absent for a
+            // SYNTHETIC agent id the daemon never spawned, which is exactly the
+            // token-less foreign-agent case those tests exercise.
+            if let Ok(resp) = attach_request_on(
+                &self.attach_socket,
+                &dot_agent_deck::daemon_protocol::AttachRequest::GetAgentToken {
+                    id: id.to_string(),
+                },
+            ) && let Some(token) = resp.agent_token
+            {
+                cmd.env(
+                    dot_agent_deck::hook_ingest::DOT_AGENT_DECK_AGENT_TOKEN,
+                    token.as_str(),
+                );
+            }
         }
         cmd.output()
             .expect("run `dot-agent-deck agent-event` subprocess")
@@ -6239,6 +6293,44 @@ fn attach_json_request_on(
     let mut body = vec![0u8; len];
     stream.read_exact(&mut body)?;
     serde_json::from_slice(&body).map_err(std::io::Error::other)
+}
+
+/// Issue #318: fetch an agent's hook capability token over the attach socket.
+///
+/// The legitimate way for a test to speak for a pane the DECK spawned (a fixture
+/// role pane, a scheduled pane) rather than one the test started itself. Goes
+/// through the real `AttachRequest::GetAgentToken` verb — the same one any
+/// attach peer would use — so nothing here is a test-only path into the daemon.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn agent_token_on(socket: &Path, agent_id: &str) -> dot_agent_deck::hook_ingest::AgentToken {
+    let resp = attach_request_on(
+        socket,
+        &dot_agent_deck::daemon_protocol::AttachRequest::GetAgentToken {
+            id: agent_id.to_string(),
+        },
+    )
+    .unwrap_or_else(|e| panic!("get-agent-token for agent {agent_id}: {e}"));
+    resp.agent_token.unwrap_or_else(|| {
+        panic!(
+            "daemon returned no capability token for agent {agent_id}: ok={} error={:?}",
+            resp.ok, resp.error
+        )
+    })
+}
+
+/// Issue #318: the capability token of the agent occupying `pane_id`.
+///
+/// Convenience over [`agent_token_on`] for the common shape — a test that knows
+/// the pane it wants to speak for and has to find the agent id first.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn pane_token_on(socket: &Path, pane_id: &str) -> dot_agent_deck::hook_ingest::AgentToken {
+    let record = agent_records_on(socket)
+        .into_iter()
+        .find(|r| r.pane_id_env.as_deref() == Some(pane_id))
+        .unwrap_or_else(|| panic!("no daemon-managed agent holds pane {pane_id}"));
+    agent_token_on(socket, &record.id)
 }
 
 /// Snapshot a daemon's live agent registry via `ListAgents` over `socket`.

@@ -546,6 +546,15 @@ pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 1;
 ///   omitted from the wire) is read as the baseline (v1) schema. This is the
 ///   **event-record** schema version, NOT the attach-wire
 ///   [`crate::daemon_protocol::PROTOCOL_VERSION`].
+/// - **`agent_token`** · string · optional (**issue #318**, added additively;
+///   omitted/`null` ⇒ `None`) · the sender's per-agent hook capability token.
+///   Producers: every `dot-agent-deck` CLI that emits an event from inside a
+///   daemon-spawned pane (`hook`, `agent-event`, `wrap`), which reads it from
+///   `DOT_AGENT_DECK_AGENT_TOKEN`. The daemon resolves it to its own
+///   `(pane_id, agent_id)`, overwrites those fields with what it resolved, and
+///   strips the token — it is never re-emitted, broadcast or persisted. An
+///   event with no token (or an unrecognized one) is refused when it names a
+///   pane the daemon manages, and accepted as a foreign card when it does not.
 /// - **`live_target`** · object (`{ "kind": <TargetKind>, "writable":
 ///   <Writable> }`, both kebab-case) · optional (**PRD #20 M3**, added
 ///   additively; omitted/`null` ⇒ `None`) · declares whether/how the session
@@ -619,6 +628,27 @@ pub struct AgentEvent {
     /// it `None`, which the UI reads as the historical live/writable default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_target: Option<LiveTarget>,
+    /// Issue #318: the sender's per-agent hook capability token — the daemon's
+    /// own proof of *which pane and agent* this event may speak for.
+    ///
+    /// Minted from the OS CSPRNG at spawn, injected into the child as
+    /// [`crate::hook_ingest::DOT_AGENT_DECK_AGENT_TOKEN`], and read back off the
+    /// environment by the `hook` / `agent-event` CLIs and by
+    /// [`crate::wrap`]. At ingest the daemon resolves it to its OWN
+    /// `(pane_id, agent_id)` and **overwrites** the two fields above with what
+    /// it resolved — the claim on the wire is never trusted, only the token is
+    /// (see [`crate::hook_ingest::admit`]). The field is then STRIPPED, so it
+    /// never reaches the attach-socket broadcast, `AppState`, or any persisted
+    /// record.
+    ///
+    /// Optional and additive for the same reasons as `agent_version` /
+    /// `schema_version`: `#[serde(default)]` lets a payload from an older
+    /// producer decode to `None`, and `skip_serializing_if` keeps it off the
+    /// wire when unset, so a producer that has no token emits byte-identical
+    /// JSON. `None` means "no capability claimed", which is accepted for a pane
+    /// this daemon does not manage and refused for one it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_token: Option<crate::hook_ingest::AgentToken>,
 }
 
 impl AgentEvent {
@@ -1067,6 +1097,7 @@ mod tests {
             agent_version: Some("codex-1.2.3".into()),
             schema_version: Some(AGENT_EVENT_SCHEMA_VERSION),
             live_target: None,
+            agent_token: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         // Both fields must appear on the wire when set…
@@ -1101,6 +1132,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(

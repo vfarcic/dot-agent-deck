@@ -1040,6 +1040,17 @@ fn main() -> ExitCode {
             // Optional — the daemon injects this on spawn (same pattern as the
             // hook path); a pane spawned before agent-id tagging has none.
             let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID).ok();
+            // Issue #318: the capability token the daemon injected at spawn.
+            // Optional for the same reason `agent_id` is — a pane spawned by a
+            // daemon that predates the token has none — but without it an event
+            // naming a pane the daemon MANAGES is now refused, which is exactly
+            // the forged `DOT_AGENT_DECK_PANE_ID=<someone-elses-pane>` case this
+            // issue exists to close.
+            let agent_token =
+                std::env::var(dot_agent_deck::hook_ingest::DOT_AGENT_DECK_AGENT_TOKEN)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(dot_agent_deck::hook_ingest::AgentToken::from_wire);
             let event_type = match dot_agent_deck::event::agent_event_type_from_state(&r#type) {
                 Some(et) => et,
                 None => {
@@ -1075,6 +1086,7 @@ fn main() -> ExitCode {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                agent_token,
             };
             let json = match serde_json::to_string(&event) {
                 Ok(j) => j,

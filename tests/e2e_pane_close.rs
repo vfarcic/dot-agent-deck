@@ -7,6 +7,7 @@ mod common;
 use std::time::Duration;
 
 use common::{TuiDeck, write_hook_line};
+use dot_agent_deck::daemon_protocol::AttachRequest;
 use spec::spec;
 
 /// Scenario: Launch a dashboard with one live card, return from PaneInput to command mode, press Ctrl+W, then move from default Cancel to Close and confirm. The modal must appear before teardown, and the card plus daemon agent record must disappear only after confirmation.
@@ -191,7 +192,7 @@ fn close_confirm_004_pre_render_mouse_burst_cannot_confirm() {
     deck.wait_for_string("No active sessions");
 }
 
-/// Scenario: Arm a real dashboard card's close confirmation, then deliver a SessionStart for a different agent on the same pane so the armed session identity is replaced before confirmation. Down+Enter must close nothing, retain the live daemon agent/card, and surface that the armed target is gone rather than retargeting the replacement.
+/// Scenario: Arm a real dashboard card's close confirmation, then genuinely replace the pane's agent — stop it and start a fresh one on the same pane id — and deliver the replacement's own SessionStart so the armed session identity is superseded before confirmation. Down+Enter must close nothing, retain the live daemon agent/card, and surface that the armed target is gone rather than retargeting the replacement.
 #[spec("prompt/close-confirm/005")]
 #[test]
 fn close_confirm_005_vanished_armed_session_closes_nothing() {
@@ -209,20 +210,70 @@ fn close_confirm_005_vanished_armed_session_closes_nothing() {
         .expect("continued pane must have a daemon AgentRecord");
     let pane_id = record
         .pane_id_env
-        .as_deref()
+        .clone()
         .expect("continued pane must retain its stable pane id");
     deck.send_keys(b"\x17");
     deck.wait_for_string("Close selected pane?");
+
+    // Issue #318: the generation change this test needs used to be FORGED — a
+    // synthetic `SessionStart` naming an `agent_id` nobody had ever spawned.
+    // That is precisely what the provenance binding now refuses: the daemon
+    // derives `(pane_id, agent_id)` from the sender's capability token and
+    // ignores what the payload claims, so an event can no longer assert a
+    // generation it is not. The replacement is therefore a REAL one — the pane's
+    // agent is stopped and a fresh one started on the same pane id, which is what
+    // a `clear = true` delegate respawn does in production — and the supersession
+    // is announced by that new agent's own token.
+    let stopped = common::attach_request_on(
+        deck.attach_socket_path(),
+        &AttachRequest::StopAgent {
+            id: record.id.clone(),
+        },
+    )
+    .expect("stop the armed pane's agent over the attach socket");
+    assert!(
+        stopped.error.is_none(),
+        "StopAgent should succeed, got error: {:?}",
+        stopped.error
+    );
+    let restarted = common::attach_request_on(
+        deck.attach_socket_path(),
+        &AttachRequest::StartAgent {
+            command: Some("cat".into()),
+            cwd: None,
+            rows: 24,
+            cols: 80,
+            env: vec![("DOT_AGENT_DECK_PANE_ID".into(), pane_id.clone())],
+            display_name: Some("vanish-target".into()),
+            tab_membership: None,
+            agent_type: None,
+            seed: None,
+        },
+    )
+    .expect("start the replacement agent on the same pane over the attach socket");
+    assert!(
+        restarted.error.is_none(),
+        "StartAgent should succeed, got error: {:?}",
+        restarted.error
+    );
+    let token = restarted
+        .agent_token
+        .clone()
+        .expect("StartAgent must return the replacement agent's hook capability token");
+
     let replacement = serde_json::json!({
         "session_id": "replacement-generation",
         "agent_type": "claude_code",
         "event_type": "session_start",
         "timestamp": "2026-07-29T12:00:00Z",
         "pane_id": pane_id,
-        "agent_id": "replacement-agent-id",
     });
-    write_hook_line(deck.hook_socket_path(), &replacement.to_string())
-        .expect("write replacement SessionStart hook");
+    write_hook_line(
+        deck.hook_socket_path(),
+        &replacement.to_string(),
+        Some(&token),
+    )
+    .expect("write replacement SessionStart hook");
     deck.wait_for_string("ClaudeCode");
 
     deck.send_keys(b"\x1b[B");

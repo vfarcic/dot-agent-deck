@@ -190,11 +190,18 @@ fn live_002_focusing_scheduled_card_does_not_delete_it() {
     // same hook. The resulting card is backed by a LIVE daemon agent but NOT by
     // a local TUI pane — the precise orphan-card condition of the bug.
     let records = common::agent_records_on(deck.attach_socket_path());
-    let pane_id = records
+    let record = records
         .iter()
         .find(|r| r.display_name.as_deref() == Some("schedfocus"))
-        .and_then(|r| r.pane_id_env.clone())
+        .expect("the scheduler-spawned agent must be registered under its friendly name");
+    let pane_id = record
+        .pane_id_env
+        .clone()
         .expect("scheduler-spawned agent must carry a DOT_AGENT_DECK_PANE_ID for hook routing");
+    // Issue #318: the pane is daemon-managed, so reproducing the real agent's
+    // hook faithfully now also means carrying the capability token the daemon
+    // injected into that agent's environment.
+    let token = common::agent_token_on(deck.attach_socket_path(), &record.id);
 
     let event = serde_json::json!({
         "session_id": "schedfocus",
@@ -204,7 +211,7 @@ fn live_002_focusing_scheduled_card_does_not_delete_it() {
         "pane_id": pane_id,
         "cwd": work.to_string_lossy(),
     });
-    common::write_hook_line(deck.hook_socket_path(), &event.to_string())
+    common::write_hook_line(deck.hook_socket_path(), &event.to_string(), Some(&token))
         .expect("write SessionStart hook to the deck's hook socket");
 
     // The hook event reaches the attached TUI over the existing event stream, so
@@ -408,6 +415,9 @@ fn live_004_real_hook_supersession_keeps_friendly_title() {
         .clone()
         .expect("scheduler-spawned agent must carry a DOT_AGENT_DECK_PANE_ID for hook routing");
     let agent_id = record.id.clone();
+    // Issue #318: the daemon-managed pane's capability token, the same one the
+    // real agent's hook would carry out of its environment.
+    let token = common::agent_token_on(deck.attach_socket_path(), &agent_id);
 
     // A real hook-emitting agent's `SessionStart` carries a Some(agent_id)
     // distinct from the synthetic placeholder's None, and NO display_name
@@ -428,7 +438,7 @@ fn live_004_real_hook_supersession_keeps_friendly_title() {
         // NOTE: no `metadata` key → the real hook carries NO display_name (only
         // the daemon's synthetic live-surface SessionStart sets that).
     });
-    common::write_hook_line(deck.hook_socket_path(), &event.to_string())
+    common::write_hook_line(deck.hook_socket_path(), &event.to_string(), Some(&token))
         .expect("write the agent's real SessionStart hook to the deck's hook socket");
 
     // Sync on the supersession landing: the placeholder ("No agent") is replaced

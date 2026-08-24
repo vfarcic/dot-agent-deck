@@ -121,6 +121,11 @@ windows-sys = { version = "0.61", features = [
     # segment from the process token's SID (the non-colliding uid analogue).
     # Also where `SetNamedSecurityInfo` lives for the M4 dir ACLs.
     "Win32_Security_Authorization",
+    # Issue #318: `BCryptGenRandom` — the OS CSPRNG behind
+    # `platform::csprng::fill_random`, which mints the per-agent hook capability
+    # token. Deliberately a feature on a crate that is already here rather than a
+    # new `rand`/`getrandom` dependency for one call site.
+    "Win32_Security_Cryptography",
     "Win32_System_JobObjects",
     # PRD #163 M3: `GenerateConsoleCtrlEvent`/`CTRL_BREAK_EVENT`, the best-effort
     # `killpg(SIGTERM)` stand-in `platform::proc` sends an agent's process group

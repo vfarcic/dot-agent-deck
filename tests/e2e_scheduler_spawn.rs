@@ -330,7 +330,10 @@ fn spawn_005_delivery_gated_on_session_start() {
         "agent_id": agent_id,
         "cwd": work.to_string_lossy(),
     });
-    common::write_hook_line(&daemon.hook_socket, &event.to_string())
+    // Issue #318: the scheduler-spawned pane is daemon-managed, so reproducing
+    // the real agent's hook means carrying its capability token too.
+    let token = common::agent_token_on(&daemon.attach_socket, &agent_id);
+    common::write_hook_line(&daemon.hook_socket, &event.to_string(), Some(&token))
         .expect("write SessionStart hook to the daemon's hook socket");
 
     // GREEN signal: once the SessionStart lands, the gate releases and the prompt

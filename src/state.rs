@@ -3810,6 +3810,7 @@ fn live_target_carrier_event(session: &SessionState, live_target: LiveTarget) ->
         agent_version: None,
         schema_version: None,
         live_target: Some(live_target),
+        agent_token: None,
     }
 }
 
@@ -5948,6 +5949,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                agent_token: None,
             }
         }
 
@@ -6035,6 +6037,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                agent_token: None,
             }
         }
 
@@ -6055,6 +6058,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         });
 
         // Even a report naming a DIFFERENT (stale) generation with a fresher
@@ -6114,6 +6118,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                agent_token: None,
             }
         }
         fn launcher(session: &str, secs: i64) -> AgentEvent {
@@ -7741,6 +7746,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                agent_token: None,
             }
         }
         for no_proof in [
@@ -7801,6 +7807,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                agent_token: None,
             }
         }
 
@@ -8271,6 +8278,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         }
     }
 
@@ -8663,6 +8671,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         }
     }
 

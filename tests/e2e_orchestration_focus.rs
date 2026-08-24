@@ -132,9 +132,15 @@ fn inject_role_status(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        agent_token: None,
     };
     let line = serde_json::to_string(&event).expect("serialize synthetic AgentEvent");
-    common::write_hook_line(deck.hook_socket_path(), &line)
+    // Issue #318: the role pane is daemon-managed, so the synthetic event has to
+    // carry the capability token the daemon injected into that role's agent —
+    // fetched over the attach socket, the legitimate route for a peer that means
+    // to speak for a pane the deck spawned.
+    let token = common::agent_token_on(socket, agent_id);
+    common::write_hook_line(deck.hook_socket_path(), &line, Some(&token))
         .expect("inject synthetic AgentEvent over hook socket");
 
     let applied = common::wait_until(Duration::from_secs(10), || {

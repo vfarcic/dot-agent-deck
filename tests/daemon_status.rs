@@ -67,6 +67,7 @@ fn thinking_event(pane_id: &str, agent_id: &str, user_prompt: Option<&str>) -> A
         agent_version: None,
         schema_version: None,
         live_target: None,
+        agent_token: None,
     }
 }
 
@@ -187,6 +188,10 @@ async fn run_agent_event_cli(
     cwd: &Path,
 ) -> AgentEvent {
     let mut events = daemon.event_tx.subscribe();
+    let token = daemon
+        .registry
+        .agent_hook_token(agent_id)
+        .expect("the daemon must hold a capability token for the agent it spawned");
     let hook_path = daemon.hook_path.clone();
     let pane_id_owned = pane_id.to_string();
     let agent_id_owned = agent_id.to_string();
@@ -202,6 +207,15 @@ async fn run_agent_event_cli(
             .env("DOT_AGENT_DECK_SOCKET", &hook_path)
             .env(DOT_AGENT_DECK_PANE_ID, &pane_id_owned)
             .env(DOT_AGENT_DECK_AGENT_ID, &agent_id_owned)
+            // Issue #318: the daemon injects the capability token into every
+            // agent it spawns, so a CLI running inside a managed pane inherits
+            // it. `env_clear()` above means the harness has to model that
+            // injection explicitly — without it the daemon refuses the event,
+            // exactly as it would for a forged `DOT_AGENT_DECK_PANE_ID`.
+            .env(
+                dot_agent_deck::hook_ingest::DOT_AGENT_DECK_AGENT_TOKEN,
+                token.as_str(),
+            )
             .output()
             .expect("run the real `dot-agent-deck agent-event --type running` CLI")
     })
@@ -282,10 +296,14 @@ async fn daemon_status_001_reports_live_agent_status_inner() {
         })
         .expect("spawn control worker stub");
 
+    // Issue #318: both stubs are daemon-managed panes, so a synthetic hook for
+    // one now has to carry that agent's capability token. In-process tests can
+    // read it straight off the registry that minted it.
     common::write_hook_line(
         &daemon.hook_path,
         &serde_json::to_string(&thinking_event(DRIVEN_PANE, &driven_agent_id, None))
             .expect("serialize driven Thinking event"),
+        daemon.registry.agent_hook_token(&driven_agent_id).as_ref(),
     )
     .expect("write driven Thinking event");
     wait_for_live_session(
@@ -398,6 +416,7 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
     common::write_hook_line(
         &daemon.hook_path,
         &serde_json::to_string(&tool_event).expect("serialize populated schema-row ToolStart"),
+        daemon.registry.agent_hook_token(&agent_id).as_ref(),
     )
     .expect("write populated schema-row ToolStart to the daemon hook socket");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -630,6 +649,7 @@ async fn daemon_status_004_outputs_never_leak_prompt_or_tool_detail_inner() {
     common::write_hook_line(
         &daemon.hook_path,
         &serde_json::to_string(&event).expect("serialize sentinel-carrying ToolStart event"),
+        daemon.registry.agent_hook_token(&agent_id).as_ref(),
     )
     .expect("write sentinel-carrying ToolStart event");
     wait_for_live_session(&daemon, LEAK_PANE, &agent_id, Duration::from_secs(5)).await;

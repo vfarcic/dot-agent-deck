@@ -2076,6 +2076,7 @@ fn surface_spawned_pane(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        agent_token: None,
     };
     let _ = event_tx.send(BroadcastMsg::Event(event));
 }
@@ -2445,6 +2446,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         }
     }
 

@@ -361,9 +361,12 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
 
     let session_start_at = Instant::now();
     let event = session_start_event(AgentType::None, WORKER_PANE, &new_agent_id, false);
+    // Issue #318: `WORKER_PANE` is daemon-managed, so the synthetic readiness
+    // hook carries the replacement generation's capability token.
     common::write_hook_line(
         &daemon.hook_path,
         &serde_json::to_string(&event).expect("serialize slow-stub SessionStart"),
+        daemon.registry.agent_hook_token(&new_agent_id).as_ref(),
     )
     .expect("write slow-stub SessionStart");
     let cat_ready = wait_for_snapshot_needle(
@@ -470,6 +473,7 @@ fn session_start_event(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        agent_token: None,
     }
 }
 
@@ -696,6 +700,7 @@ async fn delegate_007_wrapper_fork_start_does_not_release_native_hook_agent_inne
     common::write_hook_line(
         &daemon.hook_path,
         &serde_json::to_string(&native).expect("serialize native Codex SessionStart"),
+        daemon.registry.agent_hook_token(&new_agent_id).as_ref(),
     )
     .expect("write native Codex SessionStart");
     let after_native = wait_for_snapshot_needle(
@@ -855,6 +860,7 @@ async fn delegate_010_observed_session_start_waits_for_readiness_buffer_inner() 
     common::write_hook_line(
         &daemon.hook_path,
         &serde_json::to_string(&event).expect("serialize matching SessionStart"),
+        daemon.registry.agent_hook_token(&new_agent_id).as_ref(),
     )
     .expect("write matching SessionStart");
     tokio::time::sleep(Duration::from_millis(350)).await;

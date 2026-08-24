@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, broadcast};
 use tracing::{debug, error, info, warn};
 
@@ -1247,6 +1247,7 @@ fn install_delivery_notice_sink(
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                agent_token: None,
             };
             let _ = event_tx.send(BroadcastMsg::Event(event.clone()));
             guard.apply_daemon_report_event(event);
@@ -1689,6 +1690,7 @@ async fn run_shell_activity_monitor_with<S, F>(
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                agent_token: None,
             };
 
             // One ordered ingestion step (broadcast + apply under a single
@@ -1707,6 +1709,17 @@ async fn run_hook_loop(
     shutdown: Arc<Notify>,
     worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
 ) -> Result<(), DaemonError> {
+    // Issue #319: bound how many accepted hook connections may be in flight at
+    // once. A permit is acquired with `try_acquire_owned` BEFORE the
+    // per-connection task is spawned, and an excess connection is dropped —
+    // which closes it — instead of being queued: the accept loop has to stay
+    // responsive, and queueing a connection flood is the same unbounded state
+    // the cap exists to prevent, just deferred. The permit rides the spawned
+    // task and is released when it ends, so a peer that closes its connection
+    // frees a slot immediately.
+    let connections = Arc::new(tokio::sync::Semaphore::new(
+        crate::hook_ingest::MAX_HOOK_CONNECTIONS,
+    ));
     loop {
         tokio::select! {
             // PRD #93 M1.2: a notified shutdown wins over a fresh `accept` —
@@ -1725,21 +1738,57 @@ async fn run_hook_loop(
             }
             accept_res = listener.accept() => match accept_res {
             Ok(stream) => {
+                let permit = match connections.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        // Dropping `stream` closes it. Logged at `warn` because
+                        // reaching this at all means either a genuine flood or a
+                        // leak of long-lived connections, and both are worth
+                        // seeing in a post-mortem; the daemon keeps serving every
+                        // connection already inside the cap.
+                        warn!(
+                            cap = crate::hook_ingest::MAX_HOOK_CONNECTIONS,
+                            "hook socket at its concurrent-connection cap — closing the excess \
+                             connection"
+                        );
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let state = state.clone();
                 let event_tx = event_tx.clone();
                 let pty_registry = pty_registry.clone();
                 let worktree_registry = worktree_registry.clone();
                 tokio::spawn(async move {
+                    // Held for the life of this connection; dropped with the
+                    // task, which is what returns the slot to the cap.
+                    let _permit = permit;
                     // PRD #201: split so the read-only `get-seed` verb can write
                     // a reply back on the same connection. Every other message
                     // on this socket is fire-and-forget, so the write half is
                     // only ever used by the `GetSeed` arm below.
                     let (read_half, mut write_half) = tokio::io::split(stream);
-                    let reader = tokio::io::BufReader::new(read_half);
-                    let mut lines = reader.lines();
+                    // Issue #319: `BufReader::lines()` accumulated a newline-free
+                    // payload without limit, so a peer that wrote bytes and never
+                    // a `\n` grew daemon memory until the process died. The
+                    // bounded reader closes the connection at
+                    // `MAX_HOOK_LINE_BYTES` instead — and refuses the line WHOLE
+                    // rather than truncating and parsing the prefix, which would
+                    // let a peer smuggle a short valid event in behind megabytes
+                    // of padding.
+                    let mut lines = crate::hook_ingest::BoundedLines::new(read_half);
 
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        if let Ok(msg) = serde_json::from_str::<DaemonMessage>(&line) {
+                    loop {
+                        let line = match lines.next_line().await {
+                            Ok(Some(line)) => line,
+                            Ok(None) => break,
+                            Err(e) => {
+                                warn!(error = %e, "closing hook connection");
+                                break;
+                            }
+                        };
+                        let line = line.as_str();
+                        if let Ok(msg) = serde_json::from_str::<DaemonMessage>(line) {
                             match msg {
                                 DaemonMessage::Delegate(signal) => {
                                     info!(
@@ -1935,7 +1984,42 @@ async fn run_hook_loop(
                                     }
                                 }
                             }
-                        } else if let Ok(event) = serde_json::from_str::<AgentEvent>(&line) {
+                        } else if let Ok(mut event) = serde_json::from_str::<AgentEvent>(line) {
+                            // Issue #318, and it runs BEFORE anything else looks
+                            // at the event — before the log line, before the
+                            // registry's agent-type learning, before the
+                            // broadcast. `admit` strips the capability token from
+                            // the event whatever the verdict, and on success
+                            // REPLACES the claimed `pane_id`/`agent_id` with the
+                            // pair the daemon itself minted the token for. It
+                            // derives rather than compares: a valid token for pane
+                            // A on an event naming pane B binds to A, so B is
+                            // never driven by it.
+                            match crate::hook_ingest::admit(&*pty_registry, &mut event) {
+                                crate::hook_ingest::Provenance::Refused(reason) => {
+                                    // The forged-`DOT_AGENT_DECK_PANE_ID` case.
+                                    // Named in the log because the alternative —
+                                    // an event that simply does nothing — is
+                                    // indistinguishable from a hook that never
+                                    // fired, and that is a long afternoon.
+                                    warn!(
+                                        session_id = %event.session_id,
+                                        pane_id = ?event.pane_id,
+                                        event_type = ?event.event_type,
+                                        reason = %reason,
+                                        "Refused a hook event naming a pane this daemon manages: \
+                                         the sender holds no capability token for it. A hook \
+                                         running inside a deck pane inherits \
+                                         DOT_AGENT_DECK_AGENT_TOKEN automatically; an agent \
+                                         spawned by an older daemon has none and must be \
+                                         restarted"
+                                    );
+                                    continue;
+                                }
+                                crate::hook_ingest::Provenance::Foreign
+                                | crate::hook_ingest::Provenance::Bound(_) => {}
+                            }
+                            let event = event;
                             // `tool_name`/`tool_detail` are logged so a post-mortem can
                             // name the command an agent was running, not just that it ran
                             // one. Four "fleet death" investigations (2026-07-28 23:05,
@@ -2159,6 +2243,7 @@ mod hook_ingestion_tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                agent_token: None,
             }))
             .expect("surface broadcast-only card");
         let BroadcastMsg::Event(surface) = attached_rx.recv().await.expect("surface event") else {
@@ -2225,7 +2310,7 @@ mod hook_ingestion_tests {
     #[tokio::test]
     async fn run_hook_loop_persists_agent_type_into_registry() {
         let registry = Arc::new(AgentPtyRegistry::new());
-        registry
+        let agent_id = registry
             .spawn_agent(SpawnOptions {
                 command: Some("/bin/sh"),
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-it".to_string())],
@@ -2233,6 +2318,13 @@ mod hook_ingestion_tests {
                 ..SpawnOptions::default()
             })
             .expect("spawn shell agent");
+        // Issue #318: `pane-it` is a pane this registry manages, so the
+        // synthetic hook below has to carry the capability token the daemon
+        // injected into that agent's environment — exactly as the agent's own
+        // hook script would.
+        let token = registry
+            .agent_hook_token(&agent_id)
+            .expect("the registry must hold a capability token for the agent it spawned");
         // Spawn-time guess is None — the bug's starting state.
         assert_eq!(registry.agent_records()[0].agent_type, None);
 
@@ -2272,6 +2364,7 @@ mod hook_ingestion_tests {
             "event_type": "session_start",
             "timestamp": "2026-06-20T12:00:00Z",
             "pane_id": "pane-it",
+            "agent_token": token.as_str(),
         });
         let mut stream = UnixStream::connect(&sock)
             .await
@@ -2368,6 +2461,7 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         });
         assert_eq!(
             state.read().await.sessions["sess-370"].status,
@@ -2497,6 +2591,7 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         };
 
         // Generation 1, then the same-agent restart that rolls the generation
@@ -2691,6 +2786,7 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         };
         // `SessionStart` creates the card (and the `pane_hook_session_id`
         // correlation the monitor needs); `ShellBusy` promotes it to `Working`,
@@ -2809,6 +2905,7 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         });
         assert_eq!(
             state.read().await.sessions[SESSION].status,
@@ -2939,6 +3036,7 @@ mod hook_ingestion_tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         };
         state
             .write()
@@ -3236,6 +3334,7 @@ mod hook_ingestion_tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                agent_token: None,
             });
             assert!(
                 guard

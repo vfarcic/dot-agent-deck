@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use crate::config::socket_path;
 use crate::event::{AgentEvent, AgentType, EventType};
+use crate::hook_ingest::{AgentToken, DOT_AGENT_DECK_AGENT_TOKEN};
 
 #[derive(Debug, Deserialize)]
 struct ClaudeCodeHookInput {
@@ -394,7 +395,23 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         agent_version: None,
         schema_version: None,
         live_target: None,
+        agent_token: agent_token_from_env(),
     })
+}
+
+/// Issue #318: read this process's hook capability token out of the environment.
+///
+/// The daemon injects `DOT_AGENT_DECK_AGENT_TOKEN` into every agent it spawns,
+/// so a hook script running inside a managed pane inherits it and stamps it on
+/// the event. `None` — including for an empty value, which is what a shell that
+/// exports a cleared variable leaves behind — means "no capability claimed":
+/// still accepted for a pane this daemon does not manage, refused for one it
+/// does. Shared by both event builders so the two cannot drift.
+fn agent_token_from_env() -> Option<AgentToken> {
+    std::env::var(DOT_AGENT_DECK_AGENT_TOKEN)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(AgentToken::from_wire)
 }
 
 fn map_opencode_event_type(event: &str, status: Option<&str>) -> Option<EventType> {
@@ -467,6 +484,7 @@ fn build_opencode_event(input: OpenCodeHookInput) -> Option<AgentEvent> {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        agent_token: agent_token_from_env(),
     })
 }
 

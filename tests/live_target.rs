@@ -109,6 +109,7 @@ fn live_target_002_writability_survives_recent_event_eviction() {
             kind: dot_agent_deck::event::TargetKind::Process,
             writable: Writable::HistoryOnly,
         }),
+        agent_token: None,
     });
 
     for offset in 1..=51 {
@@ -127,6 +128,7 @@ fn live_target_002_writability_survives_recent_event_eviction() {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         });
     }
 

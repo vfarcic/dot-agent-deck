@@ -830,10 +830,11 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Platform coverage:** mac+linux.
 
 ##### prompt/close-confirm/005 — A vanished armed session closes nothing and never retargets its replacement.
-- **Layer:** L2 (real-binary PTY plus a synthetic replacement SessionStart delivered through the real daemon hook socket).
-- **Agent:** none (continued `cat` pane; the hook gives the same pane a distinct replacement agent/session identity in rendered state).
-- **Asserts:** after Ctrl+W arms the original session identity, a different-agent SessionStart replaces it on the same pane; confirming surfaces `Nothing closed`, retains the card, and leaves the daemon agent alive rather than closing the replacement.
+- **Layer:** L2 (real-binary PTY; the pane's agent is genuinely replaced over the attach socket and the replacement announces itself through the real daemon hook socket).
+- **Agent:** none (continued `cat` pane, stopped and re-started on the same pane id so the daemon mints a distinct replacement agent identity).
+- **Asserts:** after Ctrl+W arms the original session identity, a real replacement generation on the same pane supersedes it; confirming surfaces `Nothing closed`, retains the card, and leaves the daemon agent alive rather than closing the replacement.
 - **Does not assert:** tab identity binding (covered independently by `mouse/tabstrip/003`).
+- **Note (issue #318):** the replacement used to be FORGED — a synthetic `SessionStart` naming an `agent_id` nobody had spawned. Hook provenance binding now derives `(pane_id, agent_id)` from the sender's capability token and ignores what the payload claims, so a generation change can no longer be asserted into existence and this test performs a real StopAgent/StartAgent instead. The supersession semantics under test are unchanged; only how the generation change is produced is.
 - **Platform coverage:** mac+linux.
 
 ##### prompt/close-confirm/006 — A dashboard Session target that belongs to a Mode tab uses whole-tab copy and teardown.
@@ -1601,8 +1602,8 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### hooks/delivery/004 — A malformed hook payload is dropped without disrupting the deck.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** sending invalid JSON to the hook socket leaves all cards and statuses unchanged; the deck does not exit.
-- **Does not assert:** error logging content (best-effort logging path).
+- **Asserts:** sending invalid JSON to the hook socket leaves all cards and statuses unchanged; the deck does not exit. The adjacent bounded-input guard is `hooks/delivery/008`, which closes a newline-free payload once it exceeds the production byte limit.
+- **Does not assert:** error logging content (best-effort logging path); oversized-line connection handling (covered by `hooks/delivery/008`).
 - **Platform coverage:** mac+linux.
 
 ##### hooks/delivery/005 — Hook events survive a TUI detach/reattach cycle (daemon buffers).
@@ -1624,6 +1625,36 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** none (synthetic — `StartAgent` over the daemon protocol with a shell command whose `from_command` type is `None`, then a JSON `SessionStart` written directly to the per-test hook socket).
 - **Asserts:** an agent started with no inferable type registers with `agent_type == None`; after a `SessionStart` hook carrying `agent_type = claude_code` for that pane's id, a subsequent `ListAgents` (the same call `hydrate_from_daemon` issues on reconnect) reports `agent_type == ClaudeCode`.
 - **Does not assert:** the rendered card label (the `AgentRecord`→placeholder→render mapping is covered by `rehydration` + L1 dashboard tests); the live-stream upgrade path while a TUI is already attached.
+- **Platform coverage:** mac+linux.
+
+##### hooks/delivery/008 — A newline-free hook payload beyond the production byte limit is refused by closing its connection without disrupting later delivery.
+- **Layer:** L2 synthetic (the real `dot-agent-deck` binary and hook socket through the PTY-attached `TuiDeck` harness; no LLM).
+- **Agent:** none (raw bytes and a synthetic `SessionStart` are written directly to separate hook connections).
+- **Asserts:** the oversized peer observes connection closure; the payload creates no card; a well-formed event on a fresh connection afterward still creates its Idle card.
+- **Does not assert:** the daemon's exact allocation high-water mark; the chosen numeric byte limit (the test reads `MAX_HOOK_LINE_BYTES`).
+- **Platform coverage:** mac+linux.
+
+##### hooks/delivery/009 — A hook connection beyond the production concurrent-connection cap is closed promptly while admitted peers keep delivering.
+- **Layer:** L2 synthetic (the real `dot-agent-deck` binary and hook socket through the PTY-attached `TuiDeck` harness; no LLM).
+- **Agent:** none (idle Unix-socket peers saturate the cap and synthetic events drive the card).
+- **Asserts:** after every admitted slot is held open, the excess peer observes connection closure; a connection already inside the cap still moves its card from Idle to Working, proving the daemon stays responsive and alive.
+- **Does not assert:** fairness among admitted peers; the chosen numeric connection cap (the test reads `MAX_HOOK_CONNECTIONS`).
+- **Platform coverage:** mac+linux.
+
+#### hooks/provenance
+
+##### hooks/provenance/002 — A token-less event naming a daemon-managed pane cannot drive that pane's card.
+- **Layer:** L2 synthetic (the real daemon and PTY-attached TUI, a daemon-managed shell pane, and a raw hook-socket write; no LLM).
+- **Agent:** none (a long-lived `sleep` shell stands in for the managed agent while the test writes a deliberately token-less `ToolStart`).
+- **Asserts:** the managed card begins Idle and remains Idle after a token-less event correctly naming its pane and agent ids, instead of moving to Working.
+- **Does not assert:** rejection logging; token-to-pane derivation when a token is present (covered by `hooks/provenance/001` after the token API exists).
+- **Platform coverage:** mac+linux.
+
+##### hooks/provenance/003 — A token-less event for an unmanaged pane still registers a foreign card (deliberately GREEN before the provenance fix).
+- **Layer:** L2 synthetic (the real `dot-agent-deck` binary and hook socket through the PTY-attached `TuiDeck` harness; no LLM).
+- **Agent:** none (a synthetic foreign `SessionStart` is written directly to the hook socket).
+- **Asserts:** with no managed panes, a token-less event for an unknown pane still creates and visibly renders its Idle card. This is the intentional compatibility guard for foreign agents and the surviving remainder of issue #601, not a test expected to fail before implementation.
+- **Does not assert:** that an unmanaged pane id proves ownership; later token-less events after that foreign pane has registered.
 - **Platform coverage:** mac+linux.
 
 #### hooks/install

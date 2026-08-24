@@ -58,7 +58,10 @@ fn pane_input_004_history_only_send_reports_result_and_feedback() {
             "writable": "history-only"
         }
     });
-    common::write_hook_line(deck.hook_socket_path(), &event.to_string())
+    // Issue #318: the restored pane is daemon-managed, so the synthetic Codex
+    // SessionStart carries its capability token.
+    let token = common::agent_token_on(deck.attach_socket_path(), &agent_id);
+    common::write_hook_line(deck.hook_socket_path(), &event.to_string(), Some(&token))
         .expect("inject history-only Codex SessionStart");
     deck.wait_for_absence("No agent");
 
@@ -147,7 +150,8 @@ fn pane_input_008_stream_rejection_surfaces_feedback_and_exits_input_mode() {
                 "writable": "history-only"
             }
         });
-        common::write_hook_line(deck.hook_socket_path(), &event.to_string())
+        let token = common::agent_token_on(deck.attach_socket_path(), &record.id);
+        common::write_hook_line(deck.hook_socket_path(), &event.to_string(), Some(&token))
             .expect("make focused synthetic session history-only");
         deck.wait_for_absence("No agent");
 
@@ -204,6 +208,12 @@ payload = {
     "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "pane_id": pane,
     "agent_id": os.environ.get("DOT_AGENT_DECK_AGENT_ID"),
+    # Issue #318: this stand-in agent runs INSIDE the daemon-spawned pane, so it
+    # inherits the pane's capability token exactly as a real agent's hook script
+    # does. Forwarding it is what makes the daemon accept an event naming a pane
+    # it manages — and it is the end-to-end proof that the spawn-time env
+    # injection actually reaches the child.
+    "agent_token": os.environ.get("DOT_AGENT_DECK_AGENT_TOKEN"),
     "live_target": {
         "kind": "pty" if os.environ["WRITABLE"] == "live" else "process",
         "writable": os.environ["WRITABLE"],
