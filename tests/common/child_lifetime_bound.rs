@@ -68,7 +68,9 @@ use std::sync::OnceLock;
 /// `docs/develop/e2e-temp-dirs.md` reasons about when it sets the reaper's
 /// 10-minute floor at 2x the orphan cap.
 ///
-/// Also the CEILING, not just the default — see [`clamped`].
+/// Also the CEILING for whatever this process inherited, not just the default.
+/// It bounds *ambient* values and nothing else — a harness path that re-pins the
+/// variable after an `env_clear` bypasses it by design. See [`clamped`].
 const CHILD_MAX_LIFETIME_SECS: u64 = 300;
 
 /// The cap this process should pin, given whatever was already in `ambient`.
@@ -89,6 +91,34 @@ const CHILD_MAX_LIFETIME_SECS: u64 = 300;
 /// still nominally entitled to write there for another 50 minutes. Measured
 /// before this clamp existed: that exact value was accepted end to end and the
 /// arming regression test passed with it.
+///
+/// # The ceiling is an AMBIENT-value guarantee, and only that
+///
+/// This function sees only what the *test process* inherited, so that is the
+/// whole of what it can bound. A harness path that pins the variable explicitly
+/// after an `env_clear` never reaches it: `TuiDeck` rebuilds the child
+/// environment from its own pinned list (300 s among it) and then applies the
+/// builder's `extra_env` **last**, so a test's `with_env` overwrites that pin
+/// and is passed to the child verbatim. That ordering is deliberate and in use:
+/// #665 pins **900** on `orchestration_dispatch_002` so the daemon outlives
+/// that test's own 300 s work budget, without which the failure dump reports
+/// `NO PANE — never spawned at all` for roles the same dump renders alive
+/// (issue #663). Measured on the live processes: both the deck and its
+/// lazily-spawned daemon carry `900`.
+///
+/// So state the property precisely. "Every descendant of a test process stops
+/// within [`CHILD_MAX_LIFETIME_SECS`]" — which `clean-e2e-tmp`'s 600 s
+/// dead-owner floor takes its 2x margin from — holds for **ambient** values and
+/// is not universal: between 600 s and 900 s that one test's daemon outlives the
+/// floor. Neither half of that gap is this clamp's doing (#665's 900 and the
+/// reaper's 600 both live on `main` independently of it), and moving a
+/// *deletion* tool's margin wants its own review, so it is tracked as
+/// **issue #679** rather than settled here.
+///
+/// None of which makes the ceiling decorative: it covers the case that was
+/// actually measured — an exported `…=3600` in a contributor's shell, which
+/// reaches *every* root that shell mints and was accepted end to end before this
+/// existed.
 ///
 /// Returned as an owned `String` rather than a `&'static str` so the
 /// shorter-wins case can re-pin the value it found.
@@ -113,7 +143,10 @@ pub fn clamped(ambient: Option<&str>) -> Option<String> {
 ///
 /// A shorter ambient cap is kept; anything else — absent, zero, unparseable, or
 /// above the 300 s ceiling — is replaced. See [`clamped`] for why the ceiling is
-/// enforced rather than merely defaulted.
+/// enforced rather than merely defaulted, and for what it deliberately does not
+/// reach: a child whose environment `TuiDeck` rebuilds from scratch never sees
+/// this process's value at all, so a test's own `with_env` cap is passed through
+/// unclamped (issue #679).
 ///
 /// Idempotent: the `OnceLock` makes repeat calls free.
 ///

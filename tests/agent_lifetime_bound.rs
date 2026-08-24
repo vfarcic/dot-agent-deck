@@ -54,10 +54,16 @@ const MAX_LIFETIME_VAR: &str = "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS";
 /// a value that can never be confused with a parsed cap.
 const UNSET_MARKER: &str = "<unset>";
 
-/// The largest cap a child may carry, mirroring
+/// The largest cap a child may **inherit**, mirroring
 /// `child_lifetime_bound::CHILD_MAX_LIFETIME_SECS`. `cargo xtask clean-e2e-tmp`
 /// reaps a dead owner's root at 10 minutes and picks that as 2x this number, so
 /// this is a deletion-safety invariant rather than a preference.
+///
+/// Inherit, not carry: the clamp bounds *ambient* values only. A harness path
+/// that re-pins the variable after an `env_clear` — `TuiDeck`'s `extra_env`,
+/// applied last — bypasses it deliberately, and #665 uses that to pin 900 on
+/// `orchestration_dispatch_002` (issue #679 tracks the resulting 600-900 s
+/// window against the reaper's floor).
 const MAX_LIFETIME_CEILING_SECS: u64 = 300;
 
 fn write_executable(path: &std::path::Path, contents: &str) {
@@ -158,7 +164,10 @@ fn in_process_registry_spawn_arms_the_wrapped_child_lifetime_bound() {
     // longer than 300 s turns the reaper's margin into a deficit. An ambient
     // `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS=3600` in a developer's shell
     // reached the child unchallenged before `clamped()` existed, and this run
-    // proves it no longer does.
+    // proves it no longer does. Ambient is the whole scope: this spawn inherits
+    // the test process's environment, so it is the clamped path. A `TuiDeck`
+    // child whose `with_env` re-pins the cap after its `env_clear` is not, by
+    // design — issue #679.
     assert!(
         parsed.is_some_and(|secs| secs <= MAX_LIFETIME_CEILING_SECS),
         "a wrapped agent spawned through the in-process registry carries \
@@ -174,13 +183,14 @@ fn in_process_registry_spawn_arms_the_wrapped_child_lifetime_bound() {
 /// developer's shell can supply — absent, shorter, exactly at the ceiling, over
 /// it, zero, and not a number — and assert which ones it lets stand.
 ///
-/// Issue #668: the table that says the ceiling is enforced rather than merely
-/// defaulted. The end-to-end assertion above can only observe whatever this
-/// process happens to have inherited, so it cannot cover the over-ceiling case
-/// without an ambient value no test can portably arrange; this can, and it costs
-/// microseconds. Lives here rather than in a `#[cfg(test)] mod tests` beside the
-/// function because that file is `#[path]`-included into ~88 test crates and
-/// would run these cases once per crate.
+/// Issue #668: the table that says the ceiling is enforced on ambient values
+/// rather than merely defaulted. The end-to-end assertion above can only
+/// observe whatever this process happens to have inherited, so it cannot cover
+/// the over-ceiling case without an ambient value no test can portably
+/// arrange; this can, and it costs microseconds. Lives here rather than in a
+/// `#[cfg(test)] mod tests` beside the function because that file is
+/// `#[path]`-included into ~88 test crates and would run these cases once per
+/// crate.
 #[test]
 fn ambient_lifetime_caps_are_clamped_to_the_reapers_ceiling() {
     use common::child_lifetime_bound::clamped;
