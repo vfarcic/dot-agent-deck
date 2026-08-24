@@ -47,6 +47,8 @@ git grep -n "fn shell_foreground_busy_snapshot" origin/main -- src/agent_pty.rs
 
 Do **not** `git pull` to fix this. The runner may have local work, and this skill has no business moving their branch.
 
+**That rule is about verification, which is all this step governs.** Verifying against `origin/main` needs no pull, so refusing one here costs nothing at all. The *base each dispatched worktree is cut from* is a different problem that verifying harder does not touch, and it is what step 5b is for — same constraint, different answer: surface the staleness, hand the decision to the runner, and still never pull on your own.
+
 ## Step 1 — Resolve identity at runtime
 
 ```bash
@@ -189,6 +191,31 @@ Otherwise **ask how many to dispatch, recommending 2–3.** Do not assume "all",
 
 Ask **which** issues too, unless the runner already named them. Relative value is theirs to judge; a security issue and a 2 Hz polling inefficiency are not interchangeable just because both are small.
 
+## Step 5b — Check the base the units will be cut from
+
+**`dispatch` has no base or branch option.** `create_worktree` runs `git worktree add <dir> -b agent/dispatch-<name>` with no start-point (`src/issue_dispatch_run.rs`), and git resolves that to **`HEAD`** — so whatever `HEAD` is at dispatch time is the base every unit in this batch inherits, and no flag anywhere overrides it. The freshness of the runner's checkout is the only lever that exists.
+
+Read both halves of it. Step 0's fetch has already happened, so this costs nothing:
+
+```bash
+git rev-parse --abbrev-ref HEAD                        # the branch every unit inherits
+git rev-list --left-right --count HEAD...origin/main   # "0  6" means 6 behind
+```
+
+**Show the runner what you found and ask what they want to do about it. Never `git pull` on your own.** Step 0's reason holds here unchanged — the runner may have local work, and this skill has no business moving their branch — which is precisely *why* this is a question rather than a fix. What differs from step 0 is only the consequence: a stale checkout mis-answers a `grep`, and step 0 routes around that by verifying against `origin/main`; a stale checkout is *baked into* every worktree, and nothing downstream can route around it.
+
+Measured on the 2026-08-24 batch that motivated this step: local `main` sat at `f3752e1`, **six** commits behind `origin/main` at `c701932`, and all three units were cut there. One of those six, `a2a5953`, rewrote 58 lines of `src/state.rs` inside `AppState::apply_event` — the same function #670 was dispatched to fix — moving the metadata ingest line that issue names from 5671 to **5707**. Selection was still sound, because step 0 had every claim verified against `origin/main`; what was wrong was the ground all three units then stood on, and each had to discover and fix that for itself.
+
+**`HEAD` is not necessarily `main`, and that is the sharper failure.** Dispatch from a pane sitting on a feature branch and every unit is cut from *that branch*, carrying its unmerged work into three PRs — silently, since nothing `dispatch` prints names the base. Verified rather than inferred from git's documentation: `git worktree add <dir> -b probe` with `HEAD` on a feature branch put `probe` at the feature commit, not at `main`. This is where `dispatch` differs from `/worktree-prd`, whose `create.sh` passes the default branch as an explicit start-point — `dispatch` passes none, so there is nothing for the base to be stale *relative to* except wherever the runner happens to be standing.
+
+Three answers are legitimate and all three are the runner's to pick:
+
+- **Dispatch anyway** — reasonable when the gap is small, or touches nothing this batch does. Say which it was in step 9's report rather than leaving it implicit.
+- **The runner updates first**, after which you **re-read `HEAD`** and dispatch. Resolve this before the *first* dispatch, never between two: a mid-batch update splits one batch across two bases, and the units already started keep the old one.
+- **Drop or defer the units the gap actually touches.** `git diff --name-only HEAD..origin/main` names the files that moved; a unit whose issue targets one of them is the one worth deferring.
+
+**Say what you found even when the answer is "nothing".** A checkout already level with `origin/main` is worth one line, because the runner cannot tell "checked, current" apart from "never checked".
+
 ## Step 6 — Claim, then name
 
 **Assign the runner to every issue being dispatched.** This is a hard step, not a courtesy — it is what stops the other maintainer from starting the same work, and the whole point of dispatching is that nobody is watching the issue while the unit runs.
@@ -229,7 +256,13 @@ A unit starts either as **one agent** or as a **multi-role orchestration**. Whic
 dot-agent-deck dispatch --list-targets
 ```
 
-Show the runner that output, ask which shape they want, and **pass the matching flag explicitly on every dispatch** (`--single` or `--orchestration '<name>'`). With neither, the shape falls back to whatever the repo's config implies, which is the guess this step exists to avoid. Reuse the answer for later dispatches in the same conversation; re-ask when the runner changes it or a unit is clearly different in kind.
+Run that **once** — it is a read-only daemon round-trip and its answer describes the repo, not the unit — then show the runner the output and **ask the shape once per unit**, as a single prompt carrying one line per issue: the number, the one-line scope read from step 5, and any duplicate or coupling that unit absorbs. Enough scope to answer with, in other words, since the shape follows from what the unit will be doing. **Pass the matching flag explicitly on every dispatch** (`--single` or `--orchestration '<name>'`). With neither, the shape falls back to whatever the repo's config implies, which is the guess this step exists to avoid.
+
+**Per unit rather than per batch, because step 5 recommends 2–3 units and 2–3 issues off this backlog routinely mix kinds.** Measured on the 2026-08-24 batch: #669 is an `lstat` guard of roughly ten lines in one function, with a reference implementation already sitting on a fork; #668 is an audit of every harness spawn path #661 does not reach, plus a reaping mechanism and its coverage. Asked as one question the runner gave one answer for all three. Asked per issue they chose `--single` for #669 and #670 and `--orchestration` for #668 — so the batch-level question produced an answer the runner did not actually want, which is exactly the outcome this step exists to prevent.
+
+**One answer can still cover the whole batch — as the runner's answer, not as your assumption.** When they say "single for all three", take it and stop asking. Asking per unit costs one extra line in one prompt; not asking costs a unit started in a shape nobody chose, and the runner discovers that by watching it work.
+
+**An older build's pane seed says the opposite, in the same context you are reading this in.** Dispatcher mode seeds every pane with `DISPATCHER_SEED_PROMPT` (`src/ui.rs`), which now asks per unit — but a pane started from a build predating issue #674 still carries "before the FIRST dispatch of a session … Reuse the answer for later dispatches". Where they disagree, this skill wins: it is the more specific instruction, and it is the one with the measurement behind it.
 
 The reasoning behind this is in [`docs/dispatcher-mode.md`](../../../docs/dispatcher-mode.md), which is where it stays — it is the product's contract, not this skill's.
 
@@ -240,10 +273,12 @@ The reasoning behind this is in [`docs/dispatcher-mode.md`](../../../docs/dispat
 **The task goes in a file. `--task-file` is the default here, not an escape hatch:**
 
 ```bash
-dot-agent-deck dispatch <name> --single --task-file '.dot-agent-deck/<task-slug>.md'
+dot-agent-deck dispatch <name> (--single | --orchestration '<orchestration>') --task-file '.dot-agent-deck/<task-slug>.md'
 ```
 
-**This is a safety rule, not an ergonomic one, and the product says so itself.** The delegation protocol compiled into the binary and handed to every orchestrator it spawns (`src/orchestrator_context.rs`) states that `--task "…"` is a fallback safe *only* when the whole task is **a single line of plain text with no backticks, no `$`, no `"`, no `\` and no `!`**. The task below is a multi-bullet block, so it fails that allowlist on shape alone. `resolve_task`'s own doc comment in `src/main.rs` exists to explain the same hazard.
+**The shape flag is whatever the runner chose for _this_ unit in step 7 — never a default carried in this template.** It read `--single` unconditionally until issue #674, which quietly undid step 7 for anyone who copied the line: a template is the one place an answer belonging to the runner cannot be stored, because it is followed rather than reconsidered.
+
+**`--task-file` is a safety rule, not an ergonomic one, and the product says so itself.** The delegation protocol compiled into the binary and handed to every orchestrator it spawns (`src/orchestrator_context.rs`) states that `--task "…"` is a fallback safe *only* when the whole task is **a single line of plain text with no backticks, no `$`, no `"`, no `\` and no `!`**. The task below is a multi-bullet block, so it fails that allowlist on shape alone. `resolve_task`'s own doc comment in `src/main.rs` exists to explain the same hazard.
 
 **It fires on this skill's own material, with no attacker involved.** The most load-bearing sentence in a task is the one quoting code, so it is the one most likely to contain backticks — #429's *"a timed-out sample must yield `None`, never `Some(false)`"* is the example below. Inline, the caller's shell command-substitutes `` `None` `` and `` `Some(false)` `` to empty strings before `dot-agent-deck` sees argv, and dispatches *"a timed-out sample must yield , never "* — the inverted contract the issue exists to prevent. **The dispatch reports success**, because the mangling happened upstream of it. Nothing anywhere signals the instruction was eaten.
 
@@ -298,4 +333,5 @@ Give the runner, per unit: issue number, worktree path as `dispatch` reported it
 
 - **Nothing reports back to this pane.** `dispatch` is fire-and-forget with no return edge. Point at the worktree paths and the units' own tabs; never say results will arrive here.
 - **Anything you excluded, and why** — especially in-flight collisions, duplicates, and any candidate abandoned at step 6 or 8 over an assignee collision or a refused dispatch.
+- **The base every unit was cut from** — the branch `HEAD` was on and its distance from `origin/main` when you dispatched, plus what the runner chose to do about it (step 5b). Report it when it was already current, too: nothing else distinguishes a base that was checked from one that was never looked at.
 - **Anything you could not verify**, including a stale local checkout you chose not to move, and any list you could not confirm was untruncated.
