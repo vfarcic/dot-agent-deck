@@ -2592,6 +2592,8 @@ mod tests {
     #[derive(Clone, Copy)]
     enum Dispatch016Standing {
         SpawnedClaude,
+        SpawnedCodex,
+        SpawnedOpenCode,
         None,
         LauncherHandoff,
     }
@@ -2644,8 +2646,12 @@ mod tests {
         const PROMPT: &str = "ISSUE-666-ARMED-THIRD-PAYLOAD";
         let pane_id = format!("dispatch-016-rearm-{case}");
         let registry = Arc::new(AgentPtyRegistry::new());
-        let spawn_type =
-            matches!(standing, Dispatch016Standing::SpawnedClaude).then_some(AgentType::ClaudeCode);
+        let spawn_type = match standing {
+            Dispatch016Standing::SpawnedClaude => Some(AgentType::ClaudeCode),
+            Dispatch016Standing::SpawnedCodex => Some(AgentType::Codex),
+            Dispatch016Standing::SpawnedOpenCode => Some(AgentType::OpenCode),
+            Dispatch016Standing::None | Dispatch016Standing::LauncherHandoff => None,
+        };
         let agent_id = spawn_typed_byte_target(&registry, &pane_id, spawn_type);
 
         if matches!(standing, Dispatch016Standing::LauncherHandoff) {
@@ -3004,7 +3010,7 @@ mod tests {
         assert_eq!(declared, AgentType::ClaudeCode);
     }
 
-    /// Scenario: Hold detached spawn prompts in confirmation backoff while their target or evidence disappears, and verify every terminal, cancelled, or unauthenticated-capability watch finishes without stale retry bytes. Then vary deck-spawn standing, launcher-handoff standing, producer type, attempt count, and generation replay around a genuine post-write start: only the two vouched-for Claude cases may carry one additional payload, while controls receive bare submit probes or stop terminally.
+    /// Scenario: Hold detached spawn prompts in confirmation backoff while their target or evidence disappears, and verify every terminal, cancelled, or unauthenticated-capability watch finishes without stale retry bytes. Then vary deck-spawn standing and its trusted producer type, launcher-handoff standing, the event-declared producer type, attempt count, and generation replay around a genuine post-write start: only cases whose trusted and declared types both establish a pre-prompt Claude start may carry one additional payload, while controls receive bare submit probes or stop terminally.
     #[spec("scheduler/dispatch/016")]
     #[serial_test::serial(prompt_confirmation_tasks)]
     #[tokio::test]
@@ -3377,9 +3383,9 @@ mod tests {
             String::from_utf8_lossy(&spawned_output)
         );
 
-        // Issue #666, cases A-F. These run concurrently so the real PTY and
-        // production retry clocks cost one attempt-4 timeline rather than six.
-        let (case_a, case_b, case_c, case_d, case_e, case_f) = tokio::join!(
+        // Issue #666, cases A-H. These run concurrently so the real PTY and
+        // production retry clocks cost one attempt-4 timeline rather than eight.
+        let (case_a, case_b, case_c, case_d, case_e, case_f, case_g, case_h) = tokio::join!(
             observe_dispatch_016_rearm_case(
                 "a-spawned-Claude",
                 Dispatch016Standing::SpawnedClaude,
@@ -3421,6 +3427,20 @@ mod tests {
                 AgentType::ClaudeCode,
                 false,
                 true,
+            ),
+            observe_dispatch_016_rearm_case(
+                "g-spawned-Codex-declared-Claude",
+                Dispatch016Standing::SpawnedCodex,
+                AgentType::ClaudeCode,
+                false,
+                false,
+            ),
+            observe_dispatch_016_rearm_case(
+                "h-spawned-OpenCode-declared-Claude",
+                Dispatch016Standing::SpawnedOpenCode,
+                AgentType::ClaudeCode,
+                false,
+                false,
             ),
         );
 
@@ -3481,6 +3501,18 @@ mod tests {
                     .as_deref()
                     .map(&show)
                     .unwrap_or_else(|| "not observed".to_string())
+            ));
+        }
+        if !bare_submit(&case_g.attempt_three) {
+            rearm_failures.push(format!(
+                "G/spawned-Codex-declared-Claude: attempt 3 must be a bare submit only; {}",
+                show(&case_g.attempt_three)
+            ));
+        }
+        if !bare_submit(&case_h.attempt_three) {
+            rearm_failures.push(format!(
+                "H/spawned-OpenCode-declared-Claude: attempt 3 must be a bare submit only; {}",
+                show(&case_h.attempt_three)
             ));
         }
         assert!(
