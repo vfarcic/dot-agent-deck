@@ -176,10 +176,18 @@ slow-timeout = { period = "60s", terminate-after = 6 }
 # load-bearing with it rather than decoration: reached mid-run, an exclusive
 # test makes nextest DRAIN every running test before it can take the pool, and
 # this tier's tail holds 250-320 s tests, so it is scheduled first instead and
-# the reservation costs only its own runtime (now ~6.5 s). Staging the three
+# the reservation costs only its own runtime. Staging the three
 # seeds sequentially was the alternative and was rejected: "three concurrent
 # real dispatches" is the property under test and the field report it
 # reproduces.
+#
+# Issue #666 restaged the launcher: it now swallows BOTH payload attempts
+# rather than one, so each pane's delivery runs one further backoff step before
+# the agent-start rearm authorises the payload that finally lands. The
+# reservation's cost went from the ~6.5 s recorded here under #664 to ~10 s
+# measured on this branch — still a run-start slot rather than a drain of the
+# tier's tail, so nothing above changes. Do not read the old figure as a
+# regression budget: it described a one-swallow fixture that no longer exists.
 #
 # `retries = 1` covers what `threads-required` structurally CANNOT: load that
 # is not the tier's. Measured — with the reservation in place and NOTHING else
