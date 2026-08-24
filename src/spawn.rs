@@ -2430,16 +2430,41 @@ mod tests {
         session_id: &str,
         event_type: EventType,
     ) -> AgentEvent {
+        typed_prompt_watch_event(
+            pane_id,
+            agent_id,
+            session_id,
+            event_type,
+            AgentType::ClaudeCode,
+            false,
+        )
+    }
+
+    fn typed_prompt_watch_event(
+        pane_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        event_type: EventType,
+        agent_type: AgentType,
+        wrapper_fork: bool,
+    ) -> AgentEvent {
+        let mut metadata = std::collections::HashMap::new();
+        if wrapper_fork {
+            metadata.insert(
+                crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+            );
+        }
         AgentEvent {
             session_id: session_id.to_string(),
-            agent_type: AgentType::ClaudeCode,
+            agent_type,
             event_type,
             tool_name: None,
             tool_detail: None,
             cwd: None,
             timestamp: Utc::now(),
             user_prompt: None,
-            metadata: Default::default(),
+            metadata,
             pane_id: Some(pane_id.to_string()),
             agent_id: Some(agent_id.to_string()),
             agent_version: None,
@@ -2487,6 +2512,197 @@ mod tests {
                 ..SpawnOptions::default()
             })
             .expect("spawn byte-observation target")
+    }
+
+    #[derive(Clone, Copy)]
+    enum Dispatch016Standing {
+        SpawnedClaude,
+        None,
+        LauncherHandoff,
+    }
+
+    struct Dispatch016RearmObservation {
+        attempt_three: Vec<u8>,
+        attempt_four: Option<Vec<u8>>,
+        after_replay: Option<Vec<u8>>,
+        replay_was_terminal: bool,
+    }
+
+    async fn wait_for_detached_snapshot_growth(
+        registry: &AgentPtyRegistry,
+        agent_id: &str,
+        baseline_len: usize,
+        label: &str,
+    ) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            let snapshot = registry.snapshot(agent_id).expect("byte target snapshot");
+            if snapshot.len() > baseline_len {
+                // The payload bytes precede the delayed submit CR. Let that
+                // tail and `/bin/cat`'s echo settle before calling the write
+                // complete or emitting the post-write SessionStart.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                return registry
+                    .snapshot(agent_id)
+                    .expect("settled byte target snapshot");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {label}; snapshot={:?}",
+                String::from_utf8_lossy(&snapshot)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn snapshot_delta(before: &[u8], after: &[u8]) -> Vec<u8> {
+        after.strip_prefix(before).unwrap_or(after).to_vec()
+    }
+
+    async fn observe_dispatch_016_rearm_case(
+        case: &str,
+        standing: Dispatch016Standing,
+        declared: AgentType,
+        observe_fourth: bool,
+        replay: bool,
+    ) -> Dispatch016RearmObservation {
+        const PROMPT: &str = "ISSUE-666-ARMED-THIRD-PAYLOAD";
+        let pane_id = format!("dispatch-016-rearm-{case}");
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawn_type =
+            matches!(standing, Dispatch016Standing::SpawnedClaude).then_some(AgentType::ClaudeCode);
+        let agent_id = spawn_typed_byte_target(&registry, &pane_id, spawn_type);
+
+        if matches!(standing, Dispatch016Standing::LauncherHandoff) {
+            #[cfg(unix)]
+            let unresolvable_command = "/bin/cat";
+            #[cfg(windows)]
+            let unresolvable_command = "more.com";
+            assert_eq!(
+                AgentType::from_command(Some(unresolvable_command)),
+                None,
+                "the launcher-standing case must use a command whose spawn type cannot vouch for it"
+            );
+            assert!(
+                !registry.agent_spawned_as_reporting_agent(&agent_id),
+                "launcher standing must not pass through the deck-spawn record"
+            );
+            let (standing_tx, mut standing_rx) = broadcast::channel(4);
+            standing_tx
+                .send(BroadcastMsg::Event(typed_prompt_watch_event(
+                    &pane_id,
+                    &agent_id,
+                    "pre-write-launcher",
+                    EventType::SessionStart,
+                    AgentType::ClaudeCode,
+                    true,
+                )))
+                .expect("send pre-write launcher handoff");
+            let observed = crate::state::wait_for_session_start(
+                &mut standing_rx,
+                &pane_id,
+                &agent_id,
+                Duration::from_millis(20),
+            )
+            .await;
+            assert!(
+                !observed.ready && observed.launcher_handoff,
+                "the wrapper_fork start must establish standing without satisfying readiness: {observed:?}"
+            );
+            registry.note_launcher_handoff(&agent_id);
+        }
+
+        let (event_tx, event_rx) = broadcast::channel(16);
+        let confirmation = tokio::spawn(confirm_prompt_delivery(
+            registry.clone(),
+            event_rx,
+            ConfirmationTask {
+                pane_id: pane_id.clone(),
+                agent_id: agent_id.clone(),
+                prompt: PROMPT.into(),
+                delivery_id: format!("dispatch-016-rearm-{case}"),
+                generation: None,
+                // Retry capability is deliberately already known. Standing is
+                // varied independently and only decides whether the post-write
+                // start may authorize a payload rather than the ordinary probe.
+                can_report_prompts: true,
+                deadline: Instant::now() + Duration::from_secs(12),
+            },
+        ));
+
+        let after_attempt_two =
+            wait_for_detached_snapshot_growth(&registry, &agent_id, 0, "attempt 2").await;
+        event_tx
+            .send(BroadcastMsg::Event(typed_prompt_watch_event(
+                &pane_id,
+                &agent_id,
+                "native-session",
+                EventType::SessionStart,
+                declared,
+                false,
+            )))
+            .expect("send genuine post-write SessionStart");
+        let after_attempt_three = wait_for_detached_snapshot_growth(
+            &registry,
+            &agent_id,
+            after_attempt_two.len(),
+            "attempt 3",
+        )
+        .await;
+        let attempt_three = snapshot_delta(&after_attempt_two, &after_attempt_three);
+
+        let mut attempt_four = None;
+        let mut after_replay = None;
+        let mut replay_was_terminal = false;
+        if observe_fourth {
+            let after_attempt_four = wait_for_detached_snapshot_growth(
+                &registry,
+                &agent_id,
+                after_attempt_three.len(),
+                "attempt 4",
+            )
+            .await;
+            attempt_four = Some(snapshot_delta(&after_attempt_three, &after_attempt_four));
+        } else if replay {
+            event_tx
+                .send(BroadcastMsg::Event(typed_prompt_watch_event(
+                    &pane_id,
+                    &agent_id,
+                    "replayed-successor-session",
+                    EventType::SessionStart,
+                    AgentType::ClaudeCode,
+                    false,
+                )))
+                .expect("send replayed successor SessionStart");
+            replay_was_terminal = tokio::time::timeout(Duration::from_secs(1), confirmation)
+                .await
+                .expect("a second genuine generation must terminate the delivery")
+                .is_ok();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let after = registry
+                .snapshot(&agent_id)
+                .expect("post-replay byte target snapshot");
+            after_replay = Some(snapshot_delta(&after_attempt_three, &after));
+            drop(event_tx);
+            registry.shutdown_all();
+            return Dispatch016RearmObservation {
+                attempt_three,
+                attempt_four,
+                after_replay,
+                replay_was_terminal,
+            };
+        }
+
+        confirmation.abort();
+        let _ = confirmation.await;
+        drop(event_tx);
+        registry.shutdown_all();
+        Dispatch016RearmObservation {
+            attempt_three,
+            attempt_four,
+            after_replay,
+            replay_was_terminal,
+        }
     }
 
     async fn type_user_bytes(
@@ -2621,7 +2837,7 @@ mod tests {
         assert!(capability, "an identified Claude frame proves the channel");
     }
 
-    /// Scenario: Hold detached spawn prompts in confirmation backoff while their pane is replaced, generation ends, event stream lags or closes, pane closes, daemon shuts down, a newer prompt supersedes the watch, or an unmarked event merely claims a reporting producer. Every terminal, cancelled, or unauthenticated-capability watch must finish without stale retry bytes. Finally, send that same unmarked post-write claim to a pane the deck itself spawned as a reporting agent: there it must arm the retry instead, so the prompt is typed into the pane again rather than held unsubmitted.
+    /// Scenario: Hold detached spawn prompts in confirmation backoff while their target or evidence disappears, and verify every terminal, cancelled, or unauthenticated-capability watch finishes without stale retry bytes. Then vary deck-spawn standing, launcher-handoff standing, producer type, attempt count, and generation replay around a genuine post-write start: only the two vouched-for Claude cases may carry one additional payload, while controls receive bare submit probes or stop terminally.
     #[spec("scheduler/dispatch/016")]
     #[serial_test::serial(prompt_confirmation_tasks)]
     #[tokio::test]
@@ -2992,6 +3208,118 @@ mod tests {
                 .any(|window| window == SPAWNED_PROMPT.as_bytes()),
             "a producer identifying itself after the write must still arm the retry on a pane the deck spawned as a reporting agent, or the dispatch prompt is written and never submitted (#570); output={:?}",
             String::from_utf8_lossy(&spawned_output)
+        );
+
+        // Issue #666, cases A-F. These run concurrently so the real PTY and
+        // production retry clocks cost one attempt-4 timeline rather than six.
+        let (case_a, case_b, case_c, case_d, case_e, case_f) = tokio::join!(
+            observe_dispatch_016_rearm_case(
+                "a-spawned-Claude",
+                Dispatch016Standing::SpawnedClaude,
+                AgentType::ClaudeCode,
+                false,
+                false,
+            ),
+            observe_dispatch_016_rearm_case(
+                "b-no-standing",
+                Dispatch016Standing::None,
+                AgentType::ClaudeCode,
+                false,
+                false,
+            ),
+            observe_dispatch_016_rearm_case(
+                "c-Codex",
+                Dispatch016Standing::SpawnedClaude,
+                AgentType::Codex,
+                false,
+                false,
+            ),
+            observe_dispatch_016_rearm_case(
+                "d-launcher-handoff",
+                Dispatch016Standing::LauncherHandoff,
+                AgentType::ClaudeCode,
+                false,
+                false,
+            ),
+            observe_dispatch_016_rearm_case(
+                "e-one-shot",
+                Dispatch016Standing::SpawnedClaude,
+                AgentType::ClaudeCode,
+                true,
+                false,
+            ),
+            observe_dispatch_016_rearm_case(
+                "f-replay-terminal",
+                Dispatch016Standing::SpawnedClaude,
+                AgentType::ClaudeCode,
+                false,
+                true,
+            ),
+        );
+
+        let contains_prompt = |bytes: &[u8]| {
+            bytes
+                .windows("ISSUE-666-ARMED-THIRD-PAYLOAD".len())
+                .any(|window| window == b"ISSUE-666-ARMED-THIRD-PAYLOAD")
+        };
+        let bare_submit = |bytes: &[u8]| !bytes.is_empty() && !contains_prompt(bytes);
+        let show =
+            |bytes: &[u8]| format!("bytes={bytes:?}, text={:?}", String::from_utf8_lossy(bytes));
+        let mut rearm_failures = Vec::new();
+        if !contains_prompt(&case_a.attempt_three) {
+            rearm_failures.push(format!(
+                "A/spawned-Claude: attempt 3 must contain the prompt; {}",
+                show(&case_a.attempt_three)
+            ));
+        }
+        if !bare_submit(&case_b.attempt_three) {
+            rearm_failures.push(format!(
+                "B/no-standing: attempt 3 must be a bare submit only; {}",
+                show(&case_b.attempt_three)
+            ));
+        }
+        if !bare_submit(&case_c.attempt_three) {
+            rearm_failures.push(format!(
+                "C/Codex: attempt 3 must be a bare submit only; {}",
+                show(&case_c.attempt_three)
+            ));
+        }
+        if !contains_prompt(&case_d.attempt_three) {
+            rearm_failures.push(format!(
+                "D/launcher-handoff: attempt 3 must contain the prompt; {}",
+                show(&case_d.attempt_three)
+            ));
+        }
+        if !case_e.attempt_four.as_deref().is_some_and(&bare_submit) {
+            rearm_failures.push(format!(
+                "E/one-shot: attempt 4 must return to a bare submit only; {}",
+                case_e
+                    .attempt_four
+                    .as_deref()
+                    .map(&show)
+                    .unwrap_or_else(|| "no attempt 4 bytes".to_string())
+            ));
+        }
+        if !case_f.replay_was_terminal
+            || case_f
+                .after_replay
+                .as_deref()
+                .is_none_or(|bytes| !bytes.is_empty())
+        {
+            rearm_failures.push(format!(
+                "F/replay-terminal: a second genuine generation must finish the task with no later bytes; terminal={}, after_replay={}",
+                case_f.replay_was_terminal,
+                case_f
+                    .after_replay
+                    .as_deref()
+                    .map(&show)
+                    .unwrap_or_else(|| "not observed".to_string())
+            ));
+        }
+        assert!(
+            rearm_failures.is_empty(),
+            "scheduler/dispatch/016 issue #666 mismatches:\n{}",
+            rearm_failures.join("\n")
         );
     }
 
