@@ -9,7 +9,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
+use dot_agent_deck::agent_pty::DISPLAY_NAME_MAX_LEN;
+use dot_agent_deck::event::{AgentEvent, AgentType, DISPLAY_NAME_METADATA_KEY, EventType};
 use dot_agent_deck::state::{ActiveTool, AppState, DashboardStats, SessionState, SessionStatus};
 use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
@@ -2305,6 +2306,165 @@ fn pane_011_multibyte_session_id_renders_the_whole_deck() {
             );
         }
     }
+}
+
+/// Scenario: A hook posts a `display_name` carrying an ESC sequence, a NUL, a
+/// DEL, an embedded newline and a right-to-left override, and a second hook
+/// posts a 400-character one. Render both cards between healthy neighbours: the
+/// names stored on the sessions must come back scrubbed and length-clamped, no
+/// planted character may reach a rendered cell anywhere in the deck, and each
+/// neighbouring card must still draw its own title and status badge.
+#[spec("dashboard/pane/012")]
+#[test]
+fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
+    // Issue #670. `display_name` arrives in `event.metadata` over the hook
+    // socket — a surface every agent on the deck can post to — and used to be
+    // stored behind nothing but an is-empty filter, then drawn straight into a
+    // card title. So this drives the real `AppState::apply_event` transition
+    // instead of hand-building a `SessionState`: the defect is in the INGEST,
+    // and a fixture that assigned `display_name` directly would keep passing
+    // with the bug still in place.
+    //
+    // The blast radius is why the assertions run over a four-card deck rather
+    // than the poisoned card alone. An ESC that reaches a cell is written to
+    // the real terminal on flush, where it repaints whatever it likes; a
+    // U+202E reorders the text after it, which on a stacked deck means the
+    // neighbouring cards' titles.
+
+    // Listed literally so the assertion never consults the sanitizer it is
+    // checking. One representative of each class: ESC (C0, and the one that
+    // starts an ANSI sequence), NUL, CR and LF, DEL, and a right-to-left
+    // override — the last of which `char::is_control` does NOT catch.
+    const PLANTED: [char; 6] = ['\u{1b}', '\u{0}', '\r', '\n', '\u{7f}', '\u{202e}'];
+    const HOSTILE_NAME: &str = "\u{1b}[31m dispatch\u{0}-\u{202e}670 \u{7f}\r\nsweep";
+
+    let mut state = AppState::default();
+    let mut post = |session_id: &str, pane_id: &str, name: &str| {
+        state.register_pane(pane_id.to_string());
+        let mut metadata = HashMap::new();
+        metadata.insert(DISPLAY_NAME_METADATA_KEY.to_string(), name.to_string());
+        state.apply_event(AgentEvent {
+            session_id: session_id.to_string(),
+            agent_type: AgentType::ClaudeCode,
+            event_type: EventType::WaitingForInput,
+            tool_name: None,
+            tool_detail: None,
+            cwd: Some("/home/dev/worker".to_string()),
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata,
+            pane_id: Some(pane_id.to_string()),
+            agent_id: None,
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+        });
+        state
+            .sessions
+            .get(session_id)
+            .expect("apply_event keys the session map on the producer's id verbatim")
+            .clone()
+    };
+
+    let healthy_a = post("sess-alpha", "1", "example-alpha");
+    let hostile = post("sess-hostile", "2", HOSTILE_NAME);
+    // Well past `DISPLAY_NAME_MAX_LEN`, and multi-byte so the clamp has to snap
+    // back to a character boundary instead of slicing one in half.
+    let overlong_raw = "μ".repeat(400);
+    let overlong = post("sess-overlong", "3", &overlong_raw);
+    let healthy_b = post("sess-gamma", "4", "example-gamma");
+
+    // --- ingest ------------------------------------------------------------
+    let stored = hostile
+        .display_name
+        .as_deref()
+        .expect("a name with printable content survives as a name");
+    // The printable payload of the ESC sequence stays, by design: `[31m` is
+    // ordinary text once the ESC that would have made a terminal act on it is
+    // gone. Stripping the payload too would mean parsing ANSI, and would eat
+    // legitimate names containing brackets.
+    assert_eq!(
+        stored, "[31m dispatch-670 sweep",
+        "the stored name must be the scrubbed, trimmed text"
+    );
+    assert!(
+        !stored.chars().any(char::is_control),
+        "no control character may survive ingest: {stored:?}"
+    );
+    for c in PLANTED {
+        assert!(
+            !stored.contains(c),
+            "U+{:04X} survived ingest: {stored:?}",
+            c as u32
+        );
+    }
+
+    let clamped = overlong
+        .display_name
+        .as_deref()
+        .expect("an over-long name is repaired, not dropped");
+    let body = clamped
+        .strip_suffix('…')
+        .expect("a clamped name is marked as cut");
+    assert!(
+        body.len() <= DISPLAY_NAME_MAX_LEN,
+        "the stored name must be clamped to the daemon's own ceiling, got {} bytes",
+        body.len()
+    );
+    assert!(
+        body.chars().all(|c| c == 'μ'),
+        "the clamp must snap back to a character boundary: {body:?}"
+    );
+    assert!(
+        overlong_raw.len() > DISPLAY_NAME_MAX_LEN,
+        "the fixture only exercises the clamp if it exceeds the ceiling"
+    );
+
+    // --- render ------------------------------------------------------------
+    // Through `render_card_grid_to_buffer` — the seam that runs the deck's own
+    // `ui.display_names.get(id).or(session.display_name)` resolution — with no
+    // entry in `ui.display_names` for any of the four. That is the live
+    // scheduler-spawn case this metadata key exists to serve, and the only one
+    // in which `SessionState.display_name` titles a card at all.
+    let cards: [(&SessionState, Option<&str>); 4] = [
+        (&healthy_a, None),
+        (&hostile, None),
+        (&overlong, None),
+        (&healthy_b, None),
+    ];
+    let (buffer, _) = render_card_grid_to_buffer(&cards, Some(0), 0, 80, 40);
+    let rendered = buffer_to_text(&buffer);
+
+    // One status badge per card, so counting badges counts surviving cards.
+    assert_eq!(
+        rendered.matches("Needs Input").count(),
+        4,
+        "one hostile display name must not cost the other agents their cards:\n{rendered}"
+    );
+    // Asserted over the CELLS, not over `buffer_to_text`'s joined form — that
+    // helper separates rows with a real `\n`, so a planted newline would hide
+    // inside the separators it adds.
+    let area = *buffer.area();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            for c in buffer[(x, y)].symbol().chars() {
+                assert!(
+                    !c.is_control() && !PLANTED.contains(&c),
+                    "U+{:04X} reached cell ({x}, {y}), where a flush writes it to the real \
+                     terminal:\n{rendered}",
+                    c as u32
+                );
+            }
+        }
+    }
+    assert!(
+        rendered.contains("dispatch-670 sweep"),
+        "the readable remainder of the name must still title its card:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("example-alpha") && rendered.contains("example-gamma"),
+        "both neighbouring cards must still render their own titles:\n{rendered}"
+    );
 }
 
 // ---------------------------------------------------------------------------

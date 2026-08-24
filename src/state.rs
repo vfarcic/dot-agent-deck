@@ -5702,12 +5702,33 @@ impl AppState {
         // metadata refreshes it (the synthetic live-surface `SessionStart`
         // sets it; ordinary hooks omit the key and leave it untouched). This
         // takes precedence over any name inherited from a superseded session.
+        //
+        // Issue #670: the value is PRODUCER-supplied and was previously stored
+        // behind nothing but an is-empty filter. Every agent on the deck can
+        // post to the hook socket, and this string is drawn straight into a
+        // dashboard card title, so an ESC sequence in it repaints the terminal
+        // and a `U+202E` reorders the text around it. Neither is caught
+        // anywhere downstream: the daemon's `is_valid_display_name` gate
+        // guards the OTHER display-name path (a rename over the attach socket)
+        // and never sees this one, and the render's only defence was
+        // `ratatui`'s incidental grapheme handling — third-party behaviour this
+        // project neither owns nor tests.
+        //
+        // Sanitized at INGEST rather than at the render seam because the
+        // value is STORED: it survives on the session and is inherited by a
+        // session that supersedes this one (the `inherited_display_name`
+        // hand-off above), so a scrub at the one place that draws it today
+        // would leave the stored value hostile for every later reader, and
+        // would have to be re-applied by each new one. A name that sanitizes
+        // away to nothing is skipped exactly as the empty string always was,
+        // so the session keeps whatever name it already had rather than
+        // losing its title to a malformed frame.
         if let Some(name) = event
             .metadata
             .get(DISPLAY_NAME_METADATA_KEY)
-            .filter(|n| !n.is_empty())
+            .and_then(|n| crate::untrusted_text::sanitize_display_name(n))
         {
-            session.display_name = Some(name.clone());
+            session.display_name = Some(name);
         }
 
         if session.agent_type == AgentType::None && event.agent_type != AgentType::None {

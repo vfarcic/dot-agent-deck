@@ -97,6 +97,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** any rejection or sanitisation of the id upstream of the render (the id is stored verbatim by design); the OSC-8 hyperlink status line, which is the same defect on a different string (`mouse/hyperlink/001`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/pane/012 — A hostile `display_name` on the hook socket is scrubbed and clamped before it can reach a card (issue #670).
+- **Layer:** L1 (in-process `AppState::apply_event` + ratatui `TestBackend` via `render_card_grid_to_buffer`).
+- **Agent:** none (four synthetic hook events, two of them carrying a hostile `display_name` in `event.metadata`).
+- **Asserts:** a name carrying ESC, NUL, CR/LF, DEL and a `U+202E` right-to-left override is stored scrubbed and trimmed, and a 400-character one is stored clamped to `agent_pty::DISPLAY_NAME_MAX_LEN` bytes on a character boundary with a trailing `…`; rendering all four cards through the deck's own `ui.display_names` → `SessionState.display_name` resolution draws four status badges, leaves both neighbouring titles intact, and puts no control character or bidi override in ANY buffer cell. Before the fix the ingest applied only `.filter(|n| !n.is_empty())`, and `U+202E` was measured reaching cell (30, 9) — where a flush writes it to the real terminal and it reorders the text around it.
+- **Does not assert:** `ui.display_names`, the card's *preferred* name source, which is hydrated from the daemon's `is_valid_display_name`-gated `AgentRecord.display_name` over the attach socket and is a separate path with its own audit — deliberately out of scope here, and tracked on the fork this defect was reported from as `prageethw/dot-agent-deck#562`; the title's char-vs-display-column fit budget (`truncate_styled_segments`, issue #357).
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/stats
 
 ##### dashboard/stats/001 — A narrow stats bar keeps the `tools` total and spends no width on a per-agent-type breakdown.

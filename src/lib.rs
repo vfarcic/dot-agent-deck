@@ -55,6 +55,9 @@ pub mod terminal_widget;
 #[cfg(test)]
 mod test_temp;
 pub mod ui;
+// Issue #670: the one implementation of the control-character / Unicode-bidi
+// filter applied to producer-supplied strings before they reach a terminal.
+pub mod untrusted_text;
 pub mod version;
 pub mod watch;
 pub mod worktree_reclaim;
