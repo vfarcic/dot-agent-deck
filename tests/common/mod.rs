@@ -3830,7 +3830,7 @@ fn detach_from_any_live_deck() {
 /// `#[cfg(test)] mod tests` in the file itself — would run those pure-function
 /// cases once per including crate, i.e. ~88 times, which is the multiplication
 /// `src/test_temp.rs`'s header already reasons about avoiding.
-pub mod child_lifetime_bound;
+pub(crate) mod child_lifetime_bound;
 
 /// Idempotent setup hook for legacy daemon-spawning tests. Creates the
 /// per-process lock dir on first call; subsequent calls are no-ops.
