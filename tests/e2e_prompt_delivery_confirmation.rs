@@ -1,8 +1,8 @@
 #![cfg(all(feature = "e2e", unix))]
 
 //! L2 regressions for spawn-time prompt confirmation. The synthetic scenario
-//! deterministically swallows each pane's first PTY submission and confirms
-//! only a later retry; the real scenario repeats the reported three-dispatch
+//! covers both a one-write swallow and a two-stage boot that destroys both
+//! payload attempts; the real scenario repeats the reported three-dispatch
 //! Claude Code startup race with interactive Haiku agents.
 
 mod common;
@@ -146,10 +146,31 @@ fn prompt_attempt_log(deck: &TuiDeck, name: &str) -> String {
         .unwrap_or_else(|_| "<no attempt log>".to_string())
 }
 
-fn first_submission_was_swallowed(deck: &TuiDeck, name: &str, prompt: &str) -> bool {
+fn swallowed_submission_count(deck: &TuiDeck, name: &str, prompt: &str) -> usize {
     prompt_attempt_log(deck, name)
         .lines()
-        .any(|line| line == format!("swallowed|{prompt}"))
+        .filter(|line| *line == format!("swallowed|{prompt}"))
+        .count()
+}
+
+fn dispatch_pane_id(deck: &TuiDeck, name: &str) -> Option<String> {
+    let display_name = format!("dispatch-{name}");
+    common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|record| record.display_name.as_deref() == Some(display_name.as_str()))
+        .and_then(|record| record.pane_id_env)
+}
+
+fn pane_delivery_log_lines<'a>(log: &'a str, pane_id: &str) -> Vec<&'a str> {
+    log.lines()
+        .filter(|line| line.contains(pane_id))
+        .filter(|line| {
+            line.contains("prompt written to pane; provisional")
+                || line.contains("prompt delivery unconfirmed; re-submitting")
+                || line.contains("prompt delivery confirmed by the agent")
+                || line.contains("prompt delivery unconfirmed at the deadline; abandoning")
+        })
+        .collect()
 }
 
 fn delivery_diagnostics(deck: &TuiDeck, cases: &[(&str, &str)]) -> String {
@@ -247,9 +268,30 @@ const LATE_CLAIM_SESSION_START_DELAY_SECS: u64 = 6;
 /// post-write producer claim.
 fn write_swallowing_agent(workdir: &Path) -> PathBuf {
     let path = workdir.join("claude");
+    let stage_two = workdir.join("claude-stage-two");
     let bin = shell_quote(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    let stage_two_body = format!(
+        "#!/bin/sh\n\
+         printf '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"seed-%s\"}}' \"$DOT_AGENT_DECK_PANE_ID\" | {bin} hook --agent claude-code >/dev/null 2>&1 || exit 97\n\
+         while IFS= read -r submitted; do\n\
+           printf 'confirmed|%s\\n' \"$submitted\" >> prompt-attempts.log\n\
+           printf '{{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"seed-%s\",\"prompt\":\"%s\"}}' \"$DOT_AGENT_DECK_PANE_ID\" \"$submitted\" | {bin} hook --agent claude-code >/dev/null 2>&1 || exit 98\n\
+         done\n"
+    );
+    std::fs::write(&stage_two, stage_two_body).expect("write second-stage stand-in");
     let body = format!(
         "#!/bin/sh\n\
+         case \"$DOT_AGENT_DECK_PANE_ID\" in\n\
+           *two-write-flush*)\n\
+             printf '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"launcher-%s\",\"metadata\":{{\"{SESSION_START_ORIGIN_METADATA_KEY}\":\"{WRAPPER_FORK_SESSION_START_ORIGIN}\"}}}}' \"$DOT_AGENT_DECK_PANE_ID\" | {bin} hook --agent claude-code >/dev/null 2>&1 || exit 96\n\
+             IFS= read -r swallowed || exit 0\n\
+             printf 'swallowed|%s\\n' \"$swallowed\" >> prompt-attempts.log\n\
+             printf '{{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"launcher-%s\",\"tool_name\":\"Bootstrap\"}}' \"$DOT_AGENT_DECK_PANE_ID\" | {bin} hook --agent claude-code >/dev/null 2>&1 || exit 99\n\
+             IFS= read -r swallowed || exit 0\n\
+             printf 'swallowed|%s\\n' \"$swallowed\" >> prompt-attempts.log\n\
+             exec {stage_two}\n\
+             ;;\n\
+         esac\n\
          case \"$DOT_AGENT_DECK_PANE_ID\" in\n\
            *late-claim*) sleep {LATE_CLAIM_SESSION_START_DELAY_SECS} ;;\n\
          esac\n\
@@ -260,12 +302,15 @@ fn write_swallowing_agent(workdir: &Path) -> PathBuf {
          while IFS= read -r submitted; do\n\
            printf 'confirmed|%s\\n' \"$submitted\" >> prompt-attempts.log\n\
            printf '{{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"seed-%s\",\"prompt\":\"%s\"}}' \"$DOT_AGENT_DECK_PANE_ID\" \"$submitted\" | {bin} hook --agent claude-code >/dev/null 2>&1 || exit 98\n\
-         done\n"
+         done\n",
+        stage_two = shell_quote(&stage_two.to_string_lossy()),
     );
     std::fs::write(&path, body).expect("write swallowing stand-in");
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod swallowing stand-in");
+    for executable in [&path, &stage_two] {
+        std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod swallowing stand-in");
+    }
     path
 }
 
@@ -280,7 +325,7 @@ fn write_default_command_config(command: &str) -> tempfile::TempDir {
     dir
 }
 
-/// Scenario: Launch an attached deck whose single-agent command posts SessionStart, delays its input reader, and deliberately swallows the first submitted line, then issue four dispatch --single calls concurrently. Three panes announce themselves before the prompt is written; the fourth withholds its SessionStart until after the readiness gate has expired and the prompt is already in the pane, so its producer claims a reporting agent only afterwards. Every pane must receive a backoff retry, emit a matching UserPromptSubmit hook for that retry, retain a durable confirmation, and produce written/unconfirmed/confirmed logs under its own distinct delivery id.
+/// Scenario: Launch five concurrent single-agent dispatches through hook-emitting stand-ins: four swallow one seed, while a two-stage launcher declares a wrapper handoff, destroys both payload writes, then starts a genuine Claude-shaped reader. Every pane must durably confirm its exact seed; the two-stage pane must record two swallowed copies, receive the payload on attempt 3 exactly once, and never be abandoned.
 #[spec("scheduler/dispatch/014")]
 #[test]
 fn dispatch_014_concurrent_swallowed_seeds_retry_until_confirmed() {
@@ -311,11 +356,20 @@ fn dispatch_014_concurrent_swallowed_seeds_retry_until_confirmed() {
     // the nearest thing to the fourth that should still work. `seed-late-claim`
     // is issue #570: same command, same swallow, same everything, except its
     // producer identifies itself only after the prompt is already in the pane.
+    // The fifth is issue #666's measured alpha shape: the launcher-origin start
+    // supplies standing, consumes both attempts while emitting only
+    // non-generational capability evidence between them, then stage two posts
+    // the genuine start; only an armed third payload can recover once its
+    // reader becomes usable.
     let cases = [
         ("seed-alpha", "Confirm synthetic seed alpha-7f31"),
         ("seed-beta", "Confirm synthetic seed beta-8c42"),
         ("seed-gamma", "Confirm synthetic seed gamma-9d53"),
         ("seed-late-claim", "Confirm synthetic seed late-claim-1a05"),
+        (
+            "seed-two-write-flush",
+            "Confirm synthetic seed two-write-flush-2b16",
+        ),
     ];
     let worktrees: Vec<PathBuf> = cases
         .iter()
@@ -325,10 +379,10 @@ fn dispatch_014_concurrent_swallowed_seeds_retry_until_confirmed() {
     let outputs = dispatch_concurrently(&deck, &caller_pane, &cases);
     assert_dispatch_commands_succeeded(&cases, &outputs);
 
-    // The late-claim pane cannot confirm before its withheld `SessionStart`
-    // plus a retry round trip, so the budget covers that rather than the
-    // three-pane wait it replaced.
-    let confirmed = common::wait_until(Duration::from_secs(45), || {
+    // The two-write pane is expected to run to the production deadline on
+    // pre-fix code. Wait beyond it so RED diagnostics include the terminal
+    // abandonment rather than only an in-flight missing confirmation.
+    let confirmed = common::wait_until(Duration::from_secs(75), || {
         cases
             .iter()
             .all(|(name, prompt)| confirmed_prompt(&deck, name).as_deref() == Some(*prompt))
@@ -348,9 +402,34 @@ fn dispatch_014_concurrent_swallowed_seeds_retry_until_confirmed() {
             .values()
             .all(|states| states == &required_states);
 
+    let two_stage_name = "seed-two-write-flush";
+    let two_stage_prompt = "Confirm synthetic seed two-write-flush-2b16";
+    let two_stage_attempts = prompt_attempt_log(&deck, two_stage_name);
+    let two_stage_pane_id = dispatch_pane_id(&deck, two_stage_name);
+    let two_stage_log_lines = two_stage_pane_id
+        .as_deref()
+        .map(|pane_id| pane_delivery_log_lines(&log, pane_id))
+        .unwrap_or_default();
+    let two_stage_written_on_attempt_three = two_stage_log_lines.iter().any(|line| {
+        line.contains("prompt written to pane; provisional") && line.contains("attempt=3")
+    });
+    let two_stage_abandoned = two_stage_log_lines
+        .iter()
+        .any(|line| line.contains("prompt delivery unconfirmed at the deadline; abandoning"));
+    let two_stage_recovered = swallowed_submission_count(&deck, two_stage_name, two_stage_prompt)
+        == 2
+        && two_stage_attempts
+            .lines()
+            .filter(|line| *line == format!("confirmed|{two_stage_prompt}"))
+            .count()
+            == 1
+        && confirmed_prompt(&deck, two_stage_name).as_deref() == Some(two_stage_prompt)
+        && two_stage_written_on_attempt_three
+        && !two_stage_abandoned;
+
     assert!(
-        confirmed && retried && logged,
-        "all concurrently booting panes must retry a swallowed first PTY write until UserPromptSubmit confirms the seed, and each distinct delivery id must log written/unconfirmed/confirmed state. confirmed={confirmed}, retried={retried}, logged={logged}, states_by_delivery={states_by_delivery:?}{}\nlog tail:\n{}",
+        confirmed && retried && logged && two_stage_recovered,
+        "all concurrently booting panes must recover swallowed PTY payloads until UserPromptSubmit confirms the seed; the two-stage launcher must swallow exactly two payloads, receive one payload on attempt 3, and avoid abandonment. confirmed={confirmed}, retried={retried}, logged={logged}, two_stage_recovered={two_stage_recovered}, two_stage_written_on_attempt_three={two_stage_written_on_attempt_three}, two_stage_abandoned={two_stage_abandoned}, two_stage_pane_id={two_stage_pane_id:?}, two_stage_attempts={two_stage_attempts:?}, two_stage_log_lines={two_stage_log_lines:?}, states_by_delivery={states_by_delivery:?}{}\nlog tail:\n{}",
         delivery_diagnostics(&deck, &cases),
         log.lines()
             .rev()
@@ -404,6 +483,9 @@ fn write_bootstrap_swallowing_real_claude(workdir: &Path) -> PathBuf {
          printf '{{\"hook_event_name\":\"SessionStart\",\"session_id\":\"bootstrap-%s\",\"metadata\":{{\"{SESSION_START_ORIGIN_METADATA_KEY}\":\"{WRAPPER_FORK_SESSION_START_ORIGIN}\"}}}}' \"$DOT_AGENT_DECK_PANE_ID\" | {binary} hook --agent claude-code >/dev/null 2>&1 || exit 97\n\
          IFS= read -r swallowed || exit 98\n\
          printf 'swallowed|%s\\n' \"$swallowed\" >> prompt-attempts.log\n\
+         printf '{{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"bootstrap-%s\",\"tool_name\":\"Bootstrap\"}}' \"$DOT_AGENT_DECK_PANE_ID\" | {binary} hook --agent claude-code >/dev/null 2>&1 || exit 99\n\
+         IFS= read -r swallowed || exit 100\n\
+         printf 'swallowed|%s\\n' \"$swallowed\" >> prompt-attempts.log\n\
          exec {REAL_AGENT_COMMAND}\n"
     );
     std::fs::write(&wrapper, body).expect("write real-Claude bootstrap launcher");
@@ -413,7 +495,7 @@ fn write_bootstrap_swallowing_real_claude(workdir: &Path) -> PathBuf {
     wrapper
 }
 
-/// Scenario: Launch an attached deck with isolated Claude credentials and a bootstrap launcher that identifies its SessionStart as launcher-origin, consumes the first seed during boot, then execs real interactive Haiku Claude in each of three predicted dispatch worktrees. Every first write must be recorded as swallowed, each real pane must later submit its distinct sentinel-bearing retry through Claude's native UserPromptSubmit hook, and any failure must print each pane's exact confirmation and attempt evidence plus the daemon's own delivery-lifecycle log lines.
+/// Scenario: Launch three real interactive Haiku dispatches through bootstrap launchers that declare a wrapper handoff, consume both payload attempts, then exec Claude. Each native Claude start must recover the exact sentinel-bearing seed on attempt 3, confirm it through UserPromptSubmit, and avoid deadline abandonment; failures print per-pane attempt and delivery evidence.
 #[spec("scheduler/dispatch/015")]
 #[test]
 fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
@@ -520,13 +602,37 @@ fn dispatch_015_three_real_claude_seeds_are_genuinely_confirmed() {
             .iter()
             .all(|(name, prompt)| confirmed_prompt(&deck, name).as_deref() == Some(*prompt))
     });
-    let all_first_attempts_swallowed = cases
+    let all_two_payload_attempts_swallowed = cases
         .iter()
-        .all(|(name, prompt)| first_submission_was_swallowed(&deck, name, prompt));
+        .all(|(name, prompt)| swallowed_submission_count(&deck, name, prompt) == 2);
     let log = std::fs::read_to_string(deck.workdir().join(log_name)).unwrap_or_default();
+    let pane_log_evidence: Vec<(&str, Option<String>, Vec<&str>)> = cases
+        .iter()
+        .map(|(name, _)| {
+            let pane_id = dispatch_pane_id(&deck, name);
+            let lines = pane_id
+                .as_deref()
+                .map(|pane_id| pane_delivery_log_lines(&log, pane_id))
+                .unwrap_or_default();
+            (*name, pane_id, lines)
+        })
+        .collect();
+    let all_attempt_three_payloads_written = pane_log_evidence.iter().all(|(_, _, lines)| {
+        lines.iter().any(|line| {
+            line.contains("prompt written to pane; provisional") && line.contains("attempt=3")
+        })
+    });
+    let none_abandoned = pane_log_evidence.iter().all(|(_, _, lines)| {
+        !lines
+            .iter()
+            .any(|line| line.contains("prompt delivery unconfirmed at the deadline; abandoning"))
+    });
     assert!(
-        all_first_attempts_swallowed && all_confirmed,
-        "every bootstrap launcher must swallow its first PTY submission and every real interactive Claude pane must genuinely submit a retried sentinel-bearing seed; a healthy Idle pane with no matching UserPromptSubmit is an undelivered seed. all_first_attempts_swallowed={all_first_attempts_swallowed}, all_confirmed={all_confirmed}{}\nDelivery log:\n{}\nFinal grid:\n{}",
+        all_two_payload_attempts_swallowed
+            && all_confirmed
+            && all_attempt_three_payloads_written
+            && none_abandoned,
+        "every bootstrap launcher must swallow both payload attempts, then every real interactive Claude pane must receive the seed payload on attempt 3 and genuinely submit it without deadline abandonment; a healthy Idle pane with no matching UserPromptSubmit is an undelivered seed. all_two_payload_attempts_swallowed={all_two_payload_attempts_swallowed}, all_confirmed={all_confirmed}, all_attempt_three_payloads_written={all_attempt_three_payloads_written}, none_abandoned={none_abandoned}, pane_log_evidence={pane_log_evidence:?}{}\nDelivery log:\n{}\nFinal grid:\n{}",
         delivery_diagnostics(&deck, &cases),
         delivery_log_evidence(&log),
         deck.snapshot_grid()
