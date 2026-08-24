@@ -55,6 +55,7 @@ use crate::issue_dispatch::{
 };
 use crate::scheduler::{Notifier, NotifyEvent};
 use crate::spawn::{SpawnRequest, spawn};
+use crate::worktree_owner::Creator;
 
 // ---------------------------------------------------------------------------
 // M2.4 — daemon-side worktree registry (close → cleanup plumbing)
@@ -410,7 +411,15 @@ async fn dispatch_one_issue(
     // fire can claim it in the TOCTOU window after the idempotency check above
     // (see `create_worktree`); that benign race is a skip, not a failure —
     // mirroring the `dispatch_decision` worktree-presence skip.
-    match create_worktree(clone_dir, &paths.worktree_dir, &paths.branch, true).await? {
+    match create_worktree(
+        clone_dir,
+        &paths.worktree_dir,
+        &paths.branch,
+        true,
+        Creator::issue_dispatch(task_name, issue),
+    )
+    .await?
+    {
         WorktreeCreation::Created => {}
         // `reuse_existing_branch: true` above means `BranchExists` is never
         // returned to this caller — an existing `agent/issue-<n>` is ATTACHED,
@@ -887,11 +896,20 @@ async fn acquire_worktree_lock(clone_dir: &Path) -> Option<crate::platform::lock
 ///
 /// Neither defence swallows anything: a `commondir` that stays unreadable
 /// exhausts the attempts and surfaces as `Err`.
+///
+/// Issue #425 — `creator`. This is the ONLY `git worktree add` in `src/`, so
+/// it is also the only place that can claim a worktree as the deck's own at
+/// the moment it comes into existence. On success it writes the ownership
+/// marker `worktree_reclaim` later reads, recording `creator` so the claim
+/// names the responsible dispatch rather than a bare "the deck". Written on
+/// the `Created` arm only, and best-effort — see [`crate::worktree_owner`] for
+/// why both of those are load-bearing.
 pub async fn create_worktree(
     clone_dir: &Path,
     worktree_dir: &Path,
     branch: &str,
     reuse_existing_branch: bool,
+    creator: Creator,
 ) -> Result<WorktreeCreation, String> {
     if let Some(parent) = worktree_dir.parent() {
         std::fs::create_dir_all(parent)
@@ -977,7 +995,26 @@ pub async fn create_worktree(
         }
     };
     match add {
-        Ok(()) => Ok(WorktreeCreation::Created),
+        Ok(()) => {
+            // Issue #425: claim the worktree we just created, HERE, so no
+            // window exists in which a deck-created worktree is
+            // unrecognisable to `worktree list|reclaim`.
+            //
+            // Only on this arm. `AlreadyClaimed` below means the directory was
+            // already on disk when our add ran, so somebody else created it —
+            // marking it would be the deck asserting ownership of a directory
+            // it did not create, which is the one failure the marker exists to
+            // prevent on a path that deletes directories. (A concurrent
+            // dispatch that really did create it writes its own marker from
+            // its own `Created` arm, so nothing is lost.)
+            //
+            // Best-effort by construction: `write_marker_best_effort` warns
+            // and returns rather than failing the creation. A missing marker
+            // costs one `--yes` confirmation later, which is the fail-safe
+            // direction; a failed dispatch is not.
+            crate::worktree_owner::write_marker_best_effort(worktree_dir, branch, creator).await;
+            Ok(WorktreeCreation::Created)
+        }
         // Concurrent claim (TOCTOU): the dir is present now though we arrived
         // believing it absent — treat as already-claimed. A real failure leaves
         // the dir absent and surfaces as the original error.
@@ -1262,7 +1299,14 @@ mod tests {
         // Simulate the concurrent fire having already created the worktree dir.
         std::fs::create_dir_all(&worktree_dir).unwrap();
 
-        let outcome = create_worktree(&clone_dir, &worktree_dir, "agent/issue-7", false).await;
+        let outcome = create_worktree(
+            &clone_dir,
+            &worktree_dir,
+            "agent/issue-7",
+            false,
+            Creator::issue_dispatch("unit", 7),
+        )
+        .await;
         assert_eq!(
             outcome,
             Ok(WorktreeCreation::AlreadyClaimed),
@@ -1280,7 +1324,14 @@ mod tests {
         std::fs::create_dir_all(&clone_dir).unwrap();
         let worktree_dir = clone_dir.join(".worktrees").join("issue-9"); // absent
 
-        let outcome = create_worktree(&clone_dir, &worktree_dir, "agent/issue-9", false).await;
+        let outcome = create_worktree(
+            &clone_dir,
+            &worktree_dir,
+            "agent/issue-9",
+            false,
+            Creator::issue_dispatch("unit", 9),
+        )
+        .await;
         assert!(
             outcome.is_err(),
             "a real add failure with no worktree on disk must propagate as Err, got {outcome:?}"
@@ -1397,7 +1448,14 @@ mod tests {
             let worktree_dir = scratch.path().join(format!("repo-dispatch-{name}"));
             fires.push(tokio::spawn(async move {
                 let branch = format!("agent/dispatch-{name}");
-                let outcome = create_worktree(&clone_dir, &worktree_dir, &branch, false).await;
+                let outcome = create_worktree(
+                    &clone_dir,
+                    &worktree_dir,
+                    &branch,
+                    false,
+                    Creator::dispatch("unit"),
+                )
+                .await;
                 (name, worktree_dir, branch, outcome)
             }));
         }
@@ -1450,9 +1508,15 @@ mod tests {
         let _entry = begin_half_created_entry(&repo, "abandoned-add");
         let worktree_dir = scratch.path().join("repo-dispatch-stuck");
 
-        let err = create_worktree(&repo, &worktree_dir, "agent/dispatch-stuck", false)
-            .await
-            .expect_err("a permanently unreadable commondir must surface as an error");
+        let err = create_worktree(
+            &repo,
+            &worktree_dir,
+            "agent/dispatch-stuck",
+            false,
+            Creator::dispatch("stuck"),
+        )
+        .await
+        .expect_err("a permanently unreadable commondir must surface as an error");
         assert!(
             err.contains("commondir"),
             "the error must still name the file git could not read, got: {err}"
@@ -1502,6 +1566,7 @@ mod tests {
                 &worktree_dir,
                 "agent/dispatch-serialized",
                 false,
+                Creator::dispatch("serialized"),
             )
             .await
         });
@@ -1548,13 +1613,27 @@ mod tests {
         let worktree_dir = scratch.path().join("repo-dispatch-claimed");
 
         assert_eq!(
-            create_worktree(&repo, &worktree_dir, "agent/dispatch-claimed", false).await,
+            create_worktree(
+                &repo,
+                &worktree_dir,
+                "agent/dispatch-claimed",
+                false,
+                Creator::dispatch("claimed")
+            )
+            .await,
             Ok(WorktreeCreation::Created),
             "precondition: the first dispatch claims the name"
         );
 
         assert_eq!(
-            create_worktree(&repo, &worktree_dir, "agent/dispatch-claimed", false).await,
+            create_worktree(
+                &repo,
+                &worktree_dir,
+                "agent/dispatch-claimed",
+                false,
+                Creator::dispatch("claimed")
+            )
+            .await,
             Ok(WorktreeCreation::AlreadyClaimed),
             "a second dispatch of a name whose worktree is still THERE is a live \
              claim; reporting BranchExists would tell the user their worktree is \
@@ -1597,6 +1676,137 @@ mod tests {
                 "a genuine failure must not be retried: {genuine}"
             );
         }
+    }
+
+    // --- Issue #425: the ownership marker is written at creation time ---
+
+    /// The marker `worktree_reclaim` reads must actually be written by the one
+    /// code path that runs `git worktree add`, and it must land in the
+    /// worktree's own git metadata dir rather than anywhere in the working
+    /// tree. Both halves matter: a marker inside the tree makes
+    /// `git status --porcelain` non-empty forever, and the reclaim gate keeps
+    /// every dirty worktree — so an in-tree marker would make the worktree
+    /// permanently UNreclaimable, defeating the feature it enables.
+    #[tokio::test]
+    async fn create_worktree_marks_the_worktree_as_deck_owned_without_dirtying_it() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(&repo);
+        let worktree_dir = scratch.path().join("repo-dispatch-marked");
+
+        assert_eq!(
+            create_worktree(
+                &repo,
+                &worktree_dir,
+                "agent/dispatch-marked",
+                false,
+                Creator::dispatch("marked"),
+            )
+            .await,
+            Ok(WorktreeCreation::Created)
+        );
+
+        let marker = crate::worktree_owner::marker_path(&worktree_dir)
+            .expect("the created worktree must have a resolvable git metadata dir");
+        assert!(
+            marker.is_file(),
+            "the deck must claim the worktree it just created; no marker at {}",
+            marker.display()
+        );
+        assert!(
+            !marker.starts_with(&worktree_dir),
+            "the marker must live in the worktree's git metadata dir, never inside the \
+             working tree — got {}",
+            marker.display()
+        );
+
+        let status = std::process::Command::new("git")
+            .current_dir(&worktree_dir)
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git status");
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "marking a worktree must not make it dirty — a dirty worktree is kept by the \
+             reclaim gate, so an in-tree marker would make marked worktrees permanently \
+             unreclaimable; got:\n{}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+
+        // Idempotent: a re-created or re-attached worktree must not accumulate
+        // state. Checked by parsing rather than by comparing bytes, because an
+        // APPEND is exactly what would break — two concatenated documents are
+        // not one document — while a legitimate rewrite changes the timestamp.
+        crate::worktree_owner::write_marker(
+            &worktree_dir,
+            "agent/dispatch-marked",
+            &Creator::dispatch("marked"),
+        )
+        .expect("re-marking an already-marked worktree must succeed");
+        let after = std::fs::read_to_string(&marker).expect("read marker again");
+        serde_json::from_str::<serde_json::Value>(&after).unwrap_or_else(|e| {
+            panic!(
+                "re-marking must REPLACE the marker, never append to it: after a second \
+                 write the file must still be one document, but it did not parse ({e}):\n\
+                 {after}"
+            )
+        });
+    }
+
+    /// The dangerous direction. `AlreadyClaimed` means the worktree DIRECTORY
+    /// was already on disk when our `git worktree add` ran, so this process did
+    /// not create it — and the marker is an ownership claim consumed by a path
+    /// that DELETES directories. Claiming a directory we did not create is the
+    /// one failure this marker exists to prevent, so the already-claimed arm
+    /// must leave the marker alone. (A concurrent dispatch that genuinely
+    /// created it writes its own marker from its own `Created` arm.)
+    #[tokio::test]
+    async fn create_worktree_never_marks_a_worktree_it_did_not_create() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let repo = scratch.path().join("repo");
+        init_repo_with_commit(&repo);
+        let worktree_dir = scratch.path().join("repo-dispatch-foreign");
+
+        // Somebody else's worktree, on this same repo, at the path our dispatch
+        // is about to want: a real linked worktree, so it HAS a git metadata
+        // dir a marker could be written into.
+        let add = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "add", "-b", "someone-elses"])
+            .arg(&worktree_dir)
+            .output()
+            .expect("git worktree add");
+        assert!(
+            add.status.success(),
+            "fixture precondition: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+        let marker = crate::worktree_owner::marker_path(&worktree_dir)
+            .expect("the foreign worktree must have a resolvable git metadata dir");
+        assert!(
+            !marker.is_file(),
+            "fixture precondition: a plain `git worktree add` leaves no marker"
+        );
+
+        assert_eq!(
+            create_worktree(
+                &repo,
+                &worktree_dir,
+                "agent/dispatch-foreign",
+                false,
+                Creator::dispatch("foreign"),
+            )
+            .await,
+            Ok(WorktreeCreation::AlreadyClaimed),
+            "precondition: a present worktree dir is reported as already claimed"
+        );
+        assert!(
+            !marker.is_file(),
+            "a worktree the deck did not create must never be marked as deck-owned — \
+             the marker gates an unattended `git worktree remove`; found one at {}",
+            marker.display()
+        );
     }
 
     // --- .worktrees/ git-status hygiene via .git/info/exclude ---

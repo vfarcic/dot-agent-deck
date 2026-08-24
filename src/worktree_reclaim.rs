@@ -22,18 +22,11 @@ use std::process::Command;
 
 use serde::Serialize;
 
+use crate::worktree_owner::{is_marked, path_from_bytes};
+
 /// Version of the `--json` document shape. Bump on a field removal or a
 /// meaning change; additive fields don't need a bump.
 pub const SCHEMA_VERSION: u32 = 1;
-
-/// The name of the marker file that proves the deck created a worktree. Lives
-/// in the worktree's OWN git metadata dir (`<repo>/.git/worktrees/<name>/`,
-/// found via `git rev-parse --git-dir` run inside the worktree) — outside the
-/// working tree, so it never makes `git status --porcelain` report the
-/// worktree dirty, and it is removed automatically by `git worktree remove`.
-/// Writing this marker at worktree-creation time is out of scope for this
-/// task; only reading it is implemented here.
-pub const OWNER_MARKER_FILENAME: &str = "dot-agent-deck-owner";
 
 /// Resolved PR state for a worktree's branch, or why it could not be
 /// resolved. `Unresolvable` and `NoPr` both keep — the distinction is only
@@ -196,32 +189,6 @@ struct RawWorktree {
     branch: Option<String>,
 }
 
-/// Build a `PathBuf` from raw bytes read from `git`'s output (a `-z` path
-/// field, or a `rev-parse --git-dir` line) without a lossy UTF-8 round-trip.
-/// On Unix a path is an arbitrary byte sequence, so this goes straight
-/// through `OsStr`; elsewhere (Windows paths are UTF-16, and `git` there
-/// emits UTF-8 on the wire) a lossy fallback is the best available.
-#[cfg(unix)]
-fn path_from_bytes(field: &[u8]) -> PathBuf {
-    use std::os::unix::ffi::OsStrExt;
-    PathBuf::from(std::ffi::OsStr::from_bytes(field))
-}
-
-/// Strip a single trailing `\n` (or `\r\n`) from a `git` command's raw
-/// stdout, at the byte level — no UTF-8 round-trip, so the bytes that
-/// precede the line ending survive untouched regardless of what they are.
-fn trim_trailing_newline(bytes: &[u8]) -> &[u8] {
-    bytes
-        .strip_suffix(b"\n")
-        .map(|b| b.strip_suffix(b"\r").unwrap_or(b))
-        .unwrap_or(bytes)
-}
-
-#[cfg(not(unix))]
-fn path_from_bytes(field: &[u8]) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(field).into_owned())
-}
-
 /// Parse `git worktree list --porcelain -z` into path/branch pairs. `-z`
 /// NUL-terminates each field instead of newline-terminating it, which is
 /// what makes this safe: `--porcelain`'s default text mode C-quotes a path
@@ -332,29 +299,16 @@ fn check_cleanliness(worktree_path: &Path) -> Cleanliness {
 }
 
 /// Whether the deck can prove it created `worktree_path`: the marker file
-/// exists in the worktree's own git metadata dir. Any failure to resolve that
-/// dir, or a missing marker, resolves to `Foreign` — unknown must never
-/// resolve to `Ours`.
+/// [`crate::worktree_owner`] writes at creation time exists in the worktree's
+/// own git metadata dir. Any failure to resolve that dir, or a missing
+/// marker, resolves to `Foreign` — unknown must never resolve to `Ours`.
+///
+/// An EXISTENCE check, never a parse of the marker's content: the content is
+/// informational (which dispatch created it, when), and gating on it would
+/// mean a future format change silently reclassifies every existing
+/// deck-created worktree as foreign.
 fn ownership_of(worktree_path: &Path) -> Ownership {
-    let out = Command::new("git")
-        .current_dir(worktree_path)
-        .args(["rev-parse", "--git-dir"])
-        .output();
-    let out = match out {
-        Ok(o) if o.status.success() => o,
-        _ => return Ownership::Foreign,
-    };
-    let raw = trim_trailing_newline(&out.stdout);
-    if raw.is_empty() {
-        return Ownership::Foreign;
-    }
-    let git_dir = path_from_bytes(raw);
-    let git_dir = if git_dir.is_absolute() {
-        git_dir
-    } else {
-        worktree_path.join(git_dir)
-    };
-    if git_dir.join(OWNER_MARKER_FILENAME).is_file() {
+    if is_marked(worktree_path) {
         Ownership::Ours
     } else {
         Ownership::Foreign
