@@ -6,6 +6,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::sync::RwLock;
 
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
+use dot_agent_deck::bounded_read::read_task_input;
 use dot_agent_deck::build_version_handshake;
 use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
@@ -101,7 +102,9 @@ enum Commands {
         /// Read the task text verbatim from a file (or `-` for stdin). The
         /// shell-safe way to pass a task containing backticks, quotes, `$VAR`,
         /// or newlines, which --task would otherwise let the caller's shell
-        /// mangle. Mutually exclusive with --task.
+        /// mangle. PATH must be a regular file, not a FIFO or a device; pass
+        /// `-` to read a pipe. At most 1 MiB, from a file or from stdin.
+        /// Mutually exclusive with --task.
         #[arg(long = "task-file", value_name = "PATH")]
         task_file: Option<String>,
         /// Role name(s) to delegate to (repeatable)
@@ -119,8 +122,10 @@ enum Commands {
         /// Mutually exclusive with --task-file.
         #[arg(long, conflicts_with = "task_file")]
         task: Option<String>,
-        /// Read the task text verbatim from a file (or `-` for stdin).
-        /// Mutually exclusive with --task.
+        /// Read the task text verbatim from a file (or `-` for stdin). PATH
+        /// must be a regular file, not a FIFO or a device; pass `-` to read a
+        /// pipe. At most 1 MiB, from a file or from stdin. Mutually exclusive
+        /// with --task.
         #[arg(long = "task-file", value_name = "PATH")]
         task_file: Option<String>,
         /// Start ONE agent, even where this repo defines `[[orchestrations]]`.
@@ -158,7 +163,9 @@ enum Commands {
         task: Option<String>,
         /// Read the summary text verbatim from a file (or `-` for stdin). The
         /// shell-safe way to pass a summary containing backticks, quotes,
-        /// `$VAR`, or newlines. Mutually exclusive with --task.
+        /// `$VAR`, or newlines. PATH must be a regular file, not a FIFO or a
+        /// device; pass `-` to read a pipe. At most 1 MiB, from a file or from
+        /// stdin. Mutually exclusive with --task.
         #[arg(long = "task-file", value_name = "PATH")]
         task_file: Option<String>,
         /// Signal that the entire orchestration is complete (orchestrator only)
@@ -526,6 +533,14 @@ enum ConfigAction {
 /// command-substitute the backticks before we ever run). `--task-file -` reads
 /// stdin instead. clap's `conflicts_with` already rejects passing *both*; this
 /// function rejects passing *neither* and surfaces file/stdin read errors.
+///
+/// Both reads are size-bounded at
+/// [`MAX_TASK_BYTES`](dot_agent_deck::bounded_read::MAX_TASK_BYTES) and
+/// refused — never
+/// truncated — past it, and the path branch additionally requires a **regular
+/// file** (issue #328): a FIFO with no writer would otherwise block the CLI
+/// forever inside `open`, and a character device such as `/dev/zero` never
+/// ends. See [`read_task_input`].
 fn resolve_task(
     task: Option<String>,
     task_file: Option<String>,
@@ -533,7 +548,7 @@ fn resolve_task(
 ) -> Result<String, String> {
     match (task, task_file) {
         (Some(t), None) => Ok(t),
-        (None, Some(path)) => read_task_file(&path, stdin),
+        (None, Some(path)) => read_task_input(&path, stdin),
         // clap `conflicts_with` normally prevents this; kept as a defensive
         // guard so the invariant holds even if the two are ever resolved
         // outside clap parsing.
@@ -544,18 +559,6 @@ fn resolve_task(
             "provide the task via --task <text> or --task-file <path> (use `-` for stdin)"
                 .to_string(),
         ),
-    }
-}
-
-/// Read task text verbatim from `path`, or from `stdin` when `path` is `-`.
-fn read_task_file(path: &str, mut stdin: impl std::io::Read) -> Result<String, String> {
-    if path == "-" {
-        let mut buf = String::new();
-        std::io::Read::read_to_string(&mut stdin, &mut buf)
-            .map_err(|e| format!("failed to read task from stdin: {e}"))?;
-        Ok(buf)
-    } else {
-        std::fs::read_to_string(path).map_err(|e| format!("failed to read task file '{path}': {e}"))
     }
 }
 
@@ -2166,6 +2169,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
 mod tests {
     use super::*;
     use clap::Parser;
+    use dot_agent_deck::bounded_read::MAX_TASK_BYTES;
 
     // --- PRD #220: the dispatch shape selector's parsing ---
 
@@ -2424,6 +2428,79 @@ mod tests {
         assert!(
             err.contains("failed to read task file") && err.contains("/no/such/task-file.txt"),
             "missing-file error should name the path: {err}"
+        );
+    }
+
+    // ---- Issue #328: both reads are bounded, and a non-regular path is
+    // refused rather than opened. The per-shape refusals (FIFO, symlink to a
+    // FIFO, character device, endless stream) are unit-tested against the
+    // helper in `dot_agent_deck::bounded_read`; what these pin is that
+    // `resolve_task` — the seam every `delegate` / `work-done` call goes
+    // through — actually routes into it.
+
+    #[test]
+    fn task_file_over_the_size_limit_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("huge-task.md");
+        std::fs::write(&path, "x".repeat(MAX_TASK_BYTES as usize + 1)).expect("write");
+
+        let err = resolve_task(
+            None,
+            Some(path.to_str().unwrap().to_string()),
+            std::io::empty(),
+        )
+        .expect_err("a task file over the cap must be refused");
+        assert!(
+            err.contains("exceeds the") && err.contains("limit"),
+            "over-limit error should state the cap: {err}"
+        );
+    }
+
+    #[test]
+    fn task_file_at_the_size_limit_is_still_accepted() {
+        // The cap refuses only what is genuinely past it — an input sitting
+        // exactly on the boundary is a legitimate task, not a pathological one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("big-task.md");
+        let text = "x".repeat(MAX_TASK_BYTES as usize);
+        std::fs::write(&path, &text).expect("write");
+
+        let got = resolve_task(
+            None,
+            Some(path.to_str().unwrap().to_string()),
+            std::io::empty(),
+        )
+        .expect("a task file exactly at the cap must be accepted");
+        assert_eq!(got.len(), MAX_TASK_BYTES as usize);
+    }
+
+    #[test]
+    fn stdin_over_the_size_limit_is_refused() {
+        // `-` keeps working (see `task_file_dash_reads_task_verbatim_from_stdin`),
+        // but the same cap applies to it.
+        let oversized = "x".repeat(MAX_TASK_BYTES as usize + 1);
+        let err = resolve_task(None, Some("-".to_string()), oversized.as_bytes())
+            .expect_err("oversized stdin must be refused");
+        assert!(
+            err.contains("task from stdin") && err.contains("exceeds the"),
+            "over-limit stdin error should name stdin and the cap: {err}"
+        );
+    }
+
+    #[test]
+    fn task_file_pointing_at_a_non_regular_file_is_refused() {
+        // A directory is the portable stand-in for the whole class; the FIFO
+        // and character-device cases live in the `bounded_read` unit tests.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = resolve_task(
+            None,
+            Some(dir.path().to_str().unwrap().to_string()),
+            std::io::empty(),
+        )
+        .expect_err("a non-regular --task-file target must be refused");
+        assert!(
+            err.contains("--task-file needs a regular file") && err.contains("--task-file -"),
+            "refusal should say what is required and point at the stdin alternative: {err}"
         );
     }
 
