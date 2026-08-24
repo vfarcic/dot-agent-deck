@@ -1671,6 +1671,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** that an unmanaged pane id proves ownership; later token-less events after that foreign pane has registered.
 - **Platform coverage:** mac+linux.
 
+##### hooks/provenance/004 — No JSON spelling of the capability field reaches the daemon log.
+- **Layer:** L2 synthetic (a real headless `daemon serve` with `DOT_AGENT_DECK_LOG` redirected into the test's own temp dir, and a raw hook-socket write; no TUI, no LLM).
+- **Agent:** none (one hand-built hook line is written directly to the hook socket).
+- **Asserts:** a payload whose `agent_token` member name is written with a JSON escape (`agent_\u0074oken`), carrying a second copy of the same secret under a member the event does not have, produces the daemon's "unrecognized event_type" diagnostic naming the bad `event_type`, with neither copy of the secret anywhere in the log.
+- **Does not assert:** redaction of a line that fails to parse (unit-covered on the textual path); that the secret was a token the daemon would have resolved; log growth bounds.
+- **Platform coverage:** mac+linux.
+
 #### hooks/install
 
 ##### hooks/install/001 — Launching the deck with `~/.claude/` present writes hook entries into `~/.claude/settings.json` idempotently.

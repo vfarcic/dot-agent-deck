@@ -282,3 +282,94 @@ fn provenance_003_tokenless_event_still_registers_foreign_card() {
                 .any(|line| line.contains("ClaudeCode") && line.contains("Idle"))
     });
 }
+
+/// Write `line` verbatim, with a trailing newline and no harness-added token.
+///
+/// Distinct from [`write_tokenless_hook_line`] because that one takes a
+/// `serde_json::Value`, and re-serializing a `Value` normalizes an escaped
+/// member name back to its plain spelling — which is precisely the property
+/// under test here.
+fn write_raw_hook_line(socket: &std::path::Path, line: &str) {
+    let mut stream = UnixStream::connect(socket).expect("connect to hook socket");
+    stream
+        .write_all(line.as_bytes())
+        .expect("write raw hook JSON");
+    stream
+        .write_all(b"\n")
+        .expect("terminate raw hook JSON line");
+    stream.flush().expect("flush raw hook JSON");
+}
+
+/// Read the daemon's log file, tolerating "not created yet".
+fn read_log(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Scenario: Start a headless daemon with its log redirected into the test's own
+/// temp dir, then write one hook line whose `agent_token` member name is spelled
+/// with a JSON escape (`agent_\u0074oken`) and whose `event_type` is a typo, plus
+/// a second copy of the same secret under a member the event does not have. The
+/// daemon decodes it, takes the escaped member as the capability field, and logs
+/// its "unrecognized event_type" diagnostic — the log must name the bad
+/// `event_type` and must contain neither copy of the secret.
+#[spec("hooks/provenance/004")]
+#[test]
+fn provenance_004_no_spelling_of_the_token_field_reaches_the_daemon_log() {
+    // A value that could not occur by chance, so finding it in the log is proof
+    // and not coincidence.
+    const SECRET: &str = "provenance004-secret-capability-value";
+    const BAD_EVENT_TYPE: &str = "provenance004-not-an-event-type";
+
+    let logdir = common::race_safe_tempdir();
+    let log_path = logdir.path().join("deck.log");
+    let daemon = common::spawn_daemon_serve_with_env(
+        None,
+        "0",
+        &[(
+            "DOT_AGENT_DECK_LOG",
+            log_path.to_str().expect("the log path is UTF-8"),
+        )],
+    );
+
+    // `\u0074` is `t`. `serde_json` decodes this member name to `agent_token`,
+    // so the daemon honours it as the capability field — while a textual scan
+    // for the literal `"agent_token"` finds nothing at all to redact. `stash`
+    // carries the same value under a member the event does not have.
+    let line = format!(
+        "{{\"session_id\":\"provenance004\",\"agent_type\":\"claude_code\",\
+         \"event_type\":\"{BAD_EVENT_TYPE}\",\"timestamp\":\"2026-08-24T12:00:00Z\",\
+         \"pane_id\":\"provenance-004-unmanaged-pane\",\
+         \"agent_\\u0074oken\":\"{SECRET}\",\"stash\":\"{SECRET}\"}}"
+    );
+    assert!(
+        !line.contains("\"agent_token\""),
+        "precondition: the textual redaction has nothing to match on"
+    );
+    // Anti-vacuity, and it is what makes the log assertion below a proof rather
+    // than a hope: the textual redaction the daemon USED to apply on this branch
+    // leaks this exact line. So if the daemon were still calling it, the secret
+    // would be in the log; the assertion that it is not therefore establishes
+    // that the branch redacts structurally, without needing to inspect which
+    // function it called.
+    assert!(
+        dot_agent_deck::hook_ingest::redact_for_log(&line).contains(SECRET),
+        "precondition: a textual scan for the literal field name cannot redact \
+         this line at all"
+    );
+    write_raw_hook_line(&daemon.hook_socket, &line);
+
+    common::wait_until(Duration::from_secs(10), || {
+        read_log(&log_path).contains(BAD_EVENT_TYPE)
+    });
+    let log = read_log(&log_path);
+    assert!(
+        log.contains(BAD_EVENT_TYPE),
+        "the daemon must still report the unrecognized event_type — that is the \
+         whole reason this branch logs the payload at all. Log was:\n{log}"
+    );
+    assert!(
+        !log.contains(SECRET),
+        "no spelling of the capability field, and no unexpected member, may reach \
+         the daemon log. Log was:\n{log}"
+    );
+}

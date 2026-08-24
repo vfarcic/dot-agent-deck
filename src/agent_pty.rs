@@ -1715,6 +1715,11 @@ pub struct RunningAgent {
     /// A side map would need a matching removal on each of those, and the one
     /// that got missed would let a token outlive its agent and speak for a
     /// recycled pane id.
+    ///
+    /// Record removal is not the ONLY revocation, because it is not the only way
+    /// a generation loses its pane: see [`AgentPtyRegistry::token_still_live`],
+    /// which retires this token the moment a successor takes `pane_id_env` even
+    /// though nothing has reaped the record.
     pub hook_token: crate::hook_ingest::AgentToken,
     /// Value of [`DOT_AGENT_DECK_PANE_ID`] captured from the spawn-time env,
     /// if the caller supplied one. Echoed back to clients via the M2.x
@@ -3072,16 +3077,22 @@ struct RegistryInner {
     /// FIRST, then may spend the whole [`AGENT_TERMINATE_GRACE`] killing the
     /// child, and only reserves the pane again when it finally calls
     /// `spawn_agent`. For those seconds every other piece of registry state said
-    /// the pane was nobody's, so [`AgentPtyRegistry::manages_pane`] answered
+    /// the pane was nobody's, so [`AgentPtyRegistry::pane_is_protected`] answered
     /// `false` and a **token-less** event naming the pane was classified foreign
     /// and broadcast — a forged `SessionStart` or status could be flooded into
     /// the window reliably, since its width is an attacker-visible constant.
     ///
-    /// Deliberately a SEPARATE set from `cleanup_holds` rather than a reuse of
+    /// Deliberately a SEPARATE map from `cleanup_holds` rather than a reuse of
     /// it: `spawn_agent` refuses a pane in `cleanup_holds`, and the respawn's
     /// own spawn is the thing this hold has to let through. It answers exactly
     /// one question — "is this pane still ours?" — and blocks nothing.
-    respawn_holds: HashSet<String>,
+    ///
+    /// The value is a **reference count**, not a marker (re-audit finding 3).
+    /// As a `HashSet` this was a single entry that any [`PaneRespawnHold`] drop
+    /// removed, so two overlapping holders on one pane had the first to finish
+    /// clear the other's still-live hold — re-opening the very window the hold
+    /// closes. See [`AgentPtyRegistry::hold_pane_for_respawn`].
+    respawn_holds: HashMap<String, usize>,
     /// Issue #584: one-shot waiters for "this AGENT's PTY reached EOF", keyed by
     /// registry id.
     ///
@@ -3183,10 +3194,14 @@ impl Drop for PaneCleanupHold {
 /// Held across the whole of [`AgentPtyRegistry::respawn_agent_for_pane`], from
 /// before the outgoing record is lifted out until after the replacement has been
 /// reserved, and released on every exit including the `?` returns and a panic.
-/// While it is held, [`AgentPtyRegistry::manages_pane`] answers `true`, so a
-/// token-less event naming the pane is refused rather than accepted as a foreign
-/// card's. It grants nothing else: unlike [`PaneCleanupHold`] it does not block
-/// a spawn, because the respawn's own spawn has to pass through it.
+/// While it is held, [`AgentPtyRegistry::pane_is_protected`] answers `true`, so
+/// a token-less event naming the pane is refused rather than accepted as a
+/// foreign card's. It grants nothing else: unlike [`PaneCleanupHold`] it does
+/// not block a spawn, because the respawn's own spawn has to pass through it.
+///
+/// Each guard owns ONE reference count on the pane's entry, so overlapping
+/// holders release independently — see
+/// [`AgentPtyRegistry::hold_pane_for_respawn`] for why a marker was wrong.
 pub struct PaneRespawnHold {
     registry: Arc<AgentPtyRegistry>,
     pane_id: String,
@@ -3197,9 +3212,19 @@ impl Drop for PaneRespawnHold {
         // Same reasoning as `SpawnReservation::drop` and `PaneCleanupHold::drop`:
         // a poisoned lock means another thread panicked mid-mutation, and
         // panicking in `Drop` would abort. A leaked hold makes ONE pane id look
-        // permanently managed on a registry that can no longer answer anything.
+        // permanently protected on a registry that can no longer answer anything.
         if let Ok(mut inner) = self.registry.inner.lock() {
-            inner.respawn_holds.remove(&self.pane_id);
+            // Re-audit finding 3: release only THIS guard's count. The entry
+            // goes when the last holder drops, so a second respawn finishing
+            // early can no longer clear a hold it does not own.
+            if let std::collections::hash_map::Entry::Occupied(mut held) =
+                inner.respawn_holds.entry(self.pane_id.clone())
+            {
+                *held.get_mut() = held.get().saturating_sub(1);
+                if *held.get() == 0 {
+                    held.remove();
+                }
+            }
         }
     }
 }
@@ -3289,28 +3314,42 @@ impl crate::state::AgentOwnership for AgentPtyRegistry {
         AgentPtyRegistry::generation_ownership(self, pane_id, agent_id)
     }
 
-    /// Issue #318 (audit finding 7): does this registry hold any pane at all?
+    /// Issue #318 (audit finding 7): does this registry hold any pane at all —
+    /// i.e. is this a deck that RUNS agents, or one that only watches external
+    /// ones?
     ///
-    /// Counts every state [`AgentPtyRegistry::manages_pane`] counts, but
-    /// unkeyed: a live record with a pane, a spawn reservation for one, a
-    /// cleanup hold, a respawn hold. An `exited` record is deliberately NOT
-    /// counted — a daemon whose last agent has died is back to watching external
-    /// agents, and pinning it as "manages panes" forever on the strength of a
-    /// record nobody reaped is the same lingering-record mistake audit finding 4
-    /// fixed on the token path.
+    /// A live record with a pane, a spawn reservation for one, a cleanup hold, a
+    /// respawn hold. Unkeyed, because the caller
+    /// ([`crate::state::AppState::admits_paneless_event`]) is asking about the
+    /// process, not about a pane.
+    ///
+    /// # Why this one keeps `!exited` while `pane_is_protected` does not
+    ///
+    /// Reviewer N3 / re-audit finding 7 asked whether the two should match.
+    /// They should not, because they answer different questions. Protection asks
+    /// "could an event naming THIS pane still be ours", and a retired generation
+    /// still holding its pane is exactly such a case. This asks "is this daemon
+    /// currently running agents", and a daemon whose last agent has died is back
+    /// to watching external ones. Pinning it as "manages panes" forever on the
+    /// strength of a record nobody reaped would permanently refuse the
+    /// paneless-event path for a deck that runs nothing.
+    ///
+    /// `pane_handed_over` is filtered too, purely so the predicate reads as the
+    /// same sentence as [`AgentPtyRegistry::token_still_live`]. It changes no
+    /// answer: the duplicate-pane check refuses a spawn onto a live occupant, so
+    /// only a record that has already exited can be handed over, and `!exited`
+    /// has excluded it already.
     fn manages_any_pane(&self) -> crate::state::Ownership {
         let Ok(inner) = self.inner.lock() else {
             tracing::error!("manages_any_pane: registry lock is poisoned; cannot answer");
             return crate::state::Ownership::Unknown;
         };
-        let holds_one = inner
-            .agents
+        let holds_one = inner.agents.values().any(|a| {
+            a.pane_id_env.is_some() && !a.exited.load(Ordering::SeqCst) && !a.pane_handed_over
+        }) || inner
+            .pending_spawns
             .values()
-            .any(|a| a.pane_id_env.is_some() && !a.exited.load(Ordering::SeqCst))
-            || inner
-                .pending_spawns
-                .values()
-                .any(|reserved| reserved.is_some())
+            .any(|reserved| reserved.is_some())
             || !inner.cleanup_holds.is_empty()
             || !inner.respawn_holds.is_empty();
         if holds_one {
@@ -3330,7 +3369,7 @@ impl AgentPtyRegistry {
                 pending_spawns: HashMap::new(),
                 pending_tokens: HashMap::new(),
                 cleanup_holds: HashSet::new(),
-                respawn_holds: HashSet::new(),
+                respawn_holds: HashMap::new(),
                 exit_waiters: HashMap::new(),
             }),
             dispatch_mutexes: Mutex::new(HashMap::new()),
@@ -7012,14 +7051,19 @@ impl AgentPtyRegistry {
         })
     }
 
-    /// Issue #318: does this daemon manage `pane_id_env` right now?
+    /// Issue #318: is `pane_id_env` **protected** by this daemon — could an
+    /// event naming it still legitimately be one of ours?
     ///
     /// A superset of [`Self::has_live_pane`], and deliberately so — this is the
-    /// question the hook-ingest guard asks before refusing a token-less event,
-    /// so every state in which the pane is *ours* must answer `true` or there is
-    /// a window in which a forged event slips through:
+    /// question the hook-ingest guard
+    /// ([`crate::hook_ingest::PaneAuthority::pane_is_protected`]) asks before
+    /// refusing a token-less event, so every state in which the pane is *ours*
+    /// must answer `true` or there is a window in which a forged event slips
+    /// through:
     ///
-    /// - a published, non-exited agent (what `has_live_pane` sees);
+    /// - a published agent that **may still speak for the pane** — see
+    ///   [`Self::token_still_live`]. That is a live agent (what `has_live_pane`
+    ///   sees) **and** a retired generation whose pane no successor has taken;
     /// - a **reservation** — the fork→publish window issue #454 named, where the
     ///   daemon already owns a running child nothing can recognise yet;
     /// - an **in-flight close** — `StopAgent`'s pane-scoped cleanup holds the
@@ -7030,34 +7074,76 @@ impl AgentPtyRegistry {
     ///   [`AGENT_TERMINATE_GRACE`] the pane held none of the three states above;
     ///   [`RegistryInner::respawn_holds`] is what covers that window.
     ///
+    /// # Why the retired generation counts (re-audit finding 1)
+    ///
+    /// This method used to be `manages_pane` and filtered `!exited`, i.e. it
+    /// asked the daemon's **routing** question. Provenance needs a different
+    /// one. On a natural exit nothing removes the record — `pump_reader` only
+    /// sets `exited`, and for a pane nobody closes the record lingers forever —
+    /// so routing answered "not mine", [`crate::hook_ingest::classify`] returned
+    /// `Foreign`, [`crate::hook_ingest::admit`] left the payload's claimed pane
+    /// in place, and [`Self::generation_ownership`] then **positively accepted**
+    /// the event, because a retired generation keeps its pane until another
+    /// claims it. A token-less event naming an exited pane could therefore drive
+    /// that card indefinitely; the stale token was not even needed.
+    ///
+    /// The fix is to make this the same question the admission layer asks. The
+    /// `!exited` filter is replaced by [`Self::token_still_live`], which is the
+    /// retirement rule `generation_ownership` already applies — so a pane is
+    /// protected in exactly the cases where the ownership layer would otherwise
+    /// say [`Ownership::Owned`], plus the three in-flight holds. Late final
+    /// events keep landing, because the same rule keeps the exiting agent's own
+    /// token resolving for exactly as long as its generation may still speak.
+    ///
     /// `has_live_pane` is left as it is: it answers "is there a live agent on
     /// this pane", which is what its callers (the foreign-`SessionStart` warning,
     /// routing) actually want. Widening it would change those.
-    pub fn manages_pane(&self, pane_id_env: &str) -> bool {
+    ///
+    /// Nesting [`Self::token_still_live`] inside the scan is quadratic in the
+    /// worst case, and effectively linear in practice: the inner
+    /// `pane_claimed_by_other` scan is reached only for a record that has
+    /// **exited** and still names this pane, of which there is at most one
+    /// outside a pathological registry. It runs once per inbound hook line over
+    /// a map holding tens of agents; the alternative — writing the retirement
+    /// rule out a second time here — is how the two layers came to disagree in
+    /// the first place.
+    pub fn pane_is_protected(&self, pane_id_env: &str) -> bool {
         if pane_id_env.is_empty() {
             return false;
         }
         let inner = self.inner.lock().unwrap();
-        inner.agents.values().any(|a| {
-            a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
+        inner.agents.iter().any(|(id, a)| {
+            a.pane_id_env.as_deref() == Some(pane_id_env) && Self::token_still_live(&inner, id, a)
         }) || inner
             .pending_spawns
             .values()
             .any(|reserved| reserved.as_deref() == Some(pane_id_env))
             || inner.cleanup_holds.contains(pane_id_env)
-            || inner.respawn_holds.contains(pane_id_env)
+            || inner.respawn_holds.contains_key(pane_id_env)
     }
 
     /// Issue #318 (audit finding 5): claim `pane_id_env` for the duration of a
-    /// respawn, so [`Self::manages_pane`] keeps answering `true` while the pane
-    /// has no record, reservation or cleanup hold.
+    /// respawn, so [`Self::pane_is_protected`] keeps answering `true` while the
+    /// pane has no record, reservation or cleanup hold.
     ///
-    /// Never refuses. Two concurrent respawns of one pane are already serialised
-    /// by the record removal at the top of `respawn_agent_for_pane` (the second
-    /// finds no record and takes the `NotFound` recovery path), and a hold that
-    /// could fail would have to be handled at a call site whose failure mode is
-    /// "the pane briefly looks unmanaged" — the exact bug this closes. A
-    /// poisoned lock returns `None`, which is the same fail-closed answer every
+    /// Never refuses, and **re-entrant**: the entry is a per-pane REFERENCE
+    /// COUNT, so N overlapping holders take N counts and the pane stays held
+    /// until the last guard drops.
+    ///
+    /// # Why a count and not a set (re-audit finding 3 / reviewer N2)
+    ///
+    /// It was a `HashSet<String>`, `insert`'s boolean was ignored, and
+    /// [`PaneRespawnHold::drop`] removed the single entry unconditionally. Two
+    /// overlapping respawns of one pane therefore had the loser's early
+    /// `NotFound` drop clear the *winner's* still-live hold, re-opening exactly
+    /// the audit-finding-5 window this exists to close. That is not reachable
+    /// through today's production path — `AppState::handle_delegate` serialises
+    /// per pane on `dispatch_mutex` and nothing else calls
+    /// `respawn_agent_for_pane` — but "safe because of a lock in another module"
+    /// is a property this method's own signature promises and its state did not
+    /// hold. A count makes it true here.
+    ///
+    /// A poisoned lock returns `None`, which is the same fail-closed answer every
     /// other reader of this lock gives.
     fn hold_pane_for_respawn(self: &Arc<Self>, pane_id_env: &str) -> Option<PaneRespawnHold> {
         if pane_id_env.is_empty() {
@@ -7071,7 +7157,10 @@ impl AgentPtyRegistry {
             );
             return None;
         };
-        inner.respawn_holds.insert(pane_id_env.to_string());
+        *inner
+            .respawn_holds
+            .entry(pane_id_env.to_string())
+            .or_insert(0) += 1;
         Some(PaneRespawnHold {
             registry: Arc::clone(self),
             pane_id: pane_id_env.to_string(),
@@ -7081,31 +7170,18 @@ impl AgentPtyRegistry {
     /// Issue #318: resolve a hook capability token to the `(pane, agent)` this
     /// daemon minted it for.
     ///
-    /// `None` for a token that was never minted here, and `None` the moment its
-    /// agent's process is gone.
+    /// `None` for a token that was never minted here, and `None` once its
+    /// generation may no longer speak for its pane — see
+    /// [`Self::token_still_live`].
     ///
-    /// # Why liveness is checked here and not left to record removal
+    /// # Why revocation is checked here and not left to record removal
     ///
     /// Audit finding 4. Record removal is NOT when an agent stops: on PTY EOF
     /// [`pump_reader`] only sets `exited`, and the record lingers until
     /// `close_agent` / `respawn_agent_for_pane` / `shutdown_all*` reaps it —
     /// which for a pane nobody closes is *never*. Resolving off the map alone
-    /// therefore left a token valid indefinitely after its process died, and on
-    /// a recycled pane a replayed old token still bound. The internal
-    /// inconsistency was the tell: [`Self::manages_pane`] already filters
-    /// `!exited`, so a token-**less** event on a lingering-exited pane was
-    /// treated as foreign while a token-**bearing** one still bound.
-    ///
-    /// `pane_handed_over` is excluded for the same reason it retires a
-    /// generation in [`Self::generation_ownership`]: it is set as the pane
-    /// changes hands and never cleared, so a predecessor can never speak for a
-    /// pane its successor now holds. It implies `exited` in practice (the
-    /// duplicate-pane check refuses a spawn onto a live occupant), so this is
-    /// belt-and-braces rather than a second rule.
-    ///
-    /// Nothing legitimate is refused by either filter: the only events a live
-    /// agent can emit arrive before its own EOF, and the fork→publish window is
-    /// covered by `pending_tokens`, which has no record to be exited.
+    /// therefore let a token go on speaking for a pane a **later generation**
+    /// had inherited, which is the replay this filter forbids.
     ///
     /// Linear over the agent map on purpose: a daemon holds tens of agents, this
     /// runs once per inbound hook line, and a second index would be a third place
@@ -7115,14 +7191,16 @@ impl AgentPtyRegistry {
         token: &crate::hook_ingest::AgentToken,
     ) -> Option<crate::hook_ingest::TokenBinding> {
         let inner = self.inner.lock().unwrap();
-        if let Some((id, agent)) = inner
-            .agents
-            .iter()
-            .find(|(_, a)| a.hook_token == *token && Self::token_still_live(a))
-        {
-            return Some(crate::hook_ingest::TokenBinding {
-                pane_id: agent.pane_id_env.clone(),
-                agent_id: id.clone(),
+        if let Some((id, agent)) = inner.agents.iter().find(|(_, a)| a.hook_token == *token) {
+            // A matched-but-retired token resolves to nothing, and does NOT fall
+            // through to `pending_tokens`: tokens are unique, so a fall-through
+            // could only ever match nothing, and returning here keeps "this
+            // token is dead" a single, readable answer.
+            return Self::token_still_live(&inner, id, agent).then(|| {
+                crate::hook_ingest::TokenBinding {
+                    pane_id: agent.pane_id_env.clone(),
+                    agent_id: id.clone(),
+                }
             });
         }
         inner
@@ -7135,13 +7213,67 @@ impl AgentPtyRegistry {
             })
     }
 
-    /// Issue #318 (audit finding 4): may this record's token still speak?
+    /// Issue #318 (audit finding 4; rewritten for re-audit finding 1): may this
+    /// record's token still speak for its pane?
     ///
-    /// The one place the liveness rule for a capability is written down, shared
-    /// by [`Self::resolve_agent_token`] and [`Self::agent_hook_token`] so the
-    /// ingest side and the hand-out side cannot drift apart.
-    fn token_still_live(agent: &RunningAgent) -> bool {
-        !agent.exited.load(Ordering::SeqCst) && !agent.pane_handed_over
+    /// The one place the revocation rule for a capability is written down,
+    /// shared by [`Self::resolve_agent_token`], [`Self::agent_hook_token`] and
+    /// [`Self::pane_is_protected`], so the ingest side, the hand-out side and
+    /// the refusal side cannot drift apart.
+    ///
+    /// # It is EXACTLY the retirement rule of [`Self::generation_ownership`]
+    ///
+    /// A live record may speak. A retired one may speak for its pane **until
+    /// another generation takes it** — `pane_handed_over` (the monotone half,
+    /// set at the successor's publish and never cleared) or a pending
+    /// reservation ([`Self::pane_claimed_by_other`], which covers the
+    /// reserve→publish window). A retired *paneless* record may always speak:
+    /// registry ids only increment, so it has no successor and its report can
+    /// only reach its own session — the same reasoning `generation_ownership`'s
+    /// paneless arm states.
+    ///
+    /// # Why not simply "`!exited`"
+    ///
+    /// That is what the first round of this fix used, and it made the token
+    /// layer agree with the daemon's **routing** question while disagreeing with
+    /// its **admission** question — which is the one that decides whether an
+    /// event lands. The consequences were both real:
+    ///
+    /// * The agent's own final `Idle`/`SessionEnd`, written just before exit and
+    ///   racing its PTY EOF, had its token revoked out from under it. It still
+    ///   landed only because `classify` then called it `Foreign` and the
+    ///   ownership layer admitted it anyway — i.e. revocation-at-exit bought
+    ///   nothing end to end, because the layer behind it granted exactly what
+    ///   revocation denied.
+    /// * Making provenance strict on top of that (which is what closes re-audit
+    ///   finding 1) would have turned the same race into silent loss of the
+    ///   final event — the very delivery `generation_ownership`'s retirement
+    ///   rule exists to preserve.
+    ///
+    /// Tying both to one rule removes the disagreement instead of moving it: a
+    /// token grants exactly while its generation is still `Owned` for its pane,
+    /// and [`Self::pane_is_protected`] refuses everything else naming that pane.
+    ///
+    /// # The residual, stated
+    ///
+    /// A record nobody reaps keeps its token resolving for as long as it
+    /// lingers, so an attacker who has *read* a token (`/proc/<pid>/environ`, a
+    /// log) can drive that card after the process is gone. That is the same
+    /// window the ownership layer already grants and is bounded by the same
+    /// thing — record reaping — not by provenance. Narrowing it means reaping
+    /// lingering records (which also leak a PTY master and a reader thread), not
+    /// making these two layers disagree again.
+    fn token_still_live(inner: &RegistryInner, id: &str, agent: &RunningAgent) -> bool {
+        if !agent.exited.load(Ordering::SeqCst) {
+            return true;
+        }
+        if agent.pane_handed_over {
+            return false;
+        }
+        match agent.pane_id_env.as_deref() {
+            Some(pane) => !Self::pane_claimed_by_other(inner, pane, id),
+            None => true,
+        }
     }
 
     /// Issue #318: the capability token of an agent this daemon just spawned,
@@ -7161,7 +7293,7 @@ impl AgentPtyRegistry {
     /// process obtain any pane's token — which makes the token evidence of
     /// nothing. Do not reintroduce one, in production or behind a `cfg`.
     ///
-    /// Applies the same liveness filter as [`Self::resolve_agent_token`]
+    /// Applies the same revocation filter as [`Self::resolve_agent_token`]
     /// ([`Self::token_still_live`]): a token that would no longer be honoured at
     /// ingest must not be handed out either.
     pub fn agent_hook_token(&self, id: &str) -> Option<crate::hook_ingest::AgentToken> {
@@ -7169,7 +7301,7 @@ impl AgentPtyRegistry {
         inner
             .agents
             .get(id)
-            .filter(|a| Self::token_still_live(a))
+            .filter(|a| Self::token_still_live(&inner, id, a))
             .map(|a| a.hook_token.clone())
             .or_else(|| inner.pending_tokens.get(id).cloned())
     }
@@ -8932,17 +9064,20 @@ mod spawn_tests {
         assert!(registry.agent_hook_token(&id).is_none());
     }
 
-    /// Audit finding 4: a NATURAL exit revokes the token too.
+    /// Audit finding 4, re-audit finding 1: a natural exit does NOT revoke a
+    /// token while the pane is still its own generation's.
     ///
-    /// `closing_an_agent_revokes_its_token` above covers `close_agent`, the
-    /// path that REMOVES the record. On PTY EOF nothing is removed —
-    /// `pump_reader` only sets `exited` — so before the liveness filter in
-    /// `resolve_agent_token` a dead agent's token stayed valid indefinitely,
-    /// and on a recycled pane a replayed old token still bound. That is the
-    /// window this pins shut, from both directions: the token must stop
-    /// resolving AND must stop being handed out.
+    /// The round-1 fix revoked on `exited`, which made the token layer agree
+    /// with the daemon's *routing* question and disagree with its *admission*
+    /// question. The agent's own final `Idle`/`SessionEnd`, written just before
+    /// exit and racing its PTY EOF, then arrived with a revoked token — it
+    /// landed only because `classify` called it `Foreign` and the ownership
+    /// layer admitted it anyway, i.e. the revocation bought nothing. Once
+    /// provenance protects the lingering pane (which is what closes finding 1),
+    /// the same race would become silent loss of the final event. So the rule is
+    /// the retirement rule instead: still ours until a successor takes the pane.
     #[tokio::test]
-    async fn a_natural_exit_revokes_its_token() {
+    async fn a_natural_exit_keeps_the_token_its_own_pane_still_answers_for() {
         let registry = Arc::new(AgentPtyRegistry::new());
         let id = registry
             .spawn_agent(SpawnOptions {
@@ -8958,18 +9093,7 @@ mod spawn_tests {
             .agent_hook_token(&id)
             .expect("a freshly spawned agent has a token");
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        while tokio::time::Instant::now() < deadline {
-            if registry.live_count() == 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(
-            registry.live_count(),
-            0,
-            "test prerequisite: /usr/bin/true must have exited"
-        );
+        await_natural_exit(&registry).await;
         assert_eq!(
             registry.len(),
             1,
@@ -8978,57 +9102,110 @@ mod spawn_tests {
              for the wrong reason"
         );
 
+        let bound = registry
+            .resolve_agent_token(&token)
+            .expect("the exiting agent's own late final event must still bind");
+        assert_eq!(bound.agent_id, id);
+        assert_eq!(bound.pane_id.as_deref(), Some("token-natural-exit-pane"));
         assert!(
-            registry.resolve_agent_token(&token).is_none(),
-            "a token must stop resolving the moment its agent's process is gone, \
-             not when some later path happens to reap the record"
-        );
-        assert!(
-            registry.agent_hook_token(&id).is_none(),
-            "a token that would no longer be honoured at ingest must not be \
-             handed out either"
+            registry.agent_hook_token(&id).is_some(),
+            "hand-out and ingest share one rule, so they must answer alike"
         );
     }
 
-    /// Audit finding 4, the consequence: `manages_pane` and the token layer must
-    /// agree about a lingering-exited pane.
+    /// The other half of the same rule: the moment a successor publishes onto
+    /// the pane, the predecessor's token stops resolving — permanently.
     ///
-    /// The internal inconsistency that proved finding 4 was a gap and not a
-    /// choice: `manages_pane` already filtered `!exited`, so a token-LESS event
-    /// on such a pane was refused as foreign while a token-BEARING one still
-    /// bound. Both must now answer the same way.
+    /// This is the replay audit finding 4 was really about. `pane_handed_over`
+    /// is monotone, so it holds even after the successor exits in turn.
     #[tokio::test]
-    async fn a_lingering_exited_pane_is_refused_by_both_layers() {
+    async fn a_successor_taking_the_pane_revokes_the_predecessors_token() {
+        const PANE: &str = "token-recycled-pane";
         let registry = Arc::new(AgentPtyRegistry::new());
-        let id = registry
+        let first = registry
             .spawn_agent(SpawnOptions {
                 command: Some("/usr/bin/true"),
-                env: vec![(
-                    DOT_AGENT_DECK_PANE_ID.to_string(),
-                    "token-lingering-pane".to_string(),
-                )],
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the first generation");
+        let stale = registry
+            .agent_hook_token(&first)
+            .expect("the first generation has a token");
+        await_natural_exit(&registry).await;
+        assert!(
+            registry.resolve_agent_token(&stale).is_some(),
+            "precondition: before the handover the retired generation still \
+             answers for its own pane"
+        );
+
+        let second = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("the pane is free for a successor once its occupant exited");
+
+        assert!(
+            registry.resolve_agent_token(&stale).is_none(),
+            "a replayed token must never speak for a pane a later generation now \
+             holds"
+        );
+        assert!(
+            registry.agent_hook_token(&first).is_none(),
+            "and it must not be handed out either"
+        );
+        let fresh = registry
+            .agent_hook_token(&second)
+            .expect("the successor has its own token");
+        assert_ne!(stale, fresh);
+        registry.shutdown_all();
+    }
+
+    /// Re-audit finding 1, the finding itself: a lingering exited pane is
+    /// **protected**, so a token-less event naming it is refused instead of
+    /// falling through to the foreign path and being accepted by the older
+    /// ownership layer.
+    ///
+    /// This replaces `a_lingering_exited_pane_is_refused_by_both_layers`, which
+    /// asserted only `!manages_pane` and `resolve_agent_token(..).is_none()` and
+    /// so proved nothing about refusal: in the classifier `!manages_pane` is
+    /// precisely what SELECTS `Foreign`. The end-to-end proof — `admit` followed
+    /// by `AppState::apply_event`, showing the card does not move — is
+    /// `tests/hook_provenance_admission.rs`.
+    #[tokio::test]
+    async fn a_lingering_exited_pane_is_still_protected() {
+        const PANE: &str = "token-lingering-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
                 ..SpawnOptions::default()
             })
             .expect("spawn an agent that exits on its own");
-        let token = registry.agent_hook_token(&id).expect("token before exit");
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        while tokio::time::Instant::now() < deadline {
-            if registry.live_count() == 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(registry.live_count(), 0, "test prerequisite: exited");
+        await_natural_exit(&registry).await;
+        assert_eq!(
+            registry.len(),
+            1,
+            "test prerequisite: the record lingers unreaped"
+        );
 
         assert!(
-            !registry.manages_pane("token-lingering-pane"),
-            "precondition: `manages_pane` already treats a lingering-exited pane \
-             as not ours"
+            !registry.has_live_pane(PANE),
+            "precondition: routing correctly says no agent is running here — \
+             which is exactly what used to make provenance call it foreign"
         );
         assert!(
-            registry.resolve_agent_token(&token).is_none(),
-            "the token layer must agree with `manages_pane` about the same pane"
+            registry.pane_is_protected(PANE),
+            "the pane is still this daemon's until a successor takes it, so an \
+             event naming it may not be admitted on the strength of the payload"
+        );
+        assert_eq!(
+            registry.generation_ownership(Some(PANE), None),
+            Ownership::Owned,
+            "and this is why: the admission layer would otherwise accept it"
         );
     }
 
@@ -9040,13 +9217,13 @@ mod spawn_tests {
     /// classified foreign and broadcast. Without the second, the respawn's own
     /// `spawn_agent` would be refused with `DuplicatePaneId` and the hold would
     /// have broken the very path it protects — which is exactly why this is a
-    /// separate set from `cleanup_holds` rather than a reuse of it.
+    /// separate map from `cleanup_holds` rather than a reuse of it.
     #[tokio::test]
-    async fn a_respawn_hold_keeps_the_pane_managed_without_blocking_its_spawn() {
+    async fn a_respawn_hold_keeps_the_pane_protected_without_blocking_its_spawn() {
         const PANE: &str = "respawn-window-pane";
         let registry = Arc::new(AgentPtyRegistry::new());
         assert!(
-            !registry.manages_pane(PANE),
+            !registry.pane_is_protected(PANE),
             "precondition: nothing holds the pane yet"
         );
 
@@ -9064,7 +9241,7 @@ mod spawn_tests {
             );
         }
         assert!(
-            registry.manages_pane(PANE),
+            registry.pane_is_protected(PANE),
             "a pane mid-respawn is still this daemon's, so a token-less event \
              naming it must be refused rather than broadcast as foreign"
         );
@@ -9079,14 +9256,79 @@ mod spawn_tests {
 
         drop(hold);
         assert!(
-            registry.manages_pane(PANE),
+            registry.pane_is_protected(PANE),
             "after the hold is released the fresh generation holds the pane"
         );
         registry.close_agent(&id).expect("close the replacement");
         assert!(
-            !registry.manages_pane(PANE),
+            !registry.pane_is_protected(PANE),
             "the hold must not leak: once the replacement is gone the pane is \
              nobody's again"
+        );
+    }
+
+    /// Re-audit finding 3 / reviewer N2: two overlapping holders on one pane
+    /// must release independently.
+    ///
+    /// As a `HashSet` the hold was a single entry that any guard's drop removed,
+    /// so the loser of a concurrent respawn — which returns `NotFound` almost
+    /// immediately and drops its guard — cleared the winner's still-live hold and
+    /// re-opened the audit-finding-5 window mid-grace. Not reachable through
+    /// today's `dispatch_mutex`-serialised production path, which is exactly why
+    /// it has to be pinned here rather than argued in a docstring: the method
+    /// promises a property, and the property has to live in the state.
+    #[tokio::test]
+    async fn overlapping_respawn_holds_release_independently() {
+        const PANE: &str = "respawn-double-hold-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+
+        let winner = registry
+            .hold_pane_for_respawn(PANE)
+            .expect("first hold is granted");
+        let loser = registry
+            .hold_pane_for_respawn(PANE)
+            .expect("a second, overlapping hold is granted too — it never refuses");
+        assert_eq!(
+            registry.inner.lock().unwrap().respawn_holds.get(PANE),
+            Some(&2),
+            "each holder owns its own count"
+        );
+
+        // The loser of the race takes its early `NotFound` return and drops.
+        drop(loser);
+        assert!(
+            registry.pane_is_protected(PANE),
+            "the winner's hold must survive the loser's drop — this is the \
+             regression: a shared marker left the pane unprotected here, for the \
+             whole of the remaining terminate+spawn window"
+        );
+
+        drop(winner);
+        assert!(
+            !registry.pane_is_protected(PANE),
+            "and the last holder's drop releases the pane, so the count cannot leak"
+        );
+        assert!(
+            registry.inner.lock().unwrap().respawn_holds.is_empty(),
+            "the entry itself is removed at zero, not left at 0"
+        );
+    }
+
+    /// Spin until every agent in `registry` has reported its PTY EOF, leaving
+    /// the record in place. The lingering-record state is what several tests
+    /// above are about, so the wait must not reap anything.
+    async fn await_natural_exit(registry: &Arc<AgentPtyRegistry>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if registry.live_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            registry.live_count(),
+            0,
+            "test prerequisite: the spawned process must have exited on its own"
         );
     }
 
@@ -9194,15 +9436,18 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
-    /// `manages_pane` has to answer `true` in every state where the pane is
+    /// `pane_is_protected` has to answer `true` in every state where the pane is
     /// ours, including the fork→publish window — otherwise there is an instant
     /// in which a token-less forged event is admitted against a pane the daemon
     /// already owns.
     #[test]
-    fn manages_pane_covers_a_reservation_as_well_as_a_live_agent() {
+    fn pane_is_protected_covers_a_reservation_as_well_as_a_live_agent() {
         let registry = Arc::new(AgentPtyRegistry::new());
-        assert!(!registry.manages_pane("token-reserved-pane"));
-        assert!(!registry.manages_pane(""), "an empty pane id is nobody's");
+        assert!(!registry.pane_is_protected("token-reserved-pane"));
+        assert!(
+            !registry.pane_is_protected(""),
+            "an empty pane id is nobody's"
+        );
         {
             let mut inner = registry.inner.lock().unwrap();
             inner
@@ -9210,7 +9455,7 @@ mod spawn_tests {
                 .insert("777".to_string(), Some("token-reserved-pane".to_string()));
         }
         assert!(
-            registry.manages_pane("token-reserved-pane"),
+            registry.pane_is_protected("token-reserved-pane"),
             "a reserved-but-unpublished spawn already owns its pane"
         );
     }
@@ -12388,7 +12633,7 @@ impl crate::hook_ingest::PaneAuthority for AgentPtyRegistry {
         AgentPtyRegistry::resolve_agent_token(self, token)
     }
 
-    fn manages_pane(&self, pane_id: &str) -> bool {
-        AgentPtyRegistry::manages_pane(self, pane_id)
+    fn pane_is_protected(&self, pane_id: &str) -> bool {
+        AgentPtyRegistry::pane_is_protected(self, pane_id)
     }
 }

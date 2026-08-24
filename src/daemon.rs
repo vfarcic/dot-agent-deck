@@ -1711,6 +1711,24 @@ async fn run_shell_activity_monitor_with<S, F>(
 /// to the log at a few KiB instead of unbounded 64 KiB records.
 const MAX_RAW_PAYLOAD_LOGS_PER_CONNECTION: u32 = 5;
 
+/// Say once, on the connection that just spent the last of
+/// [`MAX_RAW_PAYLOAD_LOGS_PER_CONNECTION`], that the rest will be dropped.
+///
+/// Called from **both** payload-logging branches (re-audit finding 6 / reviewer
+/// N1). The summary used to live only inside the malformed-event branch, so a
+/// connection that exhausted the same budget through unknown-`event_type`
+/// warnings went silent with no line saying why — which reads as the peer having
+/// stopped rather than the daemon having stopped listening.
+fn note_raw_payload_log_cutoff(remaining: u32) {
+    if remaining == 0 {
+        warn!(
+            logged = MAX_RAW_PAYLOAD_LOGS_PER_CONNECTION,
+            "further malformed or unrecognized payloads on this hook \
+             connection will not be logged"
+        );
+    }
+}
+
 /// Write one JSON reply line on a hook connection, under
 /// [`crate::hook_ingest::HOOK_REPLY_WRITE_TIMEOUT`].
 ///
@@ -2161,23 +2179,36 @@ async fn run_hook_loop(
                                 && raw_log_budget > 0
                             {
                                 raw_log_budget -= 1;
-                                // Issue #318 (audit finding 6): `line` is the
-                                // ORIGINAL payload, so it still carries the
-                                // capability token that `admit` stripped from
-                                // the typed event a few lines above — the one
-                                // path by which a live capability reached the
-                                // disk, defeating `AgentToken`'s redacted
-                                // `Debug` entirely. Redacted and bounded here;
-                                // the diagnostic (which unrecognized value
-                                // arrived) survives, because it is in the head
-                                // of the line.
+                                // Issue #318 (audit finding 6, reworked for
+                                // re-audit finding 2): `line` is the ORIGINAL
+                                // payload, so it still carries the capability
+                                // token that `admit` stripped from the typed
+                                // event a few lines above — the one path by
+                                // which a live capability reached the disk,
+                                // defeating `AgentToken`'s redacted `Debug`
+                                // entirely.
+                                //
+                                // This branch is reached only for a line that
+                                // DID decode, so the redaction here is
+                                // structural: `redact_decoded_for_log` re-renders
+                                // the payload from the parsed JSON and keeps only
+                                // the event's own members. A textual scan cannot
+                                // do that job here — JSON has escaped spellings
+                                // of the member name (`\u0074` for `t`) that
+                                // serde resolves to `agent_token` and a substring
+                                // search does not, so the token was honoured as a
+                                // capability and then logged verbatim. The
+                                // diagnostic (which unrecognized `event_type`
+                                // value arrived) survives, because `event_type`
+                                // is one of the kept members.
                                 warn!(
                                     session_id = %event.session_id,
                                     pane_id = ?event.pane_id,
-                                    raw_line = %crate::hook_ingest::redact_for_log(line),
+                                    raw_line = %crate::hook_ingest::redact_decoded_for_log(line),
                                     "Event carries an unrecognized event_type — decoded as \
                                      Unknown and otherwise ignored; check the hook for a typo"
                                 );
+                                note_raw_payload_log_cutoff(raw_log_budget);
                             }
                             // Persist the agent type this hook revealed into
                             // the PTY registry (keyed by pane id), so a later
@@ -2249,18 +2280,15 @@ async fn run_hook_loop(
                             // log per line (finding 9). `redact_for_log` is
                             // textual rather than serde-shaped precisely so it
                             // still works HERE, on a line that by definition did
-                            // not parse.
+                            // not parse — there is no decoded value to project,
+                            // and nothing on this path was ever honoured as a
+                            // capability, so best-effort byte redaction is both
+                            // what is available and what is called for.
                             warn!(
                                 payload = %crate::hook_ingest::redact_for_log(line),
                                 "Malformed event"
                             );
-                            if raw_log_budget == 0 {
-                                warn!(
-                                    logged = MAX_RAW_PAYLOAD_LOGS_PER_CONNECTION,
-                                    "further malformed or unrecognized payloads on this hook \
-                                     connection will not be logged"
-                                );
-                            }
+                            note_raw_payload_log_cutoff(raw_log_budget);
                         }
                     }
                 });
