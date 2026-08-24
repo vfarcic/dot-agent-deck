@@ -74,6 +74,27 @@ fn open_pty() -> (File, File) {
         "open outer pseudo-terminal: {}",
         std::io::Error::last_os_error()
     );
+    // Issue #668, test-side: `openpty` marks neither descriptor close-on-exec,
+    // so without this every wrapper spawned below inherited the master of THIS
+    // helper's outer terminal — the same class of defect `open_inner_pty` had,
+    // one level up. It is the caller's fd hygiene rather than `wrap`'s, and the
+    // real harness never had it (`portable_pty` sets `FD_CLOEXEC` on both ends),
+    // but leaking it made `wrap_child_holds_no_descriptor_of_the_inner_pty_master`
+    // report a handed-down master on every run.
+    //
+    // The MASTER only: the slave is deliberately left inheritable, exactly as
+    // `wrap` leaves its own. Every site below hands `Stdio` a clone of it, and
+    // `dup2` onto 0/1/2 clears the flag anyway — so setting it would change
+    // nothing except the one thing this helper is measured on.
+    //
+    // SAFETY: `master` is a live descriptor this process owns; `F_SETFD` takes
+    // and returns an int, no pointers.
+    assert_ne!(
+        unsafe { libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC) },
+        -1,
+        "mark the outer pseudo-terminal master close-on-exec: {}",
+        std::io::Error::last_os_error()
+    );
     // SAFETY: successful `openpty` returned two fresh, valid descriptors.
     unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) }
 }
