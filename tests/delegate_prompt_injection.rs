@@ -984,6 +984,7 @@ async fn delegate_011_timeout_fallback_also_waits_for_readiness_buffer_inner() {
 
 #[cfg(unix)]
 async fn delegate_011_one_millisecond_buffer_is_a_real_wait_inner() {
+    common::init_test_env();
     let cwd = common::race_safe_tempdir();
     std::fs::write(
         cwd.path().join(".dot-agent-deck.toml"),
@@ -1047,6 +1048,7 @@ async fn delegate_011_one_millisecond_buffer_is_a_real_wait_inner() {
 
 #[cfg(unix)]
 async fn delegate_011_overflow_buffer_clamps_to_thirty_seconds_inner() {
+    common::init_test_env();
     let cwd = common::race_safe_tempdir();
     std::fs::write(
         cwd.path().join(".dot-agent-deck.toml"),
@@ -1468,6 +1470,7 @@ fn delegate_notice_guard_rejects_wrong_agent_rehome_and_closing() {
         .build()
         .expect("build guarded-notice runtime")
         .block_on(async {
+            common::init_test_env();
             let cwd = common::race_safe_tempdir();
             let observer = cwd.path().join("guarded-notice-observer");
             write_executable(

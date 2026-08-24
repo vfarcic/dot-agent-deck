@@ -36,6 +36,12 @@
 // `docs/develop/e2e-temp-dirs.md`.
 #[path = "../src/test_temp.rs"]
 mod test_temp;
+// Issue #668: same shape, same reason — the wrapped-child lifetime bound this
+// file's registry spawns and in-process daemon need, in a file small enough to
+// include on its own instead of pulling in the harness. `common::init_test_env`
+// calls the same `arm()`.
+#[path = "common/child_lifetime_bound.rs"]
+mod child_lifetime_bound;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -111,6 +117,11 @@ impl Drop for AgentEventDaemon {
 }
 
 async fn start_agent_event_daemon() -> AgentEventDaemon {
+    // Issue #668: this harness runs a real daemon in-process and hands its
+    // registry to the test, so arm the wrapped-child lifetime bound before
+    // anything it spawns exists.
+    child_lifetime_bound::arm();
+
     let dir = test_temp::tempdir().expect("allocate real-agent-event daemon tempdir");
     let hook_path = dir.path().join("hook.sock");
     let attach_path = dir.path().join("attach.sock");
@@ -207,6 +218,10 @@ async fn run_real_agent_event(
 }
 
 async fn start_real_server() -> Server {
+    // Issue #668: the arming point for the twelve tests that reach a registry
+    // through this harness.
+    child_lifetime_bound::arm();
+
     let registry = Arc::new(AgentPtyRegistry::new());
     let (dir, path, listener) = {
         let _g = HARNESS_BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1944,6 +1959,10 @@ fn live_002_list_agents_attaches_live_snapshot() {
 }
 
 async fn live_002_list_agents_attaches_live_snapshot_inner() {
+    // Issue #668: bare registry, so it arms the wrapped-child lifetime bound
+    // itself rather than inheriting it from `start_real_server`.
+    child_lifetime_bound::arm();
+
     let registry = Arc::new(AgentPtyRegistry::new());
     let pane = "pane-live";
 
@@ -2055,6 +2074,9 @@ fn live_003_join_picks_newest_last_activity() {
 }
 
 async fn live_003_join_picks_newest_last_activity_inner() {
+    // Issue #668: bare registry, as in `live_002` above.
+    child_lifetime_bound::arm();
+
     let registry = Arc::new(AgentPtyRegistry::new());
     let pane = "pane-dup";
     let agent_id = registry
@@ -2147,6 +2169,11 @@ fn live_004_hydrated_session_seeds_from_live_snapshot_with_fallback() {
 }
 
 async fn live_004_hydrated_session_seeds_from_live_snapshot_with_fallback_inner() {
+    // Issue #668: bare registry, as in `live_002` / `live_003` above —
+    // `start_server_with_state` takes the registry from its caller, so the
+    // caller is where the bound has to be armed.
+    child_lifetime_bound::arm();
+
     let registry = Arc::new(AgentPtyRegistry::new());
     let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
     let (_dir, path, handle) = start_server_with_state(registry.clone(), state.clone()).await;

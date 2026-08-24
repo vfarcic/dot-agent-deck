@@ -3812,72 +3812,18 @@ fn detach_from_any_live_deck() {
     });
 }
 
-/// How long a process spawned out of this test process may live before its own
-/// backstop ends it, in seconds. Matches the value [`TuiDeck`] and `DaemonProc`
-/// pin explicitly after their `env_clear`, and the 300 s figure
-/// `docs/develop/e2e-temp-dirs.md` reasons about when it sets the reaper's
-/// 10-minute floor at 2x the orphan cap.
-const CHILD_MAX_LIFETIME_SECS: &str = "300";
-
-/// Arm the wrapped-agent lifetime bound for every child this test process will
-/// ever spawn (issue #668).
-///
-/// `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` is what gates `wrap`'s
-/// `arm_wrap_self_defense` (which bounds the *wrapper*) and, since #661,
-/// `arm_child_group_backstop` (which forks a reaper holding the same deadline
-/// for the *child's* group, so an uncatchable `SIGKILL` of the wrapper cannot
-/// strand it). Both are deliberately env-gated so a production wrapper forks
-/// nothing and behaves exactly as before.
-///
-/// Rows 1 and 2 of the suite's spawn table already pin it: [`TuiDeck`] at its
-/// `env_clear`, and `DaemonProc` at its. The in-process `AgentPtyRegistry` path
-/// did not, and it is the one 15 test files spawn agents through — so the
-/// wrapped stand-ins they mint had #661's mechanism *mis-armed* rather than
-/// unreachable. Measured on a live wrapper spawned by `delegate_007`: zero
-/// `MAX_LIFETIME` matches anywhere in its `/proc/<pid>/environ`, and 221 such
-/// orphans censused on one dev box with the oldest alive 9.4 days, each pinning
-/// its e2e temp root `live-pid` against `cargo xtask clean-e2e-tmp` forever.
-///
-/// One variable, one site, and it covers spawn shapes that do not exist yet:
-/// `agent_pty::spawn` scrubs *named* deck vars but does not `env_clear`, so a
-/// value set once in this process is inherited by every child of every shape —
-/// bare `cat`, wrapped Codex, recorder script, real agent. That is what makes
-/// this a one-line fix rather than the per-`SpawnOptions` whack-a-mole it looks
-/// like.
-///
-/// Set only when absent, so a test that pins its own (shorter) cap keeps it, and
-/// so this stays idempotent.
-///
-/// Deliberately NOT done through `.cargo/config.toml`'s `[env]`: that would
-/// apply to `cargo run` as well and hand a developer a deck that self-terminates
-/// at 300 s.
-fn arm_child_lifetime_bound() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        if std::env::var_os(dot_agent_deck::agent_pty::DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS)
-            .is_some()
-        {
-            return;
-        }
-        // SAFETY: same argument as `detach_from_any_live_deck` above, which has
-        // mutated this process's environment from this call path since it was
-        // written — a `OnceLock` so it happens exactly once per test process,
-        // during the setup a test performs before it builds a runtime or spawns
-        // anything.
-        unsafe {
-            std::env::set_var(
-                dot_agent_deck::agent_pty::DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS,
-                CHILD_MAX_LIFETIME_SECS,
-            )
-        };
-    });
-}
+/// Issue #668: the wrapped-agent lifetime bound, in a file small enough for the
+/// test binaries that deliberately do NOT link this harness to
+/// `#[path]`-include on their own. `init_test_env` below calls the same
+/// [`child_lifetime_bound::arm`], so there is one implementation and one SAFETY
+/// argument rather than one per spawn-owning crate.
+mod child_lifetime_bound;
 
 /// Idempotent setup hook for legacy daemon-spawning tests. Creates the
 /// per-process lock dir on first call; subsequent calls are no-ops.
 pub fn init_test_env() {
     detach_from_any_live_deck();
-    arm_child_lifetime_bound();
+    child_lifetime_bound::arm();
     LOCK_DIR.get_or_init(|| {
         // A plain subdirectory of the harness root rather than its own
         // `TempDir`: this has to stay alive for the whole process, and a

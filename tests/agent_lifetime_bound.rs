@@ -17,10 +17,17 @@
 //! inherited a test-process environment that had never had the variable in it.
 //! Measured on a live wrapper spawned by `delegate_007`: zero `MAX_LIFETIME`
 //! matches anywhere in its `/proc/<pid>/environ`. So #661 was mis-armed rather
-//! than unreachable, and the fix is one variable pinned once in
-//! `common::init_test_env` — `agent_pty::spawn` scrubs named deck vars but does
-//! not `env_clear`, so a single value in the test process reaches every child of
-//! every spawn shape, present and future.
+//! than unreachable, and the fix is one variable pinned once by
+//! `tests/common/child_lifetime_bound.rs`'s `arm()` — `agent_pty::spawn` scrubs
+//! named deck vars but does not `env_clear`, so a single value in the test
+//! process reaches every child of every spawn shape, present and future.
+//!
+//! This file reaches it through `common::init_test_env()`, which calls the same
+//! `arm()`. The three spawning files that deliberately do not link the harness
+//! (`rehydration.rs`, `daemon_protocol.rs`, `shell_activity.rs`)
+//! `#[path]`-include that one small file instead, and linkage-check rule 10
+//! fails the build when a file under `tests/` builds an `AgentPtyRegistry` or
+//! calls `run_daemon_with` without arming either way.
 //!
 //! Named for what it contains, not for the issue that produced it (CLAUDE.md
 //! rule 3).
