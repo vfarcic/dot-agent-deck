@@ -10,7 +10,7 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-use common::{DaemonProc, TuiDeck, spawn_daemon_serve};
+use common::{DaemonProc, TuiDeck, agent_token_on, spawn_daemon_serve, write_hook_line};
 use dot_agent_deck::daemon_protocol::AttachRequest;
 use dot_agent_deck::event::AgentType;
 use spec::spec;
@@ -41,6 +41,141 @@ fn write_tokenless_hook_line(socket: &std::path::Path, event: &serde_json::Value
         .write_all(b"\n")
         .expect("terminate token-less hook JSON line");
     stream.flush().expect("flush token-less hook JSON");
+}
+
+/// Scenario: Start two daemon-managed panes and prove pane A's token drives A when the hook correctly names A. After resetting A to Idle, send the same ToolStart with A's token but pane B's claimed pane and agent ids; A must return to Working while B remains Idle.
+#[spec("hooks/provenance/001")]
+#[test]
+fn provenance_001_token_binding_overrides_claimed_pane_and_agent() {
+    const PANE_A: &str = "provenance-token-pane-a";
+    const PANE_B: &str = "provenance-token-pane-b";
+    const LABEL_A: &str = "provenance-token-card-a";
+    const LABEL_B: &str = "provenance-token-card-b";
+    const SESSION_ID: &str = "tokenbound";
+
+    let daemon = spawn_daemon_serve(None, "0");
+    for (pane_id, label, agent_type) in [
+        (PANE_A, LABEL_A, AgentType::Pi),
+        (PANE_B, LABEL_B, AgentType::Devin),
+    ] {
+        let response = daemon
+            .send_attach_request(&AttachRequest::StartAgent {
+                command: Some("/bin/sh".into()),
+                cwd: None,
+                rows: 24,
+                cols: 80,
+                env: vec![("DOT_AGENT_DECK_PANE_ID".into(), pane_id.into())],
+                display_name: Some(label.into()),
+                tab_membership: None,
+                agent_type: Some(agent_type),
+                seed: None,
+            })
+            .unwrap_or_else(|error| panic!("StartAgent for {pane_id}: {error}"));
+        assert!(
+            response.error.is_none(),
+            "StartAgent for {pane_id} should succeed, got error: {:?}",
+            response.error
+        );
+    }
+
+    let records = daemon.wait_for_agent_count(2, Duration::from_secs(5));
+    let agent_id = |pane_id: &str| {
+        records
+            .iter()
+            .find(|record| record.pane_id_env.as_deref() == Some(pane_id))
+            .unwrap_or_else(|| panic!("managed pane {pane_id} never registered: {records:?}"))
+            .id
+            .clone()
+    };
+    let agent_a = agent_id(PANE_A);
+    let agent_b = agent_id(PANE_B);
+    let token_a = agent_token_on(&daemon.attach_socket, &agent_a);
+
+    // One card per row keeps each type/status pair on its own rendered line,
+    // so the two cards cannot satisfy each other's status assertions.
+    let deck = TuiDeck::builder()
+        .with_pty_size(70, 40)
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            daemon.attach_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            daemon.hook_socket.to_string_lossy().to_string(),
+        )
+        .launch_with_fixture("minimal");
+    deck.wait_until_grid("both managed cards begin Idle", |grid| {
+        grid.lines()
+            .any(|line| line.contains("Pi") && line.contains("Idle"))
+            && grid
+                .lines()
+                .any(|line| line.contains("Devin") && line.contains("Idle"))
+    });
+
+    let correctly_named = serde_json::json!({
+        "session_id": SESSION_ID,
+        "agent_type": "pi",
+        "event_type": "tool_start",
+        "tool_name": "Bash",
+        "tool_detail": "printf provenance",
+        "timestamp": "2026-08-24T12:00:00Z",
+        "pane_id": PANE_A,
+        "agent_id": agent_a,
+    });
+    write_hook_line(
+        &daemon.hook_socket,
+        &correctly_named.to_string(),
+        Some(&token_a),
+    )
+    .expect("write correctly named token-bearing ToolStart");
+    deck.wait_until_grid("pane A's own token drives pane A", |grid| {
+        grid.lines()
+            .any(|line| line.contains("Pi") && line.contains("Working"))
+            && grid
+                .lines()
+                .any(|line| line.contains("Devin") && line.contains("Idle"))
+    });
+
+    let idle = serde_json::json!({
+        "session_id": SESSION_ID,
+        "agent_type": "pi",
+        "event_type": "idle",
+        "timestamp": "2026-08-24T12:00:01Z",
+        "pane_id": PANE_A,
+        "agent_id": agent_a,
+    });
+    write_hook_line(&daemon.hook_socket, &idle.to_string(), Some(&token_a))
+        .expect("reset pane A to Idle before the false-claim control");
+    deck.wait_until_grid("both cards are Idle before the false claim", |grid| {
+        grid.lines()
+            .any(|line| line.contains("Pi") && line.contains("Idle"))
+            && grid
+                .lines()
+                .any(|line| line.contains("Devin") && line.contains("Idle"))
+    });
+
+    let mut false_claim = correctly_named;
+    false_claim["timestamp"] = serde_json::json!("2026-08-24T12:00:02Z");
+    false_claim["pane_id"] = serde_json::json!(PANE_B);
+    false_claim["agent_id"] = serde_json::json!(agent_b);
+    write_hook_line(
+        &daemon.hook_socket,
+        &false_claim.to_string(),
+        Some(&token_a),
+    )
+    .expect("write pane A's token with pane B's claimed identity");
+
+    deck.wait_until_grid_then_hold(
+        "pane A's token is rebound to A while pane B stays Idle",
+        Duration::from_secs(1),
+        |grid| {
+            grid.lines()
+                .any(|line| line.contains("Pi") && line.contains("Working"))
+                && grid
+                    .lines()
+                    .any(|line| line.contains("Devin") && line.contains("Idle"))
+        },
+    );
 }
 
 /// Scenario: Start a daemon-managed pane and attach the real TUI so its Idle card is visible, then write a deliberately token-less ToolStart naming that pane and agent directly to the hook socket. The managed card must remain Idle rather than moving to Working.

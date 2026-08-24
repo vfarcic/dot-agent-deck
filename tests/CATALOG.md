@@ -1643,11 +1643,18 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 #### hooks/provenance
 
+##### hooks/provenance/001 — A valid token binds a hook to its own pane instead of the pane and agent ids the payload claims.
+- **Layer:** L2 synthetic (the real daemon and PTY-attached TUI, two daemon-managed shell panes, and token-bearing hook-socket writes; no LLM).
+- **Agent:** none (long-lived shell processes stand in for pane A and pane B while the test writes deterministic `ToolStart` and `Idle` events).
+- **Asserts:** pane A's token on an event correctly naming A moves A from Idle to Working as a positive control; after an Idle reset, the same token and ToolStart falsely naming B are rebound to A, so A returns to Working while B's rendered card remains Idle.
+- **Does not assert:** token-less or unrecognized-token refusal (the token-less managed-pane case is `hooks/provenance/002`); token secrecy, revocation, or rejection logging.
+- **Platform coverage:** mac+linux.
+
 ##### hooks/provenance/002 — A token-less event naming a daemon-managed pane cannot drive that pane's card.
 - **Layer:** L2 synthetic (the real daemon and PTY-attached TUI, a daemon-managed shell pane, and a raw hook-socket write; no LLM).
 - **Agent:** none (a long-lived `sleep` shell stands in for the managed agent while the test writes a deliberately token-less `ToolStart`).
 - **Asserts:** the managed card begins Idle and remains Idle after a token-less event correctly naming its pane and agent ids, instead of moving to Working.
-- **Does not assert:** rejection logging; token-to-pane derivation when a token is present (covered by `hooks/provenance/001` after the token API exists).
+- **Does not assert:** rejection logging; token-to-pane derivation when a token is present (covered by `hooks/provenance/001`).
 - **Platform coverage:** mac+linux.
 
 ##### hooks/provenance/003 — A token-less event for an unmanaged pane still registers a foreign card (deliberately GREEN before the provenance fix).
