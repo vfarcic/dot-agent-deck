@@ -3610,7 +3610,7 @@ fn process_pending_seed_prompts(
             // `wrapper_fork` start becomes the pane's generation, the delivery
             // binds it, and the real start then reads as a rollover and abandons
             // the seed. Arming a write that no longer exists fixes nothing. See
-            // the #666 follow-up.
+            // issue #684.
             let writes_payload = attempt_writes_payload(attempt, AgentStartRearm::default(), now);
             let wire_delivery_id = wire_attempt_id(&delivery_id, epoch, attempt, !writes_payload);
             // Reviewer blocker 2: from here on, a request under this wire id may
@@ -4664,7 +4664,8 @@ fn deliver_orchestrator_prompt(
     // [`crate::prompt_delivery::attempt_writes_payload`].
     //
     // Issue #666: disarmed here for the same reason as the seed path's twin — the
-    // armed third payload ships on the daemon path only. See that call site.
+    // armed third payload ships on the daemon path only. See that call site, and
+    // issue #684.
     let writes_payload = attempt_writes_payload(attempt, AgentStartRearm::default(), now);
     // Issue #424: the logical delivery keeps ONE identity; every ATTEMPT rides
     // its own wire id, or the daemon's ledger replays the first `Applied` and a
