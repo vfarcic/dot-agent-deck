@@ -530,6 +530,17 @@ pub trait AgentOwnership: Send + Sync {
     /// [`Ownership::Owned`] = it holds at least one pane; [`Ownership::Unclaimed`]
     /// = it genuinely holds none; [`Ownership::Unknown`] = it could not be
     /// asked, which the caller must treat as fail-closed rather than as "none".
+    ///
+    /// # It is narrower than "protects any pane", on purpose
+    ///
+    /// Third-pass audit finding 3. The registry's implementation filters exited
+    /// records, where its per-pane protection predicate does not — a deck whose
+    /// last agent has died is back to watching external agents, and counting an
+    /// unreaped record would refuse the pane-less path for the rest of the
+    /// daemon's life. So there is a window in which this answers
+    /// [`Ownership::Unclaimed`] while a pane is still protected, and it was
+    /// reachable: see [`AppState::paneless_event_may_take_over`], which is where
+    /// that is paid for rather than here.
     fn manages_any_pane(&self) -> Ownership;
 }
 
@@ -4180,7 +4191,36 @@ impl AppState {
     /// [`Ownership::Unknown`] denies: this is a branch where the ABSENCE of a
     /// claim grants something, which is the one place the trait's three states
     /// exist to separate.
-    fn admits_paneless_event(&self, agent_id: Option<&str>) -> bool {
+    ///
+    /// # Issue #318 (third-pass audit finding 3): not a way into a pane that IS
+    /// protected
+    ///
+    /// Both grounds above ask about the SENDER. Neither asks anything about the
+    /// session the payload names, and that gap reproduced exactly the
+    /// token-less post-exit card-driving this round's provenance work exists to
+    /// close — by the pane-LESS route, so the pane-scoped guard never saw it.
+    ///
+    /// Once a daemon's last ordinary paned agent exits naturally its record
+    /// lingers, so `AgentPtyRegistry::pane_is_protected` and `token_still_live`
+    /// both still answer for that pane. But [`AgentOwnership::manages_any_pane`]
+    /// deliberately filters exited records — counting them would pin a deck that
+    /// runs nothing as "manages panes" forever and refuse this path
+    /// permanently — so it answers [`Ownership::Unclaimed`]; and an ordinary
+    /// `StartAgent` pane is deliberately absent from [`Self::managed_pane_ids`],
+    /// so the historical set is empty too. A peer that omitted `pane_id`,
+    /// `agent_id` AND the token, naming nothing but the retired card's
+    /// `session_id` (readable from the daemon's own `Received event` line or an
+    /// attach `SubscribeEvents` stream), was admitted by BOTH grounds and drove
+    /// that card, paned identity intact.
+    ///
+    /// The collision is therefore closed where it happens, not by widening
+    /// `manages_any_pane`: see [`Self::paneless_event_may_take_over`].
+    fn admits_paneless_event(&self, agent_id: Option<&str>, session_id: &str) -> bool {
+        // Round 3 (third-pass audit finding 3). Asked FIRST, so it binds the
+        // identity exemption below as well as the fallback.
+        if !self.paneless_event_may_take_over(session_id) {
+            return false;
+        }
         // An owned pane-less agent, admitted by identity (issue #454).
         if matches!(
             self.oracle_ownership(None, agent_id),
@@ -4202,6 +4242,56 @@ impl AppState {
             // No oracle installed at all: the TUI and bare-`AppState` tests,
             // where the pane set IS the whole truth.
             None => self.managed_pane_ids.is_empty(),
+        }
+    }
+
+    /// Issue #318 (third-pass audit finding 3): may a pane-LESS event take over
+    /// the session it names?
+    ///
+    /// Only if that session does not belong to a pane this process protects.
+    /// The narrow question, asked of the TARGET rather than of the sender, and
+    /// asked ahead of every ground in [`Self::admits_paneless_event`] —
+    /// including the pane-less identity exemption, because an owned pane-less
+    /// agent has no more business writing another generation's paned card than
+    /// a stranger does.
+    ///
+    /// # Why here and not in `manages_any_pane`
+    ///
+    /// Making the oracle count exited records would answer finding 3 and give
+    /// up something real for it: a deck whose last agent has died would be
+    /// pinned as "manages panes" for the rest of the daemon's life on the
+    /// strength of a record nobody reaped, and the external-agent watcher path
+    /// would be refused permanently. The two predicates answer different
+    /// questions on purpose (see [`AgentOwnership::manages_any_pane`]), and the
+    /// price of that divergence is exactly this collision — so it is paid here,
+    /// once, at the collision.
+    ///
+    /// # Scope
+    ///
+    /// A pane-less event naming a NEW session, or an existing pane-LESS one, is
+    /// untouched, so external pane-less agents keep working — this narrows the
+    /// path, it does not disable it. Both grounds of protection are consulted:
+    /// a registry claim on the pane ([`Ownership::Owned`], which for a
+    /// token-less question is `generation_ownership`'s pane-only arm and so
+    /// covers a lingering retired record and a live reservation alike), and a
+    /// registration, which is the only ground the TUI and bare-[`AppState`]
+    /// tests have. [`Ownership::Unknown`] denies for the same reason it denies
+    /// above: it is the absence of evidence, never evidence of absence.
+    fn paneless_event_may_take_over(&self, session_id: &str) -> bool {
+        let Some(pane) = self
+            .sessions
+            .get(session_id)
+            .and_then(|s| s.pane_id.as_deref())
+        else {
+            // No session yet, or a pane-less one: nothing paned to take over.
+            return true;
+        };
+        if self.managed_pane_ids.contains(pane) {
+            return false;
+        }
+        match self.oracle_ownership(Some(pane), None) {
+            Some(Ownership::Owned) | Some(Ownership::Unknown) => false,
+            Some(Ownership::Unclaimed) | None => true,
         }
     }
 
@@ -5163,7 +5253,7 @@ impl AppState {
                     return;
                 }
             }
-        } else if !self.admits_paneless_event(event.agent_id.as_deref()) {
+        } else if !self.admits_paneless_event(event.agent_id.as_deref(), &event.session_id) {
             return;
         }
         // PRD #284 sub-problem (a): a terminal frame claims no generation, so it
@@ -8978,6 +9068,70 @@ mod tests {
         assert!(
             !state.sessions.is_empty(),
             "a deck with no panes of its own must still watch external agents"
+        );
+    }
+
+    /// Issue #318, third-pass audit finding 3, at the layer the rule lives in.
+    /// The collision guard is asked AHEAD of #454's pane-less identity
+    /// exemption, so it binds that exemption too: an owned pane-less agent may
+    /// declare and drive its OWN session, and may not reach across into a
+    /// session that belongs to a pane the registry claims.
+    ///
+    /// The exemption is the only way in here — a registry holding a pane makes
+    /// `manages_any_pane` answer `Owned`, which closes the fallback — so this
+    /// pins the branch the end-to-end regression in
+    /// `tests/hook_provenance_admission.rs` cannot reach: that one drives a real
+    /// registry, where the retired record is what makes `manages_any_pane`
+    /// answer `Unclaimed` in the first place.
+    #[test]
+    fn an_owned_paneless_agent_cannot_take_over_a_paned_session() {
+        let mut state = AppState::default();
+        let _ownership = install_ownership(
+            &mut state,
+            StubOwnership {
+                panes: [(CLI_PANE.to_string(), CLI_AGENT_ID.to_string())]
+                    .into_iter()
+                    .collect(),
+                paneless_agents: ["paneless-454".to_string()].into_iter().collect(),
+                ..StubOwnership::default()
+            },
+        );
+
+        // The card the reach-across targets, created by its own pane's agent.
+        state.apply_event(agent_event_cli_payload(CLI_PANE, CLI_AGENT_ID));
+        let session_id = format!("{CLI_PANE}-session");
+        assert_eq!(
+            state.sessions.get(&session_id).map(|s| s.status.clone()),
+            Some(SessionStatus::Thinking),
+            "precondition: the paned card exists"
+        );
+
+        let mut reach_across = agent_event_cli_payload(CLI_PANE, "paneless-454");
+        reach_across.pane_id = None;
+        reach_across.event_type = EventType::Error;
+
+        // Anti-vacuity: against a registry that claims no pane at all — the
+        // external-watcher deck — the very same event DOES move the card, so
+        // the refusal below is the guard and not the fixture.
+        let watcher = Arc::new(StubOwnership {
+            paneless_agents: ["paneless-454".to_string()].into_iter().collect(),
+            ..StubOwnership::default()
+        }) as Arc<dyn AgentOwnership>;
+        let mut shadow = state.clone();
+        shadow.set_agent_ownership(Arc::downgrade(&watcher));
+        shadow.apply_event(reach_across.clone());
+        assert_eq!(
+            shadow.sessions.get(&session_id).map(|s| s.status.clone()),
+            Some(SessionStatus::Error),
+            "anti-vacuity: this payload really is capable of driving the card"
+        );
+
+        state.apply_event(reach_across);
+        assert_eq!(
+            state.sessions.get(&session_id).map(|s| s.status.clone()),
+            Some(SessionStatus::Thinking),
+            "a pane-less event must not take over a session belonging to a pane \
+             the registry claims, however well established its sender is"
         );
     }
 

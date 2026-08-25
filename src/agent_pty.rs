@@ -3339,6 +3339,27 @@ impl crate::state::AgentOwnership for AgentPtyRegistry {
     /// answer: the duplicate-pane check refuses a spawn onto a live occupant, so
     /// only a record that has already exited can be handed over, and `!exited`
     /// has excluded it already.
+    ///
+    /// # What the divergence costs, and where that is paid (third-pass finding 3)
+    ///
+    /// The divergence is right and it is not free. Between them the two
+    /// predicates say, of the same registry at the same moment, that the retired
+    /// generation still owns and protects its pane *and* that this daemon
+    /// manages nothing — so once the last ordinary paned agent exits naturally,
+    /// this answers [`crate::state::Ownership::Unclaimed`] while that pane is
+    /// still protected. `AppState::admits_paneless_event` then had both of its
+    /// grounds satisfied (ordinary `StartAgent` panes are deliberately absent
+    /// from `managed_pane_ids` too), and a pane-LESS, token-less event naming
+    /// the retired card's `session_id` drove it — the same outcome the paned
+    /// guard closes, reached around the side.
+    ///
+    /// It is **not** fixed by counting exited records here: that would pin a
+    /// deck that runs nothing as "manages panes" for the rest of the daemon's
+    /// life and refuse the external-watcher path permanently, which is the whole
+    /// reason this predicate diverges. The collision is closed at the collision
+    /// instead — see `AppState::paneless_event_may_take_over`, which refuses a
+    /// pane-less event that would take over a session belonging to a pane the
+    /// registry still claims.
     fn manages_any_pane(&self) -> crate::state::Ownership {
         let Ok(inner) = self.inner.lock() else {
             tracing::error!("manages_any_pane: registry lock is poisoned; cannot answer");
@@ -7276,15 +7297,32 @@ impl AgentPtyRegistry {
     /// token grants exactly while its generation is still `Owned` for its pane,
     /// and [`Self::pane_is_protected`] refuses everything else naming that pane.
     ///
-    /// # The residual, stated
+    /// # The residual, and how long it actually lasts (third-pass finding 1)
     ///
     /// A record nobody reaps keeps its token resolving for as long as it
     /// lingers, so an attacker who has *read* a token (`/proc/<pid>/environ`, a
     /// log) can drive that card after the process is gone. That is the same
     /// window the ownership layer already grants and is bounded by the same
-    /// thing — record reaping — not by provenance. Narrowing it means reaping
-    /// lingering records (which also leak a PTY master and a reader thread), not
-    /// making these two layers disagree again.
+    /// thing — record reaping — not by provenance.
+    ///
+    /// **"Bounded by reaping" is weaker than it sounds, so state it plainly.** A
+    /// natural exit sets `exited` and removes nothing. The reapers are
+    /// `close_agent`, `respawn_agent_for_pane` and `shutdown_all*` — all of them
+    /// deliberate acts on that pane — plus idle shutdown, which fires only when
+    /// there are no attached clients, no live siblings and no enabled schedules,
+    /// and only when idle shutdown is on at all. An attached TUI, one live
+    /// sibling, one enabled schedule, or `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0`
+    /// therefore keeps a copied token valid **potentially until the daemon
+    /// exits**. There is no time bound anywhere in this rule and none is
+    /// implied.
+    ///
+    /// An `exited_at` grace was considered and rejected: it invents an arbitrary
+    /// deadline for a legitimate final hook (the exact delivery this rule exists
+    /// to preserve), and it would have to move `generation_ownership`,
+    /// `pane_is_protected` and this predicate together or reopen the
+    /// disagreement finding 1 exploited. Narrowing it means reaping lingering
+    /// records — which also leak a PTY master and a reader thread — not making
+    /// these two layers disagree again.
     fn token_still_live(inner: &RegistryInner, id: &str, agent: &RunningAgent) -> bool {
         if !agent.exited.load(Ordering::SeqCst) {
             return true;

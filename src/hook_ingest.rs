@@ -269,74 +269,94 @@ pub const MAX_LOGGED_HOOK_LINE_BYTES: usize = 512;
 /// available. It degrades gracefully on a truncated or almost-JSON line, which
 /// is exactly the input it gets.
 ///
-/// **It is textual, so it matches only the literal `"agent_token"` spelling.**
-/// JSON has infinitely many equivalent spellings of that member name — write
-/// any letter as a `\u`-escape and `"agent_token"` decodes to the same
-/// key — and a scanner that is not a JSON parser cannot see them. On this
-/// branch that is sound: a line that does
-/// not parse never reached [`admit`], so nothing here was ever *honoured* as a
-/// capability — the redaction is best-effort hygiene over bytes the daemon
-/// rejected. The branch where a spelling like that IS honoured is the decoded
-/// one, and it uses [`redact_decoded_for_log`], which asks serde rather than
-/// the byte stream.
+/// **It decodes member names rather than matching one spelling of them**
+/// (third-pass audit finding 2). JSON has infinitely many equivalent spellings
+/// of `agent_token` — write any letter as a `\u`-escape and the key decodes the
+/// same — and this used to scan for the literal `"agent_token"` substring
+/// alone. That made the two branches *attacker-steerable*: a payload that is
+/// valid JSON but does not decode as an [`crate::event::AgentEvent`] (a
+/// duplicate typed member, a member of the wrong type) and one that is not JSON
+/// at all (a trailing comma) both land HERE, and a sender chooses which by how
+/// they break the line — so writing the token under an escaped spelling put it
+/// in the malformed warning verbatim. The scan therefore walks JSON string
+/// literals and asks `serde_json` what each one *decodes to*, so every spelling
+/// is recognised on this branch too, parse or no parse.
+///
+/// It stays lenient about everything else, because it has to be: this input did
+/// not parse, so a value may be truncated mid-string or mid-container. An
+/// unterminated one consumes the rest of the line rather than leaving a live
+/// token in the tail, and a member name in a non-name position (a *value* whose
+/// text happens to be `agent_token`) is left alone, because nothing that looks
+/// like `: <value>` follows it.
+///
+/// What it still does not claim is the value-scoped half, which no field-scoped
+/// redaction can: a token a peer copied into `session_id`, `tool_detail` or a
+/// `metadata` value is data as far as this can tell, and is logged. See
+/// [`redact_decoded_for_log`], which says the same thing from the other side.
 pub fn redact_for_log(line: &str) -> String {
     let mut out = String::with_capacity(line.len().min(MAX_LOGGED_HOOK_LINE_BYTES) + 32);
     let mut rest = line;
-    // `"agent_token"` as it appears on the wire; the field is `#[serde(rename)]`-free
-    // so the Rust name IS the JSON name.
-    const FIELD: &str = "\"agent_token\"";
-    while let Some(at) = rest.find(FIELD) {
-        let (before, from_field) = rest.split_at(at);
+    while let Some(at) = rest.find('"') {
+        let (before, from_quote) = rest.split_at(at);
         out.push_str(before);
-        out.push_str(FIELD);
-        let after_field = &from_field[FIELD.len()..];
-        match redact_json_string_value(after_field) {
-            Some(consumed) => {
-                out.push_str(":\"<redacted>\"");
-                rest = &after_field[consumed..];
-            }
-            None => {
-                // No `: "…"` follows — the field name appeared in some other
-                // position (inside a string, or the line is truncated right
-                // after it). Nothing to redact; keep scanning past it.
-                rest = after_field;
-            }
+        let Some(len) = json_string_literal_len(from_quote) else {
+            // Unterminated: the rest of the line is one open string, so there is
+            // no further member name to find in it.
+            out.push_str(from_quote);
+            return truncate_for_log(out);
+        };
+        let (literal, after) = from_quote.split_at(len);
+        // Emit the literal AS SENT, escapes and all: an odd spelling of the
+        // member name is itself the diagnostic, and `<redacted>` already marks
+        // what was taken out.
+        out.push_str(literal);
+        rest = after;
+        if !is_token_member_name(literal) {
+            continue;
+        }
+        if let Some(consumed) = redact_json_value(after) {
+            out.push_str(":\"<redacted>\"");
+            rest = &after[consumed..];
         }
     }
     out.push_str(rest);
     truncate_for_log(out)
 }
 
-/// From just past a `"agent_token"` field name, how many bytes make up
-/// `: "<value>"`, or `None` when that is not what follows.
-fn redact_json_string_value(after_field: &str) -> Option<usize> {
-    let mut bytes = after_field.char_indices();
-    let mut idx = loop {
-        let (i, c) = bytes.next()?;
-        match c {
-            c if c.is_whitespace() => continue,
-            ':' => break i + 1,
-            _ => return None,
-        }
-    };
-    // Skip whitespace between the colon and the opening quote.
-    let opened = loop {
-        let c = after_field[idx..].chars().next()?;
-        if c.is_whitespace() {
-            idx += c.len_utf8();
-            continue;
-        }
-        if c != '"' {
-            return None;
-        }
-        break idx + 1;
-    };
-    // Find the closing quote, honouring backslash escapes so a token containing
-    // an escaped quote cannot end the span early. Tokens are hex today, but the
-    // field is `Option<String>` from the wire and takes whatever a peer sends.
-    let mut i = opened;
+/// `agent_token` as it appears on the wire. The field is `#[serde(rename)]`-free
+/// so the Rust name IS the JSON name; pinned to the real wire shape by
+/// `the_log_allowlist_is_exactly_the_wire_shape_minus_the_token`.
+const TOKEN_MEMBER: &str = "agent_token";
+
+/// Does this JSON string literal *decode* to the capability member name?
+///
+/// The literal spelling is checked first so the ordinary case costs no parse;
+/// anything else is handed to `serde_json`, which resolves `\u` escapes,
+/// surrogate pairs and the rest exactly as the decoder that would have honoured
+/// the member does. A literal with an invalid escape decodes to nothing and is
+/// not a member name.
+fn is_token_member_name(literal: &str) -> bool {
+    // Both ends are `"`, so both indices are char boundaries whatever is between
+    // them.
+    let inner = &literal[1..literal.len() - 1];
+    if !inner.contains('\\') {
+        // No escapes: the literal IS its own decoding, and no parse is needed.
+        // This is every ordinary line, and it keeps the scan a byte comparison
+        // per string rather than a parse per string.
+        return inner == TOKEN_MEMBER;
+    }
+    serde_json::from_str::<String>(literal).is_ok_and(|name| name == TOKEN_MEMBER)
+}
+
+/// Byte length of the JSON string literal starting at `s` — which must begin
+/// with `"` — including both quotes, or `None` if it never closes.
+///
+/// Honours backslash escapes, so a value containing an escaped quote cannot end
+/// the span early. Tokens are hex today, but the field is `Option<String>` from
+/// the wire and takes whatever a peer sends.
+fn json_string_literal_len(s: &str) -> Option<usize> {
     let mut escaped = false;
-    for c in after_field[opened..].chars() {
+    for (i, c) in s.char_indices().skip(1) {
         if escaped {
             escaped = false;
         } else if c == '\\' {
@@ -344,11 +364,84 @@ fn redact_json_string_value(after_field: &str) -> Option<usize> {
         } else if c == '"' {
             return Some(i + 1);
         }
-        i += c.len_utf8();
     }
-    // Unterminated string: the rest of the line IS the value, so consume it all
-    // rather than leaving a live token in the tail.
-    Some(after_field.len())
+    None
+}
+
+/// From just past a member name, how many bytes make up `: <value>` — or `None`
+/// when a `:` is not what follows, so the name was not in a member position and
+/// there is nothing to redact.
+///
+/// Consumes ANY value shape, not only a string: `{"agent_token":["…"]}` is a
+/// type error rather than a parse error, so it is one of the lines a sender can
+/// steer into the malformed branch, and a string-only span would have left the
+/// token in it. An unterminated string or container consumes the rest of the
+/// line, which is the fail-safe direction.
+fn redact_json_value(after_field: &str) -> Option<usize> {
+    let mut idx = 0usize;
+    loop {
+        let c = after_field[idx..].chars().next()?;
+        if c.is_whitespace() {
+            idx += c.len_utf8();
+            continue;
+        }
+        if c != ':' {
+            return None;
+        }
+        idx += 1;
+        break;
+    }
+    loop {
+        // A line that ends at the colon left nothing behind to redact.
+        let c = after_field[idx..].chars().next()?;
+        if !c.is_whitespace() {
+            break;
+        }
+        idx += c.len_utf8();
+    }
+    let value = &after_field[idx..];
+    let len = match value.as_bytes()[0] {
+        b'"' => json_string_literal_len(value).unwrap_or(value.len()),
+        b'[' => balanced_len(value, b'[', b']').unwrap_or(value.len()),
+        b'{' => balanced_len(value, b'{', b'}').unwrap_or(value.len()),
+        // A bare scalar — number, `true`, `null`, or garbage — runs to the next
+        // structural character.
+        _ => value.find([',', '}', ']']).unwrap_or(value.len()),
+    };
+    Some(idx + len)
+}
+
+/// Byte length of the bracketed value starting at `s`, including both brackets,
+/// or `None` if it never closes. Strings inside are skipped whole, so a bracket
+/// in a string value cannot unbalance the count.
+fn balanced_len(s: &str, open: u8, close: u8) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Multi-byte UTF-8 continuation bytes are all >= 0x80, so none of them
+        // can be mistaken for one of the ASCII structural bytes below, and `i`
+        // is only ever used to slice at a `"` — always a char boundary.
+        let b = bytes[i];
+        if b == b'"' {
+            i += json_string_literal_len(&s[i..])?;
+            continue;
+        }
+        if b == open {
+            depth += 1;
+        } else if b == close {
+            // `saturating_sub` rather than `-=`: the first byte is `open` by
+            // construction so depth cannot be zero here, but this runs inside
+            // the daemon's per-connection task on a LOGGING path, and an
+            // arithmetic panic there would kill the connection over a warning.
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(i + 1);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Every top-level member name [`crate::event::AgentEvent`] puts on the wire,
@@ -1151,6 +1244,86 @@ mod tests {
         assert!(redacted.contains("bytes total"));
     }
 
+    /// Third-pass audit finding 2, the case that made the split
+    /// attacker-steerable: a line can be valid JSON and still fail `AgentEvent`
+    /// decoding, and it can also fail to be JSON at all — and the SENDER picks
+    /// which, by how they break it. Each of these carries the capability under
+    /// an escaped spelling of its member name, and each lands in the malformed
+    /// branch rather than the decoded one.
+    #[test]
+    fn an_escaped_member_name_is_redacted_on_the_malformed_branch_too() {
+        let token = AgentToken::mint().expect("mint");
+        for (why, shape) in [
+            (
+                "not JSON at all: a trailing comma",
+                format!("{{\"agent_\\u0074oken\":\"{}\",}}", token.as_str()),
+            ),
+            (
+                "valid JSON, but a duplicate typed member fails the decode",
+                format!(
+                    "{{\"session_id\":\"a\",\"session_id\":\"b\",\"agent_\\u0074oken\":\"{}\"}}",
+                    token.as_str()
+                ),
+            ),
+            (
+                "valid JSON, but a typed member of the wrong type",
+                format!(
+                    "{{\"session_id\":7,\"agent_\\u0074oken\":\"{}\"}}",
+                    token.as_str()
+                ),
+            ),
+            (
+                "valid JSON, but the capability itself is the wrong type",
+                format!(
+                    "{{\"agent_token\":[\"{}\"],\"session_id\":7}}",
+                    token.as_str()
+                ),
+            ),
+        ] {
+            // Precondition: this really is the malformed branch's input.
+            assert!(
+                serde_json::from_str::<crate::event::AgentEvent>(&shape).is_err(),
+                "precondition ({why}): the line must NOT decode, or it would be \
+                 redacted structurally instead"
+            );
+            let redacted = redact_for_log(&shape);
+            assert!(
+                !redacted.contains(token.as_str()),
+                "({why}) the capability must not reach the log: {redacted}"
+            );
+            assert!(
+                redacted.contains("<redacted>"),
+                "({why}) the redaction must be visible rather than silent: {redacted}"
+            );
+        }
+    }
+
+    /// The other side of decoding member names: a *value* whose text happens to
+    /// be `agent_token` is not a member name, and the diagnostic must not be
+    /// eaten. Nothing that looks like `: <value>` follows it, which is what
+    /// distinguishes the two positions.
+    #[test]
+    fn a_value_that_reads_like_the_member_name_is_left_alone() {
+        let line = r#"{"tool_detail":"agent_token","event_type":"typo"}"#;
+        assert_eq!(redact_for_log(line), line);
+    }
+
+    /// A nested spelling is redacted too. The decoded branch keeps `metadata`
+    /// (it is one of the event's own members), so this is the one place a
+    /// capability copied under the capability's own NAME inside it gets taken
+    /// out — and it costs nothing, because the scan does not track depth.
+    #[test]
+    fn a_nested_token_member_is_redacted() {
+        let token = AgentToken::mint().expect("mint");
+        let line = format!(
+            "{{\"metadata\":{{\"agent_token\":\"{}\"}},\"event_type\":\"typo\"}}",
+            token.as_str()
+        );
+        let redacted = redact_for_log(&line);
+        assert!(!redacted.contains(token.as_str()), "{redacted}");
+        assert!(redacted.contains("typo"), "{redacted}");
+    }
+
     // -----------------------------------------------------------------
     // Structural log redaction for the DECODED branch (re-audit finding 2)
     // -----------------------------------------------------------------
@@ -1183,11 +1356,12 @@ mod tests {
         );
         assert!(
             !line.contains("\"agent_token\""),
-            "precondition: the textual scanner has nothing to match on"
+            "precondition: a scan for the literal substring has nothing to match on"
         );
         assert!(
-            redact_for_log(&line).contains(token.as_str()),
-            "precondition: this is exactly what the textual redaction misses"
+            !redact_for_log(&line).contains(token.as_str()),
+            "third-pass finding 2: the textual path decodes member names too now, \
+             so the branch a sender STEERS into does not leak either"
         );
 
         let logged = redact_decoded_for_log(&line);

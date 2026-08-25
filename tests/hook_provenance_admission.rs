@@ -278,3 +278,96 @@ fn a_pane_this_daemon_never_spawned_is_still_the_foreign_path() {
     );
     assert_eq!(status_of(&state, SESSION), SessionStatus::Thinking);
 }
+
+/// Scenario: Start an agent on a pane and let its process exit on its own, so
+/// the registry keeps the record but nothing is running — the same
+/// lingering-record state as the paned case above, and with no live sibling to
+/// keep the daemon looking busy. Its own token-bearing final event drives the
+/// card to `Thinking`. Then a forged event that names NO pane, NO agent id and
+/// carries NO token — only the retired card's `session_id`, which a peer can
+/// read off the daemon's own log — tries to move it to `Error`. Provenance
+/// classifies it `Foreign` (it claims no pane, so the pane-scoped guard has
+/// nothing to check), so the refusal has to come from admission: the card must
+/// not move. The same forged event applied against a clone whose oracle is an
+/// EMPTY registry — the external-watcher deck the pane-less path exists for —
+/// DOES move the card, which is what makes the registry's continued claim on
+/// the pane, and not some accident of the fixture, the thing protecting it.
+#[test]
+fn a_tokenless_paneless_event_cannot_drive_a_pane_whose_agent_has_exited() {
+    common::init_test_env();
+
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let id = spawn_and_let_it_exit(&registry, PANE);
+    let token = registry
+        .agent_hook_token(&id)
+        .expect("a retired generation still holds the token for its own pane");
+
+    let mut state = AppState::default();
+    // Same coercion the daemon does at start-up: the oracle is held as a
+    // `Weak<dyn AgentOwnership>` so the registry can own the state back.
+    let oracle: Arc<dyn AgentOwnership> = registry.clone();
+    state.set_agent_ownership(Arc::downgrade(&oracle));
+
+    // The card the attack targets, created by the agent's own final report.
+    let verdict = daemon_ingest(
+        &registry,
+        &mut state,
+        hook_event(EventType::Thinking, PANE, Some(&token)),
+    );
+    assert!(
+        matches!(verdict, Provenance::Bound(_)),
+        "precondition: the exiting agent's own late event still binds, got {verdict:?}"
+    );
+    assert_eq!(status_of(&state, SESSION), SessionStatus::Thinking);
+    assert_eq!(
+        state
+            .sessions
+            .get(SESSION)
+            .and_then(|s| s.pane_id.as_deref()),
+        Some(PANE),
+        "precondition: the card belongs to a pane — a pane-less card would make \
+         this test about something else"
+    );
+    assert!(
+        state.managed_pane_ids.is_empty(),
+        "precondition: an ordinary StartAgent pane is deliberately absent from \
+         the historical pane set, which is what leaves the pane-less fallback's \
+         other ground empty"
+    );
+
+    // The attack: no token, no pane, no agent id. Only the session id.
+    let mut forged = hook_event(EventType::Error, PANE, None);
+    forged.pane_id = None;
+
+    // Anti-vacuity, and the exact thing the guard turns on: the same forged
+    // event against a state whose registry holds nothing at all still moves the
+    // card, because that deck really is the external-agent watcher the pane-less
+    // fallback describes.
+    let watcher: Arc<dyn AgentOwnership> = Arc::new(AgentPtyRegistry::new());
+    let bypassed = {
+        let mut shadow = state.clone();
+        shadow.set_agent_ownership(Arc::downgrade(&watcher));
+        shadow.apply_event(forged.clone());
+        status_of(&shadow, SESSION)
+    };
+    assert_eq!(
+        bypassed,
+        SessionStatus::Error,
+        "anti-vacuity: with no registry claim on the pane the pane-less path DOES \
+         take this event, so the payload is genuinely capable of driving the card"
+    );
+
+    let verdict = daemon_ingest(&registry, &mut state, forged);
+    assert_eq!(
+        verdict,
+        Provenance::Foreign,
+        "a pane-less event claims no pane, so provenance has nothing to refuse — \
+         which is why admission has to"
+    );
+    assert_eq!(
+        status_of(&state, SESSION),
+        SessionStatus::Thinking,
+        "a pane-less, token-less event must not take over a session that belongs \
+         to a pane this registry still claims"
+    );
+}

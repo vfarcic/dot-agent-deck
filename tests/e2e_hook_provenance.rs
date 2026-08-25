@@ -346,15 +346,20 @@ fn provenance_004_no_spelling_of_the_token_field_reaches_the_daemon_log() {
         "precondition: the textual redaction has nothing to match on"
     );
     // Anti-vacuity, and it is what makes the log assertion below a proof rather
-    // than a hope: the textual redaction the daemon USED to apply on this branch
-    // leaks this exact line. So if the daemon were still calling it, the secret
-    // would be in the log; the assertion that it is not therefore establishes
-    // that the branch redacts structurally, without needing to inspect which
-    // function it called.
+    // than a hope: the textual redaction leaks this exact line, so if the daemon
+    // were still calling it on this branch the secret would be in the log. The
+    // assertion that it is not therefore establishes that the branch redacts
+    // structurally, without needing to inspect which function it called.
+    //
+    // What leaks it is now the `stash` copy alone. Third-pass finding 2 made the
+    // textual scan decode member names as well, so it catches the escaped
+    // spelling too — but it is a FIELD redaction either way, and only the
+    // decoded branch's allowlist drops a member the event does not have. That is
+    // the half this test still separates.
     assert!(
         dot_agent_deck::hook_ingest::redact_for_log(&line).contains(SECRET),
-        "precondition: a textual scan for the literal field name cannot redact \
-         this line at all"
+        "precondition: a field-scoped textual redaction cannot drop a secret \
+         carried under a member the event does not have"
     );
     write_raw_hook_line(&daemon.hook_socket, &line);
 
