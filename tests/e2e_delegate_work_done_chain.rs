@@ -283,6 +283,12 @@ async fn delegate_work_done_chain_claude() {
 async fn opencode_auto_submits_daemon_injected_prompt() {
     skip_unless!(common::check_opencode_available());
 
+    // Issue #668: the one test in this file that builds a bare registry instead
+    // of going through `spawn_inprocess_daemon` (which arms it for the others),
+    // so the real OpenCode worker below inherits the wrapped-child lifetime
+    // bound like every other registry-driven spawn in the suite.
+    common::init_test_env();
+
     let registry = Arc::new(AgentPtyRegistry::new());
     let cwd = common::race_safe_tempdir();
     let cwd_str = cwd

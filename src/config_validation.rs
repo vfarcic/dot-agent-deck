@@ -167,10 +167,10 @@ fn bound_chars(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
 ///   terminals still act on). This is the same predicate `ratatui-core` filters
 ///   on and the same one issue #576's exit flush escapes, so this sink is safe
 ///   on exactly the terms the deck's other text sinks already are.
-/// - [`crate::build_version_handshake::is_bidi_format_char`] — the bidi
-///   overrides and isolates, category `Cf`, which `is_control` does NOT catch
-///   and which visually reorder the text around them without changing a byte.
-///   Reused from the build-handshake render seam rather than respelled here, so
+/// - [`crate::untrusted_text::is_bidi_format_char`] — the bidi overrides and
+///   isolates, category `Cf`, which `is_control` does NOT catch and which
+///   visually reorder the text around them without changing a byte. Reused
+///   from the project's one sanitizer module rather than respelled here, so
 ///   there is one definition of that set to keep correct.
 ///
 /// Escaping rather than stripping, for issue #576's reason: this is a
@@ -200,7 +200,7 @@ fn escape_for_terminal(s: &str) -> std::borrow::Cow<'_, str> {
 /// The predicate behind [`escape_for_terminal`] — see its doc for why the set is
 /// the union of two Unicode categories rather than just `Cc`.
 fn needs_escape(c: char) -> bool {
-    c.is_control() || crate::build_version_handshake::is_bidi_format_char(c)
+    c.is_control() || crate::untrusted_text::is_bidi_format_char(c)
 }
 
 /// Validate a project config and return a list of issues.

@@ -47,6 +47,11 @@ impl WrapBinOverride {
         // guard rather than cascading one real failure into three confusing
         // ones.
         let exclusive = WRAP_BIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Issue #668: every spawning test in this file goes through this
+        // constructor, so this is the file's single arming point for the
+        // wrapped-child lifetime bound. Under the exclusion guard, which is
+        // also what makes its `set_var` sound.
+        common::init_test_env();
         // SAFETY: the guard above excludes every other test in this binary, so
         // nothing else reads or writes the environment while this runs.
         unsafe {

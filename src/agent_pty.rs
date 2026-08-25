@@ -2558,7 +2558,15 @@ pub struct AgentPtyRegistry {
     /// Issue #424 F4: agents whose pane declared BOOT PROVENANCE before their
     /// spawn-time prompt was written — a `wrapper_fork`-origin `SessionStart`
     /// that the readiness gate skipped
-    /// ([`crate::state::SessionStartWait::launcher_handoff`]).
+    /// ([`crate::state::SessionStartWait::launcher_handoff`]) — mapped to the
+    /// `AgentType` that declaration named.
+    ///
+    /// Issue #666: the TYPE is retained, not just the fact. A bare "this pane
+    /// declared something" cannot answer "does the post-write declaration AGREE
+    /// with what we already believed", which is what stops a declared type from
+    /// GRANTING privilege (#424 F4) — see
+    /// [`crate::prompt_delivery::AgentStartRearm`] and
+    /// [`Self::pre_write_believed_agent_type`].
     ///
     /// Lives here because the fact is discovered in `crate::spawn::deliver`,
     /// before the write, and needed by the detached confirmation loop, after it
@@ -2567,7 +2575,7 @@ pub struct AgentPtyRegistry {
     /// occupant's launcher declaration must not grant standing to the next
     /// delivery. Grows by agents spawned in one daemon's lifetime, like
     /// [`Self::user_input_at`] (negligible: one short string each).
-    launcher_handoff_agents: Mutex<HashSet<String>>,
+    launcher_handoff_agents: Mutex<HashMap<String, AgentType>>,
     /// PRD #20 R20-004 (finding #3): atomic, fingerprint-bound idempotency ledger
     /// for guarded write-and-submit. Keyed by the caller's stable `delivery_id`;
     /// each record binds the id to a fingerprint of the target agent identity,
@@ -3246,7 +3254,7 @@ impl AgentPtyRegistry {
             change_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
             pane_input: Arc::new(Mutex::new(PaneInputState::default())),
-            launcher_handoff_agents: Mutex::new(HashSet::new()),
+            launcher_handoff_agents: Mutex::new(HashMap::new()),
             delivery_ledger: Mutex::new(DeliveryLedger::default()),
             hook_socket: Mutex::new(None),
             delivery_notice_sink: Mutex::new(None),
@@ -4407,14 +4415,20 @@ impl AgentPtyRegistry {
     }
 
     /// Issue #424 F4: record that `agent_id`'s pane declared, before its prompt
-    /// was written, that a real agent is starting behind a launcher. See
-    /// [`Self::launcher_handoff_agents`] and
+    /// was written, that a real agent of type `declared` is starting behind a
+    /// launcher. See [`Self::launcher_handoff_agents`] and
     /// [`crate::state::SessionStartWait::launcher_handoff`].
-    pub fn note_launcher_handoff(&self, agent_id: &str) {
+    ///
+    /// Issue #666: FIRST declaration wins. A second `wrapper_fork` start naming
+    /// a different type does not revise the belief — otherwise a producer that
+    /// can post one could walk the pane's believed type to whatever it needs the
+    /// post-write declaration to match, which is the grant #424 F4 forbids.
+    pub fn note_launcher_handoff(&self, agent_id: &str, declared: AgentType) {
         self.launcher_handoff_agents
             .lock()
             .unwrap()
-            .insert(agent_id.to_string());
+            .entry(agent_id.to_string())
+            .or_insert(declared);
     }
 
     /// Issue #424 F4: whether `agent_id`'s pane made that declaration — one of
@@ -4425,7 +4439,53 @@ impl AgentPtyRegistry {
         self.launcher_handoff_agents
             .lock()
             .unwrap()
-            .contains(agent_id)
+            .contains_key(agent_id)
+    }
+
+    /// Issue #666: WHICH AGENT TYPE the deck believed occupied `agent_id`'s pane
+    /// before a byte of its spawn-time prompt was written, or `None` if nothing
+    /// the deck can vouch for ever said.
+    ///
+    /// This is fact S of [`crate::prompt_delivery::AgentStartRearm`], and it is a
+    /// TYPE rather than the `bool` the two accessors above answer, because the
+    /// question the rearm asks is not "did anything vouch for this pane" but
+    /// "does the post-write declaration AGREE with what we already believed".
+    /// Without the type, a pane the deck spawned as Codex is armed by an event
+    /// that merely claims to be Claude Code — a declared type GRANTING privilege,
+    /// which is exactly what #424 F4 forbids and what `scheduler/dispatch/016`
+    /// cases G and H pin.
+    ///
+    /// **The deck-spawn record wins.** It is the stronger of the two halves —
+    /// [`RunningAgent::spawn_agent_type`] is the frozen launch-shape identity the
+    /// spawn site supplied and no hook path can write it, while the launcher
+    /// declaration is a producer assertion that is merely *not post hoc* (see
+    /// [`crate::prompt_delivery::AgentStartRearm::new`] and **#543**). So a pane
+    /// the deck exec'd itself cannot have its believed type revised by anything a
+    /// producer posts, at any point.
+    ///
+    /// Deliberately NOT filtered through
+    /// [`crate::prompt_delivery::agent_reports_submitted_prompt`] the way
+    /// [`Self::agent_spawned_as_reporting_agent`] is: the rearm asks the strictly
+    /// narrower [`crate::prompt_delivery::agent_start_precedes_first_prompt`] of
+    /// whatever comes back, so pre-filtering here would only hide which type a
+    /// refusal was about. The launcher half arrives already filtered, because the
+    /// readiness gate withholds the declaration itself from a wrapped Pi.
+    pub fn pre_write_believed_agent_type(&self, agent_id: &str) -> Option<AgentType> {
+        if let Some(spawned) = self
+            .inner
+            .lock()
+            .unwrap()
+            .agents
+            .get(agent_id)
+            .and_then(|agent| agent.spawn_agent_type.clone())
+        {
+            return Some(spawned);
+        }
+        self.launcher_handoff_agents
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .cloned()
     }
 
     /// Issue #570: whether THIS DAEMON spawned `agent_id` as an agent type it
@@ -6294,6 +6354,33 @@ impl AgentPtyRegistry {
             .map(|a| (a.pty_rows, a.pty_cols))
     }
 
+    /// Issue #686: the agent's scrollback snapshot together with the PTY dims it
+    /// was written at, read under ONE lock acquisition.
+    ///
+    /// The pair has to be atomic. Raw PTY bytes are only interpretable as a
+    /// screen when replayed at the geometry they were produced at, so a
+    /// [`resize`] landing between a `snapshot` call and a
+    /// [`pty_size_for_pane`] call yields bytes and dims that never coexisted —
+    /// and re-wrapping a screen at the wrong width is exactly how a readable
+    /// pane turns into nonsense. Taking both inside the same guard makes that
+    /// unrepresentable.
+    ///
+    /// Keyed by AGENT id rather than pane id, unlike [`pty_size_for_pane`],
+    /// because a pane outlives the agents that occupy it: a `clear = true`
+    /// delegate respawns the worker, so a pane-keyed lookup can answer for a
+    /// different generation than the snapshot came from.
+    ///
+    /// [`resize`]: Self::resize
+    /// [`pty_size_for_pane`]: Self::pty_size_for_pane
+    pub fn snapshot_with_pty_size(&self, id: &str) -> Result<(Vec<u8>, u16, u16), AgentPtyError> {
+        let inner = self.inner.lock().unwrap();
+        let agent = inner
+            .agents
+            .get(id)
+            .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
+        Ok((agent.bus.snapshot(), agent.pty_rows, agent.pty_cols))
+    }
+
     /// Take just the current scrollback snapshot for an agent.
     pub fn snapshot(&self, id: &str) -> Result<Vec<u8>, AgentPtyError> {
         let inner = self.inner.lock().unwrap();
@@ -6791,6 +6878,46 @@ impl AgentPtyRegistry {
             .agents
             .get(id)
             .map(|a| a.writer.clone())
+    }
+
+    /// Issue #666 test-only seam: stamp `agent_id`'s SPAWN-TIME identity after
+    /// the child is already running, exactly as [`Self::spawn_agent`] would have
+    /// stamped it — both the display badge and the frozen
+    /// [`RunningAgent::spawn_agent_type`] the rearm's standing is read from.
+    ///
+    /// It exists because those two things are not separable at the real spawn
+    /// site and one of them has a side effect a test cannot want. Declaring
+    /// [`SpawnOptions::agent_type`] as a Wrapper-strategy agent makes [`spawn`]
+    /// launch `dot-agent-deck wrap --agent codex -- <command>` instead of
+    /// `<command>` — a second real deck process between the PTY and the byte
+    /// sink, which boots on its own schedule, emits its own hook events and
+    /// chunks one payload write into pieces arriving over an unbounded window.
+    /// `scheduler/dispatch/016` case G needs the pane's *believed type* to be
+    /// Codex and nothing else; it observes raw bytes, so the wrapper is pure
+    /// measurement noise there (issue #666 follow-up: it made case G flaky under
+    /// load, and its hook events posted into whatever deck the ambient
+    /// environment resolved).
+    ///
+    /// This writes the SAME field `spawn_agent` writes, so what the test under
+    /// observation reads — [`Self::pre_write_believed_agent_type`],
+    /// [`Self::agent_spawned_as_reporting_agent`] — is bit-for-bit what a real
+    /// typed spawn would have left. The spawn-site plumbing itself stays covered
+    /// by the cases that go through `SpawnOptions::agent_type` for real (A, E, F
+    /// as ClaudeCode, H as OpenCode). `#[cfg(test)]` keeps it out of the
+    /// production API surface, like [`Self::agent_writer`] above.
+    #[cfg(test)]
+    pub(crate) fn note_spawn_agent_type_for_test(&self, agent_id: &str, agent_type: AgentType) {
+        let mut inner = self.inner.lock().unwrap();
+        // Loud on a miss rather than a silent no-op: a fixture whose stamp did
+        // not land has standing `None`, and for case G that is case B — it would
+        // still refuse the rearm and still pass, having stopped testing what it
+        // names.
+        let agent = inner
+            .agents
+            .get_mut(agent_id)
+            .unwrap_or_else(|| panic!("no such agent to stamp a spawn type onto: {agent_id}"));
+        agent.agent_type = Some(agent_type.clone());
+        agent.spawn_agent_type = Some(agent_type);
     }
 
     /// Issue #581 test-only seam: register a synthetic agent that owns `child`,
