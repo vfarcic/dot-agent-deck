@@ -357,6 +357,17 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     // the repo defines. Everything else in an incoming `metadata` object is
     // still ignored, so this cannot become an arbitrary producer-controlled
     // channel into the daemon's event metadata.
+    //
+    // Issue #243 added a SECOND origin value
+    // (`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`) and it is deliberately NOT
+    // forwardable here. The asymmetry is the whole point: boot provenance is a
+    // producer CONFESSING that its child is not up yet, which costs it privilege
+    // and is therefore safe to believe from anyone; interface readiness is a
+    // producer CLAIMING that its child is up, which BUYS privilege — it releases
+    // the readiness gate and skips the post-readiness buffer. The deck believes
+    // that only from its own wrapper, which reports it over the wrapper's own
+    // event path from an observation it made itself, never from a Claude-shaped
+    // payload piped into this CLI by any same-user process.
     if event_type == EventType::SessionStart
         && extra
             .get("metadata")

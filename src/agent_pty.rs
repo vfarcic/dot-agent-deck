@@ -4461,6 +4461,30 @@ impl AgentPtyRegistry {
             .cloned()
     }
 
+    /// Issue #243: the FROZEN launch-shape identity `agent_id` was spawned as —
+    /// the agent type the spawn site computed from the command it was about to
+    /// exec ([`SpawnOptions::agent_type`]), or `None` for a command the deck could
+    /// not resolve.
+    ///
+    /// Reads [`RunningAgent::spawn_agent_type`], NOT [`RunningAgent::agent_type`],
+    /// and the difference matters for the same reason it does in
+    /// [`Self::agent_spawned_as_reporting_agent`]: the readiness gate uses this to
+    /// decide whether to SHORTEN its wait, and `agent_type` is upgradable in place
+    /// by [`Self::set_agent_type`] from a hook event. Keying off the observed badge
+    /// would let any same-user producer post one `SessionStart` claiming to be an
+    /// agent that declares no pre-prompt signal and thereby talk the gate out of
+    /// waiting — turning a producer assertion into control over when the deck
+    /// writes a prompt. `spawn_agent_type` is what the deck itself exec'd, and no
+    /// hook path can write it.
+    pub fn spawn_agent_type(&self, agent_id: &str) -> Option<AgentType> {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .get(agent_id)
+            .and_then(|agent| agent.spawn_agent_type.clone())
+    }
+
     /// Issue #570: whether THIS DAEMON spawned `agent_id` as an agent type it
     /// selected itself, and that type reports submitted prompts.
     ///

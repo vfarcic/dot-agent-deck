@@ -57,6 +57,80 @@ pub enum IntegrationStrategy {
     Wrapper,
 }
 
+/// Issue #243: what a FRESHLY STARTED instance of this agent announces BEFORE it
+/// is given a prompt — i.e. what a readiness gate can actually wait for.
+///
+/// This exists because the gate used to ask `hook_install.is_some()`, which
+/// correctly answers "does this agent have native hooks" and was standing in for
+/// a different question entirely: *will a real `SessionStart` arrive before this
+/// agent needs a prompt?* Codex and OpenCode both satisfy the first and neither
+/// satisfies the second — one mis-predicate, two victims — so a `clear = true`
+/// delegate to either burned the full [`crate::state::SESSION_START_WAIT_TIMEOUT`]
+/// (measured at 31.2 / 31.2 / 31.7 / 31.7 / 32.3 s on production Codex delegates)
+/// and only the timeout fallback ever delivered.
+///
+/// Say what is meant instead. The value is a per-agent FACT, established by
+/// measurement and recorded next to everything else the deck knows about that
+/// agent, so the gate reads it rather than inferring it from an unrelated field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrePromptReadiness {
+    /// The agent's own integration announces an initialized session before the
+    /// first prompt: a genuine, unmarked `SessionStart` (Claude Code, Devin).
+    ///
+    /// Note what this does NOT promise: `SessionStart` means "a session exists",
+    /// not "the TUI interprets `\r` as submit". Claude Code fires it early in its
+    /// boot sequence, which is why the gate still holds the prompt for
+    /// [`crate::state::DELEGATE_READINESS_BUFFER`] afterwards (#199, #249, #663).
+    NativeSessionStart,
+    /// Nothing arrives from the agent itself before the prompt, but the deck's
+    /// own `dot-agent-deck wrap` hosts the child's PTY and announces its
+    /// interface once it can SEE it — a `SessionStart` carrying
+    /// [`crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`] (Codex;
+    /// PRD #211's Gemini inherits this).
+    ///
+    /// The strongest readiness fact the deck has, because it is an observation
+    /// rather than an announcement — which is why it is the one signal the
+    /// post-readiness buffer is skipped for.
+    WrapperInterfaceReady,
+    /// MEASURED: this agent emits nothing at all before its first prompt, and no
+    /// wrapper is watching it either, so there is no signal for a gate to wait
+    /// for and waiting is a DEAD wait.
+    ///
+    /// OpenCode is the case (#146, measured against `opencode 1.18.16`): a 35 s
+    /// idle cold boot produced zero `session.*` events, and `session.created`
+    /// then landed 16 ms AFTER the prompt was accepted. It is a `Plugin` agent,
+    /// so [`IntegrationStrategy::Wrapper`] cannot cover it — the ceiling is to
+    /// skip straight to the bounded buffer, which is what the gate does.
+    NoSignal,
+    /// Not established. The conservative default: the gate keeps waiting exactly
+    /// as it does today, because "we have not measured this" is not evidence that
+    /// skipping the wait is safe.
+    ///
+    /// Carried by the neutral [`NONE`] placeholder — an unrecognized command,
+    /// where the deck genuinely does not know what is in the pane — and
+    /// deliberately by Pi as well: Pi structurally never emits
+    /// `EventType::SessionStart` (PRD #201), so [`Self::NoSignal`] is the
+    /// literally true classification, but nobody has measured Pi's boot window
+    /// and issue #243 measured only Codex and OpenCode. Claiming it would take
+    /// the scheduler's Pi delivery from a 30 s wait to a ~1 s buffer on no
+    /// evidence, and buy nothing on the delegate path, which bypasses this gate
+    /// for Pi entirely (the native seed hand-off in
+    /// [`crate::state::dispatch_one_owned`]). Reclassify when Pi's boot is
+    /// measured.
+    Unknown,
+}
+
+impl PrePromptReadiness {
+    /// Issue #243: is there a pre-prompt readiness signal for a gate to wait
+    /// FOR? `false` only for [`Self::NoSignal`] — an agent that has positively
+    /// declared it announces nothing, which is the one case where waiting is
+    /// provably dead time. [`Self::Unknown`] answers `true`: we cannot know it is
+    /// safe to skip, so it keeps waiting.
+    pub fn has_signal(self) -> bool {
+        !matches!(self, PrePromptReadiness::NoSignal)
+    }
+}
+
 /// PRD #20 finding #15: an integration-hook handler (install / uninstall) —
 /// `Ok(())` on success, `Err(message)` on a reported failure.
 pub type HookFn = fn() -> Result<(), String>;
@@ -83,6 +157,10 @@ pub struct AgentSpec {
     /// Which integration mechanism carries this agent's events to the deck.
     /// `None` for the neutral placeholder (not a real agent).
     pub strategy: Option<IntegrationStrategy>,
+    /// Issue #243: what this agent announces BEFORE its first prompt — the fact
+    /// the readiness gate needs and used to infer, wrongly, from
+    /// [`Self::hook_install`]. See [`PrePromptReadiness`].
+    pub pre_prompt_readiness: PrePromptReadiness,
     /// Per-agent badge colour. Populated now as the single source of truth even
     /// though rendering coloured badges on cards is a later PRD #20 milestone.
     /// A named ANSI colour only (no absolute `Color::Rgb`), matching the
@@ -178,6 +256,10 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
     detect_basenames: &["claude"],
     default_command: Some("claude"),
     strategy: Some(IntegrationStrategy::NativeHooks),
+    // Claude Code posts its native `SessionStart` early in boot, before any
+    // prompt — the delegate gate's healthy fast path (3.80-4.39 s end to end
+    // on the production samples in #243).
+    pre_prompt_readiness: PrePromptReadiness::NativeSessionStart,
     badge_color: Color::LightMagenta,
     hook_install: Some(claude_install),
     hook_uninstall: Some(claude_uninstall),
@@ -192,6 +274,13 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
     detect_basenames: &["opencode"],
     default_command: Some("opencode"),
     strategy: Some(IntegrationStrategy::Plugin),
+    // MEASURED (#146, `opencode 1.18.16`): nothing on the plugin bus before the
+    // prompt. 35 s of idle cold boot produced zero `session.*` events, and
+    // `session.created` then arrived 16 ms AFTER the submit — caused by the very
+    // prompt the gate withholds. `server.connected` is NOT the missing event: it
+    // is synthesized as the first frame of the SSE `/event` response, never
+    // reaches the plugin hook, and would fire on the deck's own connect.
+    pre_prompt_readiness: PrePromptReadiness::NoSignal,
     badge_color: Color::LightGreen,
     hook_install: Some(opencode_install),
     hook_uninstall: Some(opencode_uninstall),
@@ -206,6 +295,9 @@ pub static PI: AgentSpec = AgentSpec {
     detect_basenames: &["pi"],
     default_command: Some("pi"),
     strategy: Some(IntegrationStrategy::Extension),
+    // Pi emits no `EventType::SessionStart` at all, so `NoSignal` is literally
+    // true — and deliberately not claimed here. See `PrePromptReadiness::Unknown`.
+    pre_prompt_readiness: PrePromptReadiness::Unknown,
     badge_color: Color::LightCyan,
     hook_install: None,
     hook_uninstall: None,
@@ -226,6 +318,11 @@ pub static CODEX: AgentSpec = AgentSpec {
     detect_basenames: &["codex"],
     default_command: Some("codex"),
     strategy: Some(IntegrationStrategy::Wrapper),
+    // Codex's NATIVE `SessionStart` fires when the first turn starts, i.e. after
+    // a prompt is submitted (measured on 0.145.0 and still true on 0.149.0), so
+    // it is useless as a gate. The wrapper that hosts its PTY announces the
+    // child's interface instead (#243).
+    pre_prompt_readiness: PrePromptReadiness::WrapperInterfaceReady,
     badge_color: Color::LightYellow,
     // Codex is a HYBRID (PRD #20 W1): the wrapper is its PTY host, but its rich
     // events come from Codex's Claude-Code-compatible NATIVE hooks — so unlike a
@@ -263,6 +360,9 @@ pub static DEVIN: AgentSpec = AgentSpec {
     detect_basenames: &["devin"],
     default_command: Some("devin"),
     strategy: Some(IntegrationStrategy::NativeHooks),
+    // Devin documents a `SessionStart` hook and runs unwrapped, so the gate simply
+    // waits for the genuine one.
+    pre_prompt_readiness: PrePromptReadiness::NativeSessionStart,
     // A named ANSI colour not used by Claude (LightMagenta), OpenCode
     // (LightGreen), Pi (LightCyan) or Codex (LightYellow), and never the neutral
     // DarkGray reserved for the "No agent" placeholder.
@@ -284,6 +384,9 @@ pub static NONE: AgentSpec = AgentSpec {
     detect_basenames: &[],
     default_command: None,
     strategy: None,
+    // Not an agent: nothing is known about what is in the pane, so the gate keeps
+    // its conservative wait.
+    pre_prompt_readiness: PrePromptReadiness::Unknown,
     badge_color: Color::DarkGray,
     hook_install: None,
     hook_uninstall: None,

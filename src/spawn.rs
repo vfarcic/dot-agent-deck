@@ -1099,7 +1099,38 @@ async fn deliver(
     // but "can this producer report a submitted prompt at all" — which decides
     // whether an unconfirmed write may be RE-submitted. See
     // [`confirm_prompt_delivery`].
+    // Issue #243: the scheduler shares the delegate path's readiness gate, so it
+    // shares this defect too — the issue measures a 30 s OpenCode cold spawn HERE,
+    // and leaving it would mean OpenCode still paid the full wait every time a
+    // scheduled card fired. The agent type is read from the deck's own frozen
+    // launch-shape record rather than from the observed badge, so no producer can
+    // talk the gate out of waiting (see `spawn_agent_type`).
+    let spawned_agent_type = registry.spawn_agent_type(agent_id);
+    let has_readiness_signal =
+        crate::state::agent_has_pre_prompt_readiness_signal(spawned_agent_type.as_ref());
     let (mut event_rx, observed) = match event_rx {
+        // The declared-no-signal short path. Deliberately NOT a bare write: the
+        // 30 s wait it replaces was, accidentally, also the only thing standing
+        // between the prompt and a still-booting agent, so what it becomes is the
+        // bounded buffer the delegate path already uses after a readiness fact
+        // that does not prove input-readiness — the ceiling #243 names for an
+        // agent with nothing to wait for. `rx` is kept so delivery confirmation
+        // still observes the pane exactly as it does on the waiting path.
+        Some(rx) if !has_readiness_signal => {
+            let buffer = crate::state::delegate_readiness_buffer().min(remaining_before(deadline));
+            tracing::debug!(
+                pane_id,
+                agent_type = ?spawned_agent_type,
+                buffer_ms = buffer.as_millis(),
+                "scheduled spawn: this agent has DECLARED it emits no pre-prompt \
+                 readiness signal; holding the prompt for the readiness buffer \
+                 instead of waiting out a SessionStart that cannot arrive"
+            );
+            if !buffer.is_zero() {
+                tokio::time::sleep(buffer).await;
+            }
+            (Some(rx), crate::state::SessionStartWait::default())
+        }
         Some(mut rx) => {
             let timeout = session_start_wait_timeout().min(remaining_before(deadline));
             let observed =
@@ -1402,9 +1433,13 @@ fn drain_pre_write_events(
                 // call passes a sink it discards — a pre-write drain is pre-write
                 // by construction, so nothing it sees can be evidence about bytes
                 // that do not exist yet.
+                // Issue #243: G is the wrapper discriminator, not the wrapper-FORK
+                // one — an interface-ready start is the deck's own observation of
+                // a child painting, never an agent announcing a conversation it
+                // could report a submission for.
                 if agent_start.is_none()
                     && event.event_type == EventType::SessionStart
-                    && !event.is_wrapper_fork_session_start()
+                    && !event.is_wrapper_session_start()
                 {
                     *agent_start = Some((Instant::now(), event.agent_type.clone()));
                 }

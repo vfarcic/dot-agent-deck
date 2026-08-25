@@ -6040,7 +6040,11 @@ impl EventSub {
                     && event.agent_id.as_deref() == Some(agent_id)
             }) {
                 match event.event_type {
-                    EventType::SessionStart if !event.is_wrapper_fork_session_start() => {
+                    // Issue #243: EITHER wrapper origin is excluded. The wrapper's
+                    // interface-ready start is readiness, but it carries the
+                    // WRAPPER's session id — so accepting it here would hand back
+                    // `wrap-codex-1234` as the pane's live agent session.
+                    EventType::SessionStart if !event.is_wrapper_session_start() => {
                         current_session_id = Some(event.session_id.clone());
                     }
                     EventType::SessionEnd

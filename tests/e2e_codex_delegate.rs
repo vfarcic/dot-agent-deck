@@ -318,8 +318,9 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
 
     // The event PRD #225's readiness gate is about, now where it can actually
     // happen: the respawned worker's GENUINE native Codex `SessionStart` — no
-    // `wrapper_fork` origin marker, so it is Codex itself and not the wrapper's
-    // fork-time card-surfacing event. It arrives only once the injected pointer
+    // wrapper origin marker of EITHER kind, so it is Codex itself and neither the
+    // wrapper's fork-time card-surfacing event nor (issue #243) its
+    // interface-ready one. It arrives only once the injected pointer
     // starts a turn, so seeing it at all means the daemon respawned the worker
     // and delivered into the live agent. A miss panics with every observed
     // event, which distinguishes "the delegate never reached the daemon" from
@@ -328,7 +329,7 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
         |event| {
             event.event_type == EventType::SessionStart
                 && event.agent_type == AgentType::Codex
-                && !event.is_wrapper_fork_session_start()
+                && !event.is_wrapper_session_start()
         },
         Duration::from_secs(75),
     );

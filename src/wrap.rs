@@ -44,7 +44,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Command as StdCommand, ExitCode, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,7 +53,8 @@ use chrono::Utc;
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use crate::event::{
     AGENT_EVENT_SCHEMA_VERSION, AgentEvent, AgentType, EventType, LiveTarget,
-    SESSION_START_ORIGIN_METADATA_KEY, TargetKind, WRAPPER_FORK_SESSION_START_ORIGIN, Writable,
+    SESSION_START_ORIGIN_METADATA_KEY, TargetKind, WRAPPER_FORK_SESSION_START_ORIGIN,
+    WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN, Writable,
 };
 
 /// A coarse activity state detected from a single line of wrapped output.
@@ -288,6 +289,33 @@ impl Emitter {
         metadata.insert(
             SESSION_START_ORIGIN_METADATA_KEY.to_string(),
             WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+        );
+        self.emit_with_metadata(EventType::SessionStart, metadata);
+    }
+
+    /// Issue #243: the INTERFACE-READY `SessionStart` this wrapper emits once it
+    /// has observed the wrapped child's interface come up — the pre-prompt
+    /// readiness signal a delegate/scheduler gate can actually wait for.
+    ///
+    /// Distinct from BOTH the events that existed before it. It is not
+    /// [`Self::emit_fork_session_start`], which fires at `cmd.spawn()` when the
+    /// child is typically still a launcher; and it is not the agent's own native
+    /// `SessionStart`, which for codex-cli fires when the first TURN starts — a
+    /// consequence of the very prompt the gate is withholding, which is why the
+    /// gate never fast-pathed and every Codex delegate cost ~31 s.
+    ///
+    /// It carries [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`] rather than
+    /// arriving unmarked, so a consumer can tell "the deck WATCHED this interface
+    /// come up" from "an agent session announced itself". Both matter: the first
+    /// is stronger readiness (an observation, not an announcement), and the
+    /// second is what may bind a conversation — this event carries the WRAPPER's
+    /// session id, not the agent's, so it must never do that. See
+    /// [`crate::event::AgentEvent::is_wrapper_session_start`].
+    fn emit_interface_ready(&self) {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+            WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN.to_string(),
         );
         self.emit_with_metadata(EventType::SessionStart, metadata);
     }
@@ -1410,6 +1438,166 @@ fn set_pty_size(fd: RawFd, rows: u16, cols: u16) {
     }
 }
 
+/// Issue #243: how long the wrapped child's output must stay QUIET, after it has
+/// written at least one byte, before [`InterfaceWatch`] calls its interface up.
+///
+/// The signal is the SETTLING, not the first byte. A child that is still coming
+/// up is either silent (a launcher that has not printed yet — nothing fires) or
+/// still painting (each chunk pushes the deadline out), so what this detects is
+/// the transition from producing output to waiting for input. 750 ms is far
+/// longer than the gap between two frames of a TUI painting itself and far
+/// shorter than the 30 s fallback it replaces; a settle this long followed by an
+/// injected prompt is exactly the sequence a human performs by hand.
+#[cfg(unix)]
+const INTERFACE_SETTLE_WINDOW: Duration = Duration::from_millis(750);
+
+/// Issue #243: the wrapper's answer to "does the child's interface exist yet?".
+///
+/// The wrapper is the only party that can answer this. The daemon sees events;
+/// the wrapper OWNS the inner PTY the child is painting on and reads every byte
+/// that crosses it, so it can watch the interface come up instead of inferring it
+/// from an event that arrives too late (Codex's native `SessionStart`) or never
+/// (OpenCode has none at all).
+///
+/// TWO independent facts are accepted, strongest first, and both are observations
+/// of the child rather than a timer:
+///
+/// 1. **The child took the inner PTY out of cooked mode** — it cleared `ICANON`
+///    and/or `ECHO`. This is the definitive one, and it is the exact inverse of
+///    the defect the readiness gate exists to prevent: PRD #225's prompt loss was
+///    bytes written into a line discipline that was still canonical with echo on,
+///    where the payload is echoed back and swallowed. A child reading raw
+///    keystrokes is, by construction, a program that consumes input rather than
+///    echoing it. Launchers (`devbox`, a shell script, `node` starting up) never
+///    do this; a full-screen TUI does it as it initializes, before it paints.
+/// 2. **Output SETTLED** — the child wrote something and then stopped for
+///    [`INTERFACE_SETTLE_WINDOW`]. The fallback for an interface that stays in
+///    cooked mode (a line-oriented REPL, and the test stand-ins), and for the
+///    redirected-descriptor paths where no inner PTY termios exists to read.
+///
+/// What is deliberately NOT accepted: elapsed time since `exec`, and the child's
+/// FIRST byte. A wall-clock timer fires for a child that has not started, and a
+/// first-byte rule fires for a launcher's `Starting…` banner — both would put the
+/// deck straight back into writing a prompt into something that is not an agent.
+/// A child that writes nothing and never leaves cooked mode is never announced
+/// ready by this watch at all, which is correct: nothing about it is observable,
+/// so the gate falls back to the behaviour it has today.
+#[cfg(unix)]
+struct InterfaceWatch {
+    /// Latched once, so exactly one interface-ready event is ever emitted.
+    announced: AtomicBool,
+    /// [`monotonic_millis`] of the last byte the child wrote, or `0` while it has
+    /// written nothing at all.
+    last_output_ms: AtomicI64,
+    /// The inner PTY's `c_lflag` as `openpty` handed it over, sampled BEFORE the
+    /// child ran, so fact 1 above compares against what this pty actually started
+    /// as rather than against an assumed default. `None` when it could not be
+    /// read, which simply disables fact 1.
+    cooked_lflag: Option<libc::tcflag_t>,
+}
+
+#[cfg(unix)]
+impl InterfaceWatch {
+    fn new(cooked_lflag: Option<libc::tcflag_t>) -> Self {
+        Self {
+            announced: AtomicBool::new(false),
+            last_output_ms: AtomicI64::new(0),
+            cooked_lflag,
+        }
+    }
+
+    /// Record that the child produced output. Called from every tee, on the raw
+    /// byte chunk rather than on a classified line: a TUI can paint a whole frame
+    /// of escape sequences without a single `\n` or `\r`, and this must see that.
+    fn note_output(&self) {
+        // A monotonic clock never yields 0 in practice, but clamp anyway so the
+        // "nothing written yet" sentinel cannot be produced by a real write.
+        self.last_output_ms
+            .store(monotonic_millis().max(1), Ordering::SeqCst);
+    }
+
+    /// Has the child cleared `ICANON`/`ECHO` on the inner PTY since it started?
+    ///
+    /// Read from the MASTER descriptor: a pty's termios is one shared structure,
+    /// so the master's `tcgetattr` reports the line discipline the slave-side
+    /// child installed.
+    fn child_took_raw_input(&self, master_fd: RawFd) -> bool {
+        let Some(cooked) = self.cooked_lflag else {
+            return false;
+        };
+        let Some(current) = pty_lflag(master_fd) else {
+            return false;
+        };
+        // Only a CLEARED bit counts. A child that sets additional lflags has not
+        // said anything about whether it consumes keystrokes.
+        (cooked & !current & (libc::ICANON | libc::ECHO)) != 0
+    }
+
+    /// Claim the one interface-ready announcement, returning why it fired.
+    /// `None` while the interface is not (yet) observable, and `None` forever
+    /// after the single claim succeeds.
+    fn claim(&self, master_fd: RawFd) -> Option<&'static str> {
+        if self.announced.load(Ordering::SeqCst) {
+            return None;
+        }
+        let reason = if self.child_took_raw_input(master_fd) {
+            "raw-input-mode"
+        } else {
+            let last = self.last_output_ms.load(Ordering::SeqCst);
+            if last == 0 {
+                return None;
+            }
+            if monotonic_millis().saturating_sub(last) < millis_saturating(INTERFACE_SETTLE_WINDOW)
+            {
+                return None;
+            }
+            "output-settled"
+        };
+        (!self.announced.swap(true, Ordering::SeqCst)).then_some(reason)
+    }
+}
+
+/// Read a pty's local-mode flags through `fd`, or `None` when it is not a
+/// terminal / the call fails.
+#[cfg(unix)]
+fn pty_lflag(fd: RawFd) -> Option<libc::tcflag_t> {
+    // SAFETY: `tcgetattr` fills the `termios` it is handed and touches nothing
+    // else; a bad descriptor is reported by the return code, not by a write.
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
+        return None;
+    }
+    Some(termios.c_lflag)
+}
+
+/// Issue #243: a passthrough writer that tells an [`InterfaceWatch`] the child
+/// produced output.
+///
+/// Wraps the tee's downstream writer rather than changing [`tee`] itself, so the
+/// observation sits on the same bytes the user sees and costs one atomic store
+/// per chunk. The store happens whether or not the downstream write succeeds —
+/// the child wrote those bytes either way, and whether the wrapper could forward
+/// them is a different question.
+#[cfg(unix)]
+struct ActivityWriter<W: Write> {
+    inner: W,
+    watch: Arc<InterfaceWatch>,
+}
+
+#[cfg(unix)]
+impl<W: Write> Write for ActivityWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !buf.is_empty() {
+            self.watch.note_output();
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Classify one tee'd output `line` through the shared `detector` and emit the
 /// resulting card event, if the state changed. Shared by every wrap tee (the PTY
 /// master pump and the redirected-descriptor pipe pumps) so one coherent session
@@ -1588,6 +1776,12 @@ fn run_wrap_pty(
         }
     };
 
+    // Issue #243: the inner PTY's line discipline as `openpty` handed it over —
+    // sampled BEFORE the child exists, so "the child took the terminal out of
+    // cooked mode" is measured against this pty's real starting state rather than
+    // an assumed default. See `InterfaceWatch::child_took_raw_input`.
+    let interface = Arc::new(InterfaceWatch::new(pty_lflag(master.as_raw_fd())));
+
     // Build the child. `std::process::Command` inherits the wrapper's env (which
     // carries `DOT_AGENT_DECK_PANE_ID` / `_AGENT_ID` injected by the daemon), so
     // the child's own hooks and this wrapper's events attribute to the same pane.
@@ -1722,10 +1916,18 @@ fn run_wrap_pty(
         let emitter = Arc::clone(emitter);
         let detector = Arc::clone(&detector);
         let output_done = Arc::clone(&output_done);
+        let watch = Arc::clone(&interface);
         Some(std::thread::spawn(move || {
-            tee(reader, FdWriter(out_fd), |line| {
-                classify_and_emit(line, &detector, &emitter, is_codex);
-            });
+            tee(
+                reader,
+                ActivityWriter {
+                    inner: FdWriter(out_fd),
+                    watch,
+                },
+                |line| {
+                    classify_and_emit(line, &detector, &emitter, is_codex);
+                },
+            );
             output_done.store(true, Ordering::SeqCst);
         }))
     } else {
@@ -1733,10 +1935,26 @@ fn run_wrap_pty(
     };
 
     // Redirected output descriptors: tee each pipe to the matching real fd.
-    let out_pipe_thread =
-        pipe_out.map(|r| spawn_pipe_tee(r, libc::STDOUT_FILENO, emitter, &detector, is_codex));
-    let err_pipe_thread =
-        pipe_err.map(|r| spawn_pipe_tee(r, libc::STDERR_FILENO, emitter, &detector, is_codex));
+    let out_pipe_thread = pipe_out.map(|r| {
+        spawn_pipe_tee(
+            r,
+            libc::STDOUT_FILENO,
+            emitter,
+            &detector,
+            is_codex,
+            Some(&interface),
+        )
+    });
+    let err_pipe_thread = pipe_err.map(|r| {
+        spawn_pipe_tee(
+            r,
+            libc::STDERR_FILENO,
+            emitter,
+            &detector,
+            is_codex,
+            Some(&interface),
+        )
+    });
 
     // Input pump (outer stdin → inner master when stdin is a terminal, else →
     // the child's stdin pipe). Detached: on child exit the main loop returns and
@@ -1798,6 +2016,19 @@ fn run_wrap_pty(
 
         // finding #12: forward a pending signal to the child group and escalate.
         fwd.tick();
+
+        // Issue #243: the pre-prompt readiness signal. Polled here rather than
+        // pushed from the tee threads because one of the two facts it reads —
+        // the inner PTY's line discipline — is state, not an event, and because
+        // the settle window has to be noticed by SOMEBODY once the output stops
+        // (the tee is blocked in `read` at exactly that moment, so it cannot
+        // notice its own silence). This loop already ticks every 50 ms for
+        // resizes and child reaping, so the watch costs one atomic load plus, at
+        // most, one `tcgetattr` per tick and nothing at all once it has fired.
+        if let Some(reason) = interface.claim(master_fd) {
+            let _ = reason;
+            emitter.emit_interface_ready();
+        }
 
         // R20-001: the terminal output pump ended while the child is still alive
         // → the downstream terminal consumer closed; after a short settle window
@@ -1935,6 +2166,7 @@ fn run_wrap_pipe(
         emitter,
         &detector,
         is_codex,
+        None,
     );
     let err_thread = spawn_pipe_tee(
         child_stderr,
@@ -1942,6 +2174,7 @@ fn run_wrap_pipe(
         emitter,
         &detector,
         is_codex,
+        None,
     );
 
     // Input pump (outer stdin → child stdin, verbatim). On EOF/close of our
@@ -2020,13 +2253,30 @@ fn spawn_pipe_tee<R: Read + Send + 'static>(
     emitter: &Arc<Emitter>,
     detector: &Arc<Mutex<Detector>>,
     is_codex: bool,
+    interface: Option<&Arc<InterfaceWatch>>,
 ) -> std::thread::JoinHandle<()> {
     let emitter = Arc::clone(emitter);
     let detector = Arc::clone(detector);
-    std::thread::spawn(move || {
-        tee(reader, FdWriter(out_fd), |line| {
+    // Issue #243: `Some` on the interactive path, where a redirected descriptor
+    // is still one of the ways a wrapped child's interface can reach the user, so
+    // its bytes count as the child painting. `None` on the wholly non-interactive
+    // pipe path: there is no terminal there for an interface to exist on, and a
+    // batch `codex exec --json` run is never the target of a readiness gate.
+    let interface = interface.map(Arc::clone);
+    std::thread::spawn(move || match interface {
+        Some(watch) => tee(
+            reader,
+            ActivityWriter {
+                inner: FdWriter(out_fd),
+                watch,
+            },
+            |line| {
+                classify_and_emit(line, &detector, &emitter, is_codex);
+            },
+        ),
+        None => tee(reader, FdWriter(out_fd), |line| {
             classify_and_emit(line, &detector, &emitter, is_codex);
-        });
+        }),
     })
 }
 

@@ -4315,8 +4315,11 @@ fn pane_announced_generation(snapshot: &AppState, pane_id: &str) -> Option<Strin
         .values()
         .filter(|session| session.pane_id.as_deref() == Some(pane_id))
         .flat_map(|session| session.recent_events.iter())
+        // Issue #243: EITHER wrapper origin is excluded. Both carry the wrapper's
+        // own session id rather than the agent's, so neither is a conversation
+        // announcing itself over this pane.
         .filter(|event| {
-            event.event_type == EventType::SessionStart && !event.is_wrapper_fork_session_start()
+            event.event_type == EventType::SessionStart && !event.is_wrapper_session_start()
         })
         .map(|event| event.timestamp)
         .max()?;

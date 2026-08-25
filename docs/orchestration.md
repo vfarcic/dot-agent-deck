@@ -151,7 +151,11 @@ The delivery cost of that restart is timing. A freshly launched agent announces 
 
 The deck therefore holds a `clear = true` task for a short **readiness buffer** after the replacement signals its session start (and after the fallback wait expires, for agents that never signal at all). The default is 1000 ms: the spawn-time path's 500 ms, which was tuned for a warm pane, doubled because a respawn is a cold start. Nothing about this is configured per role; the only effect you should notice is that a `clear = true` delegation takes about a second longer to appear in the worker's pane than a `clear = false` one.
 
-Be clear about what that buys you: a fixed delay makes the race much less likely, but it cannot *prove* that the replacement is listening. The regression test behind this change measures a deterministic test fixture — deliberately built to ignore input for 650 ms — and confirms the task is lost with the buffer at `0` and delivered and submitted at `1000`, which pins the mechanism. It does not measure how long any real agent version takes to boot on your machine. A real "ready for input" signal from the agent side is the actual fix, and it is tracked in [#243](https://github.com/vfarcic/dot-agent-deck/issues/243).
+Be clear about what that buys you: a fixed delay makes the race much less likely, but it cannot *prove* that the replacement is listening. The regression test behind it measures a deterministic test fixture — deliberately built to ignore input for 650 ms — and confirms the task is lost with the buffer at `0` and delivered and submitted at `1000`, which pins the mechanism. It does not measure how long any real agent version takes to boot on your machine.
+
+**Codex is different, and faster.** A Codex worker runs under the deck's own wrapper, which hosts its terminal — so rather than waiting for a signal, the deck *watches* the replacement's interface come up and delivers as soon as it has. That removes both the buffer and the wait for this case: a `clear = true` delegation to Codex used to take about 31 seconds to appear in the worker's pane (Codex announces its session when its first turn starts, i.e. only *after* a task arrives, so the deck had nothing to wait for and paid the full 30-second fallback every time), and now takes under a second. If you saw a Codex worker sit apparently idle for half a minute after every delegation — long enough to make you re-run the delegation, which then superseded the worker that was about to come good — that was this.
+
+**OpenCode is different in the other direction.** It announces nothing at all before a task arrives, so there is genuinely nothing to wait for; the deck no longer spends 30 seconds finding that out and goes straight to the readiness buffer instead. That is a large speedup and a real trade: the buffer is now the only thing standing between the task and a still-booting OpenCode, so if OpenCode tasks start going missing on your machine, the buffer below is the knob — and please report it.
 
 So if tasks still go missing on your machine — a heavily loaded host, or an agent that boots more slowly than the buffer allows for — raise the buffer with the `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` environment variable, in milliseconds, on the process that starts the deck:
 
@@ -159,7 +163,7 @@ So if tasks still go missing on your machine — a heavily loaded host, or an ag
 DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=2000 dot-agent-deck
 ```
 
-Values above `30000` are capped, and `0` disables the wait entirely (the pre-fix behaviour — useful only for reproducing the problem). Please also report it: a machine that needs more than a second is exactly the evidence #243 needs.
+Values above `30000` are capped, and `0` disables the wait entirely (the pre-fix behaviour — useful only for reproducing the problem). It applies wherever the deck has *not* watched the interface come up — which is every agent except a wrapped one, plus every case where the wrapper could not observe anything — and it applies to a scheduled task's first prompt as well as to a delegation. Please also report it: a machine that needs more than a second is exactly the evidence [#243](https://github.com/vfarcic/dot-agent-deck/issues/243) needs to size this per agent.
 
 #### If you are on an older release: `clear = false` is the workaround
 

@@ -191,7 +191,15 @@ fn parse_bounded_ms_override(
 /// [`parse_bounded_ms_override`]). A zero result means "write immediately" — the
 /// pre-#249 behavior, kept reachable for the toggle test's control arm and the
 /// e2e harness.
-fn delegate_readiness_buffer() -> std::time::Duration {
+///
+/// Issue #243: PRD #249 named this for the delegate path, and it is `pub(crate)`
+/// now because the SCHEDULER's readiness gate resolves the same buffer, for the
+/// same reason, on the one path where it also skips the dead wait — see
+/// [`crate::spawn`]. The environment variable's name is public and documented, so
+/// it keeps the `DELEGATE_` in it; what it configures is "how long a gate holds a
+/// prompt after a readiness fact that does not prove input-readiness", on
+/// whichever path established that fact.
+pub(crate) fn delegate_readiness_buffer() -> std::time::Duration {
     let Ok(raw) = std::env::var(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS) else {
         return DELEGATE_READINESS_BUFFER;
     };
@@ -2397,28 +2405,72 @@ fn lookup_orchestration_role_indexed(
 /// accepted it wrote the prompt into a PTY where only `devbox` was running, and
 /// the prompt was lost (PRD #225 Defect 1).
 ///
-/// The skip MUST be conditional, and the condition is "will a genuine
-/// `SessionStart` arrive later?". The registry answers that: an agent with a
-/// native-hook installer ([`crate::agent_registry::AgentSpec::hook_install`])
-/// emits its own `SessionStart` from an initialized session — Codex is the
-/// hybrid case (wrapper as PTY host, native hooks for rich events) — so its
-/// fork-time event can be safely ignored. A pure-Wrapper agent with no hook
-/// installer (Gemini, PRD #211) will NEVER emit another one, so for it the
-/// fork-time event is the only readiness signal there is and must release the
-/// gate; skipping it unconditionally would regress those agents to a full
-/// timeout on every delegate. Keying off a registry property rather than
-/// `agent_type == Codex` is what keeps the next wrapper adapter from inheriting
-/// this bug: a new Wrapper agent gets the right behavior from its registry entry
-/// alone, with no change here.
+/// The skip MUST be conditional, and the condition is "will something better
+/// arrive later?".
 ///
-/// Events without the marker — native hooks, an OLDER wrapper build, the
-/// scheduler's synthetic card-surfacing event — are always treated as ready,
-/// which is exactly today's behavior.
+/// Issue #243 corrects HOW that question is answered. It used to be asked as
+/// `hook_install.is_none()`, which answers "does this agent have native hooks"
+/// and was standing in for a different predicate entirely — *will a real
+/// `SessionStart` arrive before this agent needs a prompt?* Codex has native
+/// hooks and posts its `SessionStart` when the first TURN starts, so the signal
+/// this gate waited for was a CONSEQUENCE of the prompt it was gating: five
+/// production delegates measured 31.2 / 31.2 / 31.7 / 31.7 / 32.3 s, the constancy
+/// being the tell that it was the timeout and not load. The registry now carries
+/// the predicate itself
+/// ([`crate::agent_registry::AgentSpec::pre_prompt_readiness`]), so a new adapter
+/// still gets the right behaviour from its registry entry alone and the entry now
+/// says what is meant.
+///
+/// Three cases, and the third is new:
+///
+/// * **The wrapper's INTERFACE-READY event is readiness, always.** That is the
+///   whole point of it — the wrapper has watched the child's interface come up
+///   (`crate::wrap::InterfaceWatch`), which is a stronger fact than any
+///   announcement, and it is the signal this gate was missing.
+/// * **The wrapper's FORK-TIME event is readiness only when nothing better can
+///   come.** An agent whose pre-prompt readiness we have not established
+///   ([`crate::agent_registry::PrePromptReadiness::Unknown`]) is the one case: a
+///   wrapped command the deck could not resolve will never announce itself any
+///   other way, and skipping its fork-time event unconditionally would regress it
+///   to a full timeout on every delegate (`orchestration/delegate/008`). Every
+///   agent with a signal of its own — native (Claude, Devin), wrapper-observed
+///   (Codex), or positively declared absent (OpenCode, which is never wrapped) —
+///   keeps waiting, exactly as it does today.
+/// * **Everything unmarked is readiness** — native hooks, an OLDER wrapper build,
+///   the scheduler's synthetic card-surfacing event — which is exactly today's
+///   behaviour.
 fn session_start_means_ready(event: &AgentEvent) -> bool {
-    !event.is_wrapper_fork_session_start()
-        || crate::agent_registry::spec(&event.agent_type)
-            .hook_install
-            .is_none()
+    if !event.is_wrapper_session_start() {
+        return true;
+    }
+    if event.is_wrapper_interface_ready_session_start() {
+        return true;
+    }
+    matches!(
+        crate::agent_registry::spec(&event.agent_type).pre_prompt_readiness,
+        crate::agent_registry::PrePromptReadiness::Unknown
+    )
+}
+
+/// Issue #243: does `agent_type` announce ANYTHING a readiness gate could wait
+/// for before its first prompt?
+///
+/// `false` only for an agent that has positively declared it emits nothing
+/// ([`crate::agent_registry::PrePromptReadiness::NoSignal`] — OpenCode, measured
+/// in #146), where the wait is not a timeout but pure dead time: 30 s spent on an
+/// event that cannot arrive, after which the fallback writes the prompt anyway.
+///
+/// `None` — a command the deck could not resolve to an agent — answers `true`.
+/// That is the load-bearing half: "we do not know what this is" is not evidence
+/// that skipping the wait is safe, so an unknown agent keeps today's conservative
+/// behaviour (`orchestration/delegate/011`, `scheduler/spawn/005`). The short path
+/// is taken only on a POSITIVE declaration.
+pub(crate) fn agent_has_pre_prompt_readiness_signal(agent_type: Option<&AgentType>) -> bool {
+    agent_type.is_none_or(|agent_type| {
+        crate::agent_registry::spec(agent_type)
+            .pre_prompt_readiness
+            .has_signal()
+    })
 }
 
 /// Issue #424 (reviewer option 3): everything one [`wait_for_session_start`]
@@ -2502,6 +2554,22 @@ pub(crate) struct SessionStartWait {
     /// [`crate::prompt_delivery::AgentStartRearm`] and
     /// [`crate::agent_pty::AgentPtyRegistry::pre_write_believed_agent_type`].
     pub(crate) launcher_handoff: Option<AgentType>,
+    /// Issue #243: the gate was released by an OBSERVATION of the agent's
+    /// interface — the wrapper's interface-ready `SessionStart` — rather than by
+    /// an announcement that a session object exists.
+    ///
+    /// This is the fourth independent fact, and it is what decides whether the
+    /// post-readiness buffer ([`DELEGATE_READINESS_BUFFER`]) is still needed. That
+    /// buffer exists because `SessionStart` means "a session exists", not "the TUI
+    /// interprets `\r` as submit" — Claude Code fires it early in its boot
+    /// sequence, and writing on it lands mid-boot (#199, #249, #663). An
+    /// interface-ready event does not have that gap by construction: the wrapper
+    /// emitted it *because* it watched the child's interface settle, so there is
+    /// nothing left for a blind interval to cover.
+    ///
+    /// `false` for every other outcome, INCLUDING the timeout: a wait that
+    /// established nothing is more reason to hold the prompt, not less.
+    pub(crate) observed_interface: bool,
 }
 
 impl SessionStartWait {
@@ -2511,6 +2579,7 @@ impl SessionStartWait {
             generation: None,
             observed_producer: None,
             launcher_handoff,
+            observed_interface: false,
         }
     }
 }
@@ -2641,12 +2710,22 @@ pub(crate) async fn wait_for_session_start(
                     // for an agent with no native hook installer, because
                     // `session_start_means_ready` above keeps waiting for the
                     // genuine `SessionStart` of every agent that will emit one.
-                    let genuine = !event.is_wrapper_fork_session_start();
+                    // Issue #243: "genuine" is a question about CONVERSATION, not
+                    // about readiness, and the two came apart the moment the
+                    // wrapper grew a second event. Both wrapper events carry the
+                    // WRAPPER's session id rather than the agent's, so neither may
+                    // bind a delivery's generation — an interface-ready event that
+                    // did would leave the delivery bound to `wrap-codex-1234`, and
+                    // Codex's own native start a moment later would then read as a
+                    // generation CHANGE and revoke a target that never moved.
+                    let genuine = !event.is_wrapper_session_start();
+                    let observed_interface = event.is_wrapper_interface_ready_session_start();
                     return SessionStartWait {
                         ready: true,
                         generation: genuine.then_some((event.session_id, event.timestamp)),
                         observed_producer: Some(event.agent_type),
                         launcher_handoff,
+                        observed_interface,
                     };
                 }
             }
@@ -2832,9 +2911,14 @@ pub(crate) async fn wait_for_prompt_submission(
                 // about input readiness. First qualifying start only: what the
                 // rearm needs is when the agent came up, not how many frames it
                 // has sent since.
+                // Issue #243: G is now the wrapper discriminator rather than the
+                // wrapper-FORK one. An interface-ready start is the deck's own
+                // observation that a child is painting, not an agent announcing a
+                // conversation it can report submissions for, so it must not arm a
+                // re-submission any more than boot provenance does.
                 if agent_start.is_none()
                     && event.event_type == EventType::SessionStart
-                    && !event.is_wrapper_fork_session_start()
+                    && !event.is_wrapper_session_start()
                 {
                     agent_start = Some((std::time::Instant::now(), event.agent_type.clone()));
                 }
@@ -2980,7 +3064,10 @@ pub(crate) fn latch_generation(
         return None;
     }
     match generation {
-        None if event.is_wrapper_fork_session_start() => None,
+        // Issue #243: BOTH wrapper origins, not just the fork one. An
+        // interface-ready event names the wrapper's own session, so binding to it
+        // would make the agent's first native start look like a generation change.
+        None if event.is_wrapper_session_start() => None,
         None => {
             *generation = Some((event.session_id.clone(), event.timestamp));
             None
@@ -3421,14 +3508,34 @@ async fn dispatch_one_owned(
                     // stands. See this function's no-delivery invariant.
                     return;
                 }
-                tracing::debug!(
-                    role = %target_role,
-                    pane_id = %pane_id,
-                    new_agent_id = %new_agent_id,
-                    timeout_secs = SESSION_START_WAIT_TIMEOUT.as_secs(),
-                    "delegate: respawned worker agent for clear=true; \
-                     waiting for SessionStart on hook broadcast"
-                );
+                // Issue #243: does this agent announce ANYTHING before its
+                // first prompt? Resolved from the role command the respawn just
+                // launched — the same derivation the respawn itself used — so
+                // the answer is about the process that is actually booting.
+                let worker_agent_type = recreate_identity.agent_type.clone();
+                let has_readiness_signal =
+                    agent_has_pre_prompt_readiness_signal(worker_agent_type.as_ref());
+                if has_readiness_signal {
+                    tracing::debug!(
+                        role = %target_role,
+                        pane_id = %pane_id,
+                        new_agent_id = %new_agent_id,
+                        timeout_secs = SESSION_START_WAIT_TIMEOUT.as_secs(),
+                        "delegate: respawned worker agent for clear=true; \
+                         waiting for SessionStart on hook broadcast"
+                    );
+                } else {
+                    tracing::debug!(
+                        role = %target_role,
+                        pane_id = %pane_id,
+                        new_agent_id = %new_agent_id,
+                        agent_type = ?worker_agent_type,
+                        buffer_ms = delegate_readiness_buffer().as_millis(),
+                        "delegate: this agent has DECLARED it emits no pre-prompt \
+                         readiness signal; skipping the dead wait and holding the \
+                         task prompt for the readiness buffer instead"
+                    );
+                }
                 // PRD #92 F9 followup-7: scope the wait to the NEW
                 // agent's id so a late `SessionStart` from the OLD
                 // agent (which carried the OLD id, injected via
@@ -3449,17 +3556,35 @@ async fn dispatch_one_owned(
                 // (`orchestration/delegate/011`), where a polling sleep would let
                 // auto-advance move the clock underneath the test.
                 let replacement_exited = registry.agent_exit_signal(&new_agent_id);
-                let observed = tokio::select! {
-                    biased;
-                    _ = replacement_exited => false,
-                    wait = wait_for_session_start(
-                        &mut event_rx,
-                        &pane_id,
-                        &new_agent_id,
-                        SESSION_START_WAIT_TIMEOUT,
-                    ) => wait.ready,
+                // Issue #243: the whole outcome, not just `ready`. The delegate
+                // path has always asked only whether readiness fired, but the
+                // buffer below now needs the OTHER answer this window carries —
+                // whether what released the gate was an OBSERVATION of the
+                // agent's interface or merely a session announcing itself.
+                //
+                // A declared-no-signal agent skips the wait entirely rather than
+                // passing a zero timeout through it: there is no event to race,
+                // and an unconditional call would still have to be given a
+                // deadline, which is the dead wait this issue exists to delete.
+                // Its `SessionStartWait::default()` is the honest record — nothing
+                // was observed, so every downstream guard treats it as the
+                // fallback path, which is exactly what it is.
+                let wait = if has_readiness_signal {
+                    tokio::select! {
+                        biased;
+                        _ = replacement_exited => SessionStartWait::default(),
+                        wait = wait_for_session_start(
+                            &mut event_rx,
+                            &pane_id,
+                            &new_agent_id,
+                            SESSION_START_WAIT_TIMEOUT,
+                        ) => wait,
+                    }
+                } else {
+                    SessionStartWait::default()
                 };
-                if !observed {
+                let observed = wait.ready;
+                if has_readiness_signal && !observed {
                     tracing::debug!(
                         role = %target_role,
                         pane_id = %pane_id,
@@ -3579,7 +3704,41 @@ async fn dispatch_one_owned(
                 // are not post-respawn and need no gate (PRD #249 open
                 // question 2). The gate belongs to the respawn, so it lives
                 // in the respawn's arm.
-                let buffer = delegate_readiness_buffer();
+                // Issue #243: the buffer is scoped by WHAT THE GATE ESTABLISHED,
+                // not by which agent this is — that is the only scoping that does
+                // not reintroduce #663. The buffer covers the gap between "a
+                // session exists" and "the TUI interprets `\r` as submit", and
+                // that gap is real for every readiness fact the deck had before
+                // this issue: a native `SessionStart` (Claude fires it early in
+                // boot — at a 0 ms buffer the pointer was written into a
+                // still-booting Claude and dropped, #663), a hookless wrapper's
+                // fork-time event, and the timeout fallback, which established
+                // nothing at all and is therefore MORE reason to wait.
+                //
+                // The one readiness fact without that gap is the wrapper's
+                // interface-ready observation: the wrapper emitted it BECAUSE it
+                // watched the child's interface come up, so there is nothing left
+                // for a blind interval to cover and holding anyway would only be
+                // an admission that the new signal is not believed.
+                //
+                // The #199 escape hatch (`…_DELEGATE_READINESS_BUFFER_MS` — "bump
+                // it and see if the prompt lands") therefore stays live for every
+                // case where the deck has NOT seen the interface, which is every
+                // case it was ever useful for. Where the deck HAS seen it, the
+                // diagnosable story is better than a knob: the interface-ready
+                // event is on the wire and in the log, so "the agent never became
+                // ready" is answered by its absence rather than by tuning.
+                let buffer = if wait.observed_interface {
+                    tracing::debug!(
+                        role = %target_role,
+                        pane_id = %pane_id,
+                        "delegate: readiness came from the wrapper's OBSERVED interface; \
+                         writing the task prompt without the post-readiness buffer"
+                    );
+                    std::time::Duration::ZERO
+                } else {
+                    delegate_readiness_buffer()
+                };
                 if !buffer.is_zero() {
                     tracing::debug!(
                         role = %target_role,
@@ -5771,8 +5930,14 @@ impl AppState {
         // off the wrapped agent's native session.
         if let Some(ref pane_id) = event.pane_id {
             let incoming_ts = event.timestamp;
-            let launcher_origin_start = event.event_type == EventType::SessionStart
-                && event.is_wrapper_fork_session_start();
+            // Issue #243: widened to EITHER wrapper origin. The reasoning above is
+            // about wrapper provenance, not about the fork moment specifically —
+            // an interface-ready event is still the wrapper talking about its own
+            // session id, so it may establish a generation where the pane has none
+            // and refresh the one it already names, but never move a pane that
+            // already has a conversation.
+            let launcher_origin_start =
+                event.event_type == EventType::SessionStart && event.is_wrapper_session_start();
             let announces_generation =
                 event.event_type == EventType::SessionStart && !launcher_origin_start;
             let advance = match self.pane_hook_session.get(pane_id) {

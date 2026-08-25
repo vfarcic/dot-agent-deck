@@ -448,15 +448,19 @@ pub const DISPLAY_NAME_METADATA_KEY: &str = "display_name";
 pub const DELIVERY_NOTICE_METADATA_KEY: &str = "delivery_notice";
 
 /// `AgentEvent.metadata` key declaring WHERE a `SessionStart` came from (PRD
-/// #225 M3). Only the wrapper adapter sets it, with the single value
-/// [`WRAPPER_FORK_SESSION_START_ORIGIN`]; every other producer omits it, and
-/// consumers read an absent key as "this `SessionStart` came from an
+/// #225 M3). Only the wrapper adapter sets it, with one of the two values
+/// [`WRAPPER_FORK_SESSION_START_ORIGIN`] /
+/// [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`]; every other producer omits
+/// it, and consumers read an absent key as "this `SessionStart` came from an
 /// initialized session".
 ///
-/// Additive on the wire in both directions: an OLD wrapper emits no key and a
-/// new daemon treats its event exactly as it does today; a NEW wrapper's key is
-/// ignored by an old daemon. That is a semantic no-op, not a
-/// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump.
+/// Additive on the wire in both directions: an OLD wrapper emits no key (or only
+/// the fork one) and a new daemon treats its events exactly as it does today; a
+/// NEW wrapper's key is ignored by an old daemon. The KEY is therefore not a
+/// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump — but issue #243's second
+/// value is a semantic change behind that stable wire, because a wrapper now
+/// emits TWO `SessionStart` events where it emitted one. See
+/// `changelog.d/243.breaking.md`.
 pub const SESSION_START_ORIGIN_METADATA_KEY: &str = "session_start_origin";
 
 /// The [`SESSION_START_ORIGIN_METADATA_KEY`] value meaning "this `SessionStart`
@@ -468,6 +472,33 @@ pub const SESSION_START_ORIGIN_METADATA_KEY: &str = "session_start_origin";
 /// interactivity for an agent that will emit a genuine native `SessionStart`
 /// later.
 pub const WRAPPER_FORK_SESSION_START_ORIGIN: &str = "wrapper_fork";
+
+/// The [`SESSION_START_ORIGIN_METADATA_KEY`] value meaning "`dot-agent-deck wrap`
+/// has OBSERVED the wrapped child's interface come up" (issue #243).
+///
+/// This is the pre-prompt readiness signal the delegate and scheduler gates were
+/// missing. Codex posts its own native `SessionStart` when the first *turn*
+/// starts — i.e. as a consequence of the very prompt the gate is withholding —
+/// so before this the gate had nothing to release on and paid
+/// [`crate::state::SESSION_START_WAIT_TIMEOUT`] in full on every `clear = true`
+/// delegate.
+///
+/// Unlike [`WRAPPER_FORK_SESSION_START_ORIGIN`] this DOES mean "the interface
+/// exists and is waiting for input" — see `Emitter::emit_interface_ready` in
+/// [`crate::wrap`] for exactly what the wrapper keys on. It is still WRAPPER
+/// PROVENANCE rather than an agent conversation, though: the session id on it is
+/// the wrapper's own, not the agent's, so it must never bind a delivery's
+/// generation or move a pane's hook session. That is what
+/// [`AgentEvent::is_wrapper_session_start`] separates from
+/// [`AgentEvent::is_wrapper_fork_session_start`], which stays fork-only so the
+/// readiness gate can still tell the two wrapper events apart.
+///
+/// Deliberately NOT forwardable through `dot-agent-deck hook` (`crate::hook`
+/// narrows that forwarding to the fork value alone): boot provenance is a
+/// producer confessing that its child is not up, which is safe to believe, while
+/// interface readiness is a producer claiming it IS — and the deck only believes
+/// that from its own wrapper, over the wrapper's own event path.
+pub const WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN: &str = "wrapper_interface_ready";
 
 /// PRD #20 M1: current schema version of the [`AgentEvent`] JSON wire shape.
 ///
@@ -631,6 +662,39 @@ impl AgentEvent {
         self.metadata
             .get(SESSION_START_ORIGIN_METADATA_KEY)
             .is_some_and(|origin| origin == WRAPPER_FORK_SESSION_START_ORIGIN)
+    }
+
+    /// Issue #243: does this event carry the wrapper's INTERFACE-READY origin
+    /// marker (see [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`])?
+    ///
+    /// The one signal in the system that means "the deck watched this child's
+    /// interface come up", as opposed to "a session object exists". Readiness
+    /// gates release on it, and it is the only readiness they do not follow with
+    /// a blind post-signal buffer.
+    pub fn is_wrapper_interface_ready_session_start(&self) -> bool {
+        self.metadata
+            .get(SESSION_START_ORIGIN_METADATA_KEY)
+            .is_some_and(|origin| origin == WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN)
+    }
+
+    /// Issue #243: was this `SessionStart` authored by `dot-agent-deck wrap`
+    /// ABOUT ITS OWN CHILD — either origin — rather than by an initialized agent
+    /// session announcing itself?
+    ///
+    /// This is the "is it a conversation" question, and it is NOT the same as the
+    /// readiness question. Both wrapper events carry the wrapper's own session
+    /// id, so neither may bind a delivery's generation, move a pane's hook
+    /// session, or arm a re-submission — while the interface-ready one *does*
+    /// satisfy the readiness gate and the fork-time one usually does not. Every
+    /// site that previously asked `!is_wrapper_fork_session_start()` to mean
+    /// "genuine conversation" asks this instead; the two sites that genuinely
+    /// mean "fork-time boot provenance" keep asking the narrower question.
+    ///
+    /// `false` for every event without the key — including everything an older
+    /// wrapper, a native hook or a future producer emits — so the absent-key
+    /// default stays "a genuine, session-derived event".
+    pub fn is_wrapper_session_start(&self) -> bool {
+        self.is_wrapper_fork_session_start() || self.is_wrapper_interface_ready_session_start()
     }
 
     /// Issue #424 D4: was this event SYNTHESIZED BY THE DAEMON rather than
