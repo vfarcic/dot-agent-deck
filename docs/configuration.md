@@ -61,13 +61,11 @@ For the full reference and more examples, see [Workspace Modes](workspace-modes.
 
 ### Choosing the Default Orchestration
 
-A project may define several `[[orchestrations]]` — commonly the same team of roles wired to different providers. Most of the time you name the one you want:
+A project may define several `[[orchestrations]]` — commonly the same team of roles wired to different providers.
 
-```bash
-dot-agent-deck dispatch fix-auth --orchestration 'anthropic' --task '…'
-```
+**You do not pick between them on a command line.** You either open one yourself from the new-pane form (`Ctrl+n`, cycle **Mode** to `Orch: <name>`), or you ask a [dispatcher pane](dispatcher-mode.md) to start one — *"start work on the login timeout bug, use the anthropic team"* — and the agent in that pane runs the `dispatch` command for you. `dispatch` is an agent-facing verb: it refuses to run outside a deck-managed pane, so typing it in your own terminal only prints `DOT_AGENT_DECK_PANE_ID environment variable not set`.
 
-But two things start an orchestration **without** naming one: `dispatch --orchestration=` with an empty value, and a [scheduled task](scheduled-tasks.md) whose working directory defines orchestrations. Add `default = true` to the block those should open:
+That leaves the case this key is for: something starts an orchestration and **nobody named one**. Two things do that — a dispatcher agent that was not told which team to use, and a [scheduled task](scheduled-tasks.md) whose working directory defines orchestrations, which has no one to ask. Add `default = true` to the block those should open:
 
 ```toml
 [[orchestrations]]
@@ -82,16 +80,27 @@ name = "anthropic"
 
 `default` sits on the block, so it moves with the block. Exactly one orchestration may declare it, and that orchestration must define roles — `dot-agent-deck validate` rejects both mistakes.
 
-**If nothing declares it, the first orchestration with roles wins.** That is the historical rule and it still applies, so a config written before this key keeps behaving identically. It is worth declaring anyway: with several orchestrations defined, reordering the file changes which one every unnamed run opens, and nothing in that diff says so. When the choice is left implicit, the deck says which one it took and what else was available — in the dispatch's reply, in `dispatch --list-targets`, in `dot-agent-deck validate`, and in the daemon log for a scheduled run that has nobody watching.
+**If nothing declares it, the first orchestration with roles wins.** That is the historical rule and it still applies, so a config written before this key keeps behaving identically. It is worth declaring anyway: with several orchestrations defined, reordering the file changes which one every unnamed run opens, and nothing in that diff says so.
 
-`dispatch --list-targets` marks the answer:
+When the choice is left implicit, the deck says so rather than quietly picking. `dot-agent-deck validate` is where **you** see it:
+
+```
+$ dot-agent-deck validate
+[warning] 'mixed': 3 orchestrations are defined and none declares `default = true`, so a dispatch or scheduled task that names none opens this one purely because it comes first in the file — reordering the file would silently change that. Add `default = true` to the one you want.
+```
+
+A **dispatcher agent** is told the same thing in its own words — appended to the reply it relays to you after starting a unit, and in the listing it consults before asking which team you want. That listing always marks the default, declared or not, which is how the agent knows what *"just use the usual one"* refers to:
 
 ```
 Available dispatch targets:
   single            one agent (--single)
   orchestration     'mixed' — 6 roles (--orchestration 'mixed')  [default]
   orchestration     'anthropic' — 6 roles (--orchestration 'anthropic')
+
+Ask the user which they want before dispatching, then pass the matching flag.
 ```
+
+A **scheduled task** has nobody to tell, so its copy goes to the daemon log — which is why declaring the default matters most for scheduled work, and why a warning you never saw is not the same as one that was never raised.
 
 ### Sharing One Orchestration Across Providers
 

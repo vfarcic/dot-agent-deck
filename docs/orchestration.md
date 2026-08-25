@@ -418,7 +418,7 @@ It reports errors (which stop an orchestration opening) and warnings (which do n
 
 ### Several definitions in one project
 
-A project can define more than one `[[orchestrations]]` block — most often the same team of roles wired to different providers, so a contributor with credentials for one provider can still run it and a run survives one provider's credits running out. This repo's own `.dot-agent-deck.toml` does exactly that with `mixed`, `anthropic` and `GPT`.
+A project can define more than one `[[orchestrations]]` block — most often the same team of roles wired to different providers, so a contributor with credentials for one provider can still run it and a run survives one provider's credits running out. The deck's own repository does exactly that, with `mixed`, `anthropic` and `GPT`.
 
 Two keys make that practical, and both are documented in [Configuration](configuration.md): `default = true` declares which one an unnamed run opens (rather than leaving it to file order), and `extends` lets the variants inherit one workflow instead of being three copies of it.
 
