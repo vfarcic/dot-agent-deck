@@ -3130,8 +3130,10 @@ impl Drop for PaneCleanupHold {
 /// that an automatic prompt delivery FAILED on `pane_id`.
 ///
 /// This is the replacement for writing a diagnostic line into the agent's own
-/// input buffer. That mechanism (`write_notice_guarded`) is retained for PRD
-/// #249's orchestrator-pane use, but its own contract says LF may be
+/// input buffer. That mechanism (`write_notice_guarded`) is retained for the two
+/// orchestrator-pane notices that still take it — `compose_worker_exited_notice`
+/// and `compose_respawn_no_live_worker_notice`; issue #702 moved PRD #249's
+/// silence notice off it onto the submitted path — but its own contract says LF may be
 /// interpreted as Enter and that a later ordinary submit sends
 /// `notice + newline + user prompt` as ONE turn — pinned by the passing
 /// regression `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`.
@@ -3400,6 +3402,19 @@ impl AgentPtyRegistry {
     ///
     /// `worker_agent_id` is the worker's registry agent id, when
     /// the caller already knows it — see [`SilenceWatchRecord::worker_agent_id`].
+    ///
+    /// **Issue #687: on the `clear = true` path this is called EARLIER than the
+    /// pointer write** — the moment the respawn establishes the new generation's
+    /// ownership of the pane, rather than ~30 s later after the `SessionStart`
+    /// wait and readiness buffer. Nothing about this function changed; what
+    /// changed is when the caller invokes the supersession the paragraph above
+    /// describes, because leaving it until the write meant the REPLACED
+    /// generation's watch stayed armed throughout its replacement's startup and
+    /// could fire against a delegation that was already live. The returned
+    /// `ArmedSilenceWatch` is then carried through the dispatch and either handed
+    /// to the watch task or released by `seq` — see
+    /// `crate::state::release_reserved_silence_watch` and the silent-worker
+    /// no-delivery invariant on `dispatch_one_owned`.
     pub fn arm_silence_watch(
         &self,
         worker_pane_id: &str,
@@ -5379,6 +5394,13 @@ impl AgentPtyRegistry {
     ///
     /// Failure and refusal are reported through the same [`GuardedSend`] vocabulary
     /// so callers classify a refused notice the way they classify a refused prompt.
+    ///
+    /// Issue #702: what this path guarantees is DEFERRAL, not inertness — see
+    /// [`crate::state::compose_worker_exited_notice`], which carries the whole
+    /// contract for the two notices that still take this call. A caller that
+    /// wants an untrusted value in its text belongs on
+    /// [`Self::write_and_submit_guarded`] instead, where the text is a turn of
+    /// its own rather than a prefix glued to the next one.
     pub async fn write_notice_guarded<Fut>(
         &self,
         pane_id: &str,

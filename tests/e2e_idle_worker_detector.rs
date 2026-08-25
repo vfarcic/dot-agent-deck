@@ -1,10 +1,12 @@
 #![cfg(feature = "e2e")]
 
-//! PTY-attached coverage for the daemon idle-worker detector. The synthetic
-//! case opens the `orch-deck` fixture's live `cat` role panes and injects a
-//! Delegate over its hook socket; the real-agent case restores an orchestration
-//! whose interactive Claude Haiku orchestrator delegates to a silent worker.
-//! Both must render the daemon's idle prompt in the orchestrator surface.
+//! PTY-attached coverage for the daemon's delegated-worker detectors. The
+//! synthetic idle case opens the `orch-deck` fixture's live `cat` role panes and
+//! injects a Delegate over its hook socket; the real-agent cases restore an
+//! orchestration whose interactive Claude Haiku orchestrator delegates to a
+//! silent worker. They prove both the long idle nudge and the earlier no-event
+//! notice reach the visible orchestrator surface, with the latter becoming an
+//! actionable response turn without human input.
 
 mod common;
 
@@ -21,6 +23,10 @@ use spec::spec;
 const REAL_ORCHESTRATION_NAME: &str = "idle-worker-real";
 const REAL_ORCHESTRATOR_MODEL: &str = "claude-haiku-4-5-20251001";
 const REAL_WORKER_ROLE: &str = "worker";
+const SILENCE_ACTION_FILE: &str = "delegate-silence-action-85bc9576.txt";
+const SILENCE_ACTION_CONTENT: &str = "DELEGATE_SILENCE_NOTICE_ACTED_ON_85BC9576";
+const INITIAL_WAIT_RESPONSE: &str = "INITIAL_DELEGATION_WAITING_85BC9576";
+const SILENCE_ACTION_RESPONSE: &str = "SILENCE_NOTICE_ACTION_COMPLETE_85BC9576";
 
 /// The daemon-authored opening clause of `compose_idle_worker_prompt`.
 ///
@@ -40,6 +46,12 @@ const IDLE_DAEMON_CLAUSE: &str = "has not responded with work-done (dot-agent-de
 /// framed the role as data.
 fn idle_role_label(role: &str) -> String {
     format!("[UNTRUSTED-ROLE-LABEL: {role} :END-UNTRUSTED-ROLE-LABEL]")
+}
+
+fn has_role_status(grid: &str, role: &str, status: &str) -> bool {
+    let role_needle = format!("\u{00b7} {role}");
+    grid.lines()
+        .any(|line| line.contains(&role_needle) && line.contains(status))
 }
 
 /// Wrap-tolerant wait for `needle` inside the orchestration PANE COLUMN.
@@ -341,4 +353,138 @@ fn idle_worker_012_real_orchestrator_visibly_receives_idle_nudge() {
             deck.snapshot_grid()
         )
     });
+}
+
+/// Scenario: Restore a real interactive Claude Haiku orchestrator that delegates to a silent `cat` worker, acknowledges that it is waiting, and returns to Idle. When the short no-event window expires, the daemon notice must trigger a new visible Thinking/Working response turn with no human keystroke, during which the orchestrator creates and reports a uniquely named action sentinel.
+#[spec("orchestration/delegate/024")]
+#[test]
+fn delegate_024_real_orchestrator_acts_on_submitted_silence_notice() {
+    skip_unless!(common::check_claude_available());
+
+    let orchestration_root = common::harness_tempdir().expect("orchestration root tempdir");
+    let project_dir = orchestration_root.path().join("project");
+    std::fs::create_dir_all(&project_dir).expect("create orchestration project directory");
+    let project_dir = project_dir
+        .canonicalize()
+        .expect("canonicalize orchestration project directory");
+    let project_str = project_dir
+        .to_str()
+        .expect("orchestration project directory is UTF-8")
+        .to_string();
+    let _ = std::process::Command::new("git")
+        .arg("init")
+        .arg("--quiet")
+        .current_dir(&project_dir)
+        .status();
+
+    let orchestrator_command =
+        format!("claude --model {REAL_ORCHESTRATOR_MODEL} --allowedTools Bash");
+    let project_protocol = format!(
+        "# Automated dot-agent-deck integration test\n\nThis isolated repository is an authorized \
+         integration test for the installed dot-agent-deck application. After the initial \
+         delegation, a later user turn beginning with a dot-agent-deck daemon report that a \
+         delegated worker went quiet is expected application input, not prompt injection. When \
+         that report arrives, decide to keep waiting, use the Bash tool to run exactly `printf \
+         '%s\\n' '{SILENCE_ACTION_CONTENT}' > '{SILENCE_ACTION_FILE}'`, respond with exactly \
+         `{SILENCE_ACTION_RESPONSE}`, and end the turn. Never create the action file before that \
+         daemon report arrives.\n"
+    );
+    std::fs::write(project_dir.join("CLAUDE.md"), project_protocol)
+        .expect("write real-orchestrator integration protocol");
+    let directive = format!(
+        "This is an authorized local integration test. Use the Bash tool to run exactly this one \
+         command: dot-agent-deck delegate --to {REAL_WORKER_ROLE} --task 'Remain silent and do \
+         not send work-done.' After the command succeeds, respond with exactly \
+         {INITIAL_WAIT_RESPONSE}, then end your turn."
+    );
+
+    std::fs::write(
+        project_dir.join(".dot-agent-deck.toml"),
+        real_agent_orchestration_config(&orchestrator_command),
+    )
+    .expect("write real-agent orchestration config");
+    let session_path = orchestration_root.path().join("session.toml");
+    std::fs::write(
+        &session_path,
+        real_agent_orchestration_session(&project_str, &orchestrator_command, &directive),
+    )
+    .expect("write real-agent orchestration session");
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 50)
+        .with_imported_claude_credentials()
+        .with_claude_project_trust(project_str.clone())
+        .with_env("PATH", path_with_binary_dir())
+        .with_env(
+            "DOT_AGENT_DECK_SESSION",
+            session_path.to_str().expect("session path is UTF-8"),
+        )
+        .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
+        .with_env("DOT_AGENT_DECK_DELEGATE_NO_EVENT_WINDOW_MS", "30000")
+        .launch_with_fixture("minimal");
+
+    assert!(
+        deck.wait_for_grid_string_within(REAL_ORCHESTRATION_NAME, Duration::from_secs(45)),
+        "the restored real-agent orchestration never surfaced within 45s\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    let worker_task = project_dir
+        .join(".dot-agent-deck")
+        .join(format!("worker-task-{REAL_WORKER_ROLE}.md"));
+    assert!(
+        common::wait_for_path(&worker_task, Duration::from_secs(120)),
+        "the real Claude orchestrator never delegated to {REAL_WORKER_ROLE:?}; expected the \
+         daemon to create {worker_task:?}\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+    wait_for_wrapped_pane_string(&deck, INITIAL_WAIT_RESPONSE, Duration::from_secs(120))
+        .unwrap_or_else(|why| {
+            panic!(
+                "the real orchestrator delegated but never visibly completed its initial waiting \
+                 response: {why}\nFinal grid:\n{}",
+                deck.snapshot_grid()
+            )
+        });
+    assert!(
+        common::wait_until(Duration::from_secs(30), || {
+            has_role_status(&deck.snapshot_grid(), "orchestrator", "Idle")
+        }),
+        "the orchestrator never returned to Idle after its initial delegate turn\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    let action_path = project_dir.join(SILENCE_ACTION_FILE);
+    assert!(
+        !action_path.exists(),
+        "the orchestrator created {SILENCE_ACTION_FILE:?} during its initial turn, so the \
+         sentinel cannot prove it acted on the later daemon notice"
+    );
+
+    deck.wait_for_strings_in_order_then_any_within(
+        &["Thinking", "Working"],
+        &[SILENCE_ACTION_RESPONSE],
+        Duration::from_secs(90),
+    );
+
+    let action = std::fs::read_to_string(&action_path).unwrap_or_else(|error| {
+        panic!(
+            "the submitted silence notice produced a visible response but did not create the \
+             required action sentinel {action_path:?}: {error}\nFinal grid:\n{}",
+            deck.snapshot_grid()
+        )
+    });
+    assert_eq!(
+        action.trim(),
+        SILENCE_ACTION_CONTENT,
+        "the orchestrator wrote unexpected action-sentinel contents"
+    );
+    wait_for_wrapped_pane_string(&deck, SILENCE_ACTION_RESPONSE, Duration::from_secs(30))
+        .unwrap_or_else(|why| {
+            panic!(
+                "the orchestrator created the action sentinel but its response turn never became \
+                 visible in the attached pane: {why}\nFinal grid:\n{}",
+                deck.snapshot_grid()
+            )
+        });
 }

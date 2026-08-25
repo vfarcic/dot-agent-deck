@@ -274,13 +274,21 @@ while True:
 
 #[cfg(unix)]
 fn snapshot_has_silence_notice(snapshot: &[u8]) -> bool {
-    String::from_utf8_lossy(snapshot)
-        .split_inclusive('\n')
-        .filter(|line| line.ends_with('\n'))
-        .any(|line| {
-            line.contains("delegated worker went quiet (dot-agent-deck daemon report)")
-                && line.contains("emitted no agent event")
-        })
+    let text = String::from_utf8_lossy(snapshot);
+    text.contains("delegated worker went quiet (dot-agent-deck daemon report)")
+        && text.contains("emitted no agent event")
+}
+
+#[cfg(unix)]
+fn silence_notice_terminator(snapshot: &[u8]) -> Option<u8> {
+    let marker = b"delegated worker went quiet (dot-agent-deck daemon report)";
+    let start = snapshot
+        .windows(marker.len())
+        .position(|window| window == marker)?;
+    snapshot[start..]
+        .iter()
+        .copied()
+        .find(|byte| matches!(byte, b'\r' | b'\n'))
 }
 
 #[cfg(unix)]
@@ -1170,7 +1178,7 @@ fn delegate_012_slow_agent_toggle_proves_delivery_and_submission() {
         });
 }
 
-/// Scenario: Delegate to a worker that receives the pointer and then emits no agent event before the short no-event window expires, in two arms. When its pane is sitting at a booted agent's ready prompt, the orchestrator's notice must QUOTE the lines that pane is actually rendering, framed as untrusted pane text. When its pane has rendered nothing at all, the notice must say so instead — proving the text is read from that pane rather than canned. Both arms stay LF-terminated with no role-name interpolation in the daemon prose.
+/// Scenario: Delegate to a worker that receives the pointer and then emits no agent event before the short no-event window expires, in two arms. A ready worker's notice must quote its nonce-bearing pane text inside the untrusted frame, while a blank worker's notice must report a blank pane. Both notices must be submitted with CR and tell the orchestrator it can keep waiting, re-delegate, reassign, or notify the user, without interpolating the role name.
 #[spec("orchestration/delegate/013")]
 #[test]
 #[cfg(unix)]
@@ -1401,7 +1409,7 @@ impl SilentWorkerArm {
         );
     }
 
-    async fn wait_for_notice(&self) -> String {
+    async fn wait_for_notice(&self) -> Vec<u8> {
         let notice = wait_for_silence_notice(
             &self.registry,
             &self.orchestrator_agent_id,
@@ -1411,10 +1419,10 @@ impl SilentWorkerArm {
         assert!(
             snapshot_has_silence_notice(&notice),
             "a worker that received its delegate pointer and emitted no agent event produced no \
-             LF-terminated daemon notice in the orchestrator pane; snapshot = {:?}",
+             daemon notice in the orchestrator pane; snapshot = {:?}",
             String::from_utf8_lossy(&notice)
         );
-        String::from_utf8_lossy(&notice).into_owned()
+        notice
     }
 }
 
@@ -1435,7 +1443,22 @@ async fn delegate_013_silent_worker_surfaces_notice_in_orchestrator_pane_inner()
         String::from_utf8_lossy(&drawn)
     );
     arm.delegate_and_confirm_delivery().await;
-    let notice_text = arm.wait_for_notice().await;
+    let notice = arm.wait_for_notice().await;
+    let notice_text = String::from_utf8_lossy(&notice);
+
+    let terminator = silence_notice_terminator(&notice);
+    let remediation_options = ["keep waiting", "re-delegat", "reassign", "notify the user"];
+    let missing_options: Vec<&str> = remediation_options
+        .iter()
+        .copied()
+        .filter(|option| !notice_text.to_ascii_lowercase().contains(option))
+        .collect();
+    assert!(
+        terminator == Some(b'\r') && missing_options.is_empty(),
+        "issue #702: the silence notice must be submitted with CR and name every remediation \
+         option (keep waiting, re-delegate, reassign, notify the user); observed terminator = \
+         {terminator:?}, missing options = {missing_options:?}, snapshot = {notice_text:?}"
+    );
 
     assert!(
         notice_text.contains(READY_PROMPT_LINE),
@@ -1471,7 +1494,8 @@ async fn delegate_013_silent_worker_surfaces_notice_in_orchestrator_pane_inner()
 async fn delegate_013_blank_worker_pane_is_reported_as_blank_inner() {
     let mut arm = SilentWorkerArm::new(write_blank_pane_worker, "blank-pane-worker").await;
     arm.delegate_and_confirm_delivery().await;
-    let notice_text = arm.wait_for_notice().await;
+    let notice = arm.wait_for_notice().await;
+    let notice_text = String::from_utf8_lossy(&notice);
 
     assert!(
         !notice_text.contains(READY_PROMPT_LINE),
@@ -1485,6 +1509,263 @@ async fn delegate_013_blank_worker_pane_is_reported_as_blank_inner() {
          {notice_text:?}"
     );
     arm.registry.shutdown_all();
+}
+
+#[cfg(unix)]
+const SUPERSEDED_GENERATION_A_SENTINEL: &str = "SILENCE-WATCH-GENERATION-A-7c4e91";
+#[cfg(unix)]
+const LIVE_GENERATION_B_SENTINEL: &str = "SILENCE-WATCH-GENERATION-B-2a8f65";
+
+#[cfg(unix)]
+fn write_generation_sentinel_worker(path: &std::path::Path, generation_marker: &std::path::Path) {
+    write_executable(
+        path,
+        &format!(
+            "#!/bin/sh\n\
+             stty raw -echo\n\
+             if [ -e '{marker}' ]; then\n\
+               printf '{generation_b}\\r\\n'\n\
+             else\n\
+               : > '{marker}'\n\
+               printf '{generation_a}\\r\\n'\n\
+             fi\n\
+             exec cat -u\n",
+            marker = generation_marker.display(),
+            generation_a = SUPERSEDED_GENERATION_A_SENTINEL,
+            generation_b = LIVE_GENERATION_B_SENTINEL,
+        ),
+    );
+}
+
+/// Scenario: Let generation A receive a delegate and arm its silence watch, then issue a `clear = true` replacement delegate so generation B owns the same pane before A's window expires and while B is still waiting to receive its payload. No notice may quote A's pane sentinel, while B must later receive its own payload and produce a notice quoting B's distinct sentinel when B's own silence window expires.
+#[spec("orchestration/delegate/025")]
+#[test]
+#[cfg(unix)]
+fn delegate_025_superseded_generation_is_silent_while_new_watch_stays_armed() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let env = EnvGuard::set(&[
+        (DELEGATE_READINESS_BUFFER_ENV, "0"),
+        (SESSION_START_WAIT_ENV, "2000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "500"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("build superseded-generation silence-watch runtime")
+        .block_on(async {
+            common::init_test_env();
+            let cwd = common::race_safe_tempdir();
+            let cwd_str = cwd.path().to_string_lossy().into_owned();
+            let worker = cwd.path().join("generation-sentinel-worker");
+            let generation_marker = cwd.path().join("generation-a-started.marker");
+            write_generation_sentinel_worker(&worker, &generation_marker);
+            std::fs::write(
+                cwd.path().join(".dot-agent-deck.toml"),
+                clear_true_config(&worker.to_string_lossy()),
+            )
+            .expect("write generation-sentinel orchestration config");
+
+            let observer = cwd.path().join("generation-silence-orchestrator");
+            write_executable(
+                &observer,
+                "#!/bin/sh\nstty raw -echo\nprintf GENERATION-ORCHESTRATOR-READY\nexec cat -u\n",
+            );
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let orchestrator_agent_id = registry
+                .spawn_agent(SpawnOptions {
+                    command: Some(&observer.to_string_lossy()),
+                    cwd: Some(&cwd_str),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn generation-silence orchestrator observer");
+            let observer_ready = wait_for_snapshot_needle(
+                &registry,
+                &orchestrator_agent_id,
+                b"GENERATION-ORCHESTRATOR-READY",
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                snapshot_contains(&observer_ready, b"GENERATION-ORCHESTRATOR-READY"),
+                "orchestrator observer never entered raw no-echo mode; snapshot = {:?}",
+                String::from_utf8_lossy(&observer_ready)
+            );
+
+            let initial_agent_id = registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("cat"),
+                    cwd: Some(&cwd_str),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn initial worker occupant");
+            let (event_tx, _rx) = broadcast::channel::<BroadcastMsg>(64);
+            let mut state = AppState::default();
+            register_orchestration(&mut state, &cwd_str);
+            state
+                .pane_cwd_map
+                .insert(ORCH_PANE.to_string(), cwd_str.clone());
+
+            state
+                .handle_delegate(
+                    DelegateSignal {
+                        pane_id: ORCH_PANE.to_string(),
+                        task: "Generation A must remain silent.".to_string(),
+                        to: vec![WORKER_ROLE.to_string()],
+                        timestamp: chrono::Utc::now(),
+                    },
+                    &registry,
+                    &event_tx,
+                )
+                .await;
+            let generation_a =
+                wait_for_replacement_agent(&registry, WORKER_PANE, &initial_agent_id).await;
+            let generation_a_started = wait_for_snapshot_needle(
+                &registry,
+                &generation_a,
+                SUPERSEDED_GENERATION_A_SENTINEL.as_bytes(),
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                snapshot_contains(
+                    &generation_a_started,
+                    SUPERSEDED_GENERATION_A_SENTINEL.as_bytes(),
+                ),
+                "generation A did not render its sentinel; snapshot = {:?}",
+                String::from_utf8_lossy(&generation_a_started)
+            );
+            event_tx
+                .send(BroadcastMsg::Event(session_start_event(
+                    AgentType::None,
+                    WORKER_PANE,
+                    &generation_a,
+                    false,
+                )))
+                .expect("generation A dispatch subscribes before respawn");
+            let generation_a_delivered = wait_for_snapshot_needle(
+                &registry,
+                &generation_a,
+                POINTER,
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                snapshot_contains(&generation_a_delivered, POINTER),
+                "generation A did not receive its payload, so its silence watch was not \
+                 observably armed; snapshot = {:?}",
+                String::from_utf8_lossy(&generation_a_delivered)
+            );
+
+            env.repoint(DELEGATE_READINESS_BUFFER_ENV, "1400");
+            state
+                .handle_delegate(
+                    DelegateSignal {
+                        pane_id: ORCH_PANE.to_string(),
+                        task: "Generation B must supersede A and remain silent.".to_string(),
+                        to: vec![WORKER_ROLE.to_string()],
+                        timestamp: chrono::Utc::now(),
+                    },
+                    &registry,
+                    &event_tx,
+                )
+                .await;
+            let generation_b =
+                wait_for_replacement_agent(&registry, WORKER_PANE, &generation_a).await;
+            event_tx
+                .send(BroadcastMsg::Event(session_start_event(
+                    AgentType::None,
+                    WORKER_PANE,
+                    &generation_b,
+                    false,
+                )))
+                .expect("generation B dispatch subscribes before respawn");
+            let generation_b_pane = wait_for_snapshot_needle(
+                &registry,
+                &generation_b,
+                LIVE_GENERATION_B_SENTINEL.as_bytes(),
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                snapshot_contains(&generation_b_pane, LIVE_GENERATION_B_SENTINEL.as_bytes()),
+                "generation B never visibly took ownership of the worker pane; snapshot = {:?}",
+                String::from_utf8_lossy(&generation_b_pane)
+            );
+            assert!(
+                !snapshot_contains(&generation_b_pane, POINTER),
+                "generation B's payload arrived before the test could exercise A's expiry \
+                 inside B's readiness wait; snapshot = {:?}",
+                String::from_utf8_lossy(&generation_b_pane)
+            );
+
+            let during_b_readiness = wait_for_silence_notice(
+                &registry,
+                &orchestrator_agent_id,
+                Duration::from_millis(800),
+            )
+            .await;
+            let generation_b_still_waiting = registry.snapshot(&generation_b).unwrap_or_default();
+            assert!(
+                !snapshot_contains(&generation_b_still_waiting, POINTER),
+                "generation B's payload arrived before A's 500 ms window expired, so the \
+                 supersession race was not reproduced; snapshot = {:?}",
+                String::from_utf8_lossy(&generation_b_still_waiting)
+            );
+            assert!(
+                !snapshot_has_silence_notice(&during_b_readiness)
+                    && !snapshot_contains(
+                        &during_b_readiness,
+                        SUPERSEDED_GENERATION_A_SENTINEL.as_bytes(),
+                    ),
+                "issue #687: generation A's silence notice reached the orchestrator after \
+                 generation B had already taken over the pane but before B received its own \
+                 payload; orchestrator snapshot = {:?}",
+                String::from_utf8_lossy(&during_b_readiness)
+            );
+
+            let generation_b_delivered = wait_for_snapshot_needle(
+                &registry,
+                &generation_b,
+                POINTER,
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                snapshot_contains(&generation_b_delivered, POINTER),
+                "generation B never received its own payload after the readiness wait; snapshot = {:?}",
+                String::from_utf8_lossy(&generation_b_delivered)
+            );
+            let generation_b_notice = wait_for_snapshot_needle(
+                &registry,
+                &orchestrator_agent_id,
+                LIVE_GENERATION_B_SENTINEL.as_bytes(),
+                Duration::from_secs(2),
+            )
+            .await;
+            let notice_count = String::from_utf8_lossy(&generation_b_notice)
+                .matches("delegated worker went quiet (dot-agent-deck daemon report)")
+                .count();
+            assert!(
+                snapshot_has_silence_notice(&generation_b_notice)
+                    && snapshot_contains(
+                        &generation_b_notice,
+                        LIVE_GENERATION_B_SENTINEL.as_bytes(),
+                    )
+                    && !snapshot_contains(
+                        &generation_b_notice,
+                        SUPERSEDED_GENERATION_A_SENTINEL.as_bytes(),
+                    )
+                    && notice_count == 1,
+                "generation B's own silence watch did not stay armed and fire exactly once with \
+                 B's pane evidence; notice_count = {notice_count}, orchestrator snapshot = {:?}",
+                String::from_utf8_lossy(&generation_b_notice)
+            );
+            registry.shutdown_all();
+        });
 }
 
 #[cfg(unix)]
