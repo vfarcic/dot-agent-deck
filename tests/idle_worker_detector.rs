@@ -115,10 +115,9 @@ const WORKER_EXITED_NEEDLE: &str =
     "delegated worker exited without work-done (dot-agent-deck daemon report)";
 
 /// The daemon-authored opening clause of `compose_delegate_silence_notice` —
-/// the OLDER, timeout-based "possibly not delivered" notice the EOF-triggered
-/// sweep must also retire promptly rather than leaving it to run out its own
-/// window.
-const SILENCE_NEEDLE: &str = "delegate possibly not delivered (dot-agent-deck daemon report)";
+/// the OLDER, timeout-based went-quiet notice the EOF-triggered sweep must also
+/// retire promptly rather than leaving it to run out its own window.
+const SILENCE_NEEDLE: &str = "delegated worker went quiet (dot-agent-deck daemon report)";
 
 /// File the [`OrchestratorStub::ExitsOnFlag`] stub polls for. Its appearance in
 /// the harness cwd is the test's remote control for a NATURAL orchestrator exit.

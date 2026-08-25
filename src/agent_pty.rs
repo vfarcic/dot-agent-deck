@@ -6185,6 +6185,33 @@ impl AgentPtyRegistry {
             .map(|a| (a.pty_rows, a.pty_cols))
     }
 
+    /// Issue #686: the agent's scrollback snapshot together with the PTY dims it
+    /// was written at, read under ONE lock acquisition.
+    ///
+    /// The pair has to be atomic. Raw PTY bytes are only interpretable as a
+    /// screen when replayed at the geometry they were produced at, so a
+    /// [`resize`] landing between a `snapshot` call and a
+    /// [`pty_size_for_pane`] call yields bytes and dims that never coexisted —
+    /// and re-wrapping a screen at the wrong width is exactly how a readable
+    /// pane turns into nonsense. Taking both inside the same guard makes that
+    /// unrepresentable.
+    ///
+    /// Keyed by AGENT id rather than pane id, unlike [`pty_size_for_pane`],
+    /// because a pane outlives the agents that occupy it: a `clear = true`
+    /// delegate respawns the worker, so a pane-keyed lookup can answer for a
+    /// different generation than the snapshot came from.
+    ///
+    /// [`resize`]: Self::resize
+    /// [`pty_size_for_pane`]: Self::pty_size_for_pane
+    pub fn snapshot_with_pty_size(&self, id: &str) -> Result<(Vec<u8>, u16, u16), AgentPtyError> {
+        let inner = self.inner.lock().unwrap();
+        let agent = inner
+            .agents
+            .get(id)
+            .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
+        Ok((agent.bus.snapshot(), agent.pty_rows, agent.pty_cols))
+    }
+
     /// Take just the current scrollback snapshot for an agent.
     pub fn snapshot(&self, id: &str) -> Result<Vec<u8>, AgentPtyError> {
         let inner = self.inner.lock().unwrap();

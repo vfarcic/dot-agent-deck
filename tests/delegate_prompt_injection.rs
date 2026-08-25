@@ -278,7 +278,7 @@ fn snapshot_has_silence_notice(snapshot: &[u8]) -> bool {
         .split_inclusive('\n')
         .filter(|line| line.ends_with('\n'))
         .any(|line| {
-            line.contains("delegate possibly not delivered (dot-agent-deck daemon report)")
+            line.contains("delegated worker went quiet (dot-agent-deck daemon report)")
                 && line.contains("emitted no agent event")
         })
 }
@@ -1168,7 +1168,7 @@ fn delegate_012_slow_agent_toggle_proves_delivery_and_submission() {
         });
 }
 
-/// Scenario: Delegate to a worker that receives the pointer but is neither hooked nor finished before the short no-event window expires. The orchestrator pane must gain an LF-terminated fixed daemon-authored notice with no role-name interpolation.
+/// Scenario: Delegate to a worker that receives the pointer and then emits no agent event before the short no-event window expires, in two arms. When its pane is sitting at a booted agent's ready prompt, the orchestrator's notice must QUOTE the lines that pane is actually rendering, framed as untrusted pane text. When its pane has rendered nothing at all, the notice must say so instead — proving the text is read from that pane rather than canned. Both arms stay LF-terminated with no role-name interpolation in the daemon prose.
 #[spec("orchestration/delegate/013")]
 #[test]
 #[cfg(unix)]
@@ -1185,83 +1185,304 @@ fn delegate_013_silent_worker_surfaces_notice_in_orchestrator_pane() {
         .enable_all()
         .build()
         .expect("build delegate failure-visibility runtime")
-        .block_on(delegate_013_silent_worker_surfaces_notice_in_orchestrator_pane_inner());
+        .block_on(async {
+            delegate_013_silent_worker_surfaces_notice_in_orchestrator_pane_inner().await;
+            delegate_013_blank_worker_pane_is_reported_as_blank_inner().await;
+        });
+}
+
+/// Issue #686: the line the ready-prompt stand-in draws, carrying a nonce so the
+/// assertion proves the notice quoted THIS pane rather than any canned string.
+#[cfg(unix)]
+const READY_PROMPT_LINE: &str = "Ask the agent to do anything \u{b7} ready-prompt-9f21c4";
+
+/// Issue #686: where a silent stand-in diverts everything written into its PTY.
+/// It must NOT echo to stdout — a real agent TUI puts a typed prompt into its
+/// own input widget, not into the scrollback — so the delivery control reads
+/// this file while the pane keeps rendering only what the agent itself drew.
+#[cfg(unix)]
+const SILENT_WORKER_DELIVERY_LOG: &str = "silent-worker-delivered-bytes.log";
+
+/// Issue #686: touched by a silent stand-in once `stty raw -echo` has taken
+/// effect. Waiting on a FILE rather than on pane output is what lets the blank
+/// arm stay blank: without this handshake the delegate can land before the line
+/// discipline is set, the PTY driver echoes the pointer, and the "blank" pane is
+/// not blank at all — measured, not hypothetical.
+#[cfg(unix)]
+const SILENT_WORKER_RAW_MARKER: &str = "silent-worker-raw-mode.marker";
+
+/// Issue #686: a stand-in for a worker that is booted, healthy and idle at its
+/// own ready prompt while emitting no agent event whatsoever — the measured
+/// shape of the report. It draws a ready prompt, swallows everything written to
+/// it without echoing, and never emits a hook event of any kind.
+///
+/// It stands in for the agents that emit nothing until their first prompt
+/// arrives (Codex and OpenCode, measured; Claude and Pi emit at boot). A
+/// stand-in is used rather than a real agent because what is under test is what
+/// the deck reports about a silent pane, which needs no LLM: the pane's bytes
+/// and the absence of events are both established by the fixture.
+#[cfg(unix)]
+fn write_ready_prompt_worker(path: &std::path::Path, dir: &std::path::Path) {
+    write_executable(
+        path,
+        &format!(
+            "#!/bin/sh\n\
+             stty raw -echo\n\
+             printf '{banner}\\r\\n'\n\
+             printf '{prompt}\\r\\n'\n\
+             : > '{marker}'\n\
+             exec cat -u > '{log}'\n",
+            banner = "stand-in agent v0 \u{b7} type a message and press enter",
+            prompt = format_args!("\u{258c} {READY_PROMPT_LINE}"),
+            marker = dir.join(SILENT_WORKER_RAW_MARKER).display(),
+            log = dir.join(SILENT_WORKER_DELIVERY_LOG).display(),
+        ),
+    );
+}
+
+/// Issue #686 control: the same silent worker with a pane that has rendered
+/// NOTHING. Everything written to it is swallowed, exactly as above, so the two
+/// arms differ only in whether the pane has any text to report.
+#[cfg(unix)]
+fn write_blank_pane_worker(path: &std::path::Path, dir: &std::path::Path) {
+    write_executable(
+        path,
+        &format!(
+            "#!/bin/sh\nstty raw -echo\n: > '{marker}'\nexec cat -u > '{log}'\n",
+            marker = dir.join(SILENT_WORKER_RAW_MARKER).display(),
+            log = dir.join(SILENT_WORKER_DELIVERY_LOG).display(),
+        ),
+    );
+}
+
+/// Poll `path` until it contains `needle` or `timeout` elapses, returning the
+/// final contents either way so the caller can assert on (and print) them.
+#[cfg(unix)]
+async fn wait_for_file_needle(path: &std::path::Path, needle: &[u8], timeout: Duration) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let contents = std::fs::read(path).unwrap_or_default();
+        if contents.windows(needle.len()).any(|w| w == needle)
+            || tokio::time::Instant::now() >= deadline
+        {
+            return contents;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Poll until `path` exists or `timeout` elapses, reporting whether it appeared.
+#[cfg(unix)]
+async fn wait_for_file(path: &std::path::Path, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if path.exists() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The two panes and the delegate wiring both `delegate/013` arms share: a raw
+/// no-echo orchestrator observer whose scrollback is exactly what the daemon
+/// wrote into it, plus a caller-supplied silent worker.
+#[cfg(unix)]
+struct SilentWorkerArm {
+    _cwd: tempfile::TempDir,
+    registry: Arc<AgentPtyRegistry>,
+    state: AppState,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    orchestrator_agent_id: String,
+    worker_agent_id: String,
+    delivery_log: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl SilentWorkerArm {
+    async fn new(
+        write_worker: impl Fn(&std::path::Path, &std::path::Path),
+        worker_file_name: &str,
+    ) -> Self {
+        common::init_test_env();
+        let cwd = common::race_safe_tempdir();
+        let observer = cwd.path().join("orchestrator-observer");
+        write_executable(
+            &observer,
+            "#!/bin/sh\nstty raw -echo\nprintf ORCHESTRATOR-NOTICE-READY\nexec cat -u\n",
+        );
+        let cwd_str = cwd.path().to_string_lossy().into_owned();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let orchestrator_agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&observer.to_string_lossy()),
+                cwd: Some(&cwd_str),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn raw orchestrator notice observer");
+        let observer_ready = wait_for_snapshot_needle(
+            &registry,
+            &orchestrator_agent_id,
+            b"ORCHESTRATOR-NOTICE-READY",
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            snapshot_contains(&observer_ready, b"ORCHESTRATOR-NOTICE-READY"),
+            "orchestrator notice observer never entered raw no-echo mode; snapshot = {:?}",
+            String::from_utf8_lossy(&observer_ready)
+        );
+        let delivery_log = cwd.path().join(SILENT_WORKER_DELIVERY_LOG);
+        let raw_marker = cwd.path().join(SILENT_WORKER_RAW_MARKER);
+        let worker = cwd.path().join(worker_file_name);
+        write_worker(&worker, cwd.path());
+        let worker_agent_id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&worker.to_string_lossy()),
+                cwd: Some(&cwd_str),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn silent delegated worker");
+        // Both arms wait for raw no-echo mode BEFORE delegating. Without it the
+        // PTY line discipline echoes the pointer into the pane and the blank arm
+        // silently stops testing a blank pane.
+        assert!(
+            wait_for_file(&raw_marker, Duration::from_secs(2)).await,
+            "silent worker never reached raw no-echo mode, so the PTY driver would echo the \
+             delegate pointer into a pane that is supposed to show only what the agent drew"
+        );
+        let (event_tx, _rx) = broadcast::channel::<BroadcastMsg>(64);
+        let mut state = AppState::default();
+        register_orchestration(&mut state, &cwd_str);
+        state
+            .pane_cwd_map
+            .insert(ORCH_PANE.to_string(), cwd_str.clone());
+        Self {
+            _cwd: cwd,
+            registry,
+            state,
+            event_tx,
+            orchestrator_agent_id,
+            worker_agent_id,
+            delivery_log,
+        }
+    }
+
+    /// Delegate, then prove the pointer physically reached the worker's PTY.
+    /// The control reads the stand-in's delivery log rather than its scrollback
+    /// precisely because a real agent TUI does not echo — the pane still shows
+    /// only whatever the agent itself drew.
+    async fn delegate_and_confirm_delivery(&mut self) {
+        self.state
+            .handle_delegate(
+                DelegateSignal {
+                    pane_id: ORCH_PANE.to_string(),
+                    task: "List the files in the current directory.".to_string(),
+                    to: vec![WORKER_ROLE.to_string()],
+                    timestamp: chrono::Utc::now(),
+                },
+                &self.registry,
+                &self.event_tx,
+            )
+            .await;
+        let delivered =
+            wait_for_file_needle(&self.delivery_log, POINTER, Duration::from_secs(2)).await;
+        assert!(
+            delivered.windows(POINTER.len()).any(|w| w == POINTER),
+            "silent-worker visibility control failed: the worker never received the delegate \
+             pointer; delivered = {:?}",
+            String::from_utf8_lossy(&delivered)
+        );
+    }
+
+    async fn wait_for_notice(&self) -> String {
+        let notice = wait_for_silence_notice(
+            &self.registry,
+            &self.orchestrator_agent_id,
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            snapshot_has_silence_notice(&notice),
+            "a worker that received its delegate pointer and emitted no agent event produced no \
+             LF-terminated daemon notice in the orchestrator pane; snapshot = {:?}",
+            String::from_utf8_lossy(&notice)
+        );
+        String::from_utf8_lossy(&notice).into_owned()
+    }
 }
 
 #[cfg(unix)]
 async fn delegate_013_silent_worker_surfaces_notice_in_orchestrator_pane_inner() {
-    common::init_test_env();
-    let cwd = common::race_safe_tempdir();
-    let observer = cwd.path().join("orchestrator-observer");
-    write_executable(
-        &observer,
-        "#!/bin/sh\nstty raw -echo\nprintf ORCHESTRATOR-NOTICE-READY\nexec cat -u\n",
-    );
-    let cwd_str = cwd.path().to_string_lossy().into_owned();
-    let registry = Arc::new(AgentPtyRegistry::new());
-    let orchestrator_agent_id = registry
-        .spawn_agent(SpawnOptions {
-            command: Some(&observer.to_string_lossy()),
-            cwd: Some(&cwd_str),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string())],
-            ..SpawnOptions::default()
-        })
-        .expect("spawn raw orchestrator notice observer");
-    let observer_ready = wait_for_snapshot_needle(
-        &registry,
-        &orchestrator_agent_id,
-        b"ORCHESTRATOR-NOTICE-READY",
+    let mut arm = SilentWorkerArm::new(write_ready_prompt_worker, "ready-prompt-worker").await;
+    let drawn = wait_for_snapshot_needle(
+        &arm.registry,
+        &arm.worker_agent_id,
+        READY_PROMPT_LINE.as_bytes(),
         Duration::from_secs(2),
     )
     .await;
     assert!(
-        snapshot_contains(&observer_ready, b"ORCHESTRATOR-NOTICE-READY"),
-        "orchestrator notice observer never entered raw no-echo mode; snapshot = {:?}",
-        String::from_utf8_lossy(&observer_ready)
+        snapshot_contains(&drawn, READY_PROMPT_LINE.as_bytes()),
+        "precondition failed: the worker pane never rendered its ready prompt, so there is \
+         nothing for the notice to report; snapshot = {:?}",
+        String::from_utf8_lossy(&drawn)
     );
-    let worker_agent_id = registry
-        .spawn_agent(SpawnOptions {
-            command: Some("cat"),
-            cwd: Some(&cwd_str),
-            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
-            ..SpawnOptions::default()
-        })
-        .expect("spawn silent delegated worker");
-    let (event_tx, _rx) = broadcast::channel::<BroadcastMsg>(64);
-    let mut state = AppState::default();
-    register_orchestration(&mut state, &cwd_str);
-    state
-        .pane_cwd_map
-        .insert(ORCH_PANE.to_string(), cwd_str.clone());
-    let signal = DelegateSignal {
-        pane_id: ORCH_PANE.to_string(),
-        task: "List the files in the current directory.".to_string(),
-        to: vec![WORKER_ROLE.to_string()],
-        timestamp: chrono::Utc::now(),
-    };
-    state.handle_delegate(signal, &registry, &event_tx).await;
+    arm.delegate_and_confirm_delivery().await;
+    let notice_text = arm.wait_for_notice().await;
 
-    let delivered =
-        wait_for_snapshot_needle(&registry, &worker_agent_id, POINTER, Duration::from_secs(2))
-            .await;
     assert!(
-        snapshot_contains(&delivered, POINTER),
-        "silent-worker visibility control failed: the worker never received the delegate pointer; snapshot = {:?}",
-        String::from_utf8_lossy(&delivered)
-    );
-    let notice =
-        wait_for_silence_notice(&registry, &orchestrator_agent_id, Duration::from_secs(3)).await;
-    assert!(
-        snapshot_has_silence_notice(&notice),
-        "a worker that received its delegate pointer and emitted no agent event produced no LF-terminated fixed daemon notice in the orchestrator pane; snapshot = {:?}",
-        String::from_utf8_lossy(&notice)
+        notice_text.contains(READY_PROMPT_LINE),
+        "issue #686: the notice must report what the worker's pane is ACTUALLY rendering — here a \
+         booted agent sitting at its ready prompt — instead of sending the reader after a \
+         delivery bug that does not exist; snapshot = {notice_text:?}"
     );
     assert!(
-        !String::from_utf8_lossy(&notice).contains(WORKER_ROLE),
-        "the fixed pane notice must not interpolate the untrusted delegate role; snapshot = {:?}",
-        String::from_utf8_lossy(&notice)
+        notice_text.contains("[UNTRUSTED-PANE-TEXT:")
+            && notice_text.contains(":END-UNTRUSTED-PANE-TEXT]"),
+        "pane text is agent-authored and must reach the orchestrator inside the untrusted-data \
+         frame, never as bare daemon prose; snapshot = {notice_text:?}"
     );
-    registry.shutdown_all();
+    assert!(
+        !notice_text.contains("It may never have received the prompt"),
+        "issue #686: with the pane's own contents in hand the notice must stop ASSERTING a \
+         delivery failure; snapshot = {notice_text:?}"
+    );
+    assert!(
+        !notice_text.contains(WORKER_ROLE),
+        "the daemon-authored prose must still not interpolate the untrusted delegate role (the \
+         framed pane text carries none in this fixture, so this pins the prose); snapshot = \
+         {notice_text:?}"
+    );
+    arm.registry.shutdown_all();
+}
+
+/// Issue #686 control: the same silence, the same delivery, a pane with nothing
+/// on it. Without this arm a notice that simply always claimed a ready prompt
+/// would pass the first arm; with it, the reported text has to come from the
+/// pane.
+#[cfg(unix)]
+async fn delegate_013_blank_worker_pane_is_reported_as_blank_inner() {
+    let mut arm = SilentWorkerArm::new(write_blank_pane_worker, "blank-pane-worker").await;
+    arm.delegate_and_confirm_delivery().await;
+    let notice_text = arm.wait_for_notice().await;
+
+    assert!(
+        !notice_text.contains(READY_PROMPT_LINE),
+        "the notice reported a ready prompt for a pane that never drew one, so its text is canned \
+         rather than read from the pane; snapshot = {notice_text:?}"
+    );
+    assert!(
+        notice_text.contains("rendered nothing"),
+        "issue #686: a pane with no text of its own must be reported as such — that is the fact \
+         that makes 'the prompt may never have arrived' a reasonable reading; snapshot = \
+         {notice_text:?}"
+    );
+    arm.registry.shutdown_all();
 }
 
 #[cfg(unix)]

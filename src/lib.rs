@@ -38,6 +38,7 @@ pub mod orchestrator_ext;
 pub mod palette;
 pub mod pane;
 pub mod pane_input;
+pub mod pane_screen_text;
 pub mod platform;
 pub mod project_config;
 pub mod prompt_delivery;
