@@ -34,15 +34,15 @@
 #      (the snapshot was written on the state change, not only at clean quit).
 #
 # 4) ORCHESTRATION-TAB RESTORE
-#    - dot-agent-deck ; open the `dot-agent-deck` orchestration via the new-pane
-#      form (Ctrl+N -> cycle Mode to "Orch: dot-agent-deck" -> submit); give it a
-#      prompt
+#    - dot-agent-deck ; open the `mixed` orchestration via the new-pane form
+#      (Ctrl+N -> cycle Mode to "Orch: mixed" -> submit); give it a prompt
 #    - WARM: detach + relaunch          -> tab rebuilt via daemon hydration
 #    - COLD: stop the daemon + relaunch -> tab rebuilt from the snapshot:
 #      orchestrator + role panes in order, the prompt replayed, start-role cursor
-#    - DRIFT: rename the `dot-agent-deck` orchestration in THIS file, stop the
-#      daemon, relaunch -> a clear warning shows and the tab falls back to a
-#      PLAIN dashboard pane (never a half-broken tab).
+#    - DRIFT: rename the `mixed` orchestration in THIS file, stop the daemon,
+#      relaunch -> a clear warning shows and the tab falls back to a PLAIN
+#      dashboard pane (never a half-broken tab). Renaming one that is LIVE also
+#      severs its role lookup (see the note above `[[orchestrations]]` below).
 #
 # 5) FRESH-START ESCAPE HATCH
 #    - dot-agent-deck snapshot clear        -> deletes the local snapshot; the
@@ -75,9 +75,36 @@ watch = false
 pattern = "git (log|status|show|diff)"
 watch = false
 
-# Dogfood: mixed agents — orchestrator/coder=claude (Opus), release=claude (Sonnet), and three GPT harnesses all on the same gpt-5.6-sol model: reviewer=pi, auditor=opencode, tester=codex — each at xhigh reasoning effort (opencode's comes from the `agent.build.variant` in opencode.json, since its TUI has no CLI flag for it). Flip any role via the commented alternative under it.
+# THREE orchestrations, one workflow (issue #705). They exist so a contributor
+# who has credentials for only one provider can still run the team, and so work
+# survives one provider's credits drying up mid-PRD:
+#
+#   mixed      the dogfooding default — four harnesses across two providers
+#   anthropic  Claude everywhere
+#   GPT        OpenCode on GPT models everywhere
+#
+# `anthropic` and `GPT` are DELIBERATELY not copies. Each `extends = "mixed"` and
+# restates only its six `command` lines; every role's prompt_template, workflow,
+# description, start flag and clear flag comes from `mixed`. So a change to how
+# this team works is made once, here, and all three get it. Three hand-maintained
+# copies of a 142-line block is the shape issue #304 was closed over, after two
+# such lists drifted until one was missing a mode the other had.
+#
+# `mixed` carries `default = true` (issue #704): that is what a bare
+# `dispatch --orchestration=` and a scheduled task rooted here open. It is a
+# DECLARATION, not the fact that it comes first — reordering this file no longer
+# changes which provider a default run uses.
+#
+# ONE HAZARD when editing the `name` of any of these: `lookup_orchestration_role_indexed`
+# re-reads this file on every delegate and matches by name against the name the
+# daemon captured at spawn. Rename an orchestration that is CURRENTLY OPEN and
+# every later worker is delegated to without its prompt_template and without its
+# clear flag — the daemon logs a warning saying so. Close the tab first.
+
+# Dogfood: mixed agents — orchestrator/coder=claude (Opus), release=claude (Sonnet), reviewer=pi (Opus, high thinking), and two GPT harnesses on gpt-5.6-sol: auditor=opencode, tester=codex — each at xhigh reasoning effort (opencode's comes from the `agent.build.variant` in opencode.json, since its TUI has no CLI flag for it). Flip any role via the commented alternative under it, or switch the whole team with `--orchestration 'anthropic'` / `--orchestration 'GPT'`.
 [[orchestrations]]
-name = "dot-agent-deck"
+name = "mixed"
+default = true
 
 [[orchestrations.roles]]
 name = "orchestrator"
@@ -218,3 +245,76 @@ Once the PR is open, CI is green, and Greptile's review has settled (per the rul
 After a successful merge and issue closure, signal completion by running:
   dot-agent-deck work-done --task "PR <url> merged as <sha>. Issue #<n> closed. <one-line summary of what shipped.>"
 """
+
+# ---------------------------------------------------------------------------
+# Claude everywhere. Same six roles, same prompts, same workflow as `mixed` —
+# only the launchers differ. For a contributor with Anthropic credentials and
+# nothing else, and for the days GPT credits are out.
+# ---------------------------------------------------------------------------
+[[orchestrations]]
+name = "anthropic"
+extends = "mixed"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "devbox run agent-orchestrator"
+
+[[orchestrations.roles]]
+name = "coder"
+command = "devbox run agent-coder"
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "devbox run agent-reviewer"
+
+[[orchestrations.roles]]
+name = "auditor"
+command = "devbox run agent-auditor"
+
+[[orchestrations.roles]]
+name = "tester"
+command = "devbox run agent-tester"
+
+[[orchestrations.roles]]
+name = "release"
+command = "devbox run agent-release"
+
+# ---------------------------------------------------------------------------
+# OpenCode on GPT models everywhere. The mirror image of `anthropic`.
+#
+# Launchers: `agent-orchestrator-oc`, `agent-coder-oc` and `agent-tester-oc` are
+# NEW devbox scripts rather than three more references to the existing `oc-big`,
+# because `oc-big` is already `mixed`'s auditor command — pointing GPT's roles at
+# it would mean a GPT-only model bump silently re-models `mixed` too. Where reuse
+# carries no such coupling it is reused: `agent-reviewer-oc` / `agent-auditor-oc`
+# (gpt-5.5, deliberately a different model from the implementers, mirroring how
+# `mixed` runs its review roles on a different harness) and `oc-release`
+# (gpt-5.4-mini, mirroring `mixed`'s cheaper Sonnet release role).
+# ---------------------------------------------------------------------------
+[[orchestrations]]
+name = "GPT"
+extends = "mixed"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "devbox run agent-orchestrator-oc"
+
+[[orchestrations.roles]]
+name = "coder"
+command = "devbox run agent-coder-oc"
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "devbox run agent-reviewer-oc"
+
+[[orchestrations.roles]]
+name = "auditor"
+command = "devbox run agent-auditor-oc"
+
+[[orchestrations.roles]]
+name = "tester"
+command = "devbox run agent-tester-oc"
+
+[[orchestrations.roles]]
+name = "release"
+command = "devbox run oc-release"
