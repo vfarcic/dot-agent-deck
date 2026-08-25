@@ -279,8 +279,11 @@ fn reformatted_toolchain_pin_fails_instead_of_vanishing() {
         return;
     }
     // The silent-rot class PR #641 named: Renovate finds these pins with a
-    // regex over a bare X.Y.Z, so a quoted value stops being tracked without
-    // anything going red. Here it goes red.
+    // regex over a bare X.Y.Z, so a value it cannot parse stops being tracked
+    // without anything going red. Here it goes red. Note what this fixture
+    // does NOT cover — `1.97.x` is not a version in any spelling, so it would
+    // fail even if the quotes were ignored. The quoting itself is covered by
+    // `a_quoted_but_otherwise_valid_toolchain_pin_fails` below.
     let body = "jobs:\n  build:\n    steps:\n      - uses: dtolnay/rust-toolchain@v1\n        \
                 with:\n          toolchain: \"1.97.x\"\n      \
                 - uses: taiki-e/install-action@v2\n        with:\n          \
@@ -296,6 +299,65 @@ fn reformatted_toolchain_pin_fails_instead_of_vanishing() {
         text.contains("unreadable"),
         "the failure must say the pin is unreadable rather than merely \
          mismatched:\n{text}"
+    );
+}
+
+#[test]
+fn a_quoted_but_otherwise_valid_toolchain_pin_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    // The dangerous half of the case above, and the one a YAML formatter
+    // actually produces: the quoted value is a PERFECTLY GOOD version, and
+    // agrees with devbox.json. YAML gives `"1.97.1"` and `1.97.1` the same
+    // meaning, so nothing looks wrong — but renovate.json matches a bare
+    // X.Y.Z, so the quotes end the tracking silently. The script used to strip
+    // one layer of quotes before testing the value, which normalised this into
+    // a pass; the sibling test above only failed because `1.97.x` is not a
+    // version in any spelling, so it never covered this.
+    let body = "jobs:\n  build:\n    steps:\n      - uses: dtolnay/rust-toolchain@v1\n        \
+                with:\n          toolchain: \"1.97.1\"\n      \
+                - uses: taiki-e/install-action@v2\n        with:\n          \
+                tool: cargo-nextest@0.9.143\n";
+    let out = Fixture::new(&good_packages(), &[("ci.yml", body.to_string())]).run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a quoted toolchain pin is invisible to Renovate and must fail even \
+         though its value agrees with devbox.json:\n{text}"
+    );
+    assert!(
+        text.contains("unreadable"),
+        "the failure must name the pin as unreadable:\n{text}"
+    );
+}
+
+#[test]
+fn a_quoted_but_otherwise_valid_nextest_pin_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    // Same silent-rot class on the other pin. renovate.json wants
+    // `tool:` followed DIRECTLY by a bare `cargo-nextest@X.Y.Z`, so quoting the
+    // whole scalar stops it being tracked while leaving the version readable to
+    // any YAML parser — and to an earlier version of this script, which scanned
+    // the line for the token rather than checking Renovate could reach it.
+    let body = "jobs:\n  build:\n    steps:\n      - uses: dtolnay/rust-toolchain@v1\n        \
+                with:\n          toolchain: 1.97.1\n      \
+                - uses: taiki-e/install-action@v2\n        with:\n          \
+                tool: \"cargo-nextest@0.9.143\"\n";
+    let out = Fixture::new(&good_packages(), &[("ci.yml", body.to_string())]).run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a quoted cargo-nextest pin is invisible to Renovate and must fail \
+         even though its value agrees with devbox.json:\n{text}"
+    );
+    assert!(
+        text.contains("cannot read"),
+        "the failure must say renovate.json cannot read the pin:\n{text}"
     );
 }
 

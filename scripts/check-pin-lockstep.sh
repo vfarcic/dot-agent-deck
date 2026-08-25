@@ -107,18 +107,18 @@ workflow_files() {
   return 0
 }
 
-# Strip a trailing YAML comment, surrounding whitespace and one layer of
-# quotes. No version contains `#`, `'` or `"`, so this cannot mangle a value it
-# should have accepted — it can only expose one it should reject.
+# Strip a trailing YAML comment and surrounding whitespace. Quotes are
+# deliberately NOT stripped: renovate.json matches `toolchain:\s*(\d+\.\d+\.\d+)`,
+# i.e. a BARE X.Y.Z, so `toolchain: "1.97.1"` is a pin Renovate cannot read even
+# though YAML gives it the same value. Normalising the quotes away here would
+# hand back a valid-looking version and let that site pass — which is the exact
+# silent-rot case check 1 above exists to catch, so the quotes have to survive
+# into the SEMVER test and fail it.
 trim_value() {
   local s="$1"
   s="${s%%#*}"
   s="${s#"${s%%[![:space:]]*}"}"
   s="${s%"${s##*[![:space:]]}"}"
-  s="${s%\"}"
-  s="${s#\"}"
-  s="${s%\'}"
-  s="${s#\'}"
   printf '%s' "$s"
 }
 
@@ -164,6 +164,17 @@ scan_workflow_nextest() {
         if ! printf '%s' "$value" | grep -qE "$SEMVER"; then
           printf '%s%s:%s has an unreadable cargo-nextest pin: %s.\n' \
             "$SCAN_ERR" "${f#"$root"/}" "$lineno" "'$value'"
+          continue
+        fi
+        # The value is a good version, but Renovate only finds it where the
+        # tool name follows `tool:` DIRECTLY: its regex is
+        # `tool:\s*cargo-nextest@(\d+\.\d+\.\d+)`. `tool: "cargo-nextest@X.Y.Z"`
+        # means the same thing to YAML and matches nothing, so the pin stops
+        # being tracked with nothing going red — the same silent-rot class as a
+        # quoted `toolchain:`, and reported for the same reason.
+        if ! printf '%s' "$rest" | grep -qE "tool:[[:space:]]*cargo-nextest@$value"; then
+          printf '%s%s:%s has a cargo-nextest pin renovate.json cannot read. Its regex wants `tool:` followed directly by a bare cargo-nextest@X.Y.Z; quoting it silently stops the pin being tracked.\n' \
+            "$SCAN_ERR" "${f#"$root"/}" "$lineno"
           continue
         fi
         printf '%s:%s %s\n' "${f#"$root"/}" "$lineno" "$value"
