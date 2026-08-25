@@ -645,7 +645,12 @@ fn sanitize_for_prompt(s: &str, keep_newlines: bool) -> String {
 /// PRD #161 FIX 4 — Unicode bidirectional formatting / override codepoints that
 /// [`char::is_control`] does NOT catch (they are category `Cf`, not `Cc`) but
 /// which can visually reorder a rendered string to spoof an agent name.
-fn is_bidi_format_char(c: char) -> bool {
+///
+/// `pub(crate)` since issue #308: the `dot-agent-deck validate` output seam
+/// ([`crate::config_validation::ValidationIssue`]'s `Display`) neutralises the
+/// same family in project-controlled config values, and reuses this definition
+/// rather than keeping a second copy of the set that could drift from it.
+pub(crate) fn is_bidi_format_char(c: char) -> bool {
     matches!(
         c,
         '\u{202A}'..='\u{202E}'   // LRE, RLE, PDF, LRO, RLO

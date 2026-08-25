@@ -23,14 +23,134 @@ pub struct ValidationIssue {
     pub message: String,
 }
 
+/// Issue #308 audit (MEDIUM): how much of a project-controlled VALUE a
+/// diagnostic quotes back before it stops and reports a count instead.
+///
+/// A value is not prose — it is a mode name, a role name, a regex, an agent
+/// name — so 120 characters is far past the longest plausible real one while
+/// leaving an absurd one unable to fill a screen. The count that replaces the
+/// tail is what keeps the diagnostic honest: "this is longer than it looks" is
+/// itself the finding when a config carries a 100 KB mode name.
+const MAX_QUOTED_VALUE_CHARS: usize = 120;
+
+/// Issue #308 audit (MEDIUM): the per-line ceiling on a whole rendered
+/// `message`.
+///
+/// Deliberately an order of magnitude above [`MAX_QUOTED_VALUE_CHARS`] and
+/// applied to the *message* rather than to each value inside it: a message is
+/// mostly the deck's own explanatory prose (the unknown-agent warning ends with
+/// the full list of shipped agent names, which is legitimately long and must not
+/// be cut), so this is a flood backstop for values no producer thought to bound,
+/// not a legibility budget. Anything that trips it is already pathological.
+const MAX_DIAGNOSTIC_CHARS: usize = 2000;
+
+/// Issue #308 audit (MEDIUM): the ONE place a `ValidationIssue` becomes terminal
+/// output, and therefore the one place it is made safe to be terminal output.
+///
+/// `dot-agent-deck validate` writes each issue straight to stderr with
+/// `eprintln!("{issue}")`, and `.dot-agent-deck.toml` travels with a repository
+/// — a clone, a contributor branch, a PR checkout. Both fields interpolate raw
+/// strings from that file: `scope` is a mode or orchestration name verbatim, and
+/// several messages quote a role name, a regex pattern or (issue #308) a
+/// declared `agent = "…"`. Without this, a repo shipping
+/// `agent = "x\n[error] 'trusted': validation passed"` makes `validate` print a
+/// line the deck never authored; an ANSI-bearing value repaints the terminal it
+/// lands in; an overlong one floods it, or a CI log.
+///
+/// **Sanitising at the `Display` impl rather than at each producer is the
+/// point**, exactly as issue #576 concluded for `session_warnings`
+/// (`flush_session_warnings`, `src/ui.rs`). There are a dozen `ValidationIssue`
+/// construction sites today and they only grow; per-producer escaping means
+/// every future one must remember, while one seam at the single consumer covers
+/// them all by construction and cannot be forgotten by a later addition. So
+/// producers keep building plain, readable strings — the escaping is invisible
+/// at the call site, which is why it is documented here at the seam that
+/// enforces it.
+///
+/// Note the scope of the claim: only the diagnostic *representation* changes.
+/// Whether a name is recognized is still decided by exact registry matching on
+/// the raw value (see [`unknown_agent_issue`]), so nothing here can turn an
+/// unknown agent into a known one — this seam runs strictly after that decision.
 impl std::fmt::Display for ValidationIssue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let level = match self.severity {
             Severity::Error => "error",
             Severity::Warning => "warning",
         };
-        write!(f, "[{}] '{}': {}", level, self.scope, self.message)
+        // `scope` is a bare config value with no prose around it, so it gets the
+        // tighter value bound; `message` is mostly ours and gets the flood
+        // backstop. Both bound BEFORE escaping: escaping expands, so cutting
+        // afterwards could sever a `\u{1b}` in half and emit `\u{1` — a bound
+        // that corrupts its own output.
+        write!(
+            f,
+            "[{}] '{}': {}",
+            level,
+            escape_for_terminal(&bound_chars(&self.scope, MAX_QUOTED_VALUE_CHARS)),
+            escape_for_terminal(&bound_chars(&self.message, MAX_DIAGNOSTIC_CHARS)),
+        )
     }
+}
+
+/// `s` cut to at most `max` CHARACTERS, with the tail replaced by the count it
+/// actually had. Borrows unchanged in the ordinary case.
+///
+/// Characters, not bytes, so the cut can never land inside a UTF-8 sequence and
+/// the reported number matches what a reader would count.
+fn bound_chars(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    let total = s.chars().count();
+    if total <= max {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let head: String = s.chars().take(max).collect();
+    std::borrow::Cow::Owned(format!("{head}… ({total} characters total)"))
+}
+
+/// Escape everything in `s` that a terminal would ACT on rather than show,
+/// borrowing unchanged when there is nothing to do (the overwhelmingly common
+/// case — a diagnostic about a well-behaved config).
+///
+/// Two families, because neither alone is enough:
+///
+/// - [`char::is_control`] — Unicode category `Cc`: C0 (U+0000..=U+001F, so ESC,
+///   LF, CR and NUL), DEL (U+007F), and C1 (U+0080..=U+009F, which some
+///   terminals still act on). This is the same predicate `ratatui-core` filters
+///   on and the same one issue #576's exit flush escapes, so this sink is safe
+///   on exactly the terms the deck's other text sinks already are.
+/// - [`crate::build_version_handshake::is_bidi_format_char`] — the bidi
+///   overrides and isolates, category `Cf`, which `is_control` does NOT catch
+///   and which visually reorder the text around them without changing a byte.
+///   Reused from the build-handshake render seam rather than respelled here, so
+///   there is one definition of that set to keep correct.
+///
+/// Escaping rather than stripping, for issue #576's reason: this is a
+/// diagnostic, and a value that silently loses characters reads as a *different*
+/// value — whereas `\r` in the output preserves the evidence that something odd
+/// was in the config. The spelling is Rust's own. A literal backslash is
+/// deliberately not escaped: nothing parses this output back, and doubling it
+/// would cost real legibility on the messages that quote a Windows path or a
+/// regex.
+fn escape_for_terminal(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.chars().any(needs_escape) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if needs_escape(c) => out.push_str(&format!("\\u{{{:02x}}}", c as u32)),
+            other => out.push(other),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// The predicate behind [`escape_for_terminal`] — see its doc for why the set is
+/// the union of two Unicode categories rather than just `Cc`.
+fn needs_escape(c: char) -> bool {
+    c.is_control() || crate::build_version_handshake::is_bidi_format_char(c)
 }
 
 /// Validate a project config and return a list of issues.
@@ -212,16 +332,26 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
 /// Resolution goes through exactly the accessor the spawn seams use, so this
 /// warns for precisely the values that will produce an agent-less pane and for
 /// no others.
+///
+/// Issue #308 audit (MEDIUM): the match is made on the RAW `name` and stays
+/// exact and fail-closed — an unrecognized value is a warning and resolves to
+/// `AgentType::None`, and nothing below can change that verdict. Only the
+/// quoted-back copy is bounded, because the message goes to a terminal and this
+/// value came out of a repository's `.dot-agent-deck.toml`. Control and bidi
+/// characters in it are handled at the output seam
+/// ([`ValidationIssue`]'s `Display`), which covers every field of every issue
+/// rather than this one call site.
 fn unknown_agent_issue(scope: &str, declared: Option<&str>) -> Option<ValidationIssue> {
     let name = declared?.trim();
     if name.is_empty() || crate::agent_registry::detect_from_basename(name).is_some() {
         return None;
     }
+    let quoted = bound_chars(name, MAX_QUOTED_VALUE_CHARS);
     Some(ValidationIssue {
         severity: Severity::Warning,
         scope: scope.to_string(),
         message: format!(
-            "unknown agent '{name}' — this pane will have no agent and no wrapper; known agents: {}",
+            "unknown agent '{quoted}' — this pane will have no agent and no wrapper; known agents: {}",
             crate::agent_registry::declarable_agent_names().join(", ")
         ),
     })
@@ -668,6 +798,179 @@ mod tests {
         assert!(
             !has_errors(&validate_config(&config)),
             "an unknown agent name is advisory — the config still loads"
+        );
+    }
+
+    /// Issue #308 audit (MEDIUM): every control character a `.dot-agent-deck.toml`
+    /// can carry into a diagnostic is escaped to printable text before
+    /// `dot-agent-deck validate` writes it to a terminal. The LF case is the
+    /// exploit: without escaping it forges a whole extra line that reads as the
+    /// deck's own verdict.
+    #[test]
+    fn display_escapes_control_characters_from_config_values() {
+        let issue = ValidationIssue {
+            severity: Severity::Warning,
+            scope: "mode\rname".to_string(),
+            message: "unknown agent 'x\n[error] \'trusted\': validation passed'".to_string(),
+        };
+        let rendered = format!("{issue}");
+
+        assert!(
+            !rendered.contains('\n') && !rendered.contains('\r'),
+            "no raw line-structure character survives to the terminal; got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("mode\\rname"),
+            "CR is escaped in the scope rather than overwriting the printed line; got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\\n[error]"),
+            "the forged line is shown inert on the deck's own single line; got {rendered:?}"
+        );
+    }
+
+    /// Issue #308 audit (MEDIUM): the whole escaped set, one character per case
+    /// — ESC (the ANSI lead-in), NUL, DEL, a C1 control that `is_control` covers
+    /// but a naive `< 0x20` test would not, and TAB. Each becomes printable
+    /// text; none reaches the terminal as a byte it could act on.
+    #[test]
+    fn display_escapes_esc_nul_del_c1_and_tab() {
+        for (raw, expected) in [
+            ('\u{1b}', "\\u{1b}"), // ESC — starts every ANSI sequence
+            ('\u{0}', "\\u{00}"),  // NUL
+            ('\u{7f}', "\\u{7f}"), // DEL
+            ('\u{9b}', "\\u{9b}"), // C1 CSI — a single-byte ANSI introducer
+            ('\t', "\\t"),         // TAB, spelled the conventional way
+        ] {
+            let issue = ValidationIssue {
+                severity: Severity::Error,
+                scope: "dev".to_string(),
+                message: format!("bad{raw}value"),
+            };
+            let rendered = format!("{issue}");
+            assert!(
+                rendered.contains(expected),
+                "U+{:04X} must render as {expected}; got {rendered:?}",
+                raw as u32
+            );
+            assert!(
+                !rendered.contains(raw),
+                "U+{:04X} must not survive as a raw character; got {rendered:?}",
+                raw as u32
+            );
+        }
+    }
+
+    /// Issue #308 audit (MEDIUM): bidi overrides are category `Cf`, so
+    /// `char::is_control` does not catch them — they are neutralised by the
+    /// second half of the predicate. Left raw, a RIGHT-TO-LEFT OVERRIDE
+    /// visually reorders the rest of the line without changing a byte of it.
+    #[test]
+    fn display_escapes_bidi_formatting_characters() {
+        let issue = ValidationIssue {
+            severity: Severity::Warning,
+            scope: "dev".to_string(),
+            message: "unknown agent '\u{202e}dessap noitadilav'".to_string(),
+        };
+        let rendered = format!("{issue}");
+
+        assert!(
+            rendered.contains("\\u{202e}"),
+            "the RLO is shown as text; got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{202e}'),
+            "no raw bidi override reaches the terminal; got {rendered:?}"
+        );
+    }
+
+    /// Issue #308 audit (MEDIUM): an absurdly long declared agent name is quoted
+    /// back as a short prefix plus its true length, so a hostile config cannot
+    /// flood a terminal or a CI log — and the count says out loud that the value
+    /// was longer than what is shown.
+    #[test]
+    fn overlong_declared_agent_name_is_bounded_in_the_warning() {
+        let long = "z".repeat(50_000);
+        let mut mode = make_mode("declared", vec![]);
+        mode.agent = Some(long.clone());
+        let config = make_config(vec![mode]);
+
+        let issues = validate_config(&config);
+        let warning = issues
+            .iter()
+            .find(|i| i.message.contains("unknown agent"))
+            .expect("an unrecognized declaration warns");
+        let rendered = format!("{warning}");
+
+        assert!(
+            !rendered.contains(&long),
+            "the full value is never echoed back"
+        );
+        assert!(
+            rendered.contains(&"z".repeat(MAX_QUOTED_VALUE_CHARS)),
+            "the prefix that identifies the typo survives; got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("(50000 characters total)"),
+            "the true length is reported instead of the tail; got {rendered:?}"
+        );
+        assert!(
+            rendered.len() < 4_000,
+            "the whole line stays terminal-sized; got {} bytes",
+            rendered.len()
+        );
+        assert!(
+            rendered.contains("known agents:"),
+            "bounding the value must not truncate the deck's own advice; got {rendered:?}"
+        );
+    }
+
+    /// Issue #308 audit (MEDIUM): the flood backstop covers fields no producer
+    /// thought to bound — here the `scope`, which is a mode name copied verbatim
+    /// out of the config with no prose around it.
+    #[test]
+    fn overlong_scope_is_bounded_at_the_output_seam() {
+        let issue = ValidationIssue {
+            severity: Severity::Error,
+            scope: "s".repeat(10_000),
+            message: "duplicate mode name".to_string(),
+        };
+        let rendered = format!("{issue}");
+
+        assert!(
+            rendered.contains("(10000 characters total)"),
+            "an unbounded scope is cut and counted; got {} bytes",
+            rendered.len()
+        );
+        assert!(
+            rendered.ends_with("duplicate mode name"),
+            "the message still follows the bounded scope; got {rendered:?}"
+        );
+    }
+
+    /// Issue #308 audit (MEDIUM): sanitising is a display concern only. An
+    /// escapable character in a declared name must not make an unknown agent
+    /// look known, or a known one look unknown — the registry match is still on
+    /// the raw value, exact and fail-closed.
+    #[test]
+    fn sanitising_does_not_change_which_names_are_recognized() {
+        let mut sneaky = make_mode("sneaky", vec![]);
+        // A real agent name wrapped in characters the escaper would rewrite.
+        sneaky.agent = Some("\u{202e}claude\u{1b}".to_string());
+        let mut plain = make_mode("plain", vec![]);
+        plain.agent = Some("claude".to_string());
+
+        let issues = validate_config(&make_config(vec![sneaky, plain]));
+        let warned: Vec<&str> = issues
+            .iter()
+            .filter(|i| i.message.contains("unknown agent"))
+            .map(|i| i.scope.as_str())
+            .collect();
+
+        assert_eq!(
+            warned,
+            vec!["sneaky"],
+            "the decorated name stays unknown and the bare one stays known"
         );
     }
 }

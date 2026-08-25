@@ -2173,6 +2173,24 @@ struct UiState {
     /// what is drawn. The same split PRD #225 made between
     /// `RunningAgent::agent_type` (observed, badge) and `spawn_agent_type`
     /// (launch), one layer up.
+    ///
+    /// **Lifecycle.** Entries are removed on exactly the paths that remove
+    /// [`Self::pane_metadata`]: closing a pane (`Action::ClosePane`), closing a
+    /// tab, and the restore-failure / mode-activation-failure arms that retire
+    /// a pane id they just spawned. A stale entry would nonetheless be inert
+    /// rather than a mislabelled card, because a pane id is never recycled
+    /// within a daemon session — `EmbeddedPaneController::allocate_id`
+    /// (`src/embedded_pane.rs`) hands out a monotonic counter and never reuses
+    /// a retired value, and the reconnect path bumps `next_id` past every
+    /// rehydrated id before allocating again. So a leftover entry can only be
+    /// looked up by the pane that put it there.
+    ///
+    /// Only the two surfaces that can carry a declaration are ever inserted:
+    /// orchestration ROLE panes and MODE agent panes. In particular the mode's
+    /// reactive SIDE panes get no entry — `TabManager::route_reactive_commands`
+    /// (`src/tab.rs`) closes and re-creates those panes under fresh ids as
+    /// rules fire, so an entry keyed on one of them would be orphaned on every
+    /// rule that fires rather than on tab close.
     pane_declared_agent: HashMap<String, AgentType>,
     /// Maps pane_id → launch metadata for auto-save/restore.
     pane_metadata: HashMap<String, config::SavedPane>,
@@ -9943,6 +9961,20 @@ fn dispatch_action(
                                     }
                                     Err(e) => {
                                         let _ = pane.close_pane(&new_id);
+                                        // Issue #308: the declaration was recorded
+                                        // before `open_mode_tab` was even called, so
+                                        // drop it again here — `close_pane` retires
+                                        // the pane id, and without this a user who
+                                        // retries a broken mode grows the map by one
+                                        // entry per attempt for the life of the
+                                        // session. Deliberately narrow: the sibling
+                                        // maps this failure path also leaves behind
+                                        // (`pane_metadata`, `pane_display_names`,
+                                        // `pane_names`, the registered pane and its
+                                        // placeholder session) leaked here before
+                                        // issue #308 and are a separate follow-up —
+                                        // this arm only cleans up what #308 added.
+                                        ui.pane_declared_agent.remove(&new_id);
                                         // PRD #196: the mode-tab spawn FAILED — do
                                         // NOT commit the submit candidate, so a
                                         // failed mode-spawn never pollutes
@@ -11843,6 +11875,25 @@ pub fn run_tui(
                             .insert(new_id.clone(), saved_pane.name.clone());
                     }
                     ui.pane_metadata.insert(new_id.clone(), saved_pane.clone());
+                    // Issue #308: mirror the orchestration-restore insert above
+                    // (`role.declared_agent_type()`), so a restored mode badges
+                    // from the SAME source a freshly-activated one does. The
+                    // spawn above also passes `mode_agent_type` into
+                    // `AgentSpawnOptions`, so `session.agent_type` usually comes
+                    // back hydrated from the daemon and this entry is never
+                    // read — the map is consulted only while that field is
+                    // `AgentType::None`. That makes this insert harmless today
+                    // and load-bearing tomorrow: the fresh path deliberately
+                    // leaves `session.agent_type` at `None` and badges from the
+                    // map, so without this the restored badge would be the one
+                    // display path with no map fallback, and a future rework of
+                    // `create_pane_with_options`'s `agent_type` wiring would
+                    // silently revert restored declared-launcher modes to
+                    // "No agent" — the exact regression this issue exists to
+                    // prevent. The `Err` arm below removes it again.
+                    if let Some(declared) = mode_config.declared_agent_type() {
+                        ui.pane_declared_agent.insert(new_id.clone(), declared);
+                    }
                     // PRD #76 M2.15 fixup pass 2 G1 — compute side-pane
                     // dims so the restored mode's side panes spawn at the
                     // viewport-derived size, not the 24×80 default.
@@ -19043,6 +19094,10 @@ pub fn render_card_to_buffer(
 /// assertion about what the user actually sees. `mode` is the ONLY input
 /// [`render_card_to_buffer`] does not expose; that seam is this one pinned to
 /// `UiMode::Normal`.
+///
+/// Issue #308: the pane DECLARATION is the second input this seam does not
+/// expose — see [`render_card_with_declared_agent_to_buffer`], which this one
+/// is pinned to `None` of.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_card_for_mode_to_buffer(
@@ -19053,6 +19108,56 @@ pub fn render_card_for_mode_to_buffer(
     tick: u64,
     selected: bool,
     mode: UiMode,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    render_card_with_declared_agent_to_buffer(
+        session,
+        display_name,
+        card_number,
+        density,
+        tick,
+        selected,
+        mode,
+        // Issue #308: the pre-#308 seams declare nothing, so a fixture that
+        // wants a badge here puts the type on the `SessionState` it hands in —
+        // which exercises the OBSERVED branch, not the declared fallback.
+        None,
+        width,
+        height,
+    )
+}
+
+/// Issue #308 L1 seam: render one session card with a pane DECLARATION in play
+/// — the `agent = "…"` a role or mode wrote in `.dot-agent-deck.toml`, which the
+/// deck keeps in `UiState::pane_declared_agent` and hands to the renderer beside
+/// the session.
+///
+/// This exists because the declared badge has exactly one interesting branch and
+/// no other public seam can reach it. `render_session_card` shows
+/// `session.agent_type` whenever it is anything but `AgentType::None`, and falls
+/// back to the declaration only when it is `None`; every other L1 seam hardcodes
+/// the declaration to `None`, so a fixture could only badge a card through
+/// `SessionState.agent_type` — the *other* branch. The one line this feature
+/// turns on was therefore L1-unreachable and covered only at L2
+/// (`codex/spawn/009`, `011`).
+///
+/// The interesting call is `session.agent_type == AgentType::None` **and**
+/// `declared_agent_type == Some(t)`: the card must badge `t` rather than read
+/// "No agent". Pass a session whose `agent_type` is already set to pin the
+/// precedence rule instead — an agent that has identified itself always wins,
+/// and the declaration must not override it.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn render_card_with_declared_agent_to_buffer(
+    session: &SessionState,
+    display_name: Option<&str>,
+    card_number: Option<u8>,
+    density: CardDensityKind,
+    tick: u64,
+    selected: bool,
+    mode: UiMode,
+    declared_agent_type: Option<&AgentType>,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
@@ -19080,10 +19185,7 @@ pub fn render_card_for_mode_to_buffer(
                 card_number,
                 density.into(),
                 mode,
-                // Issue #308: the L1 single-card seam has no pane-declaration
-                // map behind it; a fixture that wants a type puts it on the
-                // `SessionState` it hands in.
-                None,
+                declared_agent_type,
             );
         })
         .expect("TestBackend draw should succeed");
