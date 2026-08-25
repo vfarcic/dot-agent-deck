@@ -279,35 +279,85 @@ fn snapshot_has_silence_notice(snapshot: &[u8]) -> bool {
         && text.contains("emitted no agent event")
 }
 
+/// Issue #702: the byte the pane delivered immediately after `anchor`, or
+/// `None` while the anchor — or the byte that follows it — has not arrived.
+///
+/// The whole discrimination this file performs rests on reading ONE exact byte
+/// rather than searching for a class of bytes, so it is worth having in one
+/// place: both the notice's submit terminator and the observer's own raw-mode
+/// proof below are "the byte after a known anchor".
 #[cfg(unix)]
-fn silence_notice_terminator(snapshot: &[u8]) -> Option<u8> {
-    let marker = b"delegated worker went quiet (dot-agent-deck daemon report)";
-    let start = snapshot
-        .windows(marker.len())
-        .position(|window| window == marker)?;
-    snapshot[start..]
-        .iter()
-        .copied()
-        .find(|byte| matches!(byte, b'\r' | b'\n'))
+fn byte_after(snapshot: &[u8], anchor: &[u8]) -> Option<u8> {
+    let end = snapshot
+        .windows(anchor.len())
+        .position(|window| window == anchor)?
+        + anchor.len();
+    snapshot.get(end).copied()
 }
 
+/// Issue #702: the silence notice's stable FINAL clause, and therefore the last
+/// bytes of the payload the daemon writes before its terminator.
+///
+/// Present in BOTH branches of `compose_delegate_silence_notice` (the fenced
+/// pane-text one and the "rendered nothing" one), and `encode_pane_payload`'s
+/// `trim_end_matches` cannot eat it because it ends in `.` — so the byte that
+/// follows it in the pane is exactly the terminator the daemon chose.
+#[cfg(unix)]
+const SILENCE_NOTICE_TAIL: &str = "(RUST_LOG=pane_write=trace also has the delivered bytes).";
+
+/// Issue #702: the terminator the daemon wrote after the silence notice — CR if
+/// it SUBMITTED the report, LF if it left it as deferred scrollback.
+///
+/// Anchored to the END of the payload ([`SILENCE_NOTICE_TAIL`]) rather than to
+/// the first line break at or after the notice's opening clause, which is what
+/// the assertion used to search for. That search asked a weaker question than
+/// the one under test: it accepted the first `\r`-or-`\n` ANYWHERE after the
+/// notice began, so any unrelated line break landing in the orchestrator's pane
+/// between the payload and its submit CR would have been read as "the
+/// terminator" — a false LF verdict on a report that was in fact submitted.
+/// Reading the single byte that follows the payload cannot be fooled in either
+/// direction: it is the daemon's own choice of tail, and nothing else.
+#[cfg(unix)]
+fn silence_notice_terminator(snapshot: &[u8]) -> Option<u8> {
+    byte_after(snapshot, SILENCE_NOTICE_TAIL.as_bytes())
+}
+
+/// Poll an agent's snapshot until `ready` holds or `timeout` elapses, returning
+/// the final snapshot either way so the caller can assert on (and print) it.
+///
+/// Every wait in the silence-notice fixtures is on an OBSERVABLE CONDITION
+/// rather than on a duration: nothing here may be tuned against `SUBMIT_DELAY`,
+/// because a sleep that is long enough today is a silent pass tomorrow.
+#[cfg(unix)]
+async fn wait_for_snapshot_where(
+    registry: &AgentPtyRegistry,
+    agent_id: &str,
+    timeout: Duration,
+    ready: impl Fn(&[u8]) -> bool,
+) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let snapshot = registry.snapshot(agent_id).unwrap_or_default();
+        if ready(&snapshot) || tokio::time::Instant::now() >= deadline {
+            return snapshot;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Wait until the notice's payload AND the terminator byte that follows it are
+/// both in the pane — the condition the `#702` assertion reads, so the wait can
+/// never end one byte early and report a terminator that simply had not landed.
 #[cfg(unix)]
 async fn wait_for_silence_notice(
     registry: &AgentPtyRegistry,
     agent_id: &str,
     timeout: Duration,
 ) -> Vec<u8> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let snapshot = registry.snapshot(agent_id).unwrap_or_default();
-        if (snapshot_has_silence_notice(&snapshot)
-            && silence_notice_terminator(&snapshot).is_some())
-            || tokio::time::Instant::now() >= deadline
-        {
-            return snapshot;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_for_snapshot_where(registry, agent_id, timeout, |snapshot| {
+        snapshot_has_silence_notice(snapshot) && silence_notice_terminator(snapshot).is_some()
+    })
+    .await
 }
 
 #[cfg(unix)]
@@ -1299,6 +1349,13 @@ async fn wait_for_file(path: &std::path::Path, timeout: Duration) -> bool {
     }
 }
 
+/// Issue #702: what the orchestrator observer prints once `stty raw -echo` has
+/// returned. It is followed by a bare LF, and the byte the pane delivers after
+/// it is read as PROOF that the line discipline really is raw — see
+/// `SilentWorkerArm::new`.
+#[cfg(unix)]
+const ORCHESTRATOR_READY_MARKER: &str = "ORCHESTRATOR-NOTICE-READY";
+
 /// The two panes and the delegate wiring both `delegate/013` arms share: a raw
 /// no-echo orchestrator observer whose scrollback is exactly what the daemon
 /// wrote into it, plus a caller-supplied silent worker.
@@ -1322,9 +1379,15 @@ impl SilentWorkerArm {
         common::init_test_env();
         let cwd = common::race_safe_tempdir();
         let observer = cwd.path().join("orchestrator-observer");
+        // Issue #702: the readiness marker is terminated with a bare LF ON
+        // PURPOSE — see the raw-mode proof below, which reads the byte that
+        // follows it. Under `-opost` that LF reaches the master unchanged;
+        // under a cooked line discipline ONLCR rewrites it to CRLF, so the
+        // marker's own tail measures the very translation that would otherwise
+        // make this whole fixture unable to tell a submit from a deferral.
         write_executable(
             &observer,
-            "#!/bin/sh\nstty raw -echo\nprintf ORCHESTRATOR-NOTICE-READY\nexec cat -u\n",
+            "#!/bin/sh\nstty raw -echo\nprintf 'ORCHESTRATOR-NOTICE-READY\\n'\nexec cat -u\n",
         );
         let cwd_str = cwd.path().to_string_lossy().into_owned();
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -1336,16 +1399,40 @@ impl SilentWorkerArm {
                 ..SpawnOptions::default()
             })
             .expect("spawn raw orchestrator notice observer");
-        let observer_ready = wait_for_snapshot_needle(
+        let observer_ready = wait_for_snapshot_where(
             &registry,
             &orchestrator_agent_id,
-            b"ORCHESTRATOR-NOTICE-READY",
             Duration::from_secs(2),
+            |snapshot| byte_after(snapshot, ORCHESTRATOR_READY_MARKER.as_bytes()).is_some(),
         )
         .await;
         assert!(
-            snapshot_contains(&observer_ready, b"ORCHESTRATOR-NOTICE-READY"),
-            "orchestrator notice observer never entered raw no-echo mode; snapshot = {:?}",
+            snapshot_contains(&observer_ready, ORCHESTRATOR_READY_MARKER.as_bytes()),
+            "orchestrator notice observer never printed its readiness marker; snapshot = {:?}",
+            String::from_utf8_lossy(&observer_ready)
+        );
+        // Issue #702, and the reason `/013` can claim "submitted" at all: PROVE
+        // the observer's line discipline instead of assuming it.
+        //
+        // The marker alone only proves `stty` RAN. If it ran and failed — or has
+        // not been applied yet — the pane is cooked, and then OPOST/ONLCR
+        // rewrites every LF the daemon writes into CRLF. A DEFERRED,
+        // LF-terminated notice would land in this scrollback as `...\r\n` and be
+        // read as a CR, so the assertion downstream would go GREEN on exactly
+        // the evidence it exists to reject. Reading the byte after the marker
+        // measures that translation directly: LF means OPOST is off, and since
+        // `stty raw` applies its whole flag set in one `tcsetattr`, `-opost`
+        // being in effect is also proof that `-icrnl` is — which closes the
+        // input-side CR->LF translation in the same stroke.
+        let observed_tail = byte_after(&observer_ready, ORCHESTRATOR_READY_MARKER.as_bytes());
+        assert_eq!(
+            observed_tail,
+            Some(b'\n'),
+            "the orchestrator observer's PTY is NOT in raw mode: its readiness marker was printed \
+             with a bare LF but the pane delivered {observed_tail:?} after it. With OPOST/ONLCR \
+             still on, a deferred LF-terminated notice is rewritten to CRLF and would be observed \
+             as a submit CR, so this fixture could not tell #702's submitted report from the \
+             deferred one it replaced; snapshot = {:?}",
             String::from_utf8_lossy(&observer_ready)
         );
         let delivery_log = cwd.path().join(SILENT_WORKER_DELIVERY_LOG);
@@ -1459,8 +1546,11 @@ async fn delegate_013_silent_worker_surfaces_notice_in_orchestrator_pane_inner()
     assert!(
         terminator == Some(b'\r') && missing_options.is_empty(),
         "issue #702: the silence notice must be submitted with CR and name every remediation \
-         option (keep waiting, re-delegate, reassign, notify the user); observed terminator = \
-         {terminator:?}, missing options = {missing_options:?}, snapshot = {notice_text:?}"
+         option (keep waiting, re-delegate, reassign, notify the user). The terminator is the \
+         single byte the pane delivered after the payload's final clause, so Some(10) means the \
+         report was DEFERRED as LF scrollback rather than submitted as a turn; observed \
+         terminator = {terminator:?}, missing options = {missing_options:?}, snapshot = \
+         {notice_text:?}"
     );
 
     assert!(

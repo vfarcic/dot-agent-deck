@@ -3569,6 +3569,21 @@ async fn dispatch_one_owned(
                 // any other drain) during the waits below resolves it and the
                 // watch task — if one is ever spawned — exits immediately.
                 //
+                // The ACCEPTED GAP, named here so a later reader does not
+                // rediscover it as a bug: from this point the reservation is a
+                // real record, so a `work-done` landing in the window between it
+                // and the pointer write is credited against it. When a prior
+                // watch existed, the inherited `superseded` count absorbs that
+                // completion (`SilenceWatchRetirement::KeptNewer`) and this
+                // generation keeps its watch — which is #687's own case. When
+                // `superseded == 0`, i.e. no prior watch existed and there is
+                // nothing to inherit, the completion consumes the reservation
+                // instead and THIS generation ends up with no watch at all. The
+                // cost is one suppressed diagnostic on a delegation that has
+                // already reported completion — never a false report invented
+                // for a live one — so it is the safe direction to fail in and is
+                // deliberately left as is.
+                //
                 // Only when the detector is on for this delegate. `None` means no
                 // watch would be armed at the write either, so there is nothing
                 // to move; the pane's records are then left exactly as the
@@ -8708,6 +8723,101 @@ mod tests {
             "the probe must not submit the user's draft plus the silent-worker notice; before={:?}, after={:?}",
             String::from_utf8_lossy(&before_probe),
             String::from_utf8_lossy(&after_probe)
+        );
+    }
+
+    /// Scenario: Submit a silence report into an orchestrator pane exactly the way
+    /// the daemon does — a guarded submit followed by the `note_payload_settled`
+    /// release — then let the user type into that pane and submit a byte-identical
+    /// second report. The repeat must be delivered, while the same sequence WITHOUT
+    /// the release is refused, proving the release is what keeps a second silent
+    /// worker's report from being mistaken for a retry of the first.
+    #[cfg(unix)]
+    #[spec("scheduler/idle-worker/017")]
+    #[tokio::test]
+    async fn idle_worker_017_a_settled_report_does_not_refuse_an_identical_second_report() {
+        // Issue #702: `scheduler/idle-worker/015` was re-pointed at
+        // `compose_worker_exited_notice` when the silence report moved to the
+        // SUBMITTED family, which left the submit path's own
+        // `note_payload_settled` release (see `arm_delegate_silence_watch`)
+        // exercised only incidentally. This is that pin.
+        //
+        // Why the repeat is ordinary rather than exotic: the report is one-shot
+        // and nothing retries it, so its payload record guards nothing — and two
+        // silent workers on one orchestration whose panes have both rendered
+        // nothing compose BYTE-IDENTICAL text (the `None` branch interpolates
+        // only the window). Without the release, the second worker's report is
+        // refused as the user's own draft and the orchestrator is never told.
+        const SETTLED_PANE: &str = "silence-report-settled-orchestrator";
+        const UNSETTLED_PANE: &str = "silence-report-unsettled-orchestrator";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let report = compose_delegate_silence_notice(std::time::Duration::from_millis(600), None);
+
+        let spawn_orchestrator = |pane: &str| {
+            registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.to_string(),
+                    )],
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn orchestrator stand-in")
+        };
+        let settled_agent = spawn_orchestrator(SETTLED_PANE);
+        let unsettled_agent = spawn_orchestrator(UNSETTLED_PANE);
+
+        // First report on both panes, delivered the production way.
+        for (pane, agent) in [
+            (SETTLED_PANE, &settled_agent),
+            (UNSETTLED_PANE, &unsettled_agent),
+        ] {
+            assert_eq!(
+                registry
+                    .write_and_submit_guarded(pane, &report, Some(agent), || async { true })
+                    .await
+                    .expect("first silence report"),
+                crate::agent_pty::GuardedSend::Applied,
+                "precondition: the first silence report must reach {pane}"
+            );
+        }
+        // Only the SETTLED pane gets the release the production caller makes.
+        registry.note_payload_settled(SETTLED_PANE, &report);
+
+        // The user types into both panes. This is the clock that arms the
+        // repeat-payload refusal: without it the guard abstains and the test
+        // would pass for the wrong reason.
+        registry.note_user_input(SETTLED_PANE);
+        registry.note_user_input(UNSETTLED_PANE);
+
+        let settled_repeat = registry
+            .write_and_submit_guarded(SETTLED_PANE, &report, Some(&settled_agent), || async {
+                true
+            })
+            .await
+            .expect("second identical silence report after settling");
+        let unsettled_repeat = registry
+            .write_and_submit_guarded(UNSETTLED_PANE, &report, Some(&unsettled_agent), || async {
+                true
+            })
+            .await
+            .expect("second identical silence report without settling");
+        registry.shutdown_all();
+
+        assert_eq!(
+            settled_repeat,
+            crate::agent_pty::GuardedSend::Applied,
+            "a one-shot silence report releases its payload record, so a byte-identical SECOND \
+             report into the same orchestrator must still be submitted rather than refused as a \
+             repeat of the user's own unsent draft"
+        );
+        assert_eq!(
+            unsettled_repeat,
+            crate::agent_pty::GuardedSend::Stale,
+            "control: without `note_payload_settled` the identical repeat IS refused — which is \
+             what makes the release above load-bearing rather than decorative"
         );
     }
 
