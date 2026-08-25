@@ -7089,11 +7089,33 @@ impl AgentPtyRegistry {
     ///
     /// The fix is to make this the same question the admission layer asks. The
     /// `!exited` filter is replaced by [`Self::token_still_live`], which is the
-    /// retirement rule `generation_ownership` already applies — so a pane is
-    /// protected in exactly the cases where the ownership layer would otherwise
-    /// say [`Ownership::Owned`], plus the three in-flight holds. Late final
+    /// retirement rule `generation_ownership` already applies — so the two
+    /// layers now share one rule instead of each writing their own, and the
+    /// disagreement finding 1 exploited is gone rather than moved. Late final
     /// events keep landing, because the same rule keeps the exiting agent's own
     /// token resolving for exactly as long as its generation may still speak.
+    ///
+    /// # The one corner where the layers still disagree (third-pass F2)
+    ///
+    /// This is deliberately NOT stated as "protected in exactly the cases where
+    /// the ownership layer would say [`Ownership::Owned`]". That is one case too
+    /// strong, and the exception is pinned by
+    /// `spawn_tests::a_handed_over_then_reaped_pane_is_unprotected_yet_still_owned`.
+    /// A token-less event reaches `generation_ownership`'s `(Some(pane), None)`
+    /// arm, which matches ANY record still naming the pane — no `exited`, no
+    /// `pane_handed_over` filter. So a pane whose first generation was handed
+    /// over and lingers unreaped, while its successor has since been closed,
+    /// answers `false` here and [`Ownership::Owned`] there.
+    ///
+    /// Left as it is, for this round. The pane is functionally defunct (both
+    /// generations gone), the event lands as `Foreign` exactly as it did before
+    /// this change — the pre-fix `manages_pane` also answered `false` here — and
+    /// a `Foreign` card is something an attacker can already mint for any pane
+    /// id this daemon never managed. It is therefore one more instance of the
+    /// acknowledged issue #601 / residual-1 foreign-pane behaviour, not a new
+    /// class of exposure. Tightening the pane-only arm to honour
+    /// `pane_handed_over` would close it; that belongs in its own change, with
+    /// its own argument about the keyed arm it sits beside.
     ///
     /// `has_live_pane` is left as it is: it answers "is there a live agent on
     /// this pane", which is what its callers (the foreign-`SessionStart` warning,
@@ -9206,6 +9228,98 @@ mod spawn_tests {
             registry.generation_ownership(Some(PANE), None),
             Ownership::Owned,
             "and this is why: the admission layer would otherwise accept it"
+        );
+    }
+
+    /// Third-pass reviewer F2: the one corner where the two layers still
+    /// DISAGREE in the admitting direction — a pane both of whose generations
+    /// are gone, the first handed over and lingering, the second closed.
+    ///
+    /// `pane_is_protected` follows the retirement rule
+    /// ([`AgentPtyRegistry::token_still_live`]), so the handed-over lingering
+    /// record does not protect the pane. `generation_ownership`'s
+    /// `(Some(pane), None)` arm applies no such filter — it matches ANY record
+    /// still naming the pane — so it answers `Owned`. A token-less event naming
+    /// the pane is therefore classified `Foreign` by provenance and then
+    /// positively admitted by the ownership layer.
+    ///
+    /// Pinned rather than fixed, deliberately. There is no security consequence:
+    /// the pane is functionally defunct (both generations gone), and an attacker
+    /// can already mint `Foreign` cards for any pane id this daemon never
+    /// managed — the acknowledged residual 1 / issue #601 behaviour, of which
+    /// this is one more instance rather than a new class. It is also not a
+    /// regression: the pre-fix `manages_pane` (`!exited`) answered `false` here
+    /// too, so the same event was admitted the same way before this change.
+    ///
+    /// What this test exists to stop is the DOC drifting back to "the two layers
+    /// can no longer disagree in the direction that admits", which is what both
+    /// [`AgentPtyRegistry::pane_is_protected`] and
+    /// [`crate::hook_ingest::PaneAuthority::pane_is_protected`] used to claim and
+    /// now state the exception to. If a later round tightens the pane-only arm to
+    /// honour `pane_handed_over`, this test is where that change becomes visible:
+    /// flip the final assertion to `Unclaimed` and drop the exception from both
+    /// docs.
+    #[tokio::test]
+    async fn a_handed_over_then_reaped_pane_is_unprotected_yet_still_owned() {
+        const PANE: &str = "token-handed-over-then-reaped-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+
+        // 1. The first generation exits on its own and lingers unreaped.
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/usr/bin/true"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the first generation");
+        await_natural_exit(&registry).await;
+        assert!(
+            registry.pane_is_protected(PANE),
+            "precondition: before any handover the lingering generation still              protects its pane — that is re-audit finding 1's fix"
+        );
+
+        // 2. A successor publishes onto the pane, which sets the predecessor's
+        //    monotone `pane_handed_over`.
+        let second = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("the pane is free for a successor once its occupant exited");
+
+        // 3. The successor is closed through `StopAgent`'s path, which removes
+        //    ONLY its own record.
+        registry.close_agent(&second).expect("close the successor");
+
+        {
+            let inner = registry.inner.lock().unwrap();
+            assert_eq!(
+                inner.agents.len(),
+                1,
+                "test prerequisite: the successor is gone and the predecessor                  still lingers — a reaped predecessor would make this pass for                  the wrong reason"
+            );
+            let lingering = inner.agents.values().next().expect("the predecessor");
+            assert!(
+                lingering.exited.load(Ordering::SeqCst) && lingering.pane_handed_over,
+                "test prerequisite: the lingering record is the exited,                  handed-over first generation"
+            );
+            assert!(
+                inner.pending_spawns.is_empty()
+                    && inner.cleanup_holds.is_empty()
+                    && inner.respawn_holds.is_empty(),
+                "test prerequisite: no in-flight hold is standing in for the                  record under test"
+            );
+        }
+
+        assert!(
+            !registry.pane_is_protected(PANE),
+            "the retirement rule disowns a handed-over generation permanently,              so nothing protects this pane any more"
+        );
+        assert_eq!(
+            registry.generation_ownership(Some(PANE), None),
+            Ownership::Owned,
+            "and here is the disagreement F2 named: the pane-only ownership arm              matches any record still naming the pane, with no `exited` or              `pane_handed_over` filter, so a token-less event refused nothing by              provenance is admitted by the layer behind it"
         );
     }
 

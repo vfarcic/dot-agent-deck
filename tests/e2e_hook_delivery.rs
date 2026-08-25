@@ -311,8 +311,15 @@ fn delivery_010_idle_hook_peers_stop_wedging_the_connection_cap() {
     // hook CLI opens a NEW connection and is refused at saturation. The hold is
     // a third of the deadline, so it cannot be satisfied by the reclaim it is
     // supposed to run before.
-    write_hook_line(deck.hook_socket_path(), &session_start.to_string(), None)
-        .expect("write the wedged-state probe event");
+    //
+    // The write error is TOLERATED, exactly as the recovery loop below tolerates
+    // its own: with the cap saturated the daemon prompt-closes the over-cap
+    // connection, so a `BrokenPipe` here is the EXPECTED outcome and the very
+    // behaviour the next assertion exists to prove. Hard-`expect()`ing it made
+    // the test fail on the success case whenever the daemon won the race to
+    // close, which is a flake and not a signal. The signal is
+    // `!landed_while_wedged` — leave that assertion exactly as it is.
+    let _ = write_hook_line(deck.hook_socket_path(), &session_start.to_string(), None);
     let landed_while_wedged =
         deck.wait_for_grid_string_within(SESSION_ID, Duration::from_millis(DEADLINE_MS / 3));
     assert!(

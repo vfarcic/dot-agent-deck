@@ -748,9 +748,24 @@ pub trait PaneAuthority {
     /// So provenance asks the admission layer's question instead: **is any
     /// generation, live or retired-but-not-yet-succeeded, still holding this
     /// pane** (plus the in-flight reservation / close / respawn states). The
-    /// answer is a superset of the routing one, and it is true in exactly the
-    /// cases where the ownership layer would otherwise say `Owned` — so the two
-    /// layers can no longer disagree in the direction that admits.
+    /// answer is a superset of the routing one, and it applies the SAME
+    /// retirement rule the ownership layer applies (`token_still_live`) rather
+    /// than a second one written out by hand — which is what closes finding 1's
+    /// disagreement instead of relocating it.
+    ///
+    /// **Not a total equivalence, though**, and the remaining corner is stated
+    /// rather than implied (third-pass reviewer F2, confirmed by
+    /// `agent_pty::spawn_tests::a_handed_over_then_reaped_pane_is_unprotected_yet_still_owned`).
+    /// A token-less event reaches `generation_ownership`'s pane-only arm, which
+    /// matches any record still naming the pane with no `exited` or
+    /// `pane_handed_over` filter — so a pane whose first generation was handed
+    /// over and lingers unreaped, while its successor has since been closed, is
+    /// unprotected here and still `Owned` there. That pane is functionally
+    /// defunct, the event lands as [`Provenance::Foreign`] exactly as it did
+    /// before this change, and a `Foreign` card is what an attacker can already
+    /// mint for any never-managed pane id: one more instance of #601's named
+    /// remainder, not a new class of it. See
+    /// `AgentPtyRegistry::pane_is_protected` for why it is left as it is.
     fn pane_is_protected(&self, pane_id: &str) -> bool;
 }
 

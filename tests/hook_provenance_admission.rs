@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Hook provenance, end to end: `hook_ingest::admit` followed by
 //! `AppState::apply_event` — the two steps the daemon's hook loop runs, in that
 //! order, against a REAL `AgentPtyRegistry`.
@@ -22,7 +24,12 @@
 //! state with provenance bypassed, and showing that the card moves there.
 //!
 //! Fast tier: `/usr/bin/true` and `/bin/sh` stand-ins, no LLM and no daemon
-//! socket.
+//! socket. Unix-gated for the same reason the in-crate `spawn_tests` module is
+//! (`#[cfg(all(test, unix))]`): those two stand-ins are real PTY spawns of paths
+//! that do not exist on Windows, so without the gate the file would compile
+//! there — `tests/common` is deliberately ungated — and then fail at RUNTIME on
+//! a Windows contributor's `cargo test-fast`, which CI would never catch because
+//! `build-windows` is clippy-only.
 
 use std::sync::Arc;
 use std::time::Duration;
