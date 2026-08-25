@@ -187,9 +187,11 @@ scan_workflow_nextest() {
 
 # Emits "devbox.json <version>" per named package in devbox.json's array.
 scan_devbox() {
-  local name entry value
+  local name entry value found
   for name in "$@"; do
+    found=0
     while IFS= read -r entry; do
+      found=1
       value="${entry#\"$name@}"
       value="${value%\"}"
       if ! printf '%s' "$value" | grep -qE "$SEMVER"; then
@@ -198,6 +200,16 @@ scan_devbox() {
       fi
       printf 'devbox.json(%s) %s\n' "$name" "$value"
     done < <(grep -oE "\"$name@[^\"]*\"" "$root/devbox.json" || true)
+    # A component that VANISHED is not a component that agrees. `compare` only
+    # ever sees the versions that were found, so without this a devbox.json
+    # which dropped or renamed `clippy` would leave the other three agreeing
+    # with the workflows and the whole class passing. Check 2 catches that only
+    # when EVERY name in the class is gone; this is its per-name half, and the
+    # four Rust components are exactly where it matters, since they are one
+    # toolchain spelled four ways.
+    if [ "$found" -eq 0 ]; then
+      printf '%s%s\n' "$SCAN_ERR" "devbox.json pins no $name at all. Each package named here is half of a version duplicated into .github/workflows/, so an absent one cannot be in lockstep with anything. If it was removed or renamed deliberately, update this script's caller to match."
+    fi
   done
 }
 

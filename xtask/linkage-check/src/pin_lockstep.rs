@@ -414,6 +414,36 @@ fn unpinned_nextest_tool_fails() {
 }
 
 #[test]
+fn one_missing_devbox_rust_component_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    // Raised by Greptile on the PR, and it reproduced exactly: drop `clippy`
+    // and the guard reported `ok` twice and exited 0. The three survivors still
+    // agreed with each other and with the workflows, and `compare` only ever
+    // sees versions that were FOUND — so an absent component was indistinguishable
+    // from one that matches. `a_side_with_no_pins_at_all_fails` below covers the
+    // whole class vanishing; this covers one of four, which is the reachable
+    // case, since a nixpkgs rename moves one package at a time.
+    let packages: Vec<&str> = good_packages()
+        .into_iter()
+        .filter(|p| !p.starts_with("clippy@"))
+        .collect();
+    let out = Fixture::new(&packages, &good_workflows()).run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "devbox.json pinning only three of the four Rust components must fail, \
+         not pass on the agreement of the survivors:\n{text}"
+    );
+    assert!(
+        text.contains("pins no clippy"),
+        "the failure must name the component that went missing:\n{text}"
+    );
+}
+
+#[test]
 fn a_side_with_no_pins_at_all_fails() {
     if !bash_present() {
         eprintln!("SKIP: needs `bash` on PATH");
