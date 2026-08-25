@@ -935,3 +935,109 @@ fn worktree_reclaim_009_pending_bullets_never_alias_two_distinct_paths() {
         String::from_utf8_lossy(bullets[0])
     );
 }
+
+/// Scenario: A worktree created through the deck's REAL creation path
+/// (`issue_dispatch_run::create_worktree`, the only `git worktree add` in
+/// `src/` — every dispatch and every issue-dispatch fire goes through it) is
+/// recognised by `worktree list` as deck-owned, and — being MERGED and clean —
+/// gets the unattended `remove` verdict rather than `ask`. A sibling worktree
+/// created by a plain `git worktree add`, identical in every other respect,
+/// is the control: it must still read as foreign. Pins issue #425, where the
+/// marker was read but never written, so the deck's own worktrees could only
+/// ever reach `ask`.
+#[spec("worktree/reclaim/010")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_010_worktree_created_by_the_deck_reads_as_owned() {
+    let fx = Fixture::new();
+
+    // The subject: created the way production creates one. Deliberately NOT
+    // `fx.mark_owned` — the whole point is that nothing marks it by hand.
+    let deck_made = fx._scratch.path().join("wt-deck-made");
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(dot_agent_deck::issue_dispatch_run::create_worktree(
+            &fx.repo,
+            &deck_made,
+            "feat/deck-made",
+            false,
+            dot_agent_deck::worktree_owner::Creator::dispatch("deck-made"),
+        ))
+        .expect("the deck's creation path must create the worktree");
+    assert_eq!(
+        outcome,
+        dot_agent_deck::issue_dispatch_run::WorktreeCreation::Created,
+        "fixture precondition: the worktree must have been genuinely CREATED here — an \
+         already-claimed directory is somebody else's and is never marked"
+    );
+    assert!(deck_made.is_dir(), "fixture precondition: worktree on disk");
+    fx.set_pr_state("feat/deck-made", "MERGED");
+
+    // The control: same repo, same shape, same MERGED PR — created by a plain
+    // `git worktree add`, which is what an orchestrator or a human runs. It
+    // must stay foreign, or "owned" would be measuring nothing.
+    let hand_made = fx.add_worktree_with_commit("wt-hand-made", "feat/hand-made");
+    fx.set_pr_state("feat/hand-made", "MERGED");
+
+    let out = fx.run(&["worktree", "list", "--json"]);
+    assert!(
+        out.status.success(),
+        "`worktree list --json` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let doc: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must parse as JSON ({e}); got:\n{stdout}"));
+    let entry_for = |needle: &str| -> serde_json::Value {
+        doc.get("worktrees")
+            .and_then(|w| w.as_array())
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|e| {
+                        e.get("path")
+                            .and_then(|p| p.as_str())
+                            .is_some_and(|p| p.contains(needle))
+                    })
+                    .cloned()
+            })
+            .unwrap_or_else(|| panic!("no entry for {needle} in:\n{stdout}"))
+    };
+
+    let deck_entry = entry_for("wt-deck-made");
+    assert_eq!(
+        deck_entry.get("owned").and_then(|o| o.as_bool()),
+        Some(true),
+        "a worktree the deck created must read as deck-owned — the marker is written at \
+         creation time; got entry:\n{deck_entry}\nfull document:\n{stdout}"
+    );
+    assert_eq!(
+        deck_entry.get("verdict").and_then(|v| v.as_str()),
+        Some("remove"),
+        "MERGED + clean + deck-owned is the one combination that reclaims unattended; \
+         got entry:\n{deck_entry}\nfull document:\n{stdout}"
+    );
+
+    let hand_entry = entry_for("wt-hand-made");
+    assert_eq!(
+        hand_entry.get("owned").and_then(|o| o.as_bool()),
+        Some(false),
+        "control: a worktree created by a plain `git worktree add` must stay foreign — the \
+         deck never claims what it did not create; got entry:\n{hand_entry}\nfull \
+         document:\n{stdout}"
+    );
+    assert_eq!(
+        hand_entry.get("verdict").and_then(|v| v.as_str()),
+        Some("ask"),
+        "a foreign worktree, however reclaimable it otherwise looks, must require an \
+         explicit confirmation; got entry:\n{hand_entry}\nfull document:\n{stdout}"
+    );
+
+    assert!(
+        hand_made.is_dir() && deck_made.is_dir(),
+        "`worktree list` must not remove anything"
+    );
+}

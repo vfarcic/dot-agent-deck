@@ -113,11 +113,18 @@ pub(crate) const SITE_AUDIT: &[PermissionSite] = &[
     },
     PermissionSite {
         function: "ensure_owner_only_dir",
-        unix: "DirBuilder::mode(0o700) plus an unconditional set_permissions(0o700) that repairs \
+        unix: "an lstat refusal when the final component is itself a symlink (issue #669), then \
+               DirBuilder::mode(0o700) plus an unconditional set_permissions(0o700) that repairs \
                a pre-existing loose directory",
         windows: WindowsCounterpart::Enforced(
             "create_dir_all plus an unconditional SetNamedSecurityInfoW protected \
-             current-user-only DACL — the same repair-an-existing-dir semantics",
+             current-user-only DACL — the same repair-an-existing-dir semantics. The issue #669 \
+             symlink refusal has NO counterpart here yet: SetNamedSecurityInfoW resolves by name \
+             and follows a reparse point, so the same redirection shape is plausible and remains \
+             unverified on Windows rather than known-absent. What narrows it is that creating a \
+             reparse point needs Developer Mode or elevation, which an unelevated same-user \
+             attacker does not have by default (docs/develop/windows-symlinks.md), and that no \
+             Windows binaries are released",
         ),
     },
     PermissionSite {

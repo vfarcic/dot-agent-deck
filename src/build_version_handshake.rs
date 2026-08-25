@@ -631,29 +631,13 @@ async fn poll_daemon_gone(attach_path: &Path, budget: Duration) -> bool {
 /// `keep_newlines` retains `\n` for the whole-prompt backstop pass (the
 /// prompt's own line structure is ours and trusted); the per-name pass passes
 /// `false` so an embedded newline in a name can't inject extra prompt lines.
+///
+/// Issue #670 moved the filter itself to
+/// [`crate::untrusted_text::strip_control_and_bidi`], which is now the one
+/// implementation shared with the hook-event ingest path. This wrapper stays
+/// so the prompt's own call sites keep naming what they are protecting.
 fn sanitize_for_prompt(s: &str, keep_newlines: bool) -> String {
-    s.chars()
-        .filter(|&c| {
-            if keep_newlines && c == '\n' {
-                return true;
-            }
-            !(c.is_control() || is_bidi_format_char(c))
-        })
-        .collect()
-}
-
-/// PRD #161 FIX 4 — Unicode bidirectional formatting / override codepoints that
-/// [`char::is_control`] does NOT catch (they are category `Cf`, not `Cc`) but
-/// which can visually reorder a rendered string to spoof an agent name.
-fn is_bidi_format_char(c: char) -> bool {
-    matches!(
-        c,
-        '\u{202A}'..='\u{202E}'   // LRE, RLE, PDF, LRO, RLO
-            | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
-            | '\u{200E}'              // LRM
-            | '\u{200F}'              // RLM
-            | '\u{061C}'              // ALM
-    )
+    crate::untrusted_text::strip_control_and_bidi(s, keep_newlines)
 }
 
 /// Render the non-TTY (CI / piped-stdout) error message. Trailing

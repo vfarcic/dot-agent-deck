@@ -29,6 +29,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 // here costs one module and two extra test executions — not the harness.
 #[path = "../src/test_temp.rs"]
 mod test_temp;
+// Issue #668: same shape, same reason — the wrapped-child lifetime bound this
+// file's registry spawns need, in a file small enough to include on its own
+// instead of pulling in the harness. `common::init_test_env` calls the same
+// `arm()`.
+#[path = "common/child_lifetime_bound.rs"]
+mod child_lifetime_bound;
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 
@@ -72,6 +78,13 @@ impl Drop for Server {
 static HARNESS_BIND_LOCK: Mutex<()> = Mutex::new(());
 
 async fn start_server() -> Server {
+    // Issue #668: every test in this file reaches a registry through here, so
+    // this is the file's single arming point for the wrapped-child lifetime
+    // bound. Agents spawned by this harness are Codex-typed and therefore
+    // launch via `dot-agent-deck wrap`, whose self-defence and #661 child-group
+    // reaper are both gated on the cap this pins.
+    child_lifetime_bound::arm();
+
     let registry = Arc::new(AgentPtyRegistry::new());
     let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
 

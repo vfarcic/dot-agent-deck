@@ -29,11 +29,12 @@ use crate::palette;
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::prompt_delivery::{
-    AUTOMATIC_PROMPT_DEADLINE, ConfirmationCapability, attempt_delivery_id, attempt_writes_payload,
-    log_prompt_abandoned, log_prompt_accumulated, log_prompt_confirmed, log_prompt_probe_submitted,
-    log_prompt_stopped, log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written,
-    mint_delivery_id, pane_confirmation_capability, prompt_submission_accumulated,
-    prompt_submission_matches, submission_is_after_watermark, unconfirmed_retry_delay,
+    AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, ConfirmationCapability, attempt_delivery_id,
+    attempt_writes_payload, log_prompt_abandoned, log_prompt_accumulated, log_prompt_confirmed,
+    log_prompt_probe_submitted, log_prompt_stopped, log_prompt_unconfirmable,
+    log_prompt_unconfirmed, log_prompt_written, mint_delivery_id, pane_confirmation_capability,
+    prompt_submission_accumulated, prompt_submission_matches, submission_is_after_watermark,
+    unconfirmed_retry_delay,
 };
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
 use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
@@ -3600,7 +3601,17 @@ fn process_pending_seed_prompts(
             // attempts probe SUBMISSION rather than typing the seed in again —
             // same identity guards, same terminal-outcome classification, empty
             // payload. See [`crate::prompt_delivery::attempt_writes_payload`].
-            let writes_payload = attempt_writes_payload(attempt);
+            //
+            // Issue #666 ships the armed third payload on the DAEMON path only,
+            // so this passes a permanently-disarmed rearm and behaves exactly as
+            // it did before. The blocker is not the arming policy — it is that a
+            // launcher-wrapped pane's delivery does not survive the genuine
+            // agent's `SessionStart` at all on this path: the wrapper's own
+            // `wrapper_fork` start becomes the pane's generation, the delivery
+            // binds it, and the real start then reads as a rollover and abandons
+            // the seed. Arming a write that no longer exists fixes nothing. See
+            // issue #684.
+            let writes_payload = attempt_writes_payload(attempt, &AgentStartRearm::default(), now);
             let wire_delivery_id = wire_attempt_id(&delivery_id, epoch, attempt, !writes_payload);
             // Reviewer blocker 2: from here on, a request under this wire id may
             // be recorded in the daemon's ledger, so a later identity change has
@@ -4651,7 +4662,11 @@ fn deliver_orchestrator_prompt(
     // Issue #424 D5: after the one bounded replacement payload, later attempts
     // probe SUBMISSION rather than typing the role prompt in again. See
     // [`crate::prompt_delivery::attempt_writes_payload`].
-    let writes_payload = attempt_writes_payload(attempt);
+    //
+    // Issue #666: disarmed here for the same reason as the seed path's twin — the
+    // armed third payload ships on the daemon path only. See that call site, and
+    // issue #684.
+    let writes_payload = attempt_writes_payload(attempt, &AgentStartRearm::default(), now);
     // Issue #424: the logical delivery keeps ONE identity; every ATTEMPT rides
     // its own wire id, or the daemon's ledger replays the first `Applied` and a
     // retry never reaches the PTY at all. See [`attempt_delivery_id`].

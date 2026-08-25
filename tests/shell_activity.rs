@@ -22,6 +22,15 @@
 //! binary fails to compile. That compile-level RED is the point — coder
 //! implements to this file's intended API.
 
+// Issue #668: the wrapped-child lifetime bound for the one test below that
+// spawns through a bare `AgentPtyRegistry`, in a file small enough to include
+// on its own instead of pulling in the ~420 KB harness this file deliberately
+// does not link. `common::init_test_env` calls the same `arm()`. Unix-gated
+// like its only caller, so the module is not dead code on Windows.
+#[cfg(unix)]
+#[path = "common/child_lifetime_bound.rs"]
+mod child_lifetime_bound;
+
 #[cfg(unix)]
 use std::ffi::CString;
 #[cfg(unix)]
@@ -503,6 +512,11 @@ impl Drop for KillOnDrop {
 #[spec("status/shell-activity/004")]
 #[test]
 fn shell_activity_004_shell_foreground_busy_flips_for_a_real_detached_pipe_child() {
+    // Issue #668: armed before anything is spawned, so the pane shell below —
+    // and every descendant it mints — carries the wrapped-child lifetime bound
+    // that lets `wrap` reap a stranded child.
+    child_lifetime_bound::arm();
+
     const PANE_ID: &str = "shell-activity-004-pane";
     let marker = format!("shell-activity-004-target-{}", std::process::id());
     // A fixed `sleep 0.3` before the detached child launched used to give the
