@@ -8574,6 +8574,37 @@ fn hit_test_card(card_rects: &[(usize, Rect)], col: u16, row: u16) -> Option<usi
         .find_map(|(idx, rect)| point_in_rect(rect, col, row).then_some(*idx))
 }
 
+/// Unwind **every** per-pane registration a freshly spawned pane accumulated,
+/// for a spawn that succeeded and is then abandoned.
+///
+/// A pane that is created and then given up on (its mode tab failed to open)
+/// has already been recorded in six places by the time the failure is known.
+/// Removing them inline, arm by arm, is how issue #308's `pane_declared_agent`
+/// came to join a leak that five sibling maps were already in — and five of
+/// those are *card-visible*, including the placeholder session, which keeps
+/// rendering a dashboard card for a pane that no longer exists. Every abandon
+/// path routes through here so a future per-pane map is added once, rather
+/// than silently omitted from one caller.
+///
+/// Call this **only once the pane is genuinely gone**. A `close_pane` that
+/// FAILED leaves the pane live, and a live pane must keep its card and
+/// metadata so the user can still see it and retry (the same rule PRD #92 F4
+/// applies to an explicit close).
+fn rollback_abandoned_pane(pane_id: &str, ui: &mut UiState, state: &SharedState) {
+    {
+        let mut st = state.blocking_write();
+        // The placeholder session inserted right after the spawn — plus any
+        // session the daemon has already bound to this pane — would otherwise
+        // outlive the pane as a ghost card.
+        st.remove_sessions_for_pane(pane_id);
+        st.unregister_pane(pane_id);
+    }
+    ui.pane_metadata.remove(pane_id);
+    ui.pane_display_names.remove(pane_id);
+    ui.pane_names.remove(pane_id);
+    ui.pane_declared_agent.remove(pane_id);
+}
+
 /// PRD #80 M3: close the tab at `idx` and reconcile shared state — unregister
 /// every successfully-closed pane, drop the matching sessions (keeping any that
 /// failed to close so the user can retry), clean their metadata, and resweep the
@@ -9960,21 +9991,30 @@ fn dispatch_action(
                                         ui.commit_pending_last_command();
                                     }
                                     Err(e) => {
-                                        let _ = pane.close_pane(&new_id);
-                                        // Issue #308: the declaration was recorded
-                                        // before `open_mode_tab` was even called, so
-                                        // drop it again here — `close_pane` retires
-                                        // the pane id, and without this a user who
-                                        // retries a broken mode grows the map by one
-                                        // entry per attempt for the life of the
-                                        // session. Deliberately narrow: the sibling
-                                        // maps this failure path also leaves behind
-                                        // (`pane_metadata`, `pane_display_names`,
-                                        // `pane_names`, the registered pane and its
-                                        // placeholder session) leaked here before
-                                        // issue #308 and are a separate follow-up —
-                                        // this arm only cleans up what #308 added.
-                                        ui.pane_declared_agent.remove(&new_id);
+                                        // Issue #308 follow-up: the spawn SUCCEEDED
+                                        // and registered this pane id in six places
+                                        // before `open_mode_tab` failed. Unwind all
+                                        // six together via the shared helper — a
+                                        // user who retries a broken mode used to
+                                        // grow every one of those maps by an entry
+                                        // per attempt for the life of the session,
+                                        // and the placeholder session left a card
+                                        // for a pane that no longer existed.
+                                        //
+                                        // Gated on the close actually succeeding: if
+                                        // `close_pane` fails the pane is still live,
+                                        // so its card and metadata must stay visible
+                                        // and recoverable rather than being purged
+                                        // out from under it (PRD #92 F4).
+                                        match pane.close_pane(&new_id) {
+                                            Ok(()) => rollback_abandoned_pane(&new_id, ui, state),
+                                            Err(close_err) => tracing::warn!(
+                                                pane_id = %new_id,
+                                                error = %close_err,
+                                                "mode activation failed and the pane could not be \
+                                                 closed — pane state preserved"
+                                            ),
+                                        }
                                         // PRD #196: the mode-tab spawn FAILED — do
                                         // NOT commit the submit candidate, so a
                                         // failed mode-spawn never pollutes
@@ -11934,12 +11974,18 @@ pub fn run_tui(
                             }
                         }
                         Err(e) => {
+                            // Same unwind as the activation arm, through the same
+                            // helper, so the two paths cannot drift apart as
+                            // per-pane maps are added.
+                            //
+                            // Deliberately NOT gated on the close succeeding, unlike
+                            // activation: this arm goes on to substitute a fallback
+                            // dashboard pane for the same saved pane (PRD #69), so
+                            // preserving the abandoned pane's card here would leave
+                            // the user with two cards for one restored pane. That
+                            // trade-off is this path's own, and predates #308.
                             let _ = pane.close_pane(&new_id);
-                            state.blocking_write().unregister_pane(&new_id);
-                            ui.pane_metadata.remove(&new_id);
-                            ui.pane_display_names.remove(&new_id);
-                            ui.pane_names.remove(&new_id);
-                            ui.pane_declared_agent.remove(&new_id);
+                            rollback_abandoned_pane(&new_id, &mut ui, &state);
                             ui.session_warnings.push(format!(
                                 "Warning: failed to restore mode '{}': {e}",
                                 mode_config.name
