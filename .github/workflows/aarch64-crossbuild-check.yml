@@ -55,7 +55,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.97.1
           targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
         with:
