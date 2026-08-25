@@ -389,6 +389,19 @@ fn resolve_orchestration_at(
     let base: Vec<OrchestrationRoleConfig> = match &this.extends {
         None => Vec::new(),
         Some(parent) => {
+            // An unnamed block's `name` is still `""` here — `load_project_config`
+            // normalises it to the cwd basename only AFTER this runs — so an
+            // empty `extends` would silently adopt the first unnamed block as a
+            // parent. Refused rather than allowed, because the rule this module
+            // documents is that a block with no `name` cannot be one, and an
+            // empty value is a typo in every case where it is not.
+            if parent.trim().is_empty() {
+                return Err(format!(
+                    "orchestration '{}' has an empty `extends`. Name the orchestration to inherit \
+                     from, or drop the key.",
+                    this.name
+                ));
+            }
             let parent_index = raw.iter().position(|o| o.name == *parent).ok_or_else(|| {
                 let defined: Vec<&str> = raw
                     .iter()
@@ -1050,6 +1063,23 @@ clear = false
             msg.contains("'gpt'") && msg.contains("mixd") && msg.contains("mixed"),
             "the error must name the child, the missing parent AND what IS defined — otherwise \
              the symptom is 'must have at least 2 roles' in a file that plainly has six: {msg}"
+        );
+    }
+
+    /// An unnamed block's name is `""` at resolution time, so an empty `extends`
+    /// would quietly adopt it as a parent — contradicting the rule that a block
+    /// with no `name` cannot be one.
+    #[test]
+    fn an_empty_extends_is_refused_rather_than_matching_an_unnamed_block() {
+        let err = toml::from_str::<ProjectConfig>(
+            "[[orchestrations]]\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations]]\nname = \"child\"\nextends = \"\"\n",
+        )
+        .expect_err("an empty extends must not resolve to the unnamed block above it");
+        assert!(
+            err.to_string().contains("empty `extends`") && err.to_string().contains("child"),
+            "{err}"
         );
     }
 
