@@ -97,6 +97,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** any rejection or sanitisation of the id upstream of the render (the id is stored verbatim by design); the OSC-8 hyperlink status line, which is the same defect on a different string (`mouse/hyperlink/001`).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/pane/012 — A declared agent identity fills only the initial `No agent` card badge (issue #308).
+- **Layer:** L1 (ratatui `TestBackend` buffer-text assertions).
+- **Agent:** synthetic neutral and ClaudeCode `SessionState` fixtures with a declared Codex identity.
+- **Asserts:** a neutral session plus `Some(Codex)` renders `Codex · reviewer` and no `No agent`; after that session reports `ClaudeCode`, the observed identity renders `ClaudeCode · reviewer` with no stale `Codex` label. A neutral session with no declaration retains the pre-#308 `No agent` baseline.
+- **Does not assert:** declaration propagation through config, spawn, or daemon dispatch; those end-to-end paths are covered by `codex/spawn/009` and `codex/spawn/011`.
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/stats
 
 ##### dashboard/stats/001 — A narrow stats bar keeps the `tools` total and spends no width on a per-agent-type breakdown.
