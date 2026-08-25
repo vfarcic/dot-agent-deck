@@ -1170,6 +1170,320 @@ fn delegate_012_slow_agent_toggle_proves_delivery_and_submission() {
         });
 }
 
+/// Issue #243: how long a delegated worker that is DEMONSTRABLY up may take to
+/// see its task pointer before the delay is a defect rather than a boot cost.
+///
+/// Six seconds, chosen from both ends. Above: the production readiness buffer is
+/// 1000 ms, and the healthy delegates in this issue's own daemon log (a
+/// ClaudeCode worker, which emits a genuine pre-prompt `SessionStart`) land at
+/// 3.80 / 3.85 / 3.96 / 4.39 s end to end — so 6 s clears the slowest measured
+/// healthy delivery with headroom, and a loaded test machine or a legitimately
+/// short bounded readiness buffer cannot produce a false red. Below: it is five
+/// times under `SESSION_START_WAIT_TIMEOUT`, so nothing that pays that fallback
+/// can slip past it as a false green. The Codex workers in the same log sit at
+/// 31.2 / 31.2 / 31.7 / 31.7 / 32.3 s — the timeout plus the buffer, constant to
+/// the tenth of a second, which is the tell that it is the constant and not load.
+#[cfg(unix)]
+const READY_TO_POINTER_BUDGET: Duration = Duration::from_secs(6);
+
+/// Issue #243: how far past [`READY_TO_POINTER_BUDGET`] the two latency tests
+/// keep looking, once they already know they have failed, purely to MEASURE what
+/// the delay actually is.
+///
+/// A test that reports "not delivered within 6 s" pins the defect but hands the
+/// fix no before-number to beat; one that reports "delivered after 31.4 s" is the
+/// issue's evidence. Set above the 30 s fallback plus the 1000 ms buffer so the
+/// real figure lands inside it rather than at the ceiling. It is paid ONLY on the
+/// failing path — a delivery inside budget returns immediately — so it costs the
+/// fast tier nothing once the readiness signal exists.
+#[cfg(unix)]
+const MEASURED_LATENCY_CEILING: Duration = Duration::from_secs(34);
+
+/// Issue #243: the ready prompt a wrapped Codex stand-in paints once its
+/// interface exists, carrying a nonce so a snapshot match cannot be anything but
+/// this fixture's own banner.
+#[cfg(unix)]
+const WRAPPED_READY_BANNER: &str = "Ask Codex to do anything (ready-7c1e)";
+
+/// Issue #243: a stand-in for codex-cli's measured behaviour — it paints its
+/// ready interface and then accepts input, and it emits NO native `SessionStart`
+/// until a prompt actually arrives.
+///
+/// That last part is the defect, and it is why this is a `cat` stand-in rather
+/// than a hook-emitting one: codex-cli posts its native `SessionStart` when the
+/// first TURN starts, so the signal the readiness gate waits for is caused by the
+/// very prompt the gate is withholding. Wrapping is not stubbed — the deck's
+/// common spawn boundary rewrites a `codex` command into a real
+/// `dot-agent-deck wrap --agent codex -- codex`, so the fork-time
+/// card-surfacing `SessionStart` under test here is emitted by the real wrapper.
+#[cfg(unix)]
+fn write_wrapped_ready_agent(path: &std::path::Path) {
+    write_executable(
+        path,
+        &format!("#!/bin/sh\nprintf '{WRAPPED_READY_BANNER}\\r\\n'\nexec cat\n"),
+    );
+}
+
+/// Scenario: Delegate with `clear = true` to a wrapped Codex stand-in that paints its ready prompt and then, like real codex-cli, emits no native `SessionStart` until a prompt arrives. Once that ready prompt is visibly on the replacement pane, the task pointer must reach it within six seconds instead of waiting out the 30 s `SessionStart` fallback (issue #243).
+#[spec("orchestration/delegate/024")]
+#[test]
+#[cfg(unix)]
+fn delegate_024_wrapped_worker_without_native_session_start_is_delivered_promptly() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (
+            DELEGATE_READINESS_BUFFER_ENV,
+            &DELEGATE_READINESS_BUFFER_MS.to_string(),
+        ),
+        // The delegate path reads `SESSION_START_WAIT_TIMEOUT` as a bare
+        // constant with no override (`src/state.rs`), so this pins nothing here
+        // — it is set to the production value so the scheduler mirror of the
+        // same wait cannot quietly shorten what this test is measuring.
+        (SESSION_START_WAIT_ENV, "30000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
+    ]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("build wrapped prompt-latency runtime")
+        .block_on(
+            delegate_024_wrapped_worker_without_native_session_start_is_delivered_promptly_inner(),
+        );
+}
+
+#[cfg(unix)]
+async fn delegate_024_wrapped_worker_without_native_session_start_is_delivered_promptly_inner() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let cwd = common::race_safe_tempdir();
+    let bin_dir = cwd.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("create wrapped-agent bin dir");
+    write_wrapped_ready_agent(&bin_dir.join("codex"));
+    std::fs::write(
+        cwd.path().join(".dot-agent-deck.toml"),
+        clear_true_config("codex"),
+    )
+    .expect("write wrapped prompt-latency orchestration config");
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    let old_agent_id = daemon
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some("codex"),
+            cwd: Some(&cwd_str),
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+                (
+                    "DOT_AGENT_DECK_SOCKET".to_string(),
+                    daemon.hook_path.display().to_string(),
+                ),
+                ("PATH".to_string(), path_with_built_deck(&bin_dir)),
+            ],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn initial wrapped ready stand-in");
+    {
+        let mut state = daemon.state.write().await;
+        register_orchestration(&mut state, &cwd_str);
+    }
+
+    daemon
+        .state
+        .read()
+        .await
+        .handle_delegate(
+            DelegateSignal {
+                pane_id: ORCH_PANE.to_string(),
+                task: "List the files in the current directory.".to_string(),
+                to: vec![WORKER_ROLE.to_string()],
+                timestamp: chrono::Utc::now(),
+            },
+            &daemon.registry,
+            &daemon.event_tx,
+        )
+        .await;
+    let new_agent_id =
+        wait_for_replacement_agent(&daemon.registry, WORKER_PANE, &old_agent_id).await;
+
+    // CONTROL. Everything below is about a worker that is up and waiting, so
+    // this run means nothing unless the replacement genuinely reached its ready
+    // interface. Its banner on the pane is the user-visible form of "the agent
+    // is booted and healthy at its prompt" that this issue reports the deck
+    // ignoring.
+    let banner = wait_for_snapshot_needle(
+        &daemon.registry,
+        &new_agent_id,
+        WRAPPED_READY_BANNER.as_bytes(),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        snapshot_contains(&banner, WRAPPED_READY_BANNER.as_bytes()),
+        "control: the wrapped replacement never painted its ready interface, so this run proves \
+         nothing about the readiness gate; snapshot = {:?}",
+        String::from_utf8_lossy(&banner)
+    );
+    let ready_at = Instant::now();
+
+    let delivered = wait_for_snapshot_needle(
+        &daemon.registry,
+        &new_agent_id,
+        POINTER,
+        READY_TO_POINTER_BUDGET,
+    )
+    .await;
+    if !snapshot_contains(&delivered, POINTER) {
+        // Failed already; keep looking only to turn "missed the budget" into a
+        // number the fix can be measured against. See `MEASURED_LATENCY_CEILING`.
+        let eventual = wait_for_snapshot_needle(
+            &daemon.registry,
+            &new_agent_id,
+            POINTER,
+            MEASURED_LATENCY_CEILING,
+        )
+        .await;
+        let measured = ready_at.elapsed();
+        let arrived = snapshot_contains(&eventual, POINTER);
+        panic!(
+            "a wrapped worker sitting VISIBLY at its ready prompt did not receive its delegated \
+             task pointer within {READY_TO_POINTER_BUDGET:?}: it {} after {measured:?} measured \
+             from the instant that prompt appeared. The wrapper's fork-time SessionStart is \
+             skipped as boot provenance and codex-cli emits no native one until a prompt starts a \
+             turn, so the gate has nothing to release on and pays the full \
+             SESSION_START_WAIT_TIMEOUT (issue #243). snapshot = {:?}",
+            if arrived {
+                "eventually arrived"
+            } else {
+                "still had not arrived"
+            },
+            String::from_utf8_lossy(&eventual)
+        );
+    }
+}
+
+/// Scenario: Delegate with `clear = true` to a worker whose agent emits no readiness event of any kind before its first prompt (OpenCode's measured behaviour), then walk a paused Tokio clock forward a second at a time. The task pointer must reach the pane inside six virtual seconds rather than after the 30 s dead wait (issue #243).
+#[spec("orchestration/delegate/025")]
+#[test]
+#[cfg(unix)]
+fn delegate_025_agent_with_no_pre_prompt_signal_skips_the_dead_wait() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (
+            DELEGATE_READINESS_BUFFER_ENV,
+            &DELEGATE_READINESS_BUFFER_MS.to_string(),
+        ),
+        (SESSION_START_WAIT_ENV, "30000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
+    ]);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build no-signal readiness runtime")
+        .block_on(delegate_025_agent_with_no_pre_prompt_signal_skips_the_dead_wait_inner());
+}
+
+#[cfg(unix)]
+async fn delegate_025_agent_with_no_pre_prompt_signal_skips_the_dead_wait_inner() {
+    common::init_test_env();
+    let cwd = common::race_safe_tempdir();
+    let bin_dir = cwd.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("create no-signal agent bin dir");
+    // Named `opencode` on purpose: `AgentType::from_command` keys on the
+    // basename, so this is the OpenCode CONFIGURATION rather than an anonymous
+    // stand-in — a Plugin-strategy agent the deck does not wrap, whose plugin
+    // bus carries no pre-prompt event at all (`session.created` was measured
+    // arriving 16 ms AFTER the prompt was accepted, #146). Nothing in this test
+    // ever emits an event, which is precisely that agent's cold-boot stream.
+    let agent = bin_dir.join("opencode");
+    write_executable(&agent, "#!/bin/sh\nexec cat\n");
+    let command = agent.to_string_lossy().into_owned();
+    assert_eq!(
+        AgentType::from_command(Some(&command)),
+        Some(AgentType::OpenCode),
+        "control: the fixture must resolve to the OpenCode agent, or this measures nothing about \
+         an agent with no pre-prompt readiness signal"
+    );
+    std::fs::write(
+        cwd.path().join(".dot-agent-deck.toml"),
+        clear_true_config(&command),
+    )
+    .expect("write no-signal orchestration config");
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let old_agent_id = registry
+        .spawn_agent(SpawnOptions {
+            command: Some(&command),
+            cwd: Some(&cwd_str),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn initial no-signal worker");
+    let (event_tx, _rx) = broadcast::channel::<BroadcastMsg>(64);
+    let mut state = AppState::default();
+    register_orchestration(&mut state, &cwd_str);
+    state
+        .handle_delegate(
+            DelegateSignal {
+                pane_id: ORCH_PANE.to_string(),
+                task: "List the files in the current directory.".to_string(),
+                to: vec![WORKER_ROLE.to_string()],
+                timestamp: chrono::Utc::now(),
+            },
+            &registry,
+            &event_tx,
+        )
+        .await;
+    let new_agent_id = wait_for_replacement_agent(&registry, WORKER_PANE, &old_agent_id).await;
+
+    tokio::time::pause();
+    // Walk virtual time forward a second at a time rather than jumping to the
+    // budget, for two reasons. It MEASURES: the failure can report how long the
+    // pointer really took instead of only that it missed. And it is robust to a
+    // fix that arms a bounded buffer only after a shortened wait resolves — a
+    // single `advance` cannot cross a timer armed part-way through itself, so
+    // one jump would report a false red for a correct two-stage fix. Each step
+    // overshoots by `TIMER_TICK_SLACK` (#402) so crossing a deadline never
+    // depends on where its arming instant fell inside a millisecond.
+    let step = Duration::from_secs(1);
+    let mut virtual_elapsed = Duration::ZERO;
+    let delivered = loop {
+        if poll_until_after_time_advance(Duration::from_millis(60), || {
+            snapshot_contains(
+                &registry.snapshot(&new_agent_id).unwrap_or_default(),
+                POINTER,
+            )
+        })
+        .await
+        {
+            break true;
+        }
+        if virtual_elapsed >= MEASURED_LATENCY_CEILING {
+            break false;
+        }
+        advance_and_run(step + TIMER_TICK_SLACK).await;
+        virtual_elapsed += step;
+    };
+    let snapshot = registry.snapshot(&new_agent_id).unwrap_or_default();
+    registry.shutdown_all();
+
+    assert!(
+        delivered,
+        "a worker whose agent emits no readiness event ever received its delegated task pointer \
+         at all, within {MEASURED_LATENCY_CEILING:?} of virtual time; snapshot = {:?}",
+        String::from_utf8_lossy(&snapshot)
+    );
+    assert!(
+        virtual_elapsed <= READY_TO_POINTER_BUDGET,
+        "a worker whose agent has NO pre-prompt readiness signal still sat through the dead wait: \
+         the task pointer arrived after {virtual_elapsed:?} of virtual time, against a budget of \
+         {READY_TO_POINTER_BUDGET:?}. There is no signal for the gate to fast-path on, so \
+         `hook_install.is_some()` sends it into the full SESSION_START_WAIT_TIMEOUT and only the \
+         fallback delivers (issue #243). snapshot = {:?}",
+        String::from_utf8_lossy(&snapshot)
+    );
+}
+
 /// Scenario: Delegate to a worker that receives the pointer and then emits no agent event before the short no-event window expires, in two arms. When its pane is sitting at a booted agent's ready prompt, the orchestrator's notice must QUOTE the lines that pane is actually rendering, framed as untrusted pane text. When its pane has rendered nothing at all, the notice must say so instead — proving the text is read from that pane rather than canned. Both arms stay LF-terminated with no role-name interpolation in the daemon prose.
 #[spec("orchestration/delegate/013")]
 #[test]

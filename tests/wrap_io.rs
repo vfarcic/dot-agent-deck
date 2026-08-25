@@ -397,6 +397,141 @@ fn codex_wrap_005_standalone_sessions_have_unique_ids() {
     );
 }
 
+/// Collect wrapper events from `listener` until one satisfies `matcher` or
+/// `window` elapses, returning EVERYTHING received either way.
+///
+/// [`collect_wrapper_events`] stops at a COUNT, which is the wrong shape for a
+/// test whose whole question is "did a particular event ever arrive": with no
+/// idea how many other events the wrapper emits meanwhile, a count either stops
+/// early on the wrong events or always burns the full deadline. This returns the
+/// instant the awaited event lands and only pays `window` when it never does —
+/// and hands the caller the full stream so a failure can name what WAS emitted.
+fn collect_wrapper_events_until(
+    listener: &UnixListener,
+    window: Duration,
+    matcher: impl Fn(&AgentEvent) -> bool,
+) -> Vec<AgentEvent> {
+    listener
+        .set_nonblocking(true)
+        .expect("make wrapper event listener nonblocking");
+    let deadline = Instant::now() + window;
+    let mut events: Vec<AgentEvent> = Vec::new();
+    while Instant::now() < deadline {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let mut json = String::new();
+                stream
+                    .read_to_string(&mut json)
+                    .expect("read wrapper readiness event");
+                let event: AgentEvent =
+                    serde_json::from_str(json.trim()).expect("parse wrapper readiness event");
+                let matched = matcher(&event);
+                events.push(event);
+                if matched {
+                    return events;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("accept wrapper readiness event: {error}"),
+        }
+    }
+    events
+}
+
+/// Whether `event` is a `SessionStart` announcing that the wrapped agent's own
+/// interface is up, as opposed to the fork-time card-surfacing one.
+///
+/// Deliberately phrased as "a `SessionStart` NOT carrying the wrapper-fork
+/// origin marker" rather than against any new symbol: that is exactly the shape
+/// the delegate readiness gate already accepts as readiness
+/// (`state::session_start_means_ready`), so it stays honest whether the wrapper
+/// grows an unmarked ready event or a differently-marked one. See
+/// `codex/wrap/006`.
+fn is_interface_ready_signal(event: &AgentEvent) -> bool {
+    event.event_type == dot_agent_deck::event::EventType::SessionStart
+        && !event.is_wrapper_fork_session_start()
+}
+
+/// Scenario: Wrap a Codex stand-in over an interactive pseudo-terminal that
+/// prints its ready prompt and then sits waiting for input, with a real hook
+/// socket recording every event the wrapper emits. Once that prompt is on screen
+/// the wrapper must announce a readiness signal distinct from the fork-time
+/// card-surfacing `SessionStart`, so the delegate gate has something to wait for
+/// other than the native `SessionStart` the prompt itself causes (issue #243).
+#[spec("codex/wrap/006")]
+#[test]
+fn codex_wrap_006_ready_interface_announces_readiness() {
+    let fixture = common::harness_tempdir().expect("create wrapper readiness fixture");
+    let socket = fixture.path().join("hook.sock");
+    let interface_up = fixture.path().join("interface-up");
+    let listener = UnixListener::bind(&socket).expect("bind wrapper readiness event socket");
+    let (master, slave) = open_pty();
+    let mut wrapper = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args([
+            "wrap",
+            "--agent",
+            "codex",
+            "--",
+            "/bin/sh",
+            "-c",
+            // Stands in for codex-cli sitting at `Ask Codex to do anything`:
+            // paint the ready prompt, record that the interface exists, then
+            // idle at it forever. Never exits on its own, so nothing here can
+            // be mistaken for the wrapper's exit-time Idle/Error event.
+            "printf 'Ask Codex to do anything\\n'; : > \"$WRAP_INTERFACE_UP\"; \
+             while :; do sleep 0.05; done",
+        ])
+        .env("WRAP_INTERFACE_UP", &interface_up)
+        .env("DOT_AGENT_DECK_SOCKET", &socket)
+        .env(
+            "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS",
+            common::WRAP_TEST_MAX_LIFETIME_SECS,
+        )
+        .env_remove("DOT_AGENT_DECK_PANE_ID")
+        .env_remove("DOT_AGENT_DECK_AGENT_ID")
+        .stdin(Stdio::from(
+            slave.try_clone().expect("clone PTY slave for stdin"),
+        ))
+        .stdout(Stdio::from(
+            slave.try_clone().expect("clone PTY slave for stdout"),
+        ))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .expect("spawn wrapper readiness probe");
+    let _master = master;
+
+    let interface_reached = common::wait_until(Duration::from_secs(10), || interface_up.exists());
+
+    // The awaited signal is allowed to arrive at any point up to here; the
+    // window only bounds how long a MISSING one costs. Three seconds is far
+    // beyond any plausible wrapper-side emit (the fork-time event lands in
+    // milliseconds) and far below the 30 s `SESSION_START_WAIT_TIMEOUT` the
+    // delegate gate falls back to today.
+    let events =
+        collect_wrapper_events_until(&listener, Duration::from_secs(3), is_interface_ready_signal);
+
+    // SAFETY: the pid came from this test's own live `Child`; the probe idles
+    // forever by construction, so it has to be killed rather than awaited.
+    unsafe {
+        libc::kill(wrapper.id() as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = wrapper.wait();
+
+    assert!(
+        interface_reached,
+        "precondition: the wrapped stand-in never reached its ready interface; events={events:?}"
+    );
+    assert!(
+        events.iter().any(is_interface_ready_signal),
+        "the wrapper emitted no readiness signal for a wrapped child that is visibly sitting at \
+         its ready interface — every SessionStart it produced is the fork-time card-surfacing \
+         one, so the delegate gate has nothing to wait for but the native SessionStart the \
+         prompt itself causes, and pays the full 30 s fallback (issue #243). events={events:?}"
+    );
+}
+
 /// Scenario: Wrap a child that TRAPS SIGTERM and never exits, over an
 /// interactive PTY, then SIGTERM the wrapper exactly as the deck does when a
 /// pane closes. The wrapper must escalate to SIGKILL and reap the child within

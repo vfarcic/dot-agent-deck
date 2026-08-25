@@ -2457,6 +2457,20 @@ without depending on the config struct API.
 - **Does not assert:** WHY a real replacement dies — #584's own trigger was environment-side and is not reproduced here (see `orchestration/dispatch/003` for the parity control that rules out the reported hypothesis); any retry of the delegate, which this fix deliberately does not add; the daemon-log `warn!`, which carries the role and command the notice omits.
 - **Platform coverage:** mac+linux (unix-only — the stand-in is a POSIX shell script).
 
+##### orchestration/delegate/024 — A wrapped worker that emits no pre-prompt native `SessionStart` still gets its delegated pointer promptly, instead of paying the 30 s fallback while sitting visibly at its ready prompt (issue #243). **RED until the readiness signal lands.**
+- **Layer:** fast synthetic PTY integration (real `handle_delegate` + `clear = true` respawn + in-process daemon hook socket + the REAL `dot-agent-deck wrap` rewrite applied at the common spawn boundary; no LLM and no `e2e` feature gate).
+- **Agent:** a `codex`-named `cat` stand-in that paints a nonce-carrying ready prompt and then accepts input, emitting no hook event of its own — codex-cli's measured shape, where the native `SessionStart` fires when the first TURN starts and is therefore CAUSED by the prompt the gate is withholding.
+- **Asserts:** the control that the replacement genuinely painted its ready interface — the user-visible "the agent is booted and healthy at its prompt" this issue reports the deck ignoring — and then that the task pointer reaches that pane within 6 s of it. The budget is justified from both ends in `READY_TO_POINTER_BUDGET`: above the 4.39 s slowest healthy delegate in the issue's daemon log, five times under `SESSION_START_WAIT_TIMEOUT`. On failure it keeps looking up to 34 s purely to MEASURE the delay, so the red carries a before-number rather than only a verdict; measured on this branch at **30.98 s** from the ready prompt appearing.
+- **Does not assert:** which mechanism supplies the readiness (the wrapper-side signal is `codex/wrap/006`); real codex-cli boot timing (`orchestration/delegate/009`); the buffer's own behaviour once released (`orchestration/delegate/010`, `/012`); the OpenCode half, which has no signal to wait for at all (`orchestration/delegate/025`).
+- **Platform coverage:** mac+linux (unix-only — the stand-in is a POSIX shell script).
+
+##### orchestration/delegate/025 — A worker whose agent has NO pre-prompt readiness signal skips the 30 s dead wait entirely and is delivered after a bounded buffer only (issue #243, the OpenCode half of #146). **RED until the readiness predicate lands.**
+- **Layer:** fast synthetic PTY integration (real `handle_delegate` + `clear = true` respawn + daemon broadcast, with Tokio's clock paused so 31 s of gate is crossed in a 2 s test; no socket, LLM, or `e2e` feature gate).
+- **Agent:** an `opencode`-named `cat` stand-in, asserted through `AgentType::from_command` so it is the OpenCode CONFIGURATION rather than an anonymous stub — a Plugin-strategy agent the deck does not wrap, whose plugin bus was measured carrying no pre-prompt event at all (`session.created` arrives 16 ms AFTER the prompt is accepted, #146). Nothing in the test ever emits an event, which is exactly that agent's cold-boot stream.
+- **Asserts:** the control that the fixture resolves to `AgentType::OpenCode`, then that the pointer reaches the pane within 6 virtual seconds. Virtual time is walked forward a second at a time rather than jumped, both so the failure reports the real figure — measured on this branch at **31 s**, i.e. `SESSION_START_WAIT_TIMEOUT` + `DELEGATE_READINESS_BUFFER` to the second — and so a correct two-stage fix (a shortened wait that only then arms a buffer) cannot read as a false red, which a single `advance` would produce.
+- **Does not assert:** that OpenCode has no such signal (measured upstream in #146, not re-derived here); the wrapper half, which needs a different mechanism (`orchestration/delegate/024`, `codex/wrap/006`); what the bounded buffer's value should be, only that the dead wait is not part of it.
+- **Platform coverage:** mac+linux (unix-only — the stand-in is a POSIX shell script).
+
 #### orchestration/work-done
 
 ##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).
@@ -3127,6 +3141,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Asserts:** the two wrapper lifecycles produce two distinct session IDs instead of reconciling onto one synthetic `wrap-<program>` ID.
 - **Does not assert:** managed-pane session IDs, which intentionally remain pane-derived and are covered by `codex/wrap/001`.
 - **Platform coverage:** mac+linux.
+
+##### codex/wrap/006 — A wrapped child sitting at its ready interface is announced with a readiness signal of its own, distinct from the fork-time card-surfacing `SessionStart` (issue #243). **RED until the wrapper-side signal lands.**
+- **Layer:** L1/fast real-binary subprocess integration over an interactive pseudo-terminal with a real hook socket collecting every emitted event; no TUI, daemon or LLM.
+- **Agent:** deterministic shell stand-in wrapped as Codex that paints a ready prompt, records that its interface exists, and then idles at it forever — so nothing it does can be confused with the wrapper's exit-time `Idle`/`Error`.
+- **Asserts:** the precondition that the stand-in genuinely reached its ready interface, then that within three seconds the wrapper emits a `SessionStart` NOT carrying `WRAPPER_FORK_SESSION_START_ORIGIN` — the exact shape `state::session_start_means_ready` already accepts as readiness, so the assertion is agnostic about whether the new signal is unmarked or carries a new origin value. Currently RED: the wrapper's whole stream for a ready, idling child is the fork-time `SessionStart` plus a `Thinking` classified off the banner, so a delegate gate has nothing to release on.
+- **Does not assert:** what the delegate gate then does with the signal (`orchestration/delegate/024`); the fork-time event's own card-surfacing role (`orchestration/delegate/007`); real codex-cli boot output (`codex/live/001`).
+- **Platform coverage:** mac+linux (unix-only — `openpty` and a POSIX shell stand-in).
 
 #### codex/trust
 
