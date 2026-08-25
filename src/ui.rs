@@ -31256,6 +31256,372 @@ mod tests {
         );
     }
 
+    /// A mode config that DECLARES the agent its agent pane launches (issue
+    /// #308), so the `pane_declared_agent` entry the rollback has to unwind
+    /// actually gets registered. Everything else matches
+    /// [`mode_config_local`].
+    fn declared_mode_config_local(name: &str, side_pane_count: usize, agent: &str) -> ModeConfig {
+        ModeConfig {
+            agent: Some(agent.to_string()),
+            ..mode_config_local(name, side_pane_count)
+        }
+    }
+
+    /// Pane controller for the mode-activation FAILURE path that survives a
+    /// RETRY: on every attempt the agent pane succeeds with a fresh
+    /// `mock-pane-N` id and its single side pane fails, so `open_mode_tab`
+    /// returns `Err` on attempt one, attempt two, and every attempt after.
+    /// `FailSidePanePC` above cannot do this — it succeeds exactly once and
+    /// then fails the AGENT pane too, so a second attempt dies before the
+    /// registration block and never reaches the `open_mode_tab` Err arm.
+    ///
+    /// Pair it with a `mode_config_local(_, 1)`-shaped config: one persistent
+    /// side pane and no reactive panes means exactly two `create_pane` calls
+    /// per attempt, so the even/odd split IS the agent-pane/side-pane split.
+    ///
+    /// `close_fails` drives the other half of the rollback guard: a pane whose
+    /// `close_pane` failed is still LIVE, so its registrations must survive.
+    struct ModeRetryPC {
+        calls: std::sync::Mutex<u32>,
+        created: std::sync::Mutex<Vec<String>>,
+        close_fails: bool,
+    }
+    impl ModeRetryPC {
+        fn new(close_fails: bool) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(0),
+                created: std::sync::Mutex::new(Vec::new()),
+                close_fails,
+            }
+        }
+        /// Every agent-pane id handed out, in order — one per activation
+        /// attempt that genuinely got as far as registering a pane.
+        fn created(&self) -> Vec<String> {
+            self.created.lock().unwrap().clone()
+        }
+    }
+    impl crate::pane::PaneController for ModeRetryPC {
+        fn create_pane(
+            &self,
+            _cmd: Option<&str>,
+            _cwd: Option<&str>,
+        ) -> Result<String, crate::pane::PaneError> {
+            let mut n = self.calls.lock().unwrap();
+            let idx = *n;
+            *n += 1;
+            if idx.is_multiple_of(2) {
+                let id = format!("mock-pane-{idx}");
+                self.created.lock().unwrap().push(id.clone());
+                Ok(id)
+            } else {
+                Err(crate::pane::PaneError::CommandFailed(
+                    "side pane spawn failed".to_string(),
+                ))
+            }
+        }
+        fn write_to_pane(&self, _id: &str, _text: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+            if self.close_fails {
+                Err(crate::pane::PaneError::CommandFailed(
+                    "pane is still live".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        fn rename_pane(
+            &self,
+            _id: &str,
+            name: &str,
+        ) -> Result<crate::pane::RenameOutcome, crate::pane::PaneError> {
+            Ok(crate::pane::RenameOutcome::applied(name))
+        }
+        fn focus_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "mode-retry-mock"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Dispatch one mode `Action::SpawnPane` whose `open_mode_tab` fails, and
+    /// assert the handler really took the Err arm. Shared by the three
+    /// `rollback_abandoned_pane` tests below so each one asserts only its own
+    /// property.
+    fn dispatch_failing_mode_activation(
+        pc: &ModeRetryPC,
+        ui: &mut UiState,
+        state: &SharedState,
+        tab_manager: &mut TabManager,
+        snapshot: &AppState,
+        filtered: &[(&String, &SessionState)],
+    ) {
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(mode_card_request(
+                "/work/mode-card",
+                "claude --model haiku",
+                declared_mode_config_local("m", 1, "claude"),
+            ))),
+            ui,
+            pc,
+            state,
+            tab_manager,
+            snapshot,
+            filtered,
+            None,
+            Rect::new(0, 0, 80, 24),
+        );
+        assert!(
+            ui.status_message
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("Mode activation failed")),
+            "precondition: the mode activation actually failed (Err arm), got {:?}",
+            ui.status_message.as_ref().map(|(m, _)| m)
+        );
+    }
+
+    /// Issue #308 follow-up: a mode spawn that SUCCEEDS and is then abandoned
+    /// because `open_mode_tab` failed must leave NO trace of its pane. Dispatch
+    /// a mode `Action::SpawnPane` against a controller that fails the side pane
+    /// (so the agent pane is created and registered, then given up on) and
+    /// assert all six per-pane registrations are gone: `managed_pane_ids`, the
+    /// placeholder session, `pane_display_names`, `pane_names`, `pane_metadata`
+    /// and `pane_declared_agent`. The session is the user-visible half — a
+    /// surviving placeholder renders a dashboard card for a pane that no longer
+    /// exists. The `close_pane`-fails sibling below is the positive control
+    /// that these six really are registered on this path, so the absences here
+    /// are not vacuous.
+    #[test]
+    fn mode_activation_failure_unwinds_every_pane_registration() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(ModeRetryPC::new(false));
+        let mut tab_manager = TabManager::new(pc.clone());
+
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        dispatch_failing_mode_activation(
+            &pc,
+            &mut ui,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+        );
+
+        let pane_id = pc
+            .created()
+            .first()
+            .cloned()
+            .expect("the agent pane was created before the mode tab failed");
+
+        let st = state.blocking_read();
+        assert!(
+            !st.managed_pane_ids.contains(&pane_id),
+            "the abandoned pane must be unregistered"
+        );
+        assert!(
+            !st.sessions.contains_key(&format!("pane-{pane_id}")),
+            "the placeholder session must go — it renders a card for a pane that is gone"
+        );
+        assert!(
+            st.sessions
+                .values()
+                .all(|s| s.pane_id.as_deref() != Some(pane_id.as_str())),
+            "no session may still point at the abandoned pane"
+        );
+        assert!(
+            st.sessions.contains_key("s0"),
+            "unrelated sessions must survive the rollback"
+        );
+        drop(st);
+
+        assert!(
+            !ui.pane_display_names.contains_key(&pane_id),
+            "pane_display_names must not keep the abandoned pane"
+        );
+        assert!(
+            !ui.pane_names.contains_key(&pane_id),
+            "pane_names must not keep the abandoned pane"
+        );
+        assert!(
+            !ui.pane_metadata.contains_key(&pane_id),
+            "pane_metadata must not keep the abandoned pane"
+        );
+        assert!(
+            !ui.pane_declared_agent.contains_key(&pane_id),
+            "pane_declared_agent must not keep the abandoned pane"
+        );
+    }
+
+    /// Issue #308 follow-up, the other side of the guard: when the abandoned
+    /// pane's `close_pane` FAILS the pane is still live, so nothing may be
+    /// rolled back — a running agent behind no card at all is strictly worse
+    /// than a stale one, and PRD #92 F4 already draws that line for an explicit
+    /// `Ctrl+W` close. Same dispatch as the sibling above but with a controller
+    /// whose `close_pane` returns `Err`, asserting all six registrations
+    /// SURVIVE. Flipping the handler's `match pane.close_pane(..)` back to an
+    /// unconditional `rollback_abandoned_pane` fails every one of them.
+    #[test]
+    fn mode_activation_failure_with_unclosable_pane_preserves_every_registration() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(ModeRetryPC::new(true));
+        let mut tab_manager = TabManager::new(pc.clone());
+
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        dispatch_failing_mode_activation(
+            &pc,
+            &mut ui,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+        );
+
+        let pane_id = pc
+            .created()
+            .first()
+            .cloned()
+            .expect("the agent pane was created before the mode tab failed");
+
+        let st = state.blocking_read();
+        assert!(
+            st.managed_pane_ids.contains(&pane_id),
+            "a pane that could not be closed is still live and must stay registered"
+        );
+        assert!(
+            st.sessions.contains_key(&format!("pane-{pane_id}")),
+            "a still-live pane must keep its card — the placeholder session must survive"
+        );
+        drop(st);
+
+        assert_eq!(
+            ui.pane_display_names.get(&pane_id).map(String::as_str),
+            Some("card"),
+            "a still-live pane must keep its display name"
+        );
+        assert_eq!(
+            ui.pane_names.get(&pane_id).map(String::as_str),
+            Some("card"),
+            "a still-live pane must keep its name"
+        );
+        assert_eq!(
+            ui.pane_metadata
+                .get(&pane_id)
+                .map(|saved| saved.dir.as_str()),
+            Some("/work/mode-card"),
+            "a still-live pane must keep its metadata so it stays recoverable"
+        );
+        assert_eq!(
+            ui.pane_declared_agent.get(&pane_id),
+            Some(&AgentType::ClaudeCode),
+            "a still-live pane must keep its declared agent, so its badge is still right"
+        );
+    }
+
+    /// Issue #308 follow-up: the original leak symptom. Retrying a broken mode
+    /// used to grow every per-pane map by an entry per attempt for the life of
+    /// the session. Two failed activations in a row — each one a genuinely
+    /// distinct pane id, asserted below — must leave the maps exactly as they
+    /// were before the first, which is also what catches a rollback that
+    /// unwinds five of the six maps.
+    #[test]
+    fn repeated_mode_activation_failures_do_not_accumulate_pane_state() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(ModeRetryPC::new(false));
+        let mut tab_manager = TabManager::new(pc.clone());
+
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        let sessions_before = state.blocking_read().sessions.len();
+        assert!(
+            ui.pane_display_names.is_empty()
+                && ui.pane_names.is_empty()
+                && ui.pane_metadata.is_empty()
+                && ui.pane_declared_agent.is_empty(),
+            "precondition: zero activations means zero per-pane entries"
+        );
+
+        for _ in 0..2 {
+            dispatch_failing_mode_activation(
+                &pc,
+                &mut ui,
+                &state,
+                &mut tab_manager,
+                &snapshot,
+                &filtered,
+            );
+        }
+
+        assert_eq!(
+            pc.created(),
+            vec!["mock-pane-0".to_string(), "mock-pane-2".to_string()],
+            "precondition: both attempts registered a DISTINCT pane before failing, \
+             so a leak would show up as two entries rather than one"
+        );
+
+        let st = state.blocking_read();
+        assert!(
+            st.managed_pane_ids.is_empty(),
+            "two failed activations must leave no registered panes, got {:?}",
+            st.managed_pane_ids
+        );
+        assert_eq!(
+            st.sessions.len(),
+            sessions_before,
+            "two failed activations must leave no extra session cards"
+        );
+        drop(st);
+
+        assert!(
+            ui.pane_display_names.is_empty(),
+            "pane_display_names leaked"
+        );
+        assert!(ui.pane_names.is_empty(), "pane_names leaked");
+        assert!(ui.pane_metadata.is_empty(), "pane_metadata leaked");
+        assert!(
+            ui.pane_declared_agent.is_empty(),
+            "pane_declared_agent leaked"
+        );
+    }
+
     /// Pane controller like `OpenTabPC` (unique `mock-pane-N` ids, records every
     /// `focus_pane`) but it ALSO reports the last-focused pane back through
     /// `focused_pane_id()` — the live process-wide focus a real controller
