@@ -4552,7 +4552,13 @@ mod tests {
         // Split off this very test module; parsers built inside it are fixtures
         // (`wide_char_in_one_row_pane_does_not_crash_the_tui` deliberately
         // constructs a raw 1x10 parser to prove the vt100 bug still exists).
-        let (prod, _tests) = SRC
+        // `include_str!` yields the file exactly as checked out, and Windows
+        // checks it out with CRLF endings — so every `\n`-anchored marker below
+        // (this split, and the `\n}\n` that ends the helper) silently fails to
+        // match there. Normalize once so the guard reads the same source on
+        // every platform.
+        let src = SRC.replace("\r\n", "\n");
+        let (prod, _tests) = src
             .split_once("\n#[cfg(test)]\nmod tests {")
             .expect("test module marker moved; update this guard");
 
