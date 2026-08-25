@@ -55,8 +55,91 @@ watch = false
 | `[[modes]]` | `name` (required), `init_command` (optional), `panes`, `rules`, `reactive_panes` (default: 2) |
 | `[[modes.panes]]` | `command` (required), `name` (optional label), `watch` (default: true) |
 | `[[modes.rules]]` | `pattern` (regex, required), `watch` (bool), `interval` (seconds) |
+| `[[orchestrations]]` | `name` (optional), `default` (bool, default: false), `extends` (optional), `roles` |
 
-For the full reference and more examples, see [Workspace Modes](workspace-modes.md).
+For the full reference and more examples, see [Workspace Modes](workspace-modes.md) and [Orchestration](orchestration.md).
+
+### Choosing the Default Orchestration
+
+A project may define several `[[orchestrations]]` — commonly the same team of roles wired to different providers. Most of the time you name the one you want:
+
+```bash
+dot-agent-deck dispatch fix-auth --orchestration 'anthropic' --task '…'
+```
+
+But two things start an orchestration **without** naming one: `dispatch --orchestration=` with an empty value, and a [scheduled task](scheduled-tasks.md) whose working directory defines orchestrations. Add `default = true` to the block those should open:
+
+```toml
+[[orchestrations]]
+name = "mixed"
+default = true
+# roles …
+
+[[orchestrations]]
+name = "anthropic"
+# roles …
+```
+
+`default` sits on the block, so it moves with the block. Exactly one orchestration may declare it, and that orchestration must define roles — `dot-agent-deck validate` rejects both mistakes.
+
+**If nothing declares it, the first orchestration with roles wins.** That is the historical rule and it still applies, so a config written before this key keeps behaving identically. It is worth declaring anyway: with several orchestrations defined, reordering the file changes which one every unnamed run opens, and nothing in that diff says so. When the choice is left implicit, the deck says which one it took and what else was available — in the dispatch's reply, in `dispatch --list-targets`, in `dot-agent-deck validate`, and in the daemon log for a scheduled run that has nobody watching.
+
+`dispatch --list-targets` marks the answer:
+
+```
+Available dispatch targets:
+  single            one agent (--single)
+  orchestration     'mixed' — 6 roles (--orchestration 'mixed')  [default]
+  orchestration     'anthropic' — 6 roles (--orchestration 'anthropic')
+```
+
+### Sharing One Orchestration Across Providers
+
+`extends` lets one orchestration inherit another's roles, so a set of variants that differ only in which agent each role launches is written once:
+
+```toml
+[[orchestrations]]
+name = "mixed"
+default = true
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "devbox run agent-orchestrator"
+start = true
+prompt_template = """
+You coordinate the team. …
+"""
+
+[[orchestrations.roles]]
+name = "coder"
+command = "devbox run agent-coder"
+description = "Implements features, fixes bugs"
+
+[[orchestrations]]
+name = "GPT"
+extends = "mixed"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "devbox run agent-orchestrator-oc"
+
+[[orchestrations.roles]]
+name = "coder"
+command = "devbox run agent-coder-oc"
+```
+
+`GPT` gets both roles with `mixed`'s `start`, `description` and `prompt_template` intact; only the two commands differ. Editing the orchestrator's `prompt_template` in `mixed` changes it for every variant — which is the point, and the reason to prefer this over copying the block.
+
+The rules:
+
+- **`extends` names the parent's literal `name`.** The parent may appear anywhere in the file, above or below. A block with no `name` cannot be a parent.
+- **Roles are matched by name and the parent's ORDER is kept.** A role's position within the orchestration is what the tab layout and delegation key panes on, so a variant always opens with the same columns as its parent, whatever order you write the overrides in.
+- **An omitted field keeps the parent's value.** Restate only what differs. To turn off an inherited `clear = true`, write `clear = false` explicitly — an omitted boolean means "inherit", not "false".
+- **A role name the parent does not have is added** as a new role, and must carry its own `command` since there is nothing to inherit one from.
+- **Chains work** (`a` extends `b` extends `c`); a cycle is rejected when the file is read.
+- **`default` and `name` are never inherited** — they identify the block, not its workflow.
+
+An `extends` naming an orchestration that does not exist, or forming a cycle, fails the whole config to load with a message naming both sides. That is deliberate: the alternative leaves the variant with only the roles it restated, and the symptom is then "orchestration must have at least 2 roles" about a file that plainly has six.
 
 ### Top-Level Keys
 

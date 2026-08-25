@@ -24,14 +24,14 @@ Four outcomes, kept distinct because collapsing them makes the agent state somet
 
 | Situation | What you get |
 |---|---|
-| Config with orchestrations | Each role-bearing one, by the name the spawn will use |
+| Config with orchestrations | Each role-bearing one, by the name the spawn will use, with `[default]` on whichever an unnamed dispatch would open |
 | No config file | `single` only — the truth |
 | Config present but unparseable | The parse error, named, and a non-zero exit |
 | Pane's directory unknown | Said plainly, and explicitly *not* "this repo has none" |
 
 Naming an orchestration the repo does not define is an **error** listing what is available, not a silent fallback — and it is rejected *before* the worktree is created, so a typo leaves no directory or branch behind. Schedule/authoring modes never appear: a schedule creates a *future* task, so it is not something a dispatch can start.
 
-With neither flag, the shape falls back to whatever the repo's config implies (its first role-bearing `[[orchestrations]]`, else a single agent) — the pre-selector behaviour, kept so an older CLI keeps working against a newer daemon.
+With neither flag, the shape falls back to whatever the repo's config implies (its DEFAULT `[[orchestrations]]` — the block carrying `default = true`, else the first one with roles — and a single agent when it defines none) — the pre-selector behaviour, kept so an older CLI keeps working against a newer daemon. When that choice is implicit, the dispatch's reply carries a note naming what was opened and what else was defined; see [Configuration](../configuration.md#choosing-the-default-orchestration).
 
 ## What the unit actually gets
 

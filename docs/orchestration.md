@@ -214,7 +214,9 @@ The release flow is stateful: open branch → push → create PR → wait for CI
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `name` | string | no | cwd basename | Display name shown in the tab bar. Defaults to the project directory name when empty. |
-| `roles` | array | yes | — | Role definitions. Must contain at least one role with `start = true`. |
+| `default` | bool | no | `false` | Marks this as the orchestration a run opens when the caller named none — `dispatch --orchestration=` with an empty value, and a [scheduled task](scheduled-tasks.md) rooted here. Exactly one orchestration may declare it, and it must have roles. Without any declaration the first orchestration with roles wins, which is what happened before this key existed. See [Choosing the default orchestration](configuration.md#choosing-the-default-orchestration). |
+| `extends` | string | no | — | Inherit another orchestration's roles by its `name`, then override them with this block's own `[[orchestrations.roles]]` entries, matched by role name. Written for the case where several orchestrations run the same team on different providers. See [Sharing one orchestration across providers](configuration.md#sharing-one-orchestration-across-providers). |
+| `roles` | array | yes¹ | — | Role definitions. Must contain at least one role with `start = true`. ¹Optional in a block that `extends` another, which may restate only the roles it changes. |
 
 ### `[[orchestrations.roles]]`
 
@@ -410,7 +412,19 @@ cd your-project
 dot-agent-deck validate
 ```
 
+It reports errors (which stop an orchestration opening) and warnings (which do not). Among them, for projects with more than one orchestration: declaring `default = true` twice, or on a block with no roles, is an **error**; defining several orchestrations and declaring the default on none of them is a **warning**, because the choice then rests on the order of the blocks in the file.
+
 ## Running more than one orchestration
+
+### Several definitions in one project
+
+A project can define more than one `[[orchestrations]]` block — most often the same team of roles wired to different providers, so a contributor with credentials for one provider can still run it and a run survives one provider's credits running out. This repo's own `.dot-agent-deck.toml` does exactly that with `mixed`, `anthropic` and `GPT`.
+
+Two keys make that practical, and both are documented in [Configuration](configuration.md): `default = true` declares which one an unnamed run opens (rather than leaving it to file order), and `extends` lets the variants inherit one workflow instead of being three copies of it.
+
+Defining several is unrelated to *running* several at once, which is what the rest of this section is about.
+
+### Running several at once
 
 Concurrent orchestrations are safe **across directories**. Each orchestration tab is its own routing group, so a delegate never reaches another orchestration's worker and a work-done never reaches another orchestration's orchestrator — even when two orchestrations share the same `name`. Distinct directories also mean distinct `.dot-agent-deck/` coordination files and distinct working trees, so the two pipelines never contend for the same state on disk either.
 
