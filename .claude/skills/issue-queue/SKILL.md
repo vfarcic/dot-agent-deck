@@ -235,6 +235,21 @@ The reasoning behind this is in [`docs/dispatcher-mode.md`](../../../docs/dispat
 
 **If `--list-targets` errors**, you have neither of the two answers. The message says which case it is: `DOT_AGENT_DECK_PANE_ID environment variable not set` means nothing can be dispatched from here at all (see the prerequisite above), and `the daemon did not answer list-targets` means no daemon or an older build. The command's own error names the fallback — dispatch `--single`, or `--orchestration <name>` if you know the name. **Take that to the runner rather than acting on it**: guessing the shape is what this step exists to prevent, and a failed query is not a reason to start guessing.
 
+### Which orchestration — asked ONCE per session, not per unit
+
+Since issue #705 this repo defines **three** orchestrations rather than one: `mixed`, `anthropic` and `GPT`. They run the identical six roles with the identical prompts; only which agent each role launches differs. So `--list-targets` now offers three, and "single or team?" has become a four-way question.
+
+**Do not fold the provider into the per-unit shape question.** The two are different kinds of decision and asking them together makes the runner re-answer a settled one on every issue in the batch:
+
+- **Shape** (single vs team) is a property of **the work** — is it divisible, does it need independent review? It genuinely varies between two issues in one batch, so **ask it per unit**: one prompt carrying one line per issue, and take a "single for all three" as the runner's answer rather than as your assumption. (Issue #674 is the change that made this explicit in the step above; hold to it even if you are reading a build that predates it.)
+- **Provider** (`mixed` / `anthropic` / `GPT`) is a property of **the session** — which credits are healthy today, which stack the runner wants exercised. It does not vary with the issue at all, and asking a runner the same provider question five times in one batch is the symptom to avoid.
+
+So ask the provider **once**, when the first unit in the batch turns out to want an orchestration, and reuse the answer for the rest of the session. Re-ask only if the runner raises it, or if a dispatch fails on that provider's credentials.
+
+**Pass the name explicitly, always: `--orchestration 'mixed'`, never a bare `--orchestration=`.** The bare form opens whichever orchestration the repo declares as its default, which is currently `mixed` — a fact about the config file, not a choice the runner made in this conversation. `--list-targets` shows which one that is with a `[default]` marker; that marker is there to inform the question, not to answer it.
+
+If the runner has no preference, say which one you are taking and why (`mixed` is the default and exercises the most providers) rather than silently omitting the flag.
+
 ## Step 8 — Compose the task in a FILE, and dispatch one unit per issue
 
 **The task goes in a file. `--task-file` is the default here, not an escape hatch:**
