@@ -713,6 +713,7 @@ fn build_dispatcher_mode(working_dir: &std::path::Path) -> ModeConfig {
         dir = working_dir.display(),
     );
     ModeConfig {
+        agent: None,
         name: DISPATCHER_MODE_NAME.to_string(),
         init_command: None,
         seed_prompt: Some(seed),
@@ -816,6 +817,7 @@ fn build_schedule_authoring_mode(
         }
     };
     ModeConfig {
+        agent: None,
         name: SCHEDULE_MODE_NAME.to_string(),
         init_command: None,
         seed_prompt: Some(seed),
@@ -1246,6 +1248,7 @@ impl NewPaneFormState {
         // time by `build_schedule_authoring_mode` (threaded with the picked dir),
         // so `seed_prompt` here is dead data; leave it `None`.
         let schedule_authoring = ModeConfig {
+            agent: None,
             name: SCHEDULE_MODE_NAME.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -1256,6 +1259,7 @@ impl NewPaneFormState {
         // PRD #120: synthetic issue-dispatch authoring option (name only; seed
         // derived at submit time). Whether it is offered is the flag snapshot.
         let issue_dispatch_authoring = ModeConfig {
+            agent: None,
             name: ISSUE_DISPATCH_MODE_NAME.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -1455,6 +1459,7 @@ impl NewPaneFormState {
         // PRD #170 round 2 (reviewer finding 7): seed is derived at submit time by
         // `build_schedule_authoring_mode`; the synthetic mode only carries `name`.
         let schedule_authoring = ModeConfig {
+            agent: None,
             name: SCHEDULE_MODE_NAME.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -1463,6 +1468,7 @@ impl NewPaneFormState {
             reactive_panes: 0,
         };
         let issue_dispatch_authoring = ModeConfig {
+            agent: None,
             name: ISSUE_DISPATCH_MODE_NAME.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -2146,6 +2152,28 @@ struct UiState {
     pane_names: HashMap<String, String>,
     /// Maps pane_id → display name; survives session restarts (e.g. /clear).
     pane_display_names: HashMap<String, String>,
+    /// Issue #308: maps pane_id → the agent type its config DECLARED
+    /// (`agent = "…"` on the role or mode), for panes that made a declaration.
+    ///
+    /// Kept beside `SessionState.agent_type` rather than written into it,
+    /// because the two answer different questions and only one of them may
+    /// drive timing. `SessionState.agent_type` is the OBSERVED identity: it
+    /// stays `AgentType::None` until something running in the pane reports, and
+    /// three separate readiness gates read exactly that — `agent_ready` in the
+    /// orchestrator-prompt, mode-seed and dispatch paths all spell "the agent
+    /// has started" as `agent_type != AgentType::None`. Seeding a declaration
+    /// into that field would make all three fire at spawn and type a prompt
+    /// into a launcher that has not started its agent yet — which is precisely
+    /// the population (`devbox run -- codex`) this key exists for, so the
+    /// feature would break delivery for exactly the users it is meant to help.
+    ///
+    /// A declaration is nonetheless real knowledge, and the whole point of
+    /// issue #308 is that the card should show it immediately. So it lands
+    /// here, is read only by [`render_session_card`], and changes nothing but
+    /// what is drawn. The same split PRD #225 made between
+    /// `RunningAgent::agent_type` (observed, badge) and `spawn_agent_type`
+    /// (launch), one layer up.
+    pane_declared_agent: HashMap<String, AgentType>,
     /// Maps pane_id → launch metadata for auto-save/restore.
     pane_metadata: HashMap<String, config::SavedPane>,
     config: DashboardConfig,
@@ -2461,6 +2489,7 @@ impl UiState {
             new_pane_form: None,
             pane_names: HashMap::new(),
             pane_display_names: HashMap::new(),
+            pane_declared_agent: HashMap::new(),
             pane_metadata: HashMap::new(),
             config,
             keybindings,
@@ -4794,11 +4823,18 @@ fn deliver_orchestrator_prompt(
 /// mode/restore agent shell (the one launch class that doesn't pass its command
 /// through the common `agent_pty::spawn` boundary — it spawns a shell and
 /// injects the command as keystrokes). Resolves the Wrapper-strategy identity
-/// from the command and returns `dot-agent-deck wrap --agent <name> -- <cmd>`
-/// for a Wrapper agent (Codex); returns the command unchanged for native agents.
-/// Idempotent, so a re-typed already-wrapped command is never double-wrapped.
-fn wrap_agent_command(command: &str) -> String {
-    match AgentType::from_command(Some(command)) {
+/// and returns `dot-agent-deck wrap --agent <name> -- <cmd>` for a Wrapper
+/// agent (Codex); returns the command unchanged for native agents. Idempotent,
+/// so a re-typed already-wrapped command is never double-wrapped.
+///
+/// Issue #308: `declared` is the mode's `agent = "…"` key when it has one, and
+/// it wins over parsing the command — a mode agent pane running
+/// `devbox run codex-big` is otherwise typed in BARE, and an unwrapped Codex
+/// emits nothing until its first turn, so the pane reads "No agent" for as long
+/// as the user has not prompted it. `None` (every mode without the key) derives
+/// from the command exactly as before.
+fn wrap_agent_command(command: &str, declared: Option<AgentType>) -> String {
+    match declared.or_else(|| AgentType::from_command(Some(command))) {
         Some(agent_type) => crate::wrap::wrap_launch_command(command, &agent_type),
         None => command.to_string(),
     }
@@ -8554,6 +8590,7 @@ fn close_tab_by_index(
             drop(st);
             for id in &outcome.closed {
                 ui.pane_metadata.remove(id);
+                ui.pane_declared_agent.remove(id);
             }
             if outcome.is_clean() {
                 ui.status_message = Some(("Closed tab".to_string(), std::time::Instant::now()));
@@ -8980,6 +9017,7 @@ fn dispatch_action(
                             st.unregister_pane(&pane_id);
                             drop(st);
                             ui.pane_metadata.remove(&pane_id);
+                            ui.pane_declared_agent.remove(&pane_id);
                             ui.status_message =
                                 Some((format!("Closed pane {pane_id}"), std::time::Instant::now()));
                         }
@@ -9533,6 +9571,15 @@ fn dispatch_action(
                                     .insert(role_pane_ids[i].clone(), role.name.clone());
                                 ui.pane_names
                                     .insert(role_pane_ids[i].clone(), role.name.clone());
+                                // Issue #308: a role that DECLARED its agent
+                                // badges from here, not from a hook — which is
+                                // the whole point for a launcher command, and
+                                // the only option at all for an agent that
+                                // announces itself late (Codex) or never (Pi).
+                                if let Some(declared) = role.declared_agent_type() {
+                                    ui.pane_declared_agent
+                                        .insert(role_pane_ids[i].clone(), declared);
+                                }
                             }
                             let start_idx =
                                 orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
@@ -9649,10 +9696,19 @@ fn dispatch_action(
                     // hydration carries it; the local placeholder stays at `None`
                     // until the first `SessionStart` hook fires (pre-M2.13
                     // contract).
-                    let spawn_agent_type = if req.command.is_empty() {
-                        None
-                    } else {
-                        AgentType::from_command(Some(req.command.as_str()))
+                    //
+                    // Issue #308: for a MODE the command is typed in the form
+                    // while the identity may be declared in `[[modes]]`, so the
+                    // declaration answers first — that is the only thing that
+                    // can identify a `devbox run codex-big` agent pane, and it
+                    // drives the wrap below as well as the badge.
+                    let spawn_agent_type = match req.mode_config.as_ref() {
+                        Some(mode) if !req.command.is_empty() => {
+                            mode.resolved_agent_type(req.command.as_str())
+                        }
+                        Some(mode) => mode.declared_agent_type(),
+                        None if req.command.is_empty() => None,
+                        None => AgentType::from_command(Some(req.command.as_str())),
                     };
                     // PRD #20 M8: launch Wrapper-strategy agents (Codex now;
                     // Gemini later) WRAPPED so their stdout is monitored
@@ -9757,6 +9813,17 @@ fn dispatch_action(
                             ui.pane_display_names
                                 .insert(new_id.clone(), resolved_name.clone());
                             ui.pane_names.insert(new_id.clone(), resolved_name);
+                            // Issue #308: a mode may declare what its agent pane
+                            // runs, since that pane's command is typed in this
+                            // form rather than written in the config. A plain
+                            // dashboard card declares nothing and is unchanged.
+                            if let Some(declared) = req
+                                .mode_config
+                                .as_ref()
+                                .and_then(|mode| mode.declared_agent_type())
+                            {
+                                ui.pane_declared_agent.insert(new_id.clone(), declared);
+                            }
                             let mode_name_for_save =
                                 req.mode_config.as_ref().map(|m| m.name.clone());
                             ui.pane_metadata.insert(
@@ -9857,7 +9924,10 @@ fn dispatch_action(
                                                 // launch line here. The persisted
                                                 // `saved.command` stays bare (only
                                                 // the injected line is transformed).
-                                                let launch = wrap_agent_command(&agent_cmd);
+                                                let launch = wrap_agent_command(
+                                                    &agent_cmd,
+                                                    mode_config.declared_agent_type(),
+                                                );
                                                 let _ = pane.write_to_pane(&new_id, &launch);
                                             }
                                         }
@@ -11556,6 +11626,15 @@ pub fn run_tui(
                                         .insert(role_pane_ids[i].clone(), role.name.clone());
                                     ui.pane_names
                                         .insert(role_pane_ids[i].clone(), role.name.clone());
+                                    // Issue #308: a restored role keeps its
+                                    // declared badge, so a session restore looks
+                                    // like the tab that was saved rather than
+                                    // reverting every launcher role to
+                                    // "No agent".
+                                    if let Some(declared) = role.declared_agent_type() {
+                                        ui.pane_declared_agent
+                                            .insert(role_pane_ids[i].clone(), declared);
+                                    }
                                 }
                                 // Re-capture the orchestration metadata onto the
                                 // start role pane so a later snapshot keeps the
@@ -11732,10 +11811,14 @@ pub fn run_tui(
             // (the agent command is sent later via `write_to_pane`), so
             // infer agent_type from the saved command rather than from
             // the spawn command (which is `None` here).
+            // Issue #308: the mode's `agent = "…"` declaration answers first, so
+            // a restored declared agent pane badges immediately instead of
+            // waiting for a hook that a launcher-hidden Codex will not send
+            // until its first turn.
             let mode_agent_type = if saved_pane.command.is_empty() {
-                None
+                mode_config.declared_agent_type()
             } else {
-                AgentType::from_command(Some(saved_pane.command.as_str()))
+                mode_config.resolved_agent_type(saved_pane.command.as_str())
             };
             match pane.create_pane_with_options(
                 None,
@@ -11792,7 +11875,10 @@ pub fn run_tui(
                                 // (the persisted `saved_pane.command` stays bare).
                                 let _ = pane.write_to_pane(
                                     &new_id,
-                                    &wrap_agent_command(&saved_pane.command),
+                                    &wrap_agent_command(
+                                        &saved_pane.command,
+                                        mode_config.declared_agent_type(),
+                                    ),
                                 );
                             }
                         }
@@ -11802,6 +11888,7 @@ pub fn run_tui(
                             ui.pane_metadata.remove(&new_id);
                             ui.pane_display_names.remove(&new_id);
                             ui.pane_names.remove(&new_id);
+                            ui.pane_declared_agent.remove(&new_id);
                             ui.session_warnings.push(format!(
                                 "Warning: failed to restore mode '{}': {e}",
                                 mode_config.name
@@ -11822,8 +11909,13 @@ pub fn run_tui(
                                 terminal.get_frame().area(),
                             );
                             // PRD #76 M2.13: infer agent_type from the
-                            // saved command for the fallback path too.
-                            let fb_agent_type = AgentType::from_command(cmd);
+                            // saved command for the fallback path too — and,
+                            // since issue #308, prefer the mode's declaration:
+                            // the mode failed to restore, but what its agent
+                            // pane runs did not change.
+                            let fb_agent_type = mode_config
+                                .declared_agent_type()
+                                .or_else(|| AgentType::from_command(cmd));
                             match pane.create_pane_with_options(
                                 cmd,
                                 Some(&saved_pane.dir),
@@ -11890,8 +11982,11 @@ pub fn run_tui(
                         terminal.get_frame().area(),
                     );
                     // PRD #76 M2.13: infer agent_type from saved command
-                    // for this outer-error fallback as well.
-                    let fb_agent_type = AgentType::from_command(cmd);
+                    // for this outer-error fallback as well, with the mode's
+                    // issue-#308 declaration taking precedence as above.
+                    let fb_agent_type = mode_config
+                        .declared_agent_type()
+                        .or_else(|| AgentType::from_command(cmd));
                     match pane.create_pane_with_options(
                         cmd,
                         Some(&saved_pane.dir),
@@ -14323,6 +14418,13 @@ fn render_card_grid(
                 if n <= 9 { Some(n as u8) } else { None }
             };
             let card_area = col_chunks[col_idx];
+            // Issue #308: what this pane's config said it runs, for a launcher
+            // command that says nothing itself. Consulted only while the pane's
+            // agent has not identified itself.
+            let declared_agent_type = session
+                .pane_id
+                .as_deref()
+                .and_then(|pane_id| ui.pane_declared_agent.get(pane_id));
             render_session_card(
                 frame,
                 card_area,
@@ -14335,6 +14437,7 @@ fn render_card_grid(
                 // PRD #341 M4: the live deck's mode, so the seam that pins the
                 // selection accent and the running app cannot disagree.
                 ui.mode,
+                declared_agent_type,
             );
             // PRD #80 M4: record this card's screen rect (paired with its flat
             // selection index) for the mouse hit-test. Safe to mutate `ui` here
@@ -18375,8 +18478,31 @@ fn render_session_card(
     // PRD #341 M4: which mode the deck is being rendered in. Only the selected
     // card's accent reads it (see `selected_card_border_style`).
     mode: UiMode,
+    // Issue #308: the agent this pane's config DECLARED, for a pane that made a
+    // declaration and whose agent has not identified itself yet. Used ONLY when
+    // the observed `session.agent_type` is still the neutral placeholder, so an
+    // agent that has reported always wins — a declaration cannot keep
+    // mislabelling a card once the pane says otherwise. `None` for every pane
+    // with no declaration, which is every pane before this key existed and the
+    // default for the L1 render seams.
+    declared_agent_type: Option<&AgentType>,
 ) {
-    let is_placeholder = session.agent_type == crate::event::AgentType::None;
+    // The type the card SHOWS. A launcher command (`devbox run -- codex`)
+    // identifies nothing, so without the declaration this stays
+    // `AgentType::None` and the card reads "No agent" — for Codex, until the
+    // first delegated task, because it posts nothing before its first turn.
+    // Note this is a display decision and nothing more: the readiness gates
+    // that decide WHEN a prompt may be written still read
+    // `session.agent_type`, so a declared pane is drawn immediately and still
+    // waits for its agent to actually start before anything is typed into it.
+    let shown_agent_type = if session.agent_type == crate::event::AgentType::None {
+        declared_agent_type
+            .cloned()
+            .unwrap_or(crate::event::AgentType::None)
+    } else {
+        session.agent_type.clone()
+    };
+    let is_placeholder = shown_agent_type == crate::event::AgentType::None;
     let (status_label, status_style) = if is_placeholder {
         ("No agent", text_primary())
     } else {
@@ -18427,7 +18553,7 @@ fn render_session_card(
     // common case. A non-live card additionally shows a trailing
     // `history` / `view-only` marker.
     let badge_style = Style::default()
-        .fg(crate::agent_registry::spec(&session.agent_type).badge_color)
+        .fg(crate::agent_registry::spec(&shown_agent_type).badge_color)
         .add_modifier(Modifier::BOLD);
     // The marker is appended AFTER the `<type> · <id-or-name>` so the
     // `<type> · …` shape callers match on (e.g. `Codex ·`, `Pi · orch-01`)
@@ -18438,7 +18564,7 @@ fn render_session_card(
     let title_segments: Vec<(String, Style)> = {
         let mut segs = vec![
             (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
-            (format!("{}", session.agent_type), badge_style),
+            (format!("{shown_agent_type}"), badge_style),
             (label_after_badge, title_bold),
         ];
         if !is_live {
@@ -18954,6 +19080,10 @@ pub fn render_card_for_mode_to_buffer(
                 card_number,
                 density.into(),
                 mode,
+                // Issue #308: the L1 single-card seam has no pane-declaration
+                // map behind it; a fixture that wants a type puts it on the
+                // `SessionState` it hands in.
+                None,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -19018,6 +19148,7 @@ pub fn render_dashboard_cards_to_buffer(
                     card_number,
                     card_density,
                     UiMode::Normal,
+                    None,
                 );
             }
         })
@@ -20553,6 +20684,7 @@ pub fn render_new_pane_form_to_buffer(
     let modes: Vec<ModeConfig> = mode_names
         .iter()
         .map(|n| ModeConfig {
+            agent: None,
             name: (*n).to_string(),
             init_command: None,
             seed_prompt: None,
@@ -20594,6 +20726,7 @@ pub fn render_new_pane_orchestration_guard_to_buffer(
     let orchestrations = vec![OrchestrationConfig {
         name: "tdd-cycle".to_string(),
         roles: vec![crate::project_config::OrchestrationRoleConfig {
+            agent: None,
             name: "orchestrator".to_string(),
             command: "claude".to_string(),
             start: true,
@@ -20640,6 +20773,7 @@ pub fn render_new_pane_orchestration_name_collision_to_buffer(
     let orchestrations = vec![OrchestrationConfig {
         name: "tdd-cycle".to_string(),
         roles: vec![crate::project_config::OrchestrationRoleConfig {
+            agent: None,
             name: "orchestrator".to_string(),
             command: "claude".to_string(),
             start: true,
@@ -21394,6 +21528,7 @@ mod tests {
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "cat".to_string(),
                     start: true,
@@ -21402,6 +21537,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "worker".to_string(),
                     command: "cat".to_string(),
                     start: false,
@@ -21506,6 +21642,7 @@ mod tests {
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "cat".to_string(),
                     start: true,
@@ -21514,6 +21651,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "worker".to_string(),
                     command: "cat".to_string(),
                     start: false,
@@ -22548,6 +22686,7 @@ mod tests {
 
         fn mk_role(name: &str, start: bool) -> OrchestrationRoleConfig {
             OrchestrationRoleConfig {
+                agent: None,
                 name: name.to_string(),
                 command: String::new(),
                 start,
@@ -23147,6 +23286,7 @@ mod tests {
             name: "review".into(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".into(),
                     command: "claude".into(),
                     start: true,
@@ -23155,6 +23295,7 @@ mod tests {
                     clear: true,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "reviewer".into(),
                     command: "claude --model sonnet".into(),
                     start: false,
@@ -23609,6 +23750,7 @@ mod tests {
             name: "code-review".to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "claude".to_string(),
                     start: true,
@@ -23617,6 +23759,7 @@ mod tests {
                     clear: true,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "coder".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -23625,6 +23768,7 @@ mod tests {
                     clear: true,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "reviewer".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -23777,6 +23921,7 @@ mod tests {
             name: "test".to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "lead".to_string(),
                     command: "claude".to_string(),
                     start: true,
@@ -23785,6 +23930,7 @@ mod tests {
                     clear: true,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "worker".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -23809,6 +23955,7 @@ mod tests {
             name: "test".to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "lead".to_string(),
                     command: "claude".to_string(),
                     start: true,
@@ -23817,6 +23964,7 @@ mod tests {
                     clear: true,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "worker".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -25355,6 +25503,7 @@ mod tests {
     /// Mirrors the verified helper in `tab.rs`'s test module (private there).
     fn mode_config_local(name: &str, side_pane_count: usize) -> ModeConfig {
         ModeConfig {
+            agent: None,
             name: name.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -26043,6 +26192,7 @@ mod tests {
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "echo orch".to_string(),
                     start: true,
@@ -26051,6 +26201,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "coder".to_string(),
                     command: "echo coder".to_string(),
                     start: false,
@@ -26828,6 +26979,7 @@ mod tests {
             name: "orch".to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "echo orch".to_string(),
                     start: true,
@@ -26836,6 +26988,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "coder".to_string(),
                     command: "echo coder".to_string(),
                     start: false,
@@ -26844,6 +26997,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "reviewer".to_string(),
                     command: "echo reviewer".to_string(),
                     start: false,
@@ -28129,6 +28283,7 @@ mod tests {
 
     fn make_mode(name: &str) -> ModeConfig {
         ModeConfig {
+            agent: None,
             name: name.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -28143,6 +28298,7 @@ mod tests {
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "coder".to_string(),
                     command: "claude".to_string(),
                     start: true,
@@ -28151,6 +28307,7 @@ mod tests {
                     clear: true,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "reviewer".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -30003,6 +30160,7 @@ mod tests {
             name: CONFIG_NAME.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "echo orch".to_string(),
                     start: true,
@@ -30011,6 +30169,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "coder".to_string(),
                     command: "echo coder".to_string(),
                     start: false,
@@ -30493,6 +30652,7 @@ mod tests {
         let config = OrchestrationConfig {
             name: "capture-at-creation".to_string(),
             roles: vec![OrchestrationRoleConfig {
+                agent: None,
                 name: "orchestrator".to_string(),
                 command: "cat".to_string(),
                 start: true,
@@ -33914,6 +34074,7 @@ mod tests {
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "cat".to_string(),
                     start: true,
@@ -33922,6 +34083,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "worker".to_string(),
                     command: "cat".to_string(),
                     start: false,

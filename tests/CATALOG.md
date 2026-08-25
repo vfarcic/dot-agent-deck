@@ -3185,15 +3185,44 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Layer:** fast PTY registry integration (`AgentPtyRegistry::spawn_agent` + hook-path `set_agent_type` + `respawn_agent_for_pane`, with PATH recorder stubs).
 - **Agent:** synthetic `devbox run codex-big` launcher whose basename intentionally does not infer an agent type.
 - **Asserts:** the initial and replacement exec records are byte-identical `devbox run codex-big` lines even after the registry badge upgrades from `None` to `Some(Codex)`; no `dot-agent-deck wrap` line appears on respawn.
-- **Does not assert:** daemon hook-socket ingestion of the badge (covered by `hooks/delivery/007`); an EDITED role command's effect on the wrap decision (`codex/spawn/008`); real Codex behavior.
+- **Does not assert:** daemon hook-socket ingestion of the badge (covered by `hooks/delivery/007`); an EDITED role command's effect on the wrap decision (`codex/spawn/008`); a config-declared identity (`codex/spawn/009`–`010`); real Codex behavior.
 - **Platform coverage:** mac+linux.
 
 ##### codex/spawn/008 — A respawn's wrap decision follows the command it is actually launching, so an explicit Codex identity can never wrap a different agent (PRD #225 review finding 1).
 - **Layer:** fast PTY registry integration (`AgentPtyRegistry::spawn_agent` + two `respawn_agent_for_pane` calls, with PATH recorder stubs for `devbox`, `claude`, and `dot-agent-deck`).
 - **Agent:** synthetic `devbox run codex-big` launcher spawned with an explicit `AgentType::Codex` identity, then respawned once with that same command and once with the role command edited to `claude --model haiku`.
 - **Asserts:** the unchanged respawn relaunches byte-identically as `dot-agent-deck wrap --agent codex -- devbox run codex-big` (the frozen identity is the only thing that knows this launcher is Codex); the edited respawn executes a bare `claude --model haiku` and never `wrap --agent codex -- claude …`; and the pane badge follows the newly launched command (`ClaudeCode`) instead of still advertising the replaced agent. Both halves are load-bearing — replaying the frozen identity verbatim wraps Claude as Codex, and dropping it flips the unchanged pane to bare.
-- **Does not assert:** the hook-learned badge path (`codex/spawn/007`); a launcher whose command implies no type AND whose underlying agent changed (`devbox run codex-big` → `devbox run claude-big`), which keeps its creation-time identity by documented design.
+- **Does not assert:** the hook-learned badge path (`codex/spawn/007`); a freshly re-read config declaration that legitimately outranks the current command's derived type (`codex/spawn/010`); a launcher whose command implies no type AND whose underlying agent changed (`devbox run codex-big` → `devbox run claude-big`), which keeps its creation-time identity by documented design.
 - **Platform coverage:** mac+linux.
+
+##### codex/spawn/009 — A config-declared Codex orchestration role wraps and badges a non-inferable launcher before the first task.
+- **Layer:** L2 synthetic PTY-attached new-pane orchestration flow with PATH recorder stubs.
+- **Agent:** synthetic `devbox run codex-big` launcher declared as Codex by the start role.
+- **Asserts:** the role executes exactly once as `dot-agent-deck wrap --agent codex -- devbox run codex-big`, and its visible card reads `Codex` at spawn without any delegated task or synthesized hook event.
+- **Does not assert:** `clear = true` re-create precedence (`codex/spawn/010`), mode panes (`codex/spawn/011`), or a real Codex process (`codex/spawn/012`).
+- **Platform coverage:** mac+linux.
+
+##### codex/spawn/010 — A current config declaration outranks command derivation across spawn and missing-record re-create without admitting learned identity into the exec line.
+- **Layer:** fast PTY registry integration (`AgentPtyRegistry::spawn_agent` + `respawn_or_recreate_agent_for_pane` + `set_agent_type`, with PATH recorder stubs).
+- **Agent:** synthetic Codex declaration applied to a command whose basename derives Claude Code.
+- **Asserts:** declared Codex beats the conflicting Claude derivation at initial spawn and on two same-pane missing-record `clear = true` re-creates; a conflicting learned badge observation cannot replace the declared badge or alter the byte-identical Codex wrapper exec record.
+- **Does not assert:** TOML parsing or the visible card (covered by `codex/spawn/009`); ordinary frozen-identity respawn precedence (covered by `codex/spawn/008`); daemon hook-socket ingestion.
+- **Platform coverage:** mac+linux.
+
+##### codex/spawn/011 — A config-declared Codex mode pane wraps and badges a shell-injected non-inferable launcher.
+- **Layer:** L2 synthetic PTY-attached new-pane mode flow with PATH recorder stubs.
+- **Agent:** synthetic `devbox run codex-big` launcher entered for a `[[modes]]` agent pane declared as Codex.
+- **Asserts:** the mode's shell-injection seam executes exactly `dot-agent-deck wrap --agent codex -- devbox run codex-big`, and the mode agent's Dashboard card reads `Codex` without a hook event.
+- **Does not assert:** restored mode panes, persistent side panes, orchestration roles (`codex/spawn/009`), or real Codex behavior.
+- **Platform coverage:** mac+linux.
+
+##### codex/spawn/012 — A real script-launched Codex role badges at spawn before its first prompt.
+- **Layer:** L2 PTY-attached real-agent orchestration flow; runtime-skipped unless `check_codex_available` verifies the binary, persisted auth, and a live model request.
+- **Agent:** real interactive Codex on the cheap test model, launched by a bespoke `run-codex.sh` role command whose config declares `agent = "codex"`.
+- **Asserts:** the bespoke script starts the genuine Codex CLI and, before any prompt-bearing event or user input, the role card visibly reads `Codex` and `Idle`.
+- **Does not assert:** prompt delivery, model prose, tool execution, `clear = true` respawn, or post-prompt native hook behavior.
+- **Platform coverage:** mac+linux (real-agent tier is local-only).
+- **Cost note:** one minimal mini-model availability probe; the launched interactive agent receives no prompt.
 
 #### codex/hooks
 

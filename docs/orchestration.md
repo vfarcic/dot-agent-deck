@@ -222,10 +222,36 @@ The release flow is stateful: open branch → push → create PR → wait for CI
 |---|---|---|---|---|
 | `name` | string | yes | — | Role identifier. Shown on the role card in the deck so you can tell agents apart at a glance. Also used in `--to` arguments and in task/work-done file names. Must be unique within the orchestration. Must not contain `/`, `\`, or `..`. |
 | `command` | string | yes | — | Shell command that launches the agent for this role. Must result in a `claude`, `opencode`, `pi`, `codex`, or `devin` process (e.g. `claude`, `devbox run agent-big`, `opencode --model gpt-4o`, `pi --provider openrouter`, `codex`, `devin`). Other commands will run but won't get live status tracking on the role card. |
+| `agent` | string | no | — | Which agent `command` actually launches, when the command cannot say so itself — one of `claude`, `opencode`, `pi`, `codex`, `devin`. Set it whenever `command` runs the agent through something else (`devbox run -- codex`, `mise exec -- codex`, `make codex`, `./run-codex.sh`). See [Declaring the agent behind a launcher command](#declaring-the-agent-behind-a-launcher-command). |
 | `start` | bool | no | `false` | `true` marks this role as the orchestrator. Exactly one role per orchestration must have `start = true`. |
 | `description` | string | no | — | Tells the orchestrator when to use this role and what it is for, so it can decide which worker to delegate to in a given situation. Also shown on the role card in the deck. |
 | `prompt_template` | string | no | — | Standing instructions the orchestrator prepends to every task it sends this role. When set, the orchestrator's task text — however it was passed, `--task` or `--task-file` — is appended under a `## Task` heading, so the worker sees both the template and the task together. |
 | `clear` | bool | no | `true` | Restart the agent before each delegation, so every task starts from a clean context. The deck terminates the running agent, launches the role's `command` again in the same pane, waits through a readiness buffer, and only then delivers the task. Set to `false` for roles that need to carry state across delegations (e.g. a `release` role that must remember the PR URL and branch name when retrying after a CI failure). See [What `clear` does to delivery](#what-clear-does-to-delivery). |
+
+### Declaring the agent behind a launcher command
+
+The deck works out which agent a role runs by looking at the first word of its `command`. `claude --model opus`, `/usr/local/bin/codex`, `env FOO=1 codex` and `sh -c 'codex …'` all resolve fine. What cannot resolve is a command whose first word is a **launcher**: `devbox run -- codex`, `mise exec -- codex`, `nix develop -c codex`, `make codex`, or a project script like `./run-codex.sh`. The deck sees `devbox`, or `make`, or `run-codex.sh` — and there is no way to tell from the outside what any of those will end up starting, so it does not guess.
+
+Two things follow from that, and one of them is easy to miss. The obvious one: the role card reads **No agent** and shows no status. The subtler one: identifying the agent is also what lets the deck monitor it, and for **Codex** that monitoring is the only thing that can identify the pane before you give it work — Codex does not announce itself until its first turn begins. So a Codex role behind a launcher stays blank from launch until the moment you delegate the first task to it, and then quietly starts working. Claude, by comparison, announces itself as soon as it starts, which is why the same `devbox run` wrapper looks fine for a Claude role and broken for a Codex one.
+
+`agent` is how you answer the question the command cannot:
+
+```toml
+[[orchestrations.roles]]
+name = "reviewer"
+command = "devbox run -- codex --sandbox workspace-write"
+agent = "codex"
+```
+
+Notes on how it behaves:
+
+- The value is the agent's command name — `claude`, `opencode`, `pi`, `codex` or `devin` — matched exactly and in lower case. It is the same name `dot-agent-deck wrap --agent <name>` takes, and both resolve it the same way.
+- **An unrecognised name gives you no agent rather than a guess.** `agent = "codx"` does not fall back to reading the command; it means "this pane has no agent", the same as if detection had failed. That is deliberate — silently overruling what you wrote would be worse — but it does mean a typo looks like the problem you were trying to fix. `dot-agent-deck validate` warns about an unknown name and lists the ones it accepts.
+- The declaration **wins over the command**. If you declare `agent = "codex"` on a role whose command runs Claude, you get Codex, so keep the two in step.
+- It is re-read from `.dot-agent-deck.toml` on every delegation, exactly like `command` is. Edit either one and the next `clear = true` delegation picks it up — you do not have to recreate the role's pane.
+- Leaving `agent` out, or leaving it empty, changes nothing: the deck reads the command as it always has. Existing configs need no edit.
+
+For a mode's agent pane the same key lives on `[[modes]]` — see [Workspace Modes](workspace-modes.md#declaring-the-agent-behind-a-launcher-command).
 
 ### Minimal example
 
@@ -454,6 +480,10 @@ Only the role with `start = true` can call `dot-agent-deck delegate`. If a worke
 ### Worker receives no task
 
 The role name in `--to` must match the `name` field in the config exactly (case-sensitive). Check for typos. Also verify the worker's pane is part of the same orchestration tab — you cannot delegate across tabs.
+
+### A role card reads "No agent", or a Codex role stays blank until the first task
+
+The role's `command` launches the agent through something the deck cannot see past — `devbox run -- codex`, `mise exec -- codex`, `make codex`, `./run-codex.sh`. Add an [`agent`](#declaring-the-agent-behind-a-launcher-command) line to that role naming what it launches, and the card identifies itself at spawn instead. If you already have one and the card is still blank, check the spelling: an unrecognised name means "no agent" on purpose, and `dot-agent-deck validate` will name it.
 
 ### A delegated worker never came up
 

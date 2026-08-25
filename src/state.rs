@@ -3114,7 +3114,9 @@ async fn dispatch_one_owned(
     // mid-session re-delegation is a documented further enhancement.
     let is_pi_native = role_config
         .as_ref()
-        .map(|r| r.clear && AgentType::from_command(Some(&r.command)) == Some(AgentType::Pi))
+        // Issue #308: the role's RESOLVED type, so a declared Pi worker behind a
+        // launcher command takes the same native-delivery path as a bare `pi`.
+        .map(|r| r.clear && r.resolved_agent_type() == Some(AgentType::Pi))
         .unwrap_or(false);
 
     // PRD #249 review (finding B1): the registry agent id the task pointer is
@@ -3174,7 +3176,15 @@ async fn dispatch_one_owned(
                     },
                 }
             }),
-            agent_type: AgentType::from_command(Some(&role.command)),
+            // Issue #308: the role's RESOLVED type — declaration first, command
+            // derivation second. This value is CURRENT, not frozen: `role` came
+            // out of the `.dot-agent-deck.toml` re-read at the top of this
+            // function, in the same pass as the `role.command` handed to the
+            // respawn below, so the pair cannot disagree. That is precisely why
+            // `respawn_or_recreate_agent_for_pane` is allowed to let it outrank
+            // deriving from the command, where the pane's FROZEN
+            // `spawn_agent_type` is not (PRD #225 finding 1).
+            agent_type: role.resolved_agent_type(),
             env: vec![(
                 crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
                 pane_id.clone(),
@@ -7307,6 +7317,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(role_index, name)| crate::spawn::RoleSpawn {
+                agent_type: None,
                 role_index,
                 role_name: (*name).to_string(),
                 command: "cat".to_string(),

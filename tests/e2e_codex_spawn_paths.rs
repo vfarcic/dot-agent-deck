@@ -38,6 +38,10 @@ fn recorder_path(record: &Path) -> (tempfile::TempDir, String, PathBuf) {
         &dir.path().join("codex"),
         "#!/bin/sh\nprintf 'BARE codex %s\\n' \"$*\" >> \"$CODEX_PATH_RECORD\"\nexec cat\n",
     );
+    write_executable(
+        &dir.path().join("devbox"),
+        "#!/bin/sh\nprintf 'BARE devbox %s\\n' \"$*\" >> \"$CODEX_PATH_RECORD\"\nexec cat\n",
+    );
     let path = format!(
         "{}:{}",
         dir.path().display(),
@@ -68,6 +72,22 @@ fn assert_only_wrapped(record: &Path) {
         "every Codex launch on this path must cross the Wrapper strategy exactly once; observed:\n{}",
         launched.join("\n")
     );
+}
+
+fn wait_for_declared_launcher(record: &Path) -> Vec<String> {
+    common::wait_for_file_containing(record, "devbox run codex-big", Duration::from_secs(10))
+        .unwrap_or_else(|state| panic!("the declared launcher was never executed: {state}"));
+    common::recorded_agent_launches(record)
+}
+
+fn path_with_binary_dir() -> String {
+    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let bin_dir = Path::new(bin)
+        .parent()
+        .expect("test binary has a parent dir")
+        .to_str()
+        .expect("binary directory is UTF-8");
+    format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default())
 }
 
 fn open_form(deck: &TuiDeck) {
@@ -161,4 +181,175 @@ fn spawn_004_mode_restore_wraps_codex() {
         .with_continue_mode_session("restored-mode-codex", "codex", "wrapped-mode")
         .launch_with_fixture("codex-spawn-paths");
     assert_only_wrapped(&record);
+}
+
+/// Scenario: Open an orchestration whose start role declares Codex but runs
+/// through a non-inferable launcher. Without delegating a task or synthesizing a
+/// hook, the role must launch through the Codex wrapper and its card must read Codex.
+#[spec("codex/spawn/009")]
+#[test]
+#[cfg(unix)]
+fn spawn_009_declared_orchestration_launcher_wraps_and_badges_codex() {
+    let fixture = common::harness_tempdir().expect("declared orchestration record dir");
+    let record = fixture.path().join("declared-orchestration.log");
+    let (_bin, path, wrap_bin) = recorder_path(&record);
+    let deck = TuiDeck::builder()
+        .with_pty_size(160, 42)
+        .with_env("PATH", path)
+        .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+    std::fs::write(
+        deck.workdir().join(".dot-agent-deck.toml"),
+        "[[orchestrations]]\n\
+         name = \"declared-codex\"\n\n\
+         [[orchestrations.roles]]\n\
+         name = \"recorder\"\n\
+         command = \"devbox run codex-big\"\n\
+         agent = \"codex\"\n\
+         start = true\n\
+         clear = false\n",
+    )
+    .expect("write declared orchestration config");
+
+    open_form(&deck);
+    deck.send_keys(b"\x1b[C");
+    deck.wait_for_absence("Command:");
+    deck.send_keys(b"\r");
+    deck.send_keys(b"\r");
+
+    let launched = wait_for_declared_launcher(&record);
+    deck.send_bytes(b"\x04");
+    deck.wait_for_string("[New Pane Ctrl+N]");
+    let codex_badge = deck.wait_for_grid_string_within("Codex ·", Duration::from_secs(5));
+    let grid = deck.snapshot_grid();
+
+    assert!(
+        launched == ["WRAPPED wrap --agent codex -- devbox run codex-big"] && codex_badge,
+        "a declared Codex role must wrap its non-inferable launcher exactly once and render a Codex badge before any delegate or hook event; launches={launched:?}, codex_badge={codex_badge}\nFinal grid:\n{grid}"
+    );
+}
+
+/// Scenario: Select a configured mode whose agent pane declares Codex, then
+/// enter a non-inferable launcher in the form. The shell-injected command must
+/// be wrapped exactly once and the pane's Dashboard card must read Codex.
+#[spec("codex/spawn/011")]
+#[test]
+#[cfg(unix)]
+fn spawn_011_declared_mode_launcher_wraps_and_badges_codex() {
+    let fixture = common::harness_tempdir().expect("declared mode record dir");
+    let record = fixture.path().join("declared-mode.log");
+    let (_bin, path, wrap_bin) = recorder_path(&record);
+    let deck = TuiDeck::builder()
+        .with_pty_size(160, 42)
+        .with_env("PATH", path)
+        .with_env("CODEX_PATH_RECORD", record.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_WRAP_BIN", wrap_bin.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+    std::fs::write(
+        deck.workdir().join(".dot-agent-deck.toml"),
+        "[[modes]]\n\
+         name = \"declared-codex-mode\"\n\
+         agent = \"codex\"\n\
+         reactive_panes = 0\n",
+    )
+    .expect("write declared mode config");
+
+    open_form(&deck);
+    deck.send_keys(b"\x1b[C");
+    deck.send_keys(b"\r");
+    deck.send_keys(b"\r");
+    deck.send_keys(b"devbox run codex-big");
+    deck.send_keys(b"\r");
+
+    let launched = wait_for_declared_launcher(&record);
+    deck.send_bytes(b"\x04");
+    deck.send_bytes(b"\x1b[D");
+    deck.wait_for_string("session(s)");
+    let codex_badge = deck.wait_for_grid_string_within("Codex ·", Duration::from_secs(5));
+    let grid = deck.snapshot_grid();
+
+    assert!(
+        launched == ["WRAPPED wrap --agent codex -- devbox run codex-big"] && codex_badge,
+        "a declared Codex mode pane must wrap its shell-injected non-inferable launcher exactly once and render a Codex Dashboard badge; launches={launched:?}, codex_badge={codex_badge}\nFinal grid:\n{grid}"
+    );
+}
+
+/// Scenario: Start a real cheap-model Codex through a bespoke launcher script
+/// used by an orchestration role that declares Codex. Before any prompt is
+/// submitted, the role card must already read Codex and the real CLI must be live.
+#[spec("codex/spawn/012")]
+#[test]
+#[cfg(unix)]
+fn spawn_012_real_script_launched_codex_badges_before_first_prompt() {
+    skip_unless!(common::check_codex_available());
+
+    let real_codex = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("codex"))
+                .find(|candidate| candidate.is_file())
+        })
+        .expect("available Codex binary resolves on PATH");
+    let deck = TuiDeck::builder()
+        .with_pty_size(160, 42)
+        .with_env("PATH", path_with_binary_dir())
+        .with_env("REAL_CODEX_BIN", real_codex.to_string_lossy())
+        .with_imported_codex_credentials()
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    let work = deck.workdir().to_path_buf();
+    let launch_record = work.join("real-script-codex.log");
+    write_executable(
+        &work.join("run-codex.sh"),
+        "#!/bin/sh\nprintf 'REAL_CODEX %s\\n' \"$*\" >> real-script-codex.log\nexec \"$REAL_CODEX_BIN\" \"$@\"\n",
+    );
+    let command = format!(
+        "./run-codex.sh --model {} --sandbox workspace-write --ask-for-approval never -c 'sandbox_workspace_write.network_access=true' -c 'model_reasoning_effort=\"low\"'",
+        common::codex_test_model(),
+    );
+    std::fs::write(
+        work.join(".dot-agent-deck.toml"),
+        format!(
+            "[[orchestrations]]\n\
+             name = \"real-declared-codex\"\n\n\
+             [[orchestrations.roles]]\n\
+             name = \"real-codex\"\n\
+             command = {command:?}\n\
+             agent = \"codex\"\n\
+             start = true\n\
+             clear = false\n"
+        ),
+    )
+    .expect("write real declared Codex orchestration config");
+
+    let events = deck.subscribe_events();
+    open_form(&deck);
+    deck.send_keys(b"\x1b[C");
+    deck.wait_for_absence("Command:");
+    deck.send_keys(b"\r");
+    deck.send_keys(b"\r");
+    common::wait_for_file_containing(&launch_record, "REAL_CODEX", Duration::from_secs(20))
+        .unwrap_or_else(|state| panic!("the bespoke real-Codex launcher never executed: {state}"));
+
+    deck.send_bytes(b"\x04");
+    deck.wait_for_string("[New Pane Ctrl+N]");
+    let codex_badge = deck.wait_for_grid_string_within("Codex ·", Duration::from_secs(5));
+    let grid = deck.snapshot_grid();
+    let real_launch =
+        std::fs::read_to_string(&launch_record).expect("read bespoke real-Codex launch record");
+    let no_prompt_event = !events.snapshot().iter().any(|event| {
+        event
+            .user_prompt
+            .as_deref()
+            .is_some_and(|prompt| !prompt.is_empty())
+    });
+
+    assert!(
+        codex_badge && no_prompt_event && grid.contains("Idle"),
+        "the real script-launched Codex role must render a Codex Idle card before any prompt is submitted; real_launch={real_launch:?}, codex_badge={codex_badge}, no_prompt_event={no_prompt_event}\nFinal grid:\n{grid}"
+    );
 }

@@ -512,16 +512,20 @@ fn is_wrap_invocation(command: &str) -> bool {
 
 /// Resolve the agent identity emitted events should carry.
 ///
-/// An explicit `--agent` override wins and is resolved through the registry, so
-/// a name the registry doesn't know yet becomes the neutral
-/// [`AgentType::None`] rather than a guess. Otherwise the type is inferred from
-/// the wrapped binary exactly like the TUI spawn sites
-/// ([`AgentType::from_command`]). Either way, with Codex in the registry (M7),
+/// An explicit `--agent` override wins and is resolved through
+/// [`crate::agent_registry::resolve_declared_agent`], so a name the registry
+/// doesn't know yet becomes the neutral [`AgentType::None`] rather than a
+/// guess. That is the SAME function the `agent = "…"` config key resolves
+/// through (issue #308), so the two declaration surfaces cannot drift.
+/// Otherwise the type is inferred from the wrapped binary exactly like the TUI
+/// spawn sites ([`AgentType::from_command`]).
+///
+/// Either way, with Codex in the registry (M7),
 /// `wrap -- codex` (or `--agent codex`) resolves to it and [`ruleset_for`]
 /// selects the [`CODEX`] rules — with no change here.
 fn resolve_agent_type(agent_override: Option<&str>, program: &str) -> AgentType {
     if let Some(name) = agent_override {
-        return crate::agent_registry::detect_from_basename(name).unwrap_or(AgentType::None);
+        return crate::agent_registry::resolve_declared_agent(name);
     }
     AgentType::from_command(Some(program)).unwrap_or(AgentType::None)
 }

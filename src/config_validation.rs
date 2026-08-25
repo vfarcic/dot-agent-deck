@@ -87,6 +87,21 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
         }
     }
 
+    // Issue #308: a declared `agent = "…"` that no shipped agent claims is a
+    // WARNING, not an error — the config still loads and the mode still opens,
+    // it just gets no agent. Worth saying out loud because the failure is
+    // otherwise silent and looks exactly like the bug the key exists to fix: the
+    // pane reads "No agent", which is precisely what a user reaches for this key
+    // to stop seeing. `AgentType::None` is what an unrecognized name resolves
+    // to, deliberately — the declaration is honored rather than quietly
+    // replaced by a guess from the command — so the only place to surface a typo
+    // is here.
+    for mode in &config.modes {
+        if let Some(issue) = unknown_agent_issue(&mode.name, mode.agent.as_deref()) {
+            issues.push(issue);
+        }
+    }
+
     // Check for duplicate orchestration names.
     let mut seen_orch_names = HashSet::new();
     for orch in &config.orchestrations {
@@ -162,6 +177,16 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
             }
         }
 
+        // Issue #308: same unknown-name warning for a role declaration.
+        for role in &orch.roles {
+            if let Some(issue) = unknown_agent_issue(&orch.name, role.agent.as_deref()) {
+                issues.push(ValidationIssue {
+                    message: format!("role '{}': {}", role.name, issue.message),
+                    ..issue
+                });
+            }
+        }
+
         // Warn about worker roles without descriptions (helps orchestrator know capabilities).
         for role in &orch.roles {
             if !role.start && role.description.is_none() {
@@ -178,6 +203,28 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
     }
 
     issues
+}
+
+/// Issue #308: the warning for an `agent = "…"` declaration no shipped agent
+/// claims, or `None` when the declaration is absent, blank (which reads as
+/// unset) or recognized.
+///
+/// Resolution goes through exactly the accessor the spawn seams use, so this
+/// warns for precisely the values that will produce an agent-less pane and for
+/// no others.
+fn unknown_agent_issue(scope: &str, declared: Option<&str>) -> Option<ValidationIssue> {
+    let name = declared?.trim();
+    if name.is_empty() || crate::agent_registry::detect_from_basename(name).is_some() {
+        return None;
+    }
+    Some(ValidationIssue {
+        severity: Severity::Warning,
+        scope: scope.to_string(),
+        message: format!(
+            "unknown agent '{name}' — this pane will have no agent and no wrapper; known agents: {}",
+            crate::agent_registry::declarable_agent_names().join(", ")
+        ),
+    })
 }
 
 /// Returns true if any issue is an error.
@@ -203,6 +250,7 @@ mod tests {
 
     fn make_role(name: &str, start: bool) -> OrchestrationRoleConfig {
         OrchestrationRoleConfig {
+            agent: None,
             name: name.to_string(),
             command: "claude".to_string(),
             start,
@@ -234,6 +282,7 @@ mod tests {
 
     fn make_mode(name: &str, rules: Vec<ModeRule>) -> ModeConfig {
         ModeConfig {
+            agent: None,
             name: name.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -332,6 +381,7 @@ mod tests {
     #[test]
     fn rules_with_zero_reactive_panes_produces_error() {
         let config = make_config(vec![ModeConfig {
+            agent: None,
             name: "dev".to_string(),
             init_command: None,
             seed_prompt: None,
@@ -356,6 +406,7 @@ mod tests {
     #[test]
     fn empty_mode_is_valid() {
         let config = make_config(vec![ModeConfig {
+            agent: None,
             name: "empty".to_string(),
             init_command: None,
             seed_prompt: None,
@@ -451,6 +502,7 @@ mod tests {
             vec![
                 make_role("orchestrator", true),
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "worker".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -475,6 +527,7 @@ mod tests {
             vec![
                 make_role("orchestrator", true),
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "../evil".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -499,6 +552,7 @@ mod tests {
             vec![
                 make_role("orchestrator", true),
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "sub/dir".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -523,6 +577,7 @@ mod tests {
             vec![
                 make_role("orchestrator", true),
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "sub\\dir".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -557,5 +612,62 @@ mod tests {
         assert_eq!(sanitize_role_name(".\\."), "");
         assert_eq!(sanitize_role_name("./../."), "");
         assert_eq!(sanitize_role_name("a./.b"), "ab");
+    }
+
+    /// Issue #308: a declared agent name no shipped agent claims is warned
+    /// about — on a role and on a mode — while a recognized name, a blank value
+    /// (which reads as unset) and an absent key are all silent.
+    #[test]
+    fn unknown_declared_agent_warns_on_roles_and_modes() {
+        let mut role = make_role("worker", false);
+        role.agent = Some("codx".to_string());
+        let mut start = make_role("orchestrator", true);
+        start.agent = Some("codex".to_string());
+        let mut mode = make_mode("declared", vec![]);
+        mode.agent = Some("nonsense".to_string());
+        let mut blank = make_mode("blank", vec![]);
+        blank.agent = Some("  ".to_string());
+
+        let config = ProjectConfig {
+            modes: vec![mode, blank, make_mode("plain", vec![])],
+            orchestrations: vec![OrchestrationConfig {
+                name: "orch".to_string(),
+                roles: vec![start, role],
+            }],
+            worker_response_timeout_minutes:
+                crate::project_config::DEFAULT_WORKER_RESPONSE_TIMEOUT_MINUTES,
+        };
+
+        let warned: Vec<String> = validate_config(&config)
+            .into_iter()
+            .filter(|i| i.message.contains("unknown agent"))
+            .map(|i| format!("{}|{}", i.scope, i.message))
+            .collect();
+
+        assert_eq!(
+            warned.len(),
+            2,
+            "exactly the two unrecognized declarations warn; got {warned:?}"
+        );
+        assert!(
+            warned
+                .iter()
+                .any(|w| w.starts_with("declared|unknown agent 'nonsense'")),
+            "the mode declaration warns under the mode's name; got {warned:?}"
+        );
+        assert!(
+            warned
+                .iter()
+                .any(|w| w.starts_with("orch|role 'worker': unknown agent 'codx'")),
+            "the role declaration warns under the orchestration, naming the role; got {warned:?}"
+        );
+        assert!(
+            warned.iter().all(|w| w.contains("codex")),
+            "the warning must list what the user could have written; got {warned:?}"
+        );
+        assert!(
+            !has_errors(&validate_config(&config)),
+            "an unknown agent name is advisory — the config still loads"
+        );
     }
 }
