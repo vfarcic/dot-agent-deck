@@ -18,11 +18,19 @@ pub enum ProjectConfigError {
     },
 }
 
+/// A parsed, **fully resolved** `.dot-agent-deck.toml`.
+///
+/// Resolved is load-bearing: every `[[orchestrations]]` entry here carries its
+/// complete role list, with any `extends` already flattened into it
+/// ([`RawOrchestration`]). Nothing downstream re-resolves, which matters more
+/// than it looks — `state::lookup_orchestration_role_indexed` re-reads this file
+/// on EVERY delegate, `spawn` reads it per fire, and the TUI reads it per tab.
+/// A resolution step any one of them could skip is a resolution step one of them
+/// eventually would.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "RawProjectConfig")]
 pub struct ProjectConfig {
-    #[serde(default)]
     pub modes: Vec<ModeConfig>,
-    #[serde(default)]
     pub orchestrations: Vec<OrchestrationConfig>,
     /// PRD #126: how long the daemon waits for a delegated worker to send
     /// `work-done` before injecting an idle prompt into the orchestrator's
@@ -50,7 +58,6 @@ pub struct ProjectConfig {
     /// *before* the first table header (`[[modes]]` / `[[orchestrations]]`).
     /// Appended at the end of the file it would silently become a key of the
     /// last table and be ignored.
-    #[serde(default = "default_worker_response_timeout_minutes")]
     pub worker_response_timeout_minutes: u64,
 }
 
@@ -108,9 +115,10 @@ pub struct ModeRule {
     pub interval: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestrationConfig {
-    #[serde(default)]
+    /// The block's `name` as written, or the cwd basename when it had none —
+    /// normalised at load by [`load_project_config`].
     pub name: String,
     /// Issue #704: this block declares itself the orchestration a run opens when
     /// the caller named none — `default = true` in the TOML.
@@ -133,7 +141,6 @@ pub struct OrchestrationConfig {
     /// Resolution lives in [`default_orchestration`]; `dot-agent-deck validate`
     /// rejects a config that declares it twice, or declares it on a block with no
     /// roles.
-    #[serde(default)]
     pub default: bool,
     pub roles: Vec<OrchestrationRoleConfig>,
 }
@@ -235,22 +242,248 @@ impl OrchestrationConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestrationRoleConfig {
     pub name: String,
     pub command: String,
-    #[serde(default)]
     pub start: bool,
-    #[serde(default)]
     pub description: Option<String>,
-    #[serde(default)]
     pub prompt_template: Option<String>,
-    #[serde(default = "default_clear")]
     pub clear: bool,
 }
 
 fn default_clear() -> bool {
     true
+}
+
+// ---------------------------------------------------------------------------
+// The parse layer (issue #705).
+//
+// `.dot-agent-deck.toml` is deserialized into these types and immediately
+// resolved into the public ones above. Two things live here and nowhere else:
+// `extends`, which is flattened away entirely, and the OPTIONALITY of a role's
+// fields, which only an override needs.
+//
+// Why a separate layer rather than more `Option`s on `OrchestrationRoleConfig`:
+// that struct is threaded through the daemon, the TUI, the spawn path and the
+// snapshot format, and every one of them wants a role whose `command` simply
+// IS a string. Making the resolved type carry the parse type's uncertainty
+// would push a `.unwrap_or_default()` into a dozen call sites to buy nothing.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct RawProjectConfig {
+    #[serde(default)]
+    modes: Vec<ModeConfig>,
+    #[serde(default)]
+    orchestrations: Vec<RawOrchestration>,
+    #[serde(default = "default_worker_response_timeout_minutes")]
+    worker_response_timeout_minutes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawOrchestration {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    default: bool,
+    /// Issue #705: inherit another block's roles wholesale, then patch them.
+    ///
+    /// Exists because three orchestrations that differ only in each role's
+    /// `command` would otherwise be three copies of a 142-line block, ~70 lines
+    /// of which is one `prompt_template`. Issue #304 was closed over the
+    /// two-hand-maintained-lists version of that shape, after they drifted until
+    /// one was missing a mode the other had; three drift faster than two.
+    ///
+    /// Names the parent's literal `name`, which is why a block with no `name` (a
+    /// legal thing — it resolves to the cwd basename at load) cannot be a parent:
+    /// resolution runs before that basename is known, and matching on a name the
+    /// file does not contain would be a rule nobody could read off the file.
+    #[serde(default)]
+    extends: Option<String>,
+    #[serde(default)]
+    roles: Vec<RawRole>,
+}
+
+/// One role as written. Every field but `name` is optional, because in a block
+/// that `extends` another this is a PATCH: an omitted field keeps the parent's
+/// value, which is what lets a variant restate six commands and nothing else.
+///
+/// `start` and `clear` are `Option<bool>` rather than plain `bool` for exactly
+/// that reason — with a plain `bool`, "omitted" and "explicitly false" are the
+/// same token, so a patch could never turn OFF an inherited `clear = true`, and
+/// `clear`'s own default is `true`. Being unable to express half a boolean is
+/// the kind of limitation that gets discovered by someone hitting it.
+#[derive(Debug, Clone, Deserialize)]
+struct RawRole {
+    name: String,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    start: Option<bool>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    prompt_template: Option<String>,
+    #[serde(default)]
+    clear: Option<bool>,
+}
+
+impl TryFrom<RawProjectConfig> for ProjectConfig {
+    type Error = String;
+
+    fn try_from(raw: RawProjectConfig) -> Result<Self, Self::Error> {
+        Ok(ProjectConfig {
+            modes: raw.modes,
+            orchestrations: resolve_orchestrations(&raw.orchestrations)?,
+            worker_response_timeout_minutes: raw.worker_response_timeout_minutes,
+        })
+    }
+}
+
+/// Flatten every `extends` chain, in file order.
+///
+/// An unresolvable `extends` is a hard **parse** error rather than a validation
+/// warning. The alternative — leave the child with only its patch roles and let
+/// `validate_config` object — produces a config that is wrong in a way whose
+/// symptom ("orchestration must have at least 2 roles") names neither the typo
+/// nor the file it is in. Loud beats plausible here, and every caller already
+/// distinguishes an unparseable config from an absent one.
+fn resolve_orchestrations(raw: &[RawOrchestration]) -> Result<Vec<OrchestrationConfig>, String> {
+    let mut resolved: Vec<Option<OrchestrationConfig>> = vec![None; raw.len()];
+    for i in 0..raw.len() {
+        resolve_orchestration_at(raw, i, &mut resolved, &mut Vec::new())?;
+    }
+    Ok(resolved
+        .into_iter()
+        .map(|o| o.expect("every index was just resolved"))
+        .collect())
+}
+
+/// Resolve one block, resolving its parent first. `stack` carries the chain
+/// currently being resolved so a cycle is caught rather than recursed into; it
+/// also bounds the recursion depth at `raw.len()`.
+fn resolve_orchestration_at(
+    raw: &[RawOrchestration],
+    index: usize,
+    resolved: &mut Vec<Option<OrchestrationConfig>>,
+    stack: &mut Vec<usize>,
+) -> Result<(), String> {
+    if resolved[index].is_some() {
+        return Ok(());
+    }
+    if stack.contains(&index) {
+        let chain: Vec<&str> = stack
+            .iter()
+            .chain(std::iter::once(&index))
+            .map(|i| raw[*i].name.as_str())
+            .collect();
+        return Err(format!(
+            "`extends` forms a cycle: {}. An orchestration cannot inherit from itself, directly \
+             or through a chain.",
+            chain.join(" -> ")
+        ));
+    }
+
+    let this = &raw[index];
+    let base: Vec<OrchestrationRoleConfig> = match &this.extends {
+        None => Vec::new(),
+        Some(parent) => {
+            let parent_index = raw.iter().position(|o| o.name == *parent).ok_or_else(|| {
+                let defined: Vec<&str> = raw
+                    .iter()
+                    .filter(|o| !o.name.is_empty())
+                    .map(|o| o.name.as_str())
+                    .collect();
+                format!(
+                    "orchestration '{}' extends '{parent}', which is not defined in this \
+                         file{}",
+                    this.name,
+                    if defined.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (defined: {})", defined.join(", "))
+                    }
+                )
+            })?;
+            stack.push(index);
+            let outcome = resolve_orchestration_at(raw, parent_index, resolved, stack);
+            stack.pop();
+            outcome?;
+            resolved[parent_index]
+                .as_ref()
+                .expect("the parent was just resolved")
+                .roles
+                .clone()
+        }
+    };
+
+    resolved[index] = Some(OrchestrationConfig {
+        name: this.name.clone(),
+        default: this.default,
+        roles: apply_role_patches(&this.name, base, &this.roles)?,
+    });
+    Ok(())
+}
+
+/// Merge this block's roles onto the ones it inherited.
+///
+/// Matching is BY ROLE NAME, and the parent's ORDER is preserved: a role's index
+/// within the orchestration is what `TabMembership::Orchestration` and the
+/// delegate path key panes on, so a variant that reordered the roles would open
+/// its tab with the columns shuffled relative to its parent's. A patch naming a
+/// role the parent does not have is appended as a new role, which is how a
+/// variant adds one.
+fn apply_role_patches(
+    orchestration: &str,
+    mut roles: Vec<OrchestrationRoleConfig>,
+    patches: &[RawRole],
+) -> Result<Vec<OrchestrationRoleConfig>, String> {
+    for patch in patches {
+        match roles.iter_mut().find(|r| r.name == patch.name) {
+            Some(role) => {
+                if let Some(command) = &patch.command {
+                    role.command = command.clone();
+                }
+                if let Some(start) = patch.start {
+                    role.start = start;
+                }
+                if patch.description.is_some() {
+                    role.description = patch.description.clone();
+                }
+                if patch.prompt_template.is_some() {
+                    role.prompt_template = patch.prompt_template.clone();
+                }
+                if let Some(clear) = patch.clear {
+                    role.clear = clear;
+                }
+            }
+            None => {
+                // Nothing to inherit, so `command` is not optional here. Caught
+                // at parse time rather than left to `validate_config`'s empty
+                // -command error, which cannot say WHY it was empty — and the
+                // overwhelmingly likely cause is a typo in a role name that was
+                // meant to patch an inherited role.
+                let command = patch.command.clone().ok_or_else(|| {
+                    format!(
+                        "orchestration '{orchestration}' role '{}' has no `command`. Only a role \
+                         that PATCHES an inherited one (via `extends`) may omit it — check the \
+                         role name matches the parent's.",
+                        patch.name
+                    )
+                })?;
+                roles.push(OrchestrationRoleConfig {
+                    name: patch.name.clone(),
+                    command,
+                    start: patch.start.unwrap_or(false),
+                    description: patch.description.clone(),
+                    prompt_template: patch.prompt_template.clone(),
+                    clear: patch.clear.unwrap_or_else(default_clear),
+                });
+            }
+        }
+    }
+    Ok(roles)
 }
 
 /// Resolve an orchestration name with the cwd-basename fallback that
@@ -644,6 +877,209 @@ mod tests {
         let chosen =
             default_orchestration(&cfg, Path::new("/home/u/morning-digest")).expect("a candidate");
         assert_eq!(chosen.name, "morning-digest");
+    }
+
+    // --- Issue #705: `extends`, so variants share one workflow ---
+
+    /// A base with everything a real orchestration carries, so the inheritance
+    /// tests exercise more than `command`.
+    const BASE: &str = "\
+[[orchestrations]]
+name = \"mixed\"
+default = true
+
+[[orchestrations.roles]]
+name = \"orchestrator\"
+command = \"claude\"
+start = true
+prompt_template = \"You coordinate.\"
+
+[[orchestrations.roles]]
+name = \"coder\"
+command = \"claude\"
+description = \"Implements\"
+prompt_template = \"Implement it.\"
+
+[[orchestrations.roles]]
+name = \"release\"
+command = \"claude\"
+description = \"Ships\"
+clear = false
+
+";
+
+    #[test]
+    fn extends_inherits_every_role_and_field_the_child_does_not_restate() {
+        let cfg = parse(&format!(
+            "{BASE}[[orchestrations]]\nname = \"gpt\"\nextends = \"mixed\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"opencode\"\n\n\
+             [[orchestrations.roles]]\nname = \"coder\"\ncommand = \"opencode\"\n"
+        ));
+        let child = &cfg.orchestrations[1];
+        assert_eq!(child.name, "gpt");
+        assert_eq!(
+            child.roles.len(),
+            3,
+            "the un-patched `release` role must come along — inheriting only what you restate \
+             would make every variant a full copy again"
+        );
+
+        let orchestrator = &child.roles[0];
+        assert_eq!(orchestrator.command, "opencode", "the patch wins");
+        assert_eq!(
+            orchestrator.prompt_template.as_deref(),
+            Some("You coordinate."),
+            "the workflow is what the child is inheriting — restating it is the duplication this \
+             mechanism exists to remove"
+        );
+        assert!(orchestrator.start, "a bool the child never mentioned");
+
+        assert_eq!(
+            child.roles[2].command, "claude",
+            "untouched role, parent's command"
+        );
+        assert!(
+            !child.roles[2].clear,
+            "`clear = false` must survive inheritance — its own default is TRUE, so an inherited \
+             false is exactly the value a naive merge loses"
+        );
+
+        // And the parent is untouched by having been extended.
+        assert_eq!(cfg.orchestrations[0].roles[0].command, "claude");
+        assert!(cfg.orchestrations[0].default);
+        assert!(!child.default, "`default` is per-block, never inherited");
+    }
+
+    /// Role ORDER is the parent's, because a role's index is what the tab layout
+    /// and the delegate path key panes on.
+    #[test]
+    fn extends_keeps_the_parent_role_order_regardless_of_patch_order() {
+        let cfg = parse(&format!(
+            "{BASE}[[orchestrations]]\nname = \"gpt\"\nextends = \"mixed\"\n\n\
+             [[orchestrations.roles]]\nname = \"release\"\ncommand = \"oc-release\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"opencode\"\n"
+        ));
+        assert_eq!(
+            cfg.orchestrations[1]
+                .roles
+                .iter()
+                .map(|r| (r.name.as_str(), r.command.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("orchestrator", "opencode"),
+                ("coder", "claude"),
+                ("release", "oc-release")
+            ]
+        );
+    }
+
+    /// A patch naming a role the parent lacks ADDS it — that is how a variant
+    /// grows a role — and such a role must bring its own command.
+    #[test]
+    fn a_patch_for_an_unknown_role_appends_it_and_must_carry_a_command() {
+        let cfg = parse(&format!(
+            "{BASE}[[orchestrations]]\nname = \"plus\"\nextends = \"mixed\"\n\n\
+             [[orchestrations.roles]]\nname = \"auditor\"\ncommand = \"opencode\"\n"
+        ));
+        let roles = &cfg.orchestrations[1].roles;
+        assert_eq!(roles.len(), 4);
+        assert_eq!(roles[3].name, "auditor");
+        assert!(roles[3].clear, "a brand-new role takes the field defaults");
+
+        let err = toml::from_str::<ProjectConfig>(&format!(
+            "{BASE}[[orchestrations]]\nname = \"plus\"\nextends = \"mixed\"\n\n\
+             [[orchestrations.roles]]\nname = \"typoed-codre\"\n"
+        ))
+        .expect_err("a role that inherits nothing must state its command");
+        assert!(
+            err.to_string().contains("typoed-codre") && err.to_string().contains("`command`"),
+            "the error must name the role, because the likely cause is a misspelled patch \
+             target: {err}"
+        );
+    }
+
+    /// `command` stays required on an ordinary (non-extending) orchestration —
+    /// making it `Option` at the parse layer must not quietly relax that.
+    #[test]
+    fn a_role_in_a_plain_orchestration_still_requires_a_command() {
+        let err = toml::from_str::<ProjectConfig>(
+            "[[orchestrations]]\nname = \"solo\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\nstart = true\n",
+        )
+        .expect_err("no parent means nothing to inherit from");
+        assert!(err.to_string().contains("`command`"), "{err}");
+    }
+
+    #[test]
+    fn extends_chains_resolve_through_the_middle_link() {
+        let cfg = parse(&format!(
+            "{BASE}[[orchestrations]]\nname = \"gpt\"\nextends = \"mixed\"\n\n\
+             [[orchestrations.roles]]\nname = \"coder\"\ncommand = \"opencode\"\n\n\
+             [[orchestrations]]\nname = \"gpt-mini\"\nextends = \"gpt\"\n\n\
+             [[orchestrations.roles]]\nname = \"release\"\ncommand = \"oc-mini\"\n"
+        ));
+        let grandchild = &cfg.orchestrations[2];
+        assert_eq!(
+            grandchild.roles[0].command, "claude",
+            "from the grandparent"
+        );
+        assert_eq!(grandchild.roles[1].command, "opencode", "from the parent");
+        assert_eq!(grandchild.roles[2].command, "oc-mini", "its own");
+    }
+
+    /// A parent DEFINED BELOW its child still resolves — resolution is by name,
+    /// not by position, so the file can be ordered for reading.
+    #[test]
+    fn extends_resolves_a_parent_defined_later_in_the_file() {
+        let cfg = parse(&format!(
+            "[[orchestrations]]\nname = \"gpt\"\nextends = \"mixed\"\n\n\
+             [[orchestrations.roles]]\nname = \"coder\"\ncommand = \"opencode\"\n\n{BASE}"
+        ));
+        assert_eq!(cfg.orchestrations[0].roles.len(), 3);
+        assert_eq!(cfg.orchestrations[0].roles[1].command, "opencode");
+    }
+
+    #[test]
+    fn extends_naming_an_undefined_parent_is_a_parse_error_listing_what_exists() {
+        let err = toml::from_str::<ProjectConfig>(&format!(
+            "{BASE}[[orchestrations]]\nname = \"gpt\"\nextends = \"mixd\"\n"
+        ))
+        .expect_err("a typo'd parent must not resolve to an empty orchestration");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'gpt'") && msg.contains("mixd") && msg.contains("mixed"),
+            "the error must name the child, the missing parent AND what IS defined — otherwise \
+             the symptom is 'must have at least 2 roles' in a file that plainly has six: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_extends_cycle_is_refused_rather_than_recursed_into() {
+        for toml in [
+            "[[orchestrations]]\nname = \"a\"\nextends = \"a\"\n",
+            "[[orchestrations]]\nname = \"a\"\nextends = \"b\"\n\n\
+             [[orchestrations]]\nname = \"b\"\nextends = \"c\"\n\n\
+             [[orchestrations]]\nname = \"c\"\nextends = \"a\"\n",
+        ] {
+            let err = toml::from_str::<ProjectConfig>(toml).expect_err("a cycle must be refused");
+            assert!(err.to_string().contains("cycle"), "{err}");
+        }
+    }
+
+    /// Everything that parsed before this layer existed must still parse the
+    /// same way — the mechanism is opt-in per block.
+    #[test]
+    fn a_config_with_no_extends_is_unchanged_by_the_resolver() {
+        let cfg = parse(BASE);
+        assert_eq!(cfg.orchestrations.len(), 1);
+        assert_eq!(cfg.orchestrations[0].roles.len(), 3);
+        assert_eq!(cfg.orchestrations[0].roles[0].command, "claude");
+        assert!(cfg.orchestrations[0].roles[0].start);
+        assert!(!cfg.orchestrations[0].roles[2].clear);
+        assert!(
+            cfg.orchestrations[0].roles[1].clear,
+            "`clear` still defaults to true when nobody says otherwise"
+        );
     }
 
     #[test]
