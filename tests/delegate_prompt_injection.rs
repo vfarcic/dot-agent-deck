@@ -300,7 +300,10 @@ async fn wait_for_silence_notice(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let snapshot = registry.snapshot(agent_id).unwrap_or_default();
-        if snapshot_has_silence_notice(&snapshot) || tokio::time::Instant::now() >= deadline {
+        if (snapshot_has_silence_notice(&snapshot)
+            && silence_notice_terminator(&snapshot).is_some())
+            || tokio::time::Instant::now() >= deadline
+        {
             return snapshot;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
