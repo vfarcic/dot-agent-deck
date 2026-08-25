@@ -150,6 +150,76 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 filter = 'test(shell_activity_005_real_claude_bash_child_trips_the_descendant_scan)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
+# Issue #664: `scheduler/dispatch/015` boots THREE real interactive Haiku
+# panes at once and needs each of them to confirm its seed prompt inside a
+# deadline it does NOT control. `AUTOMATIC_PROMPT_DEADLINE` in
+# `src/prompt_delivery.rs` is 60 s, absolute, and captured in `spawn::deliver`
+# BEFORE the readiness wait; on expiry `abandon_spawn_prompt` publishes a
+# delivery notice that turns the card `Error` and stops retrying FOREVER. That
+# is production behaviour the test exercises, not a test budget — which is why
+# widening `slow-timeout` alone could never have fixed this one: the test's own
+# wait is already 150 s, 2.5x the production window, and nothing confirms a
+# delivery that has already been abandoned.
+#
+# Measured on `main` (`e8c443a`): green alone at 32.2 s, red in a full
+# `cargo test-e2e` at 174.1 s with two of the three panes `Error` and their
+# deliveries abandoned. The substantive fix is in the test itself — it was
+# spending half of every 60 s budget on a readiness gate this scenario cannot
+# satisfy; see the `DOT_AGENT_DECK_SESSION_START_WAIT_MS` comment in
+# `tests/e2e_prompt_delivery_confirmation.rs`. What remains here is the
+# concurrency bound the issue asks for, because three real cold boots against a
+# fixed 60 s window are only as fast as the machine underneath them.
+#
+# `threads-required` reserves the whole pool, so nothing else in the tier runs
+# alongside — the mechanism #415 and #502 both name for the PTY-contending
+# suites, applied to one test rather than to the tier. `priority` is
+# load-bearing with it rather than decoration: reached mid-run, an exclusive
+# test makes nextest DRAIN every running test before it can take the pool, and
+# this tier's tail holds 250-320 s tests, so it is scheduled first instead and
+# the reservation costs only its own runtime. Staging the three
+# seeds sequentially was the alternative and was rejected: "three concurrent
+# real dispatches" is the property under test and the field report it
+# reproduces.
+#
+# Issue #666 restaged the launcher: it now swallows BOTH payload attempts
+# rather than one, so each pane's delivery runs one further backoff step before
+# the agent-start rearm authorises the payload that finally lands. The
+# reservation's cost went from the ~6.5 s recorded here under #664 to ~10 s
+# measured on this branch — still a run-start slot rather than a drain of the
+# tier's tail, so nothing above changes. Do not read the old figure as a
+# regression budget: it described a one-swallow fixture that no longer exists.
+#
+# `retries = 1` covers what `threads-required` structurally CANNOT: load that
+# is not the tier's. Measured — with the reservation in place and NOTHING else
+# in the tier running, the test still failed once, because sibling agent
+# worktrees on the same box were mid-`rustc` and the 15-minute load average was
+# 58 on 16 cores. Two attempts is a bounded concession to that, not a
+# rerun-until-green: a genuine regression in the retry path fails BOTH, and
+# nextest reports a recovered run as FLAKY, so a machine that starts needing
+# the second attempt stays visible rather than silently absorbed. This test is
+# already in the flaky-tolerant pre-PR real-agent tier (CLAUDE.md rule 4) and
+# runs in no CI job.
+#
+# `slow-timeout` is widened for the usual reason (see the overrides above) and
+# NOT as a deadline extension — the test's 150 s assertion budget is untouched.
+# It is here because the FAILING path measured 174.1 s against the 3 x 60 s
+# default kill, a 6 s margin, and being killed there costs the per-pane
+# diagnostics that are the whole reason any of the above is known.
+#
+# The filter tracks the TEST FUNCTION name, not the `#[spec]` id, so it must
+# be updated in lockstep with any rename — a stale filter matches nothing and
+# silently drops this test back into the contended pool. A MISSPELLED SETTING
+# degrades the same way: nextest only WARNS on an unrecognised key
+# (`ignoring unknown configuration key: profile.default.overrides.N.<key>`)
+# and carries on, so read that line's absence as the confirmation that
+# `threads-required`, `priority` and `retries` were honoured.
+[[profile.default.overrides]]
+filter = 'test(dispatch_015_three_real_claude_seeds_are_genuinely_confirmed)'
+threads-required = "num-test-threads"
+priority = 50
+retries = 1
+slow-timeout = { period = "60s", terminate-after = 4 }
+
 # Decision 28 + M4.3: recording dumps land under
 # `<workspace>/.dot-agent-deck/recordings/<test-name>/` (see
 # `tests/common/mod.rs`). That tree is gitignored dev-time state, so

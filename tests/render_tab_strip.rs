@@ -110,10 +110,10 @@ fn dashboard_only_text(buffer: &ratatui::buffer::Buffer) -> String {
 /// tab whose panes carry a mix of `SessionStatus` values, and assert the
 /// orchestration tab's label renders in the `palette::status_color()` of the
 /// SINGLE highest-priority status among its panes — fixed order Error(Red) >
-/// WaitingForInput(Yellow) > Working(Green) > Thinking/Compacting(Blue) >
+/// WaitingForInput(Magenta) > Working(Green) > Thinking/Compacting(Blue) >
 /// Idle/Unknown(no tint) (PRD #333). Covers: (a) one `Error` among `Idle`
 /// panes -> Red; (b) one `WaitingForInput` among `Working`/`Idle` (no Error)
-/// -> Yellow; (c) all `Idle` -> the SAME base label color as an ordinary
+/// -> Magenta; (c) all `Idle` -> the SAME base label color as an ordinary
 /// tab, NOT `Color::DarkGray` (PRD #333 defect B: PRD #13 reserves DarkGray
 /// for purely-decorative elements, not label text); (d) `Thinking` +
 /// `Working` (no higher-priority state) -> Green, since Working outranks
@@ -148,10 +148,14 @@ fn orchestration_009_tab_label_colored_by_highest_priority_status() {
         80,
         &[None, Some(&[Working, WaitingForInput, Idle])],
     );
+    // Magenta, not Yellow: issue #579 moved the waiting role off yellow, which
+    // measured 1.70:1 against a white terminal background. A tab label is read
+    // text, so this is the surface the ratio matters most on
+    // (`theme/contrast/002` asserts it).
     assert_eq!(
         tab_label_fg(&buf, "squad"),
-        Color::Yellow,
-        "a tab with a WaitingForInput pane (no Error present) must render its label Yellow"
+        Color::Magenta,
+        "a tab with a WaitingForInput pane (no Error present) must render its label Magenta"
     );
 
     // (c) Every pane Idle -> falls through to the base/unstyled label color,

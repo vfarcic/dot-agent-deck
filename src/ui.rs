@@ -29,11 +29,12 @@ use crate::palette;
 use crate::pane::{AgentSpawnOptions, PaneController, PaneError, RenameOutcome};
 use crate::project_config::{ModeConfig, OrchestrationConfig, load_project_config};
 use crate::prompt_delivery::{
-    AUTOMATIC_PROMPT_DEADLINE, ConfirmationCapability, attempt_delivery_id, attempt_writes_payload,
-    log_prompt_abandoned, log_prompt_accumulated, log_prompt_confirmed, log_prompt_probe_submitted,
-    log_prompt_stopped, log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written,
-    mint_delivery_id, pane_confirmation_capability, prompt_submission_accumulated,
-    prompt_submission_matches, submission_is_after_watermark, unconfirmed_retry_delay,
+    AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, ConfirmationCapability, attempt_delivery_id,
+    attempt_writes_payload, log_prompt_abandoned, log_prompt_accumulated, log_prompt_confirmed,
+    log_prompt_probe_submitted, log_prompt_stopped, log_prompt_unconfirmable,
+    log_prompt_unconfirmed, log_prompt_written, mint_delivery_id, pane_confirmation_capability,
+    prompt_submission_accumulated, prompt_submission_matches, submission_is_after_watermark,
+    unconfirmed_retry_delay,
 };
 use crate::state::{AppState, DashboardStats, SessionState, SessionStatus, SharedState};
 use crate::tab::{OrchestrationRoleStatus, OrchestrationStatus, Tab, TabId, TabManager};
@@ -132,19 +133,153 @@ impl CardDensity {
     }
 }
 
-fn choose_density(total_cards: usize, cols: usize, available_height: u16) -> CardDensity {
-    let total_card_rows = total_cards.div_ceil(cols);
-    for density in [
+/// The richest density that renders `total_cards` cards in `cols` columns
+/// within `available_height` rows, or `None` when not even [`CardDensity::Compact`]
+/// fits them all.
+///
+/// The `None` is the whole point (issue #588). The predecessor of this function
+/// — `choose_density` — returned `Compact` both when Compact fit and when
+/// nothing fit, so its one caller could not tell a layout that works from one
+/// that is about to hide cards, and silently sliced in the second case.
+/// [`choose_grid_layout`] needs that distinction to decide whether to spend a
+/// column on completeness.
+fn fitting_density(total_cards: usize, cols: usize, available_height: u16) -> Option<CardDensity> {
+    let total_card_rows = total_cards.div_ceil(cols) as u64;
+    [
         CardDensity::Spacious,
         CardDensity::Normal,
         CardDensity::Compact,
-    ] {
-        let needed = total_card_rows as u16 * density.card_height();
-        if needed <= available_height {
-            return density;
+    ]
+    .into_iter()
+    .find(|density| {
+        total_card_rows * u64::from(density.card_height()) <= u64::from(available_height)
+    })
+}
+
+/// How many card columns `width` comfortably carries — the deck's historical
+/// step function, and still the column count any deck that already fits gets.
+///
+/// The thresholds encode ~50 columns per card at two columns and ~60 at three:
+/// a *comfortable* card, not the narrowest useful one. [`MIN_CARD_W`] names the
+/// other end of that range, and [`choose_grid_layout`] is what may reach for it.
+fn grid_columns(width: u16) -> usize {
+    if width >= 180 {
+        3
+    } else if width >= 100 {
+        2
+    } else {
+        1
+    }
+}
+
+/// The narrowest card the grid will ever lay out, in terminal columns.
+///
+/// Issue #588 is what naming this explicitly buys. [`grid_columns`] encoded a
+/// minimum card width *implicitly* and generously (50 columns per card at two
+/// columns, 60 at three), so a sub-100-column deck was pinned to one column no
+/// matter how many cards it had to show — a 7-role orchestration could not fit
+/// seven cards at any density and silently painted five.
+///
+/// 40 is measured against the rendered card, not guessed. A role card's title is
+/// `` ` <n> <AgentType> · <role> ` `` sharing the top border with the
+/// ` ● Thinking ` status badge, inside two border columns. At 40 that leaves ten
+/// columns of role name (`ClaudeCode · documente…`), the full-width `Dir:` row
+/// and the widest `` ` Last: 0s  Tools: 14 ` `` bottom-border rung; by 30 the
+/// role name has vanished entirely (`ClaudeCode ·…`), which would defeat the
+/// point of painting the card at all.
+///
+/// It is a floor that only ever buys completeness: [`choose_grid_layout`] goes
+/// below `grid_columns`'s comfortable widths **only** when the narrower card is
+/// what makes every card fit. A deck that already fits keeps exactly the columns
+/// it has always had.
+const MIN_CARD_W: u16 = 40;
+
+/// The most columns `width` can hold at [`MIN_CARD_W`] each.
+///
+/// This is the CEILING on [`choose_grid_layout`]'s search, never the value it
+/// returns. Floored at 1 so a terminal narrower than a single card still draws
+/// one (clipped) column rather than dividing by zero.
+fn max_columns_for_width(width: u16) -> usize {
+    ((width / MIN_CARD_W) as usize).max(1)
+}
+
+/// Both axes of the card grid, decided together by [`choose_grid_layout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GridLayout {
+    cols: usize,
+    density: CardDensity,
+}
+
+/// Choose columns and density TOGETHER: the first pair that renders **all**
+/// `total_cards` cards in `available_height` rows.
+///
+/// Issue #588: these two axes used to be decided independently — columns from
+/// width alone, density from height alone — so neither could compensate for the
+/// other. Seven roles on a 90-column, 27-row deck got `cols = 1` (width < 100);
+/// no density fit seven single-column cards in the 25 rows left after the title
+/// and stats bar (`7 * 5 = 35` at the densest tier), the density chooser
+/// returned `Compact` anyway, and the render path sliced to the five rows that
+/// fit. Two roles were never painted, and on screen a hidden role is
+/// indistinguishable from one that failed to start. The information needed to
+/// fit all seven — a second column needs only `7.div_ceil(2) * 5 = 20` of those
+/// 25 rows — was available at render time; the algorithm never looked.
+///
+/// The search starts at [`grid_columns`] and widens only as far as
+/// [`max_columns_for_width`] allows, so:
+///
+/// * a deck that already fits is **untouched** — the first `cols` tried is the
+///   one the deck has always used, and Compact fits there in every case that
+///   isn't already overflowing;
+/// * a deck that does not fit spends columns, cheapest resource first, to become
+///   complete. Within each column count the richest density wins, which answers
+///   the issue's open question ("more columns at a richer density" over "fewer
+///   columns with smaller cards") the way it suggests: prompt and tool lines are
+///   the card's actual content, horizontal space is the cheaper sacrifice.
+///
+/// When nothing fits, the layout the deck has always used is returned rather
+/// than the widest one, and the caller is left to signal the overflow. Narrowing
+/// every card is a real cost, paid here only for completeness; if completeness
+/// is out of reach the trade buys nothing, and the overflow indicator — not a
+/// squeezed grid — is what resolves the ambiguity that made this a bug.
+fn choose_grid_layout(total_cards: usize, width: u16, available_height: u16) -> GridLayout {
+    let preferred_cols = grid_columns(width);
+    // `max` guards the invariant asserted by `max_columns_for_width_never_below_grid_columns`:
+    // the ceiling can never sit below the historical count, so no deck loses a
+    // column it has today.
+    let max_cols = max_columns_for_width(width).max(preferred_cols);
+
+    for cols in preferred_cols..=max_cols {
+        if let Some(density) = fitting_density(total_cards, cols, available_height) {
+            return GridLayout { cols, density };
         }
     }
-    CardDensity::Compact
+
+    GridLayout {
+        cols: preferred_cols,
+        density: CardDensity::Compact,
+    }
+}
+
+/// The `  (↑12 ↓34)` indicator a scrollable list appends to its header when
+/// rows are hidden above and/or below the viewport, or an empty string when
+/// everything is on screen.
+///
+/// Shared by the scheduled-tasks modal and the deck's card grid. Issue #588
+/// found the two disagreeing in the way that matters: the modal signalled its
+/// hidden rows while the card grid rendered its title plain, so a role card cut
+/// off the bottom of a short deck read as a role that never started. One
+/// formatter means neither surface can drift from the other's shape.
+///
+/// The two leading spaces are part of the indicator — every caller appends it
+/// directly to a header string, and separating it there would be one more thing
+/// to keep in sync.
+fn scroll_indicator(hidden_above: usize, hidden_below: usize) -> String {
+    match (hidden_above, hidden_below) {
+        (0, 0) => String::new(),
+        (a, 0) => format!("  (\u{2191}{a})"),
+        (0, b) => format!("  (\u{2193}{b})"),
+        (a, b) => format!("  (\u{2191}{a} \u{2193}{b})"),
+    }
 }
 
 /// Clamp a (possibly stale) vertical scroll offset to the largest value that
@@ -1074,13 +1209,25 @@ struct NewPaneFormState {
     /// opened — set by the two text-edit key arms in
     /// `handle_new_pane_form_key` (`FormField::Name` only), never by the
     /// basename pre-fill `transition_after_dir_pick` applies. While `false`,
-    /// [`Self::suggest_name_if_orchestration_selected`] is free to overwrite
+    /// [`Self::resuggest_name_for_selection`] is free to overwrite
     /// `name` with the generated suggestion; once `true`, that fn leaves the
     /// field alone — a generated default may replace a generated default,
     /// never a human edit. Guards re-clicking the selected chip, arrowing
     /// between orchestrations, and arrowing off and back onto one, all of
     /// which land on the same call.
     name_touched: bool,
+    /// The Name the form opened with — the directory basename
+    /// `transition_after_dir_pick` pre-fills. Kept so that cycling AWAY from an
+    /// orchestration can put it back: the `-orchestrator-N` suggestion belongs
+    /// to the orchestration selection, and a plain pane, a workload mode or the
+    /// built-in `schedule`/`dispatcher` options must not inherit it. Without
+    /// this, the suggestion was a one-way overwrite — and since the cycler
+    /// orders orchestrations BEFORE `schedule`/`dispatcher`, merely passing
+    /// over one on the way to them left every such pane named
+    /// `<folder>-orchestrator-N`. Only ever consulted while
+    /// [`Self::name_touched`] is `false`, so it can never overwrite a human
+    /// edit.
+    name_prefill: String,
 }
 
 impl NewPaneFormState {
@@ -1118,6 +1265,9 @@ impl NewPaneFormState {
             reactive_panes: 0,
         };
         let dispatcher_authoring = build_dispatcher_mode(&dir);
+        // Remembered so leaving an orchestration can restore it — see
+        // `name_prefill`.
+        let name_prefill = name.clone();
         Self {
             dir,
             name,
@@ -1156,6 +1306,7 @@ impl NewPaneFormState {
             // A freshly opened form has no human edit yet — the basename
             // pre-fill below is not one.
             name_touched: false,
+            name_prefill,
         }
     }
 
@@ -1210,22 +1361,38 @@ impl NewPaneFormState {
         }
     }
 
-    /// Overwrite the Name field with the next free suggested name whenever
-    /// the selection LANDS on an orchestration — called from every path that
-    /// can change `selection_index` (arrow keys, click). A no-op when the
-    /// current selection isn't an orchestration (a plain mode/card/authoring
-    /// option keeps whatever the user already typed), and a no-op once
-    /// [`Self::name_touched`] is set — a generated default may replace a
-    /// generated default, never a human edit. Without this guard, re-clicking
-    /// the already-selected chip, arrowing between two orchestrations, or
-    /// arrowing off one and back all silently clobber whatever the user typed.
-    fn suggest_name_if_orchestration_selected(&mut self) {
+    /// Re-derive the Name field for the CURRENT selection — called from every
+    /// path that can change `selection_index` (arrow keys, click).
+    ///
+    /// Landing on an orchestration suggests the next free
+    /// `<folder>-orchestrator-N`; landing on anything else (No mode, a
+    /// workload mode, the built-in `schedule` / `schedule: issues` /
+    /// `dispatcher` options) restores [`Self::name_prefill`], the directory
+    /// basename the form opened with.
+    ///
+    /// **Both directions matter.** This used to apply the suggestion and
+    /// return early otherwise, which made it a one-way overwrite: the name
+    /// survived the selection that generated it. Because the cycler orders the
+    /// orchestrations BEFORE the built-in `schedule`/`dispatcher` options,
+    /// reaching those from "No mode" means passing over an orchestration — so
+    /// a plain pane, a `dev`-mode pane and a scheduled task could all end up
+    /// named `<folder>-orchestrator-N` without the user ever selecting an
+    /// orchestration.
+    ///
+    /// Still a no-op once [`Self::name_touched`] is set — a generated default
+    /// may replace a generated default, never a human edit. Without that
+    /// guard, re-clicking the already-selected chip, arrowing between two
+    /// orchestrations, or arrowing off one and back all silently clobber
+    /// whatever the user typed.
+    fn resuggest_name_for_selection(&mut self) {
         if self.name_touched {
             return;
         }
-        if self.selected_orchestration().is_some() {
-            self.name = self.suggest_orchestration_name();
-        }
+        self.name = if self.selected_orchestration().is_some() {
+            self.suggest_orchestration_name()
+        } else {
+            self.name_prefill.clone()
+        };
     }
 
     /// The title this submission will ACTUALLY take: the typed Name when it
@@ -1334,6 +1501,9 @@ impl NewPaneFormState {
             // The Name field is hidden and fixed to `SCHEDULE_MODE_NAME` on
             // this form, so there is nothing to touch.
             name_touched: false,
+            // No cycler and no orchestration on this form, so nothing ever
+            // reverts to it.
+            name_prefill: SCHEDULE_MODE_NAME.to_string(),
         };
         // Lock the selection onto the built-in schedule option (index 1 with no
         // modes/orchestrations) so the existing schedule spawn branch fires.
@@ -1407,7 +1577,7 @@ impl NewPaneFormState {
             self.selection_index += 1;
             // Selecting an orchestration suggests the next free name in
             // place of whatever was in the field.
-            self.suggest_name_if_orchestration_selected();
+            self.resuggest_name_for_selection();
         }
     }
 
@@ -1415,7 +1585,7 @@ impl NewPaneFormState {
         self.selection_index = self.selection_index.saturating_sub(1);
         // Symmetric to `select_next_mode` — cycling backward onto an
         // orchestration suggests the next free name too.
-        self.suggest_name_if_orchestration_selected();
+        self.resuggest_name_for_selection();
     }
 
     fn selected_mode(&self) -> Option<&ModeConfig> {
@@ -3431,7 +3601,17 @@ fn process_pending_seed_prompts(
             // attempts probe SUBMISSION rather than typing the seed in again —
             // same identity guards, same terminal-outcome classification, empty
             // payload. See [`crate::prompt_delivery::attempt_writes_payload`].
-            let writes_payload = attempt_writes_payload(attempt);
+            //
+            // Issue #666 ships the armed third payload on the DAEMON path only,
+            // so this passes a permanently-disarmed rearm and behaves exactly as
+            // it did before. The blocker is not the arming policy — it is that a
+            // launcher-wrapped pane's delivery does not survive the genuine
+            // agent's `SessionStart` at all on this path: the wrapper's own
+            // `wrapper_fork` start becomes the pane's generation, the delivery
+            // binds it, and the real start then reads as a rollover and abandons
+            // the seed. Arming a write that no longer exists fixes nothing. See
+            // issue #684.
+            let writes_payload = attempt_writes_payload(attempt, &AgentStartRearm::default(), now);
             let wire_delivery_id = wire_attempt_id(&delivery_id, epoch, attempt, !writes_payload);
             // Reviewer blocker 2: from here on, a request under this wire id may
             // be recorded in the daemon's ledger, so a later identity change has
@@ -4482,7 +4662,11 @@ fn deliver_orchestrator_prompt(
     // Issue #424 D5: after the one bounded replacement payload, later attempts
     // probe SUBMISSION rather than typing the role prompt in again. See
     // [`crate::prompt_delivery::attempt_writes_payload`].
-    let writes_payload = attempt_writes_payload(attempt);
+    //
+    // Issue #666: disarmed here for the same reason as the seed path's twin — the
+    // armed third payload ships on the daemon path only. See that call site, and
+    // issue #684.
+    let writes_payload = attempt_writes_payload(attempt, &AgentStartRearm::default(), now);
     // Issue #424: the logical delivery keeps ONE identity; every ATTEMPT rides
     // its own wire id, or the daemon's ledger replays the first `Applied` and a
     // retry never reaches the PTY at all. See [`attempt_delivery_id`].
@@ -9946,7 +10130,7 @@ fn dispatch_action(
                 // Clicking a chip lands on the selection the same way the
                 // arrow keys do — suggest a name if it landed on an
                 // orchestration.
-                form.suggest_name_if_orchestration_selected();
+                form.resuggest_name_for_selection();
             }
         }
         // [Submit] → spawn the pane from the form values (== Enter on the final
@@ -11983,18 +12167,16 @@ pub fn run_tui(
         // cursorless history.
         reconcile_pane_input_scrollback(&mut ui, &*pane);
 
-        let term_width = terminal.get_frame().area().width;
-        let has_embedded_panes = pane
-            .as_any()
-            .downcast_ref::<EmbeddedPaneController>()
-            .map(|e| !e.pane_ids().is_empty())
-            .unwrap_or(false);
-        let dashboard_width = if has_embedded_panes {
-            term_width * 33 / 100
-        } else {
-            term_width
-        };
-        ui.columns = grid_columns(dashboard_width);
+        // Issue #588: `ui.columns` used to be computed HERE too, by a second
+        // `grid_columns` call against a `dashboard_width` re-derived from a
+        // hardcoded 33% (the orchestration split is 34%, or 25% when narrow) —
+        // a different number from the `dashboard_area.width` the cards were
+        // actually laid out in. Two independent answers to one question, and
+        // the navigation half was the one nobody could see was wrong. The value
+        // now has exactly one writer, `render_card_grid`, which assigns the
+        // column count it just drew with. It runs inside this loop's
+        // `terminal.draw` below, i.e. before any key is handled, so navigation
+        // never reads a value from before the first frame.
 
         let has_pane_control = pane.is_available();
         let pane_layout = ui.pane_layout;
@@ -14001,6 +14183,185 @@ pub(crate) fn build_pane_status_for_gate(state: &AppState) -> HashMap<&str, Sess
         .collect()
 }
 
+/// The deck's title row: the product name, the session count, and — when the
+/// grid could not paint every card — the `  (↑a ↓b)` overflow indicator from
+/// [`scroll_indicator`].
+///
+/// Split out of [`render_frame`] because two call sites build it (the card grid
+/// and the everything-filtered-out branch) and only one of them can overflow.
+fn deck_title_line(showing: usize, total_sessions: usize, scroll_hint: &str) -> Line<'static> {
+    let title_text = if showing < total_sessions {
+        format!("— {showing}/{total_sessions} session(s)")
+    } else {
+        format!("— {total_sessions} session(s)")
+    };
+    let mut spans = vec![
+        Span::styled(
+            " dot-agent-deck ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(title_text, text_primary()),
+    ];
+    if !scroll_hint.is_empty() {
+        // Yellow + bold, not the title's own dim primary: this is the one piece
+        // of the row that says "what you are looking at is incomplete", and
+        // issue #588 is a report of that fact being invisible. It must not read
+        // as chrome.
+        spans.push(Span::styled(
+            scroll_hint.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Lay out and draw the deck's card grid into `area` — the title row, every card
+/// row that fits, and the filler above the stats bar — and return the stats-bar
+/// rect for the caller to draw into.
+///
+/// Extracted from [`render_frame`] by issue #588 so the layout decision has one
+/// home and an L1 seam ([`render_card_grid_to_buffer`]) can drive the real thing
+/// rather than a re-implementation of it.
+///
+/// Two invariants live here:
+///
+/// * **`ui.columns` is written here and nowhere else.** It is what left/right
+///   card navigation reads, so a column count computed independently of the one
+///   the cards were laid out with desyncs selection movement from what is on
+///   screen — silently, since both look correct in isolation. It used to be
+///   computed by a second [`grid_columns`] call in the main loop, from a width
+///   that was recomputed rather than the `area` actually handed to the grid.
+///   Now it can only be the value that drew this frame.
+/// * **A sliced grid says so.** `visible_rows` may still be short of
+///   `total_rows` on a genuinely tiny deck; when it is, the title carries the
+///   `(↑a ↓b)` indicator counting the CARDS (not rows) off each end. Silence
+///   there was the bug: an unpainted role is indistinguishable from a role that
+///   failed to start, which sent two separate investigations after a hydration
+///   defect that was not there.
+fn render_card_grid(
+    frame: &mut Frame,
+    area: Rect,
+    ui: &mut UiState,
+    sessions: &[&SessionState],
+    session_ids: &[&String],
+    total_sessions: usize,
+    tick: u64,
+) -> Rect {
+    // 1 row for the title + 1 row for the stats bar at the bottom of the deck.
+    let available_for_cards = area.height.saturating_sub(2);
+    let GridLayout { cols, density } =
+        choose_grid_layout(sessions.len(), area.width, available_for_cards);
+    let card_height = density.card_height();
+    // Single writer — see this function's docs.
+    ui.columns = cols;
+
+    let all_rows: Vec<&[&SessionState]> = sessions.chunks(cols).collect();
+    let all_row_ids: Vec<&[&String]> = session_ids.chunks(cols).collect();
+    let total_rows = all_rows.len();
+
+    // Calculate how many rows fit in the available area
+    let visible_rows = (available_for_cards / card_height).max(1) as usize;
+
+    // Adjust scroll offset to keep selected row visible. PRD #113: only when a
+    // card is actively highlighted — an inactive selection (`None`) leaves the
+    // scroll position alone.
+    if let Some(sel) = ui.selected_index {
+        let selected_row = sel / cols;
+        if selected_row < ui.scroll_offset {
+            ui.scroll_offset = selected_row;
+        } else if selected_row >= ui.scroll_offset + visible_rows {
+            ui.scroll_offset = selected_row + 1 - visible_rows;
+        }
+    }
+
+    // Re-clamp after a resize may have grown `visible_rows`: an offset left over
+    // from a previous overflow state must shrink so the last card row still sits
+    // at the bottom (no scrolled-off top / blank tail). Only reduces an
+    // over-large offset; legitimate scrolling is unchanged.
+    ui.scroll_offset = clamp_scroll_offset(ui.scroll_offset, total_rows, visible_rows);
+
+    let end = (ui.scroll_offset + visible_rows).min(total_rows);
+    let rows = &all_rows[ui.scroll_offset..end];
+    let row_ids = &all_row_ids[ui.scroll_offset..end];
+
+    // Counted in CARDS, off the slice that is actually about to be painted —
+    // ground truth, rather than a second opinion from `choose_grid_layout`.
+    // Every row above the window is full, so `scroll_offset * cols` cards sit
+    // above; the tail row may be partial, hence the `min`.
+    let hidden_above = ui.scroll_offset * cols;
+    let hidden_below = sessions
+        .len()
+        .saturating_sub((end * cols).min(sessions.len()));
+    let title = Paragraph::new(deck_title_line(
+        sessions.len(),
+        total_sessions,
+        &scroll_indicator(hidden_above, hidden_below),
+    ));
+
+    let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // title
+    for _ in rows {
+        constraints.push(Constraint::Length(card_height));
+    }
+    constraints.push(Constraint::Min(0)); // filler
+    constraints.push(Constraint::Length(1)); // stats bar
+
+    let row_chunks = Layout::vertical(constraints).split(area);
+
+    frame.render_widget(title, row_chunks[0]);
+
+    for (vi, (row, ids)) in rows.iter().zip(row_ids.iter()).enumerate() {
+        let col_constraints: Vec<Constraint> = (0..cols)
+            .map(|_| Constraint::Ratio(1, cols as u32))
+            .collect();
+        let col_chunks = Layout::horizontal(col_constraints).split(row_chunks[vi + 1]);
+
+        for (col_idx, session) in row.iter().enumerate() {
+            let flat_index = (ui.scroll_offset + vi) * cols + col_idx;
+            let is_selected = ui.selected_index == Some(flat_index);
+            // PRD #127 finding #2: `ui.display_names` is populated by hydration
+            // and explicit renames; a live scheduler-spawned card has no entry
+            // there, so fall back to the friendly name the synthetic
+            // `SessionStart` carried onto `SessionState.display_name`. Without
+            // this the live card degraded to the truncated pane id while a
+            // reconnect (which reads the daemon registry's display_name into
+            // `ui.display_names`) titled it correctly.
+            let display_name = ids
+                .get(col_idx)
+                .and_then(|id| ui.display_names.get(*id))
+                .or(session.display_name.as_ref());
+            let card_number = {
+                let n = flat_index + 1;
+                if n <= 9 { Some(n as u8) } else { None }
+            };
+            let card_area = col_chunks[col_idx];
+            render_session_card(
+                frame,
+                card_area,
+                session,
+                tick,
+                is_selected,
+                display_name,
+                card_number,
+                density,
+                // PRD #341 M4: the live deck's mode, so the seam that pins the
+                // selection accent and the running app cannot disagree.
+                ui.mode,
+            );
+            // PRD #80 M4: record this card's screen rect (paired with its flat
+            // selection index) for the mouse hit-test. Safe to mutate `ui` here
+            // — `display_name` was the only live `ui` borrow and its last use
+            // was the `render_session_card` call above.
+            ui.card_rects.push((flat_index, card_area));
+        }
+    }
+
+    row_chunks[row_chunks.len() - 1]
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_frame(
     frame: &mut Frame,
@@ -14206,34 +14567,14 @@ fn render_frame(
     let sessions: Vec<&SessionState> = filtered.iter().map(|(_, s)| *s).collect();
     let session_ids: Vec<&String> = filtered.iter().map(|(id, _)| *id).collect();
 
-    let cols = grid_columns(dashboard_area.width);
-
-    // Choose card density based on available vertical space
-    // 1 row for title + 1 row for stats bar at bottom of dashboard
-    let available_for_density = dashboard_area.height.saturating_sub(2);
-    let density = choose_density(sessions.len(), cols, available_for_density);
-    let card_height = density.card_height();
-
     // Title bar
     let total_sessions = state.sessions.len();
     let showing = sessions.len();
-    let title_text = if showing < total_sessions {
-        format!("— {}/{} session(s)", showing, total_sessions)
-    } else {
-        format!("— {} session(s)", total_sessions)
-    };
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " dot-agent-deck ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(title_text, text_primary()),
-    ]));
 
     if sessions.is_empty() {
-        // All filtered out
+        // All filtered out. Nothing is drawn, so nothing can be hidden — no
+        // overflow indicator on this title.
+        let title = Paragraph::new(deck_title_line(showing, total_sessions, ""));
         let vertical = Layout::vertical([
             Constraint::Length(1),
             Constraint::Fill(1),
@@ -14283,94 +14624,15 @@ fn render_frame(
         return;
     }
 
-    let all_rows: Vec<&[&SessionState]> = sessions.chunks(cols).collect();
-    let all_row_ids: Vec<&[&String]> = session_ids.chunks(cols).collect();
-    let total_rows = all_rows.len();
-
-    // Calculate how many rows fit in the available area
-    let visible_rows = (available_for_density / card_height).max(1) as usize;
-
-    // Adjust scroll offset to keep selected row visible. PRD #113: only when a
-    // card is actively highlighted — an inactive selection (`None`) leaves the
-    // scroll position alone.
-    if let Some(sel) = ui.selected_index {
-        let selected_row = sel / cols;
-        if selected_row < ui.scroll_offset {
-            ui.scroll_offset = selected_row;
-        } else if selected_row >= ui.scroll_offset + visible_rows {
-            ui.scroll_offset = selected_row + 1 - visible_rows;
-        }
-    }
-
-    // Re-clamp after a resize may have grown `visible_rows`: an offset left over
-    // from a previous overflow state must shrink so the last card row still sits
-    // at the bottom (no scrolled-off top / blank tail). Only reduces an
-    // over-large offset; legitimate scrolling is unchanged.
-    ui.scroll_offset = clamp_scroll_offset(ui.scroll_offset, total_rows, visible_rows);
-
-    let end = (ui.scroll_offset + visible_rows).min(total_rows);
-    let rows = &all_rows[ui.scroll_offset..end];
-    let row_ids = &all_row_ids[ui.scroll_offset..end];
-
-    let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // title
-    for _ in rows {
-        constraints.push(Constraint::Length(card_height));
-    }
-    constraints.push(Constraint::Min(0)); // filler
-    constraints.push(Constraint::Length(1)); // stats bar
-
-    let row_chunks = Layout::vertical(constraints).split(dashboard_area);
-
-    frame.render_widget(title, row_chunks[0]);
-
-    for (vi, (row, ids)) in rows.iter().zip(row_ids.iter()).enumerate() {
-        let col_constraints: Vec<Constraint> = (0..cols)
-            .map(|_| Constraint::Ratio(1, cols as u32))
-            .collect();
-        let col_chunks = Layout::horizontal(col_constraints).split(row_chunks[vi + 1]);
-
-        for (col_idx, session) in row.iter().enumerate() {
-            let flat_index = (ui.scroll_offset + vi) * cols + col_idx;
-            let is_selected = ui.selected_index == Some(flat_index);
-            // PRD #127 finding #2: `ui.display_names` is populated by hydration
-            // and explicit renames; a live scheduler-spawned card has no entry
-            // there, so fall back to the friendly name the synthetic
-            // `SessionStart` carried onto `SessionState.display_name`. Without
-            // this the live card degraded to the truncated pane id while a
-            // reconnect (which reads the daemon registry's display_name into
-            // `ui.display_names`) titled it correctly.
-            let display_name = ids
-                .get(col_idx)
-                .and_then(|id| ui.display_names.get(*id))
-                .or(session.display_name.as_ref());
-            let card_number = {
-                let n = flat_index + 1;
-                if n <= 9 { Some(n as u8) } else { None }
-            };
-            let card_area = col_chunks[col_idx];
-            render_session_card(
-                frame,
-                card_area,
-                session,
-                tick,
-                is_selected,
-                display_name,
-                card_number,
-                density,
-                // PRD #341 M4: the live deck's mode, so the seam that pins the
-                // selection accent and the running app cannot disagree.
-                ui.mode,
-            );
-            // PRD #80 M4: record this card's screen rect (paired with its flat
-            // selection index) for the mouse hit-test. Safe to mutate `ui` here
-            // — `display_name` was the only live `ui` borrow and its last use
-            // was the `render_session_card` call above.
-            ui.card_rects.push((flat_index, card_area));
-        }
-    }
-
-    // Stats bar at bottom of dashboard area
-    let stats_area = row_chunks[row_chunks.len() - 1];
+    let stats_area = render_card_grid(
+        frame,
+        dashboard_area,
+        ui,
+        &sessions,
+        &session_ids,
+        total_sessions,
+        tick,
+    );
     render_stats_bar(
         frame,
         &state.aggregate_stats(),
@@ -17092,19 +17354,32 @@ fn render_dir_picker(frame: &mut Frame, picker: &mut DirPickerState) -> PickerCl
 /// single navigable field (Command), so the generic "Tab: switch field" hint is
 /// misleading — `schedule_locked` shows a Command-only `Enter: confirm  Esc:
 /// cancel` instead.
+///
+/// Issue #589: `submit_refused` is [`NewPaneFormState::name_collision`] — the
+/// SAME predicate the Enter guard returns `Action::Continue` on and the same
+/// one that drops `[Submit]` from the action row. When it holds, the hint drops
+/// the `Enter:` clause entirely rather than naming a key the guard will
+/// silently refuse, matching how the button row handles it (removed, not
+/// dimmed). The caller passes the one `form.name_collision()` it already
+/// computed for the button row, so the two cannot drift apart the way the
+/// old `name_submits`-alone wording did — that boolean cannot see a collision.
+/// Only the `has_mode_field` arm consults it: a collision requires a selected
+/// orchestration, and the arms below are reachable only from the mode-locked
+/// schedule form, which offers none.
 fn new_pane_form_footer_hint(
     has_mode_field: bool,
     name_submits: bool,
+    submit_refused: bool,
     schedule_locked: bool,
 ) -> &'static str {
     if schedule_locked {
         return "  Enter: confirm  Esc: cancel";
     }
     if has_mode_field {
-        if name_submits {
-            "  Tab: switch  \u{25c0}\u{25b6}: mode  Enter: submit  Esc: cancel"
-        } else {
-            "  Tab: switch  \u{25c0}\u{25b6}: mode  Enter: next  Esc: cancel"
+        match (name_submits, submit_refused) {
+            (true, true) => "  Tab: switch  \u{25c0}\u{25b6}: mode  Esc: cancel",
+            (true, false) => "  Tab: switch  \u{25c0}\u{25b6}: mode  Enter: submit  Esc: cancel",
+            (false, _) => "  Tab: switch  \u{25c0}\u{25b6}: mode  Enter: next  Esc: cancel",
         }
     } else {
         "  Tab: switch field  Enter: next/confirm  Esc: cancel"
@@ -17267,12 +17542,7 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
         // Column header, with a scroll indicator when rows are hidden.
         let hidden_above = win_start;
         let hidden_below = ui.scheduled_tasks.len().saturating_sub(win_end);
-        let scroll_hint = match (hidden_above, hidden_below) {
-            (0, 0) => String::new(),
-            (a, 0) => format!("  (\u{2191}{a})"),
-            (0, b) => format!("  (\u{2193}{b})"),
-            (a, b) => format!("  (\u{2191}{a} \u{2193}{b})"),
-        };
+        let scroll_hint = scroll_indicator(hidden_above, hidden_below);
         lines.push(Line::styled(
             format!(
                 "  {:<name_col$}{:<status_col$}{}{}",
@@ -17702,7 +17972,15 @@ fn render_new_pane_form(frame: &mut Frame, form: &NewPaneFormState) -> FormClick
     // PRD #170: pass `show_mode` (false when locked) so the locked footer drops
     // the `◀▶: mode` hint; unlocked it equals the old `has_mode_field`. Finding 6:
     // `schedule_locked` selects the Command-only `Enter: confirm  Esc: cancel`.
-    let footer = new_pane_form_footer_hint(show_mode, name_submits, form.schedule_locked);
+    // Issue #589: reuse the SAME `name_collision` that dropped `[Submit]` from
+    // the action row above, so the footer and the button row can never disagree
+    // about whether Enter is available.
+    let footer = new_pane_form_footer_hint(
+        show_mode,
+        name_submits,
+        name_collision,
+        form.schedule_locked,
+    );
     lines.push(Line::styled(footer, text_primary()));
 
     // PRD #170: the locked schedule form retitles the modal by action; otherwise
@@ -18040,16 +18318,6 @@ fn pane_relative_coords(screen_col: u16, screen_row: u16, pane_rect: &Option<Rec
         (col, row)
     } else {
         (screen_col, screen_row)
-    }
-}
-
-fn grid_columns(width: u16) -> usize {
-    if width >= 180 {
-        3
-    } else if width >= 100 {
-        2
-    } else {
-        1
     }
 }
 
@@ -18436,7 +18704,7 @@ fn format_elapsed(last_activity: DateTime<Utc>) -> String {
 // `pub(crate)`-gated.
 
 /// Card density tier picked by the dashboard's adaptive layout
-/// (`choose_density`). Hidden-public so L1 snapshot tests can pin a
+/// (`choose_grid_layout`). Hidden-public so L1 snapshot tests can pin a
 /// specific tier rather than depending on the runtime calculation.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18770,6 +19038,92 @@ pub fn render_dashboard_cards_to_buffer(
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
+}
+
+/// What the deck's card grid decided, reported back to an L1 test alongside the
+/// buffer it drew (issue #588).
+///
+/// Deliberately one field. Everything else a test wants to know — how many cards
+/// were painted, in how many columns, whether the title carries an overflow
+/// marker — is legible in the buffer itself, and reading it there keeps the
+/// assertions on what was actually drawn instead of on a second copy of the
+/// layout arithmetic. `nav_columns` is the exception because it is not drawable:
+/// it is UI *state*, and a render that draws the grid correctly while leaving
+/// that state wrong is exactly the desync this seam exists to catch.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CardGridProbe {
+    /// `UiState::columns` **after** the render — the field left/right card
+    /// navigation reads.
+    pub nav_columns: usize,
+}
+
+/// L1 seam for the whole deck card grid — the real [`render_card_grid`], not a
+/// re-implementation of it: title row, adaptive column/density choice, the card
+/// rows that fit, and the overflow indicator.
+///
+/// Issue #588 added it because every pre-existing dashboard seam renders cards
+/// the caller has already laid out ([`render_dashboard_cards_to_buffer`] stacks
+/// them one per row at a density the test names), so the layout decision itself
+/// — the thing that was dropping cards — had no L1 coverage at all.
+///
+/// `cards` is `(session, display_name)` in deck order; `width` × `height` is the
+/// deck area, including the title and stats-bar rows it reserves.
+#[doc(hidden)]
+pub fn render_card_grid_to_buffer(
+    cards: &[(&SessionState, Option<&str>)],
+    selected: Option<usize>,
+    scroll_offset: usize,
+    width: u16,
+    height: u16,
+) -> (ratatui::buffer::Buffer, CardGridProbe) {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+    ui.selected_index = selected;
+    ui.scroll_offset = scroll_offset;
+
+    // `render_card_grid` reads display names out of `ui.display_names` keyed by
+    // session id, falling back to `SessionState.display_name`. Feed the caller's
+    // names through the map so the seam exercises the same lookup the deck does.
+    let ids: Vec<String> = cards
+        .iter()
+        .map(|(session, _)| session.session_id.clone())
+        .collect();
+    for ((_, name), id) in cards.iter().zip(ids.iter()) {
+        if let Some(name) = name {
+            ui.display_names.insert(id.clone(), (*name).to_string());
+        }
+    }
+    let sessions: Vec<&SessionState> = cards.iter().map(|(session, _)| *session).collect();
+    let id_refs: Vec<&String> = ids.iter().collect();
+
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend should construct");
+    terminal
+        .draw(|frame| {
+            render_card_grid(
+                frame,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                },
+                &mut ui,
+                &sessions,
+                &id_refs,
+                sessions.len(),
+                0,
+            );
+        })
+        .expect("TestBackend draw should succeed");
+
+    let probe = CardGridProbe {
+        nav_columns: ui.columns,
+    };
+    (terminal.backend().buffer().clone(), probe)
 }
 
 /// PRD #80 M2: render the persistent global button bar into a one-row
@@ -22901,8 +23255,11 @@ mod tests {
     fn test_status_style() {
         // PRD #155: status colors now resolve through the centralized palette
         // (single source of truth). LOCKED mapping: Working=Green,
-        // Thinking=Blue, WaitingForInput=Yellow, Error=Red, Idle=DarkGray, with
-        // Compacting sharing the thinking/Blue role.
+        // Thinking=Blue, WaitingForInput=Magenta, Error=Red, Idle=DarkGray, with
+        // Compacting sharing the thinking/Blue role. Waiting left Yellow in
+        // issue #579 — 1.70:1 against a white terminal background, and 1.07:1
+        // once the BOLD below is rendered as the bright variant. The ratios
+        // themselves are asserted by `theme/contrast/002`.
         let (label, style) = status_style(&SessionStatus::Thinking);
         assert_eq!(label, "Thinking");
         assert_eq!(style.fg, Some(Color::Blue));
@@ -22913,7 +23270,7 @@ mod tests {
 
         let (label, style) = status_style(&SessionStatus::WaitingForInput);
         assert_eq!(label, "Needs Input");
-        assert_eq!(style.fg, Some(Color::Yellow));
+        assert_eq!(style.fg, Some(Color::Magenta));
 
         let (label, style) = status_style(&SessionStatus::Idle);
         assert_eq!(label, "Idle");
@@ -26700,47 +27057,173 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn test_choose_density() {
-        // Spacious=10, Normal=8, Compact=5
+    fn choose_grid_layout_density_ladder() {
+        // Spacious=10, Normal=8, Compact=5. Widths pick the starting column
+        // count: <100 -> 1, >=100 -> 2 (see `grid_columns`).
 
-        // 1 session, 1 col, plenty of height -> Spacious
-        assert_eq!(choose_density(1, 1, 20), CardDensity::Spacious);
+        // 1 card, 1 col, plenty of height -> Spacious
+        assert_eq!(
+            choose_grid_layout(1, 90, 20),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Spacious
+            }
+        );
 
-        // 2 sessions, 2 cols = 1 row, height 10 -> Spacious (1*10=10)
-        assert_eq!(choose_density(2, 2, 10), CardDensity::Spacious);
+        // 2 cards, 2 cols = 1 row, height 10 -> Spacious (1*10=10)
+        assert_eq!(
+            choose_grid_layout(2, 100, 10),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Spacious
+            }
+        );
 
-        // 2 sessions, 2 cols = 1 row, height 9 -> Normal (1*8=8 fits)
-        assert_eq!(choose_density(2, 2, 9), CardDensity::Normal);
+        // 2 cards, 2 cols = 1 row, height 9 -> Normal (1*8=8 fits)
+        assert_eq!(
+            choose_grid_layout(2, 100, 9),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Normal
+            }
+        );
 
-        // 4 sessions, 2 cols = 2 rows, height 16 -> Normal (2*8=16)
-        assert_eq!(choose_density(4, 2, 16), CardDensity::Normal);
+        // 4 cards, 2 cols = 2 rows, height 16 -> Normal (2*8=16)
+        assert_eq!(
+            choose_grid_layout(4, 100, 16),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Normal
+            }
+        );
 
-        // 4 sessions, 2 cols = 2 rows, height 15 -> Compact (2*5=10 fits)
-        assert_eq!(choose_density(4, 2, 15), CardDensity::Compact);
+        // 4 cards, 2 cols = 2 rows, height 15 -> Compact (2*5=10 fits)
+        assert_eq!(
+            choose_grid_layout(4, 100, 15),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Compact
+            }
+        );
 
-        // Many sessions, small screen -> Compact
-        assert_eq!(choose_density(10, 1, 20), CardDensity::Compact);
-
-        // Edge: 0 sessions -> Spacious (0 rows needed)
-        assert_eq!(choose_density(0, 1, 10), CardDensity::Spacious);
+        // Edge: 0 cards -> Spacious (0 rows needed)
+        assert_eq!(
+            choose_grid_layout(0, 90, 10),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Spacious
+            }
+        );
     }
 
     #[test]
-    fn test_choose_density_boundaries() {
-        // Density is a function of card count, columns, and height only.
-        // Spacious=10, Normal=8, Compact=5.
+    fn choose_grid_layout_density_boundaries() {
+        // Density is a function of card count, columns, and height only once the
+        // column count is settled. Spacious=10, Normal=8, Compact=5.
 
-        // 1 session, height 11 -> Spacious (1*10=10)
-        assert_eq!(choose_density(1, 1, 11), CardDensity::Spacious);
+        // 1 card, height 11 -> Spacious (1*10=10)
+        assert_eq!(choose_grid_layout(1, 90, 11).density, CardDensity::Spacious);
 
-        // 1 session, height 10 -> Spacious (1*10=10)
-        assert_eq!(choose_density(1, 1, 10), CardDensity::Spacious);
+        // 1 card, height 10 -> Spacious (1*10=10)
+        assert_eq!(choose_grid_layout(1, 90, 10).density, CardDensity::Spacious);
 
-        // 2 sessions, 1 col, height 18 -> Normal (2*8=16)
-        assert_eq!(choose_density(2, 1, 18), CardDensity::Normal);
+        // 2 cards, 1 col, height 18 -> Normal (2*8=16)
+        assert_eq!(choose_grid_layout(2, 90, 18).density, CardDensity::Normal);
 
-        // 2 sessions, 1 col, height 17 -> Normal (2*8=16)
-        assert_eq!(choose_density(2, 1, 17), CardDensity::Normal);
+        // 2 cards, 1 col, height 17 -> Normal (2*8=16)
+        assert_eq!(choose_grid_layout(2, 90, 17).density, CardDensity::Normal);
+    }
+
+    /// Issue #588: `MIN_CARD_W` may only ever *widen* the search. If the ceiling
+    /// it derives ever fell below `grid_columns`, a deck that fits today would
+    /// lose a column — the fix would have become a regression. Swept rather than
+    /// spot-checked because the two functions have unrelated shapes (a step
+    /// function against integer division) and cross wherever they like.
+    #[test]
+    fn max_columns_for_width_never_below_grid_columns() {
+        for width in 0u16..=400 {
+            assert!(
+                max_columns_for_width(width) >= grid_columns(width),
+                "width {width}: ceiling {} is below the historical column count {}",
+                max_columns_for_width(width),
+                grid_columns(width),
+            );
+        }
+    }
+
+    /// Issue #588's reported case and its neighbours. Seven roles on a
+    /// 90-column deck: one column needs 7*5 = 35 rows at the densest tier, two
+    /// columns need 7.div_ceil(2)*5 = 20.
+    #[test]
+    fn choose_grid_layout_widens_only_to_fit_every_card() {
+        // 35 rows available: one column already fits all seven, so nothing is
+        // spent. This is the property that keeps every existing layout intact.
+        assert_eq!(choose_grid_layout(7, 90, 35).cols, 1);
+
+        // 25 rows — the reported geometry. One column fits five of seven at
+        // Compact; a second column fits all seven with room to spare.
+        assert_eq!(
+            choose_grid_layout(7, 90, 25),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Compact
+            }
+        );
+
+        // 34 rows: one column misses Compact by a single row. The second column
+        // buys back enough height for Normal — the issue's open question
+        // answered as it suggests, richer cards over a narrower grid.
+        assert_eq!(
+            choose_grid_layout(7, 90, 34),
+            GridLayout {
+                cols: 2,
+                density: CardDensity::Normal
+            }
+        );
+
+        // 10 rows: two columns still need 20, and 90 columns allows no third at
+        // MIN_CARD_W. Nothing fits, so the deck keeps the column count it has
+        // always had and the caller signals the overflow instead.
+        assert_eq!(
+            choose_grid_layout(7, 90, 10),
+            GridLayout {
+                cols: 1,
+                density: CardDensity::Compact
+            }
+        );
+    }
+
+    /// A card is never narrowed past [`MIN_CARD_W`] in pursuit of completeness:
+    /// widening is only allowed while each resulting card still clears the floor.
+    /// The historical count is exempt — a terminal narrower than one whole card
+    /// still gets its single column.
+    #[test]
+    fn choose_grid_layout_respects_the_minimum_card_width() {
+        for width in [10u16, 39, 40, 79, 80, 90, 99, 100, 120, 179, 180, 240] {
+            // A card count no layout can fit, so the search runs to its ceiling.
+            let cols = choose_grid_layout(40, width, 12).cols;
+            assert!(
+                cols == grid_columns(width) || (cols as u16) * MIN_CARD_W <= width,
+                "width {width}: {cols} columns leaves each card under {MIN_CARD_W} columns",
+            );
+            // And the same for a count that fits only after widening.
+            let cols = choose_grid_layout(7, width, 25).cols;
+            assert!(
+                cols == grid_columns(width) || (cols as u16) * MIN_CARD_W <= width,
+                "width {width}: {cols} columns leaves each card under {MIN_CARD_W} columns",
+            );
+        }
+    }
+
+    /// The `(↑a ↓b)` indicator shared by the scheduled-tasks modal and the deck
+    /// title (issue #588). Silence means "everything is on screen" — the one
+    /// output that must not appear when anything is hidden.
+    #[test]
+    fn scroll_indicator_reports_only_what_is_hidden() {
+        assert_eq!(scroll_indicator(0, 0), "");
+        assert_eq!(scroll_indicator(12, 0), "  (\u{2191}12)");
+        assert_eq!(scroll_indicator(0, 34), "  (\u{2193}34)");
+        assert_eq!(scroll_indicator(12, 34), "  (\u{2191}12 \u{2193}34)");
     }
 
     /// Acceptance criterion 1: `card_height` is derived from rendered content,
@@ -28978,23 +29461,46 @@ mod tests {
     }
 
     #[test]
-    fn footer_hint_switches_to_submit_when_name_focused_with_orchestration() {
+    fn footer_hint_names_only_the_enter_action_the_form_will_honour() {
         // PRD #106 follow-up: when the Command field is hidden and focus is
         // on Name, Enter submits — the footer must say so.
-        let submit_hint = new_pane_form_footer_hint(true, true, false);
+        let submit_hint = new_pane_form_footer_hint(true, true, false, false);
         assert!(
             submit_hint.contains("Enter: submit"),
             "expected submit hint, got {submit_hint:?}"
         );
 
+        // Issue #589: the one state where that promise is false — the name
+        // collides, so the Enter guard returns `Action::Continue` and nothing
+        // happens. The hint drops the `Enter:` clause entirely rather than
+        // naming a refused key, matching the action row dropping `[Submit]`.
+        let refused_hint = new_pane_form_footer_hint(true, true, true, false);
+        assert!(
+            !refused_hint.contains("Enter"),
+            "a refused submit must advertise no Enter action at all, got {refused_hint:?}"
+        );
+        assert!(
+            refused_hint.contains("Tab: switch") && refused_hint.contains("Esc: cancel"),
+            "the keys that DO still work must survive the refusal, got {refused_hint:?}"
+        );
+
         // Sanity checks: every other focus/visibility combination keeps the
         // legacy 'Enter: next' wording.
-        let next_hint = new_pane_form_footer_hint(true, false, false);
+        let next_hint = new_pane_form_footer_hint(true, false, false, false);
         assert!(
             next_hint.contains("Enter: next") && !next_hint.contains("submit"),
             "expected next hint, got {next_hint:?}"
         );
-        let no_mode_hint = new_pane_form_footer_hint(false, false, false);
+        // Issue #589 control: a collision must NOT mute Enter where Enter only
+        // moves focus. Off the Name field the guard is unreachable, so
+        // `Enter: next` stays honest and the hint is unchanged by the collision
+        // — the refusal above is attributable to the submitting field alone.
+        assert_eq!(
+            new_pane_form_footer_hint(true, false, true, false),
+            next_hint,
+            "a collision must not change the hint on a field where Enter advances focus"
+        );
+        let no_mode_hint = new_pane_form_footer_hint(false, false, false, false);
         assert!(
             no_mode_hint.contains("Enter: next/confirm"),
             "expected next/confirm hint when there's no mode field, got {no_mode_hint:?}"
@@ -29003,7 +29509,7 @@ mod tests {
         // PRD #170 finding 6: the mode-locked schedule form has a single
         // navigable field (Command), so it drops the misleading "Tab: switch
         // field" wording for a Command-only confirm/cancel hint.
-        let locked_hint = new_pane_form_footer_hint(false, false, true);
+        let locked_hint = new_pane_form_footer_hint(false, false, false, true);
         assert!(
             locked_hint.contains("Enter: confirm")
                 && locked_hint.contains("Esc: cancel")
@@ -29635,6 +30141,92 @@ mod tests {
         }
     }
 
+    /// Scenario: Open the new-pane form the way `Ctrl+n` does — Name
+    /// pre-filled with the bare directory basename `myproj` — then cycle the
+    /// Mode field RIGHT onto the orchestration (which suggests
+    /// `myproj-orchestrator-1`) and back LEFT to "No mode". The Name field
+    /// must read `myproj` again, and submitting must spawn a plain pane
+    /// called `myproj`: a pane with no mode is not an orchestrator, and a
+    /// generated suggestion must not outlive the selection that generated it.
+    /// Same for cycling FORWARD off the orchestration onto the built-in
+    /// `schedule` option — which is how the user reaches `schedule` /
+    /// `dispatcher` at all, since the cycler puts the orchestrations in
+    /// between.
+    #[spec("orchestration/identity/006")]
+    #[test]
+    fn identity_006_leaving_the_orchestration_restores_the_basename() {
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        // --- back to "No mode" (index 0) ---
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            "myproj".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        ));
+
+        handle_new_pane_form_key(right, &mut ui); // land on the orchestration
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "myproj-orchestrator-1",
+            "control: landing on the orchestration still suggests N=1"
+        );
+
+        handle_new_pane_form_key(left, &mut ui); // back to "No mode"
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().selection_index,
+            0,
+            "precondition: Left from the orchestration lands on \"No mode\""
+        );
+        assert_eq!(
+            ui.new_pane_form.as_ref().unwrap().name,
+            "myproj",
+            "leaving the orchestration must restore the basename pre-fill — a \
+             plain pane must not be named `-orchestrator-N`"
+        );
+
+        handle_new_pane_form_key(enter, &mut ui); // Mode -> Name
+        handle_new_pane_form_key(enter, &mut ui); // Name -> Command
+        let result = handle_new_pane_form_key(enter, &mut ui);
+        match result {
+            Action::SpawnPane(req) => assert_eq!(
+                req.name, "myproj",
+                "the plain pane must submit under the basename, not the stale \
+                 orchestrator suggestion"
+            ),
+            other => panic!("expected SpawnPane, got {other:?}"),
+        }
+
+        // --- forward off the orchestration onto `schedule` ---
+        let mut ui = default_ui();
+        ui.mode = UiMode::NewPaneForm;
+        ui.new_pane_form = Some(NewPaneFormState::new(
+            PathBuf::from("/tmp/myproj"),
+            "myproj".to_string(),
+            String::new(),
+            vec![],
+            vec![make_orchestration("review")],
+        ));
+
+        handle_new_pane_form_key(right, &mut ui); // orchestration
+        handle_new_pane_form_key(right, &mut ui); // `schedule`
+        let form = ui.new_pane_form.as_ref().unwrap();
+        assert!(
+            form.is_schedule_selected(),
+            "precondition: two Rights land on the built-in `schedule` option"
+        );
+        assert_eq!(
+            form.name, "myproj",
+            "cycling PAST the orchestration to reach `schedule` must not leave \
+             the orchestrator suggestion behind"
+        );
+    }
+
     /// Scenario: With `myproj-orchestrator-1` already live (a name a running
     /// orchestration in the same folder currently holds, injected via the
     /// test-only `with_live_orchestration_names` builder that mirrors
@@ -29793,10 +30385,10 @@ mod tests {
     /// orchestration, and clear the Name field to empty through real
     /// `KeyCode::Backspace` events. Submitting must be REFUSED — an empty
     /// field is not "no title", it resolves to the same canonical
-    /// `tdd-cycle` and would produce a second, indistinguishable tab. Also
-    /// render the form through the dedicated collision seam and assert
-    /// `[Submit]` is gone from the action row — the refusal's most
-    /// user-visible behaviour, pinned by nothing until now.
+    /// `tdd-cycle` and would produce a second, indistinguishable tab. The
+    /// refused state must also LOOK refused: `[Submit]` is gone from the
+    /// action row, and the footer beneath it stops advertising `Enter:
+    /// submit` (issue #589) — while typing a free name restores both.
     #[spec("orchestration/identity/005")]
     #[test]
     fn identity_005_an_empty_name_is_checked_against_its_resolved_title() {
@@ -29860,6 +30452,49 @@ mod tests {
             !rendered.contains("[Submit]"),
             "an empty Name that resolves to a taken title must drop [Submit] \
              from the action row, got:\n{rendered}"
+        );
+
+        // Issue #589: the FOOTER must keep the same promise the action row
+        // does. Rendered from the form these keystrokes actually produced —
+        // not the seam above, which opens focused on Mode where `Enter: next`
+        // is honest. Focus is on Name here, the one state where Enter reaches
+        // the refusal.
+        let collided = {
+            let form = ui.new_pane_form.as_ref().expect("form still open");
+            buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
+                render_new_pane_form(frame, form);
+            }))
+        };
+        assert!(
+            !collided.contains("Enter: submit"),
+            "the collision guard refuses Enter, so the footer must not \
+             advertise `Enter: submit`, got:\n{collided}"
+        );
+
+        // Control: one keystroke away from the collision. Typing a free name
+        // restores BOTH [Submit] and the `Enter: submit` promise, so the
+        // assertion above is attributable to the collision state and not to
+        // the hint having been dropped wholesale.
+        for ch in "review-2".chars() {
+            handle_new_pane_form_key(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &mut ui,
+            );
+        }
+        let free = {
+            let form = ui.new_pane_form.as_ref().expect("form still open");
+            assert!(
+                !form.name_collision(),
+                "control setup: `review-2` must not collide with the live `review`"
+            );
+            buffer_to_string(&render_overlay_to_buffer(100, 28, |frame| {
+                render_new_pane_form(frame, form);
+            }))
+        };
+        assert!(
+            free.contains("[Submit]") && free.contains("Enter: submit"),
+            "a free name must restore both the [Submit] button and the \
+             `Enter: submit` footer promise, got:\n{free}"
         );
     }
 

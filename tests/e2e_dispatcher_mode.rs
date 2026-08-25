@@ -21,7 +21,7 @@ use std::time::Duration;
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::TabMembership;
 use dot_agent_deck::event::SendResult;
-use dot_agent_deck::state::SessionStatus;
+use dot_agent_deck::state::{DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS, SessionStatus};
 use spec::spec;
 
 /// Removes a dispatch worktree on drop, including on panic.
@@ -197,6 +197,21 @@ fn role_diagnostics(deck: &TuiDeck, orch: &str, expected: &[&str]) -> String {
     let socket = deck.attach_socket_path();
     let found = role_states(socket, orch);
     let mut out = String::new();
+    // Issue #663: an empty registry is AMBIGUOUS, and the ambiguity misdirected a
+    // whole investigation. `role_states` reads `ListAgents` over the attach
+    // socket, so a daemon that is gone answers exactly like a daemon that spawned
+    // nothing — and every role then prints `NO PANE — never spawned at all`
+    // beside a rendered grid showing all three panes alive. Say which it is
+    // before enumerating roles, so nobody reads a dead daemon as a spawn failure.
+    if common::agent_records_on(socket).is_empty() {
+        out.push_str(
+            "\n- NOTE: the daemon returned NO agent records at all. Every `NO PANE` line \
+             below may mean the daemon is unreachable (e.g. its \
+             DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS backstop fired) rather than that \
+             anything failed to spawn — check the grid and the deck log before \
+             concluding the dispatch never started a pane.\n",
+        );
+    }
     for role in expected {
         match found.get(*role) {
             None => out.push_str(&format!("\n- {role}: NO PANE — never spawned at all\n")),
@@ -956,6 +971,9 @@ fn card_titled(grid: &str, role: &str) -> bool {
 /// pane spawned for it, and every role must be named on its own card. Then ask the
 /// real orchestrator to delegate a sentinel-file task to its `coder`: the coder
 /// agent must receive it and actually create the file in the dispatched worktree.
+/// The `coder` is `clear = true`, so that delegation respawns it; once the sentinel
+/// appears, every role must STILL be named on its own card, rather than the
+/// replacement agent's session UUID.
 #[spec("orchestration/dispatch/002")]
 #[test]
 fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
@@ -978,6 +996,31 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
         .with_imported_claude_credentials()
         // The branch build must win over any host-installed `dot-agent-deck`.
         .with_env("PATH", path_with_binary_dir())
+        // Issue #663: run the PRODUCTION post-respawn readiness buffer. The
+        // harness pins it to `0` for the many e2e scenarios whose workers are
+        // stand-ins that accept input the instant they exist; PRD #249's own
+        // measurement is that a real agent's task pointer is LOST at `0` and
+        // delivered-and-submitted at `1000`, because `SessionStart` means "a
+        // session exists", not "the TUI interprets `\r` as submit".
+        //
+        // This became a real-agent respawn scenario when the fixture's `coder`
+        // flipped to `clear = true` (#584/#606, PR #646), and it inherited the
+        // pin — so the delegate reached the right worker, respawned it, and
+        // wrote the pointer into a Claude that had emitted `SessionStart` ~400ms
+        // earlier and was still booting. The bytes were dropped, the coder sat
+        // idle for the full 300s budget, and the test was deterministically red.
+        // The other two real `clear = true` scenarios
+        // (`orchestration/delegate/014`, `/015`) already opt back in the same way.
+        .with_env(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS, "1000")
+        // The daemon must outlive this test's OWN budget, or its failure
+        // diagnostics lie. The harness's leaked-daemon backstop is 300s and
+        // `WORK_WAIT` below is also 300s, so on a red run the daemon self-exited
+        // ~25s BEFORE the assertion fired: `role_diagnostics` then queried a
+        // dead socket, got no records, and reported `NO PANE — never spawned at
+        // all` for all three roles while the same dump rendered them alive. That
+        // false diagnostic is what issue #663 was filed on. 900s still bounds a
+        // leak (the test itself runs ~320s).
+        .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "900")
         .launch_with_fixture("dispatch-orch-real");
     deck.wait_for_string("No active sessions");
 
@@ -1233,9 +1276,11 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
         resp.send_result
     );
 
-    // Generous: an orchestrator turn, a `clear = false` worker's delivery, and a
-    // worker turn — three real Haiku round trips on a machine already running
-    // three agents. A slow chain must not read as a broken one.
+    // Generous: an orchestrator turn, a `clear = true` worker RESPAWN (issue
+    // #584 — a fresh Haiku cold boot, its `SessionStart`, and the readiness
+    // buffer) and then a worker turn — three real Haiku round trips plus a cold
+    // start, on a machine already running three agents. A slow chain must not
+    // read as a broken one.
     const WORK_WAIT: Duration = Duration::from_secs(300);
     let sentinel_path = expected_worktree.join(SENTINEL);
     assert!(
@@ -1249,6 +1294,40 @@ fn orchestration_dispatch_002_every_real_agent_role_comes_alive() {
          Final grid:\n{}",
         WORK_WAIT.as_secs(),
         sentinel_path.display(),
+        role_diagnostics(&deck, ORCH, &ROLES),
+        deck.snapshot_grid()
+    );
+
+    // ===== …and the cards are STILL named after the work happened ===========
+    //
+    // Issue #663. The card assertion above runs before the delegation; this one
+    // runs after it, and only this one can see what a `clear = true` delegate
+    // does to the card. The respawn SIGTERMs the worker, its `SessionEnd`
+    // retires the named session, and the replacement's `SessionStart` is a fresh
+    // generation — so the `coder` card reverted to the replacement's session
+    // UUID (`ClaudeCode · c70493f1-13…`) the moment the orchestration did its
+    // first piece of work. Every other orchestration path masks this with the
+    // TUI-side `ui.pane_display_names` mirror; the live orchestration surface a
+    // dispatch builds does not seed it, so the dispatched deck is where the user
+    // sees it. Asserted here rather than only in the failure dump, because a
+    // dispatched team whose cards stop saying which agent is which is precisely
+    // the "looks healthy, tells you nothing" shape this test exists to catch.
+    assert!(
+        common::wait_until(CARD_WAIT, || {
+            let grid = deck.snapshot_grid();
+            ROLES.iter().all(|role| card_titled(&grid, role))
+        }),
+        "the dispatched orchestration's cards lost their role names after the \
+         delegation. Every role must STILL appear as `{}` once its agent has been \
+         respawned by a `clear = true` delegate — a card that reverts to the \
+         replacement's session UUID leaves the user unable to tell the orchestrator \
+         from a worker on a team that is actively working. Missing: {:?}{}\n\
+         Final grid:\n{}",
+        card_label("<role>"),
+        ROLES
+            .iter()
+            .filter(|role| !card_titled(&deck.snapshot_grid(), role))
+            .collect::<Vec<_>>(),
         role_diagnostics(&deck, ORCH, &ROLES),
         deck.snapshot_grid()
     );

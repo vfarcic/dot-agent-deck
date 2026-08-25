@@ -824,3 +824,220 @@ fn worktree_reclaim_008_non_utf8_path_is_reclaimed() {
         text
     );
 }
+
+/// Scenario: Two clean, MERGED, *foreign* worktrees sit side by side, whose
+/// directory names differ only in one raw byte that is not valid UTF-8
+/// (`candidate-\xff` and `candidate-\xfe`). A bare `worktree reclaim` keeps
+/// both and lists them as a pending decision. Because `to_string_lossy`
+/// collapses every invalid sequence to `U+FFFD`, both bullets render as the
+/// same line — so the operator reading the list cannot tell which of the two
+/// directories the follow-up `--yes` would remove, even though the removal
+/// acts on the distinct byte-exact paths. Asserts the two rendered bullets
+/// differ from each other.
+#[spec("worktree/reclaim/009")]
+#[test]
+#[cfg(target_os = "linux")]
+fn worktree_reclaim_009_pending_bullets_never_alias_two_distinct_paths() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let fx = Fixture::new();
+    let name_ff = OsStr::from_bytes(b"candidate-\xff");
+    let name_fe = OsStr::from_bytes(b"candidate-\xfe");
+    let wt_ff = fx.add_worktree_with_commit_raw(name_ff, "feat/cand-ff");
+    let wt_fe = fx.add_worktree_with_commit_raw(name_fe, "feat/cand-fe");
+    fx.set_pr_state("feat/cand-ff", "MERGED");
+    fx.set_pr_state("feat/cand-fe", "MERGED");
+    // Deliberately NOT marked owned, so both land on the `ask` surface --
+    // the pending list, which is the surface whose entire purpose is to let
+    // the operator decide what a following `--yes` will delete.
+
+    // Fixture precondition, as in `008`: both directories must exist on disk
+    // with the EXACT bytes intended. A filesystem that normalised or rejected
+    // either name would leave one candidate (or two identical ones), and the
+    // "two bullets differ" assertion below would then pass or fail for a
+    // reason that has nothing to do with the rendering under test.
+    let entries: Vec<_> = std::fs::read_dir(fx._scratch.path())
+        .expect("read scratch dir")
+        .map(|e| e.expect("dir entry").file_name())
+        .collect();
+    for name in [name_ff, name_fe] {
+        assert!(
+            entries.iter().any(|e| e.as_bytes() == name.as_bytes()),
+            "fixture precondition: the scratch dir must contain an entry whose raw bytes \
+             exactly match {name:?} -- the filesystem may have normalised or rejected the \
+             non-UTF-8 name; got entries: {entries:?}"
+        );
+    }
+    assert_ne!(
+        name_ff.as_bytes(),
+        name_fe.as_bytes(),
+        "fixture precondition: the two candidate names must genuinely differ in their raw \
+         bytes, or there is no aliasing to detect"
+    );
+
+    let out = fx.run(&["worktree", "reclaim"]);
+    // As in `003`/`004`/`005`/`008`: rule out clap's own usage/parse-error
+    // exit code first, so a rejected subcommand (which prints no pending
+    // section at all) cannot be mistaken for a correctly-rendered one.
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "exit code 2 is clap's own generic usage/parse-error code; status={:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        !combined(&out).contains("Usage:"),
+        "stderr still carries clap's own subcommand-usage banner, meaning `worktree reclaim` \
+         was not recognized as a real subcommand rather than being handled and raising a \
+         pending decision; out={}",
+        combined(&out)
+    );
+
+    // Control: a bare `reclaim` must KEEP both foreign worktrees. Without
+    // this, "two bullets" could be read off a report about directories that
+    // were already gone -- the pending list is a decision still to be made,
+    // not a post-mortem.
+    assert!(
+        wt_ff.exists() && wt_fe.exists(),
+        "a bare `worktree reclaim` must keep both foreign worktrees pending, not remove them; \
+         ff exists={} fe exists={}\n{}",
+        wt_ff.exists(),
+        wt_fe.exists(),
+        combined(&out)
+    );
+
+    // Compare RAW BYTES, never `String::from_utf8_lossy`. `combined()` would
+    // apply the very lossy conversion under test, so two byte-distinct
+    // bullets could be reported as colliding purely because the harness
+    // collapsed them.
+    let bullets: Vec<&[u8]> = out
+        .stdout
+        .split(|&b| b == b'\n')
+        .filter(|l| l.starts_with(b"  - "))
+        .collect();
+    let text = combined(&out);
+    assert_eq!(
+        bullets.len(),
+        2,
+        "both foreign worktrees must appear as their own pending bullet -- got {} bullet \
+         line(s); full output:\n{text}",
+        bullets.len()
+    );
+    assert_ne!(
+        bullets[0],
+        bullets[1],
+        "the pending list exists so the operator can decide what `--yes` will delete, and the \
+         removal acts on the distinct byte-exact paths -- so two directories that differ in \
+         their raw bytes must never render as the same line. Got two identical bullets \
+         {:?}; full output:\n{text}",
+        String::from_utf8_lossy(bullets[0])
+    );
+}
+
+/// Scenario: A worktree created through the deck's REAL creation path
+/// (`issue_dispatch_run::create_worktree`, the only `git worktree add` in
+/// `src/` — every dispatch and every issue-dispatch fire goes through it) is
+/// recognised by `worktree list` as deck-owned, and — being MERGED and clean —
+/// gets the unattended `remove` verdict rather than `ask`. A sibling worktree
+/// created by a plain `git worktree add`, identical in every other respect,
+/// is the control: it must still read as foreign. Pins issue #425, where the
+/// marker was read but never written, so the deck's own worktrees could only
+/// ever reach `ask`.
+#[spec("worktree/reclaim/010")]
+#[test]
+#[cfg(unix)]
+fn worktree_reclaim_010_worktree_created_by_the_deck_reads_as_owned() {
+    let fx = Fixture::new();
+
+    // The subject: created the way production creates one. Deliberately NOT
+    // `fx.mark_owned` — the whole point is that nothing marks it by hand.
+    let deck_made = fx._scratch.path().join("wt-deck-made");
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(dot_agent_deck::issue_dispatch_run::create_worktree(
+            &fx.repo,
+            &deck_made,
+            "feat/deck-made",
+            false,
+            dot_agent_deck::worktree_owner::Creator::dispatch("deck-made"),
+        ))
+        .expect("the deck's creation path must create the worktree");
+    assert_eq!(
+        outcome,
+        dot_agent_deck::issue_dispatch_run::WorktreeCreation::Created,
+        "fixture precondition: the worktree must have been genuinely CREATED here — an \
+         already-claimed directory is somebody else's and is never marked"
+    );
+    assert!(deck_made.is_dir(), "fixture precondition: worktree on disk");
+    fx.set_pr_state("feat/deck-made", "MERGED");
+
+    // The control: same repo, same shape, same MERGED PR — created by a plain
+    // `git worktree add`, which is what an orchestrator or a human runs. It
+    // must stay foreign, or "owned" would be measuring nothing.
+    let hand_made = fx.add_worktree_with_commit("wt-hand-made", "feat/hand-made");
+    fx.set_pr_state("feat/hand-made", "MERGED");
+
+    let out = fx.run(&["worktree", "list", "--json"]);
+    assert!(
+        out.status.success(),
+        "`worktree list --json` must succeed; got {:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let doc: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must parse as JSON ({e}); got:\n{stdout}"));
+    let entry_for = |needle: &str| -> serde_json::Value {
+        doc.get("worktrees")
+            .and_then(|w| w.as_array())
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|e| {
+                        e.get("path")
+                            .and_then(|p| p.as_str())
+                            .is_some_and(|p| p.contains(needle))
+                    })
+                    .cloned()
+            })
+            .unwrap_or_else(|| panic!("no entry for {needle} in:\n{stdout}"))
+    };
+
+    let deck_entry = entry_for("wt-deck-made");
+    assert_eq!(
+        deck_entry.get("owned").and_then(|o| o.as_bool()),
+        Some(true),
+        "a worktree the deck created must read as deck-owned — the marker is written at \
+         creation time; got entry:\n{deck_entry}\nfull document:\n{stdout}"
+    );
+    assert_eq!(
+        deck_entry.get("verdict").and_then(|v| v.as_str()),
+        Some("remove"),
+        "MERGED + clean + deck-owned is the one combination that reclaims unattended; \
+         got entry:\n{deck_entry}\nfull document:\n{stdout}"
+    );
+
+    let hand_entry = entry_for("wt-hand-made");
+    assert_eq!(
+        hand_entry.get("owned").and_then(|o| o.as_bool()),
+        Some(false),
+        "control: a worktree created by a plain `git worktree add` must stay foreign — the \
+         deck never claims what it did not create; got entry:\n{hand_entry}\nfull \
+         document:\n{stdout}"
+    );
+    assert_eq!(
+        hand_entry.get("verdict").and_then(|v| v.as_str()),
+        Some("ask"),
+        "a foreign worktree, however reclaimable it otherwise looks, must require an \
+         explicit confirmation; got entry:\n{hand_entry}\nfull document:\n{stdout}"
+    );
+
+    assert!(
+        hand_made.is_dir() && deck_made.is_dir(),
+        "`worktree list` must not remove anything"
+    );
+}

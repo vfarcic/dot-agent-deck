@@ -1,0 +1,97 @@
+---
+name: Issue labeler batch
+
+"on":
+  workflow_dispatch:
+    inputs:
+      item_type:
+        description: Type of every supplied number
+        required: true
+        type: choice
+        options:
+          - issue
+          - pull_request
+      numbers:
+        description: >-
+          Comma- or space-separated issue or pull request numbers (maximum 20)
+        required: true
+        type: string
+      apply:
+        description: Apply labels and enable learning instead of previewing
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      numbers: ${{ steps.parse.outputs.numbers }}
+    steps:
+      - name: Validate numbers
+        id: parse
+        env:
+          RAW_NUMBERS: ${{ inputs.numbers }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          values = os.environ["RAW_NUMBERS"].replace(",", " ").split()
+          if not values:
+              raise SystemExit("at least one number is required")
+          if len(values) > 20:
+              raise SystemExit("at most 20 numbers are allowed")
+          invalid = (
+              not value.isascii() or not value.isdigit() or int(value) < 1
+              for value in values
+          )
+          if any(invalid):
+              raise SystemExit("numbers must be positive decimal integers")
+          numbers = list(dict.fromkeys(map(int, values)))
+          encoded = json.dumps(numbers, separators=(",", ":"))
+          output_path = os.environ["GITHUB_OUTPUT"]
+          with open(output_path, "a", encoding="utf-8") as output:
+              output.write(f"numbers={encoded}\n")
+          PY
+
+  preview:
+    if: ${{ !inputs.apply }}
+    needs: prepare
+    permissions:
+      actions: write
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        number: ${{ fromJSON(needs.prepare.outputs.numbers) }}
+    uses: ./.github/workflows/issue-labeler-preview.lock.yml
+    with:
+      item_type: ${{ inputs.item_type }}
+      item_number: ${{ matrix.number }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+  apply:
+    if: ${{ inputs.apply }}
+    needs: prepare
+    permissions:
+      actions: read
+      contents: write
+      issues: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        number: ${{ fromJSON(needs.prepare.outputs.numbers) }}
+    uses: ./.github/workflows/issue-labeler.lock.yml
+    with:
+      item_type: ${{ inputs.item_type }}
+      item_number: ${{ matrix.number }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

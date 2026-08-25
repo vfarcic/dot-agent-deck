@@ -1761,10 +1761,21 @@ async fn run_hook_loop(
                                     // `SessionStart` event before writing
                                     // the prompt (event-driven readiness,
                                     // replacing the F9 250ms fixed delay).
+                                    // Issue #606: `_with_state` so a `clear = true`
+                                    // respawn that had to RE-CREATE the worker pane
+                                    // (its record removed by a concurrent close) can
+                                    // put the role registration back. The read guard
+                                    // below is released before the detached dispatch
+                                    // task ever takes the write lock.
                                     let resp = state
                                         .read()
                                         .await
-                                        .handle_delegate(signal, &pty_registry, &event_tx)
+                                        .handle_delegate_with_state(
+                                            signal,
+                                            &pty_registry,
+                                            &event_tx,
+                                            Some(&state),
+                                        )
                                         .await;
                                     // Answer on the same connection, like
                                     // `GetSeed` / `ListTargets`. Delegate used to

@@ -5,7 +5,7 @@
 //! Subcommands:
 //!
 //! - `linkage-check` (default) — first runs a repository-state preflight
-//!   (issue #557; see [`repo_state`]), then performs the nine checks
+//!   (issue #557; see [`repo_state`]), then performs the ten checks
 //!   listed in Decision 7 + Decision 30:
 //!
 //!   The preflight is deliberately not one of the numbered checks: it answers
@@ -40,6 +40,11 @@
 //!      `#[path]`-included by the lib target AND by every
 //!      integration-test crate that needs a disk-backed scratch dir.
 //!      Issue #474. See [`SELF_CONTAINED_RULE`].
+//!  10. Every file under `tests/` that builds an `AgentPtyRegistry`
+//!      or calls `run_daemon_with` also arms the wrapped-child
+//!      lifetime bound — `common::init_test_env()` or
+//!      `child_lifetime_bound::arm()`. Issue #668. See
+//!      [`UNARMED_SPAWN_RULE`].
 //!
 //!   Checks 1/2/4/6 bind each `#[spec("…")]` to its test function
 //!   through the SAME syn walker rule 7 uses
@@ -68,6 +73,11 @@
 //! Exits 0 on success, 1 on any failure with a per-finding summary.
 
 mod clean_tmp;
+/// Issue #603: the adaptive issue labeler's post-agent memory validator. Tests
+/// only — the rule lives in the agentic workflow, and these drive the real
+/// script under `node`.
+#[cfg(test)]
+mod issue_labeler_memory;
 mod list_tests;
 /// Issue #648: the toolchain pins duplicated between `devbox.json` and
 /// `.github/workflows/`. Tests only, and Unix only — the rule itself lives in
@@ -319,6 +329,138 @@ fn check_self_contained(root: &Path) -> Vec<String> {
     }
 }
 
+/// Check 10 (issue #668): a test file that spawns agents must arm the wrapped-
+/// child lifetime bound, spelled out here because nothing at the offending line
+/// says so.
+///
+/// `dot-agent-deck wrap` bounds the wrapper (`arm_wrap_self_defense`) and, since
+/// #661, the wrapped child's whole process group (`arm_child_group_backstop`,
+/// which forks a reaper that outlives an uncatchable `SIGKILL` of the wrapper).
+/// Both are gated on `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` so a *production*
+/// wrapper forks nothing. Arming that gate is therefore the caller's job, and
+/// `agent_pty::spawn` does not `env_clear` — it scrubs named deck vars and
+/// inherits the rest — so one value in the test process reaches every child of
+/// every spawn shape.
+///
+/// **This rule exists because forgetting it is silent and has already
+/// happened.** #661 armed rows 1 and 2 of the suite's spawn table (`TuiDeck` and
+/// `DaemonProc` both pin the cap after their `env_clear`) and nobody noticed row
+/// 3 — the in-process `AgentPtyRegistry` path, 15 test files — was unarmed. The
+/// symptom is not a failing test: it is a wrapped stand-in that survives the run
+/// at `ppid=1` holding a deleted working directory, 221 of them censused on one
+/// dev box with the oldest alive 9.4 days. Nothing in a diff shows the absence.
+///
+/// **Scope: `tests/` only.** `src/daemon.rs` calls `run_daemon_with` in
+/// production, where the gate must stay unarmed, and would otherwise trip this
+/// on every run.
+///
+/// **What it matches.** Constructing an `AgentPtyRegistry` (`::new()` /
+/// `::default()`) or calling `run_daemon_with(…)`. Those two are the only ways a
+/// test reaches an unarmed registry: everything else goes through
+/// `common::spawn_inprocess_daemon` or `TuiDeck`, which arm it, and a test that
+/// only borrows `daemon.pty_registry` had to build that daemon with
+/// `run_daemon_with` first.
+///
+/// **What satisfies it.** `common::init_test_env()` for the files that link the
+/// harness, or `child_lifetime_bound::arm()` for the ones that deliberately do
+/// not (`tests/common/child_lifetime_bound.rs` is `#[path]`-includable on its
+/// own, because `tests/common/mod.rs` is ~420 KB of PTY harness and pulling it
+/// into a fast-tier crate to reach one `set_var` is a real compile cost). Either
+/// marker anywhere in the file clears it.
+///
+/// **The view both halves are matched over** is comment-stripped AND
+/// literal-blanked ([`blank_string_literal_contents`]), so prose about either
+/// side is not a violation and neither is *quoted* code. That matters in both
+/// directions, and unlike the limits below neither is accepted: a file that
+/// merely mentions `child_lifetime_bound::arm()` inside a string — the obvious
+/// shape for a test asserting this rule's own remedy text — must not thereby
+/// clear its real spawn sites, and a file asserting on a message containing
+/// `run_daemon_with(` must not fail the build for spawning nothing.
+///
+/// **Its false-negative surface, stated rather than hidden.** This is a line
+/// scan, not a parser, so it is a belt: the load-bearing protection is the fd
+/// fix in `src/wrap.rs`, which makes a stranded child die of its own hangup with
+/// no env var involved. Three things it cannot see. It checks *presence*, not
+/// *ordering*, so an `arm()` call placed after the spawn passes. It is
+/// file-granular, so one armed test clears a second unarmed one in the same
+/// file. And it keys on the module being included under its own name, so
+/// `#[path = "common/child_lifetime_bound.rs"] mod bound;` defeats the marker.
+/// All three are review-visible in a way the original gap was not, which is the
+/// bar this rule is aiming at.
+const UNARMED_SPAWN_RULE: &str = "agent spawn path with no lifetime bound armed — this file \
+     builds an `AgentPtyRegistry` or runs a daemon in-process, so the agents it spawns inherit \
+     THIS process's environment, and `dot-agent-deck wrap` leaves both its self-defence and \
+     #661's child-group reaper unarmed without \
+     `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` in it. A wrapped stand-in that outlives its wrapper \
+     is then never reaped (issue #668). Fix: call `common::init_test_env()` before the first \
+     spawn if the file links the harness, otherwise add \
+     `#[path = \"common/child_lifetime_bound.rs\"] mod child_lifetime_bound;` and call \
+     `child_lifetime_bound::arm()`. A deliberate exception pins its own cap per-`Command` and \
+     carries `linkage-check:allow-unarmed-agent-spawn` on this line";
+
+/// Opt-out marker for check 10, on the offending line. Same shape as
+/// [`BARE_TEMPDIR_ALLOW`]: an exception is declared where it is taken, so review
+/// sees it, rather than in a list far from the code.
+///
+/// No file needs it today. `tests/wrap_io.rs` and `tests/agent_lifetime_bound.rs`
+/// are the two that pin their own per-`Command` caps deliberately, and neither
+/// trips the rule — `wrap_io.rs` drives the `wrap` binary directly and builds no
+/// registry, and `agent_lifetime_bound.rs` calls `init_test_env()` anyway.
+const UNARMED_SPAWN_ALLOW: &str = "linkage-check:allow-unarmed-agent-spawn";
+
+/// The spawn sites check 10 requires arming for.
+///
+/// `AgentPtyRegistry::default()` is matched alongside `::new()` even though no
+/// call site uses it: it is the ordinary second constructor, and a rule that
+/// covers most of its stated territory is the shape that let
+/// `NamedTempFile::new()` sit undetected under check 8. `run_daemon_with` needs
+/// its `(` — an import (`use dot_agent_deck::daemon::{Daemon, run_daemon_with};`)
+/// names it without calling it and is deliberately not a violation.
+fn agent_spawn_site_re() -> Regex {
+    Regex::new(r"AgentPtyRegistry\s*::\s*(new|default)\s*\(|\brun_daemon_with\s*\(")
+        .expect("agent spawn site regex compiles")
+}
+
+/// The calls that arm the bound, either of which clears check 10 for a file.
+fn lifetime_bound_armed_re() -> Regex {
+    Regex::new(r"\binit_test_env\s*\(|\bchild_lifetime_bound\s*::\s*arm\s*\(")
+        .expect("lifetime bound arming regex compiles")
+}
+
+/// Every unarmed spawn site in `text`, formatted as `<display>:<line>: <rule>`.
+///
+/// Takes the contents rather than a path so its tests can feed synthetic
+/// sources, for the same reason [`self_contained_violations`] does: a rule whose
+/// only coverage is the live checkout tests nothing whenever that checkout is
+/// clean, which is its normal state and would be its state on the day it
+/// silently stopped matching.
+///
+/// The arming marker is looked for across the whole file rather than per line —
+/// arming happens once per process, usually in a harness helper hundreds of
+/// lines from the spawn it protects.
+fn unarmed_agent_spawn_violations(display: &str, text: &str) -> Vec<String> {
+    let stripped = blank_string_literal_contents(&strip_rust_comments(text));
+    if lifetime_bound_armed_re().is_match(&stripped) {
+        return Vec::new();
+    }
+    let site_re = agent_spawn_site_re();
+    // Line endings are preserved 1-for-1 by the stripper, so these indices are
+    // the raw source's line numbers — and the raw line is what carries the
+    // opt-out marker, since the stripper removes the comment it lives in.
+    let raw_lines: Vec<&str> = text.lines().collect();
+    stripped
+        .lines()
+        .enumerate()
+        .filter(|(idx, line)| {
+            site_re.is_match(line)
+                && !raw_lines
+                    .get(*idx)
+                    .is_some_and(|raw| raw.contains(UNARMED_SPAWN_ALLOW))
+        })
+        .map(|(idx, _)| format!("{display}:{}: {UNARMED_SPAWN_RULE}", idx + 1))
+        .collect()
+}
+
 fn main() -> ExitCode {
     // PRD #77 M4: route subcommands through this binary so the
     // single `cargo xtask` alias can drive both linkage-check and
@@ -413,6 +555,7 @@ fn main() -> ExitCode {
         Regex::new(r"for\s+_\s+in\s+0\.\.\s*\d+\s*\{").expect("polling regex compiles");
     let bare_tempdir_re = bare_temp_ctor_re();
     let mut bare_tempdir_violations: Vec<String> = Vec::new();
+    let mut unarmed_spawn_violations: Vec<String> = Vec::new();
 
     for file in &test_files {
         let text = match std::fs::read_to_string(file) {
@@ -469,6 +612,18 @@ fn main() -> ExitCode {
                     ));
                 }
             }
+        }
+
+        // Check 10 (issue #668): `tests/` only — `src/daemon.rs` calls
+        // `run_daemon_with` in production, where the gate must stay unarmed.
+        // The whole-file arming lookup is inside the helper, which does its own
+        // comment-stripping so it can be unit-tested against synthetic sources
+        // rather than only against a checkout that is clean by construction.
+        if file.starts_with(&tests_dir) {
+            unarmed_spawn_violations.extend(unarmed_agent_spawn_violations(
+                &file.display().to_string(),
+                &text,
+            ));
         }
 
         if is_e2e {
@@ -592,6 +747,12 @@ fn main() -> ExitCode {
             .map(|v| format!("[8] {v}")),
     );
 
+    failures.extend(
+        unarmed_spawn_violations
+            .into_iter()
+            .map(|v| format!("[10] {v}")),
+    );
+
     // Check 9 (issue #474): `src/test_temp.rs` names no crate of its own. It is
     // read directly rather than folded into the scan above, so that the file
     // going missing is reported instead of quietly emptying the rule.
@@ -615,7 +776,7 @@ fn main() -> ExitCode {
 
     if failures.is_empty() {
         println!(
-            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 9 rules)",
+            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 10 rules)",
             catalog_ids.len(),
             discovered.len(),
             allowlist.len()
@@ -872,6 +1033,149 @@ fn visit(dir: &Path, acc: &mut BTreeMap<PathBuf, ()>) {
             acc.insert(p, ());
         }
     }
+}
+
+/// Blank the CONTENTS of every string, raw-string and char literal in `src`,
+/// replacing each content byte with a space and leaving the delimiters (and the
+/// line count) alone.
+///
+/// Fed the output of [`strip_rust_comments`], so it never has to tell a `"`
+/// inside a comment from a real one — those bytes are already spaces.
+///
+/// **Used by check 10 only, deliberately, and not folded into
+/// [`strip_rust_comments`].** That function's other callers *depend* on seeing
+/// inside literals: check 9's doc comment says so outright ("A `crate::` inside
+/// a string literal is not exempt"), and check 8's bare-tempdir scan reads the
+/// same view. Changing the shared stripper in place would silently widen those
+/// two rules' blind spots to buy check 10 its fix.
+///
+/// Why check 10 wants it, in both directions. As a **false negative**: the rule
+/// clears a whole file the moment its arming regex matches anywhere, so a test
+/// that merely *quotes* `child_lifetime_bound::arm()` — the obvious shape for a
+/// future case asserting this rule's own remedy text — would satisfy it while
+/// building an unarmed registry elsewhere in the file. As a **false positive**:
+/// a test asserting on a log or error message containing `run_daemon_with(` or
+/// `AgentPtyRegistry::new(` would fail the build for a file that spawns nothing.
+///
+/// Shares [`strip_rust_comments`]'s lexing limits, which are acceptable for the
+/// same reason: byte-string prefixes (`b"…"`) blank correctly because the `"`
+/// still opens a literal, while a raw *byte* string (`br"…"`) is read as a plain
+/// string because the `r` is not at a token boundary — so its backslashes are
+/// treated as escapes. The failure mode there is a mis-blanked literal, never a
+/// dropped line, and no such literal exists under `tests/`.
+fn blank_string_literal_contents(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    let mut in_string = false;
+    let mut in_char = false;
+    let mut raw_string_hashes: Option<usize> = None;
+    // Content bytes become spaces; newlines stay newlines so per-line indexing
+    // into the result still matches the raw source's line numbers.
+    let blank = |c: char, out: &mut String| out.push(if c == '\n' { '\n' } else { ' ' });
+
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+
+        if let Some(needed_hashes) = raw_string_hashes {
+            if c == '"' {
+                let mut hashes_seen = 0usize;
+                while hashes_seen < needed_hashes
+                    && bytes.get(i + 1 + hashes_seen).copied() == Some(b'#')
+                {
+                    hashes_seen += 1;
+                }
+                if hashes_seen == needed_hashes {
+                    out.push('"');
+                    for _ in 0..hashes_seen {
+                        out.push('#');
+                    }
+                    i += 1 + hashes_seen;
+                    raw_string_hashes = None;
+                    continue;
+                }
+            }
+            blank(c, &mut out);
+            i += 1;
+            continue;
+        }
+
+        if in_string || in_char {
+            // An escape is two bytes and cannot close the literal, so consume
+            // both — otherwise `"\""` would end one byte early.
+            if c == '\\' && i + 1 < bytes.len() {
+                blank(c, &mut out);
+                blank(bytes[i + 1] as char, &mut out);
+                i += 2;
+                continue;
+            }
+            if (in_string && c == '"') || (in_char && c == '\'') {
+                out.push(c);
+                in_string = false;
+                in_char = false;
+                i += 1;
+                continue;
+            }
+            blank(c, &mut out);
+            i += 1;
+            continue;
+        }
+
+        // Raw string start: `r"`, `r#"`, `r##"`, … at a token boundary, so `for`
+        // and `let_r` do not fire it.
+        if c == 'r' {
+            let prev = i.checked_sub(1).and_then(|p| bytes.get(p)).copied();
+            let is_token_boundary = match prev {
+                None => true,
+                Some(b) => {
+                    let pc = b as char;
+                    !(pc.is_ascii_alphanumeric() || pc == '_')
+                }
+            };
+            if is_token_boundary {
+                let mut j = i + 1;
+                while bytes.get(j).copied() == Some(b'#') {
+                    j += 1;
+                }
+                if bytes.get(j).copied() == Some(b'"') {
+                    let hashes = j - (i + 1);
+                    out.push('r');
+                    for _ in 0..hashes {
+                        out.push('#');
+                    }
+                    out.push('"');
+                    i = j + 1;
+                    raw_string_hashes = Some(hashes);
+                    continue;
+                }
+            }
+        }
+
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '\'' {
+            // Same lifetime heuristic the comment stripper uses: `'a` followed
+            // by something other than `'` is a lifetime, not a char literal.
+            let next = bytes.get(i + 1).map(|b| *b as char);
+            let after_after = bytes.get(i + 2).map(|b| *b as char);
+            let looks_like_lifetime = next.is_some_and(|n| n.is_ascii_alphabetic() || n == '_')
+                && after_after.is_some_and(|a| a != '\'');
+            if !looks_like_lifetime {
+                in_char = true;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+
+        out.push(c);
+        i += 1;
+    }
+    out
 }
 
 /// Strip Rust `//` line comments and `/* … */` block comments from
@@ -1339,6 +1643,268 @@ mod tests {
             found[0]
         );
         assert!(found[0].contains("issue #474"), "{}", found[0]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Check 10 (issue #668): the wrapped-child lifetime bound is armed.
+    // ---------------------------------------------------------------------
+    //
+    // Both directions, against synthetic sources: a checkout that is clean by
+    // construction proves nothing about a rule, and would still print `ok` on
+    // the day it silently stopped matching.
+
+    /// The unarmed direction: a file that builds a registry and never arms is
+    /// reported, at the line the registry is built on.
+    #[test]
+    fn unarmed_agent_spawn_violations_reports_a_file_that_never_arms() {
+        let src = concat!(
+            "use dot_agent_deck::agent_pty::{AgentPtyRegistry, SpawnOptions};\n",
+            "\n",
+            "#[test]\n",
+            "fn spawns_a_stand_in() {\n",
+            "    let registry = Arc::new(AgentPtyRegistry::new());\n",
+            "    registry.spawn_agent(SpawnOptions::default()).unwrap();\n",
+            "}\n",
+        );
+
+        let found = unarmed_agent_spawn_violations("tests/synthetic.rs", src);
+
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(
+            found[0].starts_with("tests/synthetic.rs:5: "),
+            "{}",
+            found[0]
+        );
+        // The message has to say what to DO — the gap this rule closes was
+        // invisible precisely because nothing at the call site named it.
+        assert!(found[0].contains("common::init_test_env()"), "{}", found[0]);
+        assert!(
+            found[0].contains("child_lifetime_bound::arm()"),
+            "{}",
+            found[0]
+        );
+        assert!(found[0].contains("issue #668"), "{}", found[0]);
+    }
+
+    /// The armed direction, both markers: the harness call for files that link
+    /// `common`, and the standalone include for the ones that deliberately do
+    /// not. Either clears the whole file, because arming happens once per
+    /// process — usually in a helper hundreds of lines from the spawn it
+    /// protects.
+    #[test]
+    fn unarmed_agent_spawn_violations_accepts_either_arming_marker() {
+        let via_harness = concat!(
+            "mod common;\n",
+            "\n",
+            "fn start() {\n",
+            "    common::init_test_env();\n",
+            "    let registry = Arc::new(AgentPtyRegistry::new());\n",
+            "    let _ = run_daemon_with(&hook, daemon);\n",
+            "}\n",
+        );
+        let via_include = concat!(
+            "#[path = \"common/child_lifetime_bound.rs\"]\n",
+            "mod child_lifetime_bound;\n",
+            "\n",
+            "async fn start_server() -> Server {\n",
+            "    child_lifetime_bound::arm();\n",
+            "    let registry = Arc::new(AgentPtyRegistry::new());\n",
+            "}\n",
+        );
+
+        assert_eq!(
+            unarmed_agent_spawn_violations("tests/harness.rs", via_harness),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            unarmed_agent_spawn_violations("tests/standalone.rs", via_include),
+            Vec::<String>::new()
+        );
+    }
+
+    /// `run_daemon_with` is the second trigger, and it needs its `(`: an import
+    /// names the function without calling it, and `tests/rehydration.rs` has one
+    /// at the top of a file that arms four helpers further down. A rule that
+    /// fired on the `use` line would be reporting the wrong thing even when the
+    /// file is correct.
+    #[test]
+    fn agent_spawn_site_re_matches_calls_not_imports() {
+        let re = agent_spawn_site_re();
+        for line in [
+            "        let _ = run_daemon_with(&hook_for_task, daemon).await;",
+            "    let registry = Arc::new(AgentPtyRegistry::new());",
+            "    let registry = AgentPtyRegistry :: default ();",
+        ] {
+            assert!(re.is_match(line), "should be a violation: {line}");
+        }
+        for line in [
+            "use dot_agent_deck::daemon::{Daemon, run_daemon_with};",
+            "    registry: Arc<AgentPtyRegistry>,",
+            "    let registry = daemon.pty_registry.clone();",
+            "    let daemon = common::spawn_inprocess_daemon().await;",
+        ] {
+            assert!(!re.is_match(line), "should NOT be a violation: {line}");
+        }
+    }
+
+    /// Prose is not a spawn site. Run over the comment-stripped view so this
+    /// rule's own doc comments — and the module headers that explain the gap by
+    /// naming `AgentPtyRegistry::new()` — are not violations of it. The same
+    /// reason checks 5, 8 and 9 strip first.
+    #[test]
+    fn unarmed_agent_spawn_violations_ignores_comments() {
+        let src = concat!(
+            "//! The in-process `AgentPtyRegistry::new()` path was unarmed.\n",
+            "// let registry = Arc::new(AgentPtyRegistry::new());\n",
+            "/* run_daemon_with(&hook, daemon) is what the harness calls. */\n",
+            "fn nothing() {}\n",
+        );
+
+        assert_eq!(
+            unarmed_agent_spawn_violations("tests/prose.rs", src),
+            Vec::<String>::new()
+        );
+    }
+
+    /// An arming marker inside a STRING is not an arming call. Without the
+    /// literal-blanking step this file passed: the regex saw
+    /// `child_lifetime_bound::arm()` in the assertion text and cleared the real,
+    /// unarmed registry below it. The shape is not hypothetical — it is what a
+    /// test asserting this rule's own remedy wording looks like.
+    #[test]
+    fn unarmed_agent_spawn_violations_ignores_arming_markers_inside_string_literals() {
+        let normal = concat!(
+            "fn asserts_the_rule_text() {\n",
+            "    assert!(msg.contains(\"child_lifetime_bound::arm()\"));\n",
+            "    assert!(msg.contains(\"common::init_test_env()\"));\n",
+            "}\n",
+            "\n",
+            "fn spawns_unarmed() {\n",
+            "    let registry = Arc::new(AgentPtyRegistry::new());\n",
+            "}\n",
+        );
+        let raw = concat!(
+            "fn asserts_the_rule_text() {\n",
+            "    let want = r#\"call common::init_test_env() before spawning\"#;\n",
+            "}\n",
+            "\n",
+            "fn spawns_unarmed() {\n",
+            "    let registry = Arc::new(AgentPtyRegistry::new());\n",
+            "}\n",
+        );
+
+        let found = unarmed_agent_spawn_violations("tests/quotes_the_remedy.rs", normal);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(
+            found[0].starts_with("tests/quotes_the_remedy.rs:7: "),
+            "{}",
+            found[0]
+        );
+
+        let found_raw = unarmed_agent_spawn_violations("tests/quotes_the_remedy_raw.rs", raw);
+        assert_eq!(found_raw.len(), 1, "{found_raw:#?}");
+        assert!(
+            found_raw[0].starts_with("tests/quotes_the_remedy_raw.rs:6: "),
+            "{}",
+            found_raw[0]
+        );
+    }
+
+    /// The other direction: a spawn-SHAPED call inside a string is not a spawn.
+    /// A test asserting on a log line or an error message that happens to
+    /// contain `run_daemon_with(` or `AgentPtyRegistry::new(` spawns nothing,
+    /// and failing the build for it would be a false positive with no escape
+    /// but the opt-out marker.
+    #[test]
+    fn unarmed_agent_spawn_violations_ignores_spawn_shapes_inside_string_literals() {
+        let src = concat!(
+            "fn asserts_on_a_message() {\n",
+            "    assert!(log.contains(\"run_daemon_with(&hook, daemon) failed\"));\n",
+            "    let want = r\"AgentPtyRegistry::new() is not called here\";\n",
+            "    let ch = '\\\"';\n",
+            "}\n",
+        );
+
+        assert_eq!(
+            unarmed_agent_spawn_violations("tests/message_assertions.rs", src),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The blanking keeps the file's shape: same line count, delimiters intact,
+    /// and code outside literals byte-identical. Line numbers in every rule-10
+    /// diagnostic depend on the first of those.
+    #[test]
+    fn blank_string_literal_contents_preserves_lines_and_leaves_code_alone() {
+        let src = concat!(
+            // A multi-line literal: the REAL newline inside it has to survive,
+            // or every line number after this point is wrong.
+            "let a = \"one\ntwo\";\n",
+            "let b = r#\"raw \"quoted\" body\"#;\n",
+            "let c = 'x';\n",
+            "let d: &'static str = \"tail\";\n",
+            "call_me(1);\n",
+        );
+        let out = blank_string_literal_contents(src);
+
+        assert_eq!(
+            out.lines().count(),
+            src.lines().count(),
+            "line count moved:\n{out}"
+        );
+        assert!(out.contains("let a = \"   \n   \";"), "{out}");
+        assert!(out.contains("let b = r#\"                 \"#;"), "{out}");
+        assert!(out.contains("let c = ' ';"), "{out}");
+        // A lifetime is not a char literal, so the code after it is untouched.
+        assert!(out.contains("let d: &'static str = \"    \";"), "{out}");
+        assert!(out.contains("call_me(1);"), "{out}");
+    }
+
+    /// An escaped quote does not close a literal one byte early — otherwise the
+    /// blanker would fall out of the string and start blanking real code.
+    #[test]
+    fn blank_string_literal_contents_handles_escaped_quotes() {
+        let src = "let s = \"a\\\"b\"; run_daemon_with(x);\n";
+        let out = blank_string_literal_contents(src);
+
+        assert!(out.contains("run_daemon_with(x);"), "{out}");
+        assert!(out.contains("let s = \"    \";"), "{out}");
+    }
+
+    /// A file with neither trigger is untouched — the rule claims territory, not
+    /// the whole directory.
+    #[test]
+    fn unarmed_agent_spawn_violations_ignores_files_that_spawn_nothing() {
+        let src = "#[test]\nfn renders() {\n    assert_eq!(2 + 2, 4);\n}\n";
+
+        assert_eq!(
+            unarmed_agent_spawn_violations("tests/render_layout.rs", src),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The escape hatch, on the offending line, the way check 8's is. No file
+    /// needs it today; it exists so a deliberate exception (one pinning its own
+    /// per-`Command` cap) is declared where it is taken instead of weakening the
+    /// rule for everyone. Note it suppresses only the line it is on — the second
+    /// site below is still reported.
+    #[test]
+    fn unarmed_agent_spawn_violations_honours_the_line_opt_out() {
+        let src = concat!(
+            "fn pins_its_own_cap() {\n",
+            "    let registry = AgentPtyRegistry::new(); // linkage-check:allow-unarmed-agent-spawn\n",
+            "    let other = AgentPtyRegistry::new();\n",
+            "}\n",
+        );
+
+        let found = unarmed_agent_spawn_violations("tests/exception.rs", src);
+
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(
+            found[0].starts_with("tests/exception.rs:3: "),
+            "{}",
+            found[0]
+        );
     }
 
     #[test]

@@ -33,7 +33,6 @@ const CLAUDE_MODEL: &str = "claude-haiku-4-5-20251001";
 const CLAUDE_SENTINEL: &str = "prd249-claude-respawn-4d37c1.txt";
 const CLAUDE_SENTINEL_CONTENT: &str = "PRD249_CLAUDE_RESPAWN_OK";
 
-const OPENCODE_MODEL: &str = "openrouter/openai/gpt-4o-mini";
 const OPENCODE_SENTINEL: &str = "prd249-opencode-respawn-8a62f4.txt";
 const OPENCODE_SENTINEL_CONTENT: &str = "PRD249_OPENCODE_RESPAWN_OK";
 
@@ -258,7 +257,7 @@ fn delegate_014_real_claude_worker_acts_on_clear_true_delegate() {
 fn delegate_015_real_opencode_worker_acts_on_clear_true_delegate() {
     skip_unless!(common::check_opencode_available());
 
-    let worker_command = format!("opencode --model {OPENCODE_MODEL} --auto");
+    let worker_command = format!("opencode --model {} --auto", common::opencode_test_model());
     let builder = TuiDeck::builder()
         .with_pty_size(180, 45)
         .with_env("PATH", path_with_binary_dir())

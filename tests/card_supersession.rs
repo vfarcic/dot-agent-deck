@@ -326,3 +326,72 @@ fn status_supersede_007_existing_pi_session_inherits_the_retired_placeholder_nam
         "the existing Pi card dropped the friendly name inherited from the retired scheduler placeholder"
     );
 }
+
+/// Scenario: A dispatched orchestration's role card is named `morning-digest`, then a
+/// `clear = true` delegate SIGTERMs that agent — its `SessionEnd` lands and the
+/// replacement reports a brand-new `SessionStart` with a different agent id. The one
+/// card left on the pane must still carry the friendly name, not the replacement's
+/// session id.
+#[spec("status/supersede/008")]
+#[test]
+fn status_supersede_008_a_respawn_across_session_end_keeps_the_friendly_name() {
+    let placeholder_timestamp = Utc::now();
+    let mut placeholder = event(
+        "spawn-placeholder",
+        AgentType::None,
+        EventType::SessionStart,
+        None,
+        placeholder_timestamp,
+    );
+    placeholder
+        .metadata
+        .insert(DISPLAY_NAME_METADATA_KEY.to_string(), TASK_NAME.to_string());
+
+    let mut state = AppState::default();
+    state.register_pane(PANE_ID.to_string());
+    state.apply_event(placeholder);
+
+    // The first real agent takes the pane and inherits the friendly name.
+    state.apply_event(event(
+        "first-generation",
+        AgentType::ClaudeCode,
+        EventType::SessionStart,
+        Some("agent-1"),
+        placeholder_timestamp + Duration::seconds(1),
+    ));
+    assert_eq!(
+        state.sessions["first-generation"].display_name.as_deref(),
+        Some(TASK_NAME),
+        "precondition: the first real generation inherits the spawn-time friendly name"
+    );
+
+    // The `clear = true` respawn: the outgoing agent's SessionEnd, then the
+    // replacement's own SessionStart under a fresh registry id.
+    state.apply_event(event(
+        "first-generation",
+        AgentType::ClaudeCode,
+        EventType::SessionEnd,
+        Some("agent-1"),
+        placeholder_timestamp + Duration::seconds(2),
+    ));
+    state.apply_event(event(
+        "second-generation",
+        AgentType::ClaudeCode,
+        EventType::SessionStart,
+        Some("agent-2"),
+        placeholder_timestamp + Duration::seconds(3),
+    ));
+
+    assert_eq!(
+        state.sessions.len(),
+        1,
+        "the replacement must leave exactly one card on the pane"
+    );
+    assert_eq!(
+        state.sessions["second-generation"].display_name.as_deref(),
+        Some(TASK_NAME),
+        "the replacement card dropped the pane's friendly name — a `clear = true` \
+         delegate's worker then renders as `ClaudeCode · <session-uuid>` instead of \
+         its role (issue #663)"
+    );
+}

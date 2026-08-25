@@ -165,7 +165,7 @@ prompt_template = "Implement the requested change. If the task references a PRD 
 
 [[orchestrations.roles]]
 name = "reviewer"
-command = "devbox run pi-sol"
+command = "devbox run pi-big"
 # command = "devbox run agent-reviewer"   # all-claude default
 description = "Reviews code changes for correctness, style, and edge cases"
 prompt_template = "Review the change. Report findings only — do not modify code. Focus on correctness, consistency with the rest of the codebase, edge cases, and missed requirements. If the task references a PRD path, verify the implementation matches it. If critical context is missing (e.g. the diff or PRD path), surface it in your work-done summary rather than guessing — the orchestrator will re-delegate with the missing context. Whenever you are blocked or missing critical context, report it back through `work-done` and stop there: never notify the user yourself and never wait on the user — the orchestrator is the only agent that does either, and it escalates for you."
