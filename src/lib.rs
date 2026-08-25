@@ -54,6 +54,12 @@ pub mod terminal_widget;
 // space in the OS temp dir — the RAM-backed `/tmp` the issue is about.
 #[cfg(test)]
 mod test_temp;
+// Issue #666 follow-up: test-only, for the same reason as `test_temp` above.
+// Unit tests do not link `tests/common/`, so `init_test_env`'s scrub of the deck
+// endpoint variables never ran for them and a fixture that spawned an emitter
+// posted hook events into the developer's live dashboard.
+#[cfg(test)]
+mod test_isolation;
 pub mod ui;
 pub mod version;
 pub mod watch;

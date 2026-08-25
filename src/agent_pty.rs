@@ -6744,6 +6744,46 @@ impl AgentPtyRegistry {
             .map(|a| a.writer.clone())
     }
 
+    /// Issue #666 test-only seam: stamp `agent_id`'s SPAWN-TIME identity after
+    /// the child is already running, exactly as [`Self::spawn_agent`] would have
+    /// stamped it — both the display badge and the frozen
+    /// [`RunningAgent::spawn_agent_type`] the rearm's standing is read from.
+    ///
+    /// It exists because those two things are not separable at the real spawn
+    /// site and one of them has a side effect a test cannot want. Declaring
+    /// [`SpawnOptions::agent_type`] as a Wrapper-strategy agent makes [`spawn`]
+    /// launch `dot-agent-deck wrap --agent codex -- <command>` instead of
+    /// `<command>` — a second real deck process between the PTY and the byte
+    /// sink, which boots on its own schedule, emits its own hook events and
+    /// chunks one payload write into pieces arriving over an unbounded window.
+    /// `scheduler/dispatch/016` case G needs the pane's *believed type* to be
+    /// Codex and nothing else; it observes raw bytes, so the wrapper is pure
+    /// measurement noise there (issue #666 follow-up: it made case G flaky under
+    /// load, and its hook events posted into whatever deck the ambient
+    /// environment resolved).
+    ///
+    /// This writes the SAME field `spawn_agent` writes, so what the test under
+    /// observation reads — [`Self::pre_write_believed_agent_type`],
+    /// [`Self::agent_spawned_as_reporting_agent`] — is bit-for-bit what a real
+    /// typed spawn would have left. The spawn-site plumbing itself stays covered
+    /// by the cases that go through `SpawnOptions::agent_type` for real (A, E, F
+    /// as ClaudeCode, H as OpenCode). `#[cfg(test)]` keeps it out of the
+    /// production API surface, like [`Self::agent_writer`] above.
+    #[cfg(test)]
+    pub(crate) fn note_spawn_agent_type_for_test(&self, agent_id: &str, agent_type: AgentType) {
+        let mut inner = self.inner.lock().unwrap();
+        // Loud on a miss rather than a silent no-op: a fixture whose stamp did
+        // not land has standing `None`, and for case G that is case B — it would
+        // still refuse the rearm and still pass, having stopped testing what it
+        // names.
+        let agent = inner
+            .agents
+            .get_mut(agent_id)
+            .unwrap_or_else(|| panic!("no such agent to stamp a spawn type onto: {agent_id}"));
+        agent.agent_type = Some(agent_type.clone());
+        agent.spawn_agent_type = Some(agent_type);
+    }
+
     /// Issue #581 test-only seam: register a synthetic agent that owns `child`,
     /// so the shutdown phases can be driven against a child whose *reap*
     /// deliberately wedges — the stuck-NFS shape, which no real process can be

@@ -2577,12 +2577,45 @@ mod tests {
         spawn_typed_byte_target(registry, pane_id, None)
     }
 
-    /// The same byte-observation target, spawned with the caller-supplied
+    /// A hook endpoint with no listener, for the byte targets' children.
+    ///
+    /// Clearing the inherited endpoints (`crate::test_isolation`) stops a child
+    /// INHERITING a route to a real deck; it does not stop one RESOLVING it.
+    /// With the variable absent, [`crate::platform::paths::socket_path`] falls
+    /// back to `$XDG_RUNTIME_DIR/dot-agent-deck.sock` — the developer's live
+    /// daemon — so an emitting child reaches it either way, and `spawn`'s own
+    /// `env_remove` of the same variable cannot help. Pinning a path nothing
+    /// listens on makes the emit fail closed instead. These targets are bare
+    /// byte sinks that emit nothing at all, so this is belt to that braces: it
+    /// is what keeps the guarantee true for a fixture added later.
+    fn unreachable_hook_endpoint() -> String {
+        std::env::temp_dir()
+            .join(format!("dad-unit-no-listener-{}.sock", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// The same byte-observation target, carrying the
     /// [`SpawnOptions::agent_type`] the deck itself decides at the spawn site
     /// (issue #570). `None` is the hookless pane the deck can vouch for
     /// nothing about; `Some(ClaudeCode)` is the `default_command = claude`
     /// dispatch the deck exec'd on purpose. The PTY is a byte sink either way,
     /// so the two differ in exactly the input under test.
+    ///
+    /// **The child is always a plain `/bin/cat`, whatever the type**, and a
+    /// Wrapper-strategy type is stamped onto the registry record afterwards
+    /// rather than declared at the spawn (issue #666 follow-up). Declared at the
+    /// spawn it would make `spawn` launch `dot-agent-deck wrap --agent codex --
+    /// /bin/cat` — a second real deck process between the PTY and the byte sink.
+    /// These fixtures measure raw bytes, and that process brings three things
+    /// none of them want: output of its own on the same PTY, an unbounded window
+    /// over which it forwards the sink's, and hook events it emits itself. The
+    /// belief under test is the pane's frozen
+    /// [`AgentPtyRegistry::pre_write_believed_agent_type`], which
+    /// [`AgentPtyRegistry::note_spawn_agent_type_for_test`] writes bit-for-bit
+    /// as the spawn would have; the spawn-site plumbing that computes it stays
+    /// covered by the types that are NOT wrapped and so still go through
+    /// `SpawnOptions::agent_type` for real.
     fn spawn_typed_byte_target(
         registry: &Arc<AgentPtyRegistry>,
         pane_id: &str,
@@ -2593,14 +2626,35 @@ mod tests {
         #[cfg(windows)]
         let command = "more.com";
 
-        registry
+        let wrapped = agent_type.as_ref().is_some_and(|declared| {
+            crate::agent_registry::spec(declared).strategy
+                == Some(crate::agent_registry::IntegrationStrategy::Wrapper)
+        });
+        let agent_id = registry
             .spawn_agent(SpawnOptions {
                 command: Some(command),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
-                agent_type,
+                env: vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string()),
+                    (
+                        crate::agent_pty::DOT_AGENT_DECK_SOCKET.to_string(),
+                        unreachable_hook_endpoint(),
+                    ),
+                ],
+                agent_type: if wrapped { None } else { agent_type.clone() },
                 ..SpawnOptions::default()
             })
-            .expect("spawn byte-observation target")
+            .expect("spawn byte-observation target");
+        if let Some(declared) = agent_type.filter(|_| wrapped) {
+            registry.note_spawn_agent_type_for_test(&agent_id, declared.clone());
+            assert_eq!(
+                registry.pre_write_believed_agent_type(&agent_id),
+                Some(declared),
+                "the stamped spawn record is the whole input under test here — a \
+                 target that did not take it is a different case wearing this \
+                 case's name"
+            );
+        }
+        agent_id
     }
 
     #[derive(Clone, Copy)]
@@ -2619,82 +2673,118 @@ mod tests {
         replay_was_terminal: bool,
     }
 
-    /// Block until the pane's byte target has produced anything beyond
-    /// `baseline_len`. Returns as soon as the FIRST new byte lands — settling is
-    /// [`wait_for_detached_write_to_settle`]'s job, because the two answer
-    /// different questions and the caller needs them at different moments.
-    async fn wait_for_detached_snapshot_growth(
+    /// Complete lines the pane's byte target has produced so far — this
+    /// fixture's attempt clock, and it is made of CONTENT rather than of time.
+    ///
+    /// Every delivery attempt puts exactly TWO line terminators into the buffer,
+    /// whatever it decided to write. The line discipline echoes the payload and
+    /// the delayed submit CR back as one `<payload>\r\n`, and `/bin/cat` copies
+    /// the same line straight back as a second `<payload>\r\n`; a submit-only
+    /// probe writes no payload, so its two lines are simply `\r\n\r\n`. Nothing
+    /// else can reach this PTY — the target is a bare `/bin/cat` with no wrapper
+    /// in front of it, which is what `spawn_typed_byte_target` guarantees for
+    /// every type — so `2N` terminators means exactly "attempts 1..=N have
+    /// landed IN FULL", and the last byte any attempt produces is the `\n` that
+    /// makes its second one.
+    fn completed_lines(bytes: &[u8]) -> usize {
+        bytes.windows(2).filter(|window| *window == b"\r\n").count()
+    }
+
+    /// The bytes of delivery attempt `attempt`, sliced out of the accumulated
+    /// buffer by position: everything after that attempt's predecessor's last
+    /// line terminator, up to and including its own second one.
+    ///
+    /// Attempt 1 is the spawn-time write these fixtures deliberately do not make
+    /// — [`confirm_prompt_delivery`] is handed a delivery whose first write has
+    /// already happened elsewhere — so the first attempt to reach the target is
+    /// 2, and it owns lines 1 and 2.
+    ///
+    /// Callers must have established that the buffer holds at least the two
+    /// lines this attempt owns; [`wait_for_detached_delivery_attempt`] is what
+    /// establishes it.
+    fn attempt_slice(bytes: &[u8], attempt: usize) -> Vec<u8> {
+        let index = attempt.saturating_sub(1);
+        let line_ends: Vec<usize> = (0..bytes.len().saturating_sub(1))
+            .filter(|&at| &bytes[at..at + 2] == b"\r\n")
+            .map(|at| at + 2)
+            .collect();
+        assert!(
+            line_ends.len() >= 2 * index,
+            "attempt {attempt} is not complete in this buffer: {:?}",
+            String::from_utf8_lossy(bytes)
+        );
+        let start = if index >= 2 {
+            line_ends[2 * index - 3]
+        } else {
+            0
+        };
+        bytes[start..line_ends[2 * index - 1]].to_vec()
+    }
+
+    /// Block until delivery attempt `attempt` has landed IN FULL, and return the
+    /// whole buffer as it stood at that moment.
+    ///
+    /// The boundary between one attempt and the next is positional, and that is
+    /// the entire point: attempt N's bytes are whatever sits between the
+    /// `2N-2`-th and the `2N`-th line terminator (see [`completed_lines`]), and a
+    /// byte that arrives later can only ever append AFTER that slice. So the
+    /// answer does not depend on when this task is scheduled, on how loaded the
+    /// machine is, or on how long the target took to produce the bytes.
+    ///
+    /// That is what the quiet-period heuristic this replaces could not promise.
+    /// It returned once the output had been still for 250 ms with a trailing
+    /// CRLF, and under a loaded machine the rest of one attempt's output
+    /// routinely arrived after that and was charged to the NEXT attempt — which
+    /// reads a case that correctly PROBED as one that wrote a payload. That is
+    /// issue #666's `scheduler/dispatch/016` case G: a measurement artifact, not
+    /// a production write, and no threshold fixes it because there is no length
+    /// of quiet that a busy scheduler cannot exceed.
+    async fn wait_for_detached_delivery_attempt(
         registry: &AgentPtyRegistry,
         agent_id: &str,
-        baseline_len: usize,
-        label: &str,
+        attempt: usize,
     ) -> Vec<u8> {
-        let deadline = Instant::now() + Duration::from_secs(4);
+        let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             let snapshot = registry.snapshot(agent_id).expect("byte target snapshot");
-            if snapshot.len() > baseline_len {
+            if completed_lines(&snapshot) >= 2 * attempt.saturating_sub(1) {
                 return snapshot;
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for {label}; snapshot={:?}",
+                "timed out waiting for attempt {attempt} to land in full; snapshot={:?}",
                 String::from_utf8_lossy(&snapshot)
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
-    /// Block until one attempt's ENTIRE output has arrived, so the next
-    /// attempt's delta ([`snapshot_delta`]) is that attempt's bytes and nothing
-    /// else.
+    /// Block until `payload`'s own echo is visible on the target, i.e. until the
+    /// delivery's bytes are demonstrably out of the deck and into the PTY.
     ///
-    /// A fixed pause cannot do this, and a fixed 250 ms one is what made
-    /// `scheduler/dispatch/016`'s issue #666 cases flake under a loaded machine:
-    /// one payload write reaches the target in several pieces — the payload's
-    /// own echo, then the delayed submit CR's echo `SUBMIT_DELAY` later, then the
-    /// child's copy of the line — and a pane spawned as `AgentType::Codex` adds
-    /// another hop, because `spawn_agent` applies the Wrapper strategy and
-    /// launches `dot-agent-deck wrap -- /bin/cat` rather than `/bin/cat`. When
-    /// the tail of attempt 2 lands after the pause, it is charged to attempt 3
-    /// and a case that correctly PROBED reads as one that wrote a payload.
-    ///
-    /// So: wait for the output to go QUIET instead. `MIN_QUIET` must exceed
-    /// `SUBMIT_DELAY`, or the gap the delayed CR leaves in the middle of a single
-    /// write reads as the end of it; the trailing line terminator is a second,
-    /// independent check on the same thing. `CAP` keeps a pathological wait from
-    /// running into the NEXT attempt, whose bytes would poison the baseline in
-    /// the other direction — it is well inside the 1 s that
-    /// `unconfirmed_retry_delay` leaves between attempt 2 and attempt 3.
-    async fn wait_for_detached_write_to_settle(
+    /// Content-keyed for the same reason as the helpers above: the caller needs
+    /// an instant that is provably AFTER a specific write, and "the buffer grew"
+    /// only proves that if nothing else can put a byte there.
+    async fn wait_for_detached_payload_echo(
         registry: &AgentPtyRegistry,
         agent_id: &str,
+        payload: &str,
     ) -> Vec<u8> {
-        const POLL: Duration = Duration::from_millis(20);
-        const MIN_QUIET: Duration = Duration::from_millis(250);
-        const MIN_ELAPSED: Duration = Duration::from_millis(400);
-        const CAP: Duration = Duration::from_millis(800);
-
-        let started = Instant::now();
-        let mut last = registry.snapshot(agent_id).expect("byte target snapshot");
-        let mut quiet_since = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(8);
         loop {
-            tokio::time::sleep(POLL).await;
             let snapshot = registry.snapshot(agent_id).expect("byte target snapshot");
-            if snapshot.len() != last.len() {
-                last = snapshot;
-                quiet_since = Instant::now();
-                continue;
-            }
-            let elapsed = started.elapsed();
-            if elapsed >= CAP {
-                return snapshot;
-            }
-            if elapsed >= MIN_ELAPSED
-                && quiet_since.elapsed() >= MIN_QUIET
-                && snapshot.ends_with(b"\r\n")
+            if snapshot
+                .windows(payload.len())
+                .any(|window| window == payload.as_bytes())
             {
                 return snapshot;
             }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {payload} to reach the target; snapshot={:?}",
+                String::from_utf8_lossy(&snapshot)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -2786,13 +2876,12 @@ mod tests {
         ));
 
         // Attempt 2's payload write has reached the target. Announce the genuine
-        // post-write `SessionStart` HERE, on the write's first byte rather than
-        // after it settles: the bytes are already out, so the event is post-write
-        // by construction, and sending it now keeps `REARM_READINESS_BUFFER`'s
-        // 500 ms margin against attempt 3 independent of how long this pane's
-        // output takes to arrive — which for the wrapped `AgentType::Codex` case
-        // is a whole extra process.
-        wait_for_detached_snapshot_growth(&registry, &agent_id, 0, "attempt 2").await;
+        // post-write `SessionStart` HERE, on the payload's own echo rather than
+        // once the attempt has fully landed: the bytes are demonstrably out, so
+        // the event is post-write by construction, and sending it now keeps
+        // `REARM_READINESS_BUFFER`'s 500 ms margin against attempt 3 independent
+        // of how long the rest of this attempt's output takes to arrive.
+        wait_for_detached_payload_echo(&registry, &agent_id, PROMPT).await;
         event_tx
             .send(BroadcastMsg::Event(typed_prompt_watch_event(
                 &pane_id,
@@ -2803,30 +2892,16 @@ mod tests {
                 false,
             )))
             .expect("send genuine post-write SessionStart");
-        let after_attempt_two = wait_for_detached_write_to_settle(&registry, &agent_id).await;
-        wait_for_detached_snapshot_growth(
-            &registry,
-            &agent_id,
-            after_attempt_two.len(),
-            "attempt 3",
-        )
-        .await;
-        let after_attempt_three = wait_for_detached_write_to_settle(&registry, &agent_id).await;
-        let attempt_three = snapshot_delta(&after_attempt_two, &after_attempt_three);
+        let after_attempt_three = wait_for_detached_delivery_attempt(&registry, &agent_id, 3).await;
+        let attempt_three = attempt_slice(&after_attempt_three, 3);
 
         let mut attempt_four = None;
         let mut after_replay = None;
         let mut replay_was_terminal = false;
         if observe_fourth {
-            wait_for_detached_snapshot_growth(
-                &registry,
-                &agent_id,
-                after_attempt_three.len(),
-                "attempt 4",
-            )
-            .await;
-            let after_attempt_four = wait_for_detached_write_to_settle(&registry, &agent_id).await;
-            attempt_four = Some(snapshot_delta(&after_attempt_three, &after_attempt_four));
+            let after_attempt_four =
+                wait_for_detached_delivery_attempt(&registry, &agent_id, 4).await;
+            attempt_four = Some(attempt_slice(&after_attempt_four, 4));
         } else if replay {
             event_tx
                 .send(BroadcastMsg::Event(typed_prompt_watch_event(
@@ -3098,6 +3173,13 @@ mod tests {
     #[serial_test::serial(prompt_confirmation_tasks)]
     #[tokio::test]
     async fn dispatch_016_detached_retry_stops_before_replacement_or_clear() {
+        // Issue #666 follow-up: this test spawns panes and posts synthetic hook
+        // events, and it is a UNIT test — it never passes through
+        // `common::init_test_env()`, so nothing had cleared the deck endpoints
+        // this process inherited from the pane the suite was launched in. See
+        // `crate::test_isolation` for what that does and does not cover; the
+        // byte targets pin an unreachable endpoint of their own for the rest.
+        crate::test_isolation::detach_from_any_live_deck();
         cancel_all_prompt_confirmations();
         const PROMPT: &str = "DETACHED-STALE-PROMPT-MARKER";
         const PANE_ID: &str = "detached-retry-rebind";
