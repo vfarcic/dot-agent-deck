@@ -1363,6 +1363,15 @@ fn main() -> ExitCode {
                     }
                 }
                 Err(e) => {
+                    // Issue #308 follow-up: the config failed to PARSE, so the
+                    // `toml` error quotes the offending source line verbatim and
+                    // this is an untrusted-bytes sink like the issue loop above.
+                    // Neutralised at the seam, not here —
+                    // `ProjectConfigError`'s `Display` escapes control, C1 and
+                    // bidi characters while keeping the error frame's own
+                    // newlines, exactly as `ValidationIssue`'s `Display` does
+                    // for the single-line case. See both impls for why the
+                    // escaping lives there rather than at each `eprintln!`.
                     eprintln!("{e}");
                     ExitCode::FAILURE
                 }

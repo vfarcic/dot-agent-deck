@@ -6,18 +6,81 @@ use crate::event::AgentType;
 
 pub const CONFIG_FILE_NAME: &str = ".dot-agent-deck.toml";
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum ProjectConfigError {
-    #[error("Failed to read {path}: {source}")]
     Io {
         path: String,
         source: std::io::Error,
     },
-    #[error("Failed to parse {path}: {source}")]
     Parse {
         path: String,
         source: toml::de::Error,
     },
+}
+
+/// Issue #308 follow-up: the ONE place a `ProjectConfigError` becomes terminal
+/// output, and therefore the one place it is made safe to be terminal output.
+///
+/// Hand-written rather than `thiserror`-derived precisely so this escaping
+/// exists — the derive would emit the two format strings straight through.
+///
+/// Both variants interpolate untrusted text. `path` is whatever directory the
+/// caller passed (`dot-agent-deck validate <path>`), and `source` on the
+/// `Parse` variant is a `toml` error that renders **the offending source line
+/// verbatim**, so real `0x1B` bytes in a `.dot-agent-deck.toml` reach the
+/// terminal:
+///
+/// ```text
+/// Failed to parse …: TOML parse error at line 3, column 10
+///   |
+/// 3 | bogus = <ESC>[31mPWNED<ESC>[0m
+/// ```
+///
+/// That is the same class and the same delivery vector as
+/// [`crate::config_validation::ValidationIssue`]'s seam, which this PR sealed —
+/// but strictly wider, because it needs no *valid* config at all: a file that
+/// merely fails to parse is enough, and `.dot-agent-deck.toml` travels with a
+/// repository (a clone, a contributor branch, a PR checkout).
+///
+/// Sealed here at `Display` rather than at `main.rs`'s `eprintln!("{e}")` for
+/// the reason the `ValidationIssue` seam records: one seam covers every sink by
+/// construction and cannot be forgotten by a later addition. That is not
+/// hypothetical for this type — `validate` is only its most obvious sink;
+/// `dispatch::list_targets` folds the same error into a message rendered to a
+/// coding agent's terminal, and the hydration path logs it with `error = %e`.
+///
+/// [`escape_multiline_for_terminal`](crate::config_validation) keeps the
+/// frame's own newlines, so a genuine syntax error stays exactly as readable as
+/// it is today — the gutter rendering is the whole value of a `toml` error, and
+/// escaping it to a single `\n`-riddled line would trade one defect for
+/// another.
+impl std::fmt::Display for ProjectConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let raw = match self {
+            Self::Io { path, source } => format!("Failed to read {path}: {source}"),
+            Self::Parse { path, source } => format!("Failed to parse {path}: {source}"),
+        };
+        f.write_str(&crate::config_validation::escape_multiline_for_terminal(
+            &raw,
+        ))
+    }
+}
+
+/// Kept from the `thiserror` derive this type used to carry, so the error chain
+/// stays intact for programmatic inspection.
+///
+/// Note that a caller who walked the chain and printed a link directly would be
+/// printing the `toml` crate's own error — the raw value the `Display` above
+/// exists to wrap — so escaping is a property of rendering *this* type, not of
+/// everything reachable from it. Nothing in the deck walks it; every sink
+/// renders the error itself with `{e}` or `%e`.
+impl std::error::Error for ProjectConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Parse { source, .. } => Some(source),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1095,6 +1158,67 @@ reactive_panes = 0
             plain.resolved_agent_type("codex"),
             Some(AgentType::Codex),
             "…and an inferable command still derives"
+        );
+    }
+
+    /// Issue #308 follow-up: a `.dot-agent-deck.toml` that merely FAILS TO
+    /// PARSE must not be able to paint the terminal `dot-agent-deck validate`
+    /// prints into. `toml` renders the offending source line verbatim, so this
+    /// goes through the real loader rather than a hand-built error — the raw
+    /// ESC has to survive `toml`'s own rendering to be worth escaping.
+    #[test]
+    fn a_parse_error_cannot_smuggle_escapes_out_of_the_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE_NAME),
+            "[[modes]]\nname = \"ok\"\nbogus = \u{1b}[31mPWNED\u{1b}[0m\n",
+        )
+        .expect("write config");
+
+        let err = load_project_config(dir.path()).expect_err("the config does not parse");
+        let rendered = err.to_string();
+
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "no ESC reaches the terminal; got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\\u{1b}[31mPWNED"),
+            "it is shown as text, so the evidence survives; got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("TOML parse error"),
+            "and it is still a toml diagnostic; got {rendered:?}"
+        );
+    }
+
+    /// Issue #308 follow-up: the other half of the same seam — an ORDINARY
+    /// syntax error must stay exactly as readable as it was. The gutter frame
+    /// is the whole value of a `toml` error, so its own newlines survive.
+    #[test]
+    fn an_ordinary_syntax_error_keeps_its_multi_line_frame() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(CONFIG_FILE_NAME),
+            "[[modes]]\nname = \"ok\"\nbogus\n",
+        )
+        .expect("write config");
+
+        let rendered = load_project_config(dir.path())
+            .expect_err("the config does not parse")
+            .to_string();
+
+        assert!(
+            rendered.lines().count() >= 4,
+            "the frame keeps its line structure; got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("\\n"),
+            "the newlines are real, not escaped away; got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("3 | bogus"),
+            "the offending line is still quoted under its gutter; got {rendered:?}"
         );
     }
 }

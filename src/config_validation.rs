@@ -44,6 +44,56 @@ const MAX_QUOTED_VALUE_CHARS: usize = 120;
 /// not a legibility budget. Anything that trips it is already pathological.
 const MAX_DIAGNOSTIC_CHARS: usize = 2000;
 
+/// Issue #308 follow-up: the ceiling on a whole rendered MULTI-LINE diagnostic
+/// — today just a `ProjectConfigError`, whose `Parse` variant carries a `toml`
+/// error frame.
+///
+/// That frame is a header line, a blank gutter rail, the offending source line
+/// quoted verbatim, a caret line and a short explanation: six lines, two of
+/// them as long as the line in the file. Twice [`MAX_DIAGNOSTIC_CHARS`]
+/// therefore clears any realistic syntax error by an order of magnitude — a
+/// 4000-character frame would need a ~1800-character source line to reach —
+/// while still stopping a config whose single "line" is 100 KB from flooding
+/// the terminal or the CI log it lands in. Same reasoning as the bound on a
+/// `ValidationIssue`, with the budget re-scaled for a diagnostic whose line
+/// structure is the point rather than an injection.
+const MAX_MULTILINE_DIAGNOSTIC_CHARS: usize = 4000;
+
+/// Escape a diagnostic that is legitimately MULTI-LINE, keeping the newlines
+/// that give it its shape and neutralising everything else.
+///
+/// [`escape_for_terminal`] escapes `\n` along with every other control
+/// character, which is right for a one-line [`ValidationIssue`] — an embedded
+/// newline there is a forged extra line and must show as `\n`. It is wrong for
+/// a `toml` parse error, whose gutter rendering (`3 | bogus = …` under a `  |`
+/// rail with a caret beneath) is the whole reason that error is worth printing,
+/// and whose newlines come from the `toml` crate rather than from the config
+/// file. So this draws the same distinction
+/// [`crate::build_version_handshake::sanitize_for_prompt`]'s `keep_newlines`
+/// flag draws: split on `\n`, escape each line independently, rejoin with the
+/// newlines intact. Every other control byte — ESC, the C1 range, NUL, DEL —
+/// and every bidi format character is escaped exactly as in the single-line
+/// case, because the *content* of those lines still quotes an untrusted file
+/// verbatim: `toml` renders the offending source line byte for byte, so a
+/// `.dot-agent-deck.toml` that merely FAILS TO PARSE can otherwise paint the
+/// terminal. No valid config is needed to reach this seam, which is what makes
+/// it the wider of the two.
+///
+/// Bounded as a whole, and BEFORE escaping, for [`bound_chars`]'s reason:
+/// escaping expands, so cutting afterwards could sever a `\u{{1b}}` in half and
+/// emit `\u{{1` — a bound that corrupts its own output.
+pub(crate) fn escape_multiline_for_terminal(s: &str) -> String {
+    let bounded = bound_chars(s, MAX_MULTILINE_DIAGNOSTIC_CHARS);
+    let mut out = String::with_capacity(bounded.len());
+    for (i, line) in bounded.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&escape_for_terminal(line));
+    }
+    out
+}
+
 /// Issue #308 audit (MEDIUM): the ONE place a `ValidationIssue` becomes terminal
 /// output, and therefore the one place it is made safe to be terminal output.
 ///
@@ -972,5 +1022,87 @@ mod tests {
             vec!["sneaky"],
             "the decorated name stays unknown and the bare one stays known"
         );
+    }
+
+    /// Issue #308 follow-up: the multi-line escaper neutralises the same
+    /// families the single-line one does — ESC, the C1 range, NUL, DEL and the
+    /// bidi overrides — so nothing a terminal ACTS on survives a line's
+    /// content.
+    #[test]
+    fn multiline_escaper_neutralises_control_c1_del_and_bidi() {
+        let dirty = "esc\u{1b}[31m c1\u{85} nul\u{0} del\u{7f} bidi\u{202e}";
+        let clean = escape_multiline_for_terminal(dirty);
+
+        assert!(
+            !clean.chars().any(needs_escape),
+            "no character a terminal acts on survives; got {clean:?}"
+        );
+        assert_eq!(
+            clean, "esc\\u{1b}[31m c1\\u{85} nul\\u{00} del\\u{7f} bidi\\u{202e}",
+            "each is rewritten to its visible Rust spelling"
+        );
+    }
+
+    /// Issue #308 follow-up: the whole point of the multi-line variant — a
+    /// `toml` error's gutter frame must stay readable, so its OWN newlines
+    /// survive while an ESC smuggled into the quoted source line does not.
+    #[test]
+    fn multiline_escaper_keeps_the_error_frames_newlines() {
+        let frame = "TOML parse error at line 3, column 10\n  |\n3 | bogus = \u{1b}[31mPWNED\n  |          ^\n";
+        let clean = escape_multiline_for_terminal(frame);
+
+        assert_eq!(
+            clean.matches('\n').count(),
+            4,
+            "every structural newline is preserved; got {clean:?}"
+        );
+        assert!(
+            clean.contains("\n  |\n3 | bogus = "),
+            "the gutter rendering is untouched; got {clean:?}"
+        );
+        assert!(
+            !clean.contains('\u{1b}'),
+            "but the ESC inside the quoted source line is gone; got {clean:?}"
+        );
+        assert!(
+            clean.contains("\\u{1b}[31mPWNED"),
+            "shown as text instead, so the evidence survives; got {clean:?}"
+        );
+    }
+
+    /// Issue #308 follow-up: the flood backstop. A config whose single "line"
+    /// is enormous cannot fill a terminal or a CI log through the parse-error
+    /// seam either.
+    #[test]
+    fn multiline_escaper_bounds_an_overlong_diagnostic() {
+        let huge = format!(
+            "TOML parse error at line 1, column 1\n1 | {}",
+            "z".repeat(100_000)
+        );
+        let total = huge.chars().count();
+        let clean = escape_multiline_for_terminal(&huge);
+
+        assert!(
+            clean.chars().count() < MAX_MULTILINE_DIAGNOSTIC_CHARS + 64,
+            "the rendered diagnostic stays bounded; got {} characters",
+            clean.chars().count()
+        );
+        assert!(
+            clean.contains(&format!("({total} characters total)")),
+            "the true length is reported instead of the tail; got {} characters",
+            clean.chars().count()
+        );
+        assert!(
+            clean.starts_with("TOML parse error at line 1, column 1\n1 | zzz"),
+            "the head that identifies the error survives the cut"
+        );
+    }
+
+    /// Issue #308 follow-up: a well-behaved diagnostic is passed through
+    /// unchanged — the escaper must not tax the ordinary case.
+    #[test]
+    fn multiline_escaper_leaves_a_clean_frame_alone() {
+        let frame = "Failed to parse /repo/.dot-agent-deck.toml: TOML parse error at line 3, column 10\n  |\n3 | bogus\n  |      ^\nexpected `.`, `=`\n";
+        assert_eq!(escape_multiline_for_terminal(frame), frame);
     }
 }
