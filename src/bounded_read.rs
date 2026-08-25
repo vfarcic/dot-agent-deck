@@ -101,14 +101,32 @@ fn read_task_file(path: &str) -> Result<String, String> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let file = options.open(path).map_err(io_err)?;
+    let file = match options.open(path) {
+        Ok(file) => file,
+        // Windows refuses `open` on a directory outright (`Access is denied`,
+        // os error 5), so control never reaches the type check below and the
+        // caller would see a bare OS error instead of the refusal this
+        // function documents. Recover the documented message from the path so
+        // the refusal reads the same on every platform.
+        //
+        // Consulting the path here cannot reintroduce the TOCTOU the open
+        // handle exists to avoid: the open has already failed, so nothing is
+        // read on this branch either way, and the only thing a race can change
+        // is the wording of an error that is returned regardless.
+        Err(e) => {
+            return Err(if std::fs::metadata(path).is_ok_and(|m| m.is_dir()) {
+                not_a_regular_file(&source, "a directory")
+            } else {
+                io_err(e)
+            });
+        }
+    };
 
     let metadata = file.metadata().map_err(io_err)?;
     if !metadata.is_file() {
-        return Err(format!(
-            "{source} is {}; --task-file needs a regular file (for a pipe, a process \
-             substitution, or a terminal, pipe the text in and pass `--task-file -` instead)",
-            describe_file_type(&metadata.file_type())
+        return Err(not_a_regular_file(
+            &source,
+            describe_file_type(&metadata.file_type()),
         ));
     }
     // Cheap and exact: refuse an oversized file by its recorded length rather
@@ -120,6 +138,15 @@ fn read_task_file(path: &str) -> Result<String, String> {
     }
 
     read_capped(file, MAX_TASK_BYTES, &source)
+}
+
+/// The not-a-regular-file refusal, shared so the type check and the Windows
+/// open-failure recovery word it identically.
+fn not_a_regular_file(source: &str, kind: &str) -> String {
+    format!(
+        "{source} is {kind}; --task-file needs a regular file (for a pipe, a process \
+         substitution, or a terminal, pipe the text in and pass `--task-file -` instead)"
+    )
 }
 
 /// The over-limit refusal, shared so the file and stdin paths word it
