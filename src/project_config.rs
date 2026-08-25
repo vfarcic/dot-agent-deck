@@ -112,6 +112,29 @@ pub struct ModeRule {
 pub struct OrchestrationConfig {
     #[serde(default)]
     pub name: String,
+    /// Issue #704: this block declares itself the orchestration a run opens when
+    /// the caller named none — `default = true` in the TOML.
+    ///
+    /// It exists because the alternative is POSITION: before this flag, both the
+    /// bare `dispatch --orchestration=` form and the scheduler took whichever
+    /// role-bearing block happened to be first in the file. Position-as-policy is
+    /// invisible in review — a diff that reorders two blocks changes which
+    /// provider every default run uses, with nothing in the diff saying so.
+    ///
+    /// Declared ON THE BLOCK rather than as a top-level `default_orchestration =`
+    /// key for two reasons. It travels with the block when the block moves, which
+    /// is the whole point; and a top-level key would inherit the placement trap
+    /// documented on [`ProjectConfig::worker_response_timeout_minutes`] — written
+    /// below the first table header TOML silently reads it as a key of that
+    /// table, `dot-agent-deck validate` still prints `Config is valid.`, and the
+    /// declaration does nothing. A key on the block cannot land in the wrong
+    /// table.
+    ///
+    /// Resolution lives in [`default_orchestration`]; `dot-agent-deck validate`
+    /// rejects a config that declares it twice, or declares it on a block with no
+    /// roles.
+    #[serde(default)]
+    pub default: bool,
     pub roles: Vec<OrchestrationRoleConfig>,
 }
 
@@ -201,6 +224,12 @@ impl OrchestrationConfig {
         }
         OrchestrationConfig {
             name: name.to_string(),
+            // Issue #704: a synthesised config is a RECONSTRUCTION of one live
+            // tab, never a candidate for "what does a bare run open" — that
+            // question is only ever asked of a config read off disk. `false`
+            // keeps it out of [`default_orchestration`]'s reckoning by
+            // construction.
+            default: false,
             roles,
         }
     }
@@ -249,6 +278,182 @@ pub fn resolve_orchestration_name(config_name: &str, dir: &Path) -> String {
         .unwrap_or_else(|| dir.display().to_string())
 }
 
+/// Issue #704: how [`default_orchestration`] arrived at its answer, so a caller
+/// can say what was chosen and — when the choice was IMPLICIT — what else was on
+/// the table.
+///
+/// The distinction that matters is between the two silent variants and the three
+/// loud ones. `Declared` and `OnlyCandidate` are choices nobody could be
+/// surprised by; the rest are cases where the file does not say what it means and
+/// the resolver picked for the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultOrchestrationReason {
+    /// Exactly one role-bearing block carries `default = true`. Nothing implicit.
+    Declared,
+    /// Only one role-bearing orchestration is defined, so there was nothing to
+    /// choose between. Also not implicit — it is the only answer there is.
+    OnlyCandidate,
+    /// Several role-bearing orchestrations are defined and none declared itself
+    /// the default, so the FIRST IN FILE ORDER won. This is the case #704 exists
+    /// to make visible: reordering the file silently changes it.
+    FirstInFile,
+    /// More than one role-bearing block declares `default = true`; the first of
+    /// them won. `validate` rejects this, but the resolver still has to answer.
+    MultipleDeclared,
+    /// A block declares `default = true` but defines no roles, so it cannot be
+    /// spawned and the implicit rule applied instead. Worth its own variant
+    /// because the user DID declare a default and did not get it.
+    DeclaredIsRoleless {
+        /// The resolved name of the roleless block that made the declaration.
+        declared: String,
+    },
+}
+
+impl DefaultOrchestrationReason {
+    /// Was the choice made FOR the user rather than BY them?
+    pub fn is_implicit(&self) -> bool {
+        !matches!(self, Self::Declared | Self::OnlyCandidate)
+    }
+}
+
+/// Issue #704: the one answer to "which orchestration does a run open when the
+/// caller named none", together with why.
+///
+/// Borrows the chosen block out of the config rather than cloning it, so a caller
+/// that only wants the diagnostic pays nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultOrchestration<'a> {
+    /// The chosen orchestration's own config.
+    pub config: &'a OrchestrationConfig,
+    /// Its resolved name (the cwd-basename fallback already applied).
+    pub name: String,
+    /// Why this one.
+    pub reason: DefaultOrchestrationReason,
+    /// Every OTHER role-bearing candidate, resolved, in file order. Empty when
+    /// this was the only one.
+    pub others: Vec<String>,
+}
+
+impl DefaultOrchestration<'_> {
+    /// The message to show when the choice was implicit, naming what was chosen
+    /// AND what else exists — `None` when the config already said what it meant.
+    ///
+    /// One string rather than structured fields because every consumer renders it
+    /// verbatim into a different medium (a dispatch reply written into the
+    /// caller's pane, the `--list-targets` listing, the daemon log), and a
+    /// diagnostic that reads differently in each of them is a diagnostic nobody
+    /// can grep for.
+    pub fn diagnostic(&self) -> Option<String> {
+        let others = self.others.join(", ");
+        match &self.reason {
+            DefaultOrchestrationReason::Declared | DefaultOrchestrationReason::OnlyCandidate => {
+                None
+            }
+            DefaultOrchestrationReason::FirstInFile => Some(format!(
+                "no orchestration in .dot-agent-deck.toml declares `default = true`, so '{}' was \
+                 chosen because it comes first in the file; {} also defined here. Add \
+                 `default = true` to the block you want, or name one with \
+                 `--orchestration '<name>'`.",
+                self.name, others
+            )),
+            DefaultOrchestrationReason::MultipleDeclared => Some(format!(
+                "more than one orchestration in .dot-agent-deck.toml declares \
+                 `default = true`, so '{}' was chosen because it declares it first; {} also \
+                 defined here. Leave the declaration on exactly one block.",
+                self.name, others
+            )),
+            DefaultOrchestrationReason::DeclaredIsRoleless { declared } => Some(format!(
+                "orchestration '{declared}' declares `default = true` but defines no roles, so \
+                 it cannot be spawned; '{}' was chosen instead. Give '{declared}' roles, or move \
+                 the declaration to the block you want.",
+                self.name
+            )),
+        }
+    }
+}
+
+/// Issue #704: THE rule for "which orchestration does a run open when the caller
+/// named none". Both paths that ask the question resolve through this function.
+///
+/// They did not always. `dispatch`'s bare `--orchestration=` form took the first
+/// **role-bearing** block, while `decide_target` — the SCHEDULED-TASK path — took
+/// the first **entry** and fell through to a single-agent card if that entry
+/// happened to be roleless. So a bare dispatch and a scheduled `issue_dispatch`
+/// rooted at the same repo could open different things, and in the roleless-slot-0
+/// case the scheduler opened no orchestration at all while `--list-targets` was
+/// still offering one. Two rules for one question is a bug whatever either rule
+/// says; this is the single rule:
+///
+/// 1. Only **role-bearing** blocks are candidates — a roleless one cannot be
+///    spawned, so offering it is offering a target that fails.
+/// 2. A candidate that declares `default = true` wins, wherever it sits in the
+///    file. Several declaring it → the first of those, and `validate` rejects the
+///    config.
+/// 3. Otherwise the first candidate in file order wins — the historical rule,
+///    kept so a config that declares nothing behaves as it always did.
+///
+/// `None` means the dir defines no spawnable orchestration at all, which is the
+/// caller's cue to fall back to a single agent.
+///
+/// `dir` only resolves an unnamed block's name to its cwd-basename, matching the
+/// TUI/daemon naming contract ([`resolve_orchestration_name`]).
+pub fn default_orchestration<'a>(
+    config: &'a ProjectConfig,
+    dir: &Path,
+) -> Option<DefaultOrchestration<'a>> {
+    let candidates: Vec<&'a OrchestrationConfig> = config
+        .orchestrations
+        .iter()
+        .filter(|o| !o.roles.is_empty())
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let declared: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.default)
+        .map(|(i, _)| i)
+        .collect();
+
+    let (chosen, reason) = match declared.as_slice() {
+        [only] => (*only, DefaultOrchestrationReason::Declared),
+        [first, ..] => (*first, DefaultOrchestrationReason::MultipleDeclared),
+        // Nothing SPAWNABLE declared it. A roleless block may still have, and
+        // saying so is more useful than reporting the positional fallback as if
+        // the user had asked for nothing — they asked, and were overruled by
+        // their own config.
+        [] => {
+            let roleless_declarant = config
+                .orchestrations
+                .iter()
+                .find(|o| o.default && o.roles.is_empty())
+                .map(|o| resolve_orchestration_name(&o.name, dir));
+            match roleless_declarant {
+                Some(declared) => (
+                    0,
+                    DefaultOrchestrationReason::DeclaredIsRoleless { declared },
+                ),
+                None if candidates.len() == 1 => (0, DefaultOrchestrationReason::OnlyCandidate),
+                None => (0, DefaultOrchestrationReason::FirstInFile),
+            }
+        }
+    };
+
+    Some(DefaultOrchestration {
+        config: candidates[chosen],
+        name: resolve_orchestration_name(&candidates[chosen].name, dir),
+        reason,
+        others: candidates
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != chosen)
+            .map(|(_, o)| resolve_orchestration_name(&o.name, dir))
+            .collect(),
+    })
+}
+
 pub fn load_project_config(dir: &Path) -> Result<Option<ProjectConfig>, ProjectConfigError> {
     let path = dir.join(CONFIG_FILE_NAME);
     match std::fs::read_to_string(&path) {
@@ -283,6 +488,172 @@ pub fn load_project_config(dir: &Path) -> Result<Option<ProjectConfig>, ProjectC
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Issue #704: which orchestration a run opens when none was named ---
+
+    fn parse(toml: &str) -> ProjectConfig {
+        toml::from_str(toml).expect("parse project config")
+    }
+
+    /// A role-bearing orchestration, `n` roles, optionally declaring the default.
+    fn orch_toml(name: &str, declares_default: bool) -> String {
+        let flag = if declares_default {
+            "default = true\n"
+        } else {
+            ""
+        };
+        format!(
+            "[[orchestrations]]\nname = \"{name}\"\n{flag}\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"sh\"\n\n"
+        )
+    }
+
+    #[test]
+    fn default_orchestration_none_when_nothing_is_spawnable() {
+        let dir = Path::new("/tmp/x");
+        assert!(default_orchestration(&parse("[[modes]]\nname = \"dev\"\n"), dir).is_none());
+        // A roleless block is not a candidate: the spawn skips it, so offering it
+        // would offer a target that cannot start.
+        assert!(
+            default_orchestration(
+                &parse("[[orchestrations]]\nname = \"placeholder\"\nroles = []\n"),
+                dir
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn default_orchestration_single_candidate_is_not_an_implicit_choice() {
+        let dir = Path::new("/tmp/x");
+        let cfg = parse(&orch_toml("solo", false));
+        let chosen = default_orchestration(&cfg, dir).expect("one candidate");
+        assert_eq!(chosen.name, "solo");
+        assert_eq!(chosen.reason, DefaultOrchestrationReason::OnlyCandidate);
+        assert!(chosen.others.is_empty());
+        assert!(
+            !chosen.reason.is_implicit(),
+            "with one candidate there was nothing to choose between, so there is nothing to warn \
+             about — a diagnostic here would fire on every single-orchestration repo"
+        );
+        assert_eq!(chosen.diagnostic(), None);
+    }
+
+    #[test]
+    fn default_orchestration_declared_wins_from_any_position() {
+        let dir = Path::new("/tmp/x");
+        let cfg = parse(&format!(
+            "{}{}{}",
+            orch_toml("first", false),
+            orch_toml("middle", false),
+            orch_toml("last", true),
+        ));
+        let chosen = default_orchestration(&cfg, dir).expect("a candidate");
+        assert_eq!(
+            chosen.name, "last",
+            "the declaration must beat file order — that is the entire point of it"
+        );
+        assert_eq!(chosen.reason, DefaultOrchestrationReason::Declared);
+        assert_eq!(chosen.others, vec!["first", "middle"]);
+        assert_eq!(
+            chosen.diagnostic(),
+            None,
+            "a declared choice is not implicit"
+        );
+    }
+
+    #[test]
+    fn default_orchestration_falls_back_to_file_order_and_says_so() {
+        let dir = Path::new("/tmp/x");
+        let cfg = parse(&format!(
+            "{}{}",
+            orch_toml("mixed", false),
+            orch_toml("gpt", false)
+        ));
+        let chosen = default_orchestration(&cfg, dir).expect("a candidate");
+        assert_eq!(chosen.name, "mixed");
+        assert_eq!(chosen.reason, DefaultOrchestrationReason::FirstInFile);
+        assert!(chosen.reason.is_implicit());
+        let note = chosen
+            .diagnostic()
+            .expect("an implicit choice must be reported");
+        assert!(
+            note.contains("'mixed'") && note.contains("gpt"),
+            "the diagnostic must name BOTH what was chosen and what else exists — naming only \
+             the winner leaves the reader unable to tell there was a choice: {note}"
+        );
+        assert!(
+            note.contains("default = true"),
+            "and it must name the fix, not just the situation: {note}"
+        );
+    }
+
+    /// A config that declares the default twice still has to resolve to exactly
+    /// one thing — `validate` rejects it, but a daemon mid-fire cannot.
+    #[test]
+    fn default_orchestration_multiple_declarations_take_the_first_and_report_it() {
+        let dir = Path::new("/tmp/x");
+        let cfg = parse(&format!("{}{}", orch_toml("a", true), orch_toml("b", true)));
+        let chosen = default_orchestration(&cfg, dir).expect("a candidate");
+        assert_eq!(chosen.name, "a");
+        assert_eq!(chosen.reason, DefaultOrchestrationReason::MultipleDeclared);
+        let note = chosen
+            .diagnostic()
+            .expect("an ambiguous declaration must be reported");
+        assert!(
+            note.contains("more than one") && note.contains("'a'"),
+            "{note}"
+        );
+    }
+
+    /// The user DID declare a default and did not get it. Saying "chose the first
+    /// one" without mentioning that is technically true and useless.
+    #[test]
+    fn default_orchestration_roleless_declaration_is_reported_by_name() {
+        let dir = Path::new("/tmp/x");
+        let cfg = parse(&format!(
+            "[[orchestrations]]\nname = \"placeholder\"\ndefault = true\nroles = []\n\n{}",
+            orch_toml("real", false)
+        ));
+        let chosen = default_orchestration(&cfg, dir).expect("the role-bearing block");
+        assert_eq!(chosen.name, "real");
+        assert_eq!(
+            chosen.reason,
+            DefaultOrchestrationReason::DeclaredIsRoleless {
+                declared: "placeholder".to_string()
+            }
+        );
+        let note = chosen
+            .diagnostic()
+            .expect("a declaration that did nothing must be reported");
+        assert!(
+            note.contains("placeholder") && note.contains("no roles") && note.contains("'real'"),
+            "{note}"
+        );
+    }
+
+    /// An unnamed block is reported under the name it will actually spawn as, so
+    /// the name in the diagnostic is one the user can pass to `--orchestration`.
+    #[test]
+    fn default_orchestration_resolves_an_unnamed_block_to_the_dir_basename() {
+        let cfg = parse(
+            "[[orchestrations]]\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n",
+        );
+        let chosen =
+            default_orchestration(&cfg, Path::new("/home/u/morning-digest")).expect("a candidate");
+        assert_eq!(chosen.name, "morning-digest");
+    }
+
+    #[test]
+    fn default_flag_defaults_to_false_when_absent() {
+        let cfg = parse(&orch_toml("plain", false));
+        assert!(
+            !cfg.orchestrations[0].default,
+            "every config written before the flag existed must keep parsing unchanged"
+        );
+    }
 
     #[test]
     fn parse_valid_full_config() {

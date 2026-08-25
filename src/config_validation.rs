@@ -99,6 +99,60 @@ pub fn validate_config(config: &ProjectConfig) -> Vec<ValidationIssue> {
         }
     }
 
+    // Issue #704: the `default = true` declaration, and the one case where the
+    // config is SILENT about a choice it is nonetheless making.
+    //
+    // The silent case is a WARNING, not an error: a config with several
+    // orchestrations and no declaration is exactly what every such config looked
+    // like before the flag existed, and it still resolves deterministically (first
+    // role-bearing block wins). What it cannot do is survive a reordering, and
+    // that is what the warning says.
+    let spawnable: Vec<&_> = config
+        .orchestrations
+        .iter()
+        .filter(|o| !o.roles.is_empty())
+        .collect();
+    let declared: Vec<&str> = config
+        .orchestrations
+        .iter()
+        .filter(|o| o.default)
+        .map(|o| o.name.as_str())
+        .collect();
+    if declared.len() > 1 {
+        issues.push(ValidationIssue {
+            severity: Severity::Error,
+            scope: declared[0].to_string(),
+            message: format!(
+                "more than one orchestration declares `default = true` ({}) — exactly one may",
+                declared.join(", ")
+            ),
+        });
+    }
+    for orch in &config.orchestrations {
+        if orch.default && orch.roles.is_empty() {
+            issues.push(ValidationIssue {
+                severity: Severity::Error,
+                scope: orch.name.clone(),
+                message: "declares `default = true` but defines no roles, so it can never be \
+                          spawned — move the declaration to an orchestration with roles"
+                    .to_string(),
+            });
+        }
+    }
+    if declared.is_empty() && spawnable.len() > 1 {
+        issues.push(ValidationIssue {
+            severity: Severity::Warning,
+            scope: spawnable[0].name.clone(),
+            message: format!(
+                "{} orchestrations are defined and none declares `default = true`, so a dispatch \
+                 or scheduled task that names none opens this one purely because it comes first \
+                 in the file — reordering the file would silently change that. Add \
+                 `default = true` to the one you want.",
+                spawnable.len()
+            ),
+        });
+    }
+
     for orch in &config.orchestrations {
         // Must have at least 2 roles.
         if orch.roles.len() < 2 {
@@ -218,6 +272,7 @@ mod tests {
 
     fn make_orchestration(name: &str, roles: Vec<OrchestrationRoleConfig>) -> OrchestrationConfig {
         OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles,
         }
@@ -557,5 +612,102 @@ mod tests {
         assert_eq!(sanitize_role_name(".\\."), "");
         assert_eq!(sanitize_role_name("./../."), "");
         assert_eq!(sanitize_role_name("a./.b"), "ab");
+    }
+
+    // --- Issue #704: the `default = true` declaration ---
+
+    fn declaring(name: &str, default: bool) -> OrchestrationConfig {
+        OrchestrationConfig {
+            name: name.to_string(),
+            default,
+            roles: vec![make_role("orchestrator", true), make_role("worker", false)],
+        }
+    }
+
+    /// One orchestration, no declaration — the shape of every config written
+    /// before the flag existed. Silent: there is nothing to choose between.
+    #[test]
+    fn single_orchestration_needs_no_default_declaration() {
+        let issues = validate_config(&make_orch_config(vec![declaring("solo", false)]));
+        assert!(
+            !issues.iter().any(|i| i.message.contains("default = true")),
+            "warning on a one-orchestration repo would fire on nearly every project: {issues:?}"
+        );
+    }
+
+    /// Several, none declared: a WARNING. It still resolves (first in file wins),
+    /// but it cannot survive a reordering, and that is the part worth saying.
+    #[test]
+    fn several_orchestrations_without_a_declaration_warn_about_file_order() {
+        let issues = validate_config(&make_orch_config(vec![
+            declaring("mixed", false),
+            declaring("gpt", false),
+        ]));
+        let warn = issues
+            .iter()
+            .find(|i| i.message.contains("default = true"))
+            .expect("an undeclared multi-orchestration config must be flagged");
+        assert_eq!(warn.severity, Severity::Warning);
+        assert!(
+            warn.message.contains("first in the file"),
+            "the warning must name the rule that is actually in force: {}",
+            warn.message
+        );
+    }
+
+    #[test]
+    fn a_declared_default_silences_the_file_order_warning() {
+        let issues = validate_config(&make_orch_config(vec![
+            declaring("mixed", true),
+            declaring("gpt", false),
+        ]));
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.message.contains("first in the file")),
+            "{issues:?}"
+        );
+    }
+
+    /// Two declarations is an ERROR, not a warning: unlike the undeclared case,
+    /// the user stated an intent the config cannot honour.
+    #[test]
+    fn two_default_declarations_are_an_error_naming_both() {
+        let issues = validate_config(&make_orch_config(vec![
+            declaring("mixed", true),
+            declaring("gpt", true),
+        ]));
+        let err = issues
+            .iter()
+            .find(|i| i.message.contains("more than one"))
+            .expect("a doubly-declared default must be rejected");
+        assert_eq!(err.severity, Severity::Error);
+        assert!(
+            err.message.contains("mixed") && err.message.contains("gpt"),
+            "{}",
+            err.message
+        );
+        assert!(has_errors(&issues));
+    }
+
+    /// Declaring the default on a block with no roles is an error: it can never
+    /// be spawned, so the declaration silently does nothing.
+    #[test]
+    fn a_default_declaration_on_a_roleless_orchestration_is_an_error() {
+        let config = make_orch_config(vec![
+            OrchestrationConfig {
+                name: "placeholder".to_string(),
+                default: true,
+                roles: vec![],
+            },
+            declaring("real", false),
+        ]);
+        let issues = validate_config(&config);
+        assert!(
+            issues.iter().any(|i| i.severity == Severity::Error
+                && i.scope == "placeholder"
+                && i.message.contains("defines no roles")),
+            "{issues:?}"
+        );
     }
 }

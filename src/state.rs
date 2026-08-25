@@ -2376,12 +2376,43 @@ fn lookup_orchestration_role_indexed(
     let cfg = load_project_config(std::path::Path::new(cwd))
         .ok()
         .flatten()?;
-    let orch = cfg
+    let Some(orch) = cfg
         .orchestrations
-        .into_iter()
-        .find(|o| o.name == orchestration_name)?;
+        .iter()
+        .find(|o| o.name == orchestration_name)
+    else {
+        // Issue #704/#705: the config is re-read on EVERY delegate and matched
+        // against the name the daemon captured at spawn, so RENAMING an
+        // orchestration that is currently open severs the link — every later
+        // worker is delegated to without its `prompt_template` and without its
+        // `clear` flag, which looks like the worker simply forgot its role. The
+        // degradation is deliberate (a delegate that reaches a worker beats one
+        // that fails), but it used to be entirely silent. Naming both sides here
+        // is what turns "the workers went strange after I edited the toml" into a
+        // one-line answer.
+        //
+        // This does NOT fix #554, which is the TUI rebuilding a tab from stale
+        // daemon metadata after the same edit; it only makes the daemon-side half
+        // legible.
+        tracing::warn!(
+            orchestration = %orchestration_name,
+            role = %role_name,
+            cwd = %cwd,
+            defined = %cfg
+                .orchestrations
+                .iter()
+                .map(|o| o.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            "no orchestration by that name in the project config — the worker will be \
+             delegated to WITHOUT its role prompt_template or clear flag. Was the \
+             orchestration renamed while this deck was open?"
+        );
+        return None;
+    };
     orch.roles
-        .into_iter()
+        .iter()
+        .cloned()
         .enumerate()
         .find(|(_, r)| r.name == role_name)
 }

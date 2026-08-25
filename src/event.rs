@@ -764,6 +764,16 @@ pub struct ListTargetsResponse {
 pub struct ListedOrchestration {
     pub name: String,
     pub roles: usize,
+    /// Issue #704: is this the one a dispatch with no `--orchestration <name>`
+    /// (and a scheduled task rooted here) would open?
+    ///
+    /// Additive and `#[serde(default)]`, so an older daemon's reply — which omits
+    /// the key entirely — still parses, with `false` for every entry. That reads
+    /// as "this build cannot tell you which is the default", which is exactly
+    /// true of it, so no `PROTOCOL_VERSION` bump: the wire SHAPE is unchanged for
+    /// every peer that does not know the field.
+    #[serde(default)]
+    pub default: bool,
 }
 
 /// The daemon's reply to a [`DaemonMessage::Delegate`], one JSON line back on

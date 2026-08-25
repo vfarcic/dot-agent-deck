@@ -50,7 +50,9 @@ use crate::agent_pty::{
     GuardedSendDetail, SpawnOptions, TabMembership, command_needs_shell_wrap,
 };
 use crate::event::{AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, EventType};
-use crate::project_config::{ProjectConfig, load_project_config, resolve_orchestration_name};
+use crate::project_config::{
+    ProjectConfig, default_orchestration, load_project_config, resolve_orchestration_name,
+};
 use crate::prompt_delivery::{
     AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, log_prompt_abandoned, log_prompt_confirmed,
     log_prompt_stopped, log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written,
@@ -261,13 +263,14 @@ pub fn decide_target_with_override(
             command: schedule_command.map(|c| c.to_string()),
         }),
         Some(SpawnShapeOverride::Orchestration(None)) => {
-            // The FIRST ROLE-BEARING orchestration, matching what `--list-targets`
-            // offers. `decide_target` inspects only `orchestrations.first()`, so a
-            // roleless placeholder in slot 0 made the bare form refuse a repo whose
-            // second entry was perfectly spawnable — and told the user to add config
-            // that already existed.
-            let orch = config
-                .and_then(|cfg| cfg.orchestrations.iter().find(|o| !o.roles.is_empty()))
+            // THE default, resolved through the one shared rule
+            // ([`crate::project_config::default_orchestration`]) that
+            // `decide_target` below also uses. Issue #704: this arm and that one
+            // used to disagree — this one took the first ROLE-BEARING block, that
+            // one took the first ENTRY and degraded to a single-agent card when
+            // slot 0 was roleless. Same question, same repo, two answers.
+            let chosen = config
+                .and_then(|cfg| default_orchestration(cfg, dir))
                 .ok_or_else(|| {
                     format!(
                         "no orchestration with roles is defined in {}: add an \
@@ -277,9 +280,9 @@ pub fn decide_target_with_override(
                     )
                 })?;
             Ok(SpawnTarget::Orchestration {
-                name: resolve_orchestration_name(&orch.name, dir),
-                roles: roles_of(orch),
-                config: Box::new(orch.clone()),
+                name: chosen.name.clone(),
+                roles: roles_of(chosen.config),
+                config: Box::new(chosen.config.clone()),
             })
         }
         Some(SpawnShapeOverride::Orchestration(Some(want))) => {
@@ -341,23 +344,27 @@ fn roles_of(orch: &crate::project_config::OrchestrationConfig) -> Vec<RoleSpawn>
 }
 
 /// Decide what to open from the target dir's config and the schedule's command.
-/// `[[orchestrations]]` with at least one role → orchestration; otherwise a
-/// single-agent card. `dir` is used only to resolve an unnamed orchestration's
-/// name to its cwd-basename (matching the TUI/daemon contract).
+/// A spawnable `[[orchestrations]]` → orchestration; otherwise a single-agent
+/// card. `dir` is used only to resolve an unnamed orchestration's name to its
+/// cwd-basename (matching the TUI/daemon contract).
+///
+/// WHICH orchestration is [`default_orchestration`]'s answer, shared with
+/// [`decide_target_with_override`]'s bare form. Issue #704: this function used to
+/// inspect `orchestrations.first()` alone, so a roleless placeholder in slot 0
+/// sent a scheduled fire to a SINGLE-AGENT CARD in a repo whose second block was
+/// perfectly spawnable — and whose `--list-targets` listing was offering it. The
+/// bare dispatch form had already been fixed; the scheduler had not, and nothing
+/// held the two together. Now one function answers for both.
 pub fn decide_target(
     config: Option<&ProjectConfig>,
     dir: &Path,
     schedule_command: Option<&str>,
 ) -> SpawnTarget {
-    if let Some(cfg) = config
-        && let Some(orch) = cfg.orchestrations.first()
-        && !orch.roles.is_empty()
-    {
-        let name = resolve_orchestration_name(&orch.name, dir);
+    if let Some(chosen) = config.and_then(|cfg| default_orchestration(cfg, dir)) {
         return SpawnTarget::Orchestration {
-            name,
-            roles: roles_of(orch),
-            config: Box::new(orch.clone()),
+            name: chosen.name.clone(),
+            roles: roles_of(chosen.config),
+            config: Box::new(chosen.config.clone()),
         };
     }
     SpawnTarget::SingleAgent {
@@ -440,11 +447,27 @@ pub async fn spawn(
     //    fallback to something the user did not pick.
     let target = match req.resolved_target.clone() {
         Some(t) => t,
-        None => decide_target(
-            load_config_for_dir(dir).as_ref(),
-            dir,
-            req.command.as_deref(),
-        ),
+        None => {
+            let cfg = load_config_for_dir(dir);
+            // Issue #704: when the config left the choice to file order, say so.
+            // This path has no user in front of it — a cron tick or an
+            // issue-dispatch fire — so the daemon log is the only place the
+            // record can land. `dispatch` (which does have a caller) puts the
+            // same sentence in its reply, and `--list-targets` / `validate` show
+            // it to the config's author before either ever fires.
+            if let Some(note) = cfg
+                .as_ref()
+                .and_then(|c| default_orchestration(c, dir))
+                .and_then(|chosen| chosen.diagnostic())
+            {
+                tracing::warn!(
+                    task = %req.task_name,
+                    dir = %dir.display(),
+                    "{note}"
+                );
+            }
+            decide_target(cfg.as_ref(), dir, req.command.as_deref())
+        }
     };
 
     // 3. Spawn + deliver.
@@ -4461,6 +4484,101 @@ mod tests {
         }
     }
 
+    // --- Issue #704: ONE default rule, shared by both paths ---
+
+    /// A roleless placeholder in slot 0 with a spawnable block behind it. This is
+    /// the config that made the two paths disagree.
+    fn roleless_slot_zero_config() -> ProjectConfig {
+        parse_config(
+            "[[orchestrations]]\nname = \"placeholder\"\nroles = []\n\n\
+             [[orchestrations]]\nname = \"real\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"sh\"\n",
+        )
+    }
+
+    /// The SCHEDULER path's half of the bug: `decide_target` looked only at
+    /// `orchestrations.first()`, so a roleless slot 0 sent a scheduled fire to a
+    /// single-agent card while `--list-targets` was offering `real` and a bare
+    /// dispatch was spawning it.
+    #[test]
+    fn decide_target_skips_a_roleless_slot_zero_instead_of_degrading_to_one_agent() {
+        let cfg = roleless_slot_zero_config();
+        let dir = Path::new("/tmp/x");
+        match decide_target(Some(&cfg), dir, Some("claude")) {
+            SpawnTarget::Orchestration { name, roles, .. } => {
+                assert_eq!(name, "real");
+                assert_eq!(roles.len(), 2);
+            }
+            SpawnTarget::SingleAgent { .. } => panic!(
+                "a scheduled fire must open the repo's spawnable orchestration, not fall through \
+                 to a single agent because slot 0 happens to be empty"
+            ),
+        }
+    }
+
+    /// The two paths must not just each be right — they must be right for the
+    /// SAME reason, which is what a shared resolver buys. Asserted over the
+    /// configs that used to separate them.
+    #[test]
+    fn scheduler_and_bare_dispatch_agree_on_the_default_orchestration() {
+        let dir = Path::new("/tmp/x");
+        let declared_last = parse_config(
+            "[[orchestrations]]\nname = \"first\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations]]\nname = \"chosen\"\ndefault = true\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"sh\"\nstart = true\n",
+        );
+        for cfg in [
+            roleless_slot_zero_config(),
+            two_orchestration_config(),
+            declared_last,
+        ] {
+            let scheduled = decide_target(Some(&cfg), dir, Some("claude"));
+            let bare = decide_target_with_override(
+                Some(&cfg),
+                dir,
+                Some("claude"),
+                Some(&SpawnShapeOverride::Orchestration(None)),
+            )
+            .expect("the bare form must resolve every one of these");
+            assert_eq!(
+                scheduled, bare,
+                "a scheduled fire and a bare `--orchestration=` dispatch into the same repo must \
+                 open the same thing — two rules for one question is the bug, whatever either \
+                 rule says"
+            );
+        }
+    }
+
+    /// The declaration beats position on BOTH paths, which is what makes it a
+    /// declaration rather than a hint.
+    #[test]
+    fn declared_default_wins_over_file_order_on_both_paths() {
+        let cfg = parse_config(
+            "[[orchestrations]]\nname = \"first\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations]]\nname = \"declared\"\ndefault = true\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"sh\"\nstart = true\n",
+        );
+        let dir = Path::new("/tmp/x");
+        for target in [
+            decide_target(Some(&cfg), dir, Some("claude")),
+            decide_target_with_override(
+                Some(&cfg),
+                dir,
+                Some("claude"),
+                Some(&SpawnShapeOverride::Orchestration(None)),
+            )
+            .expect("bare form resolves"),
+        ] {
+            match target {
+                SpawnTarget::Orchestration { name, .. } => assert_eq!(name, "declared"),
+                other => panic!("expected the declared orchestration, got {other:?}"),
+            }
+        }
+    }
+
     // --- PRD #220: the caller's explicit shape override ---
 
     fn two_orchestration_config() -> ProjectConfig {
@@ -4754,6 +4872,7 @@ mod tests {
                     role(1, "worker", "/nonexistent/dot-agent-deck-454"),
                 ],
                 config: Box::new(OrchestrationConfig {
+                    default: false,
                     name: "partial-454".to_string(),
                     roles: vec![OrchestrationRoleConfig {
                         name: "orchestrator".to_string(),

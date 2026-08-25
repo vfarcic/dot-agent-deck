@@ -242,6 +242,7 @@ mod tests {
 
     fn config() -> OrchestrationConfig {
         OrchestrationConfig {
+            default: false,
             name: "digest".to_string(),
             roles: vec![
                 role("orchestrator", true, Some("You lead the team."), None),

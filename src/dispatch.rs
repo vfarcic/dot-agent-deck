@@ -25,24 +25,32 @@ use crate::worktree_owner::Creator;
 ///
 /// Roleless `[[orchestrations]]` are filtered out because the spawn skips them
 /// too — listing one would offer a target that cannot be spawned.
+///
+/// Issue #704: each entry also carries whether it is the one a dispatch that names
+/// nothing would open, resolved through the SAME
+/// [`crate::project_config::default_orchestration`] the spawn uses. Deriving the
+/// marker here independently is exactly the two-lists-that-drift shape this issue
+/// is about, so it is derived from the selector or not at all.
 pub fn available_orchestrations(
     config: Option<&crate::project_config::ProjectConfig>,
     dir: &Path,
-) -> Vec<(String, usize)> {
-    config
-        .map(|cfg| {
-            cfg.orchestrations
-                .iter()
-                .filter(|o| !o.roles.is_empty())
-                .map(|o| {
-                    (
-                        crate::project_config::resolve_orchestration_name(&o.name, dir),
-                        o.roles.len(),
-                    )
-                })
-                .collect()
+) -> Vec<crate::event::ListedOrchestration> {
+    let Some(cfg) = config else {
+        return Vec::new();
+    };
+    let default_name = crate::project_config::default_orchestration(cfg, dir).map(|d| d.name);
+    cfg.orchestrations
+        .iter()
+        .filter(|o| !o.roles.is_empty())
+        .map(|o| {
+            let name = crate::project_config::resolve_orchestration_name(&o.name, dir);
+            crate::event::ListedOrchestration {
+                default: default_name.as_deref() == Some(name.as_str()),
+                name,
+                roles: o.roles.len(),
+            }
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// Human-readable `--list-targets` output, read by the dispatcher agent and
@@ -51,7 +59,7 @@ pub fn available_orchestrations(
 /// Schedule/authoring modes are absent by construction: a schedule creates a
 /// FUTURE task, so it is not something a dispatch can start, and the dispatcher
 /// option itself is not a target either. Only real spawn shapes appear.
-pub fn render_available_targets(orchestrations: &[(String, usize)]) -> String {
+pub fn render_available_targets(orchestrations: &[crate::event::ListedOrchestration]) -> String {
     let mut out = String::from("Available dispatch targets:\n");
     out.push_str("  single            one agent (--single)\n");
     if orchestrations.is_empty() {
@@ -61,13 +69,20 @@ pub fn render_available_targets(orchestrations: &[(String, usize)]) -> String {
         );
         return out;
     }
-    for (name, roles) in orchestrations {
+    for o in orchestrations {
         // The name is SINGLE-QUOTED in the suggested command, not bare: an
         // orchestration named `code review` produced `--orchestration code review`,
         // which clap reads as the name `code` plus a stray positional and rejects
         // outright — leaving no way to pick the target just offered.
+        //
+        // Issue #704: the `[default]` marker is what makes "dispatch without
+        // naming one" a legible choice rather than a coin flip the reader has to
+        // reconstruct from the file's order.
+        let marker = if o.default { "  [default]" } else { "" };
         out.push_str(&format!(
-            "  orchestration     '{name}' — {roles} roles (--orchestration '{name}')\n"
+            "  orchestration     '{name}' — {roles} roles (--orchestration '{name}'){marker}\n",
+            name = o.name,
+            roles = o.roles,
         ));
     }
     out.push_str(
@@ -92,7 +107,7 @@ pub fn render_available_targets(orchestrations: &[(String, usize)]) -> String {
 /// * config parsed → every role-bearing orchestration, under the name the spawn
 ///   will resolve it to.
 pub fn list_targets_response(cwd: Option<&Path>) -> crate::event::ListTargetsResponse {
-    use crate::event::{ListTargetsResponse, ListedOrchestration};
+    use crate::event::ListTargetsResponse;
     let Some(dir) = cwd else {
         let msg = "could not determine this pane's working directory".to_string();
         return ListTargetsResponse {
@@ -108,12 +123,19 @@ pub fn list_targets_response(cwd: Option<&Path>) -> crate::event::ListTargetsRes
     match crate::project_config::load_project_config(dir) {
         Ok(config) => {
             let found = available_orchestrations(config.as_ref(), dir);
+            let mut rendered = render_available_targets(&found);
+            // Issue #704: the same sentence the dispatch reply and the daemon log
+            // carry, shown to whoever is CHOOSING rather than after the fact.
+            if let Some(note) = config
+                .as_ref()
+                .and_then(|c| crate::project_config::default_orchestration(c, dir))
+                .and_then(|chosen| chosen.diagnostic())
+            {
+                rendered.push_str(&format!("\nNote: {note}\n"));
+            }
             ListTargetsResponse {
-                rendered: render_available_targets(&found),
-                orchestrations: found
-                    .into_iter()
-                    .map(|(name, roles)| ListedOrchestration { name, roles })
-                    .collect(),
+                rendered,
+                orchestrations: found,
                 error: None,
             }
         }
@@ -275,8 +297,23 @@ pub async fn handle_dispatch(
     // rolled them back, and reported "failed to spawn agent" for what is a plain
     // validation error.
     let single_command = resolve_single_agent_command(ctx.default_command.as_deref());
+    let caller_config = crate::spawn::load_config_for_dir(&clone_dir);
+    // Issue #704: when the caller named no orchestration and the config left the
+    // choice to file order, the reply says which one was opened and what else was
+    // there. This message is written straight into the caller's pane and repeated
+    // to the user verbatim, so it is the one surface where an implicit choice can
+    // still be corrected before the work starts. Computed only for the shapes that
+    // actually consult the default — an explicit `--single` or
+    // `--orchestration <name>` chose for itself and needs no note.
+    let default_note = match shape {
+        None | Some(crate::event::DispatchShape::Orchestration { name: None }) => caller_config
+            .as_ref()
+            .and_then(|c| crate::project_config::default_orchestration(c, &clone_dir))
+            .and_then(|chosen| chosen.diagnostic()),
+        _ => None,
+    };
     let resolved_target = match crate::spawn::decide_target_with_override(
-        crate::spawn::load_config_for_dir(&clone_dir).as_ref(),
+        caller_config.as_ref(),
         &clone_dir,
         Some(single_command.as_str()),
         shape_override_of(shape).as_ref(),
@@ -387,15 +424,25 @@ pub async fn handle_dispatch(
             // #220 M1.1). Hardcoding either word makes this message a lie in the
             // other case — and it is written straight into the caller's pane, so
             // the dispatching agent repeats it to the user verbatim.
-            message: match &handle.kind {
-                SpawnKind::Orchestration { name: orch } => format!(
-                    "dispatch: spawned isolated orchestration '{orch}' for '{name}' in {}",
-                    paths.worktree_dir.display()
-                ),
-                SpawnKind::SingleAgent => format!(
-                    "dispatch: spawned isolated agent for '{name}' in {}",
-                    paths.worktree_dir.display()
-                ),
+            message: {
+                let mut msg = match &handle.kind {
+                    SpawnKind::Orchestration { name: orch } => format!(
+                        "dispatch: spawned isolated orchestration '{orch}' for '{name}' in {}",
+                        paths.worktree_dir.display()
+                    ),
+                    SpawnKind::SingleAgent => format!(
+                        "dispatch: spawned isolated agent for '{name}' in {}",
+                        paths.worktree_dir.display()
+                    ),
+                };
+                // Only for an orchestration: a `--single` dispatch consulted no
+                // default, so a note about which one it would have picked is
+                // noise the caller then relays to the user as if it mattered.
+                if let (SpawnKind::Orchestration { .. }, Some(note)) = (&handle.kind, &default_note)
+                {
+                    msg.push_str(&format!("\ndispatch: {note}"));
+                }
+                msg
             },
         },
         Err(e) => {
@@ -805,8 +852,13 @@ mod tests {
              [[orchestrations.roles]]\nname = \"lead\"\ncommand = \"cat\"\nstart = true\n");
         let found = available_orchestrations(Some(&c), Path::new("/tmp/repo"));
         assert_eq!(
-            found,
-            vec![("digest".to_string(), 2), ("review".to_string(), 1)]
+            found
+                .iter()
+                .map(|o| (o.name.as_str(), o.roles, o.default))
+                .collect::<Vec<_>>(),
+            // `digest` is marked because it comes first and neither declares
+            // itself; issue #704's `default_orchestration_*` tests own the rule.
+            vec![("digest", 2, true), ("review", 1, false)]
         );
 
         let rendered = render_available_targets(&found);
@@ -829,7 +881,86 @@ mod tests {
         let c = cfg("[[orchestrations]]\n\n\
              [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n");
         let found = available_orchestrations(Some(&c), Path::new("/home/u/morning-digest"));
-        assert_eq!(found, vec![("morning-digest".to_string(), 1)]);
+        assert_eq!(
+            found
+                .iter()
+                .map(|o| (o.name.as_str(), o.roles, o.default))
+                .collect::<Vec<_>>(),
+            vec![("morning-digest", 1, true)]
+        );
+    }
+
+    /// Issue #704: the listing says which one a dispatch that names nothing would
+    /// open, AND — when the file did not say — that the answer came from file
+    /// order. Without both halves the agent relaying this to the user can only
+    /// report a list of equals.
+    #[test]
+    fn available_targets_mark_the_default_and_report_an_implicit_one() {
+        let c = cfg("[[orchestrations]]\nname = \"mixed\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations]]\nname = \"gpt\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n");
+        let rendered =
+            render_available_targets(&available_orchestrations(Some(&c), Path::new("/tmp/repo")));
+        let mixed_line = rendered
+            .lines()
+            .find(|l| l.contains("'mixed'"))
+            .expect("mixed must be listed");
+        assert!(
+            mixed_line.contains("[default]"),
+            "the default must be marked on its own line:\n{rendered}"
+        );
+        assert!(
+            !rendered
+                .lines()
+                .any(|l| l.contains("'gpt'") && l.contains("[default]")),
+            "exactly one line may carry the marker:\n{rendered}"
+        );
+
+        // And the whole daemon reply, which is what the agent actually reads. It
+        // loads the config off disk, so this half needs a real dir.
+        let tmp = crate::test_temp::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(crate::project_config::CONFIG_FILE_NAME),
+            "[[orchestrations]]\nname = \"mixed\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations]]\nname = \"gpt\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n",
+        )
+        .unwrap();
+        let listed = list_targets_response(Some(tmp.path()));
+        assert!(
+            listed.rendered.contains("Note:") && listed.rendered.contains("default = true"),
+            "an implicit default must be reported, not merely marked:\n{}",
+            listed.rendered
+        );
+        assert!(
+            listed
+                .orchestrations
+                .iter()
+                .any(|o| o.name == "mixed" && o.default),
+            "the marker must ride the WIRE too, so a caller acting structurally sees it: {:?}",
+            listed.orchestrations
+        );
+    }
+
+    /// A DECLARED default is marked but not narrated — the config already said
+    /// what it meant, so a note would be noise on every listing forever.
+    #[test]
+    fn a_declared_default_is_marked_without_a_note() {
+        let c = cfg("[[orchestrations]]\nname = \"mixed\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations]]\nname = \"gpt\"\ndefault = true\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n");
+        let found = available_orchestrations(Some(&c), Path::new("/tmp/repo"));
+        assert_eq!(
+            found
+                .iter()
+                .map(|o| (o.name.as_str(), o.default))
+                .collect::<Vec<_>>(),
+            vec![("mixed", false), ("gpt", true)],
+            "the marker follows the declaration, not the file order"
+        );
     }
 
     /// No config at all: only `single`, and the text says so rather than leaving

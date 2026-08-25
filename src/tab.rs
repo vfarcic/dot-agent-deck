@@ -1531,6 +1531,7 @@ mod tests {
 
     fn orch_config(name: &str) -> OrchestrationConfig {
         OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
@@ -2084,6 +2085,7 @@ mod tests {
     /// through them in ascending order rather than merely picking one.
     fn orch_config_4(name: &str) -> OrchestrationConfig {
         OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
@@ -2127,6 +2129,7 @@ mod tests {
     /// higher-order waiting panes among more than two roles.
     fn orch_config_3(name: &str) -> OrchestrationConfig {
         OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
