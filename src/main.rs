@@ -128,7 +128,8 @@ enum Commands {
         #[arg(long, conflicts_with = "orchestration")]
         single: bool,
         /// Start a full orchestration by name (`--orchestration review`), or this
-        /// repo's first role-bearing one (`--orchestration=` with an empty value).
+        /// repo's DEFAULT one (`--orchestration=` with an empty value) — the block
+        /// carrying `default = true`, else the first with roles.
         /// Mutually exclusive with --single.
         ///
         /// The value is REQUIRED rather than optional: with `num_args = 0..=1` clap

@@ -206,6 +206,73 @@ fn spawn_002_orchestration_vs_single_agent() {
     );
 }
 
+/// Scenario: Register one task whose `working_dir` holds a config with THREE
+/// `[[orchestrations]]` — a roleless placeholder first, then `first-real`, then
+/// `chosen` carrying `default = true`, each spawnable role running `cat`. Fire it
+/// via run-now and assert the fire opens the `chosen` orchestration's tab and
+/// delivers the prompt to its orchestrator role: not a single-agent card (which
+/// the roleless slot-0 used to produce), and not `first-real` (which file order
+/// would produce).
+#[spec("scheduler/spawn/008")]
+#[test]
+fn spawn_008_declared_default_orchestration_beats_slot_zero_and_file_order() {
+    let scratch = common::harness_tempdir().expect("scratch tempdir");
+    let target = scratch.path().join("multi");
+    std::fs::create_dir_all(&target).expect("create target dir");
+
+    // Both halves of issue #704 in one file. The roleless block in slot 0 is what
+    // used to send this fire to a single-agent card; `chosen` sitting LAST is
+    // what makes the declaration observable rather than coincidental.
+    std::fs::write(
+        target.join(".dot-agent-deck.toml"),
+        "[[orchestrations]]\nname = \"placeholder\"\nroles = []\n\n\
+         [[orchestrations]]\nname = \"first-real\"\n\n\
+         [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+         [[orchestrations]]\nname = \"chosen\"\ndefault = true\n\n\
+         [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n",
+    )
+    .expect("write multi-orchestration config");
+
+    let toml = task_block("multi", &target.to_string_lossy(), Some("cat"));
+    let daemon = common::spawn_daemon_serve(Some(&toml), "0");
+
+    daemon.run_now("multi").expect("run-now multi");
+    let records = daemon.wait_for_agent_count(1, Duration::from_secs(10));
+
+    let orchestration_name = records.iter().find_map(|r| match &r.tab_membership {
+        Some(TabMembership::Orchestration { name, .. }) => Some(name.clone()),
+        _ => None,
+    });
+    let orchestration_name = orchestration_name.unwrap_or_else(|| {
+        panic!(
+            "the fire opened no orchestration tab at all — a roleless block in slot 0 must not \
+             degrade a scheduled fire to a single-agent card while `--list-targets` is still \
+             offering the repo's spawnable orchestrations. Records: {records:?}"
+        )
+    });
+    assert_eq!(
+        orchestration_name, "chosen",
+        "the orchestration declaring `default = true` must win over the one that merely comes \
+         first in the file — otherwise the declaration is decoration and reordering the file \
+         still changes which provider every scheduled run uses"
+    );
+
+    let orchestrator = records
+        .iter()
+        .find(|r| {
+            matches!(
+                &r.tab_membership,
+                Some(TabMembership::Orchestration { role_name, .. }) if role_name == "orchestrator"
+            )
+        })
+        .expect("the chosen orchestration must bring up its start role");
+    assert!(
+        daemon.attach_and_wait_for_output(&orchestrator.id, PROMPT_MARKER, Duration::from_secs(10)),
+        "and the scheduled prompt must actually reach it — selecting the right orchestration and \
+         then delivering nowhere is the same outage with a better-looking registry"
+    );
+}
+
 /// Scenario: Register one task whose explicit `command` touches a unique marker
 /// file on startup. Fire it via run-now and assert the marker appears — proving
 /// the scheduler spawns the configured `command` itself. (The former

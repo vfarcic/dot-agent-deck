@@ -2783,6 +2783,14 @@ without depending on the config struct API.
 - **Does not assert:** PTY GEOMETRY, which legitimately differs (the daemon-side primitive opens 24×80 and the TUI forwards its viewport) and is replayed faithfully from each pane's own last-known size; the `DOT_AGENT_DECK_AGENT_ID` each child sees, which differs by construction — it is what makes a respawn a new generation; anything about a REAL agent, which is `orchestration/dispatch/002`'s job.
 - **Platform coverage:** mac+linux (unix-only — the recorder is a POSIX shell script).
 
+##### orchestration/dispatch/004 — `dispatch --list-targets` marks the orchestration a repo DECLARES as its default, reports an `extends`-inherited role count, and the bare `--orchestration=` dispatch then opens that same one (issues #704 / #705).
+- **Layer:** L2 PTY-attached (`TuiDeck` on the `orch-multi` fixture) driving the REAL `dot-agent-deck dispatch --list-targets` and `dot-agent-deck dispatch --orchestration=` CLIs against the deck's own hook socket, exactly as an agent in a pane does — so the CLI parse, the wire hop, the daemon's config load, the `extends` resolution, the default selection and the role spawn are all in the path.
+- **Agent:** none — the fixture's roles run `cat`, which stays alive on stdin. No LLM tokens.
+- **Asserts:** the listing offers both orchestrations; `[default]` sits on `gpt-side` (which declares `default = true` while being SECOND) and not on `claude-side`; no "comes first in the file" note appears, because the config said what it meant; `gpt-side` is reported as **2 roles** although its block restates one, which only holds if `extends` resolved on the daemon's own config load; and a bare `--orchestration=` dispatch then surfaces an orchestration tab named `gpt-side`.
+- **Why it exists:** the listing and the spawn are two independent readings of the same config, and #704 is precisely the case where they disagreed. Asserting them in one test is what makes "the marker is honest" a claim rather than a hope. The `2 roles` assertion is deliberately the inheritance check: a count computed from the block as written is 1, so it cannot pass without the resolution having happened in the daemon rather than in a unit test.
+- **Does not assert:** the ambiguity diagnostic for an UNDECLARED default (the `default_orchestration` / `list_targets_response` unit tests own the wording); the scheduler path's half of the same rule (`scheduler/spawn/008`); delegation, role cards or the orchestrator context (`orchestration/dispatch/001`).
+- **Platform coverage:** mac+linux.
+
 #### dispatch/close
 
 ##### dispatch/close/001 — A dispatched single-agent card closes on the FIRST confirmed Ctrl+W, instead of surviving until the user closes it a second time (PRD #220 follow-up).
@@ -3835,6 +3843,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (synthetic — a long-lived `cat` schedule gives the real CLI a stable generated pane id and daemon registry agent id).
 - **Asserts:** `RunNow` creates a registry record through the scheduler's production spawn callback; the real non-`SessionStart` lifecycle CLI exits successfully using that record's pane and agent ids; and a later `ListAgents` returns the same record with a joined `Thinking` live snapshot rather than `live = None`.
 - **Does not assert:** the TUI-rendered reconnect symptom (`session/live/012`); issue-dispatch worktree creation; prompt-delivery contents.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/spawn/008 — A scheduled fire opens the orchestration a repo DECLARES as its default, past a roleless block in slot 0 and past the one that merely comes first (issue #704).
+- **Layer:** L2 (headless `dot-agent-deck daemon serve` driven via `RunNow`, same shape as `scheduler/spawn/002`).
+- **Agent:** none (every spawnable role runs `cat`, which echoes the delivered prompt).
+- **Asserts:** a fire into a dir whose `.dot-agent-deck.toml` holds a ROLELESS block, then `first-real`, then `chosen` carrying `default = true`, registers an agent whose `TabMembership::Orchestration` names **`chosen`** — not a single-agent card, and not `first-real` — and the scheduled prompt is echoed by that orchestrator's PTY.
+- **Why it exists:** the two paths that answer "which orchestration when none was named" disagreed. The bare `dispatch --orchestration=` form took the first ROLE-BEARING block; this one took `orchestrations.first()` and degraded to a single-agent card when that entry was roleless — so a scheduled `issue_dispatch` and a bare dispatch rooted at the same repo opened different things, and in the roleless case the scheduler opened nothing while `--list-targets` was still offering a target. Both halves are verified load-bearing: reverting `decide_target` to `orchestrations.first()` fails at the first assertion (a single-agent card, `tab_membership: None`), and reverting it to "first role-bearing" fails at the second (`first-real` instead of `chosen`).
+- **Does not assert:** the diagnostic text emitted when the choice IS implicit (the `default_orchestration` unit tests own the wording); the dispatch side of the same rule (`orchestration/dispatch/004`); role layout beyond the orchestrator slot (`scheduler/spawn/002`).
 - **Platform coverage:** mac+linux.
 
 #### scheduler/dispatch

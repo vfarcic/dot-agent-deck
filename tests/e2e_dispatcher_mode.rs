@@ -1598,3 +1598,118 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
         deck.snapshot_grid()
     );
 }
+
+/// Scenario: Launch the deck on the `orch-multi` fixture — two spawnable
+/// orchestrations where the SECOND, `gpt-side`, both `extends` the first and
+/// declares `default = true` — open one ordinary `cat` pane to dispatch from,
+/// then run the REAL `dot-agent-deck dispatch --list-targets` CLI against the
+/// deck's own hook socket exactly as an agent in that pane would. The printed
+/// listing must offer both orchestrations, must mark `gpt-side` as the default
+/// rather than the one that comes first, must report it as having inherited its
+/// two roles, and must carry no "chosen because it comes first" note. Then
+/// dispatch with the BARE `--orchestration=` form and require the tab that
+/// surfaces to be `gpt-side` too.
+#[spec("orchestration/dispatch/004")]
+#[test]
+fn orchestration_dispatch_004_list_targets_marks_the_declared_default() {
+    const UNIT: &str = "default-probe";
+
+    let deck = TuiDeck::builder()
+        .with_env("PATH", path_with_binary_dir())
+        .launch_with_fixture("orch-multi");
+    deck.wait_for_string("No active sessions");
+    commit_fixture_repo(deck.workdir());
+    let caller_pane = open_cat_caller_pane(&deck);
+
+    // The READ-ONLY half: what a dispatcher agent is shown before it chooses.
+    let listed = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["dispatch", "--list-targets"])
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
+        .output()
+        .expect("the list-targets CLI should run");
+    assert!(
+        listed.status.success(),
+        "`dispatch --list-targets` failed: {}{}",
+        String::from_utf8_lossy(&listed.stdout),
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let rendered = String::from_utf8_lossy(&listed.stdout).into_owned();
+
+    let line_for = |name: &str| {
+        rendered
+            .lines()
+            .find(|l| l.contains(&format!("'{name}'")))
+            .unwrap_or_else(|| {
+                panic!("`{name}` must appear in the listing:\n{rendered}");
+            })
+            .to_string()
+    };
+    let claude_line = line_for("claude-side");
+    let gpt_line = line_for("gpt-side");
+    assert!(
+        gpt_line.contains("[default]") && !claude_line.contains("[default]"),
+        "the DECLARED default must be the marked one. Marking the first entry instead would pass \
+         a listing that merely echoes file order, which is the state issue #704 is about:\n\
+         {rendered}"
+    );
+    assert!(
+        !rendered.contains("comes first in the file"),
+        "a config that declares its default must produce no ambiguity note — a permanent one on \
+         every listing is noise that trains the reader to skip it:\n{rendered}"
+    );
+    assert!(
+        gpt_line.contains("2 roles"),
+        "`gpt-side` restates ONE role and inherits the rest through `extends`, so a count of 2 is \
+         the daemon's own config load proving the inheritance resolved (issue #705):\n{gpt_line}"
+    );
+
+    // The ACTING half: the same answer, through the spawn. A listing that says
+    // one thing while the dispatch does another is the disagreement #704 is
+    // about, so the two are asserted in one test rather than two.
+    let expected_worktree = dispatch_worktree_of(&deck, UNIT);
+    let _guard = SiblingWorktreeGuard(expected_worktree.clone());
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args([
+            "dispatch",
+            UNIT,
+            "--task",
+            "Say hello, then stop.",
+            // The BARE form: "whatever this repo's default is". `=` with an empty
+            // value is how clap expresses an optional-value flag given no value.
+            "--orchestration=",
+        ])
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
+        .output()
+        .expect("the dispatch CLI should run");
+    assert!(
+        out.status.success(),
+        "a bare `--orchestration=` dispatch failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    const TAB_WAIT: Duration = Duration::from_secs(90);
+    assert!(
+        common::wait_until(TAB_WAIT, || {
+            common::agent_records_on(deck.attach_socket_path())
+                .iter()
+                .any(|r| {
+                    matches!(
+                        &r.tab_membership,
+                        Some(dot_agent_deck::agent_pty::TabMembership::Orchestration { name, .. })
+                            if name == "gpt-side"
+                    )
+                })
+        }),
+        "the bare dispatch opened something other than the declared default within {}s — the \
+         listing and the spawn must not disagree.\nRecords: {:?}\nFinal grid:\n{}",
+        TAB_WAIT.as_secs(),
+        common::agent_records_on(deck.attach_socket_path())
+            .iter()
+            .map(|r| (r.id.clone(), r.tab_membership.clone()))
+            .collect::<Vec<_>>(),
+        deck.snapshot_grid()
+    );
+}
