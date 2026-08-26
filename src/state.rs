@@ -113,20 +113,146 @@ pub(crate) const SESSION_START_WAIT_TIMEOUT: std::time::Duration =
 /// flip it. See [`delegate_readiness_buffer`].
 ///
 /// **#243 rescoped WHEN this applies, and it is no longer only the delegate
-/// path's wait.** Two changes. (a) It is SKIPPED — and only here — when the gate
-/// was released by the wrapper's strong interface observation on an agent this
-/// daemon itself spawned as a wrapper ([`SessionStartWait::observed_interface`]
-/// and the skip in [`dispatch_one_owned`]); every other readiness fact, the
-/// wrapper's weaker output-settled guess included, still pays it. (b) The
-/// resolver below is `pub(crate)` because the SCHEDULER now floors its
-/// declared-no-signal skip with the same value, for the same reason (see
-/// [`crate::spawn`]). The environment override keeps its `DELEGATE_` name, which
-/// is public and documented; what it configures is "how long a gate holds a
-/// prompt after a readiness fact that does not prove input-readiness", on
-/// whichever path established that fact — and an explicitly-set value is never
-/// zeroed by the skip in (a).
+/// path's wait.** Two changes. (a) It is never SKIPPED — every readiness fact
+/// the deck can observe pays a buffer, including both of the wrapper's interface
+/// facts. What the strong one now buys is a DIFFERENT buffer sized against a
+/// different measurement ([`WRAPPER_INTERFACE_READINESS_BUFFER`]), not the
+/// absence of one; the reasoning that once justified a skip was measured false
+/// and is retracted there. (b) The resolver below is `pub(crate)` because the
+/// SCHEDULER now floors its declared-no-signal skip with the same value, for the
+/// same reason (see [`crate::spawn`]). The environment override keeps its
+/// `DELEGATE_` name, which is public and documented; what it configures is "how
+/// long a gate holds a prompt after a readiness fact that does not prove
+/// input-readiness", on whichever path established that fact, and an
+/// explicitly-set value overrides BOTH defaults.
 pub(crate) const DELEGATE_READINESS_BUFFER: std::time::Duration =
     std::time::Duration::from_millis(1000);
+
+/// Issue #243, round 3 (derived by measurement, not tuned): the post-readiness
+/// buffer paid when the gate was released by the wrapper's STRONG interface fact
+/// ([`crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`]) — the child
+/// clearing `ICANON`/`ECHO` on the inner PTY.
+///
+/// **This replaces a SKIP, and the premise the skip rested on was false.** Two
+/// earlier rounds of this issue asserted that a child reading raw keystrokes is
+/// "the exact inverse of the canonical-echo discipline that swallowed the prompt
+/// in PRD #225, so there is nothing left for a blind interval to cover". There
+/// is. Raw mode means *the agent owns the terminal*; it does not mean *the
+/// composer will accept a submit*. A full-screen TUI enables raw mode at INIT,
+/// before it has painted anything — measured on real codex-cli 0.149.0 launched
+/// directly (no launcher in front) at **85 ms** after exec, and independently by
+/// `orchestration/delegate/009` at fork + 100 ms on both the original worker and
+/// its `clear = true` replacement. Writing on that instant is the EARLIEST and
+/// worst moment available, and it loses the prompt silently.
+///
+/// **What the buffer has to clear.** codex-cli keeps eating input for the rest of
+/// its TUI initialisation, which ends in a full teardown-and-repaint (screen
+/// clear, scroll-region reset, every panel redrawn). Reproducing the deck's exact
+/// write shape — payload, [`crate::pane_input::SUBMIT_DELAY`], `\r` — against a
+/// real codex on a pty and reading the rendered grid back, delivery tracks that
+/// repaint and nothing else. Every run in the corpus whose submitting `\r` landed
+/// after it delivered; runs whose `\r` landed before it were lost about half the
+/// time, in two distinct windows rather than one, so the failure is a race
+/// against discrete re-init events and NOT a threshold that a slightly larger
+/// number crosses once and for all.
+///
+/// **Sized from that measurement, from both ends.**
+///
+/// * **Lower end.** On an idle box the repaint completes ~607 ms after exec, i.e.
+///   ~522 ms after the fact-1 observation, and `SUBMIT_DELAY` donates 150 ms of
+///   that for free — so idle needs only ~372 ms, and the old 1000 ms default
+///   cleared it (30/30 delivered at 600–1300 ms). Under CPU contention it does
+///   not: the whole initialisation stretches with the machine. With the cores
+///   oversubscribed 1x, 1000 ms lost the prompt **3/3**; at 2x, **3/3** again,
+///   and 2000 ms and 3000 ms were still only 1/3 and 2/3. The worst requirement
+///   observed across 24 contended runs was **3601 ms** (repaint at 4107 ms, fact
+///   1 at 356 ms, less the 150 ms `SUBMIT_DELAY`). 5000 ms is 1.39x that and
+///   delivered **10/10** at 4000–5000 ms under the same load.
+/// * **Upper end.** This is paid on every delegate to a wrapped agent, against a
+///   31.4 s baseline measured in production before this issue. Fact 1 plus this
+///   buffer puts a directly-launched Codex at ~5.1 s and one behind `devbox run
+///   codex-big` (fact 1 at ~3.1 s) at ~8.1 s — 6.2x and 3.9x better than the
+///   baseline, and both far inside the 60 s `AUTOMATIC_PROMPT_DEADLINE` that
+///   bounds a whole delivery. Much past ~5 s and the win starts being eaten by
+///   the fix for it.
+///
+/// **Deliberately asymmetric, because the two failures are not comparable.** Too
+/// short costs the prompt SILENTLY — the write succeeds, the text parks in the
+/// composer, no turn ever starts, and the worker looks alive. Too long costs
+/// bounded latency on a path that is still multiples better than the defect it
+/// replaces. So the headroom is a multiple rather than a rounding.
+///
+/// **And it is a mitigation, not a bound.** The quantity being covered is another
+/// program's initialisation time; it scaled ~7x between an idle and a contended
+/// box here, and no number measured on this box can bound it on someone else's.
+/// [`DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS`] overrides it for an operator
+/// who needs more. The durable answer is an OBSERVATION that scales — the
+/// wrapper watching the child's output settle *after* the raw-mode transition,
+/// which the launcher hazard that makes
+/// [`crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`] unsafe on its
+/// own does not apply to once fact 1 has already proved the agent owns the
+/// terminal. That is a new mechanism and is filed rather than built here.
+///
+/// Scoped to the strong fact ALONE, and that scoping is load-bearing. A wrapped
+/// agent that never leaves cooked mode has no full-screen initialisation to
+/// clear — it is a line-oriented REPL, and the measurement above says nothing
+/// about it — so the weak fact, the timeout fallback and every non-wrapper
+/// readiness fact keep [`DELEGATE_READINESS_BUFFER`] unchanged.
+pub(crate) const WRAPPER_INTERFACE_READINESS_BUFFER: std::time::Duration =
+    std::time::Duration::from_millis(5000);
+
+/// Issue #243 (regression found by measurement): how long the readiness gate
+/// holds a Wrapper-strategy agent's WEAK interface fact
+/// ([`crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`]) open,
+/// waiting to see whether the STRONG one
+/// ([`crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`]) is still
+/// coming.
+///
+/// **This is a bound on a FALLBACK, not a tuned delivery interval.** Nothing
+/// waits this long in the case it exists for: the strong fact arrives, the gate
+/// releases on it that instant, and the window is never reached. What the number
+/// buys is the shape of the failure when the strong fact never comes — release on
+/// the guess plus [`DELEGATE_READINESS_BUFFER`], i.e. exactly the behaviour that
+/// shipped before this window existed, instead of a return to the 30 s dead wait.
+/// So it must not be read as, or tuned like, the fixed intervals
+/// `DELEGATE_READINESS_BUFFER` warns about drifting: a longer value never delays
+/// a wrapped agent that reaches its interface, and `docs/develop/agent-adapters.md`
+/// says the same.
+///
+/// **Why a window is needed at all.** The wrapper's two facts do not arrive in
+/// order of strength; for the production launch shape they arrive in the exact
+/// wrong order, every time. `devbox run codex-big` prints one banner line at
+/// ~0.1 s and then computes its shellenv in SILENCE for a measured 2750–4132 ms
+/// before `codex` is exec'd at all, so the settle guess fires while the pane still
+/// holds a launcher in cooked-mode line discipline. Measured over 13 launcher
+/// probes and 8 wrapper spawns: the guess fired 21/21 and the observation never
+/// fired first, not once, arriving 2005–3370 ms LATER. Releasing on the guess put
+/// the pointer into the launcher's own line discipline at +1.85 s, where 3/3 runs
+/// left it parked unsubmitted in Codex's composer with no turn ever starting —
+/// silently, because the write itself succeeds.
+///
+/// **Sized from that measurement, from both ends, and deliberately asymmetric.**
+/// Too short costs the prompt, silently, on every Codex delegate; too long costs
+/// bounded latency on a wrapped agent that stays in cooked mode forever (a
+/// line-oriented REPL, and the test stand-ins). Those are not comparable, so the
+/// number is biased toward the recoverable side:
+///
+/// * **Lower end.** 8 s is 2.4x the worst observed fact-2→fact-1 margin (3370 ms)
+///   and 1.9x the worst observed launcher silence (4132 ms). The margin is
+///   dominated by a Nix shellenv evaluation, whose cost scales with the devbox
+///   project and the machine and is not something this box's numbers can bound
+///   for someone else's — so the headroom is a multiple, not a rounding.
+/// * **Upper end.** The fallback total is this window plus the 1000 ms buffer, so
+///   a wrapped agent that never goes raw reaches its prompt in ~9 s: under a third
+///   of the [`SESSION_START_WAIT_TIMEOUT`] dead wait this issue deleted, and well
+///   inside the 60 s `AUTOMATIC_PROMPT_DEADLINE` the scheduler bounds a whole
+///   delivery by. Above ~10 s that ordering starts to blur and the window stops
+///   reading as a fallback.
+///
+/// Bounded by the caller's own deadline as well — see [`wait_for_session_start`],
+/// which takes `min(window, time left in the readiness wait)` so this can never
+/// extend a gate past the timeout that already governs it.
+const INTERFACE_UPGRADE_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// PRD #249 M1 test/e2e seam: overrides [`DELEGATE_READINESS_BUFFER`] with an
 /// integer number of **milliseconds**. Mirrors the
@@ -228,6 +354,19 @@ fn parse_bounded_ms_override(
 /// whichever path established that fact.
 pub(crate) fn delegate_readiness_buffer() -> std::time::Duration {
     explicit_delegate_readiness_buffer().unwrap_or(DELEGATE_READINESS_BUFFER)
+}
+
+/// Issue #243, round 3: [`delegate_readiness_buffer`]'s counterpart for a gate
+/// released by the wrapper's STRONG interface fact — the operator's own interval
+/// when they set one, [`WRAPPER_INTERFACE_READINESS_BUFFER`] otherwise.
+///
+/// The operator's value OVERRIDES rather than being max()-ed against the default,
+/// which is the same shape [`delegate_readiness_buffer`] has and is deliberate on
+/// both ends: it is how the e2e harness pins 0, and it keeps "what the operator
+/// set" and "what the operator gets" the same sentence. A caller that wants the
+/// longer default has to be on the interface path to get it.
+pub(crate) fn wrapper_interface_readiness_buffer() -> std::time::Duration {
+    explicit_delegate_readiness_buffer().unwrap_or(WRAPPER_INTERFACE_READINESS_BUFFER)
 }
 
 /// Issue #243 (audit F1, mitigation 3): the buffer THE OPERATOR ASKED FOR, or
@@ -2532,6 +2671,63 @@ pub(crate) fn agent_has_pre_prompt_readiness_signal(agent_type: Option<&AgentTyp
     })
 }
 
+/// Issue #243 (regression found by measurement): how long
+/// [`wait_for_session_start`] should treat the wrapper's WEAK interface fact as
+/// PROVISIONAL for `agent_type`, rather than releasing the gate on it.
+///
+/// [`INTERFACE_UPGRADE_WINDOW`] for an agent whose readiness is declared to come
+/// from the wrapper watching it
+/// ([`crate::agent_registry::PrePromptReadiness::WrapperInterfaceReady`] — Codex
+/// today, PRD #211's Gemini next), and `ZERO` for everybody else. `ZERO` is
+/// literally today's code path: the gate releases on the first readiness fact it
+/// accepts, so every non-wrapper agent is untouched — Claude's native
+/// `SessionStart`, OpenCode's declared-no-signal skip, and the conservative
+/// unknown-agent wait all behave exactly as they did.
+///
+/// **Scoped by the agent, not by the event**, and the difference matters twice.
+/// The obvious spelling — "hold whenever a settled marker arrives" — would make
+/// every hand-wrapped cooked-mode agent and every wrapped test stand-in pay the
+/// window for a strong fact that is never coming, on no evidence that this
+/// particular agent has a raw-mode interface at all. And it would let a producer
+/// LENGTHEN an arbitrary pane's gate by posting one forged marker. Both call
+/// sites read the agent type from the deck's own frozen launch record — the
+/// delegate from the identity it just respawned, the scheduler from
+/// `spawn_agent_type` — so nothing a producer says selects the window.
+///
+/// Note what a wrongly-widened window could NOT do even so: this delays a
+/// release, it never suppresses the buffer. The three guards in
+/// [`dispatch_one_owned`] still decide that, and a forged strong fact still fails
+/// guard 2. The worst case here is latency bounded by the caller's own timeout.
+pub(crate) fn interface_upgrade_window(agent_type: Option<&AgentType>) -> std::time::Duration {
+    if agent_is_wrapper_interface_ready(agent_type) {
+        INTERFACE_UPGRADE_WINDOW
+    } else {
+        std::time::Duration::ZERO
+    }
+}
+
+/// Issue #243: does `agent_type` get its pre-prompt readiness from the WRAPPER
+/// watching it ([`crate::agent_registry::PrePromptReadiness::WrapperInterfaceReady`]
+/// — Codex today, PRD #211's Gemini next)?
+///
+/// The discriminator behind [`interface_upgrade_window`] and behind the
+/// scheduler's post-readiness buffer, factored out because both need it and both
+/// must read it from the same place: the deck's own frozen launch record, never
+/// the badge on the arriving event. A producer that could select either of those
+/// by posting a marker could lengthen a stranger's gate or mis-price its buffer.
+///
+/// `None` — a command the deck could not resolve — is `false`, and the direction
+/// is the safe one in both uses: no upgrade window (the gate behaves exactly as
+/// it did before this issue) and the ordinary buffer rather than the longer one.
+pub(crate) fn agent_is_wrapper_interface_ready(agent_type: Option<&AgentType>) -> bool {
+    matches!(
+        agent_type.map(crate::agent_registry::spec),
+        Some(spec)
+            if spec.pre_prompt_readiness
+                == crate::agent_registry::PrePromptReadiness::WrapperInterfaceReady
+    )
+}
+
 /// Issue #424 (reviewer option 3): everything one [`wait_for_session_start`]
 /// window observed — deliberately more than whether it succeeded.
 ///
@@ -2617,31 +2813,54 @@ pub(crate) struct SessionStartWait {
     /// observation — it watched the child clear `ICANON`/`ECHO` on the inner PTY
     /// — rather than by an announcement that a session object exists.
     ///
-    /// This is the fourth independent fact, and it is what decides whether the
-    /// post-readiness buffer ([`DELEGATE_READINESS_BUFFER`]) is still needed. That
-    /// buffer exists because `SessionStart` means "a session exists", not "the TUI
+    /// This is the fourth independent fact, and it is what decides WHICH
+    /// post-readiness buffer is owed — not whether one is owed at all. The buffer
+    /// exists because `SessionStart` means "a session exists", not "the TUI
     /// interprets `\r` as submit" — Claude Code fires it early in its boot
-    /// sequence, and writing on it lands mid-boot (#199, #249, #663). A child that
-    /// has taken the terminal out of cooked mode does not have that gap: reading
-    /// raw keystrokes is the exact inverse of the canonical-echo discipline that
-    /// swallowed the prompt in PRD #225, so there is nothing left for a blind
-    /// interval to cover.
+    /// sequence, and writing on it lands mid-boot (#199, #249, #663).
+    ///
+    /// **It used to mean the buffer could be skipped, and that was measured
+    /// false.** The claim was that a child reading raw keystrokes is the exact
+    /// inverse of the canonical-echo discipline that swallowed the prompt in PRD
+    /// #225, so nothing was left for a blind interval to cover. It is not: a
+    /// full-screen TUI enables raw mode at INIT, before it has painted anything.
+    /// Real codex-cli does it 85 ms after a direct exec, and
+    /// `orchestration/delegate/009` recorded fork + 100 ms on both the original
+    /// worker and its replacement — then lost the pointer into an unsubmitted
+    /// composer. Raw mode proves the AGENT owns the terminal, which is why this
+    /// fact is the best RELEASE signal available; it does not prove the composer
+    /// will accept a submit. `true` therefore now selects
+    /// [`WRAPPER_INTERFACE_READINESS_BUFFER`], measured against how long that
+    /// initialisation goes on eating input, in place of
+    /// [`DELEGATE_READINESS_BUFFER`].
     ///
     /// **Narrower than "the wrapper observed the interface", deliberately** (issue
     /// #243 review finding 1). The wrapper's OTHER fact — output settled for
-    /// 750 ms — releases the gate but does NOT set this, because a launcher
-    /// stalled part-way through its own boot settles exactly like a REPL waiting
-    /// at its prompt, and the production launch shape (`devbox run codex-big`) has
-    /// a measured ~4 s window in which to do it. Zeroing the buffer on that guess
-    /// would reintroduce PRD #225 Defect 1 through the fix for it.
+    /// 750 ms — never sets this, because a launcher stalled part-way through its
+    /// own boot settles exactly like a REPL waiting at its prompt, and the
+    /// production launch shape (`devbox run codex-big`) has a measured 2750–4132 ms
+    /// window in which to do it. The two are still priced apart, in the direction
+    /// that survived measurement: what fact 2 buys is the ORDINARY buffer, since
+    /// neither a stalled launcher nor a line-oriented REPL has a full-screen
+    /// initialisation for the longer one to cover.
     ///
-    /// **And it is not on its own sufficient to skip the buffer.** The marker it
-    /// is read from is producer-writable (see
+    /// Nor does that fact release the gate any more, for a Wrapper-strategy
+    /// agent: it is held for [`INTERFACE_UPGRADE_WINDOW`] first, because measurement
+    /// showed the weak fact beats the strong one to the daemon 21 times out of 21.
+    /// `true` here is therefore the ORDINARY outcome for a real Codex, and `false`
+    /// on an interface fact means the strong one never came at all. See
+    /// [`interface_upgrade_window`].
+    ///
+    /// **And it is not on its own sufficient to select that buffer.** The marker
+    /// it is read from is producer-writable (see
     /// [`crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`]), so
     /// [`dispatch_one_owned`] additionally requires that this daemon spawned the
-    /// agent as a wrapper, and floors the skip at any explicit
-    /// [`DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS`]. This field records what
-    /// the EVENT said; the privilege is decided there.
+    /// agent as a wrapper, and an explicit
+    /// [`DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS`] overrides either default.
+    /// This field records what the EVENT said; what it is worth is decided there
+    /// — and since a forgery can no longer suppress a buffer, only mis-price one
+    /// toward the value every other agent already gets, what it is worth is now
+    /// attribution rather than privilege.
     ///
     /// `false` for every other outcome, INCLUDING the timeout: a wait that
     /// established nothing is more reason to hold the prompt, not less.
@@ -2710,20 +2929,51 @@ impl SessionStartWait {
 /// is SKIPPED (kept waiting on) when the agent will emit a genuine native one
 /// later — see [`session_start_means_ready`] for the discriminator and why the
 /// skip must be conditional.
+///
+/// Issue #243: `upgrade_window` is how long the wrapper's WEAK interface fact
+/// ([`crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`]) is held as
+/// PROVISIONAL rather than released on, waiting to see whether the strong one is
+/// still coming behind it. `ZERO` — every non-Wrapper agent, and every caller
+/// that has no launch record to read — is this function unchanged: the first
+/// accepted readiness fact returns. Callers resolve it with
+/// [`interface_upgrade_window`] from the deck's own frozen launch record; see
+/// [`INTERFACE_UPGRADE_WINDOW`] for the measurement it is sized from. It can only
+/// ever SHORTEN into `timeout`, never extend past it.
 pub(crate) async fn wait_for_session_start(
     rx: &mut broadcast::Receiver<BroadcastMsg>,
     pane_id: &str,
     agent_id: &str,
     timeout: std::time::Duration,
+    upgrade_window: std::time::Duration,
 ) -> SessionStartWait {
     let deadline = tokio::time::Instant::now() + timeout;
     // Issue #424 F4: see [`SessionStartWait::launcher_handoff`]. Carried across
     // every exit from this loop, including the timeout, because the launcher
     // case is exactly the one that times out.
     let mut launcher_handoff: Option<AgentType> = None;
+    // Issue #243: the wrapper's WEAK interface fact, accepted as readiness but
+    // held back. `Some(producer)` means one arrived, the gate has NOT been
+    // released on it, and `upgrade_deadline` is when it will be if nothing
+    // stronger turns up. See [`INTERFACE_UPGRADE_WINDOW`] for why the weak fact
+    // is provisional and [`interface_upgrade_window`] for whose it is.
+    let mut provisional_settled: Option<AgentType> = None;
+    let mut upgrade_deadline: Option<tokio::time::Instant> = None;
     loop {
-        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
-            return SessionStartWait::unready(launcher_handoff);
+        // The loop is bounded by whichever comes first: the caller's own
+        // deadline, or the upgrade window over a fact already in hand. Taking
+        // the MIN is what keeps this from extending a gate — an upgrade window
+        // that outlives the readiness timeout simply expires at the timeout.
+        let effective_deadline = upgrade_deadline.map_or(deadline, |upgrade| upgrade.min(deadline));
+        let Some(remaining) =
+            effective_deadline.checked_duration_since(tokio::time::Instant::now())
+        else {
+            return resolve_expired_wait(
+                pane_id,
+                agent_id,
+                upgrade_window,
+                provisional_settled,
+                launcher_handoff,
+            );
         };
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(BroadcastMsg::Event(event))) => {
@@ -2794,6 +3044,38 @@ pub(crate) async fn wait_for_session_start(
                     // did would leave the delivery bound to `wrap-codex-1234`, and
                     // Codex's own native start a moment later would then read as a
                     // generation CHANGE and revoke a target that never moved.
+                    // Issue #243 (regression found by measurement): the
+                    // wrapper's WEAK fact is PROVISIONAL for a Wrapper-strategy
+                    // agent, not a release. The two facts do not arrive in order
+                    // of strength — for `devbox run codex-big` the guess beats
+                    // the observation by a measured 2005–3370 ms, 21 out of 21
+                    // times — so releasing on the first one to arrive is
+                    // releasing on the launcher, every time. The window is a
+                    // bound on the FALLBACK below, not a delivery interval:
+                    // nothing waits it out in the case it exists for.
+                    //
+                    // Only the FIRST settled fact arms it. A second cannot come
+                    // from an honest wrapper (`InterfaceWatch::claim` latches per
+                    // fact), and one that does must not be able to walk the
+                    // deadline forward indefinitely.
+                    if !upgrade_window.is_zero()
+                        && event.is_wrapper_interface_settled_session_start()
+                        && provisional_settled.is_none()
+                    {
+                        provisional_settled = Some(event.agent_type.clone());
+                        upgrade_deadline = Some(tokio::time::Instant::now() + upgrade_window);
+                        tracing::debug!(
+                            pane_id,
+                            agent_id,
+                            agent_type = ?event.agent_type,
+                            window_ms = upgrade_window.as_millis(),
+                            "readiness gate: the wrapper reports its child's output SETTLED, \
+                             which a launcher stalled mid-boot does exactly as well as a REPL \
+                             at its prompt; holding the gate for the upgrade window in case \
+                             the strong raw-input observation is still coming"
+                        );
+                        continue;
+                    }
                     let genuine = !event.is_wrapper_session_start();
                     let observed_interface = event.is_wrapper_interface_ready_session_start();
                     return SessionStartWait {
@@ -2808,10 +3090,65 @@ pub(crate) async fn wait_for_session_start(
             // PRD #120: not a hook event — keep waiting for the SessionStart.
             Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            // Issue #243: `Err(_)` is `Elapsed` — the ordinary end of this
+            // window, and the arm a provisional weak fact has to be resolved on
+            // too. It does not fall through to the check at the top of the loop.
             Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
-                return SessionStartWait::unready(launcher_handoff);
+                return resolve_expired_wait(
+                    pane_id,
+                    agent_id,
+                    upgrade_window,
+                    provisional_settled,
+                    launcher_handoff,
+                );
             }
         }
+    }
+}
+
+/// Issue #243: what one [`wait_for_session_start`] window returns once its time
+/// is up — the caller's readiness timeout, the upgrade window over a weak
+/// interface fact, or the daemon's broadcast closing under it.
+///
+/// The whole of it is `provisional_settled`. Without one this is the timeout
+/// path exactly as it always was: nothing was established, and the caller's
+/// fallback writes the prompt. With one, the gate is RELEASED on the wrapper's
+/// output-settled guess — which was always good enough to release on, since 30 s
+/// of waiting for a signal that never comes is worse — and what the expired
+/// window cost is only the CHANCE that the strong observation was still coming.
+///
+/// So the fallback is precisely the behaviour that shipped before the window
+/// existed: `ready`, no generation (both wrapper events name the WRAPPER's
+/// session, never a conversation — see [`SessionStartWait::generation`]), and
+/// `observed_interface: false`, which is what makes the caller pay
+/// [`DELEGATE_READINESS_BUFFER`] over it. A genuinely cooked-mode wrapped agent
+/// therefore keeps a bounded path to its prompt and never returns to the dead
+/// wait.
+fn resolve_expired_wait(
+    pane_id: &str,
+    agent_id: &str,
+    upgrade_window: std::time::Duration,
+    provisional_settled: Option<AgentType>,
+    launcher_handoff: Option<AgentType>,
+) -> SessionStartWait {
+    let Some(observed_producer) = provisional_settled else {
+        return SessionStartWait::unready(launcher_handoff);
+    };
+    tracing::debug!(
+        pane_id,
+        agent_id,
+        agent_type = ?observed_producer,
+        window_ms = upgrade_window.as_millis(),
+        "readiness gate: the wrapper's strong interface observation never arrived inside the \
+         upgrade window; releasing on its output-settled guess, which keeps the post-readiness \
+         buffer"
+    );
+    SessionStartWait {
+        ready: true,
+        generation: None,
+        observed_producer: Some(observed_producer),
+        launcher_handoff,
+        observed_interface: false,
     }
 }
 
@@ -3654,6 +3991,12 @@ async fn dispatch_one_owned(
                             &pane_id,
                             &new_agent_id,
                             SESSION_START_WAIT_TIMEOUT,
+                            // Issue #243: read from the identity this respawn
+                            // just launched — the deck's own record, never the
+                            // observed badge — so no producer can pick which
+                            // agents get an upgrade window. See
+                            // `interface_upgrade_window`.
+                            interface_upgrade_window(worker_agent_type.as_ref()),
                         ) => wait,
                     }
                 } else {
@@ -3784,73 +4127,119 @@ async fn dispatch_one_owned(
                 // not by which agent this is — that is the only scoping that does
                 // not reintroduce #663. The buffer covers the gap between "a
                 // session exists" and "the TUI interprets `\r` as submit", and
-                // that gap is real for every readiness fact the deck had before
-                // this issue: a native `SessionStart` (Claude fires it early in
-                // boot — at a 0 ms buffer the pointer was written into a
-                // still-booting Claude and dropped, #663), a hookless wrapper's
-                // fork-time event, and the timeout fallback, which established
-                // nothing at all and is therefore MORE reason to wait.
+                // that gap is real for every readiness fact the deck has: a native
+                // `SessionStart` (Claude fires it early in boot — at a 0 ms buffer
+                // the pointer was written into a still-booting Claude and dropped,
+                // #663), a hookless wrapper's fork-time event, the timeout
+                // fallback, which established nothing at all and is therefore MORE
+                // reason to wait — and, since this issue's third round, BOTH of
+                // the wrapper's interface facts.
                 //
-                // The one readiness fact without that gap is the wrapper watching
-                // the child take the terminal OUT OF COOKED MODE: reading raw
-                // keystrokes is the exact inverse of the canonical-echo discipline
-                // that swallowed the prompt in PRD #225, so there is nothing left
-                // for a blind interval to cover and holding anyway would only be
-                // an admission that the new signal is not believed.
+                // **The skip that used to live here is gone, and the claim under
+                // it was false.** Rounds 1 and 2 held that the wrapper watching
+                // the child take the terminal out of cooked mode left "nothing for
+                // a blind interval to cover", because reading raw keystrokes is
+                // the inverse of the canonical-echo discipline that swallowed the
+                // prompt in PRD #225. Measurement retracts it. A full-screen TUI
+                // enables raw mode at INIT — real codex-cli at 85 ms after a
+                // direct exec, and `orchestration/delegate/009` at fork + 100 ms
+                // on both the original worker and its replacement — so fact 1
+                // fires long before the composer will accept a submit, and a
+                // zero-buffer write on it is the earliest and worst instant
+                // available. `/009` lost the pointer there exactly as production
+                // did. Raw mode is NECESSARY for input-readiness and not
+                // SUFFICIENT: it proves the AGENT owns the terminal, which is
+                // still strictly better than the alternative and is why it
+                // releases the gate — see [`wait_for_session_start`] — but it
+                // still owes a buffer.
                 //
-                // Issue #243 REVIEW — three guards, and the skip needs all three.
-                // The first version of this seam asked only `wait.observed_interface`,
-                // and each guard closes a way that single question could be true
-                // while the child is not, in fact, ready for a prompt:
+                // So guard 1's job changed. It no longer decides which fact may
+                // SKIP the buffer; it decides which fact may RELEASE the gate,
+                // and here it decides only WHICH buffer is owed:
                 //
                 // 1. **The right FACT.** The wrapper reports two, and only one is
-                //    an observation. `observed_interface` is now set by the
-                //    raw-input-mode fact alone; the output-settled guess releases
-                //    the gate above and arrives here as `false`, so it pays the
-                //    buffer. A stalled `devbox run codex-big` settles exactly like
-                //    a REPL waiting at its prompt, and the measured wrapper→`node
-                //    codex` gap is ~4 s — zeroing the buffer on that would
-                //    reintroduce PRD #225 Defect 1 through the fix for it.
+                //    an observation. `observed_interface` is set by the
+                //    raw-input-mode fact alone; the output-settled guess arrives
+                //    here as `false`. That still matters, because the two owe
+                //    DIFFERENT amounts. Fact 1 means a full-screen TUI is
+                //    initialising, and [`WRAPPER_INTERFACE_READINESS_BUFFER`] is
+                //    measured against how long that takes to stop eating input.
+                //    Fact 2 means output went quiet, which a launcher stalled
+                //    mid-boot does exactly as well as a line-oriented REPL waiting
+                //    at its prompt — a `devbox run codex-big` prints one banner at
+                //    ~0.1 s and then computes its shellenv in silence for a
+                //    measured 2750–4132 ms — and neither of those has a TUI
+                //    initialisation to clear, so it keeps the ordinary
+                //    [`DELEGATE_READINESS_BUFFER`].
+                //
+                //    Pricing the two apart is not, on its own, enough, and
+                //    measurement established that too. The guess does not merely
+                //    arrive sometimes; for the production launch shape it arrives
+                //    FIRST, 21 times out of 21, by 2005–3370 ms. That is handled a
+                //    level up, by the gate holding fact 2 provisionally for
+                //    [`INTERFACE_UPGRADE_WINDOW`] rather than releasing on it; see
+                //    [`interface_upgrade_window`]. Reaching here with
+                //    `observed_interface == false` on a real Codex therefore means
+                //    the strong fact never came at all.
                 // 2. **The right AGENT.** The marker is not authenticated: the
                 //    daemon's hook socket accepts a raw `AgentEvent` line with a
                 //    free-form `metadata` map, and #243's audit reproduced a forged
                 //    `wrapper_interface_ready` `SessionStart` from a bare `python3`
-                //    with no deck environment at all. Releasing the GATE was
-                //    already forgeable that way before #243 (an unmarked
-                //    `SessionStart` does it), so the delta to take back is
-                //    precisely this: suppressing the buffer on demand. The oracle
-                //    is the frozen launch-shape record — `spawn_agent_type`, which
-                //    no hook path can write — so a pane the deck did not itself
-                //    exec under `dot-agent-deck wrap` keeps its buffer no matter
-                //    what any producer posts about it.
+                //    with no deck environment at all. The oracle is the frozen
+                //    launch-shape record — `spawn_agent_type`, which no hook path
+                //    can write — so a pane the deck did not itself exec under
+                //    `dot-agent-deck wrap` is priced on what the deck knows rather
+                //    than on what the pane claims.
+                //
+                //    Note what this guard is worth NOW, because it is less than it
+                //    was and the difference is the audit's F1 finding. When fact 1
+                //    suppressed the buffer, a forged marker bought a privilege —
+                //    it could switch the buffer OFF on demand. It cannot any more:
+                //    with no suppression available, a forgery can only release the
+                //    gate, which a bare unmarked `SessionStart` already did before
+                //    this issue and which is therefore not a new privilege. What
+                //    survives is attribution: the guard decides whether a claimed
+                //    interface fact is priced as a real TUI's initialisation or as
+                //    an ordinary readiness fact, and it fails toward the SHORTER
+                //    buffer, which is the pre-existing behaviour rather than a
+                //    concession. It is kept because release attribution is worth
+                //    getting right in the log, and because the honest case it
+                //    refuses is worth naming.
                 // 3. **Never the OPERATOR's interval.** `…_BUFFER_MS` is the #199
-                //    escape hatch. A producer must not be able to switch it off,
-                //    and an operator who raised it said something about their
-                //    machine that an observation of one child does not refute — so
-                //    the skip floors at an explicitly-set value rather than at
-                //    zero. Unset (the ordinary case) still floors at zero, which is
-                //    where the latency win lives.
+                //    escape hatch, and an explicitly-set value wins over BOTH
+                //    defaults — it is how the e2e harness pins 0 and how an
+                //    operator whose machine needs longer than the measurement says
+                //    gets it. `delegate_readiness_buffer` already resolves that;
+                //    the wrapper branch resolves it the same way rather than
+                //    max()-ing against the default, so "what the operator set" and
+                //    "what the operator gets" stay the same sentence.
                 //
                 // Where the deck HAS seen the interface, the diagnosable story is
                 // better than a knob: the interface event is on the wire and in the
                 // wrapper's log with the fact that fired, so "the agent never became
-                // ready" is answered by its absence rather than by tuning.
+                // ready" is answered by its absence rather than by tuning. The log
+                // half of that was false when it was written — `dot-agent-deck
+                // wrap` installed no tracing subscriber at all, so the line was
+                // built and discarded — and is true as of this issue's second
+                // round: `main` calls `init_logging_from_env` on the `Wrap` arm,
+                // and the watch logs at `info!` so the default filter carries it.
+                // Enable it the same way as the daemon's, with
+                // `DOT_AGENT_DECK_LOG`; the wrapper inherits it from the daemon
+                // that exec'd it, and writes to a file only, never to the pane.
                 let interface_observed = wait.observed_interface
                     && registry.agent_spawned_as_wrapper_host(&new_agent_id);
                 let buffer = if interface_observed {
-                    // Guard 3. `None` — the ordinary case — is the full skip;
-                    // `Some` means an operator pinned an interval and the skip
-                    // floors at it rather than zeroing it.
-                    let floor = explicit_delegate_readiness_buffer();
+                    let resolved = wrapper_interface_readiness_buffer();
                     tracing::debug!(
                         role = %target_role,
                         pane_id = %pane_id,
-                        operator_floor_ms = floor.map(|f| f.as_millis()),
+                        buffer_ms = resolved.as_millis(),
+                        operator_pinned = explicit_delegate_readiness_buffer().is_some(),
                         "delegate: readiness came from the wrapper's OBSERVED raw-input mode on a \
-                         pane this daemon spawned as a wrapper; dropping the post-readiness \
-                         buffer to the operator's own setting, or to zero when they set none"
+                         pane this daemon spawned as a wrapper, so a full-screen TUI is coming \
+                         up; holding for the interface buffer measured against its initialisation"
                     );
-                    floor.unwrap_or(std::time::Duration::ZERO)
+                    resolved
                 } else {
                     if wait.observed_interface {
                         // Guard 2 refused, and the two shapes that reach here are
@@ -3859,8 +4248,10 @@ async fn dispatch_one_owned(
                         // to rewrite to reach a wrapper — a hand-written
                         // `dot-agent-deck wrap … -- codex`, whose frozen launch
                         // identity `AgentType::from_command` cannot recover. The
-                        // second is honest and costs it the fast path; that is the
-                        // fail-closed direction, and the cost is one buffer.
+                        // second is honest, and what it costs it is now the LONGER
+                        // buffer rather than the fast path: it waits the ordinary
+                        // interval, which is the behaviour every non-wrapper agent
+                        // has always had.
                         warn!(
                             role = %target_role,
                             pane_id = %pane_id,
@@ -3868,7 +4259,8 @@ async fn dispatch_one_owned(
                             spawn_agent_type = ?registry.spawn_agent_type(&new_agent_id),
                             "delegate: a SessionStart claimed the wrapper had observed this \
                              agent's interface, but this daemon's own launch record does not say \
-                             it spawned the agent as a wrapper; keeping the post-readiness buffer"
+                             it spawned the agent as a wrapper; pricing it as an ordinary \
+                             readiness fact"
                         );
                     }
                     delegate_readiness_buffer()
@@ -8072,11 +8464,17 @@ mod tests {
     /// variable, and the two answer different questions:
     /// [`delegate_readiness_buffer`] answers "what buffer applies" (setting folded
     /// into default), while [`explicit_delegate_readiness_buffer`] answers "did a
-    /// human choose this interval" — which is what the interface-observation skip
-    /// floors at instead of zeroing. So every row below now pins BOTH, and the
-    /// rows where they disagree are the whole point: an unparseable value is not
-    /// a setting (`None`, floors nothing) even though the buffer still resolves to
-    /// the default, and an explicit `0` IS a setting worth exactly zero.
+    /// human choose this interval". So every row below pins BOTH, and the rows
+    /// where they disagree are the whole point: an unparseable value is not a
+    /// setting (`None`) even though the buffer still resolves to the default, and
+    /// an explicit `0` IS a setting worth exactly zero.
+    ///
+    /// Round 3 added a THIRD, [`wrapper_interface_readiness_buffer`], over the
+    /// same variable again. It is pinned alongside the others because the one
+    /// thing that could silently go wrong with it is the operator override
+    /// stopping at the ordinary default: the whole point of the variable is that a
+    /// machine slower than the one this was measured on can raise it, and an
+    /// e2e harness pinning `0` gets exactly zero on this path too.
     #[test]
     fn delegate_readiness_buffer_override_is_bounded() {
         // Serialize against any other test reading this process-global env var.
@@ -8098,6 +8496,18 @@ mod tests {
             delegate_readiness_buffer(),
             DELEGATE_READINESS_BUFFER,
             "an unset override must still resolve to the built-in buffer"
+        );
+        assert_eq!(
+            wrapper_interface_readiness_buffer(),
+            WRAPPER_INTERFACE_READINESS_BUFFER,
+            "an unset override on the interface path must resolve to the interface buffer, not \
+             to the ordinary one — they are sized against different measurements"
+        );
+        assert!(
+            WRAPPER_INTERFACE_READINESS_BUFFER > DELEGATE_READINESS_BUFFER,
+            "the interface buffer covers a full-screen TUI's own initialisation, which is longer \
+             than the session-exists-but-not-listening gap the ordinary buffer covers; if these \
+             ever converge, one of the two measurements has been lost"
         );
         for (raw, expected, explicit) in [
             // Explicitly unguarded: `orchestration/delegate/012`'s control arm.
@@ -8153,6 +8563,17 @@ mod tests {
                 explicit,
                 "{DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS}={raw:?} must read as the operator \
                  setting {explicit:?}"
+            );
+            // The interface path reads the SAME setting and falls back to its own
+            // default. A chosen value wins there too — including a chosen `0`,
+            // which is how the e2e harness opts out — and only the absence of one
+            // reaches `WRAPPER_INTERFACE_READINESS_BUFFER`.
+            assert_eq!(
+                wrapper_interface_readiness_buffer(),
+                explicit.unwrap_or(WRAPPER_INTERFACE_READINESS_BUFFER),
+                "{DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS}={raw:?} must resolve on the \
+                 interface path to the operator's own value when they set one, and to the \
+                 interface default only when they did not"
             );
         }
         // SAFETY: same lock; restore.

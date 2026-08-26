@@ -91,19 +91,25 @@ pub enum PrePromptReadiness {
     ///
     /// The best readiness fact the deck has, because in the honest case it is an
     /// observation of the child rather than an announcement about it — which is
-    /// why the strong half of it is the one signal the post-readiness buffer is
-    /// skipped for.
+    /// why the strong half of it is what the readiness gate releases on. It is
+    /// NOT an input-readiness signal, and does not skip the post-readiness
+    /// buffer: a full-screen TUI clears `ICANON`/`ECHO` at init, ~85 ms in on
+    /// real codex-cli, and goes on discarding keystrokes until it has finished
+    /// drawing. See `crate::state::WRAPPER_INTERFACE_READINESS_BUFFER`.
     ///
     /// **"Observation, not announcement" describes the honest case; it is not a
-    /// security property, and the buffer skip does not rest on it alone** (issue
+    /// security property, and nothing the deck does rests on it alone** (issue
     /// #243 audit F2). Both facts are read off the INNER PTY, which is not private
     /// to the child: a same-uid process can find it (`/proc/<wrapper-pid>/fd` →
     /// the pts node, mode `0620`) and either `tcsetattr` away `ICANON`/`ECHO` or
     /// write one byte and go quiet, making the genuine wrapper emit a genuine
     /// event about a child that is not ready. Suspected from the permissions, not
     /// reproduced, and it grants nothing beyond forging the event outright — but
-    /// it is why `crate::state::dispatch_one_owned` gates the skip on the frozen
-    /// launch shape and the operator's own interval as well as on this fact.
+    /// it is why `crate::state::dispatch_one_owned` reads the frozen launch shape
+    /// and the operator's own interval as well as this fact. What that guards is
+    /// smaller than it once was: with no buffer suppression left to buy, a forged
+    /// or driven fact can only release a gate that an unmarked `SessionStart`
+    /// already released.
     WrapperInterfaceReady,
     /// MEASURED: this agent emits nothing at all before its first prompt, and no
     /// wrapper is watching it either, so there is no signal for a gate to wait

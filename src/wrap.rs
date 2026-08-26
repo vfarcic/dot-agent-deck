@@ -324,8 +324,10 @@ impl Emitter {
     /// loop, the loop that forwards the user's `Ctrl+C`/SIGTERM to the child
     /// group, and [`crate::hook::send_to_socket`] is a blocking connect + write
     /// with no timeout. A wedged, SIGSTOPped or backlogged daemon would stall
-    /// signal forwarding. The latch bounds this to one thread per wrapped
-    /// session, and the send is bounded so that thread cannot linger either.
+    /// signal forwarding. The per-fact latches bound this to at most TWO threads
+    /// per wrapped session — one for the settle guess, one for the raw-mode
+    /// observation that may upgrade it — and the send is bounded so neither can
+    /// linger either.
     ///
     /// `#[cfg(unix)]` because [`InterfaceFact`] is: the watch reads a pty's
     /// termios, and only `run_wrap_pty` — itself Unix-only — has one.
@@ -1549,34 +1551,55 @@ impl InterfaceFact {
 /// TWO independent facts are accepted — [`InterfaceFact`] — and they are NOT
 /// equally strong, which is why the watch reports WHICH one fired rather than a
 /// bare bool. They ride distinct `session_start_origin` values so the daemon can
-/// price them separately (issue #243 review finding 1):
+/// price them separately (issue #243 review finding 1), and they are latched
+/// SEPARATELY so a session that produces the weak one can still produce the
+/// strong one afterwards — which, for the production launch shape, is every
+/// session (see [`InterfaceWatch::claim`]):
 ///
 /// 1. **The child took the inner PTY out of cooked mode**
 ///    ([`InterfaceFact::RawInputMode`]) — it cleared `ICANON` and/or `ECHO`. A
-///    genuine OBSERVATION of input-readiness, and the exact inverse of the defect
-///    the readiness gate exists to prevent: PRD #225's prompt loss was bytes
-///    written into a line discipline that was still canonical with echo on, where
-///    the payload is echoed back and swallowed. A child reading raw keystrokes
-///    is, by construction, a program that consumes input rather than echoing it.
-///    Launchers (`devbox`, a shell script, `node` starting up) never do this; a
-///    full-screen TUI does it as it initializes, before it paints.
+///    genuine OBSERVATION, and the strong one: a child reading raw keystrokes is,
+///    by construction, a program that consumes input rather than echoing it, so
+///    this cannot be satisfied by a launcher. `devbox`, a shell script and `node`
+///    starting up never do it; a full-screen TUI does.
+///
+///    **What it observes is the AGENT taking the terminal, not the agent being
+///    ready for a prompt**, and the difference cost this issue two rounds. It was
+///    written here as "a genuine observation of INPUT-READINESS, the exact
+///    inverse of the defect the readiness gate exists to prevent" — PRD #225's
+///    prompt loss being bytes written into a still-canonical line discipline,
+///    echoed back and swallowed. The inverse half is true and the readiness half
+///    is not, because a TUI does this as it INITIALIZES, *before* it paints:
+///    measured on real codex-cli 0.149.0 at 85 ms after a direct exec, and by
+///    `orchestration/delegate/009` at fork + 100 ms, where a prompt written on it
+///    parked unsubmitted in the composer and no turn ever started. So this fact
+///    is the best RELEASE signal the deck has and still owes a post-readiness
+///    buffer on the daemon side; see
+///    `crate::state::WRAPPER_INTERFACE_READINESS_BUFFER`.
 /// 2. **Output SETTLED** ([`InterfaceFact::OutputSettled`]) — the child wrote
 ///    something and then stopped for [`INTERFACE_SETTLE_WINDOW`]. The fallback
 ///    for an interface that stays in cooked mode (a line-oriented REPL, and the
 ///    test stand-ins), and for the redirected-descriptor paths where no inner PTY
 ///    termios exists to read.
 ///
-///    **This one is a GUESS, and the wrapper cannot make it a better one.**
-///    Silence says the child stopped producing output; it cannot say whether the
-///    thing that stopped is an interface waiting at its prompt or a LAUNCHER
-///    stalled part-way through its own boot. The production shape is `devbox run
-///    codex-big`, whose measured wrapper→`node codex` gap is ~4 s, so a launcher
-///    that prints one line and then evaluates its environment quietly satisfies
-///    this fact while the pty is still canonical — PRD #225 Defect 1 exactly.
-///    Nothing observable at this seam distinguishes the two cases, so the fix is
-///    not here: the daemon still releases its wait on this fact (30 s of waiting
-///    for a signal that never comes is worse) but keeps the post-readiness buffer
-///    over it. See `crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`.
+///    **This one is a GUESS, and the wrapper cannot make it a better one AT THE
+///    MOMENT IT FIRES.** Silence says the child stopped producing output; it
+///    cannot say whether the thing that stopped is an interface waiting at its
+///    prompt or a LAUNCHER stalled part-way through its own boot. The production
+///    shape is `devbox run codex-big`, which prints one banner line at ~0.1 s and
+///    then evaluates its shellenv in silence for a measured 2750–4132 ms before
+///    `codex` is exec'd at all — so it satisfies this fact while the pty is still
+///    canonical, which is PRD #225 Defect 1 exactly. Nothing observable at this
+///    seam distinguishes the two cases *yet*.
+///
+///    What the wrapper CAN do is not make the guess final. The watch stays armed
+///    after announcing it ([`InterfaceWatch::claim`] latches per fact, not per
+///    session), so if the launcher was merely slow the strong fact follows a few
+///    seconds later on the same wrapper session — and the daemon holds a bounded
+///    upgrade window on fact 2 for exactly that reason rather than releasing on
+///    it immediately. See
+///    `crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN` and
+///    `crate::state::INTERFACE_UPGRADE_WINDOW`.
 ///
 /// What is deliberately NOT accepted: elapsed time since `exec`, and the child's
 /// FIRST byte. A wall-clock timer fires for a child that has not started, and a
@@ -1597,8 +1620,17 @@ impl InterfaceFact {
 /// not a security property. Do not build a new privilege on it.
 #[cfg(unix)]
 struct InterfaceWatch {
-    /// Latched once, so exactly one interface-ready event is ever emitted.
-    announced: AtomicBool,
+    /// [`InterfaceFact::RawInputMode`] has been announced. Latching this ends
+    /// the watch outright: nothing the child does afterwards can produce a
+    /// STRONGER fact, and re-announcing the weaker one would be a downgrade.
+    announced_ready: AtomicBool,
+    /// [`InterfaceFact::OutputSettled`] has been announced. Latched SEPARATELY
+    /// from `announced_ready`, which is the whole of issue #243's regression
+    /// fix: a launcher settles, the daemon holds a bounded upgrade window, and
+    /// the real agent then clears `ICANON`/`ECHO` behind it. A single shared
+    /// latch made the weak fact the LAST word for that session, so the strong
+    /// one the wrapper went on to observe was computed and thrown away.
+    announced_settled: AtomicBool,
     /// [`monotonic_millis`] of the last byte the child wrote, or `0` while it has
     /// written nothing at all.
     last_output_ms: AtomicI64,
@@ -1613,7 +1645,8 @@ struct InterfaceWatch {
 impl InterfaceWatch {
     fn new(cooked_lflag: Option<libc::tcflag_t>) -> Self {
         Self {
-            announced: AtomicBool::new(false),
+            announced_ready: AtomicBool::new(false),
+            announced_settled: AtomicBool::new(false),
             last_output_ms: AtomicI64::new(0),
             cooked_lflag,
         }
@@ -1646,32 +1679,57 @@ impl InterfaceWatch {
         (cooked & !current & (libc::ICANON | libc::ECHO)) != 0
     }
 
-    /// Claim the one interface-ready announcement, returning WHICH fact fired.
-    /// `None` while the interface is not (yet) observable, and `None` forever
-    /// after the single claim succeeds.
+    /// Claim the next unannounced interface fact, returning WHICH one fired.
+    /// `None` while nothing new is observable, and `None` forever once
+    /// [`InterfaceFact::RawInputMode`] has been claimed.
     ///
     /// The identity of the fact is part of the answer, not a diagnostic
     /// afterthought: the two are priced differently downstream (see
     /// [`InterfaceWatch`]), so a caller that collapses them back to a bool
     /// reintroduces the launcher-settle hazard fact 2 carries.
+    ///
+    /// **Per fact, not per session** (issue #243 regression fix). This used to
+    /// latch once for the whole wrapper, which made whichever fact happened to
+    /// fire FIRST the only one the daemon would ever hear — and for the
+    /// production launch shape that is always the weak one: `devbox run
+    /// codex-big` prints a banner at ~0.1 s and then computes its shellenv in
+    /// silence for 2750–4132 ms, so the settle guess fires 2005–3370 ms before
+    /// the real `codex` has even been exec'd, let alone taken the terminal out
+    /// of cooked mode. Measured over 13 launcher probes and 8 wrapper spawns:
+    /// output-settled fired 21/21 and raw-input-mode NEVER fired first, not
+    /// once. With one latch the strong fact was computed on the very next tick
+    /// after `codex` came up and silently dropped, and the daemon was left
+    /// pricing a launcher as an interface.
+    ///
+    /// So the ORDER a caller can observe is: nothing, or fact 2, or fact 1, or
+    /// fact 2 then fact 1 — never fact 1 then fact 2. A child that goes raw
+    /// without ever settling still announces only fact 1, exactly as before.
+    ///
+    /// The cost of staying armed is one `tcgetattr` per supervisory tick for a
+    /// child that settles and never goes raw — i.e. forever, for a cooked-mode
+    /// REPL. That is the same order as the up-to-three `terminal_size` ioctls
+    /// the same 50 ms tick already performs unconditionally, and it buys the
+    /// only signal that can tell the two cases apart at all.
     fn claim(&self, master_fd: RawFd) -> Option<InterfaceFact> {
-        if self.announced.load(Ordering::SeqCst) {
+        if self.announced_ready.load(Ordering::SeqCst) {
             return None;
         }
-        let fact = if self.child_took_raw_input(master_fd) {
-            InterfaceFact::RawInputMode
-        } else {
-            let last = self.last_output_ms.load(Ordering::SeqCst);
-            if last == 0 {
-                return None;
-            }
-            if monotonic_millis().saturating_sub(last) < millis_saturating(INTERFACE_SETTLE_WINDOW)
-            {
-                return None;
-            }
-            InterfaceFact::OutputSettled
-        };
-        (!self.announced.swap(true, Ordering::SeqCst)).then_some(fact)
+        if self.child_took_raw_input(master_fd) {
+            return (!self.announced_ready.swap(true, Ordering::SeqCst))
+                .then_some(InterfaceFact::RawInputMode);
+        }
+        if self.announced_settled.load(Ordering::SeqCst) {
+            return None;
+        }
+        let last = self.last_output_ms.load(Ordering::SeqCst);
+        if last == 0 {
+            return None;
+        }
+        if monotonic_millis().saturating_sub(last) < millis_saturating(INTERFACE_SETTLE_WINDOW) {
+            return None;
+        }
+        (!self.announced_settled.swap(true, Ordering::SeqCst))
+            .then_some(InterfaceFact::OutputSettled)
     }
 }
 
@@ -2149,8 +2207,22 @@ fn run_wrap_pty(
         // (`let _ = reason;`), which threw away the single most useful field
         // diagnostic this mechanism produces — "was this a genuine TUI raw-mode
         // release, or the settle guess?" — at the one place that knows.
+        //
+        // `info!`, not `debug!`, and the level is load-bearing. The default
+        // filter is `dot_agent_deck=info` (`crate::logging`), so a `debug!` here
+        // would reach a log file only for an operator who already knew to set
+        // `RUST_LOG` — and `crate::state::dispatch_one_owned` tells the reader
+        // this fact IS in the wrapper's log, as the alternative to a tuning knob.
+        // It fires at most twice per wrapped session (see
+        // `InterfaceWatch::claim`), so the volume argument for `debug!` does not
+        // apply. Nothing is printed to the terminal in any case: `main`'s
+        // `init_logging_from_env` installs a FILE subscriber or none at all, so
+        // this cannot put a byte into the pane the child is painting.
+        //
+        // Called on every tick even after the settle guess has fired, because the
+        // strong fact usually arrives SECOND — see `InterfaceWatch::claim`.
         if let Some(fact) = interface.claim(master_fd) {
-            tracing::debug!(
+            tracing::info!(
                 reason = fact.reason(),
                 origin = fact.origin(),
                 "wrap: observed the child's interface; announcing pre-prompt readiness"

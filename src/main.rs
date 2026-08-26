@@ -1369,6 +1369,24 @@ fn main() -> ExitCode {
             }
         }
         Some(Commands::Wrap { agent, command }) => {
+            // Issue #243: the wrapper LOGS. Until this call it did not — the
+            // subcommand went straight into `run_wrap`, so the two `tracing`
+            // lines the interface watch emits (which of its two facts fired, the
+            // single most useful field diagnostic the readiness mechanism
+            // produces) were dropped on the floor by the no-op global
+            // subscriber, and `crate::state::dispatch_one_owned`'s claim that
+            // the fact is "in the wrapper's log" was false. Diagnosing a Codex
+            // delegate that never got its prompt meant reading the wire.
+            //
+            // Safe in a pane. `init_logging_from_env` installs a subscriber ONLY
+            // when `DOT_AGENT_DECK_LOG` is set, and only ever writes to that
+            // file — never to stdout or stderr — so a wrapper whose descriptors
+            // ARE the agent's terminal cannot paint a log line into it. The
+            // daemon fork-execs `dot-agent-deck wrap` without clearing the
+            // environment, so an operator who enabled the daemon's log gets the
+            // wrapper's half of the story in the same file, correlated by
+            // timestamp against the gate lines that read these events.
+            init_logging_from_env();
             dot_agent_deck::wrap::run_wrap(agent.as_deref(), &command)
         }
     }

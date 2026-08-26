@@ -493,12 +493,25 @@ pub const WRAPPER_FORK_SESSION_START_ORIGIN: &str = "wrapper_fork";
 /// **One fact, not two.** The wrapper observes the child two ways
 /// (`InterfaceWatch` in [`crate::wrap`]) and they carry DIFFERENT values, because
 /// they are not equally strong. This value is fact 1 — the child cleared
-/// `ICANON`/`ECHO`, which is the exact inverse of the PRD #225 defect where a
-/// prompt was echoed away by a still-canonical line discipline, and is therefore
-/// a genuine observation that the child consumes keystrokes. Fact 2 — output went
-/// quiet for a while — carries
+/// `ICANON`/`ECHO`, a genuine observation that the child consumes keystrokes
+/// rather than echoing them. Fact 2 — output went quiet for a while — carries
 /// [`WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`] instead and buys strictly
 /// less; see that constant for why.
+///
+/// **What this fact does NOT establish: that the child will accept a submit.**
+/// It was read that way for two rounds of this issue — as the exact inverse of
+/// the PRD #225 defect where a prompt was echoed away by a still-canonical line
+/// discipline, and therefore as proof that no blind interval was left to pay.
+/// Measurement retracts that. A full-screen TUI enables raw mode at INIT, before
+/// it paints: real codex-cli 0.149.0 does it 85 ms after a direct exec, and
+/// `orchestration/delegate/009` recorded fork + 100 ms on both the original
+/// worker and its `clear = true` replacement, then lost the pointer into an
+/// unsubmitted composer. Raw mode is NECESSARY for input-readiness and not
+/// SUFFICIENT — it says the AGENT owns the terminal, not that the composer is
+/// listening — so this value RELEASES the readiness gate (it is the best release
+/// signal the deck has) and still owes a post-readiness buffer, sized against the
+/// initialisation it announces the start of. See
+/// [`crate::state::WRAPPER_INTERFACE_READINESS_BUFFER`].
 ///
 /// It is still WRAPPER PROVENANCE rather than an agent conversation: the session
 /// id on it is the wrapper's own, not the agent's, so it must never bind a
@@ -515,11 +528,16 @@ pub const WRAPPER_FORK_SESSION_START_ORIGIN: &str = "wrapper_fork";
 /// unvalidated. Any same-uid process can therefore post an event carrying this
 /// value; it was reproduced during issue #243's audit from a bare `python3` with
 /// no deck environment at all. Provenance is established by the DAEMON, at the
-/// site that acts on it — `crate::state::dispatch_one_owned` honours the buffer
-/// skip only for an agent this daemon itself spawned as a Wrapper-strategy agent
+/// site that acts on it — `crate::state::dispatch_one_owned` prices this value as
+/// a real TUI's initialisation only for an agent this daemon itself spawned as a
+/// Wrapper-strategy agent
 /// (`crate::agent_pty::AgentPtyRegistry::agent_spawned_as_wrapper_host`, read
-/// from the frozen launch-shape record no hook path can write). Do not add a new
-/// privilege keyed on this value without going through that check too.
+/// from the frozen launch-shape record no hook path can write). What a forgery
+/// can buy is bounded by what this value grants, and since it no longer
+/// suppresses a buffer the answer is a gate release that a bare unmarked
+/// `SessionStart` already bought before this issue. Do not add a new privilege
+/// keyed on this value without going through that check too — and do not
+/// reintroduce one that a blind interval no longer covers.
 pub const WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN: &str = "wrapper_interface_ready";
 
 /// The [`SESSION_START_ORIGIN_METADATA_KEY`] value meaning "`dot-agent-deck wrap`
@@ -531,18 +549,31 @@ pub const WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN: &str = "wrapper_interfac
 /// where raw-input mode is an observation. Silence means "stopped producing
 /// output"; whether the thing that stopped is an interface waiting at its prompt
 /// or a LAUNCHER stalled part-way through its own boot is precisely what it
-/// cannot tell you. The production launch shape is `devbox run codex-big`, whose
-/// measured wrapper→`node codex` gap is ~4 s (recorded on
-/// [`crate::state::SESSION_START_WAIT_TIMEOUT`]): a launcher that prints one line
-/// and then evaluates its environment quietly for a second satisfies this fact
-/// while the pty is still in cooked mode, which is PRD #225 Defect 1 exactly.
+/// cannot tell you. The production launch shape is `devbox run codex-big`, which
+/// prints one banner line at ~0.1 s and then computes its shellenv in SILENCE for
+/// a measured 2750–4132 ms before `codex` is exec'd at all — so it satisfies this
+/// fact while the pty is still in cooked mode, which is PRD #225 Defect 1
+/// exactly.
 ///
-/// So it RELEASES the readiness gate — waiting the full 30 s for a signal that
-/// will never come is worse, and the gate's fallback would write blind anyway —
-/// but it does NOT skip the post-readiness buffer
-/// ([`crate::state::DELEGATE_READINESS_BUFFER`]). A settled launcher and a
-/// settled REPL are indistinguishable here, and the buffer is what covers the
-/// difference.
+/// **It is therefore PROVISIONAL, not a release.** That distinction was learned
+/// the expensive way. The two facts do not arrive in order of strength: measured
+/// over 13 launcher probes and 8 wrapper spawns, this one fired 21/21 and the
+/// strong observation never fired first, arriving 2005–3370 ms later. A gate that
+/// released here and paid the 1000 ms buffer still wrote at +1.85 s into the
+/// launcher's own line discipline, and 3/3 production runs left the pointer
+/// parked unsubmitted in Codex's composer with no turn ever starting. So for a
+/// Wrapper-strategy agent the gate holds this fact for
+/// [`crate::state::INTERFACE_UPGRADE_WINDOW`] to see whether
+/// [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`] is still coming, and releases
+/// on it only when the window expires — with the post-readiness buffer
+/// ([`crate::state::DELEGATE_READINESS_BUFFER`]) still on, since it never skips
+/// that. A settled launcher and a settled REPL stay indistinguishable at this
+/// seam; what the window buys is the later evidence that tells them apart, and
+/// what the buffer covers is the case where none arrives.
+///
+/// Waiting forever is still worse than releasing on a guess — 30 s for a signal
+/// that will never come is the defect this issue opened on — which is why the
+/// window is a bound and not a condition.
 ///
 /// Everything said about provenance on
 /// [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`] applies to this value too.

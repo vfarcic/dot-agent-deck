@@ -1133,8 +1133,19 @@ async fn deliver(
         }
         Some(mut rx) => {
             let timeout = session_start_wait_timeout().min(remaining_before(deadline));
-            let observed =
-                crate::state::wait_for_session_start(&mut rx, pane_id, agent_id, timeout).await;
+            // Issue #243: the scheduler shares the gate, so it shares the
+            // upgrade window — and it needs it at least as much, since this path
+            // applies no post-readiness buffer after a readiness fact at all.
+            // The agent type is the frozen launch record above, not the observed
+            // badge (see `interface_upgrade_window`).
+            let observed = crate::state::wait_for_session_start(
+                &mut rx,
+                pane_id,
+                agent_id,
+                timeout,
+                crate::state::interface_upgrade_window(spawned_agent_type.as_ref()),
+            )
+            .await;
             if !observed.ready {
                 tracing::debug!(
                     pane_id,
@@ -1142,6 +1153,56 @@ async fn deliver(
                     "scheduled spawn: SessionStart wait timed out; \
                      delivering prompt via fallback path"
                 );
+            }
+            // Issue #243, round 3: a gate released by a WRAPPER INTERFACE fact
+            // owes a buffer HERE too, and until this branch existed there was no
+            // fact on this path that could arrive early enough to need one.
+            //
+            // That is the whole reason this is not scope creep. Before this
+            // issue a Codex pane had no pre-prompt readiness signal at all, so
+            // the scheduler waited out `SESSION_START_WAIT_TIMEOUT` and the
+            // agent was long up by the time anything was written — the 30 s
+            // defect was also, accidentally, the thing standing between the
+            // prompt and a booting TUI, exactly as it was on the
+            // declared-no-signal path above. This issue's own commits give the
+            // scheduler an interface fact that fires ~100 ms after fork, so
+            // removing the wait without adding the buffer would move the
+            // scheduler onto the same silent prompt loss the delegate path is
+            // being fixed for, on the same measurement.
+            //
+            // Priced exactly as `crate::state::dispatch_one_owned` prices it,
+            // and scoped the same way — by the frozen launch record, never by
+            // the arriving badge. For a Wrapper-strategy agent every readiness
+            // fact that can arrive pre-prompt IS one of the wrapper's two (the
+            // native start comes with the first turn, which is what this issue
+            // measured), so the agent type is a sufficient discriminator without
+            // widening `SessionStartWait`. The strong fact buys the interface
+            // buffer, anything else the ordinary one, and the timeout keeps
+            // today's behaviour of no buffer at all — a fallback here has
+            // already waited out the full timeout.
+            let buffer = if observed.ready
+                && crate::state::agent_is_wrapper_interface_ready(spawned_agent_type.as_ref())
+            {
+                if observed.observed_interface && registry.agent_spawned_as_wrapper_host(agent_id) {
+                    crate::state::wrapper_interface_readiness_buffer()
+                } else {
+                    crate::state::delegate_readiness_buffer()
+                }
+                .min(remaining_before(deadline))
+            } else {
+                Duration::ZERO
+            };
+            if !buffer.is_zero() {
+                tracing::debug!(
+                    pane_id,
+                    agent_type = ?spawned_agent_type,
+                    observed_interface = observed.observed_interface,
+                    buffer_ms = buffer.as_millis(),
+                    "scheduled spawn: the readiness fact came from the wrapper watching this \
+                     agent's interface, which is not on its own input-readiness; holding the \
+                     prompt for the post-readiness buffer"
+                );
+                tokio::time::sleep(buffer).await;
             }
             (Some(rx), observed)
         }
@@ -2875,6 +2936,9 @@ mod tests {
                 &pane_id,
                 &agent_id,
                 Duration::from_millis(20),
+                // No upgrade window: this fixture posts a `wrapper_fork` start,
+                // which the gate SKIPS. Nothing here is a settled interface fact.
+                Duration::ZERO,
             )
             .await;
             assert_eq!(
