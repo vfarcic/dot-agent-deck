@@ -2419,21 +2419,74 @@ async fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inne
     daemon.registry.shutdown_all();
 }
 
-/// Scenario: Delegate with `clear = true` to a worker whose agent emits no readiness event of any kind before its first prompt (OpenCode's measured behaviour), then walk a paused Tokio clock forward a second at a time. The task pointer must reach the pane inside six virtual seconds rather than after the 30 s dead wait (issue #243).
+/// Issue #243 round 4: the floor `orchestration/delegate/025` holds the
+/// declared-no-signal path to, and the reason the buffer variable is UNSET there.
+///
+/// **It pins the CALL SITE, which nothing else in the suite does.** `/025`'s
+/// upper bound proves the 30 s dead wait is gone; it says nothing about which of
+/// the deck's three buffer defaults the skip then reaches for. With the variable
+/// pinned — as this test pinned it for three rounds — every default collapses to
+/// the pinned number and the test stays green even if the seam silently reverts
+/// to `state::delegate_readiness_buffer()`. Its real-agent sibling
+/// `orchestration/delegate/015` pins the variable too, for its own reasons, so it
+/// cannot catch that either. Unset, the run resolves
+/// `state::no_signal_readiness_buffer()` for real and this floor is what reads it
+/// back.
+///
+/// **Seven seconds, chosen to reject the two wrong answers by a whole step.** The
+/// loop below walks virtual time in 1 s steps, so a delivery attributable to the
+/// ordinary 1000 ms `DELEGATE_READINESS_BUFFER` lands at 1 s and one attributable
+/// to the 5000 ms `WRAPPER_INTERFACE_READINESS_BUFFER` lands at 5 s; the shipped
+/// 8000 ms `NO_SIGNAL_READINESS_BUFFER` lands at 8 s. A floor at 7 s separates
+/// the right answer from both wrong ones with a full step of margin either side,
+/// rather than pinning 8 s exactly and going red on a re-derivation that moves
+/// the constant by a second. **Verified load-bearing:** reverting the call site
+/// in `src/state.rs` to `delegate_readiness_buffer()` delivers at 1 s of virtual
+/// time and turns this red.
+///
+/// Deliberately a floor and not an equality: what is under test is that the
+/// no-signal path is priced as a whole cold agent start rather than as the gap
+/// after an announcement, and [`NO_SIGNAL_POINTER_CEILING`] bounds the other end.
+#[cfg(unix)]
+const NO_SIGNAL_BUFFER_FLOOR: Duration = Duration::from_secs(7);
+
+/// Issue #243 round 4: `orchestration/delegate/025`'s upper bound, split out from
+/// [`READY_TO_POINTER_BUDGET`] because the two tests no longer pay the same
+/// buffer.
+///
+/// `/024`'s 10 s is derived as "the 5000 ms interface buffer plus 5 s of slack".
+/// This path pays the 8000 ms no-signal buffer instead, so borrowing that number
+/// would leave 2 s of headroom under a derivation that never mentioned this test
+/// — and would couple `/025` to a constant that moves whenever the WRAPPER's
+/// buffer is re-derived. Twelve is the same shape recomputed: 8 s of buffer plus
+/// 4 s, on a paused clock where the only thing between the release and the write
+/// is that one timer.
+///
+/// *Below:* still 2.6x under the ~31 s (`SESSION_START_WAIT_TIMEOUT` + a buffer)
+/// that a run which regressed to the dead wait costs, which is the one thing this
+/// bound must not be able to accommodate. Do not raise it toward that figure.
+#[cfg(unix)]
+const NO_SIGNAL_POINTER_CEILING: Duration = Duration::from_secs(12);
+
+/// Scenario: Delegate with `clear = true` to a worker whose agent emits no readiness event of any kind before its first prompt (OpenCode's measured behaviour), with no operator buffer configured, then walk a paused Tokio clock forward a second at a time. The task pointer must reach the pane inside twelve virtual seconds rather than after the 30 s dead wait, and no sooner than seven — the shipped 8000 ms no-signal buffer, which is how the run proves the skip resolved THAT buffer rather than the ordinary 1000 ms one (issue #243).
 #[spec("orchestration/delegate/025")]
 #[test]
 #[cfg(unix)]
 fn delegate_025_agent_with_no_pre_prompt_signal_skips_the_dead_wait() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
-        (
-            DELEGATE_READINESS_BUFFER_ENV,
-            &DELEGATE_READINESS_BUFFER_MS.to_string(),
-        ),
         (SESSION_START_WAIT_ENV, "30000"),
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
         (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
     ]);
+    // The buffer env is REMOVED rather than pinned, for `orchestration/delegate/024`'s
+    // reason applied to the other path: guard 3 makes an explicitly-set value
+    // win over ALL THREE defaults, so a pin here buys this fixture whatever
+    // number the pin names and the bounds below stop being able to tell the
+    // no-signal buffer from the ordinary one. Left unset, the run pays the real
+    // `NO_SIGNAL_READINESS_BUFFER` a declared-`NoSignal` delegate pays in
+    // production — see `NO_SIGNAL_BUFFER_FLOOR`.
+    let _unset = EnvGuard::unset(&[DELEGATE_READINESS_BUFFER_ENV]);
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2532,12 +2585,29 @@ async fn delegate_025_agent_with_no_pre_prompt_signal_skips_the_dead_wait_inner(
         String::from_utf8_lossy(&snapshot)
     );
     assert!(
-        virtual_elapsed <= READY_TO_POINTER_BUDGET,
+        virtual_elapsed <= NO_SIGNAL_POINTER_CEILING,
         "a worker whose agent has NO pre-prompt readiness signal still sat through the dead wait: \
          the task pointer arrived after {virtual_elapsed:?} of virtual time, against a budget of \
-         {READY_TO_POINTER_BUDGET:?}. There is no signal for the gate to fast-path on, so \
+         {NO_SIGNAL_POINTER_CEILING:?}. There is no signal for the gate to fast-path on, so \
          `hook_install.is_some()` sends it into the full SESSION_START_WAIT_TIMEOUT and only the \
          fallback delivers (issue #243). snapshot = {:?}",
+        String::from_utf8_lossy(&snapshot)
+    );
+    // Round 4's addition, and the only assertion anywhere that reads WHICH
+    // buffer the declared-no-signal skip resolves. Everything above is satisfied
+    // by a seam that skipped the wait and then paid the ordinary 1000 ms — which
+    // is the shape this issue shipped and `orchestration/delegate/015` found red
+    // against a real OpenCode. See `NO_SIGNAL_BUFFER_FLOOR`.
+    assert!(
+        virtual_elapsed >= NO_SIGNAL_BUFFER_FLOOR,
+        "the declared-no-signal skip delivered the task pointer after only {virtual_elapsed:?} of \
+         virtual time, under the {NO_SIGNAL_BUFFER_FLOOR:?} floor. With no operator buffer \
+         configured this path must resolve `no_signal_readiness_buffer()` \
+         (`NO_SIGNAL_READINESS_BUFFER`, 8000 ms, sized in issue #243 round 4 against a real \
+         OpenCode's composer paint across 176 runs); a figure at or near 1 s means the call site \
+         reverted to the ordinary `delegate_readiness_buffer()`, and one near 5 s means it \
+         reached for the wrapper's interface buffer. Neither covers a whole cold agent start, \
+         and the cost of getting it wrong is a SILENTLY swallowed prompt. snapshot = {:?}",
         String::from_utf8_lossy(&snapshot)
     );
 }

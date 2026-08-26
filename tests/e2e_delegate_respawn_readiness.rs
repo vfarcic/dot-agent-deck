@@ -36,10 +36,13 @@ const CLAUDE_SENTINEL_CONTENT: &str = "PRD249_CLAUDE_RESPAWN_OK";
 const OPENCODE_SENTINEL: &str = "prd249-opencode-respawn-8a62f4.txt";
 const OPENCODE_SENTINEL_CONTENT: &str = "PRD249_OPENCODE_RESPAWN_OK";
 
-/// Test-only forwarding seam for the M2 observation run. `TuiDeck` scrubs the
-/// host environment, so setting this variable on `cargo test-e2e delegate_015`
-/// explicitly maps its value to the production readiness-buffer variable in the
-/// spawned deck and daemon. Normal runs leave it unset and exercise the default.
+/// Test-only forwarding seam for the M2 observation run, and since issue #243
+/// round 4 for re-bracketing the no-signal buffer on a machine the shipped value
+/// was not measured on. `TuiDeck` scrubs the host environment, so setting this
+/// variable on `cargo test-e2e delegate_015` explicitly maps its value to the
+/// production readiness-buffer variable in the spawned deck and daemon,
+/// REPLACING the 8000 ms `/015` pins below. Normal runs leave it unset and get
+/// that pin, which mirrors `state::NO_SIGNAL_READINESS_BUFFER`.
 const E2E_READINESS_BUFFER_OVERRIDE: &str = "DOT_AGENT_DECK_E2E_DELEGATE_READINESS_BUFFER_MS";
 
 const ORCHESTRATOR_BODY: &str = r#"#!/bin/sh
@@ -93,62 +96,61 @@ struct RealDelegateCase<'a> {
 ///
 /// *Above:* the deck's own contribution is small and known — the orchestrator
 /// script's 0.2 s trigger poll, one `dot-agent-deck delegate` CLI round trip,
-/// the `clear = true` respawn, and then exactly the 1000 ms readiness buffer
-/// this test pins via `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS`. The issue
-/// measured the equivalent scheduler path at 1.5 s end to end after the fix.
-/// Everything else inside this budget is real OpenCode booting far enough to
-/// consume the keystrokes it was handed and post `session.prompt`.
+/// the `clear = true` respawn, and then exactly the 8000 ms readiness buffer
+/// this test pins via `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS`, mirroring
+/// the `NO_SIGNAL_READINESS_BUFFER` a declared-`NoSignal` agent now resolves in
+/// production. Measured directly: `delegate→submit ≈ buffer + 0.26 s`, so the
+/// deck's own share of this leg is **257 ms** and everything else inside the
+/// budget is the buffer plus real OpenCode booting far enough to consume the
+/// keystrokes it was handed and post `session.prompt`.
 ///
-/// The caveat this carried — "nobody has measured how long a REPLACEMENT
-/// OpenCode takes to reach that point, since before #243 it always had the whole
-/// 30 s wait to boot in and now it has 1 s" — **was measured on 2026-08-26, and
-/// the answer is that 1 s is not enough.** This test had never been executed by
-/// anyone until then.
+/// **The caveat this used to carry is discharged.** For two rounds it read
+/// "nobody has measured how long a REPLACEMENT OpenCode takes to reach that
+/// point, since before #243 it always had the whole 30 s wait to boot in and now
+/// it has 1 s". That was measured on 2026-08-26, first as a red run of this test
+/// at 1000 ms and then, properly, across **176 runs** against a real
+/// `opencode --model … --auto` 1.18.23 — and the answer is a single observable
+/// boundary: the instant OpenCode paints its `Ask anything...` composer.
+/// Written before it the payload is gone; written after it, every run delivered.
+/// That boundary is **2.5 s on an idle box, 4.5 s with the cores
+/// oversubscribed, and 12 s at 4x oversubscription**, so the replacement's
+/// requirement is now a number rather than an open question. It is answered on
+/// the PRODUCT side, in `state::NO_SIGNAL_READINESS_BUFFER`, which is where the
+/// full derivation lives — this constant only has to stay clear of it.
 ///
-/// The bound itself is left at 20 s and is NOT the thing that failed: the deck
-/// delivers promptly (`delegate exit=0` and the pointer file on disk inside 5 s,
-/// every run), so this assertion is never reached. What fails is three
-/// assertions earlier, on the worker never entering `Thinking` at all. Widening
-/// this would not move that by a millisecond, which is why it was not widened.
-/// Do not widen it past ~25 s, where it stops separating the two paths.
+/// **The bound stays 20 s and must not be widened.** At the shipped 8000 ms the
+/// leg costs ~8.3 s, leaving 11.7 s of margin, and the 20 s figure keeps doing
+/// the one job it was created for: it is a full 11 s under the ~31 s a run that
+/// still pays the dead wait would take, so a silent regression to the timeout
+/// fallback cannot pass. Widening it past ~25 s stops separating the two paths
+/// and makes this test green on precisely the defect it exists to catch. If a
+/// slower box needs more room, the answer is the operator override
+/// (`DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS`, which this test already
+/// pins), not a bigger budget — and note the two move together, since the buffer
+/// is paid inside this leg.
 ///
-/// **What the measurement found: the delivery is prompt and the agent cannot
-/// consume it.** With the 1000 ms
-/// buffer this test pins — the deck's shipped `DELEGATE_READINESS_BUFFER`, which
-/// is the ONLY thing now standing between a `clear = true` respawn and the write
-/// for a `PrePromptReadiness::NoSignal` agent — the pointer is written into a
-/// replacement OpenCode that is still bringing its TUI up, and the bytes are
-/// swallowed outright. Not parked: the composer renders its empty
-/// `Ask anything...` placeholder afterwards, so this is PRD #225's Defect 1
-/// shape (a write into a line discipline that is not yet the agent's) rather
-/// than #663's unsubmitted-payload shape. The worker never enters `Thinking`,
-/// never runs a tool, and never creates the sentinel; the run dies at the 120 s
-/// status wait with a pane that has been idle since boot.
+/// **What the 2026-08-26 measurement found, kept because it is why the product
+/// changed.** With the 1000 ms `DELEGATE_READINESS_BUFFER` — the ONLY thing then
+/// standing between a `clear = true` respawn and the write for a
+/// `PrePromptReadiness::NoSignal` agent — the pointer was written into a
+/// replacement OpenCode still bringing its TUI up and the bytes were swallowed
+/// outright. Not parked: **zero of 176 runs** left the payload sitting in the
+/// composer, so this is PRD #225's Defect 1 shape (a write into a line
+/// discipline that is not yet the agent's) rather than #663's unsubmitted-payload
+/// shape, and a longer interval introduces no second failure mode here. The
+/// worker never entered `Thinking`, never ran a tool and never created the
+/// sentinel; the run died at the 120 s status wait with a pane idle since boot.
+/// This bound was never reached on those runs — the deck delivered promptly
+/// (`delegate exit=0` and the pointer file on disk inside 5 s, every run) — which
+/// is why widening it would not have moved the failure by a millisecond and why
+/// it was not widened.
 ///
-/// **Bracketed against the one seam that can move it**, `E2E_READINESS_BUFFER_OVERRIDE`,
-/// one full run per value on an otherwise idle box:
-///
-/// | buffer   | outcome                                        |
-/// |----------|------------------------------------------------|
-/// | 1000 ms  | FAIL (2/2 runs — the shipped default)           |
-/// | 2000 ms  | FAIL                                           |
-/// | 5000 ms  | PASS, whole test in 25.3 s                     |
-/// | 15000 ms | PASS, whole test in 43.0 s                     |
-///
-/// So the requirement sits between 2 s and 5 s here, and the shipped value is
-/// under it by at least 2x.
-///
-/// **This is a product finding, not a test-tuning one, and it is a REGRESSION
-/// THIS ISSUE INTRODUCED.** Before #243 an OpenCode delegate sat out the full 30 s
-/// `SESSION_START_WAIT_TIMEOUT` waiting for an event measured never to arrive —
-/// dead time by every measure except one, which is that it happened to give the
-/// replacement 30 s to boot. Deleting that dead wait for declared-`NoSignal`
-/// agents is right, and it left the 1000 ms buffer carrying a load it was never
-/// sized for: that value is PRD #249's "warm-case 500 ms, doubled for a cold
-/// start", derived against a 650 ms stub and never against a real agent's
-/// startup. The durable fix is the same shape round 3 applied to the wrapper's
-/// strong fact — a buffer sized from measurement, or better, an OBSERVATION —
-/// and it belongs on the `NoSignal` path rather than in this test.
+/// The fix is `df11513`: a third default, `NO_SIGNAL_READINESS_BUFFER` at
+/// 8000 ms, for exactly the declared-`NoSignal` path — 1.78x the contended
+/// requirement and 3.2x the idle one, **19/19 delivered** at the shipped value.
+/// It is a PRODUCT change, not a test-tuning one; this test's part is to pin
+/// that value at the seam and to keep the 20 s bound that tells a prompt
+/// delivery from the dead wait.
 const OPENCODE_DELEGATE_TO_SUBMIT_BUDGET: Duration = Duration::from_secs(20);
 
 fn path_with_binary_dir() -> String {
@@ -382,7 +384,7 @@ fn delegate_014_real_claude_worker_acts_on_clear_true_delegate() {
     );
 }
 
-/// Scenario: Open an orchestration through the real PTY-attached deck with a `clear = true` worker running interactive OpenCode on a cheap mini model, visibly wait for its TUI, and release a script that invokes the real delegate CLI. The replacement worker must submit its task pointer, visibly traverse Thinking and Working with its shell tool, and create the uniquely named sentinel requested by the delegated task; a test-only env seam permits the same scenario to be observed with the readiness buffer set to zero. The submission must also land within twenty seconds of the delegate being released (issue #243): OpenCode declares no pre-prompt readiness signal, so before the fix this delegate sat out the 30 s `SessionStart` timeout every time and only the fallback delivered — every other assertion here held throughout that, so without this bound the test cannot tell the fixed path from the broken one.
+/// Scenario: Open an orchestration through the real PTY-attached deck with a `clear = true` worker running interactive OpenCode on a cheap mini model, visibly wait for its TUI, and release a script that invokes the real delegate CLI. The replacement worker must submit its task pointer, visibly traverse Thinking and Working with its shell tool, and create the uniquely named sentinel requested by the delegated task; the run pins the shipped 8000 ms no-signal readiness buffer, and a test-only env seam can repoint that buffer to any other value so the same scenario can be re-bracketed on a slower or busier box. The submission must also land within twenty seconds of the delegate being released (issue #243), which is the one assertion that separates the fixed path from the dead wait an agent declaring no pre-prompt readiness signal used to pay: every other assertion here held under that 30 s `SessionStart` timeout too.
 #[spec("orchestration/delegate/015")]
 #[test]
 #[cfg(unix)]
@@ -393,7 +395,18 @@ fn delegate_015_real_opencode_worker_acts_on_clear_true_delegate() {
     let builder = TuiDeck::builder()
         .with_pty_size(180, 45)
         .with_env("PATH", path_with_binary_dir())
-        .with_env(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS, "1000")
+        // MIRRORS `state::NO_SIGNAL_READINESS_BUFFER` (8000 ms), which is the
+        // default a declared-`NoSignal` agent resolves in production. Pinning is
+        // not optional here and REMOVING the pin is the wrong repair: the
+        // harness base pins this variable to `0` for every `TuiDeck`
+        // (`tests/common/mod.rs`), so an unpinned run buys no buffer at all and
+        // fails harder than a mis-sized one. Kept as a literal for the same
+        // reason `/014` keeps `1000` (Claude's shipped `DELEGATE_READINESS_BUFFER`)
+        // and `orchestration/delegate/009` keeps `5000` in its own
+        // `READINESS_BUFFER_MS` (the shipped `WRAPPER_INTERFACE_READINESS_BUFFER`)
+        // — all three constants are `pub(crate)`, so the mirrors are maintained
+        // by hand; change this whenever that constant changes.
+        .with_env(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS, "8000")
         .with_imported_opencode_credentials();
     let deck = maybe_forward_readiness_override(builder).launch_with_fixture("minimal");
 
