@@ -2941,6 +2941,33 @@ pub struct PaneRecreateIdentity {
     pub cwd: Option<String>,
     pub display_name: Option<String>,
     pub tab_membership: Option<TabMembership>,
+    /// What agent this pane runs, as the caller knows it RIGHT NOW.
+    ///
+    /// This is the LAUNCH-side identity for a re-creation, and it outranks
+    /// deriving the type from the command — the reverse of the rule
+    /// [`AgentPtyRegistry::respawn_agent_for_pane`] applies to a pane's frozen
+    /// [`RunningAgent::spawn_agent_type`]. The two are not in conflict, because
+    /// they are not the same kind of value:
+    ///
+    /// * `spawn_agent_type` was captured at a PREVIOUS spawn. The command
+    ///   handed to a respawn may have been edited since, so honoring the frozen
+    ///   value over the command is how PRD #225 finding 1's "Claude launched
+    ///   wrapped as Codex" happens. It is therefore a fallback only.
+    /// * This field is supplied by the caller in the SAME pass that supplied
+    ///   the `command` beside it. `crate::state`'s delegate path re-reads
+    ///   `.dot-agent-deck.toml` on every delegate and fills both from the role
+    ///   entry it just read, so the identity cannot be stale against that
+    ///   command. Issue #308's `agent = "…"` declaration is exactly such a
+    ///   value, and it exists to answer what the command cannot.
+    ///
+    /// **Every caller must keep that contract**: fill this from a fresh read of
+    /// whatever declares the pane's identity, never from a stored, learned or
+    /// previously-frozen value. A hook-LEARNED type must never arrive here —
+    /// replaying an observed badge into a launch decision is PRD #225 Defect 2,
+    /// and this field is a route to it.
+    ///
+    /// `None` means "the caller does not know", and the type is derived from
+    /// the command exactly as before.
     pub agent_type: Option<AgentType>,
     /// Extra environment for the fresh child. The caller MUST include
     /// `DOT_AGENT_DECK_PANE_ID`; without it the new agent is not bound to the
@@ -3130,8 +3157,10 @@ impl Drop for PaneCleanupHold {
 /// that an automatic prompt delivery FAILED on `pane_id`.
 ///
 /// This is the replacement for writing a diagnostic line into the agent's own
-/// input buffer. That mechanism (`write_notice_guarded`) is retained for PRD
-/// #249's orchestrator-pane use, but its own contract says LF may be
+/// input buffer. That mechanism (`write_notice_guarded`) is retained for the two
+/// orchestrator-pane notices that still take it — `compose_worker_exited_notice`
+/// and `compose_respawn_no_live_worker_notice`; issue #702 moved PRD #249's
+/// silence notice off it onto the submitted path — but its own contract says LF may be
 /// interpreted as Enter and that a later ordinary submit sends
 /// `notice + newline + user prompt` as ONE turn — pinned by the passing
 /// regression `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`.
@@ -3400,6 +3429,19 @@ impl AgentPtyRegistry {
     ///
     /// `worker_agent_id` is the worker's registry agent id, when
     /// the caller already knows it — see [`SilenceWatchRecord::worker_agent_id`].
+    ///
+    /// **Issue #687: on the `clear = true` path this is called EARLIER than the
+    /// pointer write** — the moment the respawn establishes the new generation's
+    /// ownership of the pane, rather than ~30 s later after the `SessionStart`
+    /// wait and readiness buffer. Nothing about this function changed; what
+    /// changed is when the caller invokes the supersession the paragraph above
+    /// describes, because leaving it until the write meant the REPLACED
+    /// generation's watch stayed armed throughout its replacement's startup and
+    /// could fire against a delegation that was already live. The returned
+    /// `ArmedSilenceWatch` is then carried through the dispatch and either handed
+    /// to the watch task or released by `seq` — see
+    /// `crate::state::release_reserved_silence_watch` and the silent-worker
+    /// no-delivery invariant on `dispatch_one_owned`.
     pub fn arm_silence_watch(
         &self,
         worker_pane_id: &str,
@@ -5379,6 +5421,13 @@ impl AgentPtyRegistry {
     ///
     /// Failure and refusal are reported through the same [`GuardedSend`] vocabulary
     /// so callers classify a refused notice the way they classify a refused prompt.
+    ///
+    /// Issue #702: what this path guarantees is DEFERRAL, not inertness — see
+    /// [`crate::state::compose_worker_exited_notice`], which carries the whole
+    /// contract for the two notices that still take this call. A caller that
+    /// wants an untrusted value in its text belongs on
+    /// [`Self::write_and_submit_guarded`] instead, where the text is a turn of
+    /// its own rather than a prefix glued to the next one.
     pub async fn write_notice_guarded<Fut>(
         &self,
         pane_id: &str,
@@ -5824,6 +5873,43 @@ impl AgentPtyRegistry {
         pane_id_env: &str,
         command: &str,
     ) -> Result<String, AgentPtyError> {
+        self.respawn_agent_for_pane_declared(pane_id_env, command, None)
+            .await
+    }
+
+    /// [`Self::respawn_agent_for_pane`], plus the caller's CURRENT declared
+    /// identity for the pane (issue #308).
+    ///
+    /// `declared` is `Some` only when the caller has just re-read the pane's
+    /// identity from the same source, in the same pass, as `command` — today
+    /// that is the delegate path's `.dot-agent-deck.toml` re-read, whose role
+    /// entry carries both the `command` and its `agent = "…"` key. Such a value
+    /// is CURRENT by construction and therefore outranks both deriving from the
+    /// command and the pane's frozen `spawn_agent_type`; see the contract on
+    /// [`PaneRecreateIdentity::agent_type`] for why that is not the precedence
+    /// PRD #225 finding 1 forbids.
+    ///
+    /// Threading it matters because the frozen fallback GOES STALE against this
+    /// key specifically. A `devbox run codex-big` role declared as Codex lands
+    /// correctly on a `clear = true` respawn either way — the command implies
+    /// nothing, so the frozen `Some(Codex)` supplies it. But edit the config to
+    /// `agent = "claude"` and the frozen value is the wrong answer, and it
+    /// re-freezes itself on every respawn: the pane would relaunch as Codex for
+    /// the rest of the session while the file says Claude. The delegate path
+    /// already re-reads `command` on every delegate precisely so a config edit
+    /// takes effect without recreating the pane; the declaration beside it has
+    /// to follow the same rule or the two halves of one role entry disagree.
+    ///
+    /// `None` — every caller that has no declaration to offer, including the
+    /// public [`Self::respawn_agent_for_pane`] — reproduces the pre-#308
+    /// behavior exactly: derive from the command, fall back to the frozen
+    /// identity.
+    async fn respawn_agent_for_pane_declared(
+        self: &Arc<Self>,
+        pane_id_env: &str,
+        command: &str,
+        declared: Option<&AgentType>,
+    ) -> Result<String, AgentPtyError> {
         // Step 1: atomically lift the existing entry out of the
         // registry. Holding the sync lock across the find+remove keeps
         // a concurrent `write_to_pane_and_submit` from racing in and
@@ -5975,12 +6061,24 @@ impl AgentPtyRegistry {
         // first delegate — Defect 2 in reverse. The residual limit is inherent
         // and documented: if the command implies nothing AND its underlying
         // agent changed (`devbox run codex-big` → `devbox run claude-big`), the
-        // pane keeps its creation-time identity; that pane has to be recreated.
+        // pane keeps its creation-time identity; that pane has to be recreated —
+        // or, since issue #308, given an `agent = "…"` line, which the delegate
+        // path re-reads on every delegate and passes as `declared` below, so an
+        // edit to it takes effect on the next respawn.
         //
         // `AgentType::from_command` never yields the neutral `AgentType::None`
         // placeholder (it is absent from `agent_registry::ALL`), so a `Some`
         // here always means a real agent won the derivation.
-        let respawn_agent_type = AgentType::from_command(Some(command)).or(spawn_agent_type);
+        //
+        // Issue #308: a CURRENT declaration from the caller precedes both. It is
+        // not a third source competing with these two — it is the only source
+        // that can answer for a launcher command at all, and unlike
+        // `spawn_agent_type` it was read in the same pass as `command`, so it
+        // cannot contradict it. See `respawn_agent_for_pane_declared`.
+        let respawn_agent_type = declared
+            .cloned()
+            .or_else(|| AgentType::from_command(Some(command)))
+            .or(spawn_agent_type);
         let opts = SpawnOptions {
             command: Some(command),
             cwd: cwd.as_deref(),
@@ -6043,7 +6141,17 @@ impl AgentPtyRegistry {
         command: &str,
         identity: &PaneRecreateIdentity,
     ) -> Result<PaneRespawn, AgentPtyError> {
-        match self.respawn_agent_for_pane(pane_id_env, command).await {
+        // Issue #308: the caller's identity is CURRENT (see the contract on
+        // `PaneRecreateIdentity::agent_type`), so hand it to the respawn leg
+        // too. Without this the ordinary `clear = true` respawn — which is the
+        // overwhelmingly common outcome of this function, the re-creation below
+        // being the issue-#606 recovery — would keep relaunching from the
+        // pane's frozen `spawn_agent_type` and silently ignore an edited
+        // `agent = "…"` line for the rest of the session.
+        match self
+            .respawn_agent_for_pane_declared(pane_id_env, command, identity.agent_type.as_ref())
+            .await
+        {
             Ok(agent_id) => {
                 return Ok(PaneRespawn {
                     agent_id,
@@ -6077,7 +6185,10 @@ impl AgentPtyRegistry {
             );
         }
 
-        match self.respawn_agent_for_pane(pane_id_env, command).await {
+        match self
+            .respawn_agent_for_pane_declared(pane_id_env, command, identity.agent_type.as_ref())
+            .await
+        {
             Ok(agent_id) => {
                 return Ok(PaneRespawn {
                     agent_id,
@@ -6092,12 +6203,32 @@ impl AgentPtyRegistry {
         if !env.iter().any(|(k, _)| k == DOT_AGENT_DECK_PANE_ID) {
             env.push((DOT_AGENT_DECK_PANE_ID.to_string(), pane_id_env.to_string()));
         }
-        // The launch shape follows the command actually being launched, with the
-        // caller's declared identity as the fallback — the same rule
-        // `respawn_agent_for_pane` states as its launch-shape invariant, so a
-        // re-created pane and a respawned one exec identically.
-        let agent_type =
-            AgentType::from_command(Some(command)).or_else(|| identity.agent_type.clone());
+        // The launch shape follows the caller's CURRENT identity for this pane,
+        // falling back to deriving it from the command being launched — the same
+        // order `respawn_agent_for_pane_declared` applies, so a re-created pane
+        // and a respawned one exec identically. The respawn seam has a third,
+        // last-resort source this one does not: the pane's FROZEN
+        // `spawn_agent_type`, which exists only because a respawn HAS a
+        // predecessor to have frozen it. Nothing was frozen here.
+        //
+        // Why the caller's identity may precede the command here, when the
+        // frozen one may not there: the frozen value was captured at some
+        // earlier spawn and can disagree with an edited command, which is PRD
+        // #225 finding 1 (a pane frozen as Codex whose command was edited to
+        // `claude` relaunching as `wrap --agent codex -- claude`). The caller's
+        // identity was read in the same pass as the `command` beside it, so it
+        // cannot disagree with it — see the contract on
+        // [`PaneRecreateIdentity::agent_type`]. Deriving first would throw it
+        // away, and it is the only thing that can know a `devbox run codex-big`
+        // pane is Codex (issue #308), which is the case the identity exists for.
+        //
+        // What every ordering here guarantees is the same, and it is the
+        // property that matters: the launch decision is never made from an
+        // identity that could contradict the command it is launching.
+        let agent_type = identity
+            .agent_type
+            .clone()
+            .or_else(|| AgentType::from_command(Some(command)));
         let agent_id = self.spawn_agent(SpawnOptions {
             command: Some(command),
             cwd: identity.cwd.as_deref(),

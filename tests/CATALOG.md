@@ -104,6 +104,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** `ui.display_names`, the card's *preferred* name source, which is hydrated from the daemon's `is_valid_display_name`-gated `AgentRecord.display_name` over the attach socket and is a separate path with its own audit — deliberately out of scope here, and tracked on the fork this defect was reported from as `prageethw/dot-agent-deck#562`; the title's char-vs-display-column fit budget (`truncate_styled_segments`, issue #357).
 - **Platform coverage:** mac+linux+windows.
 
+##### dashboard/pane/013 — A declared agent identity fills only the initial `No agent` card badge (issue #308).
+- **Layer:** L1 (ratatui `TestBackend` buffer-text assertions).
+- **Agent:** synthetic neutral and ClaudeCode `SessionState` fixtures with a declared Codex identity.
+- **Asserts:** a neutral session plus `Some(Codex)` renders `Codex · reviewer` and no `No agent`; after that session reports `ClaudeCode`, the observed identity renders `ClaudeCode · reviewer` with no stale `Codex` label. A neutral session with no declaration retains the pre-#308 `No agent` baseline.
+- **Does not assert:** declaration propagation through config, spawn, or daemon dispatch; those end-to-end paths are covered by `codex/spawn/009` and `codex/spawn/011`.
+- **Platform coverage:** mac+linux+windows.
+
 #### dashboard/stats
 
 ##### dashboard/stats/001 — A narrow stats bar keeps the `tools` total and spends no width on a per-agent-type breakdown.
@@ -2378,11 +2385,11 @@ without depending on the config struct API.
 - **Does not assert:** a real Claude or OpenCode timing distribution; the deterministic stub pins the race that real-agent timing cannot reproduce reliably.
 - **Platform coverage:** mac+linux (unix-only — Python `termios` raw-mode stub).
 
-##### orchestration/delegate/013 — A worker that receives a delegate and then emits no event produces an orchestrator notice REPORTING WHAT ITS PANE IS SHOWING (PRD #249 M3; issue #686).
+##### orchestration/delegate/013 — A worker that receives a delegate and then emits no event produces a submitted, actionable orchestrator notice REPORTING WHAT ITS PANE IS SHOWING (PRD #249 M3; issues #686 and #702).
 - **Layer:** fast synthetic PTY integration (real `handle_delegate`, managed worker and orchestrator PTYs, the production silence watch, and a shortened worker-response window; no LLM and no `e2e` feature gate).
 - **Agent:** none — two silent worker stand-ins plus a raw no-echo orchestrator observer whose scrollback is exactly what the daemon wrote into it. Both workers set `stty raw -echo`, divert everything written into their PTY to a FILE rather than echoing it (a real agent TUI puts a typed prompt into its own input widget, not into the scrollback), and emit no agent event of any kind. They stand in for the agents that emit nothing until their first prompt arrives — Codex and OpenCode, measured; Claude and Pi emit at boot — which is why a silent pane needs no LLM to reproduce: the pane's bytes and the absence of events are both established by the fixture.
-- **Asserts:** two arms sharing one delegate path. **Ready-prompt arm:** a worker sitting at a booted agent's own ready prompt receives the task pointer (proved against the delivery log, not the scrollback), and its silence then produces an LF-terminated daemon notice in the ORCHESTRATOR's pane that quotes the line that pane is actually rendering — carrying a nonce, so the text provably came from that pane — inside the `[UNTRUSTED-PANE-TEXT: … :END-UNTRUSTED-PANE-TEXT]` frame, and no longer asserts "It may never have received the prompt". **Blank-pane arm (control):** the same delegate to a worker whose pane has drawn nothing is reported as blank, and does NOT carry the other arm's ready-prompt text — without it a notice that always claimed a ready prompt would pass. Both arms also pin that the daemon-authored prose still interpolates no role name (PRD #249 finding B3). Verified load-bearing: reverting the pane read turns the first arm red, and collapsing the blank branch into the generic wording turns the second red.
-- **Does not assert:** that the pane text is genuinely unreachable as instructions once it lands in an orchestrator's context — the frame is a mitigation, not a proof, and `compose_delegate_silence_notice`'s own doc records why the trade was taken; that a `vt100` replay is *required* to read a pane (a stand-in writing plain lines would also be legible raw — the cursor-addressed case is pinned by `pane_screen_text`'s unit tests instead); tracing output from the companion `warn!`; any first-run-gate string matching, which the fix deliberately does not do; an actual agent response; whether every supported agent treats bare LF as inert; or recovery after the notice.
+- **Asserts:** two arms sharing one delegate path. **Ready-prompt arm:** a worker sitting at a booted agent's own ready prompt receives the task pointer (proved against the delivery log, not the scrollback), and its silence then produces a CR-submitted daemon notice in the ORCHESTRATOR's pane that names the remediation options to keep waiting, re-delegate, reassign, or notify the user. The notice quotes the line that pane is actually rendering — carrying a nonce, so the text provably came from that pane — inside the `[UNTRUSTED-PANE-TEXT: … :END-UNTRUSTED-PANE-TEXT]` frame, and no longer asserts "It may never have received the prompt". **Blank-pane arm (control):** the same delegate to a worker whose pane has drawn nothing is reported as blank, and does NOT carry the other arm's ready-prompt text — without it a notice that always claimed a ready prompt would pass. Both arms also pin that the daemon-authored prose still interpolates no role name (PRD #249 finding B3). Verified load-bearing: reverting the pane read turns the first arm red, collapsing the blank branch into the generic wording turns the second red, and reverting the delivery to `write_notice_guarded` turns the first arm red on `observed terminator = Some(10)`. **How "submitted" is discriminated, and why it is exact:** the observer prints its readiness marker terminated by a bare LF and the fixture asserts the pane delivered that LF unchanged — under a cooked line discipline ONLCR would rewrite it to CRLF, and since `stty raw` applies its whole flag set in one `tcsetattr`, an observed `-opost` is also proof of `-icrnl`, so neither an output- nor an input-side CR/LF translation can sit between the daemon and the assertion. The terminator itself is then read as the single byte following the notice payload's stable final clause, rather than as the first line break anywhere after the notice's opening clause, so an unrelated line break landing in the pane cannot be mistaken for it and a missing CR cannot be papered over by one.
+- **Does not assert:** that the pane text is genuinely unreachable as instructions once it lands in an orchestrator's context — the frame is a mitigation, not a proof, and now the only one, since #702 makes this text an agent turn rather than scrollback; `compose_delegate_silence_notice`'s own doc records why the trade was taken and where it differs from the idle prompt's; that a `vt100` replay is *required* to read a pane (a stand-in writing plain lines would also be legible raw — the cursor-addressed case is pinned by `pane_screen_text`'s unit tests instead); tracing output from the companion `warn!`; any first-run-gate string matching, which the fix deliberately does not do; an actual agent response or recovery after the notice (covered by `/024`); that an orchestrator pane holding an unsent human draft has that draft submitted along with the notice, which is issue #544's accepted limitation on every automatic submit and is shared with the idle-worker prompt; and whether a bare LF is inert on every agent, which is moot for this caller now that it submits with CR but stays live for the two notices still on the `write_notice_guarded` path (`scheduler/idle-worker/015`).
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell stand-ins).
 
 ##### orchestration/delegate/014 — A `clear = true` delegate reaches a REAL interactive Claude worker and the worker visibly acts on it (PRD #249 M4 real-agent happy path). [reel]
@@ -2456,6 +2463,20 @@ without depending on the config struct API.
 - **Asserts:** the precondition that the FIRST worker is up before the refusal is armed; then that a notice naming the worker's pane appears in the ORCHESTRATOR's own pane, within a budget (20 s) well under the production `SESSION_START_WAIT_TIMEOUT` + readiness buffer (31 s) that the pre-fix path burned before giving up — so the assertion covers both halves of the fix, the report and the promptness. Also that nothing was written into the dead pane, and that the notice interpolates no role name (PRD #249 finding B3's precedent for this notice family). Verified load-bearing: reverting either the EOF-driven end to the readiness wait or the liveness gate turns it red.
 - **Does not assert:** WHY a real replacement dies — #584's own trigger was environment-side and is not reproduced here (see `orchestration/dispatch/003` for the parity control that rules out the reported hypothesis); any retry of the delegate, which this fix deliberately does not add; the daemon-log `warn!`, which carries the role and command the notice omits.
 - **Platform coverage:** mac+linux (unix-only — the stand-in is a POSIX shell script).
+
+##### orchestration/delegate/024 — A real interactive Haiku orchestrator visibly acts on a delegated-worker silence notice without a human pressing Enter (issue #702). [reel]
+- **Layer:** L2 PTY-attached (real `dot-agent-deck` binary and lazy daemon, with a restored orchestration rendered through the vt100 `TuiDeck` harness). Flaky-tolerant pre-PR tier; run once, not looped.
+- **Agent:** REAL interactive Claude Code orchestrator pinned to Haiku (`claude-haiku-4-5-20251001`, `--allowedTools Bash`, no `-p`) plus a long-lived `cat` worker that receives the delegate pointer and emits no agent event. Runtime-skipped when the Claude CLI or credentials are unavailable — set `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` to turn that skip into a hard failure on a run that must genuinely exercise the agent.
+- **Asserts:** the real orchestrator follows a directive to run the genuine `dot-agent-deck delegate` CLI (proved by the daemon-created worker task file), visibly acknowledges that it is waiting, returns to Idle, and has not prematurely created the action sentinel. After the no-event window expires, with no test keystroke sent at any point, the orchestrator's card visibly traverses Thinking then Working, creates a uniquely named sentinel with exact contents, and produces a response turn carrying the directive's unique completion marker. The post-Idle lifecycle plus sentinel proves the daemon notice was submitted as a new actionable turn rather than merely written into the pane.
+- **Does not assert:** exact model prose beyond the directive's unique completion marker, which remediation choice a production orchestrator should prefer, or a real silent worker agent — `orchestration/delegate/013` and `/025` deterministically pin the notice bytes, pane evidence, and generation accounting without an LLM.
+- **Platform coverage:** mac+linux.
+
+##### orchestration/delegate/025 — A silence watch cannot report a worker generation after a newer `clear = true` respawn has taken over its pane (issue #687).
+- **Layer:** fast synthetic PTY integration (real `handle_delegate`, two `clear = true` respawns on one managed worker pane, the production readiness wait and silence watches, and a raw no-echo orchestrator observer; no LLM and no `e2e` feature gate).
+- **Agent:** none — a deterministic shell stand-in renders a distinct nonce-bearing sentinel on generation A and generation B, accepts submitted payload bytes without emitting any agent event, and lets the test identify which generation a notice quoted.
+- **Asserts:** generation A renders its sentinel, receives its pointer and arms a silence watch; generation B then visibly takes ownership of the same pane before A's short window expires and remains inside its longer readiness wait with no payload of its own. No silence notice may reach the orchestrator during that gap and no later notice may quote A's sentinel. As the non-vacuous control, B subsequently receives its own pointer and its own watch remains armed long enough to fire exactly one notice quoting B's distinct sentinel.
+- **Does not assert:** internal silence-watch sequence numbers, retirement variants, or the implementation seam where supersession is recorded; the observable contract is solely which generation's pane evidence reaches the orchestrator.
+- **Platform coverage:** mac+linux (unix-only — raw-mode POSIX shell stand-ins and managed PTYs).
 
 #### orchestration/work-done
 
@@ -3207,15 +3228,44 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Layer:** fast PTY registry integration (`AgentPtyRegistry::spawn_agent` + hook-path `set_agent_type` + `respawn_agent_for_pane`, with PATH recorder stubs).
 - **Agent:** synthetic `devbox run codex-big` launcher whose basename intentionally does not infer an agent type.
 - **Asserts:** the initial and replacement exec records are byte-identical `devbox run codex-big` lines even after the registry badge upgrades from `None` to `Some(Codex)`; no `dot-agent-deck wrap` line appears on respawn.
-- **Does not assert:** daemon hook-socket ingestion of the badge (covered by `hooks/delivery/007`); an EDITED role command's effect on the wrap decision (`codex/spawn/008`); real Codex behavior.
+- **Does not assert:** daemon hook-socket ingestion of the badge (covered by `hooks/delivery/007`); an EDITED role command's effect on the wrap decision (`codex/spawn/008`); a config-declared identity (`codex/spawn/009`–`010`); real Codex behavior.
 - **Platform coverage:** mac+linux.
 
 ##### codex/spawn/008 — A respawn's wrap decision follows the command it is actually launching, so an explicit Codex identity can never wrap a different agent (PRD #225 review finding 1).
 - **Layer:** fast PTY registry integration (`AgentPtyRegistry::spawn_agent` + two `respawn_agent_for_pane` calls, with PATH recorder stubs for `devbox`, `claude`, and `dot-agent-deck`).
 - **Agent:** synthetic `devbox run codex-big` launcher spawned with an explicit `AgentType::Codex` identity, then respawned once with that same command and once with the role command edited to `claude --model haiku`.
 - **Asserts:** the unchanged respawn relaunches byte-identically as `dot-agent-deck wrap --agent codex -- devbox run codex-big` (the frozen identity is the only thing that knows this launcher is Codex); the edited respawn executes a bare `claude --model haiku` and never `wrap --agent codex -- claude …`; and the pane badge follows the newly launched command (`ClaudeCode`) instead of still advertising the replaced agent. Both halves are load-bearing — replaying the frozen identity verbatim wraps Claude as Codex, and dropping it flips the unchanged pane to bare.
-- **Does not assert:** the hook-learned badge path (`codex/spawn/007`); a launcher whose command implies no type AND whose underlying agent changed (`devbox run codex-big` → `devbox run claude-big`), which keeps its creation-time identity by documented design.
+- **Does not assert:** the hook-learned badge path (`codex/spawn/007`); a freshly re-read config declaration that legitimately outranks the current command's derived type (`codex/spawn/010`); a launcher whose command implies no type AND whose underlying agent changed (`devbox run codex-big` → `devbox run claude-big`), which keeps its creation-time identity by documented design.
 - **Platform coverage:** mac+linux.
+
+##### codex/spawn/009 — A config-declared Codex orchestration role wraps and badges a non-inferable launcher before the first task.
+- **Layer:** L2 synthetic PTY-attached new-pane orchestration flow with PATH recorder stubs.
+- **Agent:** synthetic `devbox run codex-big` launcher declared as Codex by the start role.
+- **Asserts:** the role executes exactly once as `dot-agent-deck wrap --agent codex -- devbox run codex-big`, and its visible card reads `Codex` at spawn without any delegated task or synthesized hook event.
+- **Does not assert:** `clear = true` re-create precedence (`codex/spawn/010`), mode panes (`codex/spawn/011`), or a real Codex process (`codex/spawn/012`).
+- **Platform coverage:** mac+linux.
+
+##### codex/spawn/010 — A current config declaration outranks command derivation across spawn and missing-record re-create without admitting learned identity into the exec line.
+- **Layer:** fast PTY registry integration (`AgentPtyRegistry::spawn_agent` + `respawn_or_recreate_agent_for_pane` + `set_agent_type`, with PATH recorder stubs).
+- **Agent:** synthetic Codex declaration applied to a command whose basename derives Claude Code.
+- **Asserts:** declared Codex beats the conflicting Claude derivation at initial spawn and on two same-pane missing-record `clear = true` re-creates; a conflicting learned badge observation cannot replace the declared badge or alter the byte-identical Codex wrapper exec record.
+- **Does not assert:** TOML parsing or the visible card (covered by `codex/spawn/009`); ordinary frozen-identity respawn precedence (covered by `codex/spawn/008`); daemon hook-socket ingestion.
+- **Platform coverage:** mac+linux.
+
+##### codex/spawn/011 — A config-declared Codex mode pane wraps and badges a shell-injected non-inferable launcher.
+- **Layer:** L2 synthetic PTY-attached new-pane mode flow with PATH recorder stubs.
+- **Agent:** synthetic `devbox run codex-big` launcher entered for a `[[modes]]` agent pane declared as Codex.
+- **Asserts:** the mode's shell-injection seam executes exactly `dot-agent-deck wrap --agent codex -- devbox run codex-big`, and the mode agent's Dashboard card reads `Codex` without a hook event.
+- **Does not assert:** restored mode panes, persistent side panes, orchestration roles (`codex/spawn/009`), or real Codex behavior.
+- **Platform coverage:** mac+linux.
+
+##### codex/spawn/012 — A real script-launched Codex role badges at spawn before its first prompt.
+- **Layer:** L2 PTY-attached real-agent orchestration flow; runtime-skipped unless `check_codex_available` verifies the binary, persisted auth, and a live model request.
+- **Agent:** real interactive Codex on the cheap test model, launched by a bespoke `run-codex.sh` role command whose config declares `agent = "codex"`.
+- **Asserts:** the bespoke script starts the genuine Codex CLI and, before any prompt-bearing event or user input, the role card visibly reads `Codex` and `Idle`.
+- **Does not assert:** prompt delivery, model prose, tool execution, `clear = true` respawn, or post-prompt native hook behavior.
+- **Platform coverage:** mac+linux (real-agent tier is local-only).
+- **Cost note:** one minimal mini-model availability probe; the launched interactive agent receives no prompt.
 
 #### codex/hooks
 
@@ -4255,11 +4305,11 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the pane-reuse-after-`StopAgent` path (covered by `scheduler/idle-worker/008`); the orchestration-membership half of the delivery revalidation (the successor is spawned without `tab_membership`, so that check legitimately abstains and the agent-id gate is what refuses).
 - **Platform coverage:** mac+linux.
 
-##### scheduler/idle-worker/015 — A silent-worker notice cannot launder user input into a later blind submit probe.
-- **Layer:** L1 (in-process production silent-worker watch and guarded notice/submit paths with a real `/bin/cat` byte-observation PTY).
+##### scheduler/idle-worker/015 — A deferred daemon notice cannot launder user input into a later blind submit probe.
+- **Layer:** L1 (in-process production notice composition and guarded notice/submit paths with a real `/bin/cat` byte-observation PTY).
 - **Agent:** none.
-- **Asserts:** an automatic payload lands, the user types an unsent draft, and the real silent-worker watch then writes its fixed daemon notice; a following submit-only probe is refused and leaves the draft-plus-notice snapshot unchanged rather than submitting it.
-- **Does not assert:** the broader idle-worker detection policy or the exact diagnostic prose, only that the production notice caller cannot reauthorize a blind probe.
+- **Asserts:** an automatic payload lands, the user types an unsent draft, and the production `compose_worker_exited_notice` text is then delivered through the same `write_notice_guarded` call the daemon's worker-exit sweep makes; a following submit-only probe is refused and leaves the draft-plus-notice snapshot unchanged rather than submitting it. Keyed on the DELIVERY MECHANISM rather than on which notice it is: this pins the whole `write_notice_guarded` family, whose two remaining members are the worker-exited and respawn-no-live-worker notices. Issue #702 moved the delegate silence notice out of that family onto the submitted path, where the question does not arise.
+- **Does not assert:** the broader idle-worker detection policy or the exact diagnostic prose, only that a production deferred-notice caller cannot reauthorize a blind probe; the trigger that decides to send the notice (`pump_reader`'s EOF sweep), which is stubbed out here; and the SUBMITTED family's own separate limitation, where a pane holding an unsent human draft has that draft submitted along with the daemon text (issue #544).
 - **Platform coverage:** mac+linux.
 
 ##### scheduler/idle-worker/016 — A delegated worker whose PROCESS exits on its own — no `work-done`, no SIGTERM, no `StopAgent` — has its armed `OutstandingDelegation`/`SilenceWatchRecord` retired immediately by `pump_reader`'s EOF branch, and the orchestrator sees the new "exited without work-done" notice promptly instead of either older timeout-based notice.
@@ -4267,6 +4317,20 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Agent:** none (worker stand-in; the orchestrator is a raw/no-echo `cat` so the notice is directly observable in its scrollback).
 - **Asserts:** after the delegate lands and the worker's process ends on its own, the worker pane is confirmed NOT in a close transition (so the close-time sweep is provably not what retired the records), the new EOF-triggered notice appears in the orchestrator's pane within 5s and names the exited worker's pane id, and neither the older idle-timeout prompt nor the older delegate-possibly-not-delivered silence notice appears at all.
 - **Does not assert:** the exact daemon log wording; the identity-bound worker-side match's own race-closing behavior (a delegation whose worker identity has not yet resolved falling through to its own timer instead of being mistaken for a stranger's exit) — that is a `src/agent_pty.rs` unit-test concern, not this integration harness's.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/017 — A one-shot silence report releases its payload record, so a byte-identical SECOND report into the same orchestrator is still submitted rather than refused as a repeat of the user's draft.
+- **Layer:** L1 (in-process production notice composition and the guarded submit path against two real `/bin/cat` PTY panes).
+- **Agent:** none.
+- **Asserts:** the production `compose_delegate_silence_notice` text is submitted into an orchestrator pane, the daemon's `note_payload_settled` release is made exactly where `arm_delegate_silence_watch` makes it, the user then types into that pane, and a byte-identical second report is still `Applied`. A second pane runs the identical sequence WITHOUT the release as a control and is refused (`Stale`), which is what makes the release load-bearing rather than decorative — the repeat is ordinary rather than exotic, since two silent workers on one orchestration whose panes rendered nothing compose the same bytes.
+- **Does not assert:** the trigger that decides to send the report (`arm_delegate_silence_watch`'s window, covered by `orchestration/delegate/013` and `/025`); the DEFERRED family's own laundering question, which is `scheduler/idle-worker/015`'s and lives on `write_notice_guarded`; and the identity/liveness gates on the send, which `scheduler/idle-worker/008` and `/014` pin.
+- **Platform coverage:** mac+linux.
+
+##### scheduler/idle-worker/018 — An AMBIGUOUS silence report KEEPS its payload record, so a byte-identical second report into the same orchestrator is refused rather than submitted on top of the leftover bytes.
+- **Layer:** L1 (in-process production notice composition, the guarded submit path against two real `/bin/cat` PTY panes, and the production settle decision `settle_silence_report_payload_record` driven with each outcome that leaves a record).
+- **Agent:** none.
+- **Asserts:** after the production `compose_delegate_silence_notice` text is submitted into an orchestrator pane and the settle decision is run with `Ambiguous`, the payload record survives, so once the user types a byte-identical second report is refused (`Stale`) instead of appending the leftover report bytes to the user's unsent draft and submitting both as one turn. A second pane runs the identical sequence with `Applied` as a control and IS admitted, which is what makes the refusal a property of the outcome rather than of the harness. The complement of `scheduler/idle-worker/017`, which pins the `Applied` release itself.
+- **Does not assert:** that a real `Ambiguous` arises from this seam — a `/bin/cat` PTY writer cannot be faulted into a partial write, and the classification itself is unit-tested against a fault-injecting writer in `agent_pty` (`deliver_payload_classifies_partial_write_as_ambiguous`); the registry state is identical either way, since both classification arms call `note_automatic_write` with the same payload, so only the outcome the daemon acts on varies here. Also not asserted: the trigger that decides to send the report (`orchestration/delegate/013` and `/025`); the sibling one-shot callers (`arm_idle_worker_watch`'s idle prompt and the delegate task pointer), which still release on `Ambiguous`.
 - **Platform coverage:** mac+linux.
 
 #### scheduler/live

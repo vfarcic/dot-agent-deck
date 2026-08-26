@@ -231,6 +231,7 @@ mod tests {
         desc: Option<&str>,
     ) -> OrchestrationRoleConfig {
         OrchestrationRoleConfig {
+            agent: None,
             name: name.to_string(),
             command: "cat".to_string(),
             start,
