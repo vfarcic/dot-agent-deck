@@ -11,8 +11,10 @@
 # (`ELF ... ARM aarch64` plus `libaws_lc_0_43_0_crypto.a`) before the tag.
 #
 # It reproduces exactly the aarch64 leg of `release.yml`'s build matrix — same
-# runner, same toolchain action, same `cargo install cross --locked`, same
+# runner, same toolchain action, same version-pinned `cargo install cross`, same
 # `cross build --release` — and nothing else: no tag, no publish, no artifacts.
+# The cross version is part of what is mirrored (issue #323): if it drifts from
+# `release.yml`'s, this job stops predicting the leg it exists to predict.
 #
 # KEPT DELIBERATELY, not temporary. It is scoped to PRs that touch `Cargo.toml` /
 # `Cargo.lock` / this file, so it costs nothing on unrelated PRs and fires exactly
@@ -61,7 +63,9 @@ jobs:
         with:
           key: aarch64-unknown-linux-gnu
       - name: Install cross
-        run: cargo install cross --locked
+        # Keep this version in lockstep with `release.yml`'s cross install — see
+        # the WHY block at the top of this file. Issue #323.
+        run: cargo install cross --locked --version 0.2.5
       - name: Build (this is the step that must not fail at tag time)
         run: cross build --release --target aarch64-unknown-linux-gnu
       - name: Prove aws-lc-sys actually built for aarch64

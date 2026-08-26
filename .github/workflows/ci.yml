@@ -504,7 +504,22 @@ jobs:
       # The Determinate installer rather than cachix/install-nix-action: it is
       # what the cache action below is built to pair with, and it turns on
       # flakes (`nix-command`, `flakes`) without a hand-written extra-conf.
-      - uses: DeterminateSystems/nix-installer-action@v22
+      #
+      # Issue #450: both DeterminateSystems actions in this job are SHA-pinned.
+      # A major tag is a mutable ref its owner can repoint, so `@v22` means "what
+      # the reviewer saw" only until someone moves it. The trailing comment keeps
+      # the tag readable and gives Renovate the version it needs to bump the pin.
+      #
+      # WHAT THE PIN DOES NOT COVER, for both actions: each one downloads and
+      # executes a native binary at RUNTIME (the installer fetches `nix-installer`
+      # from install.determinate.systems, the cache action fetches
+      # `magic-nix-cache` from cf.install.determinate.systems/.../stable/...).
+      # The SHA pins the fetcher, not the fetched, and `stable` is a channel that
+      # moves. Both actions expose `source-tag` / `source-revision` / `source-url`
+      # inputs that would pin the payload too; deliberately NOT set here, because
+      # the right value needs its own upstream verification and a measured run,
+      # which is a separate change from making these two refs immutable.
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
         with:
           # `determinate` defaults to TRUE, which installs Determinate Nix (a
           # downstream distribution) and runs its FlakeHub login on every job.
@@ -529,7 +544,7 @@ jobs:
       # dependency tree. Magic Nix Cache stores that in GitHub Actions' own
       # cache, so there is no third-party service and no secret, and forks and
       # PRs get the cache too.
-      - uses: DeterminateSystems/magic-nix-cache-action@v14
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
         with:
           # GitHub Actions cache only. Left at its default, this action
           # opportunistically reaches for FlakeHub Cache, which wants an OIDC
