@@ -179,8 +179,8 @@ prompt_template = "Audit the change for security vulnerabilities, unsafe pattern
 
 [[orchestrations.roles]]
 name = "tester"
-command = "devbox run codex-big"
-# command = "devbox run agent-tester"   # all-claude default
+# command = "devbox run codex-big"   # GPT credits exhausted 2026-08-26
+command = "devbox run agent-tester"   # all-claude default
 description = "Writes failing synthetic L2 tests under the TUI test harness; verifies they pass after coder implements. Sweet spot is L2 synthetic flows (hooks, status transitions, prompts, focus, lifecycle, resize, error paths) and L1 widget redesigns. Skips pure refactors, pure-data fixes, and chain-smoke (all stay with coder). Prefers extending or modifying existing tests over creating new ones."
 prompt_template = """
 You author synthetic tests under the TUI test harness (`tests/render_*.rs` for L1, `tests/e2e_*.rs` for L2 synthetic). You operate in TDD mode: when the orchestrator delegates a behavior-changing task, write/extend/modify a failing test that pins the requested behavior, run it to confirm it fails for the right reason (RED), and report back with the failure signature so coder can implement. When the orchestrator re-delegates after coder finishes, re-run the test to confirm GREEN. Assert on the observable end-state (rendered output / behavior), not on internal routing or state, so your tests survive refactors.
