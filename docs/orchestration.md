@@ -214,7 +214,7 @@ The release flow is stateful: open branch → push → create PR → wait for CI
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `name` | string | no | cwd basename | Display name shown in the tab bar. Defaults to the project directory name when empty. |
-| `default` | bool | no | `false` | Marks this as the orchestration a run opens when the caller named none — `dispatch --orchestration=` with an empty value, and a [scheduled task](scheduled-tasks.md) rooted here. Exactly one orchestration may declare it, and it must have roles. Without any declaration the first orchestration with roles wins, which is what happened before this key existed. See [Choosing the default orchestration](configuration.md#choosing-the-default-orchestration). |
+| `default` | bool | no | `false` | Marks this as the orchestration to open when nothing named one — in practice a [scheduled task](scheduled-tasks.md) rooted here, since the new-pane form and a dispatcher agent both ask. Exactly one orchestration may declare it, and it must have roles; with a single orchestration it does nothing. Without any declaration the first orchestration with roles wins, which is what happened before this key existed. See [Choosing the default orchestration](configuration.md#choosing-the-default-orchestration). |
 | `extends` | string | no | — | Inherit another orchestration's roles by its `name`, then override them with this block's own `[[orchestrations.roles]]` entries, matched by role name. Written for the case where several orchestrations run the same team on different providers. See [Sharing one orchestration across providers](configuration.md#sharing-one-orchestration-across-providers). |
 | `roles` | array | yes¹ | — | Role definitions. Must contain at least one role with `start = true`. ¹Optional in a block that `extends` another, which may restate only the roles it changes. |
 
@@ -418,9 +418,9 @@ It reports errors (which stop an orchestration opening) and warnings (which do n
 
 ### Several definitions in one project
 
-A project can define more than one `[[orchestrations]]` block — most often the same team of roles wired to different providers, so a contributor with credentials for one provider can still run it and a run survives one provider's credits running out. The deck's own repository does exactly that, with `mixed`, `anthropic` and `GPT`.
+A project can define more than one `[[orchestrations]]` block, and the usual reason is that different kinds of work want different workflows — a feature that needs a test-plan gate and a release step is not the same pipeline as a one-line bug fix. A second reason is the same team wired to a different set of agent CLIs, so a contributor who has credentials for only one provider can still run it and work survives one provider's credits running out.
 
-Two keys make that practical, and both are documented in [Configuration](configuration.md): `default = true` declares which one an unnamed run opens (rather than leaving it to file order), and `extends` lets the variants inherit one workflow instead of being three copies of it.
+Two keys make that practical, and both are documented in [Configuration](configuration.md): `extends` lets orchestrations that share a workflow inherit it instead of being copies of each other, and `default = true` declares which one a [scheduled task](scheduled-tasks.md) opens — the one path with nobody to ask.
 
 Defining several is unrelated to *running* several at once, which is what the rest of this section is about.
 

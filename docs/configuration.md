@@ -61,50 +61,50 @@ For the full reference and more examples, see [Workspace Modes](workspace-modes.
 
 ### Choosing the Default Orchestration
 
-A project may define several `[[orchestrations]]` — commonly the same team of roles wired to different providers.
+A project may define several `[[orchestrations]]` — most often one per kind of work, so a feature that needs a test-plan gate and a release step is not run by the same team as a one-line bug fix.
 
-**You do not pick between them on a command line.** You either open one yourself from the new-pane form (`Ctrl+n`, cycle **Mode** to `Orch: <name>`), or you ask a [dispatcher pane](dispatcher-mode.md) to start one — *"start work on the login timeout bug, use the anthropic team"* — and the agent in that pane runs the `dispatch` command for you. `dispatch` is an agent-facing verb: it refuses to run outside a deck-managed pane, so typing it in your own terminal only prints `DOT_AGENT_DECK_PANE_ID environment variable not set`.
+**Most of the time nothing needs a default.** Both ways of starting an orchestration ask you which one: the new-pane form (`Ctrl+n`) lists every orchestration as a Mode chip to cycle through, and a [dispatcher pane](dispatcher-mode.md) lists them and asks before it starts anything.
 
-That leaves the case this key is for: something starts an orchestration and **nobody named one**. Two things do that — a dispatcher agent that was not told which team to use, and a [scheduled task](scheduled-tasks.md) whose working directory defines orchestrations, which has no one to ask. Add `default = true` to the block those should open:
+`default = true` is for the case where **there is nobody to ask** — a [scheduled task](scheduled-tasks.md) whose working directory defines orchestrations. It fires on a cron tick, and something has to decide which team it opens:
 
 ```toml
 [[orchestrations]]
-name = "mixed"
+name = "prd"
 default = true
 # roles …
 
 [[orchestrations]]
-name = "anthropic"
+name = "issue"
 # roles …
 ```
 
-`default` sits on the block, so it moves with the block. Exactly one orchestration may declare it, and that orchestration must define roles — `dot-agent-deck validate` rejects both mistakes.
+`default` sits on the block, so it moves with the block. Exactly one orchestration may declare it, and that orchestration must define roles — `dot-agent-deck validate` rejects both mistakes. **With a single orchestration the key does nothing; omit it.**
 
-**If nothing declares it, the first orchestration with roles wins.** That is the historical rule and it still applies, so a config written before this key keeps behaving identically. It is worth declaring anyway: with several orchestrations defined, reordering the file changes which one every unnamed run opens, and nothing in that diff says so.
+**If nothing declares it, the first orchestration with roles wins.** That is the historical rule and it still applies, so a config written before this key keeps behaving identically. With several orchestrations it is worth declaring anyway, because reordering the file then changes which team every scheduled run opens, and nothing in that diff says so.
 
 When the choice is left implicit, the deck says so rather than quietly picking. `dot-agent-deck validate` is where **you** see it:
 
 ```
 $ dot-agent-deck validate
-[warning] 'mixed': 3 orchestrations are defined and none declares `default = true`, so a dispatch or scheduled task that names none opens this one purely because it comes first in the file — reordering the file would silently change that. Add `default = true` to the one you want.
+[warning] 'prd': 2 orchestrations are defined and none declares `default = true`, so a dispatch or scheduled task that names none opens this one purely because it comes first in the file — reordering the file would silently change that. Add `default = true` to the one you want.
 ```
 
-A **dispatcher agent** is told the same thing in its own words — appended to the reply it relays to you after starting a unit, and in the listing it consults before asking which team you want. That listing always marks the default, declared or not, which is how the agent knows what *"just use the usual one"* refers to:
+A **dispatcher agent** is told the same thing in its own words, and its listing marks the default so it can act on *"just use the usual one"* rather than asking twice:
 
 ```
 Available dispatch targets:
   single            one agent (--single)
-  orchestration     'mixed' — 6 roles (--orchestration 'mixed')  [default]
-  orchestration     'anthropic' — 6 roles (--orchestration 'anthropic')
+  orchestration     'prd' — 6 roles (--orchestration 'prd')  [default]
+  orchestration     'issue' — 4 roles (--orchestration 'issue')
 
 Ask the user which they want before dispatching, then pass the matching flag.
 ```
 
-A **scheduled task** has nobody to tell, so its copy goes to the daemon log — which is why declaring the default matters most for scheduled work, and why a warning you never saw is not the same as one that was never raised.
+A **scheduled task** has nobody to tell, so its copy goes only to the daemon log. That is the whole reason to declare the default: it is the one path where the deck cannot ask you and cannot show you that it did not.
 
 ### Sharing One Orchestration Across Providers
 
-`extends` lets one orchestration inherit another's roles, so a set of variants that differ only in which agent each role launches is written once:
+Two orchestrations that share a workflow — the same roles, the same prompts, the same order — should not be two copies of it. `extends` lets one inherit another's roles, so the second is only what actually differs. The clearest case is a set of provider variants, where that is just each role's `command`:
 
 ```toml
 [[orchestrations]]
