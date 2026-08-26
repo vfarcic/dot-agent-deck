@@ -257,9 +257,16 @@ impl CheckResult {
 /// stays UNKNOWN.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardObservation {
-    /// The listener accepted a SOCKS5 no-auth handshake, so it *is* the SOCKS
-    /// proxy a reverse-dynamic `RemoteForward` puts there. The only
-    /// observation this module treats as a confident PASS.
+    /// The listener accepted a SOCKS5 no-auth handshake, so it **is a SOCKS
+    /// proxy** — the form a reverse-dynamic `RemoteForward` puts there. The
+    /// only observation this module treats as a confident PASS.
+    ///
+    /// Note the ceiling, which the headline is held to: `05 00` proves *a*
+    /// SOCKS5 proxy is listening, not that it is *this user's*. Two SOCKS
+    /// proxies on one port are indistinguishable from the laptop, and the
+    /// docs' limits list says so plainly — "if you deliberately run one for
+    /// something else, expect a PASS". Claiming attribution here would have
+    /// the code assert what the documentation two sections later disclaims.
     SocksVerified,
     /// The listener accepted the connection and answered the handshake with
     /// something that is not a SOCKS5 acceptance — a foreign service holding
@@ -747,11 +754,18 @@ pub fn classify(inputs: &DoctorInputs) -> Vec<CheckResult> {
         // connect answers "is *something* listening", which is not the
         // question — see `ForwardProbe` for why the handshake is the
         // discriminator and why only this forward kind gets one.
+        //
+        // Pitched at what `05 00` actually proves: a SOCKS proxy is there, in
+        // the form this recipe's tunnel takes. It does NOT prove the proxy is
+        // this user's — a second SOCKS proxy on the same port answers
+        // identically, which the docs' limits list states outright. The
+        // headline used to say "verified as this recipe's own tunnel", an
+        // identity claim the evidence does not support.
         Some(ForwardObservation::SocksVerified) => CheckResult::new(
             CheckId::ForwardBound,
             Verdict::Pass,
             &format!(
-                "{listener} answered the SOCKS5 no-auth handshake, so the listener is verified as this recipe's own tunnel"
+                "{listener} answered the SOCKS5 no-auth handshake, so the listener is a SOCKS proxy, consistent with this recipe's tunnel"
             ),
             "",
         ),
@@ -826,7 +840,7 @@ pub fn classify(inputs: &DoctorInputs) -> Vec<CheckResult> {
                 CheckId::ForwardBound,
                 Verdict::Unknown,
                 "the live bind state on the remote was not observed",
-                "Nothing readable answered the loopback probe: either no reverse tunnel is configured to probe, or the remote is missing `bash` (for the read-only `/dev/tcp` connect) or `timeout` and `od` (for the bounded reply the deck reads back).",
+                "Nothing readable answered the loopback probe: either no reverse tunnel is configured to probe, or the remote is missing `bash` (for the read-only `/dev/tcp` connect) or `timeout`, `head` and `od` (for the bounded reply the deck reads back).",
             ),
         },
     });
@@ -1061,7 +1075,30 @@ impl ForwardProbe {
 /// deadline, which `DOT_AGENT_DECK_SSH_PROBE_TIMEOUT_SECS` lets a user stretch
 /// to an hour. Two seconds is enormous for the case that matters: a SOCKS
 /// proxy on the remote's own loopback answers in microseconds.
+///
+/// **Scope, stated precisely because the first wording of it was wrong** (PRD
+/// #345 second audit): this bounds the **reply read** and nothing else. DNS
+/// resolution of the bind host and the `/dev/tcp` connect both happen *before*
+/// `timeout` is reached, so they are bounded only by the outer ssh probe
+/// wallclock (`DOT_AGENT_DECK_SSH_PROBE_TIMEOUT_SECS`, 10s by default and
+/// clamped to an hour), not by two seconds. That is the correct division of
+/// labour — a stalled connect is a transport problem the ssh deadline already
+/// owns — but it is not what "the probe is bounded at two seconds" implies.
 const SOCKS_REPLY_TIMEOUT_SECS: u8 = 2;
+
+/// Seconds `timeout` waits after its own deadline before escalating TERM to
+/// KILL (`timeout -k`).
+///
+/// Without it the read is not actually bounded. GNU `timeout` sends SIGTERM at
+/// the deadline and then **waits**, so a child that ignores or blocks TERM
+/// keeps the probe open until the ssh wallclock fires — reproduced locally
+/// against a TERM-ignoring child during the PRD #345 second audit, which is
+/// the whole scenario [`SOCKS_REPLY_TIMEOUT_SECS`] exists to prevent. `-k`
+/// makes the escalation unconditional.
+///
+/// One second is ample: the escalation only ever runs for a `head` that is
+/// already refusing to die, and SIGKILL is unblockable.
+const SOCKS_REPLY_KILL_AFTER_SECS: u8 = 1;
 
 /// A read-only probe against the remote's loopback, used to decide whether a
 /// configured reverse listener is actually there **and whether it is ours**.
@@ -1088,9 +1125,29 @@ const SOCKS_REPLY_TIMEOUT_SECS: u8 = 2;
 ///    everything after it. That is what makes an empty reply mean "a listener
 ///    accepted and said nothing" (FAIL) rather than being confusable with
 ///    broken tooling (UNKNOWN, from a non-zero status).
-/// 2. **The read is bounded** by `timeout`; see [`SOCKS_REPLY_TIMEOUT_SECS`].
-/// 3. **Missing hex tooling exits 127**, so it lands in the same UNKNOWN as a
-///    missing `bash` instead of looking like a silent listener.
+/// 2. **The read is bounded** by `timeout -k`; see
+///    [`SOCKS_REPLY_TIMEOUT_SECS`] for what the bound does and does not cover,
+///    and [`SOCKS_REPLY_KILL_AFTER_SECS`] for why the escalation is not
+///    optional.
+/// 3. **Every tool the pipeline needs is guarded, so absent tooling exits
+///    127**, landing in the same UNKNOWN as a missing `bash` instead of
+///    looking like a silent listener. All three of `timeout`, `head` and `od`
+///    are named. `head` was the gap: without it in the guard, `timeout`
+///    reports it could not exec, `od` sees EOF, the trailing `exit 0` keeps
+///    the status at zero, and an empty reply becomes a confident
+///    **silent-listener FAIL** — a false FAIL manufactured out of a missing
+///    coreutil. False-FAIL is the wrong direction for a guard to be relaxed
+///    in, and one extra `command -v` clause removes the path entirely.
+///
+/// **What the guard deliberately does not do**, recorded rather than chased:
+/// `command -v` proves a *name resolves*, not that it resolves to the utility
+/// we mean. A `od` shadowed by a shell function, an alias, or an earlier
+/// `PATH` entry could print `0500` and force a PASS. That buys an attacker
+/// nothing here — a remote that can shadow `od` is already executing the
+/// `bash` we sent and controls every other observation this module makes, so
+/// the marginal trust boundary is empty. Hardening it (absolute paths,
+/// `command -p`) would cost portability across the remotes this has to run on
+/// for no security gain.
 ///
 /// The reply is rendered as hex because bash cannot hold the NUL byte of
 /// `05 00` in a variable. Which tool spells it is deliberately not a contract —
@@ -1105,11 +1162,15 @@ fn forward_probe_command(probe: ForwardProbe, host: &str, port: u16) -> String {
     let endpoint = format!("/dev/tcp/{host}/{port}");
     match probe {
         ForwardProbe::ConnectOnly => format!("bash -c 'exec 3<>{endpoint}'"),
+        // `-k` is written as a short option because that spelling is the one
+        // every implementation the probe can land on understands: GNU
+        // coreutils (since 7.0), BusyBox and toybox all take `-k SECS`, while
+        // `--kill-after=` is GNU-only.
         ForwardProbe::SocksHandshake => format!(
             "bash -c 'exec 3<>{endpoint} || exit 1; \
-             command -v timeout >/dev/null 2>&1 && command -v od >/dev/null 2>&1 || exit 127; \
+             command -v timeout >/dev/null 2>&1 && command -v head >/dev/null 2>&1 && command -v od >/dev/null 2>&1 || exit 127; \
              printf \"\\005\\001\\000\" >&3; \
-             timeout {SOCKS_REPLY_TIMEOUT_SECS} head -c 2 <&3 | od -An -tx1; \
+             timeout -k {SOCKS_REPLY_KILL_AFTER_SECS} {SOCKS_REPLY_TIMEOUT_SECS} head -c 2 <&3 | od -An -tx1; \
              exit 0'"
         ),
     }
@@ -1277,36 +1338,34 @@ fn probe_forward_bound(
         FORWARD_PROBE_CAP,
     ) {
         // A probe that hit its cap is not the terse reply this command
-        // produces, so nothing about the port can be concluded from it.
-        Ok(output)
-            if output.stdout.len() >= FORWARD_PROBE_CAP
-                || output.stderr.len() >= FORWARD_PROBE_CAP =>
-        {
-            None
-        }
-        Ok(output) if output.status == 0 => Some(match probe {
+        // produces, so nothing about the port can be concluded from it. The
+        // executor decides this now (`CappedOutput::truncated`) rather than
+        // this call site re-deriving it from the returned lengths, which is
+        // the same signal the version and protocol probes had been missing.
+        Ok(capped) if capped.truncated => None,
+        Ok(capped) if capped.output.status == 0 => Some(match probe {
             // Connected, and that is the whole of what we are allowed to
             // learn: nothing was sent, so nothing can attribute the listener.
             ForwardProbe::ConnectOnly => ForwardObservation::Unattributable,
-            ForwardProbe::SocksHandshake => match socks_reply(&output.stdout) {
+            ForwardProbe::SocksHandshake => match socks_reply(&capped.output.stdout) {
                 SocksReply::Accepted => ForwardObservation::SocksVerified,
                 SocksReply::Other => ForwardObservation::Foreign,
                 SocksReply::Silent => ForwardObservation::Silent,
             },
         }),
-        Ok(output) if output.status == 1 => {
+        Ok(capped) if capped.output.status == 1 => {
             // bash exits 1 both for a refused connect and for a build without
             // net redirections, where it reports the pseudo-path as missing.
             // Only the former is evidence about the port.
-            let lower = output.stderr.to_ascii_lowercase();
+            let lower = capped.output.stderr.to_ascii_lowercase();
             if lower.contains("no such file") || lower.contains("not supported") {
                 None
             } else {
                 Some(ForwardObservation::Refused)
             }
         }
-        // 127 is "bash, `timeout` or `od` missing on the remote" — absent
-        // tooling, not a free port and not a silent listener.
+        // 127 is "bash, `timeout`, `head` or `od` missing on the remote" —
+        // absent tooling, not a free port and not a silent listener.
         Ok(_) => None,
         Err(_) => None,
     }
@@ -1395,12 +1454,13 @@ fn observe(executor: &dyn SshExecutor, target: &SshTarget, name: &str) -> Observ
     }
 
     if inputs.host_reachable != Some(false) {
-        if let Ok(output) = executor.run_capped(target, SSHD_DUMP_COMMAND, SSHD_DUMP_CAP) {
+        if let Ok(capped) = executor.run_capped(target, SSHD_DUMP_COMMAND, SSHD_DUMP_CAP) {
             // A dump that reached its cap is a fragment, and a fragment parsed
             // as if complete is exactly the "confident wrong answer" the PRD
             // forbids for this probe: the missing tail is indistinguishable
             // from a key sshd never printed. Leave both fields UNKNOWN.
-            if output.stdout.len() < SSHD_DUMP_CAP && output.stderr.len() < SSHD_DUMP_CAP {
+            if !capped.truncated {
+                let output = capped.output;
                 inputs.sshd = parse_sshd_t(output.status, &output.stdout, &output.stderr);
             }
         }
@@ -2142,6 +2202,10 @@ remoteforward 1080 [socks]:0
     /// verbatim. The three properties an edit is most likely to lose — the
     /// connect deciding the exit status, the bounded read, and the 127 for
     /// absent tooling — are all spelling, so they are asserted as spelling.
+    /// Two of them are spelling the PRD #345 second audit had to correct:
+    /// `head` must be in the `command -v` guard (its absence manufactured a
+    /// silent-listener FAIL out of a missing coreutil) and `timeout` must
+    /// carry `-k` (a TERM-ignoring child otherwise outlives its deadline).
     #[test]
     fn forward_probe_command_is_pinned_for_both_forward_kinds() {
         assert_eq!(
@@ -2151,15 +2215,25 @@ remoteforward 1080 [socks]:0
         assert_eq!(
             forward_probe_command(ForwardProbe::SocksHandshake, "127.0.0.1", 1080),
             "bash -c 'exec 3<>/dev/tcp/127.0.0.1/1080 || exit 1; \
-             command -v timeout >/dev/null 2>&1 && command -v od >/dev/null 2>&1 || exit 127; \
+             command -v timeout >/dev/null 2>&1 && command -v head >/dev/null 2>&1 && command -v od >/dev/null 2>&1 || exit 127; \
              printf \"\\005\\001\\000\" >&3; \
-             timeout 2 head -c 2 <&3 | od -An -tx1; \
+             timeout -k 1 2 head -c 2 <&3 | od -An -tx1; \
              exit 0'"
         );
 
+        // Every tool the pipeline execs is guarded. Asserted by name rather
+        // than by the pinned string above so a rewrite of the command that
+        // drops one clause fails with the reason rather than with a diff.
+        let handshake = forward_probe_command(ForwardProbe::SocksHandshake, "127.0.0.1", 1080);
+        for tool in ["timeout", "head", "od"] {
+            assert!(
+                handshake.contains(&format!("command -v {tool} >/dev/null 2>&1")),
+                "{tool} must be guarded, or its absence becomes a false FAIL: {handshake:?}"
+            );
+        }
+
         // `remote/doctor/005`'s argv denylist, restated here so a failing
         // spelling is caught in the fast tier rather than in the L2 run.
-        let handshake = forward_probe_command(ForwardProbe::SocksHandshake, "127.0.0.1", 1080);
         for mutating_form in [
             " rm ",
             " mv ",

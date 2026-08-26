@@ -149,6 +149,34 @@ fn classify_ssh_error(target: &SshTarget, stderr: &str) -> SshError {
     }
 }
 
+/// What one *capped* ssh invocation produced: the captured output, plus
+/// whether the cap cut it short.
+///
+/// The flag is the entire reason this type exists. [`SshExecutor::run_capped`]
+/// used to hand back a bare [`SshOutput`], so no caller could tell a complete
+/// answer from the first `max_capture_bytes` of a flood — and a prefix that
+/// happens to parse is the most dangerous shape a bounded read has (PRD #345
+/// audit). Two concrete cases were reachable: a status-0 remote printing
+/// exactly `PROBE_VERSION_CAP` bytes that merely *begin* with a valid
+/// `dot-agent-deck <version>` pair, and a valid protocol JSON reply padded
+/// with whitespace to exactly `PROBE_PROTOCOL_STDOUT_CAP` — both parsed clean
+/// and were trusted. [`run_local_bounded`] has always distinguished the two
+/// outcomes; the signal was simply dropped on the way back to these callers.
+///
+/// Every caller must decide what a truncated stream means *before* parsing it,
+/// and none of them may parse it as authoritative.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CappedOutput {
+    pub output: SshOutput,
+    /// Whether either stream reached `max_capture_bytes`, so what is here is a
+    /// prefix of what the remote wanted to say. Mirrors
+    /// [`LocalCapture::truncated`] exactly, including that a stream landing
+    /// *on* the cap counts as truncated: a drainer that stops at the cap
+    /// cannot tell "that was all" from "there was more", and erring toward
+    /// "I could not read all of it" is the safe direction for every caller.
+    pub truncated: bool,
+}
+
 /// Abstraction over running shell commands on a remote ssh host. The
 /// production impl shells out to the `ssh` binary; tests use a fake.
 pub trait SshExecutor {
@@ -167,13 +195,19 @@ pub trait SshExecutor {
     /// The default impl only caps stdout because the test-grade fallback
     /// doesn't have a pipe-drain layer to extend; production callers that
     /// care about the symmetric cap go through `SystemSshExecutor`.
+    ///
+    /// Both impls report [`CappedOutput::truncated`] the same way — either
+    /// stream *reaching* the cap — so a caller's cap handling does not change
+    /// under a fake.
     fn run_capped(
         &self,
         target: &SshTarget,
         command: &str,
         max_capture_bytes: usize,
-    ) -> Result<SshOutput, SshError> {
+    ) -> Result<CappedOutput, SshError> {
         let mut output = self.run(target, command)?;
+        let truncated =
+            output.stdout.len() >= max_capture_bytes || output.stderr.len() >= max_capture_bytes;
         if output.stdout.len() > max_capture_bytes {
             // Truncate on a UTF-8 char boundary at or before the cap so the
             // returned `String` stays a valid `String` (callers JSON-parse
@@ -187,7 +221,7 @@ pub trait SshExecutor {
             }
             output.stdout.truncate(cap);
         }
-        Ok(output)
+        Ok(CappedOutput { output, truncated })
     }
 }
 
@@ -383,9 +417,55 @@ impl SystemSshExecutor {
 /// - `UpdateHostKeys=no` — reading a host's configuration must not rewrite
 ///   `known_hosts`.
 ///
+/// Then the **delegation** half, which `ClearAllForwardings` does NOT cover
+/// (PRD #345 second audit, verified against OpenSSH 10.2: `ssh -G -o
+/// ClearAllForwardings=yes -o ForwardAgent=yes -o ForwardX11=yes` still
+/// resolves `forwardagent yes` and `forwardx11 yes` — that option clears
+/// local, remote, dynamic and tunnel forwards and nothing else):
+///
+/// - `ForwardAgent=no` — the sharp one. A `Host` block carrying `ForwardAgent
+///   yes` otherwise exposes the laptop's ssh-agent to the endpoint on *every*
+///   probe — version, protocol, `sshd -T`, liveness — and does so before the
+///   report's own `ForwardAgent` advisory has been rendered. A compromised
+///   endpoint cannot extract private key material through an agent socket,
+///   but it can *use* the key to authenticate or sign as the user for the
+///   life of the probe, and that is the damaging capability. `remote doctor`
+///   is precisely the command you run against an endpoint you already
+///   suspect, so inheriting credential delegation is an unsafe default here
+///   in a way it is not for `connect`.
+/// - `ForwardX11=no` / `ForwardX11Trusted=no` — X11 forwarding hands the
+///   endpoint a channel to the laptop's display; trusted forwarding removes
+///   even the X security-extension restrictions on it.
+/// - `GSSAPIDelegateCredentials=no` — the Kerberos-flavoured spelling of the
+///   same mistake: a delegated TGT lets the endpoint act as the user against
+///   every service in the realm.
+/// - `AddKeysToAgent=no` — a diagnostic must not leave a new identity loaded
+///   in the user's agent as a side effect of having run.
+///
+/// None of the five has a legitimate use in an observation session: nothing
+/// the doctor runs on the remote needs the user's credentials, a display, or a
+/// realm ticket. Note the check-vs-session split this relies on — the report's
+/// `ForwardAgent` advisory reads the user's *configured* value out of `ssh
+/// -G`, which is built by [`ssh_config_dump_command`](crate::remote_doctor)
+/// and deliberately carries none of these flags, so forcing them here does not
+/// change what the report says about the user's config.
+///
 /// What is deliberately NOT here: `StrictHostKeyChecking`. Host-key
 /// *verification* is a security control, not a mutation, and weakening it to
-/// make a diagnostic quieter would be strictly worse than the problem.
+/// make a diagnostic quieter would be strictly worse than the problem —
+/// but neither is it *tightened*, and the consequence is worth naming rather
+/// than papering over. `UpdateHostKeys=no` stops the rotation-driven rewrite;
+/// it does not stop **first-use** persistence. Under a user config that sets
+/// `StrictHostKeyChecking accept-new` (or `no`/`off`), a host key the deck has
+/// never seen is still appended to `known_hosts` by this session. Forcing
+/// `yes` would break the legitimate first-run case — a diagnostic is exactly
+/// what you reach for on a remote you have not connected to yet, and failing
+/// with "host key not known" would make the command useless precisely when it
+/// is most wanted. So: the doctor issues no *deck-authored* mutation and
+/// suppresses every delegation and persistence option it can without weakening
+/// verification, and ssh still honours what the user's own config tells it to
+/// do on any connection. `docs/remote-recipes.md` states that scope to users
+/// in the same terms.
 ///
 /// Do not "helpfully" drop these flags; each one is load-bearing, and removing
 /// `ClearAllForwardings` in particular restores a check that reports PASS
@@ -397,6 +477,13 @@ fn apply_observation_options(cmd: &mut Command) {
         "ControlPath=none",
         "PermitLocalCommand=no",
         "UpdateHostKeys=no",
+        // Delegation and agent persistence — NOT covered by
+        // `ClearAllForwardings`, which clears forwards only.
+        "ForwardAgent=no",
+        "ForwardX11=no",
+        "ForwardX11Trusted=no",
+        "GSSAPIDelegateCredentials=no",
+        "AddKeysToAgent=no",
     ] {
         cmd.arg("-o").arg(option);
     }
@@ -412,7 +499,8 @@ impl SshExecutor for SystemSshExecutor {
     fn run(&self, target: &SshTarget, command: &str) -> Result<SshOutput, SshError> {
         let mut cmd = self.build_command(target, command);
         let output = match self.wallclock_timeout {
-            Some(secs) => run_with_wallclock_kill(&mut cmd, target, secs, None)?,
+            // Uncapped, so the truncation flag is always false here.
+            Some(secs) => run_with_wallclock_kill(&mut cmd, target, secs, None)?.0,
             None => cmd.output().map_err(|source| SshError::Io {
                 target: target.user_host(),
                 source,
@@ -447,18 +535,24 @@ impl SshExecutor for SystemSshExecutor {
     /// (each pipe is a separate attack vector); the no-timeout path is only
     /// used by long-running install commands (not probes), so it falls back
     /// to the default capture-then-truncate behavior.
+    ///
+    /// Either way the drainer's own [`CappedOutput::truncated`] verdict is
+    /// carried out to the caller rather than dropped — see that type for the
+    /// two probes that were parsing cap-limited prefixes as authoritative.
     fn run_capped(
         &self,
         target: &SshTarget,
         command: &str,
         max_capture_bytes: usize,
-    ) -> Result<SshOutput, SshError> {
+    ) -> Result<CappedOutput, SshError> {
         let Some(secs) = self.wallclock_timeout else {
             // No wallclock: use the post-hoc truncation from the default impl.
             // This branch is only reached by callers that have opted out of
             // the timeout (e.g. `remote add`'s install pipeline), which today
             // do not need a byte cap.
             let mut output = SshExecutor::run(self, target, command)?;
+            let truncated = output.stdout.len() >= max_capture_bytes
+                || output.stderr.len() >= max_capture_bytes;
             if output.stdout.len() > max_capture_bytes {
                 let mut cap = max_capture_bytes;
                 while cap > 0 && !output.stdout.is_char_boundary(cap) {
@@ -466,11 +560,12 @@ impl SshExecutor for SystemSshExecutor {
                 }
                 output.stdout.truncate(cap);
             }
-            return Ok(output);
+            return Ok(CappedOutput { output, truncated });
         };
 
         let mut cmd = self.build_command(target, command);
-        let output = run_with_wallclock_kill(&mut cmd, target, secs, Some(max_capture_bytes))?;
+        let (output, truncated) =
+            run_with_wallclock_kill(&mut cmd, target, secs, Some(max_capture_bytes))?;
         let status = output.status.code().unwrap_or(-1);
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -479,10 +574,13 @@ impl SshExecutor for SystemSshExecutor {
             return Err(classify_ssh_error(target, &stderr));
         }
 
-        Ok(SshOutput {
-            status,
-            stdout,
-            stderr,
+        Ok(CappedOutput {
+            output: SshOutput {
+                status,
+                stdout,
+                stderr,
+            },
+            truncated,
         })
     }
 }
@@ -656,12 +754,17 @@ pub fn run_local_bounded(
 /// into `HostUnreachable` (the right user-visible classification — the user's
 /// recourse is the same as transport-unreachable), and `max_capture_bytes` of
 /// `None` means "no cap", which the long-running install pipeline relies on.
+///
+/// Returns the capture's `truncated` verdict alongside the output. Converting
+/// a [`LocalCapture`] into a plain [`std::process::Output`] silently discarded
+/// it, which is how a cap-limited prefix reached `probe_remote_version` and
+/// `probe_remote_protocol` looking like a complete answer (PRD #345 audit).
 fn run_with_wallclock_kill(
     cmd: &mut Command,
     target: &SshTarget,
     secs: u64,
     max_capture_bytes: Option<usize>,
-) -> Result<std::process::Output, SshError> {
+) -> Result<(std::process::Output, bool), SshError> {
     let capture = run_local_bounded(cmd, secs, max_capture_bytes.unwrap_or(usize::MAX)).map_err(
         |source| SshError::Io {
             target: target.user_host(),
@@ -669,11 +772,14 @@ fn run_with_wallclock_kill(
         },
     )?;
     match capture.status {
-        Some(status) => Ok(std::process::Output {
-            status,
-            stdout: capture.stdout,
-            stderr: capture.stderr,
-        }),
+        Some(status) => Ok((
+            std::process::Output {
+                status,
+                stdout: capture.stdout,
+                stderr: capture.stderr,
+            },
+            capture.truncated,
+        )),
         None => Err(SshError::Other {
             target: target.user_host(),
             detail: format!(
@@ -1641,6 +1747,16 @@ mod tests {
             "ControlPath=none",
             "PermitLocalCommand=no",
             "UpdateHostKeys=no",
+            // Delegation: `ClearAllForwardings` clears local/remote/dynamic
+            // /tunnel forwards and NOTHING else, so a `Host` block carrying
+            // `ForwardAgent yes` would otherwise hand the laptop's ssh-agent
+            // to every probe — including the ones run against an endpoint the
+            // user already suspects (PRD #345 second audit).
+            "ForwardAgent=no",
+            "ForwardX11=no",
+            "ForwardX11Trusted=no",
+            "GSSAPIDelegateCredentials=no",
+            "AddKeysToAgent=no",
         ] {
             assert!(
                 args.iter().any(|a| a == expected),

@@ -183,6 +183,29 @@ pub enum RemoteConnectError {
         message_suffix = if message.is_empty() { String::new() } else { format!(": {message}") }
     )]
     RemoteHandshakeError { name: String, message: String },
+    /// PRD #345 second audit: a probe's captured output reached its byte cap,
+    /// so what arrived is a *prefix* of what the remote sent. Refusing to
+    /// parse it is the entire point of the variant. Both probes are
+    /// head-anchored parsers — `parse_version_output` reads the first two
+    /// tokens and ignores the rest, `serde_json::from_str` runs after a
+    /// `trim()` — so a flood that merely *begins* with a valid version pair,
+    /// or a valid reply padded with whitespace to exactly the cap, parsed
+    /// clean and was trusted as authoritative.
+    ///
+    /// Deliberately NOT folded into `HostUnreachable` (the host plainly IS
+    /// reachable — it answered, at length) nor into `RemoteBinaryMissing`
+    /// (something is installed there and it ran). `remote doctor` therefore
+    /// reports the affected check UNKNOWN rather than PASS or FAIL, and
+    /// `is_reachability_error` leaves it fatal: a remote that floods a probe
+    /// will flood the retry too.
+    #[error(
+        "Remote '{name}' produced more than {cap} bytes from `{probe}`, so the reply is a fragment and was not parsed.\nA probe answer is normally well under a kilobyte — investigate the remote binary and the shell startup files that run before it."
+    )]
+    ProbeOutputTruncated {
+        name: String,
+        probe: &'static str,
+        cap: usize,
+    },
     #[error(transparent)]
     Registry(#[from] RemoteConfigError),
     #[error("I/O error: {0}")]
@@ -410,7 +433,20 @@ pub fn probe_remote_version(
     let result = executor.run_capped(target, &cmd, PROBE_VERSION_CAP);
     match result {
         Err(ssh_err) => Err(map_probe_ssh_error(name, ssh_err)),
-        Ok(output) => {
+        // A stream that reached its cap is a prefix, and `parse_version_output`
+        // reads only the FIRST two tokens — so a status-0 remote emitting
+        // exactly `PROBE_VERSION_CAP` bytes that merely *begin* with a valid
+        // `dot-agent-deck <version>` pair would otherwise PASS on the strength
+        // of output we know we stopped reading (PRD #345 second audit).
+        // Refusing to trust a truncated handshake is strictly safer for
+        // `connect` too, not only for the doctor.
+        Ok(capped) if capped.truncated => Err(RemoteConnectError::ProbeOutputTruncated {
+            name: name.to_string(),
+            probe: "--version",
+            cap: PROBE_VERSION_CAP,
+        }),
+        Ok(capped) => {
+            let output = capped.output;
             // Exit 127 (and the typical bash "command not found" message) is
             // the canonical "binary missing" signal. We also treat any
             // non-zero exit whose stderr mentions "not found" as missing —
@@ -536,7 +572,18 @@ pub fn probe_remote_protocol(
     let result = executor.run_capped(target, &cmd, PROBE_PROTOCOL_STDOUT_CAP);
     match result {
         Err(ssh_err) => Err(map_probe_ssh_error(name, ssh_err)),
-        Ok(output) => {
+        // The parse runs on `output.stdout.trim()`, so a valid reply padded
+        // with whitespace to exactly `PROBE_PROTOCOL_STDOUT_CAP` survives
+        // truncation as valid JSON and would otherwise be accepted as an
+        // authoritative protocol answer (PRD #345 second audit). A fragment is
+        // never a handshake, whichever side of it happens to parse.
+        Ok(capped) if capped.truncated => Err(RemoteConnectError::ProbeOutputTruncated {
+            name: name.to_string(),
+            probe: "daemon hello",
+            cap: PROBE_PROTOCOL_STDOUT_CAP,
+        }),
+        Ok(capped) => {
+            let output = capped.output;
             if output.status != 0 {
                 // A pre-M2.21 binary doesn't know `daemon hello`. clap exits
                 // with status 2 and a "unrecognized subcommand" message; some
