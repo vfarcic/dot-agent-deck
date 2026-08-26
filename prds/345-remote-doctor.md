@@ -1,6 +1,6 @@
 # PRD #345: `remote doctor` — diagnose remote connectivity and ssh forwards
 
-**Status**: Not Started
+**Status**: Complete — implemented on `agent/dispatch-prd-345`
 **Priority**: Medium
 **Created**: 2026-08-02
 **GitHub Issue**: [#345](https://github.com/vfarcic/dot-agent-deck/issues/345)
@@ -84,12 +84,12 @@ Deliberately out of scope for #344 and in scope here: distinguishing *which* cau
 
 ## Milestones
 
-- [ ] **M1 — Command skeleton with the checks the deck already knows how to do.** `remote doctor <name>` exists, resolves the registry entry, and reports reachability / binary / protocol using the existing probe functions. Useful on its own for the ordinary "why won't this connect" case.
-- [ ] **M2 — Forward inventory from `ssh -G`.** Parses the resolved forwarding directives and reports what ssh actually resolved for that destination, including the `[socks]:0` reverse-dynamic form.
-- [ ] **M3 — Remote-side sshd checks.** Reads `AllowTcpForwarding` and `ClientAliveInterval` from `sshd -T` on the remote and reports the two causes that are indistinguishable from the client today.
-- [ ] **M4 — Live forward liveness and advisories.** Probes whether a configured forward is actually bound on the remote; emits the `DynamicForward` wrong-direction and `ForwardAgent` advisories.
-- [ ] **M5 — Tests.** Fast-tier coverage for `ssh -G` output parsing and check classification against captured fixtures. An e2e test can reuse [`scripts/reverse-tunnel-validation.sh`](../scripts/reverse-tunnel-validation.sh) — the harness written during #97 validation (sshd in a container, a laptop-loopback-only service), which already reproduces every failure mode above deterministically. Note the two false-pass traps it guards against, both of which cost real debugging time: an auth failure exits 255 exactly like a forward collision, and a wholesale forwarding refusal produces the same error text as a port collision, so a collision assertion must first verify the *first* session actually bound.
-- [ ] **M6 — Documentation.** A troubleshooting entry wired into the #97 recipe's "Limits worth knowing" section, so the caveats and the command that checks them are cross-referenced.
+- [x] **M1 — Command skeleton with the checks the deck already knows how to do.** `remote doctor <name>` exists, resolves the registry entry, and reports reachability / binary / protocol using the existing probe functions. Useful on its own for the ordinary "why won't this connect" case.
+- [x] **M2 — Forward inventory from `ssh -G`.** Parses the resolved forwarding directives and reports what ssh actually resolved for that destination, including the `[socks]:0` reverse-dynamic form.
+- [x] **M3 — Remote-side sshd checks.** Reads `AllowTcpForwarding` and `ClientAliveInterval` from `sshd -T` on the remote and reports the two causes that are indistinguishable from the client today.
+- [x] **M4 — Live forward liveness and advisories.** Probes whether a configured forward is actually bound on the remote; emits the `DynamicForward` wrong-direction and `ForwardAgent` advisories.
+- [x] **M5 — Tests.** Fast-tier coverage for `ssh -G` output parsing and check classification against captured fixtures. An e2e test can reuse [`scripts/reverse-tunnel-validation.sh`](../scripts/reverse-tunnel-validation.sh) — the harness written during #97 validation (sshd in a container, a laptop-loopback-only service), which already reproduces every failure mode above deterministically. Note the two false-pass traps it guards against, both of which cost real debugging time: an auth failure exits 255 exactly like a forward collision, and a wholesale forwarding refusal produces the same error text as a port collision, so a collision assertion must first verify the *first* session actually bound. **Shipped coverage:** 34 fast-tier unit tests over `ssh -G` / `sshd -T` parsing and check classification, plus 11 L2 tests (`remote/doctor/001`–`011`) driving the real binary against a PATH-stubbed `ssh`. The container harness above was **deliberately not automated** — it needs a container runtime and privileged sshd mutation, a shape the e2e tier has no precedent for, and the stubbed seam covers every classification branch deterministically. It remains the documented manual validation path, and `tests/CATALOG.md` records the skip.
+- [x] **M6 — Documentation.** A troubleshooting entry wired into the #97 recipe's "Limits worth knowing" section, so the caveats and the command that checks them are cross-referenced.
 
 ## Success Criteria
 
