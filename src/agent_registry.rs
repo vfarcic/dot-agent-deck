@@ -119,7 +119,16 @@ pub enum PrePromptReadiness {
     /// idle cold boot produced zero `session.*` events, and `session.created`
     /// then landed 16 ms AFTER the prompt was accepted. It is a `Plugin` agent,
     /// so [`IntegrationStrategy::Wrapper`] cannot cover it — the ceiling is to
-    /// skip straight to the bounded buffer, which is what the gate does.
+    /// skip straight to a bounded buffer, which is what the gate does.
+    ///
+    /// **That buffer is this value's whole safety margin, so it is sized against
+    /// a real one** ([`crate::state::NO_SIGNAL_READINESS_BUFFER`], 8 s). The dead
+    /// wait it replaces was also, accidentally, the only thing giving the agent
+    /// time to boot; the interval inherited when the wait was first deleted was
+    /// PRD #249's warm-case-doubled 1000 ms, and measurement says a replacement
+    /// OpenCode swallows a prompt written that early at every load level tested.
+    /// Declaring this for a new agent is therefore also a statement that the
+    /// shipped interval covers ITS cold start — measure, do not assume.
     NoSignal,
     /// Not established. The conservative default: the gate keeps waiting exactly
     /// as it does today, because "we have not measured this" is not evidence that

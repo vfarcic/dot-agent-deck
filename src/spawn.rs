@@ -1111,20 +1111,23 @@ async fn deliver(
     let (mut event_rx, observed) = match event_rx {
         // The declared-no-signal short path. Deliberately NOT a bare write: the
         // 30 s wait it replaces was, accidentally, also the only thing standing
-        // between the prompt and a still-booting agent, so what it becomes is the
-        // bounded buffer the delegate path already uses after a readiness fact
-        // that does not prove input-readiness — the ceiling #243 names for an
-        // agent with nothing to wait for. `rx` is kept so delivery confirmation
-        // still observes the pane exactly as it does on the waiting path.
+        // between the prompt and a still-booting agent, so what it becomes is a
+        // bounded buffer — the ceiling #243 names for an agent with nothing to
+        // wait for. `rx` is kept so delivery confirmation still observes the pane
+        // exactly as it does on the waiting path.
         Some(rx) if !has_readiness_signal => {
-            let buffer = crate::state::delegate_readiness_buffer().min(remaining_before(deadline));
+            // Issue #243, round 4: sized against a real declared-`NoSignal` agent
+            // rather than borrowing the ordinary buffer, which was PRD #249's
+            // "warm-case 500 ms, doubled" and was never measured against one —
+            // see `crate::state::NO_SIGNAL_READINESS_BUFFER`.
+            let buffer = crate::state::no_signal_readiness_buffer().min(remaining_before(deadline));
             tracing::debug!(
                 pane_id,
                 agent_type = ?spawned_agent_type,
                 buffer_ms = buffer.as_millis(),
                 "scheduled spawn: this agent has DECLARED it emits no pre-prompt \
-                 readiness signal; holding the prompt for the readiness buffer \
-                 instead of waiting out a SessionStart that cannot arrive"
+                 readiness signal; holding the prompt for the no-signal readiness \
+                 buffer instead of waiting out a SessionStart that cannot arrive"
             );
             if !buffer.is_zero() {
                 tokio::time::sleep(buffer).await;
