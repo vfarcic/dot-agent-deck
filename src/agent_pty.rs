@@ -4490,7 +4490,8 @@ impl AgentPtyRegistry {
     /// whose registry strategy is [`crate::agent_registry::IntegrationStrategy::Wrapper`]?
     ///
     /// The provenance check for the wrapper's interface-ready marker, and the
-    /// reason the marker can be trusted to skip the post-readiness buffer at all.
+    /// reason the marker can be trusted to select a post-readiness buffer of its
+    /// own at all.
     /// That marker is NOT authenticated on the wire: the daemon's hook socket
     /// accepts a raw `AgentEvent` line, `metadata` is free-form, and #243's audit
     /// reproduced a forged `wrapper_interface_ready` `SessionStart` from a bare
@@ -4501,9 +4502,13 @@ impl AgentPtyRegistry {
     /// Being fair about the delta this closes: releasing the readiness GATE was
     /// already forgeable before #243 — a bare unmarked `SessionStart` satisfies
     /// `crate::state::session_start_means_ready`'s first branch — and this does not
-    /// change that. What #243 newly granted, and what this takes back, is the
-    /// ability to also SUPPRESS the buffer, which is the last protection against
-    /// writing into a still-booting agent (#199/#249/#663).
+    /// change that. What #243's round 2 newly granted was the ability to also
+    /// SUPPRESS the buffer, which is the last protection against writing into a
+    /// still-booting agent (#199/#249/#663), and this is what took that back.
+    /// Round 3 retracted the suppression outright — the strong fact now selects a
+    /// LONGER buffer (5000 ms) rather than none — so what a forgery is left
+    /// reaching for is a mis-priced interval, not a suppressed one, and this
+    /// check is what keeps even that out of a producer's hands.
     ///
     /// Same field, and the same argument, as [`Self::agent_spawned_as_reporting_agent`]:
     /// it reads [`RunningAgent::spawn_agent_type`], the launch-shape identity the
@@ -4511,7 +4516,11 @@ impl AgentPtyRegistry {
     /// upgrade — never writes. Reading the badge instead would let a producer post
     /// one event claiming to be Codex and buy back exactly the privilege this
     /// removes. `false` for a pane the deck could not resolve to an agent, which
-    /// is the fail-closed direction: the buffer applies.
+    /// is the direction that grants nothing: the ordinary buffer applies, exactly
+    /// as it did before this issue. Note that since round 3 that is the SHORTER
+    /// of the two intervals, so refusing is no longer automatically the cautious
+    /// answer for an honest agent — see the case it refuses, below, and guard 2's
+    /// alarm in `crate::state::dispatch_one_owned`.
     ///
     /// It answers the LAUNCH-SHAPE question rather than the readiness-class one,
     /// because `wrap_launch_command` keys the wrap decision on the same
@@ -4526,10 +4535,12 @@ impl AgentPtyRegistry {
     /// double-wrapping). `AgentType::from_command` cannot see an agent through
     /// that shape, so unless the pane was created with an explicit identity the
     /// frozen record is `None` and this answers `false`. A genuine wrapper is
-    /// running and its event is genuine; it simply costs that pane the buffer
-    /// skip. The deck rewrites the command itself on every ordinary path, so this
-    /// is a hand-written shape, and one buffer is the right price for not having
-    /// to trust the marker.
+    /// running and its event is genuine; it simply costs that pane the interface
+    /// buffer, so it waits the ordinary 1000 ms rather than the 5000 ms measured
+    /// against a full-screen TUI's own initialisation. The deck rewrites the
+    /// command itself on every ordinary path, so this is a hand-written shape,
+    /// and being priced like every non-wrapper agent is the right price for not
+    /// having to trust the marker.
     pub fn agent_spawned_as_wrapper_host(&self, agent_id: &str) -> bool {
         self.inner
             .lock()

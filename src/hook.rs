@@ -365,8 +365,8 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     // that its child is not up yet, which costs it privilege and is therefore safe
     // to believe from anyone; interface readiness is a producer CLAIMING that its
     // child is up, which BUYS privilege — it releases the readiness gate, and the
-    // strong value additionally skips the post-readiness buffer. So this CLI does
-    // not carry it, and should not be taught to.
+    // strong value additionally selects which post-readiness buffer is paid over
+    // it. So this CLI does not carry it, and should not be taught to.
     //
     // **This narrowing is NOT the trust boundary, and the comment that used to
     // stand here claimed it was.** `build_event_typed` is one of several
