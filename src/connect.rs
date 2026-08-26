@@ -132,6 +132,14 @@ pub enum RemoteConnectError {
         "Could not reach remote '{name}': {detail}\nCheck your ssh config (`~/.ssh/config`), the host is up, and the network path is open."
     )]
     HostUnreachable { name: String, detail: String },
+    /// ssh reached the host but could not establish a requested remote
+    /// forward. The client cannot distinguish a listener collision from an
+    /// sshd policy refusal, so direct the user to the doctor instead of
+    /// guessing which side is at fault.
+    #[error(
+        "SSH forwarding failed for remote '{name}': {detail}\nThe remote port may already be bound, or `AllowTcpForwarding` may be disabled on the remote. Run `dot-agent-deck remote doctor {name}` to distinguish the cause."
+    )]
+    ForwardFailed { name: String, detail: String },
     /// The remote is reachable but `dot-agent-deck` isn't installed (or
     /// isn't on the absolute install path we expect). Hint at `remote
     /// upgrade` because that re-runs the install pipeline against the same
@@ -1391,6 +1399,82 @@ mod tests {
         // Right program name but version has no `.` separator (a build that
         // accidentally printed a single integer is unlikely to be ours).
         assert_eq!(parse_version_output("dot-agent-deck 9"), None);
+    }
+
+    /// Scenario: Map each canonical ssh remote-forward failure message to the
+    /// dedicated error instead of misreporting the host as unreachable.
+    #[test]
+    fn map_probe_ssh_error_classifies_forward_failures() {
+        let cases = [
+            "remote port forwarding failed for listen port 1080",
+            "bind: Address already in use",
+            "cannot listen to port",
+        ];
+
+        for detail in cases {
+            let error = map_probe_ssh_error(
+                "prod",
+                SshError::Other {
+                    target: "ops@prod.example.com".to_string(),
+                    detail: detail.to_string(),
+                },
+            );
+            assert!(
+                matches!(
+                    error,
+                    RemoteConnectError::ForwardFailed {
+                        ref name,
+                        detail: ref mapped_detail,
+                    } if name == "prod" && mapped_detail == detail
+                ),
+                "forward stderr must map to ForwardFailed: {detail:?}; got {error:?}"
+            );
+        }
+    }
+
+    /// Scenario: Feed an ordinary refused TCP connection through the same
+    /// mapper and retain the existing HostUnreachable classification.
+    #[test]
+    fn map_probe_ssh_error_keeps_unreachable_host_classification() {
+        let detail = "ssh: connect to host x port 22: Connection refused";
+        let error = map_probe_ssh_error(
+            "prod",
+            SshError::ConnectionRefused {
+                host: "x".to_string(),
+                port: 22,
+                detail: detail.to_string(),
+            },
+        );
+
+        assert!(
+            matches!(
+                error,
+                RemoteConnectError::HostUnreachable {
+                    ref name,
+                    detail: ref mapped_detail,
+                } if name == "prod" && mapped_detail == detail
+            ),
+            "ordinary connection refusal must stay HostUnreachable: {error:?}"
+        );
+    }
+
+    /// Scenario: Render an ambiguous forward failure with its listen port and
+    /// both honest possible causes, then point at `remote doctor` to distinguish them.
+    #[test]
+    fn forward_failed_message_names_ambiguous_causes_and_doctor() {
+        let message = RemoteConnectError::ForwardFailed {
+            name: "prod".to_string(),
+            detail: "remote port forwarding failed for listen port 1080".to_string(),
+        }
+        .to_string();
+        let lower = message.to_ascii_lowercase();
+
+        assert!(message.contains("prod"));
+        assert!(message.contains("1080"));
+        assert!(lower.contains("already") && lower.contains("bound"));
+        assert!(lower.contains("allowtcpforwarding"));
+        assert!(lower.contains("may") && lower.contains(" or "));
+        assert!(message.contains("remote doctor prod"));
     }
 
     // ----- signal exit-code mapping -----
