@@ -168,11 +168,11 @@ async fn codex_worker_001_inner() {
         "wrapped Codex never created {SENTINEL_NAME:?}. pointer_reached_pane={}\n=== Codex worker pane ===\n{pane}\n=== end ===",
         pane.contains("worker-task-coder.md")
     );
-    assert_eq!(
-        std::fs::read_to_string(&sentinel).expect("read Codex worker sentinel"),
-        SENTINEL_CONTENT,
-        "Codex worker created the sentinel with unexpected contents"
-    );
+    if let Err(observed) =
+        common::wait_for_file_trimmed_eq(&sentinel, SENTINEL_CONTENT, Duration::from_secs(10))
+    {
+        panic!("Codex worker created the sentinel with unexpected contents; observed: {observed}");
+    }
 
     let work_done = cwd
         .path()
