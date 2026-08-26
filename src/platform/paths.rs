@@ -983,6 +983,18 @@ mod tests {
     /// [`DEFAULT_BINARY_NAME`], though: since `current_exe()` is otherwise
     /// usable, it falls back to that absolute path instead, quoted exactly
     /// like [`shell_quote_if_needed`] would quote it directly.
+    ///
+    /// **Split by host dialect since #560.** The injected path has to be
+    /// absolute IN THE HOST'S DIALECT, because [`std::path::absolute`] is the
+    /// host's: a driveless `/usr/local/bin/x` is rooted but NOT absolute on
+    /// Windows, where it acquires the current drive and comes back as
+    /// `D:/usr/local/bin/x`. Before #560 nothing absolutised, so one set of
+    /// POSIX-shaped literals happened to pass on every platform; that is no
+    /// longer true and pretending otherwise is what `build-windows` caught.
+    /// Each arm keeps hand-written expected strings rather than composing them
+    /// through the production helpers, for the reason
+    /// [`EXPECTED_SAFE_PUNCTUATION`] gives.
+    #[cfg(unix)]
     #[test]
     fn resolve_binary_name_falls_back_to_the_absolute_path_when_the_name_is_shell_unsafe() {
         assert_eq!(
@@ -1027,6 +1039,56 @@ mod tests {
         );
     }
 
+    /// Windows arm of the test above (#560/#561). Same three gate cases with
+    /// drive-qualified inputs, and the expected strings carry the forward-slash
+    /// respelling `posix_command_word` applies — which is the whole of #561
+    /// observed at the seam rather than in the helper.
+    #[cfg(windows)]
+    #[test]
+    fn resolve_binary_name_falls_back_to_the_absolute_path_when_the_name_is_shell_unsafe() {
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from(
+                    r"C:\Program Files\deck\dot-agent-deck (1).exe"
+                )),
+                |_, _| true
+            ),
+            "'C:/Program Files/deck/dot-agent-deck (1).exe'",
+            "a name containing shell metacharacters must fall back to the absolute path, \
+             respelled with '/' and quoted for the space"
+        );
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from(r"C:\deck\dot-agent-deck copy.exe")),
+                |_, _| true
+            ),
+            "'C:/deck/dot-agent-deck copy.exe'",
+            "a name containing whitespace must fall back to the respelled, quoted path"
+        );
+        assert_eq!(
+            resolve_binary_name(Ok(PathBuf::from(r"C:\deck\-rf.exe")), |_, _| true),
+            "C:/deck/-rf.exe",
+            "a name with a leading '-' must fall back to the respelled path — unquoted, \
+             since as a full path argument a leading '-' in the file name is not a flag"
+        );
+        // Issue #560's half, in the Windows dialect: a relative `current_exe()`
+        // must be anchored before it is spelled.
+        let expected = std::env::current_dir()
+            .expect("a cwd")
+            .join(r"bin\dot-agent-deck copy.exe")
+            .to_str()
+            .expect("a UTF-8 cwd")
+            .replace('\\', "/");
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from(r".\bin\dot-agent-deck copy.exe")),
+                |_, _| true
+            ),
+            format!("'{expected}'"),
+            "a relative current_exe() must be absolutised before spelling, not emitted as-is"
+        );
+    }
+
     /// Reviewer F1 / auditor F1, updated for issue prageethw/dot-agent-deck#253's Greptile P1 and
     /// again for the `$PATH`-identity tightening: a well-formed, shell-safe
     /// name whose `$PATH` lookup does NOT identity-match `current_exe()`
@@ -1040,6 +1102,10 @@ mod tests {
     /// which the deck process's own `$PATH` cannot reliably stand in for);
     /// it falls back to the absolute `current_exe()` path instead, which
     /// resolves regardless of either process's `$PATH`.
+    ///
+    /// Split by host dialect since #560, for the reason the shell-unsafe test
+    /// above records: the injected path must be absolute in the HOST's dialect.
+    #[cfg(unix)]
     #[test]
     fn resolve_binary_name_falls_back_to_the_absolute_path_when_the_name_is_not_on_path() {
         assert_eq!(
@@ -1068,6 +1134,36 @@ mod tests {
         );
     }
 
+    /// Windows arm of the test above (#560/#561).
+    #[cfg(windows)]
+    #[test]
+    fn resolve_binary_name_falls_back_to_the_absolute_path_when_the_name_is_not_on_path() {
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from(r"C:\build\worker-agent-deck.exe")),
+                |_, _| false
+            ),
+            "C:/build/worker-agent-deck.exe",
+            "a well-formed name whose $PATH lookup does not identity-match must fall back \
+             to the respelled absolute path, which needs no quoting"
+        );
+        let expected = std::env::current_dir()
+            .expect("a cwd")
+            .join(r"target\release\dot-agent-deck.exe")
+            .to_str()
+            .expect("a UTF-8 cwd")
+            .replace('\\', "/");
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from(r".\target\release\dot-agent-deck.exe")),
+                |_, _| false
+            ),
+            expected,
+            "the emitted word must not be resolvable against the WORKER's cwd — it has to \
+             be absolute so it means the same thing in every directory"
+        );
+    }
+
     /// Issue prageethw/dot-agent-deck#253 Greptile P1: when `current_exe()` itself is fine but
     /// neither gate is satisfied, the fallback must be the absolute path,
     /// never the generic [`DEFAULT_BINARY_NAME`] literal — an absolute path
@@ -1076,14 +1172,25 @@ mod tests {
     /// gates check) is only a proxy for it and a `DEFAULT_BINARY_NAME`
     /// fallback can name a binary that was never installed under that name
     /// at all.
+    ///
+    /// The injected literal is host-dialect since #560 (see the shell-unsafe
+    /// test above); the property being asserted is identical on both.
     #[test]
     fn resolve_binary_name_absolute_path_fallback_is_never_the_default_literal() {
-        let fallback =
-            resolve_binary_name(Ok(PathBuf::from("/opt/build/worker-agent-deck")), |_, _| {
-                false
-            });
+        #[cfg(unix)]
+        let (injected, expected) = (
+            "/opt/build/worker-agent-deck",
+            "/opt/build/worker-agent-deck",
+        );
+        #[cfg(windows)]
+        let (injected, expected) = (
+            r"C:\build\worker-agent-deck.exe",
+            "C:/build/worker-agent-deck.exe",
+        );
+
+        let fallback = resolve_binary_name(Ok(PathBuf::from(injected)), |_, _| false);
         assert_ne!(fallback, DEFAULT_BINARY_NAME);
-        assert_eq!(fallback, "/opt/build/worker-agent-deck");
+        assert_eq!(fallback, expected);
     }
 
     /// Issue #560, stated as the invariant rather than as one example: whatever
@@ -1096,18 +1203,36 @@ mod tests {
     /// returns (`_NSGetExecutablePath` reports the INVOCATION path) sailed
     /// through and the worker resolved it against its own cwd.
     ///
-    /// The `..` case is deliberate: [`std::path::absolute`] is lexical and does
-    /// NOT collapse `..`, because collapsing it would change which file the
-    /// path names when a component is a symlink. An uncollapsed `..` is still
-    /// absolute, which is the property being asserted here.
+    /// **`..` is handled differently per platform, and that is why it is only
+    /// checked for absoluteness here.** [`std::path::absolute`] is purely
+    /// lexical on Unix and deliberately KEEPS `..`, because collapsing it would
+    /// change which file the path names when a component is a symlink; on
+    /// Windows it follows `GetFullPathNameW` and DOES collapse it, so the
+    /// result is no longer anchored under the cwd at all. Absoluteness holds
+    /// either way, and absoluteness is the property #560 is about — so the
+    /// cwd-anchoring assertion is applied only to the shapes where "anchored at
+    /// the cwd" is well defined on both platforms.
+    ///
+    /// The comparison is against a dialect-appropriate prefix: on Windows the
+    /// emitted word carries `/` separators (#561) while `current_dir()` returns
+    /// `\`, so the raw cwd string is not a prefix of it.
     #[test]
     fn resolve_binary_name_fallback_is_absolute_for_every_relative_current_exe_shape() {
         let cwd = std::env::current_dir().expect("a cwd");
-        for relative in [
-            "./target/release/dot-agent-deck",
-            "target/release/dot-agent-deck",
-            "../sibling/dot-agent-deck",
-            "dot-agent-deck",
+        let cwd_str = cwd.to_str().expect("a UTF-8 cwd");
+        let cwd_prefix = if cfg!(windows) {
+            cwd_str.replace('\\', "/")
+        } else {
+            cwd_str.to_string()
+        };
+
+        for (relative, anchored_at_cwd) in [
+            ("./target/release/dot-agent-deck", true),
+            ("target/release/dot-agent-deck", true),
+            ("dot-agent-deck", true),
+            // Absolute on both platforms; anchored under the cwd only where
+            // `..` survives, i.e. not on Windows — see the doc above.
+            ("../sibling/dot-agent-deck", false),
         ] {
             let fallback = resolve_binary_name(Ok(PathBuf::from(relative)), |_, _| false);
             let unquoted = parse_as_one_shell_word(&fallback)
@@ -1117,10 +1242,12 @@ mod tests {
                 "current_exe() of {relative:?} produced {fallback}, which is not absolute — a \
                  worker would resolve it against ITS OWN cwd"
             );
-            assert!(
-                unquoted.starts_with(cwd.to_str().expect("a UTF-8 cwd")),
-                "{fallback} must be {relative:?} anchored at this process's cwd"
-            );
+            if anchored_at_cwd {
+                assert!(
+                    unquoted.starts_with(&cwd_prefix),
+                    "{fallback} must be {relative:?} anchored at this process's cwd"
+                );
+            }
             assert_ne!(
                 fallback, DEFAULT_BINARY_NAME,
                 "absolutising must not degrade the fallback to the generic literal"
@@ -1277,9 +1404,18 @@ mod tests {
             resolve_binary_name(Ok(real_candidate.clone()), |candidate_name, exe_path| {
                 path_identity_match(&shadow_first, candidate_name, exe_path)
             });
+        // #561: on Windows the fallback carries the forward-slash respelling, so
+        // the expectation is spelled here rather than taken from the raw path —
+        // deriving it through `posix_command_word` would make this agree with
+        // whatever that helper does instead of pinning what it should do.
+        let expected_path = if cfg!(windows) {
+            real_candidate.to_str().unwrap().replace('\\', "/")
+        } else {
+            real_candidate.to_str().unwrap().to_string()
+        };
         assert_eq!(
             resolved,
-            shell_quote_if_needed(real_candidate.to_str().unwrap()),
+            shell_quote_if_needed(&expected_path),
             "a name shadowed earlier on $PATH must fall back to the quoted absolute path, \
              never the bare name a shell would resolve to the shadowing binary instead"
         );
