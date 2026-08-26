@@ -32,7 +32,7 @@ dot-agent-deck remote upgrade my-vm        # reinstall the binary at the local c
 dot-agent-deck remote remove my-vm         # forget the registry entry (host untouched)
 ```
 
-`remote doctor` is the one to reach for when a connection or a tunnel is not behaving: it runs a fixed list of read-only checks and prints each as PASS / WARN / FAIL / UNKNOWN with the directive and file to change. It never writes anything, anywhere. See [Reverse tunnels › Troubleshooting with `remote doctor`](remote-recipes.md#troubleshooting-with-remote-doctor).
+`remote doctor` is the one to reach for when a connection or a tunnel is not behaving: it runs a fixed list of read-only checks and prints each as PASS / WARN / FAIL / UNKNOWN with the directive and file to change. It never writes anything, anywhere. It exits `0` when the diagnosis is clear, `1` when a check failed, and `2` when a check could not be determined. See [Reverse tunnels › Troubleshooting with `remote doctor`](remote-recipes.md#troubleshooting-with-remote-doctor).
 
 ### `remote add` flags
 

@@ -211,6 +211,10 @@ pub trait SshExecutor {
 /// ceiling would be too tight.
 pub struct SystemSshExecutor {
     wallclock_timeout: Option<u64>,
+    /// PRD #345 audit: this executor's sessions are *observation* sessions —
+    /// they must not create the state they are inspecting. See
+    /// [`apply_observation_options`] for the flags and the reasoning.
+    observation: bool,
     /// PRD #161 FIX 3: ssh keepalive + ConnectTimeout for the remote-UPGRADE
     /// path. Unlike `wallclock_timeout` (which imposes a hard laptop-side
     /// wallclock kill — fine for short probes), upgrade must tolerate a
@@ -237,6 +241,7 @@ impl SystemSshExecutor {
     pub fn new() -> Self {
         Self {
             wallclock_timeout: None,
+            observation: false,
             keepalive: None,
         }
     }
@@ -248,6 +253,25 @@ impl SystemSshExecutor {
     pub fn with_wallclock_timeout(secs: u64) -> Self {
         Self {
             wallclock_timeout: Some(secs),
+            observation: false,
+            keepalive: None,
+        }
+    }
+
+    /// PRD #345: an executor whose every session is an **observation** session
+    /// — same fail-fast wallclock cap as [`Self::with_wallclock_timeout`],
+    /// plus the [`apply_observation_options`] flags that stop the session from
+    /// creating, persisting or writing any of the state it is there to read.
+    ///
+    /// Built for `remote doctor`, whose whole contract is that it probes and
+    /// reports without mutating anything. Use it for any future read-only
+    /// inspection over ssh; do NOT use it for `connect`, `remote add` or
+    /// `remote upgrade`, whose sessions are supposed to honour the user's
+    /// `Host` block in full.
+    pub fn for_observation(secs: u64) -> Self {
+        Self {
+            wallclock_timeout: Some(secs),
+            observation: true,
             keepalive: None,
         }
     }
@@ -263,6 +287,7 @@ impl SystemSshExecutor {
     pub fn with_keepalive(connect_timeout: u64, interval: u64, count_max: u32) -> Self {
         Self {
             wallclock_timeout: None,
+            observation: false,
             keepalive: Some(SshKeepalive {
                 connect_timeout,
                 interval,
@@ -280,6 +305,9 @@ impl SystemSshExecutor {
         // host yet will see an actionable error rather than the deck CLI
         // wedging.
         cmd.arg("-o").arg("BatchMode=yes");
+        if self.observation {
+            apply_observation_options(&mut cmd);
+        }
         if let Some(secs) = self.wallclock_timeout {
             // ConnectTimeout caps the pre-handshake phase (DNS, TCP, ssh
             // handshake). ServerAliveInterval + ServerAliveCountMax=1 forces
@@ -322,6 +350,55 @@ impl SystemSshExecutor {
         // not through a shell, so there's no local shell-injection surface.
         cmd.arg(remote_command);
         cmd
+    }
+}
+
+/// Turn an ssh invocation into an **observation** session: one that reads the
+/// remote's state without becoming part of it (PRD #345 audit).
+///
+/// Ordinary deck sessions deliberately honour the user's `Host` block, which
+/// is exactly what a diagnostic must not do. Without these flags a probe
+/// session applies the block's `LocalForward` / `DynamicForward` /
+/// `RemoteForward`, so the doctor **creates the very forward it then checks**
+/// — a bindable reverse forward passes because the doctor bound it, not
+/// because a user session had. It also breaks the PRD's "never mutates the
+/// remote" criterion in four concrete ways: a reverse-*dynamic* forward
+/// briefly exposes the laptop's reachable network through a SOCKS listener on
+/// the remote; `ControlMaster`/`ControlPersist` can leave a master connection
+/// *and its forwards* alive after the command exits; `UpdateHostKeys` writes
+/// `known_hosts`; and `PermitLocalCommand` runs whatever `LocalCommand` the
+/// config names. `BatchMode=yes` disables none of that.
+///
+/// So, in order:
+///
+/// - `ClearAllForwardings=yes` — the session creates no forward, so the
+///   liveness probe observes **pre-existing** remote state and answers the
+///   honest question ("is something already listening there?") instead of a
+///   self-fulfilling one.
+/// - `ControlMaster=no` / `ControlPath=none` — never join or spawn a shared
+///   master, so nothing (and no forward) outlives the probe, and the probe
+///   never rides a *pre-existing* master that already carries the user's
+///   forwards, which would silently defeat `ClearAllForwardings`.
+/// - `PermitLocalCommand=no` — a diagnostic runs no side effects on the laptop.
+/// - `UpdateHostKeys=no` — reading a host's configuration must not rewrite
+///   `known_hosts`.
+///
+/// What is deliberately NOT here: `StrictHostKeyChecking`. Host-key
+/// *verification* is a security control, not a mutation, and weakening it to
+/// make a diagnostic quieter would be strictly worse than the problem.
+///
+/// Do not "helpfully" drop these flags; each one is load-bearing, and removing
+/// `ClearAllForwardings` in particular restores a check that reports PASS
+/// because of its own side effect.
+fn apply_observation_options(cmd: &mut Command) {
+    for option in [
+        "ClearAllForwardings=yes",
+        "ControlMaster=no",
+        "ControlPath=none",
+        "PermitLocalCommand=no",
+        "UpdateHostKeys=no",
+    ] {
+        cmd.arg("-o").arg(option);
     }
 }
 
@@ -410,23 +487,41 @@ impl SshExecutor for SystemSshExecutor {
     }
 }
 
-/// Spawn `cmd` and enforce a laptop-side wallclock kill at `secs` seconds.
+/// What one bounded local subprocess run produced.
 ///
-/// `cmd.output()` has no timeout: a remote ssh server that completes the
-/// handshake but whose remote command hangs before producing output keeps
-/// answering `ServerAliveInterval` keepalives, so the ssh client sees a
-/// "healthy" transport and `cmd.output()` waits forever. The `-o
-/// ConnectTimeout=` / `ServerAliveInterval=` triple in `build_command` only
-/// catches transport-level stalls; *this* helper catches the
-/// reachable-but-stalled-remote-command case by enforcing a real local
-/// deadline around the spawned child.
+/// Distinguishes the three outcomes a caller has to treat differently — the
+/// process finished (`status` is `Some`), the deadline fired first
+/// (`timed_out`), or a stream hit its byte cap (`truncated`) — instead of
+/// collapsing them into a plain [`std::process::Output`] whose empty stdout
+/// reads like an authoritative "nothing configured".
+pub struct LocalCapture {
+    /// The child's exit status, or `None` when the deadline killed it.
+    pub status: Option<std::process::ExitStatus>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// Whether either stream reached `max_capture_bytes`, so what is here is a
+    /// prefix and not the whole output. A truncated dump must never be parsed
+    /// as if it were complete.
+    pub truncated: bool,
+    /// Whether the wallclock deadline fired and the child was killed.
+    pub timed_out: bool,
+}
+
+/// Spawn `cmd`, enforce a laptop-side wallclock kill at `secs` seconds, and
+/// bound the in-memory capture of each stream at `max_capture_bytes`.
+///
+/// `cmd.output()` has no timeout and no byte bound: a child that hangs before
+/// producing output waits forever, and one that streams at line rate grows the
+/// capture until the machine notices. This helper is the single place both are
+/// enforced, for ssh probes ([`run_with_wallclock_kill`], which wraps it) and
+/// for the purely local `ssh -G` dump `remote_doctor` runs.
 ///
 /// Behavior:
 /// - Nulls stdin so the child can't read from the user's terminal — mirrors
-///   `Command::output()`'s implicit stdin nulling. Important because the
-///   probe is meant to be non-interactive (`BatchMode=yes`); without this,
-///   a tampered remote binary or wrapping shell could observe local input
-///   for up to the deadline.
+///   `Command::output()`'s implicit stdin nulling. Important because probes are
+///   meant to be non-interactive (`BatchMode=yes`); without this, a tampered
+///   remote binary or wrapping shell could observe local input for up to the
+///   deadline.
 /// - Pipes stdout/stderr and drains them concurrently in two helper threads
 ///   while the main loop polls `child.try_wait()`. This is what
 ///   `Command::output()` does internally, and it's required for any child
@@ -434,59 +529,51 @@ impl SshExecutor for SystemSshExecutor {
 ///   without concurrent draining, the child blocks in `write(2)` before it
 ///   can exit, `try_wait` keeps returning `None`, and the wallclock fires
 ///   even though the child wasn't actually stalled.
+/// - Applies `max_capture_bytes` to *each* stream independently — stdout and
+///   stderr are separate attack vectors, and a hostile peer that floods stderr
+///   drives memory growth just as easily as one that floods stdout. A drainer
+///   stops reading altogether at its cap; if the child keeps writing it fills
+///   the kernel pipe buffer, blocks in `write(2)`, and the deadline reaps it.
 /// - Polls `child.try_wait()` every 50ms until the deadline. Polling cadence
 ///   is a wallclock-vs-CPU tradeoff; 50ms keeps the worst-case overshoot
 ///   under a tick while costing ~20 syscalls/sec.
 /// - On deadline: SIGKILL via `child.kill()`, reap with `child.wait()`, and
-///   return [`SshError::Other`] so the connect-layer mapper folds it into
-///   `HostUnreachable` (the right user-visible classification — the user's
-///   recourse is the same as transport-unreachable).
+///   return `timed_out: true`. **The kill reaches the child only.** `ssh -G`
+///   evaluates `Match exec`, so a config with `Match exec "sleep 30"` has
+///   already forked a descendant that this does not signal; such a descendant
+///   is orphaned and reaped by init when it exits on its own. The bound this
+///   helper offers is on *our* wait and *our* memory, not on what the user's
+///   own configuration chose to spawn.
 /// - Computes the deadline with `Instant::checked_add` so an absurd `secs`
 ///   (e.g. `u64::MAX`) can never panic between `spawn` and the polling
-///   loop and leak the child — the caller in `connect.rs` already clamps
-///   to a sane upper bound, this is belt-and-suspenders.
-fn run_with_wallclock_kill(
+///   loop and leak the child — probe callers already clamp to a sane upper
+///   bound, this is belt-and-suspenders.
+pub fn run_local_bounded(
     cmd: &mut Command,
-    target: &SshTarget,
     secs: u64,
-    max_capture_bytes: Option<usize>,
-) -> Result<std::process::Output, SshError> {
+    max_capture_bytes: usize,
+) -> std::io::Result<LocalCapture> {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|source| SshError::Io {
-        target: target.user_host(),
-        source,
-    })?;
+    let mut child = cmd.spawn()?;
 
-    // Drain stdout/stderr in dedicated threads so children that produce more
-    // than a pipe buffer don't deadlock waiting for us to read. The threads
-    // own the pipe handles via `take()`; on every exit path below we join
-    // them to recover the captured bytes (and to avoid leaking handles).
-    //
-    // When `max_capture_bytes` is set the same cap is applied to *each*
-    // stream independently — stdout and stderr are separate attack vectors,
-    // and a hostile remote that floods stderr can drive laptop memory
-    // growth just as easily as one that floods stdout. Each drainer stops
-    // reading altogether once its cap is reached: if the child keeps
-    // writing it will fill the kernel pipe buffer and block in `write(2)`,
-    // and the wallclock kill below reaps the still-running process.
+    // `usize::MAX` is the wrapper's spelling of "no cap"; map it back to
+    // `None` so the uncapped install path keeps its plain `read_to_end`
+    // instead of looping through the chunked capped drainer for nothing.
+    let cap = (max_capture_bytes != usize::MAX).then_some(max_capture_bytes);
     let stdout_handle = child
         .stdout
         .take()
-        .map(|s| std::thread::spawn(move || drain_pipe(s, max_capture_bytes)));
+        .map(|s| std::thread::spawn(move || drain_pipe(s, cap)));
     let stderr_handle = child
         .stderr
         .take()
-        .map(|s| std::thread::spawn(move || drain_pipe(s, max_capture_bytes)));
+        .map(|s| std::thread::spawn(move || drain_pipe(s, cap)));
 
-    // `checked_add` keeps an absurd `secs` from panicking after spawn (the
-    // unwinding `Child` drop wouldn't reap the live ssh process). On
-    // overflow we fall back to a far-future deadline; the clamp in
-    // `connect::probe_timeout_secs` already prevents this in practice.
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(secs))
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
@@ -504,18 +591,29 @@ fn run_with_wallclock_kill(
         (stdout, stderr)
     };
 
+    // A drainer stops exactly AT its cap, so a stream that reached it is a
+    // prefix of what the child wanted to say. An output that happens to be
+    // exactly `max_capture_bytes` long is reported truncated too; that errs
+    // toward "I could not read all of it", which is the safe direction for
+    // every caller here.
+    let truncated = |stdout: &[u8], stderr: &[u8]| {
+        stdout.len() >= max_capture_bytes || stderr.len() >= max_capture_bytes
+    };
+
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 // Child already exited; close the pipes by joining the
                 // drain threads (they will see EOF once the kernel reaps
-                // the writers) and assemble an Output mirroring what
-                // `Command::output()` would have returned.
+                // the writers).
                 let (stdout, stderr) = join_pipes(stdout_handle, stderr_handle);
-                return Ok(std::process::Output {
-                    status,
+                let truncated = truncated(&stdout, &stderr);
+                return Ok(LocalCapture {
+                    status: Some(status),
                     stdout,
                     stderr,
+                    truncated,
+                    timed_out: false,
                 });
             }
             Ok(None) => {
@@ -527,12 +625,14 @@ fn run_with_wallclock_kill(
                     // don't outlive this function.
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = join_pipes(stdout_handle, stderr_handle);
-                    return Err(SshError::Other {
-                        target: target.user_host(),
-                        detail: format!(
-                            "probe exceeded {secs}s wallclock deadline (laptop-side kill after ssh did not return)"
-                        ),
+                    let (stdout, stderr) = join_pipes(stdout_handle, stderr_handle);
+                    let truncated = truncated(&stdout, &stderr);
+                    return Ok(LocalCapture {
+                        status: None,
+                        stdout,
+                        stderr,
+                        truncated,
+                        timed_out: true,
                     });
                 }
                 std::thread::sleep(poll_interval);
@@ -541,12 +641,45 @@ fn run_with_wallclock_kill(
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = join_pipes(stdout_handle, stderr_handle);
-                return Err(SshError::Io {
-                    target: target.user_host(),
-                    source,
-                });
+                return Err(source);
             }
         }
+    }
+}
+
+/// Spawn `cmd` and enforce a laptop-side wallclock kill at `secs` seconds,
+/// mapping the outcome onto the ssh-flavoured error type.
+///
+/// A thin wrapper over [`run_local_bounded`] — see that function for the
+/// mechanics and the threat model. The only decisions here are ssh-specific:
+/// a deadline becomes [`SshError::Other`] so the connect-layer mapper folds it
+/// into `HostUnreachable` (the right user-visible classification — the user's
+/// recourse is the same as transport-unreachable), and `max_capture_bytes` of
+/// `None` means "no cap", which the long-running install pipeline relies on.
+fn run_with_wallclock_kill(
+    cmd: &mut Command,
+    target: &SshTarget,
+    secs: u64,
+    max_capture_bytes: Option<usize>,
+) -> Result<std::process::Output, SshError> {
+    let capture = run_local_bounded(cmd, secs, max_capture_bytes.unwrap_or(usize::MAX)).map_err(
+        |source| SshError::Io {
+            target: target.user_host(),
+            source,
+        },
+    )?;
+    match capture.status {
+        Some(status) => Ok(std::process::Output {
+            status,
+            stdout: capture.stdout,
+            stderr: capture.stderr,
+        }),
+        None => Err(SshError::Other {
+            target: target.user_host(),
+            detail: format!(
+                "probe exceeded {secs}s wallclock deadline (laptop-side kill after ssh did not return)"
+            ),
+        }),
     }
 }
 
@@ -1483,6 +1616,56 @@ mod tests {
         assert!(
             args.iter().any(|a| a == "ServerAliveCountMax=1"),
             "with_wallclock_timeout must force a single missed-keepalive abort: {args:?}"
+        );
+    }
+
+    /// PRD #345 audit: an observation session must not create, persist or
+    /// write any of the state it is inspecting — and must not weaken host-key
+    /// verification while doing so.
+    #[test]
+    fn system_ssh_executor_for_observation_creates_no_forwards_and_no_master() {
+        let target = SshTarget {
+            host: "h".to_string(),
+            user: None,
+            port: 22,
+            key: None,
+        };
+        let cmd = SystemSshExecutor::for_observation(9).build_command(&target, "echo hi");
+        let args = args_of(&cmd);
+
+        for expected in [
+            // The load-bearing one: without it the doctor's own session
+            // establishes the forward it then reports on.
+            "ClearAllForwardings=yes",
+            "ControlMaster=no",
+            "ControlPath=none",
+            "PermitLocalCommand=no",
+            "UpdateHostKeys=no",
+        ] {
+            assert!(
+                args.iter().any(|a| a == expected),
+                "observation session must set {expected}: {args:?}"
+            );
+        }
+        // It is still a probe: the fail-fast wallclock options come too.
+        assert!(args.iter().any(|a| a == "ConnectTimeout=9"), "{args:?}");
+        assert!(args.iter().any(|a| a == "BatchMode=yes"), "{args:?}");
+        // Host-key VERIFICATION is a security control, not a mutation. A
+        // diagnostic has no business relaxing it to be quieter.
+        assert!(
+            !args.iter().any(|a| a.contains("StrictHostKeyChecking")),
+            "observation must not touch host-key verification: {args:?}"
+        );
+
+        // Ordinary sessions are untouched: `connect` / `remote add` /
+        // `remote upgrade` are supposed to honour the user's Host block.
+        let ordinary =
+            SystemSshExecutor::with_wallclock_timeout(9).build_command(&target, "echo hi");
+        assert!(
+            !args_of(&ordinary)
+                .iter()
+                .any(|a| a == "ClearAllForwardings=yes"),
+            "only observation sessions clear forwardings"
         );
     }
 

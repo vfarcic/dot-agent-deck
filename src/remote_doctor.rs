@@ -21,6 +21,41 @@
 //! `remote/doctor/005` enforces that by rejecting any mutating form in the
 //! recorded ssh argv.
 //!
+//! **Every ssh session this module opens is an *observation* session**, built
+//! through [`SystemSshExecutor::for_observation`] — see
+//! `remote::apply_observation_options` for the flags and the full reasoning.
+//! The short version: an ordinary session applies the user's `Host` block, so
+//! the doctor would **establish the very reverse forward it then checks**.
+//! `ForwardBound` would report PASS because the doctor bound the port, not
+//! because a user session had it bound, and the run would stop being read-only
+//! (a reverse-*dynamic* forward briefly exposes the laptop's reachable network
+//! through a SOCKS listener on the remote; `ControlPersist` can leave a master
+//! connection *and its forwards* alive after the command exits;
+//! `UpdateHostKeys` writes `known_hosts`; `LocalCommand` runs). Do not
+//! "helpfully" drop those flags. Host-key *verification* is deliberately left
+//! alone — that is a security control, not a mutation.
+//!
+//! The one probe that deliberately does **not** carry them is `ssh -G`: it
+//! never connects, and `ClearAllForwardings` would erase the very forward
+//! inventory the dump is read for.
+//!
+//! Two limitations are accepted rather than fixed, and are worth knowing
+//! before reading a report:
+//!
+//! 1. **`ForwardBound` observes pre-existing state.** Over a session that
+//!    creates no forwards, a `/dev/tcp` connect answers "is something already
+//!    listening on that port on the remote?" — not "would a forward bind?".
+//!    A listener that answers may be a live session of yours or an unrelated
+//!    service holding the port, and a TCP connect cannot tell those apart;
+//!    asking the other question would mean binding the port ourselves, which
+//!    is exactly the mutation this module refuses. The remote's own
+//!    `AllowTcpForwarding` is what separates a policy refusal from a busy
+//!    port, and it is read independently of this probe.
+//! 2. **Only the FIRST reverse forward is bind-checked.** That covers the
+//!    single-tunnel recipe of issue #97. A `Host` block with several reverse
+//!    forwards is still reported in full by the `RemoteForward` check; only
+//!    its first listener is probed for liveness.
+//!
 //! The parsing and classification half is deliberately pure — `ssh -G` and
 //! `sshd -T` output in, ordered [`CheckResult`]s out — so the interesting
 //! decisions are covered by fast-tier tests rather than by spawning ssh.
@@ -33,7 +68,8 @@ use crate::connect::{
     REMOTE_INSTALL_PATH, RemoteConnectError, is_forward_failure_detail, lookup_remote,
     probe_remote_protocol, probe_remote_version, probe_timeout_secs, ssh_error_detail,
 };
-use crate::remote::{SshExecutor, SshTarget, SystemSshExecutor};
+use crate::remote::{SshExecutor, SshTarget, SystemSshExecutor, run_local_bounded};
+use crate::untrusted_text::escape_control_and_bidi;
 
 /// One forwarding directive from ssh's resolved (`ssh -G`) configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +189,28 @@ impl Verdict {
     /// all-clear is the failure mode the PRD calls out explicitly.
     pub fn is_clear(self) -> bool {
         matches!(self, Self::Pass | Self::Warn)
+    }
+
+    /// The process exit code this aggregate verdict maps to (review note N1).
+    ///
+    /// Three codes, not two:
+    ///
+    /// - **0** — clear. Every check PASSed, or at most raised an advisory WARN.
+    /// - **1** — a check FAILed. Something is wrong and the report names it.
+    /// - **2** — incomplete. No FAIL, but at least one check is UNKNOWN.
+    ///
+    /// Both non-zero codes satisfy the PRD's "UNKNOWN must never read as PASS".
+    /// Splitting them is what makes the single most common real-world outcome
+    /// — a healthy tunnel on a host where `sshd -T` needs root you do not have
+    /// — a stable, scriptable `2` instead of being indistinguishable from a
+    /// broken tunnel. A wrapper script can then treat 2 as "as much as I could
+    /// see is fine" without having to treat a genuine FAIL the same way.
+    pub fn exit_code(self) -> u8 {
+        match self {
+            Self::Pass | Self::Warn => 0,
+            Self::Fail => 1,
+            Self::Unknown => 2,
+        }
     }
 }
 
@@ -283,13 +341,20 @@ const SOCKS_DESTINATION: &str = "[socks]:0";
 /// non-zero, and on some hosts it prints a partial-looking dump alongside a
 /// permission complaint — which is the dangerous case, because the dump reads
 /// like an answer. Anything here forces UNKNOWN.
+///
+/// Deliberately narrow (review note N4). This list is only consulted on a
+/// **status-0** run, so it is looking for the one pathological shape where
+/// sshd printed a dump *and* complained; `"not found"` and `"no such file"`
+/// used to be here and were removed, because a benign status-0 warning
+/// containing either phrase discarded a perfectly readable dump. The absent
+/// binary they were aiming at exits 127, which
+/// [`parse_sshd_t`]'s status check already catches, and the permission
+/// markers below carry the rest of the weight.
 const SSHD_UNAVAILABLE_MARKERS: &[&str] = &[
     "permission denied",
     "operation not permitted",
     "must be run as root",
     "no hostkeys available",
-    "not found",
-    "no such file",
 ];
 
 /// Parse the known subset of a completed `sshd -T` invocation.
@@ -459,12 +524,18 @@ pub fn classify(inputs: &DoctorInputs) -> Vec<CheckResult> {
         ),
     });
 
-    // Issue #491 argues the laptop<->remote protocol comparison guards
-    // nothing, since the remote's TUI and daemon are the same install and the
-    // laptop is only ssh plus a terminal. That issue is out of scope here, so
-    // connect.rs keeps its behaviour untouched — but the doctor declines to
-    // assert a verdict the issue shows to be unfounded, and reports a
-    // difference as advisory.
+    // FAIL, not an advisory. A protocol-version mismatch is fatal in
+    // `connect.rs` today: it is part of the connect floor (PRD #161 D3),
+    // unaffected by M1.2's removal of the build-id comparison, and
+    // `run_connect`'s probe returns `Err` on it. A remote you literally cannot
+    // attach to must not be diagnosed `Overall: WARN`, exit 0, "clear" — that
+    // is precisely the "reports fine when it is not" failure this command
+    // exists to prevent. Issue #491 argues the comparison guards nothing (the
+    // remote's TUI and daemon are one install, and the laptop is only ssh plus
+    // a terminal); that argument is still worth putting in front of the user,
+    // so it stays in the fix text — but it is an open proposal, not landed
+    // behaviour, and it must not downgrade the verdict below what `connect`
+    // actually enforces.
     checks.push(match inputs.protocol_compatible {
         Some(true) => CheckResult::new(
             CheckId::ProtocolCompatible,
@@ -474,9 +545,9 @@ pub fn classify(inputs: &DoctorInputs) -> Vec<CheckResult> {
         ),
         Some(false) => CheckResult::new(
             CheckId::ProtocolCompatible,
-            Verdict::Warn,
-            "the attach protocol version differs from this laptop's (informational)",
-            "The remote's TUI and daemon come from one install, so a laptop-side version difference is not itself a defect (issue #491). Run `dot-agent-deck remote upgrade <name>` if you want them aligned.",
+            Verdict::Fail,
+            "the attach protocol version differs from this laptop's, so attaching is refused",
+            "Run `dot-agent-deck remote upgrade <name>` (or upgrade this laptop's binary if the remote is the newer one) — `dot-agent-deck connect <name>` refuses a version skew outright, so this is not advisory. Worth knowing: the remote's TUI and daemon come from one install, so the difference may not reflect a real fault, and issue #491 proposes dropping the comparison. Until it lands, this is what stops you attaching.",
         ),
         None => CheckResult::new(
             CheckId::ProtocolCompatible,
@@ -530,22 +601,28 @@ pub fn classify(inputs: &DoctorInputs) -> Vec<CheckResult> {
             "",
         ),
         setting => {
-            let headline = if setting == Some(false) {
-                "`ExitOnForwardFailure` is off, so a tunnel that cannot bind is silent"
+            // Only a real hazard once there is something to be silent about:
+            // without it ssh brings the session up anyway and agents then
+            // report git errors instead of tunnel errors.
+            let verdict = if has_reverse {
+                Verdict::Fail
             } else {
-                "`ExitOnForwardFailure` was not present in the resolved configuration"
+                Verdict::Warn
+            };
+            // The two verdicts get DIFFERENT headlines (review note Q3). An
+            // identical headline separated only by the verdict token reads as
+            // inconsistency to anyone comparing two runs; the `DynamicForward`
+            // pair above spells out why its WARN is milder, and so does this.
+            let headline = match (setting, verdict) {
+                (Some(false), Verdict::Warn) => "`ExitOnForwardFailure` is off, so a tunnel that cannot bind would be silent — harmless until you configure a tunnel".to_string(),
+                (Some(false), _) => "`ExitOnForwardFailure` is off, so a tunnel that cannot bind is silent".to_string(),
+                (_, Verdict::Warn) => "`ExitOnForwardFailure` was not present in the resolved configuration — harmless until you configure a tunnel".to_string(),
+                _ => "`ExitOnForwardFailure` was not present in the resolved configuration".to_string(),
             };
             CheckResult::new(
                 CheckId::ExitOnForwardFailure,
-                // Only a real hazard once there is something to be silent
-                // about: without it ssh brings the session up anyway and
-                // agents then report git errors instead of tunnel errors.
-                if has_reverse {
-                    Verdict::Fail
-                } else {
-                    Verdict::Warn
-                },
-                headline,
+                verdict,
+                &headline,
                 "Add `ExitOnForwardFailure yes` to this host's `Host` block in `~/.ssh/config` so a tunnel that cannot bind aborts the session instead of coming up without it.",
             )
         }
@@ -618,18 +695,36 @@ pub fn classify(inputs: &DoctorInputs) -> Vec<CheckResult> {
             &format!("{listener} is not bound on the remote, which the sshd policy above explains"),
             "This is the remote's policy refusing the tunnel, not a busy port. Fix `AllowTcpForwarding` on the remote first, then re-run this command.",
         ),
+        // The probe rides a session that creates no forwards of its own, so
+        // "not bound" is a statement about PRE-EXISTING remote state. Two very
+        // different situations produce it and the fix has to own that rather
+        // than assert the collision reading, which was written when the
+        // doctor's own session established the listener it then measured.
         Some(false) => CheckResult::new(
             CheckId::ForwardBound,
             Verdict::Fail,
             &format!("{listener} is not bound on the remote, though its sshd permits the tunnel"),
-            "That port on the remote is already taken — a collision, not a policy refusal. Give this laptop its own listen port, or drop the older session still holding it. Forward ports are per-remote, so two laptops using the same one collide.",
+            "Nothing is listening there right now. If a session to this remote is up as you read this, its tunnel did not bind — that port is taken by something else, so give this laptop its own listen port or drop whatever still holds it (forward ports are per-remote, so two laptops on the same one collide). If you are not connected, expect this: the tunnel exists only while a session does, so re-run this while connected to learn anything more.",
         ),
-        None => CheckResult::new(
-            CheckId::ForwardBound,
-            Verdict::Unknown,
-            "the live bind state on the remote was not observed",
-            "Nothing readable answered the loopback probe: either no reverse tunnel is configured to probe, or `bash` (used for a read-only `/dev/tcp` connect) is missing on the remote.",
-        ),
+        // A listen spec we refuse to probe is a DIFFERENT answer from "there
+        // was nothing to probe", and naming the value is the only way the user
+        // can act on it. See `probe_endpoint` for the accepted forms.
+        None => match listen.filter(|spec| probe_endpoint(spec).is_none()) {
+            Some(spec) => CheckResult::new(
+                CheckId::ForwardBound,
+                Verdict::Unknown,
+                &format!(
+                    "ssh resolved the listen spec `{spec}`, which is not a shape this probe will target"
+                ),
+                "The probe is refused rather than guessed at: a bind address is interpolated into a command the remote shell parses, so only an IPv4 literal, an IPv6 literal, or a hostname of letters, digits, `.` and `-` is accepted, with a port in range. Rewrite the `RemoteForward` listen address in `~/.ssh/config` as one of those, or probe the endpoint yourself.",
+            ),
+            None => CheckResult::new(
+                CheckId::ForwardBound,
+                Verdict::Unknown,
+                "the live bind state on the remote was not observed",
+                "Nothing readable answered the loopback probe: either no reverse tunnel is configured to probe, or `bash` (used for a read-only `/dev/tcp` connect) is missing on the remote.",
+            ),
+        },
     });
 
     // --- advisories -------------------------------------------------------
@@ -711,11 +806,26 @@ pub fn overall_verdict(checks: &[CheckResult]) -> Verdict {
 /// anything or serving a connection.
 const SSHD_DUMP_COMMAND: &str = "sshd -T";
 
+/// Maximum bytes kept from either stream of the remote `sshd -T` dump.
+///
+/// A real dump is ~100 short lines. 64 KiB leaves room for a verbose future
+/// sshd while bounding what a hostile remote can make the laptop hold: the
+/// wallclock deadline caps *duration*, not *bytes*, and
+/// `DOT_AGENT_DECK_SSH_PROBE_TIMEOUT_SECS` can stretch that to an hour. Output
+/// that actually reaches the cap is treated as UNKNOWN by [`observe`] — a
+/// truncated dump must never be parsed as an authoritative answer.
+const SSHD_DUMP_CAP: usize = 64 * 1024;
+
 /// Ask the ssh client to print its resolved configuration for `target`.
 ///
 /// `-G` does not connect, so this costs nothing and cannot fail because the
 /// host is down — which is why the resolved-forwards half of the report still
 /// renders when every other probe has given up.
+///
+/// Note the absence of the observation `-o` flags every *connecting* probe
+/// carries: `ClearAllForwardings=yes` would erase exactly the inventory this
+/// dump exists to read. `-G` opens no session, so none of the reasons for
+/// those flags applies here.
 fn ssh_config_dump_command(target: &SshTarget) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.arg("-G");
@@ -726,6 +836,82 @@ fn ssh_config_dump_command(target: &SshTarget) -> Command {
     cmd.arg("--");
     cmd.arg(target.user_host());
     cmd
+}
+
+/// Maximum bytes kept from either stream of the local `ssh -G` dump.
+///
+/// A real dump is ~80 short lines, a few KiB at most. 256 KiB is far more than
+/// any plausible configuration and still bounds the capture, which matters
+/// because `-G` runs a **local** subprocess whose output an included config
+/// file controls.
+const SSH_CONFIG_DUMP_CAP: usize = 256 * 1024;
+
+/// Read ssh's resolved client configuration for `target`, or explain why not.
+///
+/// The `Err` arm is the point. `-G` does not connect, but it is not
+/// consequence-free: OpenSSH **evaluates `Match exec`**, so an included
+/// `Match exec "sleep 30"` blocks it, and its output is not bounded by
+/// anything ssh does. Worse, the old implementation called `Command::output()`
+/// and parsed stdout **regardless of exit status**, so a failed or partial
+/// dump was presented as *definitive missing configuration* — the report would
+/// say "ssh resolved no reverse tunnel" when the truth was "I could not read
+/// your config". That is the same false confidence the PRD forbids for
+/// `sshd -T`, and the caller turns an `Err` here into UNKNOWN for every check
+/// derived from the dump.
+///
+/// Three ways to get an `Err`, all reported rather than papered over: the
+/// deadline fired (`run_local_bounded` SIGKILLs ssh — note that a descendant
+/// `Match exec` already forked is not signalled and is left to init), the exit
+/// status was non-zero, or a stream hit [`SSH_CONFIG_DUMP_CAP`] so what
+/// arrived is a prefix.
+fn read_resolved_ssh_config(target: &SshTarget) -> Result<ResolvedSshConfig, String> {
+    let secs = probe_timeout_secs();
+    let capture = run_local_bounded(
+        &mut ssh_config_dump_command(target),
+        secs,
+        SSH_CONFIG_DUMP_CAP,
+    )
+    .map_err(|err| format!("`ssh -G` could not be started ({err})"))?;
+    if capture.timed_out {
+        return Err(format!(
+            "`ssh -G` did not finish within {secs}s and was stopped; a `Match exec` directive in your ssh config can block it"
+        ));
+    }
+    if capture.truncated {
+        return Err(format!(
+            "`ssh -G` printed more than {} KiB, so the dump is a fragment and was not parsed",
+            SSH_CONFIG_DUMP_CAP / 1024
+        ));
+    }
+    match capture.status.and_then(|status| status.code()) {
+        Some(0) => Ok(parse_ssh_g(&String::from_utf8_lossy(&capture.stdout))),
+        Some(code) => Err(format!("`ssh -G` exited with status {code}")),
+        None => Err("`ssh -G` was terminated by a signal".to_string()),
+    }
+}
+
+/// Replace every check derived from the `ssh -G` dump with UNKNOWN, because
+/// the dump itself could not be read (review item 6).
+///
+/// Kept out of [`classify`] on purpose: the classifier's contract is pure
+/// observations in, ordered results out, and "the tool that produces the
+/// observations failed" is knowledge the probe layer has and the classifier
+/// does not. `ForwardBound` is absent from the list because it needs a listen
+/// spec that only the dump could have supplied, so it is already UNKNOWN.
+fn mark_ssh_config_unreadable(checks: &mut [CheckResult], reason: &str) {
+    const DERIVED: &[CheckId] = &[
+        CheckId::RemoteForward,
+        CheckId::DynamicForward,
+        CheckId::ExitOnForwardFailure,
+        CheckId::ForwardAgent,
+    ];
+    for check in checks.iter_mut().filter(|c| DERIVED.contains(&c.check)) {
+        check.verdict = Verdict::Unknown;
+        check.headline = "ssh's resolved configuration could not be read".to_string();
+        check.fix = format!(
+            "{reason}. Until that is fixed this says nothing about your configuration — run `ssh -G <host>` yourself to see what ssh resolves."
+        );
+    }
 }
 
 /// A read-only TCP connect against the remote's loopback, used to decide
@@ -740,11 +926,67 @@ fn forward_probe_command(host: &str, port: u16) -> String {
     format!("bash -c 'exec 3<>/dev/tcp/{host}/{port}'")
 }
 
-/// Resolve a `ssh -G` listen spec into the loopback endpoint to probe.
+/// Longest bind host accepted. The DNS ceiling for a fully qualified name;
+/// anything past it is not a hostname anyone configured on purpose.
+const MAX_BIND_HOST_LEN: usize = 255;
+
+/// Whether `host` is a bind address safe to interpolate into the remote
+/// command, and one of the forms the probe actually supports.
+///
+/// **This is a security boundary, not tidiness.** [`forward_probe_command`]
+/// puts `host` inside `bash -c 'exec 3<>/dev/tcp/{host}/{port}'`, and passing
+/// that whole string as one local `ssh` argv element protects only the *local*
+/// shell: OpenSSH hands the element to the remote **login shell**, which
+/// strips the outer quotes, and the nested `bash` then parses the interpolated
+/// host again. Two levels of shell parsing, both on the remote.
+///
+/// The bind host is attacker-reachable because `ssh -G` will happily resolve
+/// one out of `~/.ssh/config` — `RemoteForward "evil';id;#:1080"` resolves to
+/// `remoteforward [evil';id;#]:1080 [socks]:0`, which built
+/// `bash -c 'exec 3<>/dev/tcp/evil';id;#/1080'` and ran `id` on the remote
+/// under the authenticated account (verified against OpenSSH 10.2). A `$(…)`
+/// host does not even need to break the outer quote — the nested bash
+/// evaluates it in place.
+///
+/// So: **validate, don't quote.** Getting quoting right across two shell
+/// levels is possible and fragile, and no legitimate bind host contains a
+/// shell metacharacter. Accepted, and nothing else:
+///
+/// - an IPv4 literal (`127.0.0.1`),
+/// - an IPv6 literal (`::1`, `fe80::1` — brackets are stripped by the caller),
+/// - a hostname of ASCII letters, digits, `.` and `-`, at most
+///   [`MAX_BIND_HOST_LEN`] bytes.
+///
+/// Every accepted form is drawn from `[0-9a-zA-Z.:-]`, none of which is a
+/// metacharacter to either shell. Everything else — quotes, `$`, backticks,
+/// `;`, `|`, `&`, `(`, `)`, `<`, `>`, `#`, `*`, `?`, `\`, `/`, whitespace,
+/// control characters, non-ASCII — is rejected, and the caller turns a
+/// rejection into UNKNOWN naming the value rather than into a constructed
+/// command or a silent PASS. `/` is refused along with the rest: it would
+/// escape the `/dev/tcp/host/port` path shape even without a shell.
+fn is_probeable_bind_host(host: &str) -> bool {
+    if host.is_empty() || host.len() > MAX_BIND_HOST_LEN {
+        return false;
+    }
+    if host.parse::<std::net::Ipv4Addr>().is_ok() || host.parse::<std::net::Ipv6Addr>().is_ok() {
+        return true;
+    }
+    host.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+/// Resolve a `ssh -G` listen spec into the loopback endpoint to probe, or
+/// `None` when the spec is not a shape this is willing to probe.
 ///
 /// A bare port means ssh binds the remote's loopback, which is where the #97
 /// recipe expects the SOCKS listener. A wildcard bind is probed on loopback
 /// too — that is the address an agent on the remote would use.
+///
+/// The port is narrowed to a `u16`, which makes it inert; the bind host goes
+/// through [`is_probeable_bind_host`], which is what keeps a hostile listen
+/// spec out of the remote shell. Pure and total, so [`classify`] re-runs it to
+/// decide whether an unobserved forward means "refused to probe this spec" or
+/// "there was nothing to probe".
 fn probe_endpoint(listen: &str) -> Option<(String, u16)> {
     const LOOPBACK: &str = "127.0.0.1";
     if let Ok(port) = listen.parse::<u16>() {
@@ -757,17 +999,46 @@ fn probe_endpoint(listen: &str) -> Option<(String, u16)> {
         "" | "*" | "0.0.0.0" | "::" => LOOPBACK,
         other => other,
     };
+    if !is_probeable_bind_host(host) {
+        return None;
+    }
     Some((host.to_string(), port))
 }
 
+/// Maximum bytes kept from either stream of the liveness probe.
+///
+/// The command prints nothing on success and one short line on failure, so
+/// 4 KiB is generous. Capping matters because the wallclock deadline bounds
+/// *duration*, not *bytes*, and `DOT_AGENT_DECK_SSH_PROBE_TIMEOUT_SECS` lets a
+/// user stretch that window to an hour — long enough for a hostile remote
+/// streaming at line rate to matter.
+const FORWARD_PROBE_CAP: usize = 4 * 1024;
+
 /// Run the loopback probe and translate its exit status into an observation.
+///
+/// Returns `None` — UNKNOWN, never a claim about the port — when the listen
+/// spec is not one [`probe_endpoint`] will target, when the remote has no
+/// usable `bash`, or when the reply was too long to be the reply this command
+/// produces.
 fn probe_forward_bound(
     executor: &dyn SshExecutor,
     target: &SshTarget,
     listen: &str,
 ) -> Option<bool> {
     let (host, port) = probe_endpoint(listen)?;
-    match executor.run(target, &forward_probe_command(&host, port)) {
+    match executor.run_capped(
+        target,
+        &forward_probe_command(&host, port),
+        FORWARD_PROBE_CAP,
+    ) {
+        // A probe that hit its cap is not the terse reply this command
+        // produces, so nothing about the port can be concluded from it.
+        Ok(output)
+            if output.stdout.len() >= FORWARD_PROBE_CAP
+                || output.stderr.len() >= FORWARD_PROBE_CAP =>
+        {
+            None
+        }
         Ok(output) if output.status == 0 => Some(true),
         Ok(output) if output.status == 1 => {
             // bash exits 1 both for a refused connect and for a build without
@@ -793,6 +1064,10 @@ fn probe_forward_bound(
 struct Observations {
     inputs: DoctorInputs,
     ssh_detail: Option<String>,
+    /// Why `ssh -G` could not be read, when it could not. `Some` turns every
+    /// dump-derived check UNKNOWN via [`mark_ssh_config_unreadable`] instead
+    /// of letting an empty parse read as "nothing is configured".
+    ssh_config_unreadable: Option<String>,
 }
 
 /// Run every read-only probe against `target`.
@@ -805,13 +1080,14 @@ struct Observations {
 fn observe(executor: &dyn SshExecutor, target: &SshTarget, name: &str) -> Observations {
     let mut inputs = DoctorInputs::default();
     let mut ssh_detail = None;
+    let mut ssh_config_unreadable = None;
 
     // `ssh -G` first: it is the one probe that cannot fail because of the
     // network, so the resolved-configuration half of the report survives an
     // unreachable host.
-    match ssh_config_dump_command(target).output() {
-        Ok(output) => inputs.ssh = parse_ssh_g(&String::from_utf8_lossy(&output.stdout)),
-        Err(err) => ssh_detail = Some(format!("could not run `ssh -G`: {err}")),
+    match read_resolved_ssh_config(target) {
+        Ok(config) => inputs.ssh = config,
+        Err(reason) => ssh_config_unreadable = Some(reason),
     }
 
     match probe_remote_version(executor, target, name, REMOTE_INSTALL_PATH) {
@@ -854,15 +1130,25 @@ fn observe(executor: &dyn SshExecutor, target: &SshTarget, name: &str) -> Observ
     }
 
     if inputs.host_reachable != Some(false) {
-        if let Ok(output) = executor.run(target, SSHD_DUMP_COMMAND) {
-            inputs.sshd = parse_sshd_t(output.status, &output.stdout, &output.stderr);
+        if let Ok(output) = executor.run_capped(target, SSHD_DUMP_COMMAND, SSHD_DUMP_CAP) {
+            // A dump that reached its cap is a fragment, and a fragment parsed
+            // as if complete is exactly the "confident wrong answer" the PRD
+            // forbids for this probe: the missing tail is indistinguishable
+            // from a key sshd never printed. Leave both fields UNKNOWN.
+            if output.stdout.len() < SSHD_DUMP_CAP && output.stderr.len() < SSHD_DUMP_CAP {
+                inputs.sshd = parse_sshd_t(output.status, &output.stdout, &output.stderr);
+            }
         }
         if let Some(listen) = reverse_listen(&inputs.ssh) {
             inputs.forward_bound = probe_forward_bound(executor, target, listen);
         }
     }
 
-    Observations { inputs, ssh_detail }
+    Observations {
+        inputs,
+        ssh_detail,
+        ssh_config_unreadable,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -874,6 +1160,102 @@ const VERDICT_WIDTH: usize = 7;
 /// Column width for the check identity, wide enough for `ExitOnForwardFailure`.
 const CHECK_WIDTH: usize = 20;
 
+/// Every verdict token that may appear in a report line, for the shape
+/// invariant [`report_shape_violation`] enforces.
+const VERDICT_TOKENS: &[&str] = &["PASS", "WARN", "FAIL", "UNKNOWN"];
+
+/// Every check identity, for the same invariant.
+const ALL_CHECKS: &[CheckId] = &[
+    CheckId::HostReachable,
+    CheckId::RemoteBinary,
+    CheckId::ProtocolCompatible,
+    CheckId::RemoteForward,
+    CheckId::DynamicForward,
+    CheckId::ExitOnForwardFailure,
+    CheckId::AllowTcpForwarding,
+    CheckId::ClientAliveInterval,
+    CheckId::ForwardBound,
+    CheckId::ForwardAgent,
+];
+
+/// Whether `line` carries `token` as a whole alphabetic word, case-insensitively.
+///
+/// Word-wise, not substring-wise, and matching how the L2 tests read a report:
+/// `failover` must not count as `FAIL`.
+fn carries_word(line: &str, token: &str) -> bool {
+    line.split(|c: char| !c.is_ascii_alphabetic())
+        .any(|word| word.eq_ignore_ascii_case(token))
+}
+
+/// Whether `line` names `check`, matching how the L2 tests read a report:
+/// strip everything but alphanumerics, lowercase, then look for the identity.
+fn names_check(line: &str, check: CheckId) -> bool {
+    let normalize = |s: &str| -> String {
+        s.chars()
+            .filter(char::is_ascii_alphanumeric)
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    normalize(line).contains(&normalize(check.label()))
+}
+
+/// The report's shape contract, or `None` when `check`'s lines honour it
+/// (review note N2).
+///
+/// **One verdict-bearing line per check, naming exactly that one check.** The
+/// L2 tests locate a check's result by scanning for the single line that
+/// carries both its identity and a verdict token, so a second such line makes
+/// the check unfindable rather than merely untidy. That is why the fix goes on
+/// its own continuation line: `ForwardBound`'s fix deliberately names
+/// `AllowTcpForwarding`, which is only safe because a fix line carries no
+/// verdict token. The contract was real and load-bearing and written down
+/// nowhere; this is where it is written down, and `render`'s `debug_assert!`
+/// is where a future edit that breaks it fails fast instead of silently.
+///
+/// Scope, deliberately: this guards text **this module authors**. Headlines
+/// also interpolate values resolved out of the user's ssh config (a listen
+/// spec, a destination), so a host literally named `fail` could trip it in a
+/// debug build. That is why it is a `debug_assert!` — compiled out of the
+/// release binary users run — and the maintainer guard it buys is worth far
+/// more than the theoretical debug-build panic it costs.
+fn report_shape_violation(
+    check: &CheckResult,
+    verdict_line: &str,
+    fix_line: &str,
+) -> Option<String> {
+    let verdicts: Vec<&str> = VERDICT_TOKENS
+        .iter()
+        .copied()
+        .filter(|token| carries_word(verdict_line, token))
+        .collect();
+    if verdicts.len() != 1 {
+        return Some(format!(
+            "a check's verdict line must carry exactly one of PASS/WARN/FAIL/UNKNOWN, found {verdicts:?} in: {verdict_line}"
+        ));
+    }
+    let named: Vec<&str> = ALL_CHECKS
+        .iter()
+        .filter(|id| names_check(verdict_line, **id))
+        .map(|id| id.label())
+        .collect();
+    if named != [check.check.label()] {
+        return Some(format!(
+            "a check's verdict line must name exactly its own identity, found {named:?} in: {verdict_line}"
+        ));
+    }
+    let stray: Vec<&str> = VERDICT_TOKENS
+        .iter()
+        .copied()
+        .filter(|token| carries_word(fix_line, token))
+        .collect();
+    if !stray.is_empty() {
+        return Some(format!(
+            "a fix line must carry no verdict token (it would become a second report line for whichever check it names), found {stray:?} in: {fix_line}"
+        ));
+    }
+    None
+}
+
 /// Write the report.
 ///
 /// The shape is a contract the L2 tests depend on: **one verdict-bearing line
@@ -881,7 +1263,22 @@ const CHECK_WIDTH: usize = 20;
 /// / FAIL / UNKNOWN. The fix deliberately goes on its own continuation line,
 /// which keeps a phrase like "reverse tunnels" or "`AllowTcpForwarding yes`"
 /// out of the line that is being matched for a single identity and a single
-/// verdict.
+/// verdict. [`report_shape_violation`] states that contract precisely and the
+/// `debug_assert!` below enforces it.
+///
+/// **Everything a producer controls is escaped on the way out**, through
+/// [`escape_control_and_bidi`]: the registry name and target, the listen specs
+/// and destinations `ssh -G` resolved, and above all ssh's own stderr, which
+/// this quotes back at the user. A malicious remote binary, shell startup file
+/// or ssh endpoint can otherwise emit CSI/OSC sequences that clear or repaint
+/// the report, retitle the terminal, forge a hyperlink or drive the clipboard
+/// — and the sharpest version of that is a diagnostic whose own security
+/// conclusions the endpoint being diagnosed can visually falsify, needing no
+/// local config write at all. Escaping rather than stripping is the deliberate
+/// choice for a diagnostic: the user should be able to *see* that the remote
+/// sent something peculiar. (Raw `sshd -T` output never reaches here —
+/// `AllowTcpForwarding` becomes a closed enum and `ClientAliveInterval` a
+/// `u64`. Keep it that way.)
 fn render(
     out: &mut impl Write,
     name: &str,
@@ -890,34 +1287,53 @@ fn render(
     checks: &[CheckResult],
     overall: Verdict,
 ) -> io::Result<()> {
+    let safe_name = escape_control_and_bidi(name);
     writeln!(
         out,
-        "Diagnosing remote '{name}' at {}:{} (read-only)",
-        target.user_host(),
+        "Diagnosing remote '{safe_name}' at {}:{} (read-only)",
+        escape_control_and_bidi(&target.user_host()),
         target.port
     )?;
     if let Some(detail) = &observations.ssh_detail {
         // First line only, and capped: ssh's own complaint is useful context
-        // but a multi-line dump would drown the report.
+        // but a multi-line dump would drown the report. Escape AFTER taking
+        // the first line and the first 200 characters, so an escape expanding
+        // to several characters cannot smuggle bytes past the cap.
         let first = detail.lines().next().unwrap_or_default().trim();
         if !first.is_empty() {
             let quoted: String = first.chars().take(200).collect();
-            writeln!(out, "ssh itself said: {quoted}")?;
+            writeln!(out, "ssh itself said: {}", escape_control_and_bidi(&quoted))?;
         }
     }
     writeln!(out)?;
 
     for check in checks {
-        writeln!(
-            out,
+        // `<name>` is substituted in BOTH the headline and the fix (review
+        // note N3). Only fixes use the placeholder today; substituting both
+        // removes the trap where a headline that adopts it silently renders
+        // the literal `<name>`.
+        let headline = escape_control_and_bidi(&check.headline).replace("<name>", &safe_name);
+        let verdict_line = format!(
             "{verdict:<VERDICT_WIDTH$} {check_id:<CHECK_WIDTH$} {headline}",
             verdict = check.verdict.label(),
             check_id = check.check.label(),
-            headline = check.headline,
-        )?;
-        if !check.fix.is_empty() {
+        );
+        let fix_line = if check.fix.is_empty() {
+            String::new()
+        } else {
             let indent = " ".repeat(VERDICT_WIDTH + 1);
-            writeln!(out, "{indent}-> {}", check.fix.replace("<name>", name))?;
+            let fix = escape_control_and_bidi(&check.fix).replace("<name>", &safe_name);
+            format!("{indent}-> {fix}")
+        };
+        debug_assert!(
+            report_shape_violation(check, &verdict_line, &fix_line).is_none(),
+            "{}",
+            report_shape_violation(check, &verdict_line, &fix_line).unwrap_or_default()
+        );
+
+        writeln!(out, "{verdict_line}")?;
+        if !fix_line.is_empty() {
+            writeln!(out, "{fix_line}")?;
         }
     }
 
@@ -947,9 +1363,15 @@ pub fn run_doctor(
     let entry = lookup_remote(name, registry_path)?;
     let target = entry.ssh_target();
 
-    let executor = SystemSshExecutor::with_wallclock_timeout(probe_timeout_secs());
+    // `for_observation`, not `with_wallclock_timeout`: see the module doc. An
+    // ordinary executor would make every probe apply the user's `Host` block,
+    // so the doctor would create the forwards it is here to inspect.
+    let executor = SystemSshExecutor::for_observation(probe_timeout_secs());
     let observations = observe(&executor, &target, name);
-    let checks = classify(&observations.inputs);
+    let mut checks = classify(&observations.inputs);
+    if let Some(reason) = &observations.ssh_config_unreadable {
+        mark_ssh_config_unreadable(&mut checks, reason);
+    }
     let overall = overall_verdict(&checks);
 
     render(out, name, &target, &observations, &checks, overall)?;
@@ -1337,5 +1759,419 @@ remoteforward 1080 [socks]:0
             Verdict::Unknown
         );
         assert_eq!(overall_verdict(&results), Verdict::Unknown);
+    }
+
+    // -----------------------------------------------------------------
+    // Audit regressions (PRD #345 review + security audit)
+    // -----------------------------------------------------------------
+
+    /// Every listen spec whose bind host must never reach the remote shell.
+    ///
+    /// The first entry is the audit's live proof of concept: a legal
+    /// `RemoteForward "evil';id;#:1080"` in `~/.ssh/config` resolves, under
+    /// OpenSSH 10.2, to `remoteforward [evil';id;#]:1080 [socks]:0`, and the
+    /// old builder turned that into
+    /// `bash -c 'exec 3<>/dev/tcp/evil';id;#/1080'` — running `id` on the
+    /// remote under the authenticated account. The rest cover the other ways
+    /// two levels of shell parsing can be reached.
+    const HOSTILE_LISTEN_SPECS: &[&str] = &[
+        "[evil';id;#]:1080",       // the audit's proof of concept
+        "[$(id)]:1080",            // survives the outer quote entirely
+        "[`id`]:1080",             // backtick substitution
+        "[a;id]:1080",             // bare command separator
+        "[a|id]:1080",             // pipeline
+        "[a&id]:1080",             // background / list operator
+        "[a b]:1080",              // whitespace splits the nested argv
+        "[a\tb]:1080",             // and so does a tab
+        "[../../etc/passwd]:1080", // `/` escapes the /dev/tcp path shape
+        "[a/b]:1080",              // any `/` at all
+        "[a>b]:1080",              // redirection
+        "[a<b]:1080",
+        "[a*]:1080", // glob
+        "[a?]:1080",
+        "[a\\b]:1080",       // backslash
+        "[a\"b]:1080",       // double quote
+        "[a'b]:1080",        // single quote on its own
+        "[a$b]:1080",        // parameter expansion
+        "[a\nb]:1080",       // embedded newline
+        "[a\rb]:1080",       // carriage return
+        "[a\x1bb]:1080",     // ESC
+        "[a\0b]:1080",       // NUL
+        "[a\u{202e}b]:1080", // bidi override
+        "[héllo]:1080",      // non-ASCII
+    ];
+
+    /// Scenario: Feed `probe_endpoint` every hostile listen spec the audit
+    /// found or implied. Each is refused outright, so no remote command is ever
+    /// constructed from it and no probe silently reports the port as free.
+    #[test]
+    fn probe_endpoint_rejects_every_shell_metacharacter_in_a_bind_host() {
+        for spec in HOSTILE_LISTEN_SPECS {
+            assert_eq!(
+                probe_endpoint(spec),
+                None,
+                "hostile listen spec {spec:?} must be refused before a command is built"
+            );
+        }
+
+        // The port half was already inert (`u16`), but prove it stays that way
+        // rather than falling through to some other parse.
+        for spec in ["1080; id", "[127.0.0.1]:$(id)", "[127.0.0.1]:70000"] {
+            assert_eq!(probe_endpoint(spec), None, "bad port in {spec:?}");
+        }
+    }
+
+    /// Scenario: Feed `probe_endpoint` the address forms the recipe actually
+    /// uses; each resolves to a loopback-or-literal endpoint, and the command
+    /// built from it contains nothing either shell would interpret.
+    #[test]
+    fn probe_endpoint_accepts_the_supported_forms_and_builds_an_inert_command() {
+        let cases = [
+            ("1080", "127.0.0.1", 1080u16),
+            ("127.0.0.1:1080", "127.0.0.1", 1080),
+            ("localhost:1080", "localhost", 1080),
+            ("db-1.internal.example:8080", "db-1.internal.example", 8080),
+            ("[::1]:1080", "::1", 1080),
+            ("[fe80::1]:1080", "fe80::1", 1080),
+            // Wildcard binds are probed on loopback: that is the address an
+            // agent ON the remote would use.
+            ("*:1080", "127.0.0.1", 1080),
+            ("0.0.0.0:1080", "127.0.0.1", 1080),
+            ("[::]:1080", "127.0.0.1", 1080),
+            (":1080", "127.0.0.1", 1080),
+        ];
+
+        for (spec, host, port) in cases {
+            assert_eq!(
+                probe_endpoint(spec),
+                Some((host.to_string(), port)),
+                "supported listen spec {spec:?}"
+            );
+            let command = forward_probe_command(host, port);
+            // The remote login shell strips the outer quotes and a nested bash
+            // parses the result, so the accepted alphabet has to be inert to
+            // BOTH. Anything outside it is what the validator exists to stop.
+            let inert = command
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || " -/<>:'.".contains(c));
+            assert!(inert, "built command carries a metacharacter: {command:?}");
+        }
+    }
+
+    /// Scenario: A `ssh -G` dump resolves a bind host the probe refuses. The
+    /// live-bind check reports UNKNOWN and names the exact rejected spec, so
+    /// the user can find it — never PASS, and never a constructed command.
+    #[test]
+    fn classify_names_the_rejected_listen_spec_instead_of_probing_it() {
+        let mut inputs = healthy_inputs();
+        inputs.ssh.forwards = vec![ResolvedForward::RemoteDynamic {
+            listen: "[evil';id;#]:1080".to_string(),
+        }];
+        // What `observe` would have recorded: refused, so never observed.
+        inputs.forward_bound = None;
+
+        let results = classify(&inputs);
+        let result = check(&results, CheckId::ForwardBound);
+
+        assert_eq!(result.verdict, Verdict::Unknown);
+        assert!(
+            result.headline.contains("evil';id;#"),
+            "the hint must name the rejected value: {result:#?}"
+        );
+        assert_ne!(overall_verdict(&results), Verdict::Pass);
+    }
+
+    /// Scenario: The remote speaks a different attach protocol version. That is
+    /// fatal to `connect`, so the doctor reports FAIL — a remote you cannot
+    /// attach to must never read as an all-clear diagnosis.
+    #[test]
+    fn classify_protocol_mismatch_is_fatal_not_advisory() {
+        let mut inputs = healthy_inputs();
+        inputs.protocol_compatible = Some(false);
+        let results = classify(&inputs);
+        let result = check(&results, CheckId::ProtocolCompatible);
+
+        assert_eq!(
+            result.verdict,
+            Verdict::Fail,
+            "`connect` refuses a protocol skew outright (src/connect.rs, PRD #161 D3), so the \
+             doctor must not downgrade it below what connect enforces: {result:#?}"
+        );
+        assert_eq!(overall_verdict(&results), Verdict::Fail);
+        assert_eq!(overall_verdict(&results).exit_code(), 1);
+        // The issue #491 nuance is still useful context; it just must not set
+        // the verdict.
+        assert!(result.fix.contains("491"), "{result:#?}");
+        assert!(result.fix.contains("remote upgrade"), "{result:#?}");
+    }
+
+    /// Scenario: Map each aggregate verdict to its exit code. A failed check
+    /// and an incomplete diagnosis are both non-zero but distinguishable, so
+    /// "healthy tunnel, sshd unreadable without root" is scriptable.
+    #[test]
+    fn verdict_exit_codes_separate_failure_from_incompleteness() {
+        assert_eq!(Verdict::Pass.exit_code(), 0);
+        assert_eq!(Verdict::Warn.exit_code(), 0);
+        assert_eq!(Verdict::Fail.exit_code(), 1);
+        assert_eq!(Verdict::Unknown.exit_code(), 2);
+
+        // The case the split exists for: everything readable is healthy, but
+        // `sshd -T` needed root we did not have.
+        let mut inputs = healthy_inputs();
+        inputs.sshd = ResolvedSshdConfig::default();
+        let verdict = overall_verdict(&classify(&inputs));
+        assert_eq!(verdict, Verdict::Unknown);
+        assert_eq!(verdict.exit_code(), 2);
+
+        // And it is still distinguishable from a genuinely broken tunnel.
+        let mut broken = healthy_inputs();
+        broken.forward_bound = Some(false);
+        assert_eq!(overall_verdict(&classify(&broken)).exit_code(), 1);
+
+        // Both non-zero: an UNKNOWN never reads as PASS.
+        assert_ne!(Verdict::Unknown.exit_code(), 0);
+    }
+
+    /// Scenario: `ExitOnForwardFailure` is unset with and without a reverse
+    /// tunnel configured. The two verdicts get different headlines, so someone
+    /// comparing two runs is not left with only the verdict token to go on.
+    #[test]
+    fn exit_on_forward_failure_headlines_differ_between_fail_and_warn() {
+        for setting in [Some(false), None] {
+            let mut with_tunnel = healthy_inputs();
+            with_tunnel.ssh.exit_on_forward_failure = setting;
+            let failing = check(&classify(&with_tunnel), CheckId::ExitOnForwardFailure).clone();
+
+            let mut without_tunnel = with_tunnel.clone();
+            without_tunnel.ssh.forwards.clear();
+            without_tunnel.forward_bound = None;
+            let warning = check(&classify(&without_tunnel), CheckId::ExitOnForwardFailure).clone();
+
+            assert_eq!(failing.verdict, Verdict::Fail, "{failing:#?}");
+            assert_eq!(warning.verdict, Verdict::Warn, "{warning:#?}");
+            assert_ne!(
+                failing.headline, warning.headline,
+                "the two forms must not be separable only by their verdict token: {failing:#?}"
+            );
+            assert!(
+                warning
+                    .headline
+                    .contains("harmless until you configure a tunnel"),
+                "the WARN form must say why it is milder: {warning:#?}"
+            );
+        }
+    }
+
+    /// Scenario: A status-0 `sshd -T` run prints a real dump alongside a benign
+    /// warning containing "not found". The dump is still parsed — only the
+    /// permission markers, and a non-zero status, discard it.
+    #[test]
+    fn sshd_t_benign_status_zero_warning_does_not_discard_a_real_dump() {
+        let dump = "allowtcpforwarding yes\nclientaliveinterval 30\n";
+        for benign in [
+            "/etc/ssh/sshd_config.d/50-cloud.conf: line 3: Deprecated option; key not found",
+            "Could not open /etc/ssh/moduli: no such file, continuing",
+        ] {
+            let sshd = parse_sshd_t(0, dump, benign);
+            assert_eq!(
+                sshd.allow_tcp_forwarding,
+                Some(AllowTcpForwarding::Yes),
+                "a benign warning must not discard a readable dump: {benign:?}"
+            );
+            assert_eq!(sshd.client_alive_interval, Some(30));
+        }
+
+        // The markers that DO mean "we were not allowed to look" still bite.
+        for denial in ["Permission denied", "Operation not permitted"] {
+            assert_eq!(parse_sshd_t(0, dump, denial).allow_tcp_forwarding, None);
+        }
+    }
+
+    /// Scenario: `ssh -G` could not be read at all. Every check derived from it
+    /// becomes UNKNOWN with the reason, rather than reporting an empty parse as
+    /// definitive "no forward is configured".
+    #[test]
+    fn unreadable_ssh_config_is_unknown_not_definitive_absence() {
+        // What the old code did: an unreadable dump parsed to an empty config,
+        // which classifies as a confident FAIL.
+        let confident = classify(&DoctorInputs::default());
+        assert_eq!(
+            check(&confident, CheckId::RemoteForward).verdict,
+            Verdict::Fail
+        );
+
+        let mut checks = confident.clone();
+        mark_ssh_config_unreadable(&mut checks, "`ssh -G` exited with status 255");
+
+        for id in [
+            CheckId::RemoteForward,
+            CheckId::DynamicForward,
+            CheckId::ExitOnForwardFailure,
+            CheckId::ForwardAgent,
+        ] {
+            let result = check(&checks, id);
+            assert_eq!(result.verdict, Verdict::Unknown, "{result:#?}");
+            assert!(result.fix.contains("status 255"), "{result:#?}");
+        }
+        // Checks that never came from the dump are untouched.
+        assert_eq!(
+            check(&checks, CheckId::HostReachable).verdict,
+            check(&confident, CheckId::HostReachable).verdict
+        );
+
+        // And the substituted text still honours the report's shape contract,
+        // which `render`'s `debug_assert!` enforces on the way through.
+        let target = SshTarget {
+            host: "prod.example.test".to_string(),
+            user: None,
+            port: 22,
+            key: None,
+        };
+        let observations = Observations {
+            inputs: DoctorInputs::default(),
+            ssh_detail: None,
+            ssh_config_unreadable: Some("`ssh -G` exited with status 255".to_string()),
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let overall = overall_verdict(&checks);
+        render(&mut out, "prod", &target, &observations, &checks, overall)
+            .expect("rendering to a Vec cannot fail");
+        assert!(String::from_utf8_lossy(&out).contains("could not be read"));
+    }
+
+    fn rendered(name: &str, observations: &Observations) -> String {
+        let target = SshTarget {
+            host: "prod.example.test".to_string(),
+            user: Some("deck".to_string()),
+            port: 2222,
+            key: None,
+        };
+        let checks = classify(&observations.inputs);
+        let overall = overall_verdict(&checks);
+        let mut out: Vec<u8> = Vec::new();
+        render(&mut out, name, &target, observations, &checks, overall)
+            .expect("rendering to a Vec cannot fail");
+        String::from_utf8(out).expect("the report is UTF-8")
+    }
+
+    /// Scenario: A hostile remote answers the version probe with terminal
+    /// escape sequences and a bidi override, and the registry name carries them
+    /// too. The report escapes every one of them, so the endpoint being
+    /// diagnosed cannot repaint the diagnosis of itself.
+    #[test]
+    fn render_escapes_producer_controlled_text_instead_of_emitting_it() {
+        let mut inputs = healthy_inputs();
+        inputs.ssh.forwards = vec![ResolvedForward::Remote {
+            // The listen spec and destination come straight from `ssh -G`.
+            listen: "\u{202e}1080".to_string(),
+            destination: "db\x1b]0;pwn\x07.internal:5432".to_string(),
+        }];
+        let observations = Observations {
+            inputs,
+            // ssh's own stderr, quoted back at the user verbatim before this.
+            ssh_detail: Some(
+                "\x1b[2J\x1b[Hcleared the screen\r\nPASS AllowTcpForwarding all fine".to_string(),
+            ),
+            ssh_config_unreadable: None,
+        };
+        let report = rendered("prod\x1b[31m\u{202e}", &observations);
+
+        assert!(
+            !report
+                .chars()
+                .any(|c| (c.is_control() && c != '\n')
+                    || crate::untrusted_text::is_bidi_format_char(c)),
+            "a live control or bidi character survived into the report:\n{report:?}"
+        );
+        // Escaped, not stripped: a diagnostic should SHOW that the remote sent
+        // something peculiar.
+        assert!(report.contains("\\u{1b}"), "{report}");
+        assert!(report.contains("\\u{202e}"), "{report}");
+        // The quote is still first-line-only, so the forged verdict line that
+        // followed the CR/LF never reaches the report at all.
+        assert!(
+            !report.contains("all fine"),
+            "only ssh's first line may be quoted:\n{report}"
+        );
+    }
+
+    /// Scenario: Render a healthy report and read it back the way the L2 tests
+    /// do. Every check identity appears on exactly one verdict-bearing line,
+    /// and `ForwardBound`'s fix names another check without becoming a second
+    /// such line.
+    #[test]
+    fn render_holds_the_one_check_one_verdict_per_line_contract() {
+        let mut inputs = healthy_inputs();
+        // The load-bearing case: this FAIL's fix names `AllowTcpForwarding`.
+        inputs.forward_bound = Some(false);
+        inputs.sshd.allow_tcp_forwarding = Some(AllowTcpForwarding::No);
+        let observations = Observations {
+            inputs,
+            ssh_detail: None,
+            ssh_config_unreadable: None,
+        };
+        let report = rendered("prod", &observations);
+
+        assert!(
+            report.contains("AllowTcpForwarding` on the remote first"),
+            "the fix that makes this contract load-bearing is gone:\n{report}"
+        );
+        for id in ALL_CHECKS {
+            let matches: Vec<&str> = report
+                .lines()
+                .filter(|line| {
+                    names_check(line, *id) && VERDICT_TOKENS.iter().any(|t| carries_word(line, t))
+                })
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "check {} must appear on exactly one verdict-bearing line, found {matches:#?}\n\n{report}",
+                id.label()
+            );
+        }
+    }
+
+    /// Scenario: Hand the shape invariant the two mistakes it exists to catch —
+    /// a fix line that says FAIL, and a headline that names a second check —
+    /// and confirm each is reported rather than silently shipped.
+    #[test]
+    fn report_shape_violation_catches_a_fix_that_carries_a_verdict() {
+        let result = CheckResult::new(
+            CheckId::ForwardBound,
+            Verdict::Fail,
+            "port 1080 is not bound on the remote",
+            "fix it",
+        );
+        let good = "FAIL    ForwardBound         port 1080 is not bound on the remote";
+        assert_eq!(
+            report_shape_violation(&result, good, "        -> Fix `AllowTcpForwarding` first."),
+            None,
+            "naming another check in a FIX line is allowed and load-bearing"
+        );
+
+        // A fix that also carries a verdict token becomes a second report line
+        // for whichever check it names.
+        assert!(
+            report_shape_violation(
+                &result,
+                good,
+                "        -> Fix `AllowTcpForwarding` or this will FAIL."
+            )
+            .is_some()
+        );
+        // A headline that names a second check makes both unfindable.
+        assert!(
+            report_shape_violation(
+                &result,
+                "FAIL    ForwardBound         AllowTcpForwarding is to blame",
+                ""
+            )
+            .is_some()
+        );
+        // And a verdict line with two verdict tokens is ambiguous.
+        assert!(
+            report_shape_violation(&result, "FAIL    ForwardBound  it did not PASS", "").is_some()
+        );
     }
 }

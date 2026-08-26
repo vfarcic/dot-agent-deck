@@ -246,6 +246,8 @@ dot-agent-deck remote doctor desk-vm
 
 It resolves the name from your remote registry, runs a fixed ordered list of checks, and prints each as PASS / WARN / FAIL / UNKNOWN with the directive and the file to change. It is **read-only**: it never edits your ssh config, the remote's `sshd_config`, the registry, or anything else on the remote. Every remote command it runs is a query — `sshd -T` to read the resolved sshd policy, and a `/dev/tcp` connect to see whether the forward is actually listening.
 
+Read-only extends to the ssh sessions themselves. Every session the doctor opens passes `-o ClearAllForwardings=yes -o ControlMaster=no -o ControlPath=none -o PermitLocalCommand=no -o UpdateHostKeys=no`, so it creates none of the forwards your `Host` block asks for, leaves no persistent master connection behind, runs no `LocalCommand`, and does not rewrite `known_hosts`. Host-key *verification* is untouched — that is a security control, not a mutation. Two consequences worth knowing: the doctor's own probes are immune to the forwarding problems it is diagnosing (so reachability is reported cleanly instead of cascading into UNKNOWN), and `ForwardBound` reports on **pre-existing** state rather than on a listener the doctor created for itself. The one command that does *not* get those options is `ssh -G`, which never connects and whose whole purpose is to show the forwards the others suppress.
+
 A healthy remote reads top to bottom, cause before symptom:
 
 ```
@@ -265,7 +267,15 @@ PASS    ForwardAgent         agent forwarding is off for this destination
 Overall: PASS
 ```
 
-The exit status is 0 only when the diagnosis is clear — every check PASS, or at most an advisory WARN. A failed check exits non-zero, **and so does an UNKNOWN one**: a diagnostic that reports "fine" when it could not actually look is worse than one that admits it does not know.
+There are **three exit codes**, so a script can tell the outcomes apart:
+
+| Code | Meaning |
+|---|---|
+| `0` | Clear. Every check PASSed, or at most raised an advisory WARN. |
+| `1` | A check FAILed — or the command could not run at all (unknown name, unreadable registry). |
+| `2` | Incomplete. No FAIL, but at least one check is UNKNOWN. |
+
+Both non-zero codes keep the promise that an UNKNOWN never reads as PASS: a diagnostic that reports "fine" when it could not actually look is worse than one that admits it does not know. Separating them is what makes the most common real-world outcome — a perfectly healthy tunnel on a host where `sshd -T` needs a root you do not have — a stable, scriptable `2` instead of something indistinguishable from a broken tunnel.
 
 #### Which check covers which caveat
 
@@ -275,7 +285,7 @@ The exit status is 0 only when the diagnosis is clear — every check PASS, or a
 | A forward that fails silently | `ExitOnForwardFailure` | `ssh -G` |
 | `DynamicForward` pointing the wrong way | `DynamicForward` | `ssh -G` |
 | Nothing forwarded at all | `RemoteForward` | `ssh -G` |
-| Two laptops on the same listen port | `ForwardBound` | a loopback connect on the remote |
+| Two laptops on the same listen port | `ForwardBound` + `AllowTcpForwarding` | a loopback connect on the remote, read against the sshd policy |
 | A listener orphaned by a sleeping laptop | `ClientAliveInterval` | `sshd -T` over ssh |
 | `ForwardAgent yes` (advisory, never a failure) | `ForwardAgent` | `ssh -G` |
 | The ordinary broken-ssh case | `HostReachable` | the deck's existing version probe |
@@ -304,7 +314,7 @@ PASS    HostReachable        ssh connected and authenticated
 PASS    AllowTcpForwarding   the remote's sshd permits reverse (`-R`) tunnels (`AllowTcpForwarding yes`)
 PASS    ClientAliveInterval  the remote's sshd probes idle sessions every 30s
 FAIL    ForwardBound         port 1080 is not bound on the remote, though its sshd permits the tunnel
-        -> That port on the remote is already taken — a collision, not a policy refusal. Give this laptop its own listen port, or drop the older session still holding it. Forward ports are per-remote, so two laptops using the same one collide.
+        -> Nothing is listening there right now. If a session to this remote is up as you read this, its tunnel did not bind — that port is taken by something else, so give this laptop its own listen port or drop whatever still holds it (forward ports are per-remote, so two laptops on the same one collide). If you are not connected, expect this: the tunnel exists only while a session does, so re-run this while connected to learn anything more.
 ```
 
 Note that `HostReachable` is PASS in both. ssh reached the host and authenticated fine; only the forward failed. Before issue #344 the deck classified this as an unreachable host and burned its reconnect budget against a network path that was never broken — which is the fourth failure mode, and the reason the doctor's own first check had to be fixed before the rest was worth building.
@@ -322,7 +332,17 @@ UNKNOWN ClientAliveInterval  could not read the remote's sshd keepalive policy
 Overall: UNKNOWN
 ```
 
-The `ForwardBound` check degrades the same way when the remote has no `bash` for the `/dev/tcp` probe: UNKNOWN, not a claim that the port is free.
+The `ForwardBound` check degrades the same way when the remote has no `bash` for the `/dev/tcp` probe: UNKNOWN, not a claim that the port is free. It also refuses to probe a listen address that is not a plain IPv4 literal, IPv6 literal, or a hostname of letters, digits, `.` and `-` — a bind address ends up inside a command the remote's shell parses, so anything else is reported as UNKNOWN naming the value rather than guessed at.
+
+#### What `ForwardBound` does and does not tell you
+
+Because the doctor's sessions create no forwards, this check answers exactly one question: **is something already listening on that port on the remote?** Three limits follow from that, and none of them is fixable without the doctor binding the port itself, which is the mutation it refuses:
+
+- A listener that answers might be a live session of yours, or an unrelated service holding the port. A TCP connect cannot tell them apart, so read this line together with whether you are actually connected right now.
+- Nothing listening is the normal state when no session is up. Run the doctor **while connected** if you want this line to say something about your tunnel.
+- Only the **first** reverse forward `ssh -G` resolved is probed. A `Host` block with several is listed in full by `RemoteForward`, but liveness is checked for one listener — enough for the single-tunnel recipe above, which is the case this was built for.
+
+The two causes this command exists to separate do not depend on any of that: `AllowTcpForwarding` is read from the remote's own sshd and is independent of the liveness probe.
 
 #### Reproducing the failure modes yourself
 

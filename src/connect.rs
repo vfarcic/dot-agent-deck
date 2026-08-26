@@ -354,6 +354,23 @@ fn parse_version_output(stdout: &str) -> Option<String> {
     Some(version.to_string())
 }
 
+/// Maximum bytes the binary-version probe keeps from either stream.
+///
+/// `dot-agent-deck --version` prints one short line, and the biggest thing ssh
+/// itself ever writes here is a handful of lines of transport complaint, so
+/// 8 KiB is three orders of magnitude of headroom. The cap is not about the
+/// honest case: `SshExecutor::run` drains both pipes with `read_to_end`, and
+/// the wallclock deadline bounds *duration*, not *bytes* — so before this a
+/// hostile remote (or a shell startup file that never stops printing) could
+/// stream at line rate for the whole
+/// `DOT_AGENT_DECK_SSH_PROBE_TIMEOUT_SECS` window, which the user can stretch
+/// to an hour, and grow the laptop's capture the entire time. Same class of
+/// bug, and same remedy, as the bounded `--task-file`/stdin reads in `f6162aa`
+/// (issue #328). Applies symmetrically to stdout and stderr under
+/// [`crate::remote::SystemSshExecutor`]; stderr matters here because it is the
+/// stream this function quotes back into `HostUnreachable`.
+pub const PROBE_VERSION_CAP: usize = 8 * 1024;
+
 /// Run a one-shot version probe over ssh and return the remote's version.
 ///
 /// PRD #161 M1.2 (D3): this probe is part of the connect **floor** — it
@@ -390,7 +407,7 @@ pub fn probe_remote_version(
     // install_path because non-interactive ssh shells typically don't have
     // ~/.local/bin on PATH (same fix as ea8c748).
     let cmd = format!("{install_path} --version");
-    let result = executor.run(target, &cmd);
+    let result = executor.run_capped(target, &cmd, PROBE_VERSION_CAP);
     match result {
         Err(ssh_err) => Err(map_probe_ssh_error(name, ssh_err)),
         Ok(output) => {
@@ -413,10 +430,18 @@ pub fn probe_remote_version(
             // user sees the underlying message rather than a misleading
             // "binary missing" hint.
             if output.status != 0 {
+                // The remote wrote this. It reaches a terminal verbatim (and
+                // `remote doctor` quotes the first 200 characters of it into
+                // its report), so a malicious remote binary or shell startup
+                // file could otherwise smuggle CSI/OSC sequences that repaint
+                // the screen, retitle the terminal or forge a hyperlink —
+                // including over the diagnostic's own conclusions. Escape,
+                // don't strip: the user should be able to SEE that the remote
+                // sent something peculiar.
                 let detail = if output.stderr.trim().is_empty() {
                     format!("ssh exited with status {}", output.status)
                 } else {
-                    output.stderr.trim().to_string()
+                    crate::untrusted_text::escape_control_and_bidi(output.stderr.trim())
                 };
                 return Err(RemoteConnectError::HostUnreachable {
                     name: name.to_string(),
@@ -587,14 +612,22 @@ pub fn probe_remote_protocol(
 /// [`map_probe_ssh_error`] and `remote_doctor`, which needs the same text to
 /// decide whether a probe died on a forward failure rather than on the host
 /// being unreachable.
+///
+/// Every arm but the I/O one carries ssh's own stderr, which is written by a
+/// peer we do not control and ends up on a terminal. It is escaped here — once,
+/// at the single point the probe error paths funnel through — so a hostile
+/// endpoint cannot repaint the message that describes it. Escaping is
+/// idempotent, so `remote_doctor::render` escaping again at its own seam costs
+/// nothing.
 pub fn ssh_error_detail(err: &SshError) -> String {
-    match err {
+    let raw = match err {
         SshError::ConnectionRefused { detail, .. } => detail.clone(),
         SshError::AuthFailed { detail, .. } => detail.clone(),
         SshError::Io { source, .. } => source.to_string(),
         SshError::HostKeyVerificationFailed { .. } => err.to_string(),
         SshError::Other { detail, .. } => detail.clone(),
-    }
+    };
+    crate::untrusted_text::escape_control_and_bidi(&raw)
 }
 
 /// The three canonical fragments OpenSSH emits when a requested forward could
