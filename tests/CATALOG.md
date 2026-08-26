@@ -3094,14 +3094,14 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 
 #### remote/doctor
 
-##### remote/doctor/001 — A healthy registered remote reports every diagnostic check and exits successfully.
+##### remote/doctor/001 — A healthy registered remote reports every diagnostic check and exits 0.
 - **Layer:** L2 (thin real-binary subprocess spawn with a deterministic `ssh` script prepended to `PATH`; no PTY and no real remote).
 - **Agent:** none.
-- **Asserts:** `dot-agent-deck remote doctor prod` resolves a staged registry entry, exits 0 for healthy canned observations, and prints exactly one line for each stable check identity (`HostReachable` through `ForwardAgent`), with a `PASS` / `WARN` / `FAIL` / `UNKNOWN` verdict token on that line.
-- **Does not assert:** exact headline/fix prose, spacing, colour, a real ssh server, or a real forwarded socket.
+- **Asserts:** `dot-agent-deck remote doctor prod` resolves a staged registry entry, exits exactly 0 for healthy canned observations, and prints exactly one line for each stable check identity (`HostReachable` through `ForwardAgent`), with a `PASS` / `WARN` / `FAIL` / `UNKNOWN` verdict token on that line.
+- **Does not assert:** that the `ForwardBound` PASS came from parsing the canned SOCKS5 response (covered explicitly by `remote/doctor/007`), exact headline/fix prose, spacing, colour, a real ssh server, or a real forwarded socket.
 - **Platform coverage:** mac+linux (Unix-only `sh` + `PATH` executable seam).
 
-##### remote/doctor/002 — An unknown remote is rejected before any ssh probe runs.
+##### remote/doctor/002 — An unknown remote is rejected before any observation session runs.
 - **Layer:** L2 (thin real-binary subprocess spawn with test-owned registry and ssh argv recorder).
 - **Agent:** none.
 - **Asserts:** asking for an unregistered name exits non-zero, names that remote in the error, and leaves the ssh argv recorder absent/empty — registry resolution precedes all probes.
@@ -3109,24 +3109,66 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Platform coverage:** mac+linux (Unix-only `sh` + `PATH` executable seam).
 
 ##### remote/doctor/003 — Remote forwarding policy refusal and a port collision produce distinguishable reports.
-- **Layer:** L2 (two real-binary subprocess spawns; the PATH-stub returns byte-identical client-side forward failures while `sshd -T` alone differs).
+- **Layer:** L2 (two real-binary subprocess spawns; the PATH-stub independently controls `sshd -T` and the listener response).
 - **Agent:** none.
-- **Asserts:** both diagnoses exit non-zero and render the full check list; `AllowTcpForwarding no` fails the `AllowTcpForwarding` check and names that setting, while the allowed-but-unbound scenario fails `ForwardBound` and names a bound/colliding port; the complete reports differ without pinning exact prose.
-- **Does not assert:** exact fix/headline sentences, a particular loopback-probe command, or a live sshd/socket.
+- **Asserts:** both diagnoses exit exactly 1 and render the full check list; `AllowTcpForwarding no` plus a refused listener fails the `AllowTcpForwarding` check, while forwarding-allowed plus a connected non-SOCKS squatter passes `AllowTcpForwarding` and fails `ForwardBound`; both runs issue a live probe against `/dev/tcp/127.0.0.1/1080`; the complete reports differ, and so do their two `ForwardBound` lines specifically, with the collision line naming its port and saying the listener is not this tunnel's.
+- **Does not assert:** exact fix/headline sentences, the probe's shell byte-plumbing beyond the `/dev/tcp` endpoint, `blocked`'s own `ForwardBound` verdict (FAIL and UNKNOWN are both honest for a refused connect under a refusing policy), or a live sshd/socket.
 - **Platform coverage:** mac+linux (Unix-only `sh` + `PATH` executable seam).
 
-##### remote/doctor/004 — An unavailable remote `sshd -T` is UNKNOWN and does not stop the remaining checks.
+##### remote/doctor/004 — An unavailable remote `sshd -T` is UNKNOWN, exits 2, and does not stop the remaining checks.
 - **Layer:** L2 (real-binary subprocess spawn; the PATH-stub returns a permission-denied `sshd -T` result while all other probes succeed).
 - **Agent:** none.
-- **Asserts:** `AllowTcpForwarding` and `ClientAliveInterval` each report `UNKNOWN`, never `PASS`, the output carries an sshd availability/permission hint, all other stable check identities still render, and the not-all-clear diagnosis exits non-zero.
+- **Asserts:** `AllowTcpForwarding` and `ClientAliveInterval` each report `UNKNOWN`, never `PASS`, the output carries an sshd availability/permission hint, all other stable check identities still render, and the incomplete diagnosis exits exactly 2 rather than the broken-state code 1.
 - **Does not assert:** the exact hint text, whether a real host requires root, or the ordering of stderr versus stdout.
 - **Platform coverage:** mac+linux (Unix-only `sh` + `PATH` executable seam).
 
-##### remote/doctor/005 — A complete doctor run is read-only locally and over ssh.
+##### remote/doctor/005 — A complete doctor run issues no deck-authored mutation and leaves staged local bytes unchanged.
 - **Layer:** L2 (real-binary subprocess spawn with staged `remotes.toml`, `session.toml`, OpenSSH client files, and an argv-recording PATH stub).
 - **Agent:** none.
 - **Asserts:** a healthy full run leaves the registry, saved session, ssh config, and known-hosts bytes unchanged; ssh is actually invoked, and no recorded argv contains a config/file/service mutation command.
-- **Does not assert:** filesystem metadata such as atime, packets emitted by real ssh, or the container-based privileged sshd validation harness.
+- **Does not assert:** side effects performed by OpenSSH itself, because the test replaces it with a recording script — in particular `known_hosts` writes, `ControlMaster` sockets, and `LocalCommand` / `KnownHostsCommand` execution. The observation-session flags address those risks, but this seam cannot verify their effect; it also does not assert filesystem metadata such as atime, packets emitted by real ssh, or the container-based privileged sshd validation harness.
+- **Platform coverage:** mac+linux (Unix-only `sh` + `PATH` executable seam).
+
+##### remote/doctor/006 — A foreign service on the reverse-dynamic port can never produce PASS or exit 0.
+- **Layer:** L2 (two real-binary subprocess spawns; the PATH-stub returns healthy policy and configuration plus a connected listener that is not a SOCKS server — one that answers with foreign bytes, one that answers with nothing).
+- **Agent:** none.
+- **Asserts:** the probe targets the configured remote endpoint; with a listener that answers non-SOCKS bytes, `ForwardBound` is `FAIL`, the aggregate is `FAIL`, and the process exits exactly 1 even though every other observation is healthy; with a listener that accepts the connection and never replies, `ForwardBound` is not `PASS` and the exit code is not 0.
+- **Does not assert:** the foreign protocol, exact collision prose, a real socket, or whether the silent listener is `FAIL` or `UNKNOWN` — the observation cannot separate a squatter that ignores the handshake from one whose reply never arrived, so only the absence of a confident PASS is pinned.
+- **Platform coverage:** mac+linux (Unix-only `sh` + `PATH` executable seam).
+
+##### remote/doctor/007 — A SOCKS5-verified reverse-dynamic tunnel reports PASS and exits 0.
+- **Layer:** L2 (real-binary subprocess spawn; the PATH-stub answers the listener probe with hex bytes `05 00`).
+- **Agent:** none.
+- **Asserts:** `ForwardBound` is `PASS`, its line says the SOCKS listener was verified or handshaken rather than merely reachable, the aggregate is `PASS`, and the process exits exactly 0.
+- **Does not assert:** the exact shell command used to write/read the handshake, exact prose beyond attribution, or a real SOCKS server.
+- **Platform coverage:** mac+linux (Unix-only `sh` + `PATH` executable seam).
+
+##### remote/doctor/008 — Nothing listening on a configured reverse-dynamic port never reports all-clear.
+- **Layer:** L2 (real-binary subprocess spawn; the PATH-stub returns a connection-refused observation from the live probe).
+- **Agent:** none.
+- **Asserts:** the probe targets the configured endpoint, `ForwardBound` is not `PASS`, and the process does not exit successfully when no live listener was observed.
+- **Does not assert:** whether the honest non-PASS is `FAIL` or `UNKNOWN`, because the observation alone cannot distinguish a disconnected user from a failed bind.
+- **Platform coverage:** mac+linux (Unix-only `sh` + `PATH` executable seam).
+
+##### remote/doctor/009 — Unavailable listener-probe tooling is UNKNOWN and exits 2.
+- **Layer:** L2 (real-binary subprocess spawn; the PATH-stub returns status 127 for the `/dev/tcp` probe).
+- **Agent:** none.
+- **Asserts:** `ForwardBound` and the aggregate are `UNKNOWN`, never `PASS`, and the process exits exactly 2 when the remote cannot run the probe.
+- **Does not assert:** whether the real missing capability is `bash`, `/dev/tcp`, or the selected hex-rendering tool.
+- **Platform coverage:** mac+linux (Unix-only `sh` + `PATH` executable seam).
+
+##### remote/doctor/010 — An accepting listener for a concrete reverse forward remains unattributable and UNKNOWN.
+- **Layer:** L2 (real-binary subprocess spawn; `ssh -G` resolves `RemoteForward 1080 db.internal.test:5432` and the PATH-stub accepts the live TCP probe).
+- **Agent:** none.
+- **Asserts:** `ForwardBound` is `UNKNOWN`, its headline explains that the accepting listener could not be attributed or verified, the aggregate is `UNKNOWN`, and the process exits exactly 2.
+- **Does not assert:** the concrete forward's application protocol or any active protocol-specific verification beyond SOCKS5 reverse-dynamic forwards.
+- **Platform coverage:** mac+linux (Unix-only `sh` + `PATH` executable seam).
+
+##### remote/doctor/011 — A WARN-only diagnosis exits 0.
+- **Layer:** L2 (real-binary subprocess spawn; all observations are healthy except resolved `ForwardAgent yes`).
+- **Agent:** none.
+- **Asserts:** `ForwardAgent` and the aggregate are `WARN`, and the process exits exactly 0, pinning WARN as advisory rather than incomplete or broken.
+- **Does not assert:** exact agent-forwarding advisory prose or any real ssh-agent interaction.
 - **Platform coverage:** mac+linux (Unix-only `sh` + `PATH` executable seam).
 
 ### Fresh-start escape hatch (PRD #89 Phase 4)
@@ -4435,8 +4477,8 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 | Doc behavior | Why skipped |
 |---|---|
 | `dot-agent-deck connect <remote>` end-to-end SSH flow ([docs/remote-environments.md](../docs/remote-environments.md), [docs/remote-recipes.md](../docs/remote-recipes.md)) | Requires a remote-harness shape that does not exist yet. Catalogued at M4+ when remote testing lands. Local quit-dialog coverage (`prompt/quit/001`–`005`) already pins the Detach / Stop / Cancel behavior; remote attach adds only the daemon-side log distinction. |
-| `dot-agent-deck remote add / list / upgrade / remove` ([docs/remote-environments.md](../docs/remote-environments.md)) | Same — remote-harness territory; the lib already covers the pure-data slices (URL parsing, command construction, error classification) in the kept tests. **Security properties deferred to M4+ end-to-end coverage:** shell-metacharacter quoting on remote-CLI argv assembly (unit-covered by `system_ssh_executor_quotes_arguments_safely`), `remotes.toml` written at mode 0o600 (covered by the now-moved `remotes_toml_written_at_0o600` test — restore at M4+), `DOT_AGENT_DECK_VIA_DAEMON=1` propagation on the remote shell (unit-covered by `build_connect_command_has_t_flag_and_via_daemon_env`). `remote doctor` is the exception: `remote/doctor/001`–`005` cover it through the first deterministic PATH-stub `ssh` seam, without a real remote harness. |
-| Container-based `remote doctor` validation via [`scripts/reverse-tunnel-validation.sh`](../scripts/reverse-tunnel-validation.sh) (PRD #345 M5) | Deliberately remains manual: it needs a container runtime plus privileged sshd configuration mutation, a harness shape with no e2e-tier precedent. The deterministic PATH-stub coverage in `remote/doctor/001`–`005` exercises every classification branch; the script remains the documented real-sshd manual validation path. |
+| `dot-agent-deck remote add / list / upgrade / remove` ([docs/remote-environments.md](../docs/remote-environments.md)) | Same — remote-harness territory; the lib already covers the pure-data slices (URL parsing, command construction, error classification) in the kept tests. **Security properties deferred to M4+ end-to-end coverage:** shell-metacharacter quoting on remote-CLI argv assembly (unit-covered by `system_ssh_executor_quotes_arguments_safely`), `remotes.toml` written at mode 0o600 (covered by the now-moved `remotes_toml_written_at_0o600` test — restore at M4+), `DOT_AGENT_DECK_VIA_DAEMON=1` propagation on the remote shell (unit-covered by `build_connect_command_has_t_flag_and_via_daemon_env`). `remote doctor` is the exception: `remote/doctor/001`–`011` cover it through the deterministic PATH-stub `ssh` seam, without a real remote harness. |
+| Container-based `remote doctor` validation via [`scripts/reverse-tunnel-validation.sh`](../scripts/reverse-tunnel-validation.sh) (PRD #345 M5) | Deliberately remains manual: it needs a container runtime plus privileged sshd configuration mutation, a harness shape with no e2e-tier precedent. The deterministic PATH-stub coverage in `remote/doctor/001`–`011` exercises the command's observation and classification outcomes; the script remains the documented real-sshd manual validation path. |
 | `dot-agent-deck validate` CLI subcommand ([docs/workspace-modes.md#config-validation](../docs/workspace-modes.md)) | Non-TUI; the underlying validator is exhaustively covered by the pure-data `config_validation` tests. |
 | `dot-agent-deck watch` CLI subcommand ([docs/workspace-modes.md#dot-agent-deck-watch](../docs/workspace-modes.md)) | Non-TUI subcommand; an L2 test would only exercise its output formatting against a real shell — low value compared to the deck-rendering surface. |
 | `dot-agent-deck config get` / `config set` ([docs/configuration.md](../docs/configuration.md)) | Non-TUI; the underlying config field reflection is covered by pure-data tests (`*_get_set_field`, `*_get_set_fields`). |

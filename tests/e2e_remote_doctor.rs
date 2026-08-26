@@ -42,11 +42,24 @@ const VERDICTS: &[&str] = &["PASS", "WARN", "FAIL", "UNKNOWN"];
 /// - any argv containing `-G` returns resolved client configuration;
 /// - a remote command containing `sshd -T` returns remote sshd policy;
 /// - the deck's `--version` and `daemon hello` probes return parseable output;
-/// - any other remote command is treated as a live-forward probe and succeeds
-///   in healthy scenarios;
-/// - `blocked` and `collision` deliberately give every ordinary connection the
-///   SAME client-side forward error. Only `sshd -T` distinguishes them (`no`
-///   versus `yes`), which pins PRD #345's headline diagnostic behavior.
+/// - a command mentioning `/dev/tcp/127.0.0.1/1080` is the live-forward probe.
+///   Its stdout is the hex rendering of whatever the listener replied, and the
+///   probe must normalise whitespace before reading it so `05 00`, ` 05 00`
+///   and `0500` are the same observation:
+///   `healthy` writes `05 00` and exits 0 (a SOCKS5 no-auth acceptance),
+///   `collision`/`squatter` write `48 54` and exit 0 (a foreign service that
+///   answered with something else), `squatter-silent` writes NOTHING and exits
+///   0 (a foreign service that connected and never replied),
+///   `nothing-listening`/`blocked` exit 1 with a refusal, and
+///   `probe-unavailable` exits 127. An unlisted scenario exits 3 rather than
+///   defaulting, so a typo cannot masquerade as a silent listener;
+/// - `non-dynamic` resolves a concrete reverse forward whose listening port
+///   accepts a connection but cannot be attributed to this user's tunnel;
+/// - `blocked` differs from `collision` through both independent observations:
+///   `sshd -T` says forwarding is disabled and no listener answers for the
+///   former, while policy permits forwarding but a non-SOCKS squatter answers
+///   for the latter. Neither relies on an observation ssh session attempting
+///   the configured forward itself.
 const SSH_STUB_SCRIPT: &str = r#"#!/bin/sh
 {
     printf 'ssh'
@@ -58,14 +71,30 @@ const SSH_STUB_SCRIPT: &str = r#"#!/bin/sh
 
 for arg in "$@"; do
     if [ "$arg" = "-G" ]; then
+        case "$SSH_STUB_SCENARIO" in
+            non-dynamic)
+                forward='remoteforward 1080 db.internal.test:5432'
+                ;;
+            *)
+                forward='remoteforward 1080 [socks]:0'
+                ;;
+        esac
+        case "$SSH_STUB_SCENARIO" in
+            warn-forward-agent)
+                forward_agent=yes
+                ;;
+            *)
+                forward_agent=no
+                ;;
+        esac
         printf '%s\n' \
             'host prod.example.test' \
             'hostname prod.example.test' \
             'user deck' \
             'port 2222' \
-            'remoteforward 1080 [socks]:0' \
+            "$forward" \
             'exitonforwardfailure yes' \
-            'forwardagent no'
+            "forwardagent $forward_agent"
         exit 0
     fi
 done
@@ -89,13 +118,6 @@ case " $* " in
         ;;
 esac
 
-case "$SSH_STUB_SCENARIO" in
-    blocked|collision)
-        printf '%s\n' 'Error: remote port forwarding failed for listen port 1080' >&2
-        exit 255
-        ;;
-esac
-
 case " $* " in
     *"dot-agent-deck --version"*)
         printf 'dot-agent-deck %s\n' "$SSH_STUB_VERSION"
@@ -107,8 +129,40 @@ case " $* " in
         ;;
 esac
 
-# A future implementation may use any read-only loopback query for the live
-# bound check. Its exit status is the observation; no stdout shape is imposed.
+# Match the endpoint, not the shell byte-plumbing. The stdout is deliberately
+# the semantic observation a future probe must parse: the hex bytes the
+# listener replied with, or nothing at all when it replied with nothing.
+case " $* " in
+    *"/dev/tcp/127.0.0.1/1080"*)
+        case "$SSH_STUB_SCENARIO" in
+            healthy|sshd-unavailable|warn-forward-agent)
+                printf '%s\n' '05 00'
+                exit 0
+                ;;
+            collision|squatter|non-dynamic)
+                printf '%s\n' '48 54'
+                exit 0
+                ;;
+            squatter-silent)
+                exit 0
+                ;;
+            nothing-listening|blocked)
+                printf '%s\n' 'bash: connect: Connection refused' >&2
+                exit 1
+                ;;
+            probe-unavailable)
+                printf '%s\n' 'bash: command not found' >&2
+                exit 127
+                ;;
+            *)
+                printf 'ssh stub: no probe behaviour for scenario %s\n' \
+                    "$SSH_STUB_SCENARIO" >&2
+                exit 3
+                ;;
+        esac
+        ;;
+esac
+
 exit 0
 "#;
 
@@ -284,6 +338,32 @@ fn assert_verdict(text: &str, check: &str, expected: &str) {
     );
 }
 
+fn assert_exit_code(output: &Output, expected: i32, text: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(expected),
+        "expected exit code {expected}, got {:?}.\noutput:\n{text}",
+        output.status.code()
+    );
+}
+
+fn assert_overall(text: &str, expected: &str) {
+    assert!(
+        text.lines().any(|line| line
+            .trim()
+            .eq_ignore_ascii_case(&format!("Overall: {expected}"))),
+        "expected Overall: {expected}.\noutput:\n{text}"
+    );
+}
+
+fn assert_live_probe_was_run(fixture: &DoctorFixture) {
+    let argv = fixture.recorded_argv();
+    assert!(
+        argv.contains("/dev/tcp/127.0.0.1/1080"),
+        "the live-forward observation must target the resolved endpoint.\nssh argv:\n{argv}"
+    );
+}
+
 /// Scenario: Register `prod`, prepend a healthy synthetic `ssh`, and run the
 /// real `dot-agent-deck remote doctor prod` subprocess. It exits successfully
 /// and prints exactly one verdict-bearing line for every stable check identity.
@@ -293,11 +373,7 @@ fn remote_doctor_001_healthy_remote_reports_every_check_and_exits_zero() {
     let fixture = DoctorFixture::new();
     let (output, text) = fixture.run("prod", "healthy");
 
-    assert!(
-        output.status.success(),
-        "a healthy `remote doctor prod` must exit 0, got {:?}.\noutput:\n{text}",
-        output.status.code()
-    );
+    assert_exit_code(&output, 0, &text);
     assert_complete_report(&text);
 }
 
@@ -325,9 +401,9 @@ fn remote_doctor_002_unknown_remote_fails_without_invoking_ssh() {
     );
 }
 
-/// Scenario: Give two doctor runs the same client-side forward-failure bytes;
-/// in one, `sshd -T` says `AllowTcpForwarding no`, while in the other it says
-/// forwarding is allowed (a port collision). The reports name different causes
+/// Scenario: Run one diagnosis where `sshd -T` forbids forwarding and no
+/// listener answers, then another where policy permits forwarding but a
+/// non-SOCKS service occupies the port. The reports name their distinct causes
 /// and fail the corresponding `AllowTcpForwarding` versus `ForwardBound` check.
 #[spec("remote/doctor/003")]
 #[test]
@@ -337,34 +413,55 @@ fn remote_doctor_003_distinguishes_sshd_block_from_port_collision() {
     let collision_fixture = DoctorFixture::new();
     let (collision_status, collision) = collision_fixture.run("prod", "collision");
 
-    assert!(
-        !blocked_status.status.success(),
-        "AllowTcpForwarding=no is a failed diagnosis and must exit non-zero.\noutput:\n{blocked}"
-    );
-    assert!(
-        !collision_status.status.success(),
-        "an unbound/colliding remote port is a failed diagnosis and must exit non-zero.\noutput:\n{collision}"
-    );
+    assert_exit_code(&blocked_status, 1, &blocked);
+    assert_exit_code(&collision_status, 1, &collision);
     assert_complete_report(&blocked);
     assert_complete_report(&collision);
     assert_verdict(&blocked, "AllowTcpForwarding", "FAIL");
     assert_verdict(&collision, "ForwardBound", "FAIL");
+    assert_live_probe_was_run(&blocked_fixture);
+    assert_live_probe_was_run(&collision_fixture);
+
+    // The discriminator, stated as a verdict rather than as prose: policy is
+    // the cause in one run and is explicitly fine in the other.
+    assert_verdict(&collision, "AllowTcpForwarding", "PASS");
 
     assert_ne!(
         blocked, collision,
-        "the two scenarios intentionally return byte-identical client-side ssh errors; the \
-         doctor's remote-side evidence must make their reports different"
+        "independent sshd policy and listener-identity observations must make the reports \
+         different"
+    );
+    // Scoped to the ForwardBound lines on purpose: the whole-report comparison
+    // above is satisfied by the AllowTcpForwarding line alone, so without this
+    // the two runs could hand the user the SAME liveness sentence.
+    assert_ne!(
+        report_line(&blocked, "ForwardBound"),
+        report_line(&collision, "ForwardBound"),
+        "each run must explain the liveness result by its own cause.\nblocked:\n{blocked}\n\
+         collision:\n{collision}"
+    );
+
+    let collision_line = report_line(&collision, "ForwardBound").to_ascii_lowercase();
+    assert!(
+        collision_line.contains("1080"),
+        "the collision line must name the port it is talking about.\nline:\n{}\n\
+         output:\n{collision}",
+        report_line(&collision, "ForwardBound")
     );
     assert!(
-        blocked.to_ascii_lowercase().contains("allowtcpforwarding"),
-        "the sshd-policy report must name AllowTcpForwarding.\noutput:\n{blocked}"
-    );
-    let collision_lower = collision.to_ascii_lowercase();
-    assert!(
-        collision_lower.contains("port")
-            && (collision_lower.contains("bound") || collision_lower.contains("collision")),
-        "the collision report must identify the unbound/colliding port without pinning prose.\n\
-         output:\n{collision}"
+        [
+            "collision",
+            "foreign",
+            "something else",
+            "not this",
+            "taken",
+            "another"
+        ]
+        .iter()
+        .any(|marker| collision_line.contains(marker)),
+        "the collision line must say the listener is not this tunnel's, without pinning prose.\n\
+         line:\n{}\nfull output:\n{collision}",
+        report_line(&collision, "ForwardBound")
     );
 }
 
@@ -377,10 +474,7 @@ fn remote_doctor_004_unavailable_sshd_is_unknown_and_does_not_stop_report() {
     let fixture = DoctorFixture::new();
     let (output, text) = fixture.run("prod", "sshd-unavailable");
 
-    assert!(
-        !output.status.success(),
-        "a diagnosis containing UNKNOWN must not exit as all-clear success.\noutput:\n{text}"
-    );
+    assert_exit_code(&output, 2, &text);
     assert_complete_report(&text);
     assert_verdict(&text, "AllowTcpForwarding", "UNKNOWN");
     assert_verdict(&text, "ClientAliveInterval", "UNKNOWN");
@@ -396,9 +490,8 @@ fn remote_doctor_004_unavailable_sshd_is_unknown_and_does_not_stop_report() {
 }
 
 /// Scenario: Stage registry, session, and OpenSSH client files, run a complete
-/// healthy diagnosis, then compare every file byte-for-byte and inspect every
-/// recorded ssh argv. The doctor probes only: it edits neither local state nor
-/// remote configuration.
+/// healthy diagnosis through the recording ssh script, then compare every file
+/// byte-for-byte and inspect every recorded argv for deck-issued mutations.
 #[spec("remote/doctor/005")]
 #[test]
 fn remote_doctor_005_full_run_is_read_only() {
@@ -455,4 +548,139 @@ fn remote_doctor_005_full_run_is_read_only() {
             "read-only doctor invoked ssh with mutating form {mutating_form:?}:\n{argv}"
         );
     }
+}
+
+/// Scenario: Keep every remote observation healthy except for a foreign
+/// service occupying the configured reverse-dynamic port. The talkative
+/// squatter, which answers with non-SOCKS bytes, fails `ForwardBound`, makes
+/// the overall result FAIL, and exits 1; a second run with a silent squatter
+/// that accepts the connection and never replies is likewise never PASS and
+/// never exits 0.
+#[spec("remote/doctor/006")]
+#[test]
+fn remote_doctor_006_squatter_collision_never_reports_pass_or_exit_zero() {
+    let fixture = DoctorFixture::new();
+    let (output, text) = fixture.run("prod", "squatter");
+
+    assert_live_probe_was_run(&fixture);
+    assert_verdict(&text, "ForwardBound", "FAIL");
+    assert_overall(&text, "FAIL");
+    assert_exit_code(&output, 1, &text);
+
+    // A squatter that accepts the connection and then says nothing is the same
+    // collision seen through a quieter service, and it is the shape most likely
+    // to be read as success by a probe that only checks the connect. Pinned
+    // loosely — whether "connected but silent" is FAIL or UNKNOWN is an honest
+    // judgement call; a confident PASS is not.
+    let silent_fixture = DoctorFixture::new();
+    let (silent_output, silent) = silent_fixture.run("prod", "squatter-silent");
+
+    assert_live_probe_was_run(&silent_fixture);
+    assert_ne!(
+        verdict_token(report_line(&silent, "ForwardBound")),
+        Some("PASS"),
+        "a listener that never answered the handshake is not a verified tunnel.\noutput:\n{silent}"
+    );
+    assert_ne!(
+        silent_output.status.code(),
+        Some(0),
+        "an unverified listener must not exit as clear.\noutput:\n{silent}"
+    );
+}
+
+/// Scenario: A healthy reverse-dynamic listener accepts the remote probe and
+/// answers a SOCKS5 no-auth handshake with `05 00`. `ForwardBound` identifies
+/// that verified SOCKS listener as PASS, the overall result is PASS, and exit is 0.
+#[spec("remote/doctor/007")]
+#[test]
+fn remote_doctor_007_verified_socks_tunnel_reports_pass_and_exits_zero() {
+    let fixture = DoctorFixture::new();
+    let (output, text) = fixture.run("prod", "healthy");
+
+    assert_live_probe_was_run(&fixture);
+    assert_verdict(&text, "ForwardBound", "PASS");
+    let line = report_line(&text, "ForwardBound").to_ascii_lowercase();
+    assert!(
+        line.contains("socks")
+            && (line.contains("verified")
+                || line.contains("handshake")
+                || line.contains("confirmed")),
+        "a confident PASS must say the SOCKS listener was verified, not merely reachable.\n\
+         line:\n{}\nfull output:\n{text}",
+        report_line(&text, "ForwardBound")
+    );
+    assert_overall(&text, "PASS");
+    assert_exit_code(&output, 0, &text);
+}
+
+/// Scenario: The configured reverse-dynamic port refuses the live probe while
+/// every static configuration check is healthy. `ForwardBound` and the overall
+/// result are not PASS, because no live tunnel was observed.
+#[spec("remote/doctor/008")]
+#[test]
+fn remote_doctor_008_nothing_listening_never_reports_pass() {
+    let fixture = DoctorFixture::new();
+    let (output, text) = fixture.run("prod", "nothing-listening");
+
+    assert_live_probe_was_run(&fixture);
+    assert_ne!(
+        verdict_token(report_line(&text, "ForwardBound")),
+        Some("PASS"),
+        "a refused connection cannot verify the user's tunnel.\noutput:\n{text}"
+    );
+    assert!(
+        !output.status.success(),
+        "an unobserved live tunnel must not exit as clear.\noutput:\n{text}"
+    );
+}
+
+/// Scenario: The remote lacks usable tooling for the live probe while every
+/// other observation is healthy. `ForwardBound` and the overall result are
+/// UNKNOWN rather than PASS, and the incomplete diagnosis exits 2.
+#[spec("remote/doctor/009")]
+#[test]
+fn remote_doctor_009_unavailable_probe_tooling_is_unknown_and_exits_two() {
+    let fixture = DoctorFixture::new();
+    let (output, text) = fixture.run("prod", "probe-unavailable");
+
+    assert_live_probe_was_run(&fixture);
+    assert_verdict(&text, "ForwardBound", "UNKNOWN");
+    assert_overall(&text, "UNKNOWN");
+    assert_exit_code(&output, 2, &text);
+}
+
+/// Scenario: `ssh -G` resolves a concrete reverse forward and something accepts
+/// the live TCP connection. Because that observation cannot attribute the
+/// listener to this user's tunnel, `ForwardBound` is UNKNOWN and exit is 2.
+#[spec("remote/doctor/010")]
+#[test]
+fn remote_doctor_010_non_dynamic_listener_is_unattributable_and_unknown() {
+    let fixture = DoctorFixture::new();
+    let (output, text) = fixture.run("prod", "non-dynamic");
+
+    assert_live_probe_was_run(&fixture);
+    assert_verdict(&text, "ForwardBound", "UNKNOWN");
+    let line = report_line(&text, "ForwardBound").to_ascii_lowercase();
+    assert!(
+        line.contains("attribute") || line.contains("verify") || line.contains("ownership"),
+        "the caveat must say why an accepting listener is not a confident PASS.\n\
+         line:\n{}\nfull output:\n{text}",
+        report_line(&text, "ForwardBound")
+    );
+    assert_overall(&text, "UNKNOWN");
+    assert_exit_code(&output, 2, &text);
+}
+
+/// Scenario: Every diagnostic observation is healthy except that `ssh -G`
+/// resolves `ForwardAgent yes`. The advisory is the worst verdict, so the
+/// overall report is WARN and still exits 0.
+#[spec("remote/doctor/011")]
+#[test]
+fn remote_doctor_011_warn_only_report_exits_zero() {
+    let fixture = DoctorFixture::new();
+    let (output, text) = fixture.run("prod", "warn-forward-agent");
+
+    assert_verdict(&text, "ForwardAgent", "WARN");
+    assert_overall(&text, "WARN");
+    assert_exit_code(&output, 0, &text);
 }
