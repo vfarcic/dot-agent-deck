@@ -322,21 +322,64 @@ pub const DEFAULT_BINARY_NAME: &str = env!("CARGO_PKG_NAME");
 /// could not verify may still be perfectly runnable there, and conversely a
 /// literal `dot-agent-deck` fallback can name a binary that was never
 /// installed at all. Instead this falls back to `current_exe()`'s own
-/// **absolute path**, quoted with [`shell_quote_if_needed`] so a path
-/// containing whitespace still parses as one argument — a path is independent
-/// of whatever `$PATH` the agent's shell ends up with, and it names this
-/// exact running binary rather than whatever `$PATH` might resolve that name
-/// to, so it resolves correctly regardless of which proxy this process's own
-/// `$PATH` turned out to be.
+/// **absolute path**, spelled and quoted for a POSIX shell by
+/// [`posix_command_word`] so a path containing whitespace still parses as one
+/// argument — a path is independent of whatever `$PATH` *or cwd* the agent's
+/// shell ends up with, and it names this exact running binary rather than
+/// whatever `$PATH` might resolve that name to, so it resolves correctly
+/// regardless of which proxy this process's own `$PATH` turned out to be.
+///
+/// **That last claim is only true because the path is absolutised here, and
+/// it was not before (issue #560).** `current_exe()` is not documented to
+/// return an absolute path and on macOS does not: it is backed by
+/// `_NSGetExecutablePath`, which reports the path the process was INVOKED as
+/// (the same platform fact the symlink paragraph above records), so a deck
+/// launched as `./target/release/dot-agent-deck` used to emit exactly that
+/// relative word into the worker task footer. The worker then resolved it
+/// against ITS OWN cwd — an orchestration directory or a git worktree, never
+/// the deck's launch directory — and the command failed, silently, for the
+/// reason the last paragraph below gives. Linux never exhibited it, because
+/// `/proc/self/exe` is kernel-resolved and therefore always absolute; the
+/// defect was invisible on the platform the project develops on.
+/// [`std::path::absolute`] is what closes it: purely lexical plus the cwd, no
+/// filesystem access, and — unlike [`std::fs::canonicalize`] — it does not
+/// resolve symlinks, so it makes "absolute" true by construction without
+/// silently taking a position on the platform-dependent symlink behaviour
+/// documented above.
+///
+/// **The emitted word targets a POSIX shell on every platform, including
+/// Windows (issue #561).** That is not a default — it is what the text this
+/// word is interpolated into already says: both consumers fence it in
+/// ```` ```bash ```` and `state::work_done_footer` instructs the worker in
+/// prose to run it "via Bash". `cmd.exe` and PowerShell are deliberately NOT
+/// targeted, and neither could be by quoting alone: PowerShell needs the `&`
+/// call operator before a quoted string for it to be a command at all, and
+/// this repo implements no PowerShell quoting anywhere to borrow from.
+/// (`hooks_manage`'s `#[cfg(windows)]` `shell_quote_if_needed` is a `cmd.exe`
+/// quoter, but it is for a different consumer — a hook command line Claude
+/// Code hands to the *native* shell — and its own doc records that `cmd.exe`
+/// expands `%VAR%` even inside double quotes, which quoting cannot undo.)
+///
+/// Targeting POSIX is not enough on its own, though, because a POSIX shell
+/// will not treat a backslash-separated Windows path as a **path** however
+/// well it is quoted: POSIX (XCU 2.9.1.1) makes a command word containing at
+/// least one `/` a pathname and every other command word a `$PATH` lookup, so
+/// `'C:\Users\me\dot-agent-deck.exe'` is looked up in `$PATH` and reported as
+/// `command not found` — measured against real bash, not assumed. So the
+/// fallback respells a Windows path with `/` separators before quoting it,
+/// which is lossless (`/` is not a legal character in a Windows file name),
+/// is the spelling `shell_quote_if_needed`'s own safe set already treats as
+/// needing no quotes at all, and is what git-bash / WSL / MSYS want.
 ///
 /// [`DEFAULT_BINARY_NAME`] remains the fallback only when `current_exe()`
-/// itself is unusable: an error, an empty file name, or (Unix) a file name
-/// that is not valid UTF-8. The fallback matters more here than at most other
-/// `current_exe()` call sites: `delegate` and `work-done` write to the
-/// unversioned hook socket, both call sites are fire-and-forget, and the
-/// daemon drops any frame it cannot parse without logging it — so a name that
-/// resolves to a binary that cannot run produces no error anywhere, only a
-/// signal that silently never arrives.
+/// itself is unusable: an error, an empty file name, (Unix) a file name that
+/// is not valid UTF-8, a path that cannot be made absolute, or a Windows path
+/// with no POSIX spelling (see [`posix_command_word`]). The fallback matters
+/// more here than at most other `current_exe()` call sites: `delegate` and
+/// `work-done` write to the unversioned hook socket, both call sites are
+/// fire-and-forget, and the daemon drops any frame it cannot parse without
+/// logging it — so a name that resolves to a binary that cannot run produces
+/// no error anywhere, only a signal that silently never arrives.
 pub fn binary_name() -> String {
     resolve_binary_name(effective_current_exe(), resolves_on_path)
 }
@@ -413,10 +456,73 @@ fn resolve_binary_name(
     if is_safe_binary_name(name) && path_identity_matches(name, &path) {
         return name.to_string();
     }
-    match path.to_str() {
-        Some(path_str) => shell_quote_if_needed(path_str),
+    // Issue #560: absolutise BEFORE quoting. `current_exe()` is only
+    // guaranteed absolute on Linux (`/proc/self/exe`); on macOS it reports the
+    // invocation path, so this is where a relative `./target/release/…` would
+    // otherwise reach the generated command word. Purely lexical plus the cwd,
+    // and deliberately not `canonicalize` — see [`binary_name`]'s doc.
+    let Ok(absolute) = std::path::absolute(&path) else {
+        return DEFAULT_BINARY_NAME.to_string();
+    };
+    match absolute.to_str() {
+        Some(path_str) => posix_command_word(path_str, cfg!(windows))
+            .unwrap_or_else(|| DEFAULT_BINARY_NAME.to_string()),
         None => DEFAULT_BINARY_NAME.to_string(),
     }
+}
+
+/// Spell `path` — already absolute — as a command word a **POSIX shell** will
+/// execute, or `None` when it has no such spelling. Issue #561.
+///
+/// `windows_host` says whether `path` is in the Windows dialect. It is a
+/// parameter rather than a `#[cfg]` so both branches are unit-testable from
+/// any host: neither defect in this function's history could be reproduced on
+/// the platform this project is developed on, and a `#[cfg(windows)]` branch
+/// would have been type-checked by CI but exercised by nothing. Production
+/// passes `cfg!(windows)`, which is a compile-time constant, so the branch
+/// costs nothing at runtime.
+///
+/// POSIX is the target on every platform because that is what the text this
+/// word lands in already promises: `state::work_done_footer` and
+/// `orchestrator_context::build_orchestrator_context` both fence it in
+/// ```` ```bash ```` and the former tells the worker in prose to run it "via
+/// Bash". See [`binary_name`]'s doc for why `cmd.exe` and PowerShell are not
+/// targeted and cannot be reached by quoting anyway.
+///
+/// On a Windows path two things happen before [`shell_quote_if_needed`]:
+///
+/// - **A verbatim or device path is refused** (`\\?\…`, `\\.\…`). Those
+///   prefixes are defined to disable all path normalization, so `/` is *not*
+///   accepted as a separator inside them and respelling one changes which
+///   file it names. There is no POSIX-shell spelling of such a path, and
+///   [`resolve_binary_name`] therefore falls back to [`DEFAULT_BINARY_NAME`]
+///   rather than emit a word that would be misparsed — a bare name the
+///   agent's `$PATH` may well resolve beats a path that is silently wrong.
+/// - **`\` becomes `/`.** Lossless, because `/` is not a legal character in a
+///   Windows file name, and necessary rather than cosmetic: a POSIX shell
+///   picks pathname-vs-`$PATH`-lookup on whether the word contains at least
+///   one `/` (POSIX XCU 2.9.1.1), so a backslash path is looked up in `$PATH`
+///   and reported `command not found` no matter how correctly it is quoted.
+///   `C:\Users\me\deck.exe`
+///   becomes `C:/Users/me/deck.exe`, which needs no quoting at all under
+///   `shell_quote_if_needed`'s existing safe set, and `\\server\share\…`
+///   becomes `//server/share/…`, which is the UNC spelling MSYS/Cygwin use.
+///
+/// The final `contains('/')` guard makes "this is a pathname, not a `$PATH`
+/// lookup" true by construction rather than by assumption about what shapes
+/// `current_exe()` can return.
+fn posix_command_word(path: &str, windows_host: bool) -> Option<String> {
+    if !windows_host {
+        return Some(shell_quote_if_needed(path));
+    }
+    if path.starts_with(r"\\?\") || path.starts_with(r"\\.\") {
+        return None;
+    }
+    let respelled = path.replace('\\', "/");
+    if !respelled.contains('/') {
+        return None;
+    }
+    Some(shell_quote_if_needed(&respelled))
 }
 
 /// Whether `name` is safe to interpolate UNQUOTED into the generated `bash`
@@ -904,6 +1010,21 @@ mod tests {
              since as a full path argument (not a bare token) a leading '-' in the file \
              name component is not read as a flag"
         );
+        // Issue #560: every case above injects a path that is ALREADY absolute,
+        // so all three passed before anything enforced absoluteness. A relative
+        // `current_exe()` is the shape macOS actually produces, and the name
+        // "falls back to the absolute path" has to hold for it too.
+        assert_eq!(
+            resolve_binary_name(Ok(PathBuf::from("./bin/dot-agent-deck copy")), |_, _| true),
+            format!(
+                "'{}'",
+                std::env::current_dir()
+                    .expect("a cwd")
+                    .join("bin/dot-agent-deck copy")
+                    .display()
+            ),
+            "a relative current_exe() must be absolutised before quoting, not emitted as-is"
+        );
     }
 
     /// Reviewer F1 / auditor F1, updated for issue prageethw/dot-agent-deck#253's Greptile P1 and
@@ -929,6 +1050,22 @@ mod tests {
             "a well-formed name whose $PATH lookup does not identity-match must fall back \
              to the (unquoted, since it needs no quoting) absolute path"
         );
+        // Issue #560, on the branch that matters most: this is the exact case
+        // the fallback exists to serve (a build that is not on `$PATH`), and it
+        // is the one a macOS `./target/release/dot-agent-deck` launch lands in.
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from("./target/release/dot-agent-deck")),
+                |_, _| false
+            ),
+            std::env::current_dir()
+                .expect("a cwd")
+                .join("target/release/dot-agent-deck")
+                .display()
+                .to_string(),
+            "the emitted word must not be resolvable against the WORKER's cwd — it has to \
+             be absolute so it means the same thing in every directory"
+        );
     }
 
     /// Issue prageethw/dot-agent-deck#253 Greptile P1: when `current_exe()` itself is fine but
@@ -947,6 +1084,82 @@ mod tests {
             });
         assert_ne!(fallback, DEFAULT_BINARY_NAME);
         assert_eq!(fallback, "/opt/build/worker-agent-deck");
+    }
+
+    /// Issue #560, stated as the invariant rather than as one example: whatever
+    /// shape `current_exe()` comes back in, the fallback command word must
+    /// resolve to the same file from any working directory. That is the whole
+    /// justification the doc comment, the #520 changelog entry and the review
+    /// thread all give for preferring a path over [`DEFAULT_BINARY_NAME`], and
+    /// until this landed nothing enforced it — every existing test injected an
+    /// already-absolute path, so a `current_exe()` of the shape macOS actually
+    /// returns (`_NSGetExecutablePath` reports the INVOCATION path) sailed
+    /// through and the worker resolved it against its own cwd.
+    ///
+    /// The `..` case is deliberate: [`std::path::absolute`] is lexical and does
+    /// NOT collapse `..`, because collapsing it would change which file the
+    /// path names when a component is a symlink. An uncollapsed `..` is still
+    /// absolute, which is the property being asserted here.
+    #[test]
+    fn resolve_binary_name_fallback_is_absolute_for_every_relative_current_exe_shape() {
+        let cwd = std::env::current_dir().expect("a cwd");
+        for relative in [
+            "./target/release/dot-agent-deck",
+            "target/release/dot-agent-deck",
+            "../sibling/dot-agent-deck",
+            "dot-agent-deck",
+        ] {
+            let fallback = resolve_binary_name(Ok(PathBuf::from(relative)), |_, _| false);
+            let unquoted = parse_as_one_shell_word(&fallback)
+                .unwrap_or_else(|| panic!("{fallback} must parse as exactly one POSIX word"));
+            assert!(
+                Path::new(&unquoted).is_absolute(),
+                "current_exe() of {relative:?} produced {fallback}, which is not absolute — a \
+                 worker would resolve it against ITS OWN cwd"
+            );
+            assert!(
+                unquoted.starts_with(cwd.to_str().expect("a UTF-8 cwd")),
+                "{fallback} must be {relative:?} anchored at this process's cwd"
+            );
+            assert_ne!(
+                fallback, DEFAULT_BINARY_NAME,
+                "absolutising must not degrade the fallback to the generic literal"
+            );
+        }
+    }
+
+    /// Issues #560 and #561 together, on the helper that emits the word: the
+    /// two defects were in one expression and the fallback is only correct when
+    /// both hold at once, so this asserts the combined post-condition across
+    /// both host dialects. Whatever the dialect, the emitted word must be
+    /// exactly one POSIX shell word, absolute, and containing a `/` — the last
+    /// because a POSIX shell resolves a `/`-free command word through `$PATH`
+    /// instead of as a path, which is what made a correctly-quoted Windows path
+    /// unrunnable even in git-bash. (The absoluteness of what reaches this
+    /// helper is [`resolve_binary_name`]'s job and is asserted by the test
+    /// above; here the inputs stand in for what it passes down.)
+    #[test]
+    fn posix_command_word_always_emits_one_absolute_pathname_word() {
+        for (path, windows_host) in [
+            ("/opt/my deck/dot-agent-deck", false),
+            ("/opt/build/dot-agent-deck (1)", false),
+            (r"C:\Users\somebody\bin\dot-agent-deck.exe", true),
+            (r"C:\Program Files\deck\dot-agent-deck.exe", true),
+            (r"\\server\share\dot-agent-deck.exe", true),
+        ] {
+            let word = posix_command_word(path, windows_host)
+                .unwrap_or_else(|| panic!("{path} must have a POSIX spelling"));
+            let literal = parse_as_one_shell_word(&word)
+                .unwrap_or_else(|| panic!("{word} must parse as exactly one POSIX word"));
+            assert!(
+                literal.contains('/'),
+                "{word} must resolve as a pathname, not a $PATH lookup"
+            );
+            assert!(
+                literal.starts_with('/') || literal.as_bytes().get(1) == Some(&b':'),
+                "{word} must be absolute — rooted, or drive-qualified on Windows"
+            );
+        }
     }
 
     /// Issue prageethw/dot-agent-deck#253 Greptile P1 (the smaller half): [`path_contains_executable`]
@@ -1454,33 +1667,49 @@ mod tests {
         }
     }
 
-    /// Issue #563 records the CURRENT treatment of backslashes, not a desired
-    /// one: `\` is absent from the safe set, so every Windows-style path takes
-    /// the single-quoted branch. That is the property issue #561 is about —
-    /// POSIX single-quoting is meaningless to `cmd.exe` and PowerShell — and
-    /// #561 is deliberately NOT resolved here. Pinning the observed behavior is
-    /// the point: whichever way #561 lands, the change has to show up as a
-    /// deliberate edit to this test rather than passing silently.
+    /// Issue #563 pinned the treatment of backslashes here as merely *observed*
+    /// pending issue #561; #561 is now resolved, and this is the assertion of
+    /// the settled behavior. The settled behavior is that
+    /// [`shell_quote_if_needed`] keeps doing exactly this: `\` stays out of
+    /// the safe set, so a backslash-bearing path is single-quoted, and a
+    /// single-quoted POSIX run takes no escapes so every backslash survives
+    /// literally rather than being consumed as one. That is *correct* POSIX
+    /// quoting and the other call site depends on it:
+    /// `agent_hook_config::build_command` writes the Codex and Devin hook
+    /// command lines. Devin's installer is `#[cfg(unix)]` and can only ever see
+    /// a POSIX path; Codex's is NOT — `codex_home` honours `$CODEX_HOME` on
+    /// every platform — so that one can be reached on Windows. Whether a Codex
+    /// hook command needs a different dialect there is a question about a
+    /// third-party tool's own execution model, not about this quoter, and it is
+    /// deliberately out of scope for #561, which is about `binary_name`'s
+    /// fallback.
+    ///
+    /// What #561 actually diagnosed is one layer up, and is fixed there rather
+    /// than here: quoting alone never made a Windows path *runnable*, because a
+    /// POSIX shell decides pathname-vs-`$PATH`-lookup on whether the command
+    /// word contains a `/`. So the perfectly-quoted result asserted below is
+    /// still `command not found` when used as a command word — which is why
+    /// [`posix_command_word`] respells the separators before calling this, and
+    /// why the fix did NOT belong in the quoter.
     #[test]
-    fn shell_quote_if_needed_currently_quotes_backslashes_observed_behavior_for_issue_561() {
+    fn shell_quote_if_needed_keeps_backslashes_literal_in_a_posix_word() {
         assert_eq!(
             shell_quote_if_needed(r"\"),
             r"'\'",
-            "backslash is not in the safe set today, so it is quoted"
+            "backslash is outside the safe set, so it is quoted"
         );
         assert_eq!(
             shell_quote_if_needed(r"C:\Users\somebody\bin\dot-agent-deck.exe"),
             r"'C:\Users\somebody\bin\dot-agent-deck.exe'",
-            "a Windows path is POSIX-single-quoted today (issue #561)"
+            "a backslash-bearing path is single-quoted"
         );
         assert_eq!(
             shell_quote_if_needed(r"\\server\share\dot-agent-deck.exe"),
             r"'\\server\share\dot-agent-deck.exe'",
-            "a UNC path is POSIX-single-quoted today (issue #561)"
+            "a UNC path is single-quoted"
         );
 
-        // The quoting is POSIX-correct even though POSIX is arguably the wrong
-        // dialect here: a single-quoted run takes no escapes, so each backslash
+        // A single-quoted run takes no escapes (POSIX 2.2.2), so each backslash
         // survives literally rather than being consumed as one.
         assert_eq!(
             parse_as_one_shell_word(&shell_quote_if_needed(
@@ -1488,7 +1717,180 @@ mod tests {
             ))
             .as_deref(),
             Some(r"C:\Users\somebody\bin\dot-agent-deck.exe"),
-            "under POSIX rules the quoted Windows path is one word with its backslashes intact"
+            "the quoted Windows path is one word with its backslashes intact"
+        );
+
+        // The half that made #561 a defect rather than a style question: the
+        // word above is a correctly-quoted *literal*, and a correctly-quoted
+        // literal with no `/` in it is a `$PATH` lookup, not a path. Nothing
+        // this function can do changes that, which is what moves the fix to
+        // `posix_command_word`.
+        assert!(
+            !parse_as_one_shell_word(&shell_quote_if_needed(
+                r"C:\Users\somebody\bin\dot-agent-deck.exe"
+            ))
+            .expect("the quoted form parses as one word")
+            .contains('/'),
+            "the quoted Windows path contains no '/', so a POSIX shell resolves it \
+             through $PATH rather than as a pathname"
+        );
+    }
+
+    /// Issue #561, the fix side: [`posix_command_word`] is what turns an
+    /// absolute path into a word a POSIX shell will actually execute, and the
+    /// `windows_host` parameter is what makes the Windows branch reachable from
+    /// a Linux CI host. On a POSIX host it is a pass-through to
+    /// [`shell_quote_if_needed`]; on a Windows path it respells `\` as `/`
+    /// FIRST, which both makes the word a pathname and — for an ordinary
+    /// drive-letter path — removes the need to quote it at all.
+    #[test]
+    fn posix_command_word_respells_a_windows_path_with_forward_slashes() {
+        assert_eq!(
+            posix_command_word(r"C:\Users\somebody\bin\dot-agent-deck.exe", true).as_deref(),
+            Some("C:/Users/somebody/bin/dot-agent-deck.exe"),
+            "a drive-letter path is respelled and then needs no quoting"
+        );
+        assert_eq!(
+            posix_command_word(r"\\server\share\dot-agent-deck.exe", true).as_deref(),
+            Some("//server/share/dot-agent-deck.exe"),
+            "a UNC path becomes the //server/share form MSYS and Cygwin use"
+        );
+        assert_eq!(
+            posix_command_word(r"C:\Program Files\deck\dot-agent-deck.exe", true).as_deref(),
+            Some("'C:/Program Files/deck/dot-agent-deck.exe'"),
+            "a respelled path containing a space is still single-quoted"
+        );
+
+        // Every emitted word is one shell word whose literal value contains a
+        // `/` — i.e. a pathname, not a $PATH lookup. This is the property the
+        // test above proves the quoter alone cannot deliver.
+        for windows_path in [
+            r"C:\Users\somebody\bin\dot-agent-deck.exe",
+            r"\\server\share\dot-agent-deck.exe",
+            r"C:\Program Files\deck\dot-agent-deck.exe",
+            r"C:\Users\o'brien\dot-agent-deck.exe",
+        ] {
+            let word = posix_command_word(windows_path, true).expect("a spellable Windows path");
+            let literal = parse_as_one_shell_word(&word)
+                .unwrap_or_else(|| panic!("{word} must parse as exactly one POSIX word"));
+            assert!(
+                literal.contains('/'),
+                "{word} must resolve as a pathname, not a $PATH lookup"
+            );
+            assert!(
+                !literal.contains('\\'),
+                "{word} must carry no backslash separators into the shell"
+            );
+        }
+    }
+
+    /// Issue #561: a `\\?\` verbatim or `\\.\` device path is REFUSED rather
+    /// than respelled. Those prefixes are defined to disable path
+    /// normalization, so `/` is not a separator inside them and swapping the
+    /// separators would name a different file — emitting something that might
+    /// be misparsed into a command an agent executes is worse than declining.
+    /// [`resolve_binary_name`] turns the `None` into [`DEFAULT_BINARY_NAME`],
+    /// whose worst case is a `$PATH` lookup that may well succeed.
+    #[test]
+    fn posix_command_word_refuses_a_windows_path_with_no_posix_spelling() {
+        for unspellable in [
+            r"\\?\C:\Users\somebody\dot-agent-deck.exe",
+            r"\\?\UNC\server\share\dot-agent-deck.exe",
+            r"\\.\C:\Users\somebody\dot-agent-deck.exe",
+            // No separator at all: respelling would leave a bare word, which a
+            // POSIX shell resolves through $PATH rather than as a path.
+            "dot-agent-deck.exe",
+        ] {
+            assert_eq!(
+                posix_command_word(unspellable, true),
+                None,
+                "{unspellable} has no POSIX-shell spelling and must be refused"
+            );
+        }
+    }
+
+    /// Issue #561: on a POSIX host nothing changes — [`posix_command_word`] is
+    /// a pass-through to [`shell_quote_if_needed`], including for the paths a
+    /// Unix filesystem genuinely allows to contain a backslash. Pinning this is
+    /// the guard that the Windows branch never leaks onto Unix: `\` is a legal
+    /// character in a Unix file name, so respelling one there would name a
+    /// different file.
+    #[test]
+    fn posix_command_word_is_a_pass_through_on_a_posix_host() {
+        for input in [
+            "/usr/local/bin/dot-agent-deck",
+            "/opt/my deck/dot-agent-deck",
+            r"/opt/back\slash/dot-agent-deck",
+            "/home/o'brien/bin/dot-agent-deck",
+        ] {
+            assert_eq!(
+                posix_command_word(input, false).as_deref(),
+                Some(shell_quote_if_needed(input).as_str()),
+                "on a POSIX host the word is exactly what shell_quote_if_needed produces"
+            );
+        }
+        assert_eq!(
+            posix_command_word(r"/opt/back\slash/dot-agent-deck", false).as_deref(),
+            Some(r"'/opt/back\slash/dot-agent-deck'"),
+            "a backslash in a Unix path is quoted, never respelled"
+        );
+    }
+
+    /// Issue #561: the four characters whose handling has to be stated exactly,
+    /// because this word is written into a task file an agent then EXECUTES and
+    /// a mis-quote there is a command-injection surface rather than a display
+    /// bug. Pinned as literal expected strings, in both dialects, so any future
+    /// change to the safe set or the respelling has to restate them.
+    ///
+    /// - **space** — outside the safe set, so the whole word is single-quoted
+    ///   and stays one argument.
+    /// - **`'`** — ends the quoted run, so it is spliced as `'\''`: close,
+    ///   escaped literal quote, reopen. Still one word.
+    /// - **`\`** — a legal character in a Unix file name and never a separator
+    ///   there, so on Unix it is quoted and preserved verbatim (a single-quoted
+    ///   POSIX run takes no escapes). On Windows it can only ever be a
+    ///   separator (it is not legal in a file name), so it is respelled to `/`
+    ///   and no literal backslash reaches the shell at all.
+    /// - **`%`** — in the safe set and left bare, which is correct because a
+    ///   POSIX shell gives `%` no meaning in a command word. This is precisely
+    ///   where the POSIX target is load-bearing: `cmd.exe` expands `%VAR%` even
+    ///   inside double quotes, so no amount of quoting would make this word
+    ///   safe there — see [`binary_name`]'s doc for why `cmd.exe` is not the
+    ///   target.
+    #[test]
+    fn posix_command_word_handles_space_quote_backslash_and_percent() {
+        let unix = r"/opt/my deck/o'brien/50%/back\slash/dot-agent-deck";
+        assert_eq!(
+            posix_command_word(unix, false).as_deref(),
+            Some(r"'/opt/my deck/o'\''brien/50%/back\slash/dot-agent-deck'"),
+            "on Unix: space and quote force quoting, the backslash is preserved verbatim, \
+             and % is inert"
+        );
+        assert_eq!(
+            parse_as_one_shell_word(&posix_command_word(unix, false).expect("a POSIX spelling"))
+                .as_deref(),
+            Some(unix),
+            "the quoted Unix path is exactly one word whose literal value is the path"
+        );
+
+        let windows = r"C:\Program Files\o'brien\50%\dot-agent-deck.exe";
+        assert_eq!(
+            posix_command_word(windows, true).as_deref(),
+            Some(r"'C:/Program Files/o'\''brien/50%/dot-agent-deck.exe'"),
+            "on Windows: separators become '/', space and quote force quoting, % is inert"
+        );
+        assert_eq!(
+            parse_as_one_shell_word(&posix_command_word(windows, true).expect("a POSIX spelling"))
+                .as_deref(),
+            Some("C:/Program Files/o'brien/50%/dot-agent-deck.exe"),
+            "the quoted Windows path is one word carrying no backslash into the shell"
+        );
+
+        assert_eq!(
+            posix_command_word(r"C:\Users\50%\dot-agent-deck.exe", true).as_deref(),
+            Some("C:/Users/50%/dot-agent-deck.exe"),
+            "with no space and no quote, a respelled Windows path needs no quoting even \
+             though it carries a %"
         );
     }
 }
