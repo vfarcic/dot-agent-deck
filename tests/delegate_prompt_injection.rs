@@ -52,6 +52,21 @@ const WORKER_RESPONSE_TIMEOUT_ENV: &str = "DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOU
 const DELEGATE_READINESS_BUFFER_MS: u64 = 1000;
 const SLOW_STUB_NOT_READY_MS: u64 = 650;
 
+/// How long `orchestration/delegate/010` waits for the pointer AFTER the
+/// replacement worker's matching `SessionStart` before calling it undelivered.
+///
+/// Deliberately far above the 1000 ms buffer it is measuring, because it is not
+/// the assertion — the buffer's lower bound is (see the test). It only has to
+/// distinguish "released by the SessionStart" from "released by nothing", and
+/// the delegate path's fallback is the bare 30 s `SESSION_START_WAIT_TIMEOUT`
+/// constant with no env override, so anything arriving inside this window is
+/// attributable to the observed event and nothing else. Ten seconds of
+/// unused ceiling costs zero on the happy path (the poll returns the instant the
+/// needle appears) and buys the test immunity to a loaded runner, which is the
+/// whole point of the #243 rework.
+#[cfg(unix)]
+const OBSERVED_READINESS_DELIVERY_CEILING: Duration = Duration::from_secs(10);
+
 /// Serializes process-environment changes when this integration-test binary is
 /// run through plain `cargo test`; nextest already gives each test a process.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -789,7 +804,7 @@ async fn delegate_008_hookless_wrapper_fork_start_still_releases_prompt_inner() 
     registry.shutdown_all();
 }
 
-/// Scenario: Delegate with `clear = true`, emit the replacement worker's matching `SessionStart`, and force a 1000 ms readiness buffer. The task pointer must remain absent early in that interval and appear after the buffer elapses.
+/// Scenario: Delegate with `clear = true`, emit the replacement worker's matching `SessionStart`, and force a 1000 ms readiness buffer. The task pointer must arrive, and the measured delay from that `SessionStart` to its arrival must be at least the whole configured buffer — a lower bound, so a loaded machine can only overshoot it, never turn it red.
 #[spec("orchestration/delegate/010")]
 #[test]
 #[cfg(unix)]
@@ -857,26 +872,48 @@ async fn delegate_010_observed_session_start_waits_for_readiness_buffer_inner() 
         &serde_json::to_string(&event).expect("serialize matching SessionStart"),
     )
     .expect("write matching SessionStart");
-    tokio::time::sleep(Duration::from_millis(350)).await;
-    let early = daemon.registry.snapshot(&new_agent_id).unwrap_or_default();
-    assert!(
-        !snapshot_contains(&early, POINTER),
-        "matching SessionStart released delegate delivery before the configured 1000 ms readiness buffer elapsed; elapsed = {:?}, snapshot = {:?}",
-        session_start_at.elapsed(),
-        String::from_utf8_lossy(&early)
-    );
-
+    // MEASURE the hold rather than racing it (issue #243).
+    //
+    // This used to sleep 350 ms of WALL CLOCK, assert the pointer was still
+    // absent, and then give delivery a 2 s ceiling — a two-sided wall-clock
+    // constraint around a 1000 ms timer the daemon owns, with 650 ms of slack
+    // below and ~1 s above. It failed once in three full-tier runs for #243's
+    // implementer while passing every time in isolation, and #243 took the tier
+    // from ~44 s to ~30 s, so more tests are concurrent at peak. Re-deriving the
+    // two numbers would not fix the shape: every early-check instant is the same
+    // race with a different margin, and a wall-clock race that only bites under
+    // load is worse than a slow test.
+    //
+    // What replaces it is one-sided in the direction load actually moves.
+    // `held` is measured from BEFORE the hook line is even written, so it can
+    // only exceed the buffer the daemon applied — hook-socket latency, runtime
+    // jitter and the 20 ms snapshot poll all push it up and none of them push it
+    // down. The one thing that pushes it below the buffer is the buffer being
+    // bypassed, which is exactly the regression this test exists to catch:
+    // re-running it with the buffer env set to `0` delivers in 24.7 ms against
+    // this 1000 ms floor, a 40x margin. So the property is now pinned across the
+    // WHOLE buffer rather than its first 350 ms, and no amount of load can turn
+    // it red.
     let delivered = wait_for_snapshot_needle(
         &daemon.registry,
         &new_agent_id,
         POINTER,
-        Duration::from_secs(2),
+        OBSERVED_READINESS_DELIVERY_CEILING,
     )
     .await;
+    let held = session_start_at.elapsed();
     assert!(
         snapshot_contains(&delivered, POINTER),
-        "delegate pointer was not delivered after the observed-branch readiness buffer elapsed; snapshot = {:?}",
+        "delegate pointer was not delivered within {OBSERVED_READINESS_DELIVERY_CEILING:?} of the \
+         replacement worker's matching SessionStart, so the observed-readiness branch released \
+         nothing at all; snapshot = {:?}",
         String::from_utf8_lossy(&delivered)
+    );
+    assert!(
+        held >= Duration::from_millis(DELEGATE_READINESS_BUFFER_MS),
+        "the matching SessionStart released delegate delivery after only {held:?}, which is less \
+         than the configured {DELEGATE_READINESS_BUFFER_MS} ms readiness buffer could possibly \
+         have taken — the observed branch bypassed the buffer (PRD #249 M1)"
     );
 }
 

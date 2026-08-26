@@ -56,7 +56,57 @@ struct RealDelegateCase<'a> {
     input_ready_needle: &'a str,
     sentinel_name: &'a str,
     sentinel_content: &'a str,
+    /// Issue #243: the maximum time this case's worker may take to get from the
+    /// delegate being released to the task pointer being submitted inside the
+    /// replacement agent — or `None` to assert only that it happens.
+    ///
+    /// `Some` exactly where the agent's readiness path is one #243 CHANGED and
+    /// where the test would otherwise pass identically on the fixed and the
+    /// broken path. That is OpenCode (`/015`): it declares
+    /// `PrePromptReadiness::NoSignal`, so before #243 every `clear = true`
+    /// delegate to it sat out the full 30 s `SESSION_START_WAIT_TIMEOUT` waiting
+    /// for an event measured never to arrive, and the timeout fallback delivered.
+    /// Every assertion in the shared body below held throughout that, which is
+    /// precisely the problem — a silent regression to the dead wait ships green.
+    ///
+    /// `None` for Claude Code (`/014`) deliberately, not by omission. Claude
+    /// declares `NativeSessionStart` and its gate is byte-for-byte what it was
+    /// before #243: wait for the genuine `SessionStart` (which really does arrive
+    /// early in boot), then hold for the readiness buffer. There is no dead wait
+    /// to regress into, so a bound there would guard nothing while adding a
+    /// timing constraint to a real-LLM test. Claude is #243's healthy BASELINE —
+    /// the 3.80 / 3.85 / 3.96 / 4.39 s end-to-end delegates its budgets are
+    /// derived from — not one of its victims.
+    delegate_to_submit_budget: Option<Duration>,
 }
+
+/// Issue #243: `/015`'s bound, derived from both ends the same way
+/// `orchestration/delegate/024`'s 6 s `READY_TO_POINTER_BUDGET` is.
+///
+/// *Below:* under the 30 s `SESSION_START_WAIT_TIMEOUT`, and a full 11 s under
+/// the ~31 s (timeout + readiness buffer) the pre-fix path burned before the
+/// fallback wrote anything — `orchestration/delegate/025` measures exactly that
+/// 31 s for this agent's configuration in virtual time, and the issue's own
+/// scheduler measurement of an OpenCode cold spawn was 30.3 s. So a run that
+/// still pays the dead wait cannot pass this, which is the whole reason the
+/// bound exists.
+///
+/// *Above:* the deck's own contribution is small and known — the orchestrator
+/// script's 0.2 s trigger poll, one `dot-agent-deck delegate` CLI round trip,
+/// the `clear = true` respawn, and then exactly the 1000 ms readiness buffer
+/// this test pins via `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS`. The issue
+/// measured the equivalent scheduler path at 1.5 s end to end after the fix.
+/// Everything else inside this budget is real OpenCode booting far enough to
+/// consume the keystrokes it was handed and post `session.prompt`.
+///
+/// The honest caveat, because it is the one thing this number cannot be derived
+/// from: nobody has measured how long a REPLACEMENT OpenCode takes to reach that
+/// point, since before #243 it always had the whole 30 s wait to boot in and now
+/// it has 1 s. 20 s is deliberately generous for it rather than tight, and it is
+/// the half of this bound to widen — or to re-derive against a real measurement —
+/// if a healthy run is ever seen near it. Do not widen it past ~25 s, where it
+/// stops separating the two paths.
+const OPENCODE_DELEGATE_TO_SUBMIT_BUDGET: Duration = Duration::from_secs(20);
 
 fn path_with_binary_dir() -> String {
     let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
@@ -156,6 +206,12 @@ fn run_real_clear_true_delegate(deck: TuiDeck, worker_command: &str, case: RealD
     // the delegated turn rather than boot-time card paint.
     deck.send_bytes(b"\x04");
     deck.wait_for_string("[New Pane Ctrl+N]");
+    // Issue #243: stamped so the submission wait below can be scoped to events
+    // broadcast AFTER the delegate, and so the latency bound has an anchor. The
+    // FIRST worker has been up for a while by now and `EventSub::wait_for` scans
+    // everything collected since the subscription opened, so an unscoped
+    // predicate could match a pre-delegate event and measure nonsense.
+    let delegate_released_at = chrono::Utc::now();
     std::fs::write(work.join(DELEGATE_TRIGGER), "").expect("release delegate trigger");
 
     // Real native status on the user-visible card: prompt submission enters
@@ -176,6 +232,7 @@ fn run_real_clear_true_delegate(deck: TuiDeck, worker_command: &str, case: RealD
         |event| {
             event.event_type == EventType::Thinking
                 && event.agent_type == case.agent_type
+                && event.timestamp >= delegate_released_at
                 && event
                     .user_prompt
                     .as_deref()
@@ -192,6 +249,34 @@ fn run_real_clear_true_delegate(deck: TuiDeck, worker_command: &str, case: RealD
         case.agent_name,
         submitted.user_prompt
     );
+
+    // Issue #243: the delegate must also be PROMPT, for the cases where #243
+    // changed what "prompt" means. Everything above is satisfied by the pre-fix
+    // path too — the 30 s fallback delivered the pointer eventually and the
+    // worker acted on it — so for an agent that used to pay a dead wait, this is
+    // the ONLY assertion that tells the fixed path from the broken one. See
+    // `RealDelegateCase::delegate_to_submit_budget` for why `/014` carries none.
+    //
+    // Measured between the test's own stamp and the daemon's event timestamp
+    // rather than on a wall clock read here, because `EventSub::wait_for` returns
+    // from a buffer that may already hold the match — the grid wait above it
+    // would otherwise be counted into the interval.
+    if let Some(budget) = case.delegate_to_submit_budget {
+        let delegate_to_submit = submitted.timestamp - delegate_released_at;
+        assert!(
+            delegate_to_submit
+                <= chrono::Duration::from_std(budget)
+                    .expect("delegate_to_submit_budget fits a chrono Duration"),
+            "the delegated pointer reached the REAL {} worker {delegate_to_submit} after the \
+             delegate was released, against a budget of {budget:?}. This agent declares it emits \
+             NO pre-prompt readiness signal, so the gate should skip straight to the bounded \
+             readiness buffer — a delay in this range means it is waiting out the 30 s \
+             SESSION_START_WAIT_TIMEOUT for an event that cannot arrive, and only the fallback is \
+             delivering (issue #243). released={delegate_released_at:?} submitted={:?}",
+            case.agent_name,
+            submitted.timestamp
+        );
+    }
 
     let sentinel = work.join(case.sentinel_name);
     if let Err(observed) =
@@ -246,11 +331,15 @@ fn delegate_014_real_claude_worker_acts_on_clear_true_delegate() {
             input_ready_needle: "? for shortcuts",
             sentinel_name: CLAUDE_SENTINEL,
             sentinel_content: CLAUDE_SENTINEL_CONTENT,
+            // Deliberately unbounded — see the field's own doc comment. Claude's
+            // readiness path is untouched by #243 and is its healthy baseline,
+            // not one of its victims.
+            delegate_to_submit_budget: None,
         },
     );
 }
 
-/// Scenario: Open an orchestration through the real PTY-attached deck with a `clear = true` worker running interactive OpenCode on a cheap mini model, visibly wait for its TUI, and release a script that invokes the real delegate CLI. The replacement worker must submit its task pointer, visibly traverse Thinking and Working with its shell tool, and create the uniquely named sentinel requested by the delegated task; a test-only env seam permits the same scenario to be observed with the readiness buffer set to zero.
+/// Scenario: Open an orchestration through the real PTY-attached deck with a `clear = true` worker running interactive OpenCode on a cheap mini model, visibly wait for its TUI, and release a script that invokes the real delegate CLI. The replacement worker must submit its task pointer, visibly traverse Thinking and Working with its shell tool, and create the uniquely named sentinel requested by the delegated task; a test-only env seam permits the same scenario to be observed with the readiness buffer set to zero. The submission must also land within twenty seconds of the delegate being released (issue #243): OpenCode declares no pre-prompt readiness signal, so before the fix this delegate sat out the 30 s `SessionStart` timeout every time and only the fallback delivered — every other assertion here held throughout that, so without this bound the test cannot tell the fixed path from the broken one.
 #[spec("orchestration/delegate/015")]
 #[test]
 #[cfg(unix)]
@@ -274,6 +363,7 @@ fn delegate_015_real_opencode_worker_acts_on_clear_true_delegate() {
             input_ready_needle: "Ask anything...",
             sentinel_name: OPENCODE_SENTINEL,
             sentinel_content: OPENCODE_SENTINEL_CONTENT,
+            delegate_to_submit_budget: Some(OPENCODE_DELEGATE_TO_SUBMIT_BUDGET),
         },
     );
 }

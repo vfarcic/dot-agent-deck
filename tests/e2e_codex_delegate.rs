@@ -51,9 +51,19 @@
 //! Hence the pre-delegate precondition is the user-visible one — the Codex TUI
 //! is up in the pane — exactly as `codex/live/001` does it, and the native
 //! events are asserted AFTER the delegate, where they legitimately prove
-//! delivery reached the agent. A consequence worth knowing: for Codex the M3
-//! readiness gate never fast-paths, every `clear = true` delegate pays the full
-//! timeout fallback (documented in `docs/develop/agent-adapters.md`).
+//! delivery reached the agent.
+//!
+//! That used to carry a consequence — for Codex the readiness gate never
+//! fast-paths, so every `clear = true` delegate paid the full 30 s timeout
+//! fallback. **Issue #243 removed it**: `dot-agent-deck wrap` now watches the
+//! child's terminal and emits a second `SessionStart` marked
+//! `wrapper_interface_ready` once the Codex TUI takes the inner PTY out of
+//! cooked mode, and the gate releases on that instead. The precondition above is
+//! unchanged (it is still asserted on the user-visible TUI, and Codex's NATIVE
+//! `SessionStart` is still caused by the prompt), but the pointer now arrives
+//! within a second of the replacement becoming ready rather than 31 s later —
+//! which is why this test carries [`READY_TO_SUBMIT_BUDGET`] below. Without it,
+//! it passes identically on the fixed and the broken path.
 //!
 //! ## Why the orchestrator is a script and the worker is the real agent
 //! The defect lives entirely on the WORKER side of the delegate: prompt
@@ -95,6 +105,43 @@ const SENTINEL_NAME: &str = "prd225-codex-delegate-6f21ba.txt";
 /// Exact contents the directive asks for — asserted trimmed, since a model may
 /// append a newline no matter how the prompt is worded.
 const SENTINEL_CONTENT: &str = "PRD225_DELEGATE_OK";
+
+/// Issue #243: how long the REPLACEMENT worker may take to get from "the
+/// wrapper observed its interface" to "the pointer was submitted inside Codex".
+///
+/// This test needs a latency bound because without one it cannot tell the fixed
+/// path from the broken one. It passed for months while the delegate burned the
+/// full [`SESSION_START_WAIT_TIMEOUT`](dot_agent_deck::state) — the timeout
+/// fallback delivered eventually, every assertion below held, and the defect
+/// #243 fixed was invisible here. It would keep passing straight through a
+/// silent regression to that behaviour.
+///
+/// **Ten seconds, justified from both ends**, the same way
+/// `orchestration/delegate/024`'s 6 s `READY_TO_POINTER_BUDGET` is.
+///
+/// *Below:* three times under the 30 s `SESSION_START_WAIT_TIMEOUT`, and three
+/// times under the ~31 s (timeout + readiness buffer) that the pre-fix path
+/// burned before the fallback wrote anything — measured at 30.98 s / 31.00 s by
+/// `/024` on this branch, and at 31.2 / 31.2 / 31.7 / 31.7 / 32.3 s on the
+/// production Codex delegates in the issue. Nothing that pays the dead wait can
+/// slip past this as a false green, which is the entire point.
+///
+/// *Above:* the deck's own contribution to this leg is now small and bounded.
+/// The wrapper's `InterfaceWatch` polls on the same 50 ms loop it already runs,
+/// a real Codex TUI releases on the STRONG fact (it clears `ICANON`/`ECHO`
+/// rather than merely going quiet), and the e2e harness pins
+/// `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` to `0`, so no buffer is added
+/// on top. `/024` measures the whole ready→pointer leg of the synthetic
+/// equivalent at ~1.75 s WITH a 1000 ms buffer deliberately pinned on. What is
+/// left inside this budget is the part the deck does not control: codex-cli
+/// accepting the keystrokes and its native `UserPromptSubmit` hook reaching the
+/// daemon. That hook fires at SUBMIT — it is not a model round trip, and this
+/// test separately measures the whole model turn at ~5 s from submission to the
+/// sentinel landing — so 10 s is roughly an order of magnitude of headroom over
+/// the deck's measured share and still leaves seconds for a cold hook exec on a
+/// loaded runner. Widen it if a healthy run is ever seen near it; do NOT widen
+/// it past ~20 s, where it stops distinguishing the two paths at all.
+const READY_TO_SUBMIT_BUDGET: Duration = Duration::from_secs(10);
 
 /// Test-written trigger the orchestrator script blocks on, so the delegate
 /// fires only after the worker is genuinely up (production timing).
@@ -224,8 +271,13 @@ fn open_orchestration(deck: &TuiDeck) {
 /// and the worker must create the uniquely named sentinel file with the
 /// requested contents. Pre-fix the wrapper's fork-time event released the gate
 /// ~4s before the Codex TUI existed, the prompt was lost, and no sentinel ever
-/// appeared. Reel-eligible (PTY-attached real agent, records a
-/// `full-stream.cast`); flaky-tolerant (real LLM) — run once, not looped.
+/// appeared. The delegate must also be PROMPT (issue #243): the wrapper's
+/// interface-ready `SessionStart` for the replacement is captured as the anchor,
+/// and no more than ten seconds may pass between it and the pointer's submission
+/// — without that bound this test passes identically whether the gate released
+/// on the readiness signal or gave up after the 30 s fallback. Reel-eligible
+/// (PTY-attached real agent, records a `full-stream.cast`); flaky-tolerant (real
+/// LLM) — run once, not looped.
 #[spec("orchestration/delegate/009")]
 #[test]
 #[cfg(unix)]
@@ -306,6 +358,14 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
     deck.wait_for_string("[New Pane Ctrl+N]");
 
     // Release the orchestrator: it runs the real `dot-agent-deck delegate`.
+    //
+    // Stamped so the two waits below can be scoped to events broadcast AFTER
+    // this instant. `EventSub::wait_for` scans everything the subscription has
+    // collected since it opened, and this run's FIRST worker also came up
+    // wrapped — so an unscoped predicate would happily match that worker's
+    // interface-ready event from the boot precondition above and measure a
+    // negative interval.
+    let delegate_released_at = chrono::Utc::now();
     std::fs::write(work.join(DELEGATE_TRIGGER), "").expect("release the orchestrator's delegate");
 
     let orchestrator_log = || {
@@ -315,6 +375,32 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
     let task_pointer = work
         .join(".dot-agent-deck")
         .join(format!("worker-task-{WORKER_ROLE}.md"));
+
+    // ISSUE #243's readiness fact, on the wire: `dot-agent-deck wrap` watched
+    // the REPLACEMENT worker's Codex interface come up and said so. This is the
+    // instant the gate releases on — the anchor the latency bound below is
+    // measured from — and before #243 no such event existed at all, which is
+    // why this test could not tell a healthy delegate from a 31 s dead wait.
+    //
+    // Matched on EITHER interface fact (`is_wrapper_interface_session_start`),
+    // not just the strong one, because either releases the gate and the point
+    // here is to anchor on whatever actually did. A real Codex TUI clears
+    // `ICANON`/`ECHO` and so releases on the strong fact; accepting the settled
+    // fact too means a Codex that somehow released on the weak one is measured
+    // rather than mistaken for "the wrapper never observed anything", which
+    // would fail here with a misleading cause.
+    //
+    // The 90 s window is boot, not gate: it covers the replacement Codex cold
+    // starting from scratch, which is why it is generous where the bound below
+    // is tight.
+    let interface_ready = events.wait_for(
+        |event| {
+            event.event_type == EventType::SessionStart
+                && event.is_wrapper_interface_session_start()
+                && event.timestamp >= delegate_released_at
+        },
+        Duration::from_secs(90),
+    );
 
     // The event PRD #225's readiness gate is about, now where it can actually
     // happen: the respawned worker's GENUINE native Codex `SessionStart` — no
@@ -346,6 +432,7 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
             event.event_type == EventType::Thinking
                 && event.agent_type == AgentType::Codex
                 && event.user_prompt.is_some()
+                && event.timestamp >= delegate_released_at
         },
         Duration::from_secs(30),
     );
@@ -357,6 +444,37 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
         "the respawned Codex worker submitted a prompt, but not the delegated task pointer: \
          {:?}",
         submitted.user_prompt
+    );
+
+    // ISSUE #243's latency bound, and the reason the two events above are
+    // captured rather than merely awaited: how long the deck sat on the pointer
+    // AFTER the wrapper told it the replacement's interface was up.
+    //
+    // Everything else in this test is satisfied by the pre-fix path too — the
+    // 30 s fallback delivered the pointer eventually, Codex acted on it, and the
+    // sentinel appeared. This is the one assertion that distinguishes "released
+    // by the readiness signal" from "released by giving up", so it is what keeps
+    // a silent regression to the dead wait from shipping green. See
+    // `READY_TO_SUBMIT_BUDGET` for how 10 s is derived from both ends.
+    //
+    // Measured on the daemon's own clock (both events' `timestamp`s) rather than
+    // on this thread's `Instant`, because `EventSub::wait_for` returns from a
+    // buffer that may already hold the match — a wall-clock reading taken here
+    // would include however long the assertions above spent, not the interval
+    // being bounded.
+    let ready_to_submit = submitted.timestamp - interface_ready.timestamp;
+    assert!(
+        ready_to_submit
+            <= chrono::Duration::from_std(READY_TO_SUBMIT_BUDGET)
+                .expect("READY_TO_SUBMIT_BUDGET fits a chrono Duration"),
+        "the delegated pointer reached the REAL Codex worker {ready_to_submit} after the wrapper \
+         announced its interface was ready, against a budget of {READY_TO_SUBMIT_BUDGET:?}. The \
+         delegate is paying a dead wait again: the readiness signal issue #243 added is on the \
+         wire (it is what this measurement starts from), so the gate is not releasing on it and \
+         the pointer is arriving via the 30 s SESSION_START_WAIT_TIMEOUT fallback instead. \
+         interface_ready={:?} submitted={:?}",
+        interface_ready.timestamp,
+        submitted.timestamp
     );
 
     // USER-VISIBLE counterpart of the event above: the worker's card carries
