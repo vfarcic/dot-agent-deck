@@ -402,6 +402,22 @@ fn resolve_orchestration_at(
                     this.name
                 ));
             }
+            // Duplicate orchestration names are only a WARNING in
+            // `validate_config`, so a file can legally carry two blocks called
+            // `mixed` — and `position` would silently inherit from whichever was
+            // written first. Without `extends` a duplicate name is merely
+            // confusing (two chips wearing one label); with it, it silently
+            // decides WHICH AGENTS RUN, which is the same position-decides-in-
+            // silence failure issue #704 is about. Refuse instead (Greptile P1 on
+            // PR #711).
+            if raw.iter().filter(|o| o.name == *parent).count() > 1 {
+                return Err(format!(
+                    "orchestration '{}' extends '{parent}', but '{parent}' names more than one \
+                     `[[orchestrations]]` block in this file, so which one it inherits would be \
+                     decided by their order. Give them distinct names.",
+                    this.name
+                ));
+            }
             let parent_index = raw.iter().position(|o| o.name == *parent).ok_or_else(|| {
                 let defined: Vec<&str> = raw
                     .iter()
@@ -571,6 +587,12 @@ impl DefaultOrchestrationReason {
 pub struct DefaultOrchestration<'a> {
     /// The chosen orchestration's own config.
     pub config: &'a OrchestrationConfig,
+    /// Its index in [`ProjectConfig::orchestrations`].
+    ///
+    /// Carried because NAME is not an identity here: duplicate orchestration
+    /// names are only a validation warning, so a caller matching the chosen one
+    /// by name would mark every namesake as the default.
+    pub index: usize,
     /// Its resolved name (the cwd-basename fallback already applied).
     pub name: String,
     /// Why this one.
@@ -647,10 +669,11 @@ pub fn default_orchestration<'a>(
     config: &'a ProjectConfig,
     dir: &Path,
 ) -> Option<DefaultOrchestration<'a>> {
-    let candidates: Vec<&'a OrchestrationConfig> = config
+    let candidates: Vec<(usize, &'a OrchestrationConfig)> = config
         .orchestrations
         .iter()
-        .filter(|o| !o.roles.is_empty())
+        .enumerate()
+        .filter(|(_, o)| !o.roles.is_empty())
         .collect();
     if candidates.is_empty() {
         return None;
@@ -659,7 +682,7 @@ pub fn default_orchestration<'a>(
     let declared: Vec<usize> = candidates
         .iter()
         .enumerate()
-        .filter(|(_, o)| o.default)
+        .filter(|(_, (_, o))| o.default)
         .map(|(i, _)| i)
         .collect();
 
@@ -687,15 +710,17 @@ pub fn default_orchestration<'a>(
         }
     };
 
+    let (index, config_of_chosen) = candidates[chosen];
     Some(DefaultOrchestration {
-        config: candidates[chosen],
-        name: resolve_orchestration_name(&candidates[chosen].name, dir),
+        config: config_of_chosen,
+        index,
+        name: resolve_orchestration_name(&config_of_chosen.name, dir),
         reason,
         others: candidates
             .iter()
             .enumerate()
             .filter(|(i, _)| *i != chosen)
-            .map(|(_, o)| resolve_orchestration_name(&o.name, dir))
+            .map(|(_, (_, o))| resolve_orchestration_name(&o.name, dir))
             .collect(),
     })
 }
@@ -1080,6 +1105,43 @@ clear = false
         assert!(
             err.to_string().contains("empty `extends`") && err.to_string().contains("child"),
             "{err}"
+        );
+    }
+
+    /// Duplicate orchestration names are only a validation WARNING, so a file can
+    /// legally carry two blocks with one name. Inheriting from "whichever came
+    /// first" would then silently decide which agents a variant launches.
+    #[test]
+    fn extends_naming_a_duplicated_orchestration_is_refused_as_ambiguous() {
+        let err = toml::from_str::<ProjectConfig>(&format!(
+            "{BASE}[[orchestrations]]\nname = \"mixed\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"other\"\nstart = true\n\n\
+             [[orchestrations]]\nname = \"child\"\nextends = \"mixed\"\n\n\
+             [[orchestrations.roles]]\nname = \"coder\"\ncommand = \"opencode\"\n"
+        ))
+        .expect_err("an ambiguous parent must not resolve to the first namesake");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'child'") && msg.contains("more than one") && msg.contains("mixed"),
+            "the error must name the child and say WHY the parent is unusable, since the file \
+             looks perfectly well-formed: {msg}"
+        );
+    }
+
+    /// The same duplication must not make two entries look like the default.
+    #[test]
+    fn a_duplicated_name_does_not_spread_the_default_across_namesakes() {
+        let cfg = parse(&format!(
+            "{}{}",
+            orch_toml("twin", true),
+            orch_toml("twin", false)
+        ));
+        let chosen = default_orchestration(&cfg, Path::new("/tmp/x")).expect("a candidate");
+        assert_eq!(chosen.index, 0, "the DECLARING block is the chosen one");
+        assert_eq!(
+            chosen.others,
+            vec!["twin"],
+            "its namesake is another candidate, not the same one"
         );
     }
 

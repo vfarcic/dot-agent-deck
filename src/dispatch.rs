@@ -38,17 +38,18 @@ pub fn available_orchestrations(
     let Some(cfg) = config else {
         return Vec::new();
     };
-    let default_name = crate::project_config::default_orchestration(cfg, dir).map(|d| d.name);
+    // Matched by INDEX, not by name: duplicate orchestration names are only a
+    // validation warning, so comparing names would put `[default]` on every
+    // namesake and tell the reader the choice is ambiguous when it is not.
+    let default_index = crate::project_config::default_orchestration(cfg, dir).map(|d| d.index);
     cfg.orchestrations
         .iter()
-        .filter(|o| !o.roles.is_empty())
-        .map(|o| {
-            let name = crate::project_config::resolve_orchestration_name(&o.name, dir);
-            crate::event::ListedOrchestration {
-                default: default_name.as_deref() == Some(name.as_str()),
-                name,
-                roles: o.roles.len(),
-            }
+        .enumerate()
+        .filter(|(_, o)| !o.roles.is_empty())
+        .map(|(i, o)| crate::event::ListedOrchestration {
+            default: default_index == Some(i),
+            name: crate::project_config::resolve_orchestration_name(&o.name, dir),
+            roles: o.roles.len(),
         })
         .collect()
 }
@@ -960,6 +961,27 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("mixed", false), ("gpt", true)],
             "the marker follows the declaration, not the file order"
+        );
+    }
+
+    /// Two orchestrations sharing a name must not both be marked `[default]` —
+    /// duplicate names are only a validation warning, so the listing has to
+    /// resolve identity by position rather than by label.
+    #[test]
+    fn a_duplicated_orchestration_name_marks_exactly_one_default() {
+        let c = cfg("[[orchestrations]]\nname = \"twin\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations]]\nname = \"twin\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"sh\"\nstart = true\n");
+        let found = available_orchestrations(Some(&c), Path::new("/tmp/repo"));
+        assert_eq!(
+            found.iter().filter(|o| o.default).count(),
+            1,
+            "exactly one entry may carry the marker: {found:?}"
+        );
+        assert!(
+            found[0].default && !found[1].default,
+            "and it is the first: {found:?}"
         );
     }
 
