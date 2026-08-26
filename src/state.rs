@@ -202,7 +202,7 @@ pub(crate) const DELEGATE_READINESS_BUFFER: std::time::Duration =
 ///   it was not for [`WRAPPER_INTERFACE_READINESS_BUFFER`].
 /// * **Upper end.** This is paid on EVERY delegate and every scheduled first
 ///   prompt to this agent, against the 30.3 s an OpenCode cold spawn cost before
-///   this issue (`orchestration/delegate/025` measures ~31 s for the same
+///   this issue (`orchestration/delegate/030` measures ~31 s for the same
 ///   configuration in virtual time). 8 s puts the pointer at ~9.5 s end to end —
 ///   still 3.2x better than the baseline, half of `orchestration/delegate/015`'s
 ///   20 s budget, and far inside the 60 s `AUTOMATIC_PROMPT_DEADLINE` that bounds
@@ -1649,9 +1649,14 @@ const MAX_INLINED_PANE_TEXT_CHARS: usize = 400;
 /// **This deliberately relaxes PRD #249 finding B3 for this notice, and the
 /// frame is what pays for it.** B3 removed the role name from
 /// [`compose_delegate_silence_notice`] on the grounds that the notice's
-/// inertness is best-effort — an LF is not provably "not Enter" on every agent,
+/// inertness was best-effort — an LF is not provably "not Enter" on every agent,
 /// and a later ordinary prompt write can submit accumulated notice bytes — so
-/// nothing a repository controls should ride it. Pane text is strictly more
+/// nothing a repository controls should ride it. Issue #702 retired that
+/// premise for this caller rather than weakening it: the notice is now SUBMITTED
+/// (`write_and_submit_guarded`), so it is a turn of its own and cannot be fused
+/// onto somebody else's, and the value is fenced the way
+/// [`compose_idle_worker_prompt`] fences its role name. What remains true, and
+/// is not papered over, is that pane text is strictly more
 /// hostile than a role name: it is whatever an agent drew, which routinely
 /// includes text that agent read from a third-party clone. The trade is taken
 /// because the alternative measured badly in practice: a notice that names no
@@ -1937,6 +1942,45 @@ fn release_undelivered_commission(
     }
 }
 
+/// Issue #687: the counterpart to [`release_undelivered_commission`] for the
+/// silent-worker watch a `clear = true` respawn arms EARLY, and the single place
+/// that invariant is spelled out:
+///
+/// > **Every path that arms the new generation's watch at respawn time and then
+/// > fails to write that generation's task pointer must release it.**
+///
+/// The watch used to be armed immediately before the pointer write, which meant
+/// the PREVIOUS generation's watch stayed armed — and could fire — throughout the
+/// replacement's `SessionStart` wait and readiness buffer, a gap measured at ~30 s
+/// in the log #687 reports. [`AgentPtyRegistry::arm_silence_watch`] is the
+/// operation that supersedes the previous watch, so moving it to the moment the
+/// respawn establishes fresh pane ownership is what retires the old generation
+/// promptly; the record it leaves behind then has to be cleaned up on every later
+/// exit that delivers nothing, exactly as the commission ledger's is.
+///
+/// Conditional on the generation (`cancel_silence_watch_if`), never an
+/// unconditional remove: a newer delegate or a pane close may already have
+/// replaced this record, and taking somebody else's would disarm a live watch.
+fn release_reserved_silence_watch(
+    registry: &AgentPtyRegistry,
+    worker_pane_id: &str,
+    reserved: Option<crate::agent_pty::ArmedSilenceWatch>,
+    reason: &'static str,
+) {
+    let Some(reserved) = reserved else {
+        return;
+    };
+    if registry.cancel_silence_watch_if(worker_pane_id, reserved.seq) {
+        tracing::debug!(
+            pane_id = %worker_pane_id,
+            seq = reserved.seq,
+            reason,
+            "delegate: released the silent-worker watch the clear=true respawn armed for its \
+             fresh generation; that generation never received a task pointer"
+        );
+    }
+}
+
 /// PRD #126: resolve the timeout, capture the orchestrator's identity, arm the
 /// registry record and spawn its watch — the whole "this worker now owes a
 /// work-done" step of one delegate target. Split out of `handle_delegate` so the
@@ -2214,35 +2258,59 @@ fn delegate_no_event_window(
         .map(|timeout| timeout.min(MAX_DELEGATE_NO_EVENT_WINDOW))
 }
 
-/// PRD #249 M3: the single-line notice written into the orchestrator's pane when
-/// a delegated worker received its task pointer and then emitted no event at all.
+/// PRD #249 M3: the single-line prompt the daemon SUBMITS into the
+/// orchestrator's pane when a delegated worker received its task pointer and
+/// then emitted no event at all.
 ///
-/// Three properties, each load-bearing:
+/// **Issue #702: this notice belongs to [`compose_idle_worker_prompt`]'s family,
+/// not to [`compose_worker_exited_notice`]'s.** The contract is keyed on the
+/// DELIVERY MECHANISM, and it is stated once — here for the submitted family, on
+/// [`compose_worker_exited_notice`] for the deferred one:
 ///
+/// * **Submitted**, with [`AgentPtyRegistry::write_and_submit_guarded`] — the
+///   same call, the same identity gate and the same revalidation closure PRD
+///   #126's idle-worker report uses. It fires EARLIER and SHARPER than that
+///   report (the worker took its pointer and emitted *nothing*, rather than
+///   merely not finishing), which is precisely the moment re-delegating helps,
+///   so the wording asks the orchestrator to act and the delivery hands it a
+///   turn in which to do so. The alternative it left behind was the worst of
+///   the three available: [`AgentPtyRegistry::write_notice_guarded`] is not
+///   inert, only DEFERRED — its LF is not provably "not Enter" on every agent,
+///   and a later ordinary prompt write submits the accumulated bytes fused to
+///   the next real turn (pinned by
+///   `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`). So
+///   the old delivery neither prompted action nor stayed out of the model's
+///   input; it just arrived late, attached to somebody else's turn.
+/// * **The concatenation hazard therefore does not apply to this notice**, and
+///   with it goes the reason PRD #249 finding B3 gave for keeping untrusted
+///   values out. What DOES apply is issue #544's accepted limitation, shared
+///   with every automatic submit including the idle prompt: a pane already
+///   holding an unsent human draft gets that draft submitted along with this
+///   text. `write_guarded`'s user-input guard refuses only a REPEAT of bytes it
+///   already wrote, which this never is.
+/// * **Still no role name and no delegated task text.** That half of B3 is NOT
+///   relaxed. The identifying detail rides the `warn!` that always accompanies
+///   delivery — the pane gets "a worker went silent, look at the log", the log
+///   gets the worker pane, the role, the orchestrator pane and the window.
 /// * **One line**, via [`compose_delegate_prompt`] — a multi-line payload is
-///   written as bracketed paste (#187) and would sit in the pane as a compacted
-///   block.
-/// * **Not submitted.** Delivered with
-///   [`AgentPtyRegistry::write_notice_guarded`], which terminates on LF instead
-///   of the submit CR, so it forms a visible line in scrollback rather than a
-///   user turn the orchestrator must answer. The PRD #126 idle-worker report is
-///   the opposite choice on purpose: that one *asks the orchestrator to act*,
-///   this one only makes an invisible failure visible. Note that this is a
-///   best-effort property, not a guarantee — see
-///   [`AgentPtyRegistry::write_to_pane_notice`]'s KNOWN LIMITATIONS: whether an
-///   agent's TUI treats LF as Enter is unverified per agent, and a later
-///   ordinary prompt write can submit the accumulated notice bytes along with
-///   it.
-/// * **No role name and no delegated task text.** PRD #249's review (finding B3)
-///   removed the role from this notice: because inertness cannot be guaranteed
-///   (above), a role name travelling with a hostile clone's
-///   `.dot-agent-deck.toml` could still end up submitted into the orchestrator's
-///   context. The identifying detail rides the `warn!` that always accompanies
-///   delivery instead — the pane gets "a worker went silent, look at the log",
-///   the log gets the worker pane, the role, the orchestrator pane and the
-///   window. `pane_text` is the ONE untrusted value that now travels with it,
-///   and it arrives already fenced by [`quote_untrusted_pane_text`], which
-///   carries the full argument for that exception.
+///   written as bracketed paste (#187) and never auto-submits, so it would sit
+///   in the input box forever.
+///
+/// **Where this differs from [`compose_idle_worker_prompt`], and why that is
+/// acceptable.** Both submit daemon-authored text carrying one fenced untrusted
+/// value, but the values are not the same size of risk: the idle prompt
+/// interpolates a ROLE NAME — short, drawn from `.dot-agent-deck.toml`, fenced
+/// by [`quote_untrusted_role`] — while this one interpolates a WHOLE RENDERED
+/// SCREEN, longer and directly attacker-influenceable, since it is whatever an
+/// agent drew after reading a third-party clone. That is a real escalation and
+/// is not papered over. It is taken because the mitigation is
+/// [`quote_untrusted_report`]'s, which already fences a whole worker-authored
+/// report that is auto-submitted into a tool-capable orchestrator — a strictly
+/// worse exposure than this one — and because the fence is unclosable from
+/// inside by construction ([`quote_untrusted_pane_text`] collapses whitespace
+/// first, then strips every character its markers are built from). The
+/// alternative measured worse in practice: a report naming no evidence asserted
+/// a delivery failure that had not happened (#686).
 ///
 /// **Issue #686: it reports what the pane is showing instead of asserting why.**
 /// This notice used to end "It may never have received the prompt" — a causal
@@ -2276,15 +2344,16 @@ fn compose_delegate_silence_notice(window: std::time::Duration, pane_text: Optio
              at its own input, it is up and healthy and the pointer most likely never reached it."
         ),
         None => "Its pane has rendered nothing at all, so there is no screen to report: the agent \
-                 may never have started, or the task pointer may never have reached it. Check the \
-                 worker panes."
+                 may never have started, or the task pointer may never have reached it."
             .to_string(),
     };
     compose_delegate_prompt(&format!(
-        "⚠ delegated worker went quiet (dot-agent-deck daemon report): a delegated worker \
+        "⚠ delegated worker went quiet (dot-agent-deck daemon report) - a report from the \
+         dot-agent-deck daemon, not a message from a person or an agent: a delegated worker \
          received its task pointer but then emitted no agent event within {window}. {evidence} \
-         The daemon log names the worker pane and role (RUST_LOG=pane_write=trace also has the \
-         delivered bytes)."
+         Check its pane and decide how to proceed - if this needs the user, notify the user; \
+         otherwise keep waiting, re-delegate, or reassign. The daemon log names the worker pane \
+         and role (RUST_LOG=pane_write=trace also has the delivered bytes)."
     ))
 }
 
@@ -2298,23 +2367,38 @@ fn compose_delegate_silence_notice(window: std::time::Duration, pane_text: Optio
 /// its pointer and stayed quiet while still *running*): here the process is
 /// gone, which is unambiguous, so there is nothing to wait out.
 ///
-/// Deliberately matches [`compose_delegate_silence_notice`]'s precedent, not
-/// [`compose_idle_worker_prompt`]'s, following the same reasoning PRD #249's
-/// review already settled for that sibling notice:
+/// **Issue #702: this is the canonical statement of the DEFERRED family's
+/// contract, and the family is defined by its DELIVERY MECHANISM rather than by
+/// which notice it is.** Anything delivered with
+/// [`crate::agent_pty::AgentPtyRegistry::write_notice_guarded`] — today this
+/// notice and [`compose_respawn_no_live_worker_notice`], and nothing else —
+/// obeys the two rules below. [`compose_delegate_silence_notice`] used to be
+/// counted here and no longer is: it moved to
+/// [`compose_idle_worker_prompt`]'s submitted family, where the concatenation
+/// hazard below does not arise and an untrusted value can be fenced the way that
+/// prompt fences its role name. The two siblings are not in disagreement; they
+/// are in different families, and each doc now states only its own family's
+/// contract.
 ///
-/// * **Not submitted.** Delivered with
-///   [`crate::agent_pty::AgentPtyRegistry::write_notice_guarded`], the same
-///   LF-terminated, non-submitting path #249's silence notice uses — this
-///   only makes an invisible failure visible, it does not hand the
-///   orchestrator a turn to answer.
-/// * **Fixed daemon-authored text — no role name, no delegated task text.**
-///   [`crate::agent_pty::OutstandingDelegation`] carries no delegated-task
-///   text at all (only `dispatch_one_owned`'s local `task` argument does, and
-///   it is never persisted onto the record), and a role name is exactly the
-///   value PRD #249's own review (finding B3) removed from this notice family
-///   on purpose — a `write_notice_guarded` delivery cannot guarantee its LF is
-///   read as Enter, so a later ordinary write can concatenate this notice's
-///   raw bytes with the NEXT real prompt. The pane id, by contrast, is safe
+/// * **Not submitted, which means DEFERRED rather than inert.** Delivered with
+///   `write_notice_guarded`, whose LF terminator leaves a visible line in
+///   scrollback instead of handing the orchestrator a turn to answer. That is
+///   the right trade for a report the orchestrator cannot act on anyway — the
+///   process is already gone — but it is not a guarantee of inertness: whether
+///   an agent's TUI reads LF as Enter is unverified per agent, and a later
+///   ordinary prompt write submits these bytes fused to the NEXT real prompt
+///   (pinned by
+///   `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`).
+/// * **Fixed daemon-authored text — no role name, no delegated task text, and
+///   only pre-scrubbed interpolation.** This rule is a direct consequence of
+///   the one above: because these bytes can be submitted later, glued to
+///   somebody else's turn, nothing that a repository or an agent controls may
+///   ride them, and there is no submitted-turn framing to fence such a value
+///   inside. [`crate::agent_pty::OutstandingDelegation`] carries no
+///   delegated-task text at all (only `dispatch_one_owned`'s local `task`
+///   argument does, and it is never persisted onto the record), and a role name
+///   is exactly the value PRD #249's own review (finding B3) removed from this
+///   family. The pane id, by contrast, is safe
 ///   to interpolate raw not because of its format (pane ids are not always
 ///   `format!("pane-{{nonce:016x}}-{{seq}}")` — a scheduled task's pane id
 ///   embeds a sanitized task name instead), but because the value actually
@@ -2347,7 +2431,10 @@ pub(crate) fn compose_worker_exited_notice(worker_pane_id: &str) -> String {
 /// told nothing was wrong and waited for a `work-done` that could never arrive.
 ///
 /// Composition follows [`compose_worker_exited_notice`]'s precedent exactly, for
-/// the same reasons: fixed daemon-authored text, single line, and the WORKER's
+/// the same reasons — this is the deferred family's second and last member (see
+/// that function's doc for the contract, which is keyed on the
+/// `write_notice_guarded` delivery both share): fixed daemon-authored text,
+/// single line, and the WORKER's
 /// `pane_id_env` as the only interpolation — that value has been through
 /// [`crate::agent_pty::is_valid_pane_id_env`]'s `[A-Za-z0-9_-]` scrub, whereas
 /// the role name is caller-supplied config text and PRD #249's finding B3
@@ -2527,15 +2614,21 @@ struct SilenceWatch {
 /// `dispatch_one_owned`'s per-pane dispatch mutex, which would serialize the next
 /// delegate to this pane behind it.
 ///
-/// Delivery goes through [`AgentPtyRegistry::write_notice_guarded`], bound to the
+/// Delivery goes through [`AgentPtyRegistry::write_and_submit_guarded`] (issue
+/// #702 — see [`compose_delegate_silence_notice`] for why this report is
+/// submitted rather than left as deferred scrollback), bound to the
 /// orchestrator's registry agent id captured when the delegate was ISSUED (see
 /// [`SilenceWatch`]), for the same reason
 /// the PRD #126 idle prompt is guarded (M1 audit finding 2): a pane id is just a
 /// string, and an orchestrator that exits frees its `pane_id_env` for the next
 /// spawn, so unguarded routing writes one orchestration's diagnostics into
 /// whatever stranger inherited the id — `scheduler/idle-worker/008` and `/014`
-/// pin that. An orchestrator with no live registry agent has no identity to bind
-/// to, so the report stays in the log rather than being routed by string.
+/// pin that. Moving the delivery TAIL from LF to the submit CR relaxed nothing
+/// about that gate: the same `expected_agent_id` binding and the same
+/// `is_pane_closing` + [`orchestration_still_matches`] revalidation closure are
+/// still what decide whether a byte is written at all. An orchestrator with no
+/// live registry agent has no identity to bind to, so the report stays in the
+/// log rather than being routed by string.
 /// PRD #249 M3 review (finding B4/S4): the watch is CANCELLABLE, and three
 /// outcomes cancel it — a `work-done` from the worker
 /// ([`AgentPtyRegistry::retire_silence_watch`], called from
@@ -2664,11 +2757,17 @@ fn arm_delegate_silence_watch(
             .and_then(quote_untrusted_pane_text);
         // PRD #249 review (finding B3): daemon-authored text plus the one fenced
         // untrusted value above — the role rides the `warn!`, never the pane.
+        //
+        // Issue #702: SUBMITTED, via the same `write_and_submit_guarded` the PRD
+        // #126 idle-worker report uses, with the same identity binding (the
+        // orchestrator agent captured when the delegate was ISSUED) and the same
+        // revalidation closure. Only the delivery tail moved — the gate that
+        // `scheduler/idle-worker/008` and `/014` pin is untouched.
         let notice = compose_delegate_silence_notice(window, pane_text.as_deref());
         let revalidate_registry = Arc::clone(&registry);
         let revalidate_pane = orchestrator_pane_id.clone();
         let outcome = registry
-            .write_notice_guarded(
+            .write_and_submit_guarded(
                 &orchestrator_pane_id,
                 &notice,
                 Some(&expected_agent_id),
@@ -2685,35 +2784,82 @@ fn arm_delegate_silence_watch(
                 },
             )
             .await;
+        settle_silence_report_payload_record(&registry, &orchestrator_pane_id, &notice, &outcome);
         match outcome {
             Ok(crate::agent_pty::GuardedSend::Applied) => tracing::info!(
                 pane_id = %worker_pane_id,
                 role = %role,
-                "delegate: surfaced a silent worker in the orchestrator pane"
+                "delegate: submitted a silent-worker report into the orchestrator pane"
             ),
-            // Some bytes reached the authorized target; a retry would duplicate
-            // a half-written line rather than repair it.
+            // A partial write: some bytes reached the authorized target, so the
+            // report is not retried into a duplicate — and, unlike `Applied`,
+            // its payload record is deliberately left standing, because those
+            // bytes may still be in the pane's input box. See
+            // [`settle_silence_report_payload_record`].
             Ok(crate::agent_pty::GuardedSend::Ambiguous) => warn!(
                 pane_id = %orchestrator_pane_id,
                 role = %role,
-                "delegate: silent-worker notice delivery was ambiguous (partial write); \
-                 not retried"
+                "delegate: the silent-worker report's submission was ambiguous (partial write); \
+                 not retried, and its payload record is kept so a later identical report cannot \
+                 submit the leftover bytes with the user's draft"
             ),
             Ok(refused) => tracing::debug!(
                 pane_id = %orchestrator_pane_id,
                 role = %role,
                 expected_agent_id = %expected_agent_id,
                 outcome = ?refused,
-                "delegate: identity gate refused the silent-worker notice; nothing written"
+                "delegate: identity gate refused the silent-worker report; nothing submitted"
             ),
             Err(e) => warn!(
                 pane_id = %orchestrator_pane_id,
                 role = %role,
                 error = %e,
-                "delegate: failed to surface the silent-worker notice in the orchestrator pane"
+                "delegate: failed to submit the silent-worker report into the orchestrator pane"
             ),
         }
     });
+}
+
+/// Issue #424 S3 / PR #713 review: release the payload record a ONE-SHOT
+/// silence report left on the orchestrator's pane — but only for the outcome
+/// that says the pane's input box is empty again.
+///
+/// `Applied` wrote the report AND its submit CR, so the submit drained the
+/// input box and nothing of ours is left in it. The record that write left
+/// guards a retry this path will never make — the watch record was consumed
+/// before the send and nothing retries the report — so keeping it could only
+/// refuse a LATER, unrelated report of the same text into the same
+/// orchestrator. That repeat is ordinary rather than exotic: two silent workers
+/// on one orchestration reporting a blank pane in the same window compose
+/// byte-for-byte equal text (`scheduler/idle-worker/017`), and
+/// `arm_idle_worker_watch` reasons the same way about its own report.
+///
+/// `Ambiguous` deliberately does NOT release it, even though it is just as
+/// one-shot. It is by definition a PARTIAL write — some report bytes reached
+/// the authorized target and the submit did not complete — so those bytes are
+/// still sitting in the input box, un-submitted. Clearing the record there
+/// asserts the payload settled when the whole meaning of the outcome is that we
+/// do not know whether it did, and a later identical report into a pane the
+/// user has typed into since would then be admitted and submit the leftover
+/// report bytes together with the user's unsent draft as one unintended turn.
+/// The two costs are not symmetric: keeping the record costs a SUPPRESSED later
+/// report (and only until `agent_pty`'s `PAYLOAD_RECORD_TTL` elapses),
+/// while releasing it costs an INVENTED turn carrying text the user never sent.
+/// Suppressing a diagnostic beats inventing input. So this is one `matches!`
+/// arm on purpose — do not fold `Ambiguous` back into it.
+///
+/// Every other outcome — a refusal or a writer error — wrote nothing, so there
+/// is no record of ours to release and calling this would consume a concurrent
+/// delivery of the same bytes' record instead (issue #424 S2).
+fn settle_silence_report_payload_record(
+    registry: &crate::agent_pty::AgentPtyRegistry,
+    orchestrator_pane_id: &str,
+    notice: &str,
+    outcome: &Result<crate::agent_pty::GuardedSend, crate::agent_pty::AgentPtyError>,
+) {
+    if matches!(outcome, Ok(crate::agent_pty::GuardedSend::Applied)) {
+        registry.note_payload_settled(orchestrator_pane_id, notice);
+    }
 }
 
 /// CodeRabbit (PRD #93 round-9): build the file contents written to
@@ -3928,6 +4074,36 @@ fn write_work_done_summary(
 ///    as delivered on purpose: some bytes reached the authorized worker, so a
 ///    completion may genuinely be owed and keeping the commission is the
 ///    fail-safe direction.
+///
+/// # The silent-worker watch's no-delivery invariant
+///
+/// Issue #687. The same shape as the ledger's, one exit shorter, and it exists
+/// for the same reason: a record armed EARLIER than the write outlives every exit
+/// taken before that write. On the `clear = true` path the silent-worker watch is
+/// now armed the moment the respawn establishes the new generation's ownership of
+/// the pane — because arming is what supersedes and cancels the PREVIOUS
+/// generation's watch, and leaving that until just before the pointer write left
+/// the old watch armed across the `SessionStart` wait and the readiness buffer,
+/// free to report a live delegation as undelivered. See
+/// [`release_reserved_silence_watch`]. The exits that can then be reached before
+/// the pointer write, audited the same way:
+///
+/// 1. **The pi-native `clear = true` return** — releases. Unlike the commission,
+///    which the seed delivery genuinely discharges, this path spawns no watch
+///    TASK at all, so a record left behind answers to nothing and can only absorb
+///    a later `work-done`. The supersession it performed on the way in stands.
+/// 2. **The dead-replacement return** — releases. Usually a no-op: an exited
+///    replacement is swept by `pump_reader`'s EOF branch, which matches this
+///    record on the `worker_agent_id` bound at arm time.
+/// 3. **The readiness-buffer close return** — releases, and here the release is
+///    belt-and-braces rather than load-bearing for the same reason exit 4 above
+///    needs none: `begin_pane_close` drains the pane's silence watches under the
+///    same lock hold that drops the close waiter this arm woke on.
+/// 4. **The tail** — reuses the record rather than arming a second one, and the
+///    existing `!delivered` and unresolved-identity arms cancel it by `seq`.
+///
+/// The **respawn-error** exit is absent from this list on purpose: the record is
+/// armed inside the success arm, so a failed respawn never creates one.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_one_owned(
     registry: Arc<AgentPtyRegistry>,
@@ -4015,7 +4191,9 @@ async fn dispatch_one_owned(
     // mid-session re-delegation is a documented further enhancement.
     let is_pi_native = role_config
         .as_ref()
-        .map(|r| r.clear && AgentType::from_command(Some(&r.command)) == Some(AgentType::Pi))
+        // Issue #308: the role's RESOLVED type, so a declared Pi worker behind a
+        // launcher command takes the same native-delivery path as a bare `pi`.
+        .map(|r| r.clear && r.resolved_agent_type() == Some(AgentType::Pi))
         .unwrap_or(false);
 
     // PRD #249 review (finding B1): the registry agent id the task pointer is
@@ -4025,6 +4203,14 @@ async fn dispatch_one_owned(
     // send at the end of this function for why an unguarded, pane-id-keyed
     // write is not safe here.
     let mut expected_worker_agent_id: Option<String> = None;
+
+    // Issue #687: the silent-worker watch a `clear = true` respawn arms for its
+    // fresh generation the moment that generation takes the pane, rather than
+    // ~30 s later immediately before the pointer write. `Some` only on the
+    // respawn path and only when the no-event detector is on for this delegate;
+    // every exit below that writes no pointer releases it through
+    // [`release_reserved_silence_watch`].
+    let mut reserved_silence: Option<crate::agent_pty::ArmedSilenceWatch> = None;
 
     // Honor the per-role `clear` flag from `.dot-agent-deck.toml`.
     // `clear = true` terminates the existing worker child (SIGTERM
@@ -4075,7 +4261,15 @@ async fn dispatch_one_owned(
                     },
                 }
             }),
-            agent_type: AgentType::from_command(Some(&role.command)),
+            // Issue #308: the role's RESOLVED type — declaration first, command
+            // derivation second. This value is CURRENT, not frozen: `role` came
+            // out of the `.dot-agent-deck.toml` re-read at the top of this
+            // function, in the same pass as the `role.command` handed to the
+            // respawn below, so the pair cannot disagree. That is precisely why
+            // `respawn_or_recreate_agent_for_pane` is allowed to let it outrank
+            // deriving from the command, where the pane's FROZEN
+            // `spawn_agent_type` is not (PRD #225 finding 1).
+            agent_type: role.resolved_agent_type(),
             env: vec![(
                 crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
                 pane_id.clone(),
@@ -4107,6 +4301,55 @@ async fn dispatch_one_owned(
                         );
                     }
                 }
+                // Issue #687: THIS is where the previous generation stops being
+                // the pane's delegated worker, so this is where its silent-worker
+                // watch has to stop being armed. `arm_silence_watch` is the
+                // supersede-and-cancel primitive — inserting replaces the old
+                // record, dropping it resolves that watch task's cancellation
+                // channel, and the replacement inherits the old record's
+                // unaccounted-for `superseded` count so a late `work-done`
+                // belonging to the OLD delegation is still credited oldest-first
+                // (`SilenceWatchRetirement::KeptNewer`) instead of disarming this
+                // newer watch. Calling it here rather than immediately before the
+                // pointer write is the whole of issue #687: everything between
+                // the two points — the `SessionStart` wait (up to
+                // `SESSION_START_WAIT_TIMEOUT`) and the readiness buffer — used to
+                // run with the REPLACED generation's watch still armed, so its
+                // deadline could land inside that gap and report a live
+                // delegation as undelivered. In the log #687 captured the gap was
+                // ~30 s and the stale watch beat the new arming by 56 ms.
+                //
+                // The `ArmedSilenceWatch` is carried, not re-created: its
+                // cancellation channel is live from here on, so a pane close (or
+                // any other drain) during the waits below resolves it and the
+                // watch task — if one is ever spawned — exits immediately.
+                //
+                // The ACCEPTED GAP, named here so a later reader does not
+                // rediscover it as a bug: from this point the reservation is a
+                // real record, so a `work-done` landing in the window between it
+                // and the pointer write is credited against it. When a prior
+                // watch existed, the inherited `superseded` count absorbs that
+                // completion (`SilenceWatchRetirement::KeptNewer`) and this
+                // generation keeps its watch — which is #687's own case. When
+                // `superseded == 0`, i.e. no prior watch existed and there is
+                // nothing to inherit, the completion consumes the reservation
+                // instead and THIS generation ends up with no watch at all. The
+                // cost is one suppressed diagnostic on a delegation that has
+                // already reported completion — never a false report invented
+                // for a live one — so it is the safe direction to fail in and is
+                // deliberately left as is.
+                //
+                // Only when the detector is on for this delegate. `None` means no
+                // watch would be armed at the write either, so there is nothing
+                // to move; the pane's records are then left exactly as the
+                // previous behaviour left them.
+                if silence_watch.is_some() {
+                    reserved_silence = registry.arm_silence_watch(
+                        &pane_id,
+                        &orchestrator_pane_id,
+                        Some(&new_agent_id),
+                    );
+                }
                 if is_pi_native {
                     // PRD #201: NATIVE delivery — stash the pointer as the
                     // respawned pi's seed and arm the PTY-injection safety net.
@@ -4131,6 +4374,21 @@ async fn dispatch_one_owned(
                     // Commission audit exit 1: the pointer is DELIVERED here,
                     // by seed rather than by injection, so the commission
                     // stands. See this function's no-delivery invariant.
+                    //
+                    // Issue #687, silence audit exit 1: the WATCH still goes,
+                    // because this path spawns none — a native seed delivery
+                    // produces no `arm_delegate_silence_watch` task, exactly as
+                    // before, so a record left armed here would answer to
+                    // nothing and could only absorb a later `work-done`. The
+                    // supersession it performed on the way in is kept: the
+                    // previous generation's watch is cancelled either way, which
+                    // is the half of #687 this path was missing.
+                    release_reserved_silence_watch(
+                        &registry,
+                        &pane_id,
+                        reserved_silence.take(),
+                        "pi-native seed delivery spawns no silent-worker watch",
+                    );
                     return;
                 }
                 // Issue #243: does this agent announce ANYTHING before its
@@ -4307,6 +4565,19 @@ async fn dispatch_one_owned(
                         &registry,
                         &pane_id,
                         &target_role,
+                        "the clear=true replacement worker never became live",
+                    );
+                    // Issue #687, silence audit exit 2: the generation this
+                    // watch was armed for is not the pane's live agent any more
+                    // and will never be handed a pointer, so its record must not
+                    // outlive the dispatch. Usually already a no-op — a
+                    // replacement that died reaches `pump_reader`'s EOF sweep
+                    // first, and that drains this record by the very
+                    // `worker_agent_id` binding armed above.
+                    release_reserved_silence_watch(
+                        &registry,
+                        &pane_id,
+                        reserved_silence.take(),
                         "the clear=true replacement worker never became live",
                     );
                     return;
@@ -4546,6 +4817,21 @@ async fn dispatch_one_owned(
                             // drained this pane's commissions under the same lock
                             // hold that dropped the waiter this arm just woke on.
                             // See this function's no-delivery invariant.
+                            //
+                            // Issue #687, silence audit exit 3: the same
+                            // `begin_pane_close` drained this pane's silence
+                            // watches too (`drain_silence_watches_touching`), so
+                            // the release below is expected to find nothing.
+                            // Called anyway rather than reasoned around, because
+                            // the invariant is "every no-delivery exit releases"
+                            // and an exit that relies on somebody else having
+                            // done it is one refactor from being wrong.
+                            release_reserved_silence_watch(
+                                &registry,
+                                &pane_id,
+                                reserved_silence.take(),
+                                "the worker pane began closing during the readiness buffer",
+                            );
                             return;
                         }
                         _ = tokio::time::sleep(buffer) => {}
@@ -4665,14 +4951,36 @@ async fn dispatch_one_owned(
     // silence watch's own record is bound at arm time (unlike the idle
     // delegation, this call always runs AFTER the identity is known, so no
     // separate bind step is needed).
-    let silence = silence_watch.and_then(|watch| {
-        let armed = registry.arm_silence_watch(
-            &pane_id,
-            &orchestrator_pane_id,
-            expected_worker_agent_id.as_deref(),
-        )?;
-        Some((watch, armed, event_tx.subscribe()))
-    });
+    //
+    // Issue #687: on the `clear = true` path the record was already armed, back
+    // when the respawn established this generation's ownership of the pane, and
+    // it is REUSED rather than re-armed. Re-arming would bump `superseded` a
+    // second time for one delegation — mis-crediting the very late-`work-done`
+    // accounting the early arming exists to preserve — and would also refuse if a
+    // close began during the waits above, where reuse instead lets the watch
+    // task's already-live cancellation channel retire it on its own.
+    let silence = match (silence_watch, reserved_silence.take()) {
+        (Some(watch), Some(armed)) => Some((watch, armed, event_tx.subscribe())),
+        (Some(watch), None) => registry
+            .arm_silence_watch(
+                &pane_id,
+                &orchestrator_pane_id,
+                expected_worker_agent_id.as_deref(),
+            )
+            .map(|armed| (watch, armed, event_tx.subscribe())),
+        // Unreachable while the reservation is gated on `silence_watch.is_some()`
+        // above; released rather than dropped so a future caller that widens that
+        // gate cannot leave a record behind.
+        (None, reserved) => {
+            release_reserved_silence_watch(
+                &registry,
+                &pane_id,
+                reserved,
+                "the no-event detector is off for this delegate",
+            );
+            None
+        }
+    };
     // Legacy PTY injection for every non-pi-native path: claude / opencode
     // workers, and `clear = false` pi workers (which get no fresh
     // `session_start` for the extension to pull on). The pi-native `clear =
@@ -8434,6 +8742,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(role_index, name)| crate::spawn::RoleSpawn {
+                agent_type: None,
                 role_index,
                 role_name: (*name).to_string(),
                 command: "cat".to_string(),
@@ -8685,7 +8994,7 @@ mod tests {
     /// the dead wait — asserted on the RETURN VALUE rather than on latency.
     ///
     /// **This branch had behavioural coverage and lost it**, when
-    /// `orchestration/delegate/024`'s fixture was changed to one that reaches its
+    /// `orchestration/delegate/029`'s fixture was changed to one that reaches its
     /// interface. It is not cosmetic to leave uncovered: the outcome differs from
     /// the unready fallback in exactly two fields, and the second one is
     /// load-bearing. `observed_producer` is what
@@ -9515,7 +9824,7 @@ mod tests {
         );
     }
 
-    /// Scenario: Write an automatic payload, let the user type an unsent draft, and then let the production silent-worker watch write its daemon notice before a submit-only probe. The notice must not make the blind probe submit the user's draft or the accumulated notice.
+    /// Scenario: Write an automatic payload, let the user type an unsent draft, and then let the production worker-exited caller write its daemon notice before a submit-only probe. The notice must not make the blind probe submit the user's draft or the accumulated notice.
     #[cfg(unix)]
     #[spec("scheduler/idle-worker/015")]
     #[tokio::test]
@@ -9563,44 +9872,40 @@ mod tests {
         registry.note_user_input(ORCHESTRATOR_PANE);
         tokio::time::sleep(std::time::Duration::from_millis(75)).await;
 
-        let (event_tx, _) = broadcast::channel(8);
-        let armed = registry
-            .arm_silence_watch(
-                WORKER_PANE,
-                ORCHESTRATOR_PANE,
-                Some("notice-launder-worker-agent"),
-            )
-            .expect("arm production silent-worker watch");
-        arm_delegate_silence_watch(
-            registry.clone(),
-            event_tx.subscribe(),
-            SilenceWatch {
-                window: std::time::Duration::from_millis(10),
-                target: SilenceReportTarget {
-                    pane_id: ORCHESTRATOR_PANE.to_string(),
-                    agent_id: Some(orchestrator_agent.clone()),
-                    orchestration: None,
-                },
-            },
-            armed,
-            WORKER_PANE.to_string(),
-            "notice-launder-worker-agent".to_string(),
-            "worker".to_string(),
+        // Issue #702: driven through `compose_worker_exited_notice` rather than
+        // PRD #249's silence notice, because the invariant belongs to the
+        // DELIVERY MECHANISM and #249's notice has left it. Anything written
+        // with `write_notice_guarded` is deferred-and-concatenating — today the
+        // worker-exited notice and the respawn-no-live-worker notice, and
+        // nothing else — and this is the pair of calls
+        // `AgentPtyRegistry::deliver_worker_exited_notice` makes in production,
+        // with only its trigger (`pump_reader`'s EOF sweep) stubbed out. The
+        // silence notice is now submitted (`write_and_submit_guarded`), so it is
+        // a turn of its own and cannot re-arm a later blind probe by leaving
+        // bytes in the input box — it inherits instead the idle prompt's own
+        // issue #544 limitation, which is a different question from this one.
+        let notice = compose_worker_exited_notice(WORKER_PANE);
+        assert_eq!(
+            registry
+                .write_notice_guarded(
+                    ORCHESTRATOR_PANE,
+                    &notice,
+                    Some(&orchestrator_agent),
+                    || async { true },
+                )
+                .await
+                .expect("production worker-exited notice"),
+            crate::agent_pty::GuardedSend::Applied
         );
         tokio::time::sleep(std::time::Duration::from_millis(75)).await;
         let before_probe = registry
             .snapshot(&orchestrator_agent)
-            .expect("snapshot after silent-worker notice");
-        // `notice-launder-worker-agent` is not in the registry, so the #686
-        // pane read yields no screen and the notice takes its blank branch —
-        // which is what this test wants: it is about byte-for-byte delivery,
-        // not about what the notice says.
-        let notice = compose_delegate_silence_notice(std::time::Duration::from_millis(10), None);
+            .expect("snapshot after worker-exited notice");
         assert!(
             before_probe
                 .windows(notice.len())
                 .any(|window| window == notice.as_bytes()),
-            "precondition: the production silent-worker caller must land its Notice after the user's draft; output={:?}",
+            "precondition: the production notice caller must land its Notice after the user's draft; output={:?}",
             String::from_utf8_lossy(&before_probe)
         );
 
@@ -9609,13 +9914,12 @@ mod tests {
                 true
             })
             .await
-            .expect("submit-only probe after silent-worker notice");
+            .expect("submit-only probe after worker-exited notice");
         tokio::time::sleep(std::time::Duration::from_millis(75)).await;
         let after_probe = registry
             .snapshot(&orchestrator_agent)
             .expect("snapshot after submit-only probe");
 
-        drop(event_tx);
         registry.shutdown_all();
         assert_eq!(
             probe,
@@ -9628,6 +9932,219 @@ mod tests {
             "the probe must not submit the user's draft plus the silent-worker notice; before={:?}, after={:?}",
             String::from_utf8_lossy(&before_probe),
             String::from_utf8_lossy(&after_probe)
+        );
+    }
+
+    /// Scenario: Submit a silence report into an orchestrator pane exactly the way
+    /// the daemon does — a guarded submit followed by the `note_payload_settled`
+    /// release — then let the user type into that pane and submit a byte-identical
+    /// second report. The repeat must be delivered, while the same sequence WITHOUT
+    /// the release is refused, proving the release is what keeps a second silent
+    /// worker's report from being mistaken for a retry of the first.
+    #[cfg(unix)]
+    #[spec("scheduler/idle-worker/017")]
+    #[tokio::test]
+    async fn idle_worker_017_a_settled_report_does_not_refuse_an_identical_second_report() {
+        // Issue #702: `scheduler/idle-worker/015` was re-pointed at
+        // `compose_worker_exited_notice` when the silence report moved to the
+        // SUBMITTED family, which left the submit path's own
+        // `note_payload_settled` release (see `arm_delegate_silence_watch`)
+        // exercised only incidentally. This is that pin.
+        //
+        // Why the repeat is ordinary rather than exotic: the report is one-shot
+        // and nothing retries it, so its payload record guards nothing — and two
+        // silent workers on one orchestration whose panes have both rendered
+        // nothing compose BYTE-IDENTICAL text (the `None` branch interpolates
+        // only the window). Without the release, the second worker's report is
+        // refused as the user's own draft and the orchestrator is never told.
+        const SETTLED_PANE: &str = "silence-report-settled-orchestrator";
+        const UNSETTLED_PANE: &str = "silence-report-unsettled-orchestrator";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let report = compose_delegate_silence_notice(std::time::Duration::from_millis(600), None);
+
+        let spawn_orchestrator = |pane: &str| {
+            registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.to_string(),
+                    )],
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn orchestrator stand-in")
+        };
+        let settled_agent = spawn_orchestrator(SETTLED_PANE);
+        let unsettled_agent = spawn_orchestrator(UNSETTLED_PANE);
+
+        // First report on both panes, delivered the production way.
+        for (pane, agent) in [
+            (SETTLED_PANE, &settled_agent),
+            (UNSETTLED_PANE, &unsettled_agent),
+        ] {
+            assert_eq!(
+                registry
+                    .write_and_submit_guarded(pane, &report, Some(agent), || async { true })
+                    .await
+                    .expect("first silence report"),
+                crate::agent_pty::GuardedSend::Applied,
+                "precondition: the first silence report must reach {pane}"
+            );
+        }
+        // Only the SETTLED pane gets the release the production caller makes.
+        registry.note_payload_settled(SETTLED_PANE, &report);
+
+        // The user types into both panes. This is the clock that arms the
+        // repeat-payload refusal: without it the guard abstains and the test
+        // would pass for the wrong reason.
+        registry.note_user_input(SETTLED_PANE);
+        registry.note_user_input(UNSETTLED_PANE);
+
+        let settled_repeat = registry
+            .write_and_submit_guarded(SETTLED_PANE, &report, Some(&settled_agent), || async {
+                true
+            })
+            .await
+            .expect("second identical silence report after settling");
+        let unsettled_repeat = registry
+            .write_and_submit_guarded(UNSETTLED_PANE, &report, Some(&unsettled_agent), || async {
+                true
+            })
+            .await
+            .expect("second identical silence report without settling");
+        registry.shutdown_all();
+
+        assert_eq!(
+            settled_repeat,
+            crate::agent_pty::GuardedSend::Applied,
+            "a one-shot silence report releases its payload record, so a byte-identical SECOND \
+             report into the same orchestrator must still be submitted rather than refused as a \
+             repeat of the user's own unsent draft"
+        );
+        assert_eq!(
+            unsettled_repeat,
+            crate::agent_pty::GuardedSend::Stale,
+            "control: without `note_payload_settled` the identical repeat IS refused — which is \
+             what makes the release above load-bearing rather than decorative"
+        );
+    }
+
+    /// Scenario: Deliver a silence report into two orchestrator panes exactly the
+    /// way the daemon does, then run the production settle decision over each —
+    /// one pane's submit is reported `Ambiguous` (a partial write), the other's
+    /// `Applied`. The user types into both panes and a byte-identical second
+    /// report follows: the ambiguous pane must REFUSE it, because report bytes
+    /// may still be sitting un-submitted in its input box, while the applied
+    /// pane still admits it.
+    #[cfg(unix)]
+    #[spec("scheduler/idle-worker/018")]
+    #[tokio::test]
+    async fn idle_worker_018_an_ambiguous_report_keeps_its_payload_record() {
+        // PR #713 review (Greptile P1): `Ambiguous` used to share the `Applied`
+        // arm of the settle decision. It must not — it is a PARTIAL write, so
+        // some report bytes may be sitting in the orchestrator's input box with
+        // no submit behind them, and releasing the record there lets a later
+        // identical report be admitted into a pane the user has typed into,
+        // submitting the leftovers plus the user's unsent draft as one turn.
+        //
+        // The physical write is `Applied` on BOTH panes here — a real `/bin/cat`
+        // PTY writer cannot be faulted into a partial write from this seam, and
+        // `write_and_submit_guarded` classifies partiality inside the writer's
+        // critical section (`deliver_payload_and_submit`, unit-tested against a
+        // fault-injecting writer in `agent_pty`). That costs nothing here,
+        // because the registry state the decision reads is identical either way:
+        // both the `Applied` and the `Ambiguous` arm of that classification call
+        // `note_automatic_write` with the same payload, so the payload record an
+        // ambiguous write leaves IS the record an applied write leaves. What
+        // differs is only the outcome the daemon then acts on, which is exactly
+        // what varies between the two panes below.
+        const AMBIGUOUS_PANE: &str = "silence-report-ambiguous-orchestrator";
+        const APPLIED_PANE: &str = "silence-report-applied-orchestrator";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let report = compose_delegate_silence_notice(std::time::Duration::from_millis(600), None);
+
+        let spawn_orchestrator = |pane: &str| {
+            registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.to_string(),
+                    )],
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn orchestrator stand-in")
+        };
+        let ambiguous_agent = spawn_orchestrator(AMBIGUOUS_PANE);
+        let applied_agent = spawn_orchestrator(APPLIED_PANE);
+
+        // First report on both panes, delivered the production way.
+        for (pane, agent) in [
+            (AMBIGUOUS_PANE, &ambiguous_agent),
+            (APPLIED_PANE, &applied_agent),
+        ] {
+            assert_eq!(
+                registry
+                    .write_and_submit_guarded(pane, &report, Some(agent), || async { true })
+                    .await
+                    .expect("first silence report"),
+                crate::agent_pty::GuardedSend::Applied,
+                "precondition: the first silence report must reach {pane}"
+            );
+        }
+        // The production decision, fed each of the two outcomes that leave a
+        // payload record behind. Nothing here reaches around it: this is the
+        // same function `arm_delegate_silence_watch` calls with the outcome its
+        // own guarded submit returned.
+        settle_silence_report_payload_record(
+            &registry,
+            AMBIGUOUS_PANE,
+            &report,
+            &Ok(crate::agent_pty::GuardedSend::Ambiguous),
+        );
+        settle_silence_report_payload_record(
+            &registry,
+            APPLIED_PANE,
+            &report,
+            &Ok(crate::agent_pty::GuardedSend::Applied),
+        );
+
+        // The user types into both panes. This is the clock that arms the
+        // repeat-payload refusal: without it the guard abstains and the
+        // ambiguous assertion below would pass for the wrong reason.
+        registry.note_user_input(AMBIGUOUS_PANE);
+        registry.note_user_input(APPLIED_PANE);
+
+        let ambiguous_repeat = registry
+            .write_and_submit_guarded(AMBIGUOUS_PANE, &report, Some(&ambiguous_agent), || async {
+                true
+            })
+            .await
+            .expect("second identical silence report after an ambiguous first");
+        let applied_repeat = registry
+            .write_and_submit_guarded(APPLIED_PANE, &report, Some(&applied_agent), || async {
+                true
+            })
+            .await
+            .expect("second identical silence report after an applied first");
+        registry.shutdown_all();
+
+        assert_eq!(
+            ambiguous_repeat,
+            crate::agent_pty::GuardedSend::Stale,
+            "an AMBIGUOUS submit is a partial write, so the report bytes may still be in the \
+             orchestrator's input box: its payload record must survive and refuse a \
+             byte-identical later report rather than submit those leftovers together with the \
+             user's unsent draft"
+        );
+        assert_eq!(
+            applied_repeat,
+            crate::agent_pty::GuardedSend::Applied,
+            "control: the same sequence whose submit reported APPLIED does release the record, so \
+             the identical repeat is admitted — which is what makes the refusal above a property \
+             of the outcome rather than of the harness"
         );
     }
 

@@ -201,6 +201,16 @@ pub struct RoleSpawn {
     pub role_name: String,
     pub command: String,
     pub is_start_role: bool,
+    /// Issue #308: what agent this role runs — its `agent = "…"` declaration
+    /// when the config made one, else the type derived from `command`.
+    ///
+    /// Resolved here, at the point the config is flattened, rather than at the
+    /// spawn seam, because the spawn seam sees only a command. Carrying it
+    /// keeps a DISPATCHED orchestration (`dot-agent-deck dispatch`, the
+    /// scheduler) launching each role exactly as the TUI's `Ctrl+N` path does
+    /// — the parity `orchestration/dispatch/003` pins for `clear = true`
+    /// respawns, which read the spawn-time identity this value becomes.
+    pub agent_type: Option<AgentType>,
 }
 
 /// The branch decision: orchestration tab vs single-agent card. Pure data so it
@@ -336,6 +346,7 @@ fn roles_of(orch: &crate::project_config::OrchestrationConfig) -> Vec<RoleSpawn>
             role_name: r.name.clone(),
             command: r.command.clone(),
             is_start_role: r.start,
+            agent_type: r.resolved_agent_type(),
         })
         .collect()
 }
@@ -473,6 +484,9 @@ pub async fn spawn(
                 // A single-agent spawn has no role, so its card keeps the task
                 // name it always had.
                 None,
+                // …and no role config either, so nothing declares its agent:
+                // derive it from the command exactly as before (issue #308).
+                None,
                 pin_sh,
                 notifier,
             )?;
@@ -509,6 +523,9 @@ pub async fn spawn(
                     &pane_id,
                     &req.working_dir,
                     command.as_deref(),
+                    // No role config on a single-agent spawn, so nothing to
+                    // declare (issue #308).
+                    None,
                     &req.task_name,
                 );
             }
@@ -585,6 +602,10 @@ pub async fn spawn(
                     // which is the orchestrator. Matches what the interactive
                     // `Ctrl+n` path puts on each role pane (`tab.rs`).
                     Some(role.role_name.as_str()),
+                    // Issue #308: the role's resolved type, so a dispatched
+                    // orchestration wraps and badges a declared launcher role
+                    // identically to the TUI path.
+                    role.agent_type.clone(),
                     false,
                     notifier,
                 );
@@ -753,6 +774,7 @@ pub async fn spawn(
                         &agent.pane_id,
                         &req.working_dir,
                         Some(&role.command),
+                        role.agent_type.clone(),
                         &role.role_name,
                     );
                 }
@@ -924,6 +946,11 @@ fn spawn_one(
     // name. `task_name` stays the notifier's subject either way: a spawn
     // failure is reported against the dispatch, not against one role.
     display_name: Option<&str>,
+    // Issue #308: what agent this pane runs, when the caller knows something the
+    // command cannot say — an orchestration role's `agent = "…"` declaration.
+    // `None` means "derive it from the command", which is what a single-agent
+    // schedule (no role config, so nothing to declare) always passes.
+    agent_type: Option<AgentType>,
     pin_sh: bool,
     notifier: &dyn Notifier,
 ) -> Result<String, SpawnError> {
@@ -943,7 +970,11 @@ fn spawn_one(
         // but reverted to "No agent" after a reconnect rebuilt it from
         // `list_agents`. `from_command` returns `None` for bare commands, the
         // same legacy placeholder behavior.
-        agent_type: AgentType::from_command(command),
+        //
+        // Issue #308: a caller-supplied type wins, so a role whose command is a
+        // launcher (`devbox run -- codex`) is badged and WRAPPED from its first
+        // dispatched spawn rather than reading "No agent" until its first task.
+        agent_type: agent_type.or_else(|| AgentType::from_command(command)),
     };
     registry.spawn_agent(opts).map_err(|e| {
         notifier.notify(NotifyEvent::SpawnFailed {
@@ -2245,13 +2276,22 @@ fn surface_spawned_pane(
     pane_id: &str,
     cwd: &str,
     command: Option<&str>,
+    // Issue #308: the caller's resolved agent type for this pane, when it knows
+    // one the command cannot reveal (a role's `agent = "…"`). `None` derives
+    // from the command, as before. Without it a declared launcher role's
+    // freshly-surfaced card read "No agent" while the daemon registry already
+    // knew it was Codex, and the label only corrected itself on the pane's
+    // first real hook — the exact pre-first-task blankness this issue is about.
+    agent_type: Option<AgentType>,
     task_name: &str,
 ) {
     let mut metadata = HashMap::new();
     metadata.insert(DISPLAY_NAME_METADATA_KEY.to_string(), task_name.to_string());
     let event = AgentEvent {
         session_id: pane_id.to_string(),
-        agent_type: AgentType::from_command(command).unwrap_or(AgentType::None),
+        agent_type: agent_type
+            .or_else(|| AgentType::from_command(command))
+            .unwrap_or(AgentType::None),
         event_type: EventType::SessionStart,
         tool_name: None,
         tool_detail: None,
@@ -4742,12 +4782,14 @@ mod tests {
     fn orchestrator_role_index_prefers_named_orchestrator() {
         let roles = vec![
             RoleSpawn {
+                agent_type: None,
                 role_index: 0,
                 role_name: "worker".into(),
                 command: "sh".into(),
                 is_start_role: false,
             },
             RoleSpawn {
+                agent_type: None,
                 role_index: 1,
                 role_name: "orchestrator".into(),
                 command: "cat".into(),
@@ -4761,12 +4803,14 @@ mod tests {
     fn orchestrator_role_index_falls_back_to_start_role_then_first() {
         let start_role = vec![
             RoleSpawn {
+                agent_type: None,
                 role_index: 0,
                 role_name: "lead".into(),
                 command: "sh".into(),
                 is_start_role: false,
             },
             RoleSpawn {
+                agent_type: None,
                 role_index: 1,
                 role_name: "boss".into(),
                 command: "cat".into(),
@@ -4776,6 +4820,7 @@ mod tests {
         assert_eq!(orchestrator_role_index(&start_role), 1);
 
         let neither = vec![RoleSpawn {
+            agent_type: None,
             role_index: 0,
             role_name: "solo".into(),
             command: "sh".into(),
@@ -4839,6 +4884,7 @@ mod tests {
             Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
 
         let role = |idx: usize, name: &str, command: &str| RoleSpawn {
+            agent_type: None,
             role_index: idx,
             role_name: name.to_string(),
             command: command.to_string(),
@@ -4858,6 +4904,7 @@ mod tests {
                 config: Box::new(OrchestrationConfig {
                     name: "partial-454".to_string(),
                     roles: vec![OrchestrationRoleConfig {
+                        agent: None,
                         name: "orchestrator".to_string(),
                         command: "/bin/sh".to_string(),
                         start: true,
@@ -5118,6 +5165,7 @@ mod tests {
             "sched-morning-digest-0",
             "/tmp/scratch/runbox",
             Some("cat"),
+            None,
             "morning-digest",
         );
         let BroadcastMsg::Event(e) = rx.try_recv().expect("a broadcast must be queued") else {
@@ -5144,7 +5192,7 @@ mod tests {
         // The standalone-daemon case (no attached TUI): `send` errs, swallowed.
         let (tx, rx) = broadcast::channel::<BroadcastMsg>(8);
         drop(rx);
-        surface_spawned_pane(&tx, "sched-x-0", "/tmp/x", None, "x");
+        surface_spawned_pane(&tx, "sched-x-0", "/tmp/x", None, None, "x");
     }
 
     /// PRD #225 hardening: the readiness-wait override may shorten the wait but

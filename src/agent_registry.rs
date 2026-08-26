@@ -461,6 +461,45 @@ pub fn detect_from_basename(basename: &str) -> Option<AgentType> {
         .map(|spec| spec.agent_type.clone())
 }
 
+/// Resolve an EXPLICITLY DECLARED agent name to its type — the one rule every
+/// declaration surface shares.
+///
+/// Two surfaces declare an agent by name rather than letting it be inferred
+/// from the launched binary: `dot-agent-deck wrap --agent <name>` on the
+/// command line (`crate::wrap`), and the `agent = "…"` key a role or mode
+/// carries in `.dot-agent-deck.toml` (issue #308). Both exist for exactly the
+/// same reason — a command like `devbox run codex-big` names a *launcher*, and
+/// no amount of parsing can see the agent behind it — so both must answer the
+/// same name the same way. One function, so `agent = "codex"` and
+/// `wrap --agent codex` cannot drift apart.
+///
+/// Unlike [`detect_from_basename`], this never answers "unknown": an
+/// unrecognized name resolves to the neutral [`AgentType::None`] rather than to
+/// `None`. That distinction is the whole point of a declaration — the caller
+/// said what this pane is, so falling back to guessing from the command would
+/// silently overrule them. A typo therefore yields a pane with no agent (and,
+/// for a config declaration, a `dot-agent-deck validate` warning naming the
+/// unknown name) instead of a plausible-looking wrong one.
+///
+/// Matching is by detection basename and is deliberately EXACT — no trimming,
+/// no case folding — because that is what `--agent` has always done and this
+/// function is the shared implementation of it, not a new lenient sibling.
+/// Callers that own a text field rather than an argv slot (the config surface)
+/// trim before calling.
+pub fn resolve_declared_agent(name: &str) -> AgentType {
+    detect_from_basename(name).unwrap_or(AgentType::None)
+}
+
+/// Every agent name [`resolve_declared_agent`] accepts, in registry order, for
+/// error messages that have to tell a user what they could have written. The
+/// neutral [`NONE`] placeholder is excluded — it is not something anyone
+/// declares.
+pub fn declarable_agent_names() -> Vec<&'static str> {
+    ALL.iter()
+        .flat_map(|spec| spec.detect_basenames.iter().copied())
+        .collect()
+}
+
 /// PRD #20 M9: resolve a `type:<alias>` dashboard-filter token to an agent
 /// type, matching case-insensitively against either the agent's human [`label`]
 /// (e.g. `type:codex`, `type:ClaudeCode`) or any of its detection basenames

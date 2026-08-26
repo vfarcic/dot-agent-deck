@@ -12,9 +12,9 @@
 //! delegates.
 //!
 //! The behavioural end of that fix is covered by
-//! `orchestration/delegate/024`, `/025` and `codex/wrap/006`. What is covered
+//! `orchestration/delegate/029`, `/030` and `codex/wrap/006`. What is covered
 //! HERE is the data those tests happen to exercise, per agent and
-//! exhaustively — because behavioural coverage is necessarily partial: `/025`
+//! exhaustively — because behavioural coverage is necessarily partial: `/030`
 //! pins OpenCode, `/007` pins Codex, `/008` and `/011` pin the neutral
 //! placeholder, and nothing at all pins Claude Code or Devin, whose values are
 //! precisely the ones a careless refactor of the old `hook_install` predicate
@@ -265,7 +265,7 @@ fn agent_readiness_002_gate_discriminator_is_not_hook_install() {
         codex.pre_prompt_readiness,
         PrePromptReadiness::WrapperInterfaceReady,
         "Codex's readiness comes from the wrapper watching its interface, not from its native \
-         hooks (`codex/wrap/006`, `orchestration/delegate/024`)"
+         hooks (`codex/wrap/006`, `orchestration/delegate/029`)"
     );
 
     // Finally, state the disagreement as a whole-registry fact rather than three

@@ -52,11 +52,30 @@ watch = false
 
 | Block | Key Fields |
 |---|---|
-| `[[modes]]` | `name` (required), `init_command` (optional), `panes`, `rules`, `reactive_panes` (default: 2) |
+| `[[modes]]` | `name` (required), `agent` (optional), `init_command` (optional), `panes`, `rules`, `reactive_panes` (default: 2) |
 | `[[modes.panes]]` | `command` (required), `name` (optional label), `watch` (default: true) |
 | `[[modes.rules]]` | `pattern` (regex, required), `watch` (bool), `interval` (seconds) |
 
-For the full reference and more examples, see [Workspace Modes](workspace-modes.md).
+For the full reference and more examples, see [Workspace Modes](workspace-modes.md). Orchestrations live in the same file under `[[orchestrations]]`; see [Orchestration](orchestration.md#configuration-reference).
+
+### Naming the agent a command launches
+
+The deck identifies which agent a pane runs by reading the first word of its command, so `claude`, `codex`, `opencode --model gpt-4o` and `/usr/local/bin/pi` all resolve by themselves. A command that starts the agent through something else does not — `devbox run -- codex`, `mise exec -- codex`, `nix develop -c codex`, `make codex`, `./run-codex.sh` — because nothing about a launcher reveals what it will end up starting. Such a pane shows **No agent** and gets no status tracking, and for Codex it stays that way until you give it its first task.
+
+The optional `agent` key says what the command cannot. It takes one of `claude`, `opencode`, `pi`, `codex`, `devin`, and it goes on the block that owns the command:
+
+```toml
+[[modes]]
+name = "review"
+agent = "codex"          # this mode's agent pane runs Codex
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "devbox run -- codex --sandbox workspace-write"
+agent = "codex"          # …and so does this role
+```
+
+An unrecognised name resolves to no agent rather than to a guess, and `dot-agent-deck validate` warns about it by name. Omitting the key leaves behaviour exactly as before, so no existing config needs to change. Full details in [Orchestration](orchestration.md#declaring-the-agent-behind-a-launcher-command) and [Workspace Modes](workspace-modes.md#declaring-the-agent-behind-a-launcher-command).
 
 ### Top-Level Keys
 

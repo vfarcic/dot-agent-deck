@@ -84,11 +84,11 @@ struct RealDelegateCase<'a> {
 }
 
 /// Issue #243: `/015`'s bound, derived from both ends the same way
-/// `orchestration/delegate/024`'s `READY_TO_POINTER_BUDGET` is.
+/// `orchestration/delegate/029`'s `READY_TO_POINTER_BUDGET` is.
 ///
 /// *Below:* under the 30 s `SESSION_START_WAIT_TIMEOUT`, and a full 11 s under
 /// the ~31 s (timeout + readiness buffer) the pre-fix path burned before the
-/// fallback wrote anything — `orchestration/delegate/025` measures exactly that
+/// fallback wrote anything — `orchestration/delegate/030` measures exactly that
 /// 31 s for this agent's configuration in virtual time, and the issue's own
 /// scheduler measurement of an OpenCode cold spawn was 30.3 s. So a run that
 /// still pays the dead wait cannot pass this, which is the whole reason the
