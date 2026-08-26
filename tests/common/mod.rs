@@ -1580,6 +1580,37 @@ impl TuiDeck {
         }
         None
     }
+
+    /// Poll [`find_in_grid`] until `needle` is on screen, returning its
+    /// 0-based `(col, row)` start cell, or panic (dumping the final grid)
+    /// after [`WAIT_TIMEOUT`].
+    ///
+    /// Prefer this over a bare `find_in_grid(..).expect(..)` whenever the
+    /// lookup follows an input event (a click, a keystroke) rather than a
+    /// wait that already proved the target is painted. A single-shot read
+    /// landing mid-repaint sees a transiently cleared region and the
+    /// `expect` fires — a load-sensitive flake, not a real failure. A
+    /// `wait_for_string` in front narrows that window but does not close
+    /// it: the wait and the subsequent `find_in_grid` take two separate
+    /// snapshots, and the clear can land between them. Polling the lookup
+    /// itself means the coordinates always come from a grid that actually
+    /// contained the needle.
+    pub fn wait_for_in_grid(&self, needle: &str) -> (u16, u16) {
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        loop {
+            if let Some(found) = self.find_in_grid(needle) {
+                return found;
+            }
+            if Instant::now() > deadline {
+                let grid = self.snapshot_grid();
+                panic!(
+                    "did not find {needle:?} in the grid within {WAIT_TIMEOUT:?}.\n\
+                     Final grid:\n{grid}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 impl Drop for TuiDeck {
