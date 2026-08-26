@@ -57,52 +57,23 @@ watch = false
 | `[[modes.rules]]` | `pattern` (regex, required), `watch` (bool), `interval` (seconds) |
 | `[[orchestrations]]` | `name` (optional), `default` (bool, default: false), `extends` (optional), `roles` |
 
-For the full reference and more examples, see [Workspace Modes](workspace-modes.md) and [Orchestration](orchestration.md).
+For the full reference and more examples, see [Workspace Modes](workspace-modes.md) and [Orchestration](orchestration.md). `default` and `extends` only matter to a project that defines **several** orchestrations — see [Sharing a Workflow Between Orchestrations](#sharing-a-workflow-between-orchestrations) and [Which Orchestration a Scheduled Task Opens](#which-orchestration-a-scheduled-task-opens) at the end of this page.
 
-### Choosing the Default Orchestration
+### Top-Level Keys
 
-A project may define several `[[orchestrations]]` — most often one per kind of work, so a feature that needs a test-plan gate and a release step is not run by the same team as a one-line bug fix.
+These belong to no block, which makes their placement load-bearing: TOML assigns every key after a table header to that table, so a top-level key **must appear above the first `[[modes]]` or `[[orchestrations]]` header in the file**. Appended at the end it silently becomes a key of whichever table came last, where nothing reads it — the file still parses, `dot-agent-deck validate` still reports `Config is valid.`, and the default stays in effect. A misplaced key gives you no signal at all.
 
-**Most of the time nothing needs a default.** Both ways of starting an orchestration ask you which one: the new-pane form (`Ctrl+n`) lists every orchestration as a Mode chip to cycle through, and a [dispatcher pane](dispatcher-mode.md) lists them and asks before it starts anything.
+| Key | Default | Description |
+|-----|---------|-------------|
+| `worker_response_timeout_minutes` | `120` | How long a delegated worker may go without signalling `work-done` before the daemon reports it to the orchestrator. Accepted range `1`–`10080` (one minute to seven days); an out-of-range value falls back to the default rather than being clamped. **`0` disables the detector entirely** — it does not mean "report immediately". Applies to orchestrations only; see [Idle Workers & Notifications](idle-workers-and-notifications.md). |
 
-`default = true` is for the case where **there is nobody to ask** — a [scheduled task](scheduled-tasks.md) whose working directory defines orchestrations. It fires on a cron tick, and something has to decide which team it opens:
+### Scaffolding
 
-```toml
-[[orchestrations]]
-name = "prd"
-default = true
-# roles …
+Run `dot-agent-deck init` inside a project directory to generate a starter `.dot-agent-deck.toml`.
 
-[[orchestrations]]
-name = "issue"
-# roles …
-```
+### Sharing a Workflow Between Orchestrations
 
-`default` sits on the block, so it moves with the block. Exactly one orchestration may declare it, and that orchestration must define roles — `dot-agent-deck validate` rejects both mistakes. **With a single orchestration the key does nothing; omit it.**
-
-**If nothing declares it, the first orchestration with roles wins.** That is the historical rule and it still applies, so a config written before this key keeps behaving identically. With several orchestrations it is worth declaring anyway, because reordering the file then changes which team every scheduled run opens, and nothing in that diff says so.
-
-When the choice is left implicit, the deck says so rather than quietly picking. `dot-agent-deck validate` is where **you** see it:
-
-```
-$ dot-agent-deck validate
-[warning] 'prd': 2 orchestrations are defined and none declares `default = true`, so a dispatch or scheduled task that names none opens this one purely because it comes first in the file — reordering the file would silently change that. Add `default = true` to the one you want.
-```
-
-A **dispatcher agent** is told the same thing in its own words, and its listing marks the default so it can act on *"just use the usual one"* rather than asking twice:
-
-```
-Available dispatch targets:
-  single            one agent (--single)
-  orchestration     'prd' — 6 roles (--orchestration 'prd')  [default]
-  orchestration     'issue' — 4 roles (--orchestration 'issue')
-
-Ask the user which they want before dispatching, then pass the matching flag.
-```
-
-A **scheduled task** has nobody to tell, so its copy goes only to the daemon log. That is the whole reason to declare the default: it is the one path where the deck cannot ask you and cannot show you that it did not.
-
-### Sharing One Orchestration Across Providers
+*Both of the remaining sections apply only to a project that defines **several** `[[orchestrations]]` — most often one per kind of work, so a feature that needs a test-plan gate and a release step is not run by the same team as a one-line bug fix. With a single orchestration neither key is needed.*
 
 Two orchestrations that share a workflow — the same roles, the same prompts, the same order — should not be two copies of it. `extends` lets one inherit another's roles, so the second is only what actually differs. The clearest case is a set of provider variants, where that is just each role's `command`:
 
@@ -150,15 +121,43 @@ The rules:
 
 An `extends` naming an orchestration that does not exist, or forming a cycle, fails the whole config to load with a message naming both sides. That is deliberate: the alternative leaves the variant with only the roles it restated, and the symptom is then "orchestration must have at least 2 roles" about a file that plainly has six.
 
-### Top-Level Keys
+### Which Orchestration a Scheduled Task Opens
 
-These belong to no block, which makes their placement load-bearing: TOML assigns every key after a table header to that table, so a top-level key **must appear above the first `[[modes]]` or `[[orchestrations]]` header in the file**. Appended at the end it silently becomes a key of whichever table came last, where nothing reads it — the file still parses, `dot-agent-deck validate` still reports `Config is valid.`, and the default stays in effect. A misplaced key gives you no signal at all.
+**Most of the time nothing needs a default.** Both ways of starting an orchestration by hand ask you which one: the new-pane form (`Ctrl+n`) lists every orchestration as a Mode chip to cycle through, and a [dispatcher pane](dispatcher-mode.md) lists them and asks before it starts anything.
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `worker_response_timeout_minutes` | `120` | How long a delegated worker may go without signalling `work-done` before the daemon reports it to the orchestrator. Accepted range `1`–`10080` (one minute to seven days); an out-of-range value falls back to the default rather than being clamped. **`0` disables the detector entirely** — it does not mean "report immediately". Applies to orchestrations only; see [Idle Workers & Notifications](idle-workers-and-notifications.md). |
+`default = true` is for the case where **there is nobody to ask** — a [scheduled task](scheduled-tasks.md) whose working directory defines orchestrations. It fires on a cron tick, and something has to decide which team it opens:
 
-### Scaffolding
+```toml
+[[orchestrations]]
+name = "prd"
+default = true
+# roles …
 
-Run `dot-agent-deck init` inside a project directory to generate a starter `.dot-agent-deck.toml`.
+[[orchestrations]]
+name = "issue"
+# roles …
+```
 
+`default` sits on the block, so it moves with the block. Exactly one orchestration may declare it, and that orchestration must define roles — `dot-agent-deck validate` rejects both mistakes. **With a single orchestration the key does nothing; omit it.**
+
+**If nothing declares it, the first orchestration with roles wins.** That is the historical rule and it still applies, so a config written before this key keeps behaving identically. With several orchestrations it is worth declaring anyway, because reordering the file then changes which team every scheduled run opens, and nothing in that diff says so.
+
+When the choice is left implicit, the deck says so rather than quietly picking. `dot-agent-deck validate` is where **you** see it:
+
+```
+$ dot-agent-deck validate
+[warning] 'prd': 2 orchestrations are defined and none declares `default = true`, so a dispatch or scheduled task that names none opens this one purely because it comes first in the file — reordering the file would silently change that. Add `default = true` to the one you want.
+```
+
+A **dispatcher agent** is told the same thing in its own words, and its listing marks the default so it can act on *"just use the usual one"* rather than asking twice:
+
+```
+Available dispatch targets:
+  single            one agent (--single)
+  orchestration     'prd' — 6 roles (--orchestration 'prd')  [default]
+  orchestration     'issue' — 4 roles (--orchestration 'issue')
+
+Ask the user which they want before dispatching, then pass the matching flag.
+```
+
+A **scheduled task** has nobody to tell, so its copy goes only to the daemon log. That is the whole reason to declare the default: it is the one path where the deck cannot ask you and cannot show you that it did not.
