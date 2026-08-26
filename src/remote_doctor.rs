@@ -43,14 +43,24 @@
 //! before reading a report:
 //!
 //! 1. **`ForwardBound` observes pre-existing state.** Over a session that
-//!    creates no forwards, a `/dev/tcp` connect answers "is something already
-//!    listening on that port on the remote?" — not "would a forward bind?".
-//!    A listener that answers may be a live session of yours or an unrelated
-//!    service holding the port, and a TCP connect cannot tell those apart;
-//!    asking the other question would mean binding the port ourselves, which
-//!    is exactly the mutation this module refuses. The remote's own
-//!    `AllowTcpForwarding` is what separates a policy refusal from a busy
-//!    port, and it is read independently of this probe.
+//!    creates no forwards, the probe answers "what is already listening on
+//!    that port on the remote?" — not "would a forward bind?". Asking the
+//!    other question would mean binding the port ourselves, which is exactly
+//!    the mutation this module refuses. The remote's own `AllowTcpForwarding`
+//!    is what separates a policy refusal from a busy port, and it is read
+//!    independently of this probe.
+//!
+//!    A bare TCP connect could not even answer the first question usefully —
+//!    "something is listening" covers a live tunnel of yours and a squatter
+//!    equally, so a foreign service on an otherwise-perfect configuration
+//!    rendered entirely PASS, exit 0. For the recipe's reverse-**dynamic**
+//!    forward the probe therefore speaks SOCKS5: `05 01 00` out, `05 00`
+//!    back, which a foreign service will not produce. That is the module's one
+//!    write, it is scoped to ports the user declared to be SOCKS (see
+//!    [`ForwardProbe`]), and it is recorded as a decision in the PRD. A
+//!    **concrete** `RemoteForward` gets a connect and nothing else — its port
+//!    carries whatever the user tunnelled — so an accepting listener there is
+//!    honestly UNKNOWN rather than a PASS nobody verified.
 //! 2. **Only the FIRST reverse forward is bind-checked.** That covers the
 //!    single-tunnel recipe of issue #97. A `Host` block with several reverse
 //!    forwards is still reported in full by the `RemoteForward` check; only
@@ -65,8 +75,8 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::connect::{
-    REMOTE_INSTALL_PATH, RemoteConnectError, is_forward_failure_detail, lookup_remote,
-    probe_remote_protocol, probe_remote_version, probe_timeout_secs, ssh_error_detail,
+    REMOTE_INSTALL_PATH, RemoteConnectError, lookup_remote, probe_remote_protocol,
+    probe_remote_version, probe_timeout_secs,
 };
 use crate::remote::{SshExecutor, SshTarget, SystemSshExecutor, run_local_bounded};
 use crate::untrusted_text::escape_control_and_bidi;
@@ -234,6 +244,39 @@ impl CheckResult {
     }
 }
 
+/// What the live loopback probe learned about the configured reverse listener.
+///
+/// A `bool` carried this until PRD #345's attribution work and could not:
+/// "something answered" spans a verified tunnel, a foreign service, and a
+/// service that accepts and then says nothing, and those three want three
+/// different verdicts. Splitting them is what stops a squatter on an
+/// otherwise-perfect configuration from rendering entirely PASS, exit 0 —
+/// the flagship scenario reporting healthy while broken (`remote/doctor/006`).
+///
+/// `None` on [`DoctorInputs::forward_bound`] still means "not observed", which
+/// stays UNKNOWN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardObservation {
+    /// The listener accepted a SOCKS5 no-auth handshake, so it *is* the SOCKS
+    /// proxy a reverse-dynamic `RemoteForward` puts there. The only
+    /// observation this module treats as a confident PASS.
+    SocksVerified,
+    /// The listener accepted the connection and answered the handshake with
+    /// something that is not a SOCKS5 acceptance — a foreign service holding
+    /// the port.
+    Foreign,
+    /// The listener accepted the connection and never answered at all. The
+    /// quietest shape of the same collision, and the one a connect-only probe
+    /// reads as success.
+    Silent,
+    /// Something is listening on a **concrete** reverse forward's port. That
+    /// port carries whatever the user tunnelled, so there is no greeting we
+    /// may send to attribute it — see [`ForwardProbe`].
+    Unattributable,
+    /// Nothing is listening: the connect was refused.
+    Refused,
+}
+
 /// All observations consumed by the pure classifier.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DoctorInputs {
@@ -242,7 +285,7 @@ pub struct DoctorInputs {
     pub protocol_compatible: Option<bool>,
     pub ssh: ResolvedSshConfig,
     pub sshd: ResolvedSshdConfig,
-    pub forward_bound: Option<bool>,
+    pub forward_bound: Option<ForwardObservation>,
 }
 
 // ---------------------------------------------------------------------------
@@ -416,16 +459,33 @@ pub fn parse_sshd_t(status: i32, stdout: &str, stderr: &str) -> ResolvedSshdConf
 // Classification
 // ---------------------------------------------------------------------------
 
-/// The listen spec of the first reverse forward ssh resolved, if any. This is
-/// the endpoint the live-bind probe targets and the port every port-specific
-/// message names.
-fn reverse_listen(ssh: &ResolvedSshConfig) -> Option<&str> {
-    ssh.forwards.iter().find_map(|forward| match forward {
+/// The listen spec of `forward` when it is a *reverse* forward, `None` for the
+/// laptop-side directions the liveness probe has no business targeting.
+fn reverse_forward_listen(forward: &ResolvedForward) -> Option<&str> {
+    match forward {
         ResolvedForward::RemoteDynamic { listen } | ResolvedForward::Remote { listen, .. } => {
             Some(listen.as_str())
         }
         _ => None,
-    })
+    }
+}
+
+/// The first reverse forward ssh resolved, if any.
+///
+/// The probe needs the whole forward, not just its listen spec: whether it is
+/// reverse-*dynamic* decides whether a handshake may be written into it at all
+/// (see [`ForwardProbe`]).
+fn reverse_forward(ssh: &ResolvedSshConfig) -> Option<&ResolvedForward> {
+    ssh.forwards
+        .iter()
+        .find(|forward| reverse_forward_listen(forward).is_some())
+}
+
+/// The listen spec of the first reverse forward ssh resolved, if any. This is
+/// the endpoint the live-bind probe targets and the port every port-specific
+/// message names.
+fn reverse_listen(ssh: &ResolvedSshConfig) -> Option<&str> {
+    reverse_forward(ssh).and_then(reverse_forward_listen)
 }
 
 /// `port 1080` when a listen spec is known, a neutral phrase when it isn't.
@@ -683,24 +743,68 @@ pub fn classify(inputs: &DoctorInputs) -> Vec<CheckResult> {
     // produce byte-identical client errors, so the ONLY thing that separates
     // them is whether the remote's own sshd said it permits reverse tunnels.
     checks.push(match inputs.forward_bound {
-        Some(true) => CheckResult::new(
+        // The only confident PASS, and it carries its evidence. A bare TCP
+        // connect answers "is *something* listening", which is not the
+        // question — see `ForwardProbe` for why the handshake is the
+        // discriminator and why only this forward kind gets one.
+        Some(ForwardObservation::SocksVerified) => CheckResult::new(
             CheckId::ForwardBound,
             Verdict::Pass,
-            &format!("{listener} is bound and accepting connections on the remote"),
+            &format!(
+                "{listener} answered the SOCKS5 no-auth handshake, so the listener is verified as this recipe's own tunnel"
+            ),
             "",
         ),
-        Some(false) if sshd_permits_reverse == Some(false) => CheckResult::new(
+        Some(ForwardObservation::Foreign) => CheckResult::new(
             CheckId::ForwardBound,
             Verdict::Fail,
-            &format!("{listener} is not bound on the remote, which the sshd policy above explains"),
-            "This is the remote's policy refusing the tunnel, not a busy port. Fix `AllowTcpForwarding` on the remote first, then re-run this command.",
+            &format!(
+                "{listener} is held by something else — it answered the SOCKS5 handshake with bytes no SOCKS proxy sends"
+            ),
+            "A service that is not a SOCKS proxy already owns that port on the remote, so your tunnel cannot bind it. Give this laptop its own listen port, or stop whatever holds this one — forward ports are per-remote, so two laptops on the same one collide.",
         ),
+        // Connected and said nothing. The shape most likely to be read as
+        // success by a probe that only checks the connect, and the most likely
+        // real squatter: a great many services speak only when spoken to in
+        // their own protocol.
+        Some(ForwardObservation::Silent) => CheckResult::new(
+            CheckId::ForwardBound,
+            Verdict::Fail,
+            &format!(
+                "{listener} is held by something that accepted the connection and then never answered the SOCKS5 handshake"
+            ),
+            "A live SOCKS proxy replies in microseconds over loopback, so silence means the port belongs to another service. Give this laptop its own listen port, or stop whatever holds this one — forward ports are per-remote, so two laptops on the same one collide.",
+        ),
+        // UNKNOWN rather than PASS *or* FAIL, and the middle answer is the
+        // honest one. PASS and WARN both exit 0 via `Verdict::is_clear`, which
+        // would be false confidence; FAIL would be a lie, because for a
+        // concrete forward an accepting listener usually IS the user's tunnel
+        // working, and calling a healthy configuration broken trains people to
+        // ignore the tool.
+        Some(ForwardObservation::Unattributable) => CheckResult::new(
+            CheckId::ForwardBound,
+            Verdict::Unknown,
+            &format!(
+                "{listener} has a listener, but a tunnel to a concrete destination carries no greeting this probe may use to attribute it"
+            ),
+            "Your configuration is right and something is listening; the deck just cannot prove that something is yours. Only the reverse-dynamic form (`RemoteForward <port>` with no destination) puts a SOCKS proxy there, whose no-auth handshake the deck can safely speak. Confirm ownership on the remote yourself (`ss -ltnp`), or switch to the reverse-dynamic form this recipe uses.",
+        ),
+        Some(ForwardObservation::Refused) if sshd_permits_reverse == Some(false) => {
+            CheckResult::new(
+                CheckId::ForwardBound,
+                Verdict::Fail,
+                &format!(
+                    "{listener} is not bound on the remote, which the sshd policy above explains"
+                ),
+                "This is the remote's policy refusing the tunnel, not a busy port. Fix `AllowTcpForwarding` on the remote first, then re-run this command.",
+            )
+        }
         // The probe rides a session that creates no forwards of its own, so
         // "not bound" is a statement about PRE-EXISTING remote state. Two very
         // different situations produce it and the fix has to own that rather
         // than assert the collision reading, which was written when the
         // doctor's own session established the listener it then measured.
-        Some(false) => CheckResult::new(
+        Some(ForwardObservation::Refused) => CheckResult::new(
             CheckId::ForwardBound,
             Verdict::Fail,
             &format!("{listener} is not bound on the remote, though its sshd permits the tunnel"),
@@ -722,7 +826,7 @@ pub fn classify(inputs: &DoctorInputs) -> Vec<CheckResult> {
                 CheckId::ForwardBound,
                 Verdict::Unknown,
                 "the live bind state on the remote was not observed",
-                "Nothing readable answered the loopback probe: either no reverse tunnel is configured to probe, or `bash` (used for a read-only `/dev/tcp` connect) is missing on the remote.",
+                "Nothing readable answered the loopback probe: either no reverse tunnel is configured to probe, or the remote is missing `bash` (for the read-only `/dev/tcp` connect) or `timeout` and `od` (for the bounded reply the deck reads back).",
             ),
         },
     });
@@ -914,16 +1018,138 @@ fn mark_ssh_config_unreadable(checks: &mut [CheckResult], reason: &str) {
     }
 }
 
-/// A read-only TCP connect against the remote's loopback, used to decide
-/// whether a configured reverse listener is actually there.
+/// Which of the two remote probes to build for a resolved reverse forward.
 ///
-/// `bash`'s `/dev/tcp` pseudo-device is the smallest read-only way to ask "is
-/// something listening": it opens a socket and closes it. No file is created,
-/// no listener state is changed, nothing is written. When `bash` is absent the
-/// remote shell exits 127 and the check degrades to UNKNOWN rather than
-/// claiming the port is free.
-fn forward_probe_command(host: &str, port: u16) -> String {
-    format!("bash -c 'exec 3<>/dev/tcp/{host}/{port}'")
+/// **This is a safety gate, not a tuning knob.** The SOCKS5 greeting is three
+/// bytes *written* into the listening socket, and only a
+/// [`ResolvedForward::RemoteDynamic`] port is one the user declared to be
+/// SOCKS. A **concrete** `RemoteForward` carries whatever they tunnelled — a
+/// database, an internal API — so writing `05 01 00` into it means writing
+/// arbitrary bytes into someone's Postgres, which a line-oriented daemon can
+/// log or parse. [`Self::for_forward`] therefore defaults every non-dynamic
+/// forward to [`Self::ConnectOnly`], and the fast-tier test
+/// `connect_only_probe_never_writes_the_socks_greeting` pins that the built
+/// command carries no spelling of the greeting we emit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardProbe {
+    /// Connect, send the SOCKS5 no-auth greeting, and print the reply as hex.
+    /// Reverse-**dynamic** forwards only.
+    SocksHandshake,
+    /// Connect and stop. Everything else.
+    ConnectOnly,
+}
+
+impl ForwardProbe {
+    /// The probe `forward` may be subjected to.
+    ///
+    /// Deliberately a match on the one permitted variant with a catch-all
+    /// default, not the other way round: a forward kind added later gets the
+    /// safe probe until someone decides otherwise.
+    fn for_forward(forward: &ResolvedForward) -> Self {
+        match forward {
+            ResolvedForward::RemoteDynamic { .. } => Self::SocksHandshake,
+            _ => Self::ConnectOnly,
+        }
+    }
+}
+
+/// Seconds the handshake waits for the listener's reply before giving up.
+///
+/// `bash`'s `/dev/tcp` has **no read timeout**, so an unbounded `head -c 2`
+/// against a listener that accepts and never speaks — [`ForwardObservation::Silent`],
+/// and the most likely real squatter — would block until the ssh wallclock
+/// deadline, which `DOT_AGENT_DECK_SSH_PROBE_TIMEOUT_SECS` lets a user stretch
+/// to an hour. Two seconds is enormous for the case that matters: a SOCKS
+/// proxy on the remote's own loopback answers in microseconds.
+const SOCKS_REPLY_TIMEOUT_SECS: u8 = 2;
+
+/// A read-only probe against the remote's loopback, used to decide whether a
+/// configured reverse listener is actually there **and whether it is ours**.
+///
+/// `bash`'s `/dev/tcp` pseudo-device is the smallest read-only way to open the
+/// socket: no file is created, no listener state is changed, and for
+/// [`ForwardProbe::ConnectOnly`] nothing at all is written. When `bash` is
+/// absent the remote shell exits 127 and the check degrades to UNKNOWN rather
+/// than claiming the port is free.
+///
+/// The handshake form adds the five bytes that make the answer *attributable*.
+/// The #97 recipe's forward is reverse-**dynamic**, i.e. a SOCKS5 listener, and
+/// the no-auth handshake is definitive — `05 01 00` out, `05 00` back. A
+/// foreign service will not produce that, so a reply of `05 00` proves the
+/// listener is the tunnel rather than merely present. Writing those three
+/// bytes is the one thing this module sends rather than reads; it is scoped to
+/// ports the user declared to be SOCKS (see [`ForwardProbe`]) and recorded as
+/// a deliberate decision in `prds/345-remote-doctor.md`.
+///
+/// Three properties of the command matter and are easy to lose in an edit:
+///
+/// 1. **The exit status reflects the CONNECT, not the read.** `|| exit 1`
+///    carries a refusal out, and the trailing `exit 0` discards the status of
+///    everything after it. That is what makes an empty reply mean "a listener
+///    accepted and said nothing" (FAIL) rather than being confusable with
+///    broken tooling (UNKNOWN, from a non-zero status).
+/// 2. **The read is bounded** by `timeout`; see [`SOCKS_REPLY_TIMEOUT_SECS`].
+/// 3. **Missing hex tooling exits 127**, so it lands in the same UNKNOWN as a
+///    missing `bash` instead of looking like a silent listener.
+///
+/// The reply is rendered as hex because bash cannot hold the NUL byte of
+/// `05 00` in a variable. Which tool spells it is deliberately not a contract —
+/// [`socks_reply`] normalises whitespace, so `05 00`, ` 05 00` and `0500` are
+/// one observation.
+///
+/// A future robustness option, noted rather than taken: have the remote print
+/// a literal marker token before the hex, so a stray line from a remote shell
+/// profile could never be mistaken for the reply. The exit-status route above
+/// achieves the separation that actually matters without it.
+fn forward_probe_command(probe: ForwardProbe, host: &str, port: u16) -> String {
+    let endpoint = format!("/dev/tcp/{host}/{port}");
+    match probe {
+        ForwardProbe::ConnectOnly => format!("bash -c 'exec 3<>{endpoint}'"),
+        ForwardProbe::SocksHandshake => format!(
+            "bash -c 'exec 3<>{endpoint} || exit 1; \
+             command -v timeout >/dev/null 2>&1 && command -v od >/dev/null 2>&1 || exit 127; \
+             printf \"\\005\\001\\000\" >&3; \
+             timeout {SOCKS_REPLY_TIMEOUT_SECS} head -c 2 <&3 | od -An -tx1; \
+             exit 0'"
+        ),
+    }
+}
+
+/// The SOCKS5 no-auth acceptance (`05 00`), normalised the way
+/// [`socks_reply`] normalises what the remote printed.
+const SOCKS5_NO_AUTH_ACCEPTED: &str = "0500";
+
+/// What the listener said back to the SOCKS5 greeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocksReply {
+    /// Exactly the no-auth acceptance.
+    Accepted,
+    /// Some other bytes.
+    Other,
+    /// Nothing at all before the read deadline.
+    Silent,
+}
+
+/// Read the probe's stdout as the listener's reply.
+///
+/// **Whitespace is normalised away before comparing**, deliberately: `od -An
+/// -tx1` prints ` 05 00`, `xxd -p` prints `0500`, and a future edit that swaps
+/// the tool must not change the verdict. A parser that accepts one spelling
+/// is brittle against exactly the coreutils differences the remotes vary in.
+fn socks_reply(stdout: &str) -> SocksReply {
+    let hex: String = stdout
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    if hex.is_empty() {
+        return SocksReply::Silent;
+    }
+    if hex == SOCKS5_NO_AUTH_ACCEPTED {
+        SocksReply::Accepted
+    } else {
+        SocksReply::Other
+    }
 }
 
 /// Longest bind host accepted. The DNS ceiling for a fully qualified name;
@@ -1014,21 +1240,40 @@ fn probe_endpoint(listen: &str) -> Option<(String, u16)> {
 /// streaming at line rate to matter.
 const FORWARD_PROBE_CAP: usize = 4 * 1024;
 
-/// Run the loopback probe and translate its exit status into an observation.
+/// Run the loopback probe and translate what it observed.
 ///
 /// Returns `None` — UNKNOWN, never a claim about the port — when the listen
 /// spec is not one [`probe_endpoint`] will target, when the remote has no
-/// usable `bash`, or when the reply was too long to be the reply this command
-/// produces.
+/// usable `bash` or hex tooling, or when the reply was too long to be the
+/// reply this command produces.
+///
+/// The exit status is read as a statement about the **connect** because
+/// [`forward_probe_command`] makes it one; the reply bytes only ever refine an
+/// exit-0 observation. So a listener that accepted and stayed silent is
+/// [`ForwardObservation::Silent`] (FAIL) rather than being blurred into the
+/// same UNKNOWN as tooling that never ran (non-zero status).
+///
+/// There is deliberately no arm mapping ssh's own "remote port forwarding
+/// failed" stderr onto an observation. It used to exist (`Some(false)`), and
+/// it is gone because the doctor's sessions are built by
+/// [`SystemSshExecutor::for_observation`], which passes
+/// `ClearAllForwardings=yes`: no session this module opens ever *requests* a
+/// forward, so OpenSSH has nothing to fail to bind and cannot emit that
+/// stderr. Keeping it would have been worse than dead — it turned an error
+/// about the doctor's own session into a confident claim about the *user's*
+/// listener, which is the misdiagnosis this whole module exists to eliminate.
+/// (`crate::connect`'s sessions do carry forwards, so
+/// [`crate::connect::is_forward_failure_detail`] is very much alive there.)
 fn probe_forward_bound(
     executor: &dyn SshExecutor,
     target: &SshTarget,
-    listen: &str,
-) -> Option<bool> {
-    let (host, port) = probe_endpoint(listen)?;
+    forward: &ResolvedForward,
+) -> Option<ForwardObservation> {
+    let (host, port) = probe_endpoint(reverse_forward_listen(forward)?)?;
+    let probe = ForwardProbe::for_forward(forward);
     match executor.run_capped(
         target,
-        &forward_probe_command(&host, port),
+        &forward_probe_command(probe, &host, port),
         FORWARD_PROBE_CAP,
     ) {
         // A probe that hit its cap is not the terse reply this command
@@ -1039,7 +1284,16 @@ fn probe_forward_bound(
         {
             None
         }
-        Ok(output) if output.status == 0 => Some(true),
+        Ok(output) if output.status == 0 => Some(match probe {
+            // Connected, and that is the whole of what we are allowed to
+            // learn: nothing was sent, so nothing can attribute the listener.
+            ForwardProbe::ConnectOnly => ForwardObservation::Unattributable,
+            ForwardProbe::SocksHandshake => match socks_reply(&output.stdout) {
+                SocksReply::Accepted => ForwardObservation::SocksVerified,
+                SocksReply::Other => ForwardObservation::Foreign,
+                SocksReply::Silent => ForwardObservation::Silent,
+            },
+        }),
         Ok(output) if output.status == 1 => {
             // bash exits 1 both for a refused connect and for a build without
             // net redirections, where it reports the pseudo-path as missing.
@@ -1048,13 +1302,12 @@ fn probe_forward_bound(
             if lower.contains("no such file") || lower.contains("not supported") {
                 None
             } else {
-                Some(false)
+                Some(ForwardObservation::Refused)
             }
         }
-        // 127 is "bash missing on the remote" — an absent tool, not a free
-        // port.
+        // 127 is "bash, `timeout` or `od` missing on the remote" — absent
+        // tooling, not a free port and not a silent listener.
         Ok(_) => None,
-        Err(err) if is_forward_failure_detail(&ssh_error_detail(&err)) => Some(false),
         Err(_) => None,
     }
 }
@@ -1103,6 +1356,18 @@ fn observe(executor: &dyn SshExecutor, target: &SshTarget, name: &str) -> Observ
         // the host IS reachable and authentication DID work. Reporting this as
         // an unreachable host is the exact misdiagnosis the doctor exists to
         // eliminate.
+        //
+        // KEPT, though currently unreachable from here (PRD #345): the version
+        // probe rides the same `for_observation` executor as everything else
+        // in this module, so `ClearAllForwardings=yes` means it never requests
+        // a forward and OpenSSH never emits the stderr
+        // `connect::map_probe_ssh_error` matches on. It stays because it is
+        // free, it is exactly right the moment those flags change, and the
+        // catch-all below would otherwise quietly blur `host_reachable` for
+        // the one error class this arm was added to get right. That is a
+        // different judgement from the arm deleted in `probe_forward_bound`,
+        // which converted the same unreachable error into a confident claim
+        // about the USER's listener rather than about the doctor's session.
         Err(RemoteConnectError::ForwardFailed { detail, .. }) => {
             inputs.host_reachable = Some(true);
             ssh_detail = Some(detail);
@@ -1139,8 +1404,10 @@ fn observe(executor: &dyn SshExecutor, target: &SshTarget, name: &str) -> Observ
                 inputs.sshd = parse_sshd_t(output.status, &output.stdout, &output.stderr);
             }
         }
-        if let Some(listen) = reverse_listen(&inputs.ssh) {
-            inputs.forward_bound = probe_forward_bound(executor, target, listen);
+        // Cloned so the probe can borrow the forward while `inputs` is
+        // written back; a resolved forward is two short strings.
+        if let Some(forward) = reverse_forward(&inputs.ssh).cloned() {
+            inputs.forward_bound = probe_forward_bound(executor, target, &forward);
         }
     }
 
@@ -1449,7 +1716,7 @@ remoteforward 1080 [socks]:0
                 allow_tcp_forwarding: Some(AllowTcpForwarding::Yes),
                 client_alive_interval: Some(30),
             },
-            forward_bound: Some(true),
+            forward_bound: Some(ForwardObservation::SocksVerified),
         }
     }
 
@@ -1642,12 +1909,12 @@ remoteforward 1080 [socks]:0
     fn classify_distinguishes_sshd_block_from_port_collision() {
         let mut blocked = healthy_inputs();
         blocked.sshd.allow_tcp_forwarding = Some(AllowTcpForwarding::No);
-        blocked.forward_bound = Some(false);
+        blocked.forward_bound = Some(ForwardObservation::Refused);
         let blocked_results = classify(&blocked);
         let blocked_check = check(&blocked_results, CheckId::AllowTcpForwarding);
 
         let mut collision = healthy_inputs();
-        collision.forward_bound = Some(false);
+        collision.forward_bound = Some(ForwardObservation::Foreign);
         let collision_results = classify(&collision);
         let collision_check = check(&collision_results, CheckId::ForwardBound);
 
@@ -1707,7 +1974,7 @@ remoteforward 1080 [socks]:0
     #[test]
     fn classify_reports_configured_forward_not_bound() {
         let mut inputs = healthy_inputs();
-        inputs.forward_bound = Some(false);
+        inputs.forward_bound = Some(ForwardObservation::Refused);
         let results = classify(&inputs);
         let result = check(&results, CheckId::ForwardBound);
 
@@ -1847,15 +2114,227 @@ remoteforward 1080 [socks]:0
                 Some((host.to_string(), port)),
                 "supported listen spec {spec:?}"
             );
-            let command = forward_probe_command(host, port);
-            // The remote login shell strips the outer quotes and a nested bash
-            // parses the result, so the accepted alphabet has to be inert to
-            // BOTH. Anything outside it is what the validator exists to stop.
-            let inert = command
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || " -/<>:'.".contains(c));
-            assert!(inert, "built command carries a metacharacter: {command:?}");
+            for probe in [ForwardProbe::ConnectOnly, ForwardProbe::SocksHandshake] {
+                let command = forward_probe_command(probe, host, port);
+                // The remote login shell strips the outer quotes and a nested
+                // bash parses the result, so the interpolated endpoint has to
+                // be inert to BOTH. Only the endpoint comes from the user's
+                // config; the rest of the command is a literal this module
+                // authors, pinned verbatim by
+                // `forward_probe_command_is_pinned_for_both_forward_kinds`.
+                let endpoint = format!("/dev/tcp/{host}/{port}");
+                assert!(
+                    command.contains(&endpoint),
+                    "{probe:?} must target the resolved endpoint: {command:?}"
+                );
+                let inert = endpoint
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-/:.".contains(c));
+                assert!(
+                    inert,
+                    "interpolated endpoint carries a metacharacter: {endpoint:?}"
+                );
+            }
         }
+    }
+
+    /// Scenario: Build both remote probes for one endpoint and pin them
+    /// verbatim. The three properties an edit is most likely to lose — the
+    /// connect deciding the exit status, the bounded read, and the 127 for
+    /// absent tooling — are all spelling, so they are asserted as spelling.
+    #[test]
+    fn forward_probe_command_is_pinned_for_both_forward_kinds() {
+        assert_eq!(
+            forward_probe_command(ForwardProbe::ConnectOnly, "127.0.0.1", 1080),
+            "bash -c 'exec 3<>/dev/tcp/127.0.0.1/1080'"
+        );
+        assert_eq!(
+            forward_probe_command(ForwardProbe::SocksHandshake, "127.0.0.1", 1080),
+            "bash -c 'exec 3<>/dev/tcp/127.0.0.1/1080 || exit 1; \
+             command -v timeout >/dev/null 2>&1 && command -v od >/dev/null 2>&1 || exit 127; \
+             printf \"\\005\\001\\000\" >&3; \
+             timeout 2 head -c 2 <&3 | od -An -tx1; \
+             exit 0'"
+        );
+
+        // `remote/doctor/005`'s argv denylist, restated here so a failing
+        // spelling is caught in the fast tier rather than in the L2 run.
+        let handshake = forward_probe_command(ForwardProbe::SocksHandshake, "127.0.0.1", 1080);
+        for mutating_form in [
+            " rm ",
+            " mv ",
+            " cp ",
+            " touch ",
+            " mkdir ",
+            " chmod ",
+            " chown ",
+            " sed -i",
+            " tee ",
+            "systemctl ",
+            "service ",
+            "sshd_config",
+            ">>",
+        ] {
+            assert!(
+                !handshake.to_ascii_lowercase().contains(mutating_form),
+                "the probe must stay read-only, found {mutating_form:?} in {handshake:?}"
+            );
+        }
+    }
+
+    /// Scenario: Build the probe for a CONCRETE reverse forward and confirm it
+    /// carries no spelling of the SOCKS5 greeting. That port holds whatever the
+    /// user tunnelled — a database, an internal API — so the three bytes must
+    /// never be written into it.
+    #[test]
+    fn connect_only_probe_never_writes_the_socks_greeting() {
+        let concrete = ResolvedForward::Remote {
+            listen: "1080".to_string(),
+            destination: "db.internal.example:5432".to_string(),
+        };
+        assert_eq!(
+            ForwardProbe::for_forward(&concrete),
+            ForwardProbe::ConnectOnly
+        );
+        // A forward kind added later must inherit the SAFE probe, not the
+        // handshake, so the laptop-side directions are checked too.
+        for other in [
+            ResolvedForward::Dynamic {
+                listen: "9099".to_string(),
+            },
+            ResolvedForward::Local {
+                listen: "8080".to_string(),
+                destination: "localhost:80".to_string(),
+            },
+        ] {
+            assert_eq!(ForwardProbe::for_forward(&other), ForwardProbe::ConnectOnly);
+        }
+        assert_eq!(
+            ForwardProbe::for_forward(&ResolvedForward::RemoteDynamic {
+                listen: "1080".to_string()
+            }),
+            ForwardProbe::SocksHandshake
+        );
+
+        let command = forward_probe_command(ForwardProbe::ConnectOnly, "127.0.0.1", 1080);
+        // The denylist is over the spellings THIS module could emit, which is
+        // why it lives next to the emitter rather than in a test that would
+        // have to guess: the octal escapes above, the hex the parser compares
+        // against, and `printf` / `>&3` as the mechanism either would need.
+        for greeting in [
+            "\\005", "\\001", "\\000", "\\x05", "\\x01", "\\x00", "05 01 00", "050100", "printf",
+            ">&3",
+        ] {
+            assert!(
+                !command.contains(greeting),
+                "a connect-only probe must write nothing, found {greeting:?} in {command:?}"
+            );
+        }
+    }
+
+    /// Scenario: Read the same SOCKS5 acceptance as `od -An -tx1`, `xxd -p`
+    /// and a bare hex pair spell it. The deck must not care which tool the
+    /// remote had, so whitespace is normalised before comparing.
+    #[test]
+    fn socks_reply_normalises_whitespace_before_comparing() {
+        for spelling in [" 05 00", "05 00", "05 00\n", "0500", "0500\n", " 05 00 \n"] {
+            assert_eq!(
+                socks_reply(spelling),
+                SocksReply::Accepted,
+                "an acceptance spelled {spelling:?} must read as one observation"
+            );
+        }
+        for spelling in [" 48 54", "4854", "05", "05 01", "ff ff"] {
+            assert_eq!(
+                socks_reply(spelling),
+                SocksReply::Other,
+                "a non-acceptance spelled {spelling:?} is a foreign listener"
+            );
+        }
+        for silence in ["", "\n", "   ", " \n \n"] {
+            assert_eq!(
+                socks_reply(silence),
+                SocksReply::Silent,
+                "an empty reply spelled {silence:?} is a silent listener"
+            );
+        }
+    }
+
+    /// Scenario: Classify each of the five listener observations. A verified
+    /// SOCKS handshake is the only clear one; a foreign or silent squatter
+    /// fails; an unattributable concrete listener is UNKNOWN, never a
+    /// confident answer in either direction.
+    #[test]
+    fn classify_maps_every_listener_observation_to_its_own_verdict() {
+        let cases = [
+            (ForwardObservation::SocksVerified, Verdict::Pass, 0),
+            (ForwardObservation::Foreign, Verdict::Fail, 1),
+            (ForwardObservation::Silent, Verdict::Fail, 1),
+            (ForwardObservation::Unattributable, Verdict::Unknown, 2),
+            (ForwardObservation::Refused, Verdict::Fail, 1),
+        ];
+        let mut headlines = Vec::new();
+        for (observation, verdict, exit) in cases {
+            let mut inputs = healthy_inputs();
+            inputs.forward_bound = Some(observation);
+            let results = classify(&inputs);
+            let result = check(&results, CheckId::ForwardBound);
+            assert_eq!(result.verdict, verdict, "{observation:?}: {result:#?}");
+            let overall = overall_verdict(&results);
+            assert_eq!(overall.exit_code(), exit, "{observation:?}: {overall:?}");
+            headlines.push(result.headline.clone());
+        }
+        // Each observation has to explain itself; two of them sharing a
+        // sentence would hand the user the same line for different causes.
+        for (i, one) in headlines.iter().enumerate() {
+            for other in &headlines[i + 1..] {
+                assert_ne!(one, other, "two observations share a headline: {one}");
+            }
+        }
+    }
+
+    /// Scenario: A verified SOCKS listener is the one PASS this check can
+    /// give, so its prose must carry the evidence — that the handshake was
+    /// answered — rather than claiming the port was merely reachable.
+    #[test]
+    fn verified_socks_pass_states_its_evidence() {
+        let result = check(&classify(&healthy_inputs()), CheckId::ForwardBound).clone();
+        assert_eq!(result.verdict, Verdict::Pass);
+        let headline = result.headline.to_ascii_lowercase();
+        assert!(headline.contains("socks"), "{result:#?}");
+        assert!(
+            headline.contains("verified")
+                || headline.contains("handshake")
+                || headline.contains("confirmed"),
+            "a confident PASS must say WHY it is confident: {result:#?}"
+        );
+    }
+
+    /// Scenario: Something accepts the connection on a concrete reverse
+    /// forward. PASS and WARN both exit 0 and FAIL would call a healthy
+    /// configuration broken, so the honest answer is UNKNOWN with a caveat
+    /// saying the listener could not be attributed.
+    #[test]
+    fn concrete_forward_with_a_listener_is_unknown_not_pass_or_fail() {
+        let mut inputs = healthy_inputs();
+        inputs.ssh.forwards = vec![ResolvedForward::Remote {
+            listen: "1080".to_string(),
+            destination: "db.internal.example:5432".to_string(),
+        }];
+        inputs.forward_bound = Some(ForwardObservation::Unattributable);
+        let results = classify(&inputs);
+        let result = check(&results, CheckId::ForwardBound);
+
+        assert_eq!(result.verdict, Verdict::Unknown, "{result:#?}");
+        let headline = result.headline.to_ascii_lowercase();
+        assert!(
+            headline.contains("attribute")
+                || headline.contains("verify")
+                || headline.contains("ownership"),
+            "the caveat must say why this is not a confident answer: {result:#?}"
+        );
+        assert_eq!(overall_verdict(&results), Verdict::Unknown);
+        assert_eq!(overall_verdict(&results).exit_code(), 2);
     }
 
     /// Scenario: A `ssh -G` dump resolves a bind host the probe refuses. The
@@ -1925,7 +2404,7 @@ remoteforward 1080 [socks]:0
 
         // And it is still distinguishable from a genuinely broken tunnel.
         let mut broken = healthy_inputs();
-        broken.forward_bound = Some(false);
+        broken.forward_bound = Some(ForwardObservation::Refused);
         assert_eq!(overall_verdict(&classify(&broken)).exit_code(), 1);
 
         // Both non-zero: an UNKNOWN never reads as PASS.
@@ -2103,7 +2582,7 @@ remoteforward 1080 [socks]:0
     fn render_holds_the_one_check_one_verdict_per_line_contract() {
         let mut inputs = healthy_inputs();
         // The load-bearing case: this FAIL's fix names `AllowTcpForwarding`.
-        inputs.forward_bound = Some(false);
+        inputs.forward_bound = Some(ForwardObservation::Refused);
         inputs.sshd.allow_tcp_forwarding = Some(AllowTcpForwarding::No);
         let observations = Observations {
             inputs,

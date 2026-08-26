@@ -246,6 +246,8 @@ dot-agent-deck remote doctor desk-vm
 
 It resolves the name from your remote registry, runs a fixed ordered list of checks, and prints each as PASS / WARN / FAIL / UNKNOWN with the directive and the file to change. It is **read-only**: it never edits your ssh config, the remote's `sshd_config`, the registry, or anything else on the remote. Every remote command it runs is a query — `sshd -T` to read the resolved sshd policy, and a `/dev/tcp` connect to see whether the forward is actually listening.
 
+**One thing the doctor sends rather than reads**, and it is worth knowing about: when your `Host` block configures a reverse-*dynamic* forward — `RemoteForward <port>` with no destination, which is the recipe above — the liveness probe speaks SOCKS to it. It writes the three-byte SOCKS5 no-auth greeting `05 01 00` and looks for `05 00` back. That is the only way to tell *your* tunnel from an unrelated service that happens to hold the port: a plain connect answers "something is listening" and a squatter passes it. The greeting goes **only** to a port you declared to be SOCKS by omitting the destination. A `RemoteForward` with a concrete destination carries whatever you tunnelled — a database, an internal API — so the doctor connects to it and says nothing, and reports UNKNOWN rather than guessing (see [A concrete `RemoteForward` reports UNKNOWN, not PASS](#a-concrete-remoteforward-reports-unknown-not-pass)). Nothing the greeting does outlives the probe: no file, no configuration, no listener state — read-only here means your persistent state, not the bytes on a socket the doctor itself opened.
+
 Read-only extends to the ssh sessions themselves. Every session the doctor opens passes `-o ClearAllForwardings=yes -o ControlMaster=no -o ControlPath=none -o PermitLocalCommand=no -o UpdateHostKeys=no`, so it creates none of the forwards your `Host` block asks for, leaves no persistent master connection behind, runs no `LocalCommand`, and does not rewrite `known_hosts`. Host-key *verification* is untouched — that is a security control, not a mutation. Two consequences worth knowing: the doctor's own probes are immune to the forwarding problems it is diagnosing (so reachability is reported cleanly instead of cascading into UNKNOWN), and `ForwardBound` reports on **pre-existing** state rather than on a listener the doctor created for itself. The one command that does *not* get those options is `ssh -G`, which never connects and whose whole purpose is to show the forwards the others suppress.
 
 A healthy remote reads top to bottom, cause before symptom:
@@ -261,7 +263,7 @@ PASS    DynamicForward       no laptop-side SOCKS listener is configured
 PASS    ExitOnForwardFailure `ExitOnForwardFailure yes` is set, so a tunnel that cannot bind aborts the session loudly
 PASS    AllowTcpForwarding   the remote's sshd permits reverse (`-R`) tunnels (`AllowTcpForwarding yes`)
 PASS    ClientAliveInterval  the remote's sshd probes idle sessions every 30s
-PASS    ForwardBound         port 1080 is bound and accepting connections on the remote
+PASS    ForwardBound         port 1080 answered the SOCKS5 no-auth handshake, so the listener is verified as this recipe's own tunnel
 PASS    ForwardAgent         agent forwarding is off for this destination
 
 Overall: PASS
@@ -285,7 +287,7 @@ Both non-zero codes keep the promise that an UNKNOWN never reads as PASS: a diag
 | A forward that fails silently | `ExitOnForwardFailure` | `ssh -G` |
 | `DynamicForward` pointing the wrong way | `DynamicForward` | `ssh -G` |
 | Nothing forwarded at all | `RemoteForward` | `ssh -G` |
-| Two laptops on the same listen port | `ForwardBound` + `AllowTcpForwarding` | a loopback connect on the remote, read against the sshd policy |
+| Two laptops on the same listen port | `ForwardBound` + `AllowTcpForwarding` | a loopback SOCKS5 handshake on the remote, read against the sshd policy |
 | A listener orphaned by a sleeping laptop | `ClientAliveInterval` | `sshd -T` over ssh |
 | `ForwardAgent yes` (advisory, never a failure) | `ForwardAgent` | `ssh -G` |
 | The ordinary broken-ssh case | `HostReachable` | the deck's existing version probe |
@@ -306,7 +308,7 @@ FAIL    ForwardBound         port 1080 is not bound on the remote, which the ssh
         -> This is the remote's policy refusing the tunnel, not a busy port. Fix `AllowTcpForwarding` on the remote first, then re-run this command.
 ```
 
-When the policy permits the tunnel and the port is simply taken, the same client error produces a different report:
+When the policy permits the tunnel and nothing answers on the port, the same client error produces a different report:
 
 ```
 PASS    HostReachable        ssh connected and authenticated
@@ -316,6 +318,8 @@ PASS    ClientAliveInterval  the remote's sshd probes idle sessions every 30s
 FAIL    ForwardBound         port 1080 is not bound on the remote, though its sshd permits the tunnel
         -> Nothing is listening there right now. If a session to this remote is up as you read this, its tunnel did not bind — that port is taken by something else, so give this laptop its own listen port or drop whatever still holds it (forward ports are per-remote, so two laptops on the same one collide). If you are not connected, expect this: the tunnel exists only while a session does, so re-run this while connected to learn anything more.
 ```
+
+If instead something *does* answer on the port but is not your tunnel, the report is different again — see [A foreign service holding the port](#a-foreign-service-holding-the-port) below.
 
 Note that `HostReachable` is PASS in both. ssh reached the host and authenticated fine; only the forward failed. Before issue #344 the deck classified this as an unreachable host and burned its reconnect budget against a network path that was never broken — which is the fourth failure mode, and the reason the doctor's own first check had to be fixed before the rest was worth building.
 
@@ -332,13 +336,46 @@ UNKNOWN ClientAliveInterval  could not read the remote's sshd keepalive policy
 Overall: UNKNOWN
 ```
 
-The `ForwardBound` check degrades the same way when the remote has no `bash` for the `/dev/tcp` probe: UNKNOWN, not a claim that the port is free. It also refuses to probe a listen address that is not a plain IPv4 literal, IPv6 literal, or a hostname of letters, digits, `.` and `-` — a bind address ends up inside a command the remote's shell parses, so anything else is reported as UNKNOWN naming the value rather than guessed at.
+The `ForwardBound` check degrades the same way when the remote is missing the tooling the probe needs — `bash` for the `/dev/tcp` connect, or `timeout` and `od` for the bounded reply it reads back: UNKNOWN, not a claim that the port is free and not a claim that a squatter holds it. It also refuses to probe a listen address that is not a plain IPv4 literal, IPv6 literal, or a hostname of letters, digits, `.` and `-` — a bind address ends up inside a command the remote's shell parses, so anything else is reported as UNKNOWN naming the value rather than guessed at.
+
+#### A foreign service holding the port
+
+The nastiest version of a collision is the one where *everything else is right*. Your `Host` block is correct, the remote permits forwarding, and some unrelated service got to port 1080 first. A probe that only checked whether the connect succeeded would call that healthy and exit 0 — which is exactly the scenario this command exists for. The SOCKS handshake is what catches it:
+
+```
+PASS    AllowTcpForwarding   the remote's sshd permits reverse (`-R`) tunnels (`AllowTcpForwarding yes`)
+PASS    ClientAliveInterval  the remote's sshd probes idle sessions every 30s
+FAIL    ForwardBound         port 1080 is held by something else — it answered the SOCKS5 handshake with bytes no SOCKS proxy sends
+        -> A service that is not a SOCKS proxy already owns that port on the remote, so your tunnel cannot bind it. Give this laptop its own listen port, or stop whatever holds this one — forward ports are per-remote, so two laptops on the same one collide.
+```
+
+A squatter that accepts the connection and then says nothing at all — which many services do, since they speak only when spoken to in their own protocol — is the same collision seen through a quieter service, and reads the same way:
+
+```
+FAIL    ForwardBound         port 1080 is held by something that accepted the connection and then never answered the SOCKS5 handshake
+        -> A live SOCKS proxy replies in microseconds over loopback, so silence means the port belongs to another service. Give this laptop its own listen port, or stop whatever holds this one — forward ports are per-remote, so two laptops on the same one collide.
+```
+
+That second case is why the probe carries its own short read deadline instead of relying on ssh's: `bash`'s `/dev/tcp` never times a read out, so a listener that stays silent would otherwise hold the probe open for the whole `DOT_AGENT_DECK_SSH_PROBE_TIMEOUT_SECS` window.
+
+#### A concrete `RemoteForward` reports UNKNOWN, not PASS
+
+If your reverse forward names a destination — `RemoteForward 1080 db.internal:5432` rather than the destination-less reverse-dynamic form — an accepting listener is reported as UNKNOWN and the command exits 2:
+
+```
+PASS    RemoteForward        ssh resolved 1080 to db.internal.test:5432
+...
+UNKNOWN ForwardBound         port 1080 has a listener, but a tunnel to a concrete destination carries no greeting this probe may use to attribute it
+        -> Your configuration is right and something is listening; the deck just cannot prove that something is yours. Only the reverse-dynamic form (`RemoteForward <port>` with no destination) puts a SOCKS proxy there, whose no-auth handshake the deck can safely speak. Confirm ownership on the remote yourself (`ss -ltnp`), or switch to the reverse-dynamic form this recipe uses.
+```
+
+This is not a failure being reported as a mystery, and it is not a change in behaviour — it is how the check has always worked. The reasoning is worth stating, because UNKNOWN looks like a cop-out and here it is the only honest answer. PASS and WARN both exit 0, so either would be a confident all-clear about a listener nobody verified. FAIL would be worse: for a concrete forward an accepting listener usually *is* your tunnel working, and a tool that calls a healthy setup broken is a tool people learn to ignore. The deck could only do better by writing a probe into your database's port, which it will not do. UNKNOWN says the true thing — your configuration is right, and ownership of the listener could not be established from here.
 
 #### What `ForwardBound` does and does not tell you
 
-Because the doctor's sessions create no forwards, this check answers exactly one question: **is something already listening on that port on the remote?** Three limits follow from that, and none of them is fixable without the doctor binding the port itself, which is the mutation it refuses:
+Because the doctor's sessions create no forwards, this check answers a question about **pre-existing** state: what is already listening on that port on the remote? Three limits follow, and none is fixable without the doctor binding the port itself, which is the mutation it refuses:
 
-- A listener that answers might be a live session of yours, or an unrelated service holding the port. A TCP connect cannot tell them apart, so read this line together with whether you are actually connected right now.
+- A verified PASS means the listener answered a SOCKS5 handshake, so it is a SOCKS proxy — which is what the recipe puts there. It does not distinguish *your* SOCKS proxy from another one on the same port, and if you deliberately run one for something else, expect a PASS.
 - Nothing listening is the normal state when no session is up. Run the doctor **while connected** if you want this line to say something about your tunnel.
 - Only the **first** reverse forward `ssh -G` resolved is probed. A `Host` block with several is listed in full by `RemoteForward`, but liveness is checked for one listener — enough for the single-tunnel recipe above, which is the case this was built for.
 
