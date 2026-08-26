@@ -3628,6 +3628,10 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<Vec<String>>
 /// Copy only Codex's authentication state into the isolated test HOME and seed
 /// the fixture working directory as trusted. User configuration is deliberately
 /// not imported; real-agent tests pin their model for deterministic behavior.
+///
+/// Issue #243: also seeds `version.json` — see [`codex_update_notice_dismissal`]
+/// for why an isolated HOME without it can wedge a real-agent Codex test in a
+/// way that looks like a delivery failure.
 pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
     let src = host_home().join(".codex").join("auth.json");
     let bytes = read_credential_file_no_symlink(
@@ -3648,7 +3652,47 @@ pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
             std::io::Error::other("isolated Codex fixture path is not UTF-8")
         })?)
     );
-    write_credential_file_atomic_0o600(&dst.join("config.toml"), config.as_bytes())
+    write_credential_file_atomic_0o600(&dst.join("config.toml"), config.as_bytes())?;
+
+    // Issue #243: dismiss the update notice in the ISOLATED home.
+    //
+    // Everything else here is deliberately minimal — auth plus a trust entry,
+    // nothing else — and `version.json` looks like user state that a test has no
+    // business inheriting. It is not: with the file absent, codex-cli 0.149.0
+    // paints a blocking "✨ Update available! … Press enter to continue"
+    // interstitial INSTEAD of its composer, so the pane looks alive while no
+    // agent is behind it and an injected prompt goes into the interstitial. The
+    // failure surfaces as "the worker never submitted the pointer" — a delivery
+    // symptom with a boot cause, which cost #243's implementer two runs to spot
+    // and would misattribute an `orchestration/delegate/009` red to the readiness
+    // gate. Nobody meets it interactively because the host HOME has the file.
+    //
+    // Best-effort by design: it is an ergonomic, not a credential, and a test
+    // that cannot write it should still run rather than fail with an error about
+    // a notice. The host's own file is not copied — it carries a
+    // `last_checked_at` timestamp and whatever version the developer happens to
+    // be on, neither of which a test wants to inherit.
+    let _ = std::fs::write(dst.join("version.json"), codex_update_notice_dismissal());
+    Ok(())
+}
+
+/// The `version.json` body that suppresses codex-cli's update notice in an
+/// isolated HOME: a `latest_version` BELOW every real release, so there is
+/// nothing newer to announce whatever the CLI is actually running, plus a
+/// matching `dismissed_version` for the same claim by the other route.
+///
+/// `0.0.0` rather than a high sentinel, and that is measured rather than
+/// stylistic: seeding `9999.0.0` (dismissed equal to latest, the shape the host's
+/// own file has) does NOT suppress the notice — codex-cli 0.149.0 rendered
+/// `✨ Update available! 0.149.0 -> 9999.0.0` above its composer on
+/// `orchestration/delegate/009`, i.e. the seed manufactured the very banner it
+/// was meant to remove. Nothing can be newer than what is running if the
+/// recorded latest is `0.0.0`.
+///
+/// `last_checked_at` is far in the future so the CLI has no reason to re-check
+/// and overwrite this, and so a test HOME never depends on the wall clock.
+fn codex_update_notice_dismissal() -> &'static str {
+    r#"{"latest_version":"0.0.0","last_checked_at":"2099-01-01T00:00:00.000000000Z","dismissed_version":"0.0.0"}"#
 }
 
 /// Write a minimal `session.toml` containing exactly one pane that
