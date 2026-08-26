@@ -53,8 +53,14 @@ use chrono::Utc;
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
 use crate::event::{
     AGENT_EVENT_SCHEMA_VERSION, AgentEvent, AgentType, EventType, LiveTarget,
-    SESSION_START_ORIGIN_METADATA_KEY, TargetKind, WRAPPER_FORK_SESSION_START_ORIGIN,
-    WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN, Writable,
+    SESSION_START_ORIGIN_METADATA_KEY, TargetKind, WRAPPER_FORK_SESSION_START_ORIGIN, Writable,
+};
+// Issue #243: the interface-origin values are named only by `InterfaceFact`,
+// which reads the inner pty's termios and so exists only where `run_wrap_pty`
+// does. Importing them ungated would be an unused import on Windows.
+#[cfg(unix)]
+use crate::event::{
+    WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN, WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN,
 };
 
 /// A coarse activity state detected from a single line of wrapped output.
@@ -304,24 +310,53 @@ impl Emitter {
     /// consequence of the very prompt the gate is withholding, which is why the
     /// gate never fast-pathed and every Codex delegate cost ~31 s.
     ///
-    /// It carries [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`] rather than
-    /// arriving unmarked, so a consumer can tell "the deck WATCHED this interface
-    /// come up" from "an agent session announced itself". Both matter: the first
-    /// is stronger readiness (an observation, not an announcement), and the
-    /// second is what may bind a conversation — this event carries the WRAPPER's
-    /// session id, not the agent's, so it must never do that. See
+    /// It carries the origin value of the FACT that fired
+    /// ([`InterfaceFact::origin`]) rather than arriving unmarked, so a consumer
+    /// can tell "the deck WATCHED this interface come up" from "an agent session
+    /// announced itself" — and, since issue #243's review, can also tell the
+    /// strong observation (raw input mode) from the weak guess (output settled)
+    /// and price them differently. This event carries the WRAPPER's session id,
+    /// not the agent's, so it must never bind a conversation. See
     /// [`crate::event::AgentEvent::is_wrapper_session_start`].
-    fn emit_interface_ready(&self) {
+    ///
+    /// **Sent off the supervisory loop** (issue #243 audit F3). Every other
+    /// `Emitter` call site is a tee thread; this one is the wrapper's 50 ms main
+    /// loop, the loop that forwards the user's `Ctrl+C`/SIGTERM to the child
+    /// group, and [`crate::hook::send_to_socket`] is a blocking connect + write
+    /// with no timeout. A wedged, SIGSTOPped or backlogged daemon would stall
+    /// signal forwarding. The latch bounds this to one thread per wrapped
+    /// session, and the send is bounded so that thread cannot linger either.
+    ///
+    /// `#[cfg(unix)]` because [`InterfaceFact`] is: the watch reads a pty's
+    /// termios, and only `run_wrap_pty` — itself Unix-only — has one.
+    #[cfg(unix)]
+    fn emit_interface_ready(&self, fact: InterfaceFact) {
         let mut metadata = HashMap::new();
         metadata.insert(
             SESSION_START_ORIGIN_METADATA_KEY.to_string(),
-            WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN.to_string(),
+            fact.origin().to_string(),
         );
-        self.emit_with_metadata(EventType::SessionStart, metadata);
+        let Ok(json) = serde_json::to_string(&self.build_event(EventType::SessionStart, metadata))
+        else {
+            return;
+        };
+        std::thread::spawn(move || {
+            crate::hook::send_to_socket_bounded(&json, INTERFACE_READY_SEND_TIMEOUT);
+        });
     }
 
     fn emit_with_metadata(&self, event_type: EventType, metadata: HashMap<String, String>) {
-        let event = AgentEvent {
+        let event = self.build_event(event_type, metadata);
+        if let Ok(json) = serde_json::to_string(&event) {
+            let _ = crate::hook::send_to_socket(&json);
+        }
+    }
+
+    /// Issue #243 audit F3: build the [`AgentEvent`] without sending it, so a
+    /// caller that must not block on the daemon can do the (cheap, pure) build on
+    /// its own thread and hand only the serialized line to a sender.
+    fn build_event(&self, event_type: EventType, metadata: HashMap<String, String>) -> AgentEvent {
+        AgentEvent {
             session_id: self.session_id.clone(),
             agent_type: self.agent_type.clone(),
             event_type,
@@ -339,9 +374,6 @@ impl Emitter {
             // PRD #20 M3: a wrapped session is history-only from the dashboard's
             // perspective (see `Emitter::live_target`).
             live_target: Some(self.live_target),
-        };
-        if let Ok(json) = serde_json::to_string(&event) {
-            let _ = crate::hook::send_to_socket(&json);
         }
     }
 }
@@ -1451,6 +1483,61 @@ fn set_pty_size(fd: RawFd, rows: u16, cols: u16) {
 #[cfg(unix)]
 const INTERFACE_SETTLE_WINDOW: Duration = Duration::from_millis(750);
 
+/// Issue #243 audit F3: how long the interface-ready send may spend on the daemon
+/// before it gives up.
+///
+/// This send is the wrapper's ONLY daemon I/O that originates on its supervisory
+/// loop, so it is the only one whose latency could reach the code that forwards
+/// the user's `Ctrl+C` to the child group. It is already moved off that loop onto
+/// a detached thread ([`Emitter::emit_interface_ready`]); this bounds the thread
+/// so a wedged or SIGSTOPped daemon leaves nothing behind for the life of the
+/// session either.
+///
+/// Five seconds, the same budget `crate::hook`'s request/response paths give a
+/// daemon that is merely busy. Losing the event costs latency and nothing else —
+/// the readiness gate falls back to the behaviour it has without this signal —
+/// so the bound is deliberately generous rather than tight.
+#[cfg(unix)]
+const INTERFACE_READY_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Issue #243 (review finding 1): WHICH of [`InterfaceWatch`]'s two facts fired.
+///
+/// Reported rather than collapsed to a bool because the two are not equally
+/// strong and are priced differently by the daemon — see [`InterfaceWatch`] for
+/// what each one is worth and why.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterfaceFact {
+    /// The child cleared `ICANON`/`ECHO` on the inner PTY — fact 1, an
+    /// observation of input-readiness.
+    RawInputMode,
+    /// The child wrote at least one byte and then stayed quiet for
+    /// [`INTERFACE_SETTLE_WINDOW`] — fact 2, a guess.
+    OutputSettled,
+}
+
+#[cfg(unix)]
+impl InterfaceFact {
+    /// The `session_start_origin` value this fact rides to the daemon. Distinct
+    /// per fact so the daemon can price them separately; see
+    /// [`InterfaceWatch`].
+    fn origin(self) -> &'static str {
+        match self {
+            Self::RawInputMode => WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN,
+            Self::OutputSettled => WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN,
+        }
+    }
+
+    /// A short, stable label for the log line — the answer to "why did readiness
+    /// fire on this pane?", which used to be computed and then discarded.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::RawInputMode => "raw-input-mode",
+            Self::OutputSettled => "output-settled",
+        }
+    }
+}
+
 /// Issue #243: the wrapper's answer to "does the child's interface exist yet?".
 ///
 /// The wrapper is the only party that can answer this. The daemon sees events;
@@ -1459,21 +1546,37 @@ const INTERFACE_SETTLE_WINDOW: Duration = Duration::from_millis(750);
 /// from an event that arrives too late (Codex's native `SessionStart`) or never
 /// (OpenCode has none at all).
 ///
-/// TWO independent facts are accepted, strongest first, and both are observations
-/// of the child rather than a timer:
+/// TWO independent facts are accepted — [`InterfaceFact`] — and they are NOT
+/// equally strong, which is why the watch reports WHICH one fired rather than a
+/// bare bool. They ride distinct `session_start_origin` values so the daemon can
+/// price them separately (issue #243 review finding 1):
 ///
-/// 1. **The child took the inner PTY out of cooked mode** — it cleared `ICANON`
-///    and/or `ECHO`. This is the definitive one, and it is the exact inverse of
-///    the defect the readiness gate exists to prevent: PRD #225's prompt loss was
-///    bytes written into a line discipline that was still canonical with echo on,
-///    where the payload is echoed back and swallowed. A child reading raw
-///    keystrokes is, by construction, a program that consumes input rather than
-///    echoing it. Launchers (`devbox`, a shell script, `node` starting up) never
-///    do this; a full-screen TUI does it as it initializes, before it paints.
-/// 2. **Output SETTLED** — the child wrote something and then stopped for
-///    [`INTERFACE_SETTLE_WINDOW`]. The fallback for an interface that stays in
-///    cooked mode (a line-oriented REPL, and the test stand-ins), and for the
-///    redirected-descriptor paths where no inner PTY termios exists to read.
+/// 1. **The child took the inner PTY out of cooked mode**
+///    ([`InterfaceFact::RawInputMode`]) — it cleared `ICANON` and/or `ECHO`. A
+///    genuine OBSERVATION of input-readiness, and the exact inverse of the defect
+///    the readiness gate exists to prevent: PRD #225's prompt loss was bytes
+///    written into a line discipline that was still canonical with echo on, where
+///    the payload is echoed back and swallowed. A child reading raw keystrokes
+///    is, by construction, a program that consumes input rather than echoing it.
+///    Launchers (`devbox`, a shell script, `node` starting up) never do this; a
+///    full-screen TUI does it as it initializes, before it paints.
+/// 2. **Output SETTLED** ([`InterfaceFact::OutputSettled`]) — the child wrote
+///    something and then stopped for [`INTERFACE_SETTLE_WINDOW`]. The fallback
+///    for an interface that stays in cooked mode (a line-oriented REPL, and the
+///    test stand-ins), and for the redirected-descriptor paths where no inner PTY
+///    termios exists to read.
+///
+///    **This one is a GUESS, and the wrapper cannot make it a better one.**
+///    Silence says the child stopped producing output; it cannot say whether the
+///    thing that stopped is an interface waiting at its prompt or a LAUNCHER
+///    stalled part-way through its own boot. The production shape is `devbox run
+///    codex-big`, whose measured wrapper→`node codex` gap is ~4 s, so a launcher
+///    that prints one line and then evaluates its environment quietly satisfies
+///    this fact while the pty is still canonical — PRD #225 Defect 1 exactly.
+///    Nothing observable at this seam distinguishes the two cases, so the fix is
+///    not here: the daemon still releases its wait on this fact (30 s of waiting
+///    for a signal that never comes is worse) but keeps the post-readiness buffer
+///    over it. See `crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`.
 ///
 /// What is deliberately NOT accepted: elapsed time since `exec`, and the child's
 /// FIRST byte. A wall-clock timer fires for a child that has not started, and a
@@ -1482,6 +1585,16 @@ const INTERFACE_SETTLE_WINDOW: Duration = Duration::from_millis(750);
 /// A child that writes nothing and never leaves cooked mode is never announced
 /// ready by this watch at all, which is correct: nothing about it is observable,
 /// so the gate falls back to the behaviour it has today.
+///
+/// **What this watch observes is the inner PTY, which is not private to the
+/// child.** A same-uid process can find it (`/proc/<wrapper-pid>/fd` → the pts
+/// node, mode `0620`) and can therefore make either fact fire for a child that is
+/// not ready — `tcsetattr` away `ICANON`/`ECHO`, or write one byte and go quiet.
+/// The wrapper's report would be honest and the fact would be wrong. That costs
+/// nothing beyond what the same process can already do by writing a forged event
+/// straight to the daemon's hook socket (issue #243 audit F1/F2), but it does
+/// mean "observation, not announcement" is a statement about the HONEST case and
+/// not a security property. Do not build a new privilege on it.
 #[cfg(unix)]
 struct InterfaceWatch {
     /// Latched once, so exactly one interface-ready event is ever emitted.
@@ -1533,15 +1646,20 @@ impl InterfaceWatch {
         (cooked & !current & (libc::ICANON | libc::ECHO)) != 0
     }
 
-    /// Claim the one interface-ready announcement, returning why it fired.
+    /// Claim the one interface-ready announcement, returning WHICH fact fired.
     /// `None` while the interface is not (yet) observable, and `None` forever
     /// after the single claim succeeds.
-    fn claim(&self, master_fd: RawFd) -> Option<&'static str> {
+    ///
+    /// The identity of the fact is part of the answer, not a diagnostic
+    /// afterthought: the two are priced differently downstream (see
+    /// [`InterfaceWatch`]), so a caller that collapses them back to a bool
+    /// reintroduces the launcher-settle hazard fact 2 carries.
+    fn claim(&self, master_fd: RawFd) -> Option<InterfaceFact> {
         if self.announced.load(Ordering::SeqCst) {
             return None;
         }
-        let reason = if self.child_took_raw_input(master_fd) {
-            "raw-input-mode"
+        let fact = if self.child_took_raw_input(master_fd) {
+            InterfaceFact::RawInputMode
         } else {
             let last = self.last_output_ms.load(Ordering::SeqCst);
             if last == 0 {
@@ -1551,9 +1669,9 @@ impl InterfaceWatch {
             {
                 return None;
             }
-            "output-settled"
+            InterfaceFact::OutputSettled
         };
-        (!self.announced.swap(true, Ordering::SeqCst)).then_some(reason)
+        (!self.announced.swap(true, Ordering::SeqCst)).then_some(fact)
     }
 }
 
@@ -2025,9 +2143,19 @@ fn run_wrap_pty(
         // notice its own silence). This loop already ticks every 50 ms for
         // resizes and child reaping, so the watch costs one atomic load plus, at
         // most, one `tcgetattr` per tick and nothing at all once it has fired.
-        if let Some(reason) = interface.claim(master_fd) {
-            let _ = reason;
-            emitter.emit_interface_ready();
+        //
+        // Issue #243 review finding 4 / audit closing note: the FACT is logged as
+        // well as acted on. It used to be computed and then dropped
+        // (`let _ = reason;`), which threw away the single most useful field
+        // diagnostic this mechanism produces — "was this a genuine TUI raw-mode
+        // release, or the settle guess?" — at the one place that knows.
+        if let Some(fact) = interface.claim(master_fd) {
+            tracing::debug!(
+                reason = fact.reason(),
+                origin = fact.origin(),
+                "wrap: observed the child's interface; announcing pre-prompt readiness"
+            );
+            emitter.emit_interface_ready(fact);
         }
 
         // R20-001: the terminal output pump ended while the child is still alive

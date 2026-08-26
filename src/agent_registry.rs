@@ -85,12 +85,25 @@ pub enum PrePromptReadiness {
     /// Nothing arrives from the agent itself before the prompt, but the deck's
     /// own `dot-agent-deck wrap` hosts the child's PTY and announces its
     /// interface once it can SEE it — a `SessionStart` carrying
-    /// [`crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`] (Codex;
+    /// [`crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`] or
+    /// [`crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`] (Codex;
     /// PRD #211's Gemini inherits this).
     ///
-    /// The strongest readiness fact the deck has, because it is an observation
-    /// rather than an announcement — which is why it is the one signal the
-    /// post-readiness buffer is skipped for.
+    /// The best readiness fact the deck has, because in the honest case it is an
+    /// observation of the child rather than an announcement about it — which is
+    /// why the strong half of it is the one signal the post-readiness buffer is
+    /// skipped for.
+    ///
+    /// **"Observation, not announcement" describes the honest case; it is not a
+    /// security property, and the buffer skip does not rest on it alone** (issue
+    /// #243 audit F2). Both facts are read off the INNER PTY, which is not private
+    /// to the child: a same-uid process can find it (`/proc/<wrapper-pid>/fd` →
+    /// the pts node, mode `0620`) and either `tcsetattr` away `ICANON`/`ECHO` or
+    /// write one byte and go quiet, making the genuine wrapper emit a genuine
+    /// event about a child that is not ready. Suspected from the permissions, not
+    /// reproduced, and it grants nothing beyond forging the event outright — but
+    /// it is why `crate::state::dispatch_one_owned` gates the skip on the frozen
+    /// launch shape and the operator's own interval as well as on this fact.
     WrapperInterfaceReady,
     /// MEASURED: this agent emits nothing at all before its first prompt, and no
     /// wrapper is watching it either, so there is no signal for a gate to wait
@@ -362,6 +375,16 @@ pub static DEVIN: AgentSpec = AgentSpec {
     strategy: Some(IntegrationStrategy::NativeHooks),
     // Devin documents a `SessionStart` hook and runs unwrapped, so the gate simply
     // waits for the genuine one.
+    //
+    // DOCUMENTED, NOT MEASURED — the one value here that is not (issue #243
+    // review finding 3). Claude, OpenCode, Codex and Pi each rest on a boot-window
+    // observation recorded next to them; this rests on Devin's own documentation
+    // of the hook, with no measurement of WHEN in its boot the event actually
+    // lands relative to the first prompt. It is the conservative classification,
+    // so being wrong costs a delegate the 30 s fallback rather than a lost prompt
+    // — which is why it ships unmeasured rather than as `Unknown`, and why a
+    // future reader should not cite it as evidence the way the other four can be
+    // cited. Measure it before treating this as established.
     pre_prompt_readiness: PrePromptReadiness::NativeSessionStart,
     // A named ANSI colour not used by Claude (LightMagenta), OpenCode
     // (LightGreen), Pi (LightCyan) or Codex (LightYellow), and never the neutral
