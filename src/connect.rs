@@ -48,7 +48,7 @@ const PICKER_MAX_RETRIES: usize = 3;
 /// install location ever becomes user-configurable, this will become a field
 /// on `RemoteEntry`; until then, both `add` and `connect` agree on the same
 /// constant.
-const REMOTE_INSTALL_PATH: &str = "~/.local/bin/dot-agent-deck";
+pub const REMOTE_INSTALL_PATH: &str = "~/.local/bin/dot-agent-deck";
 
 /// Default cap on the version-probe ssh round-trip. Overridable via
 /// `DOT_AGENT_DECK_SSH_PROBE_TIMEOUT_SECS` — useful when a remote is reachable
@@ -316,7 +316,7 @@ pub fn pick_remote<R: BufRead, W: Write>(
 ///   values (e.g. `u64::MAX`). The clamp closes a self-DoS / ssh-child-leak
 ///   path: without it, an extreme env var would panic *after* the ssh child
 ///   was spawned, and `Child::drop` does not reap.
-fn probe_timeout_secs() -> u64 {
+pub fn probe_timeout_secs() -> u64 {
     std::env::var(PROBE_TIMEOUT_ENV)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -583,17 +583,58 @@ pub fn probe_remote_protocol(
     }
 }
 
-/// Translate an `SshError` from the version probe into the connect-side
-/// error. Auth + host-key failures fold into `HostUnreachable` because the
-/// recovery hint (check ssh config / known_hosts) is the same for the user.
-fn map_probe_ssh_error(name: &str, err: SshError) -> RemoteConnectError {
-    let detail = match &err {
+/// The best-effort human-readable detail carried by an `SshError`. Shared by
+/// [`map_probe_ssh_error`] and `remote_doctor`, which needs the same text to
+/// decide whether a probe died on a forward failure rather than on the host
+/// being unreachable.
+pub fn ssh_error_detail(err: &SshError) -> String {
+    match err {
         SshError::ConnectionRefused { detail, .. } => detail.clone(),
         SshError::AuthFailed { detail, .. } => detail.clone(),
         SshError::Io { source, .. } => source.to_string(),
         SshError::HostKeyVerificationFailed { .. } => err.to_string(),
         SshError::Other { detail, .. } => detail.clone(),
-    };
+    }
+}
+
+/// The three canonical fragments OpenSSH emits when a requested forward could
+/// not be established. Issue #344: kept deliberately narrow. An ordinary
+/// `ssh: connect to host x port 22: Connection refused` must NOT match — an
+/// over-broad pattern that swallowed real unreachability would be strictly
+/// worse than the misclassification this replaces.
+const FORWARD_FAILURE_MARKERS: &[&str] = &[
+    "remote port forwarding failed for listen port",
+    "bind: address already in use",
+    "cannot listen to port",
+];
+
+/// True when ssh's stderr names a forwarding failure rather than a transport
+/// failure. Case-insensitive; see [`FORWARD_FAILURE_MARKERS`] for the scope.
+pub fn is_forward_failure_detail(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    FORWARD_FAILURE_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Translate an `SshError` from the version probe into the connect-side
+/// error. Auth + host-key failures fold into `HostUnreachable` because the
+/// recovery hint (check ssh config / known_hosts) is the same for the user.
+///
+/// Issue #344 (folded into PRD #345): a forward that could not bind is
+/// checked FIRST, because ssh reports it with exit 255 exactly like a
+/// transport failure and the old blanket `HostUnreachable` sent users to
+/// debug a network path that was never broken. The forward markers are
+/// narrow on purpose — the doctor, not this constructor, is what tells the
+/// user *which* of the two indistinguishable causes applies.
+fn map_probe_ssh_error(name: &str, err: SshError) -> RemoteConnectError {
+    let detail = ssh_error_detail(&err);
+    if is_forward_failure_detail(&detail) {
+        return RemoteConnectError::ForwardFailed {
+            name: name.to_string(),
+            detail,
+        };
+    }
     RemoteConnectError::HostUnreachable {
         name: name.to_string(),
         detail,

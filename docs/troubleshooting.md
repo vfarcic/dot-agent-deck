@@ -174,6 +174,18 @@ scp ~/Desktop/screenshot.png my-vm:/tmp/
 
 See [Remote Environments › Getting files to the remote](remote-environments.md#getting-files-to-the-remote) for the full explanation and the ssh-config note.
 
+## A remote will not connect, or an ssh tunnel to it is not working
+
+Ask the deck instead of guessing:
+
+```bash
+dot-agent-deck remote doctor my-vm
+```
+
+It runs a fixed ordered list of read-only checks — ssh reachability and auth, whether the deck is installed on the remote, the forwards `ssh -G` actually resolved, the remote's own `AllowTcpForwarding` and `ClientAliveInterval` from `sshd -T`, and whether a configured forward is really bound — and prints each as PASS / WARN / FAIL / UNKNOWN with the directive and file to change. It exits non-zero on a failed check and on an UNKNOWN one, so an incomplete diagnosis never reads as all-clear. It writes nothing: not your ssh config, not the remote's `sshd_config`, not the registry, not the remote.
+
+It earns its keep on one case in particular. `AllowTcpForwarding no` on the remote and a port collision produce **byte-identical** errors from ssh, so no client-side message can separate them; the doctor reads the remote's own sshd policy and tells you which one you have. See [Reverse tunnels › Troubleshooting with `remote doctor`](remote-recipes.md#troubleshooting-with-remote-doctor) for annotated output of every case.
+
 ## The deck is missing cards — a role or session I know is running has no card
 
 Check the deck's title row first. If it reads something like `dot-agent-deck — 7 session(s)  (↓2)`, nothing is wrong with the agents: the count is right, and the `(↓2)` says two cards are below the bottom of the window. `(↑2)` means two are above it, and both appear together when you are scrolled into the middle. Move the selection with `j` / `k` (or the arrow keys) to bring them into view, or give the terminal a few more rows and they all fit again.

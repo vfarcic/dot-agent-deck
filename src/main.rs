@@ -440,6 +440,15 @@ enum RemoteCmd {
         /// Friendly name of the registry entry to remove.
         name: String,
     },
+    /// Diagnose a remote's ssh setup: reachability, the deck's install, the
+    /// forwards ssh actually resolved, and the remote sshd policy behind them
+    /// (PRD #345). Read-only — it never edits ssh config, sshd config, the
+    /// registry, or anything on the remote. Exits non-zero if any check
+    /// failed or could not be determined.
+    Doctor {
+        /// Friendly name of the registry entry to diagnose.
+        name: String,
+    },
     /// Re-run the binary install flow against an existing entry, then bump
     /// the registry's version field.
     Upgrade {
@@ -1294,6 +1303,7 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            RemoteCmd::Doctor { name } => run_remote_doctor(&name),
             RemoteCmd::Upgrade {
                 name,
                 version,
@@ -1695,6 +1705,35 @@ fn spawn_event_subscriber(
 /// `ssh -t` to run the deck TUI on the remote in M2.8 external-daemon
 /// mode. The laptop process blocks until ssh exits and propagates the
 /// exit code.
+/// PRD #345: `remote doctor <name>`. Resolves the registry entry FIRST so an
+/// unknown name costs zero ssh invocations, then runs the read-only probes and
+/// prints one line per check.
+///
+/// Exit status: 0 only when the diagnosis is clear (every check PASS, or at
+/// most advisory WARNs). A FAIL or an UNKNOWN exits non-zero — an incomplete
+/// diagnosis is deliberately not reported as all-clear, since the command's
+/// whole value is being trustworthy when someone is already stuck.
+fn run_remote_doctor(name: &str) -> ExitCode {
+    let registry_path = dot_agent_deck::remote::default_remotes_path();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    match dot_agent_deck::remote_doctor::run_doctor(name, &registry_path, &mut out) {
+        Ok(verdict) => {
+            let _ = out.flush();
+            if verdict.is_clear() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            let _ = out.flush();
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn run_connect(name: Option<String>) -> ExitCode {
     let registry_path = dot_agent_deck::remote::default_remotes_path();
 

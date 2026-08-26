@@ -174,7 +174,7 @@ Sometimes the remote is *less* connected than your laptop: the laptop holds a co
 
 > **Status.** The tunnel mechanism below is verified end to end (a service reachable only from the laptop's loopback, fetched from a remote through the tunnel). It has **not** been validated against a real corporate VPN — whether your internal git host is reachable this way depends on your network and your IT policy. See [issue #97](https://github.com/vfarcic/dot-agent-deck/issues/97).
 
-**Prerequisite on the remote.** Its sshd must permit TCP forwarding — `AllowTcpForwarding yes`, which is the OpenSSH default but is disabled in some distributions' packages (Alpine's, for one) and by most hardening baselines. Check with `sshd -T | grep allowtcpforwarding`. If it is off, every forward fails with `remote port forwarding failed for listen port N`, which looks identical to a port collision. Note that `sshd_config` takes the *first* value it finds for a keyword, so appending `AllowTcpForwarding yes` to the end of the file does nothing if the key is already set above — rewrite the existing line.
+**Prerequisite on the remote.** Its sshd must permit TCP forwarding — `AllowTcpForwarding yes`, which is the OpenSSH default but is disabled in some distributions' packages (Alpine's, for one) and by most hardening baselines. Check with `sshd -T | grep allowtcpforwarding`, or from the laptop with [`dot-agent-deck remote doctor <name>`](#troubleshooting-with-remote-doctor), which reads the same value over ssh and reports it as the `AllowTcpForwarding` check. If it is off, every forward fails with `remote port forwarding failed for listen port N`, which looks identical to a port collision — telling those two apart is the reason `remote doctor` exists. Note that `sshd_config` takes the *first* value it finds for a keyword, so appending `AllowTcpForwarding yes` to the end of the file does nothing if the key is already set above — rewrite the existing line.
 
 ### Reverse SOCKS proxy (recommended)
 
@@ -216,7 +216,7 @@ Host company-git
 
 Then `git clone company-git:team/repo.git`. `HostKeyAlias` records the real host's key under its real name in `known_hosts`, instead of filing it under `[127.0.0.1]:2222` where it would collide with any other host you tunnel to that port.
 
-> **`DynamicForward` is the wrong direction.** `DynamicForward` (and `ssh -D`) opens a SOCKS listener on *your laptop* that egresses via the remote — useful for reaching the remote's network from the laptop, which is the opposite of the problem here. Use `RemoteForward <port>` with no destination.
+> **`DynamicForward` is the wrong direction.** `DynamicForward` (and `ssh -D`) opens a SOCKS listener on *your laptop* that egresses via the remote — useful for reaching the remote's network from the laptop, which is the opposite of the problem here. Use `RemoteForward <port>` with no destination. This mistake is silent, so [`remote doctor`](#troubleshooting-with-remote-doctor) calls it out by name as the `DynamicForward` check.
 
 ### Authentication
 
@@ -230,11 +230,103 @@ The tunnel carries packets, not credentials. A reachable git endpoint still need
 
 **The tunnel lives and dies with the ssh session; your agents do not.** Agents survive detach by design — their access to laptop-tunneled resources does not. An agent that pushes while you are disconnected fails; one that clones, pulls, or fetches from a private registry blocks on bytes that will never arrive. Reads in particular are not deferrable. If a task needs the tunnel mid-flight, stay connected. On reconnect the forward comes back up with the new session.
 
-**The `Host` block applies to every ssh the deck makes to that host** — the version probe, `remote add`, `remote upgrade`, and each automatic reconnect attempt, not just `connect`. Mostly harmless, but it interacts badly with `ExitOnForwardFailure yes`: if a previous session's listener is still held on the remote, the next connection fails to bind and exits, and the deck reports it as an unreachable host. Two mitigations, and you want both: set `ClientAliveInterval 15` / `ClientAliveCountMax 3` in the remote's `sshd_config` so it reaps dead sessions on roughly the same ~45s budget the deck's client-side keepalive uses (sshd's default is to never probe, so a listener orphaned by a laptop sleeping can linger for a long time), and do not run two `connect` sessions to the same remote with the same forward port.
+**The `Host` block applies to every ssh the deck makes to that host** — the version probe, `remote add`, `remote upgrade`, and each automatic reconnect attempt, not just `connect`. Mostly harmless, but it interacts badly with `ExitOnForwardFailure yes`: if a previous session's listener is still held on the remote, the next connection fails to bind and exits. The deck used to report that as an unreachable host; since issue #344 it says `SSH forwarding failed` instead and points you at [`remote doctor`](#troubleshooting-with-remote-doctor), whose `ClientAliveInterval` check reads the reaping policy this paragraph asks you to set. Two mitigations, and you want both: set `ClientAliveInterval 15` / `ClientAliveCountMax 3` in the remote's `sshd_config` so it reaps dead sessions on roughly the same ~45s budget the deck's client-side keepalive uses (sshd's default is to never probe, so a listener orphaned by a laptop sleeping can linger for a long time), and do not run two `connect` sessions to the same remote with the same forward port.
 
-**Forward ports are per-remote, not per-laptop.** Two laptops connecting to the same VM with the same `RemoteForward 1080` will collide — the second one's forward fails to bind. Give each laptop its own port.
+**Forward ports are per-remote, not per-laptop.** Two laptops connecting to the same VM with the same `RemoteForward 1080` will collide — the second one's forward fails to bind. Give each laptop its own port. [`remote doctor`](#troubleshooting-with-remote-doctor)'s `ForwardBound` check is the one that catches this, and it is the check that separates a collision from a policy refusal.
 
 **Three options the deck sets explicitly override your config.** `connect` passes `ConnectTimeout`, `ServerAliveInterval`, and `ServerAliveCountMax` on the command line, and ssh gives command-line `-o` precedence over the config file, so setting those in your `Host` block has no effect. Forwarding options are untouched.
+
+### Troubleshooting with `remote doctor`
+
+Every caveat above is something you can check from the laptop in one command:
+
+```bash
+dot-agent-deck remote doctor desk-vm
+```
+
+It resolves the name from your remote registry, runs a fixed ordered list of checks, and prints each as PASS / WARN / FAIL / UNKNOWN with the directive and the file to change. It is **read-only**: it never edits your ssh config, the remote's `sshd_config`, the registry, or anything else on the remote. Every remote command it runs is a query — `sshd -T` to read the resolved sshd policy, and a `/dev/tcp` connect to see whether the forward is actually listening.
+
+A healthy remote reads top to bottom, cause before symptom:
+
+```
+Diagnosing remote 'desk-vm' at deck@desk-vm.example:22 (read-only)
+
+PASS    HostReachable        ssh connected and authenticated
+PASS    RemoteBinary         the deck answered on the remote
+PASS    ProtocolCompatible   the attach protocol version matches this laptop's
+PASS    RemoteForward        ssh resolved reverse-dynamic SOCKS on 1080
+PASS    DynamicForward       no laptop-side SOCKS listener is configured
+PASS    ExitOnForwardFailure `ExitOnForwardFailure yes` is set, so a tunnel that cannot bind aborts the session loudly
+PASS    AllowTcpForwarding   the remote's sshd permits reverse (`-R`) tunnels (`AllowTcpForwarding yes`)
+PASS    ClientAliveInterval  the remote's sshd probes idle sessions every 30s
+PASS    ForwardBound         port 1080 is bound and accepting connections on the remote
+PASS    ForwardAgent         agent forwarding is off for this destination
+
+Overall: PASS
+```
+
+The exit status is 0 only when the diagnosis is clear — every check PASS, or at most an advisory WARN. A failed check exits non-zero, **and so does an UNKNOWN one**: a diagnostic that reports "fine" when it could not actually look is worse than one that admits it does not know.
+
+#### Which check covers which caveat
+
+| Caveat | Check | What it reads |
+|---|---|---|
+| `AllowTcpForwarding` disabled on the remote | `AllowTcpForwarding` | `sshd -T` over ssh |
+| A forward that fails silently | `ExitOnForwardFailure` | `ssh -G` |
+| `DynamicForward` pointing the wrong way | `DynamicForward` | `ssh -G` |
+| Nothing forwarded at all | `RemoteForward` | `ssh -G` |
+| Two laptops on the same listen port | `ForwardBound` | a loopback connect on the remote |
+| A listener orphaned by a sleeping laptop | `ClientAliveInterval` | `sshd -T` over ssh |
+| `ForwardAgent yes` (advisory, never a failure) | `ForwardAgent` | `ssh -G` |
+| The ordinary broken-ssh case | `HostReachable` | the deck's existing version probe |
+
+#### `AllowTcpForwarding no` versus a port collision
+
+These two produce **byte-identical** client errors — `Error: remote port forwarding failed for listen port 1080` and nothing else — so no amount of client-side error text can separate them. The remote's own sshd is the only witness, which is the whole reason this command exists.
+
+When the remote refuses forwarding outright, the sshd policy is named and the unbound port is attributed to it:
+
+```
+PASS    HostReachable        ssh connected and authenticated
+...
+FAIL    AllowTcpForwarding   the remote's sshd refuses reverse (`-R`) tunnels (`AllowTcpForwarding no`)
+        -> Set `AllowTcpForwarding yes` in the remote's sshd_config and reload sshd. sshd honours the FIRST value it finds for a keyword, so rewrite the existing line — appending a new one at the end does nothing. Alpine's openssh package and most hardening baselines ship this disabled.
+PASS    ClientAliveInterval  the remote's sshd probes idle sessions every 30s
+FAIL    ForwardBound         port 1080 is not bound on the remote, which the sshd policy above explains
+        -> This is the remote's policy refusing the tunnel, not a busy port. Fix `AllowTcpForwarding` on the remote first, then re-run this command.
+```
+
+When the policy permits the tunnel and the port is simply taken, the same client error produces a different report:
+
+```
+PASS    HostReachable        ssh connected and authenticated
+...
+PASS    AllowTcpForwarding   the remote's sshd permits reverse (`-R`) tunnels (`AllowTcpForwarding yes`)
+PASS    ClientAliveInterval  the remote's sshd probes idle sessions every 30s
+FAIL    ForwardBound         port 1080 is not bound on the remote, though its sshd permits the tunnel
+        -> That port on the remote is already taken — a collision, not a policy refusal. Give this laptop its own listen port, or drop the older session still holding it. Forward ports are per-remote, so two laptops using the same one collide.
+```
+
+Note that `HostReachable` is PASS in both. ssh reached the host and authenticated fine; only the forward failed. Before issue #344 the deck classified this as an unreachable host and burned its reconnect budget against a network path that was never broken — which is the fourth failure mode, and the reason the doctor's own first check had to be fixed before the rest was worth building.
+
+#### When `sshd -T` needs root
+
+`sshd -T` typically requires root, and run as an ordinary user it either exits non-zero or prints a partial dump next to a permission complaint. Both become UNKNOWN, never PASS, and the rest of the report still renders:
+
+```
+UNKNOWN AllowTcpForwarding   could not read the remote's sshd policy
+        -> `sshd -T` needs root on most hosts and is unavailable otherwise. Re-run it on the remote with elevated permission (`sudo sshd -T | grep allowtcpforwarding`), or ask whoever administers the host.
+UNKNOWN ClientAliveInterval  could not read the remote's sshd keepalive policy
+        -> `sshd -T` needs root on most hosts and is unavailable otherwise. Re-run it on the remote with elevated permission, or ask whoever administers the host.
+
+Overall: UNKNOWN
+```
+
+The `ForwardBound` check degrades the same way when the remote has no `bash` for the `/dev/tcp` probe: UNKNOWN, not a claim that the port is free.
+
+#### Reproducing the failure modes yourself
+
+[`scripts/reverse-tunnel-validation.sh`](https://github.com/vfarcic/dot-agent-deck/blob/main/scripts/reverse-tunnel-validation.sh) is the manual, container-based validation path. It runs sshd in a container with a service reachable only from the laptop's loopback and reproduces every failure mode above deterministically, which is how the indistinguishable-error case was discovered in the first place. Two false-pass traps it guards against, both of which cost real debugging time: an auth failure exits 255 exactly like a forward collision, and a wholesale forwarding refusal produces the same error text as a port collision — so a collision assertion has to verify that the *first* session actually bound before drawing any conclusion.
 
 ## What to watch for
 
