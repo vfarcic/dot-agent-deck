@@ -208,16 +208,73 @@ pub(crate) const WRAPPER_INTERFACE_READINESS_BUFFER: std::time::Duration =
 /// ([`crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`]) is still
 /// coming.
 ///
+/// **It IS [`SESSION_START_WAIT_TIMEOUT`], definitionally, and that is the
+/// point.** This was an independent 8 s for one round, sized from a warm box and
+/// one launcher. The deck already ships exactly one answer to "how long do we
+/// wait for a readiness fact"; holding a weak fact open for a stronger one is
+/// that same question asked about a better answer, so it takes the same number
+/// and moves with it whenever that one is retuned. A second constant here would
+/// be a new tunable calibrated against a single launch shape on a single
+/// machine — which is the drift this issue exists to eliminate, not something to
+/// reintroduce one seam over.
+///
 /// **This is a bound on a FALLBACK, not a tuned delivery interval.** Nothing
 /// waits this long in the case it exists for: the strong fact arrives, the gate
 /// releases on it that instant, and the window is never reached. What the number
 /// buys is the shape of the failure when the strong fact never comes — release on
 /// the guess plus [`DELEGATE_READINESS_BUFFER`], i.e. exactly the behaviour that
-/// shipped before this window existed, instead of a return to the 30 s dead wait.
-/// So it must not be read as, or tuned like, the fixed intervals
-/// `DELEGATE_READINESS_BUFFER` warns about drifting: a longer value never delays
-/// a wrapped agent that reaches its interface, and `docs/develop/agent-adapters.md`
-/// says the same.
+/// shipped before this window existed. So it must not be read as, or tuned like,
+/// the fixed intervals `DELEGATE_READINESS_BUFFER` warns about drifting: a longer
+/// value never delays a wrapped agent that reaches its interface, and
+/// `docs/develop/agent-adapters.md` says the same.
+///
+/// **What the 8 s lost, and why no buffer could have covered it.** Measured on a
+/// FIRST run in a fresh project, where `devbox run codex-big` installs packages
+/// before it computes a shellenv:
+///
+/// ```text
+/// fact 2 at 1.1 s -> 8 s window expires at 9.1 s -> released on fact 2
+///                 -> pointer written at 14.1 s
+/// fact 1 at 15.98 s, i.e. 1.7 s AFTER the write   -> pointer PARKED
+/// ```
+///
+/// The mechanism is nastier than a plain race, which is what rules out sizing
+/// around it with a bigger [`WRAPPER_INTERFACE_READINESS_BUFFER`]. The bytes were
+/// written into a tty whose line discipline still belonged to the launcher, sat
+/// in the input queue while devbox worked, and were drained FUSED when codex
+/// finally took raw mode — so the submit `\r` arrived as a newline INSIDE the
+/// payload rather than as a submit, and the pointer sat unsent in the composer.
+/// A larger buffer does not fix that; it only moves the write. What fixes it is
+/// not writing until the fact that says the agent owns the terminal — and
+/// 15.98 s is comfortably inside [`SESSION_START_WAIT_TIMEOUT`].
+///
+/// Reproduced A/B against a real codex-cli 0.149.0 on a pty, with that launcher
+/// timing staged in front of the real `devbox run codex-big` (the machine's nix
+/// store is warm, so a genuine package install could not be re-staged): at the
+/// old 8 s window, fact 2 at 997/1000 ms, expiry at 8999/9008 ms, CR at
+/// 10.15/10.17 s, fact 1 at 15.41/15.46 s — **PARKED 2/2**, the payload sitting
+/// in Codex's composer. At this window, the same runs release on fact 1 at
+/// 15.47/15.49 s, pay [`WRAPPER_INTERFACE_READINESS_BUFFER`], put the CR at
+/// 20.63/20.65 s — **DELIVERED 2/2**, turn started and answered. Warm and
+/// unchanged in the same rig: fact 1 at 387–436 ms, CR at 5.56–5.61 s,
+/// delivered 3/3, with fact 2 never firing at all.
+///
+/// **The worst case becomes today's known-safe behaviour, so no regression is
+/// reachable.** A wrapped agent that never leaves cooked mode — a line-oriented
+/// REPL, and the test stand-ins — waits the readiness timeout out, releases on
+/// fact 2 and pays the ordinary [`DELEGATE_READINESS_BUFFER`], reaching its
+/// prompt at ~31 s. That is precisely what a Codex delegate did on `main` before
+/// this issue, where the same 30 s wait ended in the same 1000 ms buffer. The
+/// asymmetry is the whole argument: too short loses the prompt SILENTLY, too long
+/// costs latency that is still bounded by a timeout the deck already ships.
+///
+/// The three shapes at shipped defaults:
+///
+/// | case                      | releases on       | pointer at             |
+/// |---------------------------|-------------------|------------------------|
+/// | warm Codex                | fact 1 @ ~390 ms  | ~5.6 s (unchanged)     |
+/// | cold devbox               | fact 1 @ ~16 s    | ~21 s, DELIVERED       |
+/// | wrapped agent, never raw  | fact 2 at timeout | ~31 s = `main` today   |
 ///
 /// **Why a window is needed at all.** The wrapper's two facts do not arrive in
 /// order of strength; for the production launch shape they arrive in the exact
@@ -229,30 +286,19 @@ pub(crate) const WRAPPER_INTERFACE_READINESS_BUFFER: std::time::Duration =
 /// fired first, not once, arriving 2005–3370 ms LATER. Releasing on the guess put
 /// the pointer into the launcher's own line discipline at +1.85 s, where 3/3 runs
 /// left it parked unsubmitted in Codex's composer with no turn ever starting —
-/// silently, because the write itself succeeds.
+/// silently, because the write itself succeeds. Warm, that margin fits in seconds
+/// and an 8 s window covered it; cold it does not, which is the measurement above.
 ///
-/// **Sized from that measurement, from both ends, and deliberately asymmetric.**
-/// Too short costs the prompt, silently, on every Codex delegate; too long costs
-/// bounded latency on a wrapped agent that stays in cooked mode forever (a
-/// line-oriented REPL, and the test stand-ins). Those are not comparable, so the
-/// number is biased toward the recoverable side:
-///
-/// * **Lower end.** 8 s is 2.4x the worst observed fact-2→fact-1 margin (3370 ms)
-///   and 1.9x the worst observed launcher silence (4132 ms). The margin is
-///   dominated by a Nix shellenv evaluation, whose cost scales with the devbox
-///   project and the machine and is not something this box's numbers can bound
-///   for someone else's — so the headroom is a multiple, not a rounding.
-/// * **Upper end.** The fallback total is this window plus the 1000 ms buffer, so
-///   a wrapped agent that never goes raw reaches its prompt in ~9 s: under a third
-///   of the [`SESSION_START_WAIT_TIMEOUT`] dead wait this issue deleted, and well
-///   inside the 60 s `AUTOMATIC_PROMPT_DEADLINE` the scheduler bounds a whole
-///   delivery by. Above ~10 s that ordering starts to blur and the window stops
-///   reading as a fallback.
-///
-/// Bounded by the caller's own deadline as well — see [`wait_for_session_start`],
-/// which takes `min(window, time left in the readiness wait)` so this can never
-/// extend a gate past the timeout that already governs it.
-const INTERFACE_UPGRADE_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);
+/// **Bounded by the caller's deadline — and that `min` is now definitional.**
+/// [`wait_for_session_start`] takes `min(window, time left in the readiness
+/// wait)`, so this can never extend a gate past the timeout that already governs
+/// it. Since the weak fact can only arrive AFTER that wait began, a window equal
+/// to the whole timeout always outruns what is left of it, and the two now expire
+/// in the same instant by construction. The `min` stays load-bearing anyway: the
+/// scheduler's copy of the wait is shortenable per run via
+/// `DOT_AGENT_DECK_SESSION_START_WAIT_MS` ([`crate::spawn`]), and this has to
+/// shorten with it rather than outlive it.
+const INTERFACE_UPGRADE_WINDOW: std::time::Duration = SESSION_START_WAIT_TIMEOUT;
 
 /// PRD #249 M1 test/e2e seam: overrides [`DELEGATE_READINESS_BUFFER`] with an
 /// integer number of **milliseconds**. Mirrors the
@@ -2937,8 +2983,10 @@ impl SessionStartWait {
 /// that has no launch record to read — is this function unchanged: the first
 /// accepted readiness fact returns. Callers resolve it with
 /// [`interface_upgrade_window`] from the deck's own frozen launch record; see
-/// [`INTERFACE_UPGRADE_WINDOW`] for the measurement it is sized from. It can only
-/// ever SHORTEN into `timeout`, never extend past it.
+/// [`INTERFACE_UPGRADE_WINDOW`] for why it is [`SESSION_START_WAIT_TIMEOUT`]
+/// itself rather than a number of its own. It can only ever SHORTEN into
+/// `timeout`, never extend past it — which for the production value means the
+/// two expire together.
 pub(crate) async fn wait_for_session_start(
     rx: &mut broadcast::Receiver<BroadcastMsg>,
     pane_id: &str,

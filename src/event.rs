@@ -571,9 +571,12 @@ pub const WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN: &str = "wrapper_interfac
 /// seam; what the window buys is the later evidence that tells them apart, and
 /// what the buffer covers is the case where none arrives.
 ///
-/// Waiting forever is still worse than releasing on a guess — 30 s for a signal
-/// that will never come is the defect this issue opened on — which is why the
-/// window is a bound and not a condition.
+/// Waiting forever is still worse than releasing on a guess, which is why the
+/// window is a bound and not a condition. The bound is
+/// [`crate::state::SESSION_START_WAIT_TIMEOUT`] itself, so a wrapped agent whose
+/// strong fact never arrives reaches its prompt at the same instant it did
+/// before this issue: the fallback costs the wait this issue opened on, and
+/// never a second more.
 ///
 /// Everything said about provenance on
 /// [`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`] applies to this value too.

@@ -1594,10 +1594,11 @@ impl InterfaceFact {
 ///
 ///    What the wrapper CAN do is not make the guess final. The watch stays armed
 ///    after announcing it ([`InterfaceWatch::claim`] latches per fact, not per
-///    session), so if the launcher was merely slow the strong fact follows a few
-///    seconds later on the same wrapper session — and the daemon holds a bounded
-///    upgrade window on fact 2 for exactly that reason rather than releasing on
-///    it immediately. See
+///    session), so if the launcher was merely slow the strong fact follows later
+///    on the same wrapper session — a few seconds warm, and a measured ~15 s on a
+///    cold `devbox` that installs packages first — and the daemon holds an upgrade
+///    window on fact 2 for exactly that reason rather than releasing on it
+///    immediately. See
 ///    `crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN` and
 ///    `crate::state::INTERFACE_UPGRADE_WINDOW`.
 ///
