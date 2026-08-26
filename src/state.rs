@@ -2401,19 +2401,7 @@ fn arm_delegate_silence_watch(
                 },
             )
             .await;
-        // Issue #424 S3, exactly as `arm_idle_worker_watch` reasons about its own
-        // report: this path is ONE-SHOT — the watch record was consumed above and
-        // nothing retries the report — so the payload record this submit left
-        // guards no retry and must not refuse a later report of the same text
-        // into the same orchestrator. Two silent workers on one orchestration
-        // reporting a blank pane in the same window compose byte-for-byte equal
-        // text, so that repeat is ordinary rather than exotic.
-        if matches!(
-            outcome,
-            Ok(crate::agent_pty::GuardedSend::Applied | crate::agent_pty::GuardedSend::Ambiguous)
-        ) {
-            registry.note_payload_settled(&orchestrator_pane_id, &notice);
-        }
+        settle_silence_report_payload_record(&registry, &orchestrator_pane_id, &notice, &outcome);
         match outcome {
             Ok(crate::agent_pty::GuardedSend::Applied) => tracing::info!(
                 pane_id = %worker_pane_id,
@@ -2421,13 +2409,16 @@ fn arm_delegate_silence_watch(
                 "delegate: submitted a silent-worker report into the orchestrator pane"
             ),
             // A partial write: some bytes reached the authorized target, so the
-            // one-shot record stays consumed rather than being retried into a
-            // duplicate report.
+            // report is not retried into a duplicate — and, unlike `Applied`,
+            // its payload record is deliberately left standing, because those
+            // bytes may still be in the pane's input box. See
+            // [`settle_silence_report_payload_record`].
             Ok(crate::agent_pty::GuardedSend::Ambiguous) => warn!(
                 pane_id = %orchestrator_pane_id,
                 role = %role,
                 "delegate: the silent-worker report's submission was ambiguous (partial write); \
-                 not retried"
+                 not retried, and its payload record is kept so a later identical report cannot \
+                 submit the leftover bytes with the user's draft"
             ),
             Ok(refused) => tracing::debug!(
                 pane_id = %orchestrator_pane_id,
@@ -2444,6 +2435,48 @@ fn arm_delegate_silence_watch(
             ),
         }
     });
+}
+
+/// Issue #424 S3 / PR #713 review: release the payload record a ONE-SHOT
+/// silence report left on the orchestrator's pane — but only for the outcome
+/// that says the pane's input box is empty again.
+///
+/// `Applied` wrote the report AND its submit CR, so the submit drained the
+/// input box and nothing of ours is left in it. The record that write left
+/// guards a retry this path will never make — the watch record was consumed
+/// before the send and nothing retries the report — so keeping it could only
+/// refuse a LATER, unrelated report of the same text into the same
+/// orchestrator. That repeat is ordinary rather than exotic: two silent workers
+/// on one orchestration reporting a blank pane in the same window compose
+/// byte-for-byte equal text (`scheduler/idle-worker/017`), and
+/// `arm_idle_worker_watch` reasons the same way about its own report.
+///
+/// `Ambiguous` deliberately does NOT release it, even though it is just as
+/// one-shot. It is by definition a PARTIAL write — some report bytes reached
+/// the authorized target and the submit did not complete — so those bytes are
+/// still sitting in the input box, un-submitted. Clearing the record there
+/// asserts the payload settled when the whole meaning of the outcome is that we
+/// do not know whether it did, and a later identical report into a pane the
+/// user has typed into since would then be admitted and submit the leftover
+/// report bytes together with the user's unsent draft as one unintended turn.
+/// The two costs are not symmetric: keeping the record costs a SUPPRESSED later
+/// report (and only until `agent_pty`'s `PAYLOAD_RECORD_TTL` elapses),
+/// while releasing it costs an INVENTED turn carrying text the user never sent.
+/// Suppressing a diagnostic beats inventing input. So this is one `matches!`
+/// arm on purpose — do not fold `Ambiguous` back into it.
+///
+/// Every other outcome — a refusal or a writer error — wrote nothing, so there
+/// is no record of ours to release and calling this would consume a concurrent
+/// delivery of the same bytes' record instead (issue #424 S2).
+fn settle_silence_report_payload_record(
+    registry: &crate::agent_pty::AgentPtyRegistry,
+    orchestrator_pane_id: &str,
+    notice: &str,
+    outcome: &Result<crate::agent_pty::GuardedSend, crate::agent_pty::AgentPtyError>,
+) {
+    if matches!(outcome, Ok(crate::agent_pty::GuardedSend::Applied)) {
+        registry.note_payload_settled(orchestrator_pane_id, notice);
+    }
 }
 
 /// CodeRabbit (PRD #93 round-9): build the file contents written to
@@ -8818,6 +8851,124 @@ mod tests {
             crate::agent_pty::GuardedSend::Stale,
             "control: without `note_payload_settled` the identical repeat IS refused — which is \
              what makes the release above load-bearing rather than decorative"
+        );
+    }
+
+    /// Scenario: Deliver a silence report into two orchestrator panes exactly the
+    /// way the daemon does, then run the production settle decision over each —
+    /// one pane's submit is reported `Ambiguous` (a partial write), the other's
+    /// `Applied`. The user types into both panes and a byte-identical second
+    /// report follows: the ambiguous pane must REFUSE it, because report bytes
+    /// may still be sitting un-submitted in its input box, while the applied
+    /// pane still admits it.
+    #[cfg(unix)]
+    #[spec("scheduler/idle-worker/018")]
+    #[tokio::test]
+    async fn idle_worker_018_an_ambiguous_report_keeps_its_payload_record() {
+        // PR #713 review (Greptile P1): `Ambiguous` used to share the `Applied`
+        // arm of the settle decision. It must not — it is a PARTIAL write, so
+        // some report bytes may be sitting in the orchestrator's input box with
+        // no submit behind them, and releasing the record there lets a later
+        // identical report be admitted into a pane the user has typed into,
+        // submitting the leftovers plus the user's unsent draft as one turn.
+        //
+        // The physical write is `Applied` on BOTH panes here — a real `/bin/cat`
+        // PTY writer cannot be faulted into a partial write from this seam, and
+        // `write_and_submit_guarded` classifies partiality inside the writer's
+        // critical section (`deliver_payload_and_submit`, unit-tested against a
+        // fault-injecting writer in `agent_pty`). That costs nothing here,
+        // because the registry state the decision reads is identical either way:
+        // both the `Applied` and the `Ambiguous` arm of that classification call
+        // `note_automatic_write` with the same payload, so the payload record an
+        // ambiguous write leaves IS the record an applied write leaves. What
+        // differs is only the outcome the daemon then acts on, which is exactly
+        // what varies between the two panes below.
+        const AMBIGUOUS_PANE: &str = "silence-report-ambiguous-orchestrator";
+        const APPLIED_PANE: &str = "silence-report-applied-orchestrator";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let report = compose_delegate_silence_notice(std::time::Duration::from_millis(600), None);
+
+        let spawn_orchestrator = |pane: &str| {
+            registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.to_string(),
+                    )],
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn orchestrator stand-in")
+        };
+        let ambiguous_agent = spawn_orchestrator(AMBIGUOUS_PANE);
+        let applied_agent = spawn_orchestrator(APPLIED_PANE);
+
+        // First report on both panes, delivered the production way.
+        for (pane, agent) in [
+            (AMBIGUOUS_PANE, &ambiguous_agent),
+            (APPLIED_PANE, &applied_agent),
+        ] {
+            assert_eq!(
+                registry
+                    .write_and_submit_guarded(pane, &report, Some(agent), || async { true })
+                    .await
+                    .expect("first silence report"),
+                crate::agent_pty::GuardedSend::Applied,
+                "precondition: the first silence report must reach {pane}"
+            );
+        }
+        // The production decision, fed each of the two outcomes that leave a
+        // payload record behind. Nothing here reaches around it: this is the
+        // same function `arm_delegate_silence_watch` calls with the outcome its
+        // own guarded submit returned.
+        settle_silence_report_payload_record(
+            &registry,
+            AMBIGUOUS_PANE,
+            &report,
+            &Ok(crate::agent_pty::GuardedSend::Ambiguous),
+        );
+        settle_silence_report_payload_record(
+            &registry,
+            APPLIED_PANE,
+            &report,
+            &Ok(crate::agent_pty::GuardedSend::Applied),
+        );
+
+        // The user types into both panes. This is the clock that arms the
+        // repeat-payload refusal: without it the guard abstains and the
+        // ambiguous assertion below would pass for the wrong reason.
+        registry.note_user_input(AMBIGUOUS_PANE);
+        registry.note_user_input(APPLIED_PANE);
+
+        let ambiguous_repeat = registry
+            .write_and_submit_guarded(AMBIGUOUS_PANE, &report, Some(&ambiguous_agent), || async {
+                true
+            })
+            .await
+            .expect("second identical silence report after an ambiguous first");
+        let applied_repeat = registry
+            .write_and_submit_guarded(APPLIED_PANE, &report, Some(&applied_agent), || async {
+                true
+            })
+            .await
+            .expect("second identical silence report after an applied first");
+        registry.shutdown_all();
+
+        assert_eq!(
+            ambiguous_repeat,
+            crate::agent_pty::GuardedSend::Stale,
+            "an AMBIGUOUS submit is a partial write, so the report bytes may still be in the \
+             orchestrator's input box: its payload record must survive and refuse a \
+             byte-identical later report rather than submit those leftovers together with the \
+             user's unsent draft"
+        );
+        assert_eq!(
+            applied_repeat,
+            crate::agent_pty::GuardedSend::Applied,
+            "control: the same sequence whose submit reported APPLIED does release the record, so \
+             the identical repeat is admitted — which is what makes the refusal above a property \
+             of the outcome rather than of the harness"
         );
     }
 

@@ -4274,6 +4274,13 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the trigger that decides to send the report (`arm_delegate_silence_watch`'s window, covered by `orchestration/delegate/013` and `/025`); the DEFERRED family's own laundering question, which is `scheduler/idle-worker/015`'s and lives on `write_notice_guarded`; and the identity/liveness gates on the send, which `scheduler/idle-worker/008` and `/014` pin.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/idle-worker/018 — An AMBIGUOUS silence report KEEPS its payload record, so a byte-identical second report into the same orchestrator is refused rather than submitted on top of the leftover bytes.
+- **Layer:** L1 (in-process production notice composition, the guarded submit path against two real `/bin/cat` PTY panes, and the production settle decision `settle_silence_report_payload_record` driven with each outcome that leaves a record).
+- **Agent:** none.
+- **Asserts:** after the production `compose_delegate_silence_notice` text is submitted into an orchestrator pane and the settle decision is run with `Ambiguous`, the payload record survives, so once the user types a byte-identical second report is refused (`Stale`) instead of appending the leftover report bytes to the user's unsent draft and submitting both as one turn. A second pane runs the identical sequence with `Applied` as a control and IS admitted, which is what makes the refusal a property of the outcome rather than of the harness. The complement of `scheduler/idle-worker/017`, which pins the `Applied` release itself.
+- **Does not assert:** that a real `Ambiguous` arises from this seam — a `/bin/cat` PTY writer cannot be faulted into a partial write, and the classification itself is unit-tested against a fault-injecting writer in `agent_pty` (`deliver_payload_classifies_partial_write_as_ambiguous`); the registry state is identical either way, since both classification arms call `note_automatic_write` with the same payload, so only the outcome the daemon acts on varies here. Also not asserted: the trigger that decides to send the report (`orchestration/delegate/013` and `/025`); the sibling one-shot callers (`arm_idle_worker_watch`'s idle prompt and the delegate task pointer), which still release on `Ambiguous`.
+- **Platform coverage:** mac+linux.
+
 #### scheduler/live
 
 ##### scheduler/live/001 — A scheduled fire surfaces its card LIVE to an already-attached TUI, without a disconnect/reconnect (PRD #127 finding #2).
