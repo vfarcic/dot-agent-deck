@@ -36,7 +36,14 @@ fn task_block(name: &str, working_dir: &str, command: Option<&str>) -> String {
     s.push_str("cron = \"0 0 1 1 *\"\n");
     s.push_str(&format!("working_dir = \"{working_dir}\"\n"));
     if let Some(cmd) = command {
-        s.push_str(&format!("command = \"{cmd}\"\n"));
+        // A TOML LITERAL string: `common::token_publishing_command` wraps a stub
+        // in shell that needs double quotes, and a basic string would need every
+        // one of them escaped. Nothing this file schedules contains a `'`.
+        assert!(
+            !cmd.contains('\''),
+            "scheduled command must not contain a single quote: {cmd}"
+        );
+        s.push_str(&format!("command = '{cmd}'\n"));
     }
     s.push_str(&format!("prompt = \"{PROMPT_MARKER}\"\n"));
     s.push_str("enabled = true\n\n");
@@ -222,10 +229,9 @@ fn spawn_003_command_is_honored() {
 
     let cmd_marker = base.join("CMD_RAN");
 
-    let explicit_command = format!(
-        "touch \\\"{}\\\"; exec sleep 30",
-        cmd_marker.to_string_lossy()
-    );
+    // Plain double quotes: `task_block` emits a TOML LITERAL string, so nothing
+    // here needs TOML-level escaping and a `\\\"` would reach the shell verbatim.
+    let explicit_command = format!("touch \"{}\"; exec sleep 30", cmd_marker.to_string_lossy());
 
     let toml = task_block(
         "with-cmd",
@@ -289,7 +295,10 @@ fn spawn_005_delivery_gated_on_session_start() {
     let work = scratch.path().join("gated");
     std::fs::create_dir_all(&work).expect("create work dir");
 
-    let toml = task_block("gated", &work.to_string_lossy(), Some("cat"));
+    // Issue #318: the pane publishes its injected capability token so the
+    // synthetic SessionStart below can carry it (see `common::token_publishing_command`).
+    let gate_command = common::token_publishing_command("cat");
+    let toml = task_block("gated", &work.to_string_lossy(), Some(&gate_command));
     let daemon = common::spawn_daemon_serve(Some(&toml), "0");
 
     daemon.run_now("gated").expect("run-now gated");
@@ -330,7 +339,13 @@ fn spawn_005_delivery_gated_on_session_start() {
         "agent_id": agent_id,
         "cwd": work.to_string_lossy(),
     });
-    common::write_hook_line(&daemon.hook_socket, &event.to_string())
+    // Issue #318: the scheduler-spawned pane is daemon-managed, so reproducing
+    // the real agent's hook means carrying its capability token too. The DAEMON
+    // spawned this pane, not the test, so the token is read back from what the
+    // pane itself published out of its injected environment — which also proves
+    // the injection reached the child.
+    let token = common::published_pane_token(&daemon.home, &pane_id, Duration::from_secs(10));
+    common::write_hook_line(&daemon.hook_socket, &event.to_string(), Some(&token))
         .expect("write SessionStart hook to the daemon's hook socket");
 
     // GREEN signal: once the SessionStart lands, the gate releases and the prompt
@@ -441,7 +456,11 @@ fn spawn_007_scheduler_agent_event_joins_registry_record() {
     let scratch = common::harness_tempdir().expect("scheduler status-join scratch");
     let work = scratch.path().join("status-join");
     std::fs::create_dir_all(&work).expect("create scheduled status-join working dir");
-    let schedules = task_block("status-join", &work.to_string_lossy(), Some("cat"));
+    // Issue #318: same as `scheduler/spawn/006` — the pane surfaces its own
+    // token so the real `agent-event` CLI below can carry it, exactly as a hook
+    // running inside that pane would.
+    let join_command = common::token_publishing_command("cat");
+    let schedules = task_block("status-join", &work.to_string_lossy(), Some(&join_command));
     let daemon = common::spawn_daemon_serve(Some(&schedules), "0");
 
     daemon
@@ -457,7 +476,8 @@ fn spawn_007_scheduler_agent_event_joins_registry_record() {
         .clone()
         .expect("scheduler-created pane must carry its generated pane id");
 
-    let output = daemon.run_agent_event(&pane_id, Some(&agent_id), "running");
+    let token = common::published_pane_token(&daemon.home, &pane_id, Duration::from_secs(10));
+    let output = daemon.run_agent_event(&pane_id, Some(&agent_id), Some(&token), "running");
     assert!(
         output.status.success(),
         "the real non-SessionStart `agent-event --type running` CLI failed for the scheduled pane: status={:?} stdout={:?} stderr={:?}",

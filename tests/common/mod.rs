@@ -3709,8 +3709,42 @@ fn toml_escape(s: &str) -> String {
 /// socket. Connects, writes the line + newline, and drops the
 /// connection. Synthetic-event tests use this to inject events
 /// without going through the `hook` subcommand.
+///
+/// Issue #318: `token` is the capability the daemon minted for the pane the
+/// event names, and it is a REQUIRED argument rather than an optional one on
+/// purpose — every call site now has to say, in code, whether it is speaking for
+/// a pane the daemon manages. Pass `Some(&token)` — taken from the pane's own
+/// `StartAgent` reply when the test spawned it, or read back with
+/// [`published_pane_token`] when the DECK did — for a managed pane; pass `None`
+/// only for a pane the daemon does not manage, which is the foreign-agent
+/// compatibility path and still works exactly as before.
+///
+/// There is deliberately **no bypass** here: the token is injected into the JSON
+/// as the ordinary `agent_token` field, which is precisely what a real hook
+/// script does. A test-only escape hatch in the daemon would make the whole
+/// guard ceremonial.
 #[cfg(unix)]
-pub fn write_hook_line(socket: &Path, json_line: &str) -> std::io::Result<()> {
+pub fn write_hook_line(
+    socket: &Path,
+    json_line: &str,
+    token: Option<&dot_agent_deck::hook_ingest::AgentToken>,
+) -> std::io::Result<()> {
+    let json_line = match token {
+        None => json_line.to_string(),
+        Some(token) => {
+            let mut value: serde_json::Value = serde_json::from_str(json_line.trim_end())
+                .map_err(|e| std::io::Error::other(format!("hook line is not JSON: {e}")))?;
+            let obj = value
+                .as_object_mut()
+                .ok_or_else(|| std::io::Error::other("hook line is not a JSON object"))?;
+            obj.insert(
+                "agent_token".to_string(),
+                serde_json::Value::String(token.as_str().to_string()),
+            );
+            value.to_string()
+        }
+    };
+    let json_line = json_line.as_str();
     let deadline = Instant::now() + Duration::from_secs(5);
     // The daemon binds the hook socket asynchronously after the TUI
     // is up; retry briefly if it is not yet present.
@@ -5870,10 +5904,21 @@ impl DaemonProc {
     /// Replays the daemon's env (so `HOME` + `DOT_AGENT_DECK_SOCKET` match) and
     /// layers the pane-injected `DOT_AGENT_DECK_PANE_ID` / (optional)
     /// `DOT_AGENT_DECK_AGENT_ID`. Returns the captured process output.
+    ///
+    /// Issue #318: `token` models the daemon's spawn-time env injection. A real
+    /// `agent-event` runs INSIDE a daemon-spawned pane and therefore inherits
+    /// that agent's `DOT_AGENT_DECK_AGENT_TOKEN`; `env_clear()` below means the
+    /// harness has to put it back, or the daemon refuses the event for any pane
+    /// it manages. Required rather than defaulted, exactly like
+    /// [`write_hook_line`]'s, so every call site states in code whether it is
+    /// claiming a capability — `None` is the honest answer for a SYNTHETIC pane
+    /// or agent id the daemon never spawned, which is the token-less
+    /// foreign-agent case several of these tests exist to exercise.
     pub fn run_agent_event(
         &self,
         pane_id: &str,
         agent_id: Option<&str>,
+        token: Option<&dot_agent_deck::hook_ingest::AgentToken>,
         state: &str,
     ) -> std::process::Output {
         let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
@@ -5887,6 +5932,12 @@ impl DaemonProc {
         cmd.env("DOT_AGENT_DECK_PANE_ID", pane_id);
         if let Some(id) = agent_id {
             cmd.env("DOT_AGENT_DECK_AGENT_ID", id);
+        }
+        if let Some(token) = token {
+            cmd.env(
+                dot_agent_deck::hook_ingest::DOT_AGENT_DECK_AGENT_TOKEN,
+                token.as_str(),
+            );
         }
         cmd.output()
             .expect("run `dot-agent-deck agent-event` subprocess")
@@ -6239,6 +6290,87 @@ fn attach_json_request_on(
     let mut body = vec![0u8; len];
     stream.read_exact(&mut body)?;
     serde_json::from_slice(&body).map_err(std::io::Error::other)
+}
+
+/// Issue #318: wrap `inner` so the pane PUBLISHES the capability token the
+/// daemon injected into it, then runs `inner` as it always did.
+///
+/// # Why a test needs this at all
+///
+/// A token reaches exactly two places: the `StartAgent` reply, and the spawned
+/// child's environment. A test that starts its own agent over the attach socket
+/// reads the reply and is done. A test that drives a pane the **deck** spawned
+/// — a fixture role, a scheduled agent, a restored session — is not the
+/// spawning peer and has no reply to read.
+///
+/// An earlier revision of #318 solved that with a `GetAgentToken` request. The
+/// security audit rejected it: `ListAgents` is unauthenticated on the same
+/// owner-only socket, so the pair let ANY same-user process obtain ANY pane's
+/// token, which makes the token evidence of nothing and defeats the mechanism
+/// #318 exists to build. **Do not reintroduce a retrieval verb, a debug-only
+/// variant of one, or any other harness back door — all three reopen the hole.**
+///
+/// This is the replacement, and it is strictly better as a test: the pane
+/// surfaces the token from *its own environment*, so the assertion that follows
+/// also proves the daemon's spawn-time injection genuinely reached the child.
+/// `pane_input_007`'s in-pane python stand-in already does exactly this with
+/// `os.environ["DOT_AGENT_DECK_AGENT_TOKEN"]`; this is the shell form of the
+/// same idea, for panes whose command is a stub rather than a script.
+///
+/// Written to a temporary name and renamed, so a reader never sees a
+/// half-written value. `exec`s `inner` so the pane's final process — and
+/// therefore its process tree, which several tests observe — is exactly what it
+/// would have been without the wrapper.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn token_publishing_command(inner: &str) -> String {
+    // Deliberately free of single quotes: this string is embedded into TOML
+    // (`.dot-agent-deck.toml` fixtures, scheduled-task blocks) as a LITERAL
+    // string, which is the only quoting that survives the double quotes the
+    // shell needs.
+    format!(
+        "printf %s \"${{DOT_AGENT_DECK_AGENT_TOKEN:-}}\" > \"$HOME/{PUBLISHED_TOKEN_PREFIX}$DOT_AGENT_DECK_PANE_ID.part\" \
+         && mv \"$HOME/{PUBLISHED_TOKEN_PREFIX}$DOT_AGENT_DECK_PANE_ID.part\" \
+         \"$HOME/{PUBLISHED_TOKEN_PREFIX}$DOT_AGENT_DECK_PANE_ID\"; exec {inner}"
+    )
+}
+
+/// Filename prefix [`token_publishing_command`] writes under the pane's `HOME`.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub const PUBLISHED_TOKEN_PREFIX: &str = ".dad-agent-token.";
+
+/// Issue #318: read back the token a pane published via
+/// [`token_publishing_command`], waiting for the pane's first line of shell to
+/// run.
+///
+/// Panics if nothing appears — an empty or missing file means the daemon did
+/// not inject `DOT_AGENT_DECK_AGENT_TOKEN` into the child, which is a real
+/// failure of the feature and not a harness timing problem worth papering over.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn published_pane_token(
+    home: &Path,
+    pane_id: &str,
+    timeout: Duration,
+) -> dot_agent_deck::hook_ingest::AgentToken {
+    let path = home.join(format!("{PUBLISHED_TOKEN_PREFIX}{pane_id}"));
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(value) = std::fs::read_to_string(&path)
+            && !value.trim().is_empty()
+        {
+            return dot_agent_deck::hook_ingest::AgentToken::from_wire(value.trim());
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "pane {pane_id} never published its capability token at {}: the daemon must \
+                 inject DOT_AGENT_DECK_AGENT_TOKEN into every agent it spawns",
+                path.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// Snapshot a daemon's live agent registry via `ListAgents` over `socket`.

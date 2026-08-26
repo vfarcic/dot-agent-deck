@@ -322,9 +322,17 @@ fn inject_worker_status(
         agent_version: None,
         schema_version: None,
         live_target: None,
+        agent_token: None,
     };
     let line = serde_json::to_string(&event).expect("serialize synthetic AgentEvent");
-    common::write_hook_line(deck.hook_socket_path(), &line)
+    // Issue #318: the worker pane is one this daemon manages, so a synthetic
+    // event for it now has to carry the same capability token the real agent's
+    // hook would read out of its environment. The DECK spawned this pane, so its
+    // spawn reply's token went to the deck, and there is deliberately no request
+    // that fetches one afterwards — the fixture's `worker` role publishes its own
+    // injected token instead (see `orch-deck/.dot-agent-deck.toml`).
+    let token = common::published_pane_token(deck.home_dir(), pane_id, Duration::from_secs(10));
+    common::write_hook_line(deck.hook_socket_path(), &line, Some(&token))
         .expect("inject synthetic AgentEvent over hook socket");
 
     let applied = common::wait_until(Duration::from_secs(10), || {

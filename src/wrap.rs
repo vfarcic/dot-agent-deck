@@ -257,6 +257,11 @@ struct Emitter {
     session_id: String,
     pane_id: Option<String>,
     agent_id: Option<String>,
+    /// Issue #318: the wrapped pane's hook capability token, read once from
+    /// `DOT_AGENT_DECK_AGENT_TOKEN` at startup and stamped on every event this
+    /// wrapper emits. `None` for a STANDALONE wrap — there is no deck pane to
+    /// speak for, so its events take the same foreign-card path they always did.
+    agent_token: Option<crate::hook_ingest::AgentToken>,
     cwd: Option<String>,
     /// PRD #20 M3: the live-target descriptor every event this wrapper emits
     /// carries. A wrapped session is the first place the live/history-only
@@ -311,6 +316,7 @@ impl Emitter {
             // PRD #20 M3: a wrapped session is history-only from the dashboard's
             // perspective (see `Emitter::live_target`).
             live_target: Some(self.live_target),
+            agent_token: self.agent_token.clone(),
         };
         if let Ok(json) = serde_json::to_string(&event) {
             let _ = crate::hook::send_to_socket(&json);
@@ -1275,6 +1281,13 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     // Optional — the daemon injects this on spawn (same pattern as the hook /
     // agent-event paths); a standalone wrap has none.
     let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID).ok();
+    // Issue #318: same env-read pattern as the two ids above. Read ONCE here
+    // rather than per emit so a wrapped session that outlives an env edit keeps
+    // the token it was launched with.
+    let agent_token = std::env::var(crate::hook_ingest::DOT_AGENT_DECK_AGENT_TOKEN)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(crate::hook_ingest::AgentToken::from_wire);
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(String::from));
@@ -1307,6 +1320,7 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
         session_id,
         pane_id,
         agent_id,
+        agent_token,
         cwd,
         live_target,
     });

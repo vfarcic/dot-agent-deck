@@ -223,7 +223,11 @@ fn idle_worker_011_silent_worker_prompt_is_visible_in_attached_tui() {
         timestamp: chrono::Utc::now(),
     });
     let line = serde_json::to_string(&message).expect("serialize Delegate hook message");
-    common::write_hook_line(deck.hook_socket_path(), &line)
+    // No token: this is a `DaemonMessage::Delegate`, not an `AgentEvent`. Issue
+    // #318's provenance binding covers hook-event ingestion only; the other verbs
+    // on this socket keep their pre-existing unauthenticated-sender posture and
+    // are called out as an honest remainder rather than silently half-fixed.
+    common::write_hook_line(deck.hook_socket_path(), &line, None)
         .expect("inject Delegate over hook socket");
 
     wait_for_wrapped_pane_string(&deck, IDLE_DAEMON_CLAUSE, Duration::from_secs(20))

@@ -163,6 +163,14 @@ async fn run_real_agent_event(
     let hook_path = daemon.hook_path.clone();
     let pane_id_owned = pane_id.to_string();
     let agent_id_owned = agent_id.to_string();
+    // Issue #318: the daemon injects the pane's capability token into every
+    // agent it spawns, so a CLI run from inside that pane inherits it. This
+    // harness `env_clear()`s, so it has to model that injection explicitly —
+    // "exactly the pane/agent identity a daemon injects" now includes the token.
+    let token_owned = daemon
+        .registry
+        .agent_hook_token(agent_id)
+        .expect("the daemon must hold a capability token for the agent it spawned");
     let cwd = cwd.to_path_buf();
     let output = tokio::task::spawn_blocking(move || {
         std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
@@ -175,6 +183,10 @@ async fn run_real_agent_event(
             .env("DOT_AGENT_DECK_SOCKET", &hook_path)
             .env(DOT_AGENT_DECK_PANE_ID, &pane_id_owned)
             .env(DOT_AGENT_DECK_AGENT_ID, &agent_id_owned)
+            .env(
+                dot_agent_deck::hook_ingest::DOT_AGENT_DECK_AGENT_TOKEN,
+                token_owned.as_str(),
+            )
             .output()
             .expect("run real agent-event CLI for reconnect")
     })
@@ -297,6 +309,7 @@ fn drive_session_to_working(state: &mut AppState, session_id: &str, pane_id: &st
         agent_version: None,
         schema_version: None,
         live_target: None,
+        agent_token: None,
     };
     state.apply_event(mk(EventType::SessionStart, None, None, None));
     state.apply_event(mk(
@@ -2410,6 +2423,7 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        agent_token: None,
     });
 
     let sessions: Vec<&SessionState> = state

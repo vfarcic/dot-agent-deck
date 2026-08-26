@@ -36,7 +36,9 @@ fn send_session_start(deck: &TuiDeck, session_id: &str, pane_id: &str, cwd: &str
         "pane_id": pane_id,
         "cwd": cwd,
     });
-    write_hook_line(deck.hook_socket_path(), &event.to_string())
+    // `pane-alpha` / `pane-bravo` are panes no daemon spawned, so this stays the
+    // foreign-agent path and carries no capability token (issue #318).
+    write_hook_line(deck.hook_socket_path(), &event.to_string(), None)
         .expect("write SessionStart hook to per-test socket");
 }
 

@@ -20,6 +20,7 @@
 //! them so the Unix build is byte-for-byte unchanged and the Windows
 //! named-pipe build compiles.
 
+pub mod csprng;
 pub mod detach;
 pub mod fsperm;
 pub mod ipc;

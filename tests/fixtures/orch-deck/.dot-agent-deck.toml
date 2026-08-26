@@ -13,6 +13,14 @@ name = "orchestrator"
 command = "cat"
 start = true
 
+# Issue #318: the `worker` role publishes the capability token the daemon
+# injects into it, so `e2e_orchestration_lock.rs::inject_worker_status` can
+# carry it on the synthetic status events it writes to the hook socket. Since
+# #318 the daemon REFUSES a token-less event that names a pane it manages, and
+# the token reaches only two places — the `StartAgent` reply (which went to the
+# deck, not to the test) and the child's own environment. Keep this in step with
+# `common::token_publishing_command`, which is the same line for panes whose
+# command a test supplies directly; `exec` keeps the pane's final process `cat`.
 [[orchestrations.roles]]
 name = "worker"
-command = "cat"
+command = 'printf %s "$DOT_AGENT_DECK_AGENT_TOKEN" > "$HOME/.dad-agent-token.$DOT_AGENT_DECK_PANE_ID.part" && mv "$HOME/.dad-agent-token.$DOT_AGENT_DECK_PANE_ID.part" "$HOME/.dad-agent-token.$DOT_AGENT_DECK_PANE_ID"; exec cat'

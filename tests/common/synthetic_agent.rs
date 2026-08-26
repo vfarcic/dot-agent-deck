@@ -100,6 +100,7 @@ impl SyntheticAgent {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         }
     }
 

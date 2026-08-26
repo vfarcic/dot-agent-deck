@@ -889,6 +889,7 @@ fn stats_001_narrow_bar_keeps_tools_total_and_omits_agent_breakdown() {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         });
     }
 
@@ -1778,6 +1779,7 @@ fn pane_010_untagged_event_keeps_one_card_on_the_pane() {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        agent_token: None,
     });
 
     // The card list the dashboard would build for this pane.
@@ -1843,6 +1845,7 @@ fn filled_session() -> SessionState {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         });
     }
     for (name, detail) in [
@@ -1865,6 +1868,7 @@ fn filled_session() -> SessionState {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         });
     }
     SessionState {
@@ -2231,6 +2235,7 @@ fn pane_011_multibyte_session_id_renders_the_whole_deck() {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        agent_token: None,
     });
     let poisoned = state
         .sessions
@@ -2358,6 +2363,7 @@ fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         });
         state
             .sessions

@@ -100,7 +100,10 @@ fn agent_event_003_headless_pi_status_no_hook_no_settings_mutation() {
         ),
         ("finished", EventType::Idle, SessionStatus::Idle),
     ] {
-        let out = daemon.run_agent_event(PI_PANE, Some(PI_AGENT_ID), state);
+        // Issue #318: `PI_AGENT_ID` is synthetic — this daemon never spawned it,
+        // so there is no capability token to inherit and the event travels the
+        // token-less FOREIGN path, which is exactly what this test pins.
+        let out = daemon.run_agent_event(PI_PANE, Some(PI_AGENT_ID), None, state);
         assert!(
             out.status.success(),
             "`agent-event --type {state}` must exit 0 (stderr: {})",

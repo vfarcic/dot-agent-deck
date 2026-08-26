@@ -23393,6 +23393,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         };
         state.apply_event(event1.clone());
 
@@ -23416,6 +23417,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         };
         state.apply_event(event2);
 
@@ -23492,6 +23494,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                agent_token: None,
             });
         }
 
@@ -23547,6 +23550,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         };
         state.apply_event(event.clone());
 
@@ -23907,6 +23911,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                agent_token: None,
             });
         }
 
@@ -24421,6 +24426,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                agent_token: None,
             });
         }
         state
@@ -24461,6 +24467,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                agent_token: None,
             });
         }
 
@@ -24488,6 +24495,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                agent_token: None,
             });
         }
 
@@ -24516,6 +24524,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -24532,6 +24541,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         });
 
         let mut ui = default_ui();
@@ -24559,6 +24569,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         });
         state.apply_event(AgentEvent {
             session_id: "s2".to_string(),
@@ -24575,6 +24586,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         });
 
         let mut ui = default_ui();
@@ -24604,6 +24616,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         });
 
         let mut ui = default_ui();
@@ -27257,6 +27270,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                agent_token: None,
             });
         }
 
@@ -31452,6 +31466,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            agent_token: None,
         });
     }
 
@@ -31480,6 +31495,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            agent_token: None,
         });
     }
 
@@ -31686,6 +31702,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            agent_token: None,
         });
         process_pending_seed_prompts(&mut pi_ui, &pi_pane, &pi_snapshot);
         process_pending_seed_prompts(&mut pi_ui, &pi_pane, &pi_snapshot);
@@ -32224,6 +32241,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            agent_token: None,
         });
 
         ui.send_retry_backoff
@@ -32709,6 +32727,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                agent_token: None,
             });
         };
         synthetic(EventType::ShellBusy, false);
@@ -32731,6 +32750,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         });
 
         ui.send_retry_backoff
@@ -32980,6 +33000,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            agent_token: None,
         });
         process_pending_seed_prompts(&mut slow_ui, &slow_pane, &slow_snapshot);
         slow_ui
@@ -33064,6 +33085,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            agent_token: None,
         });
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
         assert_eq!(
@@ -33194,6 +33216,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            agent_token: None,
         });
         replacement_ui
             .send_retry_backoff
@@ -33242,6 +33265,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            agent_token: None,
         });
         process_pending_seed_prompts(&mut clear_ui, &clear_pane, &clear_snapshot);
         assert_eq!(clear_controller.writes_for("same-agent"), 1);
@@ -33261,6 +33285,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         });
         process_pending_seed_prompts(&mut clear_ui, &clear_pane, &clear_snapshot);
         let clear_writes = clear_controller.writes_for("same-agent");
@@ -33313,6 +33338,7 @@ mod tests {
             agent_version: None,
             schema_version: None,
             live_target: None,
+            agent_token: None,
         });
 
         // The lost-response shape: one wire request issued, no outcome learned,
@@ -33383,6 +33409,7 @@ mod tests {
                 agent_version: None,
                 schema_version: None,
                 live_target: None,
+                agent_token: None,
             });
         };
         let mut snapshot = ready_prompt_snapshot(PANE_ID, "legacy-hook-agent");
@@ -33653,6 +33680,7 @@ mod tests {
                 kind: crate::event::TargetKind::Pty,
                 writable: crate::event::Writable::Live,
             }),
+            agent_token: None,
         });
         process_pending_seed_prompts(&mut ui, &pane, &snapshot);
         let captured_sessions = expected_sessions.lock().unwrap().clone();

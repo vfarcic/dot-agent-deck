@@ -56,6 +56,13 @@ fn delivery_007_hook_teaches_daemon_agent_type_for_reconnect() {
         "StartAgent should succeed, got error: {:?}",
         resp.error
     );
+    // Issue #318: `pane-recon` is a pane THIS daemon manages, so a hook naming
+    // it is only accepted from a sender holding its capability token. The
+    // `StartAgent` reply is where the spawning peer gets it.
+    let token = resp
+        .agent_token
+        .clone()
+        .expect("StartAgent must return the fresh agent's hook capability token");
 
     // The agent registers, but with no known type yet — this is the
     // "No agent" state a reconnect would render before the fix.
@@ -74,7 +81,7 @@ fn delivery_007_hook_teaches_daemon_agent_type_for_reconnect() {
         "timestamp": "2026-06-20T12:00:00Z",
         "pane_id": "pane-recon",
     });
-    write_hook_line(&daemon.hook_socket, &event.to_string())
+    write_hook_line(&daemon.hook_socket, &event.to_string(), Some(&token))
         .expect("write SessionStart hook to the per-test socket");
 
     // A fresh ListAgents (what hydrate_from_daemon issues on reconnect) now
@@ -149,6 +156,12 @@ fn live_006_fresh_tui_renders_live_working_status_on_reconnect() {
         "StartAgent should succeed, got error: {:?}",
         resp.error
     );
+    // Issue #318: the capability token for the managed pane both hooks below
+    // speak for.
+    let token = resp
+        .agent_token
+        .clone()
+        .expect("StartAgent must return the fresh agent's hook capability token");
 
     // Capture the daemon-assigned registry id — the `ListAgents` live-snapshot
     // join (PRD #162 M1.2) matches the session on agent_id AND pane_id, so the
@@ -187,8 +200,12 @@ fn live_006_fresh_tui_renders_live_working_status_on_reconnect() {
         "pane_id": "pane-recon",
         "agent_id": agent_id,
     });
-    write_hook_line(&daemon.hook_socket, &session_start.to_string())
-        .expect("write SessionStart hook");
+    write_hook_line(
+        &daemon.hook_socket,
+        &session_start.to_string(),
+        Some(&token),
+    )
+    .expect("write SessionStart hook");
     let started = daemon.wait_for_agent_where(
         |r| {
             r.agent_type == Some(AgentType::ClaudeCode)
@@ -218,7 +235,8 @@ fn live_006_fresh_tui_renders_live_working_status_on_reconnect() {
         "pane_id": "pane-recon",
         "agent_id": agent_id,
     });
-    write_hook_line(&daemon.hook_socket, &tool_start.to_string()).expect("write ToolStart hook");
+    write_hook_line(&daemon.hook_socket, &tool_start.to_string(), Some(&token))
+        .expect("write ToolStart hook");
 
     // The daemon now holds a `Working` session; a reconnecting TUI's
     // `hydrate_from_daemon` → `ListAgents` must carry it. Gate on the
@@ -289,6 +307,14 @@ fn live_012_agent_event_status_survives_real_tui_reconnect() {
         "StartAgent should succeed, got error: {:?}",
         response.error
     );
+    // Issue #318: the spawn reply is the ONE place a token is handed out, and
+    // this test IS the spawning peer, so it reads the token straight off the
+    // reply — no retrieval verb, and nothing the harness knows that a real
+    // attach peer would not.
+    let token = response
+        .agent_token
+        .clone()
+        .expect("StartAgent must hand the spawning peer the agent's capability token");
     let records = daemon.wait_for_agent_count(1, Duration::from_secs(5));
     let agent_id = records
         .first()
@@ -299,7 +325,7 @@ fn live_012_agent_event_status_survives_real_tui_reconnect() {
     let first_tui = launch_tui_against(&daemon);
     first_tui.wait_for_string(LABEL);
 
-    let output = daemon.run_agent_event(PANE_ID, Some(&agent_id), "running");
+    let output = daemon.run_agent_event(PANE_ID, Some(&agent_id), Some(&token), "running");
     assert!(
         output.status.success(),
         "the real non-SessionStart `agent-event --type running` CLI failed: status={:?} stdout={:?} stderr={:?}",

@@ -129,6 +129,7 @@ fn session_start(pane_id: &str, agent_id: &str) -> String {
         agent_version: None,
         schema_version: None,
         live_target: None,
+        agent_token: None,
     };
     serde_json::to_string(&event).expect("serialize synthetic SessionStart")
 }
@@ -291,9 +292,13 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
 
     // A `cat` stand-in emits no readiness signal of its own, so stand in for the
     // agent's hook exactly as the rest of the fast delegate suite does.
+    // Issue #318: the worker pane is daemon-managed, so the synthetic hook has
+    // to carry the replacement generation's capability token — the same one the
+    // daemon injected into its child's environment.
     common::write_hook_line(
         &fx.daemon.hook_path,
         &session_start(WORKER_PANE, &replacement),
+        fx.daemon.registry.agent_hook_token(&replacement).as_ref(),
     )
     .expect("deliver synthetic SessionStart for the replacement worker");
 
@@ -568,6 +573,10 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
     common::write_hook_line(
         &daemon.hook_path,
         &session_start(&dispatched_worker, &dispatched_replacement),
+        daemon
+            .registry
+            .agent_hook_token(&dispatched_replacement)
+            .as_ref(),
     )
     .expect("deliver the dispatched replacement's SessionStart");
 
@@ -583,6 +592,11 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
     common::write_hook_line(
         &control.daemon.hook_path,
         &session_start(WORKER_PANE, &control_replacement),
+        control
+            .daemon
+            .registry
+            .agent_hook_token(&control_replacement)
+            .as_ref(),
     )
     .expect("deliver the control replacement's SessionStart");
 
