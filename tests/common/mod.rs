@@ -2746,7 +2746,18 @@ pub const CODEX_TEST_MODEL_ENV: &str = "DOT_AGENT_DECK_CODEX_TEST_MODEL";
 /// SKIPS — a silent no-coverage outcome that reads as a pass.
 ///
 /// A subscription host therefore exports a plain `gpt-5.*` model it *can* reach,
-/// e.g. `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5.4-mini` (verified 2026-08-23).
+/// e.g. `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5.6-luna` (verified 2026-08-26:
+/// `codex exec` answered `CODEX_AUTH_OK`, and codex-cli 0.149.0's interactive TUI
+/// came up on it).
+///
+/// `gpt-5.4-mini` — what this line named until 2026-08-26 — was re-probed the
+/// same day and **also still works**, by both routes. It is named here rather
+/// than silently dropped because the swap is a refresh of a dated claim, not the
+/// retirement of a dead model id: if you are already exporting it, nothing is
+/// wrong. (The probe that appeared to condemn it was measuring its own defect —
+/// a `pty.fork()` left at a 0x0 window size, into which codex-cli paints nothing
+/// whatever the model. Both ids emit the identical 523 bytes of empty repaint at
+/// 0x0 and the identical 2492 bytes ending in `? for shortcuts` at 180x45.)
 ///
 /// **Setting it makes the tests run, not pass.** They then fail on an unrelated
 /// defect: Codex 0.149.0 does not execute the deck's trusted command hooks in
@@ -2795,6 +2806,16 @@ pub fn codex_test_model() -> &'static str {
 /// OpenRouter credit for coverage the subscription already pays for, and made
 /// two OpenCode tests skip whenever that balance ran dry — with a skip reason
 /// naming missing *credentials*, which were present the whole time.
+///
+/// **Probed 2026-08-26** (issue #243 round 3), because this shares a model id
+/// with [`codex_test_model`]'s subscription example and a retirement here would
+/// be worse: `check_opencode_available` runs no model probe at all — it only
+/// looks for an `auth.json` — so an unreachable id would not skip
+/// `orchestration/delegate/015` cleanly, it would fail it somewhere inside the
+/// TUI with no mention of the model. `opencode run --model openai/gpt-5.4-mini`
+/// answered `OPENCODE_MODEL_OK` on the subscription credential these boxes hold.
+/// Note the id reaches the model through OpenCode's own provider layer rather
+/// than through codex-cli, so nothing measured about codex-cli's TUI bears on it.
 const OPENCODE_TEST_MODEL_DEFAULT: &str = "openai/gpt-5.4-mini";
 
 /// Env var that overrides [`opencode_test_model`] on a host whose OpenCode
@@ -2900,7 +2921,7 @@ pub fn check_codex_available() -> Result<(), String> {
             "Codex could not reach model {} with the current authentication — the two auth \
              modes reach different model families, so set {} to one these credentials can \
              reach (API key: e.g. gpt-5-nano or gpt-5.1-codex-mini; ChatGPT subscription: \
-             e.g. gpt-5.4-mini). Run `codex login status` to see which mode is in use",
+             e.g. gpt-5.6-luna). Run `codex login status` to see which mode is in use",
             codex_test_model(),
             CODEX_TEST_MODEL_ENV,
         ));

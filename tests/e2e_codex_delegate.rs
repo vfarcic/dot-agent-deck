@@ -60,10 +60,21 @@
 //! `wrapper_interface_ready` once the Codex TUI takes the inner PTY out of
 //! cooked mode, and the gate releases on that instead. The precondition above is
 //! unchanged (it is still asserted on the user-visible TUI, and Codex's NATIVE
-//! `SessionStart` is still caused by the prompt), but the pointer now arrives
-//! within a second of the replacement becoming ready rather than 31 s later —
+//! `SessionStart` is still caused by the prompt), but the pointer now arrives a
+//! few seconds after the replacement becomes ready rather than 31 s later —
 //! which is why this test carries [`READY_TO_SUBMIT_BUDGET`] below. Without it,
 //! it passes identically on the fixed and the broken path.
+//!
+//! **Round 3: raw mode releases the gate, it does not prove input-readiness.**
+//! This module said "within a second", because the strong fact used to SKIP the
+//! post-readiness buffer. It does not any more, and this test is part of why:
+//! `/009` recorded the wrapper observing raw mode at fork + 100 ms on both the
+//! original worker and its replacement, wrote on it, and lost the pointer into
+//! an unsubmitted composer — a full-screen TUI takes the terminal at INIT,
+//! before it will accept a submit. The strong fact is now priced at
+//! `WRAPPER_INTERFACE_READINESS_BUFFER` (5000 ms, measured against codex-cli's
+//! initialisation), which is what this test pins and what its budget is derived
+//! against.
 //!
 //! ## Why the orchestrator is a script and the worker is the real agent
 //! The defect lives entirely on the WORKER side of the delegate: prompt
@@ -90,6 +101,7 @@ use std::time::Duration;
 
 use common::TuiDeck;
 use dot_agent_deck::event::{AgentType, EventType};
+use dot_agent_deck::state::DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS;
 use spec::spec;
 
 /// The orchestration name declared in the generated project config — also the
@@ -106,6 +118,30 @@ const SENTINEL_NAME: &str = "prd225-codex-delegate-6f21ba.txt";
 /// append a newline no matter how the prompt is worded.
 const SENTINEL_CONTENT: &str = "PRD225_DELEGATE_OK";
 
+/// Issue #243: the post-readiness buffer this test pins, mirroring the deck's own
+/// `WRAPPER_INTERFACE_READINESS_BUFFER` because that constant is `pub(crate)`.
+///
+/// **The harness pins the buffer to `0` for every e2e test
+/// (`tests/common/mod.rs`), and this test used to inherit that.** `/014` and
+/// `/015` opt back in and say why; `/009` did not, and its own budget comment
+/// cited the `0` as a reason the number could be tight. That was defensible only
+/// while the strong interface fact skipped the buffer anyway — a wrapped Codex at
+/// `0` and at the default were the same run. Since `56c10dd` they are not: this
+/// is the ONE agent for which the buffer is now load-bearing, and 5000 ms of it
+/// is what stands between the write and a composer that is still initialising.
+/// Left at `0` this test exercised a configuration the deck does not ship, which
+/// is exactly what its own red measured — the pointer written at fork + 100 ms
+/// and parked, unsubmitted, with no turn ever starting.
+///
+/// So it opts in for the reason `/014` and `/015` cite (#663: `SessionStart`
+/// means "a session exists", not "the TUI interprets `\r` as submit"), and it
+/// opts in at the PRODUCTION value rather than at their 1000 ms. Their agents
+/// resolve `delegate_readiness_buffer()`; a wrapped Codex that released on the
+/// strong fact resolves `wrapper_interface_readiness_buffer()`, and pinning 1000
+/// here would use guard 3's operator override to buy back the very race this
+/// issue's third round exists to close.
+const READINESS_BUFFER_MS: &str = "5000";
+
 /// Issue #243: how long the REPLACEMENT worker may take to get from "the
 /// wrapper observed its interface" to "the pointer was submitted inside Codex".
 ///
@@ -116,32 +152,41 @@ const SENTINEL_CONTENT: &str = "PRD225_DELEGATE_OK";
 /// #243 fixed was invisible here. It would keep passing straight through a
 /// silent regression to that behaviour.
 ///
-/// **Ten seconds, justified from both ends**, the same way
-/// `orchestration/delegate/024`'s 6 s `READY_TO_POINTER_BUDGET` is.
+/// **Fifteen seconds, and round 3 moved one term rather than re-guessing it.**
+/// This was 10 s while the harness's `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=0`
+/// meant no buffer sat inside the interval at all, leaving the whole 10 s for the
+/// part the deck does not control. [`READINESS_BUFFER_MS`] now puts a known,
+/// pinned 5000 ms inside it, so the budget is 5 s wider and the uncontrolled
+/// share is unchanged.
 ///
-/// *Below:* three times under the 30 s `SESSION_START_WAIT_TIMEOUT`, and three
-/// times under the ~31 s (timeout + readiness buffer) that the pre-fix path
-/// burned before the fallback wrote anything — measured at 30.98 s / 31.00 s by
-/// `/024` on this branch, and at 31.2 / 31.2 / 31.7 / 31.7 / 32.3 s on the
-/// production Codex delegates in the issue. Nothing that pays the dead wait can
-/// slip past this as a false green, which is the entire point.
+/// *Below:* half of the ~30.6 s a run that still pays the dead wait would
+/// measure here — the fallback delivers at ~31 s from the respawn while this
+/// interval starts at the interface fact, which a warm Codex produces at
+/// ~390 ms. It is also under `SESSION_START_WAIT_TIMEOUT` outright. Nothing that
+/// pays the fallback can slip past this as a false green, which is the entire
+/// point. The production Codex delegates in the issue sat at 31.2 / 31.2 / 31.7
+/// / 31.7 / 32.3 s.
 ///
-/// *Above:* the deck's own contribution to this leg is now small and bounded.
-/// The wrapper's `InterfaceWatch` polls on the same 50 ms loop it already runs,
-/// a real Codex TUI releases on the STRONG fact (it clears `ICANON`/`ECHO`
-/// rather than merely going quiet), and the e2e harness pins
-/// `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` to `0`, so no buffer is added
-/// on top. `/024` measures the whole ready→pointer leg of the synthetic
-/// equivalent at ~1.75 s WITH a 1000 ms buffer deliberately pinned on. What is
-/// left inside this budget is the part the deck does not control: codex-cli
-/// accepting the keystrokes and its native `UserPromptSubmit` hook reaching the
-/// daemon. That hook fires at SUBMIT — it is not a model round trip, and this
-/// test separately measures the whole model turn at ~5 s from submission to the
-/// sentinel landing — so 10 s is roughly an order of magnitude of headroom over
-/// the deck's measured share and still leaves seconds for a cold hook exec on a
-/// loaded runner. Widen it if a healthy run is ever seen near it; do NOT widen
-/// it past ~20 s, where it stops distinguishing the two paths at all.
-const READY_TO_SUBMIT_BUDGET: Duration = Duration::from_secs(10);
+/// *Above:* the deck's own contribution is now large but exactly known — the
+/// 5000 ms buffer, plus `SUBMIT_DELAY` and a PTY write. The wrapper's
+/// `InterfaceWatch` polls on the same 50 ms loop it already runs, and a real
+/// Codex TUI releases on the STRONG fact (it clears `ICANON`/`ECHO` rather than
+/// merely going quiet). What is left inside this budget is what the deck does not
+/// control: codex-cli accepting the keystrokes and its native `UserPromptSubmit`
+/// hook reaching the daemon. That hook fires at SUBMIT — it is not a model round
+/// trip, and this test separately measures the whole model turn at ~5 s from
+/// submission to the sentinel landing — so ~10 s of headroom over the deck's
+/// share is roughly what it was before and still leaves seconds for a cold hook
+/// exec on a loaded runner. Widen it if a healthy run is ever seen near it; do
+/// NOT widen it past ~25 s, where it stops distinguishing the two paths at all.
+///
+/// **Measured 2026-08-26 against real codex-cli 0.149.0 on `gpt-5.6-luna`:
+/// 5.758 s** — the 5000 ms buffer plus 758 ms of codex-cli taking the keystrokes
+/// and its native `UserPromptSubmit` hook reaching the daemon. That is 9.2 s of
+/// headroom under this budget and 5.3x under the ~30.6 s a dead wait would
+/// measure, and it lands where the constant's own derivation predicted a warm
+/// Codex would (~5.6 s).
+const READY_TO_SUBMIT_BUDGET: Duration = Duration::from_secs(15);
 
 /// Test-written trigger the orchestrator script blocks on, so the delegate
 /// fires only after the worker is genuinely up (production timing).
@@ -294,6 +339,13 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
         // status badges) are on screen at once — the surface being asserted.
         .with_pty_size(180, 45)
         .with_env("PATH", path_with_binary_dir())
+        // Opt back into the production readiness buffer the harness pins to `0`
+        // for every other e2e test — see `READINESS_BUFFER_MS`. This is the one
+        // agent for which that buffer is load-bearing.
+        .with_env(
+            DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS,
+            READINESS_BUFFER_MS,
+        )
         // Real Codex auth in the isolated HOME; also marks the deck's workdir
         // (the role panes' shared cwd) trusted, so no first-run gate can
         // swallow the injected delegate prompt.
@@ -455,7 +507,9 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
     // sentinel appeared. This is the one assertion that distinguishes "released
     // by the readiness signal" from "released by giving up", so it is what keeps
     // a silent regression to the dead wait from shipping green. See
-    // `READY_TO_SUBMIT_BUDGET` for how 10 s is derived from both ends.
+    // `READY_TO_SUBMIT_BUDGET` for how 15 s is derived from both ends, and
+    // `READINESS_BUFFER_MS` for the 5000 ms of it this test deliberately pins
+    // rather than inheriting the harness's `0`.
     //
     // Measured on the daemon's own clock (both events' `timestamp`s) rather than
     // on this thread's `Instant`, because `EventSub::wait_for` returns from a

@@ -291,8 +291,9 @@ fn agent_readiness_002_gate_discriminator_is_not_hook_install() {
 /// `session_start_origin` values and one with no origin key at all, then ask all
 /// four of `AgentEvent`'s origin predicates about each. The full truth table must
 /// hold — in particular the settled marker must NOT answer the strong
-/// raw-input-mode question, because that is the single bit the delegate's
-/// readiness-buffer skip reads.
+/// raw-input-mode question, because that is the single bit deciding which of the
+/// wrapper's two facts may RELEASE the readiness gate, and which post-readiness
+/// buffer is then owed.
 #[spec("agent/readiness/003")]
 #[test]
 fn agent_readiness_003_session_start_origin_predicates_price_the_two_facts_apart() {
@@ -308,7 +309,12 @@ fn agent_readiness_003_session_start_origin_predicates_price_the_two_facts_apart
         // nothing about the child's interface.
         (Some(WRAPPER_FORK_SESSION_START_ORIGIN), true, false, false),
         // Fact 1, the OBSERVATION: the child cleared `ICANON`/`ECHO`. The one
-        // value that skips the post-readiness buffer.
+        // value a Wrapper-strategy agent's gate may be released on before its
+        // upgrade window expires, and the one priced at
+        // `WRAPPER_INTERFACE_READINESS_BUFFER` rather than the ordinary buffer.
+        // It used to be the one value that SKIPPED the buffer; measurement
+        // retracted that (a TUI takes raw mode at INIT, before it will accept a
+        // submit), and the predicates below are unchanged by the retraction.
         (
             Some(WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN),
             false,

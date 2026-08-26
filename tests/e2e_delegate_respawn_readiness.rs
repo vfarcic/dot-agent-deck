@@ -81,7 +81,7 @@ struct RealDelegateCase<'a> {
 }
 
 /// Issue #243: `/015`'s bound, derived from both ends the same way
-/// `orchestration/delegate/024`'s 6 s `READY_TO_POINTER_BUDGET` is.
+/// `orchestration/delegate/024`'s `READY_TO_POINTER_BUDGET` is.
 ///
 /// *Below:* under the 30 s `SESSION_START_WAIT_TIMEOUT`, and a full 11 s under
 /// the ~31 s (timeout + readiness buffer) the pre-fix path burned before the
@@ -99,13 +99,56 @@ struct RealDelegateCase<'a> {
 /// Everything else inside this budget is real OpenCode booting far enough to
 /// consume the keystrokes it was handed and post `session.prompt`.
 ///
-/// The honest caveat, because it is the one thing this number cannot be derived
-/// from: nobody has measured how long a REPLACEMENT OpenCode takes to reach that
-/// point, since before #243 it always had the whole 30 s wait to boot in and now
-/// it has 1 s. 20 s is deliberately generous for it rather than tight, and it is
-/// the half of this bound to widen — or to re-derive against a real measurement —
-/// if a healthy run is ever seen near it. Do not widen it past ~25 s, where it
-/// stops separating the two paths.
+/// The caveat this carried — "nobody has measured how long a REPLACEMENT
+/// OpenCode takes to reach that point, since before #243 it always had the whole
+/// 30 s wait to boot in and now it has 1 s" — **was measured on 2026-08-26, and
+/// the answer is that 1 s is not enough.** This test had never been executed by
+/// anyone until then.
+///
+/// The bound itself is left at 20 s and is NOT the thing that failed: the deck
+/// delivers promptly (`delegate exit=0` and the pointer file on disk inside 5 s,
+/// every run), so this assertion is never reached. What fails is three
+/// assertions earlier, on the worker never entering `Thinking` at all. Widening
+/// this would not move that by a millisecond, which is why it was not widened.
+/// Do not widen it past ~25 s, where it stops separating the two paths.
+///
+/// **What the measurement found: the delivery is prompt and the agent cannot
+/// consume it.** With the 1000 ms
+/// buffer this test pins — the deck's shipped `DELEGATE_READINESS_BUFFER`, which
+/// is the ONLY thing now standing between a `clear = true` respawn and the write
+/// for a `PrePromptReadiness::NoSignal` agent — the pointer is written into a
+/// replacement OpenCode that is still bringing its TUI up, and the bytes are
+/// swallowed outright. Not parked: the composer renders its empty
+/// `Ask anything...` placeholder afterwards, so this is PRD #225's Defect 1
+/// shape (a write into a line discipline that is not yet the agent's) rather
+/// than #663's unsubmitted-payload shape. The worker never enters `Thinking`,
+/// never runs a tool, and never creates the sentinel; the run dies at the 120 s
+/// status wait with a pane that has been idle since boot.
+///
+/// **Bracketed against the one seam that can move it**, `E2E_READINESS_BUFFER_OVERRIDE`,
+/// one full run per value on an otherwise idle box:
+///
+/// | buffer   | outcome                                        |
+/// |----------|------------------------------------------------|
+/// | 1000 ms  | FAIL (2/2 runs — the shipped default)           |
+/// | 2000 ms  | FAIL                                           |
+/// | 5000 ms  | PASS, whole test in 25.3 s                     |
+/// | 15000 ms | PASS, whole test in 43.0 s                     |
+///
+/// So the requirement sits between 2 s and 5 s here, and the shipped value is
+/// under it by at least 2x.
+///
+/// **This is a product finding, not a test-tuning one, and it is a REGRESSION
+/// THIS ISSUE INTRODUCED.** Before #243 an OpenCode delegate sat out the full 30 s
+/// `SESSION_START_WAIT_TIMEOUT` waiting for an event measured never to arrive —
+/// dead time by every measure except one, which is that it happened to give the
+/// replacement 30 s to boot. Deleting that dead wait for declared-`NoSignal`
+/// agents is right, and it left the 1000 ms buffer carrying a load it was never
+/// sized for: that value is PRD #249's "warm-case 500 ms, doubled for a cold
+/// start", derived against a 650 ms stub and never against a real agent's
+/// startup. The durable fix is the same shape round 3 applied to the wrapper's
+/// strong fact — a buffer sized from measurement, or better, an OBSERVATION —
+/// and it belongs on the `NoSignal` path rather than in this test.
 const OPENCODE_DELEGATE_TO_SUBMIT_BUDGET: Duration = Duration::from_secs(20);
 
 fn path_with_binary_dir() -> String {

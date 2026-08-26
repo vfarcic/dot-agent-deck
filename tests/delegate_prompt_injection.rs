@@ -1257,18 +1257,32 @@ fn delegate_012_slow_agent_toggle_proves_delivery_and_submission() {
 /// Issue #243: how long a delegated worker that is DEMONSTRABLY up may take to
 /// see its task pointer before the delay is a defect rather than a boot cost.
 ///
-/// Six seconds, chosen from both ends. Above: the production readiness buffer is
-/// 1000 ms, and the healthy delegates in this issue's own daemon log (a
-/// ClaudeCode worker, which emits a genuine pre-prompt `SessionStart`) land at
-/// 3.80 / 3.85 / 3.96 / 4.39 s end to end — so 6 s clears the slowest measured
-/// healthy delivery with headroom, and a loaded test machine or a legitimately
-/// short bounded readiness buffer cannot produce a false red. Below: it is five
-/// times under `SESSION_START_WAIT_TIMEOUT`, so nothing that pays that fallback
-/// can slip past it as a false green. The Codex workers in the same log sit at
-/// 31.2 / 31.2 / 31.7 / 31.7 / 32.3 s — the timeout plus the buffer, constant to
-/// the tenth of a second, which is the tell that it is the constant and not load.
+/// **Ten seconds, and the derivation is the old six with one term moved.** This
+/// was 6 s against a 1000 ms buffer — 5 s of slack over everything the deck does
+/// on this leg, sized so the slowest healthy delegate in the issue's own daemon
+/// log (a ClaudeCode worker at 3.80 / 3.85 / 3.96 / 4.39 s end to end) cleared it
+/// with headroom. Round 3 replaced the buffer this fixture pays: the stand-in now
+/// reaches its interface the way a real Codex does (it clears `ICANON`/`ECHO`,
+/// see [`write_wrapped_ready_agent`]), so the gate releases on the strong fact and
+/// pays the 5000 ms `WRAPPER_INTERFACE_READINESS_BUFFER` rather than the ordinary
+/// 1000 ms. The SLACK is unchanged at 5 s; only the constant inside it moved,
+/// which is why this is 10 and not a fresh guess.
+///
+/// *Below:* three times under `SESSION_START_WAIT_TIMEOUT`, and three times under
+/// the ~31 s that every unreleased path now costs — the Codex workers in the same
+/// log sit at 31.2 / 31.2 / 31.7 / 31.7 / 32.3 s, constant to the tenth of a
+/// second, which is the tell that it is the constant and not load. Nothing that
+/// waits the timeout out can slip past this as a false green, which is the entire
+/// reason the number is bounded above at all.
+///
+/// **Raising it to ~34 s to accommodate the OLD fixture was the wrong repair, and
+/// is why the fixture changed instead.** A `printf …; exec cat` stand-in never
+/// leaves cooked mode, so since `46ccca1` it releases on the window-expiry
+/// fallback BY DESIGN and lands at a measured 30.98 s. A budget wide enough for
+/// that would make this test pass on precisely the behaviour it was written to
+/// catch. Measured on this branch with the raw-input fixture: 5.044 s.
 #[cfg(unix)]
-const READY_TO_POINTER_BUDGET: Duration = Duration::from_secs(6);
+const READY_TO_POINTER_BUDGET: Duration = Duration::from_secs(10);
 
 /// Issue #243: how far past [`READY_TO_POINTER_BUDGET`] the two latency tests
 /// keep looking, once they already know they have failed, purely to MEASURE what
@@ -1289,9 +1303,9 @@ const MEASURED_LATENCY_CEILING: Duration = Duration::from_secs(34);
 #[cfg(unix)]
 const WRAPPED_READY_BANNER: &str = "Ask Codex to do anything (ready-7c1e)";
 
-/// Issue #243: a stand-in for codex-cli's measured behaviour — it paints its
-/// ready interface and then accepts input, and it emits NO native `SessionStart`
-/// until a prompt actually arrives.
+/// Issue #243: a stand-in for codex-cli's measured behaviour — it takes the
+/// terminal out of cooked mode, paints its ready interface and then accepts
+/// input, and it emits NO native `SessionStart` until a prompt actually arrives.
 ///
 /// That last part is the defect, and it is why this is a `cat` stand-in rather
 /// than a hook-emitting one: codex-cli posts its native `SessionStart` when the
@@ -1300,25 +1314,38 @@ const WRAPPED_READY_BANNER: &str = "Ask Codex to do anything (ready-7c1e)";
 /// common spawn boundary rewrites a `codex` command into a real
 /// `dot-agent-deck wrap --agent codex -- codex`, so the fork-time
 /// card-surfacing `SessionStart` under test here is emitted by the real wrapper.
+///
+/// **The `stty raw -echo` is round 3's repair and it is load-bearing.** This was
+/// a bare `printf …; exec cat` for two rounds, which never leaves cooked mode —
+/// so once `46ccca1` made the wrapper's WEAK fact provisional for the whole
+/// `SESSION_START_WAIT_TIMEOUT`, this fixture stopped modelling "a worker sitting
+/// at its ready prompt" and started modelling the one shape that waits the
+/// timeout out on purpose: a line-oriented REPL. The test went red at 30.98 s
+/// against its 6 s budget, and the tempting repair — widen the budget past 31 s —
+/// would have made it green on exactly the regression it exists to catch. A real
+/// Codex clears `ICANON`/`ECHO`, so the fixture does too, and the sentence the
+/// test asserts ("a worker visibly at its prompt gets its task promptly") is
+/// falsifiable again.
+///
+/// `stty` BEFORE `printf`, for [`raw_input_agent_script`]'s reason: with no
+/// output written yet the settle branch returns early, so fact 1 is the only fact
+/// that can fire and which one wins is not left to a race between the wrapper's
+/// 50 ms supervisory poll and its 750 ms settle window.
 #[cfg(unix)]
 fn write_wrapped_ready_agent(path: &std::path::Path) {
     write_executable(
         path,
-        &format!("#!/bin/sh\nprintf '{WRAPPED_READY_BANNER}\\r\\n'\nexec cat\n"),
+        &format!("#!/bin/sh\nstty raw -echo\nprintf '{WRAPPED_READY_BANNER}\\r\\n'\nexec cat\n"),
     );
 }
 
-/// Scenario: Delegate with `clear = true` to a wrapped Codex stand-in that paints its ready prompt and then, like real codex-cli, emits no native `SessionStart` until a prompt arrives. Once that ready prompt is visibly on the replacement pane, the task pointer must reach it within six seconds instead of waiting out the 30 s `SessionStart` fallback (issue #243).
+/// Scenario: Delegate with `clear = true` to a wrapped Codex stand-in that takes its terminal out of cooked mode the way a real Codex TUI does, paints its ready prompt, and then — like real codex-cli — emits no native `SessionStart` until a prompt arrives. Once that ready prompt is visibly on the replacement pane, the task pointer must reach it within ten seconds (the wrapper's strong interface fact plus the 5000 ms interface buffer it is priced at) instead of waiting out the 30 s `SessionStart` fallback (issue #243).
 #[spec("orchestration/delegate/024")]
 #[test]
 #[cfg(unix)]
 fn delegate_024_wrapped_worker_without_native_session_start_is_delivered_promptly() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
-        (
-            DELEGATE_READINESS_BUFFER_ENV,
-            &DELEGATE_READINESS_BUFFER_MS.to_string(),
-        ),
         // The delegate path reads `SESSION_START_WAIT_TIMEOUT` as a bare
         // constant with no override (`src/state.rs`), so this pins nothing here
         // — it is set to the production value so the scheduler mirror of the
@@ -1327,6 +1354,16 @@ fn delegate_024_wrapped_worker_without_native_session_start_is_delivered_promptl
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
         (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
     ]);
+    // The buffer env is REMOVED, and round 3 is when that started to matter.
+    // This test used to pin it to 1000 ms for determinism, which was harmless
+    // while the strong fact SKIPPED the buffer. It is not harmless now: guard 3
+    // makes an explicitly-set value win over BOTH defaults, so a pin here would
+    // quietly buy this fixture the ordinary 1000 ms and the test would report
+    // "delivered promptly" about a configuration the deck does not ship. Left
+    // unset, the run pays the real 5000 ms `WRAPPER_INTERFACE_READINESS_BUFFER`
+    // a wrapped Codex delegate pays in production, which is what
+    // `READY_TO_POINTER_BUDGET` is now derived against.
+    let _unset = EnvGuard::unset(&[DELEGATE_READINESS_BUFFER_ENV]);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -1431,10 +1468,13 @@ async fn delegate_024_wrapped_worker_without_native_session_start_is_delivered_p
         panic!(
             "a wrapped worker sitting VISIBLY at its ready prompt did not receive its delegated \
              task pointer within {READY_TO_POINTER_BUDGET:?}: it {} after {measured:?} measured \
-             from the instant that prompt appeared. The wrapper's fork-time SessionStart is \
-             skipped as boot provenance and codex-cli emits no native one until a prompt starts a \
-             turn, so the gate has nothing to release on and pays the full \
-             SESSION_START_WAIT_TIMEOUT (issue #243). snapshot = {:?}",
+             from the instant that prompt appeared. This fixture clears ICANON/ECHO before it \
+             paints, so the wrapper's STRONG interface fact is on the wire and the gate has \
+             something to release on; a figure near 31 s means it released on nothing instead and \
+             paid the full SESSION_START_WAIT_TIMEOUT, which is issue #243's regression. The \
+             wrapper's fork-time SessionStart is skipped as boot provenance and codex-cli emits \
+             no native one until a prompt starts a turn, so that fallback is all there would be \
+             left. snapshot = {:?}",
             if arrived {
                 "eventually arrived"
             } else {
@@ -1446,17 +1486,37 @@ async fn delegate_024_wrapped_worker_without_native_session_start_is_delivered_p
 }
 
 // ---------------------------------------------------------------------------
-// Issue #243 review: the THREE guards on the readiness-buffer skip.
+// Issue #243: the THREE guards on the wrapper's interface buffer.
 //
-// `src/state.rs`'s delegate seam drops the post-readiness buffer to zero only
-// when all three hold: the event carried the STRONG interface fact
-// (`wrapper_interface_ready`, the child cleared `ICANON`/`ECHO`), the daemon's
-// own frozen launch record says it spawned that agent as a wrapper host, and the
-// operator pinned no `…_DELEGATE_READINESS_BUFFER_MS` of their own. `/026`,
-// `/027` and `/028` below pin one guard each; between them they also pin that
-// the fast path still WORKS, which is the failure `/024` cannot see — guard 2 is
-// fail-closed, so a refactor that made it refuse every honest agent would
-// silently restore the 31 s regression with every other test still green.
+// **Round 3 changed what they guard.** For two rounds `src/state.rs`'s delegate
+// seam dropped the post-readiness buffer to ZERO when all three held, and these
+// tests pinned the skip. Measurement retracted the premise: a full-screen TUI
+// takes raw mode at INIT, before it will accept a submit, so writing on that
+// instant is the worst moment available rather than the safest. There is no skip
+// any more. What the three guards now decide is WHICH buffer is owed —
+// `WRAPPER_INTERFACE_READINESS_BUFFER` (5000 ms, measured against codex-cli's
+// initialisation) or the ordinary `DELEGATE_READINESS_BUFFER` (1000 ms):
+//
+//   1. the event carried the STRONG interface fact (`wrapper_interface_ready`,
+//      the child cleared `ICANON`/`ECHO`) — and, a level up in the gate, that
+//      fact is also the only one a Wrapper-strategy agent may be RELEASED on
+//      before the upgrade window expires;
+//   2. the daemon's own frozen launch record says it spawned that agent as a
+//      wrapper host, so a producer-written marker cannot select the pricing;
+//   3. the operator pinned no `…_DELEGATE_READINESS_BUFFER_MS` of their own,
+//      which wins over both defaults when they did.
+//
+// `/026`, `/027` and `/028` below pin one guard each. **Every one of them needed
+// a two-sided bound to survive the change**, because a dropped guard no longer
+// produces a near-zero delivery — it produces the OTHER buffer, which clears any
+// floor. `/026` and `/028` were both measured green with their guard deleted
+// before this round re-founded them.
+//
+// Between them they also pin that the interface path still WORKS, which is the
+// failure `/024` cannot see: guard 2 is fail-closed, so a refactor that made it
+// refuse every honest agent would drop every wrapped agent to the ordinary
+// buffer — 3601 ms short of what codex-cli needed under measured load — with
+// every other test still green.
 // ---------------------------------------------------------------------------
 
 /// Issue #243: every `AgentEvent` the daemon broadcast since the collector
@@ -1521,16 +1581,48 @@ impl EventCollector {
         agent_id: &str,
         timeout: Duration,
     ) -> AgentEvent {
+        self.wait_for_interface_fact(agent_id, None, timeout).await
+    }
+
+    /// Block until the wrapper announces a SPECIFIC interface fact for
+    /// `agent_id` — `None` for "whichever fact comes first".
+    ///
+    /// Issue #243 round 3: the by-origin form is what lets a test measure the
+    /// UPGRADE. The wrapper's two facts can both fire on one session, in the
+    /// order fact 2 then fact 1 and never the reverse
+    /// (`InterfaceWatch::claim` latches per fact), so a caller that only ever
+    /// sees the first one cannot tell "the gate waited for the strong fact"
+    /// from "the gate released on the weak one". `orchestration/delegate/026`
+    /// needs both events to anchor its bound against.
+    async fn wait_for_interface_fact(
+        &self,
+        agent_id: &str,
+        origin: Option<&str>,
+        timeout: Duration,
+    ) -> AgentEvent {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if let Some(event) = self.interface_session_starts(agent_id).into_iter().next() {
+            if let Some(event) = self
+                .interface_session_starts(agent_id)
+                .into_iter()
+                .find(|event| {
+                    origin.is_none_or(|want| {
+                        event
+                            .metadata
+                            .get(SESSION_START_ORIGIN_METADATA_KEY)
+                            .map(String::as_str)
+                            == Some(want)
+                    })
+                })
+            {
                 return event;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the wrapper never announced agent {agent_id:?}'s interface within {timeout:?}, \
-                 so this run establishes nothing about how the readiness buffer prices the two \
-                 interface facts; captured events = {:?}",
+                "the wrapper never announced agent {agent_id:?}'s {} interface fact within \
+                 {timeout:?}, so this run establishes nothing about how the readiness gate \
+                 prices the two of them; captured events = {:?}",
+                origin.unwrap_or("(either)"),
                 self.events
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -1563,9 +1655,11 @@ impl Drop for EventCollector {
 struct WrappedInterfaceRun {
     daemon: common::InProcDaemon,
     _cwd: tempfile::TempDir,
-    /// Kept alive only so its draining task outlives the run; queried before
-    /// the struct is built.
-    _collector: EventCollector,
+    /// Kept alive so its draining task outlives the run, and QUERIED after it:
+    /// `orchestration/delegate/026`'s fixture produces a second interface fact
+    /// some seconds after the first, and the upgrade between them is what that
+    /// test measures. See [`WrappedInterfaceRun::wait_for_interface_fact`].
+    collector: EventCollector,
     new_agent_id: String,
     /// The interface `SessionStart` the wrapper emitted for the REPLACEMENT
     /// worker — the event the buffer seam prices.
@@ -1667,10 +1761,24 @@ async fn run_wrapped_interface_delegate(script: &str, banner: &str) -> WrappedIn
     WrappedInterfaceRun {
         daemon,
         _cwd: cwd,
-        _collector: collector,
+        collector,
         new_agent_id,
         interface_event,
         banner_at,
+    }
+}
+
+#[cfg(unix)]
+impl WrappedInterfaceRun {
+    /// Block until the wrapper announces the interface fact carrying `origin`
+    /// for THIS run's replacement, and return that event.
+    ///
+    /// `interface_event` is whichever fact arrived FIRST; this is how a caller
+    /// reaches a later one. Panics with the captured stream on timeout.
+    async fn wait_for_interface_fact(&self, origin: &str, timeout: Duration) -> AgentEvent {
+        self.collector
+            .wait_for_interface_fact(&self.new_agent_id, Some(origin), timeout)
+            .await
     }
 }
 
@@ -1685,30 +1793,61 @@ async fn run_wrapped_interface_delegate(script: &str, banner: &str) -> WrappedIn
 #[cfg(unix)]
 const WRAPPER_INTERFACE_ANNOUNCE_CEILING: Duration = Duration::from_secs(15);
 
-/// Issue #243: how long the pointer is waited for after an interface event that
-/// should NOT have skipped the buffer.
+/// Issue #243: how long the pointer is waited for after the interface event a
+/// test anchors on, before the run is called "released by nothing at all".
 ///
-/// Same role as `orchestration/delegate/010`'s ceiling and set for the same
-/// reason: the assertion is the lower bound below it, and this only separates
-/// "released by the buffer" from "released by nothing at all". Comfortably above
-/// the buffer plus any plausible scheduling, and comfortably below the 30 s
-/// `SESSION_START_WAIT_TIMEOUT` the fallback would otherwise supply.
+/// Same role as `orchestration/delegate/010`'s ceiling: the load-bearing
+/// assertion is always a separate bound, and this only separates "released by
+/// the fact we anchored on" from "released by the timeout". Comfortably above
+/// the longest buffer the deck can owe (5000 ms) plus any plausible scheduling,
+/// and comfortably below the 30 s `SESSION_START_WAIT_TIMEOUT` the fallback
+/// would otherwise supply.
+///
+/// **Round 3 shrank what this can prove, and the shrinkage is why `/026` and
+/// `/028` no longer rest on it.** `46ccca1` made the upgrade window equal to
+/// `SESSION_START_WAIT_TIMEOUT`, so "released on the weak fact when the window
+/// expired" and "released by nothing at all" now land in the SAME instant —
+/// both ~31 s. No ceiling can tell those two apart any more. It still works
+/// where the anchor is a fact that releases the gate IMMEDIATELY (the strong
+/// fact in `/027`, the forged marker in `/028`), which is every remaining use.
 #[cfg(unix)]
 const HELD_POINTER_DELIVERY_CEILING: Duration = Duration::from_secs(10);
 
-/// Issue #243: the elapsed time from the wrapper's interface announcement to the
-/// pointer landing that counts as "the buffer was skipped".
+/// The deck's OWN `WRAPPER_INTERFACE_READINESS_BUFFER`, mirrored here for the
+/// same reason [`PRODUCTION_READINESS_BUFFER_MS`] is: it is `pub(crate)` and an
+/// integration test cannot name it.
 ///
-/// Chosen against the 1000 ms `DELEGATE_READINESS_BUFFER` the skip removes, from
-/// both ends. Below: everything the deck does on this leg is a socket hop, a
-/// broadcast, a PTY write and this test's own 20 ms snapshot poll, and it was
-/// **measured at 10.1 ms** on this branch — so 700 ms is ~70x the real figure,
-/// which is the headroom a loaded CI runner needs on an upper bound. Above: it
-/// is 300 ms under the buffer that appears the moment the skip stops happening
-/// — measured at **1.0157 s** with the skip disabled at the seam — so a
-/// fail-closed regression cannot pass itself off as a slow machine.
+/// Issue #243 round 3 replaced a SKIP with this second buffer, and the two
+/// defaults being DIFFERENT is what every guard test below now measures against.
+/// While the strong fact suppressed the buffer, "did guard N hold?" was
+/// answerable by a single bound near zero; now every path pays something, and the
+/// only question left is WHICH something — 5000 ms for a fact-1 release on a pane
+/// the deck itself spawned as a wrapper host, 1000 ms for everything else. If
+/// either production default moves, this and `PRODUCTION_READINESS_BUFFER_MS` are
+/// what to re-derive.
 #[cfg(unix)]
-const SKIPPED_BUFFER_DELIVERY_BUDGET: Duration = Duration::from_millis(700);
+const PRODUCTION_WRAPPER_INTERFACE_BUFFER_MS: u64 = 5000;
+
+/// Issue #243 round 3: an upper bound that says "whatever this run paid, it was
+/// NOT the 5000 ms interface buffer".
+///
+/// The guard tests that must observe the ORDINARY buffer
+/// (`orchestration/delegate/028`) or the OPERATOR's
+/// (`orchestration/delegate/027` arm 2) can no longer make their point with a
+/// lower bound alone, because dropping the guard they exist to pin now yields
+/// the LONGER buffer, which clears any floor they could set. Measured: `/028`
+/// stayed green with guard 2 deleted, and `/027` arm 2 stayed green with guard 3
+/// deleted. The bound had to become two-sided.
+///
+/// **3000 ms, from both ends.** Above the values it must accommodate: 1000 ms
+/// (`/028`) and 1500 ms (`/027` arm 2), leaving 2.0 s and 1.5 s of slack for a
+/// socket hop, a broadcast, a PTY write and a 20 ms snapshot poll on a loaded
+/// runner. Below the value it must exclude: a full 2.0 s under the 5000 ms
+/// interface buffer, so a dropped guard cannot pass itself off as scheduling
+/// noise. The gap is symmetric on purpose — there is no reason to favour a false
+/// red over a false green here, since both hide the same defect.
+#[cfg(unix)]
+const SHORT_BUFFER_ATTRIBUTION_CEILING: Duration = Duration::from_millis(3000);
 
 /// The deck's OWN `DELEGATE_READINESS_BUFFER` default, mirrored here because it
 /// is `pub(crate)` and an integration test cannot name it.
@@ -1735,26 +1874,55 @@ const PRODUCTION_READINESS_BUFFER_MS: u64 = 1000;
 #[cfg(unix)]
 const OPERATOR_PINNED_BUFFER_MS: u64 = 1500;
 
-/// The nonce-carrying banner the cooked-mode stand-in paints before going quiet.
+/// Issue #243 round 3: how long `orchestration/delegate/026`'s stand-in stays in
+/// COOKED mode after painting, before it clears `ICANON`/`ECHO`.
+///
+/// This models the production launch shape in miniature. `devbox run codex-big`
+/// prints one banner at ~0.1 s and then computes its shellenv in silence for a
+/// measured 2750–4132 ms before `codex` is exec'd at all, so the wrapper's weak
+/// fact fires while a LAUNCHER still owns the line discipline and the strong one
+/// follows 2005–3370 ms later — 21 times out of 21.
+///
+/// **Two seconds, and both ends are tight for a reason.** It must exceed the
+/// wrapper's 750 ms settle window by enough that fact 2 has certainly fired and
+/// been reported before fact 1 becomes observable — otherwise the run silently
+/// degrades into `/027`'s single-fact case and stops testing the upgrade at all,
+/// which the ordering control below is there to catch. And it is kept small
+/// because it is dead time in the fast tier: the whole test is this dwell plus
+/// the 5000 ms buffer.
+///
+/// The separation it buys is what makes the assertion falsifiable. Fact 2 lands
+/// at ~0.85 s and fact 1 at ~2.05 s, so a gate that wrongly released on the weak
+/// fact would deliver at ~1.85 s — BEFORE the strong fact exists — and the bound
+/// below, which is measured from the strong fact, reads that as a negative
+/// interval clamped to zero.
 #[cfg(unix)]
-const SETTLED_READY_BANNER: &str = "Ask Codex to do anything (settled-4b0d)";
+const UPGRADE_FIXTURE_COOKED_DWELL_SECS: u64 = 2;
+
+/// The nonce-carrying banner the settle-then-raw stand-in paints while it is
+/// still in cooked mode.
+#[cfg(unix)]
+const UPGRADED_READY_BANNER: &str = "Ask Codex to do anything (upgrade-2e77)";
 
 /// The nonce-carrying banner the raw-input stand-in paints after taking the
 /// terminal out of cooked mode.
 #[cfg(unix)]
 const RAW_INPUT_READY_BANNER: &str = "Ask Codex to do anything (raw-9f52)";
 
-/// A wrapped stand-in that paints its prompt and then waits for input **in
-/// cooked mode** — so the only interface fact the wrapper can ever observe about
-/// it is the weak one, output having settled for 750 ms.
+/// A wrapped stand-in that paints its prompt, stays in COOKED mode long enough
+/// for its output to settle, and only THEN clears `ICANON`/`ECHO` — so its
+/// wrapper reports fact 2 first and fact 1 some seconds behind it.
 ///
-/// Byte-for-byte `orchestration/delegate/024`'s shape (`printf …; exec cat`),
-/// because that shape is the point: it is what a launcher stalling mid-boot
-/// looks like from outside, and it is why the settled guess must not buy the
-/// buffer skip.
+/// This is the production launch shape in miniature and the only fixture in the
+/// suite that exercises the UPGRADE. See [`UPGRADE_FIXTURE_COOKED_DWELL_SECS`]
+/// for why the dwell is what it is, and `InterfaceWatch::claim` for why the
+/// wrapper can report a second fact at all (it latches per fact, not per
+/// session, which is exactly what round 3's regression fix restored).
 #[cfg(unix)]
-fn cooked_settle_agent_script() -> String {
-    format!("#!/bin/sh\nprintf '{SETTLED_READY_BANNER}\\r\\n'\nexec cat\n")
+fn cooked_then_raw_agent_script() -> String {
+    format!(
+        "#!/bin/sh\nprintf '{UPGRADED_READY_BANNER}\\r\\n'\nsleep          {UPGRADE_FIXTURE_COOKED_DWELL_SECS}\nstty raw -echo\nexec cat\n"
+    )
 }
 
 /// A wrapped stand-in that takes its terminal OUT of cooked mode before painting
@@ -1772,11 +1940,11 @@ fn raw_input_agent_script() -> String {
     format!("#!/bin/sh\nstty raw -echo\nprintf '{RAW_INPUT_READY_BANNER}\\r\\n'\nexec cat\n")
 }
 
-/// Scenario: Delegate with `clear = true` to a wrapped stand-in that paints its prompt and then goes quiet in COOKED mode, so the only interface fact its wrapper can report is the weak output-settled guess. Assert that fact really is what arrived, and that the pointer is then held for at least the whole configured 1000 ms readiness buffer measured from that event.
+/// Scenario: Delegate with `clear = true` to a wrapped stand-in that paints its prompt, goes quiet in COOKED mode long enough for its wrapper to report the weak output-settled guess, and only two seconds later clears `ICANON`/`ECHO` so the same wrapper reports the strong raw-input observation. Assert the two facts arrived in that order, and that the pointer was held until the STRONG one — landing a full 5000 ms interface buffer after it, rather than 1000 ms after the guess that beat it to the daemon.
 #[spec("orchestration/delegate/026")]
 #[test]
 #[cfg(unix)]
-fn delegate_026_settled_interface_fact_keeps_the_readiness_buffer() {
+fn delegate_026_settled_interface_fact_is_upgraded_before_the_pointer_is_released() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
         (SESSION_START_WAIT_ENV, "30000"),
@@ -1793,33 +1961,58 @@ fn delegate_026_settled_interface_fact_keeps_the_readiness_buffer() {
         .enable_all()
         .build()
         .expect("build settled-fact readiness runtime")
-        .block_on(delegate_026_settled_interface_fact_keeps_the_readiness_buffer_inner());
+        .block_on(
+            delegate_026_settled_interface_fact_is_upgraded_before_the_pointer_is_released_inner(),
+        );
 }
 
 #[cfg(unix)]
-async fn delegate_026_settled_interface_fact_keeps_the_readiness_buffer_inner() {
+async fn delegate_026_settled_interface_fact_is_upgraded_before_the_pointer_is_released_inner() {
     let run =
-        run_wrapped_interface_delegate(&cooked_settle_agent_script(), SETTLED_READY_BANNER).await;
+        run_wrapped_interface_delegate(&cooked_then_raw_agent_script(), UPGRADED_READY_BANNER)
+            .await;
 
-    // CONTROL: this run only prices fact 2 if fact 2 is what fired. A fixture
-    // that accidentally cleared `ICANON`/`ECHO` — or a wrapper that stopped
-    // telling the two apart and re-collapsed them onto the strong value — would
-    // otherwise make the lower bound below assert about the wrong fact, and it
-    // is the strong one that is ALLOWED to skip.
+    // CONTROL 1: the fact that arrived FIRST must be the weak one, or there is
+    // no upgrade here to measure. A fixture that cleared `ICANON`/`ECHO` sooner
+    // than intended — or a wrapper whose settle window moved — would silently
+    // degrade this run into `orchestration/delegate/027`'s single-fact case,
+    // where the bound below holds for a completely different reason.
     assert_eq!(
         run.interface_event
             .metadata
             .get(SESSION_START_ORIGIN_METADATA_KEY)
             .map(String::as_str),
         Some(WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN),
-        "control: a cooked-mode stand-in must announce the SETTLED guess, not the raw-input \
-         observation; metadata = {:?}",
+        "control: this fixture spends its first {UPGRADE_FIXTURE_COOKED_DWELL_SECS}s in cooked \
+         mode, so the FIRST interface fact must be the settled guess; metadata = {:?}",
         run.interface_event.metadata
     );
     assert!(
         !run.interface_event
             .is_wrapper_interface_ready_session_start(),
-        "control: the settled marker must not satisfy the strong predicate the buffer skip reads"
+        "control: the settled marker must not satisfy the strong predicate the gate releases on"
+    );
+
+    // The upgrade itself: the same wrapper session reports the STRONG fact once
+    // the child finally takes the terminal. `InterfaceWatch::claim` latches per
+    // FACT rather than per session precisely so this second event can exist;
+    // before that fix it was computed on the next 50 ms tick and thrown away.
+    let ready_event = run
+        .wait_for_interface_fact(
+            WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN,
+            WRAPPER_INTERFACE_ANNOUNCE_CEILING,
+        )
+        .await;
+
+    // CONTROL 2: and it must genuinely have arrived AFTER the guess. Equal or
+    // reversed timestamps mean the two facts raced rather than being ordered by
+    // the fixture, and the whole point of the dwell is that they do not.
+    assert!(
+        ready_event.timestamp > run.interface_event.timestamp,
+        "control: the strong fact was stamped {:?}, at or before the weak one at {:?} — the \
+         fixture's cooked dwell did not separate them, so this run is not measuring an upgrade",
+        ready_event.timestamp,
+        run.interface_event.timestamp
     );
 
     let delivered = wait_for_snapshot_needle(
@@ -1829,48 +2022,71 @@ async fn delegate_026_settled_interface_fact_keeps_the_readiness_buffer_inner() 
         HELD_POINTER_DELIVERY_CEILING,
     )
     .await;
-    // Measured against the event's OWN timestamp, stamped by the wrapper before
-    // the line ever reached the daemon (`Emitter::build_event`). That instant is
-    // necessarily at or before the moment the daemon armed the buffer, so socket
-    // latency, scheduling and this test's 20 ms poll can only push `held` UP —
-    // the same one-sided shape `orchestration/delegate/010` uses, and the reason
-    // load cannot turn this red. What pushes it below the floor is the buffer
-    // being skipped, which is exactly the defect: before the two facts were
-    // priced apart, this fixture's settled guess suppressed the buffer and the
-    // pointer landed within milliseconds.
-    let held = (chrono::Utc::now() - run.interface_event.timestamp)
+    // Measured against each event's OWN timestamp, stamped by the wrapper before
+    // the line ever reached the daemon (`Emitter::build_event`). Both instants
+    // are necessarily at or before the moment the daemon acted on them, so
+    // socket latency, scheduling and this test's 20 ms poll can only push these
+    // figures UP — the same one-sided shape `orchestration/delegate/010` uses,
+    // and the reason load cannot turn this red.
+    let held_from_strong = (chrono::Utc::now() - ready_event.timestamp)
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    let held_from_weak = (chrono::Utc::now() - run.interface_event.timestamp)
         .to_std()
         .unwrap_or(Duration::ZERO);
     assert!(
         snapshot_contains(&delivered, POINTER),
         "the delegate pointer never arrived within {HELD_POINTER_DELIVERY_CEILING:?} of the \
-         wrapper's settled interface event, so nothing released it at all; snapshot = {:?}",
+         wrapper's STRONG interface event, so nothing released it at all; snapshot = {:?}",
         String::from_utf8_lossy(&delivered)
     );
+    // THE ASSERTION, and it is one bound doing two jobs. Reaching 5000 ms past
+    // the strong fact means (a) the gate did not release on the weak fact that
+    // beat it here by {UPGRADE_FIXTURE_COOKED_DWELL_SECS}s, and (b) what it did
+    // release on was priced as an interface observation rather than as an
+    // ordinary readiness fact.
+    //
+    // **A ceiling cannot do this job any more, which is why this test was
+    // re-founded rather than re-tuned** (issue #243 round 3). It used to assert
+    // a 1000 ms LOWER bound under a 10 s ceiling, on the theory that the weak
+    // fact releases the gate and pays the ordinary buffer. Since `46ccca1` the
+    // upgrade window IS `SESSION_START_WAIT_TIMEOUT`, so a weak fact that never
+    // upgrades is released by window-expiry at ~30 s and then pays 1000 ms —
+    // landing in the same instant as "released by nothing at all", which no
+    // ceiling can separate from it. Worse, the old lower bound of 1000 ms was
+    // then satisfied by a ~30.2 s value whether or not any guard existed: the
+    // test passed with the entire buffer deleted. Anchoring on WHICH FACT
+    // released the gate, rather than on how long the release took, is what
+    // makes it falsifiable again.
     assert!(
-        held >= Duration::from_millis(PRODUCTION_READINESS_BUFFER_MS),
-        "the wrapper's WEAK (output-settled) interface fact released the delegate pointer after \
-         only {held:?}, which is less than the deck's own {PRODUCTION_READINESS_BUFFER_MS} ms \
-         readiness buffer could possibly have taken. Settling is a guess — a launcher stalled \
-         mid-boot settles exactly like a REPL waiting at its prompt — so only the raw-input-mode \
-         OBSERVATION may skip the buffer (issue #243 review, guard 1)"
+        held_from_strong >= Duration::from_millis(PRODUCTION_WRAPPER_INTERFACE_BUFFER_MS),
+        "the delegate pointer landed {held_from_strong:?} after the wrapper's STRONG interface \
+         fact ({held_from_weak:?} after its weak one), short of the \
+         {PRODUCTION_WRAPPER_INTERFACE_BUFFER_MS} ms interface buffer that fact is priced at. \
+         The gate released on the output-settled GUESS instead of holding for the observation \
+         behind it. Settling is not evidence of an interface — a launcher stalled mid-boot \
+         settles exactly like a REPL at its prompt, and `devbox run codex-big` does it for a \
+         measured 2750–4132 ms while the pty is still canonical — so a pointer written then goes \
+         into the LAUNCHER's line discipline, is drained fused when the agent finally takes raw \
+         mode, and parks unsubmitted in the composer (issue #243, `INTERFACE_UPGRADE_WINDOW`)"
     );
-    // The banner is the user-visible half of the same statement, and it is the
-    // one a reader can check by eye: a worker that has been sitting at its
-    // prompt this whole time still waited out the buffer.
+    // The user-visible half of the same statement, and the one a reader can
+    // check by eye: a worker whose banner has been on the pane this whole time
+    // still waited for the fact that says the AGENT owns the terminal.
     assert!(
-        run.banner_at.elapsed() >= Duration::from_millis(PRODUCTION_READINESS_BUFFER_MS),
-        "the pointer arrived {:?} after the replacement's prompt appeared, inside the buffer",
+        run.banner_at.elapsed() >= Duration::from_millis(PRODUCTION_WRAPPER_INTERFACE_BUFFER_MS),
+        "the pointer arrived {:?} after the replacement's prompt appeared, which is inside the \
+         interface buffer alone — never mind the cooked dwell before it",
         run.banner_at.elapsed()
     );
     run.daemon.registry.shutdown_all();
 }
 
-/// Scenario: Delegate with `clear = true` to a wrapped stand-in that clears `ICANON`/`ECHO` on its terminal, so its wrapper reports the strong raw-input-mode observation. With no operator buffer configured the pointer must land well inside the buffer it skips; with `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=1500` set, the very same skip must instead hold it for at least that 1500 ms.
+/// Scenario: Delegate with `clear = true` to a wrapped stand-in that clears `ICANON`/`ECHO` on its terminal, so its wrapper reports the strong raw-input-mode observation and the gate releases on it. With no operator buffer configured the pointer must then be held for the full 5000 ms interface buffer that fact is priced at — not the ordinary 1000 ms every other readiness fact gets; with `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=1500` set, the very same release must instead hold it for that 1500 ms and no longer.
 #[spec("orchestration/delegate/027")]
 #[test]
 #[cfg(unix)]
-fn delegate_027_raw_input_fact_skips_the_buffer_but_never_the_operator_setting() {
+fn delegate_027_raw_input_fact_pays_the_interface_buffer_never_the_operators() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -1881,15 +2097,19 @@ fn delegate_027_raw_input_fact_skips_the_buffer_but_never_the_operator_setting()
 
     {
         // ARM 1 — the FEATURE. The variable is REMOVED, not set to `0`: guard 3
-        // floors the skip at an explicitly-set value, so leaving a sibling
-        // test's setting in place would mask exactly what this arm measures.
+        // makes an explicitly-set value win over BOTH defaults, so leaving a
+        // sibling test's setting in place would decide the very number this arm
+        // measures. Only an unset variable reaches
+        // `WRAPPER_INTERFACE_READINESS_BUFFER`.
         let _base = EnvGuard::set(&[
             (SESSION_START_WAIT_ENV, "30000"),
             (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
             (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
         ]);
         let _unset = EnvGuard::unset(&[DELEGATE_READINESS_BUFFER_ENV]);
-        runtime.block_on(delegate_027_raw_input_fact_skips_the_buffer_inner(&script));
+        runtime.block_on(delegate_027_raw_input_fact_pays_the_interface_buffer_inner(
+            &script,
+        ));
     }
 
     {
@@ -1903,9 +2123,9 @@ fn delegate_027_raw_input_fact_skips_the_buffer_but_never_the_operator_setting()
             (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
             (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
         ]);
-        runtime.block_on(delegate_027_operator_pinned_buffer_survives_the_skip_inner(
-            &script,
-        ));
+        runtime.block_on(
+            delegate_027_operator_pinned_buffer_replaces_the_interface_buffer_inner(&script),
+        );
     }
 }
 
@@ -1924,22 +2144,30 @@ fn assert_raw_input_fact(run: &WrappedInterfaceRun) {
         "control: a stand-in that cleared ICANON/ECHO before writing a byte must announce the \
          RAW-INPUT observation — with no output yet, the settle branch cannot fire at all. \
          Getting the settled value here means the wrapper stopped observing the child's line \
-         discipline, and every skip in production silently became a 1 s wait; metadata = {:?}",
+         discipline, and every wrapped agent in production silently dropped to the ordinary \
+         buffer — or, since `46ccca1`, to waiting the readiness timeout out first; \
+         metadata = {:?}",
         run.interface_event.metadata
     );
+    // THE FAIL-CLOSED ALARM, and round 3 did not weaken it. Guard 2 refuses
+    // toward the SHORTER buffer, so a version of it that turned down every
+    // honest agent would leave the deck writing into a codex-cli that is still
+    // initialising — silently, with the payload parked in the composer — and
+    // every other assertion in this suite would stay green. This is still the
+    // only thing in the suite that would notice.
     assert!(
         run.daemon
             .registry
             .agent_spawned_as_wrapper_host(&run.new_agent_id),
         "control: guard 2 must admit this replacement — the deck resolved the bare command \
          `codex` to a Wrapper-strategy agent and exec'd it under `dot-agent-deck wrap` itself. If \
-         this is false the fast path is dead for every honest agent, which is the one regression \
-         no other test in this suite can see"
+         this is false the interface buffer is unreachable for every honest agent, which is the \
+         one regression no other test in this suite can see"
     );
 }
 
 #[cfg(unix)]
-async fn delegate_027_raw_input_fact_skips_the_buffer_inner(script: &str) {
+async fn delegate_027_raw_input_fact_pays_the_interface_buffer_inner(script: &str) {
     let run = run_wrapped_interface_delegate(script, RAW_INPUT_READY_BANNER).await;
     assert_raw_input_fact(&run);
 
@@ -1953,25 +2181,50 @@ async fn delegate_027_raw_input_fact_skips_the_buffer_inner(script: &str) {
     let held = (chrono::Utc::now() - run.interface_event.timestamp)
         .to_std()
         .unwrap_or(Duration::ZERO);
+    // The UPPER bound, and it is this `wait_for_snapshot_needle` that carries
+    // it: 10 s is a third of `SESSION_START_WAIT_TIMEOUT`, so a pointer that
+    // shows up here at all was released by the fact this run anchored on and not
+    // by the gate giving up. That separation still works for this test — unlike
+    // `orchestration/delegate/026`'s — because the strong fact releases the gate
+    // in the instant it arrives rather than at window expiry.
     assert!(
         snapshot_contains(&delivered, POINTER),
         "the delegate pointer never arrived at all within {HELD_POINTER_DELIVERY_CEILING:?} of \
          the wrapper's raw-input interface event; snapshot = {:?}",
         String::from_utf8_lossy(&delivered)
     );
+    // THE LOWER BOUND, and round 3 inverted it. This asserted `held <= 700 ms`
+    // for two rounds — that the strong fact SKIPPED the buffer outright — and
+    // the premise was measured false: a full-screen TUI enables raw mode at
+    // INIT, real codex-cli 85 ms after exec and `orchestration/delegate/009` at
+    // fork + 100 ms, so writing on that instant is the earliest and worst moment
+    // available and `/009` lost the pointer into an unsubmitted composer exactly
+    // as production did. There is no skip to pin. What fact 1 buys now is a
+    // DIFFERENT buffer, sized against how long that initialisation goes on
+    // eating input, and this bound is what tells the two defaults apart.
+    //
+    // It is one bound over both surviving guards, which is why the message names
+    // both. Guard 1 mis-priced (the strong fact treated as an ordinary readiness
+    // fact) and guard 2 fail-closed (`agent_spawned_as_wrapper_host` refusing an
+    // honest agent) both land on `delegate_readiness_buffer()` and both show up
+    // here as ~1 s instead of ~5 s.
     assert!(
-        held <= SKIPPED_BUFFER_DELIVERY_BUDGET,
-        "a wrapper-hosted agent whose interface the wrapper OBSERVED (raw input mode) took \
-         {held:?} to receive its pointer, more than {SKIPPED_BUFFER_DELIVERY_BUDGET:?}. That is \
-         the {PRODUCTION_READINESS_BUFFER_MS} ms default buffer still being paid, i.e. the skip \
-         did not happen. Guard 2 is fail-closed, so the likely cause is \
-         `agent_spawned_as_wrapper_host` refusing an honest agent — which restores issue #243's \
-         31 s regression while leaving every other test in this suite green"
+        held >= Duration::from_millis(PRODUCTION_WRAPPER_INTERFACE_BUFFER_MS),
+        "a wrapper-hosted agent whose interface the wrapper OBSERVED (raw input mode) received \
+         its pointer {held:?} after that observation, short of the \
+         {PRODUCTION_WRAPPER_INTERFACE_BUFFER_MS} ms \
+         `WRAPPER_INTERFACE_READINESS_BUFFER` the strong fact is priced at. A figure near \
+         {PRODUCTION_READINESS_BUFFER_MS} ms is the ORDINARY buffer being paid instead, and there \
+         are exactly two ways to get there: guard 1 stopped telling the wrapper's two facts \
+         apart, or guard 2 is refusing an honest agent. The second is fail-closed and silent — \
+         every other test in this suite stays green through it — and what it costs is the \
+         measured 3601 ms worst case codex-cli's TUI initialisation needs under load, i.e. the \
+         prompt parks unsubmitted in the composer and no turn ever starts"
     );
 }
 
 #[cfg(unix)]
-async fn delegate_027_operator_pinned_buffer_survives_the_skip_inner(script: &str) {
+async fn delegate_027_operator_pinned_buffer_replaces_the_interface_buffer_inner(script: &str) {
     let run = run_wrapped_interface_delegate(script, RAW_INPUT_READY_BANNER).await;
     assert_raw_input_fact(&run);
 
@@ -1995,38 +2248,59 @@ async fn delegate_027_operator_pinned_buffer_survives_the_skip_inner(script: &st
         held >= Duration::from_millis(OPERATOR_PINNED_BUFFER_MS),
         "the interface observation released the pointer after {held:?}, short of the \
          {OPERATOR_PINNED_BUFFER_MS} ms the operator pinned in \
-         {DELEGATE_READINESS_BUFFER_ENV}. The skip may zero the deck's OWN default; it must never \
-         zero the operator's setting, which is #199's escape hatch and the one knob someone whose \
-         prompts go missing on a slow machine can reach for — a marker on an unauthenticated \
-         socket must not be able to switch it off (issue #243 review, guard 3)"
+         {DELEGATE_READINESS_BUFFER_ENV}. The deck may choose its OWN default off this fact; it \
+         must never choose the operator's setting off, which is #199's escape hatch and the one \
+         knob someone whose prompts go missing on a slow machine can reach for — a marker on an \
+         unauthenticated socket must not be able to shorten it (issue #243 review, guard 3)"
+    );
+    // THE OTHER HALF, added in round 3, and without it this arm pins nothing.
+    // Guard 3 used to be the only thing standing between the operator's interval
+    // and a SKIP, so a lower bound alone said everything: no guard meant ~0 ms.
+    // Now no guard means `WRAPPER_INTERFACE_READINESS_BUFFER`, and 5000 ms
+    // clears a 1500 ms floor comfortably — measured, by deleting the operator
+    // branch and watching this arm stay green. What guard 3 actually promises is
+    // that an explicitly-set value OVERRIDES both defaults rather than being
+    // max()-ed against them, so that "what the operator set" and "what the
+    // operator gets" stay the same sentence; a value ABOVE the pin is as much a
+    // violation of that as one below it, and only a two-sided bound says so.
+    assert!(
+        held <= SHORT_BUFFER_ATTRIBUTION_CEILING,
+        "the operator pinned {OPERATOR_PINNED_BUFFER_MS} ms in \
+         {DELEGATE_READINESS_BUFFER_ENV} and the pointer was held {held:?} instead, past \
+         {SHORT_BUFFER_ATTRIBUTION_CEILING:?}. That is the \
+         {PRODUCTION_WRAPPER_INTERFACE_BUFFER_MS} ms interface default being applied over the \
+         operator's own interval — a max() rather than an override. The escape hatch has to be \
+         able to shorten this buffer as well as lengthen it: it is how the e2e harness pins 0, \
+         and an operator who measured their own machine is not overruled by a default measured \
+         on someone else's"
     );
 }
 
-/// Scenario: Delegate with `clear = true` to a plain `cat` worker the daemon never spawned as a wrapper host, then post a `SessionStart` for it carrying the wrapper's strong `wrapper_interface_ready` marker — the forgery #243's audit reproduced from a bare `python3`. The marker must release the gate but NOT the buffer: the pointer stays held for the whole configured 1000 ms.
+/// Scenario: Delegate with `clear = true` to a plain `cat` worker the daemon never spawned as a wrapper host, then post a `SessionStart` for it carrying the wrapper's strong `wrapper_interface_ready` marker — the forgery #243's audit reproduced from a bare `python3`. The marker must release the gate and be priced as an ORDINARY readiness fact: the pointer is held for the deck's 1000 ms default, and specifically not for the 5000 ms interface buffer a genuine wrapper host's observation would have bought.
 #[spec("orchestration/delegate/028")]
 #[test]
 #[cfg(unix)]
-fn delegate_028_forged_interface_marker_does_not_skip_the_buffer() {
+fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let _env = EnvGuard::set(&[
         (SESSION_START_WAIT_ENV, "30000"),
         (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
         (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
     ]);
-    // Unset for the same reason `/026` unsets it: with an explicit value pinned,
-    // guard 3 floors the skip and the buffer survives guard 2's deletion, so the
-    // test would pass while pinning nothing.
+    // Unset because guard 3 makes an explicitly-set value win over BOTH
+    // defaults: with one pinned, the forged and the honest paths resolve to the
+    // same number and this test could not tell them apart at all.
     let _unset = EnvGuard::unset(&[DELEGATE_READINESS_BUFFER_ENV]);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .expect("build forged-marker readiness runtime")
-        .block_on(delegate_028_forged_interface_marker_does_not_skip_the_buffer_inner());
+        .block_on(delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inner());
 }
 
 #[cfg(unix)]
-async fn delegate_028_forged_interface_marker_does_not_skip_the_buffer_inner() {
+async fn delegate_028_forged_interface_marker_is_priced_as_an_ordinary_fact_inner() {
     let daemon = common::spawn_inprocess_daemon().await;
     let cwd = common::race_safe_tempdir();
     std::fs::write(
@@ -2105,12 +2379,10 @@ async fn delegate_028_forged_interface_marker_does_not_skip_the_buffer_inner() {
     )
     .await;
     let held = posted_at.elapsed();
-    // Being precise about the delta this pins. Releasing the GATE was already
-    // forgeable before #243 — a bare unmarked `SessionStart` does it — and still
-    // is, which is why the pointer is expected to ARRIVE rather than be
-    // withheld. What #243 newly granted, and what guard 2 takes back, is the
-    // ability to also SUPPRESS the buffer: the last protection against writing
-    // into a still-booting agent (#199/#249/#663).
+    // Being precise about the delta this pins, because round 3 moved it.
+    // Releasing the GATE was already forgeable before #243 — a bare unmarked
+    // `SessionStart` does it — and still is, which is why the pointer is
+    // expected to ARRIVE rather than be withheld.
     assert!(
         snapshot_contains(&delivered, POINTER),
         "the forged marker should still RELEASE the gate — that was always forgeable and is not \
@@ -2120,12 +2392,29 @@ async fn delegate_028_forged_interface_marker_does_not_skip_the_buffer_inner() {
     );
     assert!(
         held >= Duration::from_millis(PRODUCTION_READINESS_BUFFER_MS),
-        "a forged `wrapper_interface_ready` marker suppressed the readiness buffer: the pointer \
-         landed {held:?} after the line hit the socket, inside the deck's own \
-         {PRODUCTION_READINESS_BUFFER_MS} ms. The daemon never spawned this pane as a wrapper \
-         host, so nothing is observing that child's interface and the claim is unbacked — an \
-         unauthenticated producer must not be able to turn the buffer off on demand (issue #243 \
-         audit F1, guard 2)"
+        "the forged marker released the pointer {held:?} after the line hit the socket, inside \
+         the deck's own {PRODUCTION_READINESS_BUFFER_MS} ms readiness buffer. Every readiness \
+         fact the deck has owes a buffer — a session existing is not the TUI interpreting `\r` \
+         as submit (#199/#249/#663) — so no marker of any kind may deliver faster than this"
+    );
+    // THE GUARD-2 ASSERTION, and it is this one, not the floor above. The
+    // catalog entry for this test claimed "dropping guard 2 delivers in 21.1 ms"
+    // and that proof expired with `56c10dd`: with the SKIP replaced by a second
+    // buffer, dropping guard 2 no longer delivers instantly — it delivers after
+    // `WRAPPER_INTERFACE_READINESS_BUFFER`, which sails over the 1000 ms floor.
+    // Measured: this test stayed green with `agent_spawned_as_wrapper_host`
+    // deleted from the seam. What guard 2 is worth is now ATTRIBUTION rather
+    // than privilege — whether a claimed interface fact is priced as a real
+    // TUI's initialisation or as an ordinary readiness fact — and telling
+    // 1000 ms from 5000 ms is the only way to observe it.
+    assert!(
+        held <= SHORT_BUFFER_ATTRIBUTION_CEILING,
+        "a forged `wrapper_interface_ready` marker was priced as a real wrapper's OBSERVATION: \
+         the pointer was held {held:?}, past {SHORT_BUFFER_ATTRIBUTION_CEILING:?} and toward the \
+         {PRODUCTION_WRAPPER_INTERFACE_BUFFER_MS} ms interface buffer. The daemon never spawned \
+         this pane as a wrapper host, so nothing is observing that child's interface and the \
+         claim is unbacked — the deck's own frozen launch record, which no hook path can write, \
+         is the only thing that may select that buffer (issue #243 audit F1, guard 2)"
     );
     daemon.registry.shutdown_all();
 }
