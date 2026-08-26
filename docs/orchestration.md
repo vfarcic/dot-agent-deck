@@ -214,8 +214,8 @@ The release flow is stateful: open branch → push → create PR → wait for CI
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `name` | string | no | cwd basename | Display name shown in the tab bar. Defaults to the project directory name when empty. |
-| `default` | bool | no | `false` | Marks this as the orchestration to open when nothing named one — in practice a [scheduled task](scheduled-tasks.md) rooted here, since the new-pane form and a dispatcher agent both ask. Exactly one orchestration may declare it, and it must have roles; with a single orchestration it does nothing. Without any declaration the first orchestration with roles wins, which is what happened before this key existed. See [Which orchestration a scheduled task opens](configuration.md#which-orchestration-a-scheduled-task-opens). |
-| `extends` | string | no | — | Inherit another orchestration's roles by its `name`, then override them with this block's own `[[orchestrations.roles]]` entries, matched by role name. Written for the case where several orchestrations run the same team on different providers. See [Sharing a workflow between orchestrations](configuration.md#sharing-a-workflow-between-orchestrations). |
+| `default` | bool | no | `false` | Marks this as the orchestration to open when nothing named one — in practice a [scheduled task](scheduled-tasks.md) rooted here, since the new-pane form and a dispatcher agent both ask. Exactly one orchestration may declare it, and it must have roles; with a single orchestration it does nothing. Without any declaration the first orchestration with roles wins, which is what happened before this key existed. See [Which orchestration a scheduled task opens](#which-orchestration-a-scheduled-task-opens). |
+| `extends` | string | no | — | Inherit another orchestration's roles by its `name`, then override them with this block's own `[[orchestrations.roles]]` entries, matched by role name. Written for the case where several orchestrations run the same team on different providers. See [Sharing a workflow with `extends`](#sharing-a-workflow-with-extends). |
 | `roles` | array | yes¹ | — | Role definitions. Must contain at least one role with `start = true`. ¹Optional in a block that `extends` another, which may restate only the roles it changes. |
 
 ### `[[orchestrations.roles]]`
@@ -414,17 +414,102 @@ dot-agent-deck validate
 
 It reports errors (which stop an orchestration opening) and warnings (which do not). Among them, for projects with more than one orchestration: declaring `default = true` twice, or on a block with no roles, is an **error**; defining several orchestrations and declaring the default on none of them is a **warning**, because the choice then rests on the order of the blocks in the file.
 
-## Running more than one orchestration
-
-### Several definitions in one project
+## More than one orchestration
 
 A project can define more than one `[[orchestrations]]` block, and the usual reason is that different kinds of work want different workflows — a feature that needs a test-plan gate and a release step is not the same pipeline as a one-line bug fix. A second reason is the same team wired to a different set of agent CLIs, so a contributor who has credentials for only one provider can still run it and work survives one provider's credits running out.
 
-Two keys make that practical, and both are documented in [Configuration](configuration.md): `extends` lets orchestrations that share a workflow inherit it instead of being copies of each other, and `default = true` declares which one a [scheduled task](scheduled-tasks.md) opens — the one path with nobody to ask.
+Two keys make that practical, and the first two sections below cover them. **Defining** several orchestrations is a separate question from **running** several at the same time, which the sections after them are about.
 
-Defining several is unrelated to *running* several at once, which is what the rest of this section is about.
+### Sharing a workflow with `extends`
 
-### Running several at once
+Two orchestrations that share a workflow — the same roles, the same prompts, the same order — should not be two copies of it. `extends` lets one inherit another's roles, so the second is only what actually differs. The clearest case is a set of provider variants, where that is just each role's `command`:
+
+```toml
+[[orchestrations]]
+name = "mixed"
+default = true
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "devbox run agent-orchestrator"
+start = true
+prompt_template = """
+You coordinate the team. …
+"""
+
+[[orchestrations.roles]]
+name = "coder"
+command = "devbox run agent-coder"
+description = "Implements features, fixes bugs"
+
+[[orchestrations]]
+name = "GPT"
+extends = "mixed"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "devbox run agent-orchestrator-oc"
+
+[[orchestrations.roles]]
+name = "coder"
+command = "devbox run agent-coder-oc"
+```
+
+`GPT` gets both roles with `mixed`'s `start`, `description` and `prompt_template` intact; only the two commands differ. Editing the orchestrator's `prompt_template` in `mixed` changes it for every variant — which is the point, and the reason to prefer this over copying the block.
+
+The rules:
+
+- **`extends` names the parent's literal `name`.** The parent may appear anywhere in the file, above or below. A block with no `name` cannot be a parent.
+- **Roles are matched by name and the parent's ORDER is kept.** A role's position within the orchestration is what the tab layout and delegation key panes on, so a variant always opens with the same columns as its parent, whatever order you write the overrides in.
+- **An omitted field keeps the parent's value.** Restate only what differs. To turn off an inherited `clear = true`, write `clear = false` explicitly — an omitted boolean means "inherit", not "false".
+- **A role name the parent does not have is added** as a new role, and must carry its own `command` since there is nothing to inherit one from.
+- **Chains work** (`a` extends `b` extends `c`); a cycle is rejected when the file is read.
+- **`default` and `name` are never inherited** — they identify the block, not its workflow.
+
+An `extends` naming an orchestration that does not exist, or forming a cycle, fails the whole config to load with a message naming both sides. That is deliberate: the alternative leaves the variant with only the roles it restated, and the symptom is then "orchestration must have at least 2 roles" about a file that plainly has six.
+
+### Which orchestration a scheduled task opens
+
+**Most of the time nothing needs a default.** Both ways of starting an orchestration by hand ask you which one: the new-pane form (`Ctrl+n`) lists every orchestration as a Mode chip to cycle through, and a [dispatcher pane](dispatcher-mode.md) lists them and asks before it starts anything.
+
+`default = true` is for the case where **there is nobody to ask** — a [scheduled task](scheduled-tasks.md) whose working directory defines orchestrations. It fires on a cron tick, and something has to decide which team it opens:
+
+```toml
+[[orchestrations]]
+name = "prd"
+default = true
+# roles …
+
+[[orchestrations]]
+name = "issue"
+# roles …
+```
+
+`default` sits on the block, so it moves with the block. Exactly one orchestration may declare it, and that orchestration must define roles — `dot-agent-deck validate` rejects both mistakes. **With a single orchestration the key does nothing; omit it.**
+
+**If nothing declares it, the first orchestration with roles wins.** That is the historical rule and it still applies, so a config written before this key keeps behaving identically. With several orchestrations it is worth declaring anyway, because reordering the file then changes which team every scheduled run opens, and nothing in that diff says so.
+
+When the choice is left implicit, the deck says so rather than quietly picking. `dot-agent-deck validate` is where **you** see it:
+
+```
+$ dot-agent-deck validate
+[warning] 'prd': 2 orchestrations are defined and none declares `default = true`, so a dispatch or scheduled task that names none opens this one purely because it comes first in the file — reordering the file would silently change that. Add `default = true` to the one you want.
+```
+
+A **dispatcher agent** is told the same thing in its own words, and its listing marks the default so it can act on *"just use the usual one"* rather than asking twice:
+
+```
+Available dispatch targets:
+  single            one agent (--single)
+  orchestration     'prd' — 6 roles (--orchestration 'prd')  [default]
+  orchestration     'issue' — 4 roles (--orchestration 'issue')
+
+Ask the user which they want before dispatching, then pass the matching flag.
+```
+
+A **scheduled task** has nobody to tell, so its copy goes only to the daemon log. That is the whole reason to declare the default: it is the one path where the deck cannot ask you and cannot show you that it did not.
+
+### Running several at the same time
 
 Concurrent orchestrations are safe **across directories**. Each orchestration tab is its own routing group, so a delegate never reaches another orchestration's worker and a work-done never reaches another orchestration's orchestrator — even when two orchestrations share the same `name`. Distinct directories also mean distinct `.dot-agent-deck/` coordination files and distinct working trees, so the two pipelines never contend for the same state on disk either.
 
@@ -505,7 +590,7 @@ The daemon re-reads `.dot-agent-deck.toml` on every delegation, so edits take ef
 
 ### Two orchestrations with the same project name conflict
 
-If you run two orchestration tabs from different directories that happen to have the same basename (e.g. `~/a/myproject` and `~/b/myproject`), the daemon disambiguates delegation routing by their full path. Two tabs of the *same* orchestration in the *same* directory are also routed separately — each tab is its own routing group — but they still share the coordination files and the working tree, which is why the deck warns about that case. See [Running more than one orchestration](#running-more-than-one-orchestration).
+If you run two orchestration tabs from different directories that happen to have the same basename (e.g. `~/a/myproject` and `~/b/myproject`), the daemon disambiguates delegation routing by their full path. Two tabs of the *same* orchestration in the *same* directory are also routed separately — each tab is its own routing group — but they still share the coordination files and the working tree, which is why the deck warns about that case. See [Running several at the same time](#running-several-at-the-same-time).
 
 ## See also
 
