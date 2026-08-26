@@ -33,6 +33,10 @@ use dot_agent_deck::agent_pty::{
 use dot_agent_deck::event::{
     AgentEvent, AgentType, BroadcastMsg, DelegateSignal, EventType, WorkDoneSignal,
 };
+#[cfg(unix)]
+use dot_agent_deck::event::{
+    WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN, WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN,
+};
 use dot_agent_deck::state::{AppState, OrchestrationIdentity};
 #[cfg(unix)]
 use spec::spec;
@@ -83,6 +87,27 @@ impl EnvGuard {
             // SAFETY: every env-mutating test in this integration-test binary
             // holds ENV_LOCK for the guard's full lifetime.
             unsafe { std::env::set_var(key, value) };
+        }
+        Self { previous }
+    }
+
+    /// Issue #243: guarantee a variable is UNSET for the guard's lifetime, and
+    /// restore whatever it was afterwards.
+    ///
+    /// `set` cannot express this, and "unset" is a distinct third state here
+    /// rather than a synonym for `0`: the buffer skip floors at an EXPLICIT
+    /// setting, so a test that means "the operator configured nothing" has to
+    /// remove the variable. Under nextest each test owns its process and it is
+    /// already absent; under plain `cargo test` a sibling test in this binary
+    /// has almost certainly left one behind, which would silently floor the very
+    /// skip the caller is measuring.
+    #[cfg(unix)]
+    fn unset(keys: &[&'static str]) -> Self {
+        let mut previous = Vec::with_capacity(keys.len());
+        for key in keys {
+            previous.push((*key, std::env::var_os(key)));
+            // SAFETY: the caller holds ENV_LOCK for the guard's full lifetime.
+            unsafe { std::env::remove_var(key) };
         }
         Self { previous }
     }
@@ -463,11 +488,33 @@ fn session_start_event(
     agent_id: &str,
     wrapper_fork: bool,
 ) -> AgentEvent {
+    session_start_event_with_origin(
+        agent_type,
+        pane_id,
+        agent_id,
+        wrapper_fork.then_some(WRAPPER_FORK_SESSION_START_ORIGIN),
+    )
+}
+
+/// A `SessionStart` carrying an arbitrary `session_start_origin` value, or none.
+///
+/// Issue #243 gave the marker three values instead of one, and the daemon prices
+/// them differently, so `wrapper_fork: bool` stopped being able to say what a
+/// test means. The forgery test (`orchestration/delegate/028`) in particular
+/// needs to post a value NO honest producer would emit for its pane, which is a
+/// thing only a free-form origin can express.
+#[cfg(unix)]
+fn session_start_event_with_origin(
+    agent_type: AgentType,
+    pane_id: &str,
+    agent_id: &str,
+    origin: Option<&str>,
+) -> AgentEvent {
     let mut metadata = std::collections::HashMap::new();
-    if wrapper_fork {
+    if let Some(origin) = origin {
         metadata.insert(
             SESSION_START_ORIGIN_METADATA_KEY.to_string(),
-            WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+            origin.to_string(),
         );
     }
     AgentEvent {
@@ -1396,6 +1443,691 @@ async fn delegate_024_wrapped_worker_without_native_session_start_is_delivered_p
             String::from_utf8_lossy(&eventual)
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #243 review: the THREE guards on the readiness-buffer skip.
+//
+// `src/state.rs`'s delegate seam drops the post-readiness buffer to zero only
+// when all three hold: the event carried the STRONG interface fact
+// (`wrapper_interface_ready`, the child cleared `ICANON`/`ECHO`), the daemon's
+// own frozen launch record says it spawned that agent as a wrapper host, and the
+// operator pinned no `…_DELEGATE_READINESS_BUFFER_MS` of their own. `/026`,
+// `/027` and `/028` below pin one guard each; between them they also pin that
+// the fast path still WORKS, which is the failure `/024` cannot see — guard 2 is
+// fail-closed, so a refactor that made it refuse every honest agent would
+// silently restore the 31 s regression with every other test still green.
+// ---------------------------------------------------------------------------
+
+/// Issue #243: every `AgentEvent` the daemon broadcast since the collector
+/// started, so a test can ask WHICH readiness fact released its gate.
+///
+/// A collector rather than an inline `subscribe()` + `recv()`: the interface
+/// event can arrive before the test's next await point (the wrapper emits it
+/// from its own 50 ms supervisory poll, off any clock the test controls), and a
+/// broadcast receiver that is not being drained lags. Started before the
+/// delegate is issued, drained continuously, and queried afterwards.
+#[cfg(unix)]
+struct EventCollector {
+    events: Arc<Mutex<Vec<AgentEvent>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl EventCollector {
+    fn start(event_tx: &broadcast::Sender<BroadcastMsg>) -> Self {
+        let mut rx = event_tx.subscribe();
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let task = tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(BroadcastMsg::Event(event)) => {
+                        sink.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+                    }
+                    Ok(BroadcastMsg::OrchestrationSurface(_)) => {}
+                    // A lagged receiver has lost events it will never see again;
+                    // the queries below report an empty result rather than
+                    // asserting, so the caller fails with its own message.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        Self { events, task }
+    }
+
+    /// Every wrapper INTERFACE `SessionStart` seen for `agent_id`, in arrival
+    /// order. Fork-time provenance events are excluded: they say a child was
+    /// forked, not that its interface exists.
+    fn interface_session_starts(&self, agent_id: &str) -> Vec<AgentEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|event| {
+                event.agent_id.as_deref() == Some(agent_id)
+                    && event.is_wrapper_interface_session_start()
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Block until the wrapper announces `agent_id`'s interface, and return that
+    /// event. Panics with the whole captured stream on timeout, because every
+    /// caller's run means nothing without it.
+    async fn wait_for_interface_session_start(
+        &self,
+        agent_id: &str,
+        timeout: Duration,
+    ) -> AgentEvent {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(event) = self.interface_session_starts(agent_id).into_iter().next() {
+                return event;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the wrapper never announced agent {agent_id:?}'s interface within {timeout:?}, \
+                 so this run establishes nothing about how the readiness buffer prices the two \
+                 interface facts; captured events = {:?}",
+                self.events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .map(|event| (
+                        event.agent_id.clone(),
+                        format!("{:?}", event.event_type),
+                        event.metadata.clone()
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EventCollector {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Issue #243: a wrapped-agent delegate run, held open so the caller can measure
+/// what happens AFTER the wrapper announces the replacement's interface.
+///
+/// Keeps the daemon and the working directory alive — dropping either kills the
+/// pane the caller is still polling.
+#[cfg(unix)]
+struct WrappedInterfaceRun {
+    daemon: common::InProcDaemon,
+    _cwd: tempfile::TempDir,
+    /// Kept alive only so its draining task outlives the run; queried before
+    /// the struct is built.
+    _collector: EventCollector,
+    new_agent_id: String,
+    /// The interface `SessionStart` the wrapper emitted for the REPLACEMENT
+    /// worker — the event the buffer seam prices.
+    interface_event: AgentEvent,
+    /// When the replacement's banner became visible on its pane. Not the timing
+    /// anchor (that is `interface_event.timestamp`); the user-visible control
+    /// that a worker really was sitting at its interface.
+    banner_at: Instant,
+}
+
+/// Drive one `clear = true` delegate to a `codex`-named stand-in that the deck
+/// really wraps, and return once the wrapper has announced the replacement's
+/// interface.
+///
+/// `script` is the stand-in's whole body and is what selects WHICH interface
+/// fact fires — a child that never leaves cooked mode can only ever produce the
+/// settled guess, and one that clears `ICANON`/`ECHO` produces the raw-input
+/// observation. Everything else is `orchestration/delegate/024`'s setup: the
+/// command is the bare name `codex` on a `$PATH` carrying both the fixture and
+/// the built deck binary, so `AgentType::from_command` resolves it to a
+/// Wrapper-strategy agent and the common spawn boundary rewrites it into a REAL
+/// `dot-agent-deck wrap --agent codex -- codex`.
+#[cfg(unix)]
+async fn run_wrapped_interface_delegate(script: &str, banner: &str) -> WrappedInterfaceRun {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let cwd = common::race_safe_tempdir();
+    let bin_dir = cwd.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("create wrapped-agent bin dir");
+    write_executable(&bin_dir.join("codex"), script);
+    std::fs::write(
+        cwd.path().join(".dot-agent-deck.toml"),
+        clear_true_config("codex"),
+    )
+    .expect("write wrapped interface-fact orchestration config");
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    let old_agent_id = daemon
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some("codex"),
+            cwd: Some(&cwd_str),
+            env: vec![
+                (DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string()),
+                (
+                    "DOT_AGENT_DECK_SOCKET".to_string(),
+                    daemon.hook_path.display().to_string(),
+                ),
+                ("PATH".to_string(), path_with_built_deck(&bin_dir)),
+            ],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn initial wrapped interface-fact stand-in");
+    {
+        let mut state = daemon.state.write().await;
+        register_orchestration(&mut state, &cwd_str);
+    }
+
+    // Started BEFORE the delegate: the replacement's interface event can land
+    // before the first poll below returns.
+    let collector = EventCollector::start(&daemon.event_tx);
+
+    daemon
+        .state
+        .read()
+        .await
+        .handle_delegate(
+            DelegateSignal {
+                pane_id: ORCH_PANE.to_string(),
+                task: "List the files in the current directory.".to_string(),
+                to: vec![WORKER_ROLE.to_string()],
+                timestamp: chrono::Utc::now(),
+            },
+            &daemon.registry,
+            &daemon.event_tx,
+        )
+        .await;
+    let new_agent_id =
+        wait_for_replacement_agent(&daemon.registry, WORKER_PANE, &old_agent_id).await;
+
+    // CONTROL, the same one `/024` opens with: nothing below means anything
+    // unless the replacement genuinely reached its interface and painted it.
+    let painted = wait_for_snapshot_needle(
+        &daemon.registry,
+        &new_agent_id,
+        banner.as_bytes(),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        snapshot_contains(&painted, banner.as_bytes()),
+        "control: the wrapped replacement never painted its ready interface, so this run proves \
+         nothing about how the readiness buffer prices the wrapper's two facts; snapshot = {:?}",
+        String::from_utf8_lossy(&painted)
+    );
+    let banner_at = Instant::now();
+
+    let interface_event = collector
+        .wait_for_interface_session_start(&new_agent_id, WRAPPER_INTERFACE_ANNOUNCE_CEILING)
+        .await;
+    WrappedInterfaceRun {
+        daemon,
+        _cwd: cwd,
+        _collector: collector,
+        new_agent_id,
+        interface_event,
+        banner_at,
+    }
+}
+
+/// Issue #243: how long the wrapper's interface announcement is waited for
+/// before a run is called inconclusive.
+///
+/// Not an assertion about latency — the wrapper's supervisory poll is 50 ms and
+/// its settle window 750 ms, so both facts announce inside a second on any
+/// machine. It is a ceiling on a precondition: if no interface event arrives at
+/// all, every timing measurement below is measuring the 30 s fallback instead
+/// and the failure must say so rather than reporting a mysterious late pointer.
+#[cfg(unix)]
+const WRAPPER_INTERFACE_ANNOUNCE_CEILING: Duration = Duration::from_secs(15);
+
+/// Issue #243: how long the pointer is waited for after an interface event that
+/// should NOT have skipped the buffer.
+///
+/// Same role as `orchestration/delegate/010`'s ceiling and set for the same
+/// reason: the assertion is the lower bound below it, and this only separates
+/// "released by the buffer" from "released by nothing at all". Comfortably above
+/// the buffer plus any plausible scheduling, and comfortably below the 30 s
+/// `SESSION_START_WAIT_TIMEOUT` the fallback would otherwise supply.
+#[cfg(unix)]
+const HELD_POINTER_DELIVERY_CEILING: Duration = Duration::from_secs(10);
+
+/// Issue #243: the elapsed time from the wrapper's interface announcement to the
+/// pointer landing that counts as "the buffer was skipped".
+///
+/// Chosen against the 1000 ms `DELEGATE_READINESS_BUFFER` the skip removes, from
+/// both ends. Below: everything the deck does on this leg is a socket hop, a
+/// broadcast, a PTY write and this test's own 20 ms snapshot poll, and it was
+/// **measured at 10.1 ms** on this branch — so 700 ms is ~70x the real figure,
+/// which is the headroom a loaded CI runner needs on an upper bound. Above: it
+/// is 300 ms under the buffer that appears the moment the skip stops happening
+/// — measured at **1.0157 s** with the skip disabled at the seam — so a
+/// fail-closed regression cannot pass itself off as a slow machine.
+#[cfg(unix)]
+const SKIPPED_BUFFER_DELIVERY_BUDGET: Duration = Duration::from_millis(700);
+
+/// The deck's OWN `DELEGATE_READINESS_BUFFER` default, mirrored here because it
+/// is `pub(crate)` and an integration test cannot name it.
+///
+/// The two guard tests that must observe a buffer NOT being skipped
+/// (`orchestration/delegate/026`, `/028`) deliberately leave
+/// `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS` unset and assert against this
+/// instead — and that is load-bearing rather than tidiness. Guard 3 floors the
+/// skip at an explicitly-set value, so with the variable pinned to anything at
+/// all the buffer survives whether or not guards 1 and 2 exist: both tests would
+/// stay green with the guard they exist to pin deleted. Measured, not reasoned —
+/// `/026` passed with guard 1 reverted until this changed. If the production
+/// default ever moves, this constant is the one thing to re-derive.
+#[cfg(unix)]
+const PRODUCTION_READINESS_BUFFER_MS: u64 = 1000;
+
+/// Issue #243: an operator-pinned buffer for `orchestration/delegate/027`'s
+/// second arm, deliberately NOT the 1000 ms default.
+///
+/// A value equal to the default would leave the arm unable to tell "the skip
+/// floored at the operator's setting" from "the skip never happened", since both
+/// produce the same hold. 1500 ms is far enough above 1000 ms to be attributable
+/// and far enough below the 30 s clamp to keep the test fast.
+#[cfg(unix)]
+const OPERATOR_PINNED_BUFFER_MS: u64 = 1500;
+
+/// The nonce-carrying banner the cooked-mode stand-in paints before going quiet.
+#[cfg(unix)]
+const SETTLED_READY_BANNER: &str = "Ask Codex to do anything (settled-4b0d)";
+
+/// The nonce-carrying banner the raw-input stand-in paints after taking the
+/// terminal out of cooked mode.
+#[cfg(unix)]
+const RAW_INPUT_READY_BANNER: &str = "Ask Codex to do anything (raw-9f52)";
+
+/// A wrapped stand-in that paints its prompt and then waits for input **in
+/// cooked mode** — so the only interface fact the wrapper can ever observe about
+/// it is the weak one, output having settled for 750 ms.
+///
+/// Byte-for-byte `orchestration/delegate/024`'s shape (`printf …; exec cat`),
+/// because that shape is the point: it is what a launcher stalling mid-boot
+/// looks like from outside, and it is why the settled guess must not buy the
+/// buffer skip.
+#[cfg(unix)]
+fn cooked_settle_agent_script() -> String {
+    format!("#!/bin/sh\nprintf '{SETTLED_READY_BANNER}\\r\\n'\nexec cat\n")
+}
+
+/// A wrapped stand-in that takes its terminal OUT of cooked mode before painting
+/// anything — the observable signature of a TUI that is reading keystrokes, and
+/// the only thing that produces the strong `wrapper_interface_ready` fact.
+///
+/// `stty` before `printf` on purpose. The watch checks the line discipline
+/// first and the settle window only as a fallback, so clearing `ICANON`/`ECHO`
+/// while the child has written nothing at all makes fact 1 the only fact that
+/// CAN fire: with no output yet, the settle branch returns early. Painting first
+/// would leave which fact wins to a race between the 50 ms supervisory poll and
+/// the 750 ms settle window.
+#[cfg(unix)]
+fn raw_input_agent_script() -> String {
+    format!("#!/bin/sh\nstty raw -echo\nprintf '{RAW_INPUT_READY_BANNER}\\r\\n'\nexec cat\n")
+}
+
+/// Scenario: Delegate with `clear = true` to a wrapped stand-in that paints its prompt and then goes quiet in COOKED mode, so the only interface fact its wrapper can report is the weak output-settled guess. Assert that fact really is what arrived, and that the pointer is then held for at least the whole configured 1000 ms readiness buffer measured from that event.
+#[spec("orchestration/delegate/026")]
+#[test]
+#[cfg(unix)]
+fn delegate_026_settled_interface_fact_keeps_the_readiness_buffer() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (SESSION_START_WAIT_ENV, "30000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
+    ]);
+    // The buffer env is REMOVED, and that is the assertion's whole load-bearing
+    // half — see `PRODUCTION_READINESS_BUFFER_MS`. Pinning it would let guard 3
+    // hold the buffer up on its own, and this test would keep passing with the
+    // guard it exists to pin deleted.
+    let _unset = EnvGuard::unset(&[DELEGATE_READINESS_BUFFER_ENV]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("build settled-fact readiness runtime")
+        .block_on(delegate_026_settled_interface_fact_keeps_the_readiness_buffer_inner());
+}
+
+#[cfg(unix)]
+async fn delegate_026_settled_interface_fact_keeps_the_readiness_buffer_inner() {
+    let run =
+        run_wrapped_interface_delegate(&cooked_settle_agent_script(), SETTLED_READY_BANNER).await;
+
+    // CONTROL: this run only prices fact 2 if fact 2 is what fired. A fixture
+    // that accidentally cleared `ICANON`/`ECHO` — or a wrapper that stopped
+    // telling the two apart and re-collapsed them onto the strong value — would
+    // otherwise make the lower bound below assert about the wrong fact, and it
+    // is the strong one that is ALLOWED to skip.
+    assert_eq!(
+        run.interface_event
+            .metadata
+            .get(SESSION_START_ORIGIN_METADATA_KEY)
+            .map(String::as_str),
+        Some(WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN),
+        "control: a cooked-mode stand-in must announce the SETTLED guess, not the raw-input \
+         observation; metadata = {:?}",
+        run.interface_event.metadata
+    );
+    assert!(
+        !run.interface_event
+            .is_wrapper_interface_ready_session_start(),
+        "control: the settled marker must not satisfy the strong predicate the buffer skip reads"
+    );
+
+    let delivered = wait_for_snapshot_needle(
+        &run.daemon.registry,
+        &run.new_agent_id,
+        POINTER,
+        HELD_POINTER_DELIVERY_CEILING,
+    )
+    .await;
+    // Measured against the event's OWN timestamp, stamped by the wrapper before
+    // the line ever reached the daemon (`Emitter::build_event`). That instant is
+    // necessarily at or before the moment the daemon armed the buffer, so socket
+    // latency, scheduling and this test's 20 ms poll can only push `held` UP —
+    // the same one-sided shape `orchestration/delegate/010` uses, and the reason
+    // load cannot turn this red. What pushes it below the floor is the buffer
+    // being skipped, which is exactly the defect: before the two facts were
+    // priced apart, this fixture's settled guess suppressed the buffer and the
+    // pointer landed within milliseconds.
+    let held = (chrono::Utc::now() - run.interface_event.timestamp)
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    assert!(
+        snapshot_contains(&delivered, POINTER),
+        "the delegate pointer never arrived within {HELD_POINTER_DELIVERY_CEILING:?} of the \
+         wrapper's settled interface event, so nothing released it at all; snapshot = {:?}",
+        String::from_utf8_lossy(&delivered)
+    );
+    assert!(
+        held >= Duration::from_millis(PRODUCTION_READINESS_BUFFER_MS),
+        "the wrapper's WEAK (output-settled) interface fact released the delegate pointer after \
+         only {held:?}, which is less than the deck's own {PRODUCTION_READINESS_BUFFER_MS} ms \
+         readiness buffer could possibly have taken. Settling is a guess — a launcher stalled \
+         mid-boot settles exactly like a REPL waiting at its prompt — so only the raw-input-mode \
+         OBSERVATION may skip the buffer (issue #243 review, guard 1)"
+    );
+    // The banner is the user-visible half of the same statement, and it is the
+    // one a reader can check by eye: a worker that has been sitting at its
+    // prompt this whole time still waited out the buffer.
+    assert!(
+        run.banner_at.elapsed() >= Duration::from_millis(PRODUCTION_READINESS_BUFFER_MS),
+        "the pointer arrived {:?} after the replacement's prompt appeared, inside the buffer",
+        run.banner_at.elapsed()
+    );
+    run.daemon.registry.shutdown_all();
+}
+
+/// Scenario: Delegate with `clear = true` to a wrapped stand-in that clears `ICANON`/`ECHO` on its terminal, so its wrapper reports the strong raw-input-mode observation. With no operator buffer configured the pointer must land well inside the buffer it skips; with `DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS=1500` set, the very same skip must instead hold it for at least that 1500 ms.
+#[spec("orchestration/delegate/027")]
+#[test]
+#[cfg(unix)]
+fn delegate_027_raw_input_fact_skips_the_buffer_but_never_the_operator_setting() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("build raw-input readiness runtime");
+    let script = raw_input_agent_script();
+
+    {
+        // ARM 1 — the FEATURE. The variable is REMOVED, not set to `0`: guard 3
+        // floors the skip at an explicitly-set value, so leaving a sibling
+        // test's setting in place would mask exactly what this arm measures.
+        let _base = EnvGuard::set(&[
+            (SESSION_START_WAIT_ENV, "30000"),
+            (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+            (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
+        ]);
+        let _unset = EnvGuard::unset(&[DELEGATE_READINESS_BUFFER_ENV]);
+        runtime.block_on(delegate_027_raw_input_fact_skips_the_buffer_inner(&script));
+    }
+
+    {
+        // ARM 2 — guard 3 in isolation, on the SAME fixture and the same fact.
+        let _env = EnvGuard::set(&[
+            (
+                DELEGATE_READINESS_BUFFER_ENV,
+                &OPERATOR_PINNED_BUFFER_MS.to_string(),
+            ),
+            (SESSION_START_WAIT_ENV, "30000"),
+            (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+            (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
+        ]);
+        runtime.block_on(delegate_027_operator_pinned_buffer_survives_the_skip_inner(
+            &script,
+        ));
+    }
+}
+
+/// Assert the run really did exercise the STRONG fact, and hand back the run.
+///
+/// Both arms depend on it identically: an assertion about what the skip does is
+/// vacuous if the fixture quietly stopped producing the only fact that skips.
+#[cfg(unix)]
+fn assert_raw_input_fact(run: &WrappedInterfaceRun) {
+    assert_eq!(
+        run.interface_event
+            .metadata
+            .get(SESSION_START_ORIGIN_METADATA_KEY)
+            .map(String::as_str),
+        Some(WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN),
+        "control: a stand-in that cleared ICANON/ECHO before writing a byte must announce the \
+         RAW-INPUT observation — with no output yet, the settle branch cannot fire at all. \
+         Getting the settled value here means the wrapper stopped observing the child's line \
+         discipline, and every skip in production silently became a 1 s wait; metadata = {:?}",
+        run.interface_event.metadata
+    );
+    assert!(
+        run.daemon
+            .registry
+            .agent_spawned_as_wrapper_host(&run.new_agent_id),
+        "control: guard 2 must admit this replacement — the deck resolved the bare command \
+         `codex` to a Wrapper-strategy agent and exec'd it under `dot-agent-deck wrap` itself. If \
+         this is false the fast path is dead for every honest agent, which is the one regression \
+         no other test in this suite can see"
+    );
+}
+
+#[cfg(unix)]
+async fn delegate_027_raw_input_fact_skips_the_buffer_inner(script: &str) {
+    let run = run_wrapped_interface_delegate(script, RAW_INPUT_READY_BANNER).await;
+    assert_raw_input_fact(&run);
+
+    let delivered = wait_for_snapshot_needle(
+        &run.daemon.registry,
+        &run.new_agent_id,
+        POINTER,
+        HELD_POINTER_DELIVERY_CEILING,
+    )
+    .await;
+    let held = (chrono::Utc::now() - run.interface_event.timestamp)
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    assert!(
+        snapshot_contains(&delivered, POINTER),
+        "the delegate pointer never arrived at all within {HELD_POINTER_DELIVERY_CEILING:?} of \
+         the wrapper's raw-input interface event; snapshot = {:?}",
+        String::from_utf8_lossy(&delivered)
+    );
+    assert!(
+        held <= SKIPPED_BUFFER_DELIVERY_BUDGET,
+        "a wrapper-hosted agent whose interface the wrapper OBSERVED (raw input mode) took \
+         {held:?} to receive its pointer, more than {SKIPPED_BUFFER_DELIVERY_BUDGET:?}. That is \
+         the {PRODUCTION_READINESS_BUFFER_MS} ms default buffer still being paid, i.e. the skip \
+         did not happen. Guard 2 is fail-closed, so the likely cause is \
+         `agent_spawned_as_wrapper_host` refusing an honest agent — which restores issue #243's \
+         31 s regression while leaving every other test in this suite green"
+    );
+}
+
+#[cfg(unix)]
+async fn delegate_027_operator_pinned_buffer_survives_the_skip_inner(script: &str) {
+    let run = run_wrapped_interface_delegate(script, RAW_INPUT_READY_BANNER).await;
+    assert_raw_input_fact(&run);
+
+    let delivered = wait_for_snapshot_needle(
+        &run.daemon.registry,
+        &run.new_agent_id,
+        POINTER,
+        HELD_POINTER_DELIVERY_CEILING,
+    )
+    .await;
+    let held = (chrono::Utc::now() - run.interface_event.timestamp)
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    assert!(
+        snapshot_contains(&delivered, POINTER),
+        "the delegate pointer never arrived within {HELD_POINTER_DELIVERY_CEILING:?} of the \
+         wrapper's raw-input interface event while an operator buffer was pinned; snapshot = {:?}",
+        String::from_utf8_lossy(&delivered)
+    );
+    assert!(
+        held >= Duration::from_millis(OPERATOR_PINNED_BUFFER_MS),
+        "the interface observation released the pointer after {held:?}, short of the \
+         {OPERATOR_PINNED_BUFFER_MS} ms the operator pinned in \
+         {DELEGATE_READINESS_BUFFER_ENV}. The skip may zero the deck's OWN default; it must never \
+         zero the operator's setting, which is #199's escape hatch and the one knob someone whose \
+         prompts go missing on a slow machine can reach for — a marker on an unauthenticated \
+         socket must not be able to switch it off (issue #243 review, guard 3)"
+    );
+}
+
+/// Scenario: Delegate with `clear = true` to a plain `cat` worker the daemon never spawned as a wrapper host, then post a `SessionStart` for it carrying the wrapper's strong `wrapper_interface_ready` marker — the forgery #243's audit reproduced from a bare `python3`. The marker must release the gate but NOT the buffer: the pointer stays held for the whole configured 1000 ms.
+#[spec("orchestration/delegate/028")]
+#[test]
+#[cfg(unix)]
+fn delegate_028_forged_interface_marker_does_not_skip_the_buffer() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _env = EnvGuard::set(&[
+        (SESSION_START_WAIT_ENV, "30000"),
+        (WORKER_RESPONSE_TIMEOUT_ENV, "0"),
+        (DELEGATE_NO_EVENT_WINDOW_ENV, "0"),
+    ]);
+    // Unset for the same reason `/026` unsets it: with an explicit value pinned,
+    // guard 3 floors the skip and the buffer survives guard 2's deletion, so the
+    // test would pass while pinning nothing.
+    let _unset = EnvGuard::unset(&[DELEGATE_READINESS_BUFFER_ENV]);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("build forged-marker readiness runtime")
+        .block_on(delegate_028_forged_interface_marker_does_not_skip_the_buffer_inner());
+}
+
+#[cfg(unix)]
+async fn delegate_028_forged_interface_marker_does_not_skip_the_buffer_inner() {
+    let daemon = common::spawn_inprocess_daemon().await;
+    let cwd = common::race_safe_tempdir();
+    std::fs::write(
+        cwd.path().join(".dot-agent-deck.toml"),
+        clear_true_config("cat"),
+    )
+    .expect("write forged-marker orchestration config");
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    let old_agent_id = daemon
+        .registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            cwd: Some(&cwd_str),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), WORKER_PANE.to_string())],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn initial forged-marker worker");
+    {
+        let mut state = daemon.state.write().await;
+        register_orchestration(&mut state, &cwd_str);
+    }
+    daemon
+        .state
+        .read()
+        .await
+        .handle_delegate(
+            DelegateSignal {
+                pane_id: ORCH_PANE.to_string(),
+                task: "List the files in the current directory.".to_string(),
+                to: vec![WORKER_ROLE.to_string()],
+                timestamp: chrono::Utc::now(),
+            },
+            &daemon.registry,
+            &daemon.event_tx,
+        )
+        .await;
+    let new_agent_id =
+        wait_for_replacement_agent(&daemon.registry, WORKER_PANE, &old_agent_id).await;
+
+    // CONTROL: the daemon's own frozen launch record must NOT call this pane a
+    // wrapper host, or the forgery is not a forgery. `cat` is a command
+    // `AgentType::from_command` cannot resolve, so `spawn_agent_type` is `None`
+    // — the ordinary shape of every pane running something the deck did not
+    // choose an agent for.
+    assert!(
+        !daemon.registry.agent_spawned_as_wrapper_host(&new_agent_id),
+        "control: this pane must not be a wrapper host, or the marker below is honest rather \
+         than forged; spawn_agent_type = {:?}",
+        daemon.registry.spawn_agent_type(&new_agent_id)
+    );
+
+    let posted_at = Instant::now();
+    // THE FORGERY. One JSON line on the daemon's hook socket, carrying the
+    // wrapper's strong interface marker for a pane no wrapper is running on.
+    // #243's audit reproduced exactly this from a bare `python3` with no deck
+    // environment at all: `metadata` is free-form by contract and the socket
+    // authenticates nobody, so the marker is producer-writable and the daemon
+    // must not grant a privilege on it alone.
+    let forged = session_start_event_with_origin(
+        AgentType::None,
+        WORKER_PANE,
+        &new_agent_id,
+        Some(WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN),
+    );
+    common::write_hook_line(
+        &daemon.hook_path,
+        &serde_json::to_string(&forged).expect("serialize forged interface SessionStart"),
+    )
+    .expect("write forged interface SessionStart");
+
+    let delivered = wait_for_snapshot_needle(
+        &daemon.registry,
+        &new_agent_id,
+        POINTER,
+        HELD_POINTER_DELIVERY_CEILING,
+    )
+    .await;
+    let held = posted_at.elapsed();
+    // Being precise about the delta this pins. Releasing the GATE was already
+    // forgeable before #243 — a bare unmarked `SessionStart` does it — and still
+    // is, which is why the pointer is expected to ARRIVE rather than be
+    // withheld. What #243 newly granted, and what guard 2 takes back, is the
+    // ability to also SUPPRESS the buffer: the last protection against writing
+    // into a still-booting agent (#199/#249/#663).
+    assert!(
+        snapshot_contains(&delivered, POINTER),
+        "the forged marker should still RELEASE the gate — that was always forgeable and is not \
+         what guard 2 defends — but no pointer arrived within \
+         {HELD_POINTER_DELIVERY_CEILING:?}; snapshot = {:?}",
+        String::from_utf8_lossy(&delivered)
+    );
+    assert!(
+        held >= Duration::from_millis(PRODUCTION_READINESS_BUFFER_MS),
+        "a forged `wrapper_interface_ready` marker suppressed the readiness buffer: the pointer \
+         landed {held:?} after the line hit the socket, inside the deck's own \
+         {PRODUCTION_READINESS_BUFFER_MS} ms. The daemon never spawned this pane as a wrapper \
+         host, so nothing is observing that child's interface and the claim is unbacked — an \
+         unauthenticated producer must not be able to turn the buffer off on demand (issue #243 \
+         audit F1, guard 2)"
+    );
+    daemon.registry.shutdown_all();
 }
 
 /// Scenario: Delegate with `clear = true` to a worker whose agent emits no readiness event of any kind before its first prompt (OpenCode's measured behaviour), then walk a paused Tokio clock forward a second at a time. The task pointer must reach the pane inside six virtual seconds rather than after the 30 s dead wait (issue #243).

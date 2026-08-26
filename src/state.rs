@@ -8067,24 +8067,79 @@ mod tests {
     /// an absurd value is capped so a mistyped pin cannot hang every delegate,
     /// and garbage falls back to the default rather than panicking.
     /// Mirrors `spawn::tests::session_start_wait_override_is_clamped_to_a_sane_range`.
+    ///
+    /// Issue #243 (audit F1, mitigation 3) added a SECOND resolver over the same
+    /// variable, and the two answer different questions:
+    /// [`delegate_readiness_buffer`] answers "what buffer applies" (setting folded
+    /// into default), while [`explicit_delegate_readiness_buffer`] answers "did a
+    /// human choose this interval" — which is what the interface-observation skip
+    /// floors at instead of zeroing. So every row below now pins BOTH, and the
+    /// rows where they disagree are the whole point: an unparseable value is not
+    /// a setting (`None`, floors nothing) even though the buffer still resolves to
+    /// the default, and an explicit `0` IS a setting worth exactly zero.
     #[test]
     fn delegate_readiness_buffer_override_is_bounded() {
         // Serialize against any other test reading this process-global env var.
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS).ok();
-        for (raw, expected) in [
+        // Unset FIRST, and pin it: this is the ordinary production case and the
+        // one the skip's `unwrap_or(ZERO)` turns into the whole latency win, so
+        // "no setting" reading as `Some(_)` would floor every skip at a value
+        // nobody chose.
+        // SAFETY: lock held for the duration; restored below.
+        unsafe { std::env::remove_var(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS) };
+        assert_eq!(
+            explicit_delegate_readiness_buffer(),
+            None,
+            "an UNSET {DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS} is not an operator setting"
+        );
+        assert_eq!(
+            delegate_readiness_buffer(),
+            DELEGATE_READINESS_BUFFER,
+            "an unset override must still resolve to the built-in buffer"
+        );
+        for (raw, expected, explicit) in [
             // Explicitly unguarded: `orchestration/delegate/012`'s control arm.
-            ("0", std::time::Duration::ZERO),
-            ("1000", std::time::Duration::from_millis(1000)),
+            // A chosen zero, so the skip floors at zero and the harness pays
+            // nothing — but it is a CHOICE, not the absence of one.
+            (
+                "0",
+                std::time::Duration::ZERO,
+                Some(std::time::Duration::ZERO),
+            ),
+            (
+                "1000",
+                std::time::Duration::from_millis(1000),
+                Some(std::time::Duration::from_millis(1000)),
+            ),
             // Raising it is allowed — an operator on a slow machine has no other knob.
-            ("5000", std::time::Duration::from_millis(5000)),
-            // Ten minutes of held-back delegates is capped.
-            ("600000", MAX_DELEGATE_READINESS_BUFFER),
-            // Unparseable → default, no panic.
-            ("soon", DELEGATE_READINESS_BUFFER),
-            ("-1", DELEGATE_READINESS_BUFFER),
-            ("", DELEGATE_READINESS_BUFFER),
+            (
+                "5000",
+                std::time::Duration::from_millis(5000),
+                Some(std::time::Duration::from_millis(5000)),
+            ),
+            // Ten minutes of held-back delegates is capped. The floor is capped
+            // with it: a mistyped pin must not become a thirty-minute hold by
+            // way of the skip either.
+            (
+                "600000",
+                MAX_DELEGATE_READINESS_BUFFER,
+                Some(MAX_DELEGATE_READINESS_BUFFER),
+            ),
+            (
+                "999999",
+                MAX_DELEGATE_READINESS_BUFFER,
+                Some(MAX_DELEGATE_READINESS_BUFFER),
+            ),
+            // Unparseable → default for the buffer, and NOT a setting for the
+            // floor. `parse_bounded_ms_override` has already `warn!`ed, and
+            // flooring a skip at a value the operator never successfully
+            // expressed would silently spend their typo.
+            ("soon", DELEGATE_READINESS_BUFFER, None),
+            ("abc", DELEGATE_READINESS_BUFFER, None),
+            ("-1", DELEGATE_READINESS_BUFFER, None),
+            ("", DELEGATE_READINESS_BUFFER, None),
         ] {
             // SAFETY: lock held for the duration; restored below.
             unsafe { std::env::set_var(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS, raw) };
@@ -8092,6 +8147,12 @@ mod tests {
                 delegate_readiness_buffer(),
                 expected,
                 "{DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS}={raw:?} must resolve to {expected:?}"
+            );
+            assert_eq!(
+                explicit_delegate_readiness_buffer(),
+                explicit,
+                "{DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS}={raw:?} must read as the operator \
+                 setting {explicit:?}"
             );
         }
         // SAFETY: same lock; restore.
