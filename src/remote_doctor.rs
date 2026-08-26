@@ -1269,6 +1269,22 @@ fn is_probeable_bind_host(host: &str) -> bool {
 /// recipe expects the SOCKS listener. A wildcard bind is probed on loopback
 /// too — that is the address an agent on the remote would use.
 ///
+/// **The loopback has to match the family of the wildcard.** An IPv6
+/// unspecified bind (`[::]:1080`, or its long spelling
+/// `[0:0:0:0:0:0:0:0]:1080` — `ssh -G` echoes IPv6 hosts verbatim rather than
+/// canonicalising them) is probed at `::1`, not at `127.0.0.1`. Sending the
+/// IPv4 loopback at it is refused wherever the listener is genuinely v6-only
+/// — `net.ipv6.bindv6only=1`, OpenBSD, `AddressFamily inet6` — and a refused
+/// connect is read as [`ForwardObservation::Refused`], so a *working* tunnel
+/// was reported FAIL with the port-collision remediation attached. Measured
+/// against a real `IPV6_V6ONLY` listener on `[::]`: `127.0.0.1` is refused
+/// while `::1` connects. Dual-stack Linux with the default
+/// `bindv6only=0` masks it, because a `[::]` listener also accepts v4-mapped
+/// IPv4 — which is why it survived review and eleven L2 tests.
+///
+/// The empty and `*` spellings carry no family, so they keep the IPv4
+/// loopback.
+///
 /// The port is narrowed to a `u16`, which makes it inert; the bind host goes
 /// through [`is_probeable_bind_host`], which is what keeps a hostile listen
 /// spec out of the remote shell. Pure and total, so [`classify`] re-runs it to
@@ -1276,6 +1292,7 @@ fn is_probeable_bind_host(host: &str) -> bool {
 /// "there was nothing to probe".
 fn probe_endpoint(listen: &str) -> Option<(String, u16)> {
     const LOOPBACK: &str = "127.0.0.1";
+    const LOOPBACK_V6: &str = "::1";
     if let Ok(port) = listen.parse::<u16>() {
         return Some((LOOPBACK.to_string(), port));
     }
@@ -1283,8 +1300,16 @@ fn probe_endpoint(listen: &str) -> Option<(String, u16)> {
     let port = port.parse::<u16>().ok()?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
     let host = match host {
-        "" | "*" | "0.0.0.0" | "::" => LOOPBACK,
-        other => other,
+        // Neither spelling names a family, so both keep the IPv4 loopback.
+        "" | "*" => LOOPBACK,
+        // Decided by parsing rather than by matching spellings, because
+        // `ssh -G` does not canonicalise an IPv6 host: `[::]` and
+        // `[0:0:0:0:0:0:0:0]` both reach here exactly as written.
+        other => match other.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(v4)) if v4.is_unspecified() => LOOPBACK,
+            Ok(std::net::IpAddr::V6(v6)) if v6.is_unspecified() => LOOPBACK_V6,
+            _ => other,
+        },
     };
     if !is_probeable_bind_host(host) {
         return None;
@@ -2161,10 +2186,14 @@ remoteforward 1080 [socks]:0
             ("[::1]:1080", "::1", 1080),
             ("[fe80::1]:1080", "fe80::1", 1080),
             // Wildcard binds are probed on loopback: that is the address an
-            // agent ON the remote would use.
+            // agent ON the remote would use. The loopback matches the FAMILY
+            // of the wildcard — see
+            // `probe_endpoint_probes_an_ipv6_wildcard_on_the_ipv6_loopback`,
+            // which is where the reasoning for the `::` rows lives.
             ("*:1080", "127.0.0.1", 1080),
             ("0.0.0.0:1080", "127.0.0.1", 1080),
-            ("[::]:1080", "127.0.0.1", 1080),
+            ("[::]:1080", "::1", 1080),
+            ("[0:0:0:0:0:0:0:0]:1080", "::1", 1080),
             (":1080", "127.0.0.1", 1080),
         ];
 
@@ -2196,6 +2225,81 @@ remoteforward 1080 [socks]:0
                 );
             }
         }
+    }
+
+    /// Scenario: Resolve every wildcard listen spec `ssh -G` can emit and
+    /// check the probe targets the loopback of the SAME address family, then
+    /// pin the command built for an IPv6 endpoint. An IPv6-only `[::]`
+    /// listener does not answer at `127.0.0.1`, so the old IPv4 mapping
+    /// turned a working tunnel into a confident `ForwardBound` FAIL.
+    #[test]
+    fn probe_endpoint_probes_an_ipv6_wildcard_on_the_ipv6_loopback() {
+        // The regression itself. This suite previously pinned
+        // `("[::]:1080", "127.0.0.1", 1080)` — it did not miss the case, it
+        // ENCODED the defect, which is worse than no coverage because it
+        // promoted a bug to a guarantee.
+        //
+        // Measured against a real `IPV6_V6ONLY` listener bound to `[::]`:
+        // `bash -c 'exec 3<>/dev/tcp/127.0.0.1/<port>'` is refused while the
+        // same command against `::1` connects and completes the SOCKS5
+        // greeting. Dual-stack Linux with the default `net.ipv6.bindv6only=0`
+        // hides this, because a `[::]` listener there also accepts IPv4 via
+        // v4-mapped addresses.
+        assert_eq!(
+            probe_endpoint("[::]:1080"),
+            Some(("::1".to_string(), 1080)),
+            "an IPv6 wildcard bind must be probed at the IPv6 loopback"
+        );
+
+        // `ssh -G` echoes an IPv6 listen host verbatim instead of
+        // canonicalising it (verified against OpenSSH 10.2:
+        // `RemoteForward [0:0:0:0:0:0:0:0]:1080` resolves to
+        // `remoteforward [0:0:0:0:0:0:0:0]:1080`), so the long spelling of
+        // the unspecified address reaches here unchanged and needs the same
+        // treatment. Matching on parsed bits rather than on spelling is what
+        // makes that fall out instead of needing its own arm.
+        assert_eq!(
+            probe_endpoint("[0:0:0:0:0:0:0:0]:1080"),
+            Some(("::1".to_string(), 1080)),
+            "the long spelling of the IPv6 wildcard is the same wildcard"
+        );
+
+        // The IPv4 wildcard is unchanged, and an explicit literal of either
+        // family is never rewritten — only the *unspecified* address is a
+        // wildcard.
+        for (spec, host) in [
+            ("0.0.0.0:1080", "127.0.0.1"),
+            ("*:1080", "127.0.0.1"),
+            (":1080", "127.0.0.1"),
+            ("[::1]:1080", "::1"),
+            ("[fe80::1]:1080", "fe80::1"),
+            ("[2001:db8::1]:1080", "2001:db8::1"),
+        ] {
+            assert_eq!(
+                probe_endpoint(spec),
+                Some((host.to_string(), 1080)),
+                "{spec:?} must resolve to {host:?}"
+            );
+        }
+
+        // The command built for an IPv6 endpoint, pinned in the shape that
+        // was measured to work: a BARE IPv6 literal in the `/dev/tcp` path,
+        // with no brackets. Bash 5.3 connects to `/dev/tcp/::1/<port>` and
+        // completes the handshake; brackets would make it a different,
+        // untested path shape.
+        assert_eq!(
+            forward_probe_command(ForwardProbe::ConnectOnly, "::1", 1080),
+            "bash -c 'exec 3<>/dev/tcp/::1/1080'"
+        );
+        let handshake = forward_probe_command(ForwardProbe::SocksHandshake, "::1", 1080);
+        assert!(
+            handshake.starts_with("bash -c 'exec 3<>/dev/tcp/::1/1080 || exit 1;"),
+            "the IPv6 endpoint must be interpolated bare: {handshake:?}"
+        );
+        assert!(
+            !handshake.contains('[') && !handshake.contains(']'),
+            "brackets around the IPv6 host are not the measured shape: {handshake:?}"
+        );
     }
 
     /// Scenario: Build both remote probes for one endpoint and pin them
