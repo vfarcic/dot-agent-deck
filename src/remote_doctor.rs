@@ -280,7 +280,11 @@ pub enum ForwardObservation {
     /// port carries whatever the user tunnelled, so there is no greeting we
     /// may send to attribute it — see [`ForwardProbe`].
     Unattributable,
-    /// Nothing is listening: the connect was refused.
+    /// Nothing is listening: the connect was **recognisably** refused.
+    ///
+    /// Only a stderr [`is_recognised_refusal`] accepts produces this. A probe
+    /// failure the module cannot classify is UNKNOWN with the stderr quoted,
+    /// never this — see [`probe_forward_bound`].
     Refused,
 }
 
@@ -293,6 +297,15 @@ pub struct DoctorInputs {
     pub ssh: ResolvedSshConfig,
     pub sshd: ResolvedSshdConfig,
     pub forward_bound: Option<ForwardObservation>,
+    /// The remote's own stderr when the loopback probe ran and failed in a
+    /// shape [`probe_forward_bound`] could not classify.
+    ///
+    /// `Some` is strictly a *reason* attached to an unobserved
+    /// [`Self::forward_bound`], never an observation: it reports UNKNOWN
+    /// carrying the evidence, so the user can see what the deck saw instead of
+    /// being handed remediation for a cause nothing established. Producer
+    /// controlled — [`render`] escapes it on the way out.
+    pub forward_probe_unclassified: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -824,19 +837,39 @@ pub fn classify(inputs: &DoctorInputs) -> Vec<CheckResult> {
             &format!("{listener} is not bound on the remote, though its sshd permits the tunnel"),
             "Nothing is listening there right now. If a session to this remote is up as you read this, its tunnel did not bind — that port is taken by something else, so give this laptop its own listen port or drop whatever still holds it (forward ports are per-remote, so two laptops on the same one collide). If you are not connected, expect this: the tunnel exists only while a session does, so re-run this while connected to learn anything more.",
         ),
-        // A listen spec we refuse to probe is a DIFFERENT answer from "there
-        // was nothing to probe", and naming the value is the only way the user
-        // can act on it. See `probe_endpoint` for the accepted forms.
-        None => match listen.filter(|spec| probe_endpoint(spec).is_none()) {
-            Some(spec) => CheckResult::new(
+        // Three shapes of "not observed", and they are three different
+        // answers. A probe that ran and failed in an unrecognised way has
+        // evidence to show; a listen spec we refuse to probe has a value to
+        // name; anything else has neither. Collapsing them would put the user
+        // back where a confident FAIL left them — told a cause, shown nothing.
+        None => match (
+            inputs.forward_probe_unclassified.as_deref(),
+            listen.filter(|spec| probe_endpoint(spec).is_none()),
+        ) {
+            // Deliberately UNKNOWN and not FAIL: the probe came back in a
+            // shape this module cannot read, so the port is undetermined. The
+            // stderr goes in the FIX line, never the verdict line — `render`
+            // escapes both, but only the verdict line must carry exactly one
+            // verdict token and exactly one check identity.
+            (Some(detail), _) => CheckResult::new(
+                CheckId::ForwardBound,
+                Verdict::Unknown,
+                &format!("the loopback probe against {listener} failed in a way the deck cannot read, so nothing was established about that port"),
+                &if detail.is_empty() {
+                    "The remote's shell rejected the read-only connect and printed nothing to explain it, so the deck will not guess a cause. Try the connect yourself on the remote (`bash -c 'exec 3<>/dev/tcp/127.0.0.1/<port>'`) to see what it says.".to_string()
+                } else {
+                    format!("The remote's shell said: `{detail}`. The deck does not recognise that as a refused connection, so it will not tell you the port is taken — run the read-only connect yourself on the remote (`bash -c 'exec 3<>/dev/tcp/127.0.0.1/<port>'`) to see it directly.")
+                },
+            ),
+            (None, Some(spec)) => CheckResult::new(
                 CheckId::ForwardBound,
                 Verdict::Unknown,
                 &format!(
                     "ssh resolved the listen spec `{spec}`, which is not a shape this probe will target"
                 ),
-                "The probe is refused rather than guessed at: a bind address is interpolated into a command the remote shell parses, so only an IPv4 literal, an IPv6 literal, or a hostname of letters, digits, `.` and `-` is accepted, with a port in range. Rewrite the `RemoteForward` listen address in `~/.ssh/config` as one of those, or probe the endpoint yourself.",
+                "The probe is refused rather than guessed at: a bind address is interpolated into a command the remote shell parses, so only an IPv4 literal, a non-link-local IPv6 literal, or a hostname of letters, digits, `.` and `-` is accepted, with a port in range. A link-local address (`fe80::…`) is excluded because it needs a zone index to connect and the deck will not interpolate one. Rewrite the `RemoteForward` listen address in `~/.ssh/config` as one of those, or probe the endpoint yourself.",
             ),
-            None => CheckResult::new(
+            (None, None) => CheckResult::new(
                 CheckId::ForwardBound,
                 Verdict::Unknown,
                 "the live bind state on the remote was not observed",
@@ -1240,7 +1273,7 @@ const MAX_BIND_HOST_LEN: usize = 255;
 /// shell metacharacter. Accepted, and nothing else:
 ///
 /// - an IPv4 literal (`127.0.0.1`),
-/// - an IPv6 literal (`::1`, `fe80::1` — brackets are stripped by the caller),
+/// - an IPv6 literal (`::1`, `2001:db8::1` — brackets are stripped by the caller),
 /// - a hostname of ASCII letters, digits, `.` and `-`, at most
 ///   [`MAX_BIND_HOST_LEN`] bytes.
 ///
@@ -1251,6 +1284,15 @@ const MAX_BIND_HOST_LEN: usize = 255;
 /// rejection into UNKNOWN naming the value rather than into a constructed
 /// command or a silent PASS. `/` is refused along with the rest: it would
 /// escape the `/dev/tcp/host/port` path shape even without a shell.
+///
+/// **This answers "is this inert to interpolate?", not "is this connectable?"**
+/// The two questions have drifted apart: an IPv6 link-local literal is
+/// perfectly inert and still cannot be connected to, because it needs a zone
+/// index and `%` is not in the allowlist. That second question belongs to
+/// [`probe_endpoint`], which is where the link-local refusal lives — widening
+/// this allowlist would put a `%` into a two-shell-level interpolation to fix
+/// a problem that is not an injection problem. A future reader may want to
+/// give the probe its own predicate rather than leaning on this one twice.
 fn is_probeable_bind_host(host: &str) -> bool {
     if host.is_empty() || host.len() > MAX_BIND_HOST_LEN {
         return false;
@@ -1285,6 +1327,17 @@ fn is_probeable_bind_host(host: &str) -> bool {
 /// The empty and `*` spellings carry no family, so they keep the IPv4
 /// loopback.
 ///
+/// **A link-local IPv6 bind (`fe80::/10`) is refused rather than probed.** It
+/// passes [`is_probeable_bind_host`] — it is inert to interpolate — but it is
+/// not *connectable*: a link-local address needs a zone index (`fe80::1%eth0`)
+/// to name an interface, `%` is not in the allowlist and is not going to be,
+/// so the command built from one can only ever come back as bash's
+/// `Invalid argument`. That is an exit 1 the probe would have to guess at, and
+/// guessing produced the collision remediation for a tunnel that may be fine.
+/// Refusing here lands it on the same UNKNOWN-naming-the-spec path a rejected
+/// spec already takes. Global and unique-local IPv6 literals are untouched —
+/// those connect.
+///
 /// The port is narrowed to a `u16`, which makes it inert; the bind host goes
 /// through [`is_probeable_bind_host`], which is what keeps a hostile listen
 /// spec out of the remote shell. Pure and total, so [`classify`] re-runs it to
@@ -1311,10 +1364,24 @@ fn probe_endpoint(listen: &str) -> Option<(String, u16)> {
             _ => other,
         },
     };
-    if !is_probeable_bind_host(host) {
+    if !is_probeable_bind_host(host) || is_unprobeable_link_local(host) {
         return None;
     }
     Some((host.to_string(), port))
+}
+
+/// Whether `host` is an IPv6 unicast link-local literal (`fe80::/10`).
+///
+/// Hand-rolled because `Ipv6Addr::is_unicast_link_local` is still unstable
+/// (`#![feature(ip)]`), and this is the whole of its definition: the top ten
+/// bits are `1111111010`. Scoped to IPv6 deliberately — IPv4's link-local
+/// block (`169.254.0.0/16`) carries no zone index and connects like any other
+/// literal, so refusing it would be inventing a case.
+fn is_unprobeable_link_local(host: &str) -> bool {
+    matches!(
+        host.parse::<std::net::IpAddr>(),
+        Ok(std::net::IpAddr::V6(v6)) if (v6.segments()[0] & 0xffc0) == 0xfe80
+    )
 }
 
 /// Maximum bytes kept from either stream of the liveness probe.
@@ -1328,10 +1395,23 @@ const FORWARD_PROBE_CAP: usize = 4 * 1024;
 
 /// Run the loopback probe and translate what it observed.
 ///
-/// Returns `None` — UNKNOWN, never a claim about the port — when the listen
-/// spec is not one [`probe_endpoint`] will target, when the remote has no
-/// usable `bash` or hex tooling, or when the reply was too long to be the
-/// reply this command produces.
+/// Returns [`ProbeOutcome::NotObserved`] — UNKNOWN, never a claim about the
+/// port — when the listen spec is not one [`probe_endpoint`] will target, when
+/// the remote has no usable `bash` or hex tooling, or when the reply was too
+/// long to be the reply this command produces.
+///
+/// **Only a recognised refusal produces [`ForwardObservation::Refused`].** A
+/// non-zero exit whose stderr this module does not understand is
+/// [`ProbeOutcome::Unclassified`], which the report renders as UNKNOWN quoting
+/// that stderr. The inverse default — anything unrecognised is a refusal —
+/// shipped a confident FAIL, with port-collision remediation attached, built
+/// on an observation nothing had classified; a link-local bind reaching bash
+/// as `Invalid argument` was one instance, and the next unrecognised bash
+/// failure would have been the next. It is the same rule this module already
+/// applies to `sshd -T`, in the other direction: a diagnostic that reports
+/// fine when it could not look is bad, and one that reports broken when it
+/// could not tell is worse, because it also prescribes a cure for a cause it
+/// never established.
 ///
 /// The exit status is read as a statement about the **connect** because
 /// [`forward_probe_command`] makes it one; the reply bytes only ever refine an
@@ -1354,8 +1434,13 @@ fn probe_forward_bound(
     executor: &dyn SshExecutor,
     target: &SshTarget,
     forward: &ResolvedForward,
-) -> Option<ForwardObservation> {
-    let (host, port) = probe_endpoint(reverse_forward_listen(forward)?)?;
+) -> ProbeOutcome {
+    let Some(listen) = reverse_forward_listen(forward) else {
+        return ProbeOutcome::NotObserved;
+    };
+    let Some((host, port)) = probe_endpoint(listen) else {
+        return ProbeOutcome::NotObserved;
+    };
     let probe = ForwardProbe::for_forward(forward);
     match executor.run_capped(
         target,
@@ -1367,8 +1452,8 @@ fn probe_forward_bound(
         // executor decides this now (`CappedOutput::truncated`) rather than
         // this call site re-deriving it from the returned lengths, which is
         // the same signal the version and protocol probes had been missing.
-        Ok(capped) if capped.truncated => None,
-        Ok(capped) if capped.output.status == 0 => Some(match probe {
+        Ok(capped) if capped.truncated => ProbeOutcome::NotObserved,
+        Ok(capped) if capped.output.status == 0 => ProbeOutcome::Observed(match probe {
             // Connected, and that is the whole of what we are allowed to
             // learn: nothing was sent, so nothing can attribute the listener.
             ForwardProbe::ConnectOnly => ForwardObservation::Unattributable,
@@ -1379,22 +1464,83 @@ fn probe_forward_bound(
             },
         }),
         Ok(capped) if capped.output.status == 1 => {
-            // bash exits 1 both for a refused connect and for a build without
-            // net redirections, where it reports the pseudo-path as missing.
-            // Only the former is evidence about the port.
-            let lower = capped.output.stderr.to_ascii_lowercase();
-            if lower.contains("no such file") || lower.contains("not supported") {
-                None
+            // bash exits 1 for a refused connect, for a build without net
+            // redirections, and for every other way the redirection can fail.
+            // Only a RECOGNISED refusal is evidence about the port; the rest
+            // is an observation this module did not understand, and is
+            // reported as one.
+            if is_recognised_refusal(&capped.output.stderr) {
+                ProbeOutcome::Observed(ForwardObservation::Refused)
             } else {
-                Some(ForwardObservation::Refused)
+                ProbeOutcome::Unclassified(first_line_capped(&capped.output.stderr))
             }
         }
         // 127 is "bash, `timeout`, `head` or `od` missing on the remote" —
-        // absent tooling, not a free port and not a silent listener.
-        Ok(_) => None,
-        Err(_) => None,
+        // absent tooling, not a free port and not a silent listener. Left on
+        // the plain UNKNOWN path deliberately: unlike the exit-1 arm above it
+        // was never a confident claim, and its existing hint already names the
+        // missing tooling more usefully than the remote's stderr would.
+        Ok(_) => ProbeOutcome::NotObserved,
+        Err(_) => ProbeOutcome::NotObserved,
     }
 }
+
+/// What one run of the loopback probe yielded.
+///
+/// The third variant is the point: before it existed, "the probe failed in a
+/// way I do not recognise" had nowhere to go except
+/// [`ForwardObservation::Refused`], and `Refused` is a confident FAIL that
+/// ships port-collision remediation. This module already refuses to let an
+/// unreadable `sshd -T` become a PASS; the mirror is that an unreadable probe
+/// must not become a FAIL.
+enum ProbeOutcome {
+    /// The probe ran and this is what it learned about the port.
+    Observed(ForwardObservation),
+    /// The probe ran and failed in a shape this module cannot classify.
+    /// Carries the remote's own first stderr line (possibly empty) so the
+    /// report can quote the evidence instead of guessing a cause.
+    Unclassified(String),
+    /// There was nothing to probe, or nothing worth quoting: no reverse
+    /// forward, a listen spec [`probe_endpoint`] refuses, an over-long reply,
+    /// or ssh itself failing to run.
+    NotObserved,
+}
+
+/// Whether `stderr` is bash reporting a **refused connect** — the one exit-1
+/// shape that is evidence the port has no listener.
+///
+/// Deliberately one phrase, not a family. `Connection refused` is ECONNREFUSED
+/// and nothing else: over loopback it means the kernel had no socket to hand
+/// the SYN to. Every other failure names a different cause and must not be
+/// read as an empty port — `Network is unreachable` is IPv6 switched off,
+/// `Invalid argument` is a link-local address with no zone, `Connection timed
+/// out` is something dropping packets, `No such file or directory` and
+/// `Operation not supported` are a bash built without net redirections. Those
+/// all become UNKNOWN with the text quoted.
+///
+/// A non-English remote locale translates the message and so reads as
+/// unclassified. That is the safe direction, and it degrades to "the deck
+/// admits it does not know" rather than to a wrong verdict.
+fn is_recognised_refusal(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("connection refused")
+}
+
+/// The first non-empty line of producer-controlled text, trimmed and capped.
+///
+/// Capped at [`QUOTED_STDERR_CAP`] **characters before escaping**, the same
+/// order [`render`] uses for ssh's own complaint, so an escape that expands to
+/// several characters cannot smuggle bytes past the cap. Returns an empty
+/// string when there is nothing to quote; the caller words that case.
+fn first_line_capped(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(QUOTED_STDERR_CAP).collect())
+        .unwrap_or_default()
+}
+
+/// How many characters of remote stderr a hint may quote.
+const QUOTED_STDERR_CAP: usize = 200;
 
 /// Everything one `remote doctor` run observed, plus the raw ssh complaint (if
 /// any) so the report can quote what ssh itself said.
@@ -1492,7 +1638,15 @@ fn observe(executor: &dyn SshExecutor, target: &SshTarget, name: &str) -> Observ
         // Cloned so the probe can borrow the forward while `inputs` is
         // written back; a resolved forward is two short strings.
         if let Some(forward) = reverse_forward(&inputs.ssh).cloned() {
-            inputs.forward_bound = probe_forward_bound(executor, target, &forward);
+            match probe_forward_bound(executor, target, &forward) {
+                ProbeOutcome::Observed(observation) => inputs.forward_bound = Some(observation),
+                // Both leave `forward_bound` unobserved; only this one has
+                // evidence worth quoting back.
+                ProbeOutcome::Unclassified(detail) => {
+                    inputs.forward_probe_unclassified = Some(detail)
+                }
+                ProbeOutcome::NotObserved => {}
+            }
         }
     }
 
@@ -1566,10 +1720,14 @@ fn names_check(line: &str, check: CheckId) -> bool {
 ///
 /// Scope, deliberately: this guards text **this module authors**. Headlines
 /// also interpolate values resolved out of the user's ssh config (a listen
-/// spec, a destination), so a host literally named `fail` could trip it in a
-/// debug build. That is why it is a `debug_assert!` — compiled out of the
-/// release binary users run — and the maintainer guard it buys is worth far
-/// more than the theoretical debug-build panic it costs.
+/// spec, a destination), and `ForwardBound`'s fix quotes the remote's own
+/// probe stderr when it could not classify it, so a host literally named
+/// `fail` — or a remote whose shell says `UNKNOWN` — could trip it in a debug
+/// build. That is why it is a `debug_assert!` — compiled out of the release
+/// binary users run — and the maintainer guard it buys is worth far more than
+/// the theoretical debug-build panic it costs. Neutering the quote to dodge it
+/// would be sanitising the evidence, which is the opposite of what quoting it
+/// is for.
 fn report_shape_violation(
     check: &CheckResult,
     verdict_line: &str,
@@ -1802,6 +1960,38 @@ remoteforward 1080 [socks]:0
                 client_alive_interval: Some(30),
             },
             forward_bound: Some(ForwardObservation::SocksVerified),
+            forward_probe_unclassified: None,
+        }
+    }
+
+    /// An [`SshExecutor`] that answers every command with one fixed result,
+    /// so a probe's translation of a status/stderr pair can be tested without
+    /// spawning ssh.
+    struct FixedExecutor {
+        status: i32,
+        stderr: String,
+    }
+
+    impl FixedExecutor {
+        fn exit(status: i32, stderr: &str) -> Self {
+            Self {
+                status,
+                stderr: stderr.to_string(),
+            }
+        }
+    }
+
+    impl crate::remote::SshExecutor for FixedExecutor {
+        fn run(
+            &self,
+            _target: &SshTarget,
+            _command: &str,
+        ) -> Result<crate::remote::SshOutput, crate::remote::SshError> {
+            Ok(crate::remote::SshOutput {
+                status: self.status,
+                stdout: String::new(),
+                stderr: self.stderr.clone(),
+            })
         }
     }
 
@@ -2184,7 +2374,10 @@ remoteforward 1080 [socks]:0
             ("localhost:1080", "localhost", 1080),
             ("db-1.internal.example:8080", "db-1.internal.example", 8080),
             ("[::1]:1080", "::1", 1080),
-            ("[fe80::1]:1080", "fe80::1", 1080),
+            // A GLOBAL IPv6 literal. The link-local block used to be pinned
+            // here too and is now refused — see
+            // `probe_endpoint_refuses_a_link_local_bind_instead_of_guessing`.
+            ("[2001:db8::1]:1080", "2001:db8::1", 1080),
             // Wildcard binds are probed on loopback: that is the address an
             // agent ON the remote would use. The loopback matches the FAMILY
             // of the wildcard — see
@@ -2272,7 +2465,6 @@ remoteforward 1080 [socks]:0
             ("*:1080", "127.0.0.1"),
             (":1080", "127.0.0.1"),
             ("[::1]:1080", "::1"),
-            ("[fe80::1]:1080", "fe80::1"),
             ("[2001:db8::1]:1080", "2001:db8::1"),
         ] {
             assert_eq!(
@@ -2513,6 +2705,224 @@ remoteforward 1080 [socks]:0
         );
         assert_eq!(overall_verdict(&results), Verdict::Unknown);
         assert_eq!(overall_verdict(&results).exit_code(), 2);
+    }
+
+    /// Scenario: Resolve every spelling of an IPv6 link-local listen spec.
+    /// Each is refused before a command is built, so it reaches the report as
+    /// UNKNOWN naming the value instead of as a bash `Invalid argument` the
+    /// probe would have read as a confident FAIL.
+    #[test]
+    fn probe_endpoint_refuses_a_link_local_bind_instead_of_guessing() {
+        // `fe80::/10`, so the whole block and not just the `fe80:` spelling.
+        // A link-local address needs a zone index to name an interface, `%` is
+        // not in `is_probeable_bind_host`'s allowlist and is not being added
+        // to one that feeds a two-shell-level interpolation, so a command
+        // built from any of these can only come back as `Invalid argument`.
+        for spec in [
+            "[fe80::1]:1080",
+            "[fe80::1%eth0]:1080",
+            "[fe80:0:0:0:0:0:0:1]:1080",
+            "[febf::1]:1080",
+            "[fe80::a00:27ff:fe4e:66a1]:1080",
+        ] {
+            assert_eq!(
+                probe_endpoint(spec),
+                None,
+                "a link-local bind is not connectable without a zone index, so it must not be probed: {spec:?}"
+            );
+        }
+
+        // The refusal is `fe80::/10` and nothing wider. Global, unique-local,
+        // loopback and both wildcards were measured working and stay probed —
+        // "anything unusual" would have been a much bigger refusal than the
+        // evidence supports.
+        for (spec, host) in [
+            ("[2001:db8::1]:1080", "2001:db8::1"),
+            ("[fec0::1]:1080", "fec0::1"),
+            ("[fd00::1]:1080", "fd00::1"),
+            ("[fe7f::1]:1080", "fe7f::1"),
+            ("[fc00::1]:1080", "fc00::1"),
+            ("[::1]:1080", "::1"),
+            ("[::]:1080", "::1"),
+            ("169.254.1.1:1080", "169.254.1.1"),
+        ] {
+            assert_eq!(
+                probe_endpoint(spec),
+                Some((host.to_string(), 1080)),
+                "{spec:?} connects without a zone index and must still be probed"
+            );
+        }
+
+        // And it lands on the path that already exists for a spec we will not
+        // probe: UNKNOWN naming the value, never a verdict about the port.
+        let mut inputs = healthy_inputs();
+        inputs.ssh.forwards = vec![ResolvedForward::RemoteDynamic {
+            listen: "[fe80::1]:1080".to_string(),
+        }];
+        inputs.forward_bound = None;
+        let results = classify(&inputs);
+        let result = check(&results, CheckId::ForwardBound);
+        assert_eq!(
+            result.verdict,
+            Verdict::Unknown,
+            "a link-local bind must not produce a confident verdict: {result:#?}"
+        );
+        assert!(
+            result.headline.contains("fe80::1"),
+            "the hint must name the spec the user has to change: {result:#?}"
+        );
+    }
+
+    /// Scenario: The remote's shell fails the loopback connect with an error
+    /// the deck has no reading for. `ForwardBound` is UNKNOWN quoting that
+    /// error, not FAIL with port-collision remediation — a recognised
+    /// `Connection refused` is still the only thing that produces `Refused`.
+    #[test]
+    fn an_unrecognised_probe_failure_is_unknown_carrying_its_evidence() {
+        // The one shape that IS evidence about the port. The L2 stub emits
+        // exactly this line (`remote/doctor/008`), and it must keep meaning
+        // FAIL.
+        for stderr in [
+            "bash: connect: Connection refused",
+            "bash: /dev/tcp/127.0.0.1/1080: Connection refused",
+            "BASH: CONNECT: CONNECTION REFUSED",
+        ] {
+            assert!(
+                is_recognised_refusal(stderr),
+                "a refused connect is the module's one confident exit-1 reading: {stderr:?}"
+            );
+        }
+
+        // Everything else names a different cause, and none of them says the
+        // port is free. `Invalid argument` is the link-local case that started
+        // this; `Network is unreachable` is IPv6 switched off on the remote,
+        // which would have called a working v4 tunnel broken.
+        for stderr in [
+            "bash: /dev/tcp/fe80::1/1080: Invalid argument",
+            "bash: connect: Network is unreachable",
+            "bash: connect: Connection timed out",
+            "bash: connect: No route to host",
+            "bash: /dev/tcp/127.0.0.1/1080: No such file or directory",
+            "bash: /dev/tcp/127.0.0.1/1080: Operation not supported",
+            "bash: connexion refusee",
+            "",
+        ] {
+            assert!(
+                !is_recognised_refusal(stderr),
+                "an unclassified failure must not be read as a refusal: {stderr:?}"
+            );
+        }
+
+        // Drive the probe itself, because `is_recognised_refusal` only
+        // matters through the arm that consults it. A recognised refusal is
+        // still an observation; everything else now carries its evidence out
+        // instead of becoming `Refused`.
+        let forward = ResolvedForward::RemoteDynamic {
+            listen: "1080".to_string(),
+        };
+        let target = SshTarget {
+            host: "prod.example.test".to_string(),
+            user: None,
+            port: 22,
+            key: None,
+        };
+        assert!(
+            matches!(
+                probe_forward_bound(
+                    &FixedExecutor::exit(1, "bash: connect: Connection refused"),
+                    &target,
+                    &forward,
+                ),
+                ProbeOutcome::Observed(ForwardObservation::Refused)
+            ),
+            "a recognised refusal must stay the confident FAIL the L2 suite pins"
+        );
+        for stderr in [
+            "bash: /dev/tcp/fe80::1/1080: Invalid argument",
+            "bash: connect: Network is unreachable",
+            "bash: /dev/tcp/127.0.0.1/1080: No such file or directory",
+            "",
+        ] {
+            let outcome = probe_forward_bound(&FixedExecutor::exit(1, stderr), &target, &forward);
+            match outcome {
+                ProbeOutcome::Unclassified(detail) => assert_eq!(
+                    detail,
+                    stderr.trim(),
+                    "the evidence must reach the report verbatim: {stderr:?}"
+                ),
+                other => panic!(
+                    "an unrecognised exit-1 must not become an observation about the port: \
+                     {stderr:?} produced {}",
+                    match other {
+                        ProbeOutcome::Observed(o) => format!("{o:?}"),
+                        ProbeOutcome::NotObserved => "NotObserved".to_string(),
+                        ProbeOutcome::Unclassified(_) => unreachable!(),
+                    }
+                ),
+            }
+        }
+
+        // What the user is shown: UNKNOWN, the observed stderr quoted, and
+        // none of the collision remediation the `Refused` arm carries.
+        let mut inputs = healthy_inputs();
+        inputs.forward_bound = None;
+        inputs.forward_probe_unclassified =
+            Some("bash: /dev/tcp/fe80::1/1080: Invalid argument".to_string());
+        let results = classify(&inputs);
+        let result = check(&results, CheckId::ForwardBound);
+
+        assert_eq!(
+            result.verdict,
+            Verdict::Unknown,
+            "an observation the probe could not classify cannot be a confident FAIL: {result:#?}"
+        );
+        assert!(
+            result.fix.contains("Invalid argument"),
+            "the hint must carry the evidence the verdict was withheld on: {result:#?}"
+        );
+        let text = format!("{} {}", result.headline, result.fix).to_ascii_lowercase();
+        assert!(
+            !text.contains("give this laptop its own listen port"),
+            "remediation for a cause nothing established is the defect being fixed: {result:#?}"
+        );
+        assert_eq!(overall_verdict(&results), Verdict::Unknown);
+        assert_eq!(overall_verdict(&results).exit_code(), 2);
+
+        // An exit-1 with nothing on stderr is still not a refusal, and the
+        // hint has to word the absence rather than quote an empty string.
+        let mut silent = healthy_inputs();
+        silent.forward_bound = None;
+        silent.forward_probe_unclassified = Some(String::new());
+        let results = classify(&silent);
+        let result = check(&results, CheckId::ForwardBound);
+        assert_eq!(result.verdict, Verdict::Unknown, "{result:#?}");
+        assert!(
+            !result.fix.contains("``"),
+            "an empty stderr must not render as an empty quote: {result:#?}"
+        );
+
+        // The evidence is producer-controlled, so it must be escaped on the
+        // way out like every other quoted remote string.
+        let mut hostile = healthy_inputs();
+        hostile.forward_bound = None;
+        hostile.forward_probe_unclassified =
+            Some("bash: \u{1b}[2Jcleared: Invalid argument".to_string());
+        let report = rendered(
+            "prod",
+            &Observations {
+                inputs: hostile,
+                ssh_detail: None,
+                ssh_config_unreadable: None,
+            },
+        );
+        assert!(
+            !report.contains('\u{1b}'),
+            "the quoted stderr must be escaped, not emitted raw: {report}"
+        );
+        assert!(
+            report.contains("Invalid argument"),
+            "escaping must not swallow the evidence: {report}"
+        );
     }
 
     /// Scenario: A `ssh -G` dump resolves a bind host the probe refuses. The
