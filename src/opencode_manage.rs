@@ -1047,17 +1047,22 @@ mod tests {
     /// The `…/target/release/dot-agent-deck` the field defect wrote, plus the
     /// durable `<home>/.local/bin/dot-agent-deck` the resolver must prefer.
     fn artifact_and_durable(root: &Path) -> (PathBuf, PathBuf) {
+        // The crate name plus the platform's executable suffix, which is the
+        // file name the resolver searches `~/.local/bin` for. Seeding the bare
+        // name left the durable candidate invisible on Windows, so the resolver
+        // refused and both tests below failed on `build-windows` (PR #733).
+        let name = format!(
+            "{}{}",
+            crate::platform::paths::DEFAULT_BINARY_NAME,
+            std::env::consts::EXE_SUFFIX
+        );
         let artifact = root
             .join("checkout")
             .join("target")
             .join("release")
-            .join("dot-agent-deck");
+            .join(&name);
         write_executable(&artifact);
-        let durable = root
-            .join("home")
-            .join(".local")
-            .join("bin")
-            .join("dot-agent-deck");
+        let durable = root.join("home").join(".local").join("bin").join(&name);
         write_executable(&durable);
         (artifact, durable)
     }
@@ -1086,7 +1091,16 @@ mod tests {
             durable.to_str(),
             "BINARY_PATH must be the durable path, not the artifact"
         );
-        for marker in ["target/release", "target/debug"] {
+        // Both separator spellings, and the Windows one as the JS literal
+        // spells it: `BINARY_PATH` is written through `serde_json`, so
+        // `target\release` is escaped to `target\\release` and a
+        // single-separator needle would pass vacuously there.
+        for marker in [
+            "target/release",
+            "target/debug",
+            r"target\\release",
+            r"target\\debug",
+        ] {
             assert!(
                 !js.contains(marker),
                 "the generated plugin names `{marker}`:\n{js}"

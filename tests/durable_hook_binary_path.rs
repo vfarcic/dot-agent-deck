@@ -40,6 +40,24 @@ const CLAUDE_SUFFIX: &str = "hook --agent claude-code";
 /// The Codex equivalent (`codex_hooks_manage::HOOK_COMMAND_SUFFIX`).
 const CODEX_SUFFIX: &str = "hook --agent codex";
 
+/// The file name the resolver actually searches for — the crate's package name
+/// plus the platform's executable suffix (`.exe` on Windows, empty elsewhere),
+/// exactly as `platform::paths::durable_binary_file_name` builds it.
+///
+/// Load-bearing, not tidiness. Seeding the bare `dot-agent-deck` left every
+/// `~/.local/bin` candidate here invisible to the resolver on Windows, so the
+/// resolver refused, nothing was written, and five of these tests failed on
+/// `build-windows` with three different-looking messages (PR #733). Their
+/// outcome came from the platform's executable-suffix convention rather than
+/// from their own fixture — the same class of defect PRD #381 is about.
+fn durable_file_name() -> String {
+    format!(
+        "{}{}",
+        dot_agent_deck::platform::paths::DEFAULT_BINARY_NAME,
+        std::env::consts::EXE_SUFFIX
+    )
+}
+
 /// A scratch tree with the three inputs the resolver takes, wired so a test can
 /// say "the running binary is a build artifact" without being one.
 struct Fixture {
@@ -72,7 +90,7 @@ impl Fixture {
             .join("checkout")
             .join("target")
             .join("release")
-            .join("dot-agent-deck");
+            .join(durable_file_name());
         write_executable(&artifact);
         artifact
     }
@@ -84,7 +102,7 @@ impl Fixture {
             .home()
             .join(".local")
             .join("bin")
-            .join("dot-agent-deck");
+            .join(durable_file_name());
         write_executable(&durable);
         durable
     }
@@ -162,18 +180,56 @@ fn commands_in(path: &Path) -> Vec<String> {
 }
 
 /// The deck-owned commands in `path` — those ending with `suffix`, which is how
-/// both writers identify their own rules.
+/// both writers identify their own rules — each with any quote wrapper around
+/// its executable stripped ([`unquoted_command`]), so a comparison against a
+/// bare `<path> <suffix>` is exact on every platform whichever writer produced
+/// it.
 fn deck_commands(path: &Path, suffix: &str) -> Vec<String> {
     let mut commands = commands_in(path);
     commands.retain(|command| command.trim_end().ends_with(suffix));
-    commands
+    commands.iter().map(|c| unquoted_command(c)).collect()
+}
+
+/// `command` with a quote wrapper around its executable stripped, mirroring
+/// `hooks_manage::unquote_if_needed`'s read side — both quoting forms, on every
+/// platform, for the same reason it does: a config written on one platform must
+/// still be readable on another.
+///
+/// Applied by [`deck_commands`] to everything it returns, because the two
+/// writers driven from this file quote differently and only one of them is
+/// platform-aware. `hooks_manage` has a `#[cfg(windows)]` `cmd.exe` sibling that
+/// leaves a backslash path verbatim, while Codex's commands go through
+/// `agent_hook_config::build_command` →
+/// `platform::paths::shell_quote_if_needed`, which is POSIX-only on every
+/// platform and therefore single-quotes a Windows path. What these tests pin is
+/// the PATH the resolver produced, not either writer's quoting, so comparing the
+/// unquoted spelling keeps every assertion here exact on both platforms rather
+/// than encoding one platform's spelling.
+fn unquoted_command(command: &str) -> String {
+    for quote in ['\'', '"'] {
+        if let Some(rest) = command.strip_prefix(quote)
+            && let Some((exe, tail)) = rest.split_once(quote)
+        {
+            return format!("{exe}{tail}");
+        }
+    }
+    command.to_string()
 }
 
 /// The invariant this whole PRD exists for, asserted on the raw bytes so it
 /// cannot be satisfied by a rule shape the walker above does not know.
 fn assert_no_build_artifact(path: &Path) {
     let body = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read: {e}"));
-    for marker in ["target/release", "target/debug"] {
+    // Both separator spellings, and the Windows one as JSON writes it: a
+    // `target\release` path is escaped to `target\\release` in the file, so a
+    // single-separator needle would silently never match there and the whole
+    // assertion would pass vacuously on `build-windows`.
+    for marker in [
+        "target/release",
+        "target/debug",
+        r"target\\release",
+        r"target\\debug",
+    ] {
         assert!(
             !body.contains(marker),
             "{} contains `{marker}` — gitignored, removed by `cargo clean`, and gone when its \

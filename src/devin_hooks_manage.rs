@@ -847,13 +847,22 @@ mod tests {
     fn install_never_writes_a_build_artifact_or_a_bare_name_into_devin_config() {
         let dir = crate::test_temp::tempdir().expect("devin fixture tempdir");
         let home = dir.path().join("home");
-        let durable = home.join(".local").join("bin").join("dot-agent-deck");
+        // The crate name plus the platform's executable suffix, which is what
+        // the resolver searches `~/.local/bin` for. Seeding the bare name left
+        // this candidate invisible on Windows, so the resolver refused and this
+        // test failed on `build-windows` alone (PR #733).
+        let name = format!(
+            "{}{}",
+            crate::platform::paths::DEFAULT_BINARY_NAME,
+            std::env::consts::EXE_SUFFIX
+        );
+        let durable = home.join(".local").join("bin").join(&name);
         let artifact = dir
             .path()
             .join("checkout")
             .join("target")
             .join("debug")
-            .join("dot-agent-deck");
+            .join(&name);
         for candidate in [&durable, &artifact] {
             std::fs::create_dir_all(candidate.parent().expect("parent")).expect("create dir");
             std::fs::write(candidate, b"#!/bin/sh\nexit 0\n").expect("write candidate");
@@ -872,17 +881,38 @@ mod tests {
         install_to(&config_dir, &resolved).expect("install Devin hooks");
 
         let body = std::fs::read_to_string(config_path(&config_dir)).expect("read config.json");
-        assert!(
-            !body.contains("target/debug") && !body.contains("target/release"),
-            "a build artifact reached Devin's config:\n{body}"
-        );
+        // Both separator spellings, and the Windows one as JSON writes it
+        // (`target\debug` is escaped to `target\\debug`): a single-separator
+        // needle passes vacuously on Windows.
+        for marker in [
+            "target/debug",
+            "target/release",
+            r"target\\debug",
+            r"target\\release",
+        ] {
+            assert!(
+                !body.contains(marker),
+                "a build artifact reached Devin's config as `{marker}`:\n{body}"
+            );
+        }
         let root = read_back(&config_dir);
+        // Compared against the writer's OWN command builder rather than a
+        // hand-spelled `<path> <suffix>`: `build_command` quotes through
+        // `platform::paths::shell_quote_if_needed`, which is POSIX-only on every
+        // platform, so a Windows path (backslashes are outside its safe set)
+        // comes back single-quoted. The value under test here is the PATH the
+        // resolver produced, not the quoting, and this way the assertion stays
+        // exact on both platforms instead of pinning one platform's spelling.
+        let expected = crate::agent_hook_config::build_command(
+            durable.to_str().expect("durable is UTF-8"),
+            HOOK_COMMAND_SUFFIX,
+        );
         for &event in DEVIN_HOOK_EVENTS {
             let commands = deck_commands_for(&root, event);
             assert!(!commands.is_empty(), "no deck rule for {event}");
             for command in commands {
-                assert!(
-                    command.starts_with(durable.to_str().expect("durable is UTF-8")),
+                assert_eq!(
+                    command, expected,
                     "{event} names {command}, not the durable path"
                 );
             }

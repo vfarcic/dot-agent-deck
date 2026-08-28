@@ -71,6 +71,36 @@ fn write_fake_codex(dir: &std::path::Path) -> std::path::PathBuf {
     path
 }
 
+/// Seed a durable deck at `<home>/.local/bin/dot-agent-deck` and return its path.
+///
+/// PRD #381's resolver refuses to pin the `target/{debug,release}` binary it is
+/// running from into another program's persistent config, so a test that drives
+/// the real `hooks install` CLI has to hand it a durable candidate of its own.
+/// Seeding one inside the fixture — instead of letting the resolver walk out to
+/// whatever the developer has at `~/.local/bin/dot-agent-deck` — is what makes
+/// the outcome the fixture's rather than the host's. That leak is why PR #733
+/// passed locally and failed on all three CI runners at once.
+///
+/// The candidate is never executed, only stat'd, so a two-line script is
+/// enough; the exec bit and the owner-only write mode are the parts the
+/// resolver actually reads.
+fn seed_durable_binary(home: &std::path::Path) -> std::path::PathBuf {
+    let bin_dir = home.join(".local").join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("create durable bin dir");
+    let durable = bin_dir.join(format!(
+        "{}{}",
+        dot_agent_deck::platform::paths::DEFAULT_BINARY_NAME,
+        std::env::consts::EXE_SUFFIX
+    ));
+    std::fs::write(&durable, "#!/bin/sh\nexit 0\n").expect("write durable deck");
+    let mut permissions = std::fs::metadata(&durable)
+        .expect("stat durable deck")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&durable, permissions).expect("make durable deck executable");
+    durable
+}
+
 fn write_fake_program(path: &std::path::Path) {
     std::fs::copy(path.parent().expect("program parent").join("codex"), path)
         .expect("copy fake program");
@@ -546,22 +576,27 @@ fn codex_trust_003_config_edits_are_preserving_idempotent_and_scoped() {
     );
 }
 
-/// Scenario: Run the documented Codex hook installation command against an isolated home and deterministic app-server stand-in. The command must succeed and materialize Codex hook definitions instead of reporting that no installer exists.
+/// Scenario: Run the documented Codex hook installation command against an isolated home, an isolated `$HOME` holding a seeded durable deck, and a deterministic app-server stand-in. The command must succeed, materialize Codex hook definitions, and pin the seeded durable binary rather than anything the host happens to have installed.
 #[spec("codex/hooks/004")]
 #[test]
 fn codex_hooks_004_cli_install_succeeds() {
     let fixture = test_temp::tempdir().expect("create CLI fixture");
     let home = test_temp::tempdir().expect("create Codex home");
+    let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
     write_fake_codex(fixture.path());
-    let path = format!(
-        "{}:{}",
-        fixture.path().display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let durable = seed_durable_binary(deck_home.path());
+    // Both halves are load-bearing. `HOME` anchors the resolver's durable
+    // candidate at the seeded one above; the pinned `PATH` carries only the
+    // fake `codex` plus the system directories the stand-in's `sed` needs, so
+    // no `dot-agent-deck` the host happens to have on `$PATH` can decide the
+    // outcome. Inheriting `$PATH` here is exactly what let this test pass on a
+    // machine with `~/.local/bin/dot-agent-deck` and fail on every CI runner.
+    let path = format!("{}:/usr/bin:/bin", fixture.path().display());
 
     let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .args(["hooks", "install", "--agent", "codex"])
         .env("PATH", path)
+        .env("HOME", deck_home.path())
         .env("CODEX_HOME", home.path())
         .env("CODEX_HOOK_LIST_RESPONSE", hook_list_response(Vec::new()))
         .output()
@@ -575,5 +610,11 @@ fn codex_hooks_004_cli_install_succeeds() {
     assert!(
         hooks_path(home.path()).exists(),
         "successful Codex hook install did not create hooks.json"
+    );
+    let written = std::fs::read_to_string(hooks_path(home.path())).expect("read hooks.json");
+    assert!(
+        written.contains(durable.to_str().expect("durable path is UTF-8")),
+        "the install pinned something other than the durable binary seeded in this fixture, so \
+         the test's outcome is being decided by host state:\n{written}"
     );
 }
