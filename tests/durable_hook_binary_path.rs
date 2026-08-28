@@ -418,6 +418,171 @@ fn self_heal_rewrites_a_deck_rule_whose_binary_is_gone_and_says_so() {
     );
 }
 
+/// **The spelling of a dead pin must not decide whether self-heal recognises
+/// it as ours** — PR #733's `build-windows` run, second round.
+///
+/// The installing path always carries the platform's executable suffix
+/// (`platform::paths::durable_binary_file_name` appends `EXE_SUFFIX`), while
+/// `DEFAULT_BINARY_NAME` never does — and `DEFAULT_BINARY_NAME` is exactly the
+/// literal the pre-fix code wrote as its `current_exe()` fallback, on Windows
+/// as much as anywhere. Comparing raw basenames therefore short-circuited
+/// before `pin_is_repairable` was ever consulted on Windows, so a machine
+/// carrying a legacy pin could never be self-healed and issue #536 stayed open
+/// there while looking closed. On Unix the same code worked only by the
+/// coincidence that `EXE_SUFFIX` is empty.
+///
+/// Both dead rules below must be repaired on every platform: `dot-agent-deck`
+/// and `dot-agent-deck.exe` are the same binary wherever `.exe` is the
+/// platform's suffix, and are the only spelling there is where it is not.
+///
+/// The third rule is the control that keeps the fix honest, and is the
+/// basename safety property this whole gate exists for: a deck-owned rule
+/// naming a genuinely DIFFERENT binary, pointing at a path that does not exist
+/// either, must survive. Pruning is keyed on "same binary, dead path", never
+/// on "dead path".
+#[test]
+fn self_heal_repairs_a_dead_pin_in_either_spelling_of_the_binary_name() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let artifact = fixture.build_artifact();
+    let durable = fixture.durable();
+    let settings = fixture.settings();
+
+    // Same binary name, two spellings, both dead. On Unix these two differ
+    // only by their directory (`EXE_SUFFIX` is empty), which is exactly the
+    // point: the test asserts the same outcome for both on every platform.
+    let bare_stem = fixture
+        .path()
+        .join("pruned-bare")
+        .join(dot_agent_deck::platform::paths::DEFAULT_BINARY_NAME);
+    let with_suffix = fixture.path().join("pruned-suffixed").join(format!(
+        "{}{}",
+        dot_agent_deck::platform::paths::DEFAULT_BINARY_NAME,
+        std::env::consts::EXE_SUFFIX
+    ));
+    // A different binary altogether, equally absent — must be left alone.
+    let other_name = fixture.path().join("keep-me").join("some-other-name");
+    for dead in [&bare_stem, &with_suffix, &other_name] {
+        assert!(
+            !dead.exists(),
+            "{} must genuinely not exist, or the test proves nothing",
+            dead.display()
+        );
+    }
+
+    let command_for = |exe: &Path| format!("{} {CLAUDE_SUFFIX}", exe.display());
+    std::fs::write(
+        &settings,
+        serde_json::to_string_pretty(&json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [ { "type": "command", "command": command_for(&bare_stem) } ] },
+                    { "hooks": [ { "type": "command", "command": command_for(&with_suffix) } ] },
+                    { "hooks": [ { "type": "command", "command": command_for(&other_name) } ] },
+                ]
+            }
+        }))
+        .expect("serialize fixture"),
+    )
+    .expect("seed settings.json");
+
+    fixture.auto_install(&settings, || {
+        durable_binary_path_with(Ok(artifact.clone()), &home, None)
+    });
+
+    let commands = deck_commands(&settings, CLAUDE_SUFFIX);
+    assert!(
+        !commands.contains(&command_for(&bare_stem)),
+        "a dead pin spelled WITHOUT the platform's executable suffix survived \
+         self-heal — issue #536 is then still open on any platform whose \
+         suffix is non-empty: {commands:?}"
+    );
+    assert!(
+        !commands.contains(&command_for(&with_suffix)),
+        "a dead pin spelled WITH the platform's executable suffix survived \
+         self-heal: {commands:?}"
+    );
+    assert!(
+        commands.contains(&command_for(&other_name)),
+        "the prune swept up a deck rule for a genuinely different binary name \
+         just because its path is absent — installing `{}` must never prune \
+         `{}`: {commands:?}",
+        durable.display(),
+        other_name.display()
+    );
+    assert!(
+        commands.contains(&format!("{} {CLAUDE_SUFFIX}", durable.display())),
+        "the durable rule was not written: {commands:?}"
+    );
+}
+
+/// The same-binary judgement is the **host platform's own** convention, taken
+/// from [`std::env::consts::EXE_SUFFIX`] — never a hardcoded `".exe"`.
+///
+/// So this test's expectation is derived, not per-platform: a dead deck rule
+/// naming a literal `dot-agent-deck.exe` is ours to repair exactly where
+/// `.exe` IS the platform's executable suffix, and is a different program name
+/// — left strictly alone — where it is not. On Unix `foo.exe` is just a file
+/// called `foo.exe`.
+///
+/// This is the inversion guard: stripping `".exe"` unconditionally (or
+/// appending the suffix instead of stripping it) fails here on Unix, and
+/// comparing raw basenames fails here on Windows.
+#[test]
+fn self_heal_judges_an_exe_suffixed_pin_by_the_platforms_own_convention() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let artifact = fixture.build_artifact();
+    let settings = fixture.settings();
+    let _durable = fixture.durable();
+
+    let dead_exe = fixture.path().join("pruned-worktree").join(format!(
+        "{}.exe",
+        dot_agent_deck::platform::paths::DEFAULT_BINARY_NAME
+    ));
+    assert!(!dead_exe.exists(), "the dead path must genuinely not exist");
+
+    let command = format!("{} {CLAUDE_SUFFIX}", dead_exe.display());
+    std::fs::write(
+        &settings,
+        serde_json::to_string_pretty(&json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [ { "type": "command", "command": command.clone() } ] }
+                ]
+            }
+        }))
+        .expect("serialize fixture"),
+    )
+    .expect("seed settings.json");
+
+    fixture.auto_install(&settings, || {
+        durable_binary_path_with(Ok(artifact.clone()), &home, None)
+    });
+
+    let commands = deck_commands(&settings, CLAUDE_SUFFIX);
+    let exe_is_this_platforms_suffix = std::env::consts::EXE_SUFFIX.eq_ignore_ascii_case(".exe");
+    if exe_is_this_platforms_suffix {
+        assert!(
+            !commands.contains(&command),
+            "`.exe` is this platform's executable suffix, so `{}` names the \
+             same binary as the installing one and its dead rule must be \
+             repaired: {commands:?}",
+            dead_exe.display()
+        );
+    } else {
+        assert!(
+            commands.contains(&command),
+            "`.exe` is NOT this platform's executable suffix (`EXE_SUFFIX` is \
+             {:?}), so `{}` is a different program name and its rule must be \
+             left alone — the suffix logic must come from `EXE_SUFFIX`, never \
+             from a hardcoded `\".exe\"`: {commands:?}",
+            std::env::consts::EXE_SUFFIX,
+            dead_exe.display()
+        );
+    }
+}
+
 /// The safety property that makes self-heal tolerable: a deck rule whose path
 /// EXISTS but differs from what would be written is left alone. PRD #381 Open
 /// Question 3 — the trigger is "the target is missing", never "the target is

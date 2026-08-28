@@ -623,38 +623,97 @@ fn legacy_format_executable(command: &str) -> Option<&str> {
     if exe.is_empty() { None } else { Some(exe) }
 }
 
+/// Whether two executable FILE NAMES name the same binary, judged by the host
+/// platform's own conventions rather than by byte equality.
+///
+/// **Unix: byte equality, unchanged.** [`std::env::consts::EXE_SUFFIX`] is
+/// empty, so [`strip_suffix_ignoring_ascii_case`] is a literal no-op and the
+/// comparison stays exact and case-sensitive. `foo.exe` on Unix is a genuinely different file
+/// name from `foo` and this must keep saying so — which is why the suffix is
+/// taken from `EXE_SUFFIX` and never hardcoded as `".exe"`.
+///
+/// **Windows: the suffix and the case are not part of a program's identity.**
+/// `dot-agent-deck` and `dot-agent-deck.exe` are the same binary — that is
+/// precisely what `PATHEXT` resolution means — and the filesystem is
+/// case-insensitive, so `Dot-Agent-Deck.EXE` is that same binary again.
+///
+/// Review finding H2 introduced this convention for [`is_legacy_deck_rule`]
+/// alone. PR #733's `build-windows` run then showed [`command_is_dead_deck`]
+/// needed it too and had silently missed it: [`durable_binary_path`] always
+/// resolves a name carrying `EXE_SUFFIX`, while [`DEFAULT_BINARY_NAME`] — the
+/// literal the pre-fix code wrote as its fallback, on Windows as much as
+/// anywhere — never does, so comparing raw basenames could never recognise a
+/// legacy Windows pin as ours to repair and issue #536 stayed open on that
+/// platform. Both call sites now share this one helper, so the convention
+/// cannot drift apart again.
+///
+/// [`durable_binary_path`]: crate::platform::paths::durable_binary_path
+fn binary_names_match(a: &str, b: &str) -> bool {
+    binary_names_match_under(a, b, std::env::consts::EXE_SUFFIX, cfg!(windows))
+}
+
+/// [`binary_names_match`] with the host's two conventions injected instead of
+/// read from the target: the executable suffix, and whether file names are
+/// case-insensitive.
+///
+/// Split out **so the arithmetic is testable on any platform**, which is not a
+/// stylistic preference here. PR #733's defect was Windows-only, could not be
+/// reproduced on the machine that had to fix it (`aws-lc-sys` does not
+/// cross-compile), and a `cfg!(windows)` branch covered by no test that runs
+/// where its author works is precisely how the first one shipped green.
+/// Passing `("", false)` reproduces every Unix exactly — an empty suffix makes
+/// [`strip_suffix_ignoring_ascii_case`] the identity, leaving plain `==`.
+fn binary_names_match_under(a: &str, b: &str, exe_suffix: &str, case_insensitive: bool) -> bool {
+    let a = strip_suffix_ignoring_ascii_case(a, exe_suffix);
+    let b = strip_suffix_ignoring_ascii_case(b, exe_suffix);
+    if case_insensitive {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+/// `name` without one trailing `suffix`, matched case-insensitively because
+/// Windows spells its executable suffix both `.exe` and `.EXE`. Returns `name`
+/// untouched when `suffix` is empty (every Unix), when it is absent, and when
+/// the name is nothing BUT the suffix — a file called `.exe` is a name in its
+/// own right, not an empty one.
+fn strip_suffix_ignoring_ascii_case<'a>(name: &'a str, suffix: &str) -> &'a str {
+    if suffix.is_empty() {
+        return name;
+    }
+    match name.len().checked_sub(suffix.len()) {
+        // `is_char_boundary` is load-bearing, not defensive: a basename ending
+        // in a multi-byte character can put `cut` inside one, and slicing
+        // there panics.
+        Some(cut)
+            if cut > 0
+                && name.is_char_boundary(cut)
+                && name[cut..].eq_ignore_ascii_case(suffix) =>
+        {
+            &name[..cut]
+        }
+        _ => name,
+    }
+}
+
 /// Whether `command` is a LEGACY deck rule: the bare `<executable> hook` shape,
-/// where `executable`'s basename is EXACTLY [`DEFAULT_BINARY_NAME`] — the
-/// historical default every rule was written under before this fix existed.
-/// Scoped to an exact basename match (never a fragment, never the installing
-/// binary's own name) so a user tool whose basename merely contains "deck"
-/// (test 012) or ends in the literal word "hook" (test 005) is never swept up.
+/// where `executable`'s basename names [`DEFAULT_BINARY_NAME`] — the historical
+/// default every rule was written under before this fix existed. Scoped to a
+/// whole-basename match via [`binary_names_match`] (never a fragment, never the
+/// installing binary's own name) so a user tool whose basename merely contains
+/// "deck" (test 012) or ends in the literal word "hook" (test 005) is never
+/// swept up.
 ///
 /// Review finding H2: on Windows the installed binary carries the platform's
 /// executable suffix (`dot-agent-deck.exe`), so every real legacy Windows rule
-/// has a basename that never equals bare [`DEFAULT_BINARY_NAME`]. The
-/// comparison is therefore extension-aware — it also accepts
-/// `DEFAULT_BINARY_NAME` with [`std::env::consts::EXE_SUFFIX`] appended, rather
-/// than hardcoding `".exe"` — and, on Windows only, case-insensitive, since
-/// Windows filesystems are and a rule reading `Dot-Agent-Deck.EXE` is a
-/// legitimate legacy rule. `EXE_SUFFIX` is empty on Unix, so this is a no-op
-/// there: the comparison stays exact-basename, case-sensitive, exactly as
-/// before.
+/// has a basename that never equals bare [`DEFAULT_BINARY_NAME`] byte for byte.
+/// [`binary_names_match`] is what closes that gap, and is a no-op on Unix.
 fn is_legacy_deck_rule(command: &str) -> bool {
-    let Some(basename) = legacy_format_executable(command)
+    legacy_format_executable(command)
         .and_then(|exe| Path::new(exe).file_name())
         .and_then(|n| n.to_str())
-    else {
-        return false;
-    };
-
-    if cfg!(windows) {
-        let with_suffix = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
-        basename.eq_ignore_ascii_case(DEFAULT_BINARY_NAME)
-            || basename.eq_ignore_ascii_case(&with_suffix)
-    } else {
-        basename == DEFAULT_BINARY_NAME
-    }
+        .is_some_and(|basename| binary_names_match(basename, DEFAULT_BINARY_NAME))
 }
 
 /// Whether `existing` and `installing` (both already unquoted) name the SAME
@@ -711,7 +770,11 @@ fn command_matches_binary(command: &str, binary_path: &str) -> bool {
 }
 
 /// Whether `command` is a deck-owned command sharing `binary_path`'s own basename
-/// whose executable is POSITIVELY KNOWN not to be a usable durable pin — see
+/// — [`binary_names_match`], so the host platform's executable-suffix and
+/// case conventions decide what "same basename" means, which is what took this
+/// from "closed on Unix by the coincidence of an empty `EXE_SUFFIX`" to closed
+/// everywhere — whose executable is POSITIVELY KNOWN not to be a usable
+/// durable pin — see
 /// [`crate::platform::paths::pin_is_repairable`] for what that means and for
 /// the one case that still gets the benefit of the doubt.
 /// `owned_command_executable` returns `None` for any command that is not
@@ -755,9 +818,22 @@ fn command_matches_binary(command: &str, binary_path: &str) -> bool {
 /// already fail to resolve a path for reasons unrelated to the binary's
 /// health. That gap is unchanged by this fix.
 fn command_is_dead_deck(command: &str, binary_path: &str) -> bool {
-    let installing_basename = Path::new(binary_path).file_name();
+    let Some(installing) = Path::new(binary_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        // No basename to compare against (an empty or `..`-terminated
+        // installing path, or a non-UTF-8 one). Fail safe: prune nothing. The
+        // old `Option == Option` comparison treated two `None`s as a MATCH,
+        // which is the one direction that deletes a user's rule off a value
+        // nobody can reason about.
+        return false;
+    };
     owned_command_executable(command).is_some_and(|exe| {
-        Path::new(&exe).file_name() == installing_basename
+        Path::new(&exe)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|existing| binary_names_match(existing, installing))
             && crate::platform::paths::pin_is_repairable(&exe)
     })
 }
@@ -961,4 +1037,182 @@ pub fn uninstall_from(path: &Path) -> io::Result<()> {
         return Ok(());
     }
     write_settings(path, &settings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The conventions [`binary_names_match`] reads off the target on Windows,
+    /// spelled out so they can be exercised from a Linux or macOS box — the
+    /// only kind available while PR #733's Windows-only defect was being
+    /// fixed, since `aws-lc-sys` does not cross-compile.
+    const WINDOWS: (&str, bool) = (".exe", true);
+    /// The same for every Unix: no executable suffix, case-sensitive names.
+    const UNIX: (&str, bool) = ("", false);
+
+    fn matches(a: &str, b: &str, (suffix, insensitive): (&str, bool)) -> bool {
+        binary_names_match_under(a, b, suffix, insensitive)
+    }
+
+    /// The Windows defect PR #733's second round exists to close: the
+    /// installing path always carries `EXE_SUFFIX`
+    /// (`platform::paths::durable_binary_file_name` appends it) while
+    /// `DEFAULT_BINARY_NAME` never does, so a legacy bare pin and the binary
+    /// installing over it are the same program spelled two ways.
+    #[test]
+    fn binary_names_match_across_the_windows_executable_suffix() {
+        assert!(matches("dot-agent-deck", "dot-agent-deck.exe", WINDOWS));
+        assert!(matches("dot-agent-deck.exe", "dot-agent-deck", WINDOWS));
+        assert!(matches("dot-agent-deck.exe", "dot-agent-deck.exe", WINDOWS));
+        assert!(matches("dot-agent-deck", "dot-agent-deck", WINDOWS));
+        // Windows file names are case-insensitive, so this is the same binary
+        // again — the review-finding-H2 half of the convention.
+        assert!(matches("Dot-Agent-Deck.EXE", "dot-agent-deck.exe", WINDOWS));
+    }
+
+    /// The inversion guard. On Unix `foo.exe` is a file called `foo.exe` and
+    /// nothing more, so stripping a hardcoded `".exe"` (or applying the
+    /// case-insensitivity everywhere) must not compile away this difference.
+    #[test]
+    fn binary_names_stay_exact_on_unix() {
+        assert!(matches("dot-agent-deck", "dot-agent-deck", UNIX));
+        assert!(
+            !matches("dot-agent-deck", "dot-agent-deck.exe", UNIX),
+            "`.exe` is not this platform's executable suffix, so these are two \
+             different file names"
+        );
+        assert!(
+            !matches("Dot-Agent-Deck", "dot-agent-deck", UNIX),
+            "Unix file names are case-sensitive"
+        );
+    }
+
+    /// The safety property the basename gate exists for, at the unit level:
+    /// installing `/a/dot-agent-deck` must never prune `/b/some-other-name`.
+    /// Neither convention may collapse two genuinely different names.
+    #[test]
+    fn binary_names_never_match_a_different_program() {
+        for conventions in [WINDOWS, UNIX] {
+            assert!(!matches("some-other-name", "dot-agent-deck", conventions));
+            assert!(!matches(
+                "some-other-name.exe",
+                "dot-agent-deck.exe",
+                conventions
+            ));
+            // A fragment is not a match, in either direction — the property
+            // `is_legacy_deck_rule` is scoped to a whole basename for.
+            assert!(!matches(
+                "dot-agent-deck-shim",
+                "dot-agent-deck",
+                conventions
+            ));
+            assert!(!matches("deck", "dot-agent-deck", conventions));
+            // Only ONE suffix comes off, so a doubled one is still distinct.
+            assert!(!matches(
+                "dot-agent-deck.exe.exe",
+                "dot-agent-deck",
+                conventions
+            ));
+        }
+    }
+
+    /// The **call site**, not just the helper: `command_is_dead_deck` must
+    /// recognise a legacy BARE pin as ours to repair when the binary installing
+    /// over it is the deck's own installed file name on THIS platform.
+    ///
+    /// This is the assertion that failed on `build-windows` in PR #733's first
+    /// round and passed everywhere else, because
+    /// `platform::paths::durable_binary_file_name` appends `EXE_SUFFIX` while
+    /// `DEFAULT_BINARY_NAME` — the literal the pre-fix code wrote as its
+    /// `current_exe()` fallback — never does. A Windows machine carrying such a
+    /// pin could therefore never be self-healed, so issue #536 was open there
+    /// while looking closed. On Unix it held only by the coincidence that
+    /// `EXE_SUFFIX` is empty.
+    #[test]
+    fn a_bare_pin_is_dead_against_the_platforms_own_installed_file_name() {
+        let installing = format!(
+            "/opt/dot-agent-deck/bin/{DEFAULT_BINARY_NAME}{}",
+            std::env::consts::EXE_SUFFIX
+        );
+        assert!(
+            command_is_dead_deck(
+                &format!("{DEFAULT_BINARY_NAME} {HOOK_COMMAND_SUFFIX}"),
+                &installing
+            ),
+            "a bare `{DEFAULT_BINARY_NAME}` pin must be repairable when \
+             installing `{installing}` — /bin/sh (or cmd.exe) resolves that \
+             persisted bare name through the AGENT's PATH at hook-fire time"
+        );
+        // And the legacy `<path> hook` shape, which reaches the same gate
+        // through `is_legacy_deck_rule` rather than the current-format parse.
+        assert!(command_is_dead_deck(
+            &format!("{DEFAULT_BINARY_NAME} hook"),
+            &installing
+        ));
+    }
+
+    /// The safety property the basename gate exists for, at its own call site
+    /// and independently of the existence check: `pin_is_repairable` says
+    /// "repairable" for every pin below on every platform — absent on Unix,
+    /// and not absolute (no drive prefix) on Windows — so the basename
+    /// comparison is the ONLY thing standing between them and deletion.
+    /// Installing `/a/dot-agent-deck` must never prune `/b/some-other-name`'s
+    /// rule.
+    #[test]
+    fn a_deck_rule_for_a_different_binary_is_never_dead_against_ours() {
+        let installing = format!(
+            "/opt/dot-agent-deck/bin/{DEFAULT_BINARY_NAME}{}",
+            std::env::consts::EXE_SUFFIX
+        );
+        assert!(!command_is_dead_deck(
+            &format!("/nowhere/some-other-name {HOOK_COMMAND_SUFFIX}"),
+            &installing
+        ));
+        assert!(!command_is_dead_deck(
+            &format!("/nowhere/{DEFAULT_BINARY_NAME}-shim {HOOK_COMMAND_SUFFIX}"),
+            &installing
+        ));
+        // A user-authored command that merely MENTIONS the deck is not ours by
+        // either shape, so it never reaches the basename gate at all.
+        assert!(!command_is_dead_deck(
+            "/opt/audit/wrapper --watch dot-agent-deck --report",
+            &installing
+        ));
+    }
+
+    /// A name that is nothing but the suffix keeps it: a file called `.exe` has
+    /// that name, and stripping it to the empty string would make it match
+    /// every other suffix-only name.
+    #[test]
+    fn a_suffix_only_name_is_not_stripped_to_nothing() {
+        assert_eq!(strip_suffix_ignoring_ascii_case(".exe", ".exe"), ".exe");
+        assert!(!matches(".exe", "", WINDOWS));
+    }
+
+    /// `strip_suffix_ignoring_ascii_case` slices by byte offset, so a basename
+    /// ending in a multi-byte character can put the cut inside one. Slicing
+    /// there panics, and a hook basename is arbitrary user-supplied text.
+    #[test]
+    fn stripping_never_panics_on_a_multibyte_boundary() {
+        // 5 bytes, and `len - ".exe".len()` == 1 lands inside the first `é`.
+        assert_eq!(strip_suffix_ignoring_ascii_case("ééa", ".exe"), "ééa");
+        assert_eq!(strip_suffix_ignoring_ascii_case("é", ".exe"), "é");
+        assert_eq!(strip_suffix_ignoring_ascii_case("", ".exe"), "");
+        assert_eq!(strip_suffix_ignoring_ascii_case("déjà.EXE", ".exe"), "déjà");
+    }
+
+    /// The whole predicate, on the real host: whatever this platform's
+    /// conventions are, the deck's own installed file name and
+    /// `DEFAULT_BINARY_NAME` must name the same binary — that identity is what
+    /// lets self-heal recognise a legacy pin as ours to repair, and it is the
+    /// one assertion here that would have failed on `build-windows` before this
+    /// fix.
+    #[test]
+    fn the_installed_file_name_and_the_default_name_are_the_same_binary() {
+        let installed = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+        assert!(binary_names_match(DEFAULT_BINARY_NAME, &installed));
+        assert!(binary_names_match(&installed, DEFAULT_BINARY_NAME));
+        assert!(!binary_names_match("some-other-name", &installed));
+    }
 }
