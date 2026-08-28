@@ -666,6 +666,17 @@ pub fn probe_remote_protocol(
 /// endpoint cannot repaint the message that describes it. Escaping is
 /// idempotent, so `remote_doctor::render` escaping again at its own seam costs
 /// nothing.
+///
+/// Since issue #723 the two `detail`-carrying arms arrive already **stripped**
+/// by `remote::scrub_remote_text`, so this escape is now a second line of
+/// defence for them rather than the first. One consequence is deliberate and
+/// worth knowing: what the doctor quotes for a transport failure is the
+/// printable residue (`[2J`) rather than the escaped original (`\u{1b}[2J`),
+/// because the bytes were dropped before this saw them. The escape still does
+/// the original work for the `Io` and `HostKeyVerificationFailed` arms, and
+/// for every other producer-controlled field the doctor renders — including
+/// `probe_remote_version`'s own stderr path above, which escapes at its own
+/// seam and is untouched by that change.
 pub fn ssh_error_detail(err: &SshError) -> String {
     let raw = match err {
         SshError::ConnectionRefused { detail, .. } => detail.clone(),

@@ -18,6 +18,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::untrusted_text::strip_control_and_bidi;
+
 /// GitHub releases base URL used to download `dot-agent-deck` binaries onto
 /// remote hosts. Hard-coded because Cargo doesn't export
 /// `[package.repository]` to the build (and our `Cargo.toml` doesn't set it).
@@ -77,7 +79,12 @@ pub struct SshOutput {
 /// Failure modes the executor distinguishes. Mapped from ssh's stderr/exit
 /// status by `SystemSshExecutor`; the production matcher is conservative —
 /// anything we can't classify ends up as `Other` so the caller can surface
-/// stderr verbatim.
+/// stderr.
+///
+/// Every `detail` field here is remote-controlled text and is scrubbed by
+/// [`scrub_remote_text`] at construction, so this type's `Display` — printed
+/// raw to the operator's terminal by `main.rs` — is safe by construction. See
+/// that function for why the seam is here and not at the `eprintln!`.
 #[derive(Debug, Error)]
 pub enum SshError {
     #[error(
@@ -106,12 +113,54 @@ pub enum SshError {
     Other { target: String, detail: String },
 }
 
+/// Scrub text the *remote* wrote — ssh's own stderr, or the stdout/stderr of a
+/// command we ran over ssh — before it becomes a field of an error whose
+/// `Display` is printed straight to the operator's terminal.
+///
+/// `remote add` is the sharpest case this exists for: it is the **first**
+/// contact with an endpoint the operator has not yet decided to trust, it runs
+/// before any registry entry exists, and its failure path is
+/// `eprintln!("{e}")`. A host that merely answers the connection could
+/// therefore write a CSI/OSC sequence into the terminal — clear the screen,
+/// move the cursor over earlier output, retitle the window — or plant a bidi
+/// override that visually reorders the line the operator is reading to decide
+/// what went wrong (issue #723).
+///
+/// Sealed here, at the boundary where a remote-controlled byte enters an error
+/// type, rather than at `main.rs`'s four `eprintln!("{e}")` sites, for the
+/// reason [`crate::project_config::ProjectConfigError`]'s `Display` records:
+/// one seam covers every sink by construction and cannot be forgotten by a
+/// fifth caller added later. Sanitizing at the print sites would pass the same
+/// tests today and rot the first time someone adds a `remote` subcommand.
+///
+/// **Stripping, not escaping**, and newlines survive. `SshError`'s messages
+/// deliberately put `Details:` on its own line and multi-line ssh stderr is
+/// genuinely useful diagnostic output, so this passes `keep_newlines: true`;
+/// the leading/trailing trim that the call sites used to do themselves happens
+/// *after* the strip, so a `"\x1b[2J\n"` tail cannot leave a stray blank
+/// line behind. `remote doctor` reaches for
+/// [`crate::untrusted_text::escape_control_and_bidi`] instead because a
+/// *report* exists to show what the peer actually sent; an error message is
+/// read for its advice, so the noise is better dropped than displayed. The one
+/// place those two policies meet is [`crate::connect::ssh_error_detail`],
+/// which reads `SshError`'s `detail` for the doctor and escapes it: it now
+/// receives a stripped value, so its escape became a second line of defence
+/// and the doctor quotes the residue rather than the escaped original. See its
+/// doc comment — that trade is recorded there.
+fn scrub_remote_text(s: &str) -> String {
+    strip_control_and_bidi(s, true).trim().to_string()
+}
+
 /// Map ssh's stderr output (when the process exited with 255) onto a typed
 /// `SshError` variant. Extracted from `SystemSshExecutor::run` so it can be
 /// unit-tested without spawning a process.
+///
+/// Classification matches against the **raw** stderr while `detail` carries the
+/// [`scrub_remote_text`] form: the matcher looks for ssh's own fixed phrases,
+/// and scrubbing first could only ever change what it sees.
 fn classify_ssh_error(target: &SshTarget, stderr: &str) -> SshError {
     let lower = stderr.to_ascii_lowercase();
-    let detail = stderr.trim().to_string();
+    let detail = scrub_remote_text(stderr);
     if lower.contains("connection refused")
         || lower.contains("network is unreachable")
         || lower.contains("no route to host")
@@ -1024,6 +1073,14 @@ pub struct AddOptions {
     pub release_base: String,
 }
 
+/// Failure modes of `remote add` (and, via `Inner`, of `remote upgrade`).
+///
+/// Several variants quote bytes the *remote* wrote — the arch probe's stderr
+/// and its stdout, the version the remote binary reports, the download step's
+/// stderr, the hook install's stderr. Every one of them is passed through
+/// [`scrub_remote_text`] at construction, because this type's `Display` is
+/// printed straight to the operator's terminal by `main.rs`. See that function
+/// for why the seam is there rather than at the `eprintln!`.
 #[derive(Debug, Error)]
 pub enum RemoteAddError {
     #[error(
@@ -1158,14 +1215,14 @@ fn install_and_verify(
         let v = executor.run(target, "~/.local/bin/dot-agent-deck --version")?;
         if v.status != 0 {
             return Err(RemoteAddError::VersionMismatch {
-                actual: format!("(exit {}) {}", v.status, v.stderr.trim()),
+                actual: format!("(exit {}) {}", v.status, scrub_remote_text(&v.stderr)),
                 expected: version.to_string(),
             });
         }
         let actual = parse_version_output(&v.stdout).unwrap_or_else(|| v.stdout.trim().to_string());
         if actual != version {
             return Err(RemoteAddError::VersionMismatch {
-                actual,
+                actual: scrub_remote_text(&actual),
                 expected: version.to_string(),
             });
         }
@@ -1183,20 +1240,24 @@ fn install_and_verify(
             version: version.to_string(),
             platform: platform.to_string(),
             url,
-            detail: format!("exit {}: {}", install.status, install.stderr.trim()),
+            detail: format!(
+                "exit {}: {}",
+                install.status,
+                scrub_remote_text(&install.stderr)
+            ),
         });
     }
     let v = executor.run(target, "~/.local/bin/dot-agent-deck --version")?;
     if v.status != 0 {
         return Err(RemoteAddError::VersionMismatch {
-            actual: format!("(exit {}) {}", v.status, v.stderr.trim()),
+            actual: format!("(exit {}) {}", v.status, scrub_remote_text(&v.stderr)),
             expected: version.to_string(),
         });
     }
     let actual = parse_version_output(&v.stdout).unwrap_or_else(|| v.stdout.trim().to_string());
     if actual != version {
         return Err(RemoteAddError::VersionMismatch {
-            actual,
+            actual: scrub_remote_text(&actual),
             expected: version.to_string(),
         });
     }
@@ -1249,12 +1310,12 @@ pub fn add(
     if uname.status != 0 {
         return Err(RemoteAddError::UnameFailed {
             status: uname.status,
-            stderr: uname.stderr,
+            stderr: scrub_remote_text(&uname.stderr),
         });
     }
     let platform =
         detect_platform(&uname.stdout).ok_or_else(|| RemoteAddError::UnsupportedArch {
-            arch: uname.stdout.trim().to_string(),
+            arch: scrub_remote_text(&uname.stdout),
         })?;
 
     // 4. Install or version-check (shared between `add` and `upgrade`).
@@ -1274,7 +1335,7 @@ pub fn add(
     if hooks.status != 0 {
         return Err(RemoteAddError::HooksInstallFailed {
             status: hooks.status,
-            stderr: hooks.stderr,
+            stderr: scrub_remote_text(&hooks.stderr),
         });
     }
     if !hooks.stdout.is_empty() {
@@ -1531,13 +1592,13 @@ pub fn upgrade(
     if uname.status != 0 {
         return Err(RemoteAddError::UnameFailed {
             status: uname.status,
-            stderr: uname.stderr,
+            stderr: scrub_remote_text(&uname.stderr),
         }
         .into());
     }
     let platform =
         detect_platform(&uname.stdout).ok_or_else(|| RemoteAddError::UnsupportedArch {
-            arch: uname.stdout.trim().to_string(),
+            arch: scrub_remote_text(&uname.stdout),
         })?;
 
     // 4. Install + version-check (shared with `add`).
@@ -1560,7 +1621,7 @@ pub fn upgrade(
     if hooks.status != 0 {
         return Err(RemoteAddError::HooksInstallFailed {
             status: hooks.status,
-            stderr: hooks.stderr,
+            stderr: scrub_remote_text(&hooks.stderr),
         }
         .into());
     }
@@ -2022,5 +2083,285 @@ mod tests {
         let target = SshTarget::parse("u@h", 22, None);
         let err = classify_ssh_error(&target, "u@h: Permission denied (publickey).");
         assert!(matches!(err, SshError::AuthFailed { .. }));
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #723 — a host that merely answers the ssh connection must not
+    // be able to drive the terminal that reports the failure.
+    // -----------------------------------------------------------------
+
+    /// What a hostile remote plants on stderr: an ANSI erase-display, an OSC
+    /// title-set terminated by BEL, and a RIGHT-TO-LEFT OVERRIDE. One fixture
+    /// shared by every case, so each `detail`-carrying variant is pinned
+    /// against exactly the same payload.
+    const HOSTILE: &str = "\x1b[2J\x1b]0;pwned\x07\u{202e}";
+
+    /// `HOSTILE` after [`scrub_remote_text`]: the bytes a terminal *acts on*
+    /// are gone and their printable residue stays, because the policy at this
+    /// seam is stripping rather than escaping.
+    const HOSTILE_SCRUBBED: &str = "[2J]0;pwned";
+
+    /// Fail on any character a terminal would interpret. `\n` is the one
+    /// exemption: the messages deliberately put `Details:` on its own line,
+    /// and multi-line ssh stderr is diagnostic output worth keeping.
+    fn assert_terminal_safe(msg: &str) {
+        for c in msg.chars() {
+            assert!(
+                c == '\n' || !(c.is_control() || crate::untrusted_text::is_bidi_format_char(c)),
+                "U+{:04X} survived into a message printed to the terminal: {msg:?}",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn scrub_remote_text_keeps_interior_newlines_and_trims_the_edges() {
+        assert_eq!(
+            scrub_remote_text("\x1b[2Jfirst\nsecond\x1b[0m\n"),
+            "[2Jfirst\nsecond[0m",
+            "the ESC bytes go; their printable residue and the interior newline stay"
+        );
+        // The trim runs AFTER the strip, so a trailing line made of nothing
+        // but an escape sequence cannot leave a blank line behind — which is
+        // what `stderr.trim()` alone used to do here.
+        assert_eq!(scrub_remote_text("body\n\x1b\x07\u{202e}\n"), "body");
+        // Ordinary multi-line stderr is untouched.
+        assert_eq!(
+            scrub_remote_text("line one\nline two"),
+            "line one\nline two"
+        );
+    }
+
+    /// One row of the variant table below: the ssh stderr phrase that routes
+    /// to a variant, the matcher that recognises it, and whether that
+    /// variant's message puts the detail behind its own `Details:` line.
+    type DetailCase = (&'static str, fn(&SshError) -> bool, bool);
+
+    #[test]
+    fn classify_ssh_error_scrubs_control_bytes_from_every_detail_variant() {
+        let target = SshTarget::parse("user@host", 22, None);
+        // Every `SshError` variant that carries a `detail`: the ssh stderr
+        // phrase that routes to it, the matcher, and whether its message puts
+        // the detail behind a `Details:` line (`Other` inlines it instead).
+        // The two variants that carry no `detail` — `HostKeyVerificationFailed`
+        // and `Io` — give a remote nothing to steer, so there is nothing to
+        // pin for them.
+        let cases: [DetailCase; 3] = [
+            (
+                "ssh: connect to host h port 22: Connection refused",
+                |e| matches!(e, SshError::ConnectionRefused { .. }),
+                true,
+            ),
+            (
+                "user@host: Permission denied (publickey).",
+                |e| matches!(e, SshError::AuthFailed { .. }),
+                true,
+            ),
+            (
+                "kex_exchange_identification: read: Broken pipe",
+                |e| matches!(e, SshError::Other { .. }),
+                false,
+            ),
+        ];
+
+        for (phrase, is_variant, uses_details_line) in cases {
+            let stderr = format!("{HOSTILE}{phrase}\nsecond line{HOSTILE}\n");
+            let err = classify_ssh_error(&target, &stderr);
+            // Scrubbing must not disturb routing — the matcher reads the raw
+            // stderr, the `detail` carries the scrubbed form.
+            assert!(is_variant(&err), "routing changed for {phrase:?}: {err:?}");
+
+            let msg = err.to_string();
+            assert_terminal_safe(&msg);
+            // Still a useful diagnostic: the remote's real words survive...
+            assert!(msg.contains(phrase), "detail lost the real stderr: {msg:?}");
+            // ...including the newline it wrote between its own two lines.
+            assert!(
+                msg.contains(&format!("{phrase}\nsecond line")),
+                "an interior newline was dropped: {msg:?}"
+            );
+            if uses_details_line {
+                assert!(
+                    msg.contains("\nDetails: "),
+                    "`Details:` lost its own line: {msg:?}"
+                );
+            }
+            // Stripped, not escaped: the printable residue is there, and no
+            // `\u{1b}`-style escape appears — that is `remote doctor`'s policy,
+            // not this seam's.
+            assert!(
+                msg.contains(HOSTILE_SCRUBBED),
+                "expected the stripped residue in {msg:?}"
+            );
+            assert!(
+                !msg.contains("\\u{1b}"),
+                "this seam strips rather than escapes: {msg:?}"
+            );
+        }
+    }
+
+    /// [`SshExecutor`] double that hands back canned outputs in call order.
+    /// Every error path under test is reached by the Nth ssh call returning a
+    /// particular status, so a queue is the whole fixture — no commands are
+    /// recorded because none of these assertions look at them.
+    struct ScriptedSsh(std::cell::RefCell<std::collections::VecDeque<SshOutput>>);
+
+    impl ScriptedSsh {
+        fn new(outputs: impl IntoIterator<Item = SshOutput>) -> Self {
+            Self(std::cell::RefCell::new(outputs.into_iter().collect()))
+        }
+    }
+
+    impl SshExecutor for ScriptedSsh {
+        fn run(&self, _target: &SshTarget, _command: &str) -> Result<SshOutput, SshError> {
+            Ok(self
+                .0
+                .borrow_mut()
+                .pop_front()
+                .expect("the script ran out of canned ssh outputs"))
+        }
+    }
+
+    /// A successful ssh call with the given stdout.
+    fn ssh_ok(stdout: &str) -> SshOutput {
+        SshOutput {
+            status: 0,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    /// A failing ssh call whose stderr wraps `body` in [`HOSTILE`] on both
+    /// sides and spans two lines, so one fixture exercises stripping and
+    /// newline preservation together.
+    fn ssh_hostile_failure(status: i32, body: &str) -> SshOutput {
+        SshOutput {
+            status,
+            stdout: String::new(),
+            stderr: format!("{HOSTILE}{body}\nsecond line{HOSTILE}\n"),
+        }
+    }
+
+    #[test]
+    fn download_failure_scrubs_control_bytes_from_the_remote_stderr() {
+        // The second site that reads a remote's stderr into an error field,
+        // and the one `remote upgrade` reaches too — both go through
+        // `install_and_verify`.
+        let executor = ScriptedSsh::new([ssh_hostile_failure(7, "curl: (22) 404 Not Found")]);
+        let target = SshTarget::parse("user@host", 22, None);
+        let err = install_and_verify(
+            &executor,
+            &target,
+            "linux-amd64",
+            "0.24.5",
+            "https://example.test/releases/download",
+            false,
+        )
+        .expect_err("a non-zero install exit must fail");
+        assert!(
+            matches!(err, RemoteAddError::DownloadFailed { .. }),
+            "got {err:?}"
+        );
+
+        let msg = err.to_string();
+        assert_terminal_safe(&msg);
+        assert!(msg.contains("exit 7: "), "exit status lost: {msg:?}");
+        assert!(
+            msg.contains("curl: (22) 404 Not Found\nsecond line"),
+            "the remote's real stderr and its interior newline must survive: {msg:?}"
+        );
+        assert!(
+            msg.contains(HOSTILE_SCRUBBED),
+            "expected the stripped residue in {msg:?}"
+        );
+    }
+
+    #[test]
+    fn remote_add_scrubs_control_bytes_from_every_remote_derived_error() {
+        // `remote add` reads the remote's own bytes at four points beyond the
+        // ssh-transport classifier — the arch probe's stderr, the arch probe's
+        // *stdout* when it does not parse, the version the remote binary
+        // reports, and the hook install's stderr. All four land in a
+        // `RemoteAddError` printed by the same `eprintln!("{e}")`, and a host
+        // that merely answers the connection reaches the first of them
+        // *before* any ssh error is classified, so leaving them raw would
+        // leave the sharpest case open.
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Deliberately a path that does not exist: `RemotesFile::load` treats
+        // NotFound as an empty registry, and every case below fails before
+        // anything is saved, so no file is ever written.
+        let path = dir.path().join("remotes.toml");
+        let opts = AddOptions {
+            name: "prod".to_string(),
+            remote_type: "ssh".to_string(),
+            target: "user@host".to_string(),
+            port: 22,
+            key: None,
+            version: "0.24.5".to_string(),
+            // Skips the download step so the version check is reached with a
+            // two-call script; the download path has its own test above.
+            no_install: true,
+            release_base: "https://example.test/releases/download".to_string(),
+        };
+
+        // (label, ssh script, variant matcher, a substring of the remote's
+        // real words that must survive with its newline)
+        #[allow(clippy::type_complexity)]
+        let cases: [(&str, Vec<SshOutput>, fn(&RemoteAddError) -> bool, &str); 4] = [
+            (
+                "uname failed",
+                vec![ssh_hostile_failure(127, "uname: command not found")],
+                |e| matches!(e, RemoteAddError::UnameFailed { .. }),
+                "uname: command not found\nsecond line",
+            ),
+            (
+                "uname output does not parse",
+                // `detect_platform` still reads the RAW stdout — only the
+                // error field is scrubbed — so this must fail to parse on the
+                // strength of `Plan9 pdp11`, not because of the payload.
+                vec![ssh_ok(&format!("{HOSTILE}Plan9 pdp11\n"))],
+                |e| matches!(e, RemoteAddError::UnsupportedArch { .. }),
+                "Plan9 pdp11",
+            ),
+            (
+                "remote reports a different version",
+                vec![
+                    ssh_ok("Linux x86_64\n"),
+                    ssh_ok(&format!("dot-agent-deck {HOSTILE}9.9.9\n")),
+                ],
+                |e| matches!(e, RemoteAddError::VersionMismatch { .. }),
+                "9.9.9",
+            ),
+            (
+                "hook install failed",
+                vec![
+                    ssh_ok("Linux x86_64\n"),
+                    ssh_ok("dot-agent-deck 0.24.5\n"),
+                    ssh_hostile_failure(3, "hooks: settings.json is not writable"),
+                ],
+                |e| matches!(e, RemoteAddError::HooksInstallFailed { .. }),
+                "hooks: settings.json is not writable\nsecond line",
+            ),
+        ];
+
+        for (label, script, is_variant, must_survive) in cases {
+            let executor = ScriptedSsh::new(script);
+            let err = match add(&opts, &executor, &path) {
+                Err(e) => e,
+                Ok(_) => panic!("{label}: this script must fail"),
+            };
+            assert!(is_variant(&err), "{label}: wrong variant {err:?}");
+
+            let msg = err.to_string();
+            assert_terminal_safe(&msg);
+            assert!(
+                msg.contains(must_survive),
+                "{label}: the remote's real words were lost: {msg:?}"
+            );
+            assert!(
+                msg.contains(HOSTILE_SCRUBBED),
+                "{label}: expected the stripped residue in {msg:?}"
+            );
+        }
     }
 }
