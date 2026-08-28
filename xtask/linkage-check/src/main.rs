@@ -5,7 +5,7 @@
 //! Subcommands:
 //!
 //! - `linkage-check` (default) — first runs a repository-state preflight
-//!   (issue #557; see [`repo_state`]), then performs the ten checks
+//!   (issue #557; see [`repo_state`]), then performs the eleven checks
 //!   listed in Decision 7 + Decision 30:
 //!
 //!   The preflight is deliberately not one of the numbered checks: it answers
@@ -45,6 +45,13 @@
 //!      lifetime bound — `common::init_test_env()` or
 //!      `child_lifetime_bound::arm()`. Issue #668. See
 //!      [`UNARMED_SPAWN_RULE`].
+//!  11. No file under `tests/` pins a wrapped-child lifetime cap
+//!      longer than the one `clean-e2e-tmp` derives its dead-owner
+//!      deletion floor from. Issue #679. See
+//!      [`overlong_lifetime_cap_rule`].
+//!
+//!   The numbers are stable identifiers in the failure output, so a
+//!   new rule takes the next one rather than renumbering the others.
 //!
 //!   Checks 1/2/4/6 bind each `#[spec("…")]` to its test function
 //!   through the SAME syn walker rule 7 uses
@@ -427,6 +434,129 @@ fn lifetime_bound_armed_re() -> Regex {
         .expect("lifetime bound arming regex compiles")
 }
 
+/// Check 11 (issue #679): no test may pin a wrapped-child lifetime cap longer
+/// than the one `clean-e2e-tmp` derives its dead-owner deletion floor from.
+///
+/// `cargo xtask clean-e2e-tmp` reaps a root whose owning *test* process is dead
+/// once the root is [`clean_tmp::MAX_PINNED_ORPHAN_CAP_SECS`] × 2 old, and it
+/// picks that multiple because a `setsid`'d daemon the test spawned can keep
+/// writing under the root for as long as its own
+/// `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` cap. So the floor is only ever as
+/// sound as "no cap in this repository exceeds that number", and until #679
+/// nothing checked it: the floor was hard-coded at 600 s and documented as
+/// "2× the 300 s default" while `orchestration_dispatch_002` already pinned
+/// **900** (issue #665), leaving a 300-second window in which `--apply` could
+/// delete a root a live, still-entitled daemon was writing under.
+///
+/// Why a build-time text scan and not a runtime clamp.
+/// `tests/common/child_lifetime_bound.rs`'s `clamped()` already bounds what the
+/// test process *inherits*, and deliberately cannot reach this: `TuiDeck`
+/// `env_clear`s and then applies the builder's `extra_env` **last**, so a
+/// test's own `with_env` overwrites the harness pin and is handed to the child
+/// verbatim. Raising that clamp's ceiling to legalise one value would weaken
+/// the ambient guarantee for everyone, and reordering `extra_env` would break
+/// the many other keys that rely on winning. A scan bounds the *written* pins
+/// instead, which is the population the floor actually needs bounded.
+///
+/// Two shapes are matched, both against the comment-stripped source so prose
+/// naming the variable is not a violation:
+///
+/// 1. the variable name adjacent to a literal value — `.env(VAR, "900")`,
+///    `.with_env(VAR, "900")`, `(VAR, "300")`, `(VAR.into(), "300".into())`,
+///    including the multi-line `.env(\n VAR,\n "900",\n)` spelling;
+/// 2. a `const …MAX_LIFETIME…_SECS` binding with a literal value, which is how
+///    `tests/common/mod.rs`'s `WRAP_TEST_MAX_LIFETIME_SECS = "120"` reaches the
+///    nine `wrap_io.rs` sites that pass it by name rather than by literal.
+///
+/// Shape 2 is a proxy and is honest about it: a cap computed at run time, or
+/// held in a constant named something else, is out of reach of any text scan.
+/// Same standing as rule 10 — the belt, not the braces. What makes it worth
+/// having anyway is that both shapes cover every pin that exists today, so the
+/// *next* one to be written is the case it is for.
+///
+/// String literals are deliberately NOT blanked first, which rule 10 does do to
+/// its input: here the pin *is* a pair of string literals, so blanking them
+/// would empty the rule. The residual is that a file under `tests/` quoting one
+/// of these two shapes inside a literal — a fixture holding Rust source, say —
+/// would be reported. No file does today, and the remedy if one ever does is to
+/// reword the fixture rather than to weaken the scan.
+///
+/// There is deliberately **no** per-line opt-out, unlike checks 8 and 10. Those
+/// two guard a local choice a reviewer can reasonably wave through at the site.
+/// This one guards a pair of numbers that must move together: a pinned cap *is*
+/// how long an orphan may write, so the only correct response to a longer one
+/// is to raise [`clean_tmp::MAX_PINNED_ORPHAN_CAP_SECS`] — which raises the
+/// floor with it — not to exempt the line.
+fn overlong_lifetime_cap_rule(secs: u64) -> String {
+    let cap = clean_tmp::MAX_PINNED_ORPHAN_CAP_SECS;
+    format!(
+        "wrapped-child lifetime cap pinned at {secs}s, above the {cap}s \
+         `clean-e2e-tmp` derives its dead-owner deletion floor from. A daemon this test \
+         spawns `setsid`s out of its process group and may keep writing under the test's \
+         temp root for the whole cap, but `cargo xtask clean-e2e-tmp --apply` would reap \
+         that root {over}s earlier — deleting a live process's working directory (issue \
+         #679). Fix: raise `MAX_PINNED_ORPHAN_CAP_SECS` in \
+         `xtask/linkage-check/src/clean_tmp.rs` (which raises `DEAD_PID_MIN_AGE` with it) \
+         and update `docs/develop/e2e-temp-dirs.md`, or pin a shorter cap here. There is \
+         deliberately no per-line opt-out",
+        over = secs.saturating_sub(cap)
+    )
+}
+
+/// Shape 1: the variable name next to a literal value.
+///
+/// `\s*` spans newlines, which is what covers the multi-line `.env(` spelling
+/// `tests/wrap_io.rs` uses. The optional `.into()` covers the owned-`String`
+/// push in `tests/common/mod.rs`, and the optional `&` the borrowed spelling.
+fn lifetime_cap_pin_re() -> Regex {
+    Regex::new(r#""DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS"\s*(?:\.into\(\))?\s*,\s*&?\s*"(\d+)""#)
+        .expect("lifetime cap pin regex compiles")
+}
+
+/// Shape 2: a constant holding the cap, matched by name.
+///
+/// Deliberately anchored on `MAX_LIFETIME` *and* a `_SECS` suffix so it reads
+/// seconds and not, say, a variable-name constant — `MAX_LIFETIME_VAR: &str =
+/// "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS"` in `tests/agent_lifetime_bound.rs`
+/// carries no digits after the `=` and is correctly ignored.
+fn lifetime_cap_const_re() -> Regex {
+    Regex::new(r#"const\s+[A-Z0-9_]*MAX_LIFETIME[A-Z0-9_]*_SECS\s*:[^=;]+=\s*"?(\d+)"?"#)
+        .expect("lifetime cap const regex compiles")
+}
+
+/// Every over-long lifetime cap in `text`, formatted as
+/// `<display>:<line>: <rule>` and ordered by line.
+///
+/// Takes the contents rather than a path for the same reason
+/// [`unarmed_agent_spawn_violations`] does: a rule whose only coverage is the
+/// live checkout tests nothing whenever that checkout is clean, which is its
+/// normal state and would be its state on the day it silently stopped matching.
+fn overlong_lifetime_cap_violations(display: &str, text: &str) -> Vec<String> {
+    let stripped = strip_rust_comments(text);
+    let mut hits: Vec<(usize, u64)> = Vec::new();
+    for re in [lifetime_cap_pin_re(), lifetime_cap_const_re()] {
+        for caps in re.captures_iter(&stripped) {
+            // An absurdly long literal saturates rather than failing to parse,
+            // so a cap of `99999999999999999999` is reported, not skipped.
+            let secs: u64 = caps[1].parse().unwrap_or(u64::MAX);
+            if secs <= clean_tmp::MAX_PINNED_ORPHAN_CAP_SECS {
+                continue;
+            }
+            // The stripper replaces comment bytes in place and preserves every
+            // newline, so the Nth newline here is the Nth newline of the raw
+            // source and this is the raw line number.
+            let start = caps.get(0).expect("whole match").start();
+            let line = stripped[..start].bytes().filter(|b| *b == b'\n').count() + 1;
+            hits.push((line, secs));
+        }
+    }
+    hits.sort_unstable();
+    hits.dedup();
+    hits.into_iter()
+        .map(|(line, secs)| format!("{display}:{line}: {}", overlong_lifetime_cap_rule(secs)))
+        .collect()
+}
+
 /// Every unarmed spawn site in `text`, formatted as `<display>:<line>: <rule>`.
 ///
 /// Takes the contents rather than a path so its tests can feed synthetic
@@ -556,6 +686,7 @@ fn main() -> ExitCode {
     let bare_tempdir_re = bare_temp_ctor_re();
     let mut bare_tempdir_violations: Vec<String> = Vec::new();
     let mut unarmed_spawn_violations: Vec<String> = Vec::new();
+    let mut overlong_cap_violations: Vec<String> = Vec::new();
 
     for file in &test_files {
         let text = match std::fs::read_to_string(file) {
@@ -621,6 +752,15 @@ fn main() -> ExitCode {
         // rather than only against a checkout that is clean by construction.
         if file.starts_with(&tests_dir) {
             unarmed_spawn_violations.extend(unarmed_agent_spawn_violations(
+                &file.display().to_string(),
+                &text,
+            ));
+
+            // Check 11 (issue #679): `tests/` only, for the same reason. The
+            // variable gates a TEST-only backstop, so `src/` never pins it —
+            // `src/agent_pty.rs` only names it — and the population the
+            // reaper's floor has to bound is exactly the pins written here.
+            overlong_cap_violations.extend(overlong_lifetime_cap_violations(
                 &file.display().to_string(),
                 &text,
             ));
@@ -753,6 +893,12 @@ fn main() -> ExitCode {
             .map(|v| format!("[10] {v}")),
     );
 
+    failures.extend(
+        overlong_cap_violations
+            .into_iter()
+            .map(|v| format!("[11] {v}")),
+    );
+
     // Check 9 (issue #474): `src/test_temp.rs` names no crate of its own. It is
     // read directly rather than folded into the scan above, so that the file
     // going missing is reported instead of quietly emptying the rule.
@@ -776,7 +922,7 @@ fn main() -> ExitCode {
 
     if failures.is_empty() {
         println!(
-            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 10 rules)",
+            "linkage-check: ok ({} catalog ids, {} annotations, {} allowlisted, 11 rules)",
             catalog_ids.len(),
             discovered.len(),
             allowlist.len()
@@ -1904,6 +2050,202 @@ mod tests {
             found[0].starts_with("tests/exception.rs:3: "),
             "{}",
             found[0]
+        );
+    }
+
+    // Check 11 (issue #679): no pinned wrapped-child lifetime cap may exceed
+    // the number `clean-e2e-tmp`'s dead-owner deletion floor is derived from.
+
+    /// The cap the rule is written against, so a future raise of
+    /// `MAX_PINNED_ORPHAN_CAP_SECS` does not quietly turn these fixtures into
+    /// no-ops. Every "over" fixture below is built from this, not from a
+    /// hard-coded 901.
+    const CAP: u64 = clean_tmp::MAX_PINNED_ORPHAN_CAP_SECS;
+
+    /// The shape that actually exists on `main` — `.with_env(VAR, "900")` on a
+    /// `TuiDeck` builder. At the cap it stands; one second over it does not.
+    #[test]
+    fn overlong_lifetime_cap_reports_a_with_env_pin_above_the_cap() {
+        let at_cap = format!(
+            "fn dispatch_002() {{\n    TuiDeck::builder()\n        .with_env(\"DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS\", \"{CAP}\")\n        .spawn();\n}}\n"
+        );
+        assert_eq!(
+            overlong_lifetime_cap_violations("tests/e2e_dispatcher_mode.rs", &at_cap),
+            Vec::<String>::new(),
+            "a pin exactly at the cap is what the floor is derived for"
+        );
+
+        let over = at_cap.replace(&format!("\"{CAP}\""), &format!("\"{}\"", CAP + 1));
+        let found = overlong_lifetime_cap_violations("tests/e2e_dispatcher_mode.rs", &over);
+
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(
+            found[0].starts_with("tests/e2e_dispatcher_mode.rs:3: "),
+            "{}",
+            found[0]
+        );
+        assert!(
+            found[0].contains(&format!("pinned at {}s", CAP + 1)),
+            "the message names the offending value: {}",
+            found[0]
+        );
+        assert!(
+            found[0].contains("MAX_PINNED_ORPHAN_CAP_SECS"),
+            "the message names the constant to raise: {}",
+            found[0]
+        );
+    }
+
+    /// `tests/wrap_io.rs` spells the pin across four lines. `\s*` has to span
+    /// the newlines or the whole file goes unchecked, which is the shape most
+    /// likely to be written next.
+    #[test]
+    fn overlong_lifetime_cap_spans_a_multi_line_env_call() {
+        let src = format!(
+            "fn run_wrap() {{\n    Command::new(bin)\n        .env(\n            \"DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS\",\n            \"{}\",\n        )\n        .spawn();\n}}\n",
+            CAP + 100
+        );
+
+        let found = overlong_lifetime_cap_violations("tests/wrap_io.rs", &src);
+
+        assert_eq!(found.len(), 1, "{found:#?}");
+        // Reported at the line the VARIABLE is on, which is where a reader
+        // looks, not at the value's line two below it.
+        assert!(found[0].starts_with("tests/wrap_io.rs:4: "), "{}", found[0]);
+    }
+
+    /// The tuple and owned-`String` spellings `tests/common/mod.rs` uses at its
+    /// two `env_clear` sites.
+    #[test]
+    fn overlong_lifetime_cap_reads_tuple_and_owned_pin_shapes() {
+        let tuple = format!(
+            "fn env() {{\n    let e = [(\"DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS\", \"{}\")];\n}}\n",
+            CAP + 1
+        );
+        let owned = format!(
+            "fn env() {{\n    env.push((\"DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS\".into(), \"{}\".into()));\n}}\n",
+            CAP + 1
+        );
+
+        for src in [&tuple, &owned] {
+            let found = overlong_lifetime_cap_violations("tests/common/mod.rs", src);
+            assert_eq!(found.len(), 1, "{src}\n{found:#?}");
+            assert!(
+                found[0].starts_with("tests/common/mod.rs:2: "),
+                "{}",
+                found[0]
+            );
+        }
+    }
+
+    /// Shape 2. `tests/wrap_io.rs` passes `common::WRAP_TEST_MAX_LIFETIME_SECS`
+    /// by name at nine sites, so the literal only ever appears at the `const`.
+    /// A scan that read shape 1 alone would call that file clean while every
+    /// one of those nine children carried the over-long cap.
+    #[test]
+    fn overlong_lifetime_cap_reads_a_constant_binding() {
+        let over = format!(
+            "pub const WRAP_TEST_MAX_LIFETIME_SECS: &str = \"{}\";\n",
+            CAP + 1
+        );
+        let found = overlong_lifetime_cap_violations("tests/common/mod.rs", &over);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(
+            found[0].starts_with("tests/common/mod.rs:1: "),
+            "{}",
+            found[0]
+        );
+
+        // The unquoted `u64` spelling `child_lifetime_bound.rs` uses, too.
+        let numeric = format!("const CHILD_MAX_LIFETIME_SECS: u64 = {};\n", CAP + 1);
+        assert_eq!(
+            overlong_lifetime_cap_violations("tests/common/child_lifetime_bound.rs", &numeric)
+                .len(),
+            1
+        );
+    }
+
+    /// `tests/agent_lifetime_bound.rs` binds the variable's NAME to a constant
+    /// whose own name matches the shape-2 pattern. Its value is a string of
+    /// letters, and reading it as seconds would be a permanent false positive
+    /// on a file that pins nothing.
+    #[test]
+    fn overlong_lifetime_cap_ignores_a_constant_holding_the_variable_name() {
+        let src = concat!(
+            "const MAX_LIFETIME_VAR: &str = \"DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS\";\n",
+            "fn f() { command.env(MAX_LIFETIME_VAR, secs); }\n",
+        );
+        assert_eq!(
+            overlong_lifetime_cap_violations("tests/agent_lifetime_bound.rs", src),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Prose is not a pin. The doc comments explaining this very rule quote the
+    /// over-long value that caused #679, and a scan that read comments would
+    /// fail the build on its own documentation.
+    #[test]
+    fn overlong_lifetime_cap_ignores_comments() {
+        let src = format!(
+            "//! An exported `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS`, `{}`, was accepted.\n// (\"DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS\", \"{}\")\nfn f() {{}}\n",
+            CAP + 2700,
+            CAP + 2700
+        );
+        assert_eq!(
+            overlong_lifetime_cap_violations("tests/prose.rs", &src),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Every pin in one file is reported, ordered by line, and a file that pins
+    /// nothing is silent.
+    #[test]
+    fn overlong_lifetime_cap_reports_every_site_in_order() {
+        let src = format!(
+            "fn a() {{ c.env(\"DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS\", \"{}\"); }}\nfn b() {{ c.env(\"DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS\", \"30\"); }}\nfn c() {{ c.env(\"DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS\", \"{}\"); }}\n",
+            CAP + 1,
+            CAP + 2
+        );
+
+        let found = overlong_lifetime_cap_violations("tests/many.rs", &src);
+
+        assert_eq!(found.len(), 2, "{found:#?}");
+        assert!(found[0].starts_with("tests/many.rs:1: "), "{}", found[0]);
+        assert!(found[1].starts_with("tests/many.rs:3: "), "{}", found[1]);
+
+        assert_eq!(
+            overlong_lifetime_cap_violations(
+                "tests/render_layout.rs",
+                "fn renders() { assert_eq!(1, 1); }\n"
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A literal too large for `u64` saturates rather than failing to parse, so
+    /// the most over-long cap anyone could write is reported rather than
+    /// silently skipped by the `?`-less parse path.
+    #[test]
+    fn overlong_lifetime_cap_reports_an_unparseable_giant() {
+        let src = "fn f() { c.env(\"DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS\", \"99999999999999999999999\"); }\n";
+        assert_eq!(
+            overlong_lifetime_cap_violations("tests/giant.rs", src).len(),
+            1
+        );
+    }
+
+    /// The rule and the floor read the SAME constant. This is the assertion
+    /// that makes rule 11 a guard rather than a second number to keep in sync:
+    /// if `DEAD_PID_MIN_AGE` were ever re-hard-coded, the guard would still
+    /// pass while the derivation it protects had drifted again.
+    #[test]
+    fn the_floor_is_derived_from_the_cap_the_rule_enforces() {
+        assert_eq!(
+            clean_tmp::DEAD_PID_MIN_AGE,
+            std::time::Duration::from_secs(clean_tmp::MAX_PINNED_ORPHAN_CAP_SECS * 2),
+            "linkage-check rule 11 bounds the caps under `tests/`; the reaper's \
+             floor has to be derived from the same number or the guard bounds \
+             nothing that matters (issue #679)"
         );
     }
 

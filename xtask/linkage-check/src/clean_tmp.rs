@@ -193,6 +193,35 @@ const TEMP_BASE_ENV: &str = "DAD_E2E_TMPDIR";
 #[cfg(unix)]
 const SHARED_VAR_TMP: &str = "/var/tmp";
 
+/// The longest `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` any test in this
+/// repository pins — the orphan window [`DEAD_PID_MIN_AGE`] is derived from.
+///
+/// The harness default is 300 s (`tests/common/mod.rs` pins it at both
+/// `env_clear` sites, and `tests/common/child_lifetime_bound.rs` clamps an
+/// ambient value to it), but a test may legitimately pin a longer one for
+/// itself: `orchestration_dispatch_002` pins **900** so the daemon outlives
+/// that test's own 300 s work budget, without which the failure dump reports
+/// `NO PANE — never spawned at all` for roles the same dump renders alive
+/// (issues #663 / #665). A `TuiDeck` builder's `extra_env` is applied *after*
+/// the harness pin, so such a value reaches the child verbatim and the clamp
+/// never sees it — that clamp is an **ambient**-value guarantee, not a
+/// universal one.
+///
+/// So this constant is what the floor below is actually entitled to assume, and
+/// it is not a preference: raising it raises the floor with it. Issue #679 is
+/// what happens when the two drift — the floor was 600 s (2× 300) while this
+/// was already 900, so between 600 s and 900 s `--apply` could delete a root a
+/// still-entitled daemon was writing under.
+///
+/// **Checked, not assumed.** linkage-check rule 11 fails the build when a pin
+/// under `tests/` exceeds this value, so the next cap raise is a red build that
+/// names this constant rather than a silent re-opening of #679. There is
+/// deliberately no per-line opt-out: unlike rules 8 and 10, an exception here
+/// would not be a local judgement call — any pinned cap *is* how long an orphan
+/// may write, so the only correct response to a longer one is to raise this
+/// number and let the floor follow.
+pub(crate) const MAX_PINNED_ORPHAN_CAP_SECS: u64 = 900;
+
 /// Minimum age before a **dead-owner** root is reaped, because owner death is
 /// not the same thing as the tree being unreferenced.
 ///
@@ -205,20 +234,29 @@ const SHARED_VAR_TMP: &str = "/var/tmp";
 /// levels down, in a group the deck cannot signal at all.
 ///
 /// So after nextest SIGKILLs a test, an orphan can keep writing under the dead
-/// test's root for up to that cap (300s). Reaping a dead owner instantly would
-/// hand `remove_dir_all` the working directory of a live process — and the
-/// moment a developer is most likely to run `--apply` is right after a run
-/// died, which is exactly when orphans are still alive.
+/// test's root for up to that cap. Reaping a dead owner instantly would hand
+/// `remove_dir_all` the working directory of a live process — and the moment a
+/// developer is most likely to run `--apply` is right after a run died, which
+/// is exactly when orphans are still alive.
 ///
 /// The old age-only rule never had this problem: its 6h floor was 72× the
 /// orphan cap. This floor restores that protection at 2× the cap instead of
 /// 72×, which is ample, and costs #461 nothing — the case it was filed for was
 /// 280 roots whose youngest was 4h09m.
 ///
+/// **The 2× is against [`MAX_PINNED_ORPHAN_CAP_SECS`], not against the 300 s
+/// default** (issue #679). It was hard-coded at 600 s and read as "2× 300"
+/// while one test already pinned 900, which left the derivation 300 s short of
+/// what it claimed. Deriving it here is what makes rule 11 able to enforce the
+/// pair: the guard and the floor now read the same number. The cost is that a
+/// killed run's roots are held 30 minutes instead of 10 before `--apply` can
+/// take them — real, but small next to #461's own case (280 roots, youngest
+/// 4h09m) and paid on the safe side.
+///
 /// Note this is a timestamp on the **keep** side. That is the safe bias, and
 /// the exact inverse of the deleted PID-recycling comparison, which biased
 /// toward deletion (see the module docs).
-const DEAD_PID_MIN_AGE: Duration = Duration::from_secs(600);
+pub(crate) const DEAD_PID_MIN_AGE: Duration = Duration::from_secs(MAX_PINNED_ORPHAN_CAP_SECS * 2);
 
 /// Per-directory lines printed before the per-reason summary. A machine that
 /// has been leaking for a few hours accumulates hundreds of roots, and 280
@@ -909,10 +947,10 @@ fn usage() {
     println!("A `{PID_TAGGED_PREFIX}<pid>-*` root is decided by whether that PID is still");
     println!("alive. A dead owner is reaped once the root is at least");
     println!(
-        "{}, a short floor that exists because a daemon the",
+        "{}, a floor separate from --older-than that exists because a",
         human_duration(DEAD_PID_MIN_AGE)
     );
-    println!("test spawned can outlive it and keep writing there. A live owner is");
+    println!("daemon the test spawned can outlive it and keep writing there. A live owner is");
     println!("never reaped. The --older-than threshold decides roots with no usable");
     println!("PID — untagged, `dad-unit-*`, lock dirs, malformed names, and hosts with");
     println!("no way to ask.");
@@ -1119,7 +1157,8 @@ fn classify(owner: Owner, age: Duration, max_age: Duration, ignore_liveness: boo
         // for, where 6.2 GB of provably-dead roots were refused for being four
         // hours old. But it IS subject to a short floor of its own: the owning
         // PID is the test process, and a daemon it spawned can outlive it by up
-        // to 300s while still writing here. See `DEAD_PID_MIN_AGE`.
+        // to `MAX_PINNED_ORPHAN_CAP_SECS` while still writing here. See
+        // `DEAD_PID_MIN_AGE`.
         Owner::Dead => Verdict {
             reap: age >= DEAD_PID_MIN_AGE,
             reason: Reason::DeadPid,
@@ -1709,10 +1748,11 @@ mod tests {
     }
 
     /// The orphan window. The owning PID names the *test* process, but a daemon
-    /// it spawned `setsid`s out of the group and can outlive it by up to 300s
-    /// while still writing under that root — so a dead owner is NOT reaped
-    /// instantly. Below the floor the root is kept and the reason says why;
-    /// above it, reaping resumes and `--older-than` still cannot hold it back.
+    /// it spawned `setsid`s out of the group and can outlive it by up to
+    /// [`MAX_PINNED_ORPHAN_CAP_SECS`] while still writing under that root — so a
+    /// dead owner is NOT reaped instantly. Below the floor the root is kept and
+    /// the reason says why; above it, reaping resumes and `--older-than` still
+    /// cannot hold it back.
     #[test]
     fn a_dead_owner_is_not_reaped_inside_the_orphan_window() {
         let generous = HOUR * 24;
@@ -1744,8 +1784,17 @@ mod tests {
         }
 
         // The floor must stay far above the orphan cap it exists for, and far
-        // below the age threshold it is not a substitute for.
-        assert!(DEAD_PID_MIN_AGE >= Duration::from_secs(600));
+        // below the age threshold it is not a substitute for. Issue #679: the
+        // first of these used to be a bare `>= 600`, which is what let the floor
+        // read as "2x the cap" while the longest cap in the repo was already
+        // 900. Pinning it to the derivation instead means a cap raise that
+        // forgets the floor cannot pass here either.
+        assert_eq!(
+            DEAD_PID_MIN_AGE,
+            Duration::from_secs(MAX_PINNED_ORPHAN_CAP_SECS) * 2,
+            "the floor is 2x the longest orphan cap, not 2x the 300s default"
+        );
+        assert!(DEAD_PID_MIN_AGE >= Duration::from_secs(MAX_PINNED_ORPHAN_CAP_SECS));
         assert!(DEAD_PID_MIN_AGE < Duration::from_secs(DEFAULT_MAX_AGE_HOURS * 3600));
 
         // Both keep-side notes name the floor, not `--older-than`, so the report

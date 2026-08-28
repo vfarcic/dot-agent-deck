@@ -954,8 +954,9 @@ fn child_group_backstop_close_ceiling() -> libc::c_int {
 /// 385 directories / 14.2 GB accrued behind them. Note what an orphan does and
 /// does not do to those roots: `cargo xtask clean-e2e-tmp` reads ownership off
 /// the **test process's** pid in the root's NAME, not off the orphan, so a root
-/// whose owning test is dead is `dead-pid` and reapable once the 10-minute floor
-/// passes even with an orphan still sitting in a deleted directory under it.
+/// whose owning test is dead is `dead-pid` and reapable once the dead-owner
+/// floor passes even with an orphan still sitting in a deleted directory under
+/// it.
 /// What the orphan costs instead is a persistent unkillable process, the deleted
 /// files' disk blocks retained for as long as it runs, a polluted `ps` for every
 /// later diagnosis, and the chance of it writing paths back under a root that
