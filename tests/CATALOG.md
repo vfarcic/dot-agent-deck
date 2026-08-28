@@ -1686,6 +1686,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the (absence of a) tracing log line.
 - **Platform coverage:** mac+linux.
 
+##### hooks/install/004 — A locally-built deck writes a DURABLE binary path into agent config, never its own `target/debug` artifact.
+- **Layer:** L2.
+- **Agent:** none (the real `target/debug` binary is the subject; a stub `codex` on `PATH` makes the Codex installer fire, and a stub executable at `$HOME/.local/bin/dot-agent-deck` is the durable candidate).
+- **Asserts:** with `~/.claude/`, `~/.codex/` and `~/.opencode/` seeded, a durable executable at `$HOME/.local/bin/dot-agent-deck`, and no `dot-agent-deck` on the child's `PATH`, every deck-owned command in `~/.claude/settings.json` and `~/.codex/hooks.json` and the OpenCode plugin's `BINARY_PATH` name that seeded path; none of the three files mentions `target/debug` or `target/release`; no command is a bare command name.
+- **Does not assert:** the resolver's `PATH`-lookup fallback (step 2b) or its behaviour when `current_exe()` is already installed (step 1) — both are unit-level; that the seeded executable actually runs.
+- **Platform coverage:** linux.
+
+##### hooks/install/005 — With no durable path resolvable, the deck writes no hook rule at all and still starts.
+- **Layer:** L2.
+- **Agent:** none (a stub `codex` on `PATH` makes the Codex installer fire; nothing else is seeded).
+- **Asserts:** with `~/.claude/`, `~/.codex/` and `~/.opencode/` seeded but no `$HOME/.local/bin/dot-agent-deck` and no `dot-agent-deck` anywhere on the child's `PATH`, `settings.json` and `hooks.json` carry no deck-owned command, the OpenCode plugin file is absent, and the dashboard still paints — refusing is not fatal.
+- **Does not assert:** the wording of the refusal message or the tracing/stderr surface it is reported on.
+- **Platform coverage:** linux.
+
 ### Pane / agent lifecycle
 
 #### lifecycle/start
