@@ -6312,8 +6312,15 @@ fn truncate_path_head(path: &str, max_width: usize) -> String {
 /// Drained on the render loop rather than applied by the event subscriber for
 /// the same reason `pending_orchestration_surfaces` is: `UiState` lives here.
 fn drain_worktree_kept(state: &SharedState, ui: &mut UiState) {
-    let Some(kept) = state.blocking_write().take_worktree_kept() else {
+    // Same cheap READ-lock peek `process_pending_orchestration_surfaces` uses,
+    // and for the same reason: this runs every frame, and the steady state is an
+    // empty slot. Taking the exclusive write lock unconditionally would put a
+    // per-frame writer in the way of the event subscriber for nothing.
+    if state.blocking_read().pending_worktree_kept.is_none() {
         return;
+    }
+    let Some(kept) = state.blocking_write().take_worktree_kept() else {
+        return; // a concurrent path took it between the peek and here
     };
     ui.status_message = Some((
         format!(
