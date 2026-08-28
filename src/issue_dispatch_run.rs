@@ -190,6 +190,124 @@ pub fn agents_rooted_in_worktree(records: &[AgentRecord], worktree_dir: &Path) -
         .count()
 }
 
+/// Does `worktree_dir` hold uncommitted work? The ONE `git status --porcelain`
+/// this feature asks, so the removal path and issue #717's close-confirmation
+/// preview cannot disagree about what "dirty" means.
+///
+/// `Err` is "the question could not be answered" (no `git`, the directory is
+/// gone, a locked index), never "clean" — both callers treat it as a reason to
+/// KEEP, because the fail-safe direction for a deletion gate is to decline.
+pub async fn worktree_is_dirty(worktree_dir: &Path) -> Result<bool, String> {
+    let worktree = worktree_dir.to_string_lossy();
+    let output = run_capture_args("git", &["-C", &worktree, "status", "--porcelain"]).await?;
+    Ok(!output.trim().is_empty())
+}
+
+/// Issue #717: the close-confirmation dialog's advance warning that a
+/// dispatched worktree is about to be KEPT rather than removed.
+///
+/// Carries the path because recovering the work means going to it — the whole
+/// point of the report. `confirmed_dirty` separates the two ways a tree gets
+/// kept, which read differently to a human:
+///
+/// * `true` — [`worktree_is_dirty`] answered yes. The dialog can state it flatly.
+/// * `false` — the probe did not answer inside its budget. `KeepIfDirty` keeps
+///   the tree on an unanswerable probe too (see [`remove_worktree`]), so the
+///   claim is still true; it just has to be phrased conditionally.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KeptWorktree {
+    /// Absolute path of the worktree that will be left on disk.
+    pub path: String,
+    /// Whether `git status --porcelain` actually reported uncommitted work, as
+    /// opposed to the probe being inconclusive. See the type docs.
+    pub confirmed_dirty: bool,
+}
+
+/// Issue #717: would closing the panes in `pane_ids` leave a dispatched
+/// worktree behind, and if so, which one?
+///
+/// Answers the question the close-confirmation dialog needs BEFORE the
+/// keystroke, from the only process that can: the registry that knows the
+/// removal policy and the filesystem that holds the tree both live here, and in
+/// remote mode neither is on the client's machine at all.
+///
+/// Three properties are deliberate:
+///
+/// * **It PEEKS at the registry, never [`take_worktree`].** This runs while the
+///   user is still deciding, and a preview that consumed the entry would strand
+///   the directory forever when they pressed Cancel.
+/// * **Only [`RemovalPolicy::KeepIfDirty`] is reported.** A `Force` worktree is
+///   removed regardless, so there is nothing kept to tell anyone about.
+/// * **The probe is time-boxed** by `probe_timeout`, because this sits on an
+///   interactive key path while `remove_worktree`'s copy does not. A probe that
+///   does not finish downgrades to `confirmed_dirty: false` rather than
+///   dropping the warning — the tree is kept either way, so the useful half of
+///   the report (the path) survives a slow checkout.
+pub async fn kept_worktree_preview(
+    records: &[AgentRecord],
+    worktrees: &WorktreeRegistry,
+    pane_ids: &[String],
+    probe_timeout: Duration,
+) -> Option<KeptWorktree> {
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for pane_id in pane_ids {
+        let Some(record) = records
+            .iter()
+            .find(|r| r.pane_id_env.as_deref() == Some(pane_id.as_str()))
+        else {
+            continue;
+        };
+        let Some(worktree) = worktree_of_record(record) else {
+            continue;
+        };
+        if seen.contains(&worktree) {
+            continue;
+        }
+        seen.push(worktree.clone());
+        let policy = worktrees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&worktree)
+            .map(|entry| entry.policy);
+        if policy != Some(RemovalPolicy::KeepIfDirty) {
+            continue;
+        }
+        let confirmed_dirty =
+            match tokio::time::timeout(probe_timeout, worktree_is_dirty(&worktree)).await {
+                Ok(Ok(true)) => true,
+                // Clean: this tree is about to be REMOVED, and saying so would be
+                // the noise that makes the warning worth ignoring. Say nothing.
+                Ok(Ok(false)) => continue,
+                // A failed probe is what `remove_worktree` itself treats as a
+                // reason to keep, so report the path — under wording that does not
+                // claim more than was measured.
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        worktree = %worktree.display(),
+                        error = %e,
+                        "close preview: could not check worktree status"
+                    );
+                    false
+                }
+                // A blown deadline is not an answer either way: the removal path
+                // runs the same probe with no deadline and may still find it clean.
+                // Report conditionally rather than dropping the path.
+                Err(_) => {
+                    tracing::debug!(
+                        worktree = %worktree.display(),
+                        "close preview: worktree status probe timed out"
+                    );
+                    false
+                }
+            };
+        return Some(KeptWorktree {
+            path: worktree.to_string_lossy().into_owned(),
+            confirmed_dirty,
+        });
+    }
+    None
+}
+
 /// Remove a dispatched worktree from its clone (`git -C <clone> worktree remove
 /// <worktree>`), PRESERVING the clone. Best-effort: a non-zero exit (already
 /// removed, locked) or a spawn error is logged, not fatal — the tab is already
@@ -204,16 +322,15 @@ pub fn agents_rooted_in_worktree(records: &[AgentRecord], worktree_dir: &Path) -
 pub async fn remove_worktree(worktree_dir: &Path, clone_dir: &Path, policy: RemovalPolicy) {
     let worktree = worktree_dir.to_string_lossy();
     if policy == RemovalPolicy::KeepIfDirty {
-        let status = run_capture_args("git", &["-C", &worktree, "status", "--porcelain"]).await;
-        match status {
-            Ok(output) if !output.trim().is_empty() => {
+        match worktree_is_dirty(worktree_dir).await {
+            Ok(true) => {
                 tracing::warn!(
                     worktree = %worktree_dir.display(),
                     "dispatch: worktree has uncommitted changes; leaving in place"
                 );
                 return;
             }
-            Ok(_) => {}
+            Ok(false) => {}
             Err(e) => {
                 tracing::warn!(
                     worktree = %worktree_dir.display(),
@@ -1130,6 +1247,223 @@ mod tests {
         assert_eq!(taken.policy, RemovalPolicy::Force);
         assert_eq!(take_worktree(&reg, &wt7), None);
         assert_eq!(take_worktree(&reg, &wt8).map(|e| e.clone_dir), Some(clone));
+    }
+
+    // --- issue #717: the kept-worktree close preview ---
+
+    /// A real repo with one commit plus a linked worktree at `worktree`, so the
+    /// preview's `git status --porcelain` runs against a genuine tree rather
+    /// than a stub. Mirrors `dispatch::tests::init_repo`.
+    fn init_repo_with_worktree(repo: &Path, worktree: &Path) {
+        let run = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git available");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        std::fs::create_dir_all(repo).unwrap();
+        run(repo, &["init", "-q", "."]);
+        run(repo, &["config", "user.email", "t@t.t"]);
+        run(repo, &["config", "user.name", "T"]);
+        std::fs::write(repo.join("a.txt"), "hi").unwrap();
+        run(repo, &["add", "."]);
+        run(repo, &["commit", "-qm", "init"]);
+        run(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "wt",
+                &worktree.to_string_lossy(),
+            ],
+        );
+    }
+
+    /// One registered pane whose cwd is `worktree`.
+    fn pane_in(pane_id: &str, worktree: &Path) -> AgentRecord {
+        let mut r = record(Some(&worktree.to_string_lossy()), None);
+        r.pane_id_env = Some(pane_id.to_string());
+        r
+    }
+
+    const PROBE: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn kept_worktree_preview_reports_a_dirty_keep_if_dirty_tree_with_its_path() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-dispatch-x");
+        init_repo_with_worktree(&repo, &wt);
+        std::fs::write(wt.join("scratch.txt"), "the user's uncommitted work").unwrap();
+
+        let reg = new_worktree_registry();
+        record_worktree(&reg, &wt, &repo, RemovalPolicy::KeepIfDirty);
+        let records = vec![pane_in("pane-1", &wt)];
+
+        let kept = kept_worktree_preview(&records, &reg, &["pane-1".to_string()], PROBE)
+            .await
+            .expect("a dirty KeepIfDirty tree must be previewed");
+        assert_eq!(kept.path, wt.to_string_lossy());
+        assert!(
+            kept.confirmed_dirty,
+            "the probe answered, so the report must say so flatly"
+        );
+        // The preview must PEEK, never consume: the user has not answered the
+        // dialog yet, and a taken entry would strand the directory on Cancel.
+        assert!(
+            take_worktree(&reg, &wt).is_some(),
+            "the preview must leave the registry entry for the close to act on"
+        );
+    }
+
+    #[tokio::test]
+    async fn kept_worktree_preview_is_silent_for_a_clean_tree() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-dispatch-x");
+        init_repo_with_worktree(&repo, &wt);
+
+        let reg = new_worktree_registry();
+        record_worktree(&reg, &wt, &repo, RemovalPolicy::KeepIfDirty);
+        let records = vec![pane_in("pane-1", &wt)];
+
+        assert_eq!(
+            kept_worktree_preview(&records, &reg, &["pane-1".to_string()], PROBE).await,
+            None,
+            "a clean tree is REMOVED, so warning that it is kept would be false"
+        );
+    }
+
+    #[tokio::test]
+    async fn kept_worktree_preview_is_silent_for_a_force_removed_tree() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-dispatch-x");
+        init_repo_with_worktree(&repo, &wt);
+        std::fs::write(wt.join("scratch.txt"), "discarded by design").unwrap();
+
+        let reg = new_worktree_registry();
+        // PRD #120 issue-dispatch: dirty or not, this tree goes.
+        record_worktree(&reg, &wt, &repo, RemovalPolicy::Force);
+        let records = vec![pane_in("pane-1", &wt)];
+
+        assert_eq!(
+            kept_worktree_preview(&records, &reg, &["pane-1".to_string()], PROBE).await,
+            None,
+            "a Force worktree is not kept, so there is nothing to report"
+        );
+    }
+
+    #[tokio::test]
+    async fn kept_worktree_preview_is_silent_for_an_ordinary_pane() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-dispatch-x");
+        init_repo_with_worktree(&repo, &wt);
+        std::fs::write(wt.join("scratch.txt"), "dirty, but nobody dispatched here").unwrap();
+
+        // Nothing recorded: this is a pane the user opened themselves, and the
+        // deck removes no directory when it closes.
+        let reg = new_worktree_registry();
+        let records = vec![pane_in("pane-1", &wt)];
+
+        assert_eq!(
+            kept_worktree_preview(&records, &reg, &["pane-1".to_string()], PROBE).await,
+            None,
+            "an unregistered cwd is not a dispatched worktree"
+        );
+    }
+
+    /// A multi-role orchestration shares ONE worktree across its role panes, so
+    /// the preview must resolve it from whichever pane ids it is handed —
+    /// including ones it does not recognise, which a tab close mixes in.
+    #[tokio::test]
+    async fn kept_worktree_preview_resolves_one_tree_from_any_of_a_tabs_panes() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-dispatch-team");
+        init_repo_with_worktree(&repo, &wt);
+        std::fs::write(wt.join("scratch.txt"), "work from role 2").unwrap();
+
+        let reg = new_worktree_registry();
+        record_worktree(&reg, &wt, &repo, RemovalPolicy::KeepIfDirty);
+        let orchestration = |pane_id: &str| {
+            let mut r = record(
+                Some("/ignored"),
+                Some(TabMembership::Orchestration {
+                    name: "team".into(),
+                    role_index: 0,
+                    role_name: "coder".into(),
+                    is_start_role: false,
+                    orchestration_cwd: Some(wt.to_string_lossy().into_owned()),
+                    display_title: None,
+                    orchestration_id: None,
+                }),
+            );
+            r.pane_id_env = Some(pane_id.to_string());
+            r
+        };
+        let records = vec![orchestration("role-0"), orchestration("role-1")];
+
+        let panes = vec![
+            "not-a-pane-the-daemon-knows".to_string(),
+            "role-1".to_string(),
+        ];
+        let kept = kept_worktree_preview(&records, &reg, &panes, PROBE)
+            .await
+            .expect("an unknown pane id must not stop the known one from resolving");
+        assert_eq!(kept.path, wt.to_string_lossy());
+    }
+
+    /// The probe's deadline degrades the WORDING, never the report: the tree is
+    /// kept whether or not the status walk finished, and the path is the half
+    /// the user actually needs.
+    #[tokio::test]
+    async fn kept_worktree_preview_still_reports_the_path_when_the_probe_times_out() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-dispatch-x");
+        init_repo_with_worktree(&repo, &wt);
+        std::fs::write(wt.join("scratch.txt"), "work").unwrap();
+
+        let reg = new_worktree_registry();
+        record_worktree(&reg, &wt, &repo, RemovalPolicy::KeepIfDirty);
+        let records = vec![pane_in("pane-1", &wt)];
+
+        let kept = kept_worktree_preview(
+            &records,
+            &reg,
+            &["pane-1".to_string()],
+            Duration::from_nanos(1),
+        )
+        .await
+        .expect("an unanswered probe must still report the path");
+        assert_eq!(kept.path, wt.to_string_lossy());
+        assert!(
+            !kept.confirmed_dirty,
+            "nothing was measured, so nothing may be claimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_is_dirty_matches_git_status_and_errs_when_it_cannot_ask() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-dispatch-x");
+        init_repo_with_worktree(&repo, &wt);
+
+        assert_eq!(worktree_is_dirty(&wt).await, Ok(false));
+        std::fs::write(wt.join("scratch.txt"), "work").unwrap();
+        assert_eq!(worktree_is_dirty(&wt).await, Ok(true));
+
+        // Unanswerable is an Err, never a `false` — both callers must be able to
+        // tell "clean" from "could not ask", because only one of them is safe
+        // to delete on.
+        assert!(worktree_is_dirty(&tmp.path().join("gone")).await.is_err());
     }
 
     #[test]

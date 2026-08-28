@@ -1599,6 +1599,162 @@ fn dispatch_close_001_first_confirm_removes_the_dispatched_card() {
     );
 }
 
+/// Scenario: Dispatch a unit so the daemon owns a `KeepIfDirty` worktree for it,
+/// leave an uncommitted file in that worktree, then close the dispatched card
+/// through the real Ctrl+W → confirm path. The confirmation dialog must say, BEFORE
+/// the destructive keystroke, that the uncommitted work is kept and where; the
+/// control close of a caller pane that owns no worktree must say nothing of the
+/// sort; and after confirming, the status line must repeat the path and the
+/// directory must still be on disk.
+#[spec("dispatch/close/002")]
+#[test]
+fn dispatch_close_002_a_kept_dirty_worktree_is_announced_before_and_after_the_close() {
+    const UNIT: &str = "keep-probe";
+    /// The single-agent dispatch labels its card with the task name.
+    const CARD: &str = "dispatch-keep-probe";
+    /// Uniquely named so the assertion cannot pass on some other stray file.
+    const WORK: &str = "uncommitted-work-717.txt";
+
+    let scratch = common::race_safe_tempdir();
+    // `cat` throughout. This test is about what the DECK says at close time, and
+    // the sentence it must say is decided by the daemon's worktree registry and a
+    // `git status` — neither of which any agent participates in. A real agent
+    // would add a cold boot and API cost while proving nothing extra here;
+    // `dispatch/close/001` next door owns the real-agent close path.
+    let cfg = scratch.path().join("config.toml");
+    std::fs::write(&cfg, "default_command = \"cat\"\n").expect("write the deck config");
+
+    let deck = TuiDeck::builder()
+        // Roomy, so neither the card title nor the dialog's path line is
+        // ellipsized by the terminal — the path IS the assertion.
+        .with_pty_size(200, 50)
+        .with_env("PATH", path_with_binary_dir())
+        .with_env("DOT_AGENT_DECK_CONFIG", cfg.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+    commit_fixture_repo(deck.workdir());
+
+    let expected_worktree = dispatch_worktree_of(&deck, UNIT);
+    let caller_pane = open_cat_caller_pane(&deck);
+    let _guard = SiblingWorktreeGuard(expected_worktree.clone());
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["dispatch", UNIT, "--task", "Wait quietly.", "--single"])
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
+        .output()
+        .expect("the dispatch CLI should run");
+    assert!(
+        out.status.success(),
+        "`dispatch --single` failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    const SURFACE_WAIT: Duration = Duration::from_secs(60);
+    assert!(
+        common::wait_until(SURFACE_WAIT, || expected_worktree.is_dir()
+            && deck.snapshot_grid().contains(CARD)),
+        "the dispatch never produced a worktree at {} with a surfaced card.\nGrid:\n{}",
+        expected_worktree.display(),
+        deck.snapshot_grid()
+    );
+
+    // The premise: the user has uncommitted work in the dispatched worktree.
+    // This is what `RemovalPolicy::KeepIfDirty` protects, and what closing the
+    // tab used to discard from view without discarding from disk.
+    std::fs::write(
+        expected_worktree.join(WORK),
+        "work the user has not committed yet",
+    )
+    .expect("dirty the dispatched worktree");
+
+    deck.send_keys(b"\x04"); // Ctrl+D → command mode
+    deck.wait_for_string("COMMAND");
+
+    // ===== control: the CALLER card owns no worktree ========================
+    //
+    // Closing it must read exactly as it always has. Without this, a dialog that
+    // warned on every close would pass every assertion below while being useless.
+    deck.send_keys(b"\x17");
+    deck.wait_for_string("Close selected pane?");
+    let control = deck.snapshot_grid();
+    assert!(
+        !control.contains("Uncommitted work"),
+        "a pane the deck removes no directory for must not warn about keeping one\n{control}"
+    );
+    deck.send_keys(b"\x1b[B");
+    deck.send_keys(b"\r");
+    assert!(
+        common::wait_until(Duration::from_secs(30), || {
+            let g = deck.snapshot_grid();
+            !g.contains("caller") && g.contains(CARD)
+        }),
+        "the caller card did not close, so the dispatched card is not the armed \
+         target below.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // ===== the dispatched card: warn BEFORE the keystroke ===================
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            let g = deck.snapshot_grid();
+            g.lines()
+                .any(|l| l.contains('\u{25b8}') && l.contains(CARD))
+        }),
+        "the dispatched card is not the selected one, so Ctrl+W would not target \
+         it.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    deck.send_keys(b"\x17");
+    deck.wait_for_string("Close selected pane?");
+    let armed = deck.snapshot_grid();
+    assert!(
+        armed.contains("Uncommitted work here is KEPT, not deleted:"),
+        "closing a dispatched card whose worktree holds uncommitted work must say \
+         so BEFORE the user answers — this is the whole of issue #717.\n{armed}"
+    );
+    assert!(
+        armed.contains(&expected_worktree.to_string_lossy().into_owned()),
+        "the warning must carry the path, because recovering the work means going \
+         to it. Expected {}\n{armed}",
+        expected_worktree.display()
+    );
+
+    // ===== …and again AFTER, because the dialog is gone the instant it is answered
+    deck.send_keys(b"\x1b[B");
+    deck.send_keys(b"\r");
+    const CLOSE_WAIT: Duration = Duration::from_secs(30);
+    assert!(
+        common::wait_until(CLOSE_WAIT, || deck
+            .snapshot_grid()
+            .contains("KEPT, not deleted")),
+        "after the close the status line must repeat where the work was kept — \
+         otherwise the one fact the user needs vanished with the modal.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // And the claim must be TRUE: the deck said it kept the tree, so the tree is
+    // there, with the uncommitted file still in it.
+    assert!(
+        common::wait_until(CLOSE_WAIT, || common::agent_records_on(
+            deck.attach_socket_path()
+        )
+        .iter()
+        .all(|r| r.display_name.as_deref() != Some(CARD))),
+        "the dispatched agent was never stopped, so the removal path this test is \
+         about never ran.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        expected_worktree.join(WORK).is_file(),
+        "the deck promised the uncommitted work was KEPT at {} — it must still be \
+         there. Keeping a dirty worktree is correct behaviour and issue #717 is \
+         only about making it visible.",
+        expected_worktree.display()
+    );
+}
+
 /// Scenario: Launch the deck on the `orch-multi` fixture — two spawnable
 /// orchestrations where the SECOND, `gpt-side`, both `extends` the first and
 /// declares `default = true` — open one ordinary `cat` pane to dispatch from,

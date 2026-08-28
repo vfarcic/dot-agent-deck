@@ -65,6 +65,8 @@ Closing a unit's tab removes that unit's copy of the repo. Your own repository i
 
 If a unit still has **uncommitted changes**, closing it leaves its directory on disk instead of deleting it, so the work is recoverable. A leftover directory costs disk space; a deleted one costs work.
 
+The close confirmation tells you when that is about to happen, and where: before you answer it, the dialog names the directory the work will be kept in, and the status line repeats that path afterwards so you can still read it once the dialog is gone. Nothing is said for a unit whose copy is clean — that one is simply removed, which is why the message appearing is worth reading. If you have already dismissed both and want the path back, `dot-agent-deck worktree list` reports every worktree the deck knows about.
+
 The unit's branch (`agent/dispatch-<name>`) always survives, since it may hold committed work. Dispatching the *same name* again is therefore refused, telling you the branch is there — delete it with `git branch -D agent/dispatch-<name>` when you are done, or use a different name.
 
 ## Current limitations

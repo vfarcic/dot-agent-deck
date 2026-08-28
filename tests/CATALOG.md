@@ -880,6 +880,22 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** internal `CloseTarget`/`ClosePlan` variants; the rendered promise and observable blast radius are the contract.
 - **Platform coverage:** mac+linux.
 
+##### prompt/close-confirm/007 — A close that would LEAVE a dispatched worktree holding uncommitted work says so, with its path, before the user answers (issue #717).
+- **Layer:** L1 (in-process `TestBackend` through `render_close_confirm_to_buffer`).
+- **Agent:** none.
+- **Asserts:** a confirmed-dirty tree renders the flat claim (`Uncommitted work here is KEPT, not deleted:`) plus the absolute path, positioned ABOVE the Cancel/Close options because it changes what answering means; an inconclusive probe renders the conditional wording (`…here, if any, is KEPT:`) with the path and never the flat claim; and a close that leaves nothing behind renders exactly the pre-#717 dialog.
+- **Why it exists:** the outcome this warns about is decided in a detached daemon task AFTER the card and pane are destroyed, so the dialog is the last surface that still exists while the information is both obtainable and actionable. The wording split is the honest half: the probe is time-boxed on an interactive key path, and a deadline it blew must degrade the sentence rather than drop the path.
+- **Does not assert:** where the preview comes from, or that it is accurate — the daemon-side resolution is unit-tested (`issue_dispatch_run::kept_worktree_preview_*`) and driven end to end by `dispatch/close/002`.
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/close-confirm/008 — A kept-worktree path too long for the terminal is clipped from the FRONT, keeping the tail that identifies it.
+- **Layer:** L1 (in-process `TestBackend`, 60-column terminal against a 130-character path).
+- **Agent:** none.
+- **Asserts:** the distinguishing tail survives, the clip is marked with a leading `…`, the full path is never claimed verbatim, and no rendered line exceeds the terminal width.
+- **Why it exists:** the popup widens to fit the path rather than truncating by default, so truncation is only reachable when the terminal itself is too narrow — and there the default (tail-dropping) rule would produce `/home/user/code/dot-agent-…`, which names none of the sibling worktrees it has to tell apart.
+- **Does not assert:** the widening itself, or the wording variants (`prompt/close-confirm/007`).
+- **Platform coverage:** mac+linux+windows.
+
 #### prompt/pane-input
 
 ##### prompt/pane-input/001 — `Enter` on a focused side pane enters PaneInput mode.
@@ -2896,6 +2912,14 @@ without depending on the config struct API.
 - **Asserts:** the dispatched agent really starts (its own PTY prints the Claude Code banner — NOT the card's `ClaudeCode` badge, which is inferred from the command at spawn and is on the card before the agent has executed anything); the CALLER card (which owns no worktree) closes on its first confirm — the control, so a later failure is attributable to the dispatched card specifically; then, after ONE confirmed close, NO card for the dispatched worktree remains. Matched on the worktree basename from the card's `Dir:` line rather than on its title, because the ghost card is titled `pane-sched-…` and a name-bound needle misses it.
 - **Why it exists:** a user reported closing a dispatched agent leaving its card behind. It reproduced THREE independent defects, and the failure message distinguishes the first two by whether the daemon still holds the agent: (a) a daemon-spawned card has no local pane until focused, so `close_pane` returned `Pane <id> not found`, the PRD #92 F4 policy preserved the card, and the agent kept running; (b) with that fixed, the daemon still awaited the worktree cleanup before answering, blowing the TUI's 5s `CTRL_W_STOP_TIMEOUT`; (c) with BOTH fixed and a real agent behind a non-inferable command, the close removed only the session its card was built from and left the pane's *other* session rendering as a ghost card badged `No agent` — the symptom as reported. Reverting any one fix alone turns this test red (verified).
 - **Does not assert:** the worktree's own removal (`KeepIfDirty` leaves a dirty one in place by design); the orchestration close path, where the last role's close is the cleanup trigger.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close/002 — Closing a dispatched card whose worktree holds uncommitted work announces the keep, with its path, both before the keystroke and after it (issue #717).
+- **Layer:** L2 PTY-attached (`TuiDeck` on the `minimal` fixture) driving the REAL `dot-agent-deck dispatch --single` CLI, then the production Ctrl+W → confirm path against the resulting card.
+- **Agent:** none (`cat` for both the caller pane and the dispatched unit). Deliberate, and the reason is narrower than convenience: the sentence under test is decided by the daemon's worktree registry and one `git status --porcelain`, and no agent participates in either. `dispatch/close/001` next door owns the real-agent close path.
+- **Asserts:** the control close of the caller pane — which owns no worktree — renders no warning at all; the dispatched card's confirmation renders `Uncommitted work here is KEPT, not deleted:` together with the worktree's absolute path BEFORE the destructive answer; after confirming, the status line repeats the path; the daemon record for the card is gone; and the uncommitted file is still on disk, so the promise the deck made was true.
+- **Why it exists:** the keep decision existed only as a `tracing::warn!` on the `RemovalPolicy::KeepIfDirty` path, so closing a dispatched tab with uncommitted work looked identical to closing a clean one while a directory quietly stayed on disk holding the work. It cannot be reported after the fact on the surfaces that exist: `remove_worktree` runs in a task spawned AFTER `close_agent` and `unregister_pane`, and the client drops the session the moment `close_pane` returns, so `DeliveryNotice`'s pane-ownership guard drops the report by construction. The control assertion is load-bearing — a dialog that warned on every close would satisfy every other assertion here and help nobody.
+- **Does not assert:** the `KeepIfDirty` policy itself (keeping the tree is correct behaviour and unchanged); the `Force` path, where a dispatched tree is removed regardless; `worktree list` / `reclaim`.
 - **Platform coverage:** mac+linux.
 
 #### orchestration/route
