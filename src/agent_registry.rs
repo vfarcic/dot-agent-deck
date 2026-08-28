@@ -253,11 +253,23 @@ fn devin_uninstall() -> Result<(), String> {
 /// `PATH` to answer `hooks/list`): the definitions are what the command promises,
 /// so a trust failure warns rather than failing the documented install.
 fn codex_install() -> Result<(), String> {
+    // PRD #381 Open Question 4, answered: this is not a spawn. It feeds
+    // `install_to`, which PERSISTS the path into `~/.codex/hooks.json`, so it
+    // resolves a durable path or refuses — the refusal reaching the shell as a
+    // non-zero exit with nothing written.
+    codex_install_resolved(crate::platform::paths::durable_binary_path())
+}
+
+/// [`codex_install`] with the binary-path resolution injected (PRD #381 M6).
+///
+/// The refusal is checked BEFORE the Codex home is resolved, so a refusing
+/// resolver makes this function touch the filesystem not at all — which is both
+/// the property M6 asks for and what lets a test drive the branch without a
+/// machine that has no durable deck.
+fn codex_install_resolved(binary_path: Result<String, String>) -> Result<(), String> {
+    let binary_path = binary_path?;
     let home = crate::codex_hooks_manage::active_codex_home()
         .ok_or_else(|| "no Codex home resolves (CODEX_HOME and HOME are both unset)".to_string())?;
-    let binary_path = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into());
     crate::codex_hooks_manage::install_to(&home, &binary_path).map_err(|e| e.to_string())?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
     if let Err(e) = crate::codex_hooks_manage::trust_deck_hooks_in(&home, &cwd) {
@@ -761,5 +773,23 @@ mod tests {
                 "a shipped agent's badge should not reuse the neutral placeholder colour"
             );
         }
+    }
+
+    /// PRD #381 Open Question 4 / M6: the `hooks install --agent codex` adapter
+    /// persists the path it resolves, so a refusal must surface as `Err` — and
+    /// must do so BEFORE anything on disk is consulted, which is why the check
+    /// is the first statement of `codex_install_resolved`. This test touches no
+    /// filesystem and no environment variable precisely because the refusal
+    /// returns first; if that order ever regresses, this test starts reading the
+    /// developer's real `~/.codex`.
+    #[test]
+    fn codex_install_surfaces_a_refused_binary_path_as_an_error() {
+        let err = codex_install_resolved(Err("no durable dot-agent-deck".to_string()))
+            .expect_err("a refused resolution must not report success");
+        assert_eq!(
+            err, "no durable dot-agent-deck",
+            "the resolver's own message must reach the CLI verbatim, not be replaced by a \
+             generic one"
+        );
     }
 }

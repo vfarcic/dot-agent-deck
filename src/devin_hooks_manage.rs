@@ -395,11 +395,18 @@ pub fn uninstall_from(config_dir: &Path) -> io::Result<Vec<String>> {
     Ok(removed)
 }
 
-/// The absolute path of the running deck binary, for pinning into hook commands.
-fn current_binary_path() -> String {
-    std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into())
+/// The DURABLE absolute path to pin into Devin's hook commands, or the
+/// resolver's refusal (PRD #381).
+///
+/// PRD #381's M2 list names six call sites and omits this one, but it is the
+/// same shape as the other six and writes a path Devin later executes — so
+/// "no remaining `current_exe()` feeding an external config write" is not
+/// satisfiable without it. It used to be `current_exe()` with a
+/// [`crate::platform::paths::DEFAULT_BINARY_NAME`] fallback, which is issue
+/// #536's bug in miniature: a bare command name in a file another program
+/// hands to a shell.
+fn durable_binary_path() -> Result<String, String> {
+    crate::platform::paths::durable_binary_path()
 }
 
 /// Startup entry: install the deck's Devin hooks into the user's Devin config,
@@ -422,7 +429,15 @@ pub fn auto_install() {
         return;
     };
 
-    match install_to(&config_dir, &current_binary_path()) {
+    let binary_path = match durable_binary_path() {
+        Ok(binary_path) => binary_path,
+        Err(e) => {
+            tracing::warn!("auto-install: {e}");
+            return;
+        }
+    };
+
+    match install_to(&config_dir, &binary_path) {
         Ok(()) => {
             tracing::info!(
                 "auto-installed Devin hooks: {}",
@@ -440,7 +455,7 @@ pub fn auto_install() {
 pub fn install() -> Result<(), String> {
     let config_dir = devin_config_dir()
         .ok_or_else(|| "no Devin config dir resolves (HOME is unset)".to_string())?;
-    install_to(&config_dir, &current_binary_path()).map_err(|e| e.to_string())?;
+    install_to(&config_dir, &durable_binary_path()?).map_err(|e| e.to_string())?;
 
     println!("Installed hooks: {}", DEVIN_HOOK_EVENTS.join(", "));
     println!("Settings file: {}", config_path(&config_dir).display());
@@ -820,6 +835,95 @@ mod tests {
             mode_of(existing.path()),
             0o600,
             "uninstall must not widen an owner-only Devin config"
+        );
+    }
+
+    /// PRD #381: the seventh write site — the one the PRD's M2 list omits.
+    /// Driving `install_to` with the REAL resolver and a build-artifact
+    /// `current_exe()` must never put that artifact into Devin's config, and
+    /// must never put a bare command name there either (issue #536, which this
+    /// site used to reproduce with its `DEFAULT_BINARY_NAME` fallback).
+    #[test]
+    fn install_never_writes_a_build_artifact_or_a_bare_name_into_devin_config() {
+        let dir = crate::test_temp::tempdir().expect("devin fixture tempdir");
+        let home = dir.path().join("home");
+        let durable = home.join(".local").join("bin").join("dot-agent-deck");
+        let artifact = dir
+            .path()
+            .join("checkout")
+            .join("target")
+            .join("debug")
+            .join("dot-agent-deck");
+        for candidate in [&durable, &artifact] {
+            std::fs::create_dir_all(candidate.parent().expect("parent")).expect("create dir");
+            std::fs::write(candidate, b"#!/bin/sh\nexit 0\n").expect("write candidate");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(candidate, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+            }
+        }
+
+        let resolved =
+            crate::platform::paths::durable_binary_path_with(Ok(artifact.clone()), &home, None)
+                .expect("a seeded ~/.local/bin candidate must resolve");
+        let config_dir = dir.path().join("config").join("devin");
+        install_to(&config_dir, &resolved).expect("install Devin hooks");
+
+        let body = std::fs::read_to_string(config_path(&config_dir)).expect("read config.json");
+        assert!(
+            !body.contains("target/debug") && !body.contains("target/release"),
+            "a build artifact reached Devin's config:\n{body}"
+        );
+        let root = read_back(&config_dir);
+        for &event in DEVIN_HOOK_EVENTS {
+            let commands = deck_commands_for(&root, event);
+            assert!(!commands.is_empty(), "no deck rule for {event}");
+            for command in commands {
+                assert!(
+                    command.starts_with(durable.to_str().expect("durable is UTF-8")),
+                    "{event} names {command}, not the durable path"
+                );
+            }
+        }
+    }
+
+    /// The refusal reaches the caller rather than degrading to a bare name.
+    /// `durable_binary_path` is a thin wrapper, so this pins the one property
+    /// that matters at this site: its error type is propagated by `install`,
+    /// which returns `Result<(), String>`.
+    #[test]
+    fn a_refused_resolution_is_an_error_not_a_bare_command_name() {
+        let dir = crate::test_temp::tempdir().expect("devin fixture tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let artifact = dir
+            .path()
+            .join("checkout")
+            .join("target")
+            .join("debug")
+            .join("dot-agent-deck");
+        std::fs::create_dir_all(artifact.parent().expect("parent")).expect("create dir");
+        std::fs::write(&artifact, b"x").expect("write artifact");
+        let empty = dir.path().join("empty-bin");
+        std::fs::create_dir_all(&empty).expect("create empty PATH dir");
+        let path_value = std::env::join_paths([empty]).expect("join PATH");
+
+        let err = crate::platform::paths::durable_binary_path_with(
+            Ok(artifact),
+            &home,
+            Some(path_value.as_os_str()),
+        )
+        .expect_err("no durable candidate must refuse");
+        assert_ne!(
+            err,
+            crate::platform::paths::DEFAULT_BINARY_NAME,
+            "issue #536: the bare crate name is never the answer here"
+        );
+        assert!(
+            err.contains("cargo install --path ."),
+            "not actionable: {err}"
         );
     }
 }

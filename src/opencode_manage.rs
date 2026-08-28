@@ -424,6 +424,34 @@ fn write_plugin(root: &Path, binary_path: &str) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// The `BINARY_PATH` an already-installed plugin under `root` pins, or `None`
+/// when there is no plugin file, it cannot be read, or it carries no readable
+/// literal (a hand-edited or truncated file).
+///
+/// The plugin is generated **JavaScript**, not JSON, and PRD #381 blames
+/// exactly that shape difference for OpenCode being the last of the three
+/// integrations to be noticed — a JSON-shaped fix silently misses it. So this
+/// reads the one line [`plugin_template`] emits and decodes the literal with
+/// `serde_json`, which is the same escaping the template wrote it with.
+fn existing_binary_path(root: &Path) -> Option<String> {
+    let js = std::fs::read_to_string(plugin_file(root)).ok()?;
+    let after = js.split_once("const BINARY_PATH = ")?.1;
+    let literal = after.split_once(";\n")?.0;
+    serde_json::from_str::<String>(literal).ok()
+}
+
+/// Whether `path` is POSITIVELY known to be gone — the only state that triggers
+/// a repair (PRD #381 M5).
+///
+/// [`Path::try_exists`] separates "the OS reports it missing" (`Ok(false)`)
+/// from "could not determine" (permission denied, an unmounted or stale mount),
+/// and only the first counts. That is the same fail-safe direction
+/// `hooks_manage::command_is_dead_deck` takes for Claude's rules: leaving a
+/// stale pin behind is recoverable, repointing a working one is not.
+fn is_positively_missing(path: &str) -> bool {
+    matches!(Path::new(path).try_exists(), Ok(false))
+}
+
 /// Remove one plugin artifact — a flat file or an obsolete nested dir — and print
 /// a line naming what was removed. A missing path is reported, not an error.
 fn uninstall_impl(path: &PathBuf) -> std::io::Result<()> {
@@ -452,7 +480,26 @@ fn auto_install_to(roots: &[PathBuf], binary_path: &str) {
         if !root.exists() {
             continue;
         }
-        match write_plugin(root, binary_path) {
+        // PRD #381 M5, and its Open Question 3: repair only what is MISSING.
+        // This path used to rewrite `BINARY_PATH` unconditionally on every
+        // dashboard startup, so a perfectly valid pin was clobbered by whatever
+        // binary happened to be launching — the "not merely different" rule
+        // broken on the one integration where nobody was looking. The file is
+        // still regenerated either way, so a template change still lands; only
+        // the pinned path is carried over.
+        let (pinned, repairing) = match existing_binary_path(root) {
+            Some(existing) if !is_positively_missing(&existing) => (existing, false),
+            Some(_) => (binary_path.to_string(), true),
+            None => (binary_path.to_string(), false),
+        };
+        match write_plugin(root, &pinned) {
+            // Repair logs what it changed: silently mutating global config is
+            // the same class of thing that caused this bug.
+            Ok(path) if repairing => tracing::info!(
+                "repaired the OpenCode plugin at {}: its BINARY_PATH no longer exists on disk, \
+                 now pinned to {pinned}",
+                path.display()
+            ),
             Ok(path) => tracing::info!("auto-installed OpenCode plugin: {}", path.display()),
             Err(e) => tracing::warn!(
                 "auto-install: failed to write OpenCode plugin under {}: {e}",
@@ -510,19 +557,34 @@ fn install_to_roots(
 }
 
 /// Silently install OpenCode plugin into every existing layout.
-/// Intended for dashboard startup — never prints to stdout.
+/// Intended for dashboard startup — never prints to stdout, refusal included.
 pub fn auto_install() {
-    let binary_path = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into());
-
-    auto_install_to(&candidate_roots(), &binary_path);
+    auto_install_resolved(
+        &candidate_roots(),
+        crate::platform::paths::durable_binary_path(),
+    );
 }
 
+/// [`auto_install`] with the binary-path resolution injected, so the PRD #381 M6
+/// refusal branch is reachable from a test.
+///
+/// On a refusal nothing is written and no directory is created — the plugin file
+/// is never opened, so there is no truncated or abandoned JavaScript left for
+/// OpenCode to load — and the complaint goes to `tracing::warn!` and nowhere
+/// else, because this is the dashboard-startup path.
+fn auto_install_resolved(roots: &[PathBuf], binary_path: Result<String, String>) {
+    match binary_path {
+        Ok(binary_path) => auto_install_to(roots, &binary_path),
+        Err(e) => tracing::warn!("auto-install: {e}"),
+    }
+}
+
+/// `dot-agent-deck hooks install --agent opencode`. Unlike [`auto_install`],
+/// this ALWAYS writes the freshly resolved path: the user asked for this
+/// install by name, so an existing pin is not preserved (PRD #381 M5).
 pub fn install() -> std::io::Result<()> {
-    let binary_path = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into());
+    let binary_path =
+        crate::platform::paths::durable_binary_path().map_err(std::io::Error::other)?;
 
     install_to_roots(
         &candidate_roots(),
@@ -693,6 +755,12 @@ mod tests {
         assert!(!plugin_file(&legacy_root).exists());
     }
 
+    /// Note what makes this pass since PRD #381: `/bin/deck-old` does not
+    /// exist, so the second pass REPAIRS a dead pin rather than overwriting a
+    /// live one. The auto path deliberately no longer clobbers a `BINARY_PATH`
+    /// that still resolves — see
+    /// `auto_install_repairs_a_dead_binary_path_and_preserves_a_valid_one`,
+    /// which pins both halves.
     #[test]
     fn auto_install_idempotent_overwrites_every_layout() {
         let tmp = tempfile::tempdir().unwrap();
@@ -876,5 +944,183 @@ mod tests {
             !stale_dir.exists(),
             "stale nested plugin dir must be removed"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #381 — the OpenCode plugin's `BINARY_PATH`.
+    //
+    // Its own tests, and its own parse, because the plugin is generated
+    // JAVASCRIPT rather than JSON: the PRD blames exactly that shape difference
+    // for OpenCode being the last of the three integrations to be noticed, so a
+    // fix that only speaks JSON silently misses it.
+    // -----------------------------------------------------------------------
+
+    /// A real executable at `path`, parents created — the resolver's "exists and
+    /// is executable" gate is a real `stat`, so this cannot be faked.
+    fn write_executable(path: &Path) {
+        std::fs::create_dir_all(path.parent().expect("path has a parent")).expect("create parent");
+        std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write executable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+    }
+
+    /// The `…/target/release/dot-agent-deck` the field defect wrote, plus the
+    /// durable `<home>/.local/bin/dot-agent-deck` the resolver must prefer.
+    fn artifact_and_durable(root: &Path) -> (PathBuf, PathBuf) {
+        let artifact = root
+            .join("checkout")
+            .join("target")
+            .join("release")
+            .join("dot-agent-deck");
+        write_executable(&artifact);
+        let durable = root
+            .join("home")
+            .join(".local")
+            .join("bin")
+            .join("dot-agent-deck");
+        write_executable(&durable);
+        (artifact, durable)
+    }
+
+    /// Driving the plugin writer with the REAL resolver and a build-artifact
+    /// `current_exe()`: `BINARY_PATH` must be the durable path, and no
+    /// `target/` path may appear anywhere in the generated JavaScript.
+    #[test]
+    fn plugin_binary_path_is_never_the_build_artifact_it_was_installed_from() {
+        let tmp = crate::test_temp::tempdir().expect("plugin tempdir");
+        let (artifact, durable) = artifact_and_durable(tmp.path());
+        let root = tmp.path().join("opencode-root");
+        std::fs::create_dir_all(&root).expect("create root");
+
+        let resolved = crate::platform::paths::durable_binary_path_with(
+            Ok(artifact.clone()),
+            &tmp.path().join("home"),
+            None,
+        )
+        .expect("a seeded ~/.local/bin candidate must resolve");
+        auto_install_to(std::slice::from_ref(&root), &resolved);
+
+        let js = std::fs::read_to_string(plugin_file(&root)).expect("read plugin");
+        assert_eq!(
+            existing_binary_path(&root).as_deref(),
+            durable.to_str(),
+            "BINARY_PATH must be the durable path, not the artifact"
+        );
+        for marker in ["target/release", "target/debug"] {
+            assert!(
+                !js.contains(marker),
+                "the generated plugin names `{marker}`:\n{js}"
+            );
+        }
+    }
+
+    /// PRD #381 M5: on the AUTO path a `BINARY_PATH` pointing at a deleted file
+    /// is repaired, and a still-valid one is left exactly as it was.
+    ///
+    /// This path used to rewrite `BINARY_PATH` unconditionally on every
+    /// dashboard startup, which is the "repair what merely differs" behaviour
+    /// Open Question 3 rules out — and on the one integration nobody was
+    /// watching.
+    #[test]
+    fn auto_install_repairs_a_dead_binary_path_and_preserves_a_valid_one() {
+        let tmp = crate::test_temp::tempdir().expect("plugin tempdir");
+        let (artifact, durable) = artifact_and_durable(tmp.path());
+        let home = tmp.path().join("home");
+        let resolved =
+            crate::platform::paths::durable_binary_path_with(Ok(artifact.clone()), &home, None)
+                .expect("resolve durable");
+
+        // A pin that still exists: preserved, byte for byte in the value.
+        let valid_root = tmp.path().join("valid-root");
+        std::fs::create_dir_all(&valid_root).expect("create root");
+        let users_own = tmp.path().join("users-own").join("dot-agent-deck");
+        write_executable(&users_own);
+        write_plugin(&valid_root, users_own.to_str().expect("UTF-8")).expect("seed valid plugin");
+
+        auto_install_to(std::slice::from_ref(&valid_root), &resolved);
+        assert_eq!(
+            existing_binary_path(&valid_root).as_deref(),
+            users_own.to_str(),
+            "a BINARY_PATH that still exists must not be repointed just because it differs"
+        );
+
+        // A pin that is positively gone: repaired to the resolved path.
+        let dead_root = tmp.path().join("dead-root");
+        std::fs::create_dir_all(&dead_root).expect("create root");
+        let gone = tmp.path().join("pruned-worktree").join("dot-agent-deck");
+        assert!(!gone.exists(), "the dead pin must genuinely not exist");
+        write_plugin(&dead_root, gone.to_str().expect("UTF-8")).expect("seed dead plugin");
+
+        auto_install_to(std::slice::from_ref(&dead_root), &resolved);
+        assert_eq!(
+            existing_binary_path(&dead_root).as_deref(),
+            durable.to_str(),
+            "a BINARY_PATH whose target is gone must be repaired"
+        );
+
+        // Idempotent: a second pass over either root changes nothing.
+        let before = std::fs::read(plugin_file(&dead_root)).expect("read repaired plugin");
+        auto_install_to(std::slice::from_ref(&dead_root), &resolved);
+        assert_eq!(
+            before,
+            std::fs::read(plugin_file(&dead_root)).expect("read again"),
+            "a second auto-install pass changed the repaired plugin"
+        );
+    }
+
+    /// PRD #381 M6: a refusal writes nothing at all — not a truncated plugin,
+    /// not even the `plugin/` directory. An abandoned half-written file is
+    /// worse than none: OpenCode would load it.
+    #[test]
+    fn auto_install_refusal_leaves_no_plugin_behind() {
+        let tmp = crate::test_temp::tempdir().expect("plugin tempdir");
+        let root = tmp.path().join("opencode-root");
+        std::fs::create_dir_all(&root).expect("create root");
+
+        auto_install_resolved(
+            std::slice::from_ref(&root),
+            Err("no durable dot-agent-deck".to_string()),
+        );
+
+        assert!(
+            !plugin_file(&root).exists(),
+            "a refused auto-install wrote {}",
+            plugin_file(&root).display()
+        );
+        assert!(
+            !root.join("plugin").exists(),
+            "a refused auto-install created the plugin directory"
+        );
+    }
+
+    /// The JS parse is the one that has to survive a hand-edited or truncated
+    /// file: anything it cannot read confidently is `None`, which
+    /// [`auto_install_to`] treats as "no pin to preserve" and overwrites.
+    #[test]
+    fn existing_binary_path_reads_the_generated_literal_and_nothing_else() {
+        let tmp = crate::test_temp::tempdir().expect("plugin tempdir");
+        let root = tmp.path().join("root");
+        write_plugin(&root, "/with space/dot-agent-deck").expect("write plugin");
+        assert_eq!(
+            existing_binary_path(&root).as_deref(),
+            Some("/with space/dot-agent-deck"),
+            "a quoted path must round-trip through the JS literal"
+        );
+
+        let truncated = tmp.path().join("truncated");
+        let file = plugin_file(&truncated);
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("create dir");
+        std::fs::write(&file, b"const BINARY_PATH = \"unterminated").expect("write truncated");
+        assert_eq!(
+            existing_binary_path(&truncated),
+            None,
+            "a truncated plugin must not be read as a valid pin"
+        );
+
+        let absent = tmp.path().join("absent");
+        assert_eq!(existing_binary_path(&absent), None);
     }
 }

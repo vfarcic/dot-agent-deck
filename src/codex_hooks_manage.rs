@@ -362,9 +362,17 @@ pub fn auto_install() {
     let Some(home) = codex_home() else {
         return;
     };
-    let binary_path = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into());
+    // PRD #381: never `current_exe()` directly — a `target/debug` path written
+    // here is gone the moment its worktree is pruned, and this write is silent
+    // and automatic. A refusal writes nothing and warns; `hooks.json` is left
+    // exactly as it was.
+    let binary_path = match crate::platform::paths::durable_binary_path() {
+        Ok(binary_path) => binary_path,
+        Err(e) => {
+            tracing::warn!("auto-install: {e}");
+            return;
+        }
+    };
     if let Err(e) = install_to(&home, &binary_path) {
         tracing::warn!("auto-install: failed to write Codex hooks.json: {e}");
     }

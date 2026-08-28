@@ -384,6 +384,250 @@ pub fn binary_name() -> String {
     resolve_binary_name(effective_current_exe(), resolves_on_path)
 }
 
+/// The absolute path this build should write into **another program's
+/// persistent configuration** — a hook command in `~/.claude/settings.json` or
+/// `~/.codex/hooks.json`, Devin's `config.json`, or the OpenCode plugin's
+/// `BINARY_PATH` (PRD #381).
+///
+/// This is deliberately **not** [`binary_name`] and deliberately not built on
+/// it. `binary_name()` answers "what text tells an agent to run the deck", and
+/// its best answer is often a BARE name the agent's own shell resolves through
+/// `$PATH`. That answer is never acceptable here: these commands run under
+/// `/bin/sh` with an environment the deck does not control, and the field
+/// failure this function exists for was exactly a `sh` `$PATH` miss
+/// (`/bin/sh: 1: …/target/release/dot-agent-deck: not found`). Everything this
+/// returns is an absolute path to a file that existed at resolution time —
+/// never a bare name, never relative.
+///
+/// Resolution order:
+///
+/// 1. `current_exe()`, when it is a usable absolute path to an executable file
+///    that is **not** a cargo build artifact ([`is_build_artifact_path`]). An
+///    installed binary performing its own install is the normal, correct case
+///    and must keep working.
+/// 2. It IS a build artifact — gitignored, deleted by `cargo clean`, and gone
+///    the moment its worktree is pruned, so it must never be persisted:
+///    - **2a.** `<home>/.local/bin/dot-agent-deck`, when that exists and is
+///      executable — the same choice `remote.rs`'s remote install already
+///      makes ("Use the absolute path consistently");
+///    - **2b.** otherwise the first `dot-agent-deck` reachable through an
+///      absolute, non-artifact `$PATH` entry, as its own absolute path;
+///    - **2c.** otherwise **refuse**: return `Err`, and the caller writes
+///      nothing at all.
+/// 3. `current_exe()` failing outright is also a refusal, **never** a fallback
+///    to [`DEFAULT_BINARY_NAME`] (issue #536). A bare `dot-agent-deck` in a
+///    file Claude Code hands to `/bin/sh` re-opens the same `$PATH` miss in
+///    the one place the deck can least afford it, and unlike [`binary_name`]'s
+///    consumers there is no shell here whose `$PATH` might still save it.
+///
+/// **The 2a candidate is deliberately NOT canonicalized.** On Linux
+/// `current_exe()` reads `/proc/self/exe`, which the kernel resolves fully, so
+/// a user who runs `~/.local/bin/dot-agent-deck` where that is a symlink into
+/// a cargo target directory arrives at step 1 holding a `target/` path, falls
+/// through to 2a, and gets the durable **symlink** path written. That is the
+/// desired outcome — canonicalizing 2a would resolve it straight back to the
+/// artifact and defeat the fix. It is also what lets the e2e harness point a
+/// sandbox `~/.local/bin` at the binary under test.
+///
+/// **"Exists and is executable" is the whole gate — a candidate is never
+/// executed** (PRD #381 Open Question 5, decided deliberately). This does a
+/// `stat` and, on Unix, checks the executable bit; it spawns nothing. Running
+/// a candidate to prove it works would put a subprocess on the silent
+/// dashboard-startup path and add a new failure mode there, to catch a
+/// version-skew problem the PRD puts out of scope: an installed deck of a
+/// different version is still a *durable* path, which is all this function
+/// claims to find.
+pub fn durable_binary_path() -> Result<String, String> {
+    durable_binary_path_with(
+        effective_current_exe(),
+        &home_dir(),
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+/// [`durable_binary_path`] with its three environmental inputs injected: the
+/// running executable, the home anchor step 2a hangs off, and the `$PATH`
+/// value step 2b walks.
+///
+/// Public because it is the seam PRD #381 M3 exists to open. `hooks_manage`'s
+/// auto-install seam used to hardcode `let binary_path =
+/// "dot-agent-deck".to_string();`, so **no test ever executed the derivation
+/// that produced the field defect** — the PRD calls closing that its
+/// highest-value milestone. A test has to be able to drive this with a
+/// `…/target/release/dot-agent-deck` `current_exe()` of its own choosing, and
+/// a real unusable `current_exe()` cannot be manufactured on demand.
+///
+/// Only the **inputs** are synthetic. The existence and executable-bit checks
+/// are the real ones against the real filesystem, and the `$PATH` walk is the
+/// real one — same precedent as [`first_path_match`], which is likewise pure
+/// over its `path` argument — so a test that passes a `tempfile` home and a
+/// `tempfile`-backed `$PATH` exercises production logic rather than a parallel
+/// copy of it.
+pub fn durable_binary_path_with(
+    current_exe: std::io::Result<PathBuf>,
+    home: &Path,
+    path_value: Option<&std::ffi::OsStr>,
+) -> Result<String, String> {
+    let name = durable_binary_file_name();
+    let installed = home.join(".local").join("bin").join(&name);
+
+    let exe = match current_exe {
+        Ok(exe) => exe,
+        // Issue #536: this is a refusal, NOT a fall back to the bare crate
+        // name. See the doc comment above.
+        Err(e) => {
+            return Err(format!(
+                "refusing to write a dot-agent-deck hook command: the running executable's own \
+                 path is unavailable ({e}), so there is no absolute path to write and a bare \
+                 command name would be resolved by whatever `$PATH` the agent's `/bin/sh` \
+                 happens to have. {}",
+                repair_advice(&installed)
+            ));
+        }
+    };
+    // `current_exe()` is only guaranteed absolute on Linux (`/proc/self/exe`);
+    // on macOS it reports the invocation path (issue #560), so absolutise
+    // before deciding anything about it. Purely lexical plus the cwd, and
+    // deliberately not `canonicalize` — resolving symlinks here would turn a
+    // durable `~/.local/bin` launch into the artifact it points at.
+    let absolute = std::path::absolute(&exe).unwrap_or(exe);
+
+    if !is_build_artifact_path(&absolute)
+        && is_executable_file(&absolute)
+        && let Some(path) = durable_path_string(&absolute)
+    {
+        return Ok(path);
+    }
+
+    if !is_build_artifact_path(&installed)
+        && is_executable_file(&installed)
+        && let Some(path) = durable_path_string(&installed)
+    {
+        return Ok(path);
+    }
+
+    if let Some(path_value) = path_value
+        && let Some(found) = first_durable_path_match(path_value, &name)
+        && let Some(path) = durable_path_string(&found)
+    {
+        return Ok(path);
+    }
+
+    Err(format!(
+        "refusing to write `{}` into agent hook config: {}. No durable dot-agent-deck was found \
+         at `{}` or on `$PATH`, and a hook command pointing at a path that will not exist is \
+         worse than no hook at all. {}",
+        absolute.display(),
+        rejection_reason(&absolute),
+        installed.display(),
+        repair_advice(&installed)
+    ))
+}
+
+/// Why `exe` was not usable as the written path, for the refusal message.
+fn rejection_reason(exe: &Path) -> String {
+    if is_build_artifact_path(exe) {
+        "it is a cargo build artifact — gitignored, removed by `cargo clean`, and gone the \
+         moment its worktree is pruned"
+            .to_string()
+    } else {
+        "it is not a usable absolute path to an executable file".to_string()
+    }
+}
+
+/// The actionable half of every refusal message: what the operator can do.
+fn repair_advice(installed: &Path) -> String {
+    format!(
+        "Install the deck to a durable location — `cargo install --path .`, or copy the binary to \
+         `{}` — or put `dot-agent-deck` on your `PATH`, then run `dot-agent-deck hooks install`.",
+        installed.display()
+    )
+}
+
+/// The file name step 2a and 2b look for: the crate's own package name plus the
+/// platform's executable suffix (`.exe` on Windows, empty elsewhere).
+///
+/// Deliberately [`DEFAULT_BINARY_NAME`] rather than `current_exe()`'s own file
+/// name. The two differ only for a deck renamed on disk, and there the
+/// question this function answers is "where is the *installed* deck", whose
+/// answer is the name `remote.rs` and every install path already use. A
+/// renamed build looking for a renamed install would find nothing on the one
+/// machine layout the project actually ships.
+fn durable_binary_file_name() -> String {
+    format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// `path` as an owned string, but only when it satisfies the contract
+/// [`durable_binary_path`] promises: absolute, and spellable as UTF-8 (every
+/// consumer interpolates it into a text config file). Anything else yields
+/// `None`, so the invariant is true by construction rather than by assumption
+/// about what shapes `current_exe()` and `$HOME` can take.
+fn durable_path_string(path: &Path) -> Option<String> {
+    if !path.is_absolute() {
+        return None;
+    }
+    path.to_str().map(str::to_string)
+}
+
+/// Whether `path` runs through a cargo build-output directory: a path
+/// **component** `debug` or `release` whose immediate parent component is
+/// `target`.
+///
+/// Component-wise, not a substring search, and that is load-bearing rather
+/// than fastidious. `path.contains("target/debug")` would also catch a user
+/// whose home directory is literally named `target`, a deck kept under
+/// `/opt/target/release-notes/`, or (on Windows) miss the same shapes because
+/// the separator is `\`. Matching components makes the test mean what it says
+/// on both platforms.
+///
+/// Known and accepted limitation: it recognises the **default** layout only. A
+/// `CARGO_TARGET_DIR=/tmp/build` puts artifacts at `/tmp/build/debug/…`, whose
+/// `debug` has no `target` parent, so such a build is treated as durable. PRD
+/// #381 defines the check as `target/debug` / `target/release`, which is the
+/// layout every path in the field report had; widening it to "any `debug` or
+/// `release` component" would reject legitimate install prefixes.
+pub(crate) fn is_build_artifact_path(path: &Path) -> bool {
+    use std::ffi::OsStr;
+    use std::path::Component;
+
+    let mut parent: Option<&OsStr> = None;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            parent = None;
+            continue;
+        };
+        if parent == Some(OsStr::new("target"))
+            && matches!(name.to_str(), Some("debug" | "release"))
+        {
+            return true;
+        }
+        parent = Some(name);
+    }
+    false
+}
+
+/// The first `name` reachable through an absolute, non-artifact entry of a
+/// `$PATH`-shaped value, as an absolute path — step 2b of
+/// [`durable_binary_path`]. Pure over its `path` argument (no environment
+/// read), matching [`first_path_match`]'s precedent.
+///
+/// Two deliberate differences from [`first_path_match`], both because this
+/// answers a different question. That function reproduces a **shell's** lookup
+/// — first match wins, and a match found through an empty or relative entry
+/// STOPS the walk without being claimed, because a shell would have selected
+/// it. Here nothing is being predicted about a shell: the goal is simply to
+/// find a durable absolute location, so an untrustworthy entry (which no
+/// absolute path can be built from — [`is_untrustworthy_path_entry`]) and a
+/// build-artifact candidate (which is exactly what this whole resolver
+/// refuses, and `$PATH` entries pointing into `target/debug` are routine on a
+/// developer's machine) are both **skipped** and the walk continues.
+fn first_durable_path_match(path: &std::ffi::OsStr, name: &str) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|dir| !is_untrustworthy_path_entry(dir))
+        .map(|dir| dir.join(name))
+        .find(|candidate| !is_build_artifact_path(candidate) && is_executable_file(candidate))
+}
+
 /// `current_exe()`, or — only under the `e2e` feature, and only once
 /// [`set_test_current_exe_override`] has been called — the injected test
 /// override. [`spawn_inprocess_daemon`]'s test harness (`tests/common/mod.rs`)
@@ -2027,6 +2271,330 @@ mod tests {
             Some("C:/Users/50%/dot-agent-deck.exe"),
             "with no space and no quote, a respelled Windows path needs no quoting even \
              though it carries a %"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // PRD #381 — the durable hook-binary-path resolver.
+    //
+    // Plain `#[test]`s, not `#[spec]` catalog entries: these are lib units,
+    // like the `resolve_binary_name` tests above. The catalog entries for this
+    // PRD are the two L2 tests in `tests/e2e_hook_binary_path.rs`.
+    //
+    // Every case drives `durable_binary_path_with`, whose three environmental
+    // inputs (`current_exe()`, the home anchor, the `$PATH` value) are
+    // injected. The filesystem checks are the REAL ones, so the fixtures below
+    // create real executables in a real scratch directory rather than stubbing
+    // out `is_executable_file`.
+    // ---------------------------------------------------------------------
+
+    /// A real executable file at `path`, parents created. Unix sets the exec
+    /// bit, which the resolver's step-2a/2b gate genuinely requires.
+    fn write_stub_executable(path: &Path) {
+        std::fs::create_dir_all(path.parent().expect("candidate has a parent"))
+            .expect("create candidate dir");
+        std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write candidate");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod candidate");
+        }
+    }
+
+    /// Every `Ok` this resolver can return has to satisfy its whole contract at
+    /// once, so each case below funnels through here rather than asserting one
+    /// property and trusting the rest: absolute, currently on disk, and never a
+    /// bare command name (the shape issue #536 is about).
+    fn assert_durable(resolved: &Result<String, String>) -> &String {
+        let path = resolved
+            .as_ref()
+            .unwrap_or_else(|e| panic!("expected a durable path, got a refusal: {e}"));
+        assert!(
+            Path::new(path).is_absolute(),
+            "resolved {path} is not absolute — a hook command runs under /bin/sh with a cwd the \
+             deck does not control"
+        );
+        assert!(
+            Path::new(path).exists(),
+            "resolved {path} does not exist on disk"
+        );
+        assert_ne!(
+            path, DEFAULT_BINARY_NAME,
+            "resolved the bare crate name — issue #536: /bin/sh would resolve it through \
+             whatever $PATH the agent has"
+        );
+        assert!(
+            Path::new(path).file_name().is_some() && path.contains(std::path::MAIN_SEPARATOR),
+            "resolved {path} is a bare command name, not a path"
+        );
+        path
+    }
+
+    /// Step 1: an installed binary performing its own install keeps working —
+    /// `current_exe()` is returned unchanged.
+    #[test]
+    fn durable_binary_path_returns_a_non_artifact_current_exe_unchanged() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let installed = dir
+            .path()
+            .join("usr")
+            .join("local")
+            .join("bin")
+            .join(format!(
+                "{DEFAULT_BINARY_NAME}{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+        write_stub_executable(&installed);
+
+        let resolved = durable_binary_path_with(Ok(installed.clone()), dir.path(), None);
+
+        assert_eq!(
+            assert_durable(&resolved),
+            installed.to_str().expect("candidate path is UTF-8"),
+            "a durable current_exe() must be used as-is, not re-resolved"
+        );
+    }
+
+    /// Step 2a: the running binary IS a build artifact, and
+    /// `<home>/.local/bin/<name>` exists and is executable — that path wins,
+    /// and the artifact never appears.
+    #[test]
+    fn durable_binary_path_prefers_the_installed_home_candidate_over_a_build_artifact() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        let installed = home.join(".local").join("bin").join(format!(
+            "{DEFAULT_BINARY_NAME}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        write_stub_executable(&installed);
+        let artifact = dir
+            .path()
+            .join("checkout")
+            .join("target")
+            .join("release")
+            .join(DEFAULT_BINARY_NAME);
+        write_stub_executable(&artifact);
+
+        let resolved = durable_binary_path_with(Ok(artifact.clone()), &home, None);
+
+        assert_eq!(
+            assert_durable(&resolved),
+            installed.to_str().expect("installed path is UTF-8")
+        );
+        assert!(
+            !resolved.as_ref().expect("resolved").contains("target"),
+            "the build artifact leaked into the resolved path: {resolved:?}"
+        );
+        // The 2a candidate is deliberately NOT canonicalized, which is what
+        // makes a `~/.local/bin` symlink into a cargo target dir resolve to the
+        // durable spelling. Prove the returned value is the candidate path
+        // itself even when it IS such a symlink.
+        #[cfg(unix)]
+        {
+            let linked_home = dir.path().join("linked-home");
+            let link = linked_home.join(".local").join("bin").join(format!(
+                "{DEFAULT_BINARY_NAME}{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+            std::fs::create_dir_all(link.parent().expect("link parent")).expect("create link dir");
+            std::os::unix::fs::symlink(&artifact, &link).expect("symlink into target dir");
+
+            let via_link = durable_binary_path_with(Ok(artifact.clone()), &linked_home, None);
+            assert_eq!(
+                assert_durable(&via_link),
+                link.to_str().expect("link path is UTF-8"),
+                "canonicalizing the 2a candidate would resolve a durable symlink straight back \
+                 to the artifact it points at"
+            );
+        }
+    }
+
+    /// Step 2b: no `~/.local/bin` candidate, but the name is on `$PATH` — its
+    /// absolute path is used. An untrustworthy (relative) entry earlier on the
+    /// same `$PATH` is skipped, and so is one pointing into a cargo target
+    /// directory, which is the routine shape on a developer's machine.
+    #[test]
+    fn durable_binary_path_falls_back_to_an_absolute_path_lookup() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let name = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+
+        let artifact_dir = dir.path().join("checkout").join("target").join("debug");
+        write_stub_executable(&artifact_dir.join(&name));
+        let installed_dir = dir.path().join("opt").join("bin");
+        write_stub_executable(&installed_dir.join(&name));
+
+        // Order matters: a relative entry first (a shell would search it, this
+        // resolver must not trust it), then the artifact dir, then the durable
+        // one. Only the last is an acceptable answer.
+        let path_value = std::env::join_paths([
+            PathBuf::from("relative-bin"),
+            artifact_dir.clone(),
+            installed_dir.clone(),
+        ])
+        .expect("join synthetic PATH");
+
+        let resolved = durable_binary_path_with(
+            Ok(artifact_dir.join(&name)),
+            &home,
+            Some(path_value.as_os_str()),
+        );
+
+        assert_eq!(
+            assert_durable(&resolved),
+            installed_dir.join(&name).to_str().expect("path is UTF-8"),
+            "the PATH fallback must skip relative and build-artifact entries"
+        );
+    }
+
+    /// Step 2c: a build artifact with neither a `~/.local/bin` candidate nor a
+    /// `$PATH` hit is a REFUSAL — and the message has to be actionable, naming
+    /// the rejected path and what to do about it.
+    #[test]
+    fn durable_binary_path_refuses_when_no_durable_candidate_exists() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let artifact = dir
+            .path()
+            .join("checkout")
+            .join("target")
+            .join("debug")
+            .join(DEFAULT_BINARY_NAME);
+        write_stub_executable(&artifact);
+        let empty = dir.path().join("empty-bin");
+        std::fs::create_dir_all(&empty).expect("create empty PATH dir");
+        let path_value = std::env::join_paths([empty]).expect("join synthetic PATH");
+
+        let err =
+            durable_binary_path_with(Ok(artifact.clone()), &home, Some(path_value.as_os_str()))
+                .expect_err("a build artifact with no durable candidate must refuse");
+
+        assert!(
+            err.contains(artifact.to_str().expect("artifact path is UTF-8")),
+            "the refusal must name the rejected current_exe() path: {err}"
+        );
+        assert!(
+            err.contains("cargo install --path ."),
+            "the refusal must say what to do about it: {err}"
+        );
+        assert!(
+            err.contains(".local"),
+            "the refusal must name the durable location it looked in: {err}"
+        );
+    }
+
+    /// Issue #536: a `current_exe()` that fails is a refusal too, and
+    /// specifically NOT a fall back to `DEFAULT_BINARY_NAME`. `binary_name()`
+    /// legitimately returns that literal in the same situation — writing it
+    /// into a file Claude Code hands to `/bin/sh` is what re-opens the very
+    /// `$PATH` miss this PRD exists to close.
+    #[test]
+    fn durable_binary_path_refuses_rather_than_naming_the_bare_binary() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        // Seeded deliberately: even with a perfectly good durable candidate
+        // available, an unknown `current_exe()` must not silently install
+        // hooks — and even if it did, it must never be the bare name.
+        let installed = dir.path().join(".local").join("bin").join(format!(
+            "{DEFAULT_BINARY_NAME}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        write_stub_executable(&installed);
+
+        let resolved = durable_binary_path_with(
+            Err(std::io::Error::other("no such process")),
+            dir.path(),
+            None,
+        );
+
+        let err = resolved.expect_err("an unresolvable current_exe() must refuse");
+        assert!(
+            !err.is_empty() && err != DEFAULT_BINARY_NAME,
+            "issue #536: the bare crate name is never an acceptable answer here"
+        );
+        assert!(
+            err.contains("cargo install --path ."),
+            "the refusal must stay actionable: {err}"
+        );
+    }
+
+    /// The build-artifact test is on path COMPONENTS, not a substring — so a
+    /// home directory literally named `target`, a deck kept under
+    /// `/opt/target/release-notes/`, and a `debug` directory whose parent is
+    /// not `target` are all accepted, while a real `target/debug` or
+    /// `target/release` is caught. A substring check would fail every
+    /// near-miss here.
+    #[test]
+    fn is_build_artifact_path_matches_components_not_substrings() {
+        for artifact in [
+            "/home/u/code/deck/target/debug/dot-agent-deck",
+            "/home/u/code/deck/target/release/dot-agent-deck",
+            "/home/u/code/deck/target/debug/deps/dot-agent-deck",
+            "target/debug/dot-agent-deck",
+        ] {
+            assert!(
+                is_build_artifact_path(Path::new(artifact)),
+                "{artifact} is a cargo build artifact"
+            );
+        }
+        for durable in [
+            "/home/target/.local/bin/dot-agent-deck",
+            "/opt/target/release-notes/dot-agent-deck",
+            "/opt/target/debugger/dot-agent-deck",
+            "/srv/build/debug/dot-agent-deck",
+            "/srv/release/dot-agent-deck",
+            "/usr/local/bin/dot-agent-deck",
+            "/home/u/targets/debug/dot-agent-deck",
+        ] {
+            assert!(
+                !is_build_artifact_path(Path::new(durable)),
+                "{durable} is not a cargo build artifact — a substring check would \
+                 misclassify it"
+            );
+        }
+    }
+
+    /// A near-miss end to end: a deck genuinely installed under a directory
+    /// named `target` is returned by step 1, not refused.
+    #[test]
+    fn durable_binary_path_accepts_an_install_under_a_directory_named_target() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let installed = dir
+            .path()
+            .join("target")
+            .join("release-notes")
+            .join(DEFAULT_BINARY_NAME);
+        write_stub_executable(&installed);
+
+        let resolved = durable_binary_path_with(Ok(installed.clone()), dir.path(), None);
+
+        assert_eq!(
+            assert_durable(&resolved),
+            installed.to_str().expect("installed path is UTF-8")
+        );
+    }
+
+    /// A `current_exe()` that resolves but is no longer on disk (an upgrade
+    /// replaced it, or Linux reported `…/dot-agent-deck (deleted)`) is not
+    /// written either: the contract is a path that exists, so the resolver
+    /// falls through to the durable candidate.
+    #[test]
+    fn durable_binary_path_skips_a_current_exe_that_is_no_longer_on_disk() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let installed = dir.path().join(".local").join("bin").join(format!(
+            "{DEFAULT_BINARY_NAME}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        write_stub_executable(&installed);
+        let gone = dir.path().join("gone").join(DEFAULT_BINARY_NAME);
+
+        let resolved = durable_binary_path_with(Ok(gone), dir.path(), None);
+
+        assert_eq!(
+            assert_durable(&resolved),
+            installed.to_str().expect("installed path is UTF-8")
         );
     }
 }

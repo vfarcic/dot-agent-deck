@@ -489,6 +489,10 @@ impl TuiDeck {
 
         let home = work.join("home");
         std::fs::create_dir_all(&home).expect("create per-test HOME");
+        // PRD #381: the durable-path candidate the deck's hook installers
+        // resolve, pointed at the binary under test. See `seed_durable_binary`.
+        #[cfg(unix)]
+        seed_durable_binary(&home);
 
         // PRD #201: the per-test HOME deliberately starts WITHOUT the bundled Pi
         // extension. Because `TuiDeck` drives the REAL binary, its lazy-spawned
@@ -2308,6 +2312,41 @@ fn terminal_reached(
             .iter()
             .any(|t| grid.contains(t) && !baseline.contains(t)),
     )
+}
+
+/// PRD #381: seed `<home>/.local/bin/dot-agent-deck` as a **symlink to the
+/// binary under test**, so the deck's durable-path resolver lands inside the
+/// sandbox instead of on the host.
+///
+/// Without this, every e2e test that relies on installed hooks would silently
+/// exercise the wrong binary. The resolver refuses to write a
+/// `target/{debug,release}` path into agent config, and under `cargo test-e2e`
+/// the binary under test IS one — so it falls to step 2a
+/// (`$HOME/.local/bin/dot-agent-deck`) and then step 2b (`$PATH`). This harness
+/// passes the HOST `PATH` through (`inherit_pass`, below), and a developer box
+/// commonly has a real installed deck on it: hooks would then point at the
+/// host's deck and the tier would test stale code, while a machine with no
+/// installed deck would get a refusal and no hooks at all. Seeding step 2a
+/// makes the resolution order run for real and land on this build.
+///
+/// A **symlink**, not a copy: the resolver deliberately does not canonicalize
+/// its 2a candidate, so the durable symlink path is what gets written while the
+/// bytes executed are the freshly-built ones. A copy would go stale on the next
+/// `cargo build` and cost the binary's size per test.
+///
+/// `#[cfg(unix)]` because the L2 tier is Unix-only, and best-effort because a
+/// failure here can only degrade a test to the pre-#381 host-`PATH` behaviour,
+/// never corrupt anything.
+#[cfg(unix)]
+fn seed_durable_binary(home: &Path) {
+    let bin_dir = home.join(".local").join("bin");
+    if std::fs::create_dir_all(&bin_dir).is_err() {
+        return;
+    }
+    // `DEFAULT_BINARY_NAME`'s value, spelled out: the resolver looks for the
+    // crate's package name, not whatever the test binary happens to be called.
+    let link = bin_dir.join("dot-agent-deck");
+    let _ = std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_dot-agent-deck"), link);
 }
 
 fn locate_fixture(name: &str) -> PathBuf {
@@ -5548,6 +5587,9 @@ pub fn spawn_daemon_serve_with_env(
     let work = tempdir.path().to_path_buf();
     let home = work.join("home");
     std::fs::create_dir_all(&home).expect("create per-test HOME");
+    // PRD #381: same durable-path seeding as `TuiDeck` — a `daemon serve` spawns
+    // wrapped agents, and `wrap` runs the Codex hook installer.
+    seed_durable_binary(&home);
     let state_dir = work.join("state");
     let hook_socket = work.join("hook.sock");
     let attach_socket = work.join("attach.sock");

@@ -370,17 +370,38 @@ fn ensure_hook_array<'a>(
         .unwrap()
 }
 
-fn install_impl(settings: &mut Value, binary_path: &str) -> (Vec<&'static str>, Vec<&'static str>) {
+/// What one [`install_impl`] pass did: which hook types got a fresh rule, which
+/// were already current, and how many deck-owned commands it removed as stale.
+///
+/// `repaired` is what makes PRD #381 M4's self-heal *observable*, and it is not
+/// cosmetic. `auto_install` returns early when nothing was installed — and a
+/// settings file holding BOTH a dead deck rule and the current one lands in
+/// exactly that state: the dead rule is pruned in memory, every hook type
+/// reports `skipped`, and the repair is then dropped on the floor instead of
+/// being written. Counting the prune separately is what gets it published, and
+/// logged.
+struct InstallOutcome {
+    installed: Vec<&'static str>,
+    skipped: Vec<&'static str>,
+    /// Deck-owned commands removed as stale: a rule whose binary is positively
+    /// gone ([`command_is_dead_deck`]), or any deck rule left under a hook type
+    /// the deck no longer installs. Never a user-authored command — both
+    /// predicates are gated on deck ownership first.
+    repaired: usize,
+}
+
+fn install_impl(settings: &mut Value, binary_path: &str) -> InstallOutcome {
     let hooks_obj = ensure_hooks_object(settings);
 
     // Clean up deck entries for hook types no longer in HOOK_TYPES. These are
     // gone from HOOK_TYPES entirely, so any deck rule there is stale regardless
     // of which binary wrote it — use the generic, binary-agnostic predicate.
+    let mut repaired = 0usize;
     let all_keys: Vec<String> = hooks_obj.keys().cloned().collect();
     for key in all_keys {
         if !HOOK_TYPES.contains(&key.as_str()) {
             if let Some(arr) = hooks_obj.get_mut(&key).and_then(|v| v.as_array_mut()) {
-                strip_deck_commands(arr, command_is_ours);
+                repaired += strip_deck_commands(arr, command_is_ours);
             }
             // Remove the key entirely if the array is now empty
             if hooks_obj
@@ -415,7 +436,7 @@ fn install_impl(settings: &mut Value, binary_path: &str) -> (Vec<&'static str>, 
         // file's fixtures are) must not be swept up just because it happens
         // not to exist on disk (test 003 pins this: installing `/b/…` must
         // never prune `/a/…`'s unrelated rule).
-        strip_deck_commands(rules, |cmd| command_is_dead_deck(cmd, binary_path));
+        repaired += strip_deck_commands(rules, |cmd| command_is_dead_deck(cmd, binary_path));
 
         let expected = make_rule(binary_path, hook_type);
 
@@ -435,7 +456,11 @@ fn install_impl(settings: &mut Value, binary_path: &str) -> (Vec<&'static str>, 
         }
     }
 
-    (installed, skipped)
+    InstallOutcome {
+        installed,
+        skipped,
+        repaired,
+    }
 }
 
 /// Outcome of [`uninstall_impl`]: which hook types had at least one deck
@@ -739,46 +764,47 @@ fn owned_command_executable(command: &str) -> Option<String> {
 }
 
 /// Silently install hooks if Claude Code is detected.
-/// Intended for dashboard startup — never prints to stdout.
+/// Intended for dashboard startup — **never prints to stdout**, including on
+/// the PRD #381 refusal path: the dashboard is already painting by the time
+/// this can fail, so a refusal goes to `tracing::warn!` and nowhere else.
 pub fn auto_install() {
-    let path = settings_path();
+    auto_install_to(
+        &settings_path(),
+        crate::platform::paths::durable_binary_path,
+    );
+}
+
+/// [`auto_install`] against an explicit settings path, with the binary-path
+/// resolver injected — the seam PRD #381 M3 exists to open.
+///
+/// This function used to take the path alone and hardcode
+/// `let binary_path = "dot-agent-deck".to_string();`. That single line is the
+/// structural reason the defect shipped: it is the seam tests drive, so **no
+/// test ever executed the `current_exe()` derivation that produced the bad
+/// value**, and the PRD calls closing it the highest-value milestone here.
+/// Production passes [`crate::platform::paths::durable_binary_path`]; a test
+/// passes a closure driving `durable_binary_path_with` with a
+/// `…/target/release/dot-agent-deck` `current_exe()` of its own and asserts
+/// that value never reaches the file.
+///
+/// The resolver is called only after the settings *directory* check, so the
+/// common "Claude Code not installed" case still costs one `exists()` and no
+/// filesystem walk.
+pub fn auto_install_to(path: &Path, resolve: impl FnOnce() -> Result<String, String>) {
     if path.parent().is_none_or(|p| !p.exists()) {
         return;
     }
 
-    let binary_path = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into());
-
-    let _guard = lock_settings();
-    let mut settings = match load_settings_or_refuse(&path) {
-        Ok(settings) => settings,
+    let binary_path = match resolve() {
+        Ok(binary_path) => binary_path,
+        // PRD #381 M6: no durable path means no write at all — not a bare
+        // command name, not a build-artifact path that breaks later.
         Err(e) => {
             tracing::warn!("auto-install: {e}");
             return;
         }
     };
-    let (installed, _skipped) = install_impl(&mut settings, &binary_path);
 
-    if installed.is_empty() {
-        return;
-    }
-
-    if let Err(e) = write_settings(&path, &settings) {
-        tracing::warn!("auto-install: failed to write Claude Code hooks: {e}");
-        return;
-    }
-
-    tracing::info!("auto-installed Claude Code hooks: {}", installed.join(", "));
-}
-
-/// Auto-install to a custom settings path (for testing).
-pub fn auto_install_to(path: &Path) {
-    if path.parent().is_none_or(|p| !p.exists()) {
-        return;
-    }
-
-    let binary_path = "dot-agent-deck".to_string();
     let _guard = lock_settings();
     let mut settings = match load_settings_or_refuse(path) {
         Ok(settings) => settings,
@@ -787,14 +813,36 @@ pub fn auto_install_to(path: &Path) {
             return;
         }
     };
-    let (installed, _skipped) = install_impl(&mut settings, &binary_path);
+    let outcome = install_impl(&mut settings, &binary_path);
 
-    if installed.is_empty() {
+    // A pass that only PRUNED (a dead deck rule sitting beside the current one)
+    // installs nothing, and returning here on `installed.is_empty()` alone
+    // would drop that repair instead of publishing it — PRD #381 M4.
+    if outcome.installed.is_empty() && outcome.repaired == 0 {
         return;
     }
 
     if let Err(e) = write_settings(path, &settings) {
         tracing::warn!("auto-install: failed to write Claude Code hooks: {e}");
+        return;
+    }
+
+    // Repair logs what it changed. Silently mutating global config is the same
+    // class of thing that caused this bug, so a self-heal that leaves no trace
+    // is not an acceptable fix for it.
+    if outcome.repaired > 0 {
+        tracing::info!(
+            "repaired {} stale dot-agent-deck hook command(s) in {} (dead binary or retired \
+             hook type); now pinned to {binary_path}",
+            outcome.repaired,
+            path.display()
+        );
+    }
+    if !outcome.installed.is_empty() {
+        tracing::info!(
+            "auto-installed Claude Code hooks: {}",
+            outcome.installed.join(", ")
+        );
     }
 }
 
@@ -806,15 +854,28 @@ pub fn auto_install_to(path: &Path) {
 /// `claude_install` adapter, which used to hardcode `Ok(())` here regardless
 /// of outcome.
 pub fn install() -> Result<(), String> {
-    let binary_path = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into());
+    install_with(crate::platform::paths::durable_binary_path)
+}
+
+/// [`install`] with the binary-path resolution injected — the explicit-install
+/// counterpart of the seam [`auto_install_to`] opens for the silent one.
+///
+/// PRD #381 M6: the resolution is the FIRST statement, so a refusal returns
+/// before `settings_path()` is even computed. That is what makes "writes
+/// nothing" a property of the code rather than a claim about it — no
+/// truncation, no partial JSON, no created-then-abandoned file — and it is what
+/// lets a test drive the refusal branch without a machine that genuinely has no
+/// durable deck on it.
+pub fn install_with(resolve: impl FnOnce() -> Result<String, String>) -> Result<(), String> {
+    let binary_path = resolve()?;
 
     let path = settings_path();
     let _guard = lock_settings();
     let mut settings = load_settings_or_refuse(&path).map_err(|e| e.to_string())?;
 
-    let (installed, skipped) = install_impl(&mut settings, &binary_path);
+    let InstallOutcome {
+        installed, skipped, ..
+    } = install_impl(&mut settings, &binary_path);
 
     write_settings(&path, &settings).map_err(|e| format!("writing {}: {e}", path.display()))?;
 
