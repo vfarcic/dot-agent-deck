@@ -2922,6 +2922,14 @@ without depending on the config struct API.
 - **Does not assert:** the `KeepIfDirty` policy itself (keeping the tree is correct behaviour and unchanged); the `Force` path, where a dispatched tree is removed regardless; `worktree list` / `reclaim`.
 - **Platform coverage:** mac+linux.
 
+##### dispatch/close/003 — A dispatched worktree that becomes CLEAN while the close confirmation is open is removed and reported as removed, not replayed from the dialog's stale prediction (issue #717).
+- **Layer:** L2 PTY-attached (`TuiDeck` on the `minimal` fixture) driving the REAL `dot-agent-deck dispatch --single` CLI, then the production Ctrl+W → confirm path, with the worktree mutated on disk while the modal is up.
+- **Agent:** none (`cat`). The mutation stands in for the one thing a live agent does that matters here — committing its work between the dialog and the close — and doing it from the test makes the timing deterministic instead of hoping an agent commits inside a window.
+- **Asserts:** a freshly dispatched worktree starts clean (the premise that makes the cleanup meaningful); the dialog warns while the tree is genuinely dirty; after the file is removed and the tree verified clean again, confirming REMOVES the worktree and the deck makes no `KEPT, not deleted` claim.
+- **Why it exists:** the close dialog's warning is necessarily a PREDICTION — the agent is still running while the modal is open. Reusing that frozen answer as the post-close report produces a confident lie in both directions: a "kept at `<path>`" message about a directory that was deleted, or silence about one that was newly dirtied and kept. This pins the fix, which is that the post-close report comes from the daemon's own post-cleanup verdict (`remove_worktree`'s return value, broadcast as `BroadcastMsg::WorktreeKept`), measured after `close_agent` reaped the agent so nothing can still be writing to the tree.
+- **Does not assert:** the newly-dirtied direction (the dialog stays silent and the daemon still keeps the tree — same mechanism, opposite sign); the warning's wording (`prompt/close-confirm/007`).
+- **Platform coverage:** mac+linux.
+
 #### orchestration/route
 
 ##### orchestration/route/001 — Two tabs of the SAME orchestration opened in the SAME directory are separate routing groups: each orchestrator's delegate reaches only its own worker and each worker's work-done reaches only its own orchestrator, with no cross-delivery in either direction (PRD #140 M5.1). [reel]

@@ -206,14 +206,20 @@ pub async fn worktree_is_dirty(worktree_dir: &Path) -> Result<bool, String> {
 /// Issue #717: the close-confirmation dialog's advance warning that a
 /// dispatched worktree is about to be KEPT rather than removed.
 ///
-/// Carries the path because recovering the work means going to it — the whole
-/// point of the report. `confirmed_dirty` separates the two ways a tree gets
-/// kept, which read differently to a human:
+/// Used by both halves of the report — the close dialog's PREDICTION
+/// ([`kept_worktree_preview`], made while the agent is still alive) and the
+/// daemon's post-cleanup FACT ([`remove_worktree`], measured once the agent is
+/// reaped). Carries the path because recovering the work means going to it —
+/// the whole point of the report.
 ///
-/// * `true` — [`worktree_is_dirty`] answered yes. The dialog can state it flatly.
-/// * `false` — the probe did not answer inside its budget. `KeepIfDirty` keeps
-///   the tree on an unanswerable probe too (see [`remove_worktree`]), so the
-///   claim is still true; it just has to be phrased conditionally.
+/// `confirmed_dirty` separates the two ways a tree ends up kept, which read
+/// differently to a human:
+///
+/// * `true` — [`worktree_is_dirty`] answered yes. It can be stated flatly.
+/// * `false` — the tree is kept, but not because uncommitted work was measured:
+///   the probe failed, or blew the preview's deadline, or the `git worktree
+///   remove` itself failed. `KeepIfDirty` keeps the tree in all of those cases,
+///   so the report is still true; it just has to be phrased conditionally.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeptWorktree {
     /// Absolute path of the worktree that will be left on disk.
@@ -242,7 +248,11 @@ pub struct KeptWorktree {
 ///   interactive key path while `remove_worktree`'s copy does not. A probe that
 ///   does not finish downgrades to `confirmed_dirty: false` rather than
 ///   dropping the warning — the tree is kept either way, so the useful half of
-///   the report (the path) survives a slow checkout.
+///   the report (the path) survives a slow checkout. The timeout abandons the
+///   `git` child rather than killing it, and deliberately: `git status`
+///   refreshes the index as it walks, so a SIGKILL mid-write is a worse
+///   outcome than letting a short read-only process finish and be reaped by
+///   tokio's orphan queue.
 pub async fn kept_worktree_preview(
     records: &[AgentRecord],
     worktrees: &WorktreeRegistry,
@@ -319,7 +329,19 @@ pub async fn kept_worktree_preview(
 /// fails, so dirtiness is unknown) is left in place and logged; under
 /// [`RemovalPolicy::Force`] the tree is removed regardless, which is what keeps
 /// PRD #120's vacated slot reclaimable.
-pub async fn remove_worktree(worktree_dir: &Path, clone_dir: &Path, policy: RemovalPolicy) {
+///
+/// Issue #717: returns `Some` exactly when a tree was KEPT rather than removed,
+/// so the caller can tell the user. This is the AUTHORITATIVE answer, and the
+/// only one that is: it is measured after `close_agent` has reaped the agent, so
+/// nothing is writing to the tree any more and the verdict cannot go stale. The
+/// close dialog's [`kept_worktree_preview`] runs while the agent is still alive
+/// and is therefore a prediction — a useful one, because it arrives while the
+/// user can still cancel, but not a fact.
+pub async fn remove_worktree(
+    worktree_dir: &Path,
+    clone_dir: &Path,
+    policy: RemovalPolicy,
+) -> Option<KeptWorktree> {
     let worktree = worktree_dir.to_string_lossy();
     if policy == RemovalPolicy::KeepIfDirty {
         match worktree_is_dirty(worktree_dir).await {
@@ -328,7 +350,10 @@ pub async fn remove_worktree(worktree_dir: &Path, clone_dir: &Path, policy: Remo
                     worktree = %worktree_dir.display(),
                     "dispatch: worktree has uncommitted changes; leaving in place"
                 );
-                return;
+                return Some(KeptWorktree {
+                    path: worktree_dir.to_string_lossy().into_owned(),
+                    confirmed_dirty: true,
+                });
             }
             Ok(false) => {}
             Err(e) => {
@@ -337,7 +362,10 @@ pub async fn remove_worktree(worktree_dir: &Path, clone_dir: &Path, policy: Remo
                     error = %e,
                     "dispatch: could not check worktree status; leaving in place"
                 );
-                return;
+                return Some(KeptWorktree {
+                    path: worktree_dir.to_string_lossy().into_owned(),
+                    confirmed_dirty: false,
+                });
             }
         }
     }
@@ -349,15 +377,29 @@ pub async fn remove_worktree(worktree_dir: &Path, clone_dir: &Path, policy: Remo
     }
     let res = run_status("git", &args).await;
     match res {
-        Ok(()) => tracing::info!(
-            worktree = %worktree_dir.display(),
-            "issue-dispatch: removed worktree on tab close (clone preserved)"
-        ),
-        Err(e) => tracing::warn!(
-            worktree = %worktree_dir.display(),
-            error = %e,
-            "issue-dispatch: worktree cleanup on close failed"
-        ),
+        Ok(()) => {
+            tracing::info!(
+                worktree = %worktree_dir.display(),
+                "issue-dispatch: removed worktree on tab close (clone preserved)"
+            );
+            None
+        }
+        // A FAILED removal leaves the directory on disk too, so the user is
+        // told about it for the same reason a deliberate keep is: something
+        // they may care about is still there. `confirmed_dirty` is false —
+        // nothing measured it — which is also the wording that fits, since the
+        // reason is a stuck `git worktree remove` rather than their edits.
+        Err(e) => {
+            tracing::warn!(
+                worktree = %worktree_dir.display(),
+                error = %e,
+                "issue-dispatch: worktree cleanup on close failed"
+            );
+            Some(KeptWorktree {
+                path: worktree_dir.to_string_lossy().into_owned(),
+                confirmed_dirty: false,
+            })
+        }
     }
 }
 
@@ -1447,6 +1489,99 @@ mod tests {
             !kept.confirmed_dirty,
             "nothing was measured, so nothing may be claimed"
         );
+    }
+
+    /// Issue #717 (Greptile P1): the AUTHORITATIVE half of the report. The
+    /// close dialog's preview is measured while the agent is still alive, so it
+    /// can be overtaken — an agent that commits between the dialog and the close
+    /// would make a reused "kept at <path>" claim false about a directory that
+    /// was in fact removed. `remove_worktree` returns what it actually did,
+    /// measured after the agent is reaped, and that is what reaches the user.
+    #[tokio::test]
+    async fn remove_worktree_reports_whether_it_kept_the_tree() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+
+        // Dirty + KeepIfDirty: kept, and it says so with the path.
+        let dirty = tmp.path().join("repo-dispatch-dirty");
+        init_repo_with_worktree(&repo, &dirty);
+        std::fs::write(dirty.join("scratch.txt"), "work").unwrap();
+        let kept = remove_worktree(&dirty, &repo, RemovalPolicy::KeepIfDirty)
+            .await
+            .expect("a kept tree must be reported");
+        assert_eq!(kept.path, dirty.to_string_lossy());
+        assert!(kept.confirmed_dirty);
+        assert!(dirty.is_dir(), "the tree must actually still be there");
+
+        // Clean + KeepIfDirty: removed, and nothing is reported.
+        let clean = tmp.path().join("repo-dispatch-clean");
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("git available");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        run(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "clean",
+            &clean.to_string_lossy(),
+        ]);
+        assert_eq!(
+            remove_worktree(&clean, &repo, RemovalPolicy::KeepIfDirty).await,
+            None,
+            "a removed tree must report nothing — there is nothing left to find"
+        );
+        assert!(!clean.exists());
+
+        // Dirty + Force: removed regardless, and still nothing reported. The
+        // report is about what was KEPT, and PRD #120's slot-reclaim model
+        // depends on this one going away.
+        let forced = tmp.path().join("repo-dispatch-forced");
+        run(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "forced",
+            &forced.to_string_lossy(),
+        ]);
+        std::fs::write(forced.join("scratch.txt"), "discarded by design").unwrap();
+        assert_eq!(
+            remove_worktree(&forced, &repo, RemovalPolicy::Force).await,
+            None
+        );
+        assert!(!forced.exists());
+    }
+
+    /// A removal that FAILS also leaves the directory on disk, so the user is
+    /// told for the same reason a deliberate keep is — under the conditional
+    /// wording, because nothing measured their edits.
+    #[tokio::test]
+    async fn remove_worktree_reports_a_tree_left_behind_by_a_failed_removal() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-dispatch-x");
+        init_repo_with_worktree(&repo, &wt);
+
+        // `git -C <clone> worktree remove` against a clone that is not a repo
+        // fails, which is the shape of every real failure here (locked, busy,
+        // already gone).
+        let not_a_repo = tmp.path().join("not-a-repo");
+        std::fs::create_dir_all(&not_a_repo).unwrap();
+        let kept = remove_worktree(&wt, &not_a_repo, RemovalPolicy::Force)
+            .await
+            .expect("a failed removal leaves the tree, so it must be reported");
+        assert_eq!(kept.path, wt.to_string_lossy());
+        assert!(
+            !kept.confirmed_dirty,
+            "nothing measured the user's edits, so nothing may claim them"
+        );
+        assert!(wt.is_dir());
     }
 
     #[tokio::test]

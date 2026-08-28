@@ -1567,7 +1567,12 @@ fn drain_pre_write_events(
                     return Some(reason);
                 }
             }
-            Ok(BroadcastMsg::OrchestrationSurface(_)) => continue,
+            // Issue #717: neither variant is evidence about this pane.
+            // Grouped rather than wildcarded so a future variant still
+            // fails this match and gets considered on its merits.
+            Ok(BroadcastMsg::OrchestrationSurface(_) | BroadcastMsg::WorktreeKept(_)) => {
+                continue;
+            }
             // Issue #424 D2 (both reviewers): TERMINAL, where this used to carry
             // on. The old comment claimed the dropped frames cost only the
             // generation latch "which the watcher re-establishes" — it does not.

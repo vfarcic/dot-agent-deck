@@ -204,15 +204,26 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// (mirroring `AgentType`'s retrofit), so future event-type additions need
 /// no further bump.
 ///
-/// Issue #717 bumped 7 → 8: a new REQUEST variant
-/// ([`AttachRequest::DispatchWorktreeClosePreview`]), which the module's own
-/// bump policy above names explicitly. The break is one-directional and mild —
-/// a NEW client asking an OLD daemon gets a decode failure, which that call site
-/// already treats as "render no warning" — but the policy does not grade
-/// severity, and the constant's job is to make `probe_remote_protocol` refuse a
-/// skewed `connect` pairing at handshake time rather than leave it to be
-/// discovered per-request. The reply's [`AttachResponse::kept_worktree`] field
-/// is additive and needed no bump on its own.
+/// Issue #717 bumped 7 → 8, for TWO changes that the module's own bump policy
+/// above names explicitly and that ship as one decision.
+///
+/// A new REQUEST variant ([`AttachRequest::DispatchWorktreeClosePreview`]) — the
+/// close dialog asking what a confirmed close would leave behind. That break is
+/// one-directional and mild: a NEW client asking an OLD daemon gets a decode
+/// failure, which the call site already treats as "render no warning".
+///
+/// And a new `KIND_EVENT` payload variant
+/// ([`crate::event::BroadcastMsg::WorktreeKept`]) — the daemon reporting what
+/// the close ACTUALLY left behind. This is the harder half, and the same class
+/// as PRD #120's `OrchestrationSurface` above: an older peer has no such `kind`
+/// tag and fails the whole-frame decode, taking its event subscription down with
+/// it rather than skipping one message.
+///
+/// The second is what makes the bump load-bearing rather than bookkeeping. The
+/// constant's job here is to make `probe_remote_protocol` refuse a skewed
+/// `connect` pairing at handshake time instead of letting it surface later as a
+/// dead event stream. The reply's [`AttachResponse::kept_worktree`] field is
+/// additive and would have needed no bump on its own.
 pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
@@ -1905,6 +1916,14 @@ async fn handle_connection(
                     if let Some(worktree) = dispatched_worktree {
                         let registry = registry.clone();
                         let worktree_registry = worktree_registry.clone();
+                        // Issue #717: the cleanup's verdict is the only
+                        // authoritative one — it is measured with the agent
+                        // already reaped, so nothing can change the tree under
+                        // it — and it lands after the card is gone. Broadcast it
+                        // so attached TUIs can say what actually happened
+                        // instead of leaving the user with the dialog's
+                        // arm-time prediction.
+                        let event_tx = event_tx.clone();
                         tokio::spawn(async move {
                             if !crate::issue_dispatch_run::worktree_still_in_use(
                                 &registry.agent_records(),
@@ -1912,13 +1931,16 @@ async fn handle_connection(
                             ) && let Some(entry) = crate::issue_dispatch_run::take_worktree(
                                 &worktree_registry,
                                 &worktree,
-                            ) {
-                                crate::issue_dispatch_run::remove_worktree(
-                                    &worktree,
-                                    &entry.clone_dir,
-                                    entry.policy,
-                                )
-                                .await;
+                            ) && let Some(kept) = crate::issue_dispatch_run::remove_worktree(
+                                &worktree,
+                                &entry.clone_dir,
+                                entry.policy,
+                            )
+                            .await
+                            {
+                                // Errs only when nothing is subscribed (a
+                                // standalone daemon), which is not a failure.
+                                let _ = event_tx.send(BroadcastMsg::WorktreeKept(kept));
                             }
                         });
                     }

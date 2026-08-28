@@ -1755,6 +1755,131 @@ fn dispatch_close_002_a_kept_dirty_worktree_is_announced_before_and_after_the_cl
     );
 }
 
+/// `git status --porcelain` in `dir`, as the test's own independent reading of
+/// what the deck is about to decide from.
+fn porcelain(dir: &Path) -> String {
+    let out = std::process::Command::new("git")
+        .args(["-C", &dir.to_string_lossy(), "status", "--porcelain"])
+        .output()
+        .expect("git available");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Scenario: Dispatch a unit, dirty its worktree, and open the close confirmation
+/// so the dialog warns that the work will be kept — then, WHILE the dialog is still
+/// open, make the worktree clean again, exactly as a live agent committing its work
+/// would. Confirming must report what actually happened rather than replaying the
+/// dialog's now-stale prediction: no "kept" claim, and the worktree really removed.
+#[spec("dispatch/close/003")]
+#[test]
+fn dispatch_close_003_a_worktree_cleaned_while_the_dialog_is_open_is_not_reported_as_kept() {
+    const UNIT: &str = "stale-probe";
+    const CARD: &str = "dispatch-stale-probe";
+    const WORK: &str = "uncommitted-work-717-stale.txt";
+
+    let scratch = common::race_safe_tempdir();
+    let cfg = scratch.path().join("config.toml");
+    std::fs::write(&cfg, "default_command = \"cat\"\n").expect("write the deck config");
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 50)
+        .with_env("PATH", path_with_binary_dir())
+        .with_env("DOT_AGENT_DECK_CONFIG", cfg.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+    commit_fixture_repo(deck.workdir());
+
+    let expected_worktree = dispatch_worktree_of(&deck, UNIT);
+    let caller_pane = open_cat_caller_pane(&deck);
+    let _guard = SiblingWorktreeGuard(expected_worktree.clone());
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+        .args(["dispatch", UNIT, "--task", "Wait quietly.", "--single"])
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
+        .output()
+        .expect("the dispatch CLI should run");
+    assert!(out.status.success(), "`dispatch --single` failed: {out:?}");
+
+    assert!(
+        common::wait_until(Duration::from_secs(60), || expected_worktree.is_dir()
+            && deck.snapshot_grid().contains(CARD)),
+        "the dispatch never produced a worktree with a surfaced card.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    // Premise: a freshly dispatched worktree is CLEAN, so the single file below
+    // is the only thing making it dirty and removing it makes it clean again.
+    // Without this the "cleaned up" half could be silently untestable.
+    assert_eq!(
+        porcelain(&expected_worktree),
+        "",
+        "a freshly dispatched worktree must start clean for this test to mean anything"
+    );
+    std::fs::write(expected_worktree.join(WORK), "work, about to be committed")
+        .expect("dirty the dispatched worktree");
+
+    deck.send_keys(b"\x04");
+    deck.wait_for_string("COMMAND");
+    confirm_close_selected(&deck); // close the caller card first
+    assert!(
+        common::wait_until(Duration::from_secs(30), || {
+            let g = deck.snapshot_grid();
+            !g.contains("caller") && g.contains(CARD)
+        }),
+        "the caller card did not close.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            let g = deck.snapshot_grid();
+            g.lines()
+                .any(|l| l.contains('\u{25b8}') && l.contains(CARD))
+        }),
+        "the dispatched card is not the selected one.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Arm the confirmation while the tree IS dirty — the dialog is right to warn.
+    deck.send_keys(b"\x17");
+    deck.wait_for_string("Close selected pane?");
+    let armed = deck.snapshot_grid();
+    assert!(
+        armed.contains("Uncommitted work here is KEPT, not deleted:"),
+        "premise: the dialog must warn while the tree is genuinely dirty\n{armed}"
+    );
+
+    // …then the world moves under it, exactly as a live agent committing its
+    // work does. The dialog's answer is now stale.
+    std::fs::remove_file(expected_worktree.join(WORK)).expect("clean the worktree");
+    assert_eq!(
+        porcelain(&expected_worktree),
+        "",
+        "premise: the worktree must be clean again before the close is confirmed"
+    );
+
+    deck.send_keys(b"\x1b[B");
+    deck.send_keys(b"\r");
+
+    // The deck must follow the world, not its own earlier guess: a clean tree is
+    // REMOVED, so nothing may claim the work was saved somewhere.
+    const CLOSE_WAIT: Duration = Duration::from_secs(60);
+    assert!(
+        common::wait_until(CLOSE_WAIT, || !expected_worktree.exists()),
+        "the worktree was clean when the close landed, so it must have been \
+         removed. Still present at {}\nGrid:\n{}",
+        expected_worktree.display(),
+        deck.snapshot_grid()
+    );
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("KEPT, not deleted"),
+        "the close reported work KEPT at a path it had just deleted — the dialog's \
+         arm-time prediction was replayed as if it were what happened. The report \
+         after a close must come from the daemon's own post-cleanup verdict, which \
+         is measured with the agent already reaped and cannot go stale.\nGrid:\n{grid}"
+    );
+}
+
 /// Scenario: Launch the deck on the `orch-multi` fixture — two spawnable
 /// orchestrations where the SECOND, `gpt-side`, both `extends` the first and
 /// declares `default = true` — open one ordinary `cat` pane to dispatch from,

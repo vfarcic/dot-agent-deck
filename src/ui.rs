@@ -5993,6 +5993,14 @@ pub struct CloseConfirmState {
     /// because recovering the work means going to it. Resolved once at arm time
     /// by [`kept_worktree_for_plan`] — the dialog describes what was armed, and
     /// re-probing every frame would put a `git status` in the render loop.
+    ///
+    /// It is a PREDICTION, and deliberately used only where a prediction is the
+    /// only thing available: the agent is still running while the dialog is
+    /// open, so it can commit the work or dirty a clean tree before the close
+    /// lands. That is what a confirmation dialog is for — it arrives while the
+    /// user can still cancel — but it must not be reused afterwards as a claim
+    /// about what happened. The post-close report comes from the daemon's own
+    /// verdict instead; see [`drain_worktree_kept`].
     pub kept_worktree: Option<KeptWorktree>,
 }
 
@@ -6292,23 +6300,29 @@ fn truncate_path_head(path: &str, max_width: usize) -> String {
     out
 }
 
-/// Issue #717: the status line a confirmed close leaves behind.
+/// Issue #717: put the daemon's post-cleanup verdict on the status line.
 ///
-/// The dialog said this already, but the dialog is gone the instant the user
-/// answers it — and the path is the one part they may still need. So the
-/// existing status line (15 s, already written on exactly this path) repeats
-/// it, rather than a new surface being invented to hold it. When the close left
-/// nothing behind, `base` is returned untouched and the line reads exactly as
-/// it did before this existed.
-fn closed_status_message(base: String, kept: Option<&KeptWorktree>) -> String {
-    match kept {
-        Some(kept) => format!(
-            "{base} — {} {}",
-            kept_worktree_headline(kept).trim_start_matches("! "),
+/// The dialog is gone the instant the user answers it, and the path is the one
+/// part they may still need — so the existing status line (15 s, already written
+/// on exactly this path) carries it. What it carries is the FACT, not the
+/// dialog's prediction: the daemon measures dirtiness after `close_agent` has
+/// reaped the agent, so nothing can still be writing to the tree, and it
+/// broadcasts the result because by then there is no card left to put it on.
+///
+/// Drained on the render loop rather than applied by the event subscriber for
+/// the same reason `pending_orchestration_surfaces` is: `UiState` lives here.
+fn drain_worktree_kept(state: &SharedState, ui: &mut UiState) {
+    let Some(kept) = state.blocking_write().take_worktree_kept() else {
+        return;
+    };
+    ui.status_message = Some((
+        format!(
+            "{} {}",
+            kept_worktree_headline(&kept).trim_start_matches("! "),
             kept.path
         ),
-        None => base,
-    }
+        std::time::Instant::now(),
+    ));
 }
 
 /// Issue #717: what the dialog (and, after the close, the status line) says
@@ -8782,11 +8796,6 @@ fn close_tab_by_index(
     ui: &mut UiState,
     state: &SharedState,
     tab_manager: &mut TabManager,
-    // Issue #717: the dispatched worktree this teardown would leave behind, as
-    // resolved when the confirmation was armed. Reported only on the CLEAN
-    // arm below — a partial failure keeps the tab, so nothing has been left
-    // behind yet and saying so would be a lie about a close that did not happen.
-    kept_worktree: Option<&KeptWorktree>,
 ) {
     match tab_manager.close_tab(idx) {
         Ok(outcome) => {
@@ -8809,10 +8818,7 @@ fn close_tab_by_index(
                 ui.pane_declared_agent.remove(id);
             }
             if outcome.is_clean() {
-                ui.status_message = Some((
-                    closed_status_message("Closed tab".to_string(), kept_worktree),
-                    std::time::Instant::now(),
-                ));
+                ui.status_message = Some(("Closed tab".to_string(), std::time::Instant::now()));
             } else {
                 let first_err = outcome
                     .failed
@@ -9194,11 +9200,16 @@ fn dispatch_action(
             ui.mode = UiMode::Normal;
             ui.close_confirm_displayed = false;
             let target = ui.close_confirm_target.take();
-            // Issue #717: carry the armed warning OUT of the dialog, so the one
-            // fact the user needs afterwards — the path — survives the modal
-            // closing. Taken (not read) for the same reason `target` is: a
-            // second confirmation must not replay a stale answer.
-            let kept_worktree = ui.close_confirm.kept_worktree.take();
+            // Issue #717: the ARM-TIME preview is deliberately NOT carried out
+            // of the dialog and reused as the post-close report. The agent is
+            // still alive while the dialog is open, so that answer is a
+            // prediction — it can commit the work (making a "kept at <path>"
+            // claim false, about a directory that was removed) or dirty a clean
+            // tree (making a silent close wrong). The authoritative answer is
+            // the daemon's own post-cleanup verdict, measured with the agent
+            // reaped, and it arrives as `BroadcastMsg::WorktreeKept`; see
+            // `drain_worktree_kept`.
+            ui.close_confirm.kept_worktree = None;
             // PRD #241: re-resolve the ARMED target through the same function
             // that decided the dialog's wording. Whatever it says here is what
             // the user was shown, because the two share this call.
@@ -9226,7 +9237,7 @@ fn dispatch_action(
                 // live in such a tab — which is why the dialog said "this tab
                 // and all its panes" either way.
                 Some(ClosePlan::Tab { index }) => {
-                    close_tab_by_index(index, ui, state, tab_manager, kept_worktree.as_ref());
+                    close_tab_by_index(index, ui, state, tab_manager);
                 }
                 // Plain dashboard pane — close just this one and inspect the
                 // result. PRD #92 F4: preserve the card / session on failure so
@@ -9248,13 +9259,8 @@ fn dispatch_action(
                             drop(st);
                             ui.pane_metadata.remove(&pane_id);
                             ui.pane_declared_agent.remove(&pane_id);
-                            ui.status_message = Some((
-                                closed_status_message(
-                                    format!("Closed pane {pane_id}"),
-                                    kept_worktree.as_ref(),
-                                ),
-                                std::time::Instant::now(),
-                            ));
+                            ui.status_message =
+                                Some((format!("Closed pane {pane_id}"), std::time::Instant::now()));
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -12364,6 +12370,10 @@ pub fn run_tui(
         // mid-session (issue dispatch). Done before the snapshot clone + tab
         // derivation below so a freshly-surfaced tab paints this same frame.
         process_pending_orchestration_surfaces(&state, &pane, &mut tab_manager);
+        // Issue #717: report a dispatched worktree the daemon actually left
+        // on disk. Queued by the event subscriber, drained here because the
+        // status line is `UiState`.
+        drain_worktree_kept(&state, &mut ui);
 
         let snapshot = state.blocking_read().clone();
 
@@ -21852,6 +21862,88 @@ mod tests {
             (25, 75),
             "a toggled orchestration tab must use the narrower-sidebar 25/75 split"
         );
+    }
+
+    /// Issue #717: the close-confirmation preview asks the daemon about EVERY
+    /// pane a confirmed close would tear down, because a multi-role
+    /// orchestration shares one dispatched worktree across its role panes and
+    /// the daemon resolves that worktree from whichever of them it recognises.
+    /// A tab close that handed over an empty list would silently lose the
+    /// kept-worktree warning for exactly the dispatched TEAMS it matters most
+    /// for, with nothing else failing.
+    #[test]
+    fn close_plan_pane_ids_covers_every_role_pane_of_an_orchestration_tab() {
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+
+        let cfg = OrchestrationConfig {
+            default: false,
+            name: "team".to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "orchestrator".to_string(),
+                    command: "cat".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "worker".to_string(),
+                    command: "cat".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+            ],
+        };
+        tm.open_orchestration_tab(
+            &cfg,
+            tmp.path().to_str().expect("utf-8 tmp path"),
+            None,
+            None,
+            (24, 80),
+        )
+        .expect("open orchestration tab");
+
+        let ids = close_plan_pane_ids(&ClosePlan::Tab { index: 1 }, &tm);
+        let expected = match &tm.tabs()[1] {
+            Tab::Orchestration { role_pane_ids, .. } => role_pane_ids.clone(),
+            _ => panic!("tab 1 should be an orchestration tab"),
+        };
+        assert_eq!(ids, expected, "every role pane must reach the daemon");
+        assert_eq!(ids.len(), 2, "both roles, not just the start role");
+
+        // A dead slot is a placeholder session, not a pane — asking the daemon
+        // about it is noise, and the empty-string sentinel is worse: it would
+        // match nothing while looking like a real id.
+        match &mut tm.tabs_mut()[1] {
+            Tab::Orchestration { role_pane_ids, .. } => {
+                role_pane_ids[1] = format!("{DEAD_SLOT_PREFIX}team-1");
+                role_pane_ids.push(String::new());
+            }
+            _ => panic!("tab 1 should be an orchestration tab"),
+        }
+        let ids = close_plan_pane_ids(&ClosePlan::Tab { index: 1 }, &tm);
+        assert_eq!(
+            ids.len(),
+            1,
+            "the dead slot and the empty sentinel must both be dropped, leaving \
+             only the real pane: {ids:?}"
+        );
+        assert!(
+            !ids[0].is_empty() && !is_dead_slot_pane_id(&ids[0]),
+            "{ids:?}"
+        );
+
+        // The Dashboard is never closable, so a plan pointing at it yields
+        // nothing to ask about rather than a panic.
+        assert!(close_plan_pane_ids(&ClosePlan::Tab { index: 0 }, &tm).is_empty());
+        assert!(close_plan_pane_ids(&ClosePlan::Tab { index: 99 }, &tm).is_empty());
     }
 
     /// Scenario: PRD #336 (post-review inversion) — the split is GLOBAL, not
