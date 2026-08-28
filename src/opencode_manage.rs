@@ -108,9 +108,27 @@ fn existing_plugin_artifacts() -> Vec<PathBuf> {
     artifacts
 }
 
+/// Render the plugin JavaScript with `BINARY_PATH` pinned to `binary_path`.
+///
+/// The pin is JSON-escaped rather than interpolated raw, so a path containing a
+/// quote or a backslash cannot break out of the string literal in the code
+/// OpenCode loads.
+///
+/// **There is deliberately no fallback on the escape.** This was
+/// `.unwrap_or_else(|_| "\"dot-agent-deck\"".to_string())`, whose only possible
+/// behaviour would have been to write the BARE command name into a file another
+/// program executes: Node's `execFileSync` resolves a bare `BINARY_PATH` through
+/// the AGENT's `$PATH`, which is issue #536's exact vector. PRD #381's rule is
+/// that losing the ability to identify ourselves must fail toward a MORE
+/// specific path or not at all — never toward a less specific one — so the
+/// literal is gone rather than made quieter, and must not come back as a "safe
+/// default". The refusal it would otherwise stand in for already happens one
+/// seam earlier, at `durable_binary_path()`; by the time we are here the path is
+/// decided and the only step left, serializing a `&str` into a `String`, cannot
+/// fail.
 fn plugin_template(binary_path: &str) -> String {
     let binary_path_json =
-        serde_json::to_string(binary_path).unwrap_or_else(|_| "\"dot-agent-deck\"".to_string());
+        serde_json::to_string(binary_path).expect("serializing a &str to a String is infallible");
     format!(
         r#"import {{ execFileSync }} from "child_process";
 
