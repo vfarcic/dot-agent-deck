@@ -1,6 +1,6 @@
 # PRD #381: Resolve the hook binary path to a durable location
 
-**Status**: Not started
+**Status**: Complete — implemented on `agent/dispatch-prd-381`, pending PR review
 **Priority**: High
 **Created**: 2026-08-04
 
@@ -85,7 +85,7 @@ Claude and Codex hooks are JSON documents with a command string per event, so re
 ## Success Criteria
 
 - No code path can write a `target/debug` or `target/release` path into global configuration.
-- Running the dashboard from a freshly-built local binary leaves existing valid hook paths unchanged.
+- Running the dashboard from a freshly-built local binary leaves existing valid hook paths unchanged. **Met for Claude and OpenCode; NOT met for Codex and Devin**, whose `install_impl`s strip every deck-owned rule by command suffix and re-add unconditionally, so a valid-but-different pin is repointed on each launch. Pre-existing behaviour, unchanged by this work, and tracked as [#730](https://github.com/vfarcic/dot-agent-deck/issues/730) rather than silently accepted. The safety property underneath it is intact — suffix ownership means a user-authored command that merely mentions `dot-agent-deck` is never touched on any of the four.
 - A config whose deck hooks point at a deleted binary is repaired automatically on the next startup, for all three integrations.
 - An install with no durable path available fails with a message naming what to do, and writes nothing.
 - A test drives the real derivation with a build-artifact input and fails if that input is written.
@@ -93,13 +93,13 @@ Claude and Codex hooks are JSON documents with a command string per event, so re
 
 ## Milestones
 
-- [ ] **M1 — The resolver exists and refuses build artifacts.** One function, the precedence above, with the refusal case, unit-tested directly.
-- [ ] **M2 — Every call site uses it.** All six sites across `hooks_manage`, `codex_hooks_manage`, `opencode_manage` and `agent_registry`. No remaining `current_exe()` feeding an external config write.
-- [ ] **M3 — Test gap closed.** The derivation is reachable from tests, with a regression test asserting a `target/` path is never written. Landable on its own and the highest-value milestone here, because it prevents recurrence.
-- [ ] **M4 — Self-heal for Claude and Codex hooks.** Stale entries repaired on startup, idempotent, user hooks untouched.
-- [ ] **M5 — Self-heal for the OpenCode plugin's `BINARY_PATH`.** Separate milestone because it is a generated JS file, not JSON.
-- [ ] **M6 — Loud failure path.** No durable path means a clear error and no write, for both `install` and `auto_install` (the latter logging rather than printing, per its contract).
-- [ ] **M7 — Troubleshooting docs.** A user seeing `not found` from a hook can find the cause and the fix.
+- [x] **M1 — The resolver exists and refuses build artifacts.** `platform::paths::durable_binary_path()`, with the pure seam `durable_binary_path_with(current_exe, home, path_var)` behind it so every branch is unit-testable without a real unusable `current_exe()` or a real `$PATH` entry. Deliberately built *beside* `binary_name()` rather than on it: `binary_name()` answers "what text tells an agent to run the deck" and may legitimately return a bare name, which is exactly what this resolver must never do.
+- [x] **M2 — Every call site uses it.** **Seven**, not six — the PRD's list predates the Devin integration, and `devin_hooks_manage.rs`'s `current_binary_path()` has the identical shape and writes a path Devin executes, so M2's own wording ("no remaining `current_exe()` feeding an external config write") is not satisfiable without it. `grep current_exe src/` now leaves only spawn/attach paths (`wrap.rs`, `mode_manager.rs`, `daemon_attach.rs`) and the resolver's own `effective_current_exe`.
+- [x] **M3 — Test gap closed.** `auto_install_to()`'s hardcoded binary string is deleted and the resolver injected. Verified non-vacuous by reverting each fix in turn and confirming the matching test went red: no test in this PRD passes with the resolver reverted.
+- [x] **M4 — Self-heal for Claude and Codex hooks.** Claude needed no new mechanism — `command_is_dead_deck` already gated on `try_exists() == Ok(false)`, i.e. *positively* missing, treating a stat error as "leave alone". One real gap did have to be closed: `auto_install_to` returned early on `installed.is_empty()`, so a file holding both a dead rule and a current one pruned the dead rule in memory and then dropped the repair. See the caveat under Success Criteria for what M4 does **not** deliver for Codex.
+- [x] **M5 — Self-heal for the OpenCode plugin's `BINARY_PATH`.** Its own line-anchored JavaScript parse, not a JSON-shaped fix. Also corrected the inverse defect found here: the auto path had been rewriting a **valid** pin on every dashboard startup.
+- [x] **M6 — Loud failure path.** Refusal reaches every caller before its writer, with four "writes nothing" tests. `install` returns `Err`; `auto_install` warns via `tracing` and never prints to stdout, per its documented contract.
+- [x] **M7 — Troubleshooting docs.** `docs/troubleshooting.md`, findable by the `not found` error text.
 
 ## Risks
 
@@ -111,6 +111,16 @@ Claude and Codex hooks are JSON documents with a command string per event, so re
 
 ## Open Questions
 
+**All five were decided before implementation. Answers recorded inline; the original text is kept so the reasoning is auditable.**
+
+1. **ANSWERED — no, the resolver has a fallback, not a hard stop.** The PRD's own Technical Approach is normative and already specifies a resolution order with a durable fallback, so the stricter "decline entirely" reading loses: it would remove the daily dev workflow this PRD's own Risks section flags as the sharper danger. A dev build may still write, provided what it writes is durable.
+2. **ANSWERED — no opt-in flag and no env var.** Out of Scope says the `hooks install` CLI surface does not change, and nothing in the implementation needed an escape hatch: the e2e harness reaches the binary under test by seeding a sandbox `~/.local/bin` symlink, which exercises the real step 2a rather than bypassing it.
+3. **ANSWERED — leave it alone.** The trigger is "the target is missing", never "the target is not what I would have written". See the Self-heal section for what "left alone" actually means, and the Success Criteria caveat for where this is not yet honoured.
+4. **ANSWERED — yes, it is in the same class.** `agent_registry`'s site is the body of `codex_install()`, the `hooks install --agent codex` adapter, and it feeds `current_exe()` straight into `codex_hooks_manage::install_to`, which persists. Not a child-process spawn. M2's list did not shrink; it grew by one (Devin).
+5. **ANSWERED — no, existence and executability are the whole gate.** The resolver stats the candidate and checks the current user can execute it (`access(X_OK)`); it never runs it. Executing a candidate on the silent dashboard-startup path would add latency and a new failure mode to catch a version-skew problem this PRD puts out of scope. Documented as a deliberate limit on the function.
+
+### Original text
+
 1. **Should a dev build be allowed to write global config at all, even with a durable path?** The strongest reading of this bug is not "the wrong path was written" but "a transient build silently mutated global state". An alternative fix is for `auto_install()` to decline entirely when `current_exe()` is a build artifact, leaving explicit `hooks install` as the only way. That is stricter, simpler to reason about, and would have prevented every instance found — but it removes a convenience that developers of this project may rely on daily. **Decide this before M1**, because it determines whether the resolver has a fallback path or a hard stop.
 2. **Should `install` support an explicit opt-in** (e.g. a flag) for pointing hooks at a local build, so the strict default in Q1 has a documented escape hatch?
 3. **How should self-heal treat a path that exists but belongs to a different worktree?** It is valid today and stale tomorrow. Repairing it is tempting but violates the "only repair what is missing" rule that keeps self-heal safe.
@@ -118,6 +128,22 @@ Claude and Codex hooks are JSON documents with a command string per event, so re
 5. **Should the repaired path be verified to actually run**, e.g. by invoking `dot-agent-deck hook` with empty input, rather than only checking that the file exists? An existing-but-incompatible binary is a plausible failure after a version change.
 
 ## Work Log
+
+### 2026-08-28 — Implemented on `agent/dispatch-prd-381`
+
+All seven milestones landed across five commits: `e7abdf6` (two failing L2 tests, written first and confirmed RED), `799169b` (resolver, seven call sites, self-heal, docs), `e30a483` (review and audit findings), `a3fe6af` (the last bare-name literal), `af8102d` (documentation corrections from the cross-version gate).
+
+**The coverage gap this PRD blames for the defect shipping is genuinely closed.** The two L2 tests drive the real `target/debug` binary through the PTY harness, so `current_exe()` really is a build artifact rather than a value a test supplied. Every fix was additionally verified non-vacuous by reverting it and confirming the matching test went red, then byte-comparing the restored source.
+
+**Both pre-PR gates passed.** The full e2e tier ran `9293 tests: 9287 passed, 6 failed`; all six passed on individual rerun and none is attributable to this branch — notably `devin_live_001`, whose failure message reads like a hook regression but whose captured grid shows Devin still on its first-run welcome banner with the prompt not yet consumed, and `shell_activity_005`/`006`, whose dumped event lists **contain** a delivered `SessionStart`, i.e. positive evidence the hook path works and only the model's Bash call was missing.
+
+**CLAUDE.md rule 12: no `PROTOCOL_VERSION` bump and no `.breaking.md`, confirmed by measurement rather than argument.** A real v0.38.0 daemon served a branch TUI and branch CLI through delegate routing, work-done feedback, native hook status transitions and raw `AgentEvent` delivery with no degradation. `PROTOCOL_VERSION` is 7 on both sides at source and over `daemon hello`, and `src/daemon_protocol.rs` is not in the diff at all.
+
+Also closes **#536** (`current_exe()` failure wrote a PATH-relative hook command). Closing it required more than removing the write-side fallback: the audit found self-heal could *preserve* a legacy bare pin, because `try_exists("dot-agent-deck")` resolves against the process **cwd** — so launching from a directory containing a file of that name made a dead bare pin look live, and it survived into the rewritten config where `/bin/sh` would resolve it through `$PATH`. A read-side predicate, `pin_is_repairable`, now holds an existing pin to the same invariant a freshly resolved path must satisfy.
+
+Four findings were deliberately deferred rather than folded in, each with a tracked issue: **#730** (Codex/Devin repoint a valid-but-different pin, and suffix-only ownership can delete a user's sibling handler), **#731** (`agent_hook_config::write_atomic`'s predictable temp name follows a pre-created symlink), **#732** (candidate provenance policy for the resolver — ownership, ancestor-directory writability, canonical-target validation). Issue **#533**'s part 2 is resolved here as a side effect, and its part 1 plus two further `mode_manager.rs` sites are recorded on that issue.
+
+Two things learned that outlived the task. First, rule 12's cross-version procedure has a hidden prerequisite: with **zero** agents under the old daemon, the newer TUI takes `MismatchAction::SilentRestart` and replaces it with no prompt and no output, so the gate silently measures new-against-new. Rule 12's "with an agent under it" is load-bearing and the consent prompt must be declined; both are now written into `docs/develop/versioning.md`. Second, the Codex/Devin re-pin is a **flap**, not a one-time correction — two valid installs resolve different durable paths, so the pin oscillates between them on every launch.
 
 ### 2026-08-04 — Discovered while diagnosing a Stop hook failure
 
