@@ -414,6 +414,12 @@ pub fn binary_name() -> String {
 ///      absolute, non-artifact `$PATH` entry, as its own absolute path;
 ///    - **2c.** otherwise **refuse**: return `Err`, and the caller writes
 ///      nothing at all.
+///
+///    A 2a or 2b candidate must additionally be owner-writable only
+///    ([`write_mode_is_owner_only`]); one the group or the world can rewrite
+///    is skipped and the walk continues. That check is scoped to 2a and 2b,
+///    and deliberately does not extend to owners, ancestor directories or
+///    symlink targets — see issue #732.
 /// 3. `current_exe()` failing outright is also a refusal, **never** a fallback
 ///    to [`DEFAULT_BINARY_NAME`] (issue #536). A bare `dot-agent-deck` in a
 ///    file Claude Code hands to `/bin/sh` re-opens the same `$PATH` miss in
@@ -499,8 +505,11 @@ pub fn durable_binary_path_with(
         return Ok(path);
     }
 
+    // `write_mode_is_owner_only` is step 2a's and 2b's, never step 1's — see
+    // that function, and issue #732 for the checks deliberately left out of it.
     if !is_build_artifact_path(&installed)
         && is_executable_file(&installed)
+        && write_mode_is_owner_only(&installed)
         && let Some(path) = durable_path_string(&installed)
     {
         return Ok(path);
@@ -620,12 +629,18 @@ pub(crate) fn is_build_artifact_path(path: &Path) -> bool {
 /// absolute path can be built from — [`is_untrustworthy_path_entry`]) and a
 /// build-artifact candidate (which is exactly what this whole resolver
 /// refuses, and `$PATH` entries pointing into `target/debug` are routine on a
-/// developer's machine) are both **skipped** and the walk continues.
+/// developer's machine) are both **skipped** and the walk continues. A
+/// candidate the group or the world can rewrite ([`write_mode_is_owner_only`],
+/// and issue #732 for its deliberate limits) is skipped the same way.
 fn first_durable_path_match(path: &std::ffi::OsStr, name: &str) -> Option<PathBuf> {
     std::env::split_paths(path)
         .filter(|dir| !is_untrustworthy_path_entry(dir))
         .map(|dir| dir.join(name))
-        .find(|candidate| !is_build_artifact_path(candidate) && is_executable_file(candidate))
+        .find(|candidate| {
+            !is_build_artifact_path(candidate)
+                && is_executable_file(candidate)
+                && write_mode_is_owner_only(candidate)
+        })
 }
 
 /// `current_exe()`, or — only under the `e2e` feature, and only once
@@ -923,27 +938,149 @@ fn same_binary_identity(candidate: &Path, exe_path: &Path) -> bool {
     }
 }
 
-/// Whether `candidate` is a regular file that is *also* executable. Same
-/// rationale and shape as `orchestrator_ext::is_executable_file`: `is_file()`
-/// alone would accept a same-named regular-but-non-executable file earlier on
-/// `$PATH`. On Unix this additionally requires at least one exec bit
-/// (`mode & 0o111 != 0`); on non-Unix targets there is no cheap exec-bit
-/// check, so a regular file is accepted.
+/// Whether `candidate` is a regular file that **this user can actually
+/// execute**. Same shape and purpose as `orchestrator_ext::is_executable_file`
+/// — `is_file()` alone would accept a same-named regular-but-non-executable
+/// file earlier on `$PATH` — but the Unix half asks `access(2)` rather than
+/// reading the mode.
+///
+/// `mode & 0o111 != 0` was the obvious spelling and the wrong question: a file
+/// owned by another user with mode `0100` has an exec bit set and is still not
+/// executable by us. The resolver would then STOP at that candidate instead of
+/// continuing to a usable later one, and persist a hook command that fails with
+/// permission denied on every single hook, indefinitely (PRD #381 audit,
+/// LOW-2). `access(X_OK)` answers the owner/group/other question the kernel
+/// will answer at exec time, and consults ACLs where the filesystem has them.
+///
+/// `access(2)` tests the REAL uid/gid rather than the effective one. That is
+/// the same answer here: the deck is never installed setuid or setgid, so the
+/// two are equal in every process this runs in, and `access` is POSIX on every
+/// Unix the crate builds for while the effective-uid variants (`eaccess`,
+/// `faccessat(…, AT_EACCESS)`) are not uniformly spelled. The
+/// [`std::path::Path::is_file`] check stays in front of it because `access`
+/// alone would accept a *directory* — every traversable directory answers
+/// `X_OK`.
+///
+/// On non-Unix targets there is no cheap equivalent, so a regular file is
+/// accepted.
 fn is_executable_file(candidate: &std::path::Path) -> bool {
     if !candidate.is_file() {
         return false;
     }
     #[cfg(unix)]
     {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        // An interior NUL cannot name a real file, so it cannot be executable.
+        let Ok(c_path) = CString::new(candidate.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: `c_path` is a valid NUL-terminated C string that outlives the
+        // call, and `access(2)` only reads through the pointer.
+        unsafe { libc::access(c_path.as_ptr(), libc::X_OK) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Whether write access to `candidate` is held by its owner alone — neither
+/// group- nor other-writable. A candidate failing this is skipped by
+/// resolution steps 2a and 2b, which move on to the next candidate or refuse
+/// (PRD #381 audit, HIGH — **partially** accepted).
+///
+/// **Scope, deliberately narrow; the rest is [issue #732].** Only the
+/// candidate's own mode is consulted. Owner checks, ancestor-directory
+/// writability, and canonical-symlink-target validation are NOT done here and
+/// must not be added without the design decision #732 exists to make: the
+/// failure mode is a **hard refusal to install**, so a false positive breaks a
+/// legitimate user outright, and `/usr/local/bin` is group-writable by `admin`
+/// on stock macOS.
+///
+/// Three consequences of that scope worth stating rather than discovering:
+///
+/// - **A symlink is exempt, not judged.** `symlink_metadata` is used so the
+///   mode read is the candidate's OWN, and a symlink's own mode is `0777` on
+///   every Unix this ships for — it says nothing about anything. Reading
+///   *through* it to the target's mode would be canonical-target validation,
+///   which is #732's, and it would also defeat step 2a's whole point: the
+///   stable `~/.local/bin` name the user controls is the durable thing, not
+///   whatever it currently points at.
+/// - **Step 1 (`current_exe()`) is not checked.** Refusing to install from the
+///   binary the user is *already running* converts a loose mode on a
+///   legitimate install prefix into a refusal, which is the failure #732 has
+///   to weigh first.
+/// - **A stat failure counts as untrusted.** Callers reach this only after
+///   [`is_executable_file`] has already stat'd the candidate successfully, so
+///   a failure here means it changed underneath us; skipping to the next
+///   candidate is free and correct.
+fn write_mode_is_owner_only(candidate: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
-        match std::fs::metadata(candidate) {
-            Ok(meta) => meta.permissions().mode() & 0o111 != 0,
+        match std::fs::symlink_metadata(candidate) {
+            Ok(meta) if meta.file_type().is_symlink() => true,
+            Ok(meta) => meta.permissions().mode() & 0o022 == 0,
             Err(_) => false,
         }
     }
     #[cfg(not(unix))]
     {
+        let _ = candidate;
         true
+    }
+}
+
+/// Whether a deck-owned pin **already sitting in an agent's configuration** —
+/// the executable path a previously written hook command names — must be
+/// replaced by a freshly resolved durable path, rather than carried forward.
+///
+/// This is the read side of [`durable_binary_path`], and it exists because
+/// issue #536 was not closed by fixing the write side alone (PRD #381 audit,
+/// MEDIUM-1). Both self-heal checks used to ask nothing but
+/// [`std::path::Path::try_exists`]. For a legacy pin of the BARE
+/// `dot-agent-deck` — exactly what the old code wrote — `try_exists` resolves
+/// **relative to the process cwd**, so launching the deck from any directory
+/// that happens to contain a file of that name made the bare pin look alive,
+/// and it was preserved. At hook-fire time `/bin/sh` and Node's `execFileSync`
+/// resolve that same persisted bare name through the **agent's** `$PATH`, not
+/// against the cwd-relative file that suppressed the repair — which is #536's
+/// arbitrary-execution vector, surviving the change that claims to close it.
+/// A relative path, a directory, a non-executable file and a live
+/// `target/{debug,release}` path all slipped through the same gate, for the
+/// same reason: it only ever asked "is this not `Ok(false)`".
+///
+/// So a pin is preserved only when it satisfies the invariant a freshly
+/// resolved path satisfies: absolute, present, a regular file, executable by
+/// this user, and not a build artifact.
+///
+/// **The one benefit of the doubt is kept, and narrowed.** A stat that returns
+/// `Err` — permission denied, an unmounted or stale mount — on an otherwise
+/// **well-formed absolute** pin still means "leave alone", because deleting a
+/// working user's hook is worse than leaving a stale one, and that is the
+/// fail-safe direction PRD #381 Open Question 3 settles on. What changed is
+/// that a MALFORMED pin — bare, or relative — is no longer eligible for it at
+/// all: there is no reading under which such a value is a path the deck should
+/// keep.
+///
+/// Note this is deliberately NOT [`write_mode_is_owner_only`]'s question. That
+/// check picks between candidates the resolver is free to reject; this one
+/// decides whether to overwrite a value the user may have put there on
+/// purpose, so it stays at "is this a usable absolute executable".
+pub(crate) fn pin_is_repairable(pin: &str) -> bool {
+    let path = Path::new(pin);
+    // Bare or relative: #536's own shape, and cwd-dependent by construction.
+    if !path.is_absolute() {
+        return true;
+    }
+    match path.try_exists() {
+        // Positively reported missing by the OS.
+        Ok(false) => true,
+        // Could not determine. Well-formed, so leave it alone.
+        Err(_) => false,
+        Ok(true) => !is_executable_file(path) || is_build_artifact_path(path),
     }
 }
 
@@ -2596,5 +2733,252 @@ mod tests {
             assert_durable(&resolved),
             installed.to_str().expect("installed path is UTF-8")
         );
+    }
+
+    /// PRD #381 audit, LOW-2. A candidate with mode `0o011` has an exec bit
+    /// set, so the old `mode & 0o111 != 0` gate accepted it — but the file is
+    /// owned by this test's own user, and for the OWNER the kernel consults the
+    /// owner triad alone, which here has no `x`. `access(X_OK)` says so; the
+    /// mode bitmask does not. The resolver must therefore step over it and keep
+    /// walking, instead of stopping there and persisting a command that fails
+    /// with permission denied on every hook, indefinitely.
+    ///
+    /// (`0o011` rather than the audit's cross-user `0o100`: same class of
+    /// defect, same fix, and reproducible without a second uid.)
+    #[cfg(unix)]
+    #[test]
+    fn durable_binary_path_skips_a_candidate_this_user_cannot_execute() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let name = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+
+        let artifact_dir = dir.path().join("checkout").join("target").join("debug");
+        write_stub_executable(&artifact_dir.join(&name));
+
+        // Step 2a: an exec bit is set, but not one that applies to us.
+        let unusable = home.join(".local").join("bin").join(&name);
+        write_stub_executable(&unusable);
+        std::fs::set_permissions(&unusable, std::fs::Permissions::from_mode(0o011))
+            .expect("chmod the unusable candidate");
+        assert_ne!(
+            std::fs::metadata(&unusable)
+                .expect("stat the unusable candidate")
+                .permissions()
+                .mode()
+                & 0o111,
+            0,
+            "the fixture must still satisfy the OLD `mode & 0o111` check, or it \
+             proves nothing"
+        );
+
+        // Step 2b: a candidate that really is executable by us.
+        let usable_dir = dir.path().join("opt").join("bin");
+        write_stub_executable(&usable_dir.join(&name));
+        let path_value = std::env::join_paths([usable_dir.clone()]).expect("join synthetic PATH");
+
+        let resolved = durable_binary_path_with(
+            Ok(artifact_dir.join(&name)),
+            &home,
+            Some(path_value.as_os_str()),
+        );
+
+        assert_eq!(
+            assert_durable(&resolved),
+            usable_dir.join(&name).to_str().expect("path is UTF-8"),
+            "a candidate this user cannot execute must be skipped, not persisted"
+        );
+    }
+
+    /// PRD #381 audit, HIGH (the accepted half). A step-2a candidate the group
+    /// can rewrite is not a path worth pinning into four agents' persistent
+    /// configuration, so resolution steps over it and continues. See
+    /// [`write_mode_is_owner_only`] for what is deliberately NOT checked here
+    /// (owners, ancestor directories, symlink targets — issue #732).
+    #[cfg(unix)]
+    #[test]
+    fn durable_binary_path_skips_a_group_writable_installed_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let name = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+
+        let artifact_dir = dir.path().join("checkout").join("target").join("debug");
+        write_stub_executable(&artifact_dir.join(&name));
+
+        let loose = home.join(".local").join("bin").join(&name);
+        write_stub_executable(&loose);
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o775))
+            .expect("chmod the group-writable candidate");
+
+        let tight_dir = dir.path().join("opt").join("bin");
+        write_stub_executable(&tight_dir.join(&name));
+        let path_value = std::env::join_paths([tight_dir.clone()]).expect("join synthetic PATH");
+
+        let resolved = durable_binary_path_with(
+            Ok(artifact_dir.join(&name)),
+            &home,
+            Some(path_value.as_os_str()),
+        );
+
+        assert_eq!(
+            assert_durable(&resolved),
+            tight_dir.join(&name).to_str().expect("path is UTF-8"),
+            "a group-writable ~/.local/bin candidate must be skipped"
+        );
+    }
+
+    /// The same rule on step 2b: a world-writable `$PATH` candidate is skipped
+    /// and the walk continues to a later owner-only one, rather than the first
+    /// executable hit winning.
+    #[cfg(unix)]
+    #[test]
+    fn durable_binary_path_skips_a_world_writable_path_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let name = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+
+        let artifact_dir = dir.path().join("checkout").join("target").join("debug");
+        write_stub_executable(&artifact_dir.join(&name));
+
+        let shared_dir = dir.path().join("srv").join("shared-bin");
+        let planted = shared_dir.join(&name);
+        write_stub_executable(&planted);
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o777))
+            .expect("chmod the world-writable candidate");
+
+        let tight_dir = dir.path().join("usr").join("bin");
+        write_stub_executable(&tight_dir.join(&name));
+
+        let path_value = std::env::join_paths([shared_dir.clone(), tight_dir.clone()])
+            .expect("join synthetic PATH");
+
+        let resolved = durable_binary_path_with(
+            Ok(artifact_dir.join(&name)),
+            &home,
+            Some(path_value.as_os_str()),
+        );
+
+        assert_eq!(
+            assert_durable(&resolved),
+            tight_dir.join(&name).to_str().expect("path is UTF-8"),
+            "a world-writable $PATH candidate must be skipped, not pinned"
+        );
+    }
+
+    /// A symlink candidate is exempt from the write-mode check rather than
+    /// judged by it: its own mode is `0777` on every Unix this ships for, and
+    /// reading through it to the target's mode is the canonical-target
+    /// validation issue #732 owns. Step 2a's whole point is that the stable
+    /// `~/.local/bin` name is the durable thing — this pins that the F4 check
+    /// did not quietly undo it.
+    #[cfg(unix)]
+    #[test]
+    fn durable_binary_path_still_accepts_a_symlinked_installed_candidate() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let name = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+
+        let artifact_dir = dir.path().join("checkout").join("target").join("debug");
+        let artifact = artifact_dir.join(&name);
+        write_stub_executable(&artifact);
+
+        let link = home.join(".local").join("bin").join(&name);
+        std::fs::create_dir_all(link.parent().expect("link has a parent"))
+            .expect("create ~/.local/bin");
+        std::os::unix::fs::symlink(&artifact, &link).expect("symlink the durable name");
+
+        let resolved = durable_binary_path_with(Ok(artifact.clone()), &home, None);
+
+        assert_eq!(
+            assert_durable(&resolved),
+            link.to_str().expect("link path is UTF-8"),
+            "the symlink spelling is the durable answer and must survive the \
+             write-mode check"
+        );
+    }
+
+    /// PRD #381 audit, MEDIUM-1, at the unit level: [`pin_is_repairable`] is
+    /// the read side of this resolver, and the whole point of it is that a BARE
+    /// pin is repairable no matter what the process cwd happens to contain.
+    /// `Path::try_exists("dot-agent-deck")` is cwd-relative; the agent's
+    /// `/bin/sh` resolves the same string through `$PATH`. The two are not the
+    /// same question, and only the second one is the one that runs.
+    #[test]
+    fn pin_is_repairable_rejects_a_bare_or_relative_pin() {
+        assert!(
+            pin_is_repairable(DEFAULT_BINARY_NAME),
+            "a bare command name is issue #536's own shape and is always repairable"
+        );
+        assert!(
+            pin_is_repairable("./dot-agent-deck"),
+            "a cwd-relative pin is resolved by the agent, not by us"
+        );
+        assert!(
+            pin_is_repairable("target/debug/dot-agent-deck"),
+            "a relative build-artifact pin is repairable twice over"
+        );
+    }
+
+    /// The other half of the same predicate, and the reason it is not simply
+    /// "is this absolute": an absolute pin still has to be a regular file this
+    /// user can execute, and still must not be a build artifact.
+    #[test]
+    fn pin_is_repairable_judges_an_absolute_pin_on_the_resolver_invariant() {
+        let dir = crate::test_temp::tempdir().expect("pin tempdir");
+
+        let live = dir.path().join("opt").join(DEFAULT_BINARY_NAME);
+        write_stub_executable(&live);
+        assert!(
+            !pin_is_repairable(live.to_str().expect("UTF-8")),
+            "a usable absolute pin is preserved — repairing what merely differs \
+             is what PRD #381 Open Question 3 rules out"
+        );
+
+        let gone = dir.path().join("pruned").join(DEFAULT_BINARY_NAME);
+        assert!(
+            pin_is_repairable(gone.to_str().expect("UTF-8")),
+            "a positively-missing pin is the original repair trigger"
+        );
+
+        let artifact = dir
+            .path()
+            .join("checkout")
+            .join("target")
+            .join("release")
+            .join(DEFAULT_BINARY_NAME);
+        write_stub_executable(&artifact);
+        assert!(
+            pin_is_repairable(artifact.to_str().expect("UTF-8")),
+            "a LIVE build artifact is repairable: it is exactly what this PRD \
+             refuses to write, and it disappears with its worktree"
+        );
+
+        let a_directory = dir.path().join("opt");
+        assert!(
+            pin_is_repairable(a_directory.to_str().expect("UTF-8")),
+            "a directory exists but is not an executable file"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let not_executable = dir.path().join("data").join(DEFAULT_BINARY_NAME);
+            write_stub_executable(&not_executable);
+            std::fs::set_permissions(&not_executable, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod");
+            assert!(
+                pin_is_repairable(not_executable.to_str().expect("UTF-8")),
+                "a non-executable file cannot be a hook command"
+            );
+        }
     }
 }

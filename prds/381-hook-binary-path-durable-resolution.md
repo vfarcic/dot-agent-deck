@@ -72,6 +72,8 @@ Step 2's refusal is the load-bearing part. Today the failure mode is a silent ba
 
 On the `auto_install` path, a deck-managed entry whose command points at a **nonexistent** path is rewritten using the resolver above. Deck-managed entries are already identifiable — `hooks_manage.rs:177-183` matches on the command containing `dot-agent-deck` — and that detection must continue to leave user-authored hooks untouched. Repair must be idempotent, and must not fire when the existing path is merely *different* from the resolved one but still valid; the trigger is "the target is missing", not "the target is not what I would have written".
 
+"Left alone" means the valid-but-different rule is **left in place alongside** the newly added durable rule, not adopted as the single rule — so both fire, and that agent produces two deck events per action until the stale binary disappears. That is pre-existing `install_impl` behaviour (`command_matches_binary` normalizes only rules whose executable canonicalizes to the *installing* binary) and it is the safe side of the Open Question 3 tradeoff: a duplicate event is recoverable, silently repointing a path the user chose deliberately is not.
+
 ### Closing the test gap
 
 `auto_install_to()` accepts a settings path but hardcodes the binary string, so no test reaches the derivation. The seam needs to accept the resolver (or a resolved path) so tests can drive it with a `target/release/...` value and assert that value is **not** what lands in the config. That single test is the regression guard for this entire PRD; without it the same bug can return unnoticed.

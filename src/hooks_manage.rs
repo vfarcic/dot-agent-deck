@@ -711,7 +711,9 @@ fn command_matches_binary(command: &str, binary_path: &str) -> bool {
 }
 
 /// Whether `command` is a deck-owned command sharing `binary_path`'s own basename
-/// whose executable is POSITIVELY KNOWN to no longer exist on disk.
+/// whose executable is POSITIVELY KNOWN not to be a usable durable pin — see
+/// [`crate::platform::paths::pin_is_repairable`] for what that means and for
+/// the one case that still gets the benefit of the doubt.
 /// `owned_command_executable` returns `None` for any command that is not
 /// deck-owned by either shape, so this can never prune a user's own hook —
 /// only a rule the deck itself would recognise as its own, and only when it
@@ -726,19 +728,29 @@ fn command_matches_binary(command: &str, binary_path: &str) -> bool {
 /// with "could not determine" — a working binary behind an unmounted volume,
 /// or a path this process cannot `stat` (permissions), both make `exists()`
 /// return `false` even though the executable is fine, and deleting a working
-/// user's hook is worse than leaving a stale rule. [`Path::try_exists`]
-/// distinguishes the two: it returns `Ok(false)` only when the OS positively
-/// reports the path missing (`NotFound`), and `Err` for every other stat
-/// failure (permission denied, an I/O error off an unmounted or stale mount).
-/// The prune now fires ONLY on `Ok(false)` — `Err` is treated the same as
-/// "exists", i.e. left alone, which is the fail-safe direction.
+/// user's hook is worse than leaving a stale rule. That fail-safe direction
+/// survives, and now lives in [`crate::platform::paths::pin_is_repairable`]
+/// together with the rest of the "is this pin still usable" question.
+///
+/// **PRD #381 audit, MEDIUM-1: `try_exists` alone was not that question.** It
+/// resolves a BARE `dot-agent-deck` — precisely what issue #536 describes the
+/// old code writing — **relative to the process cwd**, so launching the deck
+/// from any directory holding a file of that name made the bare pin look alive
+/// and this returned `false`, leaving the rule in place beside the new durable
+/// one. `/bin/sh` then resolves that persisted bare name through the AGENT's
+/// `$PATH` at hook-fire time, which is #536's arbitrary-execution vector
+/// surviving the fix that claims to close it. A relative path, a directory, a
+/// non-executable file and a live `target/{debug,release}` path all passed the
+/// same gate. [`crate::platform::paths::pin_is_repairable`] asks for the whole
+/// invariant a freshly resolved path satisfies instead, and gives the
+/// stat-error benefit of the doubt only to a well-formed absolute pin.
 ///
 /// This does not fully resolve the underlying nondeterminism, and is not
 /// meant to: it relocates the same class of problem one layer down rather
-/// than removing it. `try_exists` still assumes `exe` is itself a bare
+/// than removing it. The predicate still assumes `exe` is itself a bare
 /// filesystem path; a command whose "executable" token is actually an
 /// argv-prefixed wrapper invocation (not a literal path) will still report a
-/// confident-looking `Ok(false)` for a string that was never a real path to
+/// confident-looking "missing" for a string that was never a real path to
 /// begin with, the same way [`executables_match`]'s `canonicalize` call can
 /// already fail to resolve a path for reasons unrelated to the binary's
 /// health. That gap is unchanged by this fix.
@@ -746,7 +758,7 @@ fn command_is_dead_deck(command: &str, binary_path: &str) -> bool {
     let installing_basename = Path::new(binary_path).file_name();
     owned_command_executable(command).is_some_and(|exe| {
         Path::new(&exe).file_name() == installing_basename
-            && matches!(Path::new(&exe).try_exists(), Ok(false))
+            && crate::platform::paths::pin_is_repairable(&exe)
     })
 }
 
@@ -832,8 +844,8 @@ pub fn auto_install_to(path: &Path, resolve: impl FnOnce() -> Result<String, Str
     // is not an acceptable fix for it.
     if outcome.repaired > 0 {
         tracing::info!(
-            "repaired {} stale dot-agent-deck hook command(s) in {} (dead binary or retired \
-             hook type); now pinned to {binary_path}",
+            "repaired {} stale dot-agent-deck hook command(s) in {} (unusable binary pin or \
+             retired hook type); now pinned to {binary_path}",
             outcome.repaired,
             path.display()
         );

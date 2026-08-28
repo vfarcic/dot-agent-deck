@@ -406,6 +406,89 @@ fn self_heal_leaves_a_different_but_still_valid_deck_path_alone() {
     );
 }
 
+/// Restores the process CWD on drop, so a panic inside a test that moved it
+/// cannot leave the rest of the file running somewhere else.
+struct CwdGuard(PathBuf);
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.0);
+    }
+}
+
+/// **The scenario that reopened issue #536 after it was declared closed** (PRD
+/// #381 audit, MEDIUM-1).
+///
+/// A config left over from the old code holds the BARE `dot-agent-deck` as its
+/// pin — that is literally what `auto_install_to`'s deleted
+/// `let binary_path = "dot-agent-deck".to_string();` produced. Self-heal used to
+/// decide such a pin's fate with `Path::try_exists()`, which resolves a bare
+/// name **relative to the process cwd**. So launching the deck from any
+/// directory that happens to contain a file called `dot-agent-deck` — a
+/// checkout of this very repo after `cargo build`, say — made the bare pin look
+/// alive, and the rule was preserved beside the new durable one.
+///
+/// At hook-fire time nothing consults that cwd. `/bin/sh` resolves the
+/// persisted bare name through the **agent's** `$PATH`, which is exactly #536's
+/// arbitrary-execution vector, surviving the change that claims to close it. A
+/// malformed pin must therefore be repairable whatever the cwd holds.
+#[test]
+#[serial_test::serial]
+fn self_heal_repairs_a_bare_pin_even_when_the_cwd_holds_a_file_of_that_name() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let artifact = fixture.build_artifact();
+    let durable = fixture.durable();
+    let settings = fixture.settings();
+
+    // The decoy, and the cwd that makes it visible to a bare-name `try_exists`.
+    let cwd = fixture.path().join("some-checkout");
+    write_executable(&cwd.join("dot-agent-deck"));
+    let _restore = CwdGuard(std::env::current_dir().expect("read the current cwd"));
+    std::env::set_current_dir(&cwd).expect("move into the decoy directory");
+    assert_eq!(
+        Path::new("dot-agent-deck").try_exists().ok(),
+        Some(true),
+        "the fixture must reproduce the cwd collision, or it proves nothing"
+    );
+
+    let bare_command = format!("dot-agent-deck {CLAUDE_SUFFIX}");
+    std::fs::write(
+        &settings,
+        serde_json::to_string_pretty(&json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [ { "type": "command", "command": bare_command.clone() } ] }
+                ]
+            }
+        }))
+        .expect("serialize fixture"),
+    )
+    .expect("seed settings.json");
+
+    fixture.auto_install(&settings, || {
+        durable_binary_path_with(Ok(artifact.clone()), &home, None)
+    });
+
+    let commands = deck_commands(&settings, CLAUDE_SUFFIX);
+    assert!(
+        !commands.contains(&bare_command),
+        "issue #536: a bare pin survived self-heal because the cwd held a file of \
+         that name — /bin/sh will resolve it through the agent's $PATH: {commands:?}"
+    );
+    let expected = format!("{} {CLAUDE_SUFFIX}", durable.display());
+    assert!(
+        !commands.is_empty() && commands.iter().all(|c| c == &expected),
+        "every deck-owned command must be the durable one — the bare pin is \
+         REPLACED, not merely joined: {commands:?}"
+    );
+    let body = std::fs::read_to_string(&settings).expect("read settings");
+    assert!(
+        !body.contains(&format!("\"{bare_command}\"")),
+        "the bare command is still in the file:\n{body}"
+    );
+}
+
 /// A user-authored command that merely MENTIONS `dot-agent-deck` is never
 /// rewritten or deleted. Deck ownership is decided by the exact
 /// `hook --agent claude-code` signature, not by a substring, and this pins that
