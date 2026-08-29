@@ -516,9 +516,51 @@ fn pane_column_shows(deck: &TuiDeck, role: &str, needle: &str) -> bool {
         .is_some_and(|column| common::squeeze_wrapped_text(&column).contains(needle))
 }
 
+/// Type `directive` at the focused REAL agent's pane and wait until `token`
+/// appears in `role`'s pane column, re-pressing Enter on a cadence until it
+/// does. Returns whether the token arrived inside `budget`.
+///
+/// **The Enter nudge is load-bearing, not defensive.** Claude Code accepts
+/// characters into its composer from the moment it first draws, but an Enter
+/// that arrives in the first seconds of that boot is DROPPED — the text stays in
+/// the input box and nothing is ever submitted. Measured on this test's first
+/// run against the implementation: the whole focus -> zoom -> type sequence had
+/// completed by t=5.0s of the cast, and the directive then sat unsubmitted in
+/// the composer, verbatim, for the remaining 175s of the budget until the test
+/// failed. `orchestration/lock/012` types a directive exactly the same way and
+/// does not hit this only because its own 20s locked-directive wait sits in
+/// front of it as an accidental readiness gate.
+///
+/// A re-pressed Enter after the agent HAS submitted is harmless: Claude Code
+/// ignores a submit on an empty composer. The nudge is therefore bounded
+/// recovery for a lost keystroke, never a way to make an agent that answered
+/// wrongly eventually answer right — only `token` ends the wait.
+fn directive_is_answered(
+    deck: &TuiDeck,
+    role: &str,
+    directive: &[u8],
+    token: &str,
+    budget: Duration,
+) -> bool {
+    deck.send_keys(directive);
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if common::wait_until(Duration::from_secs(15), || {
+            pane_column_shows(deck, role, token)
+        }) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        deck.send_bytes(b"\r");
+    }
+}
+
 /// Scenario: Open the `orch-lock-live` fixture's orchestration (a `cat`
 /// orchestrator plus a REAL fully interactive Claude Haiku worker), jump to the
-/// worker with `2` so the live agent is the focused pane, and zoom it with `z`.
+/// worker with `2` so the live agent is the focused pane, wait for its pane to
+/// go quiet so the agent is genuinely ready for input, and zoom it with `z`.
 /// While zoomed, type a directive asking the agent to `ls` and name the only
 /// `.txt` file — its answer painting inside the full-width pane is proof the
 /// real agent reflowed to the new PTY size and kept working. Then unzoom and
@@ -566,6 +608,30 @@ fn orchestration_012_real_agent_reflows_across_a_zoom_round_trip() {
         deck.snapshot_grid()
     );
 
+    // The deck drawing the worker's box says nothing about the REAL agent inside
+    // it being ready for input, and typing at one that is not costs the whole
+    // run: an Enter pressed during Claude Code's first seconds is dropped and
+    // the directive sits in the composer forever (see `directive_is_answered`).
+    // Wait for the pane's own byte stream to go quiet, the same primitive
+    // `orchestration/lock/012` gets for free from the wait that precedes it.
+    let worker_id = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|record| record.display_name.as_deref() == Some("worker"))
+        .map(|record| record.id)
+        .expect("the worker role's agent is registered with the daemon");
+    assert!(
+        common::wait_until_panes_settled(
+            deck.attach_socket_path(),
+            std::slice::from_ref(&worker_id),
+            Duration::from_millis(1500),
+            Duration::from_secs(3),
+            Duration::from_secs(90),
+        ),
+        "the real worker agent's pane never settled within 90s, so a directive \
+         typed at it now would race its boot\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
     // Zoom the LIVE agent's pane.
     deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
     deck.send_keys(b"z");
@@ -588,14 +654,15 @@ fn orchestration_012_real_agent_reflows_across_a_zoom_round_trip() {
     // The directive never names the sentinel token, so only a genuine `ls` can
     // put it on the grid.
     deck.send_bytes(b"\x04"); // Ctrl+d -> PaneInput on the zoomed pane
-    deck.send_keys(
+    let painted_zoomed = directive_is_answered(
+        &deck,
+        "worker",
         b"Use the Bash tool to run ls in the current directory, then reply with \
           the full name of the only file whose name ends in .txt, and nothing \
           else.\r",
+        ZOOM_LIVE_SENTINEL_TOKEN,
+        Duration::from_secs(180),
     );
-    let painted_zoomed = common::wait_until(Duration::from_secs(180), || {
-        pane_column_shows(&deck, "worker", ZOOM_LIVE_SENTINEL_TOKEN)
-    });
     assert!(
         painted_zoomed,
         "the real agent never painted {ZOOM_LIVE_SENTINEL} inside the ZOOMED \
@@ -622,13 +689,14 @@ fn orchestration_012_real_agent_reflows_across_a_zoom_round_trip() {
     );
 
     deck.send_bytes(b"\x04"); // Ctrl+d -> PaneInput
-    deck.send_keys(
+    let painted_unzoomed = directive_is_answered(
+        &deck,
+        "worker",
         b"Use the Bash tool to run ls again, then reply with the full name of \
           the only file whose name ends in .log, and nothing else.\r",
+        ZOOM_LIVE_SENTINEL_2_TOKEN,
+        Duration::from_secs(180),
     );
-    let painted_unzoomed = common::wait_until(Duration::from_secs(180), || {
-        pane_column_shows(&deck, "worker", ZOOM_LIVE_SENTINEL_2_TOKEN)
-    });
     assert!(
         painted_unzoomed,
         "the real agent never painted {ZOOM_LIVE_SENTINEL_2} after UNZOOMING — \
