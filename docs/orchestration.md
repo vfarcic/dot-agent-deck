@@ -94,6 +94,7 @@ These require command mode — press `Ctrl+d` first if you are typing in a role 
 | `1`–`9` | Jump to role card N and focus its pane |
 | `Ctrl+w` | Close the orchestration tab (stops all role panes), after a confirmation |
 | `Ctrl+e` | **Experimental, off by default** — toggle the command-entry lock, i.e. whether you can type directly into a worker pane (see below) |
+| `z` | Zoom the focused role pane to the whole frame — the sidebar and the other panes are not drawn (see [Zooming the focused pane](#zooming-the-focused-pane)) |
 
 These work from anywhere, including while typing in a role pane:
 
@@ -106,6 +107,22 @@ The sidebar shows each role's status live (thinking, working, waiting, idle, err
 The tab bar carries the same signal one level up: a **background** orchestration tab's label is colored by the single most urgent status among its panes, in priority order Error (red) > Needs Input (magenta) > Working (green) > Thinking (blue), so you can tell which of several open orchestration tabs needs attention without switching to any of them. Color means "something in here needs you": a tab whose roles are all idle stays in the ordinary tab color, and so does the tab you are currently on — it keeps the usual highlight the active tab always has, since you are already looking at it.
 
 In the default `Stacked` pane layout, only the focused role's pane is drawn — switching roles swaps which pane is visible, but every other role's agent keeps running underneath, and the sidebar is what tells you it's still busy or idle. Toggle to `Tiled` (`Ctrl+t`) to see every role's pane at once.
+
+### Zooming the focused pane
+
+The 34/66 split is right while you are supervising — the sidebar is how you see which of seven agents is working. It is wrong once you have stopped supervising and started working *in* one agent: reading a long diff, following a plan, going back and forth with the orchestrator on a laptop screen. Press `z` in command mode and the focused agent's pane takes the whole frame.
+
+What zoom hides is the **sidebar** and the **other role panes**. What it keeps is the focused pane's own **border**, which is where the title, the focus weight and the role's status colour live — and where the zoom indicator goes. While zoomed the border title reads `orchestrator [Z]` (or whichever role you are on), mirroring the `Z` tmux puts in its status line. Press `z` again and the previous view returns exactly as it was, including a `Ctrl+l` split you had toggled.
+
+**Every agent keeps running while you are zoomed.** Zoom changes what is drawn and nothing else: no pane is stopped, delegation still routes, work-done and status hooks still arrive, and an idle worker is still detected. The `[Z]` is there precisely because the failure mode is human — concluding your other agents have disappeared, or watching one agent while another sits blocked behind the hidden sidebar. Zoomed, you are genuinely less informed about everyone else; that is the trade the feature exists to let you make deliberately.
+
+Three more things to know:
+
+- **Zoom follows focus.** A `1`–`9` role jump while zoomed stays zoomed, now on the new agent. The role jump is a deliberate "go work with that one", so the posture goes with it.
+- **Zoom is per-tab.** Each orchestration tab remembers its own, and a tab you open later starts unzoomed. This is the deliberate opposite of the `Ctrl+l` split, which is one setting for the whole deck: a sidebar width is a standing reading preference, while zoom says "I am working in *this* agent right now".
+- **Zoom does not survive a detach.** Nothing about it is written to the saved session, so reattaching always returns the full supervisory view.
+
+Zooming and unzooming resizes the agent's PTY, so the agent reflows to the new width and back. `z` is a plain letter rather than `Ctrl+Z` on purpose — `Ctrl+Z` stays job control for whatever runs inside a pane — which is why it is claimed only in command mode: while you are typing anywhere, `z` is just the letter z.
 
 ### Typing into a worker is locked by default (experimental)
 

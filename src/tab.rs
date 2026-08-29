@@ -152,6 +152,25 @@ pub enum Tab {
         /// Deliberately not persisted across launches — a fresh process starts
         /// at the 34/66 default (PRD #336 keeps persistence out of scope).
         split_narrow: bool,
+        /// PRD #313: whether this tab's focused role pane is zoomed to the
+        /// whole frame, with the sidebar and the non-focused panes not drawn.
+        /// `false` = the normal supervisory view.
+        ///
+        /// Unlike [`Self::Orchestration::split_narrow`] this is **per-tab and
+        /// is itself the source of truth** — there is deliberately no
+        /// `TabManager`-level global mirroring it. tmux zooms a *window*, not a
+        /// session, and the two states answer different questions: the split is
+        /// a standing reading preference, while zoom says "I have stopped
+        /// supervising and am working in *this* agent". A tab the user never
+        /// zoomed must not silently lose its sidebar, which a global would do —
+        /// and keeping it per-tab means no cross-tab broadcast loop like
+        /// [`TabManager::toggle_orchestration_split`]'s is needed at all.
+        ///
+        /// Ephemeral in the same way, and more so: not persisted across
+        /// launches *and* not written to the saved session, so a detach/reattach
+        /// always returns the full supervisory view. It is pure presentation —
+        /// nothing about it reaches the daemon.
+        zoomed: bool,
     },
 }
 
@@ -954,6 +973,9 @@ impl TabManager {
             all_clear_pending: false,
             // PRD #336: adopt the current GLOBAL split, not the 34/66 default.
             split_narrow: self.orchestration_split_narrow,
+            // PRD #313: zoom is PER-TAB, so a newly opened tab always starts
+            // unzoomed regardless of what any other tab is doing.
+            zoomed: false,
         });
 
         let index = self.tabs.len() - 1;
@@ -1097,6 +1119,9 @@ impl TabManager {
             // across launches, so a restore during startup lands on the 34/66
             // default; a restore mid-session picks up whatever is in effect.
             split_narrow: self.orchestration_split_narrow,
+            // PRD #313: zoom is ephemeral view state and is never persisted, so
+            // a hydrated/restored tab comes back with the full supervisory view.
+            zoomed: false,
         });
 
         let index = self.tabs.len() - 1;
@@ -1818,6 +1843,7 @@ mod tests {
             had_waiting_pane: false,
             all_clear_pending: false,
             split_narrow: false,
+            zoomed: false,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut orch, None, filtered, None);
         assert_eq!(idx, Some(0));
@@ -1850,6 +1876,7 @@ mod tests {
             had_waiting_pane: false,
             all_clear_pending: false,
             split_narrow: false,
+            zoomed: false,
         };
         assert_eq!(
             crate::ui::sync_and_derive_selection(&mut dup_tab, None, dup, Some(1)),

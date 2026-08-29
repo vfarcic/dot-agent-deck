@@ -64,6 +64,11 @@ pub enum Action {
     /// the default 34/66 ratio and a narrower-sidebar 25/75. Global across
     /// orchestration tabs, though only pressable from one.
     ToggleOrchestrationSplit,
+    /// PRD #313: zoom the focused role pane to the whole frame, hiding the
+    /// orchestration sidebar. Per-tab and claimed only on an Orchestration tab
+    /// in command mode (see `scope_zoom`) — the default binding is a plain
+    /// `z`, so off that one combination the character belongs to the agent.
+    ToggleZoom,
     Jump1,
     Jump2,
     Jump3,
@@ -110,7 +115,9 @@ pub struct ActionSpec {
 /// `src/ui.rs` as of this branch:
 /// - global Ctrl+ shortcuts: `Ctrl+d` (dashboard/command mode), `Ctrl+n`
 ///   (new pane), `Ctrl+w` (close pane), `Ctrl+t` (toggle layout), `Ctrl+l`
-///   (toggle orchestration split); `1`..`9` jump to a card. (Quit is
+///   (toggle orchestration split); `1`..`9` jump to a card; `z` (PRD #313:
+///   zoom the focused role pane — a plain letter rather than `Ctrl+z`, which
+///   stays job control for whatever runs inside a pane). (Quit is
 ///   deliberately absent — `Ctrl+C` is a hardcoded, non-overridable modal
 ///   trigger, not a remappable action.)
 /// - dashboard Normal-mode keys: `j`/`k`/`h`/`l`, `/`, `r`, `?`, `Enter`,
@@ -158,6 +165,13 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "toggle_orchestration_split",
         default: "Ctrl+l",
         description: "Toggle orchestration split",
+    },
+    ActionSpec {
+        action: Action::ToggleZoom,
+        section: Section::Global,
+        name: "toggle_zoom",
+        default: "z",
+        description: "Zoom focused pane",
     },
     ActionSpec {
         action: Action::Jump1,

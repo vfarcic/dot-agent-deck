@@ -1,6 +1,6 @@
 # PRD #313: Zoom the focused agent pane
 
-**Status**: Not started
+**Status**: In progress
 **Priority**: Medium
 **Created**: 2026-08-01
 
@@ -62,13 +62,13 @@ None — TUI-only view state. Patch bump.
 
 ## Milestones
 
-- [ ] **M1 — Zoom state and geometry.** The focused pane resolves to a full-terminal rect; sidebar and other panes are not drawn.
-- [ ] **M2 — Toggle wired to a binding**, per the decision in Open Question 1, remappable like every other action.
-- [ ] **M3 — Zoom indicator.** A visible marker while zoomed (see Open Question 2).
-- [ ] **M4 — Focus-change behaviour settled and implemented** (Open Question 3).
+- [x] **M1 — Zoom state and geometry.** The focused pane resolves to a full-terminal rect; sidebar and other panes are not drawn.
+- [x] **M2 — Toggle wired to a binding**, per the decision in Open Question 1, remappable like every other action.
+- [x] **M3 — Zoom indicator.** A visible marker while zoomed (see Open Question 2).
+- [x] **M4 — Focus-change behaviour settled and implemented** (Open Question 3).
 - [ ] **M5 — L1 snapshot coverage** for zoomed and unzoomed geometry, per CLAUDE.md rule 4.
 - [ ] **M6 — L2 PTY coverage.** A vt100 test zooms a live agent, asserts the sidebar is gone and the agent still paints, unzooms and asserts the view is restored. Per rule 4 this is a user-facing feature, so it needs at least one PTY-attached test — and a real agent if it is to be reel-eligible.
-- [ ] **M7 — Docs and changelog.** `docs/keyboard-shortcuts.md` and `docs/orchestration.md` updated; changelog fragment added.
+- [x] **M7 — Docs and changelog.** `docs/keyboard-shortcuts.md` and `docs/orchestration.md` updated; changelog fragment added.
 
 ## Risks
 
@@ -79,6 +79,8 @@ None — TUI-only view state. Patch bump.
 
 ## Open Questions
 
+**All five are decided as of 2026-08-29 and implemented — see the Work Log for each decision and its reasoning.** They are kept here as written so the trade-off each one names stays legible next to the answer.
+
 1. **`Ctrl+Z` globally, or `z` in command mode?** The trade-off is one keystroke against job-control passthrough in every pane. Leaning command-mode `z` for the tmux parallel and because losing `Ctrl+Z` inside an agent's shell is a real cost.
 2. **What exactly does zoom hide?** Sidebar certainly. The pane border is the interesting one: it carries the title, focus, status colour (PRD #155 M3) and command-mode state (`9345a74` — a deliberate fix). Dropping it silently undoes that fix unless the button bar's `[Command Mode Ctrl+D]` is judged sufficient. Leaning: keep the border, and let it carry the zoom indicator for M3.
 3. **Does zoom follow focus?** If you are zoomed on the orchestrator and jump to a role with `1`–`9`, do you stay zoomed on the new pane or drop back? tmux unzooms on pane switch; here the role-jump keys are a deliberate "go work with that agent" action, so following focus seems more useful. Needs a decision, not a default.
@@ -86,6 +88,28 @@ None — TUI-only view state. Patch bump.
 5. **Does zoom survive detach/reattach and session restore?** tmux persists it. Here it is ephemeral UI state and simplest not to persist — but a user who zooms, detaches and returns to an unzoomed deck may find that surprising.
 
 ## Work Log
+
+### 2026-08-29 — Open Questions decided; M1–M4 and M7 implemented
+
+All five Open Questions are settled, and the implementation lands the decisions rather than deferring any of them. Each decision, and why:
+
+**Q1 — `z` in command mode, not `Ctrl+Z`.** The PRD's own leaning, confirmed by what implementing it showed. `Ctrl+Z` in a pane is currently encoded to `0x1a` and forwarded to the agent (pinned by `keyevent_ctrl_c_and_ctrl_a`), so a global binding would take job control away from every shell and TUI running inside a pane — a permanent cost paid by everyone, to save one keystroke for the person zooming. `Ctrl+D` is already this app's prefix, so `Ctrl+D` `z` maps onto `tmux prefix+z` almost exactly. The bill for the choice is that the binding is an ordinary letter, which makes the scoping load-bearing rather than tidy: `global_action_for_mode` resolves ahead of every per-mode handler, so an unscoped `z` would be swallowed not only in `PaneInput` but in the filter row, a rename and the new-pane form. `scope_zoom` therefore gates on BOTH terms — orchestration tab AND `UiMode::Normal` — and that was verified against the live funnel, not assumed: a `z` typed into the filter, into a rename and into the new-pane form's Name field all land as the literal character with the tab left unzoomed, while the same key in command mode on the same tab zooms. Remappable as `toggle_zoom`.
+
+**Q2 — hide the sidebar and the non-focused panes; KEEP the focused pane's border.** The PRD's leaning, and the border turns out to be doing more work than the question implied: it carries the title, the focus weight, PRD #155 M3's status colour and commit `9345a74`'s command-mode fix. Dropping it would silently undo that fix for the one view where the user is most zoomed-in on a single agent. Keeping it also gives M3 somewhere to live that costs no rows. The indicator is the literal `[Z]` appended AFTER the role name (`orchestrator [Z]`) — bracketed so it cannot be confused with a role name or agent output, and positioned after the name because the pane-box scan every orchestration test anchors on looks for `<corner><role>` with no separator.
+
+**Q3 — zoom follows focus.** The role-jump keys are a deliberate "go work with that agent", so dropping the zoom on a jump would fight the intent; tmux unzooms on pane switch, but tmux's pane switch is navigation rather than a role selection. It also costs nothing to implement: `focus_deck` does not write the tab's focused role at all (that is synced once per frame from the pane controller), so as long as `zoomed` lives on the TAB and the render zooms whichever pane is focused, following focus falls out for free. Anything that reset `zoomed` on a focus change would have had to be added deliberately.
+
+**Q4 — per-tab.** tmux zooms a *window*, not a session, and the two states here answer different questions: PRD #336's split is a standing reading preference (hence global), while zoom says "I have stopped supervising and am working in *this* agent". A tab the user never zoomed must not silently lose its sidebar, which a global would do to every tab opened afterwards. It is also strictly simpler: `Tab::Orchestration::zoomed` is itself the source of truth with no `TabManager` mirror, so none of the cross-tab broadcast loop `TabManager::toggle_orchestration_split` needs exists here.
+
+**Q5 — ephemeral.** Not persisted across launches and not written to the saved session. Reattaching should always return the full supervisory view — the deck's answer to "what is everyone doing" is the thing you come back for, and a session that restores zoomed hides it at exactly the wrong moment. It also keeps the change strictly presentation-only, with zero persistence surface to version.
+
+**What landed.** `KbAction::ToggleZoom` (`toggle_zoom`, default `z`) and `ui::Action::ToggleZoom`; `scope_zoom` applied at the one dispatch site with tab context and, mode-term only, inside `key_action_for_mode`; a `dispatch_action` arm that flips the ACTIVE tab's flag and nothing else; `Tab::Orchestration::zoomed` and its mirror on `ActiveTabView::Orchestration`; `orchestration_layout_percents(narrow, zoomed)` wrapping PRD #336's `orchestration_split_percents` and answering `(0, 100)` when zoomed, consumed by `compute_frame_layout`; the `[Z]` marker in `render_terminal_panes`' `pane_name` closure; a help-overlay row; and `render_orchestration_frame_to_buffer`, a `#[doc(hidden)] pub` full-frame L1 render seam (the first of its kind — every other `*_to_buffer` export renders one bar, card, grid or modal) that M5's `render/layout/006` drives.
+
+**Scope discipline held.** Zoom touches geometry in exactly one place and the border title in exactly one place. Nothing else branches on it: the PTY resize needed no plumbing of its own, because `resize_panes_to_layout` reads `FrameLayout::pane_target_dims()`, which derives from the rects `compute_frame_layout` already produced — so making the layout pass zoom-aware is sufficient for the agent to reflow. The spawn path was left alone: a newly opened tab always starts unzoomed, so no role pane can ever be spawned into a zoomed tab.
+
+**Rule 12 — no contract change.** The diff is confined to `src/keybindings.rs`, `src/tab.rs` and `src/ui.rs`, and touches no daemon, protocol, orchestration-runtime or hook code; `AttachRequest::Resize { id, rows, cols }` already exists and is already driven by the per-frame sweep, so zoom adds no wire message. No `PROTOCOL_VERSION` bump, no `.breaking.md`, no cross-version run — patch bump. Related and checked: `agent_pty::resize()` drops the daemon-side scrollback RING on a real dimension change, but that only affects the snapshot a *fresh* subscriber would replay; the attached TUI's own vt100 screen is resized through `vt100::Screen::set_size`, which resizes the grid in place and touches neither its contents nor its scrollback. A toggle therefore does not blank what the user is looking at.
+
+**Rule 9 — no experimental flag**, per this PRD's explicit decision. It ships visible.
 
 ### 2026-08-01 — Created
 
