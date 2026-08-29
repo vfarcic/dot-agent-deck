@@ -60,8 +60,8 @@ safe-outputs:
     continue-on-error: false
     max-ai-credits: 10
   add-labels:
-    max: 5
-    allowed: ["bug", "documentation", "enhancement", "feature", "question", "source", "config", "dependencies", "tests", "ci-cd", "devbox", "priority:high", "priority:medium", "priority:low", "size:high", "size:medium", "size:low", "needs-triage"]
+    max: 6
+    allowed: ["bug", "documentation", "enhancement", "feature", "question", "source", "config", "dependencies", "tests", "ci-cd", "devbox", "daemon", "tui", "desktop", "priority:high", "priority:medium", "priority:low", "size:high", "size:medium", "size:low", "needs-triage"]
     blocked: ["PRD", "duplicate", "good first issue", "help wanted", "invalid", "manual-review", "stale", "wontfix"]
   noop:
     report-as-issue: false

@@ -369,13 +369,13 @@ safe-outputs:
     continue-on-error: false
     max-ai-credits: 10
   add-labels:
-    max: 5
+    max: 6
     # Label policy: the single source of truth, enforced at infrastructure
     # level (the safe-outputs job rejects anything else, whatever the model
     # says) and read by the agent at runtime to build its candidate table.
     # Both lists are case-insensitive globs. Recompile after changes.
     #
-    allowed: ["bug", "documentation", "enhancement", "feature", "question", "source", "config", "dependencies", "tests", "ci-cd", "devbox", "priority:high", "priority:medium", "priority:low", "size:high", "size:medium", "size:low", "needs-triage"]
+    allowed: ["bug", "documentation", "enhancement", "feature", "question", "source", "config", "dependencies", "tests", "ci-cd", "devbox", "daemon", "tui", "desktop", "priority:high", "priority:medium", "priority:low", "size:high", "size:medium", "size:low", "needs-triage"]
     blocked: ["PRD", "duplicate", "good first issue", "help wanted", "invalid", "manual-review", "stale", "wontfix"]
   noop:
     # No-op runs are frequent for this workflow (every human label change on an

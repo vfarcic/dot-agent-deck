@@ -19,9 +19,12 @@ The safe-output allowlist is the enforcement boundary. The model can request onl
 | --- | --- | --- |
 | Type | `bug`, `feature`, `enhancement`, `documentation`, `question` | At most one. `feature` is new user-visible behavior; `enhancement` improves existing behavior or maintainer tooling. |
 | Area | `source`, `config`, `dependencies`, `tests`, `ci-cd`, `devbox` | Zero or more when the content makes the area explicit. The deterministic pull request path labeler may apply these first. |
+| Component | `daemon`, `tui`, `desktop` | Zero or more. A **different axis** from Area: Area says what kind of file changed, Component says which of the three shipped surfaces it belongs to — the background daemon, the terminal front-end, or the Tauri GUI under `desktop/`. Multiple are normal, because a protocol change is routinely `daemon` plus every client that consumes it. Absent for work that is genuinely surface-independent. |
 | Priority | `priority:high`, `priority:medium`, `priority:low` | Issues only. High is reserved for security, data loss, release blockers, or widespread core breakage. |
 | Size | `size:high`, `size:medium`, `size:low` | One when estimable. Low is less than a day, medium is roughly one to three days, and high is broader architectural or multi-part work. |
 | Triage | `needs-triage` | Issues only, when there is not enough information to choose a type or priority confidently. |
+
+The per-item cap is **6**, raised from 5 when the Component axis was added: a fully classified issue can legitimately carry a type, an area, a component, a priority and a size, and leaving the cap at 5 would have made the new axis silently evict an existing label rather than sit alongside it.
 
 The workflow cannot apply authority or lifecycle labels including `PRD`, `duplicate`, `good first issue`, `help wanted`, `invalid`, `manual-review`, `stale`, or `wontfix`. Those decisions remain human-owned.
 
