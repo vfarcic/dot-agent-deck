@@ -128,6 +128,22 @@ fn workflow(toolchain: &str, nextest: &str) -> String {
     )
 }
 
+/// The same two pins in YAML's OTHER spelling. A flow mapping (`with: { … }`)
+/// means exactly what the block form means, and renovate.json's unanchored
+/// regexes read it — but the toolchain scanner used to anchor at the start of
+/// the line, so this whole spelling was invisible to the guard (issue #710).
+fn flow_workflow(toolchain: &str, nextest: &str) -> String {
+    format!(
+        "jobs:\n  \
+         build:\n    \
+         steps:\n      \
+         - uses: dtolnay/rust-toolchain@v1\n        \
+         with: {{ toolchain: {toolchain} }}\n      \
+         - uses: taiki-e/install-action@v2\n        \
+         with: {{tool: cargo-nextest@{nextest}}}\n"
+    )
+}
+
 fn good_workflows() -> Vec<(&'static str, String)> {
     vec![("ci.yml", workflow("1.97.1", "0.9.143"))]
 }
@@ -478,6 +494,14 @@ fn shell_expansions_and_comments_are_not_pins() {
     // regexes skip the first and match the second only where a version follows,
     // so a false positive on either would make this check unusable on the very
     // file it exists for.
+    //
+    // This became load-bearing for the TOOLCHAIN half only in #710. Until the
+    // scanner stopped anchoring at the start of the line, neither the `echo`
+    // nor the comment could reach it — both put the token mid-line — so the
+    // `$`-expansion skip and the comment exclusion were exercised on the
+    // nextest side alone. Un-anchoring is precisely what puts these two lines
+    // in front of the toolchain scanner, and they are the reason #710 was not
+    // a one-line regex swap.
     let body = "jobs:\n  build:\n    steps:\n      \
                 # the pins below are tracked by renovate.json's customManagers, which\n      \
                 # match on `toolchain:` and `tool: cargo-nextest@` under .github/workflows\n      \
@@ -529,5 +553,141 @@ fn yaml_extension_and_nested_dirs_match_renovates_file_set() {
         "a file one level down is outside Renovate's set, so reading it here \
          would fail on pins no bot maintains:\n{}",
         combined(&out)
+    );
+}
+
+#[test]
+fn a_drifted_flow_style_toolchain_pin_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    // Issue #710, in the exact shape that made it a hole rather than a wart:
+    // one block-style site agreeing with devbox.json, one flow-style site that
+    // has drifted. The scanner anchored its grep at `^[[:space:]]*toolchain:`,
+    // so the flow site was not a site at all — the class compared the one pin
+    // it could see, found it agreeing, and printed `ok` while a pin Renovate
+    // tracks and bumps sat a whole minor release away. Verified against the
+    // pre-fix script: it exited 0.
+    let drifted = "jobs:\n  build:\n    steps:\n      - uses: dtolnay/rust-toolchain@v1\n        \
+                   with: { toolchain: 1.98.0 }\n      \
+                   - uses: taiki-e/install-action@v2\n        with:\n          \
+                   tool: cargo-nextest@0.9.143\n";
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("release.yml", drifted.to_string()),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a flow-style `with: {{ toolchain: X.Y.Z }}` is a pin Renovate bumps, \
+         so its drift must fail here rather than pass unseen:\n{text}"
+    );
+    assert!(
+        text.contains("release.yml") && text.contains("1.98.0"),
+        "the failure must point at the flow-style file and name its version:\n{text}"
+    );
+    assert!(
+        !text.contains("unreadable"),
+        "flow style is ACCEPTED, not reported: calling a perfectly readable \
+         pin unreadable would be the opposite false positive:\n{text}"
+    );
+}
+
+#[test]
+fn a_drifted_flow_style_nextest_pin_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    // The sibling scanner reached the line — it already matched its token
+    // anywhere on a non-comment line — but not the VALUE: its token class
+    // ran to the closing brace, so `{tool: cargo-nextest@0.9.140}` yielded
+    // `0.9.140}`, failed the semver test, and was reported as an unreadable
+    // pin. Same class of wrong answer as the toolchain half, arrived at from
+    // the other side, and fixed in the same change so the two stay consistent.
+    let drifted = "jobs:\n  build:\n    steps:\n      - uses: dtolnay/rust-toolchain@v1\n        \
+                   with:\n          toolchain: 1.97.1\n      \
+                   - uses: taiki-e/install-action@v2\n        \
+                   with: {tool: cargo-nextest@0.9.140}\n";
+    let out = Fixture::new(
+        &good_packages(),
+        &[
+            ("ci.yml", workflow("1.97.1", "0.9.143")),
+            ("release.yml", drifted.to_string()),
+        ],
+    )
+    .run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a flow-style cargo-nextest pin that has drifted must fail:\n{text}"
+    );
+    assert!(
+        text.contains("release.yml") && text.contains("0.9.140"),
+        "the failure must point at the flow-style file and name its version:\n{text}"
+    );
+    assert!(
+        !text.contains("unreadable"),
+        "the drift must be reported as a drift, not mistaken for an \
+         unparseable value:\n{text}"
+    );
+}
+
+#[test]
+fn agreeing_flow_style_pins_pass() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    // The deliberate decision recorded in the script: a flow-style pin is
+    // ACCEPTED and compared rather than reported as unreadable. It has to be —
+    // Renovate reads it, so it is tracked, so it can drift, and a guard that
+    // refuses to read what Renovate reads is a lockstep between the wrong two
+    // things. This is the half that would go red if someone "fixed" the value
+    // extraction by widening it back to the rest of the line: `1.97.1 }` is
+    // not a version.
+    let out = Fixture::new(
+        &good_packages(),
+        &[("ci.yml", flow_workflow("1.97.1", "0.9.143"))],
+    )
+    .run();
+    assert!(
+        out.status.success(),
+        "flow style is the same mapping as block style and agrees with \
+         devbox.json here, so it must pass:\n{}",
+        combined(&out)
+    );
+}
+
+#[test]
+fn a_quoted_flow_style_toolchain_pin_fails() {
+    if !bash_present() {
+        eprintln!("SKIP: needs `bash` on PATH");
+        return;
+    }
+    // #707's rule survives the #710 rework in the spelling that could most
+    // easily have broken it. Reading flow style means stopping the value at a
+    // `,` or a `}`, and a careless stop would also swallow the quotes and hand
+    // back a valid-looking 1.97.1 — turning the silent-rot case back into a
+    // pass. The quotes have to reach the semver test intact here exactly as
+    // they do in block style, so the extra key after the comma is deliberate.
+    let body = "jobs:\n  build:\n    steps:\n      - uses: dtolnay/rust-toolchain@v1\n        \
+                with: { toolchain: \"1.97.1\", components: clippy }\n      \
+                - uses: taiki-e/install-action@v2\n        with:\n          \
+                tool: cargo-nextest@0.9.143\n";
+    let out = Fixture::new(&good_packages(), &[("ci.yml", body.to_string())]).run();
+    let text = combined(&out);
+    assert!(
+        !out.status.success(),
+        "a quoted pin is invisible to Renovate in either YAML spelling:\n{text}"
+    );
+    assert!(
+        text.contains("unreadable"),
+        "the failure must name the pin as unreadable, not merely absent:\n{text}"
     );
 }
