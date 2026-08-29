@@ -15,15 +15,22 @@
 //! content-sized modals: the new-pane form modal must render without panicking
 //! at a wide-but-very-short terminal, driving the production
 //! `render_new_pane_form` through the `render_new_pane_form_to_buffer` seam.
+//!
+//! The third (`render/layout/006`, PRD #313 M5) is the L1 snapshot rule 4 asks
+//! for on a user-facing layout change: it renders a whole orchestration tab
+//! unzoomed and zoomed through `render_orchestration_frame_to_buffer` and pins
+//! what zoom removes (the sidebar, the non-focused roles) against what it must
+//! KEEP (the focused pane's border, now carrying a `[Z]` indicator).
 
 use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::ui::{
     render_button_bar_with_bindings_to_buffer, render_new_pane_form_to_buffer,
+    render_orchestration_frame_to_buffer,
 };
 use spec::spec;
 
 mod common;
-use common::{joined_rows, nonblank_rows};
+use common::{joined_rows, nonblank_rows, role_pane_left_edge};
 
 /// Scenario: Render the full dashboard button bar (global + context buttons,
 /// ~133 cells) into a tall `TestBackend` area at the 120-col reference width and
@@ -95,4 +102,71 @@ fn layout_005_new_pane_form_survives_short_terminal() {
         (80, 3),
         "render seam must return an 80x3 buffer"
     );
+}
+
+/// Scenario: Render a two-role orchestration tab (`orchestrator` focused,
+/// `worker` not) into a 100x30 `TestBackend` twice — once unzoomed and once
+/// zoomed — and compare what is on screen. Unzoomed, the sidebar occupies the
+/// left 34% and the `worker` role card is visible beside the focused pane;
+/// zoomed, the sidebar and the non-focused role are gone, the focused pane's box
+/// starts at column 0, and its border is still drawn with a `[Z]` marker fused
+/// into the title. RED today: `render_orchestration_frame_to_buffer` does not
+/// exist and neither does the zoom state it renders.
+#[spec("render/layout/006")]
+#[test]
+fn layout_006_zoom_hides_the_sidebar_and_keeps_the_marked_border() {
+    const ROLES: [&str; 2] = ["orchestrator", "worker"];
+
+    // --- Unzoomed: sidebar on the left, pane column starting at 34%. ---
+    let unzoomed = joined_rows(&render_orchestration_frame_to_buffer(
+        &ROLES, 0, false, false, 100, 30,
+    ));
+    assert_eq!(
+        role_pane_left_edge(&unzoomed, "orchestrator"),
+        Some(34),
+        "unzoomed: the focused role pane's box must start at the 34%-width \
+         sidebar boundary\n{unzoomed}"
+    );
+    assert!(
+        unzoomed.contains("worker"),
+        "unzoomed: the non-focused `worker` role must be visible in the \
+         sidebar\n{unzoomed}"
+    );
+    assert!(
+        !unzoomed.contains("[Z]"),
+        "unzoomed: no zoom indicator may be drawn\n{unzoomed}"
+    );
+
+    // --- Zoomed: no sidebar, border kept, `[Z]` in the title. ---
+    let zoomed = joined_rows(&render_orchestration_frame_to_buffer(
+        &ROLES, 0, false, true, 100, 30,
+    ));
+    // The border is what carries the title, the focus/status colour (PRD #155
+    // M3) and the command-mode weight (`9345a74`) — PRD #313 Open Question 2
+    // decides to KEEP it, so finding the box's corner glyph fused to the role
+    // name at column 0 asserts BOTH halves at once: the sidebar is gone AND the
+    // border was not dropped with it.
+    assert_eq!(
+        role_pane_left_edge(&zoomed, "orchestrator"),
+        Some(0),
+        "zoomed: the focused role pane must keep its BORDER and start at column \
+         0 — no sidebar\n{zoomed}"
+    );
+    assert!(
+        !zoomed.contains("worker"),
+        "zoomed: the non-focused `worker` role must not be drawn anywhere — \
+         neither a sidebar card nor a pane\n{zoomed}"
+    );
+    assert!(
+        zoomed.contains("[Z]"),
+        "zoomed: the focused pane's border title must carry the `[Z]` zoom \
+         indicator, mirroring tmux's status-line Z — without it a user \
+         concludes their other agents disappeared (PRD #313 M3)\n{zoomed}"
+    );
+
+    // Snapshots last: the assertions above are the load-bearing part (a wrong
+    // rendering fails them before any snapshot can be blessed), while these
+    // record the whole frame for review and for browsing the diff.
+    insta::assert_snapshot!("layout_006_orchestration_unzoomed", unzoomed);
+    insta::assert_snapshot!("layout_006_orchestration_zoomed", zoomed);
 }

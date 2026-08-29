@@ -2128,11 +2128,31 @@ pub fn label_in_box_top_border(grid: &str, label: &str) -> bool {
 /// The returned index counts scalars, which equals the terminal column only
 /// while every cell left of the boundary is width-1. Fixtures keep it so.
 pub fn orchestration_pane_left_edge(grid: &str) -> Option<usize> {
+    role_pane_left_edge(grid, "orchestrator")
+}
+
+/// Column of the role pane box drawn for `role`, in Unicode scalars, or `None`
+/// when no such expanded box is on the grid.
+///
+/// The general form of [`orchestration_pane_left_edge`], which is just this
+/// with `"orchestrator"`. Under `PaneLayout::Stacked` only the FOCUSED role's
+/// pane is drawn, so a test that has jumped focus to a non-start role has no
+/// `orchestrator` box to anchor on and needs to name the role it focused
+/// (PRD #313's zoom coverage does exactly that). Kept as ONE scan rather than a
+/// second copy in a test file, for the reason recorded above the table: the
+/// glyph set has already had to change once, and two copies is one copy too
+/// many for that.
+///
+/// Same two preconditions as the wrapper: the box must be drawn EXPANDED (a
+/// collapsed `Stacked` pane draws no corner glyph at all), and the returned
+/// index counts scalars, which equals the terminal column only while every cell
+/// to its left is width-1.
+pub fn role_pane_left_edge(grid: &str, role: &str) -> Option<usize> {
     grid.lines().find_map(|line| {
         BORDER_WEIGHTS
             .iter()
             .filter_map(|weight| {
-                let header = format!("{}orchestrator", weight.top_left);
+                let header = format!("{}{role}", weight.top_left);
                 line.find(&header)
                     .map(|byte_index| line[..byte_index].chars().count())
             })
@@ -2149,7 +2169,18 @@ pub fn orchestration_pane_left_edge(grid: &str) -> Option<usize> {
 /// spanning `pane1`+`pane2`. Returns `None` on the same two preconditions as
 /// [`orchestration_pane_left_edge`].
 pub fn orchestration_pane_column(grid: &str) -> Option<String> {
-    let left_edge = orchestration_pane_left_edge(grid)?;
+    role_pane_column(grid, "orchestrator")
+}
+
+/// Crop every row of `grid` to the pane column of the role pane drawn for
+/// `role`, dropping the sidebar to its left. The general form of
+/// [`orchestration_pane_column`], for the same reason
+/// [`role_pane_left_edge`] is the general form of its wrapper: under
+/// `PaneLayout::Stacked` only the FOCUSED role's pane is drawn, so a test that
+/// jumped focus to a non-start role has no `orchestrator` box to crop on.
+/// Returns `None` on the same two preconditions as [`role_pane_left_edge`].
+pub fn role_pane_column(grid: &str, role: &str) -> Option<String> {
+    let left_edge = role_pane_left_edge(grid, role)?;
     Some(
         grid.lines()
             .map(|line| line.chars().skip(left_edge).collect::<String>())

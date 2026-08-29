@@ -21496,6 +21496,7 @@ mod tests {
         let tab_view = ActiveTabView::Orchestration {
             role_pane_ids: pane_ids.clone(),
             split_narrow: false,
+            zoomed: false,
         };
         let tab_bar = TabBarInfo {
             show: true,
@@ -21570,14 +21571,21 @@ mod tests {
     }
 
     /// Build the orchestration render snapshot for `role_pane_ids` at a given
-    /// split state, then return `compute_frame_layout`'s resolved
-    /// `(sidebar_width, pane_column_width)`. PRD #336: the split now travels on
-    /// `ActiveTabView::Orchestration`, so a test can pin the geometry for a
-    /// given toggle state with no shared state to set up or reset.
-    fn orch_split_widths(frame_area: Rect, role_pane_ids: &[String], narrow: bool) -> (u16, u16) {
+    /// view state, then return `compute_frame_layout`'s resolved
+    /// `(sidebar_width, pane_column_width)`. PRD #336: the split travels on
+    /// `ActiveTabView::Orchestration`, and PRD #313 adds `zoomed` alongside it —
+    /// so a test can pin the geometry for any view state with no shared state to
+    /// set up or reset.
+    fn orch_split_widths(
+        frame_area: Rect,
+        role_pane_ids: &[String],
+        narrow: bool,
+        zoomed: bool,
+    ) -> (u16, u16) {
         let tab_view = ActiveTabView::Orchestration {
             role_pane_ids: role_pane_ids.to_vec(),
             split_narrow: narrow,
+            zoomed,
         };
         let tab_bar = TabBarInfo {
             show: true,
@@ -21637,14 +21645,14 @@ mod tests {
 
         // Untoggled: today's fixed default, 34% sidebar / 66% pane column.
         assert_eq!(
-            orch_split_widths(frame_area, &role_pane_ids, false),
+            orch_split_widths(frame_area, &role_pane_ids, false, false),
             (34, 66),
             "an untoggled orchestration tab must use the 34/66 default split"
         );
 
         // Toggled: the sidebar narrows and the pane column widens.
         assert_eq!(
-            orch_split_widths(frame_area, &role_pane_ids, true),
+            orch_split_widths(frame_area, &role_pane_ids, true, false),
             (25, 75),
             "a toggled orchestration tab must use the narrower-sidebar 25/75 split"
         );
@@ -21973,6 +21981,502 @@ mod tests {
                     "None stays None (is_orch={is_orch}, {mode:?})"
                 );
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #313 — zoom the focused agent pane. A per-tab, presentation-only view
+    // state: the focused role pane takes the whole frame, the sidebar and the
+    // non-focused panes are not drawn, and the focused pane KEEPS its border so
+    // the title/focus/status channel (PRD #155 M3, commit `9345a74`) survives —
+    // which is also where the `[Z]` indicator lives.
+    // -----------------------------------------------------------------------
+
+    /// Scenario: PRD #313 — press `z` in command mode on an orchestration tab
+    /// and the deck must resolve `Action::ToggleZoom`; press it anywhere else
+    /// and the deck must not claim it, so the character reaches the agent you
+    /// are typing at. Resolves a simulated plain-`z` `KeyEvent` through
+    /// `key_action_for_mode`, then drives `scope_zoom` across every tab/mode
+    /// pair, and confirms `Ctrl+Z` still encodes to `0x1a` for the PTY rather
+    /// than becoming a second zoom binding.
+    #[spec("orchestration/layout/007")]
+    #[test]
+    fn orchestration_layout_007_scope_zoom_claims_z_only_on_an_orchestration_tab() {
+        // The default binding resolves to the zoom toggle SPECIFICALLY — not
+        // merely to "some action", which would still pass if the ACTIONS entry
+        // were wired to the wrong variant. (`Action` derives no `PartialEq`,
+        // hence `matches!` rather than `assert_eq!`.)
+        let kb = KeybindingConfig::default();
+        let z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+        let resolved = key_action_for_mode(&kb, UiMode::Normal, &z);
+        assert!(
+            matches!(resolved, Some(Action::ToggleZoom)),
+            "default `z` must resolve to Action::ToggleZoom, got {resolved:?}"
+        );
+
+        let zoom = || Some(Action::ToggleZoom);
+
+        // The ONLY combination that resolves: orchestration tab + command mode.
+        assert!(
+            matches!(
+                scope_zoom(zoom(), true, UiMode::Normal),
+                Some(Action::ToggleZoom)
+            ),
+            "orchestration tab + command mode must claim the zoom toggle"
+        );
+
+        // Wrong tab, any mode -> un-resolved, so `z` reaches the PTY.
+        for mode in [UiMode::Normal, UiMode::PaneInput] {
+            assert!(
+                scope_zoom(zoom(), false, mode).is_none(),
+                "off an orchestration tab the zoom toggle must be un-resolved \
+                 so `z` reaches the focused pane's PTY ({mode:?})"
+            );
+        }
+
+        // Right tab, wrong mode -> un-resolved. `z` is an ORDINARY CHARACTER,
+        // so this half matters far more than it does for the `Ctrl+l` split
+        // toggle (`orchestration/layout/005`): without it, nobody could type
+        // the letter z at an agent.
+        for mode in [
+            UiMode::PaneInput,
+            UiMode::Filter,
+            UiMode::Rename,
+            UiMode::Help,
+            UiMode::NewPaneForm,
+        ] {
+            assert!(
+                scope_zoom(zoom(), true, mode).is_none(),
+                "the zoom toggle must be command-mode only; {mode:?} must \
+                 un-resolve it so the keystroke is not swallowed"
+            );
+        }
+
+        // PRD #313 Open Question 1, decided: the binding is a plain `z`, NOT
+        // `Ctrl+Z`. `Ctrl+Z` must keep reaching the pane's PTY as `0x1a` (job
+        // control), which `keyevent_ctrl_c_and_ctrl_a` pins at the encoder; here
+        // we pin that the RESOLVER never turns it into the zoom toggle.
+        let ctrl_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        for mode in [UiMode::Normal, UiMode::PaneInput] {
+            assert!(
+                !matches!(
+                    key_action_for_mode(&kb, mode, &ctrl_z),
+                    Some(Action::ToggleZoom)
+                ),
+                "Ctrl+Z must NOT resolve to Action::ToggleZoom ({mode:?}) — it \
+                 is job control and belongs to the agent"
+            );
+        }
+        assert!(
+            matches!(
+                key_action_for_mode(&kb, UiMode::PaneInput, &ctrl_z),
+                Some(Action::ForwardToPane(ref bytes)) if bytes.as_slice() == [0x1a]
+            ),
+            "Ctrl+Z in PaneInput must still forward `0x1a` to the pane's PTY"
+        );
+
+        // Unrelated actions pass through untouched for every tab/mode pair —
+        // the guard must be surgical, not a general-purpose filter.
+        for is_orch in [false, true] {
+            for mode in [UiMode::Normal, UiMode::PaneInput] {
+                assert!(
+                    matches!(
+                        scope_zoom(Some(Action::ToggleLayout), is_orch, mode),
+                        Some(Action::ToggleLayout)
+                    ),
+                    "ToggleLayout must survive (is_orch={is_orch}, {mode:?})"
+                );
+                assert!(
+                    matches!(
+                        scope_zoom(Some(Action::ToggleOrchestrationSplit), is_orch, mode),
+                        Some(Action::ToggleOrchestrationSplit)
+                    ),
+                    "ToggleOrchestrationSplit must survive (is_orch={is_orch}, {mode:?})"
+                );
+                assert!(
+                    scope_zoom(None, is_orch, mode).is_none(),
+                    "None stays None (is_orch={is_orch}, {mode:?})"
+                );
+            }
+        }
+    }
+
+    /// Scenario: PRD #313 M1 — an orchestration tab's frame geometry must be the
+    /// 34/66 default unzoomed, the narrower 25/75 split when `split_narrow`, and
+    /// a ZERO-width sidebar with the pane column spanning the whole frame when
+    /// `zoomed`. Zoom wins over the narrow split in both states, and clearing
+    /// `zoomed` returns the frame to exactly whichever split was in force — the
+    /// PRD's "the same key restores the previous view exactly". Drives
+    /// `compute_frame_layout`, the single per-frame layout pass that both
+    /// `render_frame` and the pre-draw PTY-resize pass read.
+    #[spec("orchestration/layout/008")]
+    #[test]
+    fn orchestration_layout_008_zoom_gives_the_pane_column_the_whole_frame() {
+        let frame_area = Rect::new(0, 0, 100, 40);
+        let role_pane_ids = vec!["r0".to_string(), "r1".to_string()];
+        let widths = |narrow: bool, zoomed: bool| {
+            orch_split_widths(frame_area, &role_pane_ids, narrow, zoomed)
+        };
+
+        // Unzoomed: the two split states PRD #336 already established.
+        assert_eq!(
+            widths(false, false),
+            (34, 66),
+            "an unzoomed orchestration tab must use the 34/66 default split"
+        );
+        assert_eq!(
+            widths(true, false),
+            (25, 75),
+            "an unzoomed, narrowed orchestration tab must use the 25/75 split"
+        );
+
+        // Zoomed, from BOTH split states: no sidebar at all, and the pane
+        // column spans the full frame width. Asserting both is what makes this
+        // fail against a plausible-but-wrong implementation that merely widened
+        // the pane column another notch instead of reclaiming the whole frame.
+        for narrow in [false, true] {
+            let before = widths(narrow, false);
+            assert_eq!(
+                widths(narrow, true),
+                (0, 100),
+                "a zoomed orchestration tab must give the sidebar zero width and \
+                 the pane column the whole 100-col frame, regardless of the \
+                 split underneath it (split_narrow={narrow})"
+            );
+            // Zoom is a REVERSIBLE view state, not a third split: unzooming
+            // must restore exactly the split that was in force, not snap back
+            // to the 34/66 default.
+            assert_eq!(
+                widths(narrow, false),
+                before,
+                "unzooming must restore exactly the split that was in force \
+                 (split_narrow={narrow}), not reset to the default"
+            );
+        }
+    }
+
+    /// Scenario: PRD #313 Open Question 4, decided — zoom is PER-TAB, the
+    /// deliberate opposite of PRD #336's global split (`orchestration/layout/004`,
+    /// where a tab opened later ADOPTS the current global value). Open
+    /// orchestration tab A, zoom it with the real `Action::ToggleZoom` dispatch,
+    /// then open tab B and confirm B comes up unzoomed while A stays zoomed;
+    /// toggling from B must leave A alone in both directions. Dispatching on the
+    /// Dashboard must be a no-op, and a `1`-`9` role jump on a zoomed tab must
+    /// leave it zoomed with the newly focused pane now filling the frame
+    /// (Open Question 3, decided: zoom FOLLOWS focus).
+    #[spec("orchestration/layout/009")]
+    #[test]
+    fn orchestration_layout_009_zoom_is_per_tab_and_follows_focus() {
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let frame_area = Rect::new(0, 0, 100, 40);
+
+        // Two sessions backing tab A's role panes. `CapturingPaneController`
+        // mints ids in creation order, so tab A (opened first) owns `pane-0`
+        // (orchestrator) and `pane-1` (worker) — what the `Action::FocusCard(1)`
+        // role jump below has to land on.
+        let mut snapshot = AppState::default();
+        for (sid, pid) in [("sess-a0", "pane-0"), ("sess-a1", "pane-1")] {
+            let mut sess = make_session(SessionStatus::Idle);
+            sess.session_id = sid.to_string();
+            sess.pane_id = Some(pid.to_string());
+            snapshot.sessions.insert(sid.to_string(), sess);
+        }
+        let session_ids = vec!["sess-a0".to_string(), "sess-a1".to_string()];
+        let filtered: Vec<(&String, &SessionState)> = session_ids
+            .iter()
+            .map(|id| (id, snapshot.sessions.get(id).expect("seeded session")))
+            .collect();
+
+        let cfg = |name: &str| OrchestrationConfig {
+            default: false,
+            name: name.to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "orchestrator".to_string(),
+                    command: "cat".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "worker".to_string(),
+                    command: "cat".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+            ],
+        };
+
+        let zoomed_of = |tm: &TabManager, idx: usize| match &tm.tabs()[idx] {
+            Tab::Orchestration { zoomed, .. } => *zoomed,
+            _ => panic!("tab {idx} should be an orchestration tab"),
+        };
+
+        // Tab A, opened alone, starts unzoomed.
+        tm.open_orchestration_tab(
+            &cfg("tab-a"),
+            tmp.path().to_str().expect("utf-8 tmp path"),
+            None,
+            None,
+            (24, 80),
+        )
+        .expect("open orchestration tab A");
+        assert!(!zoomed_of(&tm, 1), "tab A must open unzoomed");
+
+        dispatch_action(
+            Action::ToggleZoom,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &filtered,
+            None,
+            frame_area,
+        );
+        assert!(zoomed_of(&tm, 1), "tab A must be zoomed after one toggle");
+
+        // Tab B, opened while A is zoomed, must come up UNZOOMED. This is the
+        // explicit contrast with `orchestration/layout/004`, where a later tab
+        // adopts the current GLOBAL split: a tab the user never zoomed must not
+        // lose its sidebar behind their back.
+        tm.open_orchestration_tab(
+            &cfg("tab-b"),
+            tmp.path().to_str().expect("utf-8 tmp path"),
+            None,
+            None,
+            (24, 80),
+        )
+        .expect("open orchestration tab B");
+        assert!(
+            !zoomed_of(&tm, 2),
+            "a tab opened while another tab is zoomed must start UNZOOMED — \
+             zoom is per-tab, unlike the GLOBAL split of orchestration/layout/004"
+        );
+        assert!(zoomed_of(&tm, 1), "opening tab B must not disturb tab A");
+
+        // B is now active. Toggling from B must move B and ONLY B.
+        dispatch_action(
+            Action::ToggleZoom,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &filtered,
+            None,
+            frame_area,
+        );
+        assert!(zoomed_of(&tm, 2), "toggling from tab B must zoom tab B");
+        assert!(
+            zoomed_of(&tm, 1),
+            "toggling from tab B must NOT change tab A — zoom is per-tab"
+        );
+        dispatch_action(
+            Action::ToggleZoom,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &filtered,
+            None,
+            frame_area,
+        );
+        assert!(!zoomed_of(&tm, 2), "tab B must round-trip to unzoomed");
+        assert!(
+            zoomed_of(&tm, 1),
+            "unzooming tab B must NOT change tab A either — the independence \
+             has to hold in both directions"
+        );
+
+        // On the Dashboard the action must do nothing at all, and must not
+        // reach into an orchestration tab's state.
+        tm.switch_to(0);
+        dispatch_action(
+            Action::ToggleZoom,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &filtered,
+            None,
+            frame_area,
+        );
+        assert!(
+            matches!(tm.active_tab(), Tab::Dashboard { .. }),
+            "dispatch must not disturb the Dashboard tab"
+        );
+        assert!(
+            zoomed_of(&tm, 1) && !zoomed_of(&tm, 2),
+            "a ToggleZoom dispatched on the Dashboard must not mutate any \
+             orchestration tab's zoom state"
+        );
+
+        // Open Question 3, decided: zoom FOLLOWS focus. A `1`-`9` role jump on
+        // the zoomed tab A is a deliberate "go work with that agent" action, so
+        // it must keep the tab zoomed rather than dropping back to the split.
+        tm.switch_to(1);
+        dispatch_action(
+            Action::FocusCard(1),
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &filtered,
+            None,
+            frame_area,
+        );
+        assert_eq!(
+            ui.selected_index,
+            Some(1),
+            "the role jump must land on role 2 (index 1)"
+        );
+        assert_eq!(
+            ui.mode,
+            UiMode::PaneInput,
+            "a successful role jump enters PaneInput on the newly focused pane"
+        );
+        assert!(
+            zoomed_of(&tm, 1),
+            "jumping to another role while zoomed must KEEP the tab zoomed — \
+             zoom follows focus (PRD #313 Open Question 3)"
+        );
+
+        // The render side of the same claim: with role 2 now the focused pane,
+        // the zoomed geometry must hand THAT pane the whole frame. Zoom is not
+        // pinned to whichever role happened to be focused when it was toggled.
+        let role_pane_ids = match &tm.tabs()[1] {
+            Tab::Orchestration { role_pane_ids, .. } => role_pane_ids.clone(),
+            _ => panic!("tab 1 should be an orchestration tab"),
+        };
+        tm.record_focus(&role_pane_ids[1]);
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["tab-a".into(), "tab-b".into()],
+            active_index: 0,
+            orchestration_statuses: vec![Some(vec![]), Some(vec![])],
+        };
+        let layout = compute_frame_layout(
+            frame_area,
+            &ActiveTabView::Orchestration {
+                role_pane_ids: role_pane_ids.clone(),
+                split_narrow: false,
+                zoomed: true,
+            },
+            &tab_bar,
+            &role_pane_ids,
+            PaneLayout::Stacked,
+            Some(role_pane_ids[1].as_str()),
+            1,
+        );
+        let FrameContent::Cards { pane_rects, .. } = &layout.content else {
+            panic!("Orchestration tab must produce FrameContent::Cards");
+        };
+        let focused_rect = pane_rects
+            .iter()
+            .find(|(id, _)| id == &role_pane_ids[1])
+            .map(|(_, r)| *r)
+            .expect("the focused role must have a rect");
+        assert_eq!(
+            (focused_rect.x, focused_rect.width),
+            (0, 100),
+            "while zoomed, the NEWLY focused role's pane must span the whole \
+             frame width from column 0: {focused_rect:?}"
+        );
+    }
+
+    /// Scenario: PRD #313 — zooming must resize the agent's PTY, not just the
+    /// drawn rect. The per-frame `resize_panes_to_layout` sweep sizes every role
+    /// pane from `FrameLayout::pane_target_dims`, so this asserts those dims
+    /// directly: on a 100-wide frame an unzoomed orchestration role pane targets
+    /// 64 inner columns (the 66% column less its border) and a narrowed one 73,
+    /// while a ZOOMED one must target 98 (the whole frame less its border) —
+    /// including the non-focused Stacked role, which is sized "as if focused" so
+    /// it does not reflow twice on the way back.
+    #[spec("orchestration/layout/010")]
+    #[test]
+    fn orchestration_layout_010_pane_target_dims_follow_zoom() {
+        // 100-wide frame: 66% -> 64 inner cols, 75% -> 73, zoomed (100%) -> 98.
+        let frame_area = Rect::new(0, 0, 100, 40);
+        let role_pane_ids = vec!["r0".to_string(), "r1".to_string()];
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["zoom-tab".into()],
+            active_index: 0,
+            orchestration_statuses: vec![Some(vec![])],
+        };
+        let dims = |narrow: bool, zoomed: bool| -> Vec<(String, u16, u16)> {
+            let tab_view = ActiveTabView::Orchestration {
+                role_pane_ids: role_pane_ids.clone(),
+                split_narrow: narrow,
+                zoomed,
+            };
+            let layout = compute_frame_layout(
+                frame_area,
+                &tab_view,
+                &tab_bar,
+                &role_pane_ids,
+                PaneLayout::Stacked,
+                Some("r0"),
+                1,
+            );
+            layout
+                .pane_target_dims()
+                .into_iter()
+                .map(|(id, rows, cols)| (id.to_string(), rows, cols))
+                .collect()
+        };
+
+        let cols_of =
+            |v: &[(String, u16, u16)]| -> Vec<u16> { v.iter().map(|(_, _, c)| *c).collect() };
+
+        let unzoomed = dims(false, false);
+        assert_eq!(
+            cols_of(&unzoomed),
+            vec![64, 64],
+            "unzoomed: every role pane's PTY targets the 66%-width column \
+             (64 inner cols on a 100-wide frame)"
+        );
+        assert_eq!(
+            cols_of(&dims(true, false)),
+            vec![73, 73],
+            "narrowed: every role pane's PTY targets the 75%-width column \
+             (73 inner cols), matching orchestration/layout/006"
+        );
+
+        for narrow in [false, true] {
+            let zoomed = dims(narrow, true);
+            assert_eq!(
+                cols_of(&zoomed),
+                vec![98, 98],
+                "zoomed (split_narrow={narrow}): every role pane's PTY must \
+                 target the FULL-width column (98 inner cols on a 100-wide \
+                 frame), not the 66%/75% one — this is the seam \
+                 `resize_panes_to_layout` reads, so an agent that does not get \
+                 these dims never reflows"
+            );
+            // Zoom reclaims WIDTH only: the tab strip and the bottom bar stay,
+            // so the row budget is untouched. Pins the PRD's scope discipline —
+            // zoom gets the toggle and the indicator, and nothing else.
+            let rows: Vec<u16> = zoomed.iter().map(|(_, r, _)| *r).collect();
+            assert_eq!(
+                rows,
+                unzoomed.iter().map(|(_, r, _)| *r).collect::<Vec<_>>(),
+                "zooming must not change the pane row budget — it hides the \
+                 sidebar and the non-focused panes, nothing else"
+            );
         }
     }
 
