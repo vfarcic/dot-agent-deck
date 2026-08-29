@@ -20,17 +20,22 @@
 //! for on a user-facing layout change: it renders a whole orchestration tab
 //! unzoomed and zoomed through `render_orchestration_frame_to_buffer` and pins
 //! what zoom removes (the sidebar, the non-focused roles) against what it must
-//! KEEP (the focused pane's border, now carrying a `[Z]` indicator).
+//! KEEP (the focused pane's border, now carrying a `[Z]` indicator). It is also
+//! the ONLY tier that can see the indicator's STYLE: the L2 vt100 grid carries
+//! characters and no attributes, so there a display name spelling `[Z]` is
+//! indistinguishable from the real marker, while here the `Buffer` keeps the
+//! cells and the marker's own `zoom_marker_style` span is visible.
 
 use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::ui::{
     render_button_bar_with_bindings_to_buffer, render_new_pane_form_to_buffer,
     render_orchestration_frame_to_buffer,
 };
+use ratatui::style::Modifier;
 use spec::spec;
 
 mod common;
-use common::{joined_rows, nonblank_rows, role_pane_left_edge};
+use common::{joined_rows, nonblank_rows, role_pane_border_title, role_pane_left_edge};
 
 /// Scenario: Render the full dashboard button bar (global + context buttons,
 /// ~133 cells) into a tall `TestBackend` area at the 120-col reference width and
@@ -109,18 +114,17 @@ fn layout_005_new_pane_form_survives_short_terminal() {
 /// zoomed — and compare what is on screen. Unzoomed, the sidebar occupies the
 /// left 34% and the `worker` role card is visible beside the focused pane;
 /// zoomed, the sidebar and the non-focused role are gone, the focused pane's box
-/// starts at column 0, and its border is still drawn with a `[Z]` marker fused
-/// into the title. RED today: `render_orchestration_frame_to_buffer` does not
-/// exist and neither does the zoom state it renders.
+/// starts at column 0, and its border title reads exactly `orchestrator [Z]`
+/// with the marker's cells drawn REVERSED — the styled channel a spoofed,
+/// agent-supplied display name spelling `[Z]` cannot occupy.
 #[spec("render/layout/006")]
 #[test]
 fn layout_006_zoom_hides_the_sidebar_and_keeps_the_marked_border() {
     const ROLES: [&str; 2] = ["orchestrator", "worker"];
 
     // --- Unzoomed: sidebar on the left, pane column starting at 34%. ---
-    let unzoomed = joined_rows(&render_orchestration_frame_to_buffer(
-        &ROLES, 0, false, false, 100, 30,
-    ));
+    let unzoomed_buffer = render_orchestration_frame_to_buffer(&ROLES, 0, false, false, 100, 30);
+    let unzoomed = joined_rows(&unzoomed_buffer);
     assert_eq!(
         role_pane_left_edge(&unzoomed, "orchestrator"),
         Some(34),
@@ -136,11 +140,20 @@ fn layout_006_zoom_hides_the_sidebar_and_keeps_the_marked_border() {
         !unzoomed.contains("[Z]"),
         "unzoomed: no zoom indicator may be drawn\n{unzoomed}"
     );
+    // The whole-grid check above is the strong form of the NEGATIVE (nothing
+    // anywhere), so it needs no positional anchor; this pins the same row the
+    // positive assertion below reads, so a regression that moved the marker out
+    // of the title rather than removing it cannot pass both.
+    assert_eq!(
+        role_pane_border_title(&unzoomed, "orchestrator").as_deref(),
+        Some("orchestrator"),
+        "unzoomed: the focused pane's border title must be the bare role name, \
+         with no zoom marker fused onto it\n{unzoomed}"
+    );
 
     // --- Zoomed: no sidebar, border kept, `[Z]` in the title. ---
-    let zoomed = joined_rows(&render_orchestration_frame_to_buffer(
-        &ROLES, 0, false, true, 100, 30,
-    ));
+    let zoomed_buffer = render_orchestration_frame_to_buffer(&ROLES, 0, false, true, 100, 30);
+    let zoomed = joined_rows(&zoomed_buffer);
     // The border is what carries the title, the focus/status colour (PRD #155
     // M3) and the command-mode weight (`9345a74`) — PRD #313 Open Question 2
     // decides to KEEP it, so finding the box's corner glyph fused to the role
@@ -157,12 +170,56 @@ fn layout_006_zoom_hides_the_sidebar_and_keeps_the_marked_border() {
         "zoomed: the non-focused `worker` role must not be drawn anywhere — \
          neither a sidebar card nor a pane\n{zoomed}"
     );
-    assert!(
-        zoomed.contains("[Z]"),
+    // Positional, NOT `zoomed.contains("[Z]")`: a pane title is a display name,
+    // display names reach the deck over the hook socket, and
+    // `sanitize_display_name` strips control characters and bidi overrides but
+    // not brackets — so an agent calling itself `worker [Z]` puts that token on
+    // the grid with nothing zoomed. Reading the border title of the box the
+    // geometry actually expanded is what a text-only grid can still prove.
+    assert_eq!(
+        role_pane_border_title(&zoomed, "orchestrator").as_deref(),
+        Some("orchestrator [Z]"),
         "zoomed: the focused pane's border title must carry the `[Z]` zoom \
          indicator, mirroring tmux's status-line Z — without it a user \
          concludes their other agents disappeared (PRD #313 M3)\n{zoomed}"
     );
+
+    // The style half, which only an L1 test can see: the L2 vt100 grid carries
+    // characters and no attributes, so there the spoof above is
+    // indistinguishable from the real marker. Here the `Buffer` keeps the cells'
+    // style, and the product draws the marker as its OWN span
+    // (`terminal_widget::zoom_marker_style`) precisely so a display name that
+    // merely SPELLS `[Z]` renders as ordinary title text beside it. Asserting
+    // REVERSED plus "differs from the name's own cells" pins that channel
+    // without pinning the exact colour, which is presentation.
+    let marker_column = zoomed
+        .lines()
+        .enumerate()
+        .find_map(|(row, line)| {
+            line.find("[Z]")
+                .map(|byte_index| (row as u16, line[..byte_index].chars().count() as u16))
+        })
+        .expect("the zoomed border title carries `[Z]` (asserted above)");
+    let (marker_row, marker_start) = marker_column;
+    // Column 0 is the box corner, so the title's own text starts at column 1 —
+    // the assertion above pinned that edge at 0.
+    let title_style = zoomed_buffer[(1, marker_row)].style();
+    for offset in 0..3u16 {
+        let cell_style = zoomed_buffer[(marker_start + offset, marker_row)].style();
+        assert!(
+            cell_style.add_modifier.contains(Modifier::REVERSED),
+            "zoomed: the `[Z]` marker must be drawn REVERSED so it cannot be \
+             imitated by plain title text (an agent-supplied display name), got \
+             {cell_style:?} at column {}\n{zoomed}",
+            marker_start + offset
+        );
+        assert_ne!(
+            cell_style, title_style,
+            "zoomed: the `[Z]` marker's cells must not share the style of the \
+             role name beside them — that shared style is exactly what a \
+             spoofed display name would render with\n{zoomed}"
+        );
+    }
 
     // Snapshots last: the assertions above are the load-bearing part (a wrong
     // rendering fails them before any snapshot can be blessed), while these

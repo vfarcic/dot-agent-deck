@@ -323,6 +323,12 @@ fn orchestration_008_ctrl_l_forwards_to_pty_on_non_orchestration_tab() {
 /// a bracketed `Z`, mirroring tmux's status-line `Z`. Bracketed rather than a
 /// bare letter so it cannot collide with a role name, an agent's own output, or
 /// a sidebar card label anywhere on the settled grid.
+///
+/// Bracketing narrows the accidental collisions, not the deliberate ones: a
+/// display name is agent-reachable and `sanitize_display_name` does not strip
+/// brackets. So every POSITIVE assertion below goes through
+/// [`role_border_title_marked`] rather than searching the whole grid; the
+/// negatives stay broad, which is the stronger direction for them.
 const ZOOM_MARKER: &str = "[Z]";
 
 /// Column of the box drawn for the role pane named `role`, or `None` when no
@@ -333,6 +339,27 @@ const ZOOM_MARKER: &str = "[Z]";
 /// in the harness, for the same one-copy reason recorded there.
 fn role_box_edge(grid: &str, role: &str) -> Option<u16> {
     common::role_pane_left_edge(grid, role).map(|column| column as u16)
+}
+
+/// Whether the zoom marker rides on the BORDER TITLE of the expanded box drawn
+/// for `role` — the positional form of `grid.contains(ZOOM_MARKER)`.
+///
+/// The bare `contains` is not safe to assert on: a pane title is a *display
+/// name*, display names arrive over the hook socket, and
+/// `sanitize_display_name` strips control characters and bidi overrides but not
+/// brackets — so an agent that calls itself `worker [Z]` paints that token onto
+/// an UNZOOMED pane's border (or a sidebar card) and satisfies a whole-grid
+/// search with nothing zoomed at all. Requiring the marker at the END of the
+/// title of the box the geometry actually expanded is what a text-only vt100
+/// grid can still prove; the styled-span half — the real marker is drawn
+/// REVERSED, which plain title text never is — is asserted by
+/// `render/layout/006`, whose `Buffer` keeps the cells' attributes.
+///
+/// `ends_with` rather than an exact title match on purpose: a real agent may
+/// rename itself mid-run, and this must pin WHERE the marker is, not what the
+/// role happens to be called at that moment.
+fn role_border_title_marked(grid: &str, role: &str) -> bool {
+    common::role_pane_border_title(grid, role).is_some_and(|title| title.ends_with(ZOOM_MARKER))
 }
 
 /// Scenario: Open the `orch-focus-lifecycle` fixture's 3-role orchestration on a
@@ -382,6 +409,11 @@ fn orchestration_011_z_zooms_the_focused_role_pane_in_command_mode() {
     // runs in the role pane, and must not zoom. Asserted as a predicate that is
     // expected to TIME OUT (the `orchestration_007` shape).
     deck.send_keys(b"z");
+    // Deliberately the BROAD `contains` here, unlike the positive assertions
+    // below: this predicate is expected to TIME OUT, so anything that trips it
+    // fails the test. Narrowing it to the border title would make it harder to
+    // trip and so WEAKEN the check; a spoofed display name could only ever
+    // cause a false FAILURE here, never a false pass.
     let zoomed_in_pane_input = deck
         .wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
             orchestrator_box_edge(grid).is_some_and(|e| e <= 1) || grid.contains(ZOOM_MARKER)
@@ -401,14 +433,17 @@ fn orchestration_011_z_zooms_the_focused_role_pane_in_command_mode() {
     deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
     deck.send_keys(b"z");
     let zoomed = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
-        orchestrator_box_edge(grid) == Some(0) && grid.contains(ZOOM_MARKER)
+        orchestrator_box_edge(grid) == Some(0) && role_border_title_marked(grid, "orchestrator")
     });
     assert!(
         zoomed,
         "`z` in command mode did not zoom the focused role pane within 5s — \
-         expected the pane box at column 0 with a {ZOOM_MARKER} marker in its \
-         border title, got edge {:?}\nGrid:\n{}",
+         expected the pane box at column 0 with a {ZOOM_MARKER} marker at the \
+         end of THAT box's border title (not merely somewhere on the grid, \
+         which an agent-supplied display name can spell), got edge {:?} and \
+         title {:?}\nGrid:\n{}",
         orchestrator_box_edge(&deck.snapshot_grid()),
+        common::role_pane_border_title(&deck.snapshot_grid(), "orchestrator"),
         deck.snapshot_grid()
     );
 
@@ -439,6 +474,9 @@ fn orchestration_011_z_zooms_the_focused_role_pane_in_command_mode() {
 
     // (4) A second `z` restores the previous view exactly.
     deck.send_keys(b"z");
+    // Whole-grid NEGATIVE, kept broad for the same reason as the PaneInput
+    // check above: "the marker is nowhere" is strictly stronger than "the
+    // marker is not on this one border", and unspoofable in the pass direction.
     let restored = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
         orchestrator_box_edge(grid).is_some_and(|e| (40..=41).contains(&e))
             && !grid.contains(ZOOM_MARKER)
@@ -532,13 +570,16 @@ fn orchestration_012_real_agent_reflows_across_a_zoom_round_trip() {
     deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
     deck.send_keys(b"z");
     let zoomed = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
-        role_box_edge(grid, "worker") == Some(0) && grid.contains(ZOOM_MARKER)
+        role_box_edge(grid, "worker") == Some(0) && role_border_title_marked(grid, "worker")
     });
     assert!(
         zoomed,
         "`z` did not zoom the real agent's pane within 5s — expected its box at \
-         column 0 with a {ZOOM_MARKER} marker, got edge {:?}\nGrid:\n{}",
+         column 0 with a {ZOOM_MARKER} marker at the end of THAT box's border \
+         title (not merely somewhere on the grid, which the agent's own display \
+         name can spell), got edge {:?} and title {:?}\nGrid:\n{}",
         role_box_edge(&deck.snapshot_grid(), "worker"),
+        common::role_pane_border_title(&deck.snapshot_grid(), "worker"),
         deck.snapshot_grid()
     );
 
@@ -566,6 +607,8 @@ fn orchestration_012_real_agent_reflows_across_a_zoom_round_trip() {
     // Unzoom and prove it reflows back down just as well.
     deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
     deck.send_keys(b"z");
+    // Whole-grid NEGATIVE, kept broad: "the marker is nowhere" is the stronger
+    // form and cannot be satisfied by a spoof.
     let restored = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
         role_box_edge(grid, "worker").is_some_and(|e| (40..=41).contains(&e))
             && !grid.contains(ZOOM_MARKER)

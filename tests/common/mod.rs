@@ -1999,12 +1999,14 @@ pub fn joined_rows(buffer: &ratatui::buffer::Buffer) -> String {
 // would have made the next such change a two-site edit where only one site got
 // edited (review of #465, S1/S2).
 
-/// One border weight's corner and vertical glyphs — everything needed to find
-/// a box's span on a row and to recognise its verticals.
+/// One border weight's corner, horizontal and vertical glyphs — everything
+/// needed to find a box's span on a row, to recognise its verticals, and to
+/// bound the title fused into its top edge.
 #[derive(Clone, Copy, Debug)]
 pub struct BorderWeight {
     pub top_left: char,
     pub top_right: char,
+    pub horizontal: char,
     pub vertical: char,
     pub bottom_left: char,
     pub bottom_right: char,
@@ -2028,6 +2030,7 @@ pub const BORDER_WEIGHTS: [BorderWeight; 3] = [
     BorderWeight {
         top_left: '┌',
         top_right: '┐',
+        horizontal: '─',
         vertical: '│',
         bottom_left: '└',
         bottom_right: '┘',
@@ -2035,6 +2038,7 @@ pub const BORDER_WEIGHTS: [BorderWeight; 3] = [
     BorderWeight {
         top_left: '┏',
         top_right: '┓',
+        horizontal: '━',
         vertical: '┃',
         bottom_left: '┗',
         bottom_right: '┛',
@@ -2042,6 +2046,7 @@ pub const BORDER_WEIGHTS: [BorderWeight; 3] = [
     BorderWeight {
         top_left: '╔',
         top_right: '╗',
+        horizontal: '═',
         vertical: '║',
         bottom_left: '╚',
         bottom_right: '╝',
@@ -2053,6 +2058,13 @@ pub const BORDER_WEIGHTS: [BorderWeight; 3] = [
 /// are interposed into every row of text it contains.
 pub fn is_box_vertical(ch: char) -> bool {
     BORDER_WEIGHTS.iter().any(|weight| weight.vertical == ch)
+}
+
+/// Whether `ch` is any border weight's horizontal glyph — the fill a box's top
+/// and bottom edges are drawn with, and therefore what TERMINATES a title fused
+/// into the top edge (`┏orchestrator [Z]━━━…┓`).
+pub fn is_box_horizontal(ch: char) -> bool {
+    BORDER_WEIGHTS.iter().any(|weight| weight.horizontal == ch)
 }
 
 /// Drop every whitespace run and box-drawing vertical from `text`, so a needle
@@ -2157,6 +2169,47 @@ pub fn role_pane_left_edge(grid: &str, role: &str) -> Option<usize> {
                     .map(|byte_index| line[..byte_index].chars().count())
             })
             .min()
+    })
+}
+
+/// The title text fused into the TOP BORDER of the expanded box drawn for
+/// `role` — every character on that row between the corner glyph and the first
+/// border-fill glyph. `┏orchestrator [Z]━━━…┓` yields `orchestrator [Z]`.
+/// `None` under the same two preconditions as [`role_pane_left_edge`], whose
+/// scan this shares; when several boxes for `role` are on one row the LEFTMOST
+/// wins, matching that function's `.min()`.
+///
+/// **Why a positional read rather than `grid.contains("[Z]")`.** PRD #313's
+/// zoom indicator is ordinary title text on a rendered grid — a vt100 snapshot
+/// carries characters, not style — and a pane's title is its *display name*,
+/// which is agent-reachable: names arrive over the hook socket and
+/// `sanitize_display_name` strips control characters and bidi overrides but NOT
+/// brackets. So an agent may call itself `worker [Z]`, and that token then sits
+/// on an UNZOOMED pane's border (or, truncated, on a sidebar card) and
+/// satisfies any whole-grid `contains`. Reading the title of the box the
+/// geometry actually expanded is the strongest lever a text-only grid gives:
+/// the marker must ride on the pane zoom widened, not merely appear somewhere
+/// on screen. The remaining case — the focused pane's own display name
+/// spelling the marker — is indistinguishable in text by construction, which
+/// is why the product draws the real marker in its own
+/// `terminal_widget::zoom_marker_style` span; `render/layout/006` asserts that
+/// style side against a real `Buffer`, where the styling survives.
+pub fn role_pane_border_title(grid: &str, role: &str) -> Option<String> {
+    grid.lines().find_map(|line| {
+        BORDER_WEIGHTS
+            .iter()
+            .filter_map(|weight| {
+                let header = format!("{}{role}", weight.top_left);
+                let byte_index = line.find(&header)?;
+                let title: String = line[byte_index..]
+                    .chars()
+                    .skip(1) // the corner glyph the scan anchored on
+                    .take_while(|ch| !is_box_horizontal(*ch) && *ch != weight.top_right)
+                    .collect();
+                Some((line[..byte_index].chars().count(), title))
+            })
+            .min_by_key(|(column, _)| *column)
+            .map(|(_, title)| title)
     })
 }
 
