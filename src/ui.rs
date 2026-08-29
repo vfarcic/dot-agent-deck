@@ -22809,6 +22809,246 @@ mod tests {
         }
     }
 
+    /// Scenario: PRD #313 M1 under the Tiled pane layout — tile an orchestration
+    /// tab with the real `Action::ToggleLayout` dispatch, then zoom it with
+    /// `Action::ToggleZoom` and assert only the FOCUSED role pane gets a drawn
+    /// rect, the other two collapsing to zero height (PRD #311 M2's convention),
+    /// while the same tab unzoomed still tiles all three. The deck's stored
+    /// `PaneLayout::Tiled` must survive the zoom untouched, so unzooming restores
+    /// the user's tiled view exactly rather than dropping them into Stacked.
+    #[spec("orchestration/layout/011")]
+    #[test]
+    fn orchestration_layout_011_zoom_draws_only_the_focused_pane_under_tiled() {
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let frame_area = Rect::new(0, 0, 100, 40);
+
+        // THREE roles, deliberately: with two panes "only the focused one is
+        // drawn" and "the other one happens to be empty" are the same
+        // observation, and a Tiled frame that dropped just one slot would still
+        // pass. With three, the claim has to hold for every non-focused pane.
+        let mut snapshot = AppState::default();
+        for (sid, pid) in [
+            ("sess-0", "pane-0"),
+            ("sess-1", "pane-1"),
+            ("sess-2", "pane-2"),
+        ] {
+            let mut sess = make_session(SessionStatus::Idle);
+            sess.session_id = sid.to_string();
+            sess.pane_id = Some(pid.to_string());
+            snapshot.sessions.insert(sid.to_string(), sess);
+        }
+        let session_ids = [
+            "sess-0".to_string(),
+            "sess-1".to_string(),
+            "sess-2".to_string(),
+        ];
+        let filtered: Vec<(&String, &SessionState)> = session_ids
+            .iter()
+            .map(|id| (id, snapshot.sessions.get(id).expect("seeded session")))
+            .collect();
+
+        let role = |name: &str, start: bool| OrchestrationRoleConfig {
+            agent: None,
+            name: name.to_string(),
+            command: "cat".to_string(),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: false,
+        };
+        tm.open_orchestration_tab(
+            &OrchestrationConfig {
+                default: false,
+                name: "tiled-zoom".to_string(),
+                roles: vec![
+                    role("orchestrator", true),
+                    role("worker", false),
+                    role("reviewer", false),
+                ],
+            },
+            tmp.path().to_str().expect("utf-8 tmp path"),
+            None,
+            None,
+            (24, 80),
+        )
+        .expect("open orchestration tab");
+
+        let role_pane_ids = match &tm.tabs()[1] {
+            Tab::Orchestration { role_pane_ids, .. } => role_pane_ids.clone(),
+            _ => panic!("tab 1 should be an orchestration tab"),
+        };
+        assert_eq!(role_pane_ids.len(), 3, "the tab must own three role panes");
+        let zoomed_of = |tm: &TabManager| match &tm.tabs()[1] {
+            Tab::Orchestration { zoomed, .. } => *zoomed,
+            _ => panic!("tab 1 should be an orchestration tab"),
+        };
+
+        // `Ctrl+t` — the user's own layout choice, made through the real
+        // dispatch rather than by poking `ui.pane_layout`.
+        assert_eq!(
+            ui.pane_layout,
+            PaneLayout::Stacked,
+            "the deck starts in the default Stacked layout"
+        );
+        dispatch_action(
+            Action::ToggleLayout,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &filtered,
+            None,
+            frame_area,
+        );
+        assert_eq!(
+            ui.pane_layout,
+            PaneLayout::Tiled,
+            "ToggleLayout must put the deck in Tiled"
+        );
+
+        // `z` on top of it.
+        dispatch_action(
+            Action::ToggleZoom,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &filtered,
+            None,
+            frame_area,
+        );
+        assert!(zoomed_of(&tm), "the tab must be zoomed after one toggle");
+
+        // The half a plausible-but-wrong implementation fails: zoom must NOT
+        // flip the stored layout to Stacked and flip it back on unzoom. The
+        // toggle the user set is theirs; zoom overrides the frame, not the
+        // preference, and that is what makes PRD #313's "the same key restores
+        // the previous view exactly" true for a tiled deck.
+        assert_eq!(
+            ui.pane_layout,
+            PaneLayout::Tiled,
+            "zooming must leave the deck's stored pane layout at Tiled — zoom \
+             overrides the frame for as long as it is on, it does not rewrite \
+             the user's Ctrl+t choice"
+        );
+
+        // Geometry, resolved through the same seam the render loop reads: the
+        // stored `ui.pane_layout` goes in, and the effective layout comes out.
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["tiled-zoom".into()],
+            active_index: 0,
+            orchestration_statuses: vec![Some(vec![])],
+        };
+        let rects = |zoomed: bool| -> (Rect, Vec<(String, Rect)>) {
+            let layout = compute_frame_layout(
+                frame_area,
+                &ActiveTabView::Orchestration {
+                    role_pane_ids: role_pane_ids.clone(),
+                    split_narrow: false,
+                    zoomed,
+                },
+                &tab_bar,
+                &role_pane_ids,
+                ui.pane_layout,
+                Some(role_pane_ids[0].as_str()),
+                1,
+            );
+            let FrameContent::Cards {
+                panes_area,
+                pane_rects,
+                ..
+            } = layout.content
+            else {
+                panic!("Orchestration tab must produce FrameContent::Cards");
+            };
+            (
+                panes_area.expect("role panes => a right pane column"),
+                pane_rects,
+            )
+        };
+        let height_of = |pane_rects: &[(String, Rect)], id: &str| -> u16 {
+            pane_rects
+                .iter()
+                .find(|(pid, _)| pid.as_str() == id)
+                .map(|(_, r)| r.height)
+                .unwrap_or_else(|| {
+                    panic!("role pane {id} must keep a rect in the layout: {pane_rects:?}")
+                })
+        };
+
+        // (1) Zoomed + Tiled: only the focused pane is drawn. PRD #313 M1 says
+        // "sidebar and other panes are not drawn", and under Tiled today the
+        // second half is false — every role keeps a full-width slice of the
+        // frame, so zoom reads as "make all the panes wider" instead of
+        // "get everything else out of the way".
+        let (panes_area, zoomed_rects) = rects(true);
+        assert_eq!(
+            zoomed_rects
+                .iter()
+                .find(|(id, _)| id == &role_pane_ids[0])
+                .map(|(_, r)| *r),
+            Some(panes_area),
+            "zoomed, the FOCUSED role pane must be the whole pane column \
+             (which orchestration/layout/008 pins to the whole frame), whatever \
+             the Stacked/Tiled toggle says: {zoomed_rects:?}"
+        );
+        for id in &role_pane_ids[1..] {
+            assert_eq!(
+                height_of(&zoomed_rects, id.as_str()),
+                0,
+                "zoomed, the non-focused role pane {id} must not be drawn — \
+                 zero reserved height, the same convention PRD #311 M2 gives \
+                 Stacked and orchestration/layout/002 pins: {zoomed_rects:?}"
+            );
+        }
+
+        // (2) The same tab UNZOOMED is still tiled: every role pane keeps a
+        // drawn slice. Zoom overrode the frame; it did not quietly restack the
+        // deck underneath.
+        let (unzoomed_area, unzoomed_rects) = rects(false);
+        for id in &role_pane_ids {
+            assert!(
+                height_of(&unzoomed_rects, id.as_str()) > 0,
+                "unzoomed, every role pane must still be drawn under Tiled — \
+                 {id} got zero height: {unzoomed_rects:?}"
+            );
+        }
+        assert_eq!(
+            unzoomed_rects.iter().map(|(_, r)| r.height).sum::<u16>(),
+            unzoomed_area.height,
+            "unzoomed, the three tiled panes must divide the pane column \
+             between them: {unzoomed_rects:?}"
+        );
+
+        // (3) Unzooming leaves the user exactly where they were: tab unzoomed,
+        // layout still Tiled, nothing to undo by hand.
+        dispatch_action(
+            Action::ToggleZoom,
+            &mut ui,
+            pc.as_ref(),
+            &state,
+            &mut tm,
+            &snapshot,
+            &filtered,
+            None,
+            frame_area,
+        );
+        assert!(!zoomed_of(&tm), "the tab must round-trip to unzoomed");
+        assert_eq!(
+            ui.pane_layout,
+            PaneLayout::Tiled,
+            "unzooming must leave the deck in Tiled — the layout the user chose \
+             before they ever pressed z"
+        );
+    }
+
     // PRD #144 — `modal_rect` is the shared content-driven modal sizer: clamp the
     // desired content dims into `[min, 90% of terminal]`, never exceeding the
     // terminal bounds, and center the result. Pure data, so a plain unit test.
