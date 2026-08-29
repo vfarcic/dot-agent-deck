@@ -1,6 +1,6 @@
 # PRD #313: Zoom the focused agent pane
 
-**Status**: In progress
+**Status**: Implementation complete (M1–M7) — PR pending
 **Priority**: Medium
 **Created**: 2026-08-01
 
@@ -67,7 +67,7 @@ None — TUI-only view state. Patch bump.
 - [x] **M3 — Zoom indicator.** A visible marker while zoomed (see Open Question 2).
 - [x] **M4 — Focus-change behaviour settled and implemented** (Open Question 3).
 - [x] **M5 — L1 snapshot coverage** for zoomed and unzoomed geometry, per CLAUDE.md rule 4.
-- [ ] **M6 — L2 PTY coverage.** A vt100 test zooms a live agent, asserts the sidebar is gone and the agent still paints, unzooms and asserts the view is restored. Per rule 4 this is a user-facing feature, so it needs at least one PTY-attached test — and a real agent if it is to be reel-eligible.
+- [x] **M6 — L2 PTY coverage.** A vt100 test zooms a live agent, asserts the sidebar is gone and the agent still paints, unzooms and asserts the view is restored. Per rule 4 this is a user-facing feature, so it needs at least one PTY-attached test — and a real agent if it is to be reel-eligible.
 - [x] **M7 — Docs and changelog.** `docs/keyboard-shortcuts.md` and `docs/orchestration.md` updated; changelog fragment added.
 
 ## Risks
@@ -88,6 +88,22 @@ None — TUI-only view state. Patch bump.
 5. **Does zoom survive detach/reattach and session restore?** tmux persists it. Here it is ephemeral UI state and simplest not to persist — but a user who zooms, detaches and returns to an unzoomed deck may find that surprising.
 
 ## Work Log
+
+### 2026-08-29 — Verification complete: e2e gate green with recording, rule 12 cross-version run clean; M6 ticked
+
+**M6 is done and all seven milestones are complete.** `tabs/orchestration/011` (stand-in `cat` roles, deterministic) and `tabs/orchestration/012` (a real interactive Claude agent on Haiku, ` [reel]`-marked) both pass, with casts recorded under `.dot-agent-deck/recordings/`.
+
+**The e2e tier ran once with `DOT_AGENT_DECK_RECORD=1`**, per CLAUDE.md rule 5 and PRD #180: 9181 tests, 9177 passed, 170 per-test recording directories written. Three failures were unrelated flaky-tolerant real-agent tests, each green on rerun — `card_stats_005` (agent still `Processing…` at the deadline, though the grid showed the card had narrowed correctly), `chain_smoke_pi_002` (`PermissionDenied` staging the pi extension into the worker HOME), and `shell_activity_006` (the model never issued the Bash tool call; self-diagnosed in the failure output as prompt adherence, not a badge regression). None touches `src/ui.rs` or `src/terminal_widget.rs`.
+
+**`tabs/orchestration/012` had a genuine defect, and it was in the test rather than in zoom.** It first timed out at 180.004s with no grid attached, because its declared waits budget over 500s against nextest's default `60s x 3` — the default could only ever kill it mid-wait, hiding the real cause. A scoped `[[profile.default.overrides]]` carve-out (`terminate-after = 9`, the same shape `route_001` and `shell_activity_005/006` already carry) turned the timeout into a proper failure at 182.3s with its grid attached, and that grid showed zoom working perfectly: `┌worker [Z]` at column 0, the real agent's UI reflowed to 120 columns, nothing blanked. The directive was sitting in Claude Code's composer unsubmitted. Replaying the cast through a vt100 emulator pinned it — the whole focus → zoom → type sequence completed by t=5.0s and then nothing happened for the remaining 175s, because an Enter pressed in the first seconds of a Claude Code boot is dropped. `orchestration/lock/012` types a directive the same way and passes only because its own 20s locked-directive wait sits in front of it as an accidental readiness gate. Fixed entirely in the test (`6c53691`) by waiting for the pane stream to settle before typing, plus a bounded re-press recovery that only the sentinel token can end. Green twice afterwards, at 15.4s and 12.2s.
+
+**Rule 12 cross-version run: no contract change, confirmed at runtime rather than inferred.** Run against the previous release **v0.38.0**, with both builds reporting `server_version: 7` — so this exercised semantics behind a stable wire, which is what rule 12 actually targets, rather than a handshake rejection. Delegate routing, status hooks and work-done delivery all survived five zoom/unzoom cycles, **including while zoomed**: a work-done notice painted into the zoomed orchestrator pane at full 120-column width, visibly un-wrapped beside the earlier 78-column ones, and a status transition that occurred while the sidebar was hidden was still correct on unzoom. The worker pane reflowed 78 → 118 → 78 columns with its entire scrollback intact, which confirms in practice the reading of vt100 0.16.2's `Screen::set_size` recorded in the previous entry. This closes the audit's third blocker. No `PROTOCOL_VERSION` bump, no `.breaking.md`, patch bump.
+
+**The cross-version scenario is not reachable the obvious way, and that is now written into CLAUDE.md rule 12.** Following the rule literally — start the v0.38.0 daemon, launch the branch TUI — the branch TUI silently terminated that daemon and lazy-spawned its own in under a second, because PRD #103/#161's build-version handshake restarts a mismatched daemon with no prompt when **no agents are running**. The result looks like a successful cross-version run and is a same-version run. Rule 12's existing phrase "with an agent under it" turns out to be load-bearing; the reachable sequence is v0.38.0 daemon → v0.38.0 TUI to bring the roles up → close that TUI → branch TUI → decline the mismatch prompt. Verified by exactly one `Attach protocol listening` line for the whole run and the same daemon pid (`0.38.0-g5a56361`) serving it end to end.
+
+**Three follow-up issues were spun off rather than fixed here**, all deliberately out of this PRD's scope: [#747](https://github.com/vfarcic/dot-agent-deck/issues/747) (above ~4096 columns the client parser is not bounded by `PTY_RESIZE_DIM_MAX`, so the pane renders at a different width than the child uses — pre-existing in the shared resize path, which zoom only reaches at a lower threshold), [#748](https://github.com/vfarcic/dot-agent-deck/issues/748) (24 exported `*_to_buffer` render seams allocate a caller-sized `TestBackend` with no upper bound; PRD #313 bounded only its own new seam), and [#749](https://github.com/vfarcic/dot-agent-deck/issues/749) (`render_frame`'s `pane_layout` parameter is now vestigial and should be removed so the effective layout has a single compiler-enforced source).
+
+**The `[Z]` assertions were hardened against a spoofed display name.** The audit's spoof is real and agent-reachable — display names arrive through the hook socket and are sanitized by `sanitize_display_name`, but `strip_control_and_bidi` strips control characters and bidi overrides and not brackets — and it was measured: an unzoomed role literally named `orchestrator [Z]` satisfied a `grid.contains("[Z]")` assertion. Every positive assertion is now anchored to the border title of the box the geometry actually expanded, via a new shared `common::role_pane_border_title` helper, and `render/layout/006` additionally asserts the marker's cells carry `Modifier::REVERSED` — the one channel plain title text cannot occupy, and the discriminator that separates the real marker from a spoofed one. Negative assertions were deliberately left as whole-grid `!contains` checks: "the marker is nowhere" is strictly stronger than "not on this one border", and a spoof there can only cause a false failure, never a false pass.
 
 ### 2026-08-29 — Tiled closed, review and audit findings resolved; M5 ticked
 
