@@ -2658,19 +2658,6 @@ pub(crate) const ORCHESTRATION_PANES_PERCENT: u16 = 66;
 pub(crate) const ORCHESTRATION_LEFT_PERCENT_NARROW: u16 = 25;
 pub(crate) const ORCHESTRATION_PANES_PERCENT_NARROW: u16 = 75;
 
-/// PRD #313 M3: the zoom indicator, appended after the role name in the focused
-/// pane's border title (`orchestrator [Z]`) while the tab is zoomed. tmux marks
-/// a zoomed window with a `Z` in its status line; here the border is the only
-/// chrome zoom keeps, so the marker rides on it.
-///
-/// **Bracketed, and AFTER the name — both are load-bearing.** Bracketed so it
-/// cannot be confused with a role name, an agent's own output or a card label.
-/// After the name because the pane-box scan every orchestration test anchors on
-/// (`common::role_pane_left_edge`) looks for `<corner><role>` with no separator
-/// — a marker placed before the name would break that scan and take
-/// `tabs/orchestration/007` and `e2e_idle_worker_detector.rs` down with it.
-pub(crate) const ZOOM_TITLE_MARKER: &str = "[Z]";
-
 /// PRD #336: resolve the orchestration sidebar/pane-column split percentages
 /// for a tab's toggle state — `(25, 75)` when narrow, `(34, 66)` (the default)
 /// otherwise. Single source of truth: every site that would otherwise name
@@ -14247,6 +14234,32 @@ fn compute_frame_layout(
             // new width with no spawn-site or resize-site plumbing of its own.
             let (left_percent, panes_percent) =
                 orchestration_layout_percents(*split_narrow, *zoomed);
+            // PRD #313 M1 — the EFFECTIVE pane layout for this frame. Zoom's
+            // promise is "the focused agent gets the frame and everything else
+            // gets out of the way", and the second half of that is false under
+            // `Tiled`: the sidebar resolves away above, and then every role pane
+            // still takes an equal full-width slice of the column, so zoom reads
+            // as "make all the panes wider". Resolving the layout to `Stacked`
+            // for the duration of the frame reuses PRD #311's existing
+            // "only the focused pane is drawn, the rest reserve zero rows"
+            // machinery, so zoom needs no drawing rule of its own.
+            //
+            // It is EFFECTIVE, not stored: `ui.pane_layout` is the user's
+            // `Ctrl+t` choice and stays whatever they set it to, so unzooming
+            // restores Tiled exactly (`orchestration/layout/011` asserts both
+            // halves). And it is resolved ONCE, here, then carried in
+            // `FrameContent::Cards` — `render_frame` reads it back out rather
+            // than re-deriving it, which is what stops the geometry pass and the
+            // render pass from disagreeing about what layout this frame is in
+            // (PRD #84 invariant 1). It is also why the undrawn panes are sized
+            // "as if focused" by `pane_target_dims` (PRD #311 M2) instead of
+            // keeping a stale pre-zoom Tiled slice they would never reflow out
+            // of — the case `orchestration/layout/010` exists to pin.
+            let pane_layout = if *zoomed {
+                PaneLayout::Stacked
+            } else {
+                pane_layout
+            };
             let (dashboard_area, panes_area) =
                 split_cards_area(main_area, &pane_ids, left_percent, panes_percent);
             let pane_rects = cards_pane_rects(panes_area, &pane_ids, pane_layout, focused_pane_id);
@@ -14811,6 +14824,20 @@ fn render_frame(
     // be unit-tested without a live daemon.
     let pane_status: HashMap<&str, SessionStatus> = build_pane_status(state);
 
+    // PRD #313 M1 + PRD #84 invariant 1 — the EFFECTIVE pane layout for this
+    // frame, read back out of the layout pass rather than re-derived here. A
+    // zoomed orchestration tab resolves to `Stacked` for the duration of the
+    // frame (see the Orchestration arm of `compute_frame_layout`), and reading
+    // the value the geometry actually used is what makes "the rects were split
+    // one way and the panes drawn another" unrepresentable — there is exactly
+    // one `if zoomed` in the layout, and no second one here. The `pane_layout`
+    // argument is the deck's STORED toggle (`ui.pane_layout`); a Mode tab
+    // carries no pane layout of its own and returns below before this is read.
+    let pane_layout = match &layout.content {
+        FrameContent::Cards { pane_layout, .. } => *pane_layout,
+        FrameContent::Mode { .. } => pane_layout,
+    };
+
     // Branch on the content the layout pass resolved. Mode tabs render and
     // return here; dashboard / orchestration fall through to the card grid.
     let (dashboard_area, panes_area, pane_ids, pane_rects) = match &layout.content {
@@ -14864,19 +14891,32 @@ fn render_frame(
 
     // Orchestration tabs use the same dashboard card rendering as the main dashboard.
 
+    // PRD #313 M1: a zoomed orchestration tab resolves the sidebar to `0`
+    // percent, so `split_cards_area` hands back a dashboard rect of width 0 —
+    // a surface with nowhere to paint. Skip laying it out and drawing into it.
+    //
+    // Not for the wasted work: `render_card_grid` also WRITES `ui.columns`, the
+    // field left/right card navigation reads, and a hidden surface quietly
+    // rewriting shared UI state is a trap for whoever touches that field next.
+    // It happens to be harmless today only because `max_columns_for_width(0)`
+    // and `grid_columns(0)` both floor at 1.
+    let draw_sidebar = dashboard_area.width > 0;
+
     if state.sessions.is_empty() {
-        let vertical = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ])
-        .split(dashboard_area);
-        let msg = Paragraph::new(format!(
-            "No active sessions. Press {MOD_KEY}+n to create a pane."
-        ))
-        .style(text_primary())
-        .centered();
-        frame.render_widget(msg, vertical[1]);
+        if draw_sidebar {
+            let vertical = Layout::vertical([
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+            ])
+            .split(dashboard_area);
+            let msg = Paragraph::new(format!(
+                "No active sessions. Press {MOD_KEY}+n to create a pane."
+            ))
+            .style(text_primary())
+            .centered();
+            frame.render_widget(msg, vertical[1]);
+        }
         let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
@@ -14911,34 +14951,36 @@ fn render_frame(
     let showing = sessions.len();
 
     if sessions.is_empty() {
-        // All filtered out. Nothing is drawn, so nothing can be hidden — no
-        // overflow indicator on this title.
-        let title = Paragraph::new(deck_title_line(showing, total_sessions, ""));
-        let vertical = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Fill(1),
-            Constraint::Length(1),
-        ])
-        .split(dashboard_area);
-        frame.render_widget(title, vertical[0]);
+        if draw_sidebar {
+            // All filtered out. Nothing is drawn, so nothing can be hidden — no
+            // overflow indicator on this title.
+            let title = Paragraph::new(deck_title_line(showing, total_sessions, ""));
+            let vertical = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Fill(1),
+                Constraint::Length(1),
+            ])
+            .split(dashboard_area);
+            frame.render_widget(title, vertical[0]);
 
-        let msg = Paragraph::new("No sessions match filter.")
-            .style(text_primary())
-            .centered();
-        let inner = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ])
-        .split(vertical[1]);
-        frame.render_widget(msg, inner[1]);
+            let msg = Paragraph::new("No sessions match filter.")
+                .style(text_primary())
+                .centered();
+            let inner = Layout::vertical([
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+            ])
+            .split(vertical[1]);
+            frame.render_widget(msg, inner[1]);
 
-        render_stats_bar(
-            frame,
-            &state.aggregate_stats(),
-            vertical[2],
-            active_mode_name,
-        );
+            render_stats_bar(
+                frame,
+                &state.aggregate_stats(),
+                vertical[2],
+                active_mode_name,
+            );
+        }
         let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
         // Still render live terminal panes even when filter matches zero sessions.
@@ -14964,21 +15006,23 @@ fn render_frame(
         return;
     }
 
-    let stats_area = render_card_grid(
-        frame,
-        dashboard_area,
-        ui,
-        &sessions,
-        &session_ids,
-        total_sessions,
-        tick,
-    );
-    render_stats_bar(
-        frame,
-        &state.aggregate_stats(),
-        stats_area,
-        active_mode_name,
-    );
+    if draw_sidebar {
+        let stats_area = render_card_grid(
+            frame,
+            dashboard_area,
+            ui,
+            &sessions,
+            &session_ids,
+            total_sessions,
+            tick,
+        );
+        render_stats_bar(
+            frame,
+            &state.aggregate_stats(),
+            stats_area,
+            active_mode_name,
+        );
+    }
 
     // Full-width hints bar
     let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
@@ -15686,11 +15730,13 @@ fn render_terminal_panes(
     // used for every other transient render state in that frame.
     now: std::time::Instant,
     // PRD #313 M3: is the tab being drawn zoomed? The ONLY thing this changes is
-    // the focused pane's border title, which gains the `ZOOM_TITLE_MARKER`.
-    // Geometry is not decided here — `compute_frame_layout` already handed this
-    // call the rects — so a zoomed frame differs from an unzoomed one by three
-    // characters of title and nothing else. Every caller that cannot be on a
-    // zoomed orchestration tab passes `false`.
+    // the border title of the pane the layout expanded, which gains the
+    // `ZOOM_TITLE_MARKER` (see `zoom_marked_id` below). Geometry is not decided
+    // here — `compute_frame_layout` already handed this call the rects, and
+    // already resolved a zoomed frame to an effective `Stacked` — so a zoomed
+    // frame differs from an unzoomed one by a marker on one border title and
+    // nothing else. Every caller that cannot be on a zoomed orchestration tab
+    // passes `false`.
     zoomed: bool,
 ) -> Option<Rect> {
     let ctrl = embedded?;
@@ -15719,20 +15765,32 @@ fn render_terminal_panes(
         // without this marker it is indistinguishable from an agent that is
         // merely quiet — and every keystroke into it is silently dropped. Mark
         // it in the title so the state is visible before the user types.
-        let base = match ctrl.pane_lost_reason(id) {
+        match ctrl.pane_lost_reason(id) {
             Some(reason) => format!("{base} — {}", reason.title_marker()),
             None => base,
-        };
-        // PRD #313 M3: while zoomed, the FOCUSED pane — the only one a zoom
-        // leaves on screen — carries the indicator, so nobody concludes their
-        // other agents disappeared. `pane_lost_reason` above is the precedent
-        // for appending to this same title.
-        if zoomed && focused_id.as_deref() == Some(id) {
-            format!("{base} {ZOOM_TITLE_MARKER}")
-        } else {
-            base
         }
     };
+
+    // PRD #313 M3: which pane wears the zoom indicator — the one a zoom leaves
+    // on screen, so nobody concludes their other agents disappeared.
+    //
+    // Keyed to the pane the GEOMETRY expanded, not to focus equality. Those are
+    // the same pane in the happy path, but `stacked_expanded_index` falls back
+    // to pane 0 when nothing in the stack is focused, so keying on
+    // `focused_id == Some(id)` would let a full-frame pane render with no
+    // marker the moment focus is `None` — the exact "you forgot you were
+    // zoomed" hazard M3 exists to close, arrived at by the two answers
+    // disagreeing. Asking the same helper the split asked makes "the visible
+    // pane carries `[Z]`" structural rather than contingent. A zoomed frame is
+    // always effectively `Stacked` (PRD #313 M1 resolves it in
+    // `compute_frame_layout`), which is what makes this the right question to
+    // ask under either toggle.
+    let zoom_marked_id: Option<&str> = if zoomed {
+        stacked_expanded_index(pane_ids, focused_id.as_deref()).map(|i| pane_ids[i].as_str())
+    } else {
+        None
+    };
+    let is_zoom_marked = |id: &str| zoom_marked_id == Some(id);
 
     // Track the focused pane's rect and screen for hardware cursor positioning.
     let mut focused_pane_rect: Option<Rect> = None;
@@ -15776,7 +15834,8 @@ fn render_terminal_panes(
                     // `resize_panes_to_layout` this frame, so attest the contract.
                     let mut widget = TerminalWidget::new(Arc::clone(&screen), title, focused)
                         .contract_guaranteed(true)
-                        .with_input_active(input_active);
+                        .with_input_active(input_active)
+                        .with_zoom_marker(is_zoom_marked(pane_id.as_str()));
                     // PRD #155 (M3): supply the pane's status so a non-focused
                     // pane renders its status-colored border via the palette (the
                     // focus override stays inside TerminalWidget). Panes without a
@@ -15810,7 +15869,8 @@ fn render_terminal_panes(
                     // by `resize_panes_to_layout` this frame — attest it.
                     let mut widget = TerminalWidget::new(Arc::clone(&screen), title, is_focused)
                         .contract_guaranteed(true)
-                        .with_input_active(input_active);
+                        .with_input_active(input_active)
+                        .with_zoom_marker(is_zoom_marked(pane_id.as_str()));
                     // PRD #155 (M3): same status threading as the Tiled arm.
                     if let Some(status) = pane_status.get(pane_id.as_str()) {
                         widget = widget.with_status(status.clone());
@@ -19570,6 +19630,23 @@ pub fn render_card_grid_to_buffer(
     (terminal.backend().buffer().clone(), probe)
 }
 
+/// Largest frame dimension [`render_orchestration_frame_to_buffer`] will render.
+///
+/// The seam is `#[doc(hidden)] pub`, which hides it from the docs but does not
+/// stop anyone calling it, and its `TestBackend` allocates one cell per
+/// `width * height`. 1024 x 1024 is ~1M cells — comfortably above any real
+/// terminal and comfortably below the ~4.3 BILLION that `u16::MAX` on both axes
+/// would ask for.
+#[doc(hidden)]
+pub const RENDER_SEAM_DIM_MAX: u16 = 1024;
+
+/// Largest role count [`render_orchestration_frame_to_buffer`] will render, for
+/// the same reason as [`RENDER_SEAM_DIM_MAX`]: every role allocates an inert
+/// vt100 parser and a session. Far above any orchestration tab a person would
+/// configure.
+#[doc(hidden)]
+pub const RENDER_SEAM_ROLES_MAX: usize = 64;
+
 /// PRD #313 M5 — L1 seam for a WHOLE orchestration tab: the real
 /// `compute_frame_layout` → `resize_panes_to_layout` → [`render_frame`]
 /// sequence the main loop runs, driven into a `TestBackend` and handed back as
@@ -19598,7 +19675,13 @@ pub fn render_card_grid_to_buffer(
 /// invariant-3 contract holds here rather than being waived.
 ///
 /// `#[doc(hidden)]`: `pub` because an integration test cannot enable a crate
-/// feature on demand, not because it is API.
+/// feature on demand, not because it is API. `#[doc(hidden)]` hides it from the
+/// docs; it is not a compile barrier, so the function is TOTAL over its
+/// arguments and bounded in what it allocates — see [`RENDER_SEAM_DIM_MAX`] and
+/// the degenerate-input guard at the top of the body. That is hardening of a
+/// test seam rather than the closing of an exploitable hole; it is here because
+/// the fix is cheap and a panicking `pub fn` is a bad thing to leave in a
+/// library.
 #[doc(hidden)]
 pub fn render_orchestration_frame_to_buffer(
     role_names: &[&str],
@@ -19611,10 +19694,32 @@ pub fn render_orchestration_frame_to_buffer(
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    assert!(
-        !role_names.is_empty(),
-        "an orchestration tab has at least one role"
-    );
+    // Bound the allocation BEFORE anything is allocated. `TestBackend::new`
+    // allocates exactly `width * height` cells, so `u16::MAX` on both axes asks
+    // for 4,294,836,225 of them — an OOM/abort, not an error a caller can
+    // handle. Clamping is right rather than erroring because every real caller
+    // is asking for a terminal-sized frame and no real terminal is anywhere
+    // near the cap.
+    let width = width.min(RENDER_SEAM_DIM_MAX);
+    let height = height.min(RENDER_SEAM_DIM_MAX);
+    // Degenerate inputs get a defined answer instead of a panic: a blank buffer
+    // of the clamped size. With no roles there is no orchestration tab to draw
+    // (the body below indexes `role_names[focused_role_index]`), and with a zero
+    // dimension there is nowhere to draw it — `render_tab_strip` writes `(0, 0)`
+    // into a zero-height buffer and panics inside ratatui.
+    if role_names.is_empty() || width == 0 || height == 0 {
+        return ratatui::buffer::Buffer::empty(Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        });
+    }
+    // Each role costs a session, two map entries and an inert vt100 parser, so
+    // cap the count for the same reason as the dimensions. Truncating (rather
+    // than erroring) keeps the seam pleasant to call; the focused index is
+    // re-clamped against the truncated list so it stays in range.
+    let role_names = &role_names[..role_names.len().min(RENDER_SEAM_ROLES_MAX)];
     let focused_role_index = focused_role_index.min(role_names.len() - 1);
 
     // Numeric pane ids so `filter_sessions`' pane-id sort reproduces role order

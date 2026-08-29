@@ -63,6 +63,8 @@ Focus follows the same setting. While locked, the deck steers focus for you: ont
 
 On an orchestration tab, `z` in command mode gives the focused agent's pane the whole frame: the sidebar and the other role panes are not drawn, and the pane's own border stays — now reading `orchestrator [Z]`, or whichever role you are on. Press `z` again and the previous view comes back exactly as it was, including a `Ctrl+L` split you had toggled. It is the `tmux prefix+z` model, and `Ctrl+D` is this app's prefix, so `Ctrl+D` `z` is the same two-key move.
 
+This holds whatever `Ctrl+T` is set to: a tiled deck zooms to the focused pane alone, not to three taller panes, and the `Ctrl+T` setting itself is left untouched so unzooming restores the tiling exactly.
+
 The `[Z]` in the border title is there because the one real hazard of zooming is forgetting you did it and concluding your other agents have gone. They have not: **every agent keeps running while you are zoomed**, delegation and hooks are unaffected, and the only thing that changed is what is drawn. What you do lose while zoomed is the sidebar, which is the live status of everyone else — so it is a working posture, not a supervising one.
 
 Three details worth knowing:

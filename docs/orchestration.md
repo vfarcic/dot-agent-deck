@@ -114,6 +114,8 @@ The 34/66 split is right while you are supervising — the sidebar is how you se
 
 What zoom hides is the **sidebar** and the **other role panes**. What it keeps is the focused pane's own **border**, which is where the title, the focus weight and the role's status colour live — and where the zoom indicator goes. While zoomed the border title reads `orchestrator [Z]` (or whichever role you are on), mirroring the `Z` tmux puts in its status line. Press `z` again and the previous view returns exactly as it was, including a `Ctrl+l` split you had toggled.
 
+That is true under either pane layout. A `Tiled` deck (`Ctrl+t`) does not zoom into every role pane at once, only taller — zoom shows the focused agent and nothing else, because "make everything wider" is not what you asked for. Your `Ctrl+t` choice is overridden for as long as the zoom lasts and is never rewritten, so unzooming a tiled deck puts every pane back exactly where it was.
+
 **Every agent keeps running while you are zoomed.** Zoom changes what is drawn and nothing else: no pane is stopped, delegation still routes, work-done and status hooks still arrive, and an idle worker is still detected. The `[Z]` is there precisely because the failure mode is human — concluding your other agents have disappeared, or watching one agent while another sits blocked behind the hidden sidebar. Zoomed, you are genuinely less informed about everyone else; that is the trade the feature exists to let you make deliberately.
 
 Three more things to know:
