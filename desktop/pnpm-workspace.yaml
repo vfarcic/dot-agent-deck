@@ -1,0 +1,13 @@
+# pnpm 10 warns about a dependency whose build (postinstall) script it skipped;
+# pnpm 11 makes the same condition FATAL (ERR_PNPM_IGNORED_BUILDS), which fails
+# `pnpm install --frozen-lockfile` and, through its deps-status check, every
+# `pnpm test` / `pnpm build` after it. esbuild is the only such dependency here.
+#
+# Spelling matters twice over: pnpm 11 REMOVED `onlyBuiltDependencies` (that key
+# is read as an unknown setting and silently does nothing), and `allowBuilds`
+# takes a MAP -- `allowBuilds: [esbuild]` parses but approves nothing.
+#
+# This file is not a version-bump artifact: pnpm 10 honours it too, and it makes
+# pnpm 10 actually RUN esbuild's postinstall instead of silently skipping it.
+allowBuilds:
+  esbuild: true

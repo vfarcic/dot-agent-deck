@@ -20,7 +20,7 @@
     "ripgrep@15.2.0",
     "python314Packages.pyte@0.8.2",
     "nodejs@24.12.0",
-    "pnpm_10@10.34.5"
+    "pnpm@11.22.0"
   ],
   "shell": {
     "init_hook": [
