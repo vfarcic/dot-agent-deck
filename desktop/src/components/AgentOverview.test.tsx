@@ -72,6 +72,13 @@ function titlesOf(container: HTMLElement): string[] {
   return Array.from(container.querySelectorAll("[title]")).map((node) => node.getAttribute("title") ?? "");
 }
 
+/** Every fleet instrument in the header, in the order the top bar shows them. */
+const COUNTERS = ["agents", "running", "waiting", "failed", "groups"] as const;
+
+function counterText(): string[] {
+  return COUNTERS.map((name) => screen.getByTestId(`overview-count-${name}`).querySelector("strong")?.textContent ?? "");
+}
+
 /** The crowded snapshot with its whole fleet replaced by one hand-built agent. */
 function snapshotWithAgent(overrides: Partial<AgentSession>): DeckSnapshot {
   const base = createFixtureSnapshot("crowded");
@@ -141,7 +148,7 @@ describe("AgentOverview", () => {
     }
     expect(rows(document.body)).toHaveLength(15);
     expect(screen.getAllByRole("article")).toHaveLength(4);
-    expect(screen.getByTestId("overview-count-agents")).toHaveTextContent("15");
+    expect(counterText()).toEqual(["15", "6", "8", "1", "4"]);
     expect(screen.getByTestId("daemon-group")).toHaveAttribute("data-daemon-id", FIXTURE_DAEMON_ID);
   });
 
@@ -358,6 +365,34 @@ describe("AgentOverview", () => {
     expect(screen.queryByTestId("overview-first-run")).not.toBeInTheDocument();
   });
 
+  /**
+   * The header must not out-assert the body. The `disconnected` fixture keeps
+   * the default four agents, and live mode does the same on a failed reconnect
+   * — it replaces the connection and keeps the previous snapshot's fleet — so
+   * counters derived from `snapshot.agents` printed `AGENTS 4 · GROUPS 1` over
+   * a body correctly saying the fleet cannot be read.
+   */
+  it("counts nothing while the daemon is unreachable, however many agents the last snapshot held", () => {
+    const snapshot = createFixtureSnapshot("disconnected");
+    expect(snapshot.agents.length).toBeGreaterThan(0);
+
+    renderOverview({ snapshot });
+
+    expect(counterText()).toEqual(["—", "—", "—", "—", "—"]);
+    expect(screen.getByTestId("overview-disconnected")).toBeVisible();
+    // And the header's status pips, which say the same thing in words.
+    expect(document.querySelector(".daemon-pips")).toBeNull();
+  });
+
+  it("counts nothing while the control channel is still opening", () => {
+    const snapshot = createFixtureSnapshot("crowded");
+    snapshot.connection = { status: "loading", socketPath: FIXTURE_DAEMON_ID, message: "Connecting to the daemon" };
+    renderOverview({ snapshot });
+
+    expect(counterText()).toEqual(["—", "—", "—", "—", "—"]);
+    expect(screen.getByTestId("overview-loading")).toBeVisible();
+  });
+
   it("refuses to imply a fleet it cannot read from an incompatible daemon", () => {
     const snapshot = createFixtureSnapshot("error");
     snapshot.connection = { ...snapshot.connection, daemonDetected: true, runningAgentCount: 3 };
@@ -368,6 +403,10 @@ describe("AgentOverview", () => {
     expect(screen.getByText(/reports 3 running agents/)).toBeVisible();
     expect(rows(document.body)).toHaveLength(0);
     expect(screen.queryByTestId("overview-first-run")).not.toBeInTheDocument();
+    // This snapshot carries the default fleet, so the counters are exactly
+    // where "cannot read them" would be contradicted by a number.
+    expect(snapshot.agents.length).toBeGreaterThan(0);
+    expect(counterText()).toEqual(["—", "—", "—", "—", "—"]);
   });
 
   it("reconnects on demand", () => {

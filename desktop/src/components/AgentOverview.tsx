@@ -173,6 +173,16 @@ const COLUMNS = ["Status", "Agent", "State", "CLI", "Active tool", "Tools", "Wor
 export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeState; onNavigate: (view: DeckView) => void }) {
   const { snapshot, mode } = runtime;
   const connection = snapshot.connection;
+  /**
+   * The fleet is only knowable while the daemon is answering. A reconnect
+   * failure replaces the connection and KEEPS the previous snapshot's agents
+   * (`hooks/useDeckRuntime.ts`), and both the `disconnected` and `error`
+   * fixtures ship the default four — so deriving the instruments from
+   * `snapshot.agents` unconditionally printed `AGENTS 4 · GROUPS 1` above a
+   * body correctly saying the fleet cannot be read. The body suppressed the
+   * list and the header contradicted it.
+   */
+  const connected = connection.status === "connected";
   const agents = useMemo(() => snapshot.agents.map(toOverviewAgent), [snapshot.agents]);
   const groups = useMemo(() => groupAgents(agents), [agents]);
   const counts = useMemo(() => countByStatus(agents), [agents]);
@@ -201,11 +211,11 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
             <div className="branch-line"><span title="Every agent this desktop can see, grouped the way the daemon groups them.">every agent this desktop can see · no terminals attached</span></div>
           </div>
           <div className="run-instruments">
-            <OverviewInstrument label="AGENTS" testId="overview-count-agents"><strong>{agents.length}</strong></OverviewInstrument>
-            <OverviewInstrument label="RUNNING"><strong className="count-running">{countOf("running")}</strong></OverviewInstrument>
-            <OverviewInstrument label="WAITING"><strong className="count-waiting">{countOf("waiting")}</strong></OverviewInstrument>
-            <OverviewInstrument label="FAILED"><strong className="count-failed">{countOf("failed")}</strong></OverviewInstrument>
-            <OverviewInstrument label="GROUPS"><strong>{groups.length}</strong></OverviewInstrument>
+            <OverviewInstrument label="AGENTS" testId="overview-count-agents"><OverviewCount known={connected} value={agents.length} /></OverviewInstrument>
+            <OverviewInstrument label="RUNNING" testId="overview-count-running"><OverviewCount known={connected} value={countOf("running")} className="count-running" /></OverviewInstrument>
+            <OverviewInstrument label="WAITING" testId="overview-count-waiting"><OverviewCount known={connected} value={countOf("waiting")} className="count-waiting" /></OverviewInstrument>
+            <OverviewInstrument label="FAILED" testId="overview-count-failed"><OverviewCount known={connected} value={countOf("failed")} className="count-failed" /></OverviewInstrument>
+            <OverviewInstrument label="GROUPS" testId="overview-count-groups"><OverviewCount known={connected} value={groups.length} /></OverviewInstrument>
           </div>
           <div className="top-actions">
             <button className="button secondary compact" data-testid="overview-open-deck" onClick={openDeck}><SquareTerminal size={14} /><span>Open deck</span></button>
@@ -241,7 +251,7 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
                 </code>
               </div>
               <p className="daemon-state">{daemonMessage ?? connection.status}</p>
-              {connection.status === "connected" && agents.length > 0 && (
+              {connected && agents.length > 0 && (
                 <div className="daemon-pips">{counts.map((entry) => (
                   <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {entry.status}</span>
                 ))}</div>
@@ -448,4 +458,15 @@ function OverviewRailButton({ icon: Icon, label, active, onClick, testId }: { ic
 
 function OverviewInstrument({ label, children, testId }: { label: string; children: ReactNode; testId?: string }) {
   return <div className="instrument" data-testid={testId}><span>{label}</span>{children}</div>;
+}
+
+/**
+ * A fleet total, or an explicit "not known". The em dash is this codebase's
+ * established no-value marker and is deliberately not a zero: "no agents" and
+ * "we cannot see the agents" are different statements, and only one of them is
+ * true when the daemon is unreachable.
+ */
+function OverviewCount({ known, value, className }: { known: boolean; value: number; className?: string }) {
+  if (!known) return <strong className="count-unknown" title="Not known — the daemon is not answering, so nothing can be counted.">—</strong>;
+  return <strong className={className}>{value}</strong>;
 }

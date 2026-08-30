@@ -604,6 +604,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .count-running { color: var(--teal); }
 .count-waiting { color: var(--amber); }
 .count-failed { color: var(--red); }
+/* An unreadable fleet is not an empty one: the em dash says so and stays muted. */
+.overview-screen .count-unknown { color: var(--faint); }
 
 @media (max-width: 1180px) {
   .overview-legend, .overview-row { grid-template-columns: 10px minmax(0, 1.5fr) 66px minmax(0, 1.4fr) 40px; }
