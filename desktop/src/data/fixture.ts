@@ -1,4 +1,15 @@
-import type { AgentProfile, AgentSession, DeckSnapshot, EvidenceItem, WorkflowStage } from "../types";
+import type { AgentProfile, AgentSession, AgentStatus, AgentTab, DeckSnapshot, EvidenceItem, WorkflowStage } from "../types";
+
+/**
+ * The fixture's stand-in for a daemon identity. Live mode uses the daemon's
+ * socket path, which is the only thing the handshake gives us that actually
+ * distinguishes one local daemon from another; the fixture names the socket a
+ * default deployment listens on.
+ */
+export const FIXTURE_DAEMON_ID = "/tmp/dot-agent-deck.sock";
+
+/** Which scenario `createFixtureSnapshot` builds; selected by `?state=`. */
+export type FixtureState = "connected" | "disconnected" | "error" | "empty" | "crowded";
 
 export const DEFAULT_PROFILES: AgentProfile[] = [
   {
@@ -150,6 +161,8 @@ const evidence: EvidenceItem[] = [
 const agents: AgentSession[] = [
   {
     id: "planner",
+    daemonId: FIXTURE_DAEMON_ID,
+    tab: { kind: "dashboard" },
     role: "Planner",
     displayName: "Plan / architecture",
     cli: "claude",
@@ -175,6 +188,8 @@ const agents: AgentSession[] = [
   },
   {
     id: "builder",
+    daemonId: FIXTURE_DAEMON_ID,
+    tab: { kind: "dashboard" },
     role: "Builder",
     displayName: "Desktop implementation",
     cli: "codex",
@@ -205,6 +220,8 @@ const agents: AgentSession[] = [
   },
   {
     id: "reviewer",
+    daemonId: FIXTURE_DAEMON_ID,
+    tab: { kind: "dashboard" },
     role: "Reviewer",
     displayName: "Contract review",
     cli: "codex",
@@ -231,6 +248,8 @@ const agents: AgentSession[] = [
   },
   {
     id: "tester",
+    daemonId: FIXTURE_DAEMON_ID,
+    tab: { kind: "dashboard" },
     role: "Tester",
     displayName: "User-path verification",
     cli: "codex",
@@ -260,12 +279,121 @@ const agents: AgentSession[] = [
   },
 ];
 
-export function createFixtureSnapshot(state: "connected" | "disconnected" | "error" | "empty" = "connected"): DeckSnapshot {
-  const connection = state === "connected"
-    ? { status: "connected" as const, socketPath: "/tmp/dot-agent-deck.sock", message: "Daemon responding" }
+/** One agent in the crowded scenario, described only by what a daemon reports. */
+interface CrowdedSeed {
+  id: string;
+  displayName: string;
+  role: string;
+  /** The daemon's own agent-type vocabulary, exactly as live mode renders it. */
+  cli: string;
+  status: AgentStatus;
+  cwd: string;
+  tab: AgentTab;
+  activeTool?: string;
+  activeToolDetail?: string;
+  toolCount: number;
+}
+
+/**
+ * Builds a crowded-scenario agent whose every non-daemon-reported field carries
+ * the SAME placeholder `agentFromDto` hardcodes in live mode, rather than a
+ * plausible-looking number. That makes `?fixture=1&state=crowded` a faithful
+ * preview of a real daemon at fifteen agents on both screens, instead of a demo
+ * that flatters a design with data the daemon cannot supply (PRD #745 M1).
+ */
+function crowdedAgent(seed: CrowdedSeed): AgentSession {
+  const orchestration = seed.tab.kind === "orchestration" ? seed.tab : undefined;
+  return {
+    id: seed.id,
+    daemonId: FIXTURE_DAEMON_ID,
+    role: seed.role,
+    displayName: seed.displayName,
+    cli: seed.cli,
+    model: "Unavailable",
+    status: seed.status,
+    task: seed.activeTool
+      ? `Active tool: ${seed.activeTool}${seed.activeToolDetail ? ` · ${seed.activeToolDetail}` : ""}`
+      : "Task metadata unavailable from daemon",
+    cwd: seed.cwd,
+    attempt: 1,
+    duration: "—",
+    tokens: 0,
+    cost: 0,
+    contextPercent: 0,
+    worktree: "Unavailable",
+    writeLease: "unknown",
+    rows: 40,
+    cols: 132,
+    activeTool: seed.activeTool,
+    activeToolDetail: seed.activeToolDetail,
+    toolCount: seed.toolCount,
+    transcript: "",
+    diff: [],
+    checks: [],
+    handoffIds: [],
+    artifacts: [],
+    tab: seed.tab,
+    inOrchestration: Boolean(orchestration),
+    isStartRole: orchestration?.isStartRole ?? false,
+  };
+}
+
+function orchestrationTab(orchestrationId: string, name: string, displayTitle: string, roleName: string, roleIndex: number, isStartRole = false): AgentTab {
+  return { kind: "orchestration", orchestrationId, name, displayTitle, roleName, roleIndex, isStartRole };
+}
+
+const DECK_CWD = "/home/vfarcic/code/dot-agent-deck";
+const PRD_CWD = "/home/vfarcic/code/dot-agent-deck-dispatch-prd-745";
+
+/**
+ * Fifteen agents across two orchestrations, one mode bucket and three
+ * standalone panes — the scale the overview exists for. Ids are per-daemon
+ * monotonic integers because that is what the daemon mints, which is also why
+ * nothing may key an agent by the bare id alone.
+ *
+ * Deliberately declared out of role order, and orchestration `dot-ai`'s start
+ * role is deliberately NOT its first role, so grouping, ordering and
+ * coordinator identification are three separate things a screen has to get
+ * right rather than one accident of declaration order.
+ */
+const crowdedAgents: AgentSession[] = [
+  crowdedAgent({ id: "2", displayName: "coder", role: "Coder", cli: "claude_code", status: "running", cwd: PRD_CWD, toolCount: 132, activeTool: "edit", activeToolDetail: "desktop/src/components/AgentOverview.tsx", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD #745 · agent overview", "coder", 1) }),
+  crowdedAgent({ id: "7", displayName: "writer", role: "Writer", cli: "claude_code", status: "running", cwd: DECK_CWD, toolCount: 19, activeTool: "write", activeToolDetail: "docs/develop/desktop-gui.md", tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "writer", 0) }),
+  crowdedAgent({ id: "13", displayName: "Scratch shell", role: "Codex", cli: "codex", status: "waiting", cwd: DECK_CWD, toolCount: 2, tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "1", displayName: "orchestrator", role: "Orchestrator", cli: "claude_code", status: "running", cwd: PRD_CWD, toolCount: 47, activeTool: "read", activeToolDetail: "prds/745-desktop-agent-overview-landing-screen.md", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD #745 · agent overview", "orchestrator", 0, true) }),
+  crowdedAgent({ id: "11", displayName: "Second opinion", role: "Open code", cli: "open_code", status: "running", cwd: DECK_CWD, toolCount: 33, activeTool: "read", activeToolDetail: "src/state.rs", tab: { kind: "mode", name: "review" } }),
+  crowdedAgent({ id: "5", displayName: "docs", role: "Docs", cli: "codex", status: "waiting", cwd: PRD_CWD, toolCount: 0, tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD #745 · agent overview", "docs", 4) }),
+  crowdedAgent({ id: "9", displayName: "orchestrator", role: "Orchestrator", cli: "claude_code", status: "waiting", cwd: DECK_CWD, toolCount: 12, tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "orchestrator", 2, true) }),
+  crowdedAgent({ id: "4", displayName: "reviewer", role: "Reviewer", cli: "codex", status: "running", cwd: PRD_CWD, toolCount: 24, activeTool: "grep", activeToolDetail: "attachAgents", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD #745 · agent overview", "reviewer", 3) }),
+  crowdedAgent({ id: "14", displayName: "Changelog sweep", role: "Claude code", cli: "claude_code", status: "running", cwd: DECK_CWD, toolCount: 15, activeTool: "bash", activeToolDetail: "git log --oneline -20", tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "6", displayName: "release", role: "Release", cli: "claude_code", status: "failed", cwd: PRD_CWD, toolCount: 8, activeTool: "bash", activeToolDetail: "cargo test-fast", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD #745 · agent overview", "release", 5) }),
+  crowdedAgent({ id: "3", displayName: "tester", role: "Tester", cli: "codex", status: "waiting", cwd: PRD_CWD, toolCount: 61, tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD #745 · agent overview", "tester", 2) }),
+  crowdedAgent({ id: "10", displayName: "publisher", role: "Publisher", cli: "codex", status: "waiting", cwd: DECK_CWD, toolCount: 0, tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "publisher", 3) }),
+  crowdedAgent({ id: "15", displayName: "pi-extension spike", role: "Pi", cli: "pi", status: "waiting", cwd: `${DECK_CWD}/pi-extension`, toolCount: 0, tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "8", displayName: "reviewer", role: "Reviewer", cli: "codex", status: "waiting", cwd: DECK_CWD, toolCount: 5, tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "reviewer", 1) }),
+  crowdedAgent({ id: "12", displayName: "Security pass", role: "Claude code", cli: "claude_code", status: "waiting", cwd: DECK_CWD, toolCount: 7, tab: { kind: "mode", name: "review" } }),
+];
+
+/**
+ * `empty` means CONNECTED WITH ZERO AGENTS — the first-run experience — and
+ * not a daemon that is down. It used to fall through to the `disconnected`
+ * branch, so `?fixture=1&state=empty` rendered a disconnected banner over an
+ * empty deck and the genuine first-run screen had no fixture at all (PRD #745
+ * M2). `disconnected` is the state that means nothing is listening.
+ *
+ * `crowded` is the same healthy connection carrying the fifteen-agent fleet.
+ * It is opt-in rather than the default because changing the default would
+ * churn the existing `App.test.tsx` suite for no gain.
+ */
+export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSnapshot {
+  const connected = state === "connected" || state === "crowded" || state === "empty";
+  const connection = connected
+    ? { status: "connected" as const, socketPath: FIXTURE_DAEMON_ID, message: state === "empty" ? "Daemon responding · no agents running" : "Daemon responding" }
     : state === "error"
       ? { status: "error" as const, message: "Protocol handshake failed. Desktop expects v6; daemon reported v5." }
       : { status: "disconnected" as const, message: "No dot-agent-deck daemon is listening on the configured socket." };
+
+  const fleet = state === "empty" ? [] : state === "crowded" ? crowdedAgents : agents;
 
   return {
     runId: "run_7f24a",
@@ -273,7 +401,7 @@ export function createFixtureSnapshot(state: "connected" | "disconnected" | "err
     branch: "codex/visual-control-deck",
     worktree: "/dev/active/dot-agent-deck-gui",
     connection,
-    health: state === "connected" ? "healthy" : state === "error" ? "failed" : "idle",
+    health: state === "connected" || state === "crowded" ? "healthy" : state === "error" ? "failed" : "idle",
     elapsed: "16:42",
     spend: 2.57,
     currentNode: 4,
@@ -281,7 +409,7 @@ export function createFixtureSnapshot(state: "connected" | "disconnected" | "err
     currentAttempt: 1,
     paused: false,
     stages: state === "empty" ? [] : stages.map((stage) => ({ ...stage })),
-    agents: state === "empty" ? [] : agents.map((agent) => ({ ...agent })),
+    agents: fleet.map((agent) => ({ ...agent })),
     handoffs: [
       { id: "dlg-demo-3", toRole: "Reviewer", orchestration: "dot-agent-deck", taskPreview: "Review the terminal lifecycle change; report findings only.", status: "dispatched", respawned: true, at: "14:41:22" },
       { id: "dlg-demo-2", toRole: "Builder", orchestration: "dot-agent-deck", taskPreview: "Implement the Tauri client as a second daemon surface.", status: "done", respawned: true, at: "14:40:58" },

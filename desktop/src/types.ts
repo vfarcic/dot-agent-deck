@@ -55,32 +55,99 @@ export interface Artifact {
   path: string;
 }
 
+/**
+ * Which top-level surface is mounted. A discriminated union from the start even
+ * though it carries only two variants today, so PRD #745 iteration 3's group
+ * and single-agent views arrive as added variants rather than as a refactor of
+ * a boolean. No router library is warranted for this.
+ */
+export type DeckView =
+  | { kind: "deck" }
+  | { kind: "overview" };
+
+/**
+ * An agent's tab membership exactly as the daemon reports it, mirroring
+ * `DesktopAgentDto.tab`. It is the grouping key for the agent overview, which
+ * would otherwise have to reconstruct membership from the role string —
+ * everything below already reaches the webview and used to be discarded in
+ * `agentFromDto`.
+ */
+export type AgentTab =
+  | { kind: "dashboard" }
+  | { kind: "mode"; name: string }
+  | { kind: "orchestration"; name: string; roleIndex: number; roleName: string; isStartRole: boolean; displayTitle?: string; orchestrationId?: string };
+
+/**
+ * A pane the deck knows about.
+ *
+ * PRD #745 splits this interface in two, and the split is load-bearing rather
+ * than cosmetic. The fields marked HONEST are ones the daemon genuinely
+ * reports, so a screen may present them as fact. The fields marked
+ * FIXTURE-ONLY have no source in daemon state at all — live mode hardcodes
+ * them in `agentFromDto` to `"Unavailable"` / `0` / `1` / `"—"` — and they
+ * exist solely because the existing control deck already renders them for the
+ * deterministic fixture. **No new surface may read a FIXTURE-ONLY field**: a
+ * design settled against one goes half-empty the moment it meets a real
+ * daemon. See `OverviewAgent` in `components/AgentOverview.tsx`, which is the
+ * compiler-enforced honest projection.
+ */
 export interface AgentSession {
+  /** HONEST. Per-daemon monotonic integer, so it is unique only within a daemon. */
   id: string;
+  /** HONEST. */
   paneId?: string;
+  /** HONEST. Orchestration role name, else the agent type. */
   role: string;
+  /** HONEST. */
   displayName: string;
+  /** HONEST. The daemon's agent type / CLI. */
   cli: string;
+  /** FIXTURE-ONLY — the daemon tracks no model per agent (PRD #745, #633). */
   model: string;
+  /** HONEST. */
   status: AgentStatus;
+  /** HONEST only in so far as it restates `activeTool`; otherwise a placeholder. */
   task: string;
+  /** HONEST. The agent's working directory — NOT a worktree. */
   cwd: string;
+  /** FIXTURE-ONLY — no retry counter exists anywhere in the daemon. */
   attempt: number;
+  /** FIXTURE-ONLY — `started_at` is invented on hydration, so a duration lies across a daemon restart. */
   duration: string;
+  /** FIXTURE-ONLY — no token accounting in daemon state. */
   tokens: number;
+  /** FIXTURE-ONLY — no cost accounting in daemon state. */
   cost: number;
+  /** FIXTURE-ONLY — no context-window accounting in daemon state. */
   contextPercent: number;
+  /** FIXTURE-ONLY — the daemon has no per-agent worktree or branch field. */
   worktree: string;
   writeLease: "read" | "write" | "none" | "unknown";
+  /** HONEST. */
   rows: number;
+  /** HONEST. */
   cols: number;
+  /** HONEST. Name of the tool the daemon last reported as active. */
   activeTool?: string;
+  /** HONEST. The active tool's detail, when the daemon reported one. */
+  activeToolDetail?: string;
+  /** HONEST. */
   toolCount: number;
   transcript: string;
   diff: string[];
   checks: CheckResult[];
   handoffIds: string[];
   artifacts: Artifact[];
+  /**
+   * HONEST. Which daemon owns this agent. Agent ids are per-daemon monotonic
+   * integers starting at 1, so two daemons both mint `"1"` — anything keyed by
+   * a bare `id` is wrong the moment #742 connects a second daemon. New surfaces
+   * key by the composite `(daemonId, id)`; the pre-existing bare-id maps in the
+   * bridge, the deck and the terminal registry are #742's to fix.
+   */
+  daemonId: string;
+  /** HONEST. Tab membership as the daemon reported it. Drives grouping. */
+  tab: AgentTab;
   /** True when the daemon reports this pane as an orchestration role pane. */
   inOrchestration?: boolean;
   /** True for the orchestration's start role — the coordinator an operator should message. */

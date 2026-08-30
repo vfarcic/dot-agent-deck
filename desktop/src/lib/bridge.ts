@@ -1,8 +1,9 @@
-import { createFixtureSnapshot, DEFAULT_PROFILES } from "../data/fixture";
+import { createFixtureSnapshot, DEFAULT_PROFILES, type FixtureState } from "../data/fixture";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
 import type { HandoffEdge,
   AgentSession,
   AgentStatus,
+  AgentTab,
   DeckAction,
   DeckActionResult,
   DeckSnapshot,
@@ -42,10 +43,13 @@ export interface DesktopAgentDto {
   status: "running" | "thinking" | "working" | "compacting" | "waiting_for_input" | "idle" | "error" | "unknown";
   activeTool?: { name: string; detail?: string };
   toolCount: number;
-  tab:
-    | { kind: "dashboard" }
-    | { kind: "mode"; name: string }
-    | { kind: "orchestration"; name: string; roleIndex: number; roleName: string; isStartRole: boolean; displayTitle?: string; orchestrationId?: string };
+  /**
+   * The desktop crate's `DesktopTab` is structurally identical to the app
+   * model's `AgentTab`, so the DTO reuses it and `agentFromDto` copies the
+   * value through rather than flattening it to a role string. If the IPC shape
+   * ever diverges from the model, this is where the mapping function goes.
+   */
+  tab: AgentTab;
 }
 
 /** Result returned after the ordered Tauri output channel is registered. */
@@ -146,12 +150,13 @@ function roleFromAgent(agent: DesktopAgentDto, index: number): string {
   return value ? value.charAt(0).toUpperCase() + value.slice(1) : `Agent ${index + 1}`;
 }
 
-function agentFromDto(agent: DesktopAgentDto, index: number): AgentSession {
+function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): AgentSession {
   const status = statusFromDaemon(agent.status);
   const role = roleFromAgent(agent, index);
   const orchestration = agent.tab.kind === "orchestration" ? agent.tab : undefined;
   return {
     id: agent.id,
+    daemonId,
     paneId: agent.paneId,
     role,
     displayName: agent.displayName || role,
@@ -170,12 +175,14 @@ function agentFromDto(agent: DesktopAgentDto, index: number): AgentSession {
     rows: agent.rows,
     cols: agent.cols,
     activeTool: agent.activeTool?.name,
+    activeToolDetail: agent.activeTool?.detail,
     toolCount: agent.toolCount,
     transcript: "",
     diff: [],
     checks: [],
     handoffIds: [],
     artifacts: [],
+    tab: agent.tab,
     inOrchestration: Boolean(orchestration),
     isStartRole: orchestration?.isStartRole ?? false,
   };
@@ -192,7 +199,11 @@ export function modeScopedKey(base: string): string {
 }
 
 export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnapshot, evidence?: EvidenceItem[], handoffs?: HandoffEdge[]): DeckSnapshot {
-  const agents = dto.agents.map(agentFromDto);
+  // The socket path is the only per-daemon identity the handshake gives us, and
+  // it is exactly what distinguishes one local daemon from another (PRD #745,
+  // ahead of #742).
+  const daemonId = dto.connection.socketPath;
+  const agents = dto.agents.map((agent, index) => agentFromDto(agent, index, daemonId));
   const cwd = agents.find((agent) => agent.cwd !== "Unavailable")?.cwd
     ?? dto.projectCwd
     ?? (previous?.worktree?.startsWith("/") ? previous.worktree : undefined)
@@ -237,6 +248,14 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
   };
 }
 
+/**
+ * Every scenario `?state=` accepts. Keeping the accepted values in one list
+ * next to `FixtureState` means adding a scenario cannot silently fail to be
+ * reachable from the URL — the previous inline `||` chain had to be edited in
+ * lockstep with the fixture and was not.
+ */
+const FIXTURE_STATES: readonly FixtureState[] = ["connected", "crowded", "disconnected", "error", "empty"];
+
 class FixtureDeckBridge implements DeckBridge {
   readonly mode = "fixture" as const;
   private snapshot: DeckSnapshot;
@@ -246,9 +265,7 @@ class FixtureDeckBridge implements DeckBridge {
 
   constructor() {
     const requestedState = new URLSearchParams(window.location.search).get("state");
-    const state = requestedState === "disconnected" || requestedState === "error" || requestedState === "empty"
-      ? requestedState
-      : "connected";
+    const state = FIXTURE_STATES.find((candidate) => candidate === requestedState) ?? "connected";
     this.snapshot = createFixtureSnapshot(state);
   }
 

@@ -260,4 +260,55 @@ describe("TauriDeckBridge", () => {
     expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action: { type: "restart_daemon" } });
     await bridge.dispose();
   });
+
+  it("carries the daemon identity and the daemon's own tab membership onto the agent model", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+
+    const mapped = mapDesktopSnapshot(structuredClone(snapshot));
+
+    // The socket path is the only per-daemon identity the handshake reports,
+    // and agent ids are per-daemon integers — so nothing may key on `id` alone.
+    expect(mapped.agents[0]).toMatchObject({
+      daemonId: "/tmp/deck.sock",
+      activeTool: "apply_patch",
+      activeToolDetail: "desktop/src/App.tsx",
+      tab: { kind: "orchestration", name: "dot-agent-deck", roleIndex: 1, roleName: "coder", isStartRole: false, displayTitle: "dot-agent-deck" },
+    });
+  });
+});
+
+describe("FixtureDeckBridge scenarios", () => {
+  const search = window.location.search;
+  afterEach(() => window.history.replaceState({}, "", `/${search}`));
+
+  it("reaches the crowded scenario from ?state=crowded", async () => {
+    window.history.replaceState({}, "", "/?fixture=1&state=crowded");
+    const { createDeckBridge } = await import("./bridge");
+
+    const view = await createDeckBridge("fixture").connect();
+
+    expect(view.agents).toHaveLength(15);
+    expect(view.connection.status).toBe("connected");
+    expect(new Set(view.agents.map((agent) => agent.tab.kind))).toEqual(new Set(["orchestration", "mode", "dashboard"]));
+  });
+
+  it("treats ?state=empty as a healthy daemon owning nothing, not as a disconnected one", async () => {
+    window.history.replaceState({}, "", "/?fixture=1&state=empty");
+    const { createDeckBridge } = await import("./bridge");
+
+    const view = await createDeckBridge("fixture").connect();
+
+    expect(view.connection.status).toBe("connected");
+    expect(view.agents).toHaveLength(0);
+  });
+
+  it("falls back to the four-agent scenario for an unknown ?state=", async () => {
+    window.history.replaceState({}, "", "/?fixture=1&state=nonsense");
+    const { createDeckBridge } = await import("./bridge");
+
+    const view = await createDeckBridge("fixture").connect();
+
+    expect(view.agents).toHaveLength(4);
+    expect(view.connection.status).toBe("connected");
+  });
 });
