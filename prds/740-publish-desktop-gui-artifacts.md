@@ -28,12 +28,13 @@ Users clear the OS trust warning by hand (`xattr -dr com.apple.quarantine` on ma
 - New `release.yml` jobs that bundle in parallel with the existing CLI matrix and upload to the release *after* it is created, so `finalize` never waits on them.
 - Asset naming, checksums, and a fixed release-notes section that states plainly that these are unsigned alpha builds and how to clear the OS warning.
 - Fixing `desktop/scripts/prepare-sidecar.sh` to handle the `.exe` suffix on Windows triples, with fast-tier test coverage — groundwork only, shipped without a Windows artifact (see Decision 1).
-- A short user-facing install page under `docs/`, because "unsigned" means the quarantine instructions must live somewhere linkable.
 
 ### Out of Scope
 
 - **Windows artifacts.** Deferred — see Decision 1. The `.exe` groundwork lands; the artifact does not.
 - **Signing, notarization, and SmartScreen reputation.** That is [#757](https://github.com/vfarcic/dot-agent-deck/issues/757) in full.
+- **x86_64 macOS.** Measured out, not assumed out — see Decision 2.
+- **A user-facing install page.** The alpha ships unadvertised on purpose; [#765](https://github.com/vfarcic/dot-agent-deck/issues/765) writes the page when the GUI leaves alpha. See Decision 11.
 - **aarch64 Linux.** See Decision 8.
 - **`.rpm`.** `deb` plus `AppImage` covers Debian/Ubuntu natively and everything else portably; nobody has asked for `rpm`.
 - **Auto-update.** Tauri's updater needs signing keys and an update endpoint; it belongs with #757 or later.
@@ -60,6 +61,19 @@ An incidental benefit of *not* deferring Windows would have been fixing a live b
 The issue suggests macOS arm64 alone as a first slice. The reviewer's read was Linux first, as the cheapest honest target. Both are arguing about the wrong axis: the expensive part is the *scaffolding* — a new matrix job, a pnpm install, a sidecar stage, a `tauri build`, an asset rename, an upload path, and the `finalize` interaction — and that scaffolding is shared. Once it exists for one platform, a second is one matrix row plus its platform-specific dependency step.
 
 Splitting them means paying the review-and-merge cost twice for one workflow. Doing both means the first shipped alpha covers both dogfooding platforms. The genuinely platform-specific unknowns are small and independent: macOS needs a `.icns` that does not exist in the tree yet, and Linux needs bundler packages beyond the compile set already installed in `ci.yml`.
+
+**x86_64 macOS is not built**, and the evidence is this project's own release telemetry rather than a guess about the market. Across the seven releases `v0.36.0` through `v0.38.0`, GitHub's per-asset download counts are:
+
+| Asset | Downloads across v0.36.0–v0.38.0 |
+| --- | --- |
+| `dot-agent-deck-darwin-arm64` | 77 |
+| `dot-agent-deck-linux-amd64` | 78 |
+| `dot-agent-deck-linux-arm64` | 11 |
+| `dot-agent-deck-darwin-amd64` | **1** |
+
+One download, in v0.36.0, across seven releases. The CLI has shipped an Intel Mac binary the whole time and essentially nobody has taken it, so the "an Intel audience is already assumed" argument for the GUI turns out to be assuming an audience that is not there. Building a `.dmg` for it would mean a second macOS matrix leg, a cross-compile from the arm64 runner, and a bundle nobody can test on real hardware — for a platform Apple stopped selling in 2023 and whose users cannot run an arm64 build under Rosetta in any case (Rosetta translates x86 to arm, not the reverse, so this is genuinely all-or-nothing for them).
+
+If an Intel Mac user ever asks, adding the matrix row is an afternoon. Until then it is a bundle built for one download. (The same table raises a fair question about whether the *CLI* should keep shipping `darwin-amd64` — noted as an observation, deliberately not proposed here, and not this PRD's business.)
 
 ### Decision 3 — the version is injected, never committed
 
@@ -118,13 +132,21 @@ The CLI ships `linux-arm64` by cross-compiling in a `cross` container. That cont
 
 `desktop/src-tauri/icons/` holds `icon.png` (512×512), `icon.ico` and `icon.svg`, and the artwork is genuinely ours — a terminal window with "A"/"D" letterforms, not the Tauri template. Two gaps: the config references only `icons/icon.png` (`tauri.conf.json:32`), so the `.ico` is unused, and **there is no `.icns` anywhere in the tree**, which is what macOS `.app`/`.dmg` bundles want. Whether `tauri-bundler` 2.11.4 synthesizes a missing `.icns` from the PNG or hard-errors is genuinely unknown — the bundler ships inside the prebuilt npm CLI and could not be read — so M1 determines it empirically and generates the missing sizes if needed.
 
-[#746](https://github.com/vfarcic/dot-agent-deck/issues/746) will replace the artwork later. Waiting for it would block an alpha on a design task; changing a dock icon between alpha builds is an acceptable cost, and #746 notes the dependency is soft.
+[#746](https://github.com/vfarcic/dot-agent-deck/issues/746) will replace the artwork later, and the intent is explicitly to **re-ship the bundles carrying the new icon as part of that PRD** rather than to leave the alpha looking like a draft forever. Waiting for it would block an alpha on a design task; changing a dock icon between alpha builds is an acceptable cost, and #746 itself notes the dependency is soft.
 
 ### Decision 10 — no experimental flag, and no contract change
 
 **CLAUDE.md rule 9 (experimental flag): no.** The flag is a *presentation* switch gating a TUI render or input-binding seam. This PRD adds no pane, field, command, tab, footer or keybinding — it adds CI jobs and release assets. There is no seam to gate, and the flag could not hide a published `.dmg` in any case. PRD #176 reached the same conclusion for the same reason and stated the alternative explicitly: for a separate binary, maturity is enforced by *packaging*, and Decisions 4, 5 and the docs framing are how this PRD does that.
 
 **CLAUDE.md rule 12 (cross-version contract): no change.** Nothing here touches the daemon, the TUI↔daemon protocol, orchestration or hooks. The wire shape does not move, no field changes meaning, and `PROTOCOL_VERSION` stays put. The only non-CI source change is `desktop/scripts/prepare-sidecar.sh`, a build-time staging script. Under the `0.x` policy in `docs/develop/versioning.md` this is a **feature → patch** bump, and its changelog fragment is `changelog.d/740.feature.md`. The cross-version manual test does not apply because there is no contract to test across.
+
+### Decision 11 — the alpha ships unadvertised
+
+No user-facing documentation page. The assets are on the release, the release notes carry a fixed unsigned-alpha section naming them and giving the exact `xattr -dr com.apple.quarantine` invocation, and that is the whole of the public surface. This holds PRD #176 M5.1's "unadvertised" framing intact, and it is the honest position while the artifact is unsigned, Windows-less, and about to change its icon: an install page is an invitation, and this build is not yet inviting.
+
+The obligation does not disappear, it is scheduled. [#765](https://github.com/vfarcic/dot-agent-deck/issues/765) covers writing the published install page under `docs/` when the GUI leaves alpha, and names the three things that would each make it due: #757 (signed, so the install story stops being an apology), #746 (logo settled, so screenshots do not immediately go stale), and #164 (Windows exists, so the page is not two-thirds of a platform matrix).
+
+`docs/develop/desktop-gui.md` stays where it is and gets a short note that packaging now exists — it is the maintainer guide, excluded from the Docusaurus build, and a different document for a different audience.
 
 ### Build details worth writing down before someone rediscovers them
 
@@ -168,7 +190,7 @@ The honest limit: the release workflow itself cannot be tested without cutting a
 - [ ] **M4 — `release.yml` wiring.** `desktop-bundle` and `desktop-publish` jobs per Decision 4, plus the `skip_desktop` dispatch input, plus the static check that `finalize` stays independent.
 - [ ] **M5 — Asset naming, checksums and release notes.** The rename step, `checksums-desktop-alpha.txt`, and the fixed unsigned-alpha section with the quarantine instructions.
 - [ ] **M6 — Verified by a real run.** A `workflow_dispatch` execution produces downloadable assets; the macOS and Linux bundles are installed and launched on real machines and connect to a daemon. This is the gate that the whole path works.
-- [ ] **M7 — Docs and changelog.** A short user-facing install page under `docs/` and listed in `site/sidebars.js` (published, per CLAUDE.md rule 11 — this is user-facing, not maintainer-facing), a note in `docs/develop/desktop-gui.md` that packaging now exists, PRD #176's M5.1 amended per Decision 4, and `changelog.d/740.feature.md`.
+- [ ] **M7 — Docs and changelog.** A note in `docs/develop/desktop-gui.md` that packaging now exists, PRD #176's M5.1 amended per Decision 4, and `changelog.d/740.feature.md`. **No published `docs/` page** and no `site/sidebars.js` entry, per Decision 11 — that is [#765](https://github.com/vfarcic/dot-agent-deck/issues/765).
 
 ## Risks
 
@@ -182,11 +204,7 @@ The honest limit: the release workflow itself cannot be tested without cutting a
 
 ## Open Questions
 
-1. **Is x86_64 macOS built too?** The issue flags this as needing an explicit decision and this PRD does not settle it. In favour: the CLI already ships `darwin-amd64`, so an Intel audience is already assumed, and it is one more matrix row cross-compiled from the arm64 runner. Against: it doubles macOS bundling for a shrinking platform, and cross-compiled Tauri bundles from arm64 to x86_64 are one more thing that can fail in a way nobody notices until a user reports it. **Lean: yes, include it**, matching the CLI's existing coverage — but say so explicitly, because dropping it later is easy and adding it after users have formed expectations is not.
-2. **Is Windows genuinely deferred?** The issue title says three platforms; Decision 1 proposes two, on the grounds that the missing Windows *daemon* build is #164's work. This is the largest deviation from the issue as written and needs explicit sign-off rather than inference.
-3. **"Every release" versus #176 M5.1's "excluded from the default release".** Decision 4 chooses every release, non-gating, and proposes amending M5.1's wording. Confirm that is the intended reading rather than a scope expansion.
-4. **Does the alpha get a published docs page, or stay undocumented?** M5.1's frame is "unadvertised". But unsigned means users *need* the quarantine command, and a release-notes line is not a durable home for it. Proposed: one short published page under `docs/`, linked from the release notes, that leads with "alpha, unsigned". **Lean: publish it** — an undocumented artifact that requires a terminal incantation to open is worse than an honestly-labelled documented one.
-5. **Ship on the current icons, or wait for [#746](https://github.com/vfarcic/dot-agent-deck/issues/746)?** Decision 9 says ship. Confirm the dock-identity churn between alpha builds is acceptable.
+None outstanding. All five questions raised at plan time were answered before implementation began; the answers are folded into Decisions 1, 2, 4, 9 and 11, and the reasoning is recorded in the Work Log entry below.
 
 ## Work Log
 
@@ -205,3 +223,19 @@ And three things the issue did not anticipate, one of them decisive:
 - **`bundle.active` is `false` in the base config**, flipped only by the overlay, so a bundling invocation that loses `--config` produces nothing and still exits 0 — a failure mode that looks like success.
 
 Also noted for whoever picks this up: [#487](https://github.com/vfarcic/dot-agent-deck/issues/487) covers retiring the `0.1.0` placeholders repo-wide and overlaps Decision 3; `Taskfile.yml:226`'s Scoop manifest already points at an unpublished Windows binary with an empty hash, which belongs to #164; and #754 has no PR open against it.
+
+### 2026-08-30 — Plan confirmed
+
+All five open questions were answered by the maintainer, and the PRD now carries decisions rather than questions.
+
+**x86_64 macOS: no.** The question came back as "does anyone use x86 Macs these days?", which turned out to be answerable from this project's own release telemetry instead of an opinion about the market. Across `v0.36.0`–`v0.38.0`, `darwin-amd64` was downloaded **once**, against 77 for `darwin-arm64` and 78 for `linux-amd64`. The strongest argument for building it — that the CLI already ships it, so the audience is assumed — inverts once the numbers are in: the CLI has shipped it the whole time and nobody has taken it. Folded into Decision 2.
+
+**Windows: deferred, confirmed.** The chain is what settled it, not #754 on its own. A Tauri bundle carries the daemon as a sidecar; there is no published Windows daemon binary; adding one is issue #164's substance and would mean shipping the first Windows daemon build without #164's Windows-VM e2e validation, under a packaging issue number. #754 is the second reason and the one that would hurt users: even with a sidecar, live workflow launch is refused on Windows by both `dto.rs:491` and `platform.ts`, so the headline action would be off — and fixing it properly puts the daemon's OS in the handshake, which is a rule 12 contract change that would turn this patch into a minor. The `.exe` groundwork lands anyway so the next person does not re-derive it.
+
+**"Every release": confirmed, by topology rather than by a flag.** The three statements in play — the issue title's "every release", M5.1's "excluded from the default release", and the issue's own "gate it so it cannot slow or break an ordinary tag" — only conflict if "excluded" is read as the goal rather than as the mechanism someone reached for before anyone had looked at the job graph. The two properties M5.1 was protecting are that the GUI is labelled preview and that it cannot compromise the CLI release. Decision 4's wiring gives the second one more strongly than exclusion does: because `finalize` does not list `desktop-bundle` in `needs:`, the bundler cannot slow the release *and* cannot fail it. A `workflow_dispatch` gate was rejected for the opposite reason — something a human must remember to trigger gets triggered for two releases and then never, which is how an alpha artifact ends up six versions stale and worse than none.
+
+**Documentation: unadvertised, with the obligation scheduled.** New Decision 11. [#765](https://github.com/vfarcic/dot-agent-deck/issues/765) filed to write the published install page when the GUI leaves alpha.
+
+**Icons: ship on what is in the tree**, and re-ship carrying the new icon as part of #746 rather than leaving the alpha looking like a draft. Folded into Decision 9.
+
+Also surfaced during planning and deliberately left out of this PRD's scope: **CLAUDE.md rule 2's mandated `cargo clippy --workspace --all-targets --features e2e` cannot run on a Linux machine that lacks the GTK/WebKit development packages.** `--workspace` has included `dot-agent-deck-desktop` since `daf94f0`, those packages are in neither `devbox.json` nor the host used for this planning session, and the gate dies at `glib-2.0.pc not found`. `ci.yml` installs them for its own `build` job, so CI is unaffected and this is invisible there. Every Linux contributor without those packages has been unable to run the mandated pre-commit gate since `daf94f0` landed. Adjacent to this PRD but not part of it.
