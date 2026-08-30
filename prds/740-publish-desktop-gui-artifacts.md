@@ -31,7 +31,7 @@ Users clear the OS trust warning by hand (`xattr -dr com.apple.quarantine` on ma
 
 ### Out of Scope
 
-- **Windows artifacts.** Deferred — see Decision 1. The `.exe` groundwork lands; the artifact does not.
+- **Windows artifacts.** Deferred behind [#741](https://github.com/vfarcic/dot-agent-deck/issues/741) — see Decision 1. The `.exe` groundwork lands; the artifact does not.
 - **Signing, notarization, and SmartScreen reputation.** That is [#757](https://github.com/vfarcic/dot-agent-deck/issues/757) in full.
 - **x86_64 macOS.** Measured out, not assumed out — see Decision 2.
 - **A user-facing install page.** The alpha ships unadvertised on purpose; [#765](https://github.com/vfarcic/dot-agent-deck/issues/765) writes the page when the GUI leaves alpha. See Decision 11.
@@ -44,17 +44,29 @@ Users clear the OS trust warning by hand (`xattr -dr com.apple.quarantine` on ma
 
 ## Technical Approach
 
-### Decision 1 — Windows is deferred, and the reason is not the one the issue gives
+### Decision 1 — Windows is deferred, because a Windows GUI has no daemon it can reach
 
-The issue frames Windows as blocked on two things: the `prepare-sidecar.sh` `.exe` fix, and [#754](https://github.com/vfarcic/dot-agent-deck/issues/754) leaving the GUI degraded. Both are real, but there is a third that neither the issue nor its comment mentions, and it is the decisive one.
+The issue frames Windows as blocked on two things: the `prepare-sidecar.sh` `.exe` fix, and [#754](https://github.com/vfarcic/dot-agent-deck/issues/754) leaving the GUI degraded. Both are real. But the decisive question is simpler, and it is the one to ask first: **what daemon would a Windows GUI actually talk to?**
 
-**There is no Windows daemon binary published anywhere.** `release.yml`'s matrix has exactly four entries — `x86_64`/`aarch64-unknown-linux-gnu` and `x86_64`/`aarch64-apple-darwin` — and none is `*-pc-windows-*`. `gh release view v0.38.0` confirms it: five assets, none Windows. A Tauri bundle carries the daemon as a sidecar, so a Windows GUI needs a Windows daemon build, and adding a Windows leg to the release matrix is the substance of [#164](https://github.com/vfarcic/dot-agent-deck/issues/164) ("Windows release artifacts, e2e validation & docs"), which is not started. Shipping a Windows GUI therefore means doing #164's work inside this PRD, under a different issue number, without #164's e2e validation.
+There are two candidate answers. Today neither works.
 
-Stacked on top of that, [#754](https://github.com/vfarcic/dot-agent-deck/issues/754) means the Windows GUI would ship with its headline action switched off: `desktop/src-tauri/src/dto.rs:491` blocks live workflow launch on Windows, and the frontend mirrors the block in `desktop/src/lib/platform.ts`. A user would get an app that connects, lists agents and drives terminals, but cannot start a workflow. #754 is itself a TUI↔daemon contract change (it adds the daemon's OS to the handshake), which would drag this packaging PRD across CLAUDE.md rule 12's breaking-change line and turn a patch into a minor.
+**A local Windows daemon does not exist as a download.** `release.yml`'s matrix has exactly four entries — `x86_64`/`aarch64-unknown-linux-gnu` and `x86_64`/`aarch64-apple-darwin` — and none is `*-pc-windows-*`; `gh release view v0.38.0` confirms five assets, none Windows. The daemon *compiles* and runs natively on Windows ([#42](https://github.com/vfarcic/dot-agent-deck/issues/42) and [#163](https://github.com/vfarcic/dot-agent-deck/issues/163) landed the platform backends), so a Windows user could build one — but "build the daemon from source" is precisely the friction this PRD exists to remove. Publishing one is the substance of [#164](https://github.com/vfarcic/dot-agent-deck/issues/164), which is not started.
 
-So: **the `.exe` fix lands here, the Windows artifact does not.** The fix is small, the issue names it explicitly, and leaving it out means the next person re-derives it. It ships as verified-by-reading groundwork — Tauri resolves external binaries as `{path}-{triple}{ext}` with `ext = ".exe"` on Windows (`tauri-utils-2.9.3/src/resources.rs:52-59`) — plus a fast-tier test, not as a shipped artifact.
+**A remote daemon is the intended shape, and Windows cannot reach one.** [#741](https://github.com/vfarcic/dot-agent-deck/issues/741) — "connect the desktop GUI to any daemon, anywhere, configured in the app" — is where that lives, and remote attach is already *proven*: #741 records a measured session on 2026-08-29 attaching to a real remote daemon over `ssh -N -L /tmp/dad-remote.sock:/run/user/1000/dot-agent-deck-attach.sock`, listing nine remote agents and streaming their PTYs live. Transport, as #741 puts it, is not the obstacle.
 
-An incidental benefit of *not* deferring Windows would have been fixing a live bug: `Taskfile.yml:226` greps `checksums.txt` for `dot-agent-deck-windows-amd64.exe`, which is never built, so the published Scoop manifest carries an empty hash and a 404 URL. That bug is real and pre-existing, it belongs to #164, and it is noted here so it is not lost.
+But that proof is **Unix client to Unix daemon**, and the transport is `cfg`-dispatched rather than universal. `src/platform/ipc/` hides "the Unix-domain-socket / Windows-named-pipe split behind a single `cfg`-dispatched API", and `attach_socket_path()` (`src/platform/paths.rs:1147-1180`) returns a filesystem socket path on Unix and `\.\pipe\dot-agent-deck-{user}-attach` on Windows. A Windows client speaks named pipes; a forwarded Unix socket is not one, and OpenSSH on Windows does not forward a remote Unix socket onto a local named pipe. Independently of that, the desktop crate contains **no remote code at all** — `grep -rniE "\bssh\b|\btcp\b|remote" desktop/src-tauri/src/*.rs` returns zero lines — so the app cannot establish the tunnel itself either. #741 lists exactly that as work still to do: "the app must manage the tunnel itself", because launched from Finder there are no environment variables to carry a socket path.
+
+So a Windows alpha shipped today is an application that can connect to nothing: no daemon to download, and no transport to a remote one.
+
+**#754 is the third reason, not the first.** Even once a Windows GUI *can* reach a Linux daemon, the launch guard tests the **client's** OS (`desktop/src-tauri/src/dto.rs:491`, mirrored in `desktop/src/lib/platform.ts`) rather than the daemon's, so it would wrongly refuse workflow launch in precisely the Windows-GUI-to-Linux-daemon configuration that makes a Windows build worth having. Fixing it properly puts the daemon's OS in the handshake, which is a CLAUDE.md rule 12 contract change — it would drag this packaging PRD across the breaking-change line and turn a patch into a minor.
+
+**The dependency is #741, not #164.** This is worth stating precisely because the intuitive answer is the wrong one. #164 would deliver a downloadable *Windows daemon*, which only enables the local story — a Windows user running their agents on their own Windows box. The shape actually wanted here is a Windows GUI driving a Linux daemon, and for that #164 is not needed at all. What is needed is #741, plus an answer inside #741 to the Windows transport question, which its placeholder body does not currently address. Windows GUI packaging sequences after that, and the transport question belongs in #741 rather than here.
+
+**What lands here anyway: the `.exe` fix.** It is small, the issue names it explicitly, and leaving it out means the next person re-derives it. Two places, both fatal: cargo emits `dot-agent-deck.exe` on `*-pc-windows-*` so the copy's *source* is wrong, and Tauri resolves external binaries as `{path}-{triple}{ext}` with `ext = ".exe"` on Windows (`tauri-utils-2.9.3/src/resources.rs:52-59`) so the *destination* name is wrong too. It ships as verified-by-reading groundwork plus a fast-tier test, not as a shipped artifact.
+
+One thing deliberately not claimed: that a Windows bundle *must* carry a sidecar. A GUI that only ever attaches to a remote daemon needs no local daemon binary, and a `tauri.windows.conf.json` platform overlay clearing `externalBin` is the plausible mechanism. That was not verified — the check was cut short — so it is recorded as an open avenue rather than a fact. It does not change the decision, because the blocker is reachability, not packaging.
+
+An unrelated bug is worth recording before it is lost: `Taskfile.yml:226` builds the Scoop manifest by grepping `checksums.txt` for `dot-agent-deck-windows-amd64.exe`, which is never built, so the **published Scoop manifest currently carries an empty hash and a 404 URL**. It belongs to #164, it is shipping broken today, and adding a Windows leg would fix it incidentally.
 
 ### Decision 2 — macOS arm64 and Linux x86_64 ship together in one slice
 
@@ -239,3 +251,13 @@ All five open questions were answered by the maintainer, and the PRD now carries
 **Icons: ship on what is in the tree**, and re-ship carrying the new icon as part of #746 rather than leaving the alpha looking like a draft. Folded into Decision 9.
 
 Also surfaced during planning and deliberately left out of this PRD's scope: **CLAUDE.md rule 2's mandated `cargo clippy --workspace --all-targets --features e2e` cannot run on a Linux machine that lacks the GTK/WebKit development packages.** `--workspace` has included `dot-agent-deck-desktop` since `daf94f0`, those packages are in neither `devbox.json` nor the host used for this planning session, and the gate dies at `glib-2.0.pc not found`. `ci.yml` installs them for its own `build` job, so CI is unaffected and this is invisible there. Every Linux contributor without those packages has been unable to run the mandated pre-commit gate since `daf94f0` landed. Adjacent to this PRD but not part of it.
+
+### 2026-08-30 — Windows reasoning corrected
+
+The maintainer challenged Decision 1's original reasoning, and the challenge landed. The first draft argued Windows was blocked because "a Tauri bundle carries the daemon as a sidecar, and no Windows daemon binary is published, so there is nothing to put in the bundle." His counter: the desktop app is a *client*, meant to connect to a daemon anywhere, so a Windows user could attach to a Linux daemon and would need no Windows daemon at all — and there is a PRD for exactly that.
+
+He is right about the intent, and the original reason was too absolute. A sidecar-less Windows bundle is plausible, and the sidecar is therefore not an inherent blocker. What the correction surfaced is a **stronger** blocker sitting underneath it: reachability. The IPC transport is `cfg`-dispatched — a Unix domain socket on Unix, a named pipe on Windows — so a Windows client cannot attach to the forwarded Unix socket that #741's measured 2026-08-29 remote session used, and OpenSSH on Windows will not bridge the two. The desktop crate has no remote code of its own to work around that, and #741 lists app-managed tunnelling as work still outstanding.
+
+Two things changed as a result. The stated reason is now reachability rather than the sidecar, and the **named dependency moved from #164 to #741** — #164 would only unlock the local Windows story, while the remote shape actually wanted needs #741 and does not need #164 at all. The conclusion is unchanged: Windows is deferred, its `.exe` groundwork still lands.
+
+Surfaced and worth acting on separately: **#741's placeholder body does not mention the Windows transport question**, and its measured evidence is Unix-to-Unix. Whoever writes #741 in full should decide there whether app-managed tunnelling covers Windows named pipes, because that decision — not this PRD — is what gates a Windows GUI.
