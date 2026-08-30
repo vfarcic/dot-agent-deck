@@ -15,6 +15,46 @@ use crate::state::SessionStatus;
 /// spamming one per frame. Debug builds trip the `debug_assert!` instead.
 static SIZE_MISMATCH_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// PRD #313 M3: the zoom indicator, appended after the role name in the zoomed
+/// pane's border title (`orchestrator [Z]`). tmux marks a zoomed window with a
+/// `Z` in its status line; here the border is the only chrome zoom keeps, so the
+/// marker rides on it.
+///
+/// **Bracketed, and AFTER the name — both are load-bearing.** Bracketed so it
+/// cannot be confused with a role name, an agent's own output or a card label.
+/// After the name because the pane-box scan every orchestration test anchors on
+/// (`common::role_pane_left_edge`) looks for `<corner><role>` with no separator
+/// — a marker placed before the name would break that scan and take
+/// `tabs/orchestration/007` and `e2e_idle_worker_detector.rs` down with it.
+///
+/// It is rendered as its OWN span, in [`zoom_marker_style`], rather than being
+/// concatenated into the title string — see that function for why.
+pub(crate) const ZOOM_TITLE_MARKER: &str = "[Z]";
+
+/// PRD #313 M3: the style the [`ZOOM_TITLE_MARKER`] is drawn in — deliberately
+/// NOT the title's own style.
+///
+/// A pane's border title is a *display name*, and display names are agent-
+/// reachable: they arrive over the hook socket and are sanitized by
+/// `sanitize_display_name`, which strips control characters and bidi overrides
+/// but not brackets. So an agent can call itself `worker [Z]` and, as plain
+/// title text, make an UNZOOMED pane look zoomed. Rejecting or rewriting such a
+/// name is the wrong fix — a user who names a role `worker [Z]` and confuses
+/// themselves is not a security boundary, and the sanitizer is shared code — but
+/// giving the real indicator a channel that plain text cannot occupy is cheap,
+/// and it serves M3's actual goal anyway: an indicator that stands out is better
+/// at the job of stopping you from forgetting you are zoomed.
+///
+/// `REVERSED` rather than a bare colour so the marker is legible on either
+/// terminal theme and against whichever border colour the pane's focus/status
+/// resolved to (PRD #155 M3), and `BOLD` on top so it survives a terminal that
+/// renders reverse video weakly.
+pub(crate) fn zoom_marker_style() -> Style {
+    Style::default()
+        .fg(palette::FOCUSED)
+        .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+}
+
 /// Converts a vt100 color to a ratatui Color.
 fn vt100_color_to_ratatui(color: vt100::Color) -> Color {
     match color {
@@ -91,6 +131,20 @@ pub struct TerminalWidget {
     /// tripping the contract assert. The production render path opts in via
     /// [`TerminalWidget::contract_guaranteed`].
     contract_guaranteed: bool,
+    /// PRD #313 M3: does this pane fill a ZOOMED frame — i.e. is it the one
+    /// pane a zoom left on screen? When `true` the border title gains the
+    /// [`ZOOM_TITLE_MARKER`], rendered as a separate span in
+    /// [`zoom_marker_style`] so it cannot be forged by a display name that
+    /// merely contains the same three characters.
+    ///
+    /// Kept OUT of `title` on purpose. `title` is the pane's name and is what
+    /// the PRD #84 contract diagnostic reports; the marker is deck chrome, so
+    /// concatenating the two would both style the marker like a name and put
+    /// deck state into a diagnostic that is meant to identify a pane.
+    ///
+    /// Defaults to `false` in [`TerminalWidget::new`]. Set it via
+    /// [`TerminalWidget::with_zoom_marker`].
+    zoom_marker: bool,
 }
 
 impl TerminalWidget {
@@ -102,7 +156,22 @@ impl TerminalWidget {
             status: None,
             input_active: true,
             contract_guaranteed: false,
+            zoom_marker: false,
         }
+    }
+
+    /// PRD #313 M3: mark this pane as the one filling a zoomed frame, so its
+    /// border title carries the [`ZOOM_TITLE_MARKER`] in [`zoom_marker_style`].
+    ///
+    /// Pass `true` for the pane the LAYOUT actually expanded this frame — not
+    /// merely the focused one. The two normally coincide, but the expanded slot
+    /// falls back to pane 0 when nothing in the stack is focused, and a
+    /// full-frame pane with no marker is precisely the "you forgot you were
+    /// zoomed" failure M3 exists to prevent. See the caller in
+    /// `render_terminal_panes`.
+    pub fn with_zoom_marker(mut self, zoom_marker: bool) -> Self {
+        self.zoom_marker = zoom_marker;
+        self
     }
 
     /// Issue #88 follow-up: tell the widget whether keystrokes currently reach
@@ -189,7 +258,20 @@ impl Widget for TerminalWidget {
             // Borrow the title (no per-frame clone): the block is consumed by
             // `block.render` below, releasing the borrow, so `self.title` stays
             // available for the contract-violation diagnostic (PRD #84 M5).
-            .title(self.title.as_str());
+            //
+            // PRD #313 M3: while this pane fills a zoomed frame the marker rides
+            // after the name as its OWN span, so it is drawn in
+            // `zoom_marker_style` and a display name that merely spells `[Z]`
+            // renders as ordinary title text beside it.
+            .title(if self.zoom_marker {
+                Line::from(vec![
+                    Span::raw(self.title.as_str()),
+                    Span::raw(" "),
+                    Span::styled(ZOOM_TITLE_MARKER, zoom_marker_style()),
+                ])
+            } else {
+                Line::from(self.title.as_str())
+            });
 
         let inner = block.inner(area);
         block.render(area, buf);

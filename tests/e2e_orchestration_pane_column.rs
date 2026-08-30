@@ -314,3 +314,394 @@ fn orchestration_008_ctrl_l_forwards_to_pty_on_non_orchestration_tab() {
         deck.snapshot_grid()
     );
 }
+
+// ---------------------------------------------------------------------------
+// PRD #313 — `Ctrl+Z` in command mode zooms the focused role pane.
+// ---------------------------------------------------------------------------
+
+/// The zoom indicator fused into the focused pane's border title while zoomed —
+/// a bracketed `Z`, mirroring tmux's status-line `Z`. Bracketed rather than a
+/// bare letter so it cannot collide with a role name, an agent's own output, or
+/// a sidebar card label anywhere on the settled grid.
+///
+/// Bracketing narrows the accidental collisions, not the deliberate ones: a
+/// display name is agent-reachable and `sanitize_display_name` does not strip
+/// brackets. So every POSITIVE assertion below goes through
+/// [`role_border_title_marked`] rather than searching the whole grid; the
+/// negatives stay broad, which is the stronger direction for them.
+const ZOOM_MARKER: &str = "[Z]";
+
+/// Column of the box drawn for the role pane named `role`, or `None` when no
+/// such expanded box is on the grid. [`orchestrator_box_edge`] is this with
+/// `"orchestrator"`; under `PaneLayout::Stacked` only the FOCUSED role's pane is
+/// drawn, so a test that has jumped focus to a non-start role (as the real-agent
+/// zoom test below does) has to name the role it focused. The scan itself lives
+/// in the harness, for the same one-copy reason recorded there.
+fn role_box_edge(grid: &str, role: &str) -> Option<u16> {
+    common::role_pane_left_edge(grid, role).map(|column| column as u16)
+}
+
+/// Whether the zoom marker rides on the BORDER TITLE of the expanded box drawn
+/// for `role` — the positional form of `grid.contains(ZOOM_MARKER)`.
+///
+/// The bare `contains` is not safe to assert on: a pane title is a *display
+/// name*, display names arrive over the hook socket, and
+/// `sanitize_display_name` strips control characters and bidi overrides but not
+/// brackets — so an agent that calls itself `worker [Z]` paints that token onto
+/// an UNZOOMED pane's border (or a sidebar card) and satisfies a whole-grid
+/// search with nothing zoomed at all. Requiring the marker at the END of the
+/// title of the box the geometry actually expanded is what a text-only vt100
+/// grid can still prove; the styled-span half — the real marker is drawn
+/// REVERSED, which plain title text never is — is asserted by
+/// `render/layout/006`, whose `Buffer` keeps the cells' attributes.
+///
+/// `ends_with` rather than an exact title match on purpose: a real agent may
+/// rename itself mid-run, and this must pin WHERE the marker is, not what the
+/// role happens to be called at that moment.
+fn role_border_title_marked(grid: &str, role: &str) -> bool {
+    common::role_pane_border_title(grid, role).is_some_and(|title| title.ends_with(ZOOM_MARKER))
+}
+
+/// Scenario: Open the `orch-focus-lifecycle` fixture's 3-role orchestration on a
+/// 120-column PTY and confirm `Ctrl+Z` zooms only where it should. First press
+/// `Ctrl+Z` while still in PaneInput and confirm the layout does NOT change —
+/// there it is `0x1a`, job control belonging to the agent. Then `Ctrl+d` to
+/// command mode and press `Ctrl+Z`: the sidebar disappears, the box moves to
+/// column 0 and its border title gains the `[Z]` marker, while every role's
+/// agent is still registered and running behind the zoom. A second press restores
+/// the 34/66 split with the other roles' sidebar cards — and `beta`'s live
+/// hook-driven `Working` status — visible again.
+#[spec("tabs/orchestration/011")]
+#[test]
+fn orchestration_011_z_zooms_the_focused_role_pane_in_command_mode() {
+    let deck = TuiDeck::builder()
+        .with_pty_size(120, 40)
+        .launch_with_fixture("orch-focus-lifecycle");
+    write_beta_agent(&deck);
+    deck.wait_for_string("No active sessions");
+
+    open_orchestration(&deck);
+    deck.wait_for_string("alpha");
+    deck.wait_for_string("beta");
+
+    // `beta` reaches `Working` from its own self-posted hook events. Waiting for
+    // it BEFORE zooming is what lets the post-unzoom check below mean "the
+    // status survived the round trip" rather than "it happened to arrive late".
+    assert!(
+        common::wait_until(Duration::from_secs(15), || {
+            has_role_status(&deck.snapshot_grid(), "beta", "Working")
+        }),
+        "precondition: beta's sidebar status never reached Working:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Baseline: the default 34/66 split puts the pane column's left edge at 34%
+    // of the 120-col frame (col 40 or 41, depending on Percentage rounding).
+    let default_edge = pane_column_left_edge(&deck.snapshot_grid());
+    assert!(
+        (40..=41).contains(&default_edge),
+        "expected the default 34/66 split's pane-column edge near col 40/41, \
+         got {default_edge}\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // (1) In PaneInput `Ctrl+Z` is JOB CONTROL — the tty's SUSP character,
+    // `0x1a` — and it belongs to whatever runs in the role pane, so it must not
+    // zoom. Asserted as a predicate that is expected to TIME OUT (the
+    // `orchestration_007` shape).
+    deck.send_bytes(b"\x1a"); // Ctrl+Z == 0x1a
+    // Deliberately the BROAD `contains` here, unlike the positive assertions
+    // below: this predicate is expected to TIME OUT, so anything that trips it
+    // fails the test. Narrowing it to the border title would make it harder to
+    // trip and so WEAKEN the check; a spoofed display name could only ever
+    // cause a false FAILURE here, never a false pass.
+    let zoomed_in_pane_input = deck
+        .wait_for_grid_predicate_within(Duration::from_secs(2), |grid| {
+            orchestrator_box_edge(grid).is_some_and(|e| e <= 1) || grid.contains(ZOOM_MARKER)
+        });
+    assert!(
+        !zoomed_in_pane_input,
+        "`Ctrl+Z` must NOT zoom while in PaneInput — there it is job control \
+         the agent is entitled to receive. PRD #313 scopes the toggle to \
+         command mode.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // (2) Ctrl+d -> command mode, where `Ctrl+Z` DOES resolve. The sidebar goes and
+    // the focused pane's box moves to column 0 — but it KEEPS its border (the
+    // corner glyph the edge scan anchors on is that border) and the border
+    // title gains the zoom marker.
+    deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
+    deck.send_bytes(b"\x1a"); // Ctrl+Z == 0x1a
+    let zoomed = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
+        orchestrator_box_edge(grid) == Some(0) && role_border_title_marked(grid, "orchestrator")
+    });
+    assert!(
+        zoomed,
+        "`Ctrl+Z` in command mode did not zoom the focused role pane within 5s — \
+         expected the pane box at column 0 with a {ZOOM_MARKER} marker at the \
+         end of THAT box's border title (not merely somewhere on the grid, \
+         which an agent-supplied display name can spell), got edge {:?} and \
+         title {:?}\nGrid:\n{}",
+        orchestrator_box_edge(&deck.snapshot_grid()),
+        common::role_pane_border_title(&deck.snapshot_grid(), "orchestrator"),
+        deck.snapshot_grid()
+    );
+
+    // The non-focused roles' sidebar cards are gone — that is the point of the
+    // feature, and it is the half a "widen the pane column a bit more"
+    // implementation would fail.
+    let zoomed_grid = deck.snapshot_grid();
+    assert!(
+        !has_role_status(&zoomed_grid, "beta", "Working"),
+        "while zoomed, the sidebar (and beta's status card with it) must not be \
+         drawn\nGrid:\n{zoomed_grid}"
+    );
+
+    // (3) Every non-focused agent KEEPS RUNNING while zoomed — the daemon's
+    // live agent registry still holds all three roles. Hiding a pane is a
+    // presentation change; it must not touch a single agent's lifecycle.
+    let live: Vec<String> = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .filter_map(|r| r.display_name)
+        .collect();
+    for role in ["orchestrator", "alpha", "beta"] {
+        assert!(
+            live.iter().any(|n| n == role),
+            "role `{role}`'s agent must still be live while the tab is zoomed \
+             (zoom hides panes, it does not stop agents); live roles: {live:?}"
+        );
+    }
+
+    // (4) A second `Ctrl+Z` restores the previous view exactly.
+    deck.send_bytes(b"\x1a"); // Ctrl+Z == 0x1a
+    // Whole-grid NEGATIVE, kept broad for the same reason as the PaneInput
+    // check above: "the marker is nowhere" is strictly stronger than "the
+    // marker is not on this one border", and unspoofable in the pass direction.
+    let restored = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
+        orchestrator_box_edge(grid).is_some_and(|e| (40..=41).contains(&e))
+            && !grid.contains(ZOOM_MARKER)
+    });
+    assert!(
+        restored,
+        "a second `Ctrl+Z` did not restore the 34/66 split within 5s — pane-column \
+         edge stayed at {:?}\nGrid:\n{}",
+        orchestrator_box_edge(&deck.snapshot_grid()),
+        deck.snapshot_grid()
+    );
+    let restored_grid = deck.snapshot_grid();
+    assert!(
+        has_role_status(&restored_grid, "beta", "Working"),
+        "after unzooming, beta's sidebar status card must be back and still \
+         reading Working — the zoom round trip must not cost the live status of \
+         the roles it hid\nGrid:\n{restored_grid}"
+    );
+}
+
+/// Sentinel files the REAL agent is asked to name. Neither token appears in the
+/// directive that asks for it, so a match on the grid can only come from the
+/// agent having actually run `ls` and printed what it found — an echo of the
+/// user's own typing can never satisfy it.
+const ZOOM_LIVE_SENTINEL: &str = "zoomlive_x7q2m.txt";
+const ZOOM_LIVE_SENTINEL_TOKEN: &str = "x7q2m";
+const ZOOM_LIVE_SENTINEL_2: &str = "zoomlive_k4v9p.log";
+const ZOOM_LIVE_SENTINEL_2_TOKEN: &str = "k4v9p";
+
+/// Whether `needle` is visible inside the pane column of the role pane `role`,
+/// wrap-insensitively. Cropping to the pane column first drops the sidebar,
+/// whose card text would otherwise splice between two wrapped rows of agent
+/// output and break a needle that straddles the wrap column.
+fn pane_column_shows(deck: &TuiDeck, role: &str, needle: &str) -> bool {
+    let grid = deck.snapshot_grid();
+    common::role_pane_column(&grid, role)
+        .is_some_and(|column| common::squeeze_wrapped_text(&column).contains(needle))
+}
+
+/// Type `directive` at the focused REAL agent's pane and wait until `token`
+/// appears in `role`'s pane column, re-pressing Enter on a cadence until it
+/// does. Returns whether the token arrived inside `budget`.
+///
+/// **The Enter nudge is load-bearing, not defensive.** Claude Code accepts
+/// characters into its composer from the moment it first draws, but an Enter
+/// that arrives in the first seconds of that boot is DROPPED — the text stays in
+/// the input box and nothing is ever submitted. Measured on this test's first
+/// run against the implementation: the whole focus -> zoom -> type sequence had
+/// completed by t=5.0s of the cast, and the directive then sat unsubmitted in
+/// the composer, verbatim, for the remaining 175s of the budget until the test
+/// failed. `orchestration/lock/012` types a directive exactly the same way and
+/// does not hit this only because its own 20s locked-directive wait sits in
+/// front of it as an accidental readiness gate.
+///
+/// A re-pressed Enter after the agent HAS submitted is harmless: Claude Code
+/// ignores a submit on an empty composer. The nudge is therefore bounded
+/// recovery for a lost keystroke, never a way to make an agent that answered
+/// wrongly eventually answer right — only `token` ends the wait.
+fn directive_is_answered(
+    deck: &TuiDeck,
+    role: &str,
+    directive: &[u8],
+    token: &str,
+    budget: Duration,
+) -> bool {
+    deck.send_keys(directive);
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if common::wait_until(Duration::from_secs(15), || {
+            pane_column_shows(deck, role, token)
+        }) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        deck.send_bytes(b"\r");
+    }
+}
+
+/// Scenario: Open the `orch-lock-live` fixture's orchestration (a `cat`
+/// orchestrator plus a REAL fully interactive Claude Haiku worker), jump to the
+/// worker with `2` so the live agent is the focused pane, wait for its pane to
+/// go quiet so the agent is genuinely ready for input, and zoom it with `Ctrl+Z`.
+/// While zoomed, type a directive asking the agent to `ls` and name the only
+/// `.txt` file — its answer painting inside the full-width pane is proof the
+/// real agent reflowed to the new PTY size and kept working. Then unzoom and
+/// repeat with a `.log` file, proving it reflows back down just as well. Uses a
+/// cheap model and two short turns; self-skips where the CLI or credentials are
+/// absent.
+#[spec("tabs/orchestration/012")]
+#[test]
+fn orchestration_012_real_agent_reflows_across_a_zoom_round_trip() {
+    // A missing CLI or credentials is an environmental condition, not a broken
+    // test (Decision 26).
+    skip_unless!(common::check_claude_available());
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(120, 40)
+        .with_imported_claude_credentials()
+        // The worker's cwd is the deck's own workdir (the copied
+        // `orch-lock-live` fixture root); pre-trust it so the real claude's
+        // first-run onboarding/trust gates clear with no keystroke and the
+        // directives below are not swallowed answering them.
+        .with_claude_trust_workdir()
+        .launch_with_fixture("orch-lock-live");
+    deck.wait_for_string("No active sessions");
+
+    // Uniquely-named fixture sentinels the agent has to DISCOVER. Written into
+    // the agents' cwd before the orchestration opens.
+    for name in [ZOOM_LIVE_SENTINEL, ZOOM_LIVE_SENTINEL_2] {
+        std::fs::write(deck.workdir().join(name), b"").expect("write zoom sentinel file");
+    }
+
+    open_orchestration(&deck);
+    deck.wait_for_string("worker"); // 2nd role card -> orchestration tab is up
+
+    // Focus the REAL worker role (Ctrl+d then `2` -> Jump2 -> FocusCard(1)).
+    // `focus_deck` re-enters PaneInput on success, so no separate Enter.
+    deck.send_bytes(b"\x04");
+    deck.send_keys(b"2");
+    let worker_pane_up = deck.wait_for_grid_predicate_within(Duration::from_secs(60), |grid| {
+        role_box_edge(grid, "worker").is_some_and(|e| (40..=41).contains(&e))
+    });
+    assert!(
+        worker_pane_up,
+        "the real worker role's pane never became the focused/expanded pane at \
+         the default 34/66 split\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // The deck drawing the worker's box says nothing about the REAL agent inside
+    // it being ready for input, and typing at one that is not costs the whole
+    // run: an Enter pressed during Claude Code's first seconds is dropped and
+    // the directive sits in the composer forever (see `directive_is_answered`).
+    // Wait for the pane's own byte stream to go quiet, the same primitive
+    // `orchestration/lock/012` gets for free from the wait that precedes it.
+    let worker_id = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|record| record.display_name.as_deref() == Some("worker"))
+        .map(|record| record.id)
+        .expect("the worker role's agent is registered with the daemon");
+    assert!(
+        common::wait_until_panes_settled(
+            deck.attach_socket_path(),
+            std::slice::from_ref(&worker_id),
+            Duration::from_millis(1500),
+            Duration::from_secs(3),
+            Duration::from_secs(90),
+        ),
+        "the real worker agent's pane never settled within 90s, so a directive \
+         typed at it now would race its boot\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Zoom the LIVE agent's pane.
+    deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
+    deck.send_bytes(b"\x1a"); // Ctrl+Z == 0x1a
+    let zoomed = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
+        role_box_edge(grid, "worker") == Some(0) && role_border_title_marked(grid, "worker")
+    });
+    assert!(
+        zoomed,
+        "`Ctrl+Z` did not zoom the real agent's pane within 5s — expected its box at \
+         column 0 with a {ZOOM_MARKER} marker at the end of THAT box's border \
+         title (not merely somewhere on the grid, which the agent's own display \
+         name can spell), got edge {:?} and title {:?}\nGrid:\n{}",
+        role_box_edge(&deck.snapshot_grid(), "worker"),
+        common::role_pane_border_title(&deck.snapshot_grid(), "worker"),
+        deck.snapshot_grid()
+    );
+
+    // The PRD's "resize churn" risk, verified with a real agent rather than a
+    // stand-in: the agent must still be working AND painting at the new width.
+    // The directive never names the sentinel token, so only a genuine `ls` can
+    // put it on the grid.
+    deck.send_bytes(b"\x04"); // Ctrl+d -> PaneInput on the zoomed pane
+    let painted_zoomed = directive_is_answered(
+        &deck,
+        "worker",
+        b"Use the Bash tool to run ls in the current directory, then reply with \
+          the full name of the only file whose name ends in .txt, and nothing \
+          else.\r",
+        ZOOM_LIVE_SENTINEL_TOKEN,
+        Duration::from_secs(180),
+    );
+    assert!(
+        painted_zoomed,
+        "the real agent never painted {ZOOM_LIVE_SENTINEL} inside the ZOOMED \
+         pane — after the zoom resize it either stopped working or stopped \
+         rendering at the new width\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Unzoom and prove it reflows back down just as well.
+    deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
+    deck.send_bytes(b"\x1a"); // Ctrl+Z == 0x1a
+    // Whole-grid NEGATIVE, kept broad: "the marker is nowhere" is the stronger
+    // form and cannot be satisfied by a spoof.
+    let restored = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
+        role_box_edge(grid, "worker").is_some_and(|e| (40..=41).contains(&e))
+            && !grid.contains(ZOOM_MARKER)
+    });
+    assert!(
+        restored,
+        "a second `Ctrl+Z` did not restore the 34/66 split around the real agent's \
+         pane within 5s — edge stayed at {:?}\nGrid:\n{}",
+        role_box_edge(&deck.snapshot_grid(), "worker"),
+        deck.snapshot_grid()
+    );
+
+    deck.send_bytes(b"\x04"); // Ctrl+d -> PaneInput
+    let painted_unzoomed = directive_is_answered(
+        &deck,
+        "worker",
+        b"Use the Bash tool to run ls again, then reply with the full name of \
+          the only file whose name ends in .log, and nothing else.\r",
+        ZOOM_LIVE_SENTINEL_2_TOKEN,
+        Duration::from_secs(180),
+    );
+    assert!(
+        painted_unzoomed,
+        "the real agent never painted {ZOOM_LIVE_SENTINEL_2} after UNZOOMING — \
+         the second resize left it not working or not rendering\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+}

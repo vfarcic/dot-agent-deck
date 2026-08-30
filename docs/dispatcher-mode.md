@@ -71,7 +71,7 @@ The unit's branch (`agent/dispatch-<name>`) always survives, since it may hold c
 
 ## Current limitations
 
-**You are not notified when a unit finishes.** The dispatcher tells you where each unit is running, but nothing reports back to it when the work is done — you check on the units yourself. Sending results back is planned; see [PRD #220](https://github.com/vfarcic/dot-agent-deck/issues/220).
+**You are not notified when a unit finishes.** The dispatcher tells you where each unit is running, but nothing reports back to it when the work is done — you check on the units yourself. Sending results back is planned.
 
 ## See also
 

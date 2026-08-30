@@ -2003,12 +2003,14 @@ pub fn joined_rows(buffer: &ratatui::buffer::Buffer) -> String {
 // would have made the next such change a two-site edit where only one site got
 // edited (review of #465, S1/S2).
 
-/// One border weight's corner and vertical glyphs — everything needed to find
-/// a box's span on a row and to recognise its verticals.
+/// One border weight's corner, horizontal and vertical glyphs — everything
+/// needed to find a box's span on a row, to recognise its verticals, and to
+/// bound the title fused into its top edge.
 #[derive(Clone, Copy, Debug)]
 pub struct BorderWeight {
     pub top_left: char,
     pub top_right: char,
+    pub horizontal: char,
     pub vertical: char,
     pub bottom_left: char,
     pub bottom_right: char,
@@ -2032,6 +2034,7 @@ pub const BORDER_WEIGHTS: [BorderWeight; 3] = [
     BorderWeight {
         top_left: '┌',
         top_right: '┐',
+        horizontal: '─',
         vertical: '│',
         bottom_left: '└',
         bottom_right: '┘',
@@ -2039,6 +2042,7 @@ pub const BORDER_WEIGHTS: [BorderWeight; 3] = [
     BorderWeight {
         top_left: '┏',
         top_right: '┓',
+        horizontal: '━',
         vertical: '┃',
         bottom_left: '┗',
         bottom_right: '┛',
@@ -2046,6 +2050,7 @@ pub const BORDER_WEIGHTS: [BorderWeight; 3] = [
     BorderWeight {
         top_left: '╔',
         top_right: '╗',
+        horizontal: '═',
         vertical: '║',
         bottom_left: '╚',
         bottom_right: '╝',
@@ -2057,6 +2062,13 @@ pub const BORDER_WEIGHTS: [BorderWeight; 3] = [
 /// are interposed into every row of text it contains.
 pub fn is_box_vertical(ch: char) -> bool {
     BORDER_WEIGHTS.iter().any(|weight| weight.vertical == ch)
+}
+
+/// Whether `ch` is any border weight's horizontal glyph — the fill a box's top
+/// and bottom edges are drawn with, and therefore what TERMINATES a title fused
+/// into the top edge (`┏orchestrator [Z]━━━…┓`).
+pub fn is_box_horizontal(ch: char) -> bool {
+    BORDER_WEIGHTS.iter().any(|weight| weight.horizontal == ch)
 }
 
 /// Drop every whitespace run and box-drawing vertical from `text`, so a needle
@@ -2132,15 +2144,76 @@ pub fn label_in_box_top_border(grid: &str, label: &str) -> bool {
 /// The returned index counts scalars, which equals the terminal column only
 /// while every cell left of the boundary is width-1. Fixtures keep it so.
 pub fn orchestration_pane_left_edge(grid: &str) -> Option<usize> {
+    role_pane_left_edge(grid, "orchestrator")
+}
+
+/// Column of the role pane box drawn for `role`, in Unicode scalars, or `None`
+/// when no such expanded box is on the grid.
+///
+/// The general form of [`orchestration_pane_left_edge`], which is just this
+/// with `"orchestrator"`. Under `PaneLayout::Stacked` only the FOCUSED role's
+/// pane is drawn, so a test that has jumped focus to a non-start role has no
+/// `orchestrator` box to anchor on and needs to name the role it focused
+/// (PRD #313's zoom coverage does exactly that). Kept as ONE scan rather than a
+/// second copy in a test file, for the reason recorded above the table: the
+/// glyph set has already had to change once, and two copies is one copy too
+/// many for that.
+///
+/// Same two preconditions as the wrapper: the box must be drawn EXPANDED (a
+/// collapsed `Stacked` pane draws no corner glyph at all), and the returned
+/// index counts scalars, which equals the terminal column only while every cell
+/// to its left is width-1.
+pub fn role_pane_left_edge(grid: &str, role: &str) -> Option<usize> {
     grid.lines().find_map(|line| {
         BORDER_WEIGHTS
             .iter()
             .filter_map(|weight| {
-                let header = format!("{}orchestrator", weight.top_left);
+                let header = format!("{}{role}", weight.top_left);
                 line.find(&header)
                     .map(|byte_index| line[..byte_index].chars().count())
             })
             .min()
+    })
+}
+
+/// The title text fused into the TOP BORDER of the expanded box drawn for
+/// `role` — every character on that row between the corner glyph and the first
+/// border-fill glyph. `┏orchestrator [Z]━━━…┓` yields `orchestrator [Z]`.
+/// `None` under the same two preconditions as [`role_pane_left_edge`], whose
+/// scan this shares; when several boxes for `role` are on one row the LEFTMOST
+/// wins, matching that function's `.min()`.
+///
+/// **Why a positional read rather than `grid.contains("[Z]")`.** PRD #313's
+/// zoom indicator is ordinary title text on a rendered grid — a vt100 snapshot
+/// carries characters, not style — and a pane's title is its *display name*,
+/// which is agent-reachable: names arrive over the hook socket and
+/// `sanitize_display_name` strips control characters and bidi overrides but NOT
+/// brackets. So an agent may call itself `worker [Z]`, and that token then sits
+/// on an UNZOOMED pane's border (or, truncated, on a sidebar card) and
+/// satisfies any whole-grid `contains`. Reading the title of the box the
+/// geometry actually expanded is the strongest lever a text-only grid gives:
+/// the marker must ride on the pane zoom widened, not merely appear somewhere
+/// on screen. The remaining case — the focused pane's own display name
+/// spelling the marker — is indistinguishable in text by construction, which
+/// is why the product draws the real marker in its own
+/// `terminal_widget::zoom_marker_style` span; `render/layout/006` asserts that
+/// style side against a real `Buffer`, where the styling survives.
+pub fn role_pane_border_title(grid: &str, role: &str) -> Option<String> {
+    grid.lines().find_map(|line| {
+        BORDER_WEIGHTS
+            .iter()
+            .filter_map(|weight| {
+                let header = format!("{}{role}", weight.top_left);
+                let byte_index = line.find(&header)?;
+                let title: String = line[byte_index..]
+                    .chars()
+                    .skip(1) // the corner glyph the scan anchored on
+                    .take_while(|ch| !is_box_horizontal(*ch) && *ch != weight.top_right)
+                    .collect();
+                Some((line[..byte_index].chars().count(), title))
+            })
+            .min_by_key(|(column, _)| *column)
+            .map(|(_, title)| title)
     })
 }
 
@@ -2153,7 +2226,18 @@ pub fn orchestration_pane_left_edge(grid: &str) -> Option<usize> {
 /// spanning `pane1`+`pane2`. Returns `None` on the same two preconditions as
 /// [`orchestration_pane_left_edge`].
 pub fn orchestration_pane_column(grid: &str) -> Option<String> {
-    let left_edge = orchestration_pane_left_edge(grid)?;
+    role_pane_column(grid, "orchestrator")
+}
+
+/// Crop every row of `grid` to the pane column of the role pane drawn for
+/// `role`, dropping the sidebar to its left. The general form of
+/// [`orchestration_pane_column`], for the same reason
+/// [`role_pane_left_edge`] is the general form of its wrapper: under
+/// `PaneLayout::Stacked` only the FOCUSED role's pane is drawn, so a test that
+/// jumped focus to a non-start role has no `orchestrator` box to crop on.
+/// Returns `None` on the same two preconditions as [`role_pane_left_edge`].
+pub fn role_pane_column(grid: &str, role: &str) -> Option<String> {
+    let left_edge = role_pane_left_edge(grid, role)?;
     Some(
         grid.lines()
             .map(|line| line.chars().skip(left_edge).collect::<String>())

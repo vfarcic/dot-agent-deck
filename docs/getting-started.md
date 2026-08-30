@@ -31,7 +31,7 @@ dot-agent-deck
 
 ### Windows
 
-Native Windows is [coming soon](https://github.com/vfarcic/dot-agent-deck/issues/42). For now, install [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) and follow the Linux instructions inside your WSL shell.
+Native Windows is [not supported yet](https://github.com/vfarcic/dot-agent-deck/issues/164). For now, install [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) and follow the Linux instructions inside your WSL shell.
 
 > **Tip:** Prebuilt binaries and source builds are also available for macOS and Linux. See [all install options](installation.md).
 

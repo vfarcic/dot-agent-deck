@@ -9,7 +9,7 @@ What a host must provide for a `dot-agent-deck` **remote environment** — a per
 
 For lifecycle, failure modes, and how the TUI attaches see [Remote Environments](remote-environments.md). For provisioning recipes see [Remote Recipes](remote-recipes.md).
 
-> **Status:** v1 requirements. The Required section reflects what was confirmed to work on a fresh Ubuntu 24.04 LTS UpCloud VM in M0.2 and has been the reference target throughout PRD #76 implementation; the Recommended section reflects best-practice hardening that has not yet been re-validated end-to-end on a clean provision since the M1–M4 implementation completed.
+> **Status:** v1 requirements. The Required section reflects what was confirmed to work on a fresh Ubuntu 24.04 LTS UpCloud VM, which has been the reference target throughout; the Recommended section reflects best-practice hardening that has not yet been re-validated end to end on a clean provision.
 
 ## How this page is organized
 
@@ -121,7 +121,7 @@ Hardening, persistence, and best-practice setup. None of this is needed for the 
 
 ### Non-root user account
 
-A dedicated non-root Linux user account for the daemon. Running the daemon as root works (M0.2 confirmed it does), but anything an agent does then runs with full system privileges; a non-root account is the recommended posture. The daemon runs as that user; agents run as children of the daemon and inherit the account.
+A dedicated non-root Linux user account for the daemon. Running the daemon as root works, but anything an agent does then runs with full system privileges; a non-root account is the recommended posture. The daemon runs as that user; agents run as children of the daemon and inherit the account.
 
 `systemd --user` is the recommended persistence layer, so the daemon survives logout and restarts on crash. Enable lingering for the user so user-scoped units run without an active login session:
 

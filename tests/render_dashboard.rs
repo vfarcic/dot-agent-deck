@@ -1715,6 +1715,7 @@ fn pane_005_highlight_follows_selected_session_id() {
     // session id — and must be 1, not 0.
     let mut tab = Tab::Dashboard {
         selected_session_id: Some("sess-beta".to_string()),
+        zoomed: false,
     };
     let selected_index = sync_and_derive_selection(&mut tab, None, &filtered, None)
         .expect("dashboard derives an index");

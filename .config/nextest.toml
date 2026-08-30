@@ -220,6 +220,43 @@ priority = 50
 retries = 1
 slow-timeout = { period = "60s", terminate-after = 4 }
 
+# PRD #313: `tabs/orchestration/012` drives a REAL fully interactive Haiku
+# worker through TWO turns either side of a zoom round trip, and its declared
+# waits budget far past the default kill window: 90s for the worker agent's pane
+# to settle, 60s for it to become the expanded slot, 5s for the zoom, 180s for
+# the agent to `ls` and paint the `.txt` sentinel at the zoomed width, 5s for the
+# unzoom, and 180s for the same again after it reflows back down — over 500s,
+# against the default 3 x 60s = 180s.
+#
+# The HAPPY PATH is nowhere near that: measured at 15.4s end to end, and 12.8s of
+# recorded cast. Do not read 540s as an expectation — it is the ceiling on a bad
+# day, and every second of it belongs to a wait the test declares for itself.
+#
+# What this override buys is the DIAGNOSTIC, and that is not hypothetical here.
+# The first full-tier run of this test was TERMINATED at exactly 180.004s and
+# reported `TIMEOUT` with no grid and no indication of which reflow was in
+# flight. Re-run alone under this window it FAILED instead, at 182.3s, with its
+# own assertion and the vt100 grid attached — and that grid is what identified
+# the actual bug in one read: the pane was correctly zoomed (`┌worker [Z]` at
+# column 0, the agent's UI reflowed to 120 cols) with the directive sitting
+# UNSUBMITTED in Claude Code's composer, because an Enter pressed in the first
+# seconds of that agent's boot is dropped. The fix was a readiness gate in the
+# test (see `directive_is_answered` in `tests/e2e_orchestration_pane_column.rs`);
+# the kill window would have gone on hiding the evidence for it. Same reasoning
+# as `route_001` and `shell_activity_005/006` above.
+#
+# 9 x 60s = 540s sits just above the declared budget and is still bounded, so a
+# wedged agent cannot run forever. The test's own waits are UNTOUCHED — this is
+# not a deadline extension, it is the kill window catching up to a budget the
+# test already declared.
+#
+# The filter tracks the TEST FUNCTION name, not the `#[spec]` id, so it must be
+# updated in lockstep with any rename — a stale filter matches nothing and
+# silently drops this test back to the 3 x 60s default, killing it mid-wait.
+[[profile.default.overrides]]
+filter = 'test(orchestration_012_real_agent_reflows_across_a_zoom_round_trip)'
+slow-timeout = { period = "60s", terminate-after = 9 }
+
 # Decision 28 + M4.3: recording dumps land under
 # `<workspace>/.dot-agent-deck/recordings/<test-name>/` (see
 # `tests/common/mod.rs`). That tree is gitignored dev-time state, so
