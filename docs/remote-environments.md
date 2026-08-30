@@ -173,7 +173,7 @@ SSH forwarding failed for remote 'my-vm': remote port forwarding failed for list
 The remote port may already be bound, or `AllowTcpForwarding` may be disabled on the remote. Run `dot-agent-deck remote doctor my-vm` to distinguish the cause.
 ```
 
-Both causes produce the *same* bytes from ssh, so the client genuinely cannot tell them apart and the message does not pretend to. `remote doctor` reads the remote's own sshd policy and the live bind state, which is what separates them. Before [issue #344](https://github.com/vfarcic/dot-agent-deck/issues/344) this was reported as a host-unreachable failure, which sent people to debug a network path that was never broken.
+Both causes produce the *same* bytes from ssh, so the client genuinely cannot tell them apart and the message does not pretend to. `remote doctor` reads the remote's own sshd policy and the live bind state, which is what separates them.
 
 ### Remote binary missing
 

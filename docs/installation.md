@@ -12,7 +12,7 @@ title: Installation
 | macOS (Intel & Apple Silicon) | Supported |
 | Linux (amd64 & arm64) | Supported |
 | Windows (via WSL) | Supported (runs as Linux) |
-| Windows (native) | Coming soon ([#42](https://github.com/vfarcic/dot-agent-deck/issues/42)) — comment on the issue if you need this! |
+| Windows (native) | Not yet — the daemon still reports `Unsupported` on Windows and there is no `.exe` in the release artifacts. Progress is tracked in [#164](https://github.com/vfarcic/dot-agent-deck/issues/164); comment there if you need this. |
 
 ## Homebrew (macOS / Linux)
 
