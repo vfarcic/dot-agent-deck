@@ -1,5 +1,6 @@
 import { useMemo, type ReactNode } from "react";
 import { Blocks, Boxes, LayoutList, Layers, Network, RefreshCw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
+import { UNREPORTED } from "../types";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { DISPLAY_LIMITS, displayPath, displayText, displayTitle, shortDaemonLabel } from "../lib/displayText";
 
@@ -17,12 +18,23 @@ import { DISPLAY_LIMITS, displayPath, displayText, displayTitle, shortDaemonLabe
  */
 export type OverviewAgent = Pick<
   AgentSession,
-  "id" | "daemonId" | "displayName" | "cli" | "status" | "cwd" | "activeTool" | "activeToolDetail" | "toolCount" | "tab"
->;
+  "id" | "daemonId" | "displayName" | "cli" | "status" | "activeTool" | "activeToolDetail" | "toolCount" | "tab"
+> & {
+  /**
+   * HONEST, and OPTIONAL where `AgentSession.cwd` is not. The `Pick<>` above
+   * closes dishonest field NAMES but cannot close a dishonest sentinel inside
+   * an allowed one: `agentFromDto` substitutes `UNREPORTED` for a `cwd` the
+   * daemon did not report, so the screen's guarantee that nothing on it reads
+   * "Unavailable" was violable through this very field. Absence is preserved
+   * here and rendered as nothing at all — not as a placeholder, and not as a
+   * dash, which would be one more thing to read that says less than blank.
+   */
+  cwd?: string;
+};
 
 export function toOverviewAgent(agent: AgentSession): OverviewAgent {
   const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab } = agent;
-  return { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab };
+  return { id, daemonId, displayName, cli, status, cwd: cwd === UNREPORTED ? undefined : cwd, activeTool, activeToolDetail, toolCount, tab };
 }
 
 /**
@@ -442,8 +454,12 @@ function OverviewRow({ agent, commonCwd }: { agent: OverviewAgent; commonCwd?: s
         ) : <span className="overview-tool-idle">no active tool</span>}
       </td>
       <td className="overview-tool-count" role="cell" title={`${agent.toolCount} tool calls reported`}>{agent.toolCount}</td>
-      {/* Stated once in the group header for the directory most of the group shares. */}
-      <td className="overview-cwd" role="cell" title={displayTitle(agent.cwd)}>{agent.cwd === commonCwd ? "" : displayPath(agent.cwd)}</td>
+      {/*
+        Blank for a directory the group header already states, and blank again
+        when the daemon reported none — an empty cell says "nothing to add
+        here" in both cases, which is exactly what is true.
+      */}
+      <td className="overview-cwd" role="cell" title={agent.cwd ? displayTitle(agent.cwd) : undefined}>{!agent.cwd || agent.cwd === commonCwd ? "" : displayPath(agent.cwd)}</td>
     </tr>
   );
 }

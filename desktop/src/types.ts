@@ -1,4 +1,18 @@
 export type RuntimeMode = "fixture" | "live";
+
+/**
+ * The control deck's legacy stand-in for a value the daemon did not report.
+ * The deck renders it as text AND matches on it (`mapDesktopSnapshot` picks a
+ * repo directory by skipping agents whose `cwd` is this), so it cannot simply
+ * be dropped; M8 is where live mode stops presenting these as facts.
+ *
+ * It is exported so the two sides of that substitution — the one that writes
+ * it in `agentFromDto` and the one that reverses it in `toOverviewAgent` —
+ * cannot drift apart into a placeholder leaking onto a screen that promises
+ * none. An agent's `cwd` is an absolute path, so this can never be one.
+ */
+export const UNREPORTED = "Unavailable";
+
 export type ConnectionStatus = "loading" | "connected" | "disconnected" | "error";
 export type RunHealth = "healthy" | "attention" | "failed" | "idle";
 export type AgentStatus = "queued" | "running" | "waiting" | "passed" | "failed" | "stopped";
@@ -108,7 +122,13 @@ export interface AgentSession {
   status: AgentStatus;
   /** HONEST only in so far as it restates `activeTool`; otherwise a placeholder. */
   task: string;
-  /** HONEST. The agent's working directory — NOT a worktree. */
+  /**
+   * HONEST when the daemon reported one — but the deck's model has no way to
+   * say "absent", so `agentFromDto` substitutes {@link UNREPORTED} and the deck
+   * both prints and pattern-matches that sentinel. Any surface that must not
+   * show a placeholder has to reverse the substitution at its own boundary;
+   * `toOverviewAgent` is the one that does. NOT a worktree.
+   */
   cwd: string;
   /** FIXTURE-ONLY — no retry counter exists anywhere in the daemon. */
   attempt: number;

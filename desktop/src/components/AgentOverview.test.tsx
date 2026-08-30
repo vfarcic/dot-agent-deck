@@ -2,6 +2,7 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "../data/fixture";
 import { DISPLAY_LIMITS } from "../lib/displayText";
+import { UNREPORTED } from "../types";
 import type { AgentSession, DeckRuntimeState, DeckSnapshot } from "../types";
 
 /**
@@ -287,15 +288,33 @@ describe("AgentOverview", () => {
     expect(document.querySelector(".overview-legend")).toHaveAttribute("aria-hidden", "true");
   });
 
+  it("leaves the working directory blank when the daemon reported none", () => {
+    // What `agentFromDto` produces for an agent whose `cwd` the daemon omitted.
+    renderOverview({ snapshot: snapshotWithAgent({ cwd: UNREPORTED, tab: { kind: "dashboard" } }) });
+
+    const cell = document.querySelector(".overview-cwd");
+    // Blank, and no hover text either — a `title` is the other half of what a
+    // reader sees, and there is nothing honest to put in it.
+    expect(cell).toHaveTextContent("");
+    expect(cell).not.toHaveAttribute("title");
+    // Not a placeholder, and not a dash standing in for one.
+    expect(cell?.textContent).toBe("");
+  });
+
   it("shows nothing the daemon cannot report", () => {
     const snapshot = createFixtureSnapshot("crowded");
     // Crowded agents carry live mode's own placeholders in every field the
     // daemon does not have, so a leak onto the screen shows up as this string.
-    expect(snapshot.agents[0]?.model).toBe("Unavailable");
-    expect(snapshot.agents[0]?.worktree).toBe("Unavailable");
+    expect(snapshot.agents[0]?.model).toBe(UNREPORTED);
+    expect(snapshot.agents[0]?.worktree).toBe(UNREPORTED);
+    // And one agent whose cwd is absent too: the `Pick<>` closes dishonest
+    // field names but cannot close a sentinel inside an allowed field, so the
+    // path the honesty claim was actually violable through is in this fleet.
+    snapshot.agents = [...snapshot.agents, { ...(snapshot.agents[0] as AgentSession), id: "99", displayName: "no-cwd", cwd: UNREPORTED, tab: { kind: "dashboard" } }];
 
     const { container } = renderOverview({ snapshot });
-    const text = container.textContent ?? "";
+    const text = [container.textContent ?? "", ...titlesOf(container)].join(" ~ ");
+    expect(screen.getByTestId(`overview-agent-${agentKey({ daemonId: FIXTURE_DAEMON_ID, id: "99" })}`)).toBeVisible();
     expect(text).not.toContain("Unavailable");
     expect(text).not.toMatch(/\$\d/);
     expect(text).not.toContain("TOKENS");

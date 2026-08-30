@@ -1,5 +1,6 @@
 import { createFixtureSnapshot, DEFAULT_PROFILES, type FixtureState } from "../data/fixture";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
+import { UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentSession,
   AgentStatus,
@@ -130,6 +131,13 @@ export interface DeckBridge {
  * read-only.
  */
 const DAEMON_STATUS: Record<string, AgentStatus> = {
+  // `running` is what the Rust side emits for an agent with no hook state yet
+  // — `map_agent` falls back to it when `AgentRecord.live` is absent
+  // (`desktop/src-tauri/src/dto.rs`, pinned by
+  // `record_without_hook_state_is_still_running`). It is a documented member of
+  // `DesktopAgentDto["status"]`, and its absence here sent a live, hookless
+  // agent down the unknown-status fallthrough and labelled it "waiting".
+  running: "running",
   thinking: "running",
   working: "running",
   compacting: "running",
@@ -161,16 +169,16 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     role,
     displayName: agent.displayName || role,
     cli: agent.agentType || "agent",
-    model: "Unavailable",
+    model: UNREPORTED,
     status,
     task: agent.activeTool ? `Active tool: ${agent.activeTool.name}${agent.activeTool.detail ? ` · ${agent.activeTool.detail}` : ""}` : "Task metadata unavailable from daemon",
-    cwd: agent.cwd ?? "Unavailable",
+    cwd: agent.cwd ?? UNREPORTED,
     attempt: 1,
     duration: "—",
     tokens: 0,
     cost: 0,
     contextPercent: 0,
-    worktree: "Unavailable",
+    worktree: UNREPORTED,
     writeLease: "unknown",
     rows: agent.rows,
     cols: agent.cols,
@@ -204,7 +212,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
   // ahead of #742).
   const daemonId = dto.connection.socketPath;
   const agents = dto.agents.map((agent, index) => agentFromDto(agent, index, daemonId));
-  const cwd = agents.find((agent) => agent.cwd !== "Unavailable")?.cwd
+  const cwd = agents.find((agent) => agent.cwd !== UNREPORTED)?.cwd
     ?? dto.projectCwd
     ?? (previous?.worktree?.startsWith("/") ? previous.worktree : undefined)
     ?? "No active project";

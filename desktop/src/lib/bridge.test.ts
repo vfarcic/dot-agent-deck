@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { DesktopSnapshotDto, TerminalAttachResult } from "./bridge";
+import type { DesktopAgentDto, DesktopSnapshotDto, TerminalAttachResult } from "./bridge";
 
 const invoke = vi.fn();
 const listeners = new Map<string, (event: { payload: unknown }) => void>();
@@ -259,6 +259,43 @@ describe("TauriDeckBridge", () => {
 
     expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action: { type: "restart_daemon" } });
     await bridge.dispose();
+  });
+
+  /**
+   * A cross-layer pin, not a table lookup. `DesktopAgentDto["status"]` mirrors
+   * the Rust union, and `map_agent` emits `"running"` for an agent whose hook
+   * state has not arrived yet — `record_without_hook_state_is_still_running`
+   * in `desktop/src-tauri/src/dto.rs` pins exactly that. `DAEMON_STATUS` had no
+   * `running` key, so that agent fell through the unknown-status default and a
+   * live agent the daemon called running was labelled "waiting" on every screen
+   * that reads status. Every member of the union is asserted, so the next
+   * addition on the Rust side has to be answered here rather than silently
+   * absorbed by the fallthrough.
+   */
+  it("maps every status the desktop DTO declares, including the hookless `running`", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const expected: Record<DesktopAgentDto["status"], string> = {
+      running: "running",
+      thinking: "running",
+      working: "running",
+      compacting: "running",
+      waiting_for_input: "waiting",
+      idle: "waiting",
+      error: "failed",
+      unknown: "waiting",
+    };
+
+    for (const [daemonStatus, deckStatus] of Object.entries(expected)) {
+      const dto = structuredClone(snapshot);
+      dto.agents[0].status = daemonStatus as DesktopAgentDto["status"];
+      expect(mapDesktopSnapshot(dto).agents[0]?.status, `daemon status "${daemonStatus}"`).toBe(deckStatus);
+    }
+
+    // The fallthrough itself stays "waiting" for a status this build has never
+    // heard of — a newer daemon may add one without a protocol bump.
+    const future = structuredClone(snapshot);
+    future.agents[0].status = "hyperthinking" as DesktopAgentDto["status"];
+    expect(mapDesktopSnapshot(future).agents[0]?.status).toBe("waiting");
   });
 
   it("carries the daemon identity and the daemon's own tab membership onto the agent model", async () => {
