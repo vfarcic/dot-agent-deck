@@ -25,16 +25,42 @@ use std::path::{Path, PathBuf};
 /// executable path so a path containing whitespace or shell metacharacters still
 /// produces a valid command that the agent parses to the intended argv. A "safe"
 /// path (only path-typical characters) is emitted verbatim so the common case
-/// stays human-readable and stable; anything else is single-quoted with embedded
-/// single quotes escaped.
+/// stays human-readable and stable; anything else is quoted, in the dialect of
+/// the shell that will actually run the line — single quotes for a POSIX shell,
+/// double quotes for `cmd.exe`.
 ///
 /// `suffix` is the caller's `HOOK_COMMAND_SUFFIX` — the fixed
 /// `hook --agent <agent>` signature that also identifies the resulting command
 /// as deck-owned on the way back in, so the two must stay the same string.
+///
+/// **The quoting follows the interpreter, not the compile target** (issue
+/// #734). Both agents whose configs this writes hand the whole command string
+/// to a shell — Codex to `%COMSPEC%`/`cmd.exe /C` on Windows and `$SHELL`
+/// /`/bin/sh -lc` elsewhere, Claude to the platform's native shell — so the
+/// dialect is chosen by [`native_shell_command_word`]. Before that it was POSIX
+/// on every platform, so a Windows Codex user (reachable only via `$CODEX_HOME`
+/// — see `codex_hooks_manage::codex_home`) got `'C:\…\dot-agent-deck.exe'
+/// hook --agent codex` written into `hooks.json`, which `cmd.exe` cannot run:
+/// it reads `'` as an ordinary character and looks for a file whose name
+/// literally starts with one.
+///
+/// [`native_shell_command_word`]: crate::platform::paths::native_shell_command_word
 pub(crate) fn build_command(binary_path: &str, suffix: &str) -> String {
+    build_command_for(binary_path, suffix, cfg!(windows))
+}
+
+/// [`build_command`] with the host dialect as a parameter.
+///
+/// The split exists for testability and nothing else: production passes
+/// `cfg!(windows)`, a compile-time constant, so the branch costs nothing at
+/// runtime — but a `#[cfg]` here would leave the Windows spelling of these
+/// command lines asserted by nothing on any machine this project is developed
+/// or CI-tested on except `build-windows`, which type-checks the arm without
+/// ever running it. That is exactly how #734 shipped.
+fn build_command_for(binary_path: &str, suffix: &str, windows_host: bool) -> String {
     format!(
         "{} {suffix}",
-        crate::platform::paths::shell_quote_if_needed(binary_path)
+        crate::platform::paths::native_shell_command_word(binary_path, windows_host)
     )
 }
 
@@ -228,13 +254,71 @@ mod tests {
     #[test]
     fn build_command_appends_the_agent_suffix_and_quotes_only_when_needed() {
         assert_eq!(
-            build_command("/abs/dot-agent-deck", "hook --agent codex"),
+            build_command_for("/abs/dot-agent-deck", "hook --agent codex", false),
             "/abs/dot-agent-deck hook --agent codex"
         );
         assert_eq!(
-            build_command("/with space/dot-agent-deck", "hook --agent devin"),
+            build_command_for("/with space/dot-agent-deck", "hook --agent devin", false),
             "'/with space/dot-agent-deck' hook --agent devin"
         );
+    }
+
+    /// Issue #734. The command written into a Windows Codex user's `hooks.json`
+    /// must be one `cmd.exe` can run — Codex hands the whole string to
+    /// `%COMSPEC%`/`cmd.exe /C` there. The pre-fix output single-quoted the
+    /// path, which `cmd.exe` does not implement as quoting at all: it looked
+    /// for a file whose name literally began with `'`, so every deck hook
+    /// silently failed.
+    ///
+    /// Driven through `build_command_for`'s parameter rather than `cfg!`, so
+    /// this runs on the Linux box the project is developed on. The one link it
+    /// does not cover is `build_command`'s own `cfg!(windows)`, which is a
+    /// constant.
+    #[test]
+    fn build_command_for_a_windows_host_is_runnable_by_cmd_exe() {
+        let path = r"C:\Users\somebody\AppData\Local\dot-agent-deck.exe";
+        let command = build_command_for(path, "hook --agent codex", true);
+        assert_eq!(
+            command,
+            format!(r"{path} hook --agent codex"),
+            "an ordinary Windows path is emitted verbatim — the safe set has `\\`"
+        );
+        assert!(
+            !command.starts_with('\''),
+            "#734's defect: a single-quoted Windows path is not runnable by cmd.exe; \
+             got {command}"
+        );
+
+        let spaced = r"C:\Program Files\dot-agent-deck\dot-agent-deck.exe";
+        assert_eq!(
+            build_command_for(spaced, "hook --agent codex", true),
+            format!(r#""{spaced}" hook --agent codex"#),
+            "a spaced Windows path is double-quoted, the form cmd.exe understands"
+        );
+    }
+
+    /// The suffix is what both installers use to recognise their own rules
+    /// (`command_is_deck_owned` is an `ends_with` on it), so it must survive
+    /// the dialect change untouched — that is what makes the repair automatic
+    /// for a user who already has a POSIX-quoted rule on disk: the next install
+    /// still identifies it, strips it, and writes the runnable spelling.
+    #[test]
+    fn build_command_ends_with_the_ownership_suffix_in_either_dialect() {
+        for windows_host in [true, false] {
+            for path in [
+                "/home/somebody/bin/dot-agent-deck",
+                r"C:\Program Files\deck\dot-agent-deck.exe",
+                "/with space/dot-agent-deck",
+            ] {
+                for suffix in ["hook --agent codex", "hook --agent devin"] {
+                    let command = build_command_for(path, suffix, windows_host);
+                    assert!(
+                        command.ends_with(suffix),
+                        "quoting must never disturb the ownership suffix; got {command}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

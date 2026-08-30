@@ -120,10 +120,14 @@ const DEVIN_HOOK_EVENTS: &[&str] = &[
 /// the path we would have to guess belongs to a *third-party* tool, and Devin —
 /// not this project — decides where its config lives on Windows. Writing hooks
 /// into a location Devin does not read would look like success while delivering
-/// nothing, and the POSIX quoting [`crate::platform::paths::shell_quote_if_needed`]
-/// applies to the hook command is not what Windows command parsing expects either. Native Windows
-/// support for the deck is itself still open (#42); today Windows users run
-/// under WSL, where the Unix branch below is the correct one.
+/// nothing. (The second reason this used to give — that the hook command came
+/// out POSIX-quoted, which is not what Windows command parsing expects — is
+/// gone as of #734: `agent_hook_config::build_command` now quotes for the shell
+/// that will run the line, so a hypothetical Windows Devin would get `cmd.exe`
+/// quoting. The reason above is the one that stands, and it is sufficient on
+/// its own.) Native Windows support for the deck is itself still open (#42);
+/// today Windows users run under WSL, where the Unix branch below is the
+/// correct one.
 ///
 /// Returns `None` when no real home resolves, so a guarded caller never writes
 /// into a throwaway `/tmp` config.
