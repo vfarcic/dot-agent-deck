@@ -78,6 +78,13 @@ pub enum Tab {
         /// selection to the wrong card. `UiState.selected_index` is
         /// derived from this each frame.
         selected_session_id: Option<String>,
+        /// PRD #313: whether this tab's focused pane takes the whole frame,
+        /// with the card sidebar and the non-focused panes not drawn. Ephemeral
+        /// and per-tab, exactly like [`Tab::Orchestration::zoomed`] — the two
+        /// are deliberately separate values rather than one global, so zooming
+        /// the Dashboard does not silently zoom an orchestration tab you were
+        /// supervising, or the reverse.
+        zoomed: bool,
     },
     Mode {
         id: TabId,
@@ -207,6 +214,9 @@ impl TabManager {
         Self {
             tabs: vec![Tab::Dashboard {
                 selected_session_id: None,
+                // PRD #313: a fresh deck is never zoomed; zoom is ephemeral and
+                // is not restored from a saved session.
+                zoomed: false,
             }],
             active_index: 0,
             next_id: 1,
@@ -1667,6 +1677,7 @@ mod tests {
         // Stamp a distinct remembered id onto each tab variant.
         if let Tab::Dashboard {
             selected_session_id,
+            ..
         } = &mut tm.tabs[0]
         {
             *selected_session_id = Some("sess-dashboard".to_string());
@@ -1693,7 +1704,7 @@ mod tests {
 
         assert!(matches!(
             &tm.tabs[0],
-            Tab::Dashboard { selected_session_id: Some(s) } if s == "sess-dashboard"
+            Tab::Dashboard { selected_session_id: Some(s), .. } if s == "sess-dashboard"
         ));
         assert!(matches!(
             &tm.tabs[mode_idx],
@@ -1768,6 +1779,7 @@ mod tests {
 
         let mut dash = Tab::Dashboard {
             selected_session_id: Some("s2".to_string()),
+            zoomed: false,
         };
         // No focused pane: index derives purely from the remembered id.
         let idx = crate::ui::sync_and_derive_selection(&mut dash, None, filtered, None);
@@ -1778,7 +1790,7 @@ mod tests {
         assert_eq!(idx, Some(2));
         assert!(matches!(
             &dash,
-            Tab::Dashboard { selected_session_id: Some(s) } if s == "s3"
+            Tab::Dashboard { selected_session_id: Some(s), .. } if s == "s3"
         ));
 
         // Gating: running the sync while a Mode tab is active returns
@@ -1797,7 +1809,7 @@ mod tests {
         assert_eq!(idx, None);
         assert!(matches!(
             &dash,
-            Tab::Dashboard { selected_session_id: Some(s) } if s == "s3"
+            Tab::Dashboard { selected_session_id: Some(s), .. } if s == "s3"
         ));
     }
 
@@ -1815,13 +1827,15 @@ mod tests {
         let filtered: &[(&str, Option<&str>)] = &[("s1", Some("p1")), ("s2", Some("p2"))];
         let mut dash = Tab::Dashboard {
             selected_session_id: Some("gone".to_string()),
+            zoomed: false,
         };
         let idx = crate::ui::sync_and_derive_selection(&mut dash, None, filtered, None);
         assert_eq!(idx, Some(0));
         assert!(matches!(
             &dash,
             Tab::Dashboard {
-                selected_session_id: None
+                selected_session_id: None,
+                ..
             }
         ));
 

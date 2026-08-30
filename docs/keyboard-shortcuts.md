@@ -21,7 +21,7 @@ A mode tab's side panes scroll when the pointer is over them; anywhere else the 
 | `Ctrl+N` | New pane (directory picker, then name + command form) | Any mode |
 | `Ctrl+T` | Toggle stacked / tiled layout — stacked shows only the focused pane at full height, tiled shows every pane at once | Any mode |
 | `Ctrl+L` | Toggle the orchestration sidebar/pane-column split ratio between 34/66 and 25/75 (applies to every orchestration tab) | **Orchestration tabs, command mode only** |
-| `z` | Zoom the focused agent pane — it takes the whole frame, and the sidebar and the other role panes are not drawn. Press it again to restore the view you had. See [`z` zooms the focused agent pane](#z-zooms-the-focused-agent-pane). | **Orchestration tabs, command mode only** |
+| `Ctrl+Z` | Zoom the focused agent pane — it takes the whole frame, and the card sidebar and the other panes are not drawn. Press it again to restore the view you had. See [`Ctrl+Z` zooms the focused agent pane](#ctrlz-zooms-the-focused-agent-pane). | **Dashboard and orchestration tabs, command mode only** |
 | `Ctrl+W` | Close the selected pane on the dashboard, or tear down the entire mode tab (agent + side panes) when used on a mode tab — after a confirmation dialog. The dashboard tab itself cannot be closed. | **Command mode only** |
 | `Ctrl+E` | **Experimental — off by default.** Toggle the command-entry lock — whether you can type directly into a worker pane on an orchestration tab. See [`Ctrl+E` locks command entry to the orchestrator pane](#ctrle-locks-command-entry-to-the-orchestrator-pane). | **Command mode only, on an orchestration tab**, and only while the `experimental` flag is on |
 
@@ -59,19 +59,19 @@ Three details worth knowing:
 
 Focus follows the same setting. While locked, the deck steers focus for you: onto a worker the moment it starts waiting on you, then back to the orchestrator once nothing is waiting any more. While unlocked, the deck moves focus nowhere at all — it stays exactly where you put it until you lock again.
 
-### `z` zooms the focused agent pane
+### `Ctrl+Z` zooms the focused agent pane
 
-On an orchestration tab, `z` in command mode gives the focused agent's pane the whole frame: the sidebar and the other role panes are not drawn, and the pane's own border stays — now reading `orchestrator [Z]`, or whichever role you are on. Press `z` again and the previous view comes back exactly as it was, including a `Ctrl+L` split you had toggled. It is the `tmux prefix+z` model, and `Ctrl+D` is this app's prefix, so `Ctrl+D` `z` is the same two-key move.
+On the Dashboard or an orchestration tab, `Ctrl+Z` in command mode gives the focused agent's pane the whole frame: the card sidebar and the other panes are not drawn, and the pane's own border stays — now reading `orchestrator [Z]`, or whichever pane you are on. Press `Ctrl+Z` again and the previous view comes back exactly as it was, including a `Ctrl+L` split you had toggled. So the full gesture is `Ctrl+D` then `Ctrl+Z` to zoom, and `Ctrl+Z` again to restore.
 
-This holds whatever `Ctrl+T` is set to: a tiled deck zooms to the focused pane alone, not to three taller panes, and the `Ctrl+T` setting itself is left untouched so unzooming restores the tiling exactly.
+This holds whatever `Ctrl+T` is set to: a tiled deck zooms to the focused pane alone, not to three taller panes, and the `Ctrl+T` setting itself is left untouched so unzooming restores the tiling exactly. It also works the same way on both tab kinds that have one, because they are the same shape — a card sidebar beside a stack of agent panes, at 33/67 on the Dashboard and 34/66 (or a `Ctrl+L`-narrowed 25/75) on an orchestration tab. A Mode tab has no sidebar to reclaim, so `Ctrl+Z` does nothing there and reaches the pane as ordinary input.
 
 The `[Z]` in the border title is there because the one real hazard of zooming is forgetting you did it and concluding your other agents have gone. They have not: **every agent keeps running while you are zoomed**, delegation and hooks are unaffected, and the only thing that changed is what is drawn. What you do lose while zoomed is the sidebar, which is the live status of everyone else — so it is a working posture, not a supervising one.
 
 Three details worth knowing:
 
-- **It is a plain `z`, not `Ctrl+Z`, and it is claimed only in command mode on an orchestration tab.** `Ctrl+Z` is job control for whatever runs inside a pane, and the deck deliberately keeps forwarding it as `0x1a` rather than taking it for a view toggle. The other side of that choice is that the zoom key is an ordinary letter, so it is scoped tightly: while you are typing in a pane, or into the filter, a rename or the new-pane form, `z` is just the letter z and reaches whatever you are typing at.
+- **It is claimed only in command mode, and that is what keeps job control working.** `Ctrl+Z` inside a pane is `0x1a`, the terminal's suspend character, and the deck keeps forwarding it: while you are typing at an agent, `Ctrl+Z` still suspends whatever is running there, exactly as it always has. The deck only takes the chord in command mode, on a tab that has a sidebar to hide — the same narrowing that lets `Ctrl+L` stay readline's clear-screen and `Ctrl+W` stay word-delete while you type.
 - **Zoom follows focus.** Jump to another role with `1`–`9` while zoomed and you stay zoomed, now on that agent — the role jump is a deliberate "go work with that one", so the posture travels with it.
-- **Zoom is per-tab and does not survive a detach.** Each orchestration tab remembers its own zoom, a tab you open later starts unzoomed, and nothing about it is written to the saved session — reattaching always returns the full supervisory view. This is the deliberate opposite of the `Ctrl+L` split, which is one setting for the whole deck.
+- **Zoom is per-tab and does not survive a detach.** Each tab remembers its own zoom — the Dashboard's and an orchestration tab's are separate, so zooming one never touches the other — a tab you open later starts unzoomed, and nothing about it is written to the saved session, so reattaching always returns the full supervisory view. This is the deliberate opposite of the `Ctrl+L` split, which is one setting for the whole deck.
 
 Zooming and unzooming resizes the agent's PTY, so the agent reflows to the new width both ways.
 
@@ -212,7 +212,7 @@ Notation is case-insensitive for modifier and named keys (`ctrl+enter` == `Ctrl+
 [global]
 toggle_layout = "Alt+Shift+l"   # move it off Ctrl+t
 toggle_orchestration_split = "Alt+Shift+s"   # move it off Ctrl+l
-toggle_zoom = "Ctrl+Alt+z"       # move zoom off the plain z
+toggle_zoom = "Ctrl+Alt+z"       # move zoom off Ctrl+Z
 new_pane = ""                    # disable the new-pane shortcut
 
 [dashboard]
@@ -231,7 +231,7 @@ help = "F1"                      # open help with F1 instead of ?
 | `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout — works from any mode |
 | `toggle_orchestration_lock` | `Ctrl+e` | **Experimental — requires the `experimental` flag; without it the chord is never claimed.** Toggle the orchestration command-entry lock — **command mode only, on an orchestration tab**; everywhere else the chord is ordinary input for whatever is running in the pane |
 | `toggle_orchestration_split` | `Ctrl+l` | Toggle the orchestration sidebar/pane-column split between 34/66 and 25/75 — one press applies to every orchestration tab, including ones you open afterwards. **Orchestration tabs, command mode only**; in a pane, and on every other tab, the chord is ordinary input for whatever is running there |
-| `toggle_zoom` | `z` | Zoom the focused role pane to the whole frame, hiding the sidebar and the other panes; press again to restore. Per-tab, and never saved. **Orchestration tabs, command mode only**; in a pane, in the filter/rename rows, and on every other tab the key is ordinary input for whatever you are typing at |
+| `toggle_zoom` | `Ctrl+Z` | Zoom the focused pane to the whole frame, hiding the card sidebar and the other panes; press again to restore. Per-tab, and never saved. **Dashboard and orchestration tabs, command mode only**; in a pane it is still `0x1a` job control for your agent, and in the filter/rename rows and on a Mode tab it is ordinary input |
 | `jump_1` … `jump_9` | `1` … `9` | Jump to card N and focus its pane |
 
 `close_pane`, `toggle_orchestration_lock`, `toggle_orchestration_split`, and `toggle_zoom` live in `[global]` because the section names the TOML table your binding is read from, not the modes it applies in. Whatever chord you bind any of them to is command-mode only and reaches the pane as ordinary input everywhere else.

@@ -356,7 +356,13 @@ pub(crate) enum PaneLayout {
 /// Describes which panes to render and how to lay them out, based on the active tab.
 enum ActiveTabView {
     /// Dashboard tab: show all panes except those managed by mode tabs.
-    Dashboard { exclude_pane_ids: Vec<String> },
+    Dashboard {
+        exclude_pane_ids: Vec<String>,
+        /// PRD #313: mirrors `Tab::Dashboard::zoomed`. Travels on the snapshot
+        /// for the same reason the orchestration one does — `compute_frame_layout`
+        /// stays a pure function of its inputs.
+        zoomed: bool,
+    },
     /// Mode tab: agent pane on left (50%), side panes stacked on right (50%).
     Mode {
         mode_name: String,
@@ -2701,6 +2707,25 @@ pub(crate) fn orchestration_layout_percents(narrow: bool, zoomed: bool) -> (u16,
         (0, 100)
     } else {
         orchestration_split_percents(narrow)
+    }
+}
+
+/// PRD #313: the Dashboard's sidebar/pane-column split for a tab's zoom state —
+/// `(0, 100)` when zoomed, the fixed 33/67 default otherwise.
+///
+/// The Dashboard is the same shape as an orchestration tab (card sidebar on the
+/// left, a stack of agent panes on the right; the two even share
+/// `right_column_pane_dims`), so zoom is worth exactly what it is worth there
+/// and the resolver is the mirror of [`orchestration_layout_percents`]. It stays
+/// a separate function rather than a shared one with a percentage parameter
+/// because the unzoomed halves genuinely differ — 33/67 here, and a
+/// `Ctrl+l`-toggled 34/66-or-25/75 there — and collapsing them would put a
+/// caller in the position of passing the constants back in.
+pub(crate) fn dashboard_layout_percents(zoomed: bool) -> (u16, u16) {
+    if zoomed {
+        (0, 100)
+    } else {
+        (DASHBOARD_LEFT_PERCENT, DASHBOARD_PANES_PERCENT)
     }
 }
 
@@ -6872,6 +6897,7 @@ pub fn sync_and_derive_selection(
     match tab {
         Tab::Dashboard {
             selected_session_id,
+            ..
         } => {
             if let Some(fid) = focused_pane_id
                 && let Some((sid, _)) = filtered.iter().find(|(_, pid)| *pid == Some(fid))
@@ -7248,6 +7274,7 @@ fn switch_tab_with_focus(
         // remembered pane → feed `restored_focus` → pre-seed the baseline.
         if let Tab::Dashboard {
             selected_session_id,
+            ..
         } = tab_manager.active_tab()
             && let Some(sid) = selected_session_id
             && let Some(session) = snapshot.sessions.get(sid)
@@ -8427,28 +8454,31 @@ fn scope_orchestration_split(
 }
 
 /// PRD #313: the same narrowing as [`scope_orchestration_split`], for the zoom
-/// toggle — `Action::ToggleZoom` resolves only on an orchestration tab, in
-/// command mode.
+/// toggle — `Action::ToggleZoom` resolves only on a tab that HAS a card
+/// sidebar to reclaim (Dashboard or Orchestration), and only in command mode.
 ///
-/// Both terms carry more weight here than they do for the split, because the
-/// default binding is a plain `z` rather than a chord:
-///
-/// - **Mode** — without it nobody could type the letter z anywhere in the deck.
-///   `global_action_for_mode` runs ahead of every per-mode handler, so an
-///   unscoped `z` would be swallowed in `PaneInput` (never reaching the agent's
-///   PTY) *and* in `Filter` / `Rename` / the new-pane form, where it would go
-///   missing from the text the user is typing.
-/// - **Tab type** — on a Dashboard or Mode tab there is no orchestration
-///   sidebar to reclaim, so claiming the letter there is pure loss.
+/// - **Mode (the `UiMode`)** — this is what keeps `Ctrl+Z` job control. The
+///   binding is `Ctrl+z`, and in a pane that byte is `0x1a`, the tty's SUSP
+///   character: unscoped, the deck would eat every agent's suspend/resume.
+///   `global_action_for_mode` runs ahead of every per-mode handler, so the
+///   keystroke would never reach the PTY. Un-resolving it here is what lets it
+///   fall through to `ForwardToPane([0x1a])`, exactly as `Ctrl+l` stays
+///   readline's clear-screen and `Ctrl+w` stays word-delete while you type.
+/// - **Tab type** — a Mode tab is two pane regions (agent left, side panes
+///   right), not sidebar-plus-panes, so "hide the sidebar and take the frame"
+///   has no meaning there and claiming the chord would be pure loss. The
+///   Dashboard and an Orchestration tab ARE the same shape — both are a card
+///   sidebar beside a stack of agent panes, and they even share
+///   `right_column_pane_dims` — so both zoom.
 ///
 /// Returning `None` un-resolves it so the key falls through to whichever
 /// handler owns the mode — the `PaneInput` PTY forwarding, or a text field's
 /// own insert. Every other action passes through untouched. Kept a standalone
 /// pure function for the same reason its siblings are: it is then unit-testable
 /// without a PTY (`orchestration/layout/007`).
-fn scope_zoom(action: Option<Action>, is_orchestration_tab: bool, mode: UiMode) -> Option<Action> {
+fn scope_zoom(action: Option<Action>, tab_has_card_sidebar: bool, mode: UiMode) -> Option<Action> {
     match action {
-        Some(Action::ToggleZoom) if !is_orchestration_tab || mode != UiMode::Normal => None,
+        Some(Action::ToggleZoom) if !tab_has_card_sidebar || mode != UiMode::Normal => None,
         other => other,
     }
 }
@@ -9016,22 +9046,36 @@ fn dispatch_action(
                     Some((format!("Split: {split_name}"), std::time::Instant::now()));
             }
         }
-        // `z`: zoom the active orchestration tab's focused role pane (PRD
-        // #313). PER-TAB, which is the deliberate contrast with the split
-        // above: this writes the ACTIVE tab's own flag and touches no other
-        // tab, so a tab the user never zoomed never loses its sidebar. The
-        // `matches!` guard has the same job as the split's — unreachable off an
-        // orchestration tab (`scope_zoom` un-resolves the key there), but a
-        // no-op rather than a surprise if that ever changes.
+        // `Ctrl+z`: zoom the active tab's focused pane (PRD #313). PER-TAB,
+        // which is the deliberate contrast with the split above: this writes the
+        // ACTIVE tab's own flag and touches no other tab, so a tab the user
+        // never zoomed never loses its sidebar — and the Dashboard's flag and an
+        // orchestration tab's are separate values for the same reason.
+        //
+        // Both card-shaped tab kinds are handled, because they are the same
+        // shape: a card sidebar on the left and a stack of agent panes on the
+        // right, differing only in the percentage (33/67 vs a `Ctrl+l`-toggled
+        // 34/66-or-25/75) and in which panes they scope to. A Mode tab is
+        // deliberately absent — it is two pane regions rather than
+        // sidebar-plus-panes, so "hide the sidebar" has no meaning there; see
+        // the follow-up issue referenced in the PRD.
+        //
+        // The `match` arm has the same job the split's `matches!` guard does —
+        // unreachable on a Mode tab (`scope_zoom` un-resolves the key there),
+        // but a no-op rather than a surprise if that ever changes.
         Action::ToggleZoom => {
-            if let Tab::Orchestration { zoomed, .. } = tab_manager.active_tab_mut() {
+            let flag = match tab_manager.active_tab_mut() {
+                Tab::Orchestration { zoomed, .. } | Tab::Dashboard { zoomed, .. } => Some(zoomed),
+                Tab::Mode { .. } => None,
+            };
+            if let Some(zoomed) = flag {
                 *zoomed = !*zoomed;
                 let zoom_name = if *zoomed { "on" } else { "off" };
                 // Mirroring `ToggleOrchestrationSplit`: flip the flag and let
                 // the next frame pick it up. `compute_frame_layout` reads it off
-                // `ActiveTabView::Orchestration` and the pre-draw
-                // `resize_panes_to_layout` pass reflows the role panes' PTYs
-                // from the same rects — no resize is pushed from here.
+                // the render snapshot and the pre-draw `resize_panes_to_layout`
+                // pass reflows the panes' PTYs from the same rects — no resize is
+                // pushed from here.
                 ui.status_message = Some((format!("Zoom: {zoom_name}"), std::time::Instant::now()));
             }
         }
@@ -9304,6 +9348,7 @@ fn dispatch_action(
                 ui.selected_index = Some(idx);
                 if let Tab::Dashboard {
                     selected_session_id,
+                    ..
                 } = tab_manager.active_tab_mut()
                 {
                     *selected_session_id = Some(filtered[idx].0.clone());
@@ -10985,10 +11030,16 @@ fn handle_key_event(
         // so narrow it here — otherwise `Ctrl+l` is claimed everywhere and
         // never reaches a pane's PTY. See `scope_orchestration_split`.
         action = scope_orchestration_split(action, is_orchestration_tab, ui.mode);
-        // PRD #313: and the zoom toggle, on the same terms. See `scope_zoom` —
-        // the default binding is a plain `z`, so this is what keeps the letter
-        // typeable at an agent and inside the filter/rename rows.
-        action = scope_zoom(action, is_orchestration_tab, ui.mode);
+        // PRD #313: and the zoom toggle, on nearly the same terms — but a
+        // WIDER tab predicate, because the Dashboard is the same card-sidebar
+        // shape as an orchestration tab and zoom is worth the same there. See
+        // `scope_zoom`; the mode half is what keeps `Ctrl+Z` reaching a pane as
+        // `0x1a` job control.
+        let tab_has_card_sidebar = matches!(
+            tab_manager.active_tab(),
+            Tab::Orchestration { .. } | Tab::Dashboard { .. }
+        );
+        action = scope_zoom(action, tab_has_card_sidebar, ui.mode);
     }
 
     // PRD #341 M5: command-mode focused-pane scrolling (`scroll_pane_up` /
@@ -12479,8 +12530,9 @@ pub fn run_tui(
         let has_pane_control = pane.is_available();
         let pane_layout = ui.pane_layout;
         let tab_view = match tab_manager.active_tab() {
-            Tab::Dashboard { .. } => ActiveTabView::Dashboard {
+            Tab::Dashboard { zoomed, .. } => ActiveTabView::Dashboard {
                 exclude_pane_ids: tab_manager.all_managed_pane_ids(),
+                zoomed: *zoomed,
             },
             Tab::Mode {
                 name,
@@ -14192,18 +14244,29 @@ fn compute_frame_layout(
                 side_pane_rects,
             }
         }
-        ActiveTabView::Dashboard { exclude_pane_ids } => {
+        ActiveTabView::Dashboard {
+            exclude_pane_ids,
+            zoomed,
+        } => {
             let pane_ids: Vec<String> = all_pane_ids
                 .iter()
                 .filter(|&id| !exclude_pane_ids.contains(id))
                 .cloned()
                 .collect();
-            let (dashboard_area, panes_area) = split_cards_area(
-                main_area,
-                &pane_ids,
-                DASHBOARD_LEFT_PERCENT,
-                DASHBOARD_PANES_PERCENT,
-            );
+            // PRD #313: the Dashboard zooms on exactly the same terms as an
+            // orchestration tab — zero-width sidebar, full-frame pane column,
+            // and an effective `Stacked` layout so the non-focused panes are not
+            // drawn whatever `Ctrl+t` is set to. Both halves are resolved here,
+            // once, and carried in `FrameContent::Cards`; see the Orchestration
+            // arm below for why that matters (PRD #84 invariant 1).
+            let (left_percent, panes_percent) = dashboard_layout_percents(*zoomed);
+            let pane_layout = if *zoomed {
+                PaneLayout::Stacked
+            } else {
+                pane_layout
+            };
+            let (dashboard_area, panes_area) =
+                split_cards_area(main_area, &pane_ids, left_percent, panes_percent);
             let pane_rects = cards_pane_rects(panes_area, &pane_ids, pane_layout, focused_pane_id);
             FrameContent::Cards {
                 dashboard_area,
@@ -14740,10 +14803,14 @@ fn render_frame(
     // PRD #313: is this frame's tab zoomed? Resolved once here and threaded into
     // every `render_terminal_panes` call below, so the three Cards paths (no
     // sessions / all filtered out / the normal grid) cannot disagree about
-    // whether the focused pane wears the indicator. Only an orchestration tab
-    // can be zoomed; the geometry it implies was already resolved by
-    // `compute_frame_layout`, so all this decides is the border title.
-    let zoomed = matches!(tab_view, ActiveTabView::Orchestration { zoomed: true, .. });
+    // whether the focused pane wears the indicator. Both card-shaped tabs can be
+    // zoomed — a Mode tab cannot; the geometry each implies was already resolved
+    // by `compute_frame_layout`, so all this decides is the border title.
+    let zoomed = matches!(
+        tab_view,
+        ActiveTabView::Orchestration { zoomed: true, .. }
+            | ActiveTabView::Dashboard { zoomed: true, .. }
+    );
 
     // PRD #341 M3: reconcile the banner against the mode this frame is about to
     // draw, then read its decay state ONCE and thread that one value into every
@@ -17487,7 +17554,7 @@ fn render_help_overlay(
         // PRD #313: same scope as the split above (command mode, orchestration
         // tab), so it sits in the same place. The description names the tab
         // scope and stays inside the ~30 columns this field renders.
-        help_key_line(&n(KbAction::ToggleZoom), "Zoom orch tab focused pane"),
+        help_key_line(&n(KbAction::ToggleZoom), "Zoom focused pane"),
         help_key_line(&n(KbAction::Filter), "Filter sessions"),
         help_key_line(&n(KbAction::ClearFilter), "Clear filter"),
         help_key_line(&n(KbAction::Rename), "Rename session"),
@@ -21780,6 +21847,7 @@ mod tests {
         let frame_area = Rect::new(0, 0, 100, 40);
         let tab_view = ActiveTabView::Dashboard {
             exclude_pane_ids: vec![],
+            zoomed: false,
         };
         let tab_bar = TabBarInfo {
             show: true,
@@ -22426,52 +22494,73 @@ mod tests {
     // which is also where the `[Z]` indicator lives.
     // -----------------------------------------------------------------------
 
-    /// Scenario: PRD #313 — press `z` in command mode on an orchestration tab
-    /// and the deck must resolve `Action::ToggleZoom`; press it anywhere else
-    /// and the deck must not claim it, so the character reaches the agent you
-    /// are typing at. Resolves a simulated plain-`z` `KeyEvent` through
-    /// `key_action_for_mode`, then drives `scope_zoom` across every tab/mode
-    /// pair, and confirms `Ctrl+Z` still encodes to `0x1a` for the PTY rather
-    /// than becoming a second zoom binding.
+    /// Scenario: PRD #313 — press `Ctrl+Z` in command mode on a tab that has a
+    /// card sidebar (Dashboard or Orchestration) and the deck must resolve
+    /// `Action::ToggleZoom`; press it while typing at a pane and the deck must
+    /// NOT claim it, so the byte still reaches the agent as `0x1a` job control.
+    /// Resolves a simulated `Ctrl+Z` `KeyEvent` through `key_action_for_mode`,
+    /// drives `scope_zoom` across every tab/mode pair, and confirms the
+    /// `PaneInput` path still forwards `0x1a` to the PTY.
     #[spec("orchestration/layout/007")]
     #[test]
-    fn orchestration_layout_007_scope_zoom_claims_z_only_on_an_orchestration_tab() {
+    fn orchestration_layout_007_scope_zoom_claims_ctrl_z_only_on_a_card_sidebar_tab() {
         // The default binding resolves to the zoom toggle SPECIFICALLY — not
         // merely to "some action", which would still pass if the ACTIONS entry
         // were wired to the wrong variant. (`Action` derives no `PartialEq`,
         // hence `matches!` rather than `assert_eq!`.)
         let kb = KeybindingConfig::default();
-        let z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
-        let resolved = key_action_for_mode(&kb, UiMode::Normal, &z);
+        let ctrl_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        let resolved = key_action_for_mode(&kb, UiMode::Normal, &ctrl_z);
         assert!(
             matches!(resolved, Some(Action::ToggleZoom)),
-            "default `z` must resolve to Action::ToggleZoom, got {resolved:?}"
+            "default `Ctrl+z` must resolve to Action::ToggleZoom, got {resolved:?}"
         );
+
+        // A PLAIN `z` must NOT resolve — it is an ordinary character and belongs
+        // to whatever the user is typing into. This is the inverse of the
+        // assertion this test carried before the binding moved, and it is the
+        // half that would break if someone "restored" the old default without
+        // also restoring its scoping.
+        let plain_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+        for mode in [UiMode::Normal, UiMode::PaneInput] {
+            assert!(
+                !matches!(
+                    key_action_for_mode(&kb, mode, &plain_z),
+                    Some(Action::ToggleZoom)
+                ),
+                "a plain `z` must not resolve to the zoom toggle ({mode:?})"
+            );
+        }
 
         let zoom = || Some(Action::ToggleZoom);
 
-        // The ONLY combination that resolves: orchestration tab + command mode.
+        // Card-sidebar tab + command mode resolves. PRD #313 covers BOTH card
+        // shapes: the Dashboard is a 33/67 card sidebar beside a pane stack and
+        // an orchestration tab is a 34/66 one, so the predicate is "does this
+        // tab have a sidebar to reclaim", not "is it an orchestration tab".
         assert!(
             matches!(
                 scope_zoom(zoom(), true, UiMode::Normal),
                 Some(Action::ToggleZoom)
             ),
-            "orchestration tab + command mode must claim the zoom toggle"
+            "a card-sidebar tab in command mode must claim the zoom toggle"
         );
 
-        // Wrong tab, any mode -> un-resolved, so `z` reaches the PTY.
+        // No card sidebar (a Mode tab), any mode -> un-resolved, so `Ctrl+Z`
+        // reaches the PTY.
         for mode in [UiMode::Normal, UiMode::PaneInput] {
             assert!(
                 scope_zoom(zoom(), false, mode).is_none(),
-                "off an orchestration tab the zoom toggle must be un-resolved \
-                 so `z` reaches the focused pane's PTY ({mode:?})"
+                "on a tab with no card sidebar the zoom toggle must be \
+                 un-resolved so `Ctrl+Z` reaches the focused pane's PTY ({mode:?})"
             );
         }
 
-        // Right tab, wrong mode -> un-resolved. `z` is an ORDINARY CHARACTER,
-        // so this half matters far more than it does for the `Ctrl+l` split
-        // toggle (`orchestration/layout/005`): without it, nobody could type
-        // the letter z at an agent.
+        // Right tab, wrong mode -> un-resolved. This is the half that keeps
+        // JOB CONTROL working: `Ctrl+Z` in a pane is `0x1a`, the tty's SUSP
+        // character, so an unscoped binding would eat suspend/resume in every
+        // agent's shell. Same narrowing `Ctrl+l` uses to stay readline's
+        // clear-screen (`orchestration/layout/005`).
         for mode in [
             UiMode::PaneInput,
             UiMode::Filter,
@@ -22486,21 +22575,12 @@ mod tests {
             );
         }
 
-        // PRD #313 Open Question 1, decided: the binding is a plain `z`, NOT
-        // `Ctrl+Z`. `Ctrl+Z` must keep reaching the pane's PTY as `0x1a` (job
-        // control), which `keyevent_ctrl_c_and_ctrl_a` pins at the encoder; here
-        // we pin that the RESOLVER never turns it into the zoom toggle.
-        let ctrl_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
-        for mode in [UiMode::Normal, UiMode::PaneInput] {
-            assert!(
-                !matches!(
-                    key_action_for_mode(&kb, mode, &ctrl_z),
-                    Some(Action::ToggleZoom)
-                ),
-                "Ctrl+Z must NOT resolve to Action::ToggleZoom ({mode:?}) — it \
-                 is job control and belongs to the agent"
-            );
-        }
+        // And the payoff, end to end: in `PaneInput` the chord still reaches the
+        // PTY as `0x1a` rather than being swallowed by the zoom binding. This is
+        // what made `Ctrl+Z` affordable at all — the PRD's Open Question 1 framed
+        // the choice as "Ctrl+Z globally OR a plain `z`", but scoping is a
+        // property of the ACTION, not the key, so command-mode-only `Ctrl+Z`
+        // costs no job control.
         assert!(
             matches!(
                 key_action_for_mode(&kb, UiMode::PaneInput, &ctrl_z),
@@ -22533,6 +22613,137 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Same shape as [`orch_split_widths`], for a Dashboard tab: drive the real
+    /// `compute_frame_layout` and report `(sidebar_width, pane_column_width)`.
+    fn dashboard_zoom_widths(frame_area: Rect, pane_ids: &[String], zoomed: bool) -> (u16, u16) {
+        let tab_view = ActiveTabView::Dashboard {
+            exclude_pane_ids: Vec::new(),
+            zoomed,
+        };
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["Dashboard".into()],
+            active_index: 0,
+            orchestration_statuses: vec![],
+        };
+        let layout = compute_frame_layout(
+            frame_area,
+            &tab_view,
+            &tab_bar,
+            pane_ids,
+            PaneLayout::Tiled,
+            None,
+            1,
+        );
+        let FrameContent::Cards {
+            dashboard_area,
+            panes_area,
+            pane_rects,
+            ..
+        } = layout.content
+        else {
+            panic!("Dashboard tab must produce FrameContent::Cards");
+        };
+        assert_eq!(
+            pane_rects.len(),
+            pane_ids.len(),
+            "every pane must get a rect, drawn or not"
+        );
+        (
+            dashboard_area.width,
+            panes_area.expect("panes => a right column").width,
+        )
+    }
+
+    /// Scenario: PRD #313 — the Dashboard zooms on the same terms as an
+    /// orchestration tab, because it is the same shape: a card sidebar beside a
+    /// stack of agent panes. Drive `compute_frame_layout` for a Dashboard tab
+    /// with two panes, unzoomed and zoomed, and assert the sidebar goes from the
+    /// 33/67 default to zero width with the pane column taking the whole frame,
+    /// that only the focused pane is drawn while zoomed even under `Tiled`, and
+    /// that unzooming restores 33/67 exactly.
+    #[spec("orchestration/layout/012")]
+    #[test]
+    fn orchestration_layout_012_the_dashboard_zooms_like_an_orchestration_tab() {
+        let frame_area = Rect::new(0, 0, 100, 40);
+        let pane_ids = vec!["p0".to_string(), "p1".to_string()];
+
+        // Unzoomed: the Dashboard's own fixed split, which is 33/67 rather than
+        // orchestration's 34/66 — asserted as the real constants, so this test
+        // fails if zoom is wired to the wrong resolver.
+        assert_eq!(
+            dashboard_zoom_widths(frame_area, &pane_ids, false),
+            (33, 67),
+            "an unzoomed Dashboard must use the 33/67 split"
+        );
+
+        // Zoomed: no sidebar, pane column takes the whole frame.
+        assert_eq!(
+            dashboard_zoom_widths(frame_area, &pane_ids, true),
+            (0, 100),
+            "a zoomed Dashboard must give the sidebar zero width and the pane \
+             column the whole 100-col frame"
+        );
+
+        // Reversible, exactly: unzooming restores 33/67 rather than leaving the
+        // tab on some third geometry.
+        assert_eq!(
+            dashboard_zoom_widths(frame_area, &pane_ids, false),
+            (33, 67),
+            "unzooming the Dashboard must restore the 33/67 split exactly"
+        );
+
+        // And the second half of M1 — "other panes are not drawn" — holds here
+        // too, under `Tiled`, via the same effective-Stacked resolution the
+        // Orchestration arm uses (`orchestration/layout/011` is its sibling).
+        let tab_view = ActiveTabView::Dashboard {
+            exclude_pane_ids: Vec::new(),
+            zoomed: true,
+        };
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["Dashboard".into()],
+            active_index: 0,
+            orchestration_statuses: vec![],
+        };
+        let layout = compute_frame_layout(
+            frame_area,
+            &tab_view,
+            &tab_bar,
+            &pane_ids,
+            PaneLayout::Tiled,
+            Some("p0"),
+            1,
+        );
+        let FrameContent::Cards {
+            panes_area,
+            pane_rects,
+            ..
+        } = layout.content
+        else {
+            panic!("Dashboard tab must produce FrameContent::Cards");
+        };
+        let rect = |id: &str| {
+            pane_rects
+                .iter()
+                .find(|(pid, _)| pid == id)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("{id} must still be present in pane_rects"))
+        };
+        assert_eq!(
+            rect("p0"),
+            panes_area.expect("panes => a right column"),
+            "zoomed, the focused Dashboard pane must be the whole pane column \
+             whatever the Stacked/Tiled toggle says"
+        );
+        assert_eq!(
+            rect("p1").height,
+            0,
+            "zoomed, a non-focused Dashboard pane must reserve zero rows \
+             (PRD #311 M2's convention) rather than take a tiled slice"
+        );
     }
 
     /// Scenario: PRD #313 M1 — an orchestration tab's frame geometry must be the
@@ -23249,6 +23460,7 @@ mod tests {
         let ui = UiState::default();
         let tab_view = ActiveTabView::Dashboard {
             exclude_pane_ids: Vec::new(),
+            zoomed: false,
         };
         // 8 cols is narrower than any single full button label, so every button
         // wraps onto its own row — the uncapped count (9) exceeds each of these
@@ -24829,6 +25041,7 @@ mod tests {
                 // (one layout pass per frame); compute it from the same inputs.
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
+                    zoomed: false,
                 };
                 let tab_bar = TabBarInfo {
                     show: false,
@@ -24919,6 +25132,7 @@ mod tests {
                 // (one layout pass per frame); compute it from the same inputs.
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
+                    zoomed: false,
                 };
                 let tab_bar = TabBarInfo {
                     show: false,
@@ -25059,6 +25273,7 @@ mod tests {
                 // (one layout pass per frame); compute it from the same inputs.
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
+                    zoomed: false,
                 };
                 let tab_bar = TabBarInfo {
                     show: false,
@@ -25420,6 +25635,7 @@ mod tests {
                 // (one layout pass per frame); compute it from the same inputs.
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
+                    zoomed: false,
                 };
                 let tab_bar = TabBarInfo {
                     show: false,
@@ -25513,6 +25729,7 @@ mod tests {
                 // (one layout pass per frame); compute it from the same inputs.
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
+                    zoomed: false,
                 };
                 let tab_bar = TabBarInfo {
                     show: false,
@@ -25581,6 +25798,7 @@ mod tests {
                 // (one layout pass per frame); compute it from the same inputs.
                 let tab_view = ActiveTabView::Dashboard {
                     exclude_pane_ids: vec![],
+                    zoomed: false,
                 };
                 let tab_bar = TabBarInfo {
                     show: false,
@@ -27146,6 +27364,7 @@ mod tests {
         ui.selected_index = Some(1);
         if let Tab::Dashboard {
             selected_session_id,
+            ..
         } = tab_manager.active_tab_mut()
         {
             *selected_session_id = Some("s1".to_string());
@@ -27282,6 +27501,7 @@ mod tests {
         ui.selected_index = Some(1);
         if let Tab::Dashboard {
             selected_session_id,
+            ..
         } = tab_manager.active_tab_mut()
         {
             *selected_session_id = Some("s1".to_string());
@@ -27458,6 +27678,7 @@ mod tests {
         ui.selected_index = None; // inactive
         let mut tab = Tab::Dashboard {
             selected_session_id: None,
+            zoomed: false,
         };
         reconcile_dashboard_selection(&mut ui, &mut tab, Some("p1"), &filtered);
         assert_eq!(
@@ -27471,6 +27692,7 @@ mod tests {
         ui2.selected_index = None;
         let mut tab2 = Tab::Dashboard {
             selected_session_id: None,
+            zoomed: false,
         };
         reconcile_dashboard_selection(&mut ui2, &mut tab2, None, &filtered);
         assert_eq!(
@@ -27606,6 +27828,7 @@ mod tests {
         ui.selected_index = Some(1);
         if let Tab::Dashboard {
             selected_session_id,
+            ..
         } = tab_manager.active_tab_mut()
         {
             *selected_session_id = Some("s1".to_string());
@@ -27957,6 +28180,7 @@ mod tests {
             ui.selected_index = Some(1);
             if let Tab::Dashboard {
                 selected_session_id,
+                ..
             } = tab_manager.active_tab_mut()
             {
                 *selected_session_id = Some("s1".to_string());
@@ -28071,6 +28295,7 @@ mod tests {
         ui.selected_index = Some(1);
         if let Tab::Dashboard {
             selected_session_id,
+            ..
         } = tab_manager.active_tab_mut()
         {
             *selected_session_id = Some("agent-sess".to_string());
@@ -28121,6 +28346,7 @@ mod tests {
         ui.selected_index = None; // inactive
         let mut tab = Tab::Dashboard {
             selected_session_id: None,
+            zoomed: false,
         };
         let filtered: [(&str, Option<&str>); 3] =
             [("s0", Some("p0")), ("s1", Some("p1")), ("s2", Some("p2"))];

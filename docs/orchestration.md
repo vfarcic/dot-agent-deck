@@ -94,7 +94,7 @@ These require command mode — press `Ctrl+d` first if you are typing in a role 
 | `1`–`9` | Jump to role card N and focus its pane |
 | `Ctrl+w` | Close the orchestration tab (stops all role panes), after a confirmation |
 | `Ctrl+e` | **Experimental, off by default** — toggle the command-entry lock, i.e. whether you can type directly into a worker pane (see below) |
-| `z` | Zoom the focused role pane to the whole frame — the sidebar and the other panes are not drawn (see [Zooming the focused pane](#zooming-the-focused-pane)) |
+| `Ctrl+Z` | Zoom the focused role pane to the whole frame — the sidebar and the other panes are not drawn (see [Zooming the focused pane](#zooming-the-focused-pane)) |
 
 These work from anywhere, including while typing in a role pane:
 
@@ -110,9 +110,9 @@ In the default `Stacked` pane layout, only the focused role's pane is drawn — 
 
 ### Zooming the focused pane
 
-The 34/66 split is right while you are supervising — the sidebar is how you see which of seven agents is working. It is wrong once you have stopped supervising and started working *in* one agent: reading a long diff, following a plan, going back and forth with the orchestrator on a laptop screen. Press `z` in command mode and the focused agent's pane takes the whole frame.
+The 34/66 split is right while you are supervising — the sidebar is how you see which of seven agents is working. It is wrong once you have stopped supervising and started working *in* one agent: reading a long diff, following a plan, going back and forth with the orchestrator on a laptop screen. Press `Ctrl+Z` in command mode and the focused agent's pane takes the whole frame.
 
-What zoom hides is the **sidebar** and the **other role panes**. What it keeps is the focused pane's own **border**, which is where the title, the focus weight and the role's status colour live — and where the zoom indicator goes. While zoomed the border title reads `orchestrator [Z]` (or whichever role you are on), mirroring the `Z` tmux puts in its status line. Press `z` again and the previous view returns exactly as it was, including a `Ctrl+l` split you had toggled.
+What zoom hides is the **sidebar** and the **other role panes**. What it keeps is the focused pane's own **border**, which is where the title, the focus weight and the role's status colour live — and where the zoom indicator goes. While zoomed the border title reads `orchestrator [Z]` (or whichever role you are on), mirroring the `Z` tmux puts in its status line. Press `Ctrl+Z` again and the previous view returns exactly as it was, including a `Ctrl+l` split you had toggled.
 
 That is true under either pane layout. A `Tiled` deck (`Ctrl+t`) does not zoom into every role pane at once, only taller — zoom shows the focused agent and nothing else, because "make everything wider" is not what you asked for. Your `Ctrl+t` choice is overridden for as long as the zoom lasts and is never rewritten, so unzooming a tiled deck puts every pane back exactly where it was.
 
@@ -121,10 +121,11 @@ That is true under either pane layout. A `Tiled` deck (`Ctrl+t`) does not zoom i
 Three more things to know:
 
 - **Zoom follows focus.** A `1`–`9` role jump while zoomed stays zoomed, now on the new agent. The role jump is a deliberate "go work with that one", so the posture goes with it.
-- **Zoom is per-tab.** Each orchestration tab remembers its own, and a tab you open later starts unzoomed. This is the deliberate opposite of the `Ctrl+l` split, which is one setting for the whole deck: a sidebar width is a standing reading preference, while zoom says "I am working in *this* agent right now".
+- **Zoom is per-tab.** Each tab remembers its own, and a tab you open later starts unzoomed. This is the deliberate opposite of the `Ctrl+l` split, which is one setting for the whole deck: a sidebar width is a standing reading preference, while zoom says "I am working in *this* agent right now".
+- **The Dashboard zooms too.** It is the same shape as an orchestration tab — a card sidebar beside a stack of agent panes, at 33/67 rather than 34/66 — so `Ctrl+Z` does the same thing there, with its own independent flag. A Mode tab is two pane regions rather than sidebar-plus-panes, so there is no sidebar to reclaim and the chord reaches the pane instead.
 - **Zoom does not survive a detach.** Nothing about it is written to the saved session, so reattaching always returns the full supervisory view.
 
-Zooming and unzooming resizes the agent's PTY, so the agent reflows to the new width and back. `z` is a plain letter rather than `Ctrl+Z` on purpose — `Ctrl+Z` stays job control for whatever runs inside a pane — which is why it is claimed only in command mode: while you are typing anywhere, `z` is just the letter z.
+Zooming and unzooming resizes the agent's PTY, so the agent reflows to the new width and back. The chord is claimed **only in command mode**, and that is what keeps job control intact: `Ctrl+Z` inside a pane is `0x1a`, the terminal's suspend character, and the deck goes on forwarding it there — so suspending an agent still works exactly as it always did. It is the same narrowing that lets `Ctrl+l` stay readline's clear-screen while you type.
 
 ### Typing into a worker is locked by default (experimental)
 

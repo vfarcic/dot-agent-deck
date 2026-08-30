@@ -316,7 +316,7 @@ fn orchestration_008_ctrl_l_forwards_to_pty_on_non_orchestration_tab() {
 }
 
 // ---------------------------------------------------------------------------
-// PRD #313 — `z` in command mode zooms the focused role pane.
+// PRD #313 — `Ctrl+Z` in command mode zooms the focused role pane.
 // ---------------------------------------------------------------------------
 
 /// The zoom indicator fused into the focused pane's border title while zoomed —
@@ -363,12 +363,12 @@ fn role_border_title_marked(grid: &str, role: &str) -> bool {
 }
 
 /// Scenario: Open the `orch-focus-lifecycle` fixture's 3-role orchestration on a
-/// 120-column PTY and confirm `z` zooms only where it should. First press `z`
-/// while still in PaneInput and confirm the layout does NOT change — there `z`
-/// is an ordinary character belonging to the agent. Then `Ctrl+d` to command
-/// mode and press `z`: the sidebar disappears, the focused pane's box moves to
+/// 120-column PTY and confirm `Ctrl+Z` zooms only where it should. First press
+/// `Ctrl+Z` while still in PaneInput and confirm the layout does NOT change —
+/// there it is `0x1a`, job control belonging to the agent. Then `Ctrl+d` to
+/// command mode and press `Ctrl+Z`: the sidebar disappears, the box moves to
 /// column 0 and its border title gains the `[Z]` marker, while every role's
-/// agent is still registered and running behind the zoom. A second `z` restores
+/// agent is still registered and running behind the zoom. A second press restores
 /// the 34/66 split with the other roles' sidebar cards — and `beta`'s live
 /// hook-driven `Working` status — visible again.
 #[spec("tabs/orchestration/011")]
@@ -405,10 +405,11 @@ fn orchestration_011_z_zooms_the_focused_role_pane_in_command_mode() {
         deck.snapshot_grid()
     );
 
-    // (1) In PaneInput `z` is an ORDINARY CHARACTER — it belongs to whatever
-    // runs in the role pane, and must not zoom. Asserted as a predicate that is
-    // expected to TIME OUT (the `orchestration_007` shape).
-    deck.send_keys(b"z");
+    // (1) In PaneInput `Ctrl+Z` is JOB CONTROL — the tty's SUSP character,
+    // `0x1a` — and it belongs to whatever runs in the role pane, so it must not
+    // zoom. Asserted as a predicate that is expected to TIME OUT (the
+    // `orchestration_007` shape).
+    deck.send_bytes(b"\x1a"); // Ctrl+Z == 0x1a
     // Deliberately the BROAD `contains` here, unlike the positive assertions
     // below: this predicate is expected to TIME OUT, so anything that trips it
     // fails the test. Narrowing it to the border title would make it harder to
@@ -420,24 +421,24 @@ fn orchestration_011_z_zooms_the_focused_role_pane_in_command_mode() {
         });
     assert!(
         !zoomed_in_pane_input,
-        "`z` must NOT zoom while in PaneInput — there it is a plain character \
+        "`Ctrl+Z` must NOT zoom while in PaneInput — there it is job control \
          the agent is entitled to receive. PRD #313 scopes the toggle to \
          command mode.\nGrid:\n{}",
         deck.snapshot_grid()
     );
 
-    // (2) Ctrl+d -> command mode, where `z` DOES resolve. The sidebar goes and
+    // (2) Ctrl+d -> command mode, where `Ctrl+Z` DOES resolve. The sidebar goes and
     // the focused pane's box moves to column 0 — but it KEEPS its border (the
     // corner glyph the edge scan anchors on is that border) and the border
     // title gains the zoom marker.
     deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
-    deck.send_keys(b"z");
+    deck.send_bytes(b"\x1a"); // Ctrl+Z == 0x1a
     let zoomed = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
         orchestrator_box_edge(grid) == Some(0) && role_border_title_marked(grid, "orchestrator")
     });
     assert!(
         zoomed,
-        "`z` in command mode did not zoom the focused role pane within 5s — \
+        "`Ctrl+Z` in command mode did not zoom the focused role pane within 5s — \
          expected the pane box at column 0 with a {ZOOM_MARKER} marker at the \
          end of THAT box's border title (not merely somewhere on the grid, \
          which an agent-supplied display name can spell), got edge {:?} and \
@@ -472,8 +473,8 @@ fn orchestration_011_z_zooms_the_focused_role_pane_in_command_mode() {
         );
     }
 
-    // (4) A second `z` restores the previous view exactly.
-    deck.send_keys(b"z");
+    // (4) A second `Ctrl+Z` restores the previous view exactly.
+    deck.send_bytes(b"\x1a"); // Ctrl+Z == 0x1a
     // Whole-grid NEGATIVE, kept broad for the same reason as the PaneInput
     // check above: "the marker is nowhere" is strictly stronger than "the
     // marker is not on this one border", and unspoofable in the pass direction.
@@ -483,7 +484,7 @@ fn orchestration_011_z_zooms_the_focused_role_pane_in_command_mode() {
     });
     assert!(
         restored,
-        "a second `z` did not restore the 34/66 split within 5s — pane-column \
+        "a second `Ctrl+Z` did not restore the 34/66 split within 5s — pane-column \
          edge stayed at {:?}\nGrid:\n{}",
         orchestrator_box_edge(&deck.snapshot_grid()),
         deck.snapshot_grid()
@@ -560,7 +561,7 @@ fn directive_is_answered(
 /// Scenario: Open the `orch-lock-live` fixture's orchestration (a `cat`
 /// orchestrator plus a REAL fully interactive Claude Haiku worker), jump to the
 /// worker with `2` so the live agent is the focused pane, wait for its pane to
-/// go quiet so the agent is genuinely ready for input, and zoom it with `z`.
+/// go quiet so the agent is genuinely ready for input, and zoom it with `Ctrl+Z`.
 /// While zoomed, type a directive asking the agent to `ls` and name the only
 /// `.txt` file — its answer painting inside the full-width pane is proof the
 /// real agent reflowed to the new PTY size and kept working. Then unzoom and
@@ -634,13 +635,13 @@ fn orchestration_012_real_agent_reflows_across_a_zoom_round_trip() {
 
     // Zoom the LIVE agent's pane.
     deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
-    deck.send_keys(b"z");
+    deck.send_bytes(b"\x1a"); // Ctrl+Z == 0x1a
     let zoomed = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
         role_box_edge(grid, "worker") == Some(0) && role_border_title_marked(grid, "worker")
     });
     assert!(
         zoomed,
-        "`z` did not zoom the real agent's pane within 5s — expected its box at \
+        "`Ctrl+Z` did not zoom the real agent's pane within 5s — expected its box at \
          column 0 with a {ZOOM_MARKER} marker at the end of THAT box's border \
          title (not merely somewhere on the grid, which the agent's own display \
          name can spell), got edge {:?} and title {:?}\nGrid:\n{}",
@@ -673,7 +674,7 @@ fn orchestration_012_real_agent_reflows_across_a_zoom_round_trip() {
 
     // Unzoom and prove it reflows back down just as well.
     deck.send_bytes(b"\x04"); // Ctrl+d -> command mode
-    deck.send_keys(b"z");
+    deck.send_bytes(b"\x1a"); // Ctrl+Z == 0x1a
     // Whole-grid NEGATIVE, kept broad: "the marker is nowhere" is the stronger
     // form and cannot be satisfied by a spoof.
     let restored = deck.wait_for_grid_predicate_within(Duration::from_secs(5), |grid| {
@@ -682,7 +683,7 @@ fn orchestration_012_real_agent_reflows_across_a_zoom_round_trip() {
     });
     assert!(
         restored,
-        "a second `z` did not restore the 34/66 split around the real agent's \
+        "a second `Ctrl+Z` did not restore the 34/66 split around the real agent's \
          pane within 5s — edge stayed at {:?}\nGrid:\n{}",
         role_box_edge(&deck.snapshot_grid(), "worker"),
         deck.snapshot_grid()

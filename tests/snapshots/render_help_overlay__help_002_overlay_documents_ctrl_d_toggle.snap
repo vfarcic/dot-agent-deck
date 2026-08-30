@@ -37,7 +37,7 @@ expression: buf
    │  enter              focus selected pane             j / down        select next                     │    
    │  ctrl+w             close selected pane (confirms)  k / up          select previous                 │    
    │  ctrl+l             toggle orch tab split ratio     l / right / enter   enter directory             │    
-   │  z                  zoom orch tab focused pane      h / left / bksp     go up one level             │    
+   │  ctrl+z             zoom focused pane               h / left / bksp     go up one level             │    
    │  /                  filter sessions                 space           confirm current directory       │    
    │  esc                clear filter                    /               filter (case-insensitive)       │    
    │  r                  rename session                  esc             clear filter (twice = close)    │    
