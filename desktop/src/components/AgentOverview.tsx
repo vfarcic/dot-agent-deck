@@ -54,7 +54,25 @@ export function agentKey(agent: Pick<OverviewAgent, "daemonId" | "id">): string 
 export type OverviewGroupKind = "orchestration" | "mode" | "standalone";
 
 export interface OverviewGroup {
+  /**
+   * The group's identity WITHIN its kind, raw and unescaped: an orchestration
+   * id, a mode name, or the literal `"standalone"`. Kept raw because it is the
+   * daemon-side identity a future drill-in navigates by; it is never a React
+   * key and never a DOM id — see `key`.
+   */
   id: string;
+  /**
+   * Unique across every kind, and safe as an HTML id. Orchestration ids, mode
+   * names and the standalone literal shared ONE key space, so a mode named
+   * `standalone`, or one whose name equalled an orchestration id, produced
+   * duplicate sibling React keys and duplicate `data-testid`s. And an id
+   * interpolated raw into `aria-labelledby` breaks the IDREF silently the
+   * moment a daemon-supplied name contains a space: the label association just
+   * stops working, with no error anywhere. `encodeURIComponent` leaves no
+   * whitespace and escapes the `:` separator, so the join stays unambiguous
+   * and the result is always a legal id.
+   */
+  key: string;
   kind: OverviewGroupKind;
   title: string;
   /** The orchestration's own name, shown only when `title` is a display title. */
@@ -93,6 +111,7 @@ export function groupAgents(agents: OverviewAgent[]): OverviewGroup[] {
       const id = agent.tab.orchestrationId ?? `agent:${agentKey(agent)}`;
       const group = orchestrations.get(id) ?? {
         id,
+        key: groupKey("orchestration", id),
         kind: "orchestration" as const,
         title: agent.tab.displayTitle || agent.tab.name,
         subtitle: agent.tab.displayTitle ? agent.tab.name : undefined,
@@ -101,7 +120,7 @@ export function groupAgents(agents: OverviewAgent[]): OverviewGroup[] {
       group.agents.push(agent);
       orchestrations.set(id, group);
     } else if (agent.tab.kind === "mode") {
-      const group = modes.get(agent.tab.name) ?? { id: agent.tab.name, kind: "mode" as const, title: agent.tab.name, agents: [] };
+      const group = modes.get(agent.tab.name) ?? { id: agent.tab.name, key: groupKey("mode", agent.tab.name), kind: "mode" as const, title: agent.tab.name, agents: [] };
       group.agents.push(agent);
       modes.set(agent.tab.name, group);
     } else {
@@ -116,10 +135,23 @@ export function groupAgents(agents: OverviewAgent[]): OverviewGroup[] {
   const groups = [
     ...orchestrations.values(),
     ...modes.values(),
-    ...(standalone.length ? [{ id: "standalone", kind: "standalone" as const, title: "Standalone agents", agents: standalone }] : []),
+    ...(standalone.length ? [{ id: "standalone", key: groupKey("standalone", "standalone"), kind: "standalone" as const, title: "Standalone agents", agents: standalone }] : []),
   ];
   for (const group of groups) group.commonCwd = commonCwdOf(group.agents);
   return groups;
+}
+
+/**
+ * A group's key: its kind and its raw identity, escaped. See `OverviewGroup.key`
+ * for why both halves are load-bearing.
+ *
+ * Note the daemon's PRE-ID orchestration identity is `(name, cwd)`, so a
+ * name-only fallback would merge two unrelated orchestrations. `groupAgents`
+ * has no such fallback — an id-less orchestration agent keys on itself — and
+ * anything that reintroduces one has to carry cwd with the name.
+ */
+export function groupKey(kind: OverviewGroupKind, id: string): string {
+  return `${kind}:${encodeURIComponent(id)}`;
 }
 
 /**
@@ -369,7 +401,7 @@ function DaemonBody({ agents, groups, connection, message, onOpenDeck, onReconne
         <span>WORKING DIRECTORY</span>
       </div>
       <div className="overview-groups">
-        {groups.map((group) => <OverviewGroupCard key={group.id} group={group} />)}
+        {groups.map((group) => <OverviewGroupCard key={group.key} group={group} />)}
       </div>
     </>
   );
@@ -378,9 +410,9 @@ function DaemonBody({ agents, groups, connection, message, onOpenDeck, onReconne
 function OverviewGroupCard({ group }: { group: OverviewGroup }) {
   const Icon = GROUP_ICON[group.kind];
   const counts = countByStatus(group.agents);
-  const titleId = `overview-group-title-${group.id}`;
+  const titleId = `overview-group-title-${group.key}`;
   return (
-    <article className="overview-group" data-testid={`overview-group-${group.id}`} data-group-kind={group.kind} aria-labelledby={titleId}>
+    <article className="overview-group" data-testid={`overview-group-${group.key}`} data-group-id={group.id} data-group-kind={group.kind} aria-labelledby={titleId}>
       <header className="overview-group-header">
         <Icon size={14} aria-hidden="true" />
         <div className="overview-group-identity">

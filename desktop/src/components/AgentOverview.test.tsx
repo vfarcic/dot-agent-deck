@@ -20,7 +20,7 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell } from "../App";
-import { agentKey, AgentOverview, groupAgents, type OverviewAgent, toOverviewAgent } from "./AgentOverview";
+import { agentKey, AgentOverview, groupAgents, groupKey, type OverviewAgent, type OverviewGroupKind, toOverviewAgent } from "./AgentOverview";
 
 /**
  * Every codepoint the render seam must strip, enumerated rather than sampled —
@@ -73,6 +73,11 @@ function titlesOf(container: HTMLElement): string[] {
   return Array.from(container.querySelectorAll("[title]")).map((node) => node.getAttribute("title") ?? "");
 }
 
+/** One group's card, addressed exactly the way the component keys it. */
+function groupCard(kind: OverviewGroupKind, id: string): HTMLElement {
+  return screen.getByTestId(`overview-group-${groupKey(kind, id)}`);
+}
+
 /** Every fleet instrument in the header, in the order the top bar shows them. */
 const COUNTERS = ["agents", "running", "waiting", "failed", "groups"] as const;
 
@@ -108,7 +113,7 @@ describe("AgentOverview", () => {
   it("renders an orchestration as one unit, in role order, with the coordinator identifiable", () => {
     renderOverview();
 
-    const prd = screen.getByTestId("overview-group-orc-745");
+    const prd = groupCard("orchestration", "orc-745");
     expect(prd).toHaveAttribute("data-group-kind", "orchestration");
     expect(within(prd).getByRole("heading", { name: "PRD #745 · agent overview" })).toBeVisible();
     // The fixture declares these six out of role order on purpose.
@@ -121,7 +126,7 @@ describe("AgentOverview", () => {
   it("marks the start role as coordinator even when it is not the first role", () => {
     renderOverview();
 
-    const dotAi = screen.getByTestId("overview-group-orc-dot-ai");
+    const dotAi = groupCard("orchestration", "orc-dot-ai");
     expect(rowNames(dotAi)).toEqual(["writer", "reviewer", "orchestrator", "publisher"]);
     expect(rows(dotAi)[2]).toContainElement(within(dotAi).getByText("COORDINATOR"));
   });
@@ -129,11 +134,11 @@ describe("AgentOverview", () => {
   it("buckets mode tabs and untabbed panes into their own groups", () => {
     renderOverview();
 
-    const mode = screen.getByTestId("overview-group-review");
+    const mode = groupCard("mode", "review");
     expect(mode).toHaveAttribute("data-group-kind", "mode");
     expect(rows(mode)).toHaveLength(2);
 
-    const standalone = screen.getByTestId("overview-group-standalone");
+    const standalone = groupCard("standalone", "standalone");
     expect(standalone).toHaveAttribute("data-group-kind", "standalone");
     expect(rows(standalone)).toHaveLength(3);
     expect(within(standalone).queryByText("COORDINATOR")).not.toBeInTheDocument();
@@ -174,7 +179,7 @@ describe("AgentOverview", () => {
 
     // Every role of this orchestration works in one directory, so the group
     // says it and all six rows stay quiet.
-    const prd = screen.getByTestId("overview-group-orc-745");
+    const prd = groupCard("orchestration", "orc-745");
     expect(prd.querySelector(".overview-group-cwd")).toHaveTextContent("~/code/dot-agent-deck-dispatch-prd-745");
     expect(rows(prd).map((row) => row.querySelector(".overview-cwd")?.textContent)).toEqual(["", "", "", "", "", ""]);
 
@@ -182,7 +187,7 @@ describe("AgentOverview", () => {
     // rather than a shared-value one: two of its three agents work in the deck
     // checkout and one does not, so the common directory is hoisted and the one
     // row that differs is the only thing printed down the column.
-    const standalone = screen.getByTestId("overview-group-standalone");
+    const standalone = groupCard("standalone", "standalone");
     expect(standalone.querySelector(".overview-group-cwd")).toHaveTextContent("~/code/dot-agent-deck");
     expect(rows(standalone).map((row) => row.querySelector(".overview-cwd")?.textContent))
       .toEqual(["", "", "~/code/dot-agent-deck/pi-extension"]);
@@ -233,7 +238,7 @@ describe("AgentOverview", () => {
     }
     // Stripped, not blanked: every legitimate character is still there.
     expect(container.querySelector(".overview-agent-name strong")).toHaveTextContent("pwned");
-    expect(within(screen.getByTestId("overview-group-orc-x")).getByRole("heading")).toHaveTextContent("OrcA");
+    expect(within(groupCard("orchestration", "orc-x")).getByRole("heading")).toHaveTextContent("OrcA");
   });
 
   it("keeps zero-width joiners, which cannot reorder anything", () => {
@@ -275,10 +280,45 @@ describe("AgentOverview", () => {
     }
   });
 
+  /**
+   * The group heading names its table through `aria-labelledby`, and an IDREF
+   * containing a space matches nothing at all — the association just stops,
+   * with no error and nothing visibly wrong. A daemon-supplied mode name is
+   * exactly where a space arrives.
+   */
+  it("keeps the group heading associated with its table when the mode name contains spaces", () => {
+    renderOverview({ snapshot: snapshotWithAgent({ tab: { kind: "mode", name: "code review" } }) });
+
+    const card = groupCard("mode", "code review");
+    const table = within(card).getByRole("table", { name: "code review" });
+    const labelledBy = table.getAttribute("aria-labelledby") ?? "";
+    expect(labelledBy).not.toMatch(/\s/);
+    expect(document.getElementById(labelledBy)).toHaveTextContent("code review");
+    expect(card).toHaveAttribute("data-group-id", "code review");
+  });
+
+  it("renders both groups when a mode name collides with an orchestration id", () => {
+    const base = createFixtureSnapshot("crowded");
+    const [first] = base.agents;
+    renderOverview({
+      snapshot: {
+        ...base,
+        agents: [
+          { ...(first as AgentSession), id: "1", displayName: "in-orchestration", tab: { kind: "orchestration", orchestrationId: "review", name: "review", roleName: "writer", roleIndex: 0, isStartRole: true } },
+          { ...(first as AgentSession), id: "2", displayName: "in-mode", tab: { kind: "mode", name: "review" } },
+        ],
+      },
+    });
+
+    expect(rowNames(groupCard("orchestration", "review"))).toEqual(["in-orchestration"]);
+    expect(rowNames(groupCard("mode", "review"))).toEqual(["in-mode"]);
+    expect(screen.getAllByRole("article")).toHaveLength(2);
+  });
+
   it("exposes real column headers so a screen reader can name the column a cell is in", () => {
     renderOverview();
 
-    const prd = screen.getByTestId("overview-group-orc-745");
+    const prd = groupCard("orchestration", "orc-745");
     const table = within(prd).getByRole("table");
     expect(within(table).getAllByRole("columnheader").map((header) => header.textContent))
       .toEqual(["Status", "Agent", "State", "CLI", "Active tool", "Tools", "Working directory"]);
@@ -466,6 +506,42 @@ describe("groupAgents", () => {
 
     expect(groups).toHaveLength(2);
     expect(groups.map((group) => group.agents.length)).toEqual([1, 1]);
+  });
+
+  /**
+   * Orchestration ids, mode names and the standalone literal used to share one
+   * key space, so a mode whose name equalled an orchestration id gave two
+   * sibling cards the same React key and the same `data-testid`.
+   */
+  it("keeps a mode and an orchestration apart when their names collide", () => {
+    const [seed] = crowded();
+    const groups = groupAgents([
+      { ...seed, id: "1", tab: { kind: "orchestration", orchestrationId: "review", name: "review", roleName: "writer", roleIndex: 0, isStartRole: true } },
+      { ...seed, id: "2", tab: { kind: "mode", name: "review" } },
+    ]);
+
+    expect(groups.map((group) => group.id)).toEqual(["review", "review"]);
+    expect(new Set(groups.map((group) => group.key)).size).toBe(2);
+    expect(groups.map((group) => group.agents.length)).toEqual([1, 1]);
+  });
+
+  it("keeps a mode named `standalone` out of the standalone bucket", () => {
+    const [seed] = crowded();
+    const groups = groupAgents([
+      { ...seed, id: "1", tab: { kind: "mode", name: "standalone" } },
+      { ...seed, id: "2", tab: { kind: "dashboard" } },
+    ]);
+
+    expect(new Set(groups.map((group) => group.key)).size).toBe(2);
+    expect(groups.map((group) => group.kind)).toEqual(["mode", "standalone"]);
+  });
+
+  it("produces a key that is legal as an HTML id whatever the daemon named the group", () => {
+    // No whitespace: `aria-labelledby` is a space-separated token list, so a
+    // single space in a raw name silently splits the reference in two.
+    for (const name of ["code review", "a\tb", "50%", "why?", "#hash"]) {
+      expect(groupKey("mode", name)).not.toMatch(/\s/);
+    }
   });
 
   it("hoists a working directory only when at least two members share it", () => {
