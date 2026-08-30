@@ -568,7 +568,11 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-agent-name strong { overflow: hidden; font-size: 11px; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
 .overview-role-index { flex: 0 0 auto; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: 9px; font-style: normal; }
 .overview-role-name { overflow: hidden; color: var(--faint); font-size: 9px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
-.coordinator-badge { flex: 0 0 auto; padding: 1px 4px; border-radius: 2px; color: var(--teal); background: var(--teal-soft); font-size: 7px; font-weight: 800; letter-spacing: .08em; }
+/* Scoped to the overview on purpose: `.coordinator-badge` is also used by
+   AgentTile and has never had a rule, so an unscoped selector here would
+   restyle the deck — which PRD #745 iteration 1 must not do. Giving the
+   deck's badge a style is a separate change. */
+.overview-row .coordinator-badge { flex: 0 0 auto; padding: 1px 4px; border-radius: 2px; color: var(--teal); background: var(--teal-soft); font-size: 7px; font-weight: 800; letter-spacing: .08em; }
 .overview-row .status-label { justify-self: start; }
 .overview-cli, .overview-cwd, .overview-tool-count { overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .overview-tool-count { justify-self: end; color: var(--faint); }
