@@ -53,11 +53,11 @@ With the flag on, on an **orchestration tab**, typing into a worker pane is lock
 
 Three details worth knowing:
 
-- **`Ctrl+E` is command-mode only**, for the same reason `Ctrl+W` is. `Ctrl+E` is readline's `end-of-line` (byte `0x05`) in shells, agents, and anything else running inside a pane. While you are typing in a pane the deck does not claim it, so the byte reaches the program and moves your cursor to the end of the line as usual.
+- **`Ctrl+E` is command-mode only**, for the same reason `Ctrl+W` is. `Ctrl+E` is readline's `end-of-line` in shells, agents, and anything else running inside a pane. While you are typing in a pane the deck does not claim it, so the byte reaches the program and moves your cursor to the end of the line as usual.
 - **The lock is one setting for the whole deck.** Unlocking on one orchestration tab unlocks all of them, and a newly opened orchestration tab adopts whatever the current setting is. It describes how you are working right now, not which tab you happened to open. It is not saved across restarts — every deck starts locked.
-- **A worker that has stopped and asked you something is not locked.** While a role pane reports `WaitingForInput`, every key reaches it with no unlock at all, and the lock re-engages the moment that status clears. Answering a question the agent itself asked is a response to a request, not an interruption of one. The flip side: an agent that never reports `WaitingForInput` gets no such exemption, and reaching it still needs a deliberate `Ctrl+D`, `Ctrl+E`.
+- **A worker that has stopped and asked you something is not locked.** While a role pane reports `WaitingForInput`, every key reaches it with no unlock at all, and the lock re-engages the moment that status clears. Answering a question the agent itself asked is a response to a request, not an interruption of one. Two limits are worth knowing: an agent that never reports `WaitingForInput` gets no such exemption and still needs a deliberate `Ctrl+D`, `Ctrl+E`; and a pane that is temporarily typeable for this reason looks no different from a locked one, so a stuck or mis-reported status leaves a pane open with no visual cue.
 
-Focus follows the same setting. While locked, the deck steers focus for you: onto a worker the moment it starts waiting on you, then back to the orchestrator once nothing is waiting any more. While unlocked, the deck moves focus nowhere at all — it stays exactly where you put it until you lock again.
+Focus follows the same setting: while locked the deck steers focus onto a worker that starts waiting on you and back to the orchestrator afterwards, and while unlocked it moves focus nowhere at all. That steering is orchestration behaviour rather than a keybinding — see [Focus follows the lock](orchestration.md#focus-follows-the-lock) for which pane it picks and when.
 
 ### `Ctrl+Z` zooms the focused agent pane
 

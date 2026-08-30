@@ -94,6 +94,7 @@ These require command mode — press `Ctrl+d` first if you are typing in a role 
 | `1`–`9` | Jump to role card N and focus its pane |
 | `Ctrl+w` | Close the orchestration tab (stops all role panes), after a confirmation |
 | `Ctrl+e` | **Experimental, off by default** — toggle the command-entry lock, i.e. whether you can type directly into a worker pane (see below) |
+| `Ctrl+l` | Narrow the sidebar from the default 34/66 split to 25/75, giving the pane column more width (one setting for every orchestration tab) |
 | `Ctrl+Z` | Zoom the focused role pane to the whole frame — the sidebar and the other panes are not drawn (see [Zooming the focused pane](#zooming-the-focused-pane)) |
 
 These work from anywhere, including while typing in a role pane:
@@ -110,38 +111,19 @@ In the default `Stacked` pane layout, only the focused role's pane is drawn — 
 
 ### Zooming the focused pane
 
-The 34/66 split is right while you are supervising — the sidebar is how you see which of seven agents is working. It is wrong once you have stopped supervising and started working *in* one agent: reading a long diff, following a plan, going back and forth with the orchestrator on a laptop screen. Press `Ctrl+Z` in command mode and the focused agent's pane takes the whole frame.
+The 34/66 split is right while you are supervising — the sidebar is how you see which of seven agents is working. It is wrong once you have stopped supervising and started working *in* one agent: reading a long diff, following a plan, going back and forth with the orchestrator on a laptop screen. Press `Ctrl+Z` in command mode and the focused agent's pane takes the whole frame; press it again and the previous view returns exactly as it was. See [`Ctrl+Z` zooms the focused agent pane](keyboard-shortcuts.md#ctrlz-zooms-the-focused-agent-pane) for what it hides, what it keeps, and how it behaves on other tabs.
 
-What zoom hides is the **sidebar** and the **other role panes**. What it keeps is the focused pane's own **border**, which is where the title, the focus weight and the role's status colour live — and where the zoom indicator goes. While zoomed the border title reads `orchestrator [Z]` (or whichever role you are on), mirroring the `Z` tmux puts in its status line. Press `Ctrl+Z` again and the previous view returns exactly as it was, including a `Ctrl+l` split you had toggled.
-
-That is true under either pane layout. A `Tiled` deck (`Ctrl+t`) does not zoom into every role pane at once, only taller — zoom shows the focused agent and nothing else, because "make everything wider" is not what you asked for. Your `Ctrl+t` choice is overridden for as long as the zoom lasts and is never rewritten, so unzooming a tiled deck puts every pane back exactly where it was.
-
-**Every agent keeps running while you are zoomed.** Zoom changes what is drawn and nothing else: no pane is stopped, delegation still routes, work-done and status hooks still arrive, and an idle worker is still detected. The `[Z]` is there precisely because the failure mode is human — concluding your other agents have disappeared, or watching one agent while another sits blocked behind the hidden sidebar. Zoomed, you are genuinely less informed about everyone else; that is the trade the feature exists to let you make deliberately.
-
-Three more things to know:
-
-- **Zoom follows focus.** A `1`–`9` role jump while zoomed stays zoomed, now on the new agent. The role jump is a deliberate "go work with that one", so the posture goes with it.
-- **Zoom is per-tab.** Each tab remembers its own, and a tab you open later starts unzoomed. This is the deliberate opposite of the `Ctrl+l` split, which is one setting for the whole deck: a sidebar width is a standing reading preference, while zoom says "I am working in *this* agent right now".
-- **The Dashboard zooms too.** It is the same shape as an orchestration tab — a card sidebar beside a stack of agent panes, at 33/67 rather than 34/66 — so `Ctrl+Z` does the same thing there, with its own independent flag. A Mode tab is two pane regions rather than sidebar-plus-panes, so there is no sidebar to reclaim and the chord reaches the pane instead.
-- **Zoom does not survive a detach.** Nothing about it is written to the saved session, so reattaching always returns the full supervisory view.
-
-The agent reflows to the new width and back, so nothing is lost or garbled either way. The chord is claimed **only in command mode**, and that is what keeps job control intact: `Ctrl+Z` inside a pane is the terminal's suspend character, and the deck goes on forwarding it there — so suspending an agent still works exactly as it always did. It is the same narrowing that lets `Ctrl+l` stay readline's clear-screen while you type.
+**Every agent keeps running while you are zoomed.** Zoom changes what is drawn and nothing else: no pane is stopped, delegation still routes, work-done and status hooks still arrive, and an idle worker is still detected. The `[Z]` marker on the border is there precisely because the failure mode is human — concluding your other agents have disappeared, or watching one agent while another sits blocked behind the hidden sidebar. Zoomed, you are genuinely less informed about everyone else; that is the trade the feature exists to let you make deliberately, which is why it is a working posture rather than a supervising one.
 
 ### Typing into a worker is locked by default (experimental)
 
-> **Experimental — this section describes a surface that is off unless you turn it on.**
->
-> The command-entry lock, and the focus steering that comes with it, are gated behind the `experimental` feature flag while the behaviour is evaluated in real use. With the flag off — the default — typing into a worker pane works exactly as it always has, `Ctrl+e` is not claimed, and the deck never moves focus on its own. To try it, set `experimental = true` under a `[features]` table in your `.dot-agent-deck.toml`, or launch with `DOT_AGENT_DECK_EXPERIMENTAL=1` (the environment variable wins over the file).
+> **Experimental — this section describes a surface that is off unless you turn it on.** Set `experimental = true` under a `[features]` table in your `.dot-agent-deck.toml`, or launch with `DOT_AGENT_DECK_EXPERIMENTAL=1`. With the flag off — the default — typing into a worker pane works exactly as it always has and the deck never moves focus on its own.
 
-You talk to the orchestrator; the orchestrator talks to the workers. With the flag on, an orchestration tab makes that the default rather than a convention you have to remember: keystrokes aimed at a worker role are dropped instead of delivered, and the bottom bar says `Pane locked — Ctrl+d then Ctrl+e to unlock`. The orchestrator's own pane is never locked, and Dashboard and mode tabs are not affected at all.
+You talk to the orchestrator; the orchestrator talks to the workers. With the flag on, an orchestration tab makes that the default rather than a convention you have to remember: keystrokes aimed at a worker role are dropped instead of delivered until you deliberately unlock with `Ctrl+d`, `Ctrl+e`. See [`Ctrl+E` locks command entry to the orchestrator pane](keyboard-shortcuts.md#ctrle-locks-command-entry-to-the-orchestrator-pane) for the chord, its scope, and the exemption for a worker that is waiting on you.
 
 The reason is that an orchestration is one workflow with a single coordinator. Type into a worker and you become a second, uncoordinated actor inside it: you change state the orchestrator believes it owns, and there is no path for it to learn that you did. What you usually get is not an obviously broken deck but a quietly diverged one — commonly the orchestrator and a worker contradicting each other into a deadlock. And most of the time it is not even deliberate: you open a worker pane to see how it is doing, get distracted, and type your next instruction into the pane that happens to be in front of you rather than the one you meant.
 
-**Nothing is read-only, and nothing is taken away.** When you do want to reach into a worker — a provider hiccup parked an agent, a weaker model never called `work-done`, an agent is waiting somewhere you did not expect — it costs one deliberate `Ctrl+d`, `Ctrl+e`. That pause is the whole feature: it converts a reflex into a decision. Unlocking reports `Pane entry: unlocked` and leaves you in command mode, so press `Ctrl+d` once more to return to the pane and type; the same chord locks it again. The setting is one value for the whole deck, so unlocking on one orchestration tab unlocks all of them and a newly opened tab adopts the current value; it is not saved across restarts, so every deck starts locked.
-
-**A worker that has stopped and asked you something is never locked.** While a role pane reports `WaitingForInput` — an agent showing a permission prompt, a numbered option list, or a plain "what next?" — every key reaches it with no unlock at all, and the lock re-engages the instant that status clears. Answering a question the agent itself asked is a response to a request, not an intrusion into one. Two limits are worth knowing: an agent that never reports `WaitingForInput` gets no exemption and still needs the deliberate unlock, and a pane that is temporarily typeable for this reason looks no different from a locked one, so a stuck or mis-reported status leaves a pane open with no visual cue.
-
-`Ctrl+e` is claimed only in command mode, like `Ctrl+w`. While you are typing in a role pane the deck does not take it, so `0x05` reaches the agent and readline's `end-of-line` works normally.
+**Nothing is read-only, and nothing is taken away.** When you do want to reach into a worker — a provider hiccup parked an agent, a weaker model never called `work-done`, an agent is waiting somewhere you did not expect — it costs one deliberate `Ctrl+d`, `Ctrl+e`. That pause is the whole feature: it converts a reflex into a decision, which is why the default has to be locked for it to mean anything.
 
 #### Focus follows the lock
 
