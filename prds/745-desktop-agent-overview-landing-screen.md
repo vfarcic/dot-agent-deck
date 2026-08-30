@@ -19,30 +19,44 @@ Three things make that worse than a layout complaint.
 
 ## Solution Overview
 
-The app lands on a fleet overview: every agent the daemon runs, grouped the way the daemon already groups them, described only by things that are actually true, with no terminal attached. You drill into an agent or an orchestration from there, and only then does a PTY get attached.
+A fleet overview: every agent the daemon runs, grouped the way the daemon already groups them, described only by things that are actually true, with no terminal attached. Eventually it is what the app opens on, and you drill from it into an agent or an orchestration — but that promotion depends on those destinations existing, so it is staged deliberately rather than taken in one step (see [Staging](#staging)).
 
 Three commitments define the screen.
 
 **Honesty over completeness.** The overview shows what the daemon genuinely knows and nothing else. It is explicitly better to ship a narrow screen than a wide one padded with `Unavailable` — see [Columns: the central decision](#columns-the-central-decision), which settles this field by field. This extends to values the app currently *fabricates*: live mode renders `ATT 01` on every tile from a hardcoded `attempt: 1` (`desktop/src/lib/bridge.ts:163`, `desktop/src/components/AgentTile.tsx:135-138`), which is worse than showing nothing because it looks like data.
 
-**No terminal on this screen, ever.** Drill-in is what attaches. That requires making attach demand-driven first, which is the prerequisite milestone rather than an optimisation.
+**No terminal on this screen, ever.** Whatever is showing output is what attaches. That requires making attach demand-driven, which is real work rather than a consequence of rendering no terminals — see [Demand-driven attach](#demand-driven-attach).
 
 **Single-daemon today, daemon-shaped from day one.** The screen is written against one daemon, but the model carries a daemon identity and the layout's top-level unit is a daemon group — see [Preserving the multi-daemon extension](#preserving-the-multi-daemon-extension).
+
+### Staging
+
+The work is deliberately split so the *design* can be reviewed before any of the plumbing is built.
+
+**Iteration 1 — fixture only.** The overview is built against the existing fixture transport, with no daemon involved, and ships **alongside** the current deck rather than replacing it: one rail button, deck still the default. It is knowingly a **dead-end dashboard** — informative, with nothing to click through to. The point is to settle layout, grouping, density and what a card carries while all of that is still cheap to change. This iteration touches no Rust and opens no socket.
+
+**Iteration 2 — connected.** The same screen against a live daemon. This is where demand-driven attach becomes necessary (M7) and where the daemon-side `last_activity` field lands. Note the trap: because fixture mode opens no sockets at all, iteration 1 genuinely does not need the attach change — which makes it easy to carry the omission into iteration 2 unnoticed and ship a screen that is visually clean and costs exactly what today costs.
+
+**Iteration 3 — destinations, and promotion to landing screen.** Deferred, explicitly. The overview only becomes the *landing* screen once there is somewhere to go from it: a group view (the current deck, filtered to one tab bucket) and a single-agent view. Until then, making it the default would land users somewhere they cannot leave. This is recorded here as the design's endpoint; whether it ships as a later iteration of this PRD or as its own is decided when we get there.
+
+So this PRD as scoped **does not fully satisfy the title of issue #745**. It builds the overview and defers making it the landing screen. That is intentional and was the explicit decision — an overview with no exits is worse than no overview.
 
 ## Scope
 
 ### In Scope
 
-- **Demand-driven terminal attach.** Attach on drill-in rather than on every snapshot. This is a behaviour change to the existing deck as well, and is the prerequisite for everything else here.
-- **The overview screen itself**: grouped agent cards, honest columns, live status.
+- **The overview screen itself**: grouped agent cards, honest columns, live status, no terminals.
 - **Grouping by the daemon's own tab buckets**: an orchestration reads as one unit with its roles in role order and its coordinator marked; mode tabs group by mode name; dashboard agents form a standalone bucket.
-- **Navigation**: land on the overview, drill into an agent or an orchestration, return to the overview.
-- **View state above `ControlDeck`**, so the overview renders *instead of* the deck rather than inside it.
+- **View state above `ControlDeck`**, as a discriminated union from the start even while it carries only two values, so later destinations arrive as added variants rather than as a refactor.
+- **One "Overview" rail button** to reach it. Converting the rail into real navigation is not attempted here.
 - **A daemon identity on the agent model** and composite `(daemonId, agentId)` keying, while there is still exactly one daemon and it costs nothing.
-- **Empty, unreachable and incompatible states**, including a genuine "connected, zero agents" first-run state — and the fixture for it, which does not currently exist.
-- **Surfacing three fields already on the wire but dropped by the desktop's own Rust DTO**: write lease, last user prompt, orchestration cwd. No protocol change; see [Cross-version safety](#cross-version-safety).
+- **Fixture work**, which is where iteration 1's whole value sits: cutting the fixture's agent shape down to the columns that genuinely exist; a **crowded scenario** (`?fixture=1&state=crowded` — several orchestrations, a mode bucket, standalone agents), because a four-agent fixture cannot answer a question about many agents; and a genuine **connected-with-zero-agents** state, which has no fixture at all today.
+- **Empty, unreachable and incompatible states.**
+- **Demand-driven terminal attach** (iteration 2): attach where a terminal is actually shown, rather than for every agent in every snapshot.
+- **Surfacing three fields already on the wire but dropped by the desktop's own Rust DTO** (iteration 2): write lease, last user prompt, orchestration cwd. No protocol change; see [Cross-version safety](#cross-version-safety).
 - **Removing the two fabricated live-mode values** (`attempt`, `branch`) from what the app presents as fact.
-- **`last_activity` as an additive optional field on `SessionSnapshot`** — the one daemon-side change in this PRD, sequenced last and severable. See M7 and Open Question 4.
+- **`last_activity` as an additive optional field on `SessionSnapshot`** (iteration 2) — the one daemon-side change in this PRD.
+- **The Linux build-prerequisite docs gap.** `docs/develop/desktop-gui.md:8` names no command and never says that `cargo test-fast` and rule 2's clippy gate *require* the Tauri system packages because both run `--workspace`. A Linux contributor hits `gobject-2.0 was not found` on their first commit attempt with no pointer to that page.
 
 ### Out of Scope
 
@@ -50,7 +64,10 @@ Three commitments define the screen.
 - **Git branch per agent.** Nothing tracks it daemon-side; the only `git branch` calls in `src/` are deletions in the dispatch flows. Reconstructing it means either a subprocess per agent cwd on the daemon, or a desktop-side git call that breaks the "local daemons only" boundary (`docs/develop/desktop-gui.md:97`).
 - **Attempt/retry count.** No such counter exists anywhere. Removing the fabricated one is in scope; inventing a real one is not.
 - **Session duration.** `SessionState.started_at` exists but is invented as `now` on hydration (`src/state.rs:5684-5694`), so any duration resets when the daemon restarts under a live agent. A duration that silently lies about long-running work is worse than no duration.
-- **Terminal thumbnails, previews or output snippets on the overview.** Any of them re-creates the attach cost this PRD exists to remove.
+- **Terminal thumbnails, previews or output snippets on the overview.** Any of them re-creates the attach cost this PRD exists to remove. Worth noting for the future: this is the *only* thing discussed here that the daemon's API genuinely could not serve today — see [Why no new daemon API](#why-no-new-daemon-api).
+- **Any change to the existing control deck's layout or contents.** It keeps working exactly as it does now and stays the default screen. Its eventual future is to become the group view (iteration 3), reached already filtered to one tab bucket; nothing here anticipates that beyond leaving it alone.
+- **A group view and a single-agent view**, and therefore any drill-in navigation. Deferred to iteration 3 — see [Staging](#staging). This is what makes iteration 1 a dead-end dashboard, deliberately.
+- **An unfiltered "show all agents" view.** Once the deck becomes the group view, a global all-agents variant is one more value in the view union. It is not built until someone misses it.
 - **Connecting to more than one daemon.** That is [#742](https://github.com/vfarcic/dot-agent-deck/issues/742). This PRD only owes it a layout and a key that do not have to be rewritten.
 - **Virtualisation or pagination of the overview.** Cards without terminals are cheap; revisit if a real deployment exceeds what one screen holds.
 - **The `experimental` feature flag.** Deliberately not applied — see [Feature flag](#feature-flag).
@@ -90,11 +107,32 @@ Requiring **daemon work**, and taken only in the last, severable milestone:
 
 Explicitly **rejected** as columns, with the reason recorded so this does not get relitigated: model, tokens, cost, context-window percentage, git branch, attempt count, session duration. The first four do not exist in daemon state in any form; branch would need a subprocess per agent or a boundary violation; attempt has no counter; duration cannot survive a daemon restart honestly. The TUI's own session card shows none of them either (`src/ui.rs:18805-19017`), which is independent confirmation that the daemon does not have them rather than that the desktop forgot to ask.
 
+### Why no new daemon API
+
+The natural reading of "the overview is cheap, the deck is expensive" is that the daemon over-serves and needs a leaner endpoint. It does not, and building one would solve a problem we do not have.
+
+The daemon's API is already factored into exactly the two things needed, kept apart:
+
+- **`ListAgents`** returns structured metadata per agent — `AgentRecord` (`src/agent_pty.rs:1958-2028`) with id, pane id, display name, cwd, tab membership, agent type, rows/cols, and a nested `live: Option<SessionSnapshot>` (`src/state.rs:639-668`) carrying status, active tool, tool count, first prompts, last user prompt and write lease. **That single response covers every column in the table above.** `get_snapshot` already builds the desktop's whole snapshot from that one call (`desktop/src-tauri/src/daemon_bridge.rs:196-221`).
+- **`AttachStream`** is the PTY byte stream, expensive by nature: a full scrollback replay on connect, then live output.
+
+Two other things ride alongside, both already in place and both **O(1) in agent count**: one global event subscription (`desktop/src-tauri/src/lib.rs:654`), which is what makes the screen live rather than frozen at connect, and the `Hello` handshake that produces the connected / disconnected / incompatible states.
+
+So the overview costs **one RPC plus one already-open event stream, whatever the agent count**. Today's deck costs that *plus one `AttachStream` socket and one full scrollback replay per agent*. Nine agents: one connection instead of ten. The entire difference is client-side.
+
+The one thing the daemon genuinely could not serve today is an *output preview* — last N lines per agent without a live subscription — because the only way to get output at all is to subscribe to all of it. Previews are out of scope precisely so that gap never has to be filled; if that decision is ever revisited, this is the daemon-side work it implies.
+
 ### Demand-driven attach
 
-`attachAgents` moves from "every agent in every snapshot" to "the agents currently being viewed". Concretely: `connect()` (`desktop/src/lib/bridge.ts:488`) and the snapshot listener (`:506`) stop attaching en masse, and attach becomes an explicit call the deck makes for the agent(s) it is showing. Detach on leaving a drill-in is a judgement call — re-attaching replays scrollback from the daemon, so nothing is lost, but a user bouncing between two agents pays that replay each time. Keeping a small most-recently-used set attached is the likely answer; measuring beats guessing here.
+What makes the deck expensive is not that it renders terminals — it is that attach is not tied to rendering at all. `attachAgents` lives inside `TauriDeckBridge`, takes the snapshot payload, and attaches every agent it has not already attached (`desktop/src/lib/bridge.ts:367-373`), filtered on `this.attached` rather than on anything mounted. It is called from `connect()` (`:488`) and from the `desktop://snapshot` listener (`:505`), neither of which knows what is on screen. `TerminalViewport` triggers nothing.
 
-All of this is desktop-side. It is also directly testable at the bridge level today: `bridge.test.ts:118-142` already asserts on attach behaviour against a mocked `invoke`, so "the overview attaches nothing" is a real assertion, not an aspiration.
+The consequence is the thing most likely to be lost: **a screen that displays no output still opens a socket per agent.** Launch the app on an overview today and the bridge opens nine `AttachStream` sockets with nine scrollback replays, streaming bytes into in-memory buffers that nothing displays. "Shows no terminals" and "opens no PTYs" are separate properties, and only the first comes free.
+
+So attach moves out of the snapshot listener and to wherever a terminal is actually shown. Detach on leaving is a judgement call — re-attaching replays scrollback so nothing is lost, but bouncing between two agents pays that replay each time; a small most-recently-used set is the likely answer, and measuring beats guessing.
+
+Note this change is **only meaningful alongside a screen that shows agents without their output**. Shipped against today's deck alone it would be a no-op, since every agent is displayed with a terminal and "attach what is shown" and "attach everything" name the same set. That is why it belongs in this PRD rather than in one of its own.
+
+All of it is desktop-side, and directly testable at the bridge level today: `bridge.test.ts:118-142` already asserts on attach behaviour against a mocked `invoke`, so "the overview attaches nothing" is a real assertion rather than an aspiration.
 
 ### Grouping
 
@@ -108,7 +146,11 @@ The daemon's `TabMembership` is the grouping key, exactly as the issue suggests:
 
 ### Screen and view state
 
-There is no router and no view-state concept: every "which surface" decision today is a boolean overlay flag inside `ControlDeck`'s own `useState` block (`desktop/src/App.tsx:69-87`), and the rail's "Runs" button merely closes the panels (`:301`). The overview needs to render *instead of* the deck, so the new state belongs in `App` (`:63-65`), above `ControlDeck` — one discriminated view value (`overview` | drill-in target), not a seventh overlay boolean. No router library is warranted for two views.
+**The rail looks like navigation and is not.** Of its six buttons (`desktop/src/App.tsx:299-306`), five open overlay sheets over the always-mounted deck — `projectsOpen`, `promptsOpen`, `workflowOpen`, `profilesOpen`, and Settings, which only sets a notice — and the sixth, "Runs", is a no-op whose `onClick` closes all four panels and whose `active` is computed as "none of them are open" (`:301`). Nothing in the app is a view; every "which surface" decision is a boolean in `ControlDeck`'s own `useState` block (`:69-87`). So adding real view state fills in an intent the code already gestures at rather than fighting an existing model.
+
+The overview renders *instead of* the deck, so the new state belongs in `App` (`:63-65`), above `ControlDeck`. It goes in as a **discriminated union from the start**, even while it carries only `deck` and `overview`, so that iteration 3's group and agent views arrive as added variants rather than as a refactor of a boolean. No router library is warranted.
+
+The rail gains one **Overview** button. "Runs" keeps its current behaviour for now, even though it will eventually have no referent once the deck becomes the group view — converting the rail into real navigation is iteration 3's problem, and pre-empting it here would be guessing.
 
 ### Preserving the multi-daemon extension
 
@@ -158,44 +200,58 @@ The single most valuable test in this PRD is the bridge-level one asserting that
 
 ## Success Criteria
 
-- Opening the app lands on an overview of every agent the daemon runs, not on a deck of terminals.
-- Rendering the overview attaches **zero** PTYs, proven by an automated test rather than by inspection. Attaching happens on drill-in and nowhere else.
+- An overview of every agent the daemon runs is one click from launch, and reading it does not require opening a terminal.
+- Rendering the overview attaches **zero** PTYs, proven by an automated test rather than by inspection.
 - Nine agents across two orchestrations read as two units, with roles in role order and each coordinator identifiable — not as nine unrelated tiles.
 - Every value on the screen is one the daemon actually reported. Nothing is fabricated, and nothing reads `Unavailable`.
 - A daemon that is down, incompatible, or owns zero agents each produce a screen that says what happened and what to do next — and each is reachable in the fixture without a real daemon.
-- Drilling into an agent and returning leaves the terminal working, with no lost or duplicated output.
+- The crowded fixture scenario is legible: the design answers "what is running right now" at fifteen agents, not only at four.
+- The existing control deck is unchanged in behaviour and remains the default screen.
 - Adding a second daemon later means adding a sibling group and no inner component changes; nothing in the overview is keyed by a bare agent id.
 
 ## Milestones
 
-- [ ] **M1 — Demand-driven attach.** `attachAgents` stops firing for every agent on `connect()` and on every snapshot; attach becomes explicit and scoped to what is being viewed. Bridge-level test asserting a snapshot with N agents attaches none. Prerequisite for everything below.
-- [ ] **M2 — Model: daemon identity and tab membership.** `AgentSession` grows a daemon identity and a structured `tab`; the overview and drill-in key by `(daemonId, agentId)`. Rust DTO recovers orchestration cwd (`map_tab`'s dropped `..`).
-- [ ] **M3 — Overview screen and grouping.** Daemon group as the outer unit; orchestration / mode / standalone groups inside it; honest columns per the table above. View state lives in `App`, above `ControlDeck`.
-- [ ] **M4 — Drill-in and back.** Navigate to one agent or one orchestration, attach there, return to the overview. Existing deck behaviour preserved for a drilled-in orchestration.
-- [ ] **M5 — Empty, disconnected, incompatible and zero-agent states**, plus a genuine "connected, zero agents" fixture (closing the `state=empty` → disconnected mis-mapping at `desktop/src/data/fixture.ts:264-268`).
-- [ ] **M6 — Honest fields and de-fabrication.** Surface `last_user_prompt` and `live_target` through `map_agent`; remove the fabricated `attempt` and `branch` from what live mode presents as fact. No protocol impact.
-- [ ] **M7 — Last activity (daemon-side, severable).** `last_activity` added to `SessionSnapshot` as an additive optional field — no `PROTOCOL_VERSION` bump — surfaced through the DTO and rendered. Includes rule 12's cross-version manual test. Drop this milestone and the PRD becomes purely desktop-side.
-- [ ] **M8 — Coverage.** Testing Library tests for grouping, every state, and drill-in navigation; Rust `dto.rs` tests pinning each newly surfaced field's frontend-facing shape; the M1 attach assertion. Per rule 4, and per the honest ceiling stated above.
-- [ ] **M9 — Docs and changelog.** `docs/develop/desktop-gui.md` updated (landing screen, attach model, the states, the extended manual smoke check); changelog fragment via the `dot-ai-changelog-fragment` skill.
+### Iteration 1 — fixture only (no daemon, no Rust)
+
+- [ ] **M1 — Honest fixture.** Cut the fixture's agent shape down to the columns that genuinely exist, so the design is not settled against data (`model`, `cost`, `tokens`, `contextPercent`, `branch`, `spend`) that vanishes the moment it meets a real daemon. This is the trap iteration 1 exists to avoid, not a tidy-up.
+- [ ] **M2 — Crowded and zero-agent fixture states.** `?fixture=1&state=crowded` with several orchestrations, a mode bucket and standalone agents; and a genuine connected-with-zero-agents state, closing the `state=empty` → disconnected mis-mapping (`desktop/src/data/fixture.ts:264-268`) that currently makes the first-run screen impossible to view.
+- [ ] **M3 — View state and rail entry.** A discriminated view union in `App` above `ControlDeck` (`desktop/src/App.tsx:63-65`), plus one Overview rail button. The deck stays the default.
+- [ ] **M4 — The overview screen.** Daemon group as the outer unit; orchestration / mode / standalone groups inside it; honest columns per the table above. No terminals.
+- [ ] **M5 — Model: daemon identity and tab membership.** `AgentSession` grows a daemon identity and a structured `tab`; the overview keys by `(daemonId, agentId)`.
+- [ ] **M6 — Iteration 1 coverage.** Testing Library tests for grouping, the crowded scenario, and every connection state.
+
+### Iteration 2 — connected
+
+- [ ] **M7 — Demand-driven attach.** `attachAgents` stops firing for every agent on `connect()` and on every snapshot; attach happens where a terminal is shown. Bridge-level test asserting a snapshot with N agents attaches none while the overview is up.
+- [ ] **M8 — Honest fields and de-fabrication.** Surface `last_user_prompt`, `live_target` and orchestration cwd through `map_agent` / `map_tab` (`desktop/src-tauri/src/dto.rs:249-302`); remove the fabricated `attempt` and `branch` from what live mode presents as fact. Rust `dto.rs` tests pinning each newly surfaced field's frontend-facing shape. No protocol impact.
+- [ ] **M9 — Last activity.** `last_activity` added to `SessionSnapshot` as an additive optional field — no `PROTOCOL_VERSION` bump — surfaced through the DTO and rendered. The only daemon-side change in this PRD; includes rule 12's cross-version manual test.
+- [ ] **M10 — Docs and changelog.** `docs/develop/desktop-gui.md` updated: the overview screen, the attach model, the states, the extended manual smoke check, and the Linux build prerequisites gap — the literal five-package apt line from `.github/workflows/ci.yml:171-175`, the fact that `cargo test-fast` and rule 2's clippy gate need it because both run `--workspace`, and the devbox/nix `LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu` note for contributors working inside this repo's shell. Changelog fragment via the `dot-ai-changelog-fragment` skill.
+
+### Iteration 3 — destinations (deferred)
+
+Not built here, recorded so the design's endpoint is not lost: a **group view** (the existing deck, filtered to one tab bucket), a **single-agent view**, drill-in navigation between them, promoting the overview to the actual landing screen, and whatever the rail should become once it is real navigation. Whether this is a later iteration of this PRD or its own is decided when we get there.
 
 ## Risks
 
-- **Demand-driven attach is a behaviour change to the existing deck, not just new code.** Get it wrong and a drilled-in terminal is blank, or duplicates output on re-attach. The existing generation/replay machinery (`desktop/src/lib/terminalBuffer.ts`, tested at `terminalBuffer.test.ts`) is what protects this, and re-attach replays scrollback from the daemon — but this is the change most likely to break something that currently works.
-- **Re-attach latency on every drill-in.** A full scrollback replay per attach is fine once and annoying when bouncing between agents. Mitigated by keeping a small MRU set attached; the risk is that the "right" set is picked by guess rather than measurement.
-- **An honest screen may read as an empty screen.** Removing model, cost, tokens, context and duration leaves status, tool, prompt and membership. That is genuinely useful information, but it is a smaller card than the fixture's, and the fixture is what everyone has seen. The design has to make the remaining columns carry their weight rather than looking like a stripped-down version of something better.
-- **Scope creep toward #742.** Introducing a daemon identity is cheap; building per-endpoint connection state, partial-failure handling and a keyed bridge map is #742's whole job. The line is: this PRD adds the *key* and the *outer group*, and nothing else.
+- **"The overview shows no output" is not "the overview opens no PTYs".** These come apart because attach is snapshot-driven, not render-driven, and conflating them is how M7 gets dropped as unnecessary and the whole thing ships as a cosmetic change. Iteration 1 genuinely does not need it — fixture mode opens no sockets — which makes the omission easy to carry into iteration 2 unnoticed.
+- **Demand-driven attach is a behaviour change to code that currently works.** Get it wrong and a terminal is blank, or duplicates output on re-attach. The existing generation/replay machinery (`desktop/src/lib/terminalBuffer.ts`, tested at `terminalBuffer.test.ts`) is the protection, and re-attach replays scrollback from the daemon — but this is the change most likely to break something people rely on.
+- **Designing against a fixture that lies.** The fixture carries `model`, `cost`, `tokens`, `contextPercent`, `branch`, `spend: 2.57` and `run_7f24a`, none of which exist in live mode. Approve a layout built on those and it goes half-empty on first contact with a daemon. M1 exists solely to remove this risk, and it has to land before the design is reviewed, not after.
+- **A four-agent fixture cannot answer a many-agent question.** The premise of the whole PRD is that the current screen fails at scale; reviewing the replacement at four agents reviews the wrong thing. Hence M2.
+- **An honest screen may read as an empty screen.** Removing model, cost, tokens, context and duration leaves status, tool, prompt and membership. That is genuinely useful, but it is a smaller card than the fixture's, and the fixture is what everyone has seen. The design has to make the remaining columns carry their weight rather than looking like a stripped-down version of something better.
+- **A dead-end dashboard is only acceptable while it is additive.** Iteration 1 ships a screen you cannot navigate out of, which is fine only because the deck stays the default and nobody's workflow depends on the overview. Promote it to landing screen before iteration 3 exists and the app gets strictly worse than it is today.
+- **Silent WebGL degradation, in the deck this PRD does not touch.** Every visible tile allocates an xterm with 8000-line scrollback and attempts a WebGL context (`desktop/src/components/TerminalViewport.tsx:61,93-104`); browsers cap concurrent contexts and past the cap the addon's `catch` drops that pane to DOM rendering with no indication. Nothing measures where that cap is. The overview sidesteps it; the deck and any future group view do not.
+- **Scope creep toward #742.** Introducing a daemon identity is cheap; per-endpoint connection state, partial-failure handling and a keyed bridge map are #742's whole job. The line is: this PRD adds the *key* and the *outer group*, nothing else.
 - **Scope creep toward #633.** Every rejected column has an obvious "but we could just…" answer. Each of them means new daemon state, and that is a different PRD.
-- **No end-to-end coverage of the real window.** The screen can be proven correct against a hand-built snapshot and proven not to attach terminals at the bridge, but nothing automated proves it works in the actual Tauri app against a real daemon. The manual smoke check is the only backstop, and manual checks decay.
-- **PRD #176 M1.3 remains unmeasured.** This PRD reduces the load (no terminals on the landing screen) without measuring anything, so the ceiling stays unknown — better, but still unquantified.
+- **No end-to-end coverage of the real window.** The screen can be proven correct against a hand-built snapshot and proven not to attach at the bridge, but nothing automated proves it works in the actual Tauri app against a real daemon. The manual smoke check is the only backstop, and manual checks decay.
+- **PRD #176 M1.3 remains unmeasured.** This PRD reduces load without measuring anything, so the ceiling stays unknown — better, but still unquantified.
 
 ## Open Questions
 
-1. **Does drill-in target an agent or an orchestration?** Clicking a role inside an orchestration group could open just that agent, or open the whole orchestration deck focused on that role. The second matches how the TUI works and how people actually supervise, but it makes "drill into one agent" and "drill into a group" the same action with different focus. Leaning: orchestration groups open the orchestration with the clicked role focused; standalone agents open alone.
-2. **Is the flat deck still reachable as a "show everything" view?** Today it is the only view. After this PRD, the overview is the entry point and drill-in is the way to a terminal — but a user with three agents may simply want the old deck. Leaning: no separate toggle initially; if it is missed, it is one view value away.
-3. **Does the app remember where you were?** Relaunching always onto the overview is predictable and matches the PRD title; returning to the agent you were working in is kinder to someone mid-task. Leaning: always land on the overview, because "landing screen" is the point, and drill-in is one click.
-4. **Is M7 (`last_activity` daemon-side) in this PRD or a follow-up?** It is the only milestone that touches the daemon and the only one that triggers rule 12's cross-version manual test. Including it makes the overview genuinely useful on first paint; deferring it keeps this PRD purely desktop-side and its rule 12 answer an unqualified no. Leaning: include, sequenced last so it can be dropped without disturbing M1–M6.
-5. **Detach policy on leaving a drill-in.** Detach immediately (cheapest, replays on return), keep an MRU set (smoother, unbounded if unmanaged), or never detach within a session (fastest, re-creates today's problem slowly). Leaning: MRU with a small fixed bound, chosen by measurement during M1.
-6. **How much does the single-daemon group header show?** Enough that a second daemon slots in without a redesign, little enough that it is not chrome around a single item. This is a design question the implementation should answer visually, not one to settle on paper.
+1. **Does the group view mount a terminal per member, or only the focused one?** Deferred with iteration 3, but recorded now because it decides whether the group view answers the original complaint or relocates it: a single orchestration is commonly six roles, and the dashboard bucket is unbounded. Leaning: focused-only, with the rest as status cards — which makes the group view structurally the same component as the overview, just scoped.
+2. **Two paths to the agent view.** Once destinations exist, overview → agent and overview → group → agent reach the same screen with different back behaviour. Worth deciding rather than discovering.
+3. **Detach policy on leaving a terminal.** Detach immediately (cheapest, replays on return), keep a small MRU set (smoother, unbounded if unmanaged), or never detach within a session (fastest, re-creates today's problem slowly). Leaning: MRU with a small fixed bound, chosen by measurement during M7.
+4. **How much does the single-daemon group header show?** Enough that a second daemon slots in without a redesign, little enough that it is not chrome around a single item. A design question to answer visually in iteration 1, not on paper.
+5. **Should the crowded scenario eventually become the default fixture?** It is opt-in for now, because changing the default would churn the 14 existing `App.test.tsx` tests for no gain. If the crowded case is what people actually want to look at, that trade is worth revisiting once.
 
 ## Work Log
 
@@ -208,3 +264,19 @@ Written from the placeholder in [#745](https://github.com/vfarcic/dot-agent-deck
 - **The `experimental` question was already answered.** PRD #176 decision 6 (`prds/176-desktop-gui.md:101`) records that the flag does not apply to the GUI binary at all, so rule 9's question is settled by precedent rather than re-decided here.
 
 Also noted: `?fixture=1&state=empty` is not the "connected, zero agents" case — it routes through the disconnected branch (`desktop/src/data/fixture.ts:264-268`), so the first-run state currently has no fixture at all.
+
+### 2026-08-30 — Scope settled with the user
+
+Design review with the user changed the shape of the work substantially. Recorded because most of it was arrived at by disagreement rather than by plan.
+
+**Settled:** no `experimental` flag (rule 9, following PRD #176 decision 6). `last_activity` stays in this PRD rather than becoming a follow-up. The Linux build-prerequisite docs gap is folded in. The crowded fixture is opt-in (`state=crowded`) rather than the default, so the 14 existing `App.test.tsx` tests stay stable.
+
+**The existing deck is preserved untouched**, and becomes the group view later rather than being replaced or dropped. This resolved a three-way question — delete it, keep it behind a "show all" toggle, or keep it as the drill-in target for a bucket — in favour of the third, which is better than any of the options originally offered: the deck reached already filtered to one tab bucket is the coherent unit, rather than an escape hatch back to the problem. An unfiltered all-agents view is deferred until someone misses it.
+
+**Split into iterations, with iteration 1 built entirely against the fixture** so the design can be reviewed before any plumbing exists. Two traps were identified in doing so and are now milestones in their own right: the fixture *lies* (it carries model, cost, tokens, context and branch, none of which exist live), so a design approved against it would go half-empty on first contact with a daemon; and the fixture has only four agents, so it cannot answer a question whose entire premise is many agents.
+
+**Navigation deferred, and the overview does not become the landing screen in this PRD.** Iteration 1 is knowingly a dead-end dashboard, acceptable only because it is additive — the deck stays default. This means the PRD as scoped does not fully satisfy issue #745's title, which is stated plainly above rather than glossed.
+
+**A new daemon API was considered and rejected.** The question was whether the daemon should grow an endpoint returning "only what the overview needs". It should not: `ListAgents` already returns exactly that, in one call, and the expense is a *separate* per-agent `AttachStream` the desktop opens unconditionally. The daemon's API is correctly factored; the client conflates the two halves. Recorded in [Why no new daemon API](#why-no-new-daemon-api), along with the one case that would genuinely need daemon work — output previews — which is why previews are out of scope.
+
+**Demand-driven attach stays in this PRD rather than becoming its own.** On its own it would be unobservable: today's deck displays every agent with a terminal, so "attach what is shown" and "attach everything" name the same set. It only becomes meaningful next to a screen that shows agents without their output.
