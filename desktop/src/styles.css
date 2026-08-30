@@ -527,3 +527,78 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .handoff-edge time { margin-left: auto; color: var(--faint); font-size: 9.5px; }
 .handoff-reason { width: 100%; margin: 1px 0 0; color: var(--red); font-size: 10.5px; }
 .handoff-task { width: 100%; margin: 1px 0 0; color: var(--muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---- Agent overview: the fleet at a glance, with no terminals (PRD #745) ---- */
+.overview-body { padding: 14px 16px 20px; }
+.daemon-group { border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); }
+.daemon-group-header { min-height: 50px; padding: 9px 13px; display: flex; align-items: center; gap: 11px; border-bottom: 1px solid var(--line); background: var(--paper-strong); border-radius: var(--radius) var(--radius) 0 0; }
+.daemon-identity { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.daemon-identity strong { font-size: 12px; font-weight: 720; }
+.daemon-identity code { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.daemon-state { min-width: 0; margin: 0; overflow: hidden; color: var(--faint); font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
+.daemon-pips { margin-left: auto; display: flex; flex-wrap: wrap; gap: 5px; }
+.daemon-group-body { padding: 11px 12px 13px; }
+
+.overview-legend { padding: 0 12px 6px; }
+.overview-legend span { color: var(--faint); font-size: 6.5px; font-weight: 800; letter-spacing: .12em; }
+.overview-groups { display: flex; flex-direction: column; gap: 9px; }
+
+.overview-group { overflow: hidden; border: 1px solid var(--line); border-radius: 5px; background: var(--paper-strong); }
+.overview-group[data-group-kind="orchestration"] { border-left: 3px solid var(--teal); }
+.overview-group[data-group-kind="mode"] { border-left: 3px solid var(--violet); }
+.overview-group[data-group-kind="standalone"] { border-left: 3px solid var(--line-strong); }
+.overview-group-header { min-height: 40px; padding: 7px 11px; display: flex; align-items: center; gap: 9px; border-bottom: 1px solid var(--line); background: #f6f4ee; color: var(--muted); }
+.overview-group-identity { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.overview-group-identity h3 { margin: 0; overflow: hidden; color: var(--ink); font-size: 12px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.overview-group-subtitle { color: var(--faint); font-size: 9px; }
+.overview-group-cwd { min-width: 0; overflow: hidden; color: var(--faint); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.overview-group-count { margin-left: auto; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: 9px; white-space: nowrap; }
+.overview-group-pips { display: flex; flex-wrap: wrap; gap: 4px; }
+
+.overview-rows { margin: 0; padding: 0; list-style: none; }
+/* One grid template shared by the legend and every row, so the columns line up
+   across group cards and the whole fleet reads as one table. */
+.overview-legend, .overview-row { display: grid; grid-template-columns: 10px minmax(0, 1.45fr) 66px 84px minmax(0, 1.5fr) 40px minmax(0, 1.6fr); align-items: center; gap: 10px; }
+.overview-row { min-height: 34px; padding: 5px 11px; border-top: 1px solid #eae7de; }
+.overview-row:first-child { border-top: 0; }
+.overview-row:hover { background: #f7f5ef; }
+.overview-row[data-status="failed"] { background: rgba(161, 62, 56, .05); }
+.overview-row .agent-state-mark { margin: 0; }
+.overview-agent-name { min-width: 0; display: flex; align-items: baseline; gap: 6px; }
+.overview-agent-name strong { overflow: hidden; font-size: 11px; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
+.overview-role-index { flex: 0 0 auto; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: 9px; font-style: normal; }
+.overview-role-name { overflow: hidden; color: var(--faint); font-size: 9px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+.coordinator-badge { flex: 0 0 auto; padding: 1px 4px; border-radius: 2px; color: var(--teal); background: var(--teal-soft); font-size: 7px; font-weight: 800; letter-spacing: .08em; }
+.overview-row .status-label { justify-self: start; }
+.overview-cli, .overview-cwd, .overview-tool-count { overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.overview-tool-count { justify-self: end; color: var(--faint); }
+.overview-tool { min-width: 0; display: flex; align-items: center; gap: 5px; color: var(--muted); }
+.overview-tool strong { flex: 0 0 auto; font-family: "JetBrains Mono", monospace; font-size: 9.5px; font-weight: 650; }
+.overview-tool em { overflow: hidden; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: 9px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+.overview-tool-idle { color: #a7ada9; font-size: 9px; font-style: italic; }
+
+.overview-note { min-height: 260px; padding: 30px; display: flex; flex-direction: column; align-items: center; justify-content: center; border: 1px dashed var(--line-strong); border-radius: var(--radius); color: var(--muted); background: rgba(248, 246, 240, .55); text-align: center; }
+.overview-note h3 { margin: 11px 0 5px; color: var(--ink); font-size: 14px; }
+.overview-note p { max-width: 460px; margin: 0 0 4px; font-size: 10px; line-height: 1.55; }
+.overview-note-hint { color: var(--faint); }
+.overview-note > div { margin-top: 15px; display: flex; gap: 7px; }
+.overview-footnote { max-width: 760px; margin: 11px 2px 0; color: var(--faint); font-size: 9px; line-height: 1.5; }
+
+.count-running { color: var(--teal); }
+.count-waiting { color: var(--amber); }
+.count-failed { color: var(--red); }
+
+@media (max-width: 1180px) {
+  .overview-legend, .overview-row { grid-template-columns: 10px minmax(0, 1.5fr) 66px minmax(0, 1.4fr) 40px; }
+  .overview-legend span:nth-child(4), .overview-row .overview-cli { display: none; }
+  .overview-legend span:nth-child(7), .overview-row .overview-cwd { display: none; }
+}
+
+@media (max-width: 680px) {
+  .overview-body { padding: 8px; }
+  .daemon-group-body { padding: 8px; }
+  .overview-legend, .overview-row { grid-template-columns: 10px minmax(0, 1fr) 66px; }
+  .overview-legend span:nth-child(5), .overview-row .overview-tool { display: none; }
+  .overview-legend span:nth-child(6), .overview-row .overview-tool-count { display: none; }
+  .daemon-pips, .overview-group-pips { display: none; }
+}

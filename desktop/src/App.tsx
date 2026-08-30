@@ -17,6 +17,7 @@ import {
   HelpCircle,
   History,
   Keyboard,
+  LayoutList,
   Network,
   PanelRight,
   Pause,
@@ -32,6 +33,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
+import { AgentOverview } from "./components/AgentOverview";
 import { AgentTile } from "./components/AgentTile";
 import { HandoffRail } from "./components/HandoffRail";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, WorkflowPanel } from "./components/ConfigurationPanels";
@@ -40,7 +42,7 @@ import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useProjects } from "./hooks/useProjects";
 import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
-import type { DeckAction, DeckActionResult, DeckRuntimeState, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
+import type { DeckAction, DeckActionResult, DeckRuntimeState, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
 
 const WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-preview.v1");
@@ -61,10 +63,27 @@ interface ConfirmState {
 }
 
 export default function App() {
-  return <ControlDeck runtime={useDeckRuntime()} />;
+  return <DeckShell runtime={useDeckRuntime()} />;
 }
 
-export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPlatformIssue() }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string }) {
+/**
+ * Owns which top-level surface is mounted. The overview renders *instead of*
+ * the deck, so the state belongs above `ControlDeck` rather than as one more
+ * boolean inside it — none of the deck's own `useState` booleans is a view, and
+ * five of the rail's six buttons are overlay toggles over an always-mounted
+ * deck. `DeckView` is a discriminated union from the start so PRD #745
+ * iteration 3's group and single-agent views arrive as added variants.
+ *
+ * The deck stays the default: launching the app lands exactly where it does
+ * today.
+ */
+export function DeckShell({ runtime, workflowPlatformIssue }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string }) {
+  const [view, setView] = useState<DeckView>({ kind: "deck" });
+  if (view.kind === "overview") return <AgentOverview runtime={runtime} onNavigate={setView} />;
+  return <ControlDeck runtime={runtime} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} />;
+}
+
+export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void }) {
   const { snapshot, mode } = runtime;
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [tabs, setTabs] = useState<Record<string, PanelTab>>({});
@@ -299,6 +318,8 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
         <nav>
           <RailButton icon={FolderGit2} label="Projects" active={projectsOpen} onClick={() => setProjectsOpen(true)} testId="open-projects" />
           <RailButton icon={Activity} label="Runs" active={!projectsOpen && !workflowOpen && !profilesOpen && !promptsOpen} onClick={() => { setProjectsOpen(false); setWorkflowOpen(false); setProfilesOpen(false); setPromptsOpen(false); }} />
+          {/* The one rail button that is a real view rather than an overlay toggle. */}
+          <RailButton icon={LayoutList} label="Overview" onClick={() => onNavigate?.({ kind: "overview" })} testId="open-overview" />
           <RailButton icon={BookMarked} label="Prompts" active={promptsOpen} onClick={() => setPromptsOpen(true)} testId="open-prompts" />
           <RailButton icon={Network} label="Workflows" active={workflowOpen} onClick={() => setWorkflowOpen(true)} />
           <RailButton icon={Bot} label="Agent Profiles" active={profilesOpen} onClick={() => setProfilesOpen(true)} testId="open-agent-profiles" />
