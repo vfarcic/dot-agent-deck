@@ -342,8 +342,15 @@ function orchestrationTab(orchestrationId: string, name: string, displayTitle: s
   return { kind: "orchestration", orchestrationId, name, displayTitle, roleName, roleIndex, isStartRole };
 }
 
-const DECK_CWD = "/home/vfarcic/code/dot-agent-deck";
-const PRD_CWD = "/home/vfarcic/code/dot-agent-deck-dispatch-prd-745";
+/*
+ * Neutral home paths: a fixture capture is what ends up in a screenshot or a
+ * demo recording, so it carries no real machine's username or directory layout.
+ * They stay home-SHAPED on purpose, because that is what exercises the
+ * overview's home-relative rendering (`~/code/...`) in the very captures where
+ * an absolute home path would be the thing worth hiding.
+ */
+const DECK_CWD = "/home/dev/code/dot-agent-deck";
+const PRD_CWD = "/home/dev/code/dot-agent-deck-dispatch-prd-745";
 
 /**
  * Fifteen agents across two orchestrations, one mode bucket and three
