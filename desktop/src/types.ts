@@ -122,6 +122,13 @@ export interface AgentSession {
   contextPercent: number;
   /** FIXTURE-ONLY — the daemon has no per-agent worktree or branch field. */
   worktree: string;
+  /**
+   * FIXTURE-ONLY (until M8 surfaces `live_target`). The value IS on the wire —
+   * `SessionSnapshot.live_target` — but the desktop's own DTO drops it and
+   * `agentFromDto` hardcodes `"unknown"`, so today it reports nothing about the
+   * write lease. Unmarked it would read as honest, which is the failure the
+   * annotation scheme exists to prevent.
+   */
   writeLease: "read" | "write" | "none" | "unknown";
   /** HONEST. */
   rows: number;
@@ -133,6 +140,12 @@ export interface AgentSession {
   activeToolDetail?: string;
   /** HONEST. */
   toolCount: number;
+  /**
+   * FIXTURE-ONLY, all five. These are deck-internal collections the fixture
+   * populates to make the control deck's panels demonstrable; live mode leaves
+   * every one of them empty (`agentFromDto`), so a surface that renders one
+   * shows nothing at all against a real daemon.
+   */
   transcript: string;
   diff: string[];
   checks: CheckResult[];
@@ -148,9 +161,9 @@ export interface AgentSession {
   daemonId: string;
   /** HONEST. Tab membership as the daemon reported it. Drives grouping. */
   tab: AgentTab;
-  /** True when the daemon reports this pane as an orchestration role pane. */
+  /** HONEST. True when the daemon reports this pane as an orchestration role pane. */
   inOrchestration?: boolean;
-  /** True for the orchestration's start role — the coordinator an operator should message. */
+  /** HONEST. True for the orchestration's start role — the coordinator an operator should message. */
   isStartRole?: boolean;
 }
 
