@@ -3588,6 +3588,7 @@ dependencies = [
  "libc",
  "proc-macro2",
  "regex",
+ "serde_json",
  "syn 3.0.4",
  "tempfile",
  "xtask-docs",

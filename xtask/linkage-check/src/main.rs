@@ -85,6 +85,10 @@ mod clean_tmp;
 /// script under `node`.
 #[cfg(test)]
 mod issue_labeler_memory;
+/// The same workflow's `Extract label policy for the agent` setup step. Tests
+/// only — these drive the real script under `python3`.
+#[cfg(test)]
+mod issue_labeler_policy;
 mod list_tests;
 /// Issue #648: the toolchain pins duplicated between `devbox.json` and
 /// `.github/workflows/`. Tests only, and Unix only — the rule itself lives in

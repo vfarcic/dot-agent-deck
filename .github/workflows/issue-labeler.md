@@ -116,11 +116,22 @@ pre-agent-steps:
       if not m:
           bail("no frontmatter found")
       fm = m.group(1)
+      # Scope the search to the add-labels: block. Three keys in this
+      # frontmatter are spelled `allowed:` — network's and the tools list both
+      # come first — so an unanchored search matches `network:`'s
+      # `allowed: [defaults]`, fails to parse it as JSON, and bails on every
+      # run without ever reaching the label list.
+      anchor = re.search(r"^([ \t]*)add-labels:[ \t]*$", fm, re.M)
+      if not anchor:
+          bail("no add-labels: block found in frontmatter")
+      rest = fm[anchor.end():]
+      closer = re.search(rf"^{anchor.group(1)}\S", rest, re.M)
+      scope = rest[:closer.start()] if closer else rest
       policy = {}
       for key in ("allowed", "blocked"):
-          km = re.search(rf"^\s*{key}:\s*(\[.*\])\s*$", fm, re.M)
+          km = re.search(rf"^[ \t]*{key}:[ \t]*(\[.*\])[ \t]*$", scope, re.M)
           if not km:
-              bail(f"no {key}: list found in frontmatter")
+              bail(f"no {key}: list found in the add-labels: block")
           try:
               policy[key] = json.loads(km.group(1))
           except json.JSONDecodeError:
