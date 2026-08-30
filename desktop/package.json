@@ -31,7 +31,7 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",
     "@vitejs/plugin-react": "^6.0.5",
-    "esbuild": "^0.27.7",
+    "esbuild": "^0.28.0",
     "jsdom": "^29.0.0",
     "typescript": "^7.0.2",
     "vite": "^8.2.1",
