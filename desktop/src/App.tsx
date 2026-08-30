@@ -42,7 +42,7 @@ import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useProjects } from "./hooks/useProjects";
 import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { desktopWorkflowPlatformIssue } from "./lib/platform";
-import type { DeckAction, DeckActionResult, DeckRuntimeState, DeckView, EvidenceItem, PanelTab, WorkflowLaunchConfig } from "./types";
+import type { DeckAction, DeckActionResult, DeckRuntimeState, DeckView, EvidenceItem, PanelTab, RuntimeMode, WorkflowLaunchConfig } from "./types";
 import { modeScopedKey } from "./lib/bridge";
 
 const WORKFLOW_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.workflow-preview.v1");
@@ -77,10 +77,27 @@ export default function App() {
  * The deck stays the default: launching the app lands exactly where it does
  * today.
  */
-export function DeckShell({ runtime, workflowPlatformIssue }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string }) {
-  const [view, setView] = useState<DeckView>({ kind: "deck" });
-  if (view.kind === "overview") return <AgentOverview runtime={runtime} onNavigate={setView} />;
+export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind: "deck" } }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; initialView?: DeckView }) {
+  const [view, setView] = useState<DeckView>(initialView);
+  // GATE UNTIL M7 (PRD #745). The overview renders no terminal, but attach is
+  // snapshot-driven, not render-driven: `attachAgents` still fires for every
+  // agent from `connect()` and from every `desktop://snapshot` (lib/bridge.ts),
+  // so in LIVE mode the bridge holds one socket, one scrollback replay and one
+  // stream per agent behind a screen whose own copy says nothing is attached.
+  // Iteration 1 is fixture-only by decision, and this is where that boundary is
+  // enforced. M7 makes attach demand-driven; removing this condition, and the
+  // one on the rail button below, is part of M7's definition of done.
+  if (view.kind === "overview" && showOverview(runtime.mode)) return <AgentOverview runtime={runtime} onNavigate={setView} />;
   return <ControlDeck runtime={runtime} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} />;
+}
+
+/**
+ * Whether the agent overview may be reached at all. See the gate comment in
+ * `DeckShell`; both seams — this one and the rail button — read this function
+ * so `grep showOverview` finds every one of them when M7 lifts the gate.
+ */
+export function showOverview(mode: RuntimeMode): boolean {
+  return mode === "fixture";
 }
 
 export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void }) {
@@ -318,8 +335,13 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
         <nav>
           <RailButton icon={FolderGit2} label="Projects" active={projectsOpen} onClick={() => setProjectsOpen(true)} testId="open-projects" />
           <RailButton icon={Activity} label="Runs" active={!projectsOpen && !workflowOpen && !profilesOpen && !promptsOpen} onClick={() => { setProjectsOpen(false); setWorkflowOpen(false); setProfilesOpen(false); setPromptsOpen(false); }} />
-          {/* The one rail button that is a real view rather than an overlay toggle. */}
-          <RailButton icon={LayoutList} label="Overview" onClick={() => onNavigate?.({ kind: "overview" })} testId="open-overview" />
+          {/*
+            The one rail button that is a real view rather than an overlay
+            toggle — and, until M7, fixture-only (see `DeckShell`'s gate).
+            Absent rather than disabled in live mode: a disabled control
+            advertises a screen this iteration cannot honestly serve.
+          */}
+          {showOverview(mode) && <RailButton icon={LayoutList} label="Overview" onClick={() => onNavigate?.({ kind: "overview" })} testId="open-overview" />}
           <RailButton icon={BookMarked} label="Prompts" active={promptsOpen} onClick={() => setPromptsOpen(true)} testId="open-prompts" />
           <RailButton icon={Network} label="Workflows" active={workflowOpen} onClick={() => setWorkflowOpen(true)} />
           <RailButton icon={Bot} label="Agent Profiles" active={profilesOpen} onClick={() => setProfilesOpen(true)} testId="open-agent-profiles" />

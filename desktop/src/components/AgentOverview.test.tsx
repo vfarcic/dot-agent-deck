@@ -459,4 +459,34 @@ describe("DeckShell", () => {
     expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
     expect(screen.queryByTestId("daemon-group")).not.toBeInTheDocument();
   });
+
+  /**
+   * The overview is fixture-only until M7 makes attach demand-driven. Live mode
+   * still attaches one PTY per agent from `connect()` and from every snapshot,
+   * so a live user reaching this screen would be told nothing is attached while
+   * every socket stayed open. Both seams are covered, because either one alone
+   * leaves the screen reachable.
+   */
+  it("does not offer the overview in live mode", () => {
+    render(<DeckShell runtime={runtime({ mode: "live", snapshot: createFixtureSnapshot("connected") })} />);
+
+    expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
+    expect(screen.queryByTestId("open-overview")).not.toBeInTheDocument();
+    // Absent, not disabled: a disabled control advertises the unbuilt feature.
+    expect(screen.queryByRole("button", { name: "Overview" })).not.toBeInTheDocument();
+  });
+
+  it("renders the deck when a live session is already holding an overview view state", () => {
+    render(<DeckShell runtime={runtime({ mode: "live", snapshot: createFixtureSnapshot("connected") })} initialView={{ kind: "overview" }} />);
+
+    expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
+    expect(screen.queryByTestId("daemon-group")).not.toBeInTheDocument();
+  });
+
+  it("still honours an overview view state in fixture mode", () => {
+    render(<DeckShell runtime={runtime()} initialView={{ kind: "overview" }} />);
+
+    expect(screen.getByTestId("daemon-group")).toBeVisible();
+    expect(terminalMounted).not.toHaveBeenCalled();
+  });
 });
