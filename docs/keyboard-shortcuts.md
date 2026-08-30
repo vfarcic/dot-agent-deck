@@ -49,7 +49,7 @@ The confirmation defaults to **Cancel**, so an accidental `Ctrl+W` followed by a
 
 With the flag on, on an **orchestration tab**, typing into a worker pane is locked by default. Your keystrokes reach the orchestrator's pane exactly as before; aim them at a worker role and they are dropped rather than delivered, and the bottom bar says `Pane locked — Ctrl+d then Ctrl+e to unlock`. Press `Ctrl+D` to reach command mode, then `Ctrl+E`, and the deck reports `Pane entry: unlocked`; the same chord locks it again. `Ctrl+E` leaves you in command mode, so press `Ctrl+D` once more to return to the pane and type.
 
-**This is not a read-only mode, and it does not apply anywhere else.** Dashboard and mode tabs are untouched, nothing is disabled, and every pane still shows live output and scrolls normally. On an orchestration tab the lock costs one deliberate `Ctrl+D`, `Ctrl+E` before you can type at a worker — and that pause is the point. An orchestration is one workflow with a single coordinator, and an open pane invites the reflex of answering a worker's question on the spot. Doing that puts a second, uncoordinated actor inside the workflow: you change state the orchestrator believes it owns, with no way for it to find out. Most often this is not even deliberate — you inspect a worker pane, get distracted, and type your next instruction into the wrong pane. The lock turns that reflex into a decision, and the default has to be locked for it to mean anything.
+**This is not a read-only mode, and it does not apply anywhere else.** Dashboard and mode tabs are untouched, nothing is disabled, and every pane still shows live output and scrolls normally. On an orchestration tab the lock costs one deliberate `Ctrl+D`, `Ctrl+E` before you can type at a worker — and that pause is the point. Why it is worth a pause, and why the default has to be locked for it to mean anything, is covered in [Typing into a worker is locked by default](orchestration.md#typing-into-a-worker-is-locked-by-default-experimental).
 
 Three details worth knowing:
 
@@ -65,7 +65,7 @@ On the Dashboard or an orchestration tab, `Ctrl+Z` in command mode gives the foc
 
 This holds whatever `Ctrl+T` is set to: a tiled deck zooms to the focused pane alone, not to three taller panes, and the `Ctrl+T` setting itself is left untouched so unzooming restores the tiling exactly. It also works the same way on both tab kinds that have one, because they are the same shape — a card sidebar beside a stack of agent panes, at 33/67 on the Dashboard and 34/66 (or a `Ctrl+L`-narrowed 25/75) on an orchestration tab. A Mode tab has no sidebar to reclaim, so `Ctrl+Z` does nothing there and reaches the pane as ordinary input.
 
-The `[Z]` in the border title is there because the one real hazard of zooming is forgetting you did it and concluding your other agents have gone. They have not: **every agent keeps running while you are zoomed**, delegation and hooks are unaffected, and the only thing that changed is what is drawn. What you do lose while zoomed is the sidebar, which is the live status of everyone else — so it is a working posture, not a supervising one.
+The `[Z]` in the border title is there because the one real hazard of zooming is forgetting you did it and concluding your other panes have gone. They have not — nothing is stopped, only hidden. What that costs you on an orchestration tab, where the sidebar you lose is the live status of every other agent, is covered in [Zooming the focused pane](orchestration.md#zooming-the-focused-pane).
 
 Three details worth knowing:
 
