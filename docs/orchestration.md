@@ -125,7 +125,7 @@ Three more things to know:
 - **The Dashboard zooms too.** It is the same shape as an orchestration tab — a card sidebar beside a stack of agent panes, at 33/67 rather than 34/66 — so `Ctrl+Z` does the same thing there, with its own independent flag. A Mode tab is two pane regions rather than sidebar-plus-panes, so there is no sidebar to reclaim and the chord reaches the pane instead.
 - **Zoom does not survive a detach.** Nothing about it is written to the saved session, so reattaching always returns the full supervisory view.
 
-Zooming and unzooming resizes the agent's PTY, so the agent reflows to the new width and back. The chord is claimed **only in command mode**, and that is what keeps job control intact: `Ctrl+Z` inside a pane is `0x1a`, the terminal's suspend character, and the deck goes on forwarding it there — so suspending an agent still works exactly as it always did. It is the same narrowing that lets `Ctrl+l` stay readline's clear-screen while you type.
+The agent reflows to the new width and back, so nothing is lost or garbled either way. The chord is claimed **only in command mode**, and that is what keeps job control intact: `Ctrl+Z` inside a pane is the terminal's suspend character, and the deck goes on forwarding it there — so suspending an agent still works exactly as it always did. It is the same narrowing that lets `Ctrl+l` stay readline's clear-screen while you type.
 
 ### Typing into a worker is locked by default (experimental)
 
@@ -628,7 +628,7 @@ If you want a role to stay gone, remove it from `.dot-agent-deck.toml` (or close
 
 ### Orchestrator receives no work-done feedback
 
-The daemon writes feedback to the orchestrator pane via the PTY. If the orchestrator's pane is closed, the feedback write fails silently. The `.dot-agent-deck/work-done-<role>.md` file is written first, so for a delegated task it can still be read manually — unless the daemon could not write it, in which case the daemon log carries a `failed to write work-done summary` warning and any file at that path belongs to an **earlier** delegation (or is a partial write).
+Feedback is written into the orchestrator's pane. If that pane is closed, there is nowhere to write it and the message is lost silently. The `.dot-agent-deck/work-done-<role>.md` file is written first, so for a delegated task it can still be read manually — unless the daemon could not write it, in which case the daemon log carries a `failed to write work-done summary` warning and any file at that path belongs to an **earlier** delegation (or is a partial write).
 
 ### Orchestrator is told a completion was "unsolicited"
 

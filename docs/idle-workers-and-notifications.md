@@ -260,7 +260,7 @@ A chat id is an **identifier, not a credential**: knowing it does not let anyone
 
 There is an asymmetry here worth understanding before you rely on any of this.
 
-The escalation, merge-gate, and done notifications live in the **orchestrator's prompt**. On a long run that prompt can be compacted away — the instructions were context, and context is what compaction reclaims. The symptom is silence: the run reaches a gate and stops, correctly, but no message is sent, and you find out by wandering back to the terminal. Nothing errors, so nothing tells you it happened. See [PRD #82](https://github.com/vfarcic/dot-agent-deck/issues/82) for how that mechanism is being addressed more generally.
+The escalation, merge-gate, and done notifications live in the **orchestrator's prompt**. On a long run that prompt can be compacted away — the instructions were context, and context is what compaction reclaims. The symptom is silence: the run reaches a gate and stops, correctly, but no message is sent, and you find out by wandering back to the terminal. Nothing errors, so nothing tells you it happened. See [issue #82](https://github.com/vfarcic/dot-agent-deck/issues/82) for how that mechanism is being addressed more generally.
 
 The daemon's **idle-worker prompt does not have that failure mode**. It is injected fresh at the moment it fires and it is self-describing: it explains what it is and what the orchestrator might do about it, in its own text. An orchestrator that has forgotten every notification instruction still receives a coherent report and can still act sensibly on it.
 

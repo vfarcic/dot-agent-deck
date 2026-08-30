@@ -69,11 +69,11 @@ The `[Z]` in the border title is there because the one real hazard of zooming is
 
 Three details worth knowing:
 
-- **It is claimed only in command mode, and that is what keeps job control working.** `Ctrl+Z` inside a pane is `0x1a`, the terminal's suspend character, and the deck keeps forwarding it: while you are typing at an agent, `Ctrl+Z` still suspends whatever is running there, exactly as it always has. The deck only takes the chord in command mode, on a tab that has a sidebar to hide — the same narrowing that lets `Ctrl+L` stay readline's clear-screen and `Ctrl+W` stay word-delete while you type.
+- **It is claimed only in command mode, and that is what keeps job control working.** `Ctrl+Z` inside a pane is the terminal's suspend character, and the deck keeps forwarding it: while you are typing at an agent, `Ctrl+Z` still suspends whatever is running there, exactly as it always has. The deck only takes the chord in command mode, on a tab that has a sidebar to hide — the same narrowing that lets `Ctrl+L` stay readline's clear-screen and `Ctrl+W` stay word-delete while you type.
 - **Zoom follows focus.** Jump to another role with `1`–`9` while zoomed and you stay zoomed, now on that agent — the role jump is a deliberate "go work with that one", so the posture travels with it.
 - **Zoom is per-tab and does not survive a detach.** Each tab remembers its own zoom — the Dashboard's and an orchestration tab's are separate, so zooming one never touches the other — a tab you open later starts unzoomed, and nothing about it is written to the saved session, so reattaching always returns the full supervisory view. This is the deliberate opposite of the `Ctrl+L` split, which is one setting for the whole deck.
 
-Zooming and unzooming resizes the agent's PTY, so the agent reflows to the new width both ways.
+The agent reflows to the new width both ways, so nothing is lost or garbled.
 
 ### `Ctrl+C`
 
@@ -231,7 +231,7 @@ help = "F1"                      # open help with F1 instead of ?
 | `toggle_layout` | `Ctrl+t` | Toggle stacked / tiled layout — works from any mode |
 | `toggle_orchestration_lock` | `Ctrl+e` | **Experimental — requires the `experimental` flag; without it the chord is never claimed.** Toggle the orchestration command-entry lock — **command mode only, on an orchestration tab**; everywhere else the chord is ordinary input for whatever is running in the pane |
 | `toggle_orchestration_split` | `Ctrl+l` | Toggle the orchestration sidebar/pane-column split between 34/66 and 25/75 — one press applies to every orchestration tab, including ones you open afterwards. **Orchestration tabs, command mode only**; in a pane, and on every other tab, the chord is ordinary input for whatever is running there |
-| `toggle_zoom` | `Ctrl+Z` | Zoom the focused pane to the whole frame, hiding the card sidebar and the other panes; press again to restore. Per-tab, and never saved. **Dashboard and orchestration tabs, command mode only**; in a pane it is still `0x1a` job control for your agent, and in the filter/rename rows and on a Mode tab it is ordinary input |
+| `toggle_zoom` | `Ctrl+Z` | Zoom the focused pane to the whole frame, hiding the card sidebar and the other panes; press again to restore. Per-tab, and never saved. **Dashboard and orchestration tabs, command mode only**; in a pane it is still job control for your agent, and in the filter/rename rows and on a Mode tab it is ordinary input |
 | `jump_1` … `jump_9` | `1` … `9` | Jump to card N and focus its pane |
 
 `close_pane`, `toggle_orchestration_lock`, `toggle_orchestration_split`, and `toggle_zoom` live in `[global]` because the section names the TOML table your binding is read from, not the modes it applies in. Whatever chord you bind any of them to is command-mode only and reaches the pane as ordinary input everywhere else.
