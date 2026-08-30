@@ -1,0 +1,30 @@
+# Fixture for the L2 `--list-targets` default-marker test
+# (orchestration/dispatch/004, issues #704 / #705). Two spawnable orchestrations
+# where the SECOND declares `default = true`, so the marker cannot be satisfied
+# by anything that merely reports file order.
+#
+# `gpt-side` also `extends` the first, which puts issue #705's inheritance on the
+# daemon's own config-load path: the listing's role COUNT for it can only be 2 if
+# `extends` resolved, since the block itself restates one role.
+#
+# Every role runs `cat`, which stays alive on stdin. No real LLM tokens.
+[[orchestrations]]
+name = "claude-side"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "cat"
+start = true
+
+[[orchestrations.roles]]
+name = "worker"
+command = "cat"
+
+[[orchestrations]]
+name = "gpt-side"
+extends = "claude-side"
+default = true
+
+[[orchestrations.roles]]
+name = "worker"
+command = "cat"

@@ -49,15 +49,30 @@ pub(crate) const MAX_FIRST_PROMPTS: usize = 3;
 /// wrapper→`node codex` gap alone was ~4 s (`devbox run codex-big`), with
 /// Codex's own TUI initialization on top; 10 s left almost no margin on a
 /// loaded machine. This value only matters when the gate FALLS THROUGH — i.e.
-/// the agent's native hooks never fired (not installed, not trusted) — and that
+/// no pre-prompt readiness signal ever arrived — and that
 /// path is load-bearing: it must wait long enough that the prompt lands in a
 /// live agent rather than in a launcher's line discipline, where it is echoed
 /// and lost. The cost of over-waiting is a delayed prompt; the cost of
 /// under-waiting is a silently dropped one, so this is deliberately generous.
+///
 /// The healthy path is unaffected — a genuine `SessionStart` releases the gate
 /// in milliseconds. The scheduler mirror of this wait is overridable per-run via
 /// `DOT_AGENT_DECK_SESSION_START_WAIT_MS` (see
 /// [`crate::spawn`]) so the e2e harness never pays the full fallback.
+///
+/// **#243: WHO still reaches this, and who no longer does.** The wait used to be
+/// entered by every agent, so "falls through" above used to mean only "the
+/// agent's native hooks never fired". Two classes now leave it before the
+/// deadline or never enter it at all. A declared-`NoSignal` agent
+/// ([`agent_has_pre_prompt_readiness_signal`], OpenCode) skips the wait
+/// ENTIRELY — for it this was never a timeout but pure dead time, though note
+/// what else it accidentally was, which is why the skip pays
+/// [`NO_SIGNAL_READINESS_BUFFER`] rather than the ordinary one — and a
+/// wrapper-hosted one (Codex) is released early by the wrapper's interface
+/// observation ([`session_start_means_ready`]). What is left here is the genuine
+/// fallback: an agent that declares a native `SessionStart` and does not deliver
+/// one, and an agent the deck could not resolve at all. Both still need the full
+/// window.
 pub(crate) const SESSION_START_WAIT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 
@@ -98,10 +113,303 @@ pub(crate) const SESSION_START_WAIT_TIMEOUT: std::time::Duration =
 /// Overridable via [`DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS`] — that is what
 /// lets the e2e harness skip the buffer entirely and what lets the toggle test
 /// flip it. See [`delegate_readiness_buffer`].
+///
+/// **#243 rescoped WHEN this applies, and it is no longer only the delegate
+/// path's wait.** Two changes. (a) It is never SKIPPED — every readiness fact
+/// the deck can observe pays a buffer, including both of the wrapper's interface
+/// facts. What the strong one now buys is a DIFFERENT buffer sized against a
+/// different measurement ([`WRAPPER_INTERFACE_READINESS_BUFFER`]), not the
+/// absence of one; the reasoning that once justified a skip was measured false
+/// and is retracted there. (b) The resolver below is `pub(crate)` because the
+/// SCHEDULER now floors its declared-no-signal skip with the same value, for the
+/// same reason (see [`crate::spawn`]). The environment override keeps its
+/// `DELEGATE_` name, which is public and documented; what it configures is "how
+/// long a gate holds a prompt before writing it", on whichever path the gate
+/// released, and an explicitly-set value overrides EVERY default.
+///
+/// Round 4 widened that sentence once more, and it is worth reading exactly:
+/// the declared-no-signal path establishes no readiness fact AT ALL, so "after a
+/// readiness fact that does not prove input-readiness" — how this was worded
+/// through round 3 — stopped describing the variable's third default
+/// ([`NO_SIGNAL_READINESS_BUFFER`]). Nothing about the variable itself changed;
+/// it is still the one knob, still clamped the same way, and still the #199
+/// escape hatch.
+/// What it still covers after round 4, which is everything EXCEPT the two paths
+/// that now have a measured number of their own: a native `SessionStart`
+/// (Claude, Devin), the wrapper's weak output-settled fact, the timeout fallback,
+/// and any agent the deck could not resolve. A declared-`NoSignal` agent takes
+/// [`NO_SIGNAL_READINESS_BUFFER`] and the wrapper's strong interface fact takes
+/// [`WRAPPER_INTERFACE_READINESS_BUFFER`] — both because this value was measured
+/// against neither of those situations and was found, when it was finally asked
+/// to cover them, not to.
 pub(crate) const DELEGATE_READINESS_BUFFER: std::time::Duration =
     std::time::Duration::from_millis(1000);
 
-/// PRD #249 M1 test/e2e seam: overrides [`DELEGATE_READINESS_BUFFER`] with an
+/// Issue #243, round 4 (derived by measurement, not tuned): the post-readiness
+/// buffer paid when there was no readiness fact at all, because the agent has
+/// DECLARED it emits none ([`crate::agent_registry::PrePromptReadiness::NoSignal`]
+/// — OpenCode) and the gate skipped straight past the wait.
+///
+/// **This exists because deleting the dead wait deleted a cover nobody had
+/// priced.** Before this issue an OpenCode delegate sat out the full
+/// [`SESSION_START_WAIT_TIMEOUT`] waiting for an event #146 measured never to
+/// arrive. That was dead time by every measure except one: it happened to give
+/// the replacement 30 s to boot. Skipping it for a declared-`NoSignal` agent is
+/// right and stays — but it left [`DELEGATE_READINESS_BUFFER`] as the SOLE thing
+/// between a `clear = true` respawn and the write, and that value is PRD #249's
+/// "warm-case 500 ms, doubled for a cold start", derived against a 650 ms stub
+/// and never against a real agent. Its own doc says so. `orchestration/delegate/015`
+/// was executed for the first time on 2026-08-26 and is RED at 1000 ms: the deck
+/// delivers promptly every run and the replacement never consumes the bytes.
+///
+/// **What the buffer has to clear, measured on the real article.** Reproducing
+/// the deck's exact write shape — exec, sleep, payload,
+/// [`crate::pane_input::SUBMIT_DELAY`], `\r` — against a real
+/// `opencode --model … --auto` 1.18.23 on a pty and reading the rendered grid
+/// back, across **176 runs**: delivery tracks ONE boundary, the instant OpenCode
+/// paints its composer (`Ask anything...`). Written before it, the payload is
+/// gone — not parked, gone. Written after it, every run delivered.
+///
+/// The failure shape is worth stating because it is not the wrapper's. Only in
+/// the first half-second is the pane still in cooked mode and the payload echoed
+/// back by the line discipline (5/5 runs at a 0 ms buffer, PRD #225 Defect 1
+/// exactly); after that OpenCode holds the terminal raw and simply DISCARDS
+/// keystrokes until it has finished initialising. Across every run on the final
+/// classifier, **zero** landed in the composer unsubmitted — #663's parked shape
+/// does not occur here, so there is no second failure for a longer interval to
+/// introduce.
+///
+/// **Sized from that measurement, from both ends.**
+///
+/// * **Lower end.** The requirement is the composer paint, and it stretches with
+///   the machine. Per arm: last delay that still LOST the prompt / first delay
+///   that delivered every run / where the composer painted (median).
+///
+///   | box                        | lost at   | delivered  | composer paint |
+///   |----------------------------|-----------|------------|----------------|
+///   | idle                       | 2400 ms   | 2500 ms    | 2.61 s         |
+///   | cores oversubscribed 1x    | 4000 ms   | 4500 ms    | 4.41 s         |
+///   | cores oversubscribed 2x    | 3500 ms   | 4000 ms    | 4.45 s         |
+///   | cores oversubscribed 4x    | 10000 ms  | 12000 ms   | 12.5 s         |
+///
+///   So a contended-but-usable box needs **4500 ms**, and 8000 ms is 1.78x that
+///   and 3.2x the idle requirement. Verified at the shipped value: **19/19**
+///   delivered — 5/5 idle, 8/8 at 1x, 6/6 at 2x.
+///
+///   Unlike codex-cli's, this loss window is **monotonic**: one contiguous prefix
+///   and no second window at the repaint. Checked to 20 s idle (15/15 delivered
+///   at 6/8/10/15/20 s) and to 16 s at 1x. "Bigger is safer" is true here, which
+///   it was not for [`WRAPPER_INTERFACE_READINESS_BUFFER`].
+/// * **Upper end.** This is paid on EVERY delegate and every scheduled first
+///   prompt to this agent, against the 30.3 s an OpenCode cold spawn cost before
+///   this issue (`orchestration/delegate/030` measures ~31 s for the same
+///   configuration in virtual time). 8 s puts the pointer at ~9.5 s end to end —
+///   still 3.2x better than the baseline, half of `orchestration/delegate/015`'s
+///   20 s budget, and far inside the 60 s `AUTOMATIC_PROMPT_DEADLINE` that bounds
+///   a whole delivery. Past ~15 s the fix starts eating its own win, and past
+///   ~25 s it stops being distinguishable from the defect.
+///
+/// **Deliberately asymmetric, for the same reason as everywhere else in this
+/// issue.** Too short costs the prompt SILENTLY — the write succeeds, the bytes
+/// are discarded by a TUI that is not listening yet, the composer renders its
+/// empty placeholder, and the worker looks alive while no turn ever starts. Too
+/// long costs bounded latency on a path that is still multiples better than the
+/// defect it replaces.
+///
+/// **And it is a mitigation, not a bound — this one more plainly than the
+/// others.** The quantity is another program's initialisation, it scaled 4.8x
+/// between an idle and a 4x-oversubscribed box HERE, and a box in that state
+/// needs ~12 s where this ships 8. No number measured on this machine bounds it
+/// on someone else's, and this value deliberately does not try:
+/// [`DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS`] is the operator's override and
+/// is the documented answer for a machine that needs more.
+///
+/// The durable answer is an OBSERVATION that scales, and for this agent it does
+/// not exist yet. There is no pre-prompt signal by construction (#146 measured
+/// it) and `server.connected` is refuted — it is synthesized as the first frame
+/// of the SSE response, never reaches the plugin hook, and says nothing about
+/// input readiness, so do not re-propose it. What the measurement above DOES
+/// hand PRD #234 (screen-state observation for hookless agents) is the target:
+/// for OpenCode the input-readiness boundary is exactly the `Ask anything...`
+/// paint, which the deck already has on the pane's own PTY, and which
+/// `orchestration/delegate/015` already waits for by hand. Until something
+/// watches it, an interval is the ceiling here.
+pub(crate) const NO_SIGNAL_READINESS_BUFFER: std::time::Duration =
+    std::time::Duration::from_millis(8000);
+
+/// Issue #243, round 3 (derived by measurement, not tuned): the post-readiness
+/// buffer paid when the gate was released by the wrapper's STRONG interface fact
+/// ([`crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`]) — the child
+/// clearing `ICANON`/`ECHO` on the inner PTY.
+///
+/// **This replaces a SKIP, and the premise the skip rested on was false.** Two
+/// earlier rounds of this issue asserted that a child reading raw keystrokes is
+/// "the exact inverse of the canonical-echo discipline that swallowed the prompt
+/// in PRD #225, so there is nothing left for a blind interval to cover". There
+/// is. Raw mode means *the agent owns the terminal*; it does not mean *the
+/// composer will accept a submit*. A full-screen TUI enables raw mode at INIT,
+/// before it has painted anything — measured on real codex-cli 0.149.0 launched
+/// directly (no launcher in front) at **85 ms** after exec, and independently by
+/// `orchestration/delegate/009` at fork + 100 ms on both the original worker and
+/// its `clear = true` replacement. Writing on that instant is the EARLIEST and
+/// worst moment available, and it loses the prompt silently.
+///
+/// **What the buffer has to clear.** codex-cli keeps eating input for the rest of
+/// its TUI initialisation, which ends in a full teardown-and-repaint (screen
+/// clear, scroll-region reset, every panel redrawn). Reproducing the deck's exact
+/// write shape — payload, [`crate::pane_input::SUBMIT_DELAY`], `\r` — against a
+/// real codex on a pty and reading the rendered grid back, delivery tracks that
+/// repaint and nothing else. Every run in the corpus whose submitting `\r` landed
+/// after it delivered; runs whose `\r` landed before it were lost about half the
+/// time, in two distinct windows rather than one, so the failure is a race
+/// against discrete re-init events and NOT a threshold that a slightly larger
+/// number crosses once and for all.
+///
+/// **Sized from that measurement, from both ends.**
+///
+/// * **Lower end.** On an idle box the repaint completes ~607 ms after exec, i.e.
+///   ~522 ms after the fact-1 observation, and `SUBMIT_DELAY` donates 150 ms of
+///   that for free — so idle needs only ~372 ms, and the old 1000 ms default
+///   cleared it (30/30 delivered at 600–1300 ms). Under CPU contention it does
+///   not: the whole initialisation stretches with the machine. With the cores
+///   oversubscribed 1x, 1000 ms lost the prompt **3/3**; at 2x, **3/3** again,
+///   and 2000 ms and 3000 ms were still only 1/3 and 2/3. The worst requirement
+///   observed across 24 contended runs was **3601 ms** (repaint at 4107 ms, fact
+///   1 at 356 ms, less the 150 ms `SUBMIT_DELAY`). 5000 ms is 1.39x that and
+///   delivered **10/10** at 4000–5000 ms under the same load.
+/// * **Upper end.** This is paid on every delegate to a wrapped agent, against a
+///   31.4 s baseline measured in production before this issue. Fact 1 plus this
+///   buffer puts a directly-launched Codex at ~5.1 s and one behind `devbox run
+///   codex-big` (fact 1 at ~3.1 s) at ~8.1 s — 6.2x and 3.9x better than the
+///   baseline, and both far inside the 60 s `AUTOMATIC_PROMPT_DEADLINE` that
+///   bounds a whole delivery. Much past ~5 s and the win starts being eaten by
+///   the fix for it.
+///
+/// **Deliberately asymmetric, because the two failures are not comparable.** Too
+/// short costs the prompt SILENTLY — the write succeeds, the text parks in the
+/// composer, no turn ever starts, and the worker looks alive. Too long costs
+/// bounded latency on a path that is still multiples better than the defect it
+/// replaces. So the headroom is a multiple rather than a rounding.
+///
+/// **And it is a mitigation, not a bound.** The quantity being covered is another
+/// program's initialisation time; it scaled ~7x between an idle and a contended
+/// box here, and no number measured on this box can bound it on someone else's.
+/// [`DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS`] overrides it for an operator
+/// who needs more. The durable answer is an OBSERVATION that scales — the
+/// wrapper watching the child's output settle *after* the raw-mode transition,
+/// which the launcher hazard that makes
+/// [`crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`] unsafe on its
+/// own does not apply to once fact 1 has already proved the agent owns the
+/// terminal. That is a new mechanism and is filed rather than built here.
+///
+/// Scoped to the strong fact ALONE, and that scoping is load-bearing. A wrapped
+/// agent that never leaves cooked mode has no full-screen initialisation to
+/// clear — it is a line-oriented REPL, and the measurement above says nothing
+/// about it — so the weak fact, the timeout fallback and every non-wrapper
+/// readiness fact keep [`DELEGATE_READINESS_BUFFER`] unchanged.
+pub(crate) const WRAPPER_INTERFACE_READINESS_BUFFER: std::time::Duration =
+    std::time::Duration::from_millis(5000);
+
+/// Issue #243 (regression found by measurement): how long the readiness gate
+/// holds a Wrapper-strategy agent's WEAK interface fact
+/// ([`crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`]) open,
+/// waiting to see whether the STRONG one
+/// ([`crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`]) is still
+/// coming.
+///
+/// **It IS [`SESSION_START_WAIT_TIMEOUT`], definitionally, and that is the
+/// point.** This was an independent 8 s for one round, sized from a warm box and
+/// one launcher. The deck already ships exactly one answer to "how long do we
+/// wait for a readiness fact"; holding a weak fact open for a stronger one is
+/// that same question asked about a better answer, so it takes the same number
+/// and moves with it whenever that one is retuned. A second constant here would
+/// be a new tunable calibrated against a single launch shape on a single
+/// machine — which is the drift this issue exists to eliminate, not something to
+/// reintroduce one seam over.
+///
+/// **This is a bound on a FALLBACK, not a tuned delivery interval.** Nothing
+/// waits this long in the case it exists for: the strong fact arrives, the gate
+/// releases on it that instant, and the window is never reached. What the number
+/// buys is the shape of the failure when the strong fact never comes — release on
+/// the guess plus [`DELEGATE_READINESS_BUFFER`], i.e. exactly the behaviour that
+/// shipped before this window existed. So it must not be read as, or tuned like,
+/// the fixed intervals `DELEGATE_READINESS_BUFFER` warns about drifting: a longer
+/// value never delays a wrapped agent that reaches its interface, and
+/// `docs/develop/agent-adapters.md` says the same.
+///
+/// **What the 8 s lost, and why no buffer could have covered it.** Measured on a
+/// FIRST run in a fresh project, where `devbox run codex-big` installs packages
+/// before it computes a shellenv:
+///
+/// ```text
+/// fact 2 at 1.1 s -> 8 s window expires at 9.1 s -> released on fact 2
+///                 -> pointer written at 14.1 s
+/// fact 1 at 15.98 s, i.e. 1.7 s AFTER the write   -> pointer PARKED
+/// ```
+///
+/// The mechanism is nastier than a plain race, which is what rules out sizing
+/// around it with a bigger [`WRAPPER_INTERFACE_READINESS_BUFFER`]. The bytes were
+/// written into a tty whose line discipline still belonged to the launcher, sat
+/// in the input queue while devbox worked, and were drained FUSED when codex
+/// finally took raw mode — so the submit `\r` arrived as a newline INSIDE the
+/// payload rather than as a submit, and the pointer sat unsent in the composer.
+/// A larger buffer does not fix that; it only moves the write. What fixes it is
+/// not writing until the fact that says the agent owns the terminal — and
+/// 15.98 s is comfortably inside [`SESSION_START_WAIT_TIMEOUT`].
+///
+/// Reproduced A/B against a real codex-cli 0.149.0 on a pty, with that launcher
+/// timing staged in front of the real `devbox run codex-big` (the machine's nix
+/// store is warm, so a genuine package install could not be re-staged): at the
+/// old 8 s window, fact 2 at 997/1000 ms, expiry at 8999/9008 ms, CR at
+/// 10.15/10.17 s, fact 1 at 15.41/15.46 s — **PARKED 2/2**, the payload sitting
+/// in Codex's composer. At this window, the same runs release on fact 1 at
+/// 15.47/15.49 s, pay [`WRAPPER_INTERFACE_READINESS_BUFFER`], put the CR at
+/// 20.63/20.65 s — **DELIVERED 2/2**, turn started and answered. Warm and
+/// unchanged in the same rig: fact 1 at 387–436 ms, CR at 5.56–5.61 s,
+/// delivered 3/3, with fact 2 never firing at all.
+///
+/// **The worst case becomes today's known-safe behaviour, so no regression is
+/// reachable.** A wrapped agent that never leaves cooked mode — a line-oriented
+/// REPL, and the test stand-ins — waits the readiness timeout out, releases on
+/// fact 2 and pays the ordinary [`DELEGATE_READINESS_BUFFER`], reaching its
+/// prompt at ~31 s. That is precisely what a Codex delegate did on `main` before
+/// this issue, where the same 30 s wait ended in the same 1000 ms buffer. The
+/// asymmetry is the whole argument: too short loses the prompt SILENTLY, too long
+/// costs latency that is still bounded by a timeout the deck already ships.
+///
+/// The three shapes at shipped defaults:
+///
+/// | case                      | releases on       | pointer at             |
+/// |---------------------------|-------------------|------------------------|
+/// | warm Codex                | fact 1 @ ~390 ms  | ~5.6 s (unchanged)     |
+/// | cold devbox               | fact 1 @ ~16 s    | ~21 s, DELIVERED       |
+/// | wrapped agent, never raw  | fact 2 at timeout | ~31 s = `main` today   |
+///
+/// **Why a window is needed at all.** The wrapper's two facts do not arrive in
+/// order of strength; for the production launch shape they arrive in the exact
+/// wrong order, every time. `devbox run codex-big` prints one banner line at
+/// ~0.1 s and then computes its shellenv in SILENCE for a measured 2750–4132 ms
+/// before `codex` is exec'd at all, so the settle guess fires while the pane still
+/// holds a launcher in cooked-mode line discipline. Measured over 13 launcher
+/// probes and 8 wrapper spawns: the guess fired 21/21 and the observation never
+/// fired first, not once, arriving 2005–3370 ms LATER. Releasing on the guess put
+/// the pointer into the launcher's own line discipline at +1.85 s, where 3/3 runs
+/// left it parked unsubmitted in Codex's composer with no turn ever starting —
+/// silently, because the write itself succeeds. Warm, that margin fits in seconds
+/// and an 8 s window covered it; cold it does not, which is the measurement above.
+///
+/// **Bounded by the caller's deadline — and that `min` is now definitional.**
+/// [`wait_for_session_start`] takes `min(window, time left in the readiness
+/// wait)`, so this can never extend a gate past the timeout that already governs
+/// it. Since the weak fact can only arrive AFTER that wait began, a window equal
+/// to the whole timeout always outruns what is left of it, and the two now expire
+/// in the same instant by construction. The `min` stays load-bearing anyway: the
+/// scheduler's copy of the wait is shortenable per run via
+/// `DOT_AGENT_DECK_SESSION_START_WAIT_MS` ([`crate::spawn`]), and this has to
+/// shorten with it rather than outlive it.
+const INTERFACE_UPGRADE_WINDOW: std::time::Duration = SESSION_START_WAIT_TIMEOUT;
+
+/// PRD #249 M1 test/e2e seam: overrides the post-readiness buffer with an
 /// integer number of **milliseconds**. Mirrors the
 /// `DOT_AGENT_DECK_SESSION_START_WAIT_MS` override idiom
 /// ([`crate::spawn`]) — read at use time, never cached.
@@ -110,6 +418,15 @@ pub(crate) const DELEGATE_READINESS_BUFFER: std::time::Duration =
 /// slow-readiness toggle test (`orchestration/delegate/012`) needs the
 /// unguarded pre-fix behavior as its control arm, and the e2e harness needs to
 /// not pay a second per delegate.
+///
+/// **It overrides ALL THREE defaults, and that is deliberate on both ends** —
+/// [`DELEGATE_READINESS_BUFFER`], [`WRAPPER_INTERFACE_READINESS_BUFFER`] and
+/// [`NO_SIGNAL_READINESS_BUFFER`]. Setting it wins outright rather than being
+/// max()-ed against whichever default applies, which is what lets a harness pin
+/// `0` on every path at once, and what keeps "what the operator set" and "what
+/// the operator gets" the same sentence. It is also the #199 escape hatch, so
+/// nothing a producer can post may suppress it (see
+/// [`explicit_delegate_readiness_buffer`]).
 pub const DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS: &str =
     "DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS";
 
@@ -191,16 +508,82 @@ fn parse_bounded_ms_override(
 /// [`parse_bounded_ms_override`]). A zero result means "write immediately" — the
 /// pre-#249 behavior, kept reachable for the toggle test's control arm and the
 /// e2e harness.
-fn delegate_readiness_buffer() -> std::time::Duration {
-    let Ok(raw) = std::env::var(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS) else {
-        return DELEGATE_READINESS_BUFFER;
-    };
+///
+/// Issue #243: PRD #249 named this for the delegate path, and it is `pub(crate)`
+/// now because the SCHEDULER's readiness gate resolves the same buffer, for the
+/// same reason — see [`crate::spawn`]. The environment variable's name is public
+/// and documented, so it keeps the `DELEGATE_` in it; what it configures is "how
+/// long a gate holds a prompt before writing it", on whichever path the gate
+/// released.
+///
+/// Round 4: this resolver is no longer what the declared-no-signal skip reaches
+/// for. That path has [`no_signal_readiness_buffer`], because it is the one case
+/// where the gate established nothing AND did not spend the timeout finding that
+/// out — so what the interval has to cover there is a whole cold agent start,
+/// not the gap after an announcement. What is left here is the ordinary case: a
+/// native `SessionStart`, the wrapper's weak fact, and the timeout fallback.
+pub(crate) fn delegate_readiness_buffer() -> std::time::Duration {
+    explicit_delegate_readiness_buffer().unwrap_or(DELEGATE_READINESS_BUFFER)
+}
+
+/// Issue #243, round 3: [`delegate_readiness_buffer`]'s counterpart for a gate
+/// released by the wrapper's STRONG interface fact — the operator's own interval
+/// when they set one, [`WRAPPER_INTERFACE_READINESS_BUFFER`] otherwise.
+///
+/// The operator's value OVERRIDES rather than being max()-ed against the default,
+/// which is the same shape [`delegate_readiness_buffer`] has and is deliberate on
+/// both ends: it is how the e2e harness pins 0, and it keeps "what the operator
+/// set" and "what the operator gets" the same sentence. A caller that wants the
+/// longer default has to be on the interface path to get it.
+pub(crate) fn wrapper_interface_readiness_buffer() -> std::time::Duration {
+    explicit_delegate_readiness_buffer().unwrap_or(WRAPPER_INTERFACE_READINESS_BUFFER)
+}
+
+/// Issue #243, round 4: [`delegate_readiness_buffer`]'s counterpart for a gate
+/// that established NOTHING because the agent declares it announces nothing —
+/// the operator's own interval when they set one,
+/// [`NO_SIGNAL_READINESS_BUFFER`] otherwise.
+///
+/// Same shape as [`wrapper_interface_readiness_buffer`] and deliberate for the
+/// same two reasons: an explicit `0` is how the e2e harness opts out, and an
+/// explicit value is how an operator whose machine needs longer than the
+/// measurement says gets it (guard 3). The default is reached only when nobody
+/// asked for anything.
+pub(crate) fn no_signal_readiness_buffer() -> std::time::Duration {
+    explicit_delegate_readiness_buffer().unwrap_or(NO_SIGNAL_READINESS_BUFFER)
+}
+
+/// Issue #243 (audit F1, mitigation 3): the buffer THE OPERATOR ASKED FOR, or
+/// `None` when they asked for nothing usable.
+///
+/// [`delegate_readiness_buffer`] answers "what buffer applies", which folds the
+/// operator's setting and the built-in default into one duration and is exactly
+/// right for every path that is going to wait. This answers the different
+/// question the interface-observation SKIP has to ask first: *was this interval
+/// chosen by a human?*
+///
+/// The skip may zero the deck's own default — that is the whole point of the
+/// observation — but it must not zero [`DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS`].
+/// That variable is the #199 escape hatch: the one thing an operator whose prompts
+/// are going missing on a slow machine can reach for. A readiness marker is
+/// producer-writable on an unauthenticated socket, so leaving it able to suppress
+/// the hatch would let a producer turn the operator's setting off on demand — and
+/// even in the honest case, "I set this to 2000 because 1000 was not enough" is a
+/// statement about the machine that an observation of one child does not refute.
+/// So the skip floors at this value instead of at zero.
+///
+/// `None` for unset, for non-UTF-8, and for a value that is not a usable number —
+/// the last of which [`parse_bounded_ms_override`] has already `warn!`ed about.
+/// An unparseable value is not a setting, so it floors nothing; an explicit `0`
+/// is a setting, and it means zero (the e2e harness and the toggle test's control
+/// arm both rely on that).
+fn explicit_delegate_readiness_buffer() -> Option<std::time::Duration> {
+    let raw = std::env::var(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS).ok()?;
     parse_bounded_ms_override(
         DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS,
         &raw,
         MAX_DELEGATE_READINESS_BUFFER,
     )
-    .unwrap_or(DELEGATE_READINESS_BUFFER)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -650,6 +1033,14 @@ pub struct AppState {
     /// Empty in the common case; bounded by `MAX_PENDING_ORCHESTRATION_SURFACES`
     /// (L1) so a flood can't grow it unbounded.
     pub pending_orchestration_surfaces: Vec<OrchestrationSurface>,
+    /// Issue #717: dispatched worktrees a close LEFT ON DISK, waiting to be
+    /// reported on the status line. Filled by the event subscriber (which has no
+    /// `UiState`) from [`crate::event::BroadcastMsg::WorktreeKept`] and drained
+    /// by the render loop. Only the LAST one is kept — the status line shows one
+    /// message, so an older keep would only ever be overwritten unseen, and
+    /// holding a queue of them would invite the unbounded growth
+    /// `pending_orchestration_surfaces` needs a cap for.
+    pub pending_worktree_kept: Option<crate::issue_dispatch_run::KeptWorktree>,
     /// PRD #20 R20-003 (finding #4): the DAEMON-AUTHORITATIVE hook session id
     /// (the "generation") currently bound to each pane, keyed by `pane_id`.
     /// Captured from every event's ORIGINAL `session_id` BEFORE the same-agent
@@ -1266,9 +1657,14 @@ const MAX_INLINED_PANE_TEXT_CHARS: usize = 400;
 /// **This deliberately relaxes PRD #249 finding B3 for this notice, and the
 /// frame is what pays for it.** B3 removed the role name from
 /// [`compose_delegate_silence_notice`] on the grounds that the notice's
-/// inertness is best-effort — an LF is not provably "not Enter" on every agent,
+/// inertness was best-effort — an LF is not provably "not Enter" on every agent,
 /// and a later ordinary prompt write can submit accumulated notice bytes — so
-/// nothing a repository controls should ride it. Pane text is strictly more
+/// nothing a repository controls should ride it. Issue #702 retired that
+/// premise for this caller rather than weakening it: the notice is now SUBMITTED
+/// (`write_and_submit_guarded`), so it is a turn of its own and cannot be fused
+/// onto somebody else's, and the value is fenced the way
+/// [`compose_idle_worker_prompt`] fences its role name. What remains true, and
+/// is not papered over, is that pane text is strictly more
 /// hostile than a role name: it is whatever an agent drew, which routinely
 /// includes text that agent read from a third-party clone. The trade is taken
 /// because the alternative measured badly in practice: a notice that names no
@@ -1554,6 +1950,45 @@ fn release_undelivered_commission(
     }
 }
 
+/// Issue #687: the counterpart to [`release_undelivered_commission`] for the
+/// silent-worker watch a `clear = true` respawn arms EARLY, and the single place
+/// that invariant is spelled out:
+///
+/// > **Every path that arms the new generation's watch at respawn time and then
+/// > fails to write that generation's task pointer must release it.**
+///
+/// The watch used to be armed immediately before the pointer write, which meant
+/// the PREVIOUS generation's watch stayed armed — and could fire — throughout the
+/// replacement's `SessionStart` wait and readiness buffer, a gap measured at ~30 s
+/// in the log #687 reports. [`AgentPtyRegistry::arm_silence_watch`] is the
+/// operation that supersedes the previous watch, so moving it to the moment the
+/// respawn establishes fresh pane ownership is what retires the old generation
+/// promptly; the record it leaves behind then has to be cleaned up on every later
+/// exit that delivers nothing, exactly as the commission ledger's is.
+///
+/// Conditional on the generation (`cancel_silence_watch_if`), never an
+/// unconditional remove: a newer delegate or a pane close may already have
+/// replaced this record, and taking somebody else's would disarm a live watch.
+fn release_reserved_silence_watch(
+    registry: &AgentPtyRegistry,
+    worker_pane_id: &str,
+    reserved: Option<crate::agent_pty::ArmedSilenceWatch>,
+    reason: &'static str,
+) {
+    let Some(reserved) = reserved else {
+        return;
+    };
+    if registry.cancel_silence_watch_if(worker_pane_id, reserved.seq) {
+        tracing::debug!(
+            pane_id = %worker_pane_id,
+            seq = reserved.seq,
+            reason,
+            "delegate: released the silent-worker watch the clear=true respawn armed for its \
+             fresh generation; that generation never received a task pointer"
+        );
+    }
+}
+
 /// PRD #126: resolve the timeout, capture the orchestrator's identity, arm the
 /// registry record and spawn its watch — the whole "this worker now owes a
 /// work-done" step of one delegate target. Split out of `handle_delegate` so the
@@ -1831,35 +2266,59 @@ fn delegate_no_event_window(
         .map(|timeout| timeout.min(MAX_DELEGATE_NO_EVENT_WINDOW))
 }
 
-/// PRD #249 M3: the single-line notice written into the orchestrator's pane when
-/// a delegated worker received its task pointer and then emitted no event at all.
+/// PRD #249 M3: the single-line prompt the daemon SUBMITS into the
+/// orchestrator's pane when a delegated worker received its task pointer and
+/// then emitted no event at all.
 ///
-/// Three properties, each load-bearing:
+/// **Issue #702: this notice belongs to [`compose_idle_worker_prompt`]'s family,
+/// not to [`compose_worker_exited_notice`]'s.** The contract is keyed on the
+/// DELIVERY MECHANISM, and it is stated once — here for the submitted family, on
+/// [`compose_worker_exited_notice`] for the deferred one:
 ///
+/// * **Submitted**, with [`AgentPtyRegistry::write_and_submit_guarded`] — the
+///   same call, the same identity gate and the same revalidation closure PRD
+///   #126's idle-worker report uses. It fires EARLIER and SHARPER than that
+///   report (the worker took its pointer and emitted *nothing*, rather than
+///   merely not finishing), which is precisely the moment re-delegating helps,
+///   so the wording asks the orchestrator to act and the delivery hands it a
+///   turn in which to do so. The alternative it left behind was the worst of
+///   the three available: [`AgentPtyRegistry::write_notice_guarded`] is not
+///   inert, only DEFERRED — its LF is not provably "not Enter" on every agent,
+///   and a later ordinary prompt write submits the accumulated bytes fused to
+///   the next real turn (pinned by
+///   `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`). So
+///   the old delivery neither prompted action nor stayed out of the model's
+///   input; it just arrived late, attached to somebody else's turn.
+/// * **The concatenation hazard therefore does not apply to this notice**, and
+///   with it goes the reason PRD #249 finding B3 gave for keeping untrusted
+///   values out. What DOES apply is issue #544's accepted limitation, shared
+///   with every automatic submit including the idle prompt: a pane already
+///   holding an unsent human draft gets that draft submitted along with this
+///   text. `write_guarded`'s user-input guard refuses only a REPEAT of bytes it
+///   already wrote, which this never is.
+/// * **Still no role name and no delegated task text.** That half of B3 is NOT
+///   relaxed. The identifying detail rides the `warn!` that always accompanies
+///   delivery — the pane gets "a worker went silent, look at the log", the log
+///   gets the worker pane, the role, the orchestrator pane and the window.
 /// * **One line**, via [`compose_delegate_prompt`] — a multi-line payload is
-///   written as bracketed paste (#187) and would sit in the pane as a compacted
-///   block.
-/// * **Not submitted.** Delivered with
-///   [`AgentPtyRegistry::write_notice_guarded`], which terminates on LF instead
-///   of the submit CR, so it forms a visible line in scrollback rather than a
-///   user turn the orchestrator must answer. The PRD #126 idle-worker report is
-///   the opposite choice on purpose: that one *asks the orchestrator to act*,
-///   this one only makes an invisible failure visible. Note that this is a
-///   best-effort property, not a guarantee — see
-///   [`AgentPtyRegistry::write_to_pane_notice`]'s KNOWN LIMITATIONS: whether an
-///   agent's TUI treats LF as Enter is unverified per agent, and a later
-///   ordinary prompt write can submit the accumulated notice bytes along with
-///   it.
-/// * **No role name and no delegated task text.** PRD #249's review (finding B3)
-///   removed the role from this notice: because inertness cannot be guaranteed
-///   (above), a role name travelling with a hostile clone's
-///   `.dot-agent-deck.toml` could still end up submitted into the orchestrator's
-///   context. The identifying detail rides the `warn!` that always accompanies
-///   delivery instead — the pane gets "a worker went silent, look at the log",
-///   the log gets the worker pane, the role, the orchestrator pane and the
-///   window. `pane_text` is the ONE untrusted value that now travels with it,
-///   and it arrives already fenced by [`quote_untrusted_pane_text`], which
-///   carries the full argument for that exception.
+///   written as bracketed paste (#187) and never auto-submits, so it would sit
+///   in the input box forever.
+///
+/// **Where this differs from [`compose_idle_worker_prompt`], and why that is
+/// acceptable.** Both submit daemon-authored text carrying one fenced untrusted
+/// value, but the values are not the same size of risk: the idle prompt
+/// interpolates a ROLE NAME — short, drawn from `.dot-agent-deck.toml`, fenced
+/// by [`quote_untrusted_role`] — while this one interpolates a WHOLE RENDERED
+/// SCREEN, longer and directly attacker-influenceable, since it is whatever an
+/// agent drew after reading a third-party clone. That is a real escalation and
+/// is not papered over. It is taken because the mitigation is
+/// [`quote_untrusted_report`]'s, which already fences a whole worker-authored
+/// report that is auto-submitted into a tool-capable orchestrator — a strictly
+/// worse exposure than this one — and because the fence is unclosable from
+/// inside by construction ([`quote_untrusted_pane_text`] collapses whitespace
+/// first, then strips every character its markers are built from). The
+/// alternative measured worse in practice: a report naming no evidence asserted
+/// a delivery failure that had not happened (#686).
 ///
 /// **Issue #686: it reports what the pane is showing instead of asserting why.**
 /// This notice used to end "It may never have received the prompt" — a causal
@@ -1893,15 +2352,16 @@ fn compose_delegate_silence_notice(window: std::time::Duration, pane_text: Optio
              at its own input, it is up and healthy and the pointer most likely never reached it."
         ),
         None => "Its pane has rendered nothing at all, so there is no screen to report: the agent \
-                 may never have started, or the task pointer may never have reached it. Check the \
-                 worker panes."
+                 may never have started, or the task pointer may never have reached it."
             .to_string(),
     };
     compose_delegate_prompt(&format!(
-        "⚠ delegated worker went quiet (dot-agent-deck daemon report): a delegated worker \
+        "⚠ delegated worker went quiet (dot-agent-deck daemon report) - a report from the \
+         dot-agent-deck daemon, not a message from a person or an agent: a delegated worker \
          received its task pointer but then emitted no agent event within {window}. {evidence} \
-         The daemon log names the worker pane and role (RUST_LOG=pane_write=trace also has the \
-         delivered bytes)."
+         Check its pane and decide how to proceed - if this needs the user, notify the user; \
+         otherwise keep waiting, re-delegate, or reassign. The daemon log names the worker pane \
+         and role (RUST_LOG=pane_write=trace also has the delivered bytes)."
     ))
 }
 
@@ -1915,23 +2375,38 @@ fn compose_delegate_silence_notice(window: std::time::Duration, pane_text: Optio
 /// its pointer and stayed quiet while still *running*): here the process is
 /// gone, which is unambiguous, so there is nothing to wait out.
 ///
-/// Deliberately matches [`compose_delegate_silence_notice`]'s precedent, not
-/// [`compose_idle_worker_prompt`]'s, following the same reasoning PRD #249's
-/// review already settled for that sibling notice:
+/// **Issue #702: this is the canonical statement of the DEFERRED family's
+/// contract, and the family is defined by its DELIVERY MECHANISM rather than by
+/// which notice it is.** Anything delivered with
+/// [`crate::agent_pty::AgentPtyRegistry::write_notice_guarded`] — today this
+/// notice and [`compose_respawn_no_live_worker_notice`], and nothing else —
+/// obeys the two rules below. [`compose_delegate_silence_notice`] used to be
+/// counted here and no longer is: it moved to
+/// [`compose_idle_worker_prompt`]'s submitted family, where the concatenation
+/// hazard below does not arise and an untrusted value can be fenced the way that
+/// prompt fences its role name. The two siblings are not in disagreement; they
+/// are in different families, and each doc now states only its own family's
+/// contract.
 ///
-/// * **Not submitted.** Delivered with
-///   [`crate::agent_pty::AgentPtyRegistry::write_notice_guarded`], the same
-///   LF-terminated, non-submitting path #249's silence notice uses — this
-///   only makes an invisible failure visible, it does not hand the
-///   orchestrator a turn to answer.
-/// * **Fixed daemon-authored text — no role name, no delegated task text.**
-///   [`crate::agent_pty::OutstandingDelegation`] carries no delegated-task
-///   text at all (only `dispatch_one_owned`'s local `task` argument does, and
-///   it is never persisted onto the record), and a role name is exactly the
-///   value PRD #249's own review (finding B3) removed from this notice family
-///   on purpose — a `write_notice_guarded` delivery cannot guarantee its LF is
-///   read as Enter, so a later ordinary write can concatenate this notice's
-///   raw bytes with the NEXT real prompt. The pane id, by contrast, is safe
+/// * **Not submitted, which means DEFERRED rather than inert.** Delivered with
+///   `write_notice_guarded`, whose LF terminator leaves a visible line in
+///   scrollback instead of handing the orchestrator a turn to answer. That is
+///   the right trade for a report the orchestrator cannot act on anyway — the
+///   process is already gone — but it is not a guarantee of inertness: whether
+///   an agent's TUI reads LF as Enter is unverified per agent, and a later
+///   ordinary prompt write submits these bytes fused to the NEXT real prompt
+///   (pinned by
+///   `write_to_pane_notice_bytes_precede_next_submit_with_only_lf_between`).
+/// * **Fixed daemon-authored text — no role name, no delegated task text, and
+///   only pre-scrubbed interpolation.** This rule is a direct consequence of
+///   the one above: because these bytes can be submitted later, glued to
+///   somebody else's turn, nothing that a repository or an agent controls may
+///   ride them, and there is no submitted-turn framing to fence such a value
+///   inside. [`crate::agent_pty::OutstandingDelegation`] carries no
+///   delegated-task text at all (only `dispatch_one_owned`'s local `task`
+///   argument does, and it is never persisted onto the record), and a role name
+///   is exactly the value PRD #249's own review (finding B3) removed from this
+///   family. The pane id, by contrast, is safe
 ///   to interpolate raw not because of its format (pane ids are not always
 ///   `format!("pane-{{nonce:016x}}-{{seq}}")` — a scheduled task's pane id
 ///   embeds a sanitized task name instead), but because the value actually
@@ -1964,7 +2439,10 @@ pub(crate) fn compose_worker_exited_notice(worker_pane_id: &str) -> String {
 /// told nothing was wrong and waited for a `work-done` that could never arrive.
 ///
 /// Composition follows [`compose_worker_exited_notice`]'s precedent exactly, for
-/// the same reasons: fixed daemon-authored text, single line, and the WORKER's
+/// the same reasons — this is the deferred family's second and last member (see
+/// that function's doc for the contract, which is keyed on the
+/// `write_notice_guarded` delivery both share): fixed daemon-authored text,
+/// single line, and the WORKER's
 /// `pane_id_env` as the only interpolation — that value has been through
 /// [`crate::agent_pty::is_valid_pane_id_env`]'s `[A-Za-z0-9_-]` scrub, whereas
 /// the role name is caller-supplied config text and PRD #249's finding B3
@@ -2073,7 +2551,12 @@ async fn wait_for_worker_event(
                     return true;
                 }
             }
-            Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
+            // Issue #717: neither variant is evidence about this pane.
+            // Grouped rather than wildcarded so a future variant still
+            // fails this match and gets considered on its merits.
+            Ok(Ok(BroadcastMsg::OrchestrationSurface(_) | BroadcastMsg::WorktreeKept(_))) => {
+                continue;
+            }
             Ok(Err(broadcast::error::RecvError::Lagged(dropped))) => {
                 warn!(
                     pane_id = %pane_id,
@@ -2144,15 +2627,21 @@ struct SilenceWatch {
 /// `dispatch_one_owned`'s per-pane dispatch mutex, which would serialize the next
 /// delegate to this pane behind it.
 ///
-/// Delivery goes through [`AgentPtyRegistry::write_notice_guarded`], bound to the
+/// Delivery goes through [`AgentPtyRegistry::write_and_submit_guarded`] (issue
+/// #702 — see [`compose_delegate_silence_notice`] for why this report is
+/// submitted rather than left as deferred scrollback), bound to the
 /// orchestrator's registry agent id captured when the delegate was ISSUED (see
 /// [`SilenceWatch`]), for the same reason
 /// the PRD #126 idle prompt is guarded (M1 audit finding 2): a pane id is just a
 /// string, and an orchestrator that exits frees its `pane_id_env` for the next
 /// spawn, so unguarded routing writes one orchestration's diagnostics into
 /// whatever stranger inherited the id — `scheduler/idle-worker/008` and `/014`
-/// pin that. An orchestrator with no live registry agent has no identity to bind
-/// to, so the report stays in the log rather than being routed by string.
+/// pin that. Moving the delivery TAIL from LF to the submit CR relaxed nothing
+/// about that gate: the same `expected_agent_id` binding and the same
+/// `is_pane_closing` + [`orchestration_still_matches`] revalidation closure are
+/// still what decide whether a byte is written at all. An orchestrator with no
+/// live registry agent has no identity to bind to, so the report stays in the
+/// log rather than being routed by string.
 /// PRD #249 M3 review (finding B4/S4): the watch is CANCELLABLE, and three
 /// outcomes cancel it — a `work-done` from the worker
 /// ([`AgentPtyRegistry::retire_silence_watch`], called from
@@ -2281,11 +2770,17 @@ fn arm_delegate_silence_watch(
             .and_then(quote_untrusted_pane_text);
         // PRD #249 review (finding B3): daemon-authored text plus the one fenced
         // untrusted value above — the role rides the `warn!`, never the pane.
+        //
+        // Issue #702: SUBMITTED, via the same `write_and_submit_guarded` the PRD
+        // #126 idle-worker report uses, with the same identity binding (the
+        // orchestrator agent captured when the delegate was ISSUED) and the same
+        // revalidation closure. Only the delivery tail moved — the gate that
+        // `scheduler/idle-worker/008` and `/014` pin is untouched.
         let notice = compose_delegate_silence_notice(window, pane_text.as_deref());
         let revalidate_registry = Arc::clone(&registry);
         let revalidate_pane = orchestrator_pane_id.clone();
         let outcome = registry
-            .write_notice_guarded(
+            .write_and_submit_guarded(
                 &orchestrator_pane_id,
                 &notice,
                 Some(&expected_agent_id),
@@ -2302,35 +2797,82 @@ fn arm_delegate_silence_watch(
                 },
             )
             .await;
+        settle_silence_report_payload_record(&registry, &orchestrator_pane_id, &notice, &outcome);
         match outcome {
             Ok(crate::agent_pty::GuardedSend::Applied) => tracing::info!(
                 pane_id = %worker_pane_id,
                 role = %role,
-                "delegate: surfaced a silent worker in the orchestrator pane"
+                "delegate: submitted a silent-worker report into the orchestrator pane"
             ),
-            // Some bytes reached the authorized target; a retry would duplicate
-            // a half-written line rather than repair it.
+            // A partial write: some bytes reached the authorized target, so the
+            // report is not retried into a duplicate — and, unlike `Applied`,
+            // its payload record is deliberately left standing, because those
+            // bytes may still be in the pane's input box. See
+            // [`settle_silence_report_payload_record`].
             Ok(crate::agent_pty::GuardedSend::Ambiguous) => warn!(
                 pane_id = %orchestrator_pane_id,
                 role = %role,
-                "delegate: silent-worker notice delivery was ambiguous (partial write); \
-                 not retried"
+                "delegate: the silent-worker report's submission was ambiguous (partial write); \
+                 not retried, and its payload record is kept so a later identical report cannot \
+                 submit the leftover bytes with the user's draft"
             ),
             Ok(refused) => tracing::debug!(
                 pane_id = %orchestrator_pane_id,
                 role = %role,
                 expected_agent_id = %expected_agent_id,
                 outcome = ?refused,
-                "delegate: identity gate refused the silent-worker notice; nothing written"
+                "delegate: identity gate refused the silent-worker report; nothing submitted"
             ),
             Err(e) => warn!(
                 pane_id = %orchestrator_pane_id,
                 role = %role,
                 error = %e,
-                "delegate: failed to surface the silent-worker notice in the orchestrator pane"
+                "delegate: failed to submit the silent-worker report into the orchestrator pane"
             ),
         }
     });
+}
+
+/// Issue #424 S3 / PR #713 review: release the payload record a ONE-SHOT
+/// silence report left on the orchestrator's pane — but only for the outcome
+/// that says the pane's input box is empty again.
+///
+/// `Applied` wrote the report AND its submit CR, so the submit drained the
+/// input box and nothing of ours is left in it. The record that write left
+/// guards a retry this path will never make — the watch record was consumed
+/// before the send and nothing retries the report — so keeping it could only
+/// refuse a LATER, unrelated report of the same text into the same
+/// orchestrator. That repeat is ordinary rather than exotic: two silent workers
+/// on one orchestration reporting a blank pane in the same window compose
+/// byte-for-byte equal text (`scheduler/idle-worker/017`), and
+/// `arm_idle_worker_watch` reasons the same way about its own report.
+///
+/// `Ambiguous` deliberately does NOT release it, even though it is just as
+/// one-shot. It is by definition a PARTIAL write — some report bytes reached
+/// the authorized target and the submit did not complete — so those bytes are
+/// still sitting in the input box, un-submitted. Clearing the record there
+/// asserts the payload settled when the whole meaning of the outcome is that we
+/// do not know whether it did, and a later identical report into a pane the
+/// user has typed into since would then be admitted and submit the leftover
+/// report bytes together with the user's unsent draft as one unintended turn.
+/// The two costs are not symmetric: keeping the record costs a SUPPRESSED later
+/// report (and only until `agent_pty`'s `PAYLOAD_RECORD_TTL` elapses),
+/// while releasing it costs an INVENTED turn carrying text the user never sent.
+/// Suppressing a diagnostic beats inventing input. So this is one `matches!`
+/// arm on purpose — do not fold `Ambiguous` back into it.
+///
+/// Every other outcome — a refusal or a writer error — wrote nothing, so there
+/// is no record of ours to release and calling this would consume a concurrent
+/// delivery of the same bytes' record instead (issue #424 S2).
+fn settle_silence_report_payload_record(
+    registry: &crate::agent_pty::AgentPtyRegistry,
+    orchestrator_pane_id: &str,
+    notice: &str,
+    outcome: &Result<crate::agent_pty::GuardedSend, crate::agent_pty::AgentPtyError>,
+) {
+    if matches!(outcome, Ok(crate::agent_pty::GuardedSend::Applied)) {
+        registry.note_payload_settled(orchestrator_pane_id, notice);
+    }
 }
 
 /// CodeRabbit (PRD #93 round-9): build the file contents written to
@@ -2376,12 +2918,43 @@ fn lookup_orchestration_role_indexed(
     let cfg = load_project_config(std::path::Path::new(cwd))
         .ok()
         .flatten()?;
-    let orch = cfg
+    let Some(orch) = cfg
         .orchestrations
-        .into_iter()
-        .find(|o| o.name == orchestration_name)?;
+        .iter()
+        .find(|o| o.name == orchestration_name)
+    else {
+        // Issue #704/#705: the config is re-read on EVERY delegate and matched
+        // against the name the daemon captured at spawn, so RENAMING an
+        // orchestration that is currently open severs the link — every later
+        // worker is delegated to without its `prompt_template` and without its
+        // `clear` flag, which looks like the worker simply forgot its role. The
+        // degradation is deliberate (a delegate that reaches a worker beats one
+        // that fails), but it used to be entirely silent. Naming both sides here
+        // is what turns "the workers went strange after I edited the toml" into a
+        // one-line answer.
+        //
+        // This does NOT fix #554, which is the TUI rebuilding a tab from stale
+        // daemon metadata after the same edit; it only makes the daemon-side half
+        // legible.
+        tracing::warn!(
+            orchestration = %orchestration_name,
+            role = %role_name,
+            cwd = %cwd,
+            defined = %cfg
+                .orchestrations
+                .iter()
+                .map(|o| o.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            "no orchestration by that name in the project config — the worker will be \
+             delegated to WITHOUT its role prompt_template or clear flag. Was the \
+             orchestration renamed while this deck was open?"
+        );
+        return None;
+    };
     orch.roles
-        .into_iter()
+        .iter()
+        .cloned()
         .enumerate()
         .find(|(_, r)| r.name == role_name)
 }
@@ -2397,28 +2970,136 @@ fn lookup_orchestration_role_indexed(
 /// accepted it wrote the prompt into a PTY where only `devbox` was running, and
 /// the prompt was lost (PRD #225 Defect 1).
 ///
-/// The skip MUST be conditional, and the condition is "will a genuine
-/// `SessionStart` arrive later?". The registry answers that: an agent with a
-/// native-hook installer ([`crate::agent_registry::AgentSpec::hook_install`])
-/// emits its own `SessionStart` from an initialized session — Codex is the
-/// hybrid case (wrapper as PTY host, native hooks for rich events) — so its
-/// fork-time event can be safely ignored. A pure-Wrapper agent with no hook
-/// installer (Gemini, PRD #211) will NEVER emit another one, so for it the
-/// fork-time event is the only readiness signal there is and must release the
-/// gate; skipping it unconditionally would regress those agents to a full
-/// timeout on every delegate. Keying off a registry property rather than
-/// `agent_type == Codex` is what keeps the next wrapper adapter from inheriting
-/// this bug: a new Wrapper agent gets the right behavior from its registry entry
-/// alone, with no change here.
+/// The skip MUST be conditional, and the condition is "will something better
+/// arrive later?".
 ///
-/// Events without the marker — native hooks, an OLDER wrapper build, the
-/// scheduler's synthetic card-surfacing event — are always treated as ready,
-/// which is exactly today's behavior.
+/// Issue #243 corrects HOW that question is answered. It used to be asked as
+/// `hook_install.is_none()`, which answers "does this agent have native hooks"
+/// and was standing in for a different predicate entirely — *will a real
+/// `SessionStart` arrive before this agent needs a prompt?* Codex has native
+/// hooks and posts its `SessionStart` when the first TURN starts, so the signal
+/// this gate waited for was a CONSEQUENCE of the prompt it was gating: five
+/// production delegates measured 31.2 / 31.2 / 31.7 / 31.7 / 32.3 s, the constancy
+/// being the tell that it was the timeout and not load. The registry now carries
+/// the predicate itself
+/// ([`crate::agent_registry::AgentSpec::pre_prompt_readiness`]), so a new adapter
+/// still gets the right behaviour from its registry entry alone and the entry now
+/// says what is meant.
+///
+/// Three cases, and the third is new:
+///
+/// * **An INTERFACE event from the wrapper is readiness, always** — either of
+///   the two facts `crate::wrap::InterfaceWatch` reports. The wrapper has watched
+///   something happen to the child rather than being told about it, and it is the
+///   signal this gate was missing. The two facts are NOT equally strong and the
+///   gate deliberately does not try to separate them here: the alternative to
+///   releasing on the weaker one is waiting the full 30 s for a signal that never
+///   comes and then writing blind, which is strictly worse. Where the difference
+///   is paid is the post-readiness buffer — see
+///   [`SessionStartWait::observed_interface`] and the skip in
+///   [`dispatch_one_owned`], which honours only the strong fact and only for an
+///   agent this daemon spawned as a wrapper.
+/// * **The wrapper's FORK-TIME event is readiness only when nothing better can
+///   come.** An agent whose pre-prompt readiness we have not established
+///   ([`crate::agent_registry::PrePromptReadiness::Unknown`]) is the one case: a
+///   wrapped command the deck could not resolve will never announce itself any
+///   other way, and skipping its fork-time event unconditionally would regress it
+///   to a full timeout on every delegate (`orchestration/delegate/008`). Every
+///   agent with a signal of its own — native (Claude, Devin), wrapper-observed
+///   (Codex), or positively declared absent (OpenCode, which is never wrapped) —
+///   keeps waiting, exactly as it does today.
+/// * **Everything unmarked is readiness** — native hooks, an OLDER wrapper build,
+///   the scheduler's synthetic card-surfacing event — which is exactly today's
+///   behaviour.
 fn session_start_means_ready(event: &AgentEvent) -> bool {
-    !event.is_wrapper_fork_session_start()
-        || crate::agent_registry::spec(&event.agent_type)
-            .hook_install
-            .is_none()
+    if !event.is_wrapper_session_start() {
+        return true;
+    }
+    if event.is_wrapper_interface_session_start() {
+        return true;
+    }
+    matches!(
+        crate::agent_registry::spec(&event.agent_type).pre_prompt_readiness,
+        crate::agent_registry::PrePromptReadiness::Unknown
+    )
+}
+
+/// Issue #243: does `agent_type` announce ANYTHING a readiness gate could wait
+/// for before its first prompt?
+///
+/// `false` only for an agent that has positively declared it emits nothing
+/// ([`crate::agent_registry::PrePromptReadiness::NoSignal`] — OpenCode, measured
+/// in #146), where the wait is not a timeout but pure dead time: 30 s spent on an
+/// event that cannot arrive, after which the fallback writes the prompt anyway.
+///
+/// `None` — a command the deck could not resolve to an agent — answers `true`.
+/// That is the load-bearing half: "we do not know what this is" is not evidence
+/// that skipping the wait is safe, so an unknown agent keeps today's conservative
+/// behaviour (`orchestration/delegate/011`, `scheduler/spawn/005`). The short path
+/// is taken only on a POSITIVE declaration.
+pub(crate) fn agent_has_pre_prompt_readiness_signal(agent_type: Option<&AgentType>) -> bool {
+    agent_type.is_none_or(|agent_type| {
+        crate::agent_registry::spec(agent_type)
+            .pre_prompt_readiness
+            .has_signal()
+    })
+}
+
+/// Issue #243 (regression found by measurement): how long
+/// [`wait_for_session_start`] should treat the wrapper's WEAK interface fact as
+/// PROVISIONAL for `agent_type`, rather than releasing the gate on it.
+///
+/// [`INTERFACE_UPGRADE_WINDOW`] for an agent whose readiness is declared to come
+/// from the wrapper watching it
+/// ([`crate::agent_registry::PrePromptReadiness::WrapperInterfaceReady`] — Codex
+/// today, PRD #211's Gemini next), and `ZERO` for everybody else. `ZERO` is
+/// literally today's code path: the gate releases on the first readiness fact it
+/// accepts, so every non-wrapper agent is untouched — Claude's native
+/// `SessionStart`, OpenCode's declared-no-signal skip, and the conservative
+/// unknown-agent wait all behave exactly as they did.
+///
+/// **Scoped by the agent, not by the event**, and the difference matters twice.
+/// The obvious spelling — "hold whenever a settled marker arrives" — would make
+/// every hand-wrapped cooked-mode agent and every wrapped test stand-in pay the
+/// window for a strong fact that is never coming, on no evidence that this
+/// particular agent has a raw-mode interface at all. And it would let a producer
+/// LENGTHEN an arbitrary pane's gate by posting one forged marker. Both call
+/// sites read the agent type from the deck's own frozen launch record — the
+/// delegate from the identity it just respawned, the scheduler from
+/// `spawn_agent_type` — so nothing a producer says selects the window.
+///
+/// Note what a wrongly-widened window could NOT do even so: this delays a
+/// release, it never suppresses the buffer. The three guards in
+/// [`dispatch_one_owned`] still decide that, and a forged strong fact still fails
+/// guard 2. The worst case here is latency bounded by the caller's own timeout.
+pub(crate) fn interface_upgrade_window(agent_type: Option<&AgentType>) -> std::time::Duration {
+    if agent_is_wrapper_interface_ready(agent_type) {
+        INTERFACE_UPGRADE_WINDOW
+    } else {
+        std::time::Duration::ZERO
+    }
+}
+
+/// Issue #243: does `agent_type` get its pre-prompt readiness from the WRAPPER
+/// watching it ([`crate::agent_registry::PrePromptReadiness::WrapperInterfaceReady`]
+/// — Codex today, PRD #211's Gemini next)?
+///
+/// The discriminator behind [`interface_upgrade_window`] and behind the
+/// scheduler's post-readiness buffer, factored out because both need it and both
+/// must read it from the same place: the deck's own frozen launch record, never
+/// the badge on the arriving event. A producer that could select either of those
+/// by posting a marker could lengthen a stranger's gate or mis-price its buffer.
+///
+/// `None` — a command the deck could not resolve — is `false`, and the direction
+/// is the safe one in both uses: no upgrade window (the gate behaves exactly as
+/// it did before this issue) and the ordinary buffer rather than the longer one.
+pub(crate) fn agent_is_wrapper_interface_ready(agent_type: Option<&AgentType>) -> bool {
+    matches!(
+        agent_type.map(crate::agent_registry::spec),
+        Some(spec)
+            if spec.pre_prompt_readiness
+                == crate::agent_registry::PrePromptReadiness::WrapperInterfaceReady
+    )
 }
 
 /// Issue #424 (reviewer option 3): everything one [`wait_for_session_start`]
@@ -2502,6 +3183,62 @@ pub(crate) struct SessionStartWait {
     /// [`crate::prompt_delivery::AgentStartRearm`] and
     /// [`crate::agent_pty::AgentPtyRegistry::pre_write_believed_agent_type`].
     pub(crate) launcher_handoff: Option<AgentType>,
+    /// Issue #243: the gate was released by the wrapper's STRONG interface
+    /// observation — it watched the child clear `ICANON`/`ECHO` on the inner PTY
+    /// — rather than by an announcement that a session object exists.
+    ///
+    /// This is the fourth independent fact, and it is what decides WHICH
+    /// post-readiness buffer is owed — not whether one is owed at all. The buffer
+    /// exists because `SessionStart` means "a session exists", not "the TUI
+    /// interprets `\r` as submit" — Claude Code fires it early in its boot
+    /// sequence, and writing on it lands mid-boot (#199, #249, #663).
+    ///
+    /// **It used to mean the buffer could be skipped, and that was measured
+    /// false.** The claim was that a child reading raw keystrokes is the exact
+    /// inverse of the canonical-echo discipline that swallowed the prompt in PRD
+    /// #225, so nothing was left for a blind interval to cover. It is not: a
+    /// full-screen TUI enables raw mode at INIT, before it has painted anything.
+    /// Real codex-cli does it 85 ms after a direct exec, and
+    /// `orchestration/delegate/009` recorded fork + 100 ms on both the original
+    /// worker and its replacement — then lost the pointer into an unsubmitted
+    /// composer. Raw mode proves the AGENT owns the terminal, which is why this
+    /// fact is the best RELEASE signal available; it does not prove the composer
+    /// will accept a submit. `true` therefore now selects
+    /// [`WRAPPER_INTERFACE_READINESS_BUFFER`], measured against how long that
+    /// initialisation goes on eating input, in place of
+    /// [`DELEGATE_READINESS_BUFFER`].
+    ///
+    /// **Narrower than "the wrapper observed the interface", deliberately** (issue
+    /// #243 review finding 1). The wrapper's OTHER fact — output settled for
+    /// 750 ms — never sets this, because a launcher stalled part-way through its
+    /// own boot settles exactly like a REPL waiting at its prompt, and the
+    /// production launch shape (`devbox run codex-big`) has a measured 2750–4132 ms
+    /// window in which to do it. The two are still priced apart, in the direction
+    /// that survived measurement: what fact 2 buys is the ORDINARY buffer, since
+    /// neither a stalled launcher nor a line-oriented REPL has a full-screen
+    /// initialisation for the longer one to cover.
+    ///
+    /// Nor does that fact release the gate any more, for a Wrapper-strategy
+    /// agent: it is held for [`INTERFACE_UPGRADE_WINDOW`] first, because measurement
+    /// showed the weak fact beats the strong one to the daemon 21 times out of 21.
+    /// `true` here is therefore the ORDINARY outcome for a real Codex, and `false`
+    /// on an interface fact means the strong one never came at all. See
+    /// [`interface_upgrade_window`].
+    ///
+    /// **And it is not on its own sufficient to select that buffer.** The marker
+    /// it is read from is producer-writable (see
+    /// [`crate::event::WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`]), so
+    /// [`dispatch_one_owned`] additionally requires that this daemon spawned the
+    /// agent as a wrapper, and an explicit
+    /// [`DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS`] overrides either default.
+    /// This field records what the EVENT said; what it is worth is decided there
+    /// — and since a forgery can no longer suppress a buffer, only mis-price one
+    /// toward the value every other agent already gets, what it is worth is now
+    /// attribution rather than privilege.
+    ///
+    /// `false` for every other outcome, INCLUDING the timeout: a wait that
+    /// established nothing is more reason to hold the prompt, not less.
+    pub(crate) observed_interface: bool,
 }
 
 impl SessionStartWait {
@@ -2511,6 +3248,7 @@ impl SessionStartWait {
             generation: None,
             observed_producer: None,
             launcher_handoff,
+            observed_interface: false,
         }
     }
 }
@@ -2565,20 +3303,53 @@ impl SessionStartWait {
 /// is SKIPPED (kept waiting on) when the agent will emit a genuine native one
 /// later — see [`session_start_means_ready`] for the discriminator and why the
 /// skip must be conditional.
+///
+/// Issue #243: `upgrade_window` is how long the wrapper's WEAK interface fact
+/// ([`crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`]) is held as
+/// PROVISIONAL rather than released on, waiting to see whether the strong one is
+/// still coming behind it. `ZERO` — every non-Wrapper agent, and every caller
+/// that has no launch record to read — is this function unchanged: the first
+/// accepted readiness fact returns. Callers resolve it with
+/// [`interface_upgrade_window`] from the deck's own frozen launch record; see
+/// [`INTERFACE_UPGRADE_WINDOW`] for why it is [`SESSION_START_WAIT_TIMEOUT`]
+/// itself rather than a number of its own. It can only ever SHORTEN into
+/// `timeout`, never extend past it — which for the production value means the
+/// two expire together.
 pub(crate) async fn wait_for_session_start(
     rx: &mut broadcast::Receiver<BroadcastMsg>,
     pane_id: &str,
     agent_id: &str,
     timeout: std::time::Duration,
+    upgrade_window: std::time::Duration,
 ) -> SessionStartWait {
     let deadline = tokio::time::Instant::now() + timeout;
     // Issue #424 F4: see [`SessionStartWait::launcher_handoff`]. Carried across
     // every exit from this loop, including the timeout, because the launcher
     // case is exactly the one that times out.
     let mut launcher_handoff: Option<AgentType> = None;
+    // Issue #243: the wrapper's WEAK interface fact, accepted as readiness but
+    // held back. `Some(producer)` means one arrived, the gate has NOT been
+    // released on it, and `upgrade_deadline` is when it will be if nothing
+    // stronger turns up. See [`INTERFACE_UPGRADE_WINDOW`] for why the weak fact
+    // is provisional and [`interface_upgrade_window`] for whose it is.
+    let mut provisional_settled: Option<AgentType> = None;
+    let mut upgrade_deadline: Option<tokio::time::Instant> = None;
     loop {
-        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
-            return SessionStartWait::unready(launcher_handoff);
+        // The loop is bounded by whichever comes first: the caller's own
+        // deadline, or the upgrade window over a fact already in hand. Taking
+        // the MIN is what keeps this from extending a gate — an upgrade window
+        // that outlives the readiness timeout simply expires at the timeout.
+        let effective_deadline = upgrade_deadline.map_or(deadline, |upgrade| upgrade.min(deadline));
+        let Some(remaining) =
+            effective_deadline.checked_duration_since(tokio::time::Instant::now())
+        else {
+            return resolve_expired_wait(
+                pane_id,
+                agent_id,
+                upgrade_window,
+                provisional_settled,
+                launcher_handoff,
+            );
         };
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(BroadcastMsg::Event(event))) => {
@@ -2641,22 +3412,150 @@ pub(crate) async fn wait_for_session_start(
                     // for an agent with no native hook installer, because
                     // `session_start_means_ready` above keeps waiting for the
                     // genuine `SessionStart` of every agent that will emit one.
-                    let genuine = !event.is_wrapper_fork_session_start();
+                    // Issue #243: "genuine" is a question about CONVERSATION, not
+                    // about readiness, and the two came apart the moment the
+                    // wrapper grew a second event. Both wrapper events carry the
+                    // WRAPPER's session id rather than the agent's, so neither may
+                    // bind a delivery's generation — an interface-ready event that
+                    // did would leave the delivery bound to `wrap-codex-1234`, and
+                    // Codex's own native start a moment later would then read as a
+                    // generation CHANGE and revoke a target that never moved.
+                    // Issue #243 (regression found by measurement): the
+                    // wrapper's WEAK fact is PROVISIONAL for a Wrapper-strategy
+                    // agent, not a release. The two facts do not arrive in order
+                    // of strength — for `devbox run codex-big` the guess beats
+                    // the observation by a measured 2005–3370 ms, 21 out of 21
+                    // times — so releasing on the first one to arrive is
+                    // releasing on the launcher, every time. The window is a
+                    // bound on the FALLBACK below, not a delivery interval:
+                    // nothing waits it out in the case it exists for.
+                    //
+                    // Only the FIRST settled fact arms it. A second cannot come
+                    // from an honest wrapper (`InterfaceWatch::claim` latches per
+                    // fact), and one that does must not be able to walk the
+                    // deadline forward indefinitely.
+                    if !upgrade_window.is_zero()
+                        && event.is_wrapper_interface_settled_session_start()
+                        && provisional_settled.is_none()
+                    {
+                        provisional_settled = Some(event.agent_type.clone());
+                        upgrade_deadline = Some(tokio::time::Instant::now() + upgrade_window);
+                        tracing::debug!(
+                            pane_id,
+                            agent_id,
+                            agent_type = ?event.agent_type,
+                            window_ms = upgrade_window.as_millis(),
+                            "readiness gate: the wrapper reports its child's output SETTLED, \
+                             which a launcher stalled mid-boot does exactly as well as a REPL \
+                             at its prompt; holding the gate for the upgrade window in case \
+                             the strong raw-input observation is still coming"
+                        );
+                        continue;
+                    }
+                    let genuine = !event.is_wrapper_session_start();
+                    let observed_interface = event.is_wrapper_interface_ready_session_start();
                     return SessionStartWait {
                         ready: true,
                         generation: genuine.then_some((event.session_id, event.timestamp)),
                         observed_producer: Some(event.agent_type),
                         launcher_handoff,
+                        observed_interface,
                     };
                 }
             }
             // PRD #120: not a hook event — keep waiting for the SessionStart.
-            Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
+            // Issue #717: neither variant is evidence about this pane.
+            // Grouped rather than wildcarded so a future variant still
+            // fails this match and gets considered on its merits.
+            Ok(Ok(BroadcastMsg::OrchestrationSurface(_) | BroadcastMsg::WorktreeKept(_))) => {
+                continue;
+            }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            // Issue #243: `Err(_)` is `Elapsed` — the ordinary end of this
+            // window, and the arm a provisional weak fact has to be resolved on
+            // too. It does not fall through to the check at the top of the loop.
             Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
-                return SessionStartWait::unready(launcher_handoff);
+                return resolve_expired_wait(
+                    pane_id,
+                    agent_id,
+                    upgrade_window,
+                    provisional_settled,
+                    launcher_handoff,
+                );
             }
         }
+    }
+}
+
+/// Issue #243: what one [`wait_for_session_start`] window returns once its time
+/// is up — the caller's readiness timeout, the upgrade window over a weak
+/// interface fact, or the daemon's broadcast closing under it.
+///
+/// The whole of it is `provisional_settled`. Without one this is the timeout
+/// path exactly as it always was: nothing was established, and the caller's
+/// fallback writes the prompt. With one, the gate is RELEASED on the wrapper's
+/// output-settled guess — which was always good enough to release on, since 30 s
+/// of waiting for a signal that never comes is worse — and what the expired
+/// window cost is only the CHANCE that the strong observation was still coming.
+///
+/// So the fallback is precisely the behaviour that shipped before the window
+/// existed: `ready`, no generation (both wrapper events name the WRAPPER's
+/// session, never a conversation — see [`SessionStartWait::generation`]), and
+/// `observed_interface: false`, which is what makes the caller pay
+/// [`DELEGATE_READINESS_BUFFER`] over it. A genuinely cooked-mode wrapped agent
+/// therefore keeps a bounded path to its prompt and never returns to the dead
+/// wait.
+///
+/// **"The upgrade window expired" and "the readiness timeout expired" are the
+/// same instant on the delegate path, not two deadlines.**
+/// [`INTERFACE_UPGRADE_WINDOW`] IS [`SESSION_START_WAIT_TIMEOUT`], and the weak
+/// fact can only arrive after the wait began, so the window always outruns what
+/// is left of the timeout and the `min` in [`wait_for_session_start`] resolves
+/// them together. Both arms below therefore reach here through the same door,
+/// and the debug line says so with a field — worth knowing before reading it as
+/// evidence that a second deadline was involved. The one caller where they
+/// genuinely differ is the scheduler, whose copy of the wait is shortenable per
+/// run via `DOT_AGENT_DECK_SESSION_START_WAIT_MS` ([`crate::spawn`]).
+///
+/// The `provisional_settled` branch is pinned by
+/// `an_expired_upgrade_window_releases_on_the_weak_fact_rather_than_timing_out`,
+/// on the RETURN VALUE rather than on latency: with the window equal to the
+/// timeout this outcome and the unready fallback land in the same instant, so no
+/// test that measures time can separate them (issue #243 round 4).
+fn resolve_expired_wait(
+    pane_id: &str,
+    agent_id: &str,
+    upgrade_window: std::time::Duration,
+    provisional_settled: Option<AgentType>,
+    launcher_handoff: Option<AgentType>,
+) -> SessionStartWait {
+    let Some(observed_producer) = provisional_settled else {
+        return SessionStartWait::unready(launcher_handoff);
+    };
+    tracing::debug!(
+        pane_id,
+        agent_id,
+        agent_type = ?observed_producer,
+        window_ms = upgrade_window.as_millis(),
+        // Issue #243 round 4: `window_is_the_readiness_timeout` because
+        // [`INTERFACE_UPGRADE_WINDOW`] IS [`SESSION_START_WAIT_TIMEOUT`], so on
+        // the delegate path the two expire in the SAME INSTANT by construction
+        // and there is no second deadline to go looking for. It is a field
+        // rather than a sentence because the scheduler's copy of the wait is
+        // shortenable per run (`DOT_AGENT_DECK_SESSION_START_WAIT_MS`), which is
+        // the one case where they genuinely differ — and the `min` in
+        // [`wait_for_session_start`] is what keeps this from outliving it.
+        window_is_the_readiness_timeout = upgrade_window == SESSION_START_WAIT_TIMEOUT,
+        "readiness gate: the wrapper's strong interface observation never arrived inside the \
+         upgrade window; releasing on its output-settled guess, which keeps the post-readiness \
+         buffer"
+    );
+    SessionStartWait {
+        ready: true,
+        generation: None,
+        observed_producer: Some(observed_producer),
+        launcher_handoff,
+        observed_interface: false,
     }
 }
 
@@ -2832,9 +3731,14 @@ pub(crate) async fn wait_for_prompt_submission(
                 // about input readiness. First qualifying start only: what the
                 // rearm needs is when the agent came up, not how many frames it
                 // has sent since.
+                // Issue #243: G is now the wrapper discriminator rather than the
+                // wrapper-FORK one. An interface-ready start is the deck's own
+                // observation that a child is painting, not an agent announcing a
+                // conversation it can report submissions for, so it must not arm a
+                // re-submission any more than boot provenance does.
                 if agent_start.is_none()
                     && event.event_type == EventType::SessionStart
-                    && !event.is_wrapper_fork_session_start()
+                    && !event.is_wrapper_session_start()
                 {
                     agent_start = Some((std::time::Instant::now(), event.agent_type.clone()));
                 }
@@ -2850,7 +3754,12 @@ pub(crate) async fn wait_for_prompt_submission(
                     }
                 }
             }
-            Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
+            // Issue #717: neither variant is evidence about this pane.
+            // Grouped rather than wildcarded so a future variant still
+            // fails this match and gets considered on its merits.
+            Ok(Ok(BroadcastMsg::OrchestrationSurface(_) | BroadcastMsg::WorktreeKept(_))) => {
+                continue;
+            }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => return PromptWatch::Indeterminate,
             Ok(Err(broadcast::error::RecvError::Closed)) => return PromptWatch::Closed,
             Err(_) => {
@@ -2980,7 +3889,10 @@ pub(crate) fn latch_generation(
         return None;
     }
     match generation {
-        None if event.is_wrapper_fork_session_start() => None,
+        // Issue #243: BOTH wrapper origins, not just the fork one. An
+        // interface-ready event names the wrapper's own session, so binding to it
+        // would make the agent's first native start look like a generation change.
+        None if event.is_wrapper_session_start() => None,
         None => {
             *generation = Some((event.session_id.clone(), event.timestamp));
             None
@@ -3216,6 +4128,36 @@ fn write_work_done_summary(
 ///    as delivered on purpose: some bytes reached the authorized worker, so a
 ///    completion may genuinely be owed and keeping the commission is the
 ///    fail-safe direction.
+///
+/// # The silent-worker watch's no-delivery invariant
+///
+/// Issue #687. The same shape as the ledger's, one exit shorter, and it exists
+/// for the same reason: a record armed EARLIER than the write outlives every exit
+/// taken before that write. On the `clear = true` path the silent-worker watch is
+/// now armed the moment the respawn establishes the new generation's ownership of
+/// the pane — because arming is what supersedes and cancels the PREVIOUS
+/// generation's watch, and leaving that until just before the pointer write left
+/// the old watch armed across the `SessionStart` wait and the readiness buffer,
+/// free to report a live delegation as undelivered. See
+/// [`release_reserved_silence_watch`]. The exits that can then be reached before
+/// the pointer write, audited the same way:
+///
+/// 1. **The pi-native `clear = true` return** — releases. Unlike the commission,
+///    which the seed delivery genuinely discharges, this path spawns no watch
+///    TASK at all, so a record left behind answers to nothing and can only absorb
+///    a later `work-done`. The supersession it performed on the way in stands.
+/// 2. **The dead-replacement return** — releases. Usually a no-op: an exited
+///    replacement is swept by `pump_reader`'s EOF branch, which matches this
+///    record on the `worker_agent_id` bound at arm time.
+/// 3. **The readiness-buffer close return** — releases, and here the release is
+///    belt-and-braces rather than load-bearing for the same reason exit 4 above
+///    needs none: `begin_pane_close` drains the pane's silence watches under the
+///    same lock hold that drops the close waiter this arm woke on.
+/// 4. **The tail** — reuses the record rather than arming a second one, and the
+///    existing `!delivered` and unresolved-identity arms cancel it by `seq`.
+///
+/// The **respawn-error** exit is absent from this list on purpose: the record is
+/// armed inside the success arm, so a failed respawn never creates one.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_one_owned(
     registry: Arc<AgentPtyRegistry>,
@@ -3303,7 +4245,9 @@ async fn dispatch_one_owned(
     // mid-session re-delegation is a documented further enhancement.
     let is_pi_native = role_config
         .as_ref()
-        .map(|r| r.clear && AgentType::from_command(Some(&r.command)) == Some(AgentType::Pi))
+        // Issue #308: the role's RESOLVED type, so a declared Pi worker behind a
+        // launcher command takes the same native-delivery path as a bare `pi`.
+        .map(|r| r.clear && r.resolved_agent_type() == Some(AgentType::Pi))
         .unwrap_or(false);
 
     // PRD #249 review (finding B1): the registry agent id the task pointer is
@@ -3313,6 +4257,14 @@ async fn dispatch_one_owned(
     // send at the end of this function for why an unguarded, pane-id-keyed
     // write is not safe here.
     let mut expected_worker_agent_id: Option<String> = None;
+
+    // Issue #687: the silent-worker watch a `clear = true` respawn arms for its
+    // fresh generation the moment that generation takes the pane, rather than
+    // ~30 s later immediately before the pointer write. `Some` only on the
+    // respawn path and only when the no-event detector is on for this delegate;
+    // every exit below that writes no pointer releases it through
+    // [`release_reserved_silence_watch`].
+    let mut reserved_silence: Option<crate::agent_pty::ArmedSilenceWatch> = None;
 
     // Honor the per-role `clear` flag from `.dot-agent-deck.toml`.
     // `clear = true` terminates the existing worker child (SIGTERM
@@ -3363,7 +4315,15 @@ async fn dispatch_one_owned(
                     },
                 }
             }),
-            agent_type: AgentType::from_command(Some(&role.command)),
+            // Issue #308: the role's RESOLVED type — declaration first, command
+            // derivation second. This value is CURRENT, not frozen: `role` came
+            // out of the `.dot-agent-deck.toml` re-read at the top of this
+            // function, in the same pass as the `role.command` handed to the
+            // respawn below, so the pair cannot disagree. That is precisely why
+            // `respawn_or_recreate_agent_for_pane` is allowed to let it outrank
+            // deriving from the command, where the pane's FROZEN
+            // `spawn_agent_type` is not (PRD #225 finding 1).
+            agent_type: role.resolved_agent_type(),
             env: vec![(
                 crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
                 pane_id.clone(),
@@ -3395,6 +4355,55 @@ async fn dispatch_one_owned(
                         );
                     }
                 }
+                // Issue #687: THIS is where the previous generation stops being
+                // the pane's delegated worker, so this is where its silent-worker
+                // watch has to stop being armed. `arm_silence_watch` is the
+                // supersede-and-cancel primitive — inserting replaces the old
+                // record, dropping it resolves that watch task's cancellation
+                // channel, and the replacement inherits the old record's
+                // unaccounted-for `superseded` count so a late `work-done`
+                // belonging to the OLD delegation is still credited oldest-first
+                // (`SilenceWatchRetirement::KeptNewer`) instead of disarming this
+                // newer watch. Calling it here rather than immediately before the
+                // pointer write is the whole of issue #687: everything between
+                // the two points — the `SessionStart` wait (up to
+                // `SESSION_START_WAIT_TIMEOUT`) and the readiness buffer — used to
+                // run with the REPLACED generation's watch still armed, so its
+                // deadline could land inside that gap and report a live
+                // delegation as undelivered. In the log #687 captured the gap was
+                // ~30 s and the stale watch beat the new arming by 56 ms.
+                //
+                // The `ArmedSilenceWatch` is carried, not re-created: its
+                // cancellation channel is live from here on, so a pane close (or
+                // any other drain) during the waits below resolves it and the
+                // watch task — if one is ever spawned — exits immediately.
+                //
+                // The ACCEPTED GAP, named here so a later reader does not
+                // rediscover it as a bug: from this point the reservation is a
+                // real record, so a `work-done` landing in the window between it
+                // and the pointer write is credited against it. When a prior
+                // watch existed, the inherited `superseded` count absorbs that
+                // completion (`SilenceWatchRetirement::KeptNewer`) and this
+                // generation keeps its watch — which is #687's own case. When
+                // `superseded == 0`, i.e. no prior watch existed and there is
+                // nothing to inherit, the completion consumes the reservation
+                // instead and THIS generation ends up with no watch at all. The
+                // cost is one suppressed diagnostic on a delegation that has
+                // already reported completion — never a false report invented
+                // for a live one — so it is the safe direction to fail in and is
+                // deliberately left as is.
+                //
+                // Only when the detector is on for this delegate. `None` means no
+                // watch would be armed at the write either, so there is nothing
+                // to move; the pane's records are then left exactly as the
+                // previous behaviour left them.
+                if silence_watch.is_some() {
+                    reserved_silence = registry.arm_silence_watch(
+                        &pane_id,
+                        &orchestrator_pane_id,
+                        Some(&new_agent_id),
+                    );
+                }
                 if is_pi_native {
                     // PRD #201: NATIVE delivery — stash the pointer as the
                     // respawned pi's seed and arm the PTY-injection safety net.
@@ -3419,16 +4428,51 @@ async fn dispatch_one_owned(
                     // Commission audit exit 1: the pointer is DELIVERED here,
                     // by seed rather than by injection, so the commission
                     // stands. See this function's no-delivery invariant.
+                    //
+                    // Issue #687, silence audit exit 1: the WATCH still goes,
+                    // because this path spawns none — a native seed delivery
+                    // produces no `arm_delegate_silence_watch` task, exactly as
+                    // before, so a record left armed here would answer to
+                    // nothing and could only absorb a later `work-done`. The
+                    // supersession it performed on the way in is kept: the
+                    // previous generation's watch is cancelled either way, which
+                    // is the half of #687 this path was missing.
+                    release_reserved_silence_watch(
+                        &registry,
+                        &pane_id,
+                        reserved_silence.take(),
+                        "pi-native seed delivery spawns no silent-worker watch",
+                    );
                     return;
                 }
-                tracing::debug!(
-                    role = %target_role,
-                    pane_id = %pane_id,
-                    new_agent_id = %new_agent_id,
-                    timeout_secs = SESSION_START_WAIT_TIMEOUT.as_secs(),
-                    "delegate: respawned worker agent for clear=true; \
-                     waiting for SessionStart on hook broadcast"
-                );
+                // Issue #243: does this agent announce ANYTHING before its
+                // first prompt? Resolved from the role command the respawn just
+                // launched — the same derivation the respawn itself used — so
+                // the answer is about the process that is actually booting.
+                let worker_agent_type = recreate_identity.agent_type.clone();
+                let has_readiness_signal =
+                    agent_has_pre_prompt_readiness_signal(worker_agent_type.as_ref());
+                if has_readiness_signal {
+                    tracing::debug!(
+                        role = %target_role,
+                        pane_id = %pane_id,
+                        new_agent_id = %new_agent_id,
+                        timeout_secs = SESSION_START_WAIT_TIMEOUT.as_secs(),
+                        "delegate: respawned worker agent for clear=true; \
+                         waiting for SessionStart on hook broadcast"
+                    );
+                } else {
+                    tracing::debug!(
+                        role = %target_role,
+                        pane_id = %pane_id,
+                        new_agent_id = %new_agent_id,
+                        agent_type = ?worker_agent_type,
+                        buffer_ms = no_signal_readiness_buffer().as_millis(),
+                        "delegate: this agent has DECLARED it emits no pre-prompt \
+                         readiness signal; skipping the dead wait and holding the \
+                         task prompt for the no-signal readiness buffer instead"
+                    );
+                }
                 // PRD #92 F9 followup-7: scope the wait to the NEW
                 // agent's id so a late `SessionStart` from the OLD
                 // agent (which carried the OLD id, injected via
@@ -3449,17 +4493,41 @@ async fn dispatch_one_owned(
                 // (`orchestration/delegate/011`), where a polling sleep would let
                 // auto-advance move the clock underneath the test.
                 let replacement_exited = registry.agent_exit_signal(&new_agent_id);
-                let observed = tokio::select! {
-                    biased;
-                    _ = replacement_exited => false,
-                    wait = wait_for_session_start(
-                        &mut event_rx,
-                        &pane_id,
-                        &new_agent_id,
-                        SESSION_START_WAIT_TIMEOUT,
-                    ) => wait.ready,
+                // Issue #243: the whole outcome, not just `ready`. The delegate
+                // path has always asked only whether readiness fired, but the
+                // buffer below now needs the OTHER answer this window carries —
+                // whether what released the gate was an OBSERVATION of the
+                // agent's interface or merely a session announcing itself.
+                //
+                // A declared-no-signal agent skips the wait entirely rather than
+                // passing a zero timeout through it: there is no event to race,
+                // and an unconditional call would still have to be given a
+                // deadline, which is the dead wait this issue exists to delete.
+                // Its `SessionStartWait::default()` is the honest record — nothing
+                // was observed, so every downstream guard treats it as the
+                // fallback path, which is exactly what it is.
+                let wait = if has_readiness_signal {
+                    tokio::select! {
+                        biased;
+                        _ = replacement_exited => SessionStartWait::default(),
+                        wait = wait_for_session_start(
+                            &mut event_rx,
+                            &pane_id,
+                            &new_agent_id,
+                            SESSION_START_WAIT_TIMEOUT,
+                            // Issue #243: read from the identity this respawn
+                            // just launched — the deck's own record, never the
+                            // observed badge — so no producer can pick which
+                            // agents get an upgrade window. See
+                            // `interface_upgrade_window`.
+                            interface_upgrade_window(worker_agent_type.as_ref()),
+                        ) => wait,
+                    }
+                } else {
+                    SessionStartWait::default()
                 };
-                if !observed {
+                let observed = wait.ready;
+                if has_readiness_signal && !observed {
                     tracing::debug!(
                         role = %target_role,
                         pane_id = %pane_id,
@@ -3553,6 +4621,19 @@ async fn dispatch_one_owned(
                         &target_role,
                         "the clear=true replacement worker never became live",
                     );
+                    // Issue #687, silence audit exit 2: the generation this
+                    // watch was armed for is not the pane's live agent any more
+                    // and will never be handed a pointer, so its record must not
+                    // outlive the dispatch. Usually already a no-op — a
+                    // replacement that died reaches `pump_reader`'s EOF sweep
+                    // first, and that drains this record by the very
+                    // `worker_agent_id` binding armed above.
+                    release_reserved_silence_watch(
+                        &registry,
+                        &pane_id,
+                        reserved_silence.take(),
+                        "the clear=true replacement worker never became live",
+                    );
                     return;
                 }
                 // PRD #249 M1: the readiness gate. Sitting AFTER the
@@ -3579,7 +4660,162 @@ async fn dispatch_one_owned(
                 // are not post-respawn and need no gate (PRD #249 open
                 // question 2). The gate belongs to the respawn, so it lives
                 // in the respawn's arm.
-                let buffer = delegate_readiness_buffer();
+                // Issue #243: the buffer is scoped by WHAT THE GATE ESTABLISHED,
+                // not by which agent this is — that is the only scoping that does
+                // not reintroduce #663. The buffer covers the gap between "a
+                // session exists" and "the TUI interprets `\r` as submit", and
+                // that gap is real for every readiness fact the deck has: a native
+                // `SessionStart` (Claude fires it early in boot — at a 0 ms buffer
+                // the pointer was written into a still-booting Claude and dropped,
+                // #663), a hookless wrapper's fork-time event, the timeout
+                // fallback, which established nothing at all and is therefore MORE
+                // reason to wait — and, since this issue's third round, BOTH of
+                // the wrapper's interface facts.
+                //
+                // **The skip that used to live here is gone, and the claim under
+                // it was false.** Rounds 1 and 2 held that the wrapper watching
+                // the child take the terminal out of cooked mode left "nothing for
+                // a blind interval to cover", because reading raw keystrokes is
+                // the inverse of the canonical-echo discipline that swallowed the
+                // prompt in PRD #225. Measurement retracts it. A full-screen TUI
+                // enables raw mode at INIT — real codex-cli at 85 ms after a
+                // direct exec, and `orchestration/delegate/009` at fork + 100 ms
+                // on both the original worker and its replacement — so fact 1
+                // fires long before the composer will accept a submit, and a
+                // zero-buffer write on it is the earliest and worst instant
+                // available. `/009` lost the pointer there exactly as production
+                // did. Raw mode is NECESSARY for input-readiness and not
+                // SUFFICIENT: it proves the AGENT owns the terminal, which is
+                // still strictly better than the alternative and is why it
+                // releases the gate — see [`wait_for_session_start`] — but it
+                // still owes a buffer.
+                //
+                // So guard 1's job changed. It no longer decides which fact may
+                // SKIP the buffer; it decides which fact may RELEASE the gate,
+                // and here it decides only WHICH buffer is owed:
+                //
+                // 1. **The right FACT.** The wrapper reports two, and only one is
+                //    an observation. `observed_interface` is set by the
+                //    raw-input-mode fact alone; the output-settled guess arrives
+                //    here as `false`. That still matters, because the two owe
+                //    DIFFERENT amounts. Fact 1 means a full-screen TUI is
+                //    initialising, and [`WRAPPER_INTERFACE_READINESS_BUFFER`] is
+                //    measured against how long that takes to stop eating input.
+                //    Fact 2 means output went quiet, which a launcher stalled
+                //    mid-boot does exactly as well as a line-oriented REPL waiting
+                //    at its prompt — a `devbox run codex-big` prints one banner at
+                //    ~0.1 s and then computes its shellenv in silence for a
+                //    measured 2750–4132 ms — and neither of those has a TUI
+                //    initialisation to clear, so it keeps the ordinary
+                //    [`DELEGATE_READINESS_BUFFER`].
+                //
+                //    Pricing the two apart is not, on its own, enough, and
+                //    measurement established that too. The guess does not merely
+                //    arrive sometimes; for the production launch shape it arrives
+                //    FIRST, 21 times out of 21, by 2005–3370 ms. That is handled a
+                //    level up, by the gate holding fact 2 provisionally for
+                //    [`INTERFACE_UPGRADE_WINDOW`] rather than releasing on it; see
+                //    [`interface_upgrade_window`]. Reaching here with
+                //    `observed_interface == false` on a real Codex therefore means
+                //    the strong fact never came at all.
+                // 2. **The right AGENT.** The marker is not authenticated: the
+                //    daemon's hook socket accepts a raw `AgentEvent` line with a
+                //    free-form `metadata` map, and #243's audit reproduced a forged
+                //    `wrapper_interface_ready` `SessionStart` from a bare `python3`
+                //    with no deck environment at all. The oracle is the frozen
+                //    launch-shape record — `spawn_agent_type`, which no hook path
+                //    can write — so a pane the deck did not itself exec under
+                //    `dot-agent-deck wrap` is priced on what the deck knows rather
+                //    than on what the pane claims.
+                //
+                //    Note what this guard is worth NOW, because it is less than it
+                //    was and the difference is the audit's F1 finding. When fact 1
+                //    suppressed the buffer, a forged marker bought a privilege —
+                //    it could switch the buffer OFF on demand. It cannot any more:
+                //    with no suppression available, a forgery can only release the
+                //    gate, which a bare unmarked `SessionStart` already did before
+                //    this issue and which is therefore not a new privilege. What
+                //    survives is attribution: the guard decides whether a claimed
+                //    interface fact is priced as a real TUI's initialisation or as
+                //    an ordinary readiness fact, and it fails toward the SHORTER
+                //    buffer, which is the pre-existing behaviour rather than a
+                //    concession. It is kept because release attribution is worth
+                //    getting right in the log, and because the honest case it
+                //    refuses is worth naming.
+                // 3. **Never the OPERATOR's interval.** `…_BUFFER_MS` is the #199
+                //    escape hatch, and an explicitly-set value wins over BOTH
+                //    defaults — it is how the e2e harness pins 0 and how an
+                //    operator whose machine needs longer than the measurement says
+                //    gets it. `delegate_readiness_buffer` already resolves that;
+                //    the wrapper branch resolves it the same way rather than
+                //    max()-ing against the default, so "what the operator set" and
+                //    "what the operator gets" stay the same sentence.
+                //
+                // Where the deck HAS seen the interface, the diagnosable story is
+                // better than a knob: the interface event is on the wire and in the
+                // wrapper's log with the fact that fired, so "the agent never became
+                // ready" is answered by its absence rather than by tuning. The log
+                // half of that was false when it was written — `dot-agent-deck
+                // wrap` installed no tracing subscriber at all, so the line was
+                // built and discarded — and is true as of this issue's second
+                // round: `main` calls `init_logging_from_env` on the `Wrap` arm,
+                // and the watch logs at `info!` so the default filter carries it.
+                // Enable it the same way as the daemon's, with
+                // `DOT_AGENT_DECK_LOG`; the wrapper inherits it from the daemon
+                // that exec'd it, and writes to a file only, never to the pane.
+                let interface_observed = wait.observed_interface
+                    && registry.agent_spawned_as_wrapper_host(&new_agent_id);
+                let buffer = if interface_observed {
+                    let resolved = wrapper_interface_readiness_buffer();
+                    tracing::debug!(
+                        role = %target_role,
+                        pane_id = %pane_id,
+                        buffer_ms = resolved.as_millis(),
+                        operator_pinned = explicit_delegate_readiness_buffer().is_some(),
+                        "delegate: readiness came from the wrapper's OBSERVED raw-input mode on a \
+                         pane this daemon spawned as a wrapper, so a full-screen TUI is coming \
+                         up; holding for the interface buffer measured against its initialisation"
+                    );
+                    resolved
+                } else {
+                    if wait.observed_interface {
+                        // Guard 2 refused, and the two shapes that reach here are
+                        // worth telling apart in the log. Either the marker is
+                        // forged, or the role command is one the deck did not have
+                        // to rewrite to reach a wrapper — a hand-written
+                        // `dot-agent-deck wrap … -- codex`, whose frozen launch
+                        // identity `AgentType::from_command` cannot recover. The
+                        // second is honest, and what it costs it is now the LONGER
+                        // buffer rather than the fast path: it waits the ordinary
+                        // interval, which is the behaviour every non-wrapper agent
+                        // has always had.
+                        warn!(
+                            role = %target_role,
+                            pane_id = %pane_id,
+                            new_agent_id = %new_agent_id,
+                            spawn_agent_type = ?registry.spawn_agent_type(&new_agent_id),
+                            "delegate: a SessionStart claimed the wrapper had observed this \
+                             agent's interface, but this daemon's own launch record does not say \
+                             it spawned the agent as a wrapper; pricing it as an ordinary \
+                             readiness fact"
+                        );
+                    }
+                    // Issue #243 round 4: the OTHER path with a measurement of its
+                    // own. A declared-`NoSignal` agent never entered the wait, so
+                    // nothing here established anything — and unlike the timeout
+                    // fallback, which at least spent 30 s letting the agent boot,
+                    // this one skipped straight to the write. Deleting that dead
+                    // wait deleted the only cover a cold OpenCode had, so the
+                    // interval that replaces it is sized against a real one; see
+                    // [`NO_SIGNAL_READINESS_BUFFER`]. Read from the identity the
+                    // respawn just launched, never from an arriving badge, for the
+                    // same reason `interface_upgrade_window` is.
+                    if has_readiness_signal {
+                        delegate_readiness_buffer()
+                    } else {
+                        no_signal_readiness_buffer()
+                    }
+                };
                 if !buffer.is_zero() {
                     tracing::debug!(
                         role = %target_role,
@@ -3635,6 +4871,21 @@ async fn dispatch_one_owned(
                             // drained this pane's commissions under the same lock
                             // hold that dropped the waiter this arm just woke on.
                             // See this function's no-delivery invariant.
+                            //
+                            // Issue #687, silence audit exit 3: the same
+                            // `begin_pane_close` drained this pane's silence
+                            // watches too (`drain_silence_watches_touching`), so
+                            // the release below is expected to find nothing.
+                            // Called anyway rather than reasoned around, because
+                            // the invariant is "every no-delivery exit releases"
+                            // and an exit that relies on somebody else having
+                            // done it is one refactor from being wrong.
+                            release_reserved_silence_watch(
+                                &registry,
+                                &pane_id,
+                                reserved_silence.take(),
+                                "the worker pane began closing during the readiness buffer",
+                            );
                             return;
                         }
                         _ = tokio::time::sleep(buffer) => {}
@@ -3754,14 +5005,36 @@ async fn dispatch_one_owned(
     // silence watch's own record is bound at arm time (unlike the idle
     // delegation, this call always runs AFTER the identity is known, so no
     // separate bind step is needed).
-    let silence = silence_watch.and_then(|watch| {
-        let armed = registry.arm_silence_watch(
-            &pane_id,
-            &orchestrator_pane_id,
-            expected_worker_agent_id.as_deref(),
-        )?;
-        Some((watch, armed, event_tx.subscribe()))
-    });
+    //
+    // Issue #687: on the `clear = true` path the record was already armed, back
+    // when the respawn established this generation's ownership of the pane, and
+    // it is REUSED rather than re-armed. Re-arming would bump `superseded` a
+    // second time for one delegation — mis-crediting the very late-`work-done`
+    // accounting the early arming exists to preserve — and would also refuse if a
+    // close began during the waits above, where reuse instead lets the watch
+    // task's already-live cancellation channel retire it on its own.
+    let silence = match (silence_watch, reserved_silence.take()) {
+        (Some(watch), Some(armed)) => Some((watch, armed, event_tx.subscribe())),
+        (Some(watch), None) => registry
+            .arm_silence_watch(
+                &pane_id,
+                &orchestrator_pane_id,
+                expected_worker_agent_id.as_deref(),
+            )
+            .map(|armed| (watch, armed, event_tx.subscribe())),
+        // Unreachable while the reservation is gated on `silence_watch.is_some()`
+        // above; released rather than dropped so a future caller that widens that
+        // gate cannot leave a record behind.
+        (None, reserved) => {
+            release_reserved_silence_watch(
+                &registry,
+                &pane_id,
+                reserved,
+                "the no-event detector is off for this delegate",
+            );
+            None
+        }
+    };
     // Legacy PTY injection for every non-pi-native path: claude / opencode
     // workers, and `clear = false` pi workers (which get no fresh
     // `session_start` for the extension to pull on). The pi-native `clear =
@@ -4357,6 +5630,18 @@ impl AppState {
             );
         }
         self.pending_orchestration_surfaces.push(surface);
+    }
+
+    /// Issue #717: record a worktree a close left on disk, for the render loop
+    /// to put on the status line. Last-writer-wins for the reason in the
+    /// field's docs.
+    pub fn queue_worktree_kept(&mut self, kept: crate::issue_dispatch_run::KeptWorktree) {
+        self.pending_worktree_kept = Some(kept);
+    }
+
+    /// Issue #717: take the pending kept-worktree report, if any.
+    pub fn take_worktree_kept(&mut self) -> Option<crate::issue_dispatch_run::KeptWorktree> {
+        self.pending_worktree_kept.take()
     }
 
     /// Create a placeholder session for a newly created pane so it always
@@ -5771,8 +7056,14 @@ impl AppState {
         // off the wrapped agent's native session.
         if let Some(ref pane_id) = event.pane_id {
             let incoming_ts = event.timestamp;
-            let launcher_origin_start = event.event_type == EventType::SessionStart
-                && event.is_wrapper_fork_session_start();
+            // Issue #243: widened to EITHER wrapper origin. The reasoning above is
+            // about wrapper provenance, not about the fork moment specifically —
+            // an interface-ready event is still the wrapper talking about its own
+            // session id, so it may establish a generation where the pane has none
+            // and refresh the one it already names, but never move a pane that
+            // already has a conversation.
+            let launcher_origin_start =
+                event.event_type == EventType::SessionStart && event.is_wrapper_session_start();
             let announces_generation =
                 event.event_type == EventType::SessionStart && !launcher_origin_start;
             let advance = match self.pane_hook_session.get(pane_id) {
@@ -7517,6 +8808,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(role_index, name)| crate::spawn::RoleSpawn {
+                agent_type: None,
                 role_index,
                 role_name: (*name).to_string(),
                 command: "cat".to_string(),
@@ -7763,29 +9055,247 @@ mod tests {
         );
     }
 
+    /// Issue #243 round 4: [`resolve_expired_wait`]'s `provisional_settled`
+    /// branch — the path that keeps a genuinely cooked-mode WRAPPED agent out of
+    /// the dead wait — asserted on the RETURN VALUE rather than on latency.
+    ///
+    /// **This branch had behavioural coverage and lost it**, when
+    /// `orchestration/delegate/029`'s fixture was changed to one that reaches its
+    /// interface. It is not cosmetic to leave uncovered: the outcome differs from
+    /// the unready fallback in exactly two fields, and the second one is
+    /// load-bearing. `observed_producer` is what
+    /// [`crate::prompt_delivery::agent_reports_submitted_prompt`] reads to decide
+    /// `can_report_prompts` in [`crate::spawn`] — i.e. whether an unconfirmed
+    /// write could EVER be confirmed — so a regression that collapsed this branch
+    /// into the fallback would silently disarm re-submission for every wrapped
+    /// agent that never leaves cooked mode.
+    ///
+    /// **It cannot be re-added as a latency test, which is why it is here.**
+    /// [`INTERFACE_UPGRADE_WINDOW`] IS [`SESSION_START_WAIT_TIMEOUT`], so the
+    /// window expiring and the readiness wait expiring are the same instant on
+    /// the delegate path: both outcomes below arrive at the same moment, and no
+    /// test that measures time can tell them apart. Trying costs ~31 s of the
+    /// fast tier to assert nothing.
+    ///
+    /// The clock is paused, so the 30 s window costs no wall time at all.
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_upgrade_window_releases_on_the_weak_fact_rather_than_timing_out() {
+        const PANE: &str = "worker-pane";
+        const AGENT: &str = "agent-1";
+
+        fn settled_start() -> AgentEvent {
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
+                crate::event::WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN.to_string(),
+            );
+            AgentEvent {
+                // The wrapper's own session id, never the agent's — which is why
+                // neither outcome below may bind a generation.
+                session_id: "wrap-codex-1".to_string(),
+                agent_type: AgentType::Codex,
+                event_type: EventType::SessionStart,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: Utc::now(),
+                user_prompt: None,
+                metadata,
+                pane_id: Some(PANE.to_string()),
+                agent_id: Some(AGENT.to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+
+        // The window is the shipped one, so this pins the production arithmetic
+        // rather than a test-sized variant of it.
+        let window = interface_upgrade_window(Some(&AgentType::Codex));
+        assert_eq!(
+            window, SESSION_START_WAIT_TIMEOUT,
+            "a Wrapper-strategy agent's upgrade window is the readiness timeout itself; if these \
+             diverge, the two outcomes below stop landing in the same instant and a latency test \
+             becomes possible again"
+        );
+
+        let (tx, mut rx) = broadcast::channel(8);
+        tx.send(BroadcastMsg::Event(settled_start()))
+            .expect("the receiver is alive");
+        let settled =
+            wait_for_session_start(&mut rx, PANE, AGENT, SESSION_START_WAIT_TIMEOUT, window).await;
+
+        // The control: the same wait, the same window, nothing ever posted.
+        let (_idle_tx, mut idle_rx) = broadcast::channel(8);
+        let nothing = wait_for_session_start(
+            &mut idle_rx,
+            PANE,
+            AGENT,
+            SESSION_START_WAIT_TIMEOUT,
+            window,
+        )
+        .await;
+
+        // Difference 1: the gate was RELEASED. The weak fact was always good
+        // enough to release on — 30 s of waiting for a signal that never comes is
+        // worse — so what the expired window cost is only the CHANCE that the
+        // strong observation was still coming.
+        assert!(
+            settled.ready,
+            "a held weak interface fact must RELEASE the gate when the window expires, not fall \
+             through to the unready path"
+        );
+        assert!(
+            !nothing.ready,
+            "a window that saw nothing at all establishes nothing"
+        );
+
+        // Difference 2: WHICH producer owns the pane. This is the field that
+        // feeds `agent_reports_submitted_prompt`, and therefore whether an
+        // unconfirmed delivery can ever be confirmed.
+        assert_eq!(
+            settled.observed_producer,
+            Some(AgentType::Codex),
+            "the released fact names its producer, which is what decides whether a re-submission \
+             could ever be confirmed"
+        );
+        assert_eq!(
+            nothing.observed_producer, None,
+            "a timeout names no producer — nothing was observed"
+        );
+
+        // Everything else is IDENTICAL, which is the whole reason the two fields
+        // above have to be asserted: no other observable separates these.
+        assert_eq!(
+            settled.generation, None,
+            "both wrapper events name the WRAPPER's session, so neither may bind a delivery's \
+             generation"
+        );
+        assert_eq!(nothing.generation, None);
+        assert!(
+            !settled.observed_interface,
+            "the output-settled guess is not an interface observation, so the caller pays the \
+             ORDINARY buffer over it and not the interface one"
+        );
+        assert!(!nothing.observed_interface);
+        assert_eq!(settled.launcher_handoff, None);
+        assert_eq!(nothing.launcher_handoff, None);
+    }
+
     /// PRD #249 M1: the readiness buffer's env seam. `0` must stay reachable —
     /// it is the toggle test's control arm and the e2e harness's opt-out — while
     /// an absurd value is capped so a mistyped pin cannot hang every delegate,
     /// and garbage falls back to the default rather than panicking.
     /// Mirrors `spawn::tests::session_start_wait_override_is_clamped_to_a_sane_range`.
+    ///
+    /// Issue #243 (audit F1, mitigation 3) added a SECOND resolver over the same
+    /// variable, and the two answer different questions:
+    /// [`delegate_readiness_buffer`] answers "what buffer applies" (setting folded
+    /// into default), while [`explicit_delegate_readiness_buffer`] answers "did a
+    /// human choose this interval". So every row below pins BOTH, and the rows
+    /// where they disagree are the whole point: an unparseable value is not a
+    /// setting (`None`) even though the buffer still resolves to the default, and
+    /// an explicit `0` IS a setting worth exactly zero.
+    ///
+    /// Round 3 added a THIRD, [`wrapper_interface_readiness_buffer`], over the
+    /// same variable again. It is pinned alongside the others because the one
+    /// thing that could silently go wrong with it is the operator override
+    /// stopping at the ordinary default: the whole point of the variable is that a
+    /// machine slower than the one this was measured on can raise it, and an
+    /// e2e harness pinning `0` gets exactly zero on this path too.
     #[test]
     fn delegate_readiness_buffer_override_is_bounded() {
         // Serialize against any other test reading this process-global env var.
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS).ok();
-        for (raw, expected) in [
+        // Unset FIRST, and pin it: this is the ordinary production case and the
+        // one the skip's `unwrap_or(ZERO)` turns into the whole latency win, so
+        // "no setting" reading as `Some(_)` would floor every skip at a value
+        // nobody chose.
+        // SAFETY: lock held for the duration; restored below.
+        unsafe { std::env::remove_var(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS) };
+        assert_eq!(
+            explicit_delegate_readiness_buffer(),
+            None,
+            "an UNSET {DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS} is not an operator setting"
+        );
+        assert_eq!(
+            delegate_readiness_buffer(),
+            DELEGATE_READINESS_BUFFER,
+            "an unset override must still resolve to the built-in buffer"
+        );
+        assert_eq!(
+            wrapper_interface_readiness_buffer(),
+            WRAPPER_INTERFACE_READINESS_BUFFER,
+            "an unset override on the interface path must resolve to the interface buffer, not \
+             to the ordinary one — they are sized against different measurements"
+        );
+        assert!(
+            WRAPPER_INTERFACE_READINESS_BUFFER > DELEGATE_READINESS_BUFFER,
+            "the interface buffer covers a full-screen TUI's own initialisation, which is longer \
+             than the session-exists-but-not-listening gap the ordinary buffer covers; if these \
+             ever converge, one of the two measurements has been lost"
+        );
+        assert_eq!(
+            no_signal_readiness_buffer(),
+            NO_SIGNAL_READINESS_BUFFER,
+            "an unset override on the declared-no-signal path must resolve to the no-signal \
+             buffer, not to the ordinary one — that path skips the wait entirely, so this \
+             interval is the ONLY thing between the respawn and the write"
+        );
+        assert!(
+            NO_SIGNAL_READINESS_BUFFER > DELEGATE_READINESS_BUFFER,
+            "the no-signal buffer covers a whole cold agent start with no readiness fact at all, \
+             where the ordinary one covers the gap after a session announced itself; measured on \
+             real OpenCode, the ordinary value loses the prompt at every load level tested"
+        );
+        assert!(
+            NO_SIGNAL_READINESS_BUFFER < SESSION_START_WAIT_TIMEOUT,
+            "this replaces the dead wait, so a value at or above it would hand the prompt back \
+             the latency this issue exists to remove"
+        );
+        for (raw, expected, explicit) in [
             // Explicitly unguarded: `orchestration/delegate/012`'s control arm.
-            ("0", std::time::Duration::ZERO),
-            ("1000", std::time::Duration::from_millis(1000)),
+            // A chosen zero, so the skip floors at zero and the harness pays
+            // nothing — but it is a CHOICE, not the absence of one.
+            (
+                "0",
+                std::time::Duration::ZERO,
+                Some(std::time::Duration::ZERO),
+            ),
+            (
+                "1000",
+                std::time::Duration::from_millis(1000),
+                Some(std::time::Duration::from_millis(1000)),
+            ),
             // Raising it is allowed — an operator on a slow machine has no other knob.
-            ("5000", std::time::Duration::from_millis(5000)),
-            // Ten minutes of held-back delegates is capped.
-            ("600000", MAX_DELEGATE_READINESS_BUFFER),
-            // Unparseable → default, no panic.
-            ("soon", DELEGATE_READINESS_BUFFER),
-            ("-1", DELEGATE_READINESS_BUFFER),
-            ("", DELEGATE_READINESS_BUFFER),
+            (
+                "5000",
+                std::time::Duration::from_millis(5000),
+                Some(std::time::Duration::from_millis(5000)),
+            ),
+            // Ten minutes of held-back delegates is capped. The floor is capped
+            // with it: a mistyped pin must not become a thirty-minute hold by
+            // way of the skip either.
+            (
+                "600000",
+                MAX_DELEGATE_READINESS_BUFFER,
+                Some(MAX_DELEGATE_READINESS_BUFFER),
+            ),
+            (
+                "999999",
+                MAX_DELEGATE_READINESS_BUFFER,
+                Some(MAX_DELEGATE_READINESS_BUFFER),
+            ),
+            // Unparseable → default for the buffer, and NOT a setting for the
+            // floor. `parse_bounded_ms_override` has already `warn!`ed, and
+            // flooring a skip at a value the operator never successfully
+            // expressed would silently spend their typo.
+            ("soon", DELEGATE_READINESS_BUFFER, None),
+            ("abc", DELEGATE_READINESS_BUFFER, None),
+            ("-1", DELEGATE_READINESS_BUFFER, None),
+            ("", DELEGATE_READINESS_BUFFER, None),
         ] {
             // SAFETY: lock held for the duration; restored below.
             unsafe { std::env::set_var(DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS, raw) };
@@ -7793,6 +9303,36 @@ mod tests {
                 delegate_readiness_buffer(),
                 expected,
                 "{DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS}={raw:?} must resolve to {expected:?}"
+            );
+            assert_eq!(
+                explicit_delegate_readiness_buffer(),
+                explicit,
+                "{DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS}={raw:?} must read as the operator \
+                 setting {explicit:?}"
+            );
+            // The interface path reads the SAME setting and falls back to its own
+            // default. A chosen value wins there too — including a chosen `0`,
+            // which is how the e2e harness opts out — and only the absence of one
+            // reaches `WRAPPER_INTERFACE_READINESS_BUFFER`.
+            assert_eq!(
+                wrapper_interface_readiness_buffer(),
+                explicit.unwrap_or(WRAPPER_INTERFACE_READINESS_BUFFER),
+                "{DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS}={raw:?} must resolve on the \
+                 interface path to the operator's own value when they set one, and to the \
+                 interface default only when they did not"
+            );
+            // Issue #243 round 4, guard 3 on the third path: the declared-no-
+            // signal buffer reads the SAME setting. This is how the e2e harness
+            // pins `0`, how `orchestration/delegate/015` bracketed the defect,
+            // and how an operator on a machine slower than the measurement gets
+            // more — so a default that stopped being overridable here would take
+            // the only knob away from the path with the least evidence behind it.
+            assert_eq!(
+                no_signal_readiness_buffer(),
+                explicit.unwrap_or(NO_SIGNAL_READINESS_BUFFER),
+                "{DOT_AGENT_DECK_DELEGATE_READINESS_BUFFER_MS}={raw:?} must resolve on the \
+                 declared-no-signal path to the operator's own value when they set one, and to \
+                 the no-signal default only when they did not"
             );
         }
         // SAFETY: same lock; restore.
@@ -8350,7 +9890,7 @@ mod tests {
         );
     }
 
-    /// Scenario: Write an automatic payload, let the user type an unsent draft, and then let the production silent-worker watch write its daemon notice before a submit-only probe. The notice must not make the blind probe submit the user's draft or the accumulated notice.
+    /// Scenario: Write an automatic payload, let the user type an unsent draft, and then let the production worker-exited caller write its daemon notice before a submit-only probe. The notice must not make the blind probe submit the user's draft or the accumulated notice.
     #[cfg(unix)]
     #[spec("scheduler/idle-worker/015")]
     #[tokio::test]
@@ -8398,44 +9938,40 @@ mod tests {
         registry.note_user_input(ORCHESTRATOR_PANE);
         tokio::time::sleep(std::time::Duration::from_millis(75)).await;
 
-        let (event_tx, _) = broadcast::channel(8);
-        let armed = registry
-            .arm_silence_watch(
-                WORKER_PANE,
-                ORCHESTRATOR_PANE,
-                Some("notice-launder-worker-agent"),
-            )
-            .expect("arm production silent-worker watch");
-        arm_delegate_silence_watch(
-            registry.clone(),
-            event_tx.subscribe(),
-            SilenceWatch {
-                window: std::time::Duration::from_millis(10),
-                target: SilenceReportTarget {
-                    pane_id: ORCHESTRATOR_PANE.to_string(),
-                    agent_id: Some(orchestrator_agent.clone()),
-                    orchestration: None,
-                },
-            },
-            armed,
-            WORKER_PANE.to_string(),
-            "notice-launder-worker-agent".to_string(),
-            "worker".to_string(),
+        // Issue #702: driven through `compose_worker_exited_notice` rather than
+        // PRD #249's silence notice, because the invariant belongs to the
+        // DELIVERY MECHANISM and #249's notice has left it. Anything written
+        // with `write_notice_guarded` is deferred-and-concatenating — today the
+        // worker-exited notice and the respawn-no-live-worker notice, and
+        // nothing else — and this is the pair of calls
+        // `AgentPtyRegistry::deliver_worker_exited_notice` makes in production,
+        // with only its trigger (`pump_reader`'s EOF sweep) stubbed out. The
+        // silence notice is now submitted (`write_and_submit_guarded`), so it is
+        // a turn of its own and cannot re-arm a later blind probe by leaving
+        // bytes in the input box — it inherits instead the idle prompt's own
+        // issue #544 limitation, which is a different question from this one.
+        let notice = compose_worker_exited_notice(WORKER_PANE);
+        assert_eq!(
+            registry
+                .write_notice_guarded(
+                    ORCHESTRATOR_PANE,
+                    &notice,
+                    Some(&orchestrator_agent),
+                    || async { true },
+                )
+                .await
+                .expect("production worker-exited notice"),
+            crate::agent_pty::GuardedSend::Applied
         );
         tokio::time::sleep(std::time::Duration::from_millis(75)).await;
         let before_probe = registry
             .snapshot(&orchestrator_agent)
-            .expect("snapshot after silent-worker notice");
-        // `notice-launder-worker-agent` is not in the registry, so the #686
-        // pane read yields no screen and the notice takes its blank branch —
-        // which is what this test wants: it is about byte-for-byte delivery,
-        // not about what the notice says.
-        let notice = compose_delegate_silence_notice(std::time::Duration::from_millis(10), None);
+            .expect("snapshot after worker-exited notice");
         assert!(
             before_probe
                 .windows(notice.len())
                 .any(|window| window == notice.as_bytes()),
-            "precondition: the production silent-worker caller must land its Notice after the user's draft; output={:?}",
+            "precondition: the production notice caller must land its Notice after the user's draft; output={:?}",
             String::from_utf8_lossy(&before_probe)
         );
 
@@ -8444,13 +9980,12 @@ mod tests {
                 true
             })
             .await
-            .expect("submit-only probe after silent-worker notice");
+            .expect("submit-only probe after worker-exited notice");
         tokio::time::sleep(std::time::Duration::from_millis(75)).await;
         let after_probe = registry
             .snapshot(&orchestrator_agent)
             .expect("snapshot after submit-only probe");
 
-        drop(event_tx);
         registry.shutdown_all();
         assert_eq!(
             probe,
@@ -8463,6 +9998,219 @@ mod tests {
             "the probe must not submit the user's draft plus the silent-worker notice; before={:?}, after={:?}",
             String::from_utf8_lossy(&before_probe),
             String::from_utf8_lossy(&after_probe)
+        );
+    }
+
+    /// Scenario: Submit a silence report into an orchestrator pane exactly the way
+    /// the daemon does — a guarded submit followed by the `note_payload_settled`
+    /// release — then let the user type into that pane and submit a byte-identical
+    /// second report. The repeat must be delivered, while the same sequence WITHOUT
+    /// the release is refused, proving the release is what keeps a second silent
+    /// worker's report from being mistaken for a retry of the first.
+    #[cfg(unix)]
+    #[spec("scheduler/idle-worker/017")]
+    #[tokio::test]
+    async fn idle_worker_017_a_settled_report_does_not_refuse_an_identical_second_report() {
+        // Issue #702: `scheduler/idle-worker/015` was re-pointed at
+        // `compose_worker_exited_notice` when the silence report moved to the
+        // SUBMITTED family, which left the submit path's own
+        // `note_payload_settled` release (see `arm_delegate_silence_watch`)
+        // exercised only incidentally. This is that pin.
+        //
+        // Why the repeat is ordinary rather than exotic: the report is one-shot
+        // and nothing retries it, so its payload record guards nothing — and two
+        // silent workers on one orchestration whose panes have both rendered
+        // nothing compose BYTE-IDENTICAL text (the `None` branch interpolates
+        // only the window). Without the release, the second worker's report is
+        // refused as the user's own draft and the orchestrator is never told.
+        const SETTLED_PANE: &str = "silence-report-settled-orchestrator";
+        const UNSETTLED_PANE: &str = "silence-report-unsettled-orchestrator";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let report = compose_delegate_silence_notice(std::time::Duration::from_millis(600), None);
+
+        let spawn_orchestrator = |pane: &str| {
+            registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.to_string(),
+                    )],
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn orchestrator stand-in")
+        };
+        let settled_agent = spawn_orchestrator(SETTLED_PANE);
+        let unsettled_agent = spawn_orchestrator(UNSETTLED_PANE);
+
+        // First report on both panes, delivered the production way.
+        for (pane, agent) in [
+            (SETTLED_PANE, &settled_agent),
+            (UNSETTLED_PANE, &unsettled_agent),
+        ] {
+            assert_eq!(
+                registry
+                    .write_and_submit_guarded(pane, &report, Some(agent), || async { true })
+                    .await
+                    .expect("first silence report"),
+                crate::agent_pty::GuardedSend::Applied,
+                "precondition: the first silence report must reach {pane}"
+            );
+        }
+        // Only the SETTLED pane gets the release the production caller makes.
+        registry.note_payload_settled(SETTLED_PANE, &report);
+
+        // The user types into both panes. This is the clock that arms the
+        // repeat-payload refusal: without it the guard abstains and the test
+        // would pass for the wrong reason.
+        registry.note_user_input(SETTLED_PANE);
+        registry.note_user_input(UNSETTLED_PANE);
+
+        let settled_repeat = registry
+            .write_and_submit_guarded(SETTLED_PANE, &report, Some(&settled_agent), || async {
+                true
+            })
+            .await
+            .expect("second identical silence report after settling");
+        let unsettled_repeat = registry
+            .write_and_submit_guarded(UNSETTLED_PANE, &report, Some(&unsettled_agent), || async {
+                true
+            })
+            .await
+            .expect("second identical silence report without settling");
+        registry.shutdown_all();
+
+        assert_eq!(
+            settled_repeat,
+            crate::agent_pty::GuardedSend::Applied,
+            "a one-shot silence report releases its payload record, so a byte-identical SECOND \
+             report into the same orchestrator must still be submitted rather than refused as a \
+             repeat of the user's own unsent draft"
+        );
+        assert_eq!(
+            unsettled_repeat,
+            crate::agent_pty::GuardedSend::Stale,
+            "control: without `note_payload_settled` the identical repeat IS refused — which is \
+             what makes the release above load-bearing rather than decorative"
+        );
+    }
+
+    /// Scenario: Deliver a silence report into two orchestrator panes exactly the
+    /// way the daemon does, then run the production settle decision over each —
+    /// one pane's submit is reported `Ambiguous` (a partial write), the other's
+    /// `Applied`. The user types into both panes and a byte-identical second
+    /// report follows: the ambiguous pane must REFUSE it, because report bytes
+    /// may still be sitting un-submitted in its input box, while the applied
+    /// pane still admits it.
+    #[cfg(unix)]
+    #[spec("scheduler/idle-worker/018")]
+    #[tokio::test]
+    async fn idle_worker_018_an_ambiguous_report_keeps_its_payload_record() {
+        // PR #713 review (Greptile P1): `Ambiguous` used to share the `Applied`
+        // arm of the settle decision. It must not — it is a PARTIAL write, so
+        // some report bytes may be sitting in the orchestrator's input box with
+        // no submit behind them, and releasing the record there lets a later
+        // identical report be admitted into a pane the user has typed into,
+        // submitting the leftovers plus the user's unsent draft as one turn.
+        //
+        // The physical write is `Applied` on BOTH panes here — a real `/bin/cat`
+        // PTY writer cannot be faulted into a partial write from this seam, and
+        // `write_and_submit_guarded` classifies partiality inside the writer's
+        // critical section (`deliver_payload_and_submit`, unit-tested against a
+        // fault-injecting writer in `agent_pty`). That costs nothing here,
+        // because the registry state the decision reads is identical either way:
+        // both the `Applied` and the `Ambiguous` arm of that classification call
+        // `note_automatic_write` with the same payload, so the payload record an
+        // ambiguous write leaves IS the record an applied write leaves. What
+        // differs is only the outcome the daemon then acts on, which is exactly
+        // what varies between the two panes below.
+        const AMBIGUOUS_PANE: &str = "silence-report-ambiguous-orchestrator";
+        const APPLIED_PANE: &str = "silence-report-applied-orchestrator";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let report = compose_delegate_silence_notice(std::time::Duration::from_millis(600), None);
+
+        let spawn_orchestrator = |pane: &str| {
+            registry
+                .spawn_agent(crate::agent_pty::SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: vec![(
+                        crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                        pane.to_string(),
+                    )],
+                    ..crate::agent_pty::SpawnOptions::default()
+                })
+                .expect("spawn orchestrator stand-in")
+        };
+        let ambiguous_agent = spawn_orchestrator(AMBIGUOUS_PANE);
+        let applied_agent = spawn_orchestrator(APPLIED_PANE);
+
+        // First report on both panes, delivered the production way.
+        for (pane, agent) in [
+            (AMBIGUOUS_PANE, &ambiguous_agent),
+            (APPLIED_PANE, &applied_agent),
+        ] {
+            assert_eq!(
+                registry
+                    .write_and_submit_guarded(pane, &report, Some(agent), || async { true })
+                    .await
+                    .expect("first silence report"),
+                crate::agent_pty::GuardedSend::Applied,
+                "precondition: the first silence report must reach {pane}"
+            );
+        }
+        // The production decision, fed each of the two outcomes that leave a
+        // payload record behind. Nothing here reaches around it: this is the
+        // same function `arm_delegate_silence_watch` calls with the outcome its
+        // own guarded submit returned.
+        settle_silence_report_payload_record(
+            &registry,
+            AMBIGUOUS_PANE,
+            &report,
+            &Ok(crate::agent_pty::GuardedSend::Ambiguous),
+        );
+        settle_silence_report_payload_record(
+            &registry,
+            APPLIED_PANE,
+            &report,
+            &Ok(crate::agent_pty::GuardedSend::Applied),
+        );
+
+        // The user types into both panes. This is the clock that arms the
+        // repeat-payload refusal: without it the guard abstains and the
+        // ambiguous assertion below would pass for the wrong reason.
+        registry.note_user_input(AMBIGUOUS_PANE);
+        registry.note_user_input(APPLIED_PANE);
+
+        let ambiguous_repeat = registry
+            .write_and_submit_guarded(AMBIGUOUS_PANE, &report, Some(&ambiguous_agent), || async {
+                true
+            })
+            .await
+            .expect("second identical silence report after an ambiguous first");
+        let applied_repeat = registry
+            .write_and_submit_guarded(APPLIED_PANE, &report, Some(&applied_agent), || async {
+                true
+            })
+            .await
+            .expect("second identical silence report after an applied first");
+        registry.shutdown_all();
+
+        assert_eq!(
+            ambiguous_repeat,
+            crate::agent_pty::GuardedSend::Stale,
+            "an AMBIGUOUS submit is a partial write, so the report bytes may still be in the \
+             orchestrator's input box: its payload record must survive and refuse a \
+             byte-identical later report rather than submit those leftovers together with the \
+             user's unsent draft"
+        );
+        assert_eq!(
+            applied_repeat,
+            crate::agent_pty::GuardedSend::Applied,
+            "control: the same sequence whose submit reported APPLIED does release the record, so \
+             the identical repeat is admitted — which is what makes the refusal above a property \
+             of the outcome rather than of the harness"
         );
     }
 

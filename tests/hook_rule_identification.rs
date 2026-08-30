@@ -33,6 +33,26 @@ use serde_json::{Value, json};
 #[path = "../src/test_temp.rs"]
 mod test_temp;
 
+/// A stand-in deck binary on disk: a real file that is really executable.
+///
+/// The exec bit is not decoration. Since PRD #381 a deck-owned rule is
+/// preserved only when its pin satisfies the same invariant a freshly resolved
+/// path does — absolute, present, a regular file, executable by this user, and
+/// not a build artifact (`platform::paths::pin_is_repairable`, closing issue
+/// #536's cwd-relative bare-name hole). A fixture written with a bare
+/// `fs::write` is a file no deck could ever have run, so treating it as a live
+/// deployment would be the test asserting something the product does not claim.
+fn write_deck_binary(path: &Path) {
+    std::fs::write(path, b"#!/bin/sh\nexit 0\n")
+        .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
+    }
+}
+
 fn settings_path() -> (tempfile::TempDir, PathBuf) {
     let dir = test_temp::tempdir().expect("create settings dir");
     let path = dir.path().join("settings.json");
@@ -386,7 +406,7 @@ fn hook_rule_identification_009_historical_unquoted_spaced_rule_is_still_recogni
 fn hook_rule_identification_010_symlinked_binary_collapses_to_one_rule() {
     let binary_dir = test_temp::tempdir().expect("create binary tempdir");
     let real_binary = binary_dir.path().join("worker-agent-deck");
-    std::fs::write(&real_binary, b"#!/bin/sh\n").expect("write real binary");
+    write_deck_binary(&real_binary);
     let symlink_path = binary_dir.path().join("dot-agent-deck");
     std::os::unix::fs::symlink(&real_binary, &symlink_path).expect("create symlink");
 
@@ -418,11 +438,11 @@ fn hook_rule_identification_010_symlinked_binary_collapses_to_one_rule() {
 fn hook_rule_identification_011_distinct_builds_sharing_basename_do_not_collapse() {
     let build_a_dir = test_temp::tempdir().expect("build a tempdir");
     let build_a = build_a_dir.path().join("dot-agent-deck");
-    std::fs::write(&build_a, b"#!/bin/sh\n").expect("write build a");
+    write_deck_binary(&build_a);
 
     let build_b_dir = test_temp::tempdir().expect("build b tempdir");
     let build_b = build_b_dir.path().join("dot-agent-deck");
-    std::fs::write(&build_b, b"#!/bin/sh\n").expect("write build b");
+    write_deck_binary(&build_b);
 
     let (_dir, path) = settings_path();
     install_to(&path, build_a.to_str().expect("build a path is utf8")).expect("install");
@@ -498,12 +518,12 @@ fn hook_rule_identification_012_fragment_match_mutation_guard() {
 fn hook_rule_identification_014_dead_binary_rule_is_pruned_on_install() {
     let build_a_dir = test_temp::tempdir().expect("build a tempdir");
     let build_a = build_a_dir.path().join("dot-agent-deck");
-    std::fs::write(&build_a, b"#!/bin/sh\n").expect("write build a");
+    write_deck_binary(&build_a);
     let build_a_str = build_a.to_str().expect("build a path is utf8").to_string();
 
     let build_b_dir = test_temp::tempdir().expect("build b tempdir");
     let build_b = build_b_dir.path().join("dot-agent-deck");
-    std::fs::write(&build_b, b"#!/bin/sh\n").expect("write build b");
+    write_deck_binary(&build_b);
     let build_b_str = build_b.to_str().expect("build b path is utf8").to_string();
 
     let (_dir, path) = settings_path();

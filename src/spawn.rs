@@ -50,7 +50,9 @@ use crate::agent_pty::{
     GuardedSendDetail, SpawnOptions, TabMembership, command_needs_shell_wrap,
 };
 use crate::event::{AgentEvent, AgentType, BroadcastMsg, DISPLAY_NAME_METADATA_KEY, EventType};
-use crate::project_config::{ProjectConfig, load_project_config, resolve_orchestration_name};
+use crate::project_config::{
+    ProjectConfig, default_orchestration, load_project_config, resolve_orchestration_name,
+};
 use crate::prompt_delivery::{
     AUTOMATIC_PROMPT_DEADLINE, AgentStartRearm, log_prompt_abandoned, log_prompt_confirmed,
     log_prompt_stopped, log_prompt_unconfirmable, log_prompt_unconfirmed, log_prompt_written,
@@ -201,6 +203,16 @@ pub struct RoleSpawn {
     pub role_name: String,
     pub command: String,
     pub is_start_role: bool,
+    /// Issue #308: what agent this role runs — its `agent = "…"` declaration
+    /// when the config made one, else the type derived from `command`.
+    ///
+    /// Resolved here, at the point the config is flattened, rather than at the
+    /// spawn seam, because the spawn seam sees only a command. Carrying it
+    /// keeps a DISPATCHED orchestration (`dot-agent-deck dispatch`, the
+    /// scheduler) launching each role exactly as the TUI's `Ctrl+N` path does
+    /// — the parity `orchestration/dispatch/003` pins for `clear = true`
+    /// respawns, which read the spawn-time identity this value becomes.
+    pub agent_type: Option<AgentType>,
 }
 
 /// The branch decision: orchestration tab vs single-agent card. Pure data so it
@@ -261,13 +273,14 @@ pub fn decide_target_with_override(
             command: schedule_command.map(|c| c.to_string()),
         }),
         Some(SpawnShapeOverride::Orchestration(None)) => {
-            // The FIRST ROLE-BEARING orchestration, matching what `--list-targets`
-            // offers. `decide_target` inspects only `orchestrations.first()`, so a
-            // roleless placeholder in slot 0 made the bare form refuse a repo whose
-            // second entry was perfectly spawnable — and told the user to add config
-            // that already existed.
-            let orch = config
-                .and_then(|cfg| cfg.orchestrations.iter().find(|o| !o.roles.is_empty()))
+            // THE default, resolved through the one shared rule
+            // ([`crate::project_config::default_orchestration`]) that
+            // `decide_target` below also uses. Issue #704: this arm and that one
+            // used to disagree — this one took the first ROLE-BEARING block, that
+            // one took the first ENTRY and degraded to a single-agent card when
+            // slot 0 was roleless. Same question, same repo, two answers.
+            let chosen = config
+                .and_then(|cfg| default_orchestration(cfg, dir))
                 .ok_or_else(|| {
                     format!(
                         "no orchestration with roles is defined in {}: add an \
@@ -277,9 +290,9 @@ pub fn decide_target_with_override(
                     )
                 })?;
             Ok(SpawnTarget::Orchestration {
-                name: resolve_orchestration_name(&orch.name, dir),
-                roles: roles_of(orch),
-                config: Box::new(orch.clone()),
+                name: chosen.name.clone(),
+                roles: roles_of(chosen.config),
+                config: Box::new(chosen.config.clone()),
             })
         }
         Some(SpawnShapeOverride::Orchestration(Some(want))) => {
@@ -336,28 +349,33 @@ fn roles_of(orch: &crate::project_config::OrchestrationConfig) -> Vec<RoleSpawn>
             role_name: r.name.clone(),
             command: r.command.clone(),
             is_start_role: r.start,
+            agent_type: r.resolved_agent_type(),
         })
         .collect()
 }
 
 /// Decide what to open from the target dir's config and the schedule's command.
-/// `[[orchestrations]]` with at least one role → orchestration; otherwise a
-/// single-agent card. `dir` is used only to resolve an unnamed orchestration's
-/// name to its cwd-basename (matching the TUI/daemon contract).
+/// A spawnable `[[orchestrations]]` → orchestration; otherwise a single-agent
+/// card. `dir` is used only to resolve an unnamed orchestration's name to its
+/// cwd-basename (matching the TUI/daemon contract).
+///
+/// WHICH orchestration is [`default_orchestration`]'s answer, shared with
+/// [`decide_target_with_override`]'s bare form. Issue #704: this function used to
+/// inspect `orchestrations.first()` alone, so a roleless placeholder in slot 0
+/// sent a scheduled fire to a SINGLE-AGENT CARD in a repo whose second block was
+/// perfectly spawnable — and whose `--list-targets` listing was offering it. The
+/// bare dispatch form had already been fixed; the scheduler had not, and nothing
+/// held the two together. Now one function answers for both.
 pub fn decide_target(
     config: Option<&ProjectConfig>,
     dir: &Path,
     schedule_command: Option<&str>,
 ) -> SpawnTarget {
-    if let Some(cfg) = config
-        && let Some(orch) = cfg.orchestrations.first()
-        && !orch.roles.is_empty()
-    {
-        let name = resolve_orchestration_name(&orch.name, dir);
+    if let Some(chosen) = config.and_then(|cfg| default_orchestration(cfg, dir)) {
         return SpawnTarget::Orchestration {
-            name,
-            roles: roles_of(orch),
-            config: Box::new(orch.clone()),
+            name: chosen.name.clone(),
+            roles: roles_of(chosen.config),
+            config: Box::new(chosen.config.clone()),
         };
     }
     SpawnTarget::SingleAgent {
@@ -440,11 +458,27 @@ pub async fn spawn(
     //    fallback to something the user did not pick.
     let target = match req.resolved_target.clone() {
         Some(t) => t,
-        None => decide_target(
-            load_config_for_dir(dir).as_ref(),
-            dir,
-            req.command.as_deref(),
-        ),
+        None => {
+            let cfg = load_config_for_dir(dir);
+            // Issue #704: when the config left the choice to file order, say so.
+            // This path has no user in front of it — a cron tick or an
+            // issue-dispatch fire — so the daemon log is the only place the
+            // record can land. `dispatch` (which does have a caller) puts the
+            // same sentence in its reply, and `--list-targets` / `validate` show
+            // it to the config's author before either ever fires.
+            if let Some(note) = cfg
+                .as_ref()
+                .and_then(|c| default_orchestration(c, dir))
+                .and_then(|chosen| chosen.diagnostic())
+            {
+                tracing::warn!(
+                    task = %req.task_name,
+                    dir = %dir.display(),
+                    "{note}"
+                );
+            }
+            decide_target(cfg.as_ref(), dir, req.command.as_deref())
+        }
     };
 
     // 3. Spawn + deliver.
@@ -472,6 +506,9 @@ pub async fn spawn(
                 &req.task_name,
                 // A single-agent spawn has no role, so its card keeps the task
                 // name it always had.
+                None,
+                // …and no role config either, so nothing declares its agent:
+                // derive it from the command exactly as before (issue #308).
                 None,
                 pin_sh,
                 notifier,
@@ -509,6 +546,9 @@ pub async fn spawn(
                     &pane_id,
                     &req.working_dir,
                     command.as_deref(),
+                    // No role config on a single-agent spawn, so nothing to
+                    // declare (issue #308).
+                    None,
                     &req.task_name,
                 );
             }
@@ -585,6 +625,10 @@ pub async fn spawn(
                     // which is the orchestrator. Matches what the interactive
                     // `Ctrl+n` path puts on each role pane (`tab.rs`).
                     Some(role.role_name.as_str()),
+                    // Issue #308: the role's resolved type, so a dispatched
+                    // orchestration wraps and badges a declared launcher role
+                    // identically to the TUI path.
+                    role.agent_type.clone(),
                     false,
                     notifier,
                 );
@@ -753,6 +797,7 @@ pub async fn spawn(
                         &agent.pane_id,
                         &req.working_dir,
                         Some(&role.command),
+                        role.agent_type.clone(),
                         &role.role_name,
                     );
                 }
@@ -924,6 +969,11 @@ fn spawn_one(
     // name. `task_name` stays the notifier's subject either way: a spawn
     // failure is reported against the dispatch, not against one role.
     display_name: Option<&str>,
+    // Issue #308: what agent this pane runs, when the caller knows something the
+    // command cannot say — an orchestration role's `agent = "…"` declaration.
+    // `None` means "derive it from the command", which is what a single-agent
+    // schedule (no role config, so nothing to declare) always passes.
+    agent_type: Option<AgentType>,
     pin_sh: bool,
     notifier: &dyn Notifier,
 ) -> Result<String, SpawnError> {
@@ -943,7 +993,11 @@ fn spawn_one(
         // but reverted to "No agent" after a reconnect rebuilt it from
         // `list_agents`. `from_command` returns `None` for bare commands, the
         // same legacy placeholder behavior.
-        agent_type: AgentType::from_command(command),
+        //
+        // Issue #308: a caller-supplied type wins, so a role whose command is a
+        // launcher (`devbox run -- codex`) is badged and WRAPPED from its first
+        // dispatched spawn rather than reading "No agent" until its first task.
+        agent_type: agent_type.or_else(|| AgentType::from_command(command)),
     };
     registry.spawn_agent(opts).map_err(|e| {
         notifier.notify(NotifyEvent::SpawnFailed {
@@ -1099,11 +1153,56 @@ async fn deliver(
     // but "can this producer report a submitted prompt at all" — which decides
     // whether an unconfirmed write may be RE-submitted. See
     // [`confirm_prompt_delivery`].
+    // Issue #243: the scheduler shares the delegate path's readiness gate, so it
+    // shares this defect too — the issue measures a 30 s OpenCode cold spawn HERE,
+    // and leaving it would mean OpenCode still paid the full wait every time a
+    // scheduled card fired. The agent type is read from the deck's own frozen
+    // launch-shape record rather than from the observed badge, so no producer can
+    // talk the gate out of waiting (see `spawn_agent_type`).
+    let spawned_agent_type = registry.spawn_agent_type(agent_id);
+    let has_readiness_signal =
+        crate::state::agent_has_pre_prompt_readiness_signal(spawned_agent_type.as_ref());
     let (mut event_rx, observed) = match event_rx {
+        // The declared-no-signal short path. Deliberately NOT a bare write: the
+        // 30 s wait it replaces was, accidentally, also the only thing standing
+        // between the prompt and a still-booting agent, so what it becomes is a
+        // bounded buffer — the ceiling #243 names for an agent with nothing to
+        // wait for. `rx` is kept so delivery confirmation still observes the pane
+        // exactly as it does on the waiting path.
+        Some(rx) if !has_readiness_signal => {
+            // Issue #243, round 4: sized against a real declared-`NoSignal` agent
+            // rather than borrowing the ordinary buffer, which was PRD #249's
+            // "warm-case 500 ms, doubled" and was never measured against one —
+            // see `crate::state::NO_SIGNAL_READINESS_BUFFER`.
+            let buffer = crate::state::no_signal_readiness_buffer().min(remaining_before(deadline));
+            tracing::debug!(
+                pane_id,
+                agent_type = ?spawned_agent_type,
+                buffer_ms = buffer.as_millis(),
+                "scheduled spawn: this agent has DECLARED it emits no pre-prompt \
+                 readiness signal; holding the prompt for the no-signal readiness \
+                 buffer instead of waiting out a SessionStart that cannot arrive"
+            );
+            if !buffer.is_zero() {
+                tokio::time::sleep(buffer).await;
+            }
+            (Some(rx), crate::state::SessionStartWait::default())
+        }
         Some(mut rx) => {
             let timeout = session_start_wait_timeout().min(remaining_before(deadline));
-            let observed =
-                crate::state::wait_for_session_start(&mut rx, pane_id, agent_id, timeout).await;
+            // Issue #243: the scheduler shares the gate, so it shares the
+            // upgrade window — and it needs it at least as much, since this path
+            // applies no post-readiness buffer after a readiness fact at all.
+            // The agent type is the frozen launch record above, not the observed
+            // badge (see `interface_upgrade_window`).
+            let observed = crate::state::wait_for_session_start(
+                &mut rx,
+                pane_id,
+                agent_id,
+                timeout,
+                crate::state::interface_upgrade_window(spawned_agent_type.as_ref()),
+            )
+            .await;
             if !observed.ready {
                 tracing::debug!(
                     pane_id,
@@ -1111,6 +1210,56 @@ async fn deliver(
                     "scheduled spawn: SessionStart wait timed out; \
                      delivering prompt via fallback path"
                 );
+            }
+            // Issue #243, round 3: a gate released by a WRAPPER INTERFACE fact
+            // owes a buffer HERE too, and until this branch existed there was no
+            // fact on this path that could arrive early enough to need one.
+            //
+            // That is the whole reason this is not scope creep. Before this
+            // issue a Codex pane had no pre-prompt readiness signal at all, so
+            // the scheduler waited out `SESSION_START_WAIT_TIMEOUT` and the
+            // agent was long up by the time anything was written — the 30 s
+            // defect was also, accidentally, the thing standing between the
+            // prompt and a booting TUI, exactly as it was on the
+            // declared-no-signal path above. This issue's own commits give the
+            // scheduler an interface fact that fires ~100 ms after fork, so
+            // removing the wait without adding the buffer would move the
+            // scheduler onto the same silent prompt loss the delegate path is
+            // being fixed for, on the same measurement.
+            //
+            // Priced exactly as `crate::state::dispatch_one_owned` prices it,
+            // and scoped the same way — by the frozen launch record, never by
+            // the arriving badge. For a Wrapper-strategy agent every readiness
+            // fact that can arrive pre-prompt IS one of the wrapper's two (the
+            // native start comes with the first turn, which is what this issue
+            // measured), so the agent type is a sufficient discriminator without
+            // widening `SessionStartWait`. The strong fact buys the interface
+            // buffer, anything else the ordinary one, and the timeout keeps
+            // today's behaviour of no buffer at all — a fallback here has
+            // already waited out the full timeout.
+            let buffer = if observed.ready
+                && crate::state::agent_is_wrapper_interface_ready(spawned_agent_type.as_ref())
+            {
+                if observed.observed_interface && registry.agent_spawned_as_wrapper_host(agent_id) {
+                    crate::state::wrapper_interface_readiness_buffer()
+                } else {
+                    crate::state::delegate_readiness_buffer()
+                }
+                .min(remaining_before(deadline))
+            } else {
+                Duration::ZERO
+            };
+            if !buffer.is_zero() {
+                tracing::debug!(
+                    pane_id,
+                    agent_type = ?spawned_agent_type,
+                    observed_interface = observed.observed_interface,
+                    buffer_ms = buffer.as_millis(),
+                    "scheduled spawn: the readiness fact came from the wrapper watching this \
+                     agent's interface, which is not on its own input-readiness; holding the \
+                     prompt for the post-readiness buffer"
+                );
+                tokio::time::sleep(buffer).await;
             }
             (Some(rx), observed)
         }
@@ -1402,9 +1551,13 @@ fn drain_pre_write_events(
                 // call passes a sink it discards — a pre-write drain is pre-write
                 // by construction, so nothing it sees can be evidence about bytes
                 // that do not exist yet.
+                // Issue #243: G is the wrapper discriminator, not the wrapper-FORK
+                // one — an interface-ready start is the deck's own observation of
+                // a child painting, never an agent announcing a conversation it
+                // could report a submission for.
                 if agent_start.is_none()
                     && event.event_type == EventType::SessionStart
-                    && !event.is_wrapper_fork_session_start()
+                    && !event.is_wrapper_session_start()
                 {
                     *agent_start = Some((Instant::now(), event.agent_type.clone()));
                 }
@@ -1414,7 +1567,12 @@ fn drain_pre_write_events(
                     return Some(reason);
                 }
             }
-            Ok(BroadcastMsg::OrchestrationSurface(_)) => continue,
+            // Issue #717: neither variant is evidence about this pane.
+            // Grouped rather than wildcarded so a future variant still
+            // fails this match and gets considered on its merits.
+            Ok(BroadcastMsg::OrchestrationSurface(_) | BroadcastMsg::WorktreeKept(_)) => {
+                continue;
+            }
             // Issue #424 D2 (both reviewers): TERMINAL, where this used to carry
             // on. The old comment claimed the dropped frames cost only the
             // generation latch "which the watcher re-establishes" — it does not.
@@ -2146,13 +2304,22 @@ fn surface_spawned_pane(
     pane_id: &str,
     cwd: &str,
     command: Option<&str>,
+    // Issue #308: the caller's resolved agent type for this pane, when it knows
+    // one the command cannot reveal (a role's `agent = "…"`). `None` derives
+    // from the command, as before. Without it a declared launcher role's
+    // freshly-surfaced card read "No agent" while the daemon registry already
+    // knew it was Codex, and the label only corrected itself on the pane's
+    // first real hook — the exact pre-first-task blankness this issue is about.
+    agent_type: Option<AgentType>,
     task_name: &str,
 ) {
     let mut metadata = HashMap::new();
     metadata.insert(DISPLAY_NAME_METADATA_KEY.to_string(), task_name.to_string());
     let event = AgentEvent {
         session_id: pane_id.to_string(),
-        agent_type: AgentType::from_command(command).unwrap_or(AgentType::None),
+        agent_type: agent_type
+            .or_else(|| AgentType::from_command(command))
+            .unwrap_or(AgentType::None),
         event_type: EventType::SessionStart,
         tool_name: None,
         tool_detail: None,
@@ -2840,6 +3007,9 @@ mod tests {
                 &pane_id,
                 &agent_id,
                 Duration::from_millis(20),
+                // No upgrade window: this fixture posts a `wrapper_fork` start,
+                // which the gate SKIPS. Nothing here is a settled interface fact.
+                Duration::ZERO,
             )
             .await;
             assert_eq!(
@@ -4461,6 +4631,101 @@ mod tests {
         }
     }
 
+    // --- Issue #704: ONE default rule, shared by both paths ---
+
+    /// A roleless placeholder in slot 0 with a spawnable block behind it. This is
+    /// the config that made the two paths disagree.
+    fn roleless_slot_zero_config() -> ProjectConfig {
+        parse_config(
+            "[[orchestrations]]\nname = \"placeholder\"\nroles = []\n\n\
+             [[orchestrations]]\nname = \"real\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"sh\"\n",
+        )
+    }
+
+    /// The SCHEDULER path's half of the bug: `decide_target` looked only at
+    /// `orchestrations.first()`, so a roleless slot 0 sent a scheduled fire to a
+    /// single-agent card while `--list-targets` was offering `real` and a bare
+    /// dispatch was spawning it.
+    #[test]
+    fn decide_target_skips_a_roleless_slot_zero_instead_of_degrading_to_one_agent() {
+        let cfg = roleless_slot_zero_config();
+        let dir = Path::new("/tmp/x");
+        match decide_target(Some(&cfg), dir, Some("claude")) {
+            SpawnTarget::Orchestration { name, roles, .. } => {
+                assert_eq!(name, "real");
+                assert_eq!(roles.len(), 2);
+            }
+            SpawnTarget::SingleAgent { .. } => panic!(
+                "a scheduled fire must open the repo's spawnable orchestration, not fall through \
+                 to a single agent because slot 0 happens to be empty"
+            ),
+        }
+    }
+
+    /// The two paths must not just each be right — they must be right for the
+    /// SAME reason, which is what a shared resolver buys. Asserted over the
+    /// configs that used to separate them.
+    #[test]
+    fn scheduler_and_bare_dispatch_agree_on_the_default_orchestration() {
+        let dir = Path::new("/tmp/x");
+        let declared_last = parse_config(
+            "[[orchestrations]]\nname = \"first\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations]]\nname = \"chosen\"\ndefault = true\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"sh\"\nstart = true\n",
+        );
+        for cfg in [
+            roleless_slot_zero_config(),
+            two_orchestration_config(),
+            declared_last,
+        ] {
+            let scheduled = decide_target(Some(&cfg), dir, Some("claude"));
+            let bare = decide_target_with_override(
+                Some(&cfg),
+                dir,
+                Some("claude"),
+                Some(&SpawnShapeOverride::Orchestration(None)),
+            )
+            .expect("the bare form must resolve every one of these");
+            assert_eq!(
+                scheduled, bare,
+                "a scheduled fire and a bare `--orchestration=` dispatch into the same repo must \
+                 open the same thing — two rules for one question is the bug, whatever either \
+                 rule says"
+            );
+        }
+    }
+
+    /// The declaration beats position on BOTH paths, which is what makes it a
+    /// declaration rather than a hint.
+    #[test]
+    fn declared_default_wins_over_file_order_on_both_paths() {
+        let cfg = parse_config(
+            "[[orchestrations]]\nname = \"first\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+             [[orchestrations]]\nname = \"declared\"\ndefault = true\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"sh\"\nstart = true\n",
+        );
+        let dir = Path::new("/tmp/x");
+        for target in [
+            decide_target(Some(&cfg), dir, Some("claude")),
+            decide_target_with_override(
+                Some(&cfg),
+                dir,
+                Some("claude"),
+                Some(&SpawnShapeOverride::Orchestration(None)),
+            )
+            .expect("bare form resolves"),
+        ] {
+            match target {
+                SpawnTarget::Orchestration { name, .. } => assert_eq!(name, "declared"),
+                other => panic!("expected the declared orchestration, got {other:?}"),
+            }
+        }
+    }
+
     // --- PRD #220: the caller's explicit shape override ---
 
     fn two_orchestration_config() -> ProjectConfig {
@@ -4640,12 +4905,14 @@ mod tests {
     fn orchestrator_role_index_prefers_named_orchestrator() {
         let roles = vec![
             RoleSpawn {
+                agent_type: None,
                 role_index: 0,
                 role_name: "worker".into(),
                 command: "sh".into(),
                 is_start_role: false,
             },
             RoleSpawn {
+                agent_type: None,
                 role_index: 1,
                 role_name: "orchestrator".into(),
                 command: "cat".into(),
@@ -4659,12 +4926,14 @@ mod tests {
     fn orchestrator_role_index_falls_back_to_start_role_then_first() {
         let start_role = vec![
             RoleSpawn {
+                agent_type: None,
                 role_index: 0,
                 role_name: "lead".into(),
                 command: "sh".into(),
                 is_start_role: false,
             },
             RoleSpawn {
+                agent_type: None,
                 role_index: 1,
                 role_name: "boss".into(),
                 command: "cat".into(),
@@ -4674,6 +4943,7 @@ mod tests {
         assert_eq!(orchestrator_role_index(&start_role), 1);
 
         let neither = vec![RoleSpawn {
+            agent_type: None,
             role_index: 0,
             role_name: "solo".into(),
             command: "sh".into(),
@@ -4737,6 +5007,7 @@ mod tests {
             Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
 
         let role = |idx: usize, name: &str, command: &str| RoleSpawn {
+            agent_type: None,
             role_index: idx,
             role_name: name.to_string(),
             command: command.to_string(),
@@ -4754,8 +5025,10 @@ mod tests {
                     role(1, "worker", "/nonexistent/dot-agent-deck-454"),
                 ],
                 config: Box::new(OrchestrationConfig {
+                    default: false,
                     name: "partial-454".to_string(),
                     roles: vec![OrchestrationRoleConfig {
+                        agent: None,
                         name: "orchestrator".to_string(),
                         command: "/bin/sh".to_string(),
                         start: true,
@@ -5016,6 +5289,7 @@ mod tests {
             "sched-morning-digest-0",
             "/tmp/scratch/runbox",
             Some("cat"),
+            None,
             "morning-digest",
         );
         let BroadcastMsg::Event(e) = rx.try_recv().expect("a broadcast must be queued") else {
@@ -5042,7 +5316,7 @@ mod tests {
         // The standalone-daemon case (no attached TUI): `send` errs, swallowed.
         let (tx, rx) = broadcast::channel::<BroadcastMsg>(8);
         drop(rx);
-        surface_spawned_pane(&tx, "sched-x-0", "/tmp/x", None, "x");
+        surface_spawned_pane(&tx, "sched-x-0", "/tmp/x", None, None, "x");
     }
 
     /// PRD #225 hardening: the readiness-wait override may shorten the wait but

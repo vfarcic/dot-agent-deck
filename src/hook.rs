@@ -357,6 +357,30 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
     // the repo defines. Everything else in an incoming `metadata` object is
     // still ignored, so this cannot become an arbitrary producer-controlled
     // channel into the daemon's event metadata.
+    //
+    // Issue #243 added the INTERFACE origin values
+    // (`WRAPPER_INTERFACE_READY_SESSION_START_ORIGIN`,
+    // `WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN`) and neither is forwardable
+    // here. The asymmetry is deliberate: boot provenance is a producer CONFESSING
+    // that its child is not up yet, which costs it privilege and is therefore safe
+    // to believe from anyone; interface readiness is a producer CLAIMING that its
+    // child is up, which BUYS privilege — it releases the readiness gate, and the
+    // strong value additionally selects which post-readiness buffer is paid over
+    // it. So this CLI does not carry it, and should not be taught to.
+    //
+    // **This narrowing is NOT the trust boundary, and the comment that used to
+    // stand here claimed it was.** `build_event_typed` is one of several
+    // `AgentEvent` builders, not a chokepoint: the daemon's hook socket also
+    // accepts a RAW `AgentEvent` JSON line whose `metadata` map is free-form and
+    // unvalidated (`crate::daemon`, and `crate::event::AgentEvent`'s own note that
+    // the wrapper rides that same socket). Issue #243's audit reproduced a forged
+    // `wrapper_interface_ready` `SessionStart` from a bare `python3` with no deck
+    // environment variables at all. Keep the narrowing — it is correct and cheap,
+    // and it keeps the Claude-shaped path honest — but do not build an argument on
+    // it. The privilege is gated where it is USED, by asking whether this daemon
+    // spawned the named agent as a wrapper: see
+    // `crate::agent_pty::AgentPtyRegistry::agent_spawned_as_wrapper_host` and its
+    // caller in `crate::state::dispatch_one_owned`.
     if event_type == EventType::SessionStart
         && extra
             .get("metadata")
@@ -522,6 +546,43 @@ pub fn send_to_socket(json: &str) -> Option<()> {
 /// `socket_path()` reads.
 fn send_to_socket_at(path: &std::path::Path, json: &str) -> Option<()> {
     let mut stream = crate::platform::ipc::IpcClient::connect(path).ok()?;
+    let msg = format!("{json}\n");
+    stream.write_all(msg.as_bytes()).ok()?;
+    stream.flush().ok()?;
+    Some(())
+}
+
+/// Issue #243 audit F3: [`send_to_socket`] with every blocking step bounded by
+/// `timeout` — the connect (`IpcClient::connect_timeout`) and the write/flush
+/// (`IpcClient::set_timeouts`).
+///
+/// [`send_to_socket`] is deliberately unbounded and stays that way: its callers
+/// are one-shot CLI invocations and wrapper tee threads, where blocking until the
+/// daemon accepts is the right trade and dropping an event silently is not. This
+/// variant exists for the one caller whose thread must not outlive its usefulness
+/// no matter what the daemon is doing — `crate::wrap`'s interface-ready
+/// announcement, which fires from the wrapper's supervisory loop.
+///
+/// Fire-and-forget by design: a failure is a lost readiness event, which costs
+/// the readiness gate its fast path and nothing else, so there is no outcome for
+/// a caller on a detached thread to act on.
+pub fn send_to_socket_bounded(json: &str, timeout: std::time::Duration) {
+    let _ = send_to_socket_bounded_at(&socket_path(), json, timeout);
+}
+
+/// [`send_to_socket_bounded`] against an explicit endpoint. Same rationale as
+/// [`send_to_socket_at`]: it lets a test point at a temp-dir path instead of
+/// mutating the process-global `DOT_AGENT_DECK_SOCKET`.
+fn send_to_socket_bounded_at(
+    path: &std::path::Path,
+    json: &str,
+    timeout: std::time::Duration,
+) -> Option<()> {
+    let mut stream = crate::platform::ipc::IpcClient::connect_timeout(path, timeout).ok()?;
+    // A failure here leaves the stream blocking-without-deadline, which is the
+    // pre-#243 behaviour and no worse than not trying; the connect bound has
+    // already done the part that matters most.
+    let _ = stream.set_timeouts(timeout);
     let msg = format!("{json}\n");
     stream.write_all(msg.as_bytes()).ok()?;
     stream.flush().ok()?;

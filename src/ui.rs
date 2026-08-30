@@ -20,6 +20,7 @@ use crate::config::{BellConfig, DashboardConfig};
 use crate::embedded_pane::{EmbeddedPaneController, HydratedPane};
 use crate::event::{AgentType, EventType, OrchestrationSurface, SendResult};
 use crate::features::Features;
+use crate::issue_dispatch_run::KeptWorktree;
 // PRD #80 introduced a UI-dispatch `Action` enum in this module (the renamed
 // `KeyResult`), which collides with the keybinding-action enum. Import the
 // latter under an alias so both coexist: `Action` = the UI dispatch action,
@@ -714,6 +715,7 @@ fn build_dispatcher_mode(working_dir: &std::path::Path) -> ModeConfig {
         dir = working_dir.display(),
     );
     ModeConfig {
+        agent: None,
         name: DISPATCHER_MODE_NAME.to_string(),
         init_command: None,
         seed_prompt: Some(seed),
@@ -817,6 +819,7 @@ fn build_schedule_authoring_mode(
         }
     };
     ModeConfig {
+        agent: None,
         name: SCHEDULE_MODE_NAME.to_string(),
         init_command: None,
         seed_prompt: Some(seed),
@@ -1247,6 +1250,7 @@ impl NewPaneFormState {
         // time by `build_schedule_authoring_mode` (threaded with the picked dir),
         // so `seed_prompt` here is dead data; leave it `None`.
         let schedule_authoring = ModeConfig {
+            agent: None,
             name: SCHEDULE_MODE_NAME.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -1257,6 +1261,7 @@ impl NewPaneFormState {
         // PRD #120: synthetic issue-dispatch authoring option (name only; seed
         // derived at submit time). Whether it is offered is the flag snapshot.
         let issue_dispatch_authoring = ModeConfig {
+            agent: None,
             name: ISSUE_DISPATCH_MODE_NAME.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -1456,6 +1461,7 @@ impl NewPaneFormState {
         // PRD #170 round 2 (reviewer finding 7): seed is derived at submit time by
         // `build_schedule_authoring_mode`; the synthetic mode only carries `name`.
         let schedule_authoring = ModeConfig {
+            agent: None,
             name: SCHEDULE_MODE_NAME.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -1464,6 +1470,7 @@ impl NewPaneFormState {
             reactive_panes: 0,
         };
         let issue_dispatch_authoring = ModeConfig {
+            agent: None,
             name: ISSUE_DISPATCH_MODE_NAME.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -2069,7 +2076,7 @@ struct PromptDelivery {
 /// PROMPTLY once the target transitions, rather than languishing behind a
 /// minutes-long exponential delay. The cap is the "wait for a matching target
 /// transition" bound from the finding: it keeps the catch-up latency small.
-fn send_retry_delay(attempts: u32) -> std::time::Duration {
+pub fn send_retry_delay(attempts: u32) -> std::time::Duration {
     const BASE_MS: u64 = 500;
     const CAP: std::time::Duration = std::time::Duration::from_secs(2);
     let shift = attempts.saturating_sub(1).min(6);
@@ -2147,6 +2154,46 @@ struct UiState {
     pane_names: HashMap<String, String>,
     /// Maps pane_id → display name; survives session restarts (e.g. /clear).
     pane_display_names: HashMap<String, String>,
+    /// Issue #308: maps pane_id → the agent type its config DECLARED
+    /// (`agent = "…"` on the role or mode), for panes that made a declaration.
+    ///
+    /// Kept beside `SessionState.agent_type` rather than written into it,
+    /// because the two answer different questions and only one of them may
+    /// drive timing. `SessionState.agent_type` is the OBSERVED identity: it
+    /// stays `AgentType::None` until something running in the pane reports, and
+    /// three separate readiness gates read exactly that — `agent_ready` in the
+    /// orchestrator-prompt, mode-seed and dispatch paths all spell "the agent
+    /// has started" as `agent_type != AgentType::None`. Seeding a declaration
+    /// into that field would make all three fire at spawn and type a prompt
+    /// into a launcher that has not started its agent yet — which is precisely
+    /// the population (`devbox run -- codex`) this key exists for, so the
+    /// feature would break delivery for exactly the users it is meant to help.
+    ///
+    /// A declaration is nonetheless real knowledge, and the whole point of
+    /// issue #308 is that the card should show it immediately. So it lands
+    /// here, is read only by [`render_session_card`], and changes nothing but
+    /// what is drawn. The same split PRD #225 made between
+    /// `RunningAgent::agent_type` (observed, badge) and `spawn_agent_type`
+    /// (launch), one layer up.
+    ///
+    /// **Lifecycle.** Entries are removed on exactly the paths that remove
+    /// [`Self::pane_metadata`]: closing a pane (`Action::ClosePane`), closing a
+    /// tab, and the restore-failure / mode-activation-failure arms that retire
+    /// a pane id they just spawned. A stale entry would nonetheless be inert
+    /// rather than a mislabelled card, because a pane id is never recycled
+    /// within a daemon session — `EmbeddedPaneController::allocate_id`
+    /// (`src/embedded_pane.rs`) hands out a monotonic counter and never reuses
+    /// a retired value, and the reconnect path bumps `next_id` past every
+    /// rehydrated id before allocating again. So a leftover entry can only be
+    /// looked up by the pane that put it there.
+    ///
+    /// Only the two surfaces that can carry a declaration are ever inserted:
+    /// orchestration ROLE panes and MODE agent panes. In particular the mode's
+    /// reactive SIDE panes get no entry — `TabManager::route_reactive_commands`
+    /// (`src/tab.rs`) closes and re-creates those panes under fresh ids as
+    /// rules fire, so an entry keyed on one of them would be orphaned on every
+    /// rule that fires rather than on tab close.
+    pane_declared_agent: HashMap<String, AgentType>,
     /// Maps pane_id → launch metadata for auto-save/restore.
     pane_metadata: HashMap<String, config::SavedPane>,
     config: DashboardConfig,
@@ -2462,6 +2509,7 @@ impl UiState {
             new_pane_form: None,
             pane_names: HashMap::new(),
             pane_display_names: HashMap::new(),
+            pane_declared_agent: HashMap::new(),
             pane_metadata: HashMap::new(),
             config,
             keybindings,
@@ -4315,8 +4363,11 @@ fn pane_announced_generation(snapshot: &AppState, pane_id: &str) -> Option<Strin
         .values()
         .filter(|session| session.pane_id.as_deref() == Some(pane_id))
         .flat_map(|session| session.recent_events.iter())
+        // Issue #243: EITHER wrapper origin is excluded. Both carry the wrapper's
+        // own session id rather than the agent's, so neither is a conversation
+        // announcing itself over this pane.
         .filter(|event| {
-            event.event_type == EventType::SessionStart && !event.is_wrapper_fork_session_start()
+            event.event_type == EventType::SessionStart && !event.is_wrapper_session_start()
         })
         .map(|event| event.timestamp)
         .max()?;
@@ -4368,7 +4419,7 @@ fn schedule_unconfirmed_retry(
 ///   partial write — a retry could duplicate the input).
 /// * RETRYABLE: `HistoryOnly` / `Stale` / `NoLiveTarget` (the target may become
 ///   live / re-settle). `Applied` / `Queued` never reach this helper.
-fn is_terminal_send_result(result: SendResult) -> bool {
+pub fn is_terminal_send_result(result: SendResult) -> bool {
     matches!(
         result,
         SendResult::WrongSession | SendResult::Unknown | SendResult::Ambiguous
@@ -4809,11 +4860,18 @@ fn deliver_orchestrator_prompt(
 /// mode/restore agent shell (the one launch class that doesn't pass its command
 /// through the common `agent_pty::spawn` boundary — it spawns a shell and
 /// injects the command as keystrokes). Resolves the Wrapper-strategy identity
-/// from the command and returns `dot-agent-deck wrap --agent <name> -- <cmd>`
-/// for a Wrapper agent (Codex); returns the command unchanged for native agents.
-/// Idempotent, so a re-typed already-wrapped command is never double-wrapped.
-fn wrap_agent_command(command: &str) -> String {
-    match AgentType::from_command(Some(command)) {
+/// and returns `dot-agent-deck wrap --agent <name> -- <cmd>` for a Wrapper
+/// agent (Codex); returns the command unchanged for native agents. Idempotent,
+/// so a re-typed already-wrapped command is never double-wrapped.
+///
+/// Issue #308: `declared` is the mode's `agent = "…"` key when it has one, and
+/// it wins over parsing the command — a mode agent pane running
+/// `devbox run codex-big` is otherwise typed in BARE, and an unwrapped Codex
+/// emits nothing until its first turn, so the pane reads "No agent" for as long
+/// as the user has not prompted it. `None` (every mode without the key) derives
+/// from the command exactly as before.
+fn wrap_agent_command(command: &str, declared: Option<AgentType>) -> String {
+    match declared.or_else(|| AgentType::from_command(Some(command))) {
         Some(agent_type) => crate::wrap::wrap_launch_command(command, &agent_type),
         None => command.to_string(),
     }
@@ -4822,7 +4880,7 @@ fn wrap_agent_command(command: &str) -> String {
 /// PRD #20 blocker-5: a short human-readable reason a [`SendResult`] was not
 /// delivered, for the status-bar feedback shown when a seed / orchestrator
 /// prompt could not reach a live target.
-fn describe_send_result(result: SendResult) -> &'static str {
+pub fn describe_send_result(result: SendResult) -> &'static str {
     match result {
         SendResult::Applied => "applied",
         SendResult::Queued => "queued",
@@ -5919,7 +5977,7 @@ fn gate_pane_input_key(
 /// [`UiState::close_confirm_target`] as a [`CloseTarget`]. See its docs for why
 /// the two are separate. `scope` is not identity — it is the one bit of the
 /// resolved close the dialog has to be able to say out loud.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CloseConfirmState {
     /// 0 = Cancel (default), 1 = Close.
     pub selected: usize,
@@ -5927,6 +5985,23 @@ pub struct CloseConfirmState {
     /// [`resolve_close_plan`] — the same function the confirmed close itself
     /// branches on. Defaults to [`CloseScope::Pane`], the narrower claim.
     pub scope: CloseScope,
+    /// Issue #717: the dispatched worktree this close would LEAVE BEHIND,
+    /// holding uncommitted work — `None` when it leaves nothing.
+    ///
+    /// The second thing (after `scope`) the dialog has to be able to say out
+    /// loud, and the reason this type is no longer `Copy`: it carries a path,
+    /// because recovering the work means going to it. Resolved once at arm time
+    /// by [`kept_worktree_for_plan`] — the dialog describes what was armed, and
+    /// re-probing every frame would put a `git status` in the render loop.
+    ///
+    /// It is a PREDICTION, and deliberately used only where a prediction is the
+    /// only thing available: the agent is still running while the dialog is
+    /// open, so it can commit the work or dirty a clean tree before the close
+    /// lands. That is what a confirmation dialog is for — it arrives while the
+    /// user can still cancel — but it must not be reused afterwards as a claim
+    /// about what happened. The post-close report comes from the daemon's own
+    /// verdict instead; see [`drain_worktree_kept`].
+    pub kept_worktree: Option<KeptWorktree>,
 }
 
 /// PRD #241 fact-check follow-up: how much a confirmed close destroys, and
@@ -6063,8 +6138,13 @@ fn arm_close_confirmation(
     prompt: CloseConfirmState,
     target: CloseTarget,
     scope: CloseScope,
+    kept_worktree: Option<KeptWorktree>,
 ) {
-    ui.close_confirm = CloseConfirmState { scope, ..prompt };
+    ui.close_confirm = CloseConfirmState {
+        scope,
+        kept_worktree,
+        ..prompt
+    };
     ui.close_confirm_target = Some(target);
     ui.close_confirm_displayed = false;
     ui.mode = UiMode::CloseConfirm;
@@ -6118,6 +6198,148 @@ fn resolve_close_plan(
                 }),
             }
         }
+    }
+}
+
+/// Issue #717: the close-confirmation dialog's budget for asking the daemon
+/// what a confirmed close would leave behind.
+///
+/// Larger than [`DAEMON_HINT_TIMEOUT`] on purpose. That constant sizes a hint
+/// whose answer is a pure registry read; this one waits on a `git status`
+/// behind it, and it must exceed the daemon's own
+/// `CLOSE_PREVIEW_PROBE_TIMEOUT` or the client would always give up first and
+/// the daemon's graceful degradation would never be reachable. Still an
+/// interactive key path, so it fails OPEN like every other hint here: a slow or
+/// down daemon means no warning, never a frozen `Ctrl+W`.
+const CLOSE_PREVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Every pane a confirmed `plan` would tear down.
+///
+/// One for a plain dashboard card; for a Mode/Orchestration tab, the agent pane
+/// plus every side or role pane it owns — because a multi-role orchestration
+/// shares ONE dispatched worktree across its role panes, and the daemon
+/// resolves that worktree from whichever of them it recognises. Dead-slot
+/// sentinels are skipped for the same reason [`TabManager::all_managed_pane_ids`]
+/// skips them: they are placeholder sessions, not panes.
+fn close_plan_pane_ids(plan: &ClosePlan, tab_manager: &TabManager) -> Vec<String> {
+    match plan {
+        ClosePlan::Pane { pane_id, .. } => vec![pane_id.clone()],
+        ClosePlan::Tab { index } => match tab_manager.tabs().get(*index) {
+            Some(Tab::Mode {
+                agent_pane_id,
+                mode_manager,
+                ..
+            }) => std::iter::once(agent_pane_id.clone())
+                .chain(mode_manager.managed_pane_ids())
+                .collect(),
+            Some(Tab::Orchestration { role_pane_ids, .. }) => role_pane_ids
+                .iter()
+                .filter(|id| !id.is_empty() && !is_dead_slot_pane_id(id))
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        },
+    }
+}
+
+/// Issue #717: ask the daemon whether confirming `plan` would leave a
+/// dispatched worktree on disk holding uncommitted work.
+///
+/// The daemon is asked rather than the local filesystem because it owns both
+/// halves of the answer: the removal POLICY lives only in its in-memory
+/// worktree registry, and under a remote deck the worktree is not on this
+/// machine at all. Best-effort throughout — a down daemon, a blown deadline or
+/// an older daemon that does not know the request all resolve to `None`, and
+/// the dialog then reads exactly as it did before this existed.
+fn kept_worktree_for_plan(plan: &ClosePlan, tab_manager: &TabManager) -> Option<KeptWorktree> {
+    let pane_ids = close_plan_pane_ids(plan, tab_manager);
+    if pane_ids.is_empty() {
+        return None;
+    }
+    send_daemon_request_blocking_with_timeout(
+        &crate::daemon_protocol::AttachRequest::DispatchWorktreeClosePreview { pane_ids },
+        CLOSE_PREVIEW_TIMEOUT,
+    )
+    .ok()?
+    .kept_worktree
+}
+
+/// Issue #717: fit a filesystem path into `max_width` columns by dropping
+/// leading characters, not trailing ones.
+///
+/// The opposite of [`truncate_with_ellipsis`], and deliberately so: for a
+/// sentence the beginning carries the meaning, but for a path the TAIL is what
+/// distinguishes `…/deck-dispatch-issue-717` from its dozen siblings, and a
+/// path clipped to `/home/vfarcic/code/dot-agent-…` names nothing at all. Only
+/// reachable when the terminal is too narrow for the popup to widen to fit —
+/// see [`render_close_confirm`].
+fn truncate_path_head(path: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    let cell_width = |c: char| UnicodeWidthChar::width(c).unwrap_or(0);
+    if max_width == 0 {
+        return String::new();
+    }
+    if path.chars().map(cell_width).sum::<usize>() <= max_width {
+        return path.to_string();
+    }
+    // Overflow confirmed, so one column now belongs to the leading `…`.
+    let budget = max_width - 1;
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 0usize;
+    for c in path.chars().rev() {
+        let w = cell_width(c);
+        if used + w > budget {
+            break;
+        }
+        tail.push(c);
+        used += w;
+    }
+    let mut out = String::from("\u{2026}");
+    out.extend(tail.into_iter().rev());
+    out
+}
+
+/// Issue #717: put the daemon's post-cleanup verdict on the status line.
+///
+/// The dialog is gone the instant the user answers it, and the path is the one
+/// part they may still need — so the existing status line (15 s, already written
+/// on exactly this path) carries it. What it carries is the FACT, not the
+/// dialog's prediction: the daemon measures dirtiness after `close_agent` has
+/// reaped the agent, so nothing can still be writing to the tree, and it
+/// broadcasts the result because by then there is no card left to put it on.
+///
+/// Drained on the render loop rather than applied by the event subscriber for
+/// the same reason `pending_orchestration_surfaces` is: `UiState` lives here.
+fn drain_worktree_kept(state: &SharedState, ui: &mut UiState) {
+    // Same cheap READ-lock peek `process_pending_orchestration_surfaces` uses,
+    // and for the same reason: this runs every frame, and the steady state is an
+    // empty slot. Taking the exclusive write lock unconditionally would put a
+    // per-frame writer in the way of the event subscriber for nothing.
+    if state.blocking_read().pending_worktree_kept.is_none() {
+        return;
+    }
+    let Some(kept) = state.blocking_write().take_worktree_kept() else {
+        return; // a concurrent path took it between the peek and here
+    };
+    ui.status_message = Some((
+        format!(
+            "{} {}",
+            kept_worktree_headline(&kept).trim_start_matches("! "),
+            kept.path
+        ),
+        std::time::Instant::now(),
+    ));
+}
+
+/// Issue #717: what the dialog (and, after the close, the status line) says
+/// about a worktree that will be kept. Two sentences, because the probe has two
+/// honest outcomes — see [`KeptWorktree::confirmed_dirty`].
+fn kept_worktree_headline(kept: &KeptWorktree) -> &'static str {
+    if kept.confirmed_dirty {
+        "! Uncommitted work here is KEPT, not deleted:"
+    } else {
+        "! Uncommitted work here, if any, is KEPT:"
     }
 }
 
@@ -8535,6 +8757,37 @@ fn hit_test_card(card_rects: &[(usize, Rect)], col: u16, row: u16) -> Option<usi
         .find_map(|(idx, rect)| point_in_rect(rect, col, row).then_some(*idx))
 }
 
+/// Unwind **every** per-pane registration a freshly spawned pane accumulated,
+/// for a spawn that succeeded and is then abandoned.
+///
+/// A pane that is created and then given up on (its mode tab failed to open)
+/// has already been recorded in six places by the time the failure is known.
+/// Removing them inline, arm by arm, is how issue #308's `pane_declared_agent`
+/// came to join a leak that five sibling maps were already in — and five of
+/// those are *card-visible*, including the placeholder session, which keeps
+/// rendering a dashboard card for a pane that no longer exists. Every abandon
+/// path routes through here so a future per-pane map is added once, rather
+/// than silently omitted from one caller.
+///
+/// Call this **only once the pane is genuinely gone**. A `close_pane` that
+/// FAILED leaves the pane live, and a live pane must keep its card and
+/// metadata so the user can still see it and retry (the same rule PRD #92 F4
+/// applies to an explicit close).
+fn rollback_abandoned_pane(pane_id: &str, ui: &mut UiState, state: &SharedState) {
+    {
+        let mut st = state.blocking_write();
+        // The placeholder session inserted right after the spawn — plus any
+        // session the daemon has already bound to this pane — would otherwise
+        // outlive the pane as a ghost card.
+        st.remove_sessions_for_pane(pane_id);
+        st.unregister_pane(pane_id);
+    }
+    ui.pane_metadata.remove(pane_id);
+    ui.pane_display_names.remove(pane_id);
+    ui.pane_names.remove(pane_id);
+    ui.pane_declared_agent.remove(pane_id);
+}
+
 /// PRD #80 M3: close the tab at `idx` and reconcile shared state — unregister
 /// every successfully-closed pane, drop the matching sessions (keeping any that
 /// failed to close so the user can retry), clean their metadata, and resweep the
@@ -8569,6 +8822,7 @@ fn close_tab_by_index(
             drop(st);
             for id in &outcome.closed {
                 ui.pane_metadata.remove(id);
+                ui.pane_declared_agent.remove(id);
             }
             if outcome.is_clean() {
                 ui.status_message = Some(("Closed tab".to_string(), std::time::Instant::now()));
@@ -8925,9 +9179,15 @@ fn dispatch_action(
                 // PRD #241: the dialog's wording comes from the SAME resolution
                 // `ConfirmCloseSelected` runs below, so it can never promise a
                 // pane and take a tab.
-                let scope = resolve_close_plan(&target, tab_manager, snapshot)
-                    .map_or(CloseScope::Pane, |plan| plan.scope());
-                arm_close_confirmation(ui, prompt, target, scope);
+                let plan = resolve_close_plan(&target, tab_manager, snapshot);
+                let scope = plan.as_ref().map_or(CloseScope::Pane, ClosePlan::scope);
+                // Issue #717: and the SAME plan decides whether this close
+                // would leave a dispatched worktree behind, so the sentence and
+                // the warning describe one resolution rather than two.
+                let kept = plan
+                    .as_ref()
+                    .and_then(|plan| kept_worktree_for_plan(plan, tab_manager));
+                arm_close_confirmation(ui, prompt, target, scope, kept);
             }
             // No target (PRD #113 finding 2: an inactive dashboard selection
             // means nothing is armed) — stay exactly as silent as before, and
@@ -8947,6 +9207,16 @@ fn dispatch_action(
             ui.mode = UiMode::Normal;
             ui.close_confirm_displayed = false;
             let target = ui.close_confirm_target.take();
+            // Issue #717: the ARM-TIME preview is deliberately NOT carried out
+            // of the dialog and reused as the post-close report. The agent is
+            // still alive while the dialog is open, so that answer is a
+            // prediction — it can commit the work (making a "kept at <path>"
+            // claim false, about a directory that was removed) or dirty a clean
+            // tree (making a silent close wrong). The authoritative answer is
+            // the daemon's own post-cleanup verdict, measured with the agent
+            // reaped, and it arrives as `BroadcastMsg::WorktreeKept`; see
+            // `drain_worktree_kept`.
+            ui.close_confirm.kept_worktree = None;
             // PRD #241: re-resolve the ARMED target through the same function
             // that decided the dialog's wording. Whatever it says here is what
             // the user was shown, because the two share this call.
@@ -8995,6 +9265,7 @@ fn dispatch_action(
                             st.unregister_pane(&pane_id);
                             drop(st);
                             ui.pane_metadata.remove(&pane_id);
+                            ui.pane_declared_agent.remove(&pane_id);
                             ui.status_message =
                                 Some((format!("Closed pane {pane_id}"), std::time::Instant::now()));
                         }
@@ -9095,9 +9366,12 @@ fn dispatch_action(
                 // so — through the same `resolve_close_plan` seam as every other
                 // door rather than a second hand-written answer.
                 let target = CloseTarget::Tab(id);
-                let scope = resolve_close_plan(&target, tab_manager, snapshot)
-                    .map_or(CloseScope::Pane, |plan| plan.scope());
-                arm_close_confirmation(ui, CloseConfirmState::default(), target, scope);
+                let plan = resolve_close_plan(&target, tab_manager, snapshot);
+                let scope = plan.as_ref().map_or(CloseScope::Pane, ClosePlan::scope);
+                let kept = plan
+                    .as_ref()
+                    .and_then(|plan| kept_worktree_for_plan(plan, tab_manager));
+                arm_close_confirmation(ui, CloseConfirmState::default(), target, scope, kept);
             }
         }
         // PRD #80 M4 / PRD #83: single-click a card → select exactly that card
@@ -9548,6 +9822,15 @@ fn dispatch_action(
                                     .insert(role_pane_ids[i].clone(), role.name.clone());
                                 ui.pane_names
                                     .insert(role_pane_ids[i].clone(), role.name.clone());
+                                // Issue #308: a role that DECLARED its agent
+                                // badges from here, not from a hook — which is
+                                // the whole point for a launcher command, and
+                                // the only option at all for an agent that
+                                // announces itself late (Codex) or never (Pi).
+                                if let Some(declared) = role.declared_agent_type() {
+                                    ui.pane_declared_agent
+                                        .insert(role_pane_ids[i].clone(), declared);
+                                }
                             }
                             let start_idx =
                                 orch_config.roles.iter().position(|r| r.start).unwrap_or(0);
@@ -9664,10 +9947,19 @@ fn dispatch_action(
                     // hydration carries it; the local placeholder stays at `None`
                     // until the first `SessionStart` hook fires (pre-M2.13
                     // contract).
-                    let spawn_agent_type = if req.command.is_empty() {
-                        None
-                    } else {
-                        AgentType::from_command(Some(req.command.as_str()))
+                    //
+                    // Issue #308: for a MODE the command is typed in the form
+                    // while the identity may be declared in `[[modes]]`, so the
+                    // declaration answers first — that is the only thing that
+                    // can identify a `devbox run codex-big` agent pane, and it
+                    // drives the wrap below as well as the badge.
+                    let spawn_agent_type = match req.mode_config.as_ref() {
+                        Some(mode) if !req.command.is_empty() => {
+                            mode.resolved_agent_type(req.command.as_str())
+                        }
+                        Some(mode) => mode.declared_agent_type(),
+                        None if req.command.is_empty() => None,
+                        None => AgentType::from_command(Some(req.command.as_str())),
                     };
                     // PRD #20 M8: launch Wrapper-strategy agents (Codex now;
                     // Gemini later) WRAPPED so their stdout is monitored
@@ -9772,6 +10064,17 @@ fn dispatch_action(
                             ui.pane_display_names
                                 .insert(new_id.clone(), resolved_name.clone());
                             ui.pane_names.insert(new_id.clone(), resolved_name);
+                            // Issue #308: a mode may declare what its agent pane
+                            // runs, since that pane's command is typed in this
+                            // form rather than written in the config. A plain
+                            // dashboard card declares nothing and is unchanged.
+                            if let Some(declared) = req
+                                .mode_config
+                                .as_ref()
+                                .and_then(|mode| mode.declared_agent_type())
+                            {
+                                ui.pane_declared_agent.insert(new_id.clone(), declared);
+                            }
                             let mode_name_for_save =
                                 req.mode_config.as_ref().map(|m| m.name.clone());
                             ui.pane_metadata.insert(
@@ -9872,7 +10175,10 @@ fn dispatch_action(
                                                 // launch line here. The persisted
                                                 // `saved.command` stays bare (only
                                                 // the injected line is transformed).
-                                                let launch = wrap_agent_command(&agent_cmd);
+                                                let launch = wrap_agent_command(
+                                                    &agent_cmd,
+                                                    mode_config.declared_agent_type(),
+                                                );
                                                 let _ = pane.write_to_pane(&new_id, &launch);
                                             }
                                         }
@@ -9887,7 +10193,30 @@ fn dispatch_action(
                                         ui.commit_pending_last_command();
                                     }
                                     Err(e) => {
-                                        let _ = pane.close_pane(&new_id);
+                                        // Issue #308 follow-up: the spawn SUCCEEDED
+                                        // and registered this pane id in six places
+                                        // before `open_mode_tab` failed. Unwind all
+                                        // six together via the shared helper — a
+                                        // user who retries a broken mode used to
+                                        // grow every one of those maps by an entry
+                                        // per attempt for the life of the session,
+                                        // and the placeholder session left a card
+                                        // for a pane that no longer existed.
+                                        //
+                                        // Gated on the close actually succeeding: if
+                                        // `close_pane` fails the pane is still live,
+                                        // so its card and metadata must stay visible
+                                        // and recoverable rather than being purged
+                                        // out from under it (PRD #92 F4).
+                                        match pane.close_pane(&new_id) {
+                                            Ok(()) => rollback_abandoned_pane(&new_id, ui, state),
+                                            Err(close_err) => tracing::warn!(
+                                                pane_id = %new_id,
+                                                error = %close_err,
+                                                "mode activation failed and the pane could not be \
+                                                 closed — pane state preserved"
+                                            ),
+                                        }
                                         // PRD #196: the mode-tab spawn FAILED — do
                                         // NOT commit the submit candidate, so a
                                         // failed mode-spawn never pollutes
@@ -11571,6 +11900,15 @@ pub fn run_tui(
                                         .insert(role_pane_ids[i].clone(), role.name.clone());
                                     ui.pane_names
                                         .insert(role_pane_ids[i].clone(), role.name.clone());
+                                    // Issue #308: a restored role keeps its
+                                    // declared badge, so a session restore looks
+                                    // like the tab that was saved rather than
+                                    // reverting every launcher role to
+                                    // "No agent".
+                                    if let Some(declared) = role.declared_agent_type() {
+                                        ui.pane_declared_agent
+                                            .insert(role_pane_ids[i].clone(), declared);
+                                    }
                                 }
                                 // Re-capture the orchestration metadata onto the
                                 // start role pane so a later snapshot keeps the
@@ -11747,10 +12085,14 @@ pub fn run_tui(
             // (the agent command is sent later via `write_to_pane`), so
             // infer agent_type from the saved command rather than from
             // the spawn command (which is `None` here).
+            // Issue #308: the mode's `agent = "…"` declaration answers first, so
+            // a restored declared agent pane badges immediately instead of
+            // waiting for a hook that a launcher-hidden Codex will not send
+            // until its first turn.
             let mode_agent_type = if saved_pane.command.is_empty() {
-                None
+                mode_config.declared_agent_type()
             } else {
-                AgentType::from_command(Some(saved_pane.command.as_str()))
+                mode_config.resolved_agent_type(saved_pane.command.as_str())
             };
             match pane.create_pane_with_options(
                 None,
@@ -11775,6 +12117,25 @@ pub fn run_tui(
                             .insert(new_id.clone(), saved_pane.name.clone());
                     }
                     ui.pane_metadata.insert(new_id.clone(), saved_pane.clone());
+                    // Issue #308: mirror the orchestration-restore insert above
+                    // (`role.declared_agent_type()`), so a restored mode badges
+                    // from the SAME source a freshly-activated one does. The
+                    // spawn above also passes `mode_agent_type` into
+                    // `AgentSpawnOptions`, so `session.agent_type` usually comes
+                    // back hydrated from the daemon and this entry is never
+                    // read — the map is consulted only while that field is
+                    // `AgentType::None`. That makes this insert harmless today
+                    // and load-bearing tomorrow: the fresh path deliberately
+                    // leaves `session.agent_type` at `None` and badges from the
+                    // map, so without this the restored badge would be the one
+                    // display path with no map fallback, and a future rework of
+                    // `create_pane_with_options`'s `agent_type` wiring would
+                    // silently revert restored declared-launcher modes to
+                    // "No agent" — the exact regression this issue exists to
+                    // prevent. The `Err` arm below removes it again.
+                    if let Some(declared) = mode_config.declared_agent_type() {
+                        ui.pane_declared_agent.insert(new_id.clone(), declared);
+                    }
                     // PRD #76 M2.15 fixup pass 2 G1 — compute side-pane
                     // dims so the restored mode's side panes spawn at the
                     // viewport-derived size, not the 24×80 default.
@@ -11807,16 +12168,26 @@ pub fn run_tui(
                                 // (the persisted `saved_pane.command` stays bare).
                                 let _ = pane.write_to_pane(
                                     &new_id,
-                                    &wrap_agent_command(&saved_pane.command),
+                                    &wrap_agent_command(
+                                        &saved_pane.command,
+                                        mode_config.declared_agent_type(),
+                                    ),
                                 );
                             }
                         }
                         Err(e) => {
+                            // Same unwind as the activation arm, through the same
+                            // helper, so the two paths cannot drift apart as
+                            // per-pane maps are added.
+                            //
+                            // Deliberately NOT gated on the close succeeding, unlike
+                            // activation: this arm goes on to substitute a fallback
+                            // dashboard pane for the same saved pane (PRD #69), so
+                            // preserving the abandoned pane's card here would leave
+                            // the user with two cards for one restored pane. That
+                            // trade-off is this path's own, and predates #308.
                             let _ = pane.close_pane(&new_id);
-                            state.blocking_write().unregister_pane(&new_id);
-                            ui.pane_metadata.remove(&new_id);
-                            ui.pane_display_names.remove(&new_id);
-                            ui.pane_names.remove(&new_id);
+                            rollback_abandoned_pane(&new_id, &mut ui, &state);
                             ui.session_warnings.push(format!(
                                 "Warning: failed to restore mode '{}': {e}",
                                 mode_config.name
@@ -11837,8 +12208,13 @@ pub fn run_tui(
                                 terminal.get_frame().area(),
                             );
                             // PRD #76 M2.13: infer agent_type from the
-                            // saved command for the fallback path too.
-                            let fb_agent_type = AgentType::from_command(cmd);
+                            // saved command for the fallback path too — and,
+                            // since issue #308, prefer the mode's declaration:
+                            // the mode failed to restore, but what its agent
+                            // pane runs did not change.
+                            let fb_agent_type = mode_config
+                                .declared_agent_type()
+                                .or_else(|| AgentType::from_command(cmd));
                             match pane.create_pane_with_options(
                                 cmd,
                                 Some(&saved_pane.dir),
@@ -11905,8 +12281,11 @@ pub fn run_tui(
                         terminal.get_frame().area(),
                     );
                     // PRD #76 M2.13: infer agent_type from saved command
-                    // for this outer-error fallback as well.
-                    let fb_agent_type = AgentType::from_command(cmd);
+                    // for this outer-error fallback as well, with the mode's
+                    // issue-#308 declaration taking precedence as above.
+                    let fb_agent_type = mode_config
+                        .declared_agent_type()
+                        .or_else(|| AgentType::from_command(cmd));
                     match pane.create_pane_with_options(
                         cmd,
                         Some(&saved_pane.dir),
@@ -11998,6 +12377,10 @@ pub fn run_tui(
         // mid-session (issue dispatch). Done before the snapshot clone + tab
         // derivation below so a freshly-surfaced tab paints this same frame.
         process_pending_orchestration_surfaces(&state, &pane, &mut tab_manager);
+        // Issue #717: report a dispatched worktree the daemon actually left
+        // on disk. Queued by the event subscriber, drained here because the
+        // status line is `UiState`.
+        drain_worktree_kept(&state, &mut ui);
 
         let snapshot = state.blocking_read().clone();
 
@@ -14338,6 +14721,13 @@ fn render_card_grid(
                 if n <= 9 { Some(n as u8) } else { None }
             };
             let card_area = col_chunks[col_idx];
+            // Issue #308: what this pane's config said it runs, for a launcher
+            // command that says nothing itself. Consulted only while the pane's
+            // agent has not identified itself.
+            let declared_agent_type = session
+                .pane_id
+                .as_deref()
+                .and_then(|pane_id| ui.pane_declared_agent.get(pane_id));
             render_session_card(
                 frame,
                 card_area,
@@ -14350,6 +14740,7 @@ fn render_card_grid(
                 // PRD #341 M4: the live deck's mode, so the seam that pins the
                 // selection accent and the running app cannot disagree.
                 ui.mode,
+                declared_agent_type,
             );
             // PRD #80 M4: record this card's screen rect (paired with its flat
             // selection index) for the mouse hit-test. Safe to mutate `ui` here
@@ -16560,8 +16951,22 @@ fn render_quit_confirm(frame: &mut Frame, selected: usize) -> Vec<(Action, Rect)
 fn render_close_confirm(frame: &mut Frame, state: &CloseConfirmState) -> Vec<(Action, Rect)> {
     let selected = state.selected;
     let area = frame.area();
-    let popup_width = 64u16.min(area.width.saturating_sub(4));
-    let popup_height = 9u16.min(area.height.saturating_sub(4));
+    // Issue #717: the kept-worktree warning adds a headline and a path line.
+    // The path is the actionable half — the user has to `cd` to it — so the
+    // popup WIDENS to fit it rather than truncating by default, and only falls
+    // back to a head-truncation when the terminal itself is too narrow.
+    let kept_lines = if state.kept_worktree.is_some() { 3 } else { 0 };
+    // Saturating rather than `as u16`: the path arrives over the wire, and a
+    // wrapping cast would turn an absurd length into a tiny popup instead of a
+    // wide one clamped to the terminal.
+    let want_width: u16 = state
+        .kept_worktree
+        .as_ref()
+        .map_or(0, |kept| kept.path.chars().count().saturating_add(8))
+        .try_into()
+        .unwrap_or(u16::MAX);
+    let popup_width = want_width.max(64).min(area.width.saturating_sub(4));
+    let popup_height = (9u16 + kept_lines).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -16578,6 +16983,25 @@ fn render_close_confirm(frame: &mut Frame, state: &CloseConfirmState) -> Vec<(Ac
         ),
         Line::from(""),
     ];
+
+    // Issue #717: BEFORE the options, because it changes what the answer means
+    // — a close that keeps a directory full of uncommitted work is a different
+    // decision from one that cleans up after itself, and the user is about to
+    // press Enter.
+    if let Some(kept) = state.kept_worktree.as_ref() {
+        let inner_width = popup_width.saturating_sub(6) as usize;
+        text.push(Line::styled(
+            format!("  {}", kept_worktree_headline(kept)),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        text.push(Line::styled(
+            format!("    {}", truncate_path_head(&kept.path, inner_width)),
+            text_primary(),
+        ));
+        text.push(Line::from(""));
+    }
 
     for (i, (label, desc)) in close_confirm_options(state.scope).iter().enumerate() {
         let cursor = if i == selected { ">" } else { " " };
@@ -18390,8 +18814,31 @@ fn render_session_card(
     // PRD #341 M4: which mode the deck is being rendered in. Only the selected
     // card's accent reads it (see `selected_card_border_style`).
     mode: UiMode,
+    // Issue #308: the agent this pane's config DECLARED, for a pane that made a
+    // declaration and whose agent has not identified itself yet. Used ONLY when
+    // the observed `session.agent_type` is still the neutral placeholder, so an
+    // agent that has reported always wins — a declaration cannot keep
+    // mislabelling a card once the pane says otherwise. `None` for every pane
+    // with no declaration, which is every pane before this key existed and the
+    // default for the L1 render seams.
+    declared_agent_type: Option<&AgentType>,
 ) {
-    let is_placeholder = session.agent_type == crate::event::AgentType::None;
+    // The type the card SHOWS. A launcher command (`devbox run -- codex`)
+    // identifies nothing, so without the declaration this stays
+    // `AgentType::None` and the card reads "No agent" — for Codex, until the
+    // first delegated task, because it posts nothing before its first turn.
+    // Note this is a display decision and nothing more: the readiness gates
+    // that decide WHEN a prompt may be written still read
+    // `session.agent_type`, so a declared pane is drawn immediately and still
+    // waits for its agent to actually start before anything is typed into it.
+    let shown_agent_type = if session.agent_type == crate::event::AgentType::None {
+        declared_agent_type
+            .cloned()
+            .unwrap_or(crate::event::AgentType::None)
+    } else {
+        session.agent_type.clone()
+    };
+    let is_placeholder = shown_agent_type == crate::event::AgentType::None;
     let (status_label, status_style) = if is_placeholder {
         ("No agent", text_primary())
     } else {
@@ -18442,7 +18889,7 @@ fn render_session_card(
     // common case. A non-live card additionally shows a trailing
     // `history` / `view-only` marker.
     let badge_style = Style::default()
-        .fg(crate::agent_registry::spec(&session.agent_type).badge_color)
+        .fg(crate::agent_registry::spec(&shown_agent_type).badge_color)
         .add_modifier(Modifier::BOLD);
     // The marker is appended AFTER the `<type> · <id-or-name>` so the
     // `<type> · …` shape callers match on (e.g. `Codex ·`, `Pi · orch-01`)
@@ -18453,7 +18900,7 @@ fn render_session_card(
     let title_segments: Vec<(String, Style)> = {
         let mut segs = vec![
             (format!(" {sel_prefix}{num_prefix}"), shortcut_style),
-            (format!("{}", session.agent_type), badge_style),
+            (format!("{shown_agent_type}"), badge_style),
             (label_after_badge, title_bold),
         ];
         if !is_live {
@@ -18932,6 +19379,10 @@ pub fn render_card_to_buffer(
 /// assertion about what the user actually sees. `mode` is the ONLY input
 /// [`render_card_to_buffer`] does not expose; that seam is this one pinned to
 /// `UiMode::Normal`.
+///
+/// Issue #308: the pane DECLARATION is the second input this seam does not
+/// expose — see [`render_card_with_declared_agent_to_buffer`], which this one
+/// is pinned to `None` of.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn render_card_for_mode_to_buffer(
@@ -18942,6 +19393,56 @@ pub fn render_card_for_mode_to_buffer(
     tick: u64,
     selected: bool,
     mode: UiMode,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    render_card_with_declared_agent_to_buffer(
+        session,
+        display_name,
+        card_number,
+        density,
+        tick,
+        selected,
+        mode,
+        // Issue #308: the pre-#308 seams declare nothing, so a fixture that
+        // wants a badge here puts the type on the `SessionState` it hands in —
+        // which exercises the OBSERVED branch, not the declared fallback.
+        None,
+        width,
+        height,
+    )
+}
+
+/// Issue #308 L1 seam: render one session card with a pane DECLARATION in play
+/// — the `agent = "…"` a role or mode wrote in `.dot-agent-deck.toml`, which the
+/// deck keeps in `UiState::pane_declared_agent` and hands to the renderer beside
+/// the session.
+///
+/// This exists because the declared badge has exactly one interesting branch and
+/// no other public seam can reach it. `render_session_card` shows
+/// `session.agent_type` whenever it is anything but `AgentType::None`, and falls
+/// back to the declaration only when it is `None`; every other L1 seam hardcodes
+/// the declaration to `None`, so a fixture could only badge a card through
+/// `SessionState.agent_type` — the *other* branch. The one line this feature
+/// turns on was therefore L1-unreachable and covered only at L2
+/// (`codex/spawn/009`, `011`).
+///
+/// The interesting call is `session.agent_type == AgentType::None` **and**
+/// `declared_agent_type == Some(t)`: the card must badge `t` rather than read
+/// "No agent". Pass a session whose `agent_type` is already set to pin the
+/// precedence rule instead — an agent that has identified itself always wins,
+/// and the declaration must not override it.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn render_card_with_declared_agent_to_buffer(
+    session: &SessionState,
+    display_name: Option<&str>,
+    card_number: Option<u8>,
+    density: CardDensityKind,
+    tick: u64,
+    selected: bool,
+    mode: UiMode,
+    declared_agent_type: Option<&AgentType>,
     width: u16,
     height: u16,
 ) -> ratatui::buffer::Buffer {
@@ -18969,6 +19470,7 @@ pub fn render_card_for_mode_to_buffer(
                 card_number,
                 density.into(),
                 mode,
+                declared_agent_type,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -19033,6 +19535,7 @@ pub fn render_dashboard_cards_to_buffer(
                     card_number,
                     card_density,
                     UiMode::Normal,
+                    None,
                 );
             }
         })
@@ -20568,6 +21071,7 @@ pub fn render_new_pane_form_to_buffer(
     let modes: Vec<ModeConfig> = mode_names
         .iter()
         .map(|n| ModeConfig {
+            agent: None,
             name: (*n).to_string(),
             init_command: None,
             seed_prompt: None,
@@ -20607,8 +21111,10 @@ pub fn render_new_pane_orchestration_guard_to_buffer(
     height: u16,
 ) -> ratatui::buffer::Buffer {
     let orchestrations = vec![OrchestrationConfig {
+        default: false,
         name: "tdd-cycle".to_string(),
         roles: vec![crate::project_config::OrchestrationRoleConfig {
+            agent: None,
             name: "orchestrator".to_string(),
             command: "claude".to_string(),
             start: true,
@@ -20653,8 +21159,10 @@ pub fn render_new_pane_orchestration_name_collision_to_buffer(
     height: u16,
 ) -> ratatui::buffer::Buffer {
     let orchestrations = vec![OrchestrationConfig {
+        default: false,
         name: "tdd-cycle".to_string(),
         roles: vec![crate::project_config::OrchestrationRoleConfig {
+            agent: None,
             name: "orchestrator".to_string(),
             command: "claude".to_string(),
             start: true,
@@ -21363,6 +21871,88 @@ mod tests {
         );
     }
 
+    /// Issue #717: the close-confirmation preview asks the daemon about EVERY
+    /// pane a confirmed close would tear down, because a multi-role
+    /// orchestration shares one dispatched worktree across its role panes and
+    /// the daemon resolves that worktree from whichever of them it recognises.
+    /// A tab close that handed over an empty list would silently lose the
+    /// kept-worktree warning for exactly the dispatched TEAMS it matters most
+    /// for, with nothing else failing.
+    #[test]
+    fn close_plan_pane_ids_covers_every_role_pane_of_an_orchestration_tab() {
+        let tmp = tempdir().expect("tempdir");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+
+        let cfg = OrchestrationConfig {
+            default: false,
+            name: "team".to_string(),
+            roles: vec![
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "orchestrator".to_string(),
+                    command: "cat".to_string(),
+                    start: true,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+                OrchestrationRoleConfig {
+                    agent: None,
+                    name: "worker".to_string(),
+                    command: "cat".to_string(),
+                    start: false,
+                    description: None,
+                    prompt_template: None,
+                    clear: false,
+                },
+            ],
+        };
+        tm.open_orchestration_tab(
+            &cfg,
+            tmp.path().to_str().expect("utf-8 tmp path"),
+            None,
+            None,
+            (24, 80),
+        )
+        .expect("open orchestration tab");
+
+        let ids = close_plan_pane_ids(&ClosePlan::Tab { index: 1 }, &tm);
+        let expected = match &tm.tabs()[1] {
+            Tab::Orchestration { role_pane_ids, .. } => role_pane_ids.clone(),
+            _ => panic!("tab 1 should be an orchestration tab"),
+        };
+        assert_eq!(ids, expected, "every role pane must reach the daemon");
+        assert_eq!(ids.len(), 2, "both roles, not just the start role");
+
+        // A dead slot is a placeholder session, not a pane — asking the daemon
+        // about it is noise, and the empty-string sentinel is worse: it would
+        // match nothing while looking like a real id.
+        match &mut tm.tabs_mut()[1] {
+            Tab::Orchestration { role_pane_ids, .. } => {
+                role_pane_ids[1] = format!("{DEAD_SLOT_PREFIX}team-1");
+                role_pane_ids.push(String::new());
+            }
+            _ => panic!("tab 1 should be an orchestration tab"),
+        }
+        let ids = close_plan_pane_ids(&ClosePlan::Tab { index: 1 }, &tm);
+        assert_eq!(
+            ids.len(),
+            1,
+            "the dead slot and the empty sentinel must both be dropped, leaving \
+             only the real pane: {ids:?}"
+        );
+        assert!(
+            !ids[0].is_empty() && !is_dead_slot_pane_id(&ids[0]),
+            "{ids:?}"
+        );
+
+        // The Dashboard is never closable, so a plan pointing at it yields
+        // nothing to ask about rather than a panic.
+        assert!(close_plan_pane_ids(&ClosePlan::Tab { index: 0 }, &tm).is_empty());
+        assert!(close_plan_pane_ids(&ClosePlan::Tab { index: 99 }, &tm).is_empty());
+    }
+
     /// Scenario: PRD #336 (post-review inversion) — the split is GLOBAL, not
     /// per-tab. Open a single orchestration tab A, dispatch the real
     /// `Action::ToggleOrchestrationSplit` against it, then open a second
@@ -21406,9 +21996,11 @@ mod tests {
         );
 
         let cfg = |name: &str| OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "cat".to_string(),
                     start: true,
@@ -21417,6 +22009,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "worker".to_string(),
                     command: "cat".to_string(),
                     start: false,
@@ -21518,9 +22111,11 @@ mod tests {
         let frame_area = Rect::new(0, 0, 100, 40);
 
         let cfg = |name: &str| OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "cat".to_string(),
                     start: true,
@@ -21529,6 +22124,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "worker".to_string(),
                     command: "cat".to_string(),
                     start: false,
@@ -22563,6 +23159,7 @@ mod tests {
 
         fn mk_role(name: &str, start: bool) -> OrchestrationRoleConfig {
             OrchestrationRoleConfig {
+                agent: None,
                 name: name.to_string(),
                 command: String::new(),
                 start,
@@ -22574,6 +23171,7 @@ mod tests {
 
         let state = AppState::default();
         let cfg = OrchestrationConfig {
+            default: false,
             name: "tdd-cycle".into(),
             roles: vec![
                 mk_role("orch", true),
@@ -23159,9 +23757,11 @@ mod tests {
     fn local_config_enrichment_preserved_when_available() {
         use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
         let local = OrchestrationConfig {
+            default: false,
             name: "review".into(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".into(),
                     command: "claude".into(),
                     start: true,
@@ -23170,6 +23770,7 @@ mod tests {
                     clear: true,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "reviewer".into(),
                     command: "claude --model sonnet".into(),
                     start: false,
@@ -23621,9 +24222,11 @@ mod tests {
         use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
 
         let config = OrchestrationConfig {
+            default: false,
             name: "code-review".to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "claude".to_string(),
                     start: true,
@@ -23632,6 +24235,7 @@ mod tests {
                     clear: true,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "coder".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -23640,6 +24244,7 @@ mod tests {
                     clear: true,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "reviewer".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -23789,9 +24394,11 @@ mod tests {
         use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
 
         let config = OrchestrationConfig {
+            default: false,
             name: "test".to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "lead".to_string(),
                     command: "claude".to_string(),
                     start: true,
@@ -23800,6 +24407,7 @@ mod tests {
                     clear: true,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "worker".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -23821,9 +24429,11 @@ mod tests {
         use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
 
         let config = OrchestrationConfig {
+            default: false,
             name: "test".to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "lead".to_string(),
                     command: "claude".to_string(),
                     start: true,
@@ -23832,6 +24442,7 @@ mod tests {
                     clear: true,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "worker".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -25370,6 +25981,7 @@ mod tests {
     /// Mirrors the verified helper in `tab.rs`'s test module (private there).
     fn mode_config_local(name: &str, side_pane_count: usize) -> ModeConfig {
         ModeConfig {
+            agent: None,
             name: name.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -26055,9 +26667,11 @@ mod tests {
     /// exercised. Mirrors the verified helper in `tab.rs`'s test module.
     fn orch_config_local(name: &str) -> OrchestrationConfig {
         OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "echo orch".to_string(),
                     start: true,
@@ -26066,6 +26680,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "coder".to_string(),
                     command: "echo coder".to_string(),
                     start: false,
@@ -26840,9 +27455,11 @@ mod tests {
         // valid role index — otherwise `dashboard_focus_target`'s clamp to
         // `role_count - 1` would mask the leak by coincidentally yielding 1.
         let three_role_orch = OrchestrationConfig {
+            default: false,
             name: "orch".to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "echo orch".to_string(),
                     start: true,
@@ -26851,6 +27468,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "coder".to_string(),
                     command: "echo coder".to_string(),
                     start: false,
@@ -26859,6 +27477,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "reviewer".to_string(),
                     command: "echo reviewer".to_string(),
                     start: false,
@@ -28144,6 +28763,7 @@ mod tests {
 
     fn make_mode(name: &str) -> ModeConfig {
         ModeConfig {
+            agent: None,
             name: name.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -28155,9 +28775,11 @@ mod tests {
 
     fn make_orchestration(name: &str) -> OrchestrationConfig {
         OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "coder".to_string(),
                     command: "claude".to_string(),
                     start: true,
@@ -28166,6 +28788,7 @@ mod tests {
                     clear: true,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "reviewer".to_string(),
                     command: "claude".to_string(),
                     start: false,
@@ -30038,9 +30661,11 @@ mod tests {
         // "dot-agent-deck", a worker role `coder` with clear = true (the
         // respawn the bug silently drops on each delegate).
         let config = OrchestrationConfig {
+            default: false,
             name: CONFIG_NAME.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "echo orch".to_string(),
                     start: true,
@@ -30049,6 +30674,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "coder".to_string(),
                     command: "echo coder".to_string(),
                     start: false,
@@ -30529,8 +31155,10 @@ mod tests {
     fn pane_input_016_orchestrator_prompt_captures_identity_at_tab_creation() {
         let tmp = tempdir().expect("tempdir");
         let config = OrchestrationConfig {
+            default: false,
             name: "capture-at-creation".to_string(),
             roles: vec![OrchestrationRoleConfig {
+                agent: None,
                 name: "orchestrator".to_string(),
                 command: "cat".to_string(),
                 start: true,
@@ -30983,6 +31611,372 @@ mod tests {
             ui.last_command.as_deref(),
             Some("claude --model haiku"),
             "a SUCCESSFUL mode-spawn must persist last_command"
+        );
+    }
+
+    /// A mode config that DECLARES the agent its agent pane launches (issue
+    /// #308), so the `pane_declared_agent` entry the rollback has to unwind
+    /// actually gets registered. Everything else matches
+    /// [`mode_config_local`].
+    fn declared_mode_config_local(name: &str, side_pane_count: usize, agent: &str) -> ModeConfig {
+        ModeConfig {
+            agent: Some(agent.to_string()),
+            ..mode_config_local(name, side_pane_count)
+        }
+    }
+
+    /// Pane controller for the mode-activation FAILURE path that survives a
+    /// RETRY: on every attempt the agent pane succeeds with a fresh
+    /// `mock-pane-N` id and its single side pane fails, so `open_mode_tab`
+    /// returns `Err` on attempt one, attempt two, and every attempt after.
+    /// `FailSidePanePC` above cannot do this — it succeeds exactly once and
+    /// then fails the AGENT pane too, so a second attempt dies before the
+    /// registration block and never reaches the `open_mode_tab` Err arm.
+    ///
+    /// Pair it with a `mode_config_local(_, 1)`-shaped config: one persistent
+    /// side pane and no reactive panes means exactly two `create_pane` calls
+    /// per attempt, so the even/odd split IS the agent-pane/side-pane split.
+    ///
+    /// `close_fails` drives the other half of the rollback guard: a pane whose
+    /// `close_pane` failed is still LIVE, so its registrations must survive.
+    struct ModeRetryPC {
+        calls: std::sync::Mutex<u32>,
+        created: std::sync::Mutex<Vec<String>>,
+        close_fails: bool,
+    }
+    impl ModeRetryPC {
+        fn new(close_fails: bool) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(0),
+                created: std::sync::Mutex::new(Vec::new()),
+                close_fails,
+            }
+        }
+        /// Every agent-pane id handed out, in order — one per activation
+        /// attempt that genuinely got as far as registering a pane.
+        fn created(&self) -> Vec<String> {
+            self.created.lock().unwrap().clone()
+        }
+    }
+    impl crate::pane::PaneController for ModeRetryPC {
+        fn create_pane(
+            &self,
+            _cmd: Option<&str>,
+            _cwd: Option<&str>,
+        ) -> Result<String, crate::pane::PaneError> {
+            let mut n = self.calls.lock().unwrap();
+            let idx = *n;
+            *n += 1;
+            if idx.is_multiple_of(2) {
+                let id = format!("mock-pane-{idx}");
+                self.created.lock().unwrap().push(id.clone());
+                Ok(id)
+            } else {
+                Err(crate::pane::PaneError::CommandFailed(
+                    "side pane spawn failed".to_string(),
+                ))
+            }
+        }
+        fn write_to_pane(&self, _id: &str, _text: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn close_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+            if self.close_fails {
+                Err(crate::pane::PaneError::CommandFailed(
+                    "pane is still live".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        fn rename_pane(
+            &self,
+            _id: &str,
+            name: &str,
+        ) -> Result<crate::pane::RenameOutcome, crate::pane::PaneError> {
+            Ok(crate::pane::RenameOutcome::applied(name))
+        }
+        fn focus_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, crate::pane::PaneError> {
+            Ok(Vec::new())
+        }
+        fn resize_pane(
+            &self,
+            _id: &str,
+            _direction: crate::pane::PaneDirection,
+            _amount: u16,
+        ) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn toggle_layout(&self) -> Result<(), crate::pane::PaneError> {
+            Ok(())
+        }
+        fn name(&self) -> &str {
+            "mode-retry-mock"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Dispatch one mode `Action::SpawnPane` whose `open_mode_tab` fails, and
+    /// assert the handler really took the Err arm. Shared by the three
+    /// `rollback_abandoned_pane` tests below so each one asserts only its own
+    /// property.
+    fn dispatch_failing_mode_activation(
+        pc: &ModeRetryPC,
+        ui: &mut UiState,
+        state: &SharedState,
+        tab_manager: &mut TabManager,
+        snapshot: &AppState,
+        filtered: &[(&String, &SessionState)],
+    ) {
+        let _ = dispatch_action(
+            Action::SpawnPane(Box::new(mode_card_request(
+                "/work/mode-card",
+                "claude --model haiku",
+                declared_mode_config_local("m", 1, "claude"),
+            ))),
+            ui,
+            pc,
+            state,
+            tab_manager,
+            snapshot,
+            filtered,
+            None,
+            Rect::new(0, 0, 80, 24),
+        );
+        assert!(
+            ui.status_message
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("Mode activation failed")),
+            "precondition: the mode activation actually failed (Err arm), got {:?}",
+            ui.status_message.as_ref().map(|(m, _)| m)
+        );
+    }
+
+    /// Issue #308 follow-up: a mode spawn that SUCCEEDS and is then abandoned
+    /// because `open_mode_tab` failed must leave NO trace of its pane. Dispatch
+    /// a mode `Action::SpawnPane` against a controller that fails the side pane
+    /// (so the agent pane is created and registered, then given up on) and
+    /// assert all six per-pane registrations are gone: `managed_pane_ids`, the
+    /// placeholder session, `pane_display_names`, `pane_names`, `pane_metadata`
+    /// and `pane_declared_agent`. The session is the user-visible half — a
+    /// surviving placeholder renders a dashboard card for a pane that no longer
+    /// exists. The `close_pane`-fails sibling below is the positive control
+    /// that these six really are registered on this path, so the absences here
+    /// are not vacuous.
+    #[test]
+    fn mode_activation_failure_unwinds_every_pane_registration() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(ModeRetryPC::new(false));
+        let mut tab_manager = TabManager::new(pc.clone());
+
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        dispatch_failing_mode_activation(
+            &pc,
+            &mut ui,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+        );
+
+        let pane_id = pc
+            .created()
+            .first()
+            .cloned()
+            .expect("the agent pane was created before the mode tab failed");
+
+        let st = state.blocking_read();
+        assert!(
+            !st.managed_pane_ids.contains(&pane_id),
+            "the abandoned pane must be unregistered"
+        );
+        assert!(
+            !st.sessions.contains_key(&format!("pane-{pane_id}")),
+            "the placeholder session must go — it renders a card for a pane that is gone"
+        );
+        assert!(
+            st.sessions
+                .values()
+                .all(|s| s.pane_id.as_deref() != Some(pane_id.as_str())),
+            "no session may still point at the abandoned pane"
+        );
+        assert!(
+            st.sessions.contains_key("s0"),
+            "unrelated sessions must survive the rollback"
+        );
+        drop(st);
+
+        assert!(
+            !ui.pane_display_names.contains_key(&pane_id),
+            "pane_display_names must not keep the abandoned pane"
+        );
+        assert!(
+            !ui.pane_names.contains_key(&pane_id),
+            "pane_names must not keep the abandoned pane"
+        );
+        assert!(
+            !ui.pane_metadata.contains_key(&pane_id),
+            "pane_metadata must not keep the abandoned pane"
+        );
+        assert!(
+            !ui.pane_declared_agent.contains_key(&pane_id),
+            "pane_declared_agent must not keep the abandoned pane"
+        );
+    }
+
+    /// Issue #308 follow-up, the other side of the guard: when the abandoned
+    /// pane's `close_pane` FAILS the pane is still live, so nothing may be
+    /// rolled back — a running agent behind no card at all is strictly worse
+    /// than a stale one, and PRD #92 F4 already draws that line for an explicit
+    /// `Ctrl+W` close. Same dispatch as the sibling above but with a controller
+    /// whose `close_pane` returns `Err`, asserting all six registrations
+    /// SURVIVE. Flipping the handler's `match pane.close_pane(..)` back to an
+    /// unconditional `rollback_abandoned_pane` fails every one of them.
+    #[test]
+    fn mode_activation_failure_with_unclosable_pane_preserves_every_registration() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(ModeRetryPC::new(true));
+        let mut tab_manager = TabManager::new(pc.clone());
+
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        dispatch_failing_mode_activation(
+            &pc,
+            &mut ui,
+            &state,
+            &mut tab_manager,
+            &snapshot,
+            &filtered,
+        );
+
+        let pane_id = pc
+            .created()
+            .first()
+            .cloned()
+            .expect("the agent pane was created before the mode tab failed");
+
+        let st = state.blocking_read();
+        assert!(
+            st.managed_pane_ids.contains(&pane_id),
+            "a pane that could not be closed is still live and must stay registered"
+        );
+        assert!(
+            st.sessions.contains_key(&format!("pane-{pane_id}")),
+            "a still-live pane must keep its card — the placeholder session must survive"
+        );
+        drop(st);
+
+        assert_eq!(
+            ui.pane_display_names.get(&pane_id).map(String::as_str),
+            Some("card"),
+            "a still-live pane must keep its display name"
+        );
+        assert_eq!(
+            ui.pane_names.get(&pane_id).map(String::as_str),
+            Some("card"),
+            "a still-live pane must keep its name"
+        );
+        assert_eq!(
+            ui.pane_metadata
+                .get(&pane_id)
+                .map(|saved| saved.dir.as_str()),
+            Some("/work/mode-card"),
+            "a still-live pane must keep its metadata so it stays recoverable"
+        );
+        assert_eq!(
+            ui.pane_declared_agent.get(&pane_id),
+            Some(&AgentType::ClaudeCode),
+            "a still-live pane must keep its declared agent, so its badge is still right"
+        );
+    }
+
+    /// Issue #308 follow-up: the original leak symptom. Retrying a broken mode
+    /// used to grow every per-pane map by an entry per attempt for the life of
+    /// the session. Two failed activations in a row — each one a genuinely
+    /// distinct pane id, asserted below — must leave the maps exactly as they
+    /// were before the first, which is also what catches a rollback that
+    /// unwinds five of the six maps.
+    #[test]
+    fn repeated_mode_activation_failures_do_not_accumulate_pane_state() {
+        use tokio::sync::RwLock;
+
+        let pc = Arc::new(ModeRetryPC::new(false));
+        let mut tab_manager = TabManager::new(pc.clone());
+
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let mut filtered: Vec<(&String, &SessionState)> = snapshot.sessions.iter().collect();
+        filtered.sort_by(|a, b| a.0.cmp(b.0));
+
+        let mut ui = default_ui();
+        let sessions_before = state.blocking_read().sessions.len();
+        assert!(
+            ui.pane_display_names.is_empty()
+                && ui.pane_names.is_empty()
+                && ui.pane_metadata.is_empty()
+                && ui.pane_declared_agent.is_empty(),
+            "precondition: zero activations means zero per-pane entries"
+        );
+
+        for _ in 0..2 {
+            dispatch_failing_mode_activation(
+                &pc,
+                &mut ui,
+                &state,
+                &mut tab_manager,
+                &snapshot,
+                &filtered,
+            );
+        }
+
+        assert_eq!(
+            pc.created(),
+            vec!["mock-pane-0".to_string(), "mock-pane-2".to_string()],
+            "precondition: both attempts registered a DISTINCT pane before failing, \
+             so a leak would show up as two entries rather than one"
+        );
+
+        let st = state.blocking_read();
+        assert!(
+            st.managed_pane_ids.is_empty(),
+            "two failed activations must leave no registered panes, got {:?}",
+            st.managed_pane_ids
+        );
+        assert_eq!(
+            st.sessions.len(),
+            sessions_before,
+            "two failed activations must leave no extra session cards"
+        );
+        drop(st);
+
+        assert!(
+            ui.pane_display_names.is_empty(),
+            "pane_display_names leaked"
+        );
+        assert!(ui.pane_names.is_empty(), "pane_names leaked");
+        assert!(ui.pane_metadata.is_empty(), "pane_metadata leaked");
+        assert!(
+            ui.pane_declared_agent.is_empty(),
+            "pane_declared_agent leaked"
         );
     }
 
@@ -33949,9 +34943,11 @@ mod tests {
     /// by the lock tests below.
     fn lock_test_orch_config(name: &str) -> OrchestrationConfig {
         OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "cat".to_string(),
                     start: true,
@@ -33960,6 +34956,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "worker".to_string(),
                     command: "cat".to_string(),
                     start: false,

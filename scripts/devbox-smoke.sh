@@ -41,6 +41,12 @@ task --version
 jq --version
 rg --version
 
+echo "== desktop gui toolchain =="
+# The Tauri preview under desktop/ is the only consumer; pinned in devbox.json
+# so contributors do not hand-install a JS toolchain (PRD #176).
+node --version
+pnpm --version
+
 echo "== recording toolchain =="
 asciinema --version
 agg --version

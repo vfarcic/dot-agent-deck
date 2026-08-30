@@ -9,13 +9,19 @@
 //! Unicode bidi override in one of them can repaint, reorder or hide text the
 //! user is relying on to make a decision.
 //!
-//! The policy here is to **strip**, not escape: these values land in
+//! Two policies live here, and which one is right depends on where the value
+//! lands. [`strip_control_and_bidi`] **strips**, because its values land in
 //! width-constrained regions (a dashboard card title gets whatever columns the
-//! status badge leaves it), and `\x1b` expanding to four visible characters
-//! would spend that budget on the attacker's behalf. Escaping is right for a
-//! diagnostic line that wants to show what was there — see
-//! `keybindings::sanitize_for_terminal`, which does exactly that for a warning
-//! printed once to stderr — and wrong for a title that has to stay readable.
+//! status badge leaves it) and `\x1b` expanding to four visible characters
+//! would spend that budget on the attacker's behalf.
+//! [`escape_control_and_bidi`] **escapes**, because a diagnostic line wants to
+//! *show* that the producer sent something peculiar rather than quietly hide
+//! it, and has a whole scrollback line to spend saying so — see
+//! `keybindings::sanitize_for_terminal`, which does the same for a warning
+//! printed once to stderr, and `remote_doctor::render`, which routes every
+//! producer-controlled field of its report through the escaping form (PRD
+//! #345 audit). Pick stripping for a value that has to stay readable inside a
+//! fixed box, escaping for one whose whole purpose is to be inspected.
 //!
 //! This is now the single implementation of the control+bidi filter.
 //! [`crate::build_version_handshake`] carried a byte-identical copy until issue
@@ -69,6 +75,39 @@ pub fn strip_control_and_bidi(s: &str, keep_newlines: bool) -> String {
             !(c.is_control() || is_bidi_format_char(c))
         })
         .collect()
+}
+
+/// Escape, rather than drop, every character [`strip_control_and_bidi`] would
+/// remove: C0/C1 controls (ESC, NUL, CR, LF, DEL and friends) become their
+/// `\n` / `\u{1b}` source form, and the bidi formatting / override
+/// codepoints become `\u{202e}`-style escapes. Everything else — accents,
+/// CJK, emoji, punctuation — passes through byte for byte.
+///
+/// Use this on producer-controlled text written to a **diagnostic**, where the
+/// reader is trying to work out what a peer actually sent. Silently stripping
+/// there would hide the very evidence the line exists to carry, and the
+/// diagnostic's own conclusions are what an attacker wants to repaint: PRD
+/// #345's `remote doctor` quotes ssh's stderr, the remote's registry entry and
+/// the listen specs `ssh -G` resolved, every one of which a hostile remote or
+/// a planted `~/.ssh/config` can fill with CSI/OSC sequences that clear the
+/// screen, retitle the terminal or forge a hyperlink.
+///
+/// The result contains no control characters, so applying this twice is a
+/// no-op on the second pass — callers may escape at the boundary where the
+/// value enters an error type *and* again at the render seam without producing
+/// `\\u{1b}`.
+pub fn escape_control_and_bidi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else if is_bidi_format_char(c) {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Sanitize a producer-supplied display name into something safe to store and
@@ -149,6 +188,46 @@ mod tests {
                 "ab",
                 "U+{:04X} survived the filter",
                 c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn escape_control_and_bidi_shows_what_was_sent_instead_of_hiding_it() {
+        // The same fixture the stripping test uses, so the two policies are
+        // directly comparable: every class survives as visible evidence.
+        let dirty = "ze\x1b[31mta\0-li\u{202e}ve\x7f-\u{0085}77\r\n";
+        let escaped = escape_control_and_bidi(dirty);
+        assert_eq!(
+            escaped,
+            "ze\\u{1b}[31mta\\u{0}-li\\u{202e}ve\\u{7f}-\\u{85}77\\r\\n"
+        );
+        // Nothing a terminal acts on may survive — that is the whole point.
+        assert!(
+            !escaped
+                .chars()
+                .any(|c| c.is_control() || is_bidi_format_char(c)),
+            "escaped output still carries a live control/bidi character: {escaped:?}"
+        );
+
+        // Ordinary text is untouched, so a report stays readable.
+        assert_eq!(escape_control_and_bidi("café-日本-🎉"), "café-日本-🎉");
+        assert_eq!(
+            escape_control_and_bidi("port 1080 is bound"),
+            "port 1080 is bound"
+        );
+    }
+
+    #[test]
+    fn escape_control_and_bidi_is_idempotent() {
+        // Callers escape at the error boundary AND again at the render seam;
+        // a second pass must not turn `\u{1b}` into `\\u{1b}`.
+        for raw in ["\x1b]0;pwn\x07", "a\u{202e}b", "plain", "back\\slash"] {
+            let once = escape_control_and_bidi(raw);
+            assert_eq!(
+                escape_control_and_bidi(&once),
+                once,
+                "escaping {raw:?} twice changed the result"
             );
         }
     }

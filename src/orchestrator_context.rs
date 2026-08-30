@@ -231,6 +231,7 @@ mod tests {
         desc: Option<&str>,
     ) -> OrchestrationRoleConfig {
         OrchestrationRoleConfig {
+            agent: None,
             name: name.to_string(),
             command: "cat".to_string(),
             start,
@@ -242,6 +243,7 @@ mod tests {
 
     fn config() -> OrchestrationConfig {
         OrchestrationConfig {
+            default: false,
             name: "digest".to_string(),
             roles: vec![
                 role("orchestrator", true, Some("You lead the team."), None),

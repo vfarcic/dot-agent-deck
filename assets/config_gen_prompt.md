@@ -127,6 +127,9 @@ Reference material for step 4. **Agent orchestrations** are multi-agent workflow
 ```toml
 [[orchestrations]]
 name = "orchestration-name"   # e.g., "code-review", "tdd-cycle"
+# default = true              # Only when proposing SEVERAL — the one a scheduled task opens
+# extends = "other-name"      # Only when proposing SEVERAL — inherit that one's roles,
+                              # then override below by role name (omit a field to keep the parent's)
 
 [[orchestrations.roles]]
 name = "orchestrator"         # The orchestrator role — delegates work, never does it
@@ -161,7 +164,11 @@ description = "Reviews code changes for correctness, style, and edge cases"
 - **Worker `prompt_template`** is optional standing instructions, NOT task instructions. The orchestrator provides task instructions each time via delegation.
 - **`clear = true` (default)**: Restarts the agent session between delegations for context isolation. Set `clear = false` for agents that need to resume after a failure (e.g. a `release` agent retrying after a CI hiccup).
 - **`command`**: Use the full invocation form of a project launcher (discovered in step 1), matched by semantic intent — e.g. `command = "devbox run agent-strong"`, never just `"agent-strong"`, because devbox/npm/task scripts are not binaries on PATH. If the project has no launcher convention, fall back to a bare CLI that is on PATH; if multiple agent CLIs are available with no project signal, ask the user. Verify availability with `which <runner-or-binary>` before including it.
-- **Propose exactly one orchestration.** Combine all relevant workers into that single orchestration — the orchestrator routes each task to the right worker. Do NOT present multiple orchestrations as either/or alternatives.
+- **One orchestration is the right answer for most projects.** Combine all relevant workers into it — the orchestrator routes each task to the right worker. Do NOT split a team across several orchestrations just because it has several kinds of worker.
+- **Propose more than one only when the project has genuinely different WORKFLOWS**, not different workers: a PRD/feature flow that needs a test-plan gate and a release step, versus a quick bug-fix flow that does not; or the same team wired to a second set of agent CLIs so contributors who only have one provider's credentials can still run it. If you propose several, name them for the workflow (`prd`, `issue`, `review`) or the provider (`anthropic`, `GPT`) — never `orchestration-1`.
+- **Never present orchestrations as an either/or menu.** Propose the whole set you think the project wants and let the user drop from it, the same way you present modes. A multiple-choice question costs a round-trip the user did not need.
+- **When you propose more than one, use `extends` rather than copying.** A block with `extends = "<other-name>"` inherits that orchestration's roles; its own `[[orchestrations.roles]]` entries then override them by role name, and anything they leave out keeps the parent's value. Provider variants are usually six `command` lines and nothing else. Copying the whole block instead guarantees the copies drift.
+- **When you propose more than one, put `default = true` on exactly one of them.** That is the one a SCHEDULED task opens, and a scheduled run has nobody to ask. It is not used by the `Ctrl+n` form or by a dispatcher agent, both of which list every orchestration and ask the user — so with a single orchestration the key is unnecessary; omit it.
 
 ### Worked Example
 

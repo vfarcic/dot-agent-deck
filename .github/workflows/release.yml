@@ -272,14 +272,21 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
       - name: Install cross
         if: matrix.use_cross
-        run: cargo install cross --locked
+        # Issue #323: `--locked` pins cross's own dependency GRAPH, not the
+        # version of cross being installed, so without `--version` this resolved
+        # whatever crates.io called newest. 0.2.5 is not an arbitrary choice —
+        # it is the version the `CROSS_BUILD_ENV_PASSTHROUGH` measurement below
+        # was taken on, and an unpinned install is what let that measurement
+        # silently stop describing the binary actually running. The same pin is
+        # in aarch64-crossbuild-check.yml, which exists to mirror this leg.
+        run: cargo install cross --locked --version 0.2.5
       - name: Build
         # Issue #250: bake the version being released into the binary rather than
         # letting `build.rs` re-derive it from the checkout.
@@ -306,8 +313,8 @@ jobs:
           # `build.env.passthrough` in a `Cross.toml` (whitespace-separated
           # list) and is inert for the plain `cargo build` targets.
           #
-          # MEASURED, not assumed (cross 0.2.5, the version `cargo install cross
-          # --locked` resolves to today): with this set, the build script inside
+          # MEASURED, not assumed (cross 0.2.5, now the version the install step
+          # above pins explicitly): with this set, the build script inside
           # the aarch64 container observes DAD_VERSION and resolves
           # `source=INJECTED`; with it unset the variable is absent inside the
           # container and the script falls back to the checkout's git tag. That
@@ -317,9 +324,11 @@ jobs:
           CROSS_BUILD_ENV_PASSTHROUGH: DAD_VERSION
           # Second, independent channel for the same value, because the line
           # above is the only thing standing between a dispatch release and a
-          # mislabeled ARM64 binary, and `cargo install cross --locked` is NOT
-          # version-pinned — a future cross release could rename or retire its
+          # mislabeled ARM64 binary — a cross release could rename or retire its
           # passthrough allowlist and this leg would go quiet rather than fail.
+          # Since #323 the install is version-pinned, so such a change can now
+          # only arrive with a visible bump to that pin rather than on its own;
+          # this channel stays as the second, independent line of defense.
           # `CROSS_CONTAINER_OPTS` is appended to cross's `docker run` argv, so
           # `-e DAD_VERSION` forwards the host value through docker itself,
           # below cross's own config layer. Measured to be sufficient ON ITS OWN

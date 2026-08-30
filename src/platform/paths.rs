@@ -322,23 +322,325 @@ pub const DEFAULT_BINARY_NAME: &str = env!("CARGO_PKG_NAME");
 /// could not verify may still be perfectly runnable there, and conversely a
 /// literal `dot-agent-deck` fallback can name a binary that was never
 /// installed at all. Instead this falls back to `current_exe()`'s own
-/// **absolute path**, quoted with [`shell_quote_if_needed`] so a path
-/// containing whitespace still parses as one argument — a path is independent
-/// of whatever `$PATH` the agent's shell ends up with, and it names this
-/// exact running binary rather than whatever `$PATH` might resolve that name
-/// to, so it resolves correctly regardless of which proxy this process's own
-/// `$PATH` turned out to be.
+/// **absolute path**, spelled and quoted for a POSIX shell by
+/// [`posix_command_word`] so a path containing whitespace still parses as one
+/// argument — a path is independent of whatever `$PATH` *or cwd* the agent's
+/// shell ends up with, and it names this exact running binary rather than
+/// whatever `$PATH` might resolve that name to, so it resolves correctly
+/// regardless of which proxy this process's own `$PATH` turned out to be.
+///
+/// **That last claim is only true because the path is absolutised here, and
+/// it was not before (issue #560).** `current_exe()` is not documented to
+/// return an absolute path and on macOS does not: it is backed by
+/// `_NSGetExecutablePath`, which reports the path the process was INVOKED as
+/// (the same platform fact the symlink paragraph above records), so a deck
+/// launched as `./target/release/dot-agent-deck` used to emit exactly that
+/// relative word into the worker task footer. The worker then resolved it
+/// against ITS OWN cwd — an orchestration directory or a git worktree, never
+/// the deck's launch directory — and the command failed, silently, for the
+/// reason the last paragraph below gives. Linux never exhibited it, because
+/// `/proc/self/exe` is kernel-resolved and therefore always absolute; the
+/// defect was invisible on the platform the project develops on.
+/// [`std::path::absolute`] is what closes it: purely lexical plus the cwd, no
+/// filesystem access, and — unlike [`std::fs::canonicalize`] — it does not
+/// resolve symlinks, so it makes "absolute" true by construction without
+/// silently taking a position on the platform-dependent symlink behaviour
+/// documented above.
+///
+/// **The emitted word targets a POSIX shell on every platform, including
+/// Windows (issue #561).** That is not a default — it is what the text this
+/// word is interpolated into already says: both consumers fence it in
+/// ```` ```bash ```` and `state::work_done_footer` instructs the worker in
+/// prose to run it "via Bash". `cmd.exe` and PowerShell are deliberately NOT
+/// targeted, and neither could be by quoting alone: PowerShell needs the `&`
+/// call operator before a quoted string for it to be a command at all, and
+/// this repo implements no PowerShell quoting anywhere to borrow from.
+/// (`hooks_manage`'s `#[cfg(windows)]` `shell_quote_if_needed` is a `cmd.exe`
+/// quoter, but it is for a different consumer — a hook command line Claude
+/// Code hands to the *native* shell — and its own doc records that `cmd.exe`
+/// expands `%VAR%` even inside double quotes, which quoting cannot undo.)
+///
+/// Targeting POSIX is not enough on its own, though, because a POSIX shell
+/// will not treat a backslash-separated Windows path as a **path** however
+/// well it is quoted: POSIX (XCU 2.9.1.1) makes a command word containing at
+/// least one `/` a pathname and every other command word a `$PATH` lookup, so
+/// `'C:\Users\me\dot-agent-deck.exe'` is looked up in `$PATH` and reported as
+/// `command not found` — measured against real bash, not assumed. So the
+/// fallback respells a Windows path with `/` separators before quoting it,
+/// which is lossless (`/` is not a legal character in a Windows file name),
+/// is the spelling `shell_quote_if_needed`'s own safe set already treats as
+/// needing no quotes at all, and is what git-bash / WSL / MSYS want.
 ///
 /// [`DEFAULT_BINARY_NAME`] remains the fallback only when `current_exe()`
-/// itself is unusable: an error, an empty file name, or (Unix) a file name
-/// that is not valid UTF-8. The fallback matters more here than at most other
-/// `current_exe()` call sites: `delegate` and `work-done` write to the
-/// unversioned hook socket, both call sites are fire-and-forget, and the
-/// daemon drops any frame it cannot parse without logging it — so a name that
-/// resolves to a binary that cannot run produces no error anywhere, only a
-/// signal that silently never arrives.
+/// itself is unusable: an error, an empty file name, (Unix) a file name that
+/// is not valid UTF-8, a path that cannot be made absolute, or a Windows path
+/// with no POSIX spelling (see [`posix_command_word`]). The fallback matters
+/// more here than at most other `current_exe()` call sites: `delegate` and
+/// `work-done` write to the unversioned hook socket, both call sites are
+/// fire-and-forget, and the daemon drops any frame it cannot parse without
+/// logging it — so a name that resolves to a binary that cannot run produces
+/// no error anywhere, only a signal that silently never arrives.
 pub fn binary_name() -> String {
     resolve_binary_name(effective_current_exe(), resolves_on_path)
+}
+
+/// The absolute path this build should write into **another program's
+/// persistent configuration** — a hook command in `~/.claude/settings.json` or
+/// `~/.codex/hooks.json`, Devin's `config.json`, or the OpenCode plugin's
+/// `BINARY_PATH` (PRD #381).
+///
+/// This is deliberately **not** [`binary_name`] and deliberately not built on
+/// it. `binary_name()` answers "what text tells an agent to run the deck", and
+/// its best answer is often a BARE name the agent's own shell resolves through
+/// `$PATH`. That answer is never acceptable here: these commands run under
+/// `/bin/sh` with an environment the deck does not control, and the field
+/// failure this function exists for was exactly a `sh` `$PATH` miss
+/// (`/bin/sh: 1: …/target/release/dot-agent-deck: not found`). Everything this
+/// returns is an absolute path to a file that existed at resolution time —
+/// never a bare name, never relative.
+///
+/// Resolution order:
+///
+/// 1. `current_exe()`, when it is a usable absolute path to an executable file
+///    that is **not** a cargo build artifact ([`is_build_artifact_path`]). An
+///    installed binary performing its own install is the normal, correct case
+///    and must keep working.
+/// 2. It IS a build artifact — gitignored, deleted by `cargo clean`, and gone
+///    the moment its worktree is pruned, so it must never be persisted:
+///    - **2a.** `<home>/.local/bin/dot-agent-deck`, when that exists and is
+///      executable — the same choice `remote.rs`'s remote install already
+///      makes ("Use the absolute path consistently");
+///    - **2b.** otherwise the first `dot-agent-deck` reachable through an
+///      absolute, non-artifact `$PATH` entry, as its own absolute path;
+///    - **2c.** otherwise **refuse**: return `Err`, and the caller writes
+///      nothing at all.
+///
+///    A 2a or 2b candidate must additionally be owner-writable only
+///    ([`write_mode_is_owner_only`]); one the group or the world can rewrite
+///    is skipped and the walk continues. That check is scoped to 2a and 2b,
+///    and deliberately does not extend to owners, ancestor directories or
+///    symlink targets — see issue #732.
+/// 3. `current_exe()` failing outright is also a refusal, **never** a fallback
+///    to [`DEFAULT_BINARY_NAME`] (issue #536). A bare `dot-agent-deck` in a
+///    file Claude Code hands to `/bin/sh` re-opens the same `$PATH` miss in
+///    the one place the deck can least afford it, and unlike [`binary_name`]'s
+///    consumers there is no shell here whose `$PATH` might still save it.
+///
+/// **The 2a candidate is deliberately NOT canonicalized.** On Linux
+/// `current_exe()` reads `/proc/self/exe`, which the kernel resolves fully, so
+/// a user who runs `~/.local/bin/dot-agent-deck` where that is a symlink into
+/// a cargo target directory arrives at step 1 holding a `target/` path, falls
+/// through to 2a, and gets the durable **symlink** path written. That is the
+/// desired outcome — canonicalizing 2a would resolve it straight back to the
+/// artifact and defeat the fix. It is also what lets the e2e harness point a
+/// sandbox `~/.local/bin` at the binary under test.
+///
+/// **"Exists and is executable" is the whole gate — a candidate is never
+/// executed** (PRD #381 Open Question 5, decided deliberately). This does a
+/// `stat` and, on Unix, checks the executable bit; it spawns nothing. Running
+/// a candidate to prove it works would put a subprocess on the silent
+/// dashboard-startup path and add a new failure mode there, to catch a
+/// version-skew problem the PRD puts out of scope: an installed deck of a
+/// different version is still a *durable* path, which is all this function
+/// claims to find.
+pub fn durable_binary_path() -> Result<String, String> {
+    durable_binary_path_with(
+        effective_current_exe(),
+        &home_dir(),
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+/// [`durable_binary_path`] with its three environmental inputs injected: the
+/// running executable, the home anchor step 2a hangs off, and the `$PATH`
+/// value step 2b walks.
+///
+/// Public because it is the seam PRD #381 M3 exists to open. `hooks_manage`'s
+/// auto-install seam used to hardcode `let binary_path =
+/// "dot-agent-deck".to_string();`, so **no test ever executed the derivation
+/// that produced the field defect** — the PRD calls closing that its
+/// highest-value milestone. A test has to be able to drive this with a
+/// `…/target/release/dot-agent-deck` `current_exe()` of its own choosing, and
+/// a real unusable `current_exe()` cannot be manufactured on demand.
+///
+/// Only the **inputs** are synthetic. The existence and executable-bit checks
+/// are the real ones against the real filesystem, and the `$PATH` walk is the
+/// real one — same precedent as [`first_path_match`], which is likewise pure
+/// over its `path` argument — so a test that passes a `tempfile` home and a
+/// `tempfile`-backed `$PATH` exercises production logic rather than a parallel
+/// copy of it.
+pub fn durable_binary_path_with(
+    current_exe: std::io::Result<PathBuf>,
+    home: &Path,
+    path_value: Option<&std::ffi::OsStr>,
+) -> Result<String, String> {
+    let name = durable_binary_file_name();
+    let installed = home.join(".local").join("bin").join(&name);
+
+    let exe = match current_exe {
+        Ok(exe) => exe,
+        // Issue #536: this is a refusal, NOT a fall back to the bare crate
+        // name. See the doc comment above.
+        Err(e) => {
+            return Err(format!(
+                "refusing to write a dot-agent-deck hook command: the running executable's own \
+                 path is unavailable ({e}), so there is no absolute path to write and a bare \
+                 command name would be resolved by whatever `$PATH` the agent's `/bin/sh` \
+                 happens to have. {}",
+                repair_advice(&installed)
+            ));
+        }
+    };
+    // `current_exe()` is only guaranteed absolute on Linux (`/proc/self/exe`);
+    // on macOS it reports the invocation path (issue #560), so absolutise
+    // before deciding anything about it. Purely lexical plus the cwd, and
+    // deliberately not `canonicalize` — resolving symlinks here would turn a
+    // durable `~/.local/bin` launch into the artifact it points at.
+    let absolute = std::path::absolute(&exe).unwrap_or(exe);
+
+    if !is_build_artifact_path(&absolute)
+        && is_executable_file(&absolute)
+        && let Some(path) = durable_path_string(&absolute)
+    {
+        return Ok(path);
+    }
+
+    // `write_mode_is_owner_only` is step 2a's and 2b's, never step 1's — see
+    // that function, and issue #732 for the checks deliberately left out of it.
+    if !is_build_artifact_path(&installed)
+        && is_executable_file(&installed)
+        && write_mode_is_owner_only(&installed)
+        && let Some(path) = durable_path_string(&installed)
+    {
+        return Ok(path);
+    }
+
+    if let Some(path_value) = path_value
+        && let Some(found) = first_durable_path_match(path_value, &name)
+        && let Some(path) = durable_path_string(&found)
+    {
+        return Ok(path);
+    }
+
+    Err(format!(
+        "refusing to write `{}` into agent hook config: {}. No durable dot-agent-deck was found \
+         at `{}` or on `$PATH`, and a hook command pointing at a path that will not exist is \
+         worse than no hook at all. {}",
+        absolute.display(),
+        rejection_reason(&absolute),
+        installed.display(),
+        repair_advice(&installed)
+    ))
+}
+
+/// Why `exe` was not usable as the written path, for the refusal message.
+fn rejection_reason(exe: &Path) -> String {
+    if is_build_artifact_path(exe) {
+        "it is a cargo build artifact — gitignored, removed by `cargo clean`, and gone the \
+         moment its worktree is pruned"
+            .to_string()
+    } else {
+        "it is not a usable absolute path to an executable file".to_string()
+    }
+}
+
+/// The actionable half of every refusal message: what the operator can do.
+fn repair_advice(installed: &Path) -> String {
+    format!(
+        "Install the deck to a durable location — `cargo install --path .`, or copy the binary to \
+         `{}` — or put `dot-agent-deck` on your `PATH`, then run `dot-agent-deck hooks install`.",
+        installed.display()
+    )
+}
+
+/// The file name step 2a and 2b look for: the crate's own package name plus the
+/// platform's executable suffix (`.exe` on Windows, empty elsewhere).
+///
+/// Deliberately [`DEFAULT_BINARY_NAME`] rather than `current_exe()`'s own file
+/// name. The two differ only for a deck renamed on disk, and there the
+/// question this function answers is "where is the *installed* deck", whose
+/// answer is the name `remote.rs` and every install path already use. A
+/// renamed build looking for a renamed install would find nothing on the one
+/// machine layout the project actually ships.
+fn durable_binary_file_name() -> String {
+    format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// `path` as an owned string, but only when it satisfies the contract
+/// [`durable_binary_path`] promises: absolute, and spellable as UTF-8 (every
+/// consumer interpolates it into a text config file). Anything else yields
+/// `None`, so the invariant is true by construction rather than by assumption
+/// about what shapes `current_exe()` and `$HOME` can take.
+fn durable_path_string(path: &Path) -> Option<String> {
+    if !path.is_absolute() {
+        return None;
+    }
+    path.to_str().map(str::to_string)
+}
+
+/// Whether `path` runs through a cargo build-output directory: a path
+/// **component** `debug` or `release` whose immediate parent component is
+/// `target`.
+///
+/// Component-wise, not a substring search, and that is load-bearing rather
+/// than fastidious. `path.contains("target/debug")` would also catch a user
+/// whose home directory is literally named `target`, a deck kept under
+/// `/opt/target/release-notes/`, or (on Windows) miss the same shapes because
+/// the separator is `\`. Matching components makes the test mean what it says
+/// on both platforms.
+///
+/// Known and accepted limitation: it recognises the **default** layout only. A
+/// `CARGO_TARGET_DIR=/tmp/build` puts artifacts at `/tmp/build/debug/…`, whose
+/// `debug` has no `target` parent, so such a build is treated as durable. PRD
+/// #381 defines the check as `target/debug` / `target/release`, which is the
+/// layout every path in the field report had; widening it to "any `debug` or
+/// `release` component" would reject legitimate install prefixes.
+pub(crate) fn is_build_artifact_path(path: &Path) -> bool {
+    use std::ffi::OsStr;
+    use std::path::Component;
+
+    let mut parent: Option<&OsStr> = None;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            parent = None;
+            continue;
+        };
+        if parent == Some(OsStr::new("target"))
+            && matches!(name.to_str(), Some("debug" | "release"))
+        {
+            return true;
+        }
+        parent = Some(name);
+    }
+    false
+}
+
+/// The first `name` reachable through an absolute, non-artifact entry of a
+/// `$PATH`-shaped value, as an absolute path — step 2b of
+/// [`durable_binary_path`]. Pure over its `path` argument (no environment
+/// read), matching [`first_path_match`]'s precedent.
+///
+/// Two deliberate differences from [`first_path_match`], both because this
+/// answers a different question. That function reproduces a **shell's** lookup
+/// — first match wins, and a match found through an empty or relative entry
+/// STOPS the walk without being claimed, because a shell would have selected
+/// it. Here nothing is being predicted about a shell: the goal is simply to
+/// find a durable absolute location, so an untrustworthy entry (which no
+/// absolute path can be built from — [`is_untrustworthy_path_entry`]) and a
+/// build-artifact candidate (which is exactly what this whole resolver
+/// refuses, and `$PATH` entries pointing into `target/debug` are routine on a
+/// developer's machine) are both **skipped** and the walk continues. A
+/// candidate the group or the world can rewrite ([`write_mode_is_owner_only`],
+/// and issue #732 for its deliberate limits) is skipped the same way.
+fn first_durable_path_match(path: &std::ffi::OsStr, name: &str) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|dir| !is_untrustworthy_path_entry(dir))
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            !is_build_artifact_path(candidate)
+                && is_executable_file(candidate)
+                && write_mode_is_owner_only(candidate)
+        })
 }
 
 /// `current_exe()`, or — only under the `e2e` feature, and only once
@@ -413,10 +715,73 @@ fn resolve_binary_name(
     if is_safe_binary_name(name) && path_identity_matches(name, &path) {
         return name.to_string();
     }
-    match path.to_str() {
-        Some(path_str) => shell_quote_if_needed(path_str),
+    // Issue #560: absolutise BEFORE quoting. `current_exe()` is only
+    // guaranteed absolute on Linux (`/proc/self/exe`); on macOS it reports the
+    // invocation path, so this is where a relative `./target/release/…` would
+    // otherwise reach the generated command word. Purely lexical plus the cwd,
+    // and deliberately not `canonicalize` — see [`binary_name`]'s doc.
+    let Ok(absolute) = std::path::absolute(&path) else {
+        return DEFAULT_BINARY_NAME.to_string();
+    };
+    match absolute.to_str() {
+        Some(path_str) => posix_command_word(path_str, cfg!(windows))
+            .unwrap_or_else(|| DEFAULT_BINARY_NAME.to_string()),
         None => DEFAULT_BINARY_NAME.to_string(),
     }
+}
+
+/// Spell `path` — already absolute — as a command word a **POSIX shell** will
+/// execute, or `None` when it has no such spelling. Issue #561.
+///
+/// `windows_host` says whether `path` is in the Windows dialect. It is a
+/// parameter rather than a `#[cfg]` so both branches are unit-testable from
+/// any host: neither defect in this function's history could be reproduced on
+/// the platform this project is developed on, and a `#[cfg(windows)]` branch
+/// would have been type-checked by CI but exercised by nothing. Production
+/// passes `cfg!(windows)`, which is a compile-time constant, so the branch
+/// costs nothing at runtime.
+///
+/// POSIX is the target on every platform because that is what the text this
+/// word lands in already promises: `state::work_done_footer` and
+/// `orchestrator_context::build_orchestrator_context` both fence it in
+/// ```` ```bash ```` and the former tells the worker in prose to run it "via
+/// Bash". See [`binary_name`]'s doc for why `cmd.exe` and PowerShell are not
+/// targeted and cannot be reached by quoting anyway.
+///
+/// On a Windows path two things happen before [`shell_quote_if_needed`]:
+///
+/// - **A verbatim or device path is refused** (`\\?\…`, `\\.\…`). Those
+///   prefixes are defined to disable all path normalization, so `/` is *not*
+///   accepted as a separator inside them and respelling one changes which
+///   file it names. There is no POSIX-shell spelling of such a path, and
+///   [`resolve_binary_name`] therefore falls back to [`DEFAULT_BINARY_NAME`]
+///   rather than emit a word that would be misparsed — a bare name the
+///   agent's `$PATH` may well resolve beats a path that is silently wrong.
+/// - **`\` becomes `/`.** Lossless, because `/` is not a legal character in a
+///   Windows file name, and necessary rather than cosmetic: a POSIX shell
+///   picks pathname-vs-`$PATH`-lookup on whether the word contains at least
+///   one `/` (POSIX XCU 2.9.1.1), so a backslash path is looked up in `$PATH`
+///   and reported `command not found` no matter how correctly it is quoted.
+///   `C:\Users\me\deck.exe`
+///   becomes `C:/Users/me/deck.exe`, which needs no quoting at all under
+///   `shell_quote_if_needed`'s existing safe set, and `\\server\share\…`
+///   becomes `//server/share/…`, which is the UNC spelling MSYS/Cygwin use.
+///
+/// The final `contains('/')` guard makes "this is a pathname, not a `$PATH`
+/// lookup" true by construction rather than by assumption about what shapes
+/// `current_exe()` can return.
+fn posix_command_word(path: &str, windows_host: bool) -> Option<String> {
+    if !windows_host {
+        return Some(shell_quote_if_needed(path));
+    }
+    if path.starts_with(r"\\?\") || path.starts_with(r"\\.\") {
+        return None;
+    }
+    let respelled = path.replace('\\', "/");
+    if !respelled.contains('/') {
+        return None;
+    }
+    Some(shell_quote_if_needed(&respelled))
 }
 
 /// Whether `name` is safe to interpolate UNQUOTED into the generated `bash`
@@ -573,27 +938,149 @@ fn same_binary_identity(candidate: &Path, exe_path: &Path) -> bool {
     }
 }
 
-/// Whether `candidate` is a regular file that is *also* executable. Same
-/// rationale and shape as `orchestrator_ext::is_executable_file`: `is_file()`
-/// alone would accept a same-named regular-but-non-executable file earlier on
-/// `$PATH`. On Unix this additionally requires at least one exec bit
-/// (`mode & 0o111 != 0`); on non-Unix targets there is no cheap exec-bit
-/// check, so a regular file is accepted.
+/// Whether `candidate` is a regular file that **this user can actually
+/// execute**. Same shape and purpose as `orchestrator_ext::is_executable_file`
+/// — `is_file()` alone would accept a same-named regular-but-non-executable
+/// file earlier on `$PATH` — but the Unix half asks `access(2)` rather than
+/// reading the mode.
+///
+/// `mode & 0o111 != 0` was the obvious spelling and the wrong question: a file
+/// owned by another user with mode `0100` has an exec bit set and is still not
+/// executable by us. The resolver would then STOP at that candidate instead of
+/// continuing to a usable later one, and persist a hook command that fails with
+/// permission denied on every single hook, indefinitely (PRD #381 audit,
+/// LOW-2). `access(X_OK)` answers the owner/group/other question the kernel
+/// will answer at exec time, and consults ACLs where the filesystem has them.
+///
+/// `access(2)` tests the REAL uid/gid rather than the effective one. That is
+/// the same answer here: the deck is never installed setuid or setgid, so the
+/// two are equal in every process this runs in, and `access` is POSIX on every
+/// Unix the crate builds for while the effective-uid variants (`eaccess`,
+/// `faccessat(…, AT_EACCESS)`) are not uniformly spelled. The
+/// [`std::path::Path::is_file`] check stays in front of it because `access`
+/// alone would accept a *directory* — every traversable directory answers
+/// `X_OK`.
+///
+/// On non-Unix targets there is no cheap equivalent, so a regular file is
+/// accepted.
 fn is_executable_file(candidate: &std::path::Path) -> bool {
     if !candidate.is_file() {
         return false;
     }
     #[cfg(unix)]
     {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        // An interior NUL cannot name a real file, so it cannot be executable.
+        let Ok(c_path) = CString::new(candidate.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: `c_path` is a valid NUL-terminated C string that outlives the
+        // call, and `access(2)` only reads through the pointer.
+        unsafe { libc::access(c_path.as_ptr(), libc::X_OK) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Whether write access to `candidate` is held by its owner alone — neither
+/// group- nor other-writable. A candidate failing this is skipped by
+/// resolution steps 2a and 2b, which move on to the next candidate or refuse
+/// (PRD #381 audit, HIGH — **partially** accepted).
+///
+/// **Scope, deliberately narrow; the rest is [issue #732].** Only the
+/// candidate's own mode is consulted. Owner checks, ancestor-directory
+/// writability, and canonical-symlink-target validation are NOT done here and
+/// must not be added without the design decision #732 exists to make: the
+/// failure mode is a **hard refusal to install**, so a false positive breaks a
+/// legitimate user outright, and `/usr/local/bin` is group-writable by `admin`
+/// on stock macOS.
+///
+/// Three consequences of that scope worth stating rather than discovering:
+///
+/// - **A symlink is exempt, not judged.** `symlink_metadata` is used so the
+///   mode read is the candidate's OWN, and a symlink's own mode is `0777` on
+///   every Unix this ships for — it says nothing about anything. Reading
+///   *through* it to the target's mode would be canonical-target validation,
+///   which is #732's, and it would also defeat step 2a's whole point: the
+///   stable `~/.local/bin` name the user controls is the durable thing, not
+///   whatever it currently points at.
+/// - **Step 1 (`current_exe()`) is not checked.** Refusing to install from the
+///   binary the user is *already running* converts a loose mode on a
+///   legitimate install prefix into a refusal, which is the failure #732 has
+///   to weigh first.
+/// - **A stat failure counts as untrusted.** Callers reach this only after
+///   [`is_executable_file`] has already stat'd the candidate successfully, so
+///   a failure here means it changed underneath us; skipping to the next
+///   candidate is free and correct.
+fn write_mode_is_owner_only(candidate: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
-        match std::fs::metadata(candidate) {
-            Ok(meta) => meta.permissions().mode() & 0o111 != 0,
+        match std::fs::symlink_metadata(candidate) {
+            Ok(meta) if meta.file_type().is_symlink() => true,
+            Ok(meta) => meta.permissions().mode() & 0o022 == 0,
             Err(_) => false,
         }
     }
     #[cfg(not(unix))]
     {
+        let _ = candidate;
         true
+    }
+}
+
+/// Whether a deck-owned pin **already sitting in an agent's configuration** —
+/// the executable path a previously written hook command names — must be
+/// replaced by a freshly resolved durable path, rather than carried forward.
+///
+/// This is the read side of [`durable_binary_path`], and it exists because
+/// issue #536 was not closed by fixing the write side alone (PRD #381 audit,
+/// MEDIUM-1). Both self-heal checks used to ask nothing but
+/// [`std::path::Path::try_exists`]. For a legacy pin of the BARE
+/// `dot-agent-deck` — exactly what the old code wrote — `try_exists` resolves
+/// **relative to the process cwd**, so launching the deck from any directory
+/// that happens to contain a file of that name made the bare pin look alive,
+/// and it was preserved. At hook-fire time `/bin/sh` and Node's `execFileSync`
+/// resolve that same persisted bare name through the **agent's** `$PATH`, not
+/// against the cwd-relative file that suppressed the repair — which is #536's
+/// arbitrary-execution vector, surviving the change that claims to close it.
+/// A relative path, a directory, a non-executable file and a live
+/// `target/{debug,release}` path all slipped through the same gate, for the
+/// same reason: it only ever asked "is this not `Ok(false)`".
+///
+/// So a pin is preserved only when it satisfies the invariant a freshly
+/// resolved path satisfies: absolute, present, a regular file, executable by
+/// this user, and not a build artifact.
+///
+/// **The one benefit of the doubt is kept, and narrowed.** A stat that returns
+/// `Err` — permission denied, an unmounted or stale mount — on an otherwise
+/// **well-formed absolute** pin still means "leave alone", because deleting a
+/// working user's hook is worse than leaving a stale one, and that is the
+/// fail-safe direction PRD #381 Open Question 3 settles on. What changed is
+/// that a MALFORMED pin — bare, or relative — is no longer eligible for it at
+/// all: there is no reading under which such a value is a path the deck should
+/// keep.
+///
+/// Note this is deliberately NOT [`write_mode_is_owner_only`]'s question. That
+/// check picks between candidates the resolver is free to reject; this one
+/// decides whether to overwrite a value the user may have put there on
+/// purpose, so it stays at "is this a usable absolute executable".
+pub(crate) fn pin_is_repairable(pin: &str) -> bool {
+    let path = Path::new(pin);
+    // Bare or relative: #536's own shape, and cwd-dependent by construction.
+    if !path.is_absolute() {
+        return true;
+    }
+    match path.try_exists() {
+        // Positively reported missing by the OS.
+        Ok(false) => true,
+        // Could not determine. Well-formed, so leave it alone.
+        Err(_) => false,
+        Ok(true) => !is_executable_file(path) || is_build_artifact_path(path),
     }
 }
 
@@ -877,6 +1364,18 @@ mod tests {
     /// [`DEFAULT_BINARY_NAME`], though: since `current_exe()` is otherwise
     /// usable, it falls back to that absolute path instead, quoted exactly
     /// like [`shell_quote_if_needed`] would quote it directly.
+    ///
+    /// **Split by host dialect since #560.** The injected path has to be
+    /// absolute IN THE HOST'S DIALECT, because [`std::path::absolute`] is the
+    /// host's: a driveless `/usr/local/bin/x` is rooted but NOT absolute on
+    /// Windows, where it acquires the current drive and comes back as
+    /// `D:/usr/local/bin/x`. Before #560 nothing absolutised, so one set of
+    /// POSIX-shaped literals happened to pass on every platform; that is no
+    /// longer true and pretending otherwise is what `build-windows` caught.
+    /// Each arm keeps hand-written expected strings rather than composing them
+    /// through the production helpers, for the reason
+    /// [`EXPECTED_SAFE_PUNCTUATION`] gives.
+    #[cfg(unix)]
     #[test]
     fn resolve_binary_name_falls_back_to_the_absolute_path_when_the_name_is_shell_unsafe() {
         assert_eq!(
@@ -904,6 +1403,71 @@ mod tests {
              since as a full path argument (not a bare token) a leading '-' in the file \
              name component is not read as a flag"
         );
+        // Issue #560: every case above injects a path that is ALREADY absolute,
+        // so all three passed before anything enforced absoluteness. A relative
+        // `current_exe()` is the shape macOS actually produces, and the name
+        // "falls back to the absolute path" has to hold for it too.
+        assert_eq!(
+            resolve_binary_name(Ok(PathBuf::from("./bin/dot-agent-deck copy")), |_, _| true),
+            format!(
+                "'{}'",
+                std::env::current_dir()
+                    .expect("a cwd")
+                    .join("bin/dot-agent-deck copy")
+                    .display()
+            ),
+            "a relative current_exe() must be absolutised before quoting, not emitted as-is"
+        );
+    }
+
+    /// Windows arm of the test above (#560/#561). Same three gate cases with
+    /// drive-qualified inputs, and the expected strings carry the forward-slash
+    /// respelling `posix_command_word` applies — which is the whole of #561
+    /// observed at the seam rather than in the helper.
+    #[cfg(windows)]
+    #[test]
+    fn resolve_binary_name_falls_back_to_the_absolute_path_when_the_name_is_shell_unsafe() {
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from(
+                    r"C:\Program Files\deck\dot-agent-deck (1).exe"
+                )),
+                |_, _| true
+            ),
+            "'C:/Program Files/deck/dot-agent-deck (1).exe'",
+            "a name containing shell metacharacters must fall back to the absolute path, \
+             respelled with '/' and quoted for the space"
+        );
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from(r"C:\deck\dot-agent-deck copy.exe")),
+                |_, _| true
+            ),
+            "'C:/deck/dot-agent-deck copy.exe'",
+            "a name containing whitespace must fall back to the respelled, quoted path"
+        );
+        assert_eq!(
+            resolve_binary_name(Ok(PathBuf::from(r"C:\deck\-rf.exe")), |_, _| true),
+            "C:/deck/-rf.exe",
+            "a name with a leading '-' must fall back to the respelled path — unquoted, \
+             since as a full path argument a leading '-' in the file name is not a flag"
+        );
+        // Issue #560's half, in the Windows dialect: a relative `current_exe()`
+        // must be anchored before it is spelled.
+        let expected = std::env::current_dir()
+            .expect("a cwd")
+            .join(r"bin\dot-agent-deck copy.exe")
+            .to_str()
+            .expect("a UTF-8 cwd")
+            .replace('\\', "/");
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from(r".\bin\dot-agent-deck copy.exe")),
+                |_, _| true
+            ),
+            format!("'{expected}'"),
+            "a relative current_exe() must be absolutised before spelling, not emitted as-is"
+        );
     }
 
     /// Reviewer F1 / auditor F1, updated for issue prageethw/dot-agent-deck#253's Greptile P1 and
@@ -919,6 +1483,10 @@ mod tests {
     /// which the deck process's own `$PATH` cannot reliably stand in for);
     /// it falls back to the absolute `current_exe()` path instead, which
     /// resolves regardless of either process's `$PATH`.
+    ///
+    /// Split by host dialect since #560, for the reason the shell-unsafe test
+    /// above records: the injected path must be absolute in the HOST's dialect.
+    #[cfg(unix)]
     #[test]
     fn resolve_binary_name_falls_back_to_the_absolute_path_when_the_name_is_not_on_path() {
         assert_eq!(
@@ -928,6 +1496,52 @@ mod tests {
             "/opt/build/worker-agent-deck",
             "a well-formed name whose $PATH lookup does not identity-match must fall back \
              to the (unquoted, since it needs no quoting) absolute path"
+        );
+        // Issue #560, on the branch that matters most: this is the exact case
+        // the fallback exists to serve (a build that is not on `$PATH`), and it
+        // is the one a macOS `./target/release/dot-agent-deck` launch lands in.
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from("./target/release/dot-agent-deck")),
+                |_, _| false
+            ),
+            std::env::current_dir()
+                .expect("a cwd")
+                .join("target/release/dot-agent-deck")
+                .display()
+                .to_string(),
+            "the emitted word must not be resolvable against the WORKER's cwd — it has to \
+             be absolute so it means the same thing in every directory"
+        );
+    }
+
+    /// Windows arm of the test above (#560/#561).
+    #[cfg(windows)]
+    #[test]
+    fn resolve_binary_name_falls_back_to_the_absolute_path_when_the_name_is_not_on_path() {
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from(r"C:\build\worker-agent-deck.exe")),
+                |_, _| false
+            ),
+            "C:/build/worker-agent-deck.exe",
+            "a well-formed name whose $PATH lookup does not identity-match must fall back \
+             to the respelled absolute path, which needs no quoting"
+        );
+        let expected = std::env::current_dir()
+            .expect("a cwd")
+            .join(r"target\release\dot-agent-deck.exe")
+            .to_str()
+            .expect("a UTF-8 cwd")
+            .replace('\\', "/");
+        assert_eq!(
+            resolve_binary_name(
+                Ok(PathBuf::from(r".\target\release\dot-agent-deck.exe")),
+                |_, _| false
+            ),
+            expected,
+            "the emitted word must not be resolvable against the WORKER's cwd — it has to \
+             be absolute so it means the same thing in every directory"
         );
     }
 
@@ -939,14 +1553,121 @@ mod tests {
     /// gates check) is only a proxy for it and a `DEFAULT_BINARY_NAME`
     /// fallback can name a binary that was never installed under that name
     /// at all.
+    ///
+    /// The injected literal is host-dialect since #560 (see the shell-unsafe
+    /// test above); the property being asserted is identical on both.
     #[test]
     fn resolve_binary_name_absolute_path_fallback_is_never_the_default_literal() {
-        let fallback =
-            resolve_binary_name(Ok(PathBuf::from("/opt/build/worker-agent-deck")), |_, _| {
-                false
-            });
+        #[cfg(unix)]
+        let (injected, expected) = (
+            "/opt/build/worker-agent-deck",
+            "/opt/build/worker-agent-deck",
+        );
+        #[cfg(windows)]
+        let (injected, expected) = (
+            r"C:\build\worker-agent-deck.exe",
+            "C:/build/worker-agent-deck.exe",
+        );
+
+        let fallback = resolve_binary_name(Ok(PathBuf::from(injected)), |_, _| false);
         assert_ne!(fallback, DEFAULT_BINARY_NAME);
-        assert_eq!(fallback, "/opt/build/worker-agent-deck");
+        assert_eq!(fallback, expected);
+    }
+
+    /// Issue #560, stated as the invariant rather than as one example: whatever
+    /// shape `current_exe()` comes back in, the fallback command word must
+    /// resolve to the same file from any working directory. That is the whole
+    /// justification the doc comment, the #520 changelog entry and the review
+    /// thread all give for preferring a path over [`DEFAULT_BINARY_NAME`], and
+    /// until this landed nothing enforced it — every existing test injected an
+    /// already-absolute path, so a `current_exe()` of the shape macOS actually
+    /// returns (`_NSGetExecutablePath` reports the INVOCATION path) sailed
+    /// through and the worker resolved it against its own cwd.
+    ///
+    /// **`..` is handled differently per platform, and that is why it is only
+    /// checked for absoluteness here.** [`std::path::absolute`] is purely
+    /// lexical on Unix and deliberately KEEPS `..`, because collapsing it would
+    /// change which file the path names when a component is a symlink; on
+    /// Windows it follows `GetFullPathNameW` and DOES collapse it, so the
+    /// result is no longer anchored under the cwd at all. Absoluteness holds
+    /// either way, and absoluteness is the property #560 is about — so the
+    /// cwd-anchoring assertion is applied only to the shapes where "anchored at
+    /// the cwd" is well defined on both platforms.
+    ///
+    /// The comparison is against a dialect-appropriate prefix: on Windows the
+    /// emitted word carries `/` separators (#561) while `current_dir()` returns
+    /// `\`, so the raw cwd string is not a prefix of it.
+    #[test]
+    fn resolve_binary_name_fallback_is_absolute_for_every_relative_current_exe_shape() {
+        let cwd = std::env::current_dir().expect("a cwd");
+        let cwd_str = cwd.to_str().expect("a UTF-8 cwd");
+        let cwd_prefix = if cfg!(windows) {
+            cwd_str.replace('\\', "/")
+        } else {
+            cwd_str.to_string()
+        };
+
+        for (relative, anchored_at_cwd) in [
+            ("./target/release/dot-agent-deck", true),
+            ("target/release/dot-agent-deck", true),
+            ("dot-agent-deck", true),
+            // Absolute on both platforms; anchored under the cwd only where
+            // `..` survives, i.e. not on Windows — see the doc above.
+            ("../sibling/dot-agent-deck", false),
+        ] {
+            let fallback = resolve_binary_name(Ok(PathBuf::from(relative)), |_, _| false);
+            let unquoted = parse_as_one_shell_word(&fallback)
+                .unwrap_or_else(|| panic!("{fallback} must parse as exactly one POSIX word"));
+            assert!(
+                Path::new(&unquoted).is_absolute(),
+                "current_exe() of {relative:?} produced {fallback}, which is not absolute — a \
+                 worker would resolve it against ITS OWN cwd"
+            );
+            if anchored_at_cwd {
+                assert!(
+                    unquoted.starts_with(&cwd_prefix),
+                    "{fallback} must be {relative:?} anchored at this process's cwd"
+                );
+            }
+            assert_ne!(
+                fallback, DEFAULT_BINARY_NAME,
+                "absolutising must not degrade the fallback to the generic literal"
+            );
+        }
+    }
+
+    /// Issues #560 and #561 together, on the helper that emits the word: the
+    /// two defects were in one expression and the fallback is only correct when
+    /// both hold at once, so this asserts the combined post-condition across
+    /// both host dialects. Whatever the dialect, the emitted word must be
+    /// exactly one POSIX shell word, absolute, and containing a `/` — the last
+    /// because a POSIX shell resolves a `/`-free command word through `$PATH`
+    /// instead of as a path, which is what made a correctly-quoted Windows path
+    /// unrunnable even in git-bash. (The absoluteness of what reaches this
+    /// helper is [`resolve_binary_name`]'s job and is asserted by the test
+    /// above; here the inputs stand in for what it passes down.)
+    #[test]
+    fn posix_command_word_always_emits_one_absolute_pathname_word() {
+        for (path, windows_host) in [
+            ("/opt/my deck/dot-agent-deck", false),
+            ("/opt/build/dot-agent-deck (1)", false),
+            (r"C:\Users\somebody\bin\dot-agent-deck.exe", true),
+            (r"C:\Program Files\deck\dot-agent-deck.exe", true),
+            (r"\\server\share\dot-agent-deck.exe", true),
+        ] {
+            let word = posix_command_word(path, windows_host)
+                .unwrap_or_else(|| panic!("{path} must have a POSIX spelling"));
+            let literal = parse_as_one_shell_word(&word)
+                .unwrap_or_else(|| panic!("{word} must parse as exactly one POSIX word"));
+            assert!(
+                literal.contains('/'),
+                "{word} must resolve as a pathname, not a $PATH lookup"
+            );
+            assert!(
+                literal.starts_with('/') || literal.as_bytes().get(1) == Some(&b':'),
+                "{word} must be absolute — rooted, or drive-qualified on Windows"
+            );
+        }
     }
 
     /// Issue prageethw/dot-agent-deck#253 Greptile P1 (the smaller half): [`path_contains_executable`]
@@ -1064,9 +1785,18 @@ mod tests {
             resolve_binary_name(Ok(real_candidate.clone()), |candidate_name, exe_path| {
                 path_identity_match(&shadow_first, candidate_name, exe_path)
             });
+        // #561: on Windows the fallback carries the forward-slash respelling, so
+        // the expectation is spelled here rather than taken from the raw path —
+        // deriving it through `posix_command_word` would make this agree with
+        // whatever that helper does instead of pinning what it should do.
+        let expected_path = if cfg!(windows) {
+            real_candidate.to_str().unwrap().replace('\\', "/")
+        } else {
+            real_candidate.to_str().unwrap().to_string()
+        };
         assert_eq!(
             resolved,
-            shell_quote_if_needed(real_candidate.to_str().unwrap()),
+            shell_quote_if_needed(&expected_path),
             "a name shadowed earlier on $PATH must fall back to the quoted absolute path, \
              never the bare name a shell would resolve to the shadowing binary instead"
         );
@@ -1454,33 +2184,49 @@ mod tests {
         }
     }
 
-    /// Issue #563 records the CURRENT treatment of backslashes, not a desired
-    /// one: `\` is absent from the safe set, so every Windows-style path takes
-    /// the single-quoted branch. That is the property issue #561 is about —
-    /// POSIX single-quoting is meaningless to `cmd.exe` and PowerShell — and
-    /// #561 is deliberately NOT resolved here. Pinning the observed behavior is
-    /// the point: whichever way #561 lands, the change has to show up as a
-    /// deliberate edit to this test rather than passing silently.
+    /// Issue #563 pinned the treatment of backslashes here as merely *observed*
+    /// pending issue #561; #561 is now resolved, and this is the assertion of
+    /// the settled behavior. The settled behavior is that
+    /// [`shell_quote_if_needed`] keeps doing exactly this: `\` stays out of
+    /// the safe set, so a backslash-bearing path is single-quoted, and a
+    /// single-quoted POSIX run takes no escapes so every backslash survives
+    /// literally rather than being consumed as one. That is *correct* POSIX
+    /// quoting and the other call site depends on it:
+    /// `agent_hook_config::build_command` writes the Codex and Devin hook
+    /// command lines. Devin's installer is `#[cfg(unix)]` and can only ever see
+    /// a POSIX path; Codex's is NOT — `codex_home` honours `$CODEX_HOME` on
+    /// every platform — so that one can be reached on Windows. Whether a Codex
+    /// hook command needs a different dialect there is a question about a
+    /// third-party tool's own execution model, not about this quoter, and it is
+    /// deliberately out of scope for #561, which is about `binary_name`'s
+    /// fallback.
+    ///
+    /// What #561 actually diagnosed is one layer up, and is fixed there rather
+    /// than here: quoting alone never made a Windows path *runnable*, because a
+    /// POSIX shell decides pathname-vs-`$PATH`-lookup on whether the command
+    /// word contains a `/`. So the perfectly-quoted result asserted below is
+    /// still `command not found` when used as a command word — which is why
+    /// [`posix_command_word`] respells the separators before calling this, and
+    /// why the fix did NOT belong in the quoter.
     #[test]
-    fn shell_quote_if_needed_currently_quotes_backslashes_observed_behavior_for_issue_561() {
+    fn shell_quote_if_needed_keeps_backslashes_literal_in_a_posix_word() {
         assert_eq!(
             shell_quote_if_needed(r"\"),
             r"'\'",
-            "backslash is not in the safe set today, so it is quoted"
+            "backslash is outside the safe set, so it is quoted"
         );
         assert_eq!(
             shell_quote_if_needed(r"C:\Users\somebody\bin\dot-agent-deck.exe"),
             r"'C:\Users\somebody\bin\dot-agent-deck.exe'",
-            "a Windows path is POSIX-single-quoted today (issue #561)"
+            "a backslash-bearing path is single-quoted"
         );
         assert_eq!(
             shell_quote_if_needed(r"\\server\share\dot-agent-deck.exe"),
             r"'\\server\share\dot-agent-deck.exe'",
-            "a UNC path is POSIX-single-quoted today (issue #561)"
+            "a UNC path is single-quoted"
         );
 
-        // The quoting is POSIX-correct even though POSIX is arguably the wrong
-        // dialect here: a single-quoted run takes no escapes, so each backslash
+        // A single-quoted run takes no escapes (POSIX 2.2.2), so each backslash
         // survives literally rather than being consumed as one.
         assert_eq!(
             parse_as_one_shell_word(&shell_quote_if_needed(
@@ -1488,7 +2234,751 @@ mod tests {
             ))
             .as_deref(),
             Some(r"C:\Users\somebody\bin\dot-agent-deck.exe"),
-            "under POSIX rules the quoted Windows path is one word with its backslashes intact"
+            "the quoted Windows path is one word with its backslashes intact"
         );
+
+        // The half that made #561 a defect rather than a style question: the
+        // word above is a correctly-quoted *literal*, and a correctly-quoted
+        // literal with no `/` in it is a `$PATH` lookup, not a path. Nothing
+        // this function can do changes that, which is what moves the fix to
+        // `posix_command_word`.
+        assert!(
+            !parse_as_one_shell_word(&shell_quote_if_needed(
+                r"C:\Users\somebody\bin\dot-agent-deck.exe"
+            ))
+            .expect("the quoted form parses as one word")
+            .contains('/'),
+            "the quoted Windows path contains no '/', so a POSIX shell resolves it \
+             through $PATH rather than as a pathname"
+        );
+    }
+
+    /// Issue #561, the fix side: [`posix_command_word`] is what turns an
+    /// absolute path into a word a POSIX shell will actually execute, and the
+    /// `windows_host` parameter is what makes the Windows branch reachable from
+    /// a Linux CI host. On a POSIX host it is a pass-through to
+    /// [`shell_quote_if_needed`]; on a Windows path it respells `\` as `/`
+    /// FIRST, which both makes the word a pathname and — for an ordinary
+    /// drive-letter path — removes the need to quote it at all.
+    #[test]
+    fn posix_command_word_respells_a_windows_path_with_forward_slashes() {
+        assert_eq!(
+            posix_command_word(r"C:\Users\somebody\bin\dot-agent-deck.exe", true).as_deref(),
+            Some("C:/Users/somebody/bin/dot-agent-deck.exe"),
+            "a drive-letter path is respelled and then needs no quoting"
+        );
+        assert_eq!(
+            posix_command_word(r"\\server\share\dot-agent-deck.exe", true).as_deref(),
+            Some("//server/share/dot-agent-deck.exe"),
+            "a UNC path becomes the //server/share form MSYS and Cygwin use"
+        );
+        assert_eq!(
+            posix_command_word(r"C:\Program Files\deck\dot-agent-deck.exe", true).as_deref(),
+            Some("'C:/Program Files/deck/dot-agent-deck.exe'"),
+            "a respelled path containing a space is still single-quoted"
+        );
+
+        // Every emitted word is one shell word whose literal value contains a
+        // `/` — i.e. a pathname, not a $PATH lookup. This is the property the
+        // test above proves the quoter alone cannot deliver.
+        for windows_path in [
+            r"C:\Users\somebody\bin\dot-agent-deck.exe",
+            r"\\server\share\dot-agent-deck.exe",
+            r"C:\Program Files\deck\dot-agent-deck.exe",
+            r"C:\Users\o'brien\dot-agent-deck.exe",
+        ] {
+            let word = posix_command_word(windows_path, true).expect("a spellable Windows path");
+            let literal = parse_as_one_shell_word(&word)
+                .unwrap_or_else(|| panic!("{word} must parse as exactly one POSIX word"));
+            assert!(
+                literal.contains('/'),
+                "{word} must resolve as a pathname, not a $PATH lookup"
+            );
+            assert!(
+                !literal.contains('\\'),
+                "{word} must carry no backslash separators into the shell"
+            );
+        }
+    }
+
+    /// Issue #561: a `\\?\` verbatim or `\\.\` device path is REFUSED rather
+    /// than respelled. Those prefixes are defined to disable path
+    /// normalization, so `/` is not a separator inside them and swapping the
+    /// separators would name a different file — emitting something that might
+    /// be misparsed into a command an agent executes is worse than declining.
+    /// [`resolve_binary_name`] turns the `None` into [`DEFAULT_BINARY_NAME`],
+    /// whose worst case is a `$PATH` lookup that may well succeed.
+    #[test]
+    fn posix_command_word_refuses_a_windows_path_with_no_posix_spelling() {
+        for unspellable in [
+            r"\\?\C:\Users\somebody\dot-agent-deck.exe",
+            r"\\?\UNC\server\share\dot-agent-deck.exe",
+            r"\\.\C:\Users\somebody\dot-agent-deck.exe",
+            // No separator at all: respelling would leave a bare word, which a
+            // POSIX shell resolves through $PATH rather than as a path.
+            "dot-agent-deck.exe",
+        ] {
+            assert_eq!(
+                posix_command_word(unspellable, true),
+                None,
+                "{unspellable} has no POSIX-shell spelling and must be refused"
+            );
+        }
+    }
+
+    /// Issue #561: on a POSIX host nothing changes — [`posix_command_word`] is
+    /// a pass-through to [`shell_quote_if_needed`], including for the paths a
+    /// Unix filesystem genuinely allows to contain a backslash. Pinning this is
+    /// the guard that the Windows branch never leaks onto Unix: `\` is a legal
+    /// character in a Unix file name, so respelling one there would name a
+    /// different file.
+    #[test]
+    fn posix_command_word_is_a_pass_through_on_a_posix_host() {
+        for input in [
+            "/usr/local/bin/dot-agent-deck",
+            "/opt/my deck/dot-agent-deck",
+            r"/opt/back\slash/dot-agent-deck",
+            "/home/o'brien/bin/dot-agent-deck",
+        ] {
+            assert_eq!(
+                posix_command_word(input, false).as_deref(),
+                Some(shell_quote_if_needed(input).as_str()),
+                "on a POSIX host the word is exactly what shell_quote_if_needed produces"
+            );
+        }
+        assert_eq!(
+            posix_command_word(r"/opt/back\slash/dot-agent-deck", false).as_deref(),
+            Some(r"'/opt/back\slash/dot-agent-deck'"),
+            "a backslash in a Unix path is quoted, never respelled"
+        );
+    }
+
+    /// Issue #561: the four characters whose handling has to be stated exactly,
+    /// because this word is written into a task file an agent then EXECUTES and
+    /// a mis-quote there is a command-injection surface rather than a display
+    /// bug. Pinned as literal expected strings, in both dialects, so any future
+    /// change to the safe set or the respelling has to restate them.
+    ///
+    /// - **space** — outside the safe set, so the whole word is single-quoted
+    ///   and stays one argument.
+    /// - **`'`** — ends the quoted run, so it is spliced as `'\''`: close,
+    ///   escaped literal quote, reopen. Still one word.
+    /// - **`\`** — a legal character in a Unix file name and never a separator
+    ///   there, so on Unix it is quoted and preserved verbatim (a single-quoted
+    ///   POSIX run takes no escapes). On Windows it can only ever be a
+    ///   separator (it is not legal in a file name), so it is respelled to `/`
+    ///   and no literal backslash reaches the shell at all.
+    /// - **`%`** — in the safe set and left bare, which is correct because a
+    ///   POSIX shell gives `%` no meaning in a command word. This is precisely
+    ///   where the POSIX target is load-bearing: `cmd.exe` expands `%VAR%` even
+    ///   inside double quotes, so no amount of quoting would make this word
+    ///   safe there — see [`binary_name`]'s doc for why `cmd.exe` is not the
+    ///   target.
+    #[test]
+    fn posix_command_word_handles_space_quote_backslash_and_percent() {
+        let unix = r"/opt/my deck/o'brien/50%/back\slash/dot-agent-deck";
+        assert_eq!(
+            posix_command_word(unix, false).as_deref(),
+            Some(r"'/opt/my deck/o'\''brien/50%/back\slash/dot-agent-deck'"),
+            "on Unix: space and quote force quoting, the backslash is preserved verbatim, \
+             and % is inert"
+        );
+        assert_eq!(
+            parse_as_one_shell_word(&posix_command_word(unix, false).expect("a POSIX spelling"))
+                .as_deref(),
+            Some(unix),
+            "the quoted Unix path is exactly one word whose literal value is the path"
+        );
+
+        let windows = r"C:\Program Files\o'brien\50%\dot-agent-deck.exe";
+        assert_eq!(
+            posix_command_word(windows, true).as_deref(),
+            Some(r"'C:/Program Files/o'\''brien/50%/dot-agent-deck.exe'"),
+            "on Windows: separators become '/', space and quote force quoting, % is inert"
+        );
+        assert_eq!(
+            parse_as_one_shell_word(&posix_command_word(windows, true).expect("a POSIX spelling"))
+                .as_deref(),
+            Some("C:/Program Files/o'brien/50%/dot-agent-deck.exe"),
+            "the quoted Windows path is one word carrying no backslash into the shell"
+        );
+
+        assert_eq!(
+            posix_command_word(r"C:\Users\50%\dot-agent-deck.exe", true).as_deref(),
+            Some("C:/Users/50%/dot-agent-deck.exe"),
+            "with no space and no quote, a respelled Windows path needs no quoting even \
+             though it carries a %"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // PRD #381 — the durable hook-binary-path resolver.
+    //
+    // Plain `#[test]`s, not `#[spec]` catalog entries: these are lib units,
+    // like the `resolve_binary_name` tests above. The catalog entries for this
+    // PRD are the two L2 tests in `tests/e2e_hook_binary_path.rs`.
+    //
+    // Every case drives `durable_binary_path_with`, whose three environmental
+    // inputs (`current_exe()`, the home anchor, the `$PATH` value) are
+    // injected. The filesystem checks are the REAL ones, so the fixtures below
+    // create real executables in a real scratch directory rather than stubbing
+    // out `is_executable_file`.
+    // ---------------------------------------------------------------------
+
+    /// A real executable file at `path`, parents created. Unix sets the exec
+    /// bit, which the resolver's step-2a/2b gate genuinely requires.
+    fn write_stub_executable(path: &Path) {
+        std::fs::create_dir_all(path.parent().expect("candidate has a parent"))
+            .expect("create candidate dir");
+        std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write candidate");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod candidate");
+        }
+    }
+
+    /// Every `Ok` this resolver can return has to satisfy its whole contract at
+    /// once, so each case below funnels through here rather than asserting one
+    /// property and trusting the rest: absolute, currently on disk, and never a
+    /// bare command name (the shape issue #536 is about).
+    fn assert_durable(resolved: &Result<String, String>) -> &String {
+        let path = resolved
+            .as_ref()
+            .unwrap_or_else(|e| panic!("expected a durable path, got a refusal: {e}"));
+        assert!(
+            Path::new(path).is_absolute(),
+            "resolved {path} is not absolute — a hook command runs under /bin/sh with a cwd the \
+             deck does not control"
+        );
+        assert!(
+            Path::new(path).exists(),
+            "resolved {path} does not exist on disk"
+        );
+        assert_ne!(
+            path, DEFAULT_BINARY_NAME,
+            "resolved the bare crate name — issue #536: /bin/sh would resolve it through \
+             whatever $PATH the agent has"
+        );
+        assert!(
+            Path::new(path).file_name().is_some() && path.contains(std::path::MAIN_SEPARATOR),
+            "resolved {path} is a bare command name, not a path"
+        );
+        path
+    }
+
+    /// Step 1: an installed binary performing its own install keeps working —
+    /// `current_exe()` is returned unchanged.
+    #[test]
+    fn durable_binary_path_returns_a_non_artifact_current_exe_unchanged() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let installed = dir
+            .path()
+            .join("usr")
+            .join("local")
+            .join("bin")
+            .join(format!(
+                "{DEFAULT_BINARY_NAME}{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+        write_stub_executable(&installed);
+
+        let resolved = durable_binary_path_with(Ok(installed.clone()), dir.path(), None);
+
+        assert_eq!(
+            assert_durable(&resolved),
+            installed.to_str().expect("candidate path is UTF-8"),
+            "a durable current_exe() must be used as-is, not re-resolved"
+        );
+    }
+
+    /// Step 2a: the running binary IS a build artifact, and
+    /// `<home>/.local/bin/<name>` exists and is executable — that path wins,
+    /// and the artifact never appears.
+    #[test]
+    fn durable_binary_path_prefers_the_installed_home_candidate_over_a_build_artifact() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        let installed = home.join(".local").join("bin").join(format!(
+            "{DEFAULT_BINARY_NAME}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        write_stub_executable(&installed);
+        let artifact = dir
+            .path()
+            .join("checkout")
+            .join("target")
+            .join("release")
+            .join(DEFAULT_BINARY_NAME);
+        write_stub_executable(&artifact);
+
+        let resolved = durable_binary_path_with(Ok(artifact.clone()), &home, None);
+
+        assert_eq!(
+            assert_durable(&resolved),
+            installed.to_str().expect("installed path is UTF-8")
+        );
+        assert!(
+            !resolved.as_ref().expect("resolved").contains("target"),
+            "the build artifact leaked into the resolved path: {resolved:?}"
+        );
+        // The 2a candidate is deliberately NOT canonicalized, which is what
+        // makes a `~/.local/bin` symlink into a cargo target dir resolve to the
+        // durable spelling. Prove the returned value is the candidate path
+        // itself even when it IS such a symlink.
+        #[cfg(unix)]
+        {
+            let linked_home = dir.path().join("linked-home");
+            let link = linked_home.join(".local").join("bin").join(format!(
+                "{DEFAULT_BINARY_NAME}{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+            std::fs::create_dir_all(link.parent().expect("link parent")).expect("create link dir");
+            std::os::unix::fs::symlink(&artifact, &link).expect("symlink into target dir");
+
+            let via_link = durable_binary_path_with(Ok(artifact.clone()), &linked_home, None);
+            assert_eq!(
+                assert_durable(&via_link),
+                link.to_str().expect("link path is UTF-8"),
+                "canonicalizing the 2a candidate would resolve a durable symlink straight back \
+                 to the artifact it points at"
+            );
+        }
+    }
+
+    /// Step 2b: no `~/.local/bin` candidate, but the name is on `$PATH` — its
+    /// absolute path is used. An untrustworthy (relative) entry earlier on the
+    /// same `$PATH` is skipped, and so is one pointing into a cargo target
+    /// directory, which is the routine shape on a developer's machine.
+    #[test]
+    fn durable_binary_path_falls_back_to_an_absolute_path_lookup() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let name = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+
+        let artifact_dir = dir.path().join("checkout").join("target").join("debug");
+        write_stub_executable(&artifact_dir.join(&name));
+        let installed_dir = dir.path().join("opt").join("bin");
+        write_stub_executable(&installed_dir.join(&name));
+
+        // Order matters: a relative entry first (a shell would search it, this
+        // resolver must not trust it), then the artifact dir, then the durable
+        // one. Only the last is an acceptable answer.
+        let path_value = std::env::join_paths([
+            PathBuf::from("relative-bin"),
+            artifact_dir.clone(),
+            installed_dir.clone(),
+        ])
+        .expect("join synthetic PATH");
+
+        let resolved = durable_binary_path_with(
+            Ok(artifact_dir.join(&name)),
+            &home,
+            Some(path_value.as_os_str()),
+        );
+
+        assert_eq!(
+            assert_durable(&resolved),
+            installed_dir.join(&name).to_str().expect("path is UTF-8"),
+            "the PATH fallback must skip relative and build-artifact entries"
+        );
+    }
+
+    /// Step 2c: a build artifact with neither a `~/.local/bin` candidate nor a
+    /// `$PATH` hit is a REFUSAL — and the message has to be actionable, naming
+    /// the rejected path and what to do about it.
+    #[test]
+    fn durable_binary_path_refuses_when_no_durable_candidate_exists() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let artifact = dir
+            .path()
+            .join("checkout")
+            .join("target")
+            .join("debug")
+            .join(DEFAULT_BINARY_NAME);
+        write_stub_executable(&artifact);
+        let empty = dir.path().join("empty-bin");
+        std::fs::create_dir_all(&empty).expect("create empty PATH dir");
+        let path_value = std::env::join_paths([empty]).expect("join synthetic PATH");
+
+        let err =
+            durable_binary_path_with(Ok(artifact.clone()), &home, Some(path_value.as_os_str()))
+                .expect_err("a build artifact with no durable candidate must refuse");
+
+        assert!(
+            err.contains(artifact.to_str().expect("artifact path is UTF-8")),
+            "the refusal must name the rejected current_exe() path: {err}"
+        );
+        assert!(
+            err.contains("cargo install --path ."),
+            "the refusal must say what to do about it: {err}"
+        );
+        assert!(
+            err.contains(".local"),
+            "the refusal must name the durable location it looked in: {err}"
+        );
+    }
+
+    /// Issue #536: a `current_exe()` that fails is a refusal too, and
+    /// specifically NOT a fall back to `DEFAULT_BINARY_NAME`. `binary_name()`
+    /// legitimately returns that literal in the same situation — writing it
+    /// into a file Claude Code hands to `/bin/sh` is what re-opens the very
+    /// `$PATH` miss this PRD exists to close.
+    #[test]
+    fn durable_binary_path_refuses_rather_than_naming_the_bare_binary() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        // Seeded deliberately: even with a perfectly good durable candidate
+        // available, an unknown `current_exe()` must not silently install
+        // hooks — and even if it did, it must never be the bare name.
+        let installed = dir.path().join(".local").join("bin").join(format!(
+            "{DEFAULT_BINARY_NAME}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        write_stub_executable(&installed);
+
+        let resolved = durable_binary_path_with(
+            Err(std::io::Error::other("no such process")),
+            dir.path(),
+            None,
+        );
+
+        let err = resolved.expect_err("an unresolvable current_exe() must refuse");
+        assert!(
+            !err.is_empty() && err != DEFAULT_BINARY_NAME,
+            "issue #536: the bare crate name is never an acceptable answer here"
+        );
+        assert!(
+            err.contains("cargo install --path ."),
+            "the refusal must stay actionable: {err}"
+        );
+    }
+
+    /// The build-artifact test is on path COMPONENTS, not a substring — so a
+    /// home directory literally named `target`, a deck kept under
+    /// `/opt/target/release-notes/`, and a `debug` directory whose parent is
+    /// not `target` are all accepted, while a real `target/debug` or
+    /// `target/release` is caught. A substring check would fail every
+    /// near-miss here.
+    #[test]
+    fn is_build_artifact_path_matches_components_not_substrings() {
+        for artifact in [
+            "/home/u/code/deck/target/debug/dot-agent-deck",
+            "/home/u/code/deck/target/release/dot-agent-deck",
+            "/home/u/code/deck/target/debug/deps/dot-agent-deck",
+            "target/debug/dot-agent-deck",
+        ] {
+            assert!(
+                is_build_artifact_path(Path::new(artifact)),
+                "{artifact} is a cargo build artifact"
+            );
+        }
+        for durable in [
+            "/home/target/.local/bin/dot-agent-deck",
+            "/opt/target/release-notes/dot-agent-deck",
+            "/opt/target/debugger/dot-agent-deck",
+            "/srv/build/debug/dot-agent-deck",
+            "/srv/release/dot-agent-deck",
+            "/usr/local/bin/dot-agent-deck",
+            "/home/u/targets/debug/dot-agent-deck",
+        ] {
+            assert!(
+                !is_build_artifact_path(Path::new(durable)),
+                "{durable} is not a cargo build artifact — a substring check would \
+                 misclassify it"
+            );
+        }
+    }
+
+    /// A near-miss end to end: a deck genuinely installed under a directory
+    /// named `target` is returned by step 1, not refused.
+    #[test]
+    fn durable_binary_path_accepts_an_install_under_a_directory_named_target() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let installed = dir
+            .path()
+            .join("target")
+            .join("release-notes")
+            .join(DEFAULT_BINARY_NAME);
+        write_stub_executable(&installed);
+
+        let resolved = durable_binary_path_with(Ok(installed.clone()), dir.path(), None);
+
+        assert_eq!(
+            assert_durable(&resolved),
+            installed.to_str().expect("installed path is UTF-8")
+        );
+    }
+
+    /// A `current_exe()` that resolves but is no longer on disk (an upgrade
+    /// replaced it, or Linux reported `…/dot-agent-deck (deleted)`) is not
+    /// written either: the contract is a path that exists, so the resolver
+    /// falls through to the durable candidate.
+    #[test]
+    fn durable_binary_path_skips_a_current_exe_that_is_no_longer_on_disk() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let installed = dir.path().join(".local").join("bin").join(format!(
+            "{DEFAULT_BINARY_NAME}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        write_stub_executable(&installed);
+        let gone = dir.path().join("gone").join(DEFAULT_BINARY_NAME);
+
+        let resolved = durable_binary_path_with(Ok(gone), dir.path(), None);
+
+        assert_eq!(
+            assert_durable(&resolved),
+            installed.to_str().expect("installed path is UTF-8")
+        );
+    }
+
+    /// PRD #381 audit, LOW-2. A candidate with mode `0o011` has an exec bit
+    /// set, so the old `mode & 0o111 != 0` gate accepted it — but the file is
+    /// owned by this test's own user, and for the OWNER the kernel consults the
+    /// owner triad alone, which here has no `x`. `access(X_OK)` says so; the
+    /// mode bitmask does not. The resolver must therefore step over it and keep
+    /// walking, instead of stopping there and persisting a command that fails
+    /// with permission denied on every hook, indefinitely.
+    ///
+    /// (`0o011` rather than the audit's cross-user `0o100`: same class of
+    /// defect, same fix, and reproducible without a second uid.)
+    #[cfg(unix)]
+    #[test]
+    fn durable_binary_path_skips_a_candidate_this_user_cannot_execute() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let name = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+
+        let artifact_dir = dir.path().join("checkout").join("target").join("debug");
+        write_stub_executable(&artifact_dir.join(&name));
+
+        // Step 2a: an exec bit is set, but not one that applies to us.
+        let unusable = home.join(".local").join("bin").join(&name);
+        write_stub_executable(&unusable);
+        std::fs::set_permissions(&unusable, std::fs::Permissions::from_mode(0o011))
+            .expect("chmod the unusable candidate");
+        assert_ne!(
+            std::fs::metadata(&unusable)
+                .expect("stat the unusable candidate")
+                .permissions()
+                .mode()
+                & 0o111,
+            0,
+            "the fixture must still satisfy the OLD `mode & 0o111` check, or it \
+             proves nothing"
+        );
+
+        // Step 2b: a candidate that really is executable by us.
+        let usable_dir = dir.path().join("opt").join("bin");
+        write_stub_executable(&usable_dir.join(&name));
+        let path_value = std::env::join_paths([usable_dir.clone()]).expect("join synthetic PATH");
+
+        let resolved = durable_binary_path_with(
+            Ok(artifact_dir.join(&name)),
+            &home,
+            Some(path_value.as_os_str()),
+        );
+
+        assert_eq!(
+            assert_durable(&resolved),
+            usable_dir.join(&name).to_str().expect("path is UTF-8"),
+            "a candidate this user cannot execute must be skipped, not persisted"
+        );
+    }
+
+    /// PRD #381 audit, HIGH (the accepted half). A step-2a candidate the group
+    /// can rewrite is not a path worth pinning into four agents' persistent
+    /// configuration, so resolution steps over it and continues. See
+    /// [`write_mode_is_owner_only`] for what is deliberately NOT checked here
+    /// (owners, ancestor directories, symlink targets — issue #732).
+    #[cfg(unix)]
+    #[test]
+    fn durable_binary_path_skips_a_group_writable_installed_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let name = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+
+        let artifact_dir = dir.path().join("checkout").join("target").join("debug");
+        write_stub_executable(&artifact_dir.join(&name));
+
+        let loose = home.join(".local").join("bin").join(&name);
+        write_stub_executable(&loose);
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o775))
+            .expect("chmod the group-writable candidate");
+
+        let tight_dir = dir.path().join("opt").join("bin");
+        write_stub_executable(&tight_dir.join(&name));
+        let path_value = std::env::join_paths([tight_dir.clone()]).expect("join synthetic PATH");
+
+        let resolved = durable_binary_path_with(
+            Ok(artifact_dir.join(&name)),
+            &home,
+            Some(path_value.as_os_str()),
+        );
+
+        assert_eq!(
+            assert_durable(&resolved),
+            tight_dir.join(&name).to_str().expect("path is UTF-8"),
+            "a group-writable ~/.local/bin candidate must be skipped"
+        );
+    }
+
+    /// The same rule on step 2b: a world-writable `$PATH` candidate is skipped
+    /// and the walk continues to a later owner-only one, rather than the first
+    /// executable hit winning.
+    #[cfg(unix)]
+    #[test]
+    fn durable_binary_path_skips_a_world_writable_path_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let name = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+
+        let artifact_dir = dir.path().join("checkout").join("target").join("debug");
+        write_stub_executable(&artifact_dir.join(&name));
+
+        let shared_dir = dir.path().join("srv").join("shared-bin");
+        let planted = shared_dir.join(&name);
+        write_stub_executable(&planted);
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o777))
+            .expect("chmod the world-writable candidate");
+
+        let tight_dir = dir.path().join("usr").join("bin");
+        write_stub_executable(&tight_dir.join(&name));
+
+        let path_value = std::env::join_paths([shared_dir.clone(), tight_dir.clone()])
+            .expect("join synthetic PATH");
+
+        let resolved = durable_binary_path_with(
+            Ok(artifact_dir.join(&name)),
+            &home,
+            Some(path_value.as_os_str()),
+        );
+
+        assert_eq!(
+            assert_durable(&resolved),
+            tight_dir.join(&name).to_str().expect("path is UTF-8"),
+            "a world-writable $PATH candidate must be skipped, not pinned"
+        );
+    }
+
+    /// A symlink candidate is exempt from the write-mode check rather than
+    /// judged by it: its own mode is `0777` on every Unix this ships for, and
+    /// reading through it to the target's mode is the canonical-target
+    /// validation issue #732 owns. Step 2a's whole point is that the stable
+    /// `~/.local/bin` name is the durable thing — this pins that the F4 check
+    /// did not quietly undo it.
+    #[cfg(unix)]
+    #[test]
+    fn durable_binary_path_still_accepts_a_symlinked_installed_candidate() {
+        let dir = crate::test_temp::tempdir().expect("resolver tempdir");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let name = format!("{DEFAULT_BINARY_NAME}{}", std::env::consts::EXE_SUFFIX);
+
+        let artifact_dir = dir.path().join("checkout").join("target").join("debug");
+        let artifact = artifact_dir.join(&name);
+        write_stub_executable(&artifact);
+
+        let link = home.join(".local").join("bin").join(&name);
+        std::fs::create_dir_all(link.parent().expect("link has a parent"))
+            .expect("create ~/.local/bin");
+        std::os::unix::fs::symlink(&artifact, &link).expect("symlink the durable name");
+
+        let resolved = durable_binary_path_with(Ok(artifact.clone()), &home, None);
+
+        assert_eq!(
+            assert_durable(&resolved),
+            link.to_str().expect("link path is UTF-8"),
+            "the symlink spelling is the durable answer and must survive the \
+             write-mode check"
+        );
+    }
+
+    /// PRD #381 audit, MEDIUM-1, at the unit level: [`pin_is_repairable`] is
+    /// the read side of this resolver, and the whole point of it is that a BARE
+    /// pin is repairable no matter what the process cwd happens to contain.
+    /// `Path::try_exists("dot-agent-deck")` is cwd-relative; the agent's
+    /// `/bin/sh` resolves the same string through `$PATH`. The two are not the
+    /// same question, and only the second one is the one that runs.
+    #[test]
+    fn pin_is_repairable_rejects_a_bare_or_relative_pin() {
+        assert!(
+            pin_is_repairable(DEFAULT_BINARY_NAME),
+            "a bare command name is issue #536's own shape and is always repairable"
+        );
+        assert!(
+            pin_is_repairable("./dot-agent-deck"),
+            "a cwd-relative pin is resolved by the agent, not by us"
+        );
+        assert!(
+            pin_is_repairable("target/debug/dot-agent-deck"),
+            "a relative build-artifact pin is repairable twice over"
+        );
+    }
+
+    /// The other half of the same predicate, and the reason it is not simply
+    /// "is this absolute": an absolute pin still has to be a regular file this
+    /// user can execute, and still must not be a build artifact.
+    #[test]
+    fn pin_is_repairable_judges_an_absolute_pin_on_the_resolver_invariant() {
+        let dir = crate::test_temp::tempdir().expect("pin tempdir");
+
+        let live = dir.path().join("opt").join(DEFAULT_BINARY_NAME);
+        write_stub_executable(&live);
+        assert!(
+            !pin_is_repairable(live.to_str().expect("UTF-8")),
+            "a usable absolute pin is preserved — repairing what merely differs \
+             is what PRD #381 Open Question 3 rules out"
+        );
+
+        let gone = dir.path().join("pruned").join(DEFAULT_BINARY_NAME);
+        assert!(
+            pin_is_repairable(gone.to_str().expect("UTF-8")),
+            "a positively-missing pin is the original repair trigger"
+        );
+
+        let artifact = dir
+            .path()
+            .join("checkout")
+            .join("target")
+            .join("release")
+            .join(DEFAULT_BINARY_NAME);
+        write_stub_executable(&artifact);
+        assert!(
+            pin_is_repairable(artifact.to_str().expect("UTF-8")),
+            "a LIVE build artifact is repairable: it is exactly what this PRD \
+             refuses to write, and it disappears with its worktree"
+        );
+
+        let a_directory = dir.path().join("opt");
+        assert!(
+            pin_is_repairable(a_directory.to_str().expect("UTF-8")),
+            "a directory exists but is not an executable file"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let not_executable = dir.path().join("data").join(DEFAULT_BINARY_NAME);
+            write_stub_executable(&not_executable);
+            std::fs::set_permissions(&not_executable, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod");
+            assert!(
+                pin_is_repairable(not_executable.to_str().expect("UTF-8")),
+                "a non-executable file cannot be a hook command"
+            );
+        }
     }
 }

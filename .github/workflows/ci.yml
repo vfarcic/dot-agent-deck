@@ -124,6 +124,34 @@ jobs:
           echo "devbox_only=$devbox_only" >> "$GITHUB_OUTPUT"
           echo "flake_only=$flake_only" >> "$GITHUB_OUTPUT"
 
+  # PR #416 review M2: the desktop web app's TypeScript tests and type-check
+  # were previously run by no CI job anywhere (~800 lines of vitest invisible
+  # to every gate). This job is the front-end sibling of `build`'s
+  # `--workspace` widening, and deliberately separate from the Rust jobs: it
+  # needs only Node + pnpm, so it starts (and fails) fast.
+  desktop-web:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      # `pnpm build` is tsc --noEmit + vite build: the type gate and the
+      # bundle gate in one step, no Rust or Tauri required.
+      - run: pnpm build
+
   build:
     needs: changes
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
@@ -132,12 +160,19 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.97.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2 # v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.140
+          tool: cargo-nextest@0.9.143
+      # Tauri's Linux build deps, needed because clippy/nextest below run with
+      # --workspace, which includes desktop/src-tauri (dot-agent-deck-desktop).
+      # Without them the desktop crate fails to build on this runner at all.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev
       - run: cargo fmt --check
       # Issue #407 — `--all-targets --features e2e`, not the bare `cargo clippy`
       # this used to be. Both flags are load-bearing: without `--all-targets`
@@ -251,7 +286,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.97.1
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
       - name: Type-check the workspace for Windows from Linux
@@ -331,13 +366,13 @@ jobs:
           scripts/check-symlinks.sh
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.97.1
           targets: x86_64-pc-windows-msvc
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.140
+          tool: cargo-nextest@0.9.143
       - run: cargo build
       # Match the Linux `build` job's clippy invocation (no --all-targets) so a
       # test-only lint can't fail Windows-only and be unreproducible on the
@@ -392,12 +427,12 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.97.1
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.140
+          tool: cargo-nextest@0.9.143
       - run: cargo build
       # Match the Linux `build` job's clippy invocation (no --all-targets) so a
       # test-only lint can't fail macOS-only and be unreproducible on the Linux
@@ -459,7 +494,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.97.1
       - uses: Swatinem/rust-cache@v2 # v2
       - run: cargo install cargo-audit --locked
       - run: cargo audit
@@ -504,7 +539,22 @@ jobs:
       # The Determinate installer rather than cachix/install-nix-action: it is
       # what the cache action below is built to pair with, and it turns on
       # flakes (`nix-command`, `flakes`) without a hand-written extra-conf.
-      - uses: DeterminateSystems/nix-installer-action@v22
+      #
+      # Issue #450: both DeterminateSystems actions in this job are SHA-pinned.
+      # A major tag is a mutable ref its owner can repoint, so `@v22` means "what
+      # the reviewer saw" only until someone moves it. The trailing comment keeps
+      # the tag readable and gives Renovate the version it needs to bump the pin.
+      #
+      # WHAT THE PIN DOES NOT COVER, for both actions: each one downloads and
+      # executes a native binary at RUNTIME (the installer fetches `nix-installer`
+      # from install.determinate.systems, the cache action fetches
+      # `magic-nix-cache` from cf.install.determinate.systems/.../stable/...).
+      # The SHA pins the fetcher, not the fetched, and `stable` is a channel that
+      # moves. Both actions expose `source-tag` / `source-revision` / `source-url`
+      # inputs that would pin the payload too; deliberately NOT set here, because
+      # the right value needs its own upstream verification and a measured run,
+      # which is a separate change from making these two refs immutable.
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
         with:
           # `determinate` defaults to TRUE, which installs Determinate Nix (a
           # downstream distribution) and runs its FlakeHub login on every job.
@@ -529,7 +579,7 @@ jobs:
       # dependency tree. Magic Nix Cache stores that in GitHub Actions' own
       # cache, so there is no third-party service and no secret, and forks and
       # PRs get the cache too.
-      - uses: DeterminateSystems/magic-nix-cache-action@v14
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
         with:
           # GitHub Actions cache only. Left at its default, this action
           # opportunistically reaches for FlakeHub Cache, which wants an OIDC
@@ -580,10 +630,22 @@ jobs:
   # Duplication is kept honest by Renovate rather than by discipline: the
   # `customManagers` entries in renovate.json track both pinned values (Rust from
   # rust-lang/rust releases, nextest from the crates.io datasource) and open the
-  # same upgrade PRs the devbox pins get, so the two sides move together instead
-  # of drifting silently. The upstream-breakage signal that the old floating refs
-  # provided now arrives as those PRs — visible and gated on CI, rather than
-  # landing unannounced in the middle of an unrelated change.
+  # same upgrade PRs the devbox pins get. The upstream-breakage signal that the
+  # old floating refs provided now arrives as those PRs — visible and gated on
+  # CI, rather than landing unannounced in the middle of an unrelated change.
+  #
+  # This paragraph used to end "so the two sides move together instead of
+  # drifting silently", and issue #648 is the measured refutation: Renovate opens
+  # a PR per side, and until #648 those two PRs had OPPOSITE automerge policies —
+  # the devbox one merged itself, the workflow one waited for a human — so they
+  # separated on every release rather than moving together. cargo-nextest sat at
+  # 0.9.143 in devbox.json and 0.9.140 here for eleven days, and no check
+  # anywhere could see it. Renovate raises the two halves; it never joined them.
+  #
+  # The joining is now a check, in the step below. renovate.json holds the
+  # toolchain-class devbox packages for the same human who holds the workflow
+  # ones, so both halves arrive labelled and land in one change, and
+  # `scripts/check-pin-lockstep.sh` fails if they do not.
   #
   # SCOPE: x86_64-linux only. The aarch64-darwin entries in devbox.lock stay
   # unvalidated; add a macos-latest leg if that gap starts to bite.
@@ -591,6 +653,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # Issue #648. Needs nothing but bash and the checkout, so it runs FIRST —
+      # a drifted pin is reported in seconds rather than after the Nix store
+      # restore.
+      #
+      # It lives HERE rather than on a job of its own for one reason: `devbox`
+      # is the only job in this file with no `changes` gate. A Renovate PR
+      # touching devbox.json alone skips `build`, `build-windows`, `build-macos`
+      # and `security` — and GitHub counts a skipped required check as passing —
+      # so a bump landing on the devbox side alone would meet no check at all on
+      # the PR that introduced it. That is exactly how the 0.9.140/0.9.143 split
+      # reached main. The same script also runs inside `cargo test-fast` (see
+      # xtask/linkage-check/src/pin_lockstep.rs), which covers every OTHER kind
+      # of PR from the three required build jobs and from a contributor's local
+      # gate; this step covers the one case that tier cannot see.
+      #
+      # `devbox` is NOT one of the four required contexts and this change does
+      # not make it one: the required set is a repository ruleset, edited by
+      # `scripts/apply-branch-protection.sh` under an admin identity, and the
+      # four were chosen deliberately as the ones establishing objective
+      # correctness of the shipped binary (CLAUDE.md rule 8). It has teeth
+      # anyway. The fast-tier half turns `build`, `build-macos` and
+      # `build-windows` — all three required — red for any PR that is not
+      # devbox-only, which is every human PR that edits a pin. And for the
+      # devbox-only PRs the required jobs skip, Renovate's own automerge waits
+      # on the whole branch status rather than on the required subset, so a red
+      # `devbox` job stops the lane that produced #648 from merging itself.
+      - name: Toolchain pins in devbox.json and the workflows agree
+        run: scripts/check-pin-lockstep.sh
       - uses: jetify-com/devbox-install-action@v0.15.0
         with:
           # Caches the whole Nix store keyed on devbox.json. Worth it: the

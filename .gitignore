@@ -1,4 +1,5 @@
 /target
+/desktop/src-tauri/binaries/
 tmp/
 
 # `nix build` drops a `result` symlink (or `result-<output>` for a named

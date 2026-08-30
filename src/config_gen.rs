@@ -104,7 +104,14 @@ mod tests {
         let prompt = config_gen_prompt("/tmp/test");
         assert!(prompt.contains("dev-flow"));
         assert!(prompt.contains("reviewer"));
-        assert!(prompt.contains("Propose exactly one orchestration"));
+        // The generator's stance on HOW MANY orchestrations to propose. One is
+        // still the default answer; several are legitimate for genuinely
+        // different workflows, and the prompt must carry both halves plus the
+        // `extends` / `default` keys that make several maintainable (#704/#705).
+        assert!(prompt.contains("One orchestration is the right answer for most projects"));
+        assert!(prompt.contains("Propose more than one only when"));
+        assert!(prompt.contains("use `extends` rather than copying"));
+        assert!(prompt.contains("put `default = true` on exactly one"));
     }
 
     #[test]

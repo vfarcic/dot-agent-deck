@@ -863,6 +863,24 @@ impl AttachConnection {
     pub fn into_split(self) -> (IpcReadHalf, IpcWriteHalf) {
         (self.rd, self.wr)
     }
+
+    /// Test-only: an `AttachConnection` over an already-connected in-process
+    /// socket pair, so a unit test can drive code that *takes* one without a
+    /// daemon, a listener, or a filesystem path. The returned peer half is the
+    /// other end — hold it to keep the connection open, drop it to give the
+    /// reader EOF.
+    ///
+    /// `#[cfg(test)]`, so it is absent from the release library: PRD #341's
+    /// finding was that release-exposed test seams are a real attack surface,
+    /// and this deliberately is not one. Unix-only because
+    /// [`tokio::net::UnixStream::pair`] is; the Windows named-pipe backend has
+    /// no in-process equivalent, and the only consumer is likewise Unix-gated.
+    #[cfg(all(test, unix))]
+    pub(crate) fn connected_pair_for_test() -> (Self, tokio::net::UnixStream) {
+        let (ours, peer) = tokio::net::UnixStream::pair().expect("socket pair for test");
+        let (rd, wr) = ours.into_split();
+        (Self { rd, wr }, peer)
+    }
 }
 
 #[cfg(test)]

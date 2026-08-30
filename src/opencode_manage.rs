@@ -1,4 +1,30 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+
+/// Serializes the whole read-preserve-write span over the plugin file, for
+/// every install path in this module (PRD #381 audit, MEDIUM-2).
+///
+/// Locking the write alone would not be enough: [`auto_install_to`] reads the
+/// existing `BINARY_PATH` back, decides whether to preserve it, and only then
+/// writes. Two callers racing that span both read the same "before" state, and
+/// the second one republishes a pin the first had just repaired. Same shape and
+/// same reasoning as `hooks_manage::SETTINGS_LOCK` and
+/// `codex_hooks_manage::INSTALL_LOCK`.
+///
+/// What it does NOT close is the cross-PROCESS lost update — two deck binaries
+/// starting at the same instant, or a deck racing a hand-edit of the plugin.
+/// That needs an advisory file lock, which no sibling adapter has either; the
+/// atomic publish means the loser of such a race loses a whole update rather
+/// than leaving OpenCode a torn JavaScript file to load.
+static PLUGIN_LOCK: Mutex<()> = Mutex::new(());
+
+/// Take [`PLUGIN_LOCK`], recovering from a poisoned mutex rather than
+/// panicking: a previous caller panicking mid-install says nothing about
+/// whether the plugin file is usable now, and the read is re-done from disk
+/// under the guard regardless.
+fn lock_plugin() -> MutexGuard<'static, ()> {
+    PLUGIN_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 /// The FLAT plugin file dot-agent-deck installs under an OpenCode config root:
 /// `<root>/plugin/dot-agent-deck.js`.
@@ -82,9 +108,27 @@ fn existing_plugin_artifacts() -> Vec<PathBuf> {
     artifacts
 }
 
+/// Render the plugin JavaScript with `BINARY_PATH` pinned to `binary_path`.
+///
+/// The pin is JSON-escaped rather than interpolated raw, so a path containing a
+/// quote or a backslash cannot break out of the string literal in the code
+/// OpenCode loads.
+///
+/// **There is deliberately no fallback on the escape.** This was
+/// `.unwrap_or_else(|_| "\"dot-agent-deck\"".to_string())`, whose only possible
+/// behaviour would have been to write the BARE command name into a file another
+/// program executes: Node's `execFileSync` resolves a bare `BINARY_PATH` through
+/// the AGENT's `$PATH`, which is issue #536's exact vector. PRD #381's rule is
+/// that losing the ability to identify ourselves must fail toward a MORE
+/// specific path or not at all — never toward a less specific one — so the
+/// literal is gone rather than made quieter, and must not come back as a "safe
+/// default". The refusal it would otherwise stand in for already happens one
+/// seam earlier, at `durable_binary_path()`; by the time we are here the path is
+/// decided and the only step left, serializing a `&str` into a `String`, cannot
+/// fail.
 fn plugin_template(binary_path: &str) -> String {
     let binary_path_json =
-        serde_json::to_string(binary_path).unwrap_or_else(|_| "\"dot-agent-deck\"".to_string());
+        serde_json::to_string(binary_path).expect("serializing a &str to a String is infallible");
     format!(
         r#"import {{ execFileSync }} from "child_process";
 
@@ -419,9 +463,54 @@ fn write_plugin(root: &Path, binary_path: &str) -> std::io::Result<PathBuf> {
 
     let path = plugin_file(root);
     let content = plugin_template(binary_path);
-    std::fs::write(&path, content)?;
+    // PRD #381 audit, MEDIUM-2. This was `std::fs::write`, the only one of the
+    // four config writers not publishing atomically — and the file it writes is
+    // JavaScript OpenCode *executes*. `fs::write` follows a pre-created symlink
+    // at the destination and truncates in place, so a crash or a concurrent
+    // startup could leave a partial plugin for OpenCode to load. Temp file plus
+    // `rename` removes both. (The shared helper's own temp-name predictability
+    // is issue #731, which fixes it for all four writers at once; routing this
+    // one in is what puts the OpenCode plugin behind that fix too.)
+    crate::agent_hook_config::write_atomic(&plugin_dir, &path, content.as_bytes())?;
 
     Ok(path)
+}
+
+/// The `BINARY_PATH` an already-installed plugin under `root` pins, or `None`
+/// when there is no plugin file, it cannot be read, or it carries no readable
+/// literal (a hand-edited or truncated file).
+///
+/// The plugin is generated **JavaScript**, not JSON, and PRD #381 blames
+/// exactly that shape difference for OpenCode being the last of the three
+/// integrations to be noticed — a JSON-shaped fix silently misses it. So this
+/// reads the one line [`plugin_template`] emits and decodes the literal with
+/// `serde_json`, which is the same escaping the template wrote it with.
+///
+/// **Line-oriented, and both halves of that are fixes.** It used to
+/// `split_once("const BINARY_PATH = ")` and then `split_once(";\n")`:
+///
+/// - The terminator was the literal `";\n"`, so a plugin a user had opened in a
+///   CRLF editor (`;\r\n`) parsed as "no pin found" and the still-valid pin was
+///   clobbered on the next auto-install — the "repair only when missing" rule
+///   silently bypassed for that corner (reviewer N1). [`str::lines`] splits on
+///   `\n` and strips a trailing `\r`, so both line endings decode the same.
+/// - The marker matched **anywhere** in the file, including inside a comment in
+///   a hand-edited plugin, and whatever followed became the preserved — and
+///   republished — value (PRD #381 audit, MEDIUM-1). Anchoring it to the start
+///   of a line is what [`plugin_template`] actually emits (`const BINARY_PATH =
+///   …;` at column 0), so a commented-out or incidental occurrence cannot
+///   become the pin.
+///
+/// Stripping the trailing `;` rather than splitting on one is deliberate: a `;`
+/// inside the path itself survives, because `serde_json` escaping keeps the
+/// literal on one line and the `;` the template writes is always the last byte
+/// of it. The first matching line wins, as before.
+fn existing_binary_path(root: &Path) -> Option<String> {
+    let js = std::fs::read_to_string(plugin_file(root)).ok()?;
+    js.lines()
+        .filter_map(|line| line.strip_prefix("const BINARY_PATH = "))
+        .filter_map(|rest| rest.strip_suffix(';'))
+        .find_map(|literal| serde_json::from_str::<String>(literal).ok())
 }
 
 /// Remove one plugin artifact — a flat file or an obsolete nested dir — and print
@@ -448,11 +537,42 @@ fn uninstall_impl(path: &PathBuf) -> std::io::Result<()> {
 /// failures are logged via `tracing::warn!` and never abort the remaining targets.
 /// Silent on stdout (dashboard startup path).
 fn auto_install_to(roots: &[PathBuf], binary_path: &str) {
+    // Held across the read-preserve-write span, not just the write. See
+    // [`PLUGIN_LOCK`].
+    let _guard = lock_plugin();
     for root in roots {
         if !root.exists() {
             continue;
         }
-        match write_plugin(root, binary_path) {
+        // PRD #381 M5, and its Open Question 3: repair only what is UNUSABLE.
+        // This path used to rewrite `BINARY_PATH` unconditionally on every
+        // dashboard startup, so a perfectly valid pin was clobbered by whatever
+        // binary happened to be launching — the "not merely different" rule
+        // broken on the one integration where nobody was looking. The file is
+        // still regenerated either way, so a template change still lands; only
+        // the pinned path is carried over.
+        //
+        // `pin_is_repairable`, not a bare existence probe: a legacy plugin
+        // pinning the BARE `"dot-agent-deck"` would otherwise be preserved
+        // whenever the process cwd happened to hold a file of that name, and
+        // Node's `execFileSync` then resolves that persisted bare name through
+        // the AGENT's `$PATH` (PRD #381 audit, MEDIUM-1 — issue #536's own
+        // vector).
+        let (pinned, repairing) = match existing_binary_path(root) {
+            Some(existing) if !crate::platform::paths::pin_is_repairable(&existing) => {
+                (existing, false)
+            }
+            Some(_) => (binary_path.to_string(), true),
+            None => (binary_path.to_string(), false),
+        };
+        match write_plugin(root, &pinned) {
+            // Repair logs what it changed: silently mutating global config is
+            // the same class of thing that caused this bug.
+            Ok(path) if repairing => tracing::info!(
+                "repaired the OpenCode plugin at {}: its BINARY_PATH was not a usable \
+                 durable path, now pinned to {pinned}",
+                path.display()
+            ),
             Ok(path) => tracing::info!("auto-installed OpenCode plugin: {}", path.display()),
             Err(e) => tracing::warn!(
                 "auto-install: failed to write OpenCode plugin under {}: {e}",
@@ -475,6 +595,10 @@ fn install_to_roots(
     binary_path: &str,
     out: &mut impl std::io::Write,
 ) -> std::io::Result<()> {
+    // The explicit path writes rather than preserves, but it publishes to the
+    // same file the auto path reads back — so it takes the same lock. See
+    // [`PLUGIN_LOCK`].
+    let _guard = lock_plugin();
     let mut targets: Vec<PathBuf> = Vec::new();
     for root in roots {
         if root.exists() {
@@ -510,19 +634,34 @@ fn install_to_roots(
 }
 
 /// Silently install OpenCode plugin into every existing layout.
-/// Intended for dashboard startup — never prints to stdout.
+/// Intended for dashboard startup — never prints to stdout, refusal included.
 pub fn auto_install() {
-    let binary_path = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into());
-
-    auto_install_to(&candidate_roots(), &binary_path);
+    auto_install_resolved(
+        &candidate_roots(),
+        crate::platform::paths::durable_binary_path(),
+    );
 }
 
+/// [`auto_install`] with the binary-path resolution injected, so the PRD #381 M6
+/// refusal branch is reachable from a test.
+///
+/// On a refusal nothing is written and no directory is created — the plugin file
+/// is never opened, so there is no truncated or abandoned JavaScript left for
+/// OpenCode to load — and the complaint goes to `tracing::warn!` and nowhere
+/// else, because this is the dashboard-startup path.
+fn auto_install_resolved(roots: &[PathBuf], binary_path: Result<String, String>) {
+    match binary_path {
+        Ok(binary_path) => auto_install_to(roots, &binary_path),
+        Err(e) => tracing::warn!("auto-install: {e}"),
+    }
+}
+
+/// `dot-agent-deck hooks install --agent opencode`. Unlike [`auto_install`],
+/// this ALWAYS writes the freshly resolved path: the user asked for this
+/// install by name, so an existing pin is not preserved (PRD #381 M5).
 pub fn install() -> std::io::Result<()> {
-    let binary_path = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| crate::platform::paths::DEFAULT_BINARY_NAME.into());
+    let binary_path =
+        crate::platform::paths::durable_binary_path().map_err(std::io::Error::other)?;
 
     install_to_roots(
         &candidate_roots(),
@@ -693,6 +832,12 @@ mod tests {
         assert!(!plugin_file(&legacy_root).exists());
     }
 
+    /// Note what makes this pass since PRD #381: `/bin/deck-old` does not
+    /// exist, so the second pass REPAIRS a dead pin rather than overwriting a
+    /// live one. The auto path deliberately no longer clobbers a `BINARY_PATH`
+    /// that still resolves — see
+    /// `auto_install_repairs_a_dead_binary_path_and_preserves_a_valid_one`,
+    /// which pins both halves.
     #[test]
     fn auto_install_idempotent_overwrites_every_layout() {
         let tmp = tempfile::tempdir().unwrap();
@@ -875,6 +1020,353 @@ mod tests {
         assert!(
             !stale_dir.exists(),
             "stale nested plugin dir must be removed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #381 — the OpenCode plugin's `BINARY_PATH`.
+    //
+    // Its own tests, and its own parse, because the plugin is generated
+    // JAVASCRIPT rather than JSON: the PRD blames exactly that shape difference
+    // for OpenCode being the last of the three integrations to be noticed, so a
+    // fix that only speaks JSON silently misses it.
+    // -----------------------------------------------------------------------
+
+    /// A real executable at `path`, parents created — the resolver's "exists and
+    /// is executable" gate is a real `stat`, so this cannot be faked.
+    fn write_executable(path: &Path) {
+        std::fs::create_dir_all(path.parent().expect("path has a parent")).expect("create parent");
+        std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write executable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+    }
+
+    /// The `…/target/release/dot-agent-deck` the field defect wrote, plus the
+    /// durable `<home>/.local/bin/dot-agent-deck` the resolver must prefer.
+    fn artifact_and_durable(root: &Path) -> (PathBuf, PathBuf) {
+        // The crate name plus the platform's executable suffix, which is the
+        // file name the resolver searches `~/.local/bin` for. Seeding the bare
+        // name left the durable candidate invisible on Windows, so the resolver
+        // refused and both tests below failed on `build-windows` (PR #733).
+        let name = format!(
+            "{}{}",
+            crate::platform::paths::DEFAULT_BINARY_NAME,
+            std::env::consts::EXE_SUFFIX
+        );
+        let artifact = root
+            .join("checkout")
+            .join("target")
+            .join("release")
+            .join(&name);
+        write_executable(&artifact);
+        let durable = root.join("home").join(".local").join("bin").join(&name);
+        write_executable(&durable);
+        (artifact, durable)
+    }
+
+    /// Driving the plugin writer with the REAL resolver and a build-artifact
+    /// `current_exe()`: `BINARY_PATH` must be the durable path, and no
+    /// `target/` path may appear anywhere in the generated JavaScript.
+    #[test]
+    fn plugin_binary_path_is_never_the_build_artifact_it_was_installed_from() {
+        let tmp = crate::test_temp::tempdir().expect("plugin tempdir");
+        let (artifact, durable) = artifact_and_durable(tmp.path());
+        let root = tmp.path().join("opencode-root");
+        std::fs::create_dir_all(&root).expect("create root");
+
+        let resolved = crate::platform::paths::durable_binary_path_with(
+            Ok(artifact.clone()),
+            &tmp.path().join("home"),
+            None,
+        )
+        .expect("a seeded ~/.local/bin candidate must resolve");
+        auto_install_to(std::slice::from_ref(&root), &resolved);
+
+        let js = std::fs::read_to_string(plugin_file(&root)).expect("read plugin");
+        assert_eq!(
+            existing_binary_path(&root).as_deref(),
+            durable.to_str(),
+            "BINARY_PATH must be the durable path, not the artifact"
+        );
+        // Both separator spellings, and the Windows one as the JS literal
+        // spells it: `BINARY_PATH` is written through `serde_json`, so
+        // `target\release` is escaped to `target\\release` and a
+        // single-separator needle would pass vacuously there.
+        for marker in [
+            "target/release",
+            "target/debug",
+            r"target\\release",
+            r"target\\debug",
+        ] {
+            assert!(
+                !js.contains(marker),
+                "the generated plugin names `{marker}`:\n{js}"
+            );
+        }
+    }
+
+    /// PRD #381 M5: on the AUTO path a `BINARY_PATH` pointing at a deleted file
+    /// is repaired, and a still-valid one is left exactly as it was.
+    ///
+    /// This path used to rewrite `BINARY_PATH` unconditionally on every
+    /// dashboard startup, which is the "repair what merely differs" behaviour
+    /// Open Question 3 rules out — and on the one integration nobody was
+    /// watching.
+    #[test]
+    fn auto_install_repairs_a_dead_binary_path_and_preserves_a_valid_one() {
+        let tmp = crate::test_temp::tempdir().expect("plugin tempdir");
+        let (artifact, durable) = artifact_and_durable(tmp.path());
+        let home = tmp.path().join("home");
+        let resolved =
+            crate::platform::paths::durable_binary_path_with(Ok(artifact.clone()), &home, None)
+                .expect("resolve durable");
+
+        // A pin that still exists: preserved, byte for byte in the value.
+        let valid_root = tmp.path().join("valid-root");
+        std::fs::create_dir_all(&valid_root).expect("create root");
+        let users_own = tmp.path().join("users-own").join("dot-agent-deck");
+        write_executable(&users_own);
+        write_plugin(&valid_root, users_own.to_str().expect("UTF-8")).expect("seed valid plugin");
+
+        auto_install_to(std::slice::from_ref(&valid_root), &resolved);
+        assert_eq!(
+            existing_binary_path(&valid_root).as_deref(),
+            users_own.to_str(),
+            "a BINARY_PATH that still exists must not be repointed just because it differs"
+        );
+
+        // A pin that is positively gone: repaired to the resolved path.
+        let dead_root = tmp.path().join("dead-root");
+        std::fs::create_dir_all(&dead_root).expect("create root");
+        let gone = tmp.path().join("pruned-worktree").join("dot-agent-deck");
+        assert!(!gone.exists(), "the dead pin must genuinely not exist");
+        write_plugin(&dead_root, gone.to_str().expect("UTF-8")).expect("seed dead plugin");
+
+        auto_install_to(std::slice::from_ref(&dead_root), &resolved);
+        assert_eq!(
+            existing_binary_path(&dead_root).as_deref(),
+            durable.to_str(),
+            "a BINARY_PATH whose target is gone must be repaired"
+        );
+
+        // Idempotent: a second pass over either root changes nothing.
+        let before = std::fs::read(plugin_file(&dead_root)).expect("read repaired plugin");
+        auto_install_to(std::slice::from_ref(&dead_root), &resolved);
+        assert_eq!(
+            before,
+            std::fs::read(plugin_file(&dead_root)).expect("read again"),
+            "a second auto-install pass changed the repaired plugin"
+        );
+    }
+
+    /// PRD #381 M6: a refusal writes nothing at all — not a truncated plugin,
+    /// not even the `plugin/` directory. An abandoned half-written file is
+    /// worse than none: OpenCode would load it.
+    #[test]
+    fn auto_install_refusal_leaves_no_plugin_behind() {
+        let tmp = crate::test_temp::tempdir().expect("plugin tempdir");
+        let root = tmp.path().join("opencode-root");
+        std::fs::create_dir_all(&root).expect("create root");
+
+        auto_install_resolved(
+            std::slice::from_ref(&root),
+            Err("no durable dot-agent-deck".to_string()),
+        );
+
+        assert!(
+            !plugin_file(&root).exists(),
+            "a refused auto-install wrote {}",
+            plugin_file(&root).display()
+        );
+        assert!(
+            !root.join("plugin").exists(),
+            "a refused auto-install created the plugin directory"
+        );
+    }
+
+    /// The JS parse is the one that has to survive a hand-edited or truncated
+    /// file: anything it cannot read confidently is `None`, which
+    /// [`auto_install_to`] treats as "no pin to preserve" and overwrites.
+    #[test]
+    fn existing_binary_path_reads_the_generated_literal_and_nothing_else() {
+        let tmp = crate::test_temp::tempdir().expect("plugin tempdir");
+        let root = tmp.path().join("root");
+        write_plugin(&root, "/with space/dot-agent-deck").expect("write plugin");
+        assert_eq!(
+            existing_binary_path(&root).as_deref(),
+            Some("/with space/dot-agent-deck"),
+            "a quoted path must round-trip through the JS literal"
+        );
+
+        let truncated = tmp.path().join("truncated");
+        let file = plugin_file(&truncated);
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("create dir");
+        std::fs::write(&file, b"const BINARY_PATH = \"unterminated").expect("write truncated");
+        assert_eq!(
+            existing_binary_path(&truncated),
+            None,
+            "a truncated plugin must not be read as a valid pin"
+        );
+
+        let absent = tmp.path().join("absent");
+        assert_eq!(existing_binary_path(&absent), None);
+    }
+
+    /// Reviewer N1. The parse used to split on the literal `";\n"`, so a plugin
+    /// a user had opened in a CRLF editor terminated its line with `;\r\n`, read
+    /// back as `None`, and [`auto_install_to`] then treated a perfectly valid
+    /// pin as "nothing to preserve" and clobbered it with the launching build's
+    /// path — the "repair only when unusable" rule silently bypassed for that
+    /// corner.
+    #[test]
+    fn a_crlf_converted_plugin_still_yields_its_pin_and_keeps_it() {
+        let tmp = crate::test_temp::tempdir().expect("plugin tempdir");
+        let root = tmp.path().join("root");
+        let users_own = tmp.path().join("users-own").join("dot-agent-deck");
+        write_executable(&users_own);
+        let pin = users_own.to_str().expect("UTF-8");
+
+        write_plugin(&root, pin).expect("seed plugin");
+        let file = plugin_file(&root);
+        let crlf = std::fs::read_to_string(&file)
+            .expect("read plugin")
+            .replace('\n', "\r\n");
+        std::fs::write(&file, &crlf).expect("rewrite as CRLF");
+
+        assert_eq!(
+            existing_binary_path(&root).as_deref(),
+            Some(pin),
+            "a CRLF line ending must not hide the pin"
+        );
+
+        auto_install_to(std::slice::from_ref(&root), "/bin/deck-launching");
+        assert_eq!(
+            existing_binary_path(&root).as_deref(),
+            Some(pin),
+            "a valid pin was clobbered because its line ended CRLF"
+        );
+    }
+
+    /// PRD #381 audit, MEDIUM-1 (the OpenCode half). `split_once` accepted the
+    /// first `const BINARY_PATH = ` marker ANYWHERE in the file, so a mention
+    /// inside a comment in a hand-edited plugin became the preserved — and
+    /// republished — value. The marker is now anchored to the start of a line,
+    /// which is where [`plugin_template`] emits it.
+    #[test]
+    fn a_commented_out_marker_cannot_become_the_preserved_pin() {
+        let tmp = crate::test_temp::tempdir().expect("plugin tempdir");
+        let root = tmp.path().join("root");
+        let users_own = tmp.path().join("users-own").join("dot-agent-deck");
+        write_executable(&users_own);
+        let pin = users_own.to_str().expect("UTF-8");
+
+        write_plugin(&root, pin).expect("seed plugin");
+        let file = plugin_file(&root);
+        let body = std::fs::read_to_string(&file).expect("read plugin");
+        let hand_edited =
+            format!("// was: const BINARY_PATH = \"/tmp/attacker/dot-agent-deck\";\n{body}");
+        std::fs::write(&file, &hand_edited).expect("rewrite with a comment above");
+
+        assert_eq!(
+            existing_binary_path(&root).as_deref(),
+            Some(pin),
+            "a commented-out marker must not be read as the pin"
+        );
+
+        auto_install_to(std::slice::from_ref(&root), "/bin/deck-launching");
+        let after = std::fs::read_to_string(&file).expect("read regenerated plugin");
+        assert!(
+            !after.contains("/tmp/attacker/dot-agent-deck"),
+            "a commented-out path was promoted into the generated constant:\n{after}"
+        );
+    }
+
+    /// PRD #381 audit, MEDIUM-2: the plugin is JavaScript OpenCode *executes*,
+    /// and it is now published temp-file-plus-`rename` like the other three
+    /// config writers. `std::fs::write` followed a pre-created symlink at the
+    /// destination and truncated it in place; `rename` replaces the name.
+    #[cfg(unix)]
+    #[test]
+    fn write_plugin_publishes_atomically_and_does_not_write_through_a_symlink() {
+        let tmp = crate::test_temp::tempdir().expect("plugin tempdir");
+        let root = tmp.path().join("root");
+        let file = plugin_file(&root);
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("create plugin dir");
+
+        let elsewhere = tmp.path().join("elsewhere.js");
+        std::fs::write(&elsewhere, b"// the victim's own file\n").expect("seed the link target");
+        std::os::unix::fs::symlink(&elsewhere, &file).expect("pre-create the destination symlink");
+
+        write_plugin(&root, "/bin/deck").expect("publish plugin");
+
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).expect("read the link target"),
+            "// the victim's own file\n",
+            "the publish wrote through a pre-created destination symlink"
+        );
+        assert!(
+            std::fs::symlink_metadata(&file)
+                .expect("stat the published plugin")
+                .file_type()
+                .is_file(),
+            "the destination should now be a regular file, not the symlink"
+        );
+        assert_eq!(existing_binary_path(&root).as_deref(), Some("/bin/deck"));
+
+        // No temp file is left beside the destination.
+        let strays: Vec<_> = std::fs::read_dir(file.parent().expect("parent"))
+            .expect("list plugin dir")
+            .map(|e| e.expect("dir entry").file_name())
+            .filter(|n| n != "dot-agent-deck.js")
+            .collect();
+        assert!(strays.is_empty(), "temp file left behind: {strays:?}");
+    }
+
+    /// PRD #381 audit, MEDIUM-1 (OpenCode, the pin side): a legacy plugin
+    /// pinning the BARE `"dot-agent-deck"` is repaired even when the process cwd
+    /// holds a file of that name. `Path::try_exists` is cwd-relative; Node's
+    /// `execFileSync` resolves the persisted string through the AGENT's `$PATH`.
+    #[test]
+    #[serial_test::serial]
+    fn a_bare_pin_is_repaired_even_when_the_cwd_holds_a_file_of_that_name() {
+        struct CwdGuard(PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+
+        let tmp = crate::test_temp::tempdir().expect("plugin tempdir");
+        let root = tmp.path().join("root");
+        write_plugin(&root, crate::platform::paths::DEFAULT_BINARY_NAME).expect("seed bare pin");
+
+        let cwd = tmp.path().join("some-checkout");
+        write_executable(&cwd.join(crate::platform::paths::DEFAULT_BINARY_NAME));
+        let _restore = CwdGuard(std::env::current_dir().expect("read cwd"));
+        std::env::set_current_dir(&cwd).expect("move into the decoy directory");
+        assert_eq!(
+            Path::new(crate::platform::paths::DEFAULT_BINARY_NAME)
+                .try_exists()
+                .ok(),
+            Some(true),
+            "the fixture must reproduce the cwd collision, or it proves nothing"
+        );
+
+        let durable = tmp.path().join("opt").join("dot-agent-deck");
+        write_executable(&durable);
+        auto_install_to(
+            std::slice::from_ref(&root),
+            durable.to_str().expect("UTF-8"),
+        );
+
+        assert_eq!(
+            existing_binary_path(&root).as_deref(),
+            durable.to_str(),
+            "issue #536: a bare BINARY_PATH survived because the cwd held a file \
+             of that name"
         );
     }
 }

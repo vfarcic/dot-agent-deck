@@ -1,0 +1,900 @@
+//! PRD #381 — hook installation must resolve a **durable** binary path before
+//! writing it into another program's persistent, user-level configuration.
+//!
+//! The field defect: `hooks install` (and, silently, dashboard startup) wrote
+//! `std::env::current_exe()` into `~/.claude/settings.json`, `~/.codex/hooks.json`
+//! and the OpenCode plugin. From a local build that is a `target/debug` or
+//! `target/release` path — gitignored, removed by `cargo clean`, and gone the
+//! moment its worktree is pruned — so every hook then failed with
+//! `/bin/sh: 1: /…/target/release/dot-agent-deck: not found`.
+//!
+//! The reason no test caught it is structural, and closing it is the PRD's
+//! highest-value milestone: `hooks_manage::auto_install_to` — the seam the
+//! existing hook-install tests drive — hardcoded
+//! `let binary_path = "dot-agent-deck".to_string();`, so **the derivation that
+//! produced the bad value was never executed by a test**. That seam now takes
+//! the resolver, and every test here drives it with a
+//! `…/target/release/dot-agent-deck` `current_exe()` of its own choosing and
+//! asserts that value never reaches the file.
+//!
+//! Conventions follow `hook_rule_identification.rs`: the public
+//! explicit-path seams against a `tempfile` fixture, no `$HOME` manipulation,
+//! no spawned processes. These are lib units, NOT `#[spec]` catalog entries —
+//! the catalog entries for this PRD are the two L2 tests in
+//! `e2e_hook_binary_path.rs`.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use dot_agent_deck::platform::paths::durable_binary_path_with;
+use serde_json::{Value, json};
+use tracing_subscriber::fmt::MakeWriter;
+
+#[path = "../src/test_temp.rs"]
+mod test_temp;
+
+/// Claude's deck-owned command signature (`hooks_manage::HOOK_COMMAND_SUFFIX`).
+const CLAUDE_SUFFIX: &str = "hook --agent claude-code";
+
+/// The Codex equivalent (`codex_hooks_manage::HOOK_COMMAND_SUFFIX`).
+const CODEX_SUFFIX: &str = "hook --agent codex";
+
+/// The file name the resolver actually searches for — the crate's package name
+/// plus the platform's executable suffix (`.exe` on Windows, empty elsewhere),
+/// exactly as `platform::paths::durable_binary_file_name` builds it.
+///
+/// Load-bearing, not tidiness. Seeding the bare `dot-agent-deck` left every
+/// `~/.local/bin` candidate here invisible to the resolver on Windows, so the
+/// resolver refused, nothing was written, and five of these tests failed on
+/// `build-windows` with three different-looking messages (PR #733). Their
+/// outcome came from the platform's executable-suffix convention rather than
+/// from their own fixture — the same class of defect PRD #381 is about.
+fn durable_file_name() -> String {
+    format!(
+        "{}{}",
+        dot_agent_deck::platform::paths::DEFAULT_BINARY_NAME,
+        std::env::consts::EXE_SUFFIX
+    )
+}
+
+/// A scratch tree with the three inputs the resolver takes, wired so a test can
+/// say "the running binary is a build artifact" without being one.
+struct Fixture {
+    dir: tempfile::TempDir,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        Self {
+            dir: test_temp::tempdir().expect("resolver fixture tempdir"),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// The isolated home the resolver's `~/.local/bin` candidate hangs off.
+    fn home(&self) -> PathBuf {
+        let home = self.path().join("home");
+        std::fs::create_dir_all(&home).expect("create fixture home");
+        home
+    }
+
+    /// A `…/target/release/dot-agent-deck` that really exists — the exact input
+    /// the field defect wrote into global config.
+    fn build_artifact(&self) -> PathBuf {
+        let artifact = self
+            .path()
+            .join("checkout")
+            .join("target")
+            .join("release")
+            .join(durable_file_name());
+        write_executable(&artifact);
+        artifact
+    }
+
+    /// The durable candidate at `<home>/.local/bin/dot-agent-deck` (resolution
+    /// order step 2a).
+    fn durable(&self) -> PathBuf {
+        let durable = self
+            .home()
+            .join(".local")
+            .join("bin")
+            .join(durable_file_name());
+        write_executable(&durable);
+        durable
+    }
+
+    /// An empty settings.json path inside the fixture (its parent exists, which
+    /// is what `auto_install_to`'s guard requires).
+    fn settings(&self) -> PathBuf {
+        let dir = self.path().join("claude");
+        std::fs::create_dir_all(&dir).expect("create claude dir");
+        dir.join("settings.json")
+    }
+
+    /// Drive `hooks_manage::auto_install_to` — the PRD #381 M3 seam — and
+    /// return the log lines it produced *for this fixture*.
+    ///
+    /// Every `auto_install_to` call in this file goes through here rather than
+    /// calling it directly, which is what guarantees the shared subscriber is
+    /// installed before any of those callsites is first reached. See
+    /// [`log_buffer`] for why that ordering matters.
+    fn auto_install(
+        &self,
+        settings: &Path,
+        resolve: impl FnOnce() -> Result<String, String>,
+    ) -> String {
+        let _ = log_buffer();
+        dot_agent_deck::hooks_manage::auto_install_to(settings, resolve);
+        logs_mentioning(self.path().to_str().expect("fixture path is UTF-8"))
+    }
+}
+
+/// A real executable file at `path`, parents created — the resolver's step-2a
+/// gate is "exists and is executable", so the exec bit is load-bearing.
+fn write_executable(path: &Path) {
+    std::fs::create_dir_all(path.parent().expect("path has a parent")).expect("create parent");
+    std::fs::write(path, b"#!/bin/sh\nexit 0\n").expect("write executable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+}
+
+/// Every `"command"` string anywhere in a hook document. Walks the whole tree
+/// rather than the documented nesting, so a path smuggled into a
+/// differently-shaped rule is still caught.
+fn collect_commands(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if key == "command"
+                    && let Some(text) = child.as_str()
+                {
+                    out.push(text.to_string());
+                }
+                collect_commands(child, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_commands(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn commands_in(path: &Path) -> Vec<String> {
+    let body =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let doc: Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("parse {} as JSON: {e}\n{body}", path.display()));
+    let mut out = Vec::new();
+    collect_commands(&doc, &mut out);
+    out
+}
+
+/// The deck-owned commands in `path` — those ending with `suffix`, which is how
+/// both writers identify their own rules — each with any quote wrapper around
+/// its executable stripped ([`unquoted_command`]), so a comparison against a
+/// bare `<path> <suffix>` is exact on every platform whichever writer produced
+/// it.
+fn deck_commands(path: &Path, suffix: &str) -> Vec<String> {
+    let mut commands = commands_in(path);
+    commands.retain(|command| command.trim_end().ends_with(suffix));
+    commands.iter().map(|c| unquoted_command(c)).collect()
+}
+
+/// `command` with a quote wrapper around its executable stripped, mirroring
+/// `hooks_manage::unquote_if_needed`'s read side — both quoting forms, on every
+/// platform, for the same reason it does: a config written on one platform must
+/// still be readable on another.
+///
+/// Applied by [`deck_commands`] to everything it returns, because the two
+/// writers driven from this file quote differently and only one of them is
+/// platform-aware. `hooks_manage` has a `#[cfg(windows)]` `cmd.exe` sibling that
+/// leaves a backslash path verbatim, while Codex's commands go through
+/// `agent_hook_config::build_command` →
+/// `platform::paths::shell_quote_if_needed`, which is POSIX-only on every
+/// platform and therefore single-quotes a Windows path. What these tests pin is
+/// the PATH the resolver produced, not either writer's quoting, so comparing the
+/// unquoted spelling keeps every assertion here exact on both platforms rather
+/// than encoding one platform's spelling.
+fn unquoted_command(command: &str) -> String {
+    for quote in ['\'', '"'] {
+        if let Some(rest) = command.strip_prefix(quote)
+            && let Some((exe, tail)) = rest.split_once(quote)
+        {
+            return format!("{exe}{tail}");
+        }
+    }
+    command.to_string()
+}
+
+/// The invariant this whole PRD exists for, asserted on the raw bytes so it
+/// cannot be satisfied by a rule shape the walker above does not know.
+fn assert_no_build_artifact(path: &Path) {
+    let body = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read: {e}"));
+    // Both separator spellings, and the Windows one as JSON writes it: a
+    // `target\release` path is escaped to `target\\release` in the file, so a
+    // single-separator needle would silently never match there and the whole
+    // assertion would pass vacuously on `build-windows`.
+    for marker in [
+        "target/release",
+        "target/debug",
+        r"target\\release",
+        r"target\\debug",
+    ] {
+        assert!(
+            !body.contains(marker),
+            "{} contains `{marker}` — gitignored, removed by `cargo clean`, and gone when its \
+             worktree is pruned, so it must never be written into persistent user config:\n{body}",
+            path.display()
+        );
+    }
+}
+
+/// A `MakeWriter` over a shared in-memory buffer, so a test can read back what
+/// the code under test logged. Same shape as `logging_filter.rs`'s, and
+/// hand-rolled for the same reason (`tracing-subscriber`'s blanket impls do not
+/// cover a shareable `Mutex<Vec<u8>>`).
+#[derive(Clone)]
+struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("capture buffer poisoned").write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for CaptureWriter {
+    type Writer = CaptureWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// The process-wide log buffer, installed as the **global** tracing subscriber
+/// the first time any test here drives an installer.
+///
+/// A global subscriber rather than a per-test `with_default`, and the
+/// difference is not stylistic. `tracing` caches each callsite's interest
+/// process-wide the first time that callsite is hit, so under `cargo test`'s
+/// thread parallelism a callsite first reached from a thread that has no
+/// subscriber can be cached as "never" and then stay silent for every later
+/// thread. That is not hypothetical here: it made the self-heal assertion below
+/// pass in isolation and fail in the full run, depending purely on which test
+/// won the race. One subscriber, installed before any installer can run,
+/// removes the race — and because every fixture lives in its own tempdir, a
+/// test can still pick its own lines out of the shared buffer unambiguously.
+fn log_buffer() -> &'static Arc<Mutex<Vec<u8>>> {
+    static BUFFER: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+    BUFFER.get_or_init(|| {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(CaptureWriter(Arc::clone(&buf)))
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        // Another integration test in this binary could in principle have set
+        // one already; losing that race is not a reason to fail, only to read
+        // whatever the winner captured.
+        let _ = tracing::subscriber::set_global_default(subscriber);
+        buf
+    })
+}
+
+/// Everything currently in the shared buffer whose line mentions `needle` — a
+/// fixture's own tempdir path, which is unique per test.
+fn logs_mentioning(needle: &str) -> String {
+    let bytes = log_buffer().lock().expect("log buffer poisoned").clone();
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter(|line| line.contains(needle))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// The regression guard the PRD calls its highest-value milestone.
+// ---------------------------------------------------------------------------
+
+/// The flagship: the Claude auto-install seam, driven by the REAL resolver with
+/// a `…/target/release/dot-agent-deck` `current_exe()`. That value must not
+/// appear anywhere in the written settings — the durable candidate must.
+#[test]
+fn claude_auto_install_never_writes_the_build_artifact_it_is_running_from() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let artifact = fixture.build_artifact();
+    let durable = fixture.durable();
+    let settings = fixture.settings();
+
+    fixture.auto_install(&settings, || {
+        durable_binary_path_with(Ok(artifact.clone()), &home, None)
+    });
+
+    assert_no_build_artifact(&settings);
+    let commands = deck_commands(&settings, CLAUDE_SUFFIX);
+    assert_eq!(
+        commands.len(),
+        10,
+        "one deck rule per hook type: {commands:?}"
+    );
+    let expected = format!("{} {CLAUDE_SUFFIX}", durable.display());
+    for command in &commands {
+        assert_eq!(command, &expected);
+    }
+}
+
+/// The same property for Codex's `hooks.json`, which is a separate writer with
+/// its own document shape.
+#[test]
+fn codex_install_never_writes_the_build_artifact_it_is_running_from() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let artifact = fixture.build_artifact();
+    let durable = fixture.durable();
+    let codex_home = fixture.path().join("codex");
+
+    let resolved = durable_binary_path_with(Ok(artifact.clone()), &home, None)
+        .expect("a seeded ~/.local/bin candidate must resolve");
+    dot_agent_deck::codex_hooks_manage::install_to(&codex_home, &resolved)
+        .expect("install Codex hooks.json");
+
+    let hooks = codex_home.join("hooks.json");
+    assert_no_build_artifact(&hooks);
+    let commands = deck_commands(&hooks, CODEX_SUFFIX);
+    assert!(!commands.is_empty(), "no deck-owned Codex rule was written");
+    let expected = format!("{} {CODEX_SUFFIX}", durable.display());
+    for command in &commands {
+        assert_eq!(command, &expected);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M4 — self-heal, and the three properties that keep it safe.
+// ---------------------------------------------------------------------------
+
+/// A deck-owned rule whose binary is positively gone is repaired on the auto
+/// path, and the repair is LOGGED — silently mutating global config is the same
+/// class of thing that caused this bug.
+///
+/// The dead rule sits beside an already-current one, which is the case that
+/// used to be dropped on the floor: every hook type reports "already
+/// installed", so the pass installed nothing and returned before writing the
+/// prune out.
+#[test]
+fn self_heal_rewrites_a_deck_rule_whose_binary_is_gone_and_says_so() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let artifact = fixture.build_artifact();
+    let durable = fixture.durable();
+    let settings = fixture.settings();
+    let dead = fixture
+        .path()
+        .join("pruned-worktree")
+        .join("dot-agent-deck");
+    assert!(!dead.exists(), "the dead path must genuinely not exist");
+
+    let current = format!("{} {CLAUDE_SUFFIX}", durable.display());
+    std::fs::write(
+        &settings,
+        serde_json::to_string_pretty(&json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [ { "type": "command", "command": format!("{} {CLAUDE_SUFFIX}", dead.display()) } ] },
+                    { "hooks": [ { "type": "command", "command": current } ] },
+                ]
+            }
+        }))
+        .expect("serialize fixture"),
+    )
+    .expect("seed settings.json");
+
+    let logs = fixture.auto_install(&settings, || {
+        durable_binary_path_with(Ok(artifact.clone()), &home, None)
+    });
+
+    let body = std::fs::read_to_string(&settings).expect("read settings");
+    assert!(
+        !body.contains("pruned-worktree"),
+        "the dead deck rule survived the repair:\n{body}"
+    );
+    assert!(
+        logs.contains("repaired") && logs.contains("stale dot-agent-deck hook command"),
+        "the repair was not logged:\n{logs}"
+    );
+}
+
+/// **The spelling of a dead pin must not decide whether self-heal recognises
+/// it as ours** — PR #733's `build-windows` run, second round.
+///
+/// The installing path always carries the platform's executable suffix
+/// (`platform::paths::durable_binary_file_name` appends `EXE_SUFFIX`), while
+/// `DEFAULT_BINARY_NAME` never does — and `DEFAULT_BINARY_NAME` is exactly the
+/// literal the pre-fix code wrote as its `current_exe()` fallback, on Windows
+/// as much as anywhere. Comparing raw basenames therefore short-circuited
+/// before `pin_is_repairable` was ever consulted on Windows, so a machine
+/// carrying a legacy pin could never be self-healed and issue #536 stayed open
+/// there while looking closed. On Unix the same code worked only by the
+/// coincidence that `EXE_SUFFIX` is empty.
+///
+/// Both dead rules below must be repaired on every platform: `dot-agent-deck`
+/// and `dot-agent-deck.exe` are the same binary wherever `.exe` is the
+/// platform's suffix, and are the only spelling there is where it is not.
+///
+/// The third rule is the control that keeps the fix honest, and is the
+/// basename safety property this whole gate exists for: a deck-owned rule
+/// naming a genuinely DIFFERENT binary, pointing at a path that does not exist
+/// either, must survive. Pruning is keyed on "same binary, dead path", never
+/// on "dead path".
+#[test]
+fn self_heal_repairs_a_dead_pin_in_either_spelling_of_the_binary_name() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let artifact = fixture.build_artifact();
+    let durable = fixture.durable();
+    let settings = fixture.settings();
+
+    // Same binary name, two spellings, both dead. On Unix these two differ
+    // only by their directory (`EXE_SUFFIX` is empty), which is exactly the
+    // point: the test asserts the same outcome for both on every platform.
+    let bare_stem = fixture
+        .path()
+        .join("pruned-bare")
+        .join(dot_agent_deck::platform::paths::DEFAULT_BINARY_NAME);
+    let with_suffix = fixture.path().join("pruned-suffixed").join(format!(
+        "{}{}",
+        dot_agent_deck::platform::paths::DEFAULT_BINARY_NAME,
+        std::env::consts::EXE_SUFFIX
+    ));
+    // A different binary altogether, equally absent — must be left alone.
+    let other_name = fixture.path().join("keep-me").join("some-other-name");
+    for dead in [&bare_stem, &with_suffix, &other_name] {
+        assert!(
+            !dead.exists(),
+            "{} must genuinely not exist, or the test proves nothing",
+            dead.display()
+        );
+    }
+
+    let command_for = |exe: &Path| format!("{} {CLAUDE_SUFFIX}", exe.display());
+    std::fs::write(
+        &settings,
+        serde_json::to_string_pretty(&json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [ { "type": "command", "command": command_for(&bare_stem) } ] },
+                    { "hooks": [ { "type": "command", "command": command_for(&with_suffix) } ] },
+                    { "hooks": [ { "type": "command", "command": command_for(&other_name) } ] },
+                ]
+            }
+        }))
+        .expect("serialize fixture"),
+    )
+    .expect("seed settings.json");
+
+    fixture.auto_install(&settings, || {
+        durable_binary_path_with(Ok(artifact.clone()), &home, None)
+    });
+
+    let commands = deck_commands(&settings, CLAUDE_SUFFIX);
+    assert!(
+        !commands.contains(&command_for(&bare_stem)),
+        "a dead pin spelled WITHOUT the platform's executable suffix survived \
+         self-heal — issue #536 is then still open on any platform whose \
+         suffix is non-empty: {commands:?}"
+    );
+    assert!(
+        !commands.contains(&command_for(&with_suffix)),
+        "a dead pin spelled WITH the platform's executable suffix survived \
+         self-heal: {commands:?}"
+    );
+    assert!(
+        commands.contains(&command_for(&other_name)),
+        "the prune swept up a deck rule for a genuinely different binary name \
+         just because its path is absent — installing `{}` must never prune \
+         `{}`: {commands:?}",
+        durable.display(),
+        other_name.display()
+    );
+    assert!(
+        commands.contains(&format!("{} {CLAUDE_SUFFIX}", durable.display())),
+        "the durable rule was not written: {commands:?}"
+    );
+}
+
+/// The same-binary judgement is the **host platform's own** convention, taken
+/// from [`std::env::consts::EXE_SUFFIX`] — never a hardcoded `".exe"`.
+///
+/// So this test's expectation is derived, not per-platform: a dead deck rule
+/// naming a literal `dot-agent-deck.exe` is ours to repair exactly where
+/// `.exe` IS the platform's executable suffix, and is a different program name
+/// — left strictly alone — where it is not. On Unix `foo.exe` is just a file
+/// called `foo.exe`.
+///
+/// This is the inversion guard: stripping `".exe"` unconditionally (or
+/// appending the suffix instead of stripping it) fails here on Unix, and
+/// comparing raw basenames fails here on Windows.
+#[test]
+fn self_heal_judges_an_exe_suffixed_pin_by_the_platforms_own_convention() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let artifact = fixture.build_artifact();
+    let settings = fixture.settings();
+    let _durable = fixture.durable();
+
+    let dead_exe = fixture.path().join("pruned-worktree").join(format!(
+        "{}.exe",
+        dot_agent_deck::platform::paths::DEFAULT_BINARY_NAME
+    ));
+    assert!(!dead_exe.exists(), "the dead path must genuinely not exist");
+
+    let command = format!("{} {CLAUDE_SUFFIX}", dead_exe.display());
+    std::fs::write(
+        &settings,
+        serde_json::to_string_pretty(&json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [ { "type": "command", "command": command.clone() } ] }
+                ]
+            }
+        }))
+        .expect("serialize fixture"),
+    )
+    .expect("seed settings.json");
+
+    fixture.auto_install(&settings, || {
+        durable_binary_path_with(Ok(artifact.clone()), &home, None)
+    });
+
+    let commands = deck_commands(&settings, CLAUDE_SUFFIX);
+    let exe_is_this_platforms_suffix = std::env::consts::EXE_SUFFIX.eq_ignore_ascii_case(".exe");
+    if exe_is_this_platforms_suffix {
+        assert!(
+            !commands.contains(&command),
+            "`.exe` is this platform's executable suffix, so `{}` names the \
+             same binary as the installing one and its dead rule must be \
+             repaired: {commands:?}",
+            dead_exe.display()
+        );
+    } else {
+        assert!(
+            commands.contains(&command),
+            "`.exe` is NOT this platform's executable suffix (`EXE_SUFFIX` is \
+             {:?}), so `{}` is a different program name and its rule must be \
+             left alone — the suffix logic must come from `EXE_SUFFIX`, never \
+             from a hardcoded `\".exe\"`: {commands:?}",
+            std::env::consts::EXE_SUFFIX,
+            dead_exe.display()
+        );
+    }
+}
+
+/// The safety property that makes self-heal tolerable: a deck rule whose path
+/// EXISTS but differs from what would be written is left alone. PRD #381 Open
+/// Question 3 — the trigger is "the target is missing", never "the target is
+/// not what I would have written", because the second reading is what would let
+/// a startup silently repoint a developer's or a user's deliberate choice.
+#[test]
+fn self_heal_leaves_a_different_but_still_valid_deck_path_alone() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let artifact = fixture.build_artifact();
+    let durable = fixture.durable();
+    let settings = fixture.settings();
+    let other = fixture.path().join("other-install").join("dot-agent-deck");
+    write_executable(&other);
+
+    let other_command = format!("{} {CLAUDE_SUFFIX}", other.display());
+    std::fs::write(
+        &settings,
+        serde_json::to_string_pretty(&json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [ { "type": "command", "command": other_command.clone() } ] }
+                ]
+            }
+        }))
+        .expect("serialize fixture"),
+    )
+    .expect("seed settings.json");
+
+    fixture.auto_install(&settings, || {
+        durable_binary_path_with(Ok(artifact.clone()), &home, None)
+    });
+
+    let commands = deck_commands(&settings, CLAUDE_SUFFIX);
+    assert!(
+        commands.contains(&other_command),
+        "an existing, still-valid deck path was rewritten: {commands:?}"
+    );
+    assert!(
+        commands.contains(&format!("{} {CLAUDE_SUFFIX}", durable.display())),
+        "the durable rule was not added alongside it: {commands:?}"
+    );
+}
+
+/// Restores the process CWD on drop, so a panic inside a test that moved it
+/// cannot leave the rest of the file running somewhere else.
+struct CwdGuard(PathBuf);
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.0);
+    }
+}
+
+/// **The scenario that reopened issue #536 after it was declared closed** (PRD
+/// #381 audit, MEDIUM-1).
+///
+/// A config left over from the old code holds the BARE `dot-agent-deck` as its
+/// pin — that is literally what `auto_install_to`'s deleted
+/// `let binary_path = "dot-agent-deck".to_string();` produced. Self-heal used to
+/// decide such a pin's fate with `Path::try_exists()`, which resolves a bare
+/// name **relative to the process cwd**. So launching the deck from any
+/// directory that happens to contain a file called `dot-agent-deck` — a
+/// checkout of this very repo after `cargo build`, say — made the bare pin look
+/// alive, and the rule was preserved beside the new durable one.
+///
+/// At hook-fire time nothing consults that cwd. `/bin/sh` resolves the
+/// persisted bare name through the **agent's** `$PATH`, which is exactly #536's
+/// arbitrary-execution vector, surviving the change that claims to close it. A
+/// malformed pin must therefore be repairable whatever the cwd holds.
+#[test]
+#[serial_test::serial]
+fn self_heal_repairs_a_bare_pin_even_when_the_cwd_holds_a_file_of_that_name() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let artifact = fixture.build_artifact();
+    let durable = fixture.durable();
+    let settings = fixture.settings();
+
+    // The decoy, and the cwd that makes it visible to a bare-name `try_exists`.
+    let cwd = fixture.path().join("some-checkout");
+    write_executable(&cwd.join("dot-agent-deck"));
+    let _restore = CwdGuard(std::env::current_dir().expect("read the current cwd"));
+    std::env::set_current_dir(&cwd).expect("move into the decoy directory");
+    assert_eq!(
+        Path::new("dot-agent-deck").try_exists().ok(),
+        Some(true),
+        "the fixture must reproduce the cwd collision, or it proves nothing"
+    );
+
+    let bare_command = format!("dot-agent-deck {CLAUDE_SUFFIX}");
+    std::fs::write(
+        &settings,
+        serde_json::to_string_pretty(&json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [ { "type": "command", "command": bare_command.clone() } ] }
+                ]
+            }
+        }))
+        .expect("serialize fixture"),
+    )
+    .expect("seed settings.json");
+
+    fixture.auto_install(&settings, || {
+        durable_binary_path_with(Ok(artifact.clone()), &home, None)
+    });
+
+    let commands = deck_commands(&settings, CLAUDE_SUFFIX);
+    assert!(
+        !commands.contains(&bare_command),
+        "issue #536: a bare pin survived self-heal because the cwd held a file of \
+         that name — /bin/sh will resolve it through the agent's $PATH: {commands:?}"
+    );
+    let expected = format!("{} {CLAUDE_SUFFIX}", durable.display());
+    assert!(
+        !commands.is_empty() && commands.iter().all(|c| c == &expected),
+        "every deck-owned command must be the durable one — the bare pin is \
+         REPLACED, not merely joined: {commands:?}"
+    );
+    let body = std::fs::read_to_string(&settings).expect("read settings");
+    assert!(
+        !body.contains(&format!("\"{bare_command}\"")),
+        "the bare command is still in the file:\n{body}"
+    );
+}
+
+/// A user-authored command that merely MENTIONS `dot-agent-deck` is never
+/// rewritten or deleted. Deck ownership is decided by the exact
+/// `hook --agent claude-code` signature, not by a substring, and this pins that
+/// the repair pass does not widen it.
+#[test]
+fn self_heal_never_touches_a_user_command_that_merely_mentions_the_deck() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let artifact = fixture.build_artifact();
+    let settings = fixture.settings();
+    let _durable = fixture.durable();
+    // Deliberately a path that does not exist: even so, this is not ours.
+    let user_command = "/opt/audit/wrapper --watch dot-agent-deck --report";
+
+    std::fs::write(
+        &settings,
+        serde_json::to_string_pretty(&json!({
+            "hooks": {
+                "Stop": [
+                    { "matcher": "mine", "hooks": [ { "type": "command", "command": user_command } ] }
+                ]
+            }
+        }))
+        .expect("serialize fixture"),
+    )
+    .expect("seed settings.json");
+
+    fixture.auto_install(&settings, || {
+        durable_binary_path_with(Ok(artifact.clone()), &home, None)
+    });
+
+    let commands = commands_in(&settings);
+    assert!(
+        commands.iter().any(|c| c == user_command),
+        "a user-authored command mentioning the deck was removed: {commands:?}"
+    );
+    let body = std::fs::read_to_string(&settings).expect("read settings");
+    assert!(
+        body.contains("\"matcher\": \"mine\""),
+        "the user's own matcher was dropped:\n{body}"
+    );
+}
+
+/// Repair is idempotent: a second pass over the repaired file leaves it
+/// byte-identical. Without this, a "self-heal" could churn global config on
+/// every dashboard start.
+#[test]
+fn self_heal_is_idempotent_byte_for_byte() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let artifact = fixture.build_artifact();
+    let settings = fixture.settings();
+    let _durable = fixture.durable();
+    let dead = fixture
+        .path()
+        .join("pruned-worktree")
+        .join("dot-agent-deck");
+
+    std::fs::write(
+        &settings,
+        serde_json::to_string_pretty(&json!({
+            "model": "sonnet",
+            "hooks": {
+                "Stop": [
+                    { "hooks": [ { "type": "command", "command": format!("{} {CLAUDE_SUFFIX}", dead.display()) } ] }
+                ]
+            }
+        }))
+        .expect("serialize fixture"),
+    )
+    .expect("seed settings.json");
+
+    let install = || {
+        fixture.auto_install(&settings, || {
+            durable_binary_path_with(Ok(artifact.clone()), &home, None)
+        });
+    };
+    install();
+    let first = std::fs::read(&settings).expect("read after first pass");
+    install();
+    let second = std::fs::read(&settings).expect("read after second pass");
+
+    assert_eq!(
+        String::from_utf8_lossy(&first),
+        String::from_utf8_lossy(&second),
+        "a second self-heal pass changed the file"
+    );
+    let body = String::from_utf8_lossy(&first);
+    assert!(
+        body.contains("\"model\": \"sonnet\""),
+        "the user's unrelated settings did not survive:\n{body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M6 — loud failure, and genuinely no write.
+// ---------------------------------------------------------------------------
+
+/// The explicit install refuses with an actionable message and writes nothing —
+/// no file created, no partial JSON. The refusal is the first statement in
+/// `install_with`, before the settings path is even computed, which is what
+/// makes "nothing was touched" structural rather than incidental.
+#[test]
+fn explicit_install_refuses_loudly_and_writes_nothing() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let artifact = fixture.build_artifact();
+    let settings = fixture.settings();
+
+    // No `~/.local/bin` candidate and an empty `$PATH` — the 2c refusal.
+    let empty = fixture.path().join("empty-bin");
+    std::fs::create_dir_all(&empty).expect("create empty PATH dir");
+    let path_value = std::env::join_paths([empty]).expect("join synthetic PATH");
+
+    let err = dot_agent_deck::hooks_manage::install_with(|| {
+        durable_binary_path_with(Ok(artifact.clone()), &home, Some(path_value.as_os_str()))
+    })
+    .expect_err("no durable path must be an error, not a silent bad write");
+
+    assert!(
+        err.contains(artifact.to_str().expect("artifact is UTF-8")),
+        "the error must name the rejected path: {err}"
+    );
+    assert!(
+        err.contains("cargo install --path ."),
+        "the error must name the fix: {err}"
+    );
+    assert!(
+        !settings.exists(),
+        "a refused install created {}",
+        settings.display()
+    );
+}
+
+/// The silent startup path refuses the same way but through `tracing` — it must
+/// write nothing and it must not print. `auto_install`'s documented contract is
+/// "never prints to stdout" and the dashboard-startup path depends on it, so the
+/// refusal is a `warn!` and nothing else.
+#[test]
+fn auto_install_refusal_writes_nothing_and_only_warns() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let artifact = fixture.build_artifact();
+    let settings = fixture.settings();
+    let empty = fixture.path().join("empty-bin");
+    std::fs::create_dir_all(&empty).expect("create empty PATH dir");
+    let path_value = std::env::join_paths([empty]).expect("join synthetic PATH");
+
+    let logs = fixture.auto_install(&settings, || {
+        durable_binary_path_with(Ok(artifact.clone()), &home, Some(path_value.as_os_str()))
+    });
+
+    assert!(
+        !settings.exists(),
+        "a refused auto-install created {}",
+        settings.display()
+    );
+    assert!(
+        logs.contains("WARN") && logs.contains("auto-install"),
+        "the refusal was not reported on the log surface:\n{logs}"
+    );
+    assert!(
+        logs.contains("cargo install --path ."),
+        "the logged refusal must stay actionable:\n{logs}"
+    );
+}
+
+/// Issue #536, at the level a user feels it: when `current_exe()` itself fails,
+/// the deck must not write a bare `dot-agent-deck` into a file Claude Code
+/// hands to `/bin/sh`. Nothing is written at all.
+#[test]
+fn an_unresolvable_current_exe_writes_no_bare_command_name() {
+    let fixture = Fixture::new();
+    let home = fixture.home();
+    let settings = fixture.settings();
+    // Seeded on purpose: even with a durable candidate right there, an unknown
+    // `current_exe()` is a refusal, never a guess.
+    let _durable = fixture.durable();
+
+    fixture.auto_install(&settings, || {
+        durable_binary_path_with(Err(std::io::Error::other("no such process")), &home, None)
+    });
+
+    assert!(
+        !settings.exists(),
+        "issue #536: a failed current_exe() must write nothing, not a bare command name"
+    );
+}

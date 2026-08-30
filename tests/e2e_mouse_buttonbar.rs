@@ -111,18 +111,18 @@ fn buttonbar_007_dimmed_close_is_inert_outside_command_mode() {
     deck.send_bytes(b"?");
     deck.wait_for_string("Create new pane");
 
-    let (close_col, close_row) = deck
-        .find_in_grid("[Close Ctrl+W]")
-        .expect("Help mode must still render the dimmed Close button");
+    // Both lookups poll (`wait_for_in_grid`) rather than reading the grid once:
+    // each follows an input event, and a single-shot read landing mid-repaint
+    // sees a transiently cleared region. The `[Close]` lookup below was
+    // observed failing exactly that way under tier load while passing alone.
+    let (close_col, close_row) = deck.wait_for_in_grid("[Close Ctrl+W]");
     deck.click(close_col + 1, close_row);
 
     // The help overlay's exact `[Close]` label is distinct from the bar's
     // `[Close Ctrl+W]`. If the dimmed click wrongly armed close confirmation,
     // this second real click either hits that modal or leaves it visible; both
     // outcomes fail the assertions below.
-    let (help_close_col, help_close_row) = deck
-        .find_in_grid("[Close]")
-        .expect("the Help overlay must render its own Close button");
+    let (help_close_col, help_close_row) = deck.wait_for_in_grid("[Close]");
     deck.click(help_close_col + 1, help_close_row);
     deck.wait_for_absence("Create new pane");
     deck.wait_for_string("[Back to Pane Ctrl+D]");

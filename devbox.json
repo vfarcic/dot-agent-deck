@@ -1,11 +1,11 @@
 {
   "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.16.0/.schema/devbox.schema.json",
   "packages": [
-    "vals@0.45.0",
-    "go-task@3.52.0",
+    "vals@0.46.0",
+    "go-task@3.53.1",
     "git@2.55.0",
     "upcloud-cli@3.36.0",
-    "gh@2.97.0",
+    "gh@2.98.0",
     "asciinema@3.2.1",
     "cargo-nextest@0.9.143",
     "rustc@1.97.1",
@@ -18,7 +18,9 @@
     "jq@1.8.2",
     "curl@8.17.0",
     "ripgrep@15.2.0",
-    "python314Packages.pyte@0.8.2"
+    "python314Packages.pyte@0.8.2",
+    "nodejs@24.12.0",
+    "pnpm_10@10.34.5"
   ],
   "shell": {
     "init_hook": [
@@ -34,12 +36,15 @@
       "agent-small":        ["claude --model haiku"],
       "agent-big":          ["claude --model opus"],
       "agent-orchestrator": ["claude --model opus"],
+      "agent-orchestrator-oc": ["opencode --model openai/gpt-5.6-sol"],
       "agent-coder":        ["claude --model opus"],
+      "agent-coder-oc":     ["opencode --model openai/gpt-5.6-sol"],
       "agent-reviewer":     ["claude --model opus"],
       "agent-reviewer-oc":  ["opencode --model openai/gpt-5.5"],
       "agent-auditor":      ["claude --model opus"],
       "agent-auditor-oc":   ["opencode --model openai/gpt-5.5"],
       "agent-tester":       ["claude --model opus"],
+      "agent-tester-oc":    ["opencode --model openai/gpt-5.6-sol"],
       "agent-release":      ["claude --model sonnet"],
       "pi-big":             ["pi --model anthropic/claude-opus-4-8 --thinking high --approve"],
       "pi-sol":             ["pi --provider openai --model gpt-5.6-sol --thinking xhigh --approve"],

@@ -6,6 +6,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::sync::RwLock;
 
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
+use dot_agent_deck::bounded_read::read_task_input;
 use dot_agent_deck::build_version_handshake;
 use dot_agent_deck::config::{DashboardConfig, attach_socket_path, socket_path};
 use dot_agent_deck::daemon::{Daemon, run_daemon_with};
@@ -101,7 +102,9 @@ enum Commands {
         /// Read the task text verbatim from a file (or `-` for stdin). The
         /// shell-safe way to pass a task containing backticks, quotes, `$VAR`,
         /// or newlines, which --task would otherwise let the caller's shell
-        /// mangle. Mutually exclusive with --task.
+        /// mangle. PATH must be a regular file, not a FIFO or a device; pass
+        /// `-` to read a pipe. At most 1 MiB, from a file or from stdin.
+        /// Mutually exclusive with --task.
         #[arg(long = "task-file", value_name = "PATH")]
         task_file: Option<String>,
         /// Role name(s) to delegate to (repeatable)
@@ -119,8 +122,10 @@ enum Commands {
         /// Mutually exclusive with --task-file.
         #[arg(long, conflicts_with = "task_file")]
         task: Option<String>,
-        /// Read the task text verbatim from a file (or `-` for stdin).
-        /// Mutually exclusive with --task.
+        /// Read the task text verbatim from a file (or `-` for stdin). PATH
+        /// must be a regular file, not a FIFO or a device; pass `-` to read a
+        /// pipe. At most 1 MiB, from a file or from stdin. Mutually exclusive
+        /// with --task.
         #[arg(long = "task-file", value_name = "PATH")]
         task_file: Option<String>,
         /// Start ONE agent, even where this repo defines `[[orchestrations]]`.
@@ -128,7 +133,8 @@ enum Commands {
         #[arg(long, conflicts_with = "orchestration")]
         single: bool,
         /// Start a full orchestration by name (`--orchestration review`), or this
-        /// repo's first role-bearing one (`--orchestration=` with an empty value).
+        /// repo's DEFAULT one (`--orchestration=` with an empty value) — the block
+        /// carrying `default = true`, else the first with roles.
         /// Mutually exclusive with --single.
         ///
         /// The value is REQUIRED rather than optional: with `num_args = 0..=1` clap
@@ -158,7 +164,9 @@ enum Commands {
         task: Option<String>,
         /// Read the summary text verbatim from a file (or `-` for stdin). The
         /// shell-safe way to pass a summary containing backticks, quotes,
-        /// `$VAR`, or newlines. Mutually exclusive with --task.
+        /// `$VAR`, or newlines. PATH must be a regular file, not a FIFO or a
+        /// device; pass `-` to read a pipe. At most 1 MiB, from a file or from
+        /// stdin. Mutually exclusive with --task.
         #[arg(long = "task-file", value_name = "PATH")]
         task_file: Option<String>,
         /// Signal that the entire orchestration is complete (orchestrator only)
@@ -433,6 +441,16 @@ enum RemoteCmd {
         /// Friendly name of the registry entry to remove.
         name: String,
     },
+    /// Diagnose a remote's ssh setup: reachability, the deck's install, the
+    /// forwards ssh actually resolved, and the remote sshd policy behind them
+    /// (PRD #345). Read-only — it never edits ssh config, sshd config, the
+    /// registry, or anything on the remote. Exits 0 when the diagnosis is
+    /// clear, 1 when a check failed, and 2 when a check could not be
+    /// determined.
+    Doctor {
+        /// Friendly name of the registry entry to diagnose.
+        name: String,
+    },
     /// Re-run the binary install flow against an existing entry, then bump
     /// the registry's version field.
     Upgrade {
@@ -526,6 +544,14 @@ enum ConfigAction {
 /// command-substitute the backticks before we ever run). `--task-file -` reads
 /// stdin instead. clap's `conflicts_with` already rejects passing *both*; this
 /// function rejects passing *neither* and surfaces file/stdin read errors.
+///
+/// Both reads are size-bounded at
+/// [`MAX_TASK_BYTES`](dot_agent_deck::bounded_read::MAX_TASK_BYTES) and
+/// refused — never
+/// truncated — past it, and the path branch additionally requires a **regular
+/// file** (issue #328): a FIFO with no writer would otherwise block the CLI
+/// forever inside `open`, and a character device such as `/dev/zero` never
+/// ends. See [`read_task_input`].
 fn resolve_task(
     task: Option<String>,
     task_file: Option<String>,
@@ -533,7 +559,7 @@ fn resolve_task(
 ) -> Result<String, String> {
     match (task, task_file) {
         (Some(t), None) => Ok(t),
-        (None, Some(path)) => read_task_file(&path, stdin),
+        (None, Some(path)) => read_task_input(&path, stdin),
         // clap `conflicts_with` normally prevents this; kept as a defensive
         // guard so the invariant holds even if the two are ever resolved
         // outside clap parsing.
@@ -544,18 +570,6 @@ fn resolve_task(
             "provide the task via --task <text> or --task-file <path> (use `-` for stdin)"
                 .to_string(),
         ),
-    }
-}
-
-/// Read task text verbatim from `path`, or from `stdin` when `path` is `-`.
-fn read_task_file(path: &str, mut stdin: impl std::io::Read) -> Result<String, String> {
-    if path == "-" {
-        let mut buf = String::new();
-        std::io::Read::read_to_string(&mut stdin, &mut buf)
-            .map_err(|e| format!("failed to read task from stdin: {e}"))?;
-        Ok(buf)
-    } else {
-        std::fs::read_to_string(path).map_err(|e| format!("failed to read task file '{path}': {e}"))
     }
 }
 
@@ -1291,6 +1305,7 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            RemoteCmd::Doctor { name } => run_remote_doctor(&name),
             RemoteCmd::Upgrade {
                 name,
                 version,
@@ -1363,12 +1378,39 @@ fn main() -> ExitCode {
                     }
                 }
                 Err(e) => {
+                    // Issue #308 follow-up: the config failed to PARSE, so the
+                    // `toml` error quotes the offending source line verbatim and
+                    // this is an untrusted-bytes sink like the issue loop above.
+                    // Neutralised at the seam, not here —
+                    // `ProjectConfigError`'s `Display` escapes control, C1 and
+                    // bidi characters while keeping the error frame's own
+                    // newlines, exactly as `ValidationIssue`'s `Display` does
+                    // for the single-line case. See both impls for why the
+                    // escaping lives there rather than at each `eprintln!`.
                     eprintln!("{e}");
                     ExitCode::FAILURE
                 }
             }
         }
         Some(Commands::Wrap { agent, command }) => {
+            // Issue #243: the wrapper LOGS. Until this call it did not — the
+            // subcommand went straight into `run_wrap`, so the two `tracing`
+            // lines the interface watch emits (which of its two facts fired, the
+            // single most useful field diagnostic the readiness mechanism
+            // produces) were dropped on the floor by the no-op global
+            // subscriber, and `crate::state::dispatch_one_owned`'s claim that
+            // the fact is "in the wrapper's log" was false. Diagnosing a Codex
+            // delegate that never got its prompt meant reading the wire.
+            //
+            // Safe in a pane. `init_logging_from_env` installs a subscriber ONLY
+            // when `DOT_AGENT_DECK_LOG` is set, and only ever writes to that
+            // file — never to stdout or stderr — so a wrapper whose descriptors
+            // ARE the agent's terminal cannot paint a log line into it. The
+            // daemon fork-execs `dot-agent-deck wrap` without clearing the
+            // environment, so an operator who enabled the daemon's log gets the
+            // wrapper's half of the story in the same file, correlated by
+            // timestamp against the gate lines that read these events.
+            init_logging_from_env();
             dot_agent_deck::wrap::run_wrap(agent.as_deref(), &command)
         }
     }
@@ -1652,6 +1694,13 @@ fn spawn_event_subscriber(
                             Ok(Some(BroadcastMsg::OrchestrationSurface(surface))) => {
                                 state.write().await.queue_orchestration_surface(surface);
                             }
+                            // Issue #717: a close left a dispatched worktree on
+                            // disk. Queue it for the render loop for the same
+                            // reason as the surface above — the status line is
+                            // `UiState`, which this task cannot touch.
+                            Ok(Some(BroadcastMsg::WorktreeKept(kept))) => {
+                                state.write().await.queue_worktree_kept(kept);
+                            }
                             Ok(None) => break,
                             Err(e) => {
                                 tracing::warn!(
@@ -1674,6 +1723,43 @@ fn spawn_event_subscriber(
             delay = std::cmp::min(delay * 2, max_delay);
         }
     });
+}
+
+/// PRD #345: `remote doctor <name>`. Resolves the registry entry FIRST so an
+/// unknown name costs zero ssh invocations, then runs the read-only probes and
+/// prints one line per check.
+///
+/// **Three exit codes**, so the outcomes a script has to treat differently are
+/// distinguishable:
+///
+/// - **0** — clear. Every check PASSed, or at most raised an advisory WARN.
+/// - **1** — a check FAILed, or the command could not run at all (an unknown
+///   registry name, an unreadable registry).
+/// - **2** — incomplete: no FAIL, but at least one check is UNKNOWN.
+///
+/// Both non-zero codes keep the PRD's promise that an UNKNOWN never reads as
+/// PASS. Separating them makes the single most common real-world outcome — a
+/// healthy tunnel on a host where `sshd -T` needs root you do not have — a
+/// stable, scriptable `2` rather than something indistinguishable from a
+/// broken tunnel. See [`dot_agent_deck::remote_doctor::Verdict::exit_code`].
+fn run_remote_doctor(name: &str) -> ExitCode {
+    let registry_path = dot_agent_deck::remote::default_remotes_path();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    match dot_agent_deck::remote_doctor::run_doctor(name, &registry_path, &mut out) {
+        Ok(verdict) => {
+            let _ = out.flush();
+            ExitCode::from(verdict.exit_code())
+        }
+        Err(e) => {
+            let _ = out.flush();
+            eprintln!("{e}");
+            // The diagnosis never started, so there is no verdict to map. `1`
+            // rather than `2`: the command itself failed, which is a different
+            // thing from a diagnosis that ran and could not see everything.
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `dot-agent-deck connect [name]` — PRD #76 M2.9.
@@ -2166,6 +2252,7 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
 mod tests {
     use super::*;
     use clap::Parser;
+    use dot_agent_deck::bounded_read::MAX_TASK_BYTES;
 
     // --- PRD #220: the dispatch shape selector's parsing ---
 
@@ -2424,6 +2511,79 @@ mod tests {
         assert!(
             err.contains("failed to read task file") && err.contains("/no/such/task-file.txt"),
             "missing-file error should name the path: {err}"
+        );
+    }
+
+    // ---- Issue #328: both reads are bounded, and a non-regular path is
+    // refused rather than opened. The per-shape refusals (FIFO, symlink to a
+    // FIFO, character device, endless stream) are unit-tested against the
+    // helper in `dot_agent_deck::bounded_read`; what these pin is that
+    // `resolve_task` — the seam every `delegate` / `work-done` call goes
+    // through — actually routes into it.
+
+    #[test]
+    fn task_file_over_the_size_limit_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("huge-task.md");
+        std::fs::write(&path, "x".repeat(MAX_TASK_BYTES as usize + 1)).expect("write");
+
+        let err = resolve_task(
+            None,
+            Some(path.to_str().unwrap().to_string()),
+            std::io::empty(),
+        )
+        .expect_err("a task file over the cap must be refused");
+        assert!(
+            err.contains("exceeds the") && err.contains("limit"),
+            "over-limit error should state the cap: {err}"
+        );
+    }
+
+    #[test]
+    fn task_file_at_the_size_limit_is_still_accepted() {
+        // The cap refuses only what is genuinely past it — an input sitting
+        // exactly on the boundary is a legitimate task, not a pathological one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("big-task.md");
+        let text = "x".repeat(MAX_TASK_BYTES as usize);
+        std::fs::write(&path, &text).expect("write");
+
+        let got = resolve_task(
+            None,
+            Some(path.to_str().unwrap().to_string()),
+            std::io::empty(),
+        )
+        .expect("a task file exactly at the cap must be accepted");
+        assert_eq!(got.len(), MAX_TASK_BYTES as usize);
+    }
+
+    #[test]
+    fn stdin_over_the_size_limit_is_refused() {
+        // `-` keeps working (see `task_file_dash_reads_task_verbatim_from_stdin`),
+        // but the same cap applies to it.
+        let oversized = "x".repeat(MAX_TASK_BYTES as usize + 1);
+        let err = resolve_task(None, Some("-".to_string()), oversized.as_bytes())
+            .expect_err("oversized stdin must be refused");
+        assert!(
+            err.contains("task from stdin") && err.contains("exceeds the"),
+            "over-limit stdin error should name stdin and the cap: {err}"
+        );
+    }
+
+    #[test]
+    fn task_file_pointing_at_a_non_regular_file_is_refused() {
+        // A directory is the portable stand-in for the whole class; the FIFO
+        // and character-device cases live in the `bounded_read` unit tests.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = resolve_task(
+            None,
+            Some(dir.path().to_str().unwrap().to_string()),
+            std::io::empty(),
+        )
+        .expect_err("a non-regular --task-file target must be refused");
+        assert!(
+            err.contains("--task-file needs a regular file") && err.contains("--task-file -"),
+            "refusal should say what is required and point at the stdin alternative: {err}"
         );
     }
 

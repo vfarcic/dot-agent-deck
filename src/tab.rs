@@ -813,7 +813,12 @@ impl TabManager {
             .roles
             .iter()
             .find(|r| r.start)
-            .map(|r| AgentType::from_command(Some(&r.command)) == Some(AgentType::Pi))
+            // Issue #308: the role's RESOLVED type — its `agent = "…"`
+            // declaration when it made one, else the type derived from the
+            // command — so a Pi orchestrator launched through a wrapper script
+            // still gets native seeding instead of silently falling back to
+            // keystroke injection.
+            .map(|r| r.resolved_agent_type() == Some(AgentType::Pi))
             .unwrap_or(false);
 
         // CodeRabbit round-9 #7 / round-10 #1: `config.name` defaults
@@ -888,7 +893,12 @@ impl TabManager {
                 // back via `list_agents` on reconnect so the hydration
                 // path can build the placeholder session with the right
                 // type instead of "No agent".
-                agent_type: AgentType::from_command(Some(&role.command)),
+                // Issue #308: a role may DECLARE its agent (`agent = "codex"`)
+                // for a command no parser can resolve — `devbox run -- codex`,
+                // `make codex`, a bespoke `run-codex.sh`. The declaration wins
+                // here, so such a role badges and wraps at spawn instead of
+                // reading "No agent" until its first delegated task.
+                agent_type: role.resolved_agent_type(),
                 // PRD #201: seed only the Pi start-role pane for native pull.
                 seed: if role.start && start_role_is_pi {
                     orchestrator_prompt.clone()
@@ -1514,6 +1524,7 @@ mod tests {
     /// panes and no reactive pool, so `managed_pane_ids()` is deterministic.
     fn mode_config(name: &str, side_pane_count: usize) -> ModeConfig {
         ModeConfig {
+            agent: None,
             name: name.to_string(),
             init_command: None,
             seed_prompt: None,
@@ -1531,9 +1542,11 @@ mod tests {
 
     fn orch_config(name: &str) -> OrchestrationConfig {
         OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "echo orch".to_string(),
                     start: true,
@@ -1542,6 +1555,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "coder".to_string(),
                     command: "echo coder".to_string(),
                     start: false,
@@ -2084,9 +2098,11 @@ mod tests {
     /// through them in ascending order rather than merely picking one.
     fn orch_config_4(name: &str) -> OrchestrationConfig {
         OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "echo orch".to_string(),
                     start: true,
@@ -2095,6 +2111,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "alpha".to_string(),
                     command: "echo alpha".to_string(),
                     start: false,
@@ -2103,6 +2120,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "beta".to_string(),
                     command: "echo beta".to_string(),
                     start: false,
@@ -2111,6 +2129,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "gamma".to_string(),
                     command: "echo gamma".to_string(),
                     start: false,
@@ -2127,9 +2146,11 @@ mod tests {
     /// higher-order waiting panes among more than two roles.
     fn orch_config_3(name: &str) -> OrchestrationConfig {
         OrchestrationConfig {
+            default: false,
             name: name.to_string(),
             roles: vec![
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "orchestrator".to_string(),
                     command: "echo orch".to_string(),
                     start: true,
@@ -2138,6 +2159,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "alpha".to_string(),
                     command: "echo alpha".to_string(),
                     start: false,
@@ -2146,6 +2168,7 @@ mod tests {
                     clear: false,
                 },
                 OrchestrationRoleConfig {
+                    agent: None,
                     name: "beta".to_string(),
                     command: "echo beta".to_string(),
                     start: false,

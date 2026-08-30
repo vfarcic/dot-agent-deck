@@ -27,9 +27,12 @@ Other registry commands:
 
 ```bash
 dot-agent-deck remote list                 # show configured remotes
+dot-agent-deck remote doctor my-vm         # diagnose ssh, the install, and any forwards (read-only)
 dot-agent-deck remote upgrade my-vm        # reinstall the binary at the local client's version
 dot-agent-deck remote remove my-vm         # forget the registry entry (host untouched)
 ```
+
+`remote doctor` is the one to reach for when a connection or a tunnel is not behaving: it runs a fixed list of read-only checks and prints each as PASS / WARN / FAIL / UNKNOWN with the directive and file to change. It never writes anything, anywhere. It exits `0` when the diagnosis is clear, `1` when a check failed, and `2` when a check could not be determined. See [Reverse tunnels › Troubleshooting with `remote doctor`](remote-recipes.md#troubleshooting-with-remote-doctor).
 
 ### `remote add` flags
 
@@ -160,6 +163,17 @@ What to check:
 - Is the host on, and is its sshd listening on the configured port?
 - Does `ssh user@host` work outside the deck? If not, this isn't a deck problem — it's an ssh/network problem and you'll see the same error.
 - Did the host key change? `ssh-keygen -R host` to remove the stale entry, then re-`ssh` to accept the new one.
+
+### SSH forwarding failed
+
+Symptom: ssh reached the host and authenticated, but could not establish a forward your `~/.ssh/config` asked for. This only applies if you have set up a tunnel — see [Reaching networks only your laptop can see](remote-recipes.md#reaching-networks-only-your-laptop-can-see).
+
+```
+SSH forwarding failed for remote 'my-vm': remote port forwarding failed for listen port 1080
+The remote port may already be bound, or `AllowTcpForwarding` may be disabled on the remote. Run `dot-agent-deck remote doctor my-vm` to distinguish the cause.
+```
+
+Both causes produce the *same* bytes from ssh, so the client genuinely cannot tell them apart and the message does not pretend to. `remote doctor` reads the remote's own sshd policy and the live bind state, which is what separates them. Before [issue #344](https://github.com/vfarcic/dot-agent-deck/issues/344) this was reported as a host-unreachable failure, which sent people to debug a network path that was never broken.
 
 ### Remote binary missing
 

@@ -876,9 +876,11 @@ impl PaneController for DelayedCloseController {
 
 fn six_role_orchestration() -> OrchestrationConfig {
     OrchestrationConfig {
+        default: false,
         name: "six-role-close".to_string(),
         roles: (0..6)
             .map(|index| OrchestrationRoleConfig {
+                agent: None,
                 name: format!("role-{index}"),
                 command: "cat".to_string(),
                 start: index == 0,

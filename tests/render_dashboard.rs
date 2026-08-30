@@ -16,9 +16,10 @@ use dot_agent_deck::tab::Tab;
 use dot_agent_deck::terminal_widget::TerminalWidget;
 use dot_agent_deck::ui::{
     CardDensityKind, UiMode, card_stats_border_label, render_card_for_mode_to_buffer,
-    render_card_grid_to_buffer, render_card_to_buffer, render_config_gen_prompt_to_buffer,
-    render_dashboard_cards_to_buffer, render_quit_confirm_to_buffer, render_star_prompt_to_buffer,
-    render_stats_bar_to_buffer, render_stop_confirm_to_buffer, sync_and_derive_selection,
+    render_card_grid_to_buffer, render_card_to_buffer, render_card_with_declared_agent_to_buffer,
+    render_config_gen_prompt_to_buffer, render_dashboard_cards_to_buffer,
+    render_quit_confirm_to_buffer, render_star_prompt_to_buffer, render_stats_bar_to_buffer,
+    render_stop_confirm_to_buffer, sync_and_derive_selection,
 };
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
@@ -2464,6 +2465,75 @@ fn pane_012_hostile_display_name_cannot_corrupt_the_card() {
     assert!(
         rendered.contains("example-alpha") && rendered.contains("example-gamma"),
         "both neighbouring cards must still render their own titles:\n{rendered}"
+    );
+}
+
+/// Scenario: Render a neutral session with a declared Codex identity, then
+/// render the same card after it reports ClaudeCode. The declaration must fill
+/// only the initial `No agent` badge and yield to the observed agent identity.
+#[spec("dashboard/pane/013")]
+#[test]
+fn pane_013_declared_agent_fallback_yields_to_observed_agent() {
+    let now = chrono::Utc::now();
+    let mut session = SessionState {
+        session_id: "declared-agent".to_string(),
+        agent_type: AgentType::None,
+        cwd: Some("/home/dev/workspace".to_string()),
+        status: SessionStatus::Idle,
+        active_tool: None,
+        started_at: now,
+        last_activity: now + chrono::Duration::seconds(30),
+        recent_events: VecDeque::new(),
+        tool_count: 0,
+        last_user_prompt: None,
+        first_prompts: Vec::new(),
+        pane_id: Some("pane-declared-agent".to_string()),
+        agent_id: Some("agent-declared-agent".to_string()),
+        display_name: Some("reviewer".to_string()),
+        shell_synthetic_working: false,
+    };
+    let density = CardDensityKind::Normal;
+    let render = |session: &SessionState, declared_agent_type: Option<&AgentType>| {
+        buffer_to_text(&render_card_with_declared_agent_to_buffer(
+            session,
+            Some("reviewer"),
+            Some(1),
+            density,
+            0,
+            false,
+            UiMode::Normal,
+            declared_agent_type,
+            80,
+            density.rendered_height(),
+        ))
+    };
+
+    let declared = render(&session, Some(&AgentType::Codex));
+    assert!(
+        declared.contains("Codex · reviewer"),
+        "an unidentified session must render its declared Codex badge:\n{declared}"
+    );
+    assert!(
+        !declared.contains("No agent"),
+        "a declared Codex pane must not retain the placeholder badge or status:\n{declared}"
+    );
+
+    session.agent_type = AgentType::ClaudeCode;
+    let observed = render(&session, Some(&AgentType::Codex));
+    assert!(
+        observed.contains("ClaudeCode · reviewer"),
+        "an observed ClaudeCode identity must override the Codex declaration:\n{observed}"
+    );
+    assert!(
+        !observed.contains("Codex"),
+        "a stale declaration must not relabel an agent that identified itself:\n{observed}"
+    );
+
+    session.agent_type = AgentType::None;
+    let baseline = render(&session, None);
+    assert!(
+        baseline.contains("No agent"),
+        "without an observation or declaration the pre-#308 placeholder remains:\n{baseline}"
     );
 }
 

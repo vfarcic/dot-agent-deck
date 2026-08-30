@@ -511,6 +511,25 @@ impl std::fmt::Debug for PinnedProcess {
     }
 }
 
+// SAFETY: `PinnedProcess` wraps a Win32 `HANDLE`, which is `*mut c_void` and so
+// `!Send` by inference alone — not because moving one between threads is unsound.
+// A handle is a per-process kernel-object reference, valid from any thread in the
+// owning process; `CloseHandle` carries no thread affinity either, so the `Drop`
+// above is correct wherever it runs. (Thread affinity applies to a few specific
+// object types such as window and GDI handles. This one is `OpenProcess` with
+// `PROCESS_QUERY_LIMITED_INFORMATION`, which has none.) The wrapper never hands
+// out the raw handle and closes it exactly once, so there is no aliasing to race.
+//
+// This is load-bearing rather than tidiness. `run_daemon_stop` holds the pin
+// across `.await`s on purpose — the pin's whole job is to keep the pid's identity
+// stable for the escalation window (`src/daemon_stop.rs:168-226`) — which makes
+// the enclosing future `!Send` without this. Tauri requires a `Send` future for
+// every `#[tauri::command]`, so the desktop crate's `desktop_run_action` failed to
+// compile on Windows with E0277 the moment it called into this path. Implemented
+// on `PinnedProcess` rather than on `OwnedHandle` to keep the claim as narrow as
+// the need: the pin is the only handle that crosses an await.
+unsafe impl Send for PinnedProcess {}
+
 /// Pin `pid`'s identity for as long as the returned value is held — see
 /// [`PinnedProcess`].
 ///

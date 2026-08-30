@@ -64,9 +64,15 @@ use std::sync::OnceLock;
 
 /// How long a process spawned out of a test process may live before its own
 /// backstop ends it, in seconds. Matches the value `TuiDeck` and `DaemonProc`
-/// pin explicitly after their `env_clear`, and the 300 s figure
-/// `docs/develop/e2e-temp-dirs.md` reasons about when it sets the reaper's
-/// 10-minute floor at 2x the orphan cap.
+/// pin explicitly after their `env_clear`.
+///
+/// Not the number the reaper's floor is derived from — that is
+/// `clean_tmp::MAX_PINNED_ORPHAN_CAP_SECS` (900 s), the longest cap any test
+/// pins, and it is deliberately larger than this default. Issue #679: the floor
+/// was documented as "2x the orphan cap" while pointing at *this* 300 s, which
+/// left it 300 s short of the longest pin actually in the tree. See [`clamped`]
+/// for why this file cannot bound that pin, and linkage-check rule 11 for what
+/// does.
 ///
 /// Also the CEILING for whatever this process inherited, not just the default.
 /// It bounds *ambient* values and nothing else — a harness path that re-pins the
@@ -80,17 +86,18 @@ const CHILD_MAX_LIFETIME_SECS: u64 = 300;
 /// outlive the case that made it, and that is deliberate.
 ///
 /// A **longer** one does not, and neither does an unparseable or zero one. Both
-/// are replaced by [`CHILD_MAX_LIFETIME_SECS`], because 300 s is not a
-/// preference here — it is the number `cargo xtask clean-e2e-tmp`'s deletion
-/// safety rests on. That reaper reaps a root whose owning test process is dead
-/// once the root is 10 minutes old, and it picks 10 minutes as *2x this cap*
-/// (`docs/develop/e2e-temp-dirs.md`, "The 10-minute floor on dead owners"). So
-/// an exported `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS=3600` does not merely
-/// widen a test-only bound: it silently converts the reaper's margin into a
-/// deficit, and `--apply` can then delete a root out from under a descendant
-/// still nominally entitled to write there for another 50 minutes. Measured
-/// before this clamp existed: that exact value was accepted end to end and the
-/// arming regression test passed with it.
+/// are replaced by [`CHILD_MAX_LIFETIME_SECS`], because the cap is not a
+/// preference here — it is what `cargo xtask clean-e2e-tmp`'s deletion safety
+/// rests on. That reaper reaps a root whose owning test process is dead once
+/// the root is 30 minutes old, and it picks 30 minutes as *2x the longest cap
+/// any test pins* (`docs/develop/e2e-temp-dirs.md`, "The 30-minute floor on
+/// dead owners"). So an exported
+/// `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS=3600` does not merely widen a
+/// test-only bound: it silently converts the reaper's margin into a deficit,
+/// and `--apply` can then delete a root out from under a descendant still
+/// nominally entitled to write there for another half hour. Measured before
+/// this clamp existed: that exact value was accepted end to end and the arming
+/// regression test passed with it.
 ///
 /// # The ceiling is an AMBIENT-value guarantee, and only that
 ///
@@ -107,13 +114,16 @@ const CHILD_MAX_LIFETIME_SECS: u64 = 300;
 /// lazily-spawned daemon carry `900`.
 ///
 /// So state the property precisely. "Every descendant of a test process stops
-/// within [`CHILD_MAX_LIFETIME_SECS`]" — which `clean-e2e-tmp`'s 600 s
-/// dead-owner floor takes its 2x margin from — holds for **ambient** values and
-/// is not universal: between 600 s and 900 s that one test's daemon outlives the
-/// floor. Neither half of that gap is this clamp's doing (#665's 900 and the
-/// reaper's 600 both live on `main` independently of it), and moving a
-/// *deletion* tool's margin wants its own review, so it is tracked as
-/// **issue #679** rather than settled here.
+/// within [`CHILD_MAX_LIFETIME_SECS`]" holds for **ambient** values and is not
+/// universal — which is why the reaper's floor is no longer derived from this
+/// number at all. Issue #679: while it was, the floor sat at 600 s (2x 300)
+/// against a tree in which one test already pinned 900, so between 600 s and
+/// 900 s that test's daemon outlived the floor and `--apply` could delete the
+/// root under it. The floor is now 2x `clean_tmp::MAX_PINNED_ORPHAN_CAP_SECS`
+/// — the longest cap *written anywhere under `tests/`*, 900 s — and
+/// linkage-check rule 11 fails the build if a pin exceeds it, so the guarantee
+/// the reaper needs is the one that is actually checked. This clamp keeps the
+/// narrower job it can do: bounding what a contributor's shell hands in.
 ///
 /// None of which makes the ceiling decorative: it covers the case that was
 /// actually measured — an exported `…=3600` in a contributor's shell, which

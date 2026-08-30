@@ -374,6 +374,42 @@ pub fn parser_init_dims(rows: u16, cols: u16) -> (u16, u16) {
     (24, 80)
 }
 
+/// The single construction point for a pane's local vt100 parser (issue #363).
+///
+/// Every parser this module builds — spawn, hydration, the L1 render/scroll
+/// seams, and the rebuild that follows a contained parser panic — goes through
+/// here, so "what is a valid parser geometry?" has one definition
+/// ([`parser_init_dims`]) and one place it is applied.
+///
+/// Not having that is what issue #363 was: `wire_stream_pane` reached
+/// `vt100::Parser::new` raw on the **shipped spawn path**, while
+/// [`EmbeddedPaneController::seam_pane`] a few hundred lines above already
+/// clamped. The spawn caller forwards viewport-derived dims from `ui.rs`'s
+/// layout helpers, every one of which ends in a `saturating_sub(2)` border
+/// allowance, so a short or narrow terminal built a 0-row or 0-column parser in
+/// the real binary.
+///
+/// A zero axis breaks the grid at *construction*, not at first byte: vt100
+/// 0.16.2's `Grid::new` sets `scroll_bottom: size.rows - 1`, which under debug
+/// overflow checks panics outright (measured — `grid.rs:26`) and in a release
+/// build wraps to 65535, leaving a grid with no rows claiming a scroll region
+/// that ends at row 65535. That is why [`guarded_parser_feed`] never covered
+/// this: it wraps feeds, not construction. The only thing that did was the next
+/// frame's resize sweep landing before any output arrived — incidental, not
+/// designed. (`col_wrap`'s `prev_pos.row -= scrolled` underflow on a *1-row*
+/// grid is a separate, feed-time hazard, and that one the feed guard does
+/// contain.)
+///
+/// This guards *construction* only, which is the whole of the contract. A
+/// parser's geometry can still move afterwards through `screen_mut().set_size`
+/// in [`EmbeddedPaneController::resize_pane_pty`], which does not clamp — its
+/// one caller, `ui.rs`'s `resize_panes_to_layout`, skips a zero axis instead —
+/// and feeding stays separately guarded by [`guarded_parser_feed`].
+fn new_pane_parser(rows: u16, cols: u16) -> vt100::Parser {
+    let (rows, cols) = parser_init_dims(rows, cols);
+    vt100::Parser::new(rows, cols, PANE_SCROLLBACK_LINES)
+}
+
 use crate::pane_input::{SUBMIT_DELAY, encode_pane_payload};
 
 /// Placeholder daemon socket path for the render-only constructors below. It
@@ -630,12 +666,12 @@ impl EmbeddedPaneController {
     /// `screen` / `mouse_mode`, which is the whole point of the seams.
     ///
     /// `rows` / `cols` are caller-controlled on every seam above, and these are
-    /// ordinary `pub` entry points of the release library — so they go through the
-    /// same [`parser_init_dims`] guard the hydration path uses rather than reaching
-    /// `vt100::Parser::new` raw. A zero axis would otherwise build a parser whose
-    /// grid panics on the first byte, and `u16::MAX` square would ask for ~4.3
-    /// billion cells. This is the single construction point for a seam pane, so it
-    /// is the single place the guard has to sit.
+    /// ordinary `pub` entry points of the release library — so they go through
+    /// [`new_pane_parser`], the one guarded constructor the spawn and hydration
+    /// paths also use, rather than reaching `vt100::Parser::new` raw. A zero axis
+    /// would otherwise build a parser whose grid is already inconsistent before
+    /// the first byte (`Grid::new` computes `scroll_bottom` as `rows - 1`), and
+    /// `u16::MAX` square would ask for ~4.3 billion cells.
     ///
     /// Valid dims are not enough on their own: `parser_init_dims` admits a 1-row /
     /// 1-col parser, and vt100 0.16.2 underflows in `col_wrap` the moment text
@@ -651,8 +687,11 @@ impl EmbeddedPaneController {
         mouse_mode_enabled: bool,
         focused: bool,
     ) -> (Pane, tokio::sync::mpsc::UnboundedReceiver<StreamCmd>) {
-        let (rows, cols) = parser_init_dims(rows, cols);
-        let mut parser = vt100::Parser::new(rows, cols, PANE_SCROLLBACK_LINES);
+        let mut parser = new_pane_parser(rows, cols);
+        // Post-guard geometry, read back off the parser itself rather than
+        // re-derived: what the warning below should name, and what the rebuild
+        // has to reproduce. Re-deriving it is how two copies of a rule drift.
+        let (rows, cols) = parser.screen().size();
         if guarded_parser_feed(|| parser.process(bytes)).is_err() {
             tracing::warn!(
                 rows,
@@ -660,7 +699,7 @@ impl EmbeddedPaneController {
                 "vt100 parser panicked seeding an inert seam pane; rebuilding it empty at the \
                  same geometry. Known vt100 0.16.2 edge case in a very short pane."
             );
-            parser = vt100::Parser::new(rows, cols, PANE_SCROLLBACK_LINES);
+            parser = new_pane_parser(rows, cols);
         }
 
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<StreamCmd>();
@@ -1127,11 +1166,16 @@ impl EmbeddedPaneController {
         // A 24×80 parser receiving an already-correctly-sized frame would
         // clip it; resize-time keeps both sides in sync via the per-pane
         // resize worker + `resize_pane_pty`.
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(
-            rows,
-            cols,
-            PANE_SCROLLBACK_LINES,
-        )));
+        //
+        // Issue #363: through [`new_pane_parser`], never `vt100::Parser::new`
+        // raw. The two hydration callers hand over dims the daemon vouched for,
+        // but the spawn caller (`create_stream_pane`) forwards viewport-derived
+        // dims straight from `ui.rs`'s layout helpers — `right_column_pane_dims`,
+        // `mode_side_pane_dims` and `mode_agent_pane_dims` all end in a
+        // `saturating_sub(2)` border allowance — so a short or narrow terminal
+        // arrives here with a zero axis and no caller in between rejects it, the
+        // way `resize_panes_to_layout` does on the resize path.
+        let parser = Arc::new(Mutex::new(new_pane_parser(rows, cols)));
         let mouse_mode = Arc::new(AtomicBool::new(false));
         let hyperlinks = Arc::new(Mutex::new(HyperlinkMap::new()));
         // PRD #611 M2: born at zero even on the hydration path. The daemon
@@ -3297,7 +3341,9 @@ fn process_agent_output_chunk(
     let mut parser_reset = false;
     if let Ok(mut p) = parser.lock() {
         // Captured while the parser is known-good so a contained panic can
-        // rebuild it at the same geometry.
+        // rebuild it at the same geometry. Rebuilt through `new_pane_parser`
+        // (issue #363), so a parser that somehow holds a degenerate geometry is
+        // replaced by a valid one instead of reproducing the degenerate grid.
         let (rows, cols) = p.screen().size();
         for segment in &segments {
             // The MutexGuard `p` is borrowed into the closure but lives in this
@@ -3324,7 +3370,7 @@ fn process_agent_output_chunk(
                          pane parser to a clean state (screen/scrollback cleared). Known \
                          vt100 0.16.2 edge case with wide characters in a very short pane."
                     );
-                    *p = vt100::Parser::new(rows, cols, PANE_SCROLLBACK_LINES);
+                    *p = new_pane_parser(rows, cols);
                     new_links.clear();
                     scroll_amount = 0;
                     parser_reset = true;
@@ -4380,6 +4426,164 @@ mod tests {
         assert_eq!(parser_init_dims(PTY_RESIZE_DIM_MAX + 1, 40), (24, 80));
         assert_eq!(parser_init_dims(40, PTY_RESIZE_DIM_MAX + 1), (24, 80));
         assert_eq!(parser_init_dims(u16::MAX, u16::MAX), (24, 80));
+    }
+
+    // ---- Issue #363: every parser is built through one guarded constructor --
+
+    /// Regression for issue #363, on the **shipped spawn path**.
+    ///
+    /// `create_stream_pane` forwards viewport-derived dims into
+    /// `wire_stream_pane`, and every `ui.rs` layout helper that produces them
+    /// ends in a `saturating_sub(2)` border allowance — so a terminal too short
+    /// or too narrow reaches the wiring with a zero axis. Before the fix that
+    /// went straight into `vt100::Parser::new`, which breaks at construction:
+    /// `Grid::new` computes `scroll_bottom` as `rows - 1`. Written against the
+    /// unfixed code this test does not merely assert a wrong size — it panics in
+    /// `grid.rs:26`, which is what a debug build of the shipped binary would do
+    /// too.
+    ///
+    /// L1 by construction, and deliberately so: what is under test is parser
+    /// *construction* from caller-supplied dims. Nothing here needs the spawned
+    /// binary, a real PTY, or a daemon — the connection is an in-process socket
+    /// pair — so an L2 `e2e_*` test would cost a process spawn to observe the
+    /// same `screen().size()`.
+    #[cfg(unix)]
+    #[test]
+    fn wire_stream_pane_never_builds_a_degenerate_parser() {
+        let controller = EmbeddedPaneController::for_render_only_tests();
+        // `UnixStream::pair` registers with the reactor, so it needs a runtime
+        // in scope. The same one the controller will spawn its (never-polled)
+        // I/O and resize tasks onto.
+        let rt = render_only_runtime();
+        let _enter = rt.enter();
+
+        // Every way a border allowance can collapse an axis, plus the
+        // hostile/oversized direction `parser_init_dims` also refuses.
+        for (i, (rows, cols)) in [
+            (0u16, 0u16),
+            (0, 80),
+            (24, 0),
+            (u16::MAX, u16::MAX),
+            (PTY_RESIZE_DIM_MAX + 1, 40),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let pane_id = format!("{i}");
+            // Held for the duration: dropping it would EOF the reader half.
+            let (conn, _peer) = AttachConnection::connected_pair_for_test();
+            controller.wire_stream_pane(
+                pane_id.clone(),
+                format!("agent-{i}"),
+                conn,
+                format!("pane-{i}"),
+                None,
+                None,
+                rows,
+                cols,
+            );
+
+            let screen = controller
+                .get_screen(&pane_id)
+                .expect("wire_stream_pane must have registered the pane");
+            let size = screen.lock().unwrap().screen().size();
+            assert_eq!(
+                size,
+                (24, 80),
+                "wire_stream_pane({rows}, {cols}) must fall back to the guarded 24x80 \
+                 parser, not build a {size:?} grid"
+            );
+        }
+    }
+
+    /// Valid dims must still reach the parser untouched — the guard is a floor
+    /// and a ceiling, not a rewrite. A pane sized to its real viewport has to
+    /// parse the daemon's already-correctly-sized frames without clipping.
+    #[cfg(unix)]
+    #[test]
+    fn wire_stream_pane_preserves_usable_dimensions() {
+        let controller = EmbeddedPaneController::for_render_only_tests();
+        let rt = render_only_runtime();
+        let _enter = rt.enter();
+
+        let (conn, _peer) = AttachConnection::connected_pair_for_test();
+        controller.wire_stream_pane(
+            "1".to_string(),
+            "agent-1".to_string(),
+            conn,
+            "pane-1".to_string(),
+            None,
+            None,
+            21,
+            38,
+        );
+
+        let screen = controller.get_screen("1").expect("pane registered");
+        let size = screen.lock().unwrap().screen().size();
+        assert_eq!(size, (21, 38), "usable dims must pass through unchanged");
+    }
+
+    /// The shared constructor is the whole point of the fix: one definition of
+    /// "valid parser geometry", applied in one place. Pin both halves.
+    #[test]
+    fn new_pane_parser_clamps_and_passes_through() {
+        assert_eq!(new_pane_parser(0, 0).screen().size(), (24, 80));
+        assert_eq!(new_pane_parser(0, 80).screen().size(), (24, 80));
+        assert_eq!(new_pane_parser(24, 0).screen().size(), (24, 80));
+        assert_eq!(
+            new_pane_parser(u16::MAX, u16::MAX).screen().size(),
+            (24, 80)
+        );
+        assert_eq!(new_pane_parser(21, 38).screen().size(), (21, 38));
+        assert_eq!(new_pane_parser(1, 1).screen().size(), (1, 1));
+    }
+
+    /// The failure mode issue #363 warns about is a *fourth* call site added
+    /// later that quietly skips the guard — the same drift that produced this
+    /// bug, and the same class as any rule kept in two hand-maintained copies.
+    ///
+    /// So pin the structural invariant rather than only the behaviour: in this
+    /// file's non-test code there is exactly ONE `vt100::Parser::new`, and it is
+    /// inside `new_pane_parser`. `include_str!` is compile-time, so this reads
+    /// no file at runtime and stays inside the fast tier's budget.
+    #[test]
+    fn parser_is_constructed_in_exactly_one_place() {
+        const SRC: &str = include_str!("embedded_pane.rs");
+        // Split off this very test module; parsers built inside it are fixtures
+        // (`wide_char_in_one_row_pane_does_not_crash_the_tui` deliberately
+        // constructs a raw 1x10 parser to prove the vt100 bug still exists).
+        // `include_str!` yields the file exactly as checked out, and Windows
+        // checks it out with CRLF endings — so every `\n`-anchored marker below
+        // (this split, and the `\n}\n` that ends the helper) silently fails to
+        // match there. Normalize once so the guard reads the same source on
+        // every platform.
+        let src = SRC.replace("\r\n", "\n");
+        let (prod, _tests) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("test module marker moved; update this guard");
+
+        let needle = "vt100::Parser::new(";
+        let hits: Vec<usize> = prod.match_indices(needle).map(|(i, _)| i).collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "non-test code in embedded_pane.rs must construct vt100 parsers only \
+             through `new_pane_parser` (issue #363); found {} raw call sites at \
+             byte offsets {hits:?}",
+            hits.len()
+        );
+
+        let helper_start = prod
+            .find("fn new_pane_parser(")
+            .expect("`new_pane_parser` must exist");
+        let helper_end = prod[helper_start..]
+            .find("\n}\n")
+            .map(|rel| helper_start + rel)
+            .expect("`new_pane_parser` must end at a top-level brace");
+        assert!(
+            (helper_start..helper_end).contains(&hits[0]),
+            "the one raw `vt100::Parser::new` must live inside `new_pane_parser`"
+        );
     }
 
     // ---- PRD #611 M3: `scan_mouse_mode` -----------------------------------

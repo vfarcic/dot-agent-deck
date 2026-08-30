@@ -48,7 +48,7 @@ const PICKER_MAX_RETRIES: usize = 3;
 /// install location ever becomes user-configurable, this will become a field
 /// on `RemoteEntry`; until then, both `add` and `connect` agree on the same
 /// constant.
-const REMOTE_INSTALL_PATH: &str = "~/.local/bin/dot-agent-deck";
+pub const REMOTE_INSTALL_PATH: &str = "~/.local/bin/dot-agent-deck";
 
 /// Default cap on the version-probe ssh round-trip. Overridable via
 /// `DOT_AGENT_DECK_SSH_PROBE_TIMEOUT_SECS` — useful when a remote is reachable
@@ -132,6 +132,14 @@ pub enum RemoteConnectError {
         "Could not reach remote '{name}': {detail}\nCheck your ssh config (`~/.ssh/config`), the host is up, and the network path is open."
     )]
     HostUnreachable { name: String, detail: String },
+    /// ssh reached the host but could not establish a requested remote
+    /// forward. The client cannot distinguish a listener collision from an
+    /// sshd policy refusal, so direct the user to the doctor instead of
+    /// guessing which side is at fault.
+    #[error(
+        "SSH forwarding failed for remote '{name}': {detail}\nThe remote port may already be bound, or `AllowTcpForwarding` may be disabled on the remote. Run `dot-agent-deck remote doctor {name}` to distinguish the cause."
+    )]
+    ForwardFailed { name: String, detail: String },
     /// The remote is reachable but `dot-agent-deck` isn't installed (or
     /// isn't on the absolute install path we expect). Hint at `remote
     /// upgrade` because that re-runs the install pipeline against the same
@@ -175,6 +183,29 @@ pub enum RemoteConnectError {
         message_suffix = if message.is_empty() { String::new() } else { format!(": {message}") }
     )]
     RemoteHandshakeError { name: String, message: String },
+    /// PRD #345 second audit: a probe's captured output reached its byte cap,
+    /// so what arrived is a *prefix* of what the remote sent. Refusing to
+    /// parse it is the entire point of the variant. Both probes are
+    /// head-anchored parsers — `parse_version_output` reads the first two
+    /// tokens and ignores the rest, `serde_json::from_str` runs after a
+    /// `trim()` — so a flood that merely *begins* with a valid version pair,
+    /// or a valid reply padded with whitespace to exactly the cap, parsed
+    /// clean and was trusted as authoritative.
+    ///
+    /// Deliberately NOT folded into `HostUnreachable` (the host plainly IS
+    /// reachable — it answered, at length) nor into `RemoteBinaryMissing`
+    /// (something is installed there and it ran). `remote doctor` therefore
+    /// reports the affected check UNKNOWN rather than PASS or FAIL, and
+    /// `is_reachability_error` leaves it fatal: a remote that floods a probe
+    /// will flood the retry too.
+    #[error(
+        "Remote '{name}' produced more than {cap} bytes from `{probe}`, so the reply is a fragment and was not parsed.\nA probe answer is normally well under a kilobyte — investigate the remote binary and the shell startup files that run before it."
+    )]
+    ProbeOutputTruncated {
+        name: String,
+        probe: &'static str,
+        cap: usize,
+    },
     #[error(transparent)]
     Registry(#[from] RemoteConfigError),
     #[error("I/O error: {0}")]
@@ -308,7 +339,7 @@ pub fn pick_remote<R: BufRead, W: Write>(
 ///   values (e.g. `u64::MAX`). The clamp closes a self-DoS / ssh-child-leak
 ///   path: without it, an extreme env var would panic *after* the ssh child
 ///   was spawned, and `Child::drop` does not reap.
-fn probe_timeout_secs() -> u64 {
+pub fn probe_timeout_secs() -> u64 {
     std::env::var(PROBE_TIMEOUT_ENV)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -346,6 +377,23 @@ fn parse_version_output(stdout: &str) -> Option<String> {
     Some(version.to_string())
 }
 
+/// Maximum bytes the binary-version probe keeps from either stream.
+///
+/// `dot-agent-deck --version` prints one short line, and the biggest thing ssh
+/// itself ever writes here is a handful of lines of transport complaint, so
+/// 8 KiB is three orders of magnitude of headroom. The cap is not about the
+/// honest case: `SshExecutor::run` drains both pipes with `read_to_end`, and
+/// the wallclock deadline bounds *duration*, not *bytes* — so before this a
+/// hostile remote (or a shell startup file that never stops printing) could
+/// stream at line rate for the whole
+/// `DOT_AGENT_DECK_SSH_PROBE_TIMEOUT_SECS` window, which the user can stretch
+/// to an hour, and grow the laptop's capture the entire time. Same class of
+/// bug, and same remedy, as the bounded `--task-file`/stdin reads in `f6162aa`
+/// (issue #328). Applies symmetrically to stdout and stderr under
+/// [`crate::remote::SystemSshExecutor`]; stderr matters here because it is the
+/// stream this function quotes back into `HostUnreachable`.
+pub const PROBE_VERSION_CAP: usize = 8 * 1024;
+
 /// Run a one-shot version probe over ssh and return the remote's version.
 ///
 /// PRD #161 M1.2 (D3): this probe is part of the connect **floor** — it
@@ -382,10 +430,23 @@ pub fn probe_remote_version(
     // install_path because non-interactive ssh shells typically don't have
     // ~/.local/bin on PATH (same fix as ea8c748).
     let cmd = format!("{install_path} --version");
-    let result = executor.run(target, &cmd);
+    let result = executor.run_capped(target, &cmd, PROBE_VERSION_CAP);
     match result {
         Err(ssh_err) => Err(map_probe_ssh_error(name, ssh_err)),
-        Ok(output) => {
+        // A stream that reached its cap is a prefix, and `parse_version_output`
+        // reads only the FIRST two tokens — so a status-0 remote emitting
+        // exactly `PROBE_VERSION_CAP` bytes that merely *begin* with a valid
+        // `dot-agent-deck <version>` pair would otherwise PASS on the strength
+        // of output we know we stopped reading (PRD #345 second audit).
+        // Refusing to trust a truncated handshake is strictly safer for
+        // `connect` too, not only for the doctor.
+        Ok(capped) if capped.truncated => Err(RemoteConnectError::ProbeOutputTruncated {
+            name: name.to_string(),
+            probe: "--version",
+            cap: PROBE_VERSION_CAP,
+        }),
+        Ok(capped) => {
+            let output = capped.output;
             // Exit 127 (and the typical bash "command not found" message) is
             // the canonical "binary missing" signal. We also treat any
             // non-zero exit whose stderr mentions "not found" as missing —
@@ -405,10 +466,18 @@ pub fn probe_remote_version(
             // user sees the underlying message rather than a misleading
             // "binary missing" hint.
             if output.status != 0 {
+                // The remote wrote this. It reaches a terminal verbatim (and
+                // `remote doctor` quotes the first 200 characters of it into
+                // its report), so a malicious remote binary or shell startup
+                // file could otherwise smuggle CSI/OSC sequences that repaint
+                // the screen, retitle the terminal or forge a hyperlink —
+                // including over the diagnostic's own conclusions. Escape,
+                // don't strip: the user should be able to SEE that the remote
+                // sent something peculiar.
                 let detail = if output.stderr.trim().is_empty() {
                     format!("ssh exited with status {}", output.status)
                 } else {
-                    output.stderr.trim().to_string()
+                    crate::untrusted_text::escape_control_and_bidi(output.stderr.trim())
                 };
                 return Err(RemoteConnectError::HostUnreachable {
                     name: name.to_string(),
@@ -503,7 +572,18 @@ pub fn probe_remote_protocol(
     let result = executor.run_capped(target, &cmd, PROBE_PROTOCOL_STDOUT_CAP);
     match result {
         Err(ssh_err) => Err(map_probe_ssh_error(name, ssh_err)),
-        Ok(output) => {
+        // The parse runs on `output.stdout.trim()`, so a valid reply padded
+        // with whitespace to exactly `PROBE_PROTOCOL_STDOUT_CAP` survives
+        // truncation as valid JSON and would otherwise be accepted as an
+        // authoritative protocol answer (PRD #345 second audit). A fragment is
+        // never a handshake, whichever side of it happens to parse.
+        Ok(capped) if capped.truncated => Err(RemoteConnectError::ProbeOutputTruncated {
+            name: name.to_string(),
+            probe: "daemon hello",
+            cap: PROBE_PROTOCOL_STDOUT_CAP,
+        }),
+        Ok(capped) => {
+            let output = capped.output;
             if output.status != 0 {
                 // A pre-M2.21 binary doesn't know `daemon hello`. clap exits
                 // with status 2 and a "unrecognized subcommand" message; some
@@ -575,17 +655,77 @@ pub fn probe_remote_protocol(
     }
 }
 
-/// Translate an `SshError` from the version probe into the connect-side
-/// error. Auth + host-key failures fold into `HostUnreachable` because the
-/// recovery hint (check ssh config / known_hosts) is the same for the user.
-fn map_probe_ssh_error(name: &str, err: SshError) -> RemoteConnectError {
-    let detail = match &err {
+/// The best-effort human-readable detail carried by an `SshError`. Shared by
+/// [`map_probe_ssh_error`] and `remote_doctor`, which needs the same text to
+/// decide whether a probe died on a forward failure rather than on the host
+/// being unreachable.
+///
+/// Every arm but the I/O one carries ssh's own stderr, which is written by a
+/// peer we do not control and ends up on a terminal. It is escaped here — once,
+/// at the single point the probe error paths funnel through — so a hostile
+/// endpoint cannot repaint the message that describes it. Escaping is
+/// idempotent, so `remote_doctor::render` escaping again at its own seam costs
+/// nothing.
+///
+/// Since issue #723 the two `detail`-carrying arms arrive already **stripped**
+/// by `remote::scrub_remote_text`, so this escape is now a second line of
+/// defence for them rather than the first. One consequence is deliberate and
+/// worth knowing: what the doctor quotes for a transport failure is the
+/// printable residue (`[2J`) rather than the escaped original (`\u{1b}[2J`),
+/// because the bytes were dropped before this saw them. The escape still does
+/// the original work for the `Io` and `HostKeyVerificationFailed` arms, and
+/// for every other producer-controlled field the doctor renders — including
+/// `probe_remote_version`'s own stderr path above, which escapes at its own
+/// seam and is untouched by that change.
+pub fn ssh_error_detail(err: &SshError) -> String {
+    let raw = match err {
         SshError::ConnectionRefused { detail, .. } => detail.clone(),
         SshError::AuthFailed { detail, .. } => detail.clone(),
         SshError::Io { source, .. } => source.to_string(),
         SshError::HostKeyVerificationFailed { .. } => err.to_string(),
         SshError::Other { detail, .. } => detail.clone(),
     };
+    crate::untrusted_text::escape_control_and_bidi(&raw)
+}
+
+/// The three canonical fragments OpenSSH emits when a requested forward could
+/// not be established. Issue #344: kept deliberately narrow. An ordinary
+/// `ssh: connect to host x port 22: Connection refused` must NOT match — an
+/// over-broad pattern that swallowed real unreachability would be strictly
+/// worse than the misclassification this replaces.
+const FORWARD_FAILURE_MARKERS: &[&str] = &[
+    "remote port forwarding failed for listen port",
+    "bind: address already in use",
+    "cannot listen to port",
+];
+
+/// True when ssh's stderr names a forwarding failure rather than a transport
+/// failure. Case-insensitive; see [`FORWARD_FAILURE_MARKERS`] for the scope.
+pub fn is_forward_failure_detail(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    FORWARD_FAILURE_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Translate an `SshError` from the version probe into the connect-side
+/// error. Auth + host-key failures fold into `HostUnreachable` because the
+/// recovery hint (check ssh config / known_hosts) is the same for the user.
+///
+/// Issue #344 (folded into PRD #345): a forward that could not bind is
+/// checked FIRST, because ssh reports it with exit 255 exactly like a
+/// transport failure and the old blanket `HostUnreachable` sent users to
+/// debug a network path that was never broken. The forward markers are
+/// narrow on purpose — the doctor, not this constructor, is what tells the
+/// user *which* of the two indistinguishable causes applies.
+fn map_probe_ssh_error(name: &str, err: SshError) -> RemoteConnectError {
+    let detail = ssh_error_detail(&err);
+    if is_forward_failure_detail(&detail) {
+        return RemoteConnectError::ForwardFailed {
+            name: name.to_string(),
+            detail,
+        };
+    }
     RemoteConnectError::HostUnreachable {
         name: name.to_string(),
         detail,
@@ -1391,6 +1531,82 @@ mod tests {
         // Right program name but version has no `.` separator (a build that
         // accidentally printed a single integer is unlikely to be ours).
         assert_eq!(parse_version_output("dot-agent-deck 9"), None);
+    }
+
+    /// Scenario: Map each canonical ssh remote-forward failure message to the
+    /// dedicated error instead of misreporting the host as unreachable.
+    #[test]
+    fn map_probe_ssh_error_classifies_forward_failures() {
+        let cases = [
+            "remote port forwarding failed for listen port 1080",
+            "bind: Address already in use",
+            "cannot listen to port",
+        ];
+
+        for detail in cases {
+            let error = map_probe_ssh_error(
+                "prod",
+                SshError::Other {
+                    target: "ops@prod.example.com".to_string(),
+                    detail: detail.to_string(),
+                },
+            );
+            assert!(
+                matches!(
+                    error,
+                    RemoteConnectError::ForwardFailed {
+                        ref name,
+                        detail: ref mapped_detail,
+                    } if name == "prod" && mapped_detail == detail
+                ),
+                "forward stderr must map to ForwardFailed: {detail:?}; got {error:?}"
+            );
+        }
+    }
+
+    /// Scenario: Feed an ordinary refused TCP connection through the same
+    /// mapper and retain the existing HostUnreachable classification.
+    #[test]
+    fn map_probe_ssh_error_keeps_unreachable_host_classification() {
+        let detail = "ssh: connect to host x port 22: Connection refused";
+        let error = map_probe_ssh_error(
+            "prod",
+            SshError::ConnectionRefused {
+                host: "x".to_string(),
+                port: 22,
+                detail: detail.to_string(),
+            },
+        );
+
+        assert!(
+            matches!(
+                error,
+                RemoteConnectError::HostUnreachable {
+                    ref name,
+                    detail: ref mapped_detail,
+                } if name == "prod" && mapped_detail == detail
+            ),
+            "ordinary connection refusal must stay HostUnreachable: {error:?}"
+        );
+    }
+
+    /// Scenario: Render an ambiguous forward failure with its listen port and
+    /// both honest possible causes, then point at `remote doctor` to distinguish them.
+    #[test]
+    fn forward_failed_message_names_ambiguous_causes_and_doctor() {
+        let message = RemoteConnectError::ForwardFailed {
+            name: "prod".to_string(),
+            detail: "remote port forwarding failed for listen port 1080".to_string(),
+        }
+        .to_string();
+        let lower = message.to_ascii_lowercase();
+
+        assert!(message.contains("prod"));
+        assert!(message.contains("1080"));
+        assert!(lower.contains("already") && lower.contains("bound"));
+        assert!(lower.contains("allowtcpforwarding"));
+        assert!(lower.contains("may") && lower.contains(" or "));
+        assert!(message.contains("remote doctor prod"));
     }
 
     // ----- signal exit-code mapping -----

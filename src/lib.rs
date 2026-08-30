@@ -3,6 +3,7 @@
 mod agent_hook_config;
 pub mod agent_pty;
 pub mod agent_registry;
+pub mod bounded_read;
 pub mod build_id;
 pub mod build_version_handshake;
 pub mod codex_hooks_manage;
@@ -43,6 +44,7 @@ pub mod platform;
 pub mod project_config;
 pub mod prompt_delivery;
 pub mod remote;
+pub mod remote_doctor;
 pub mod schedule_cli;
 pub mod scheduler;
 pub mod spawn;

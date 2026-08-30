@@ -321,11 +321,38 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
     );
 }
 
+/// Issue #584's promptness half: how long the orchestrator may be left in the
+/// dark after its `clear = true` replacement worker dies before it is ready.
+///
+/// **Re-derived in issue #243, from a measurement rather than from the
+/// alternative.** It was 20 s, justified in the catalog as "well under the
+/// production `SESSION_START_WAIT_TIMEOUT` + readiness buffer (31 s) that the
+/// pre-fix path burned" — a bound picked to be under the thing it was replacing.
+/// That reasoning has expired twice over: #584 itself ended the readiness wait
+/// on the replacement's PTY reaching EOF, and #243 removed the dead wait for
+/// declared-no-signal agents outright, so 31 s is nobody's behaviour any more and
+/// a 20 s ceiling on a ~0.1 s operation asserts approximately nothing.
+///
+/// **Measured on this branch: 103.1 / 103.4 / 103.9 / 104.1 ms idle, and
+/// 54.4-108.4 ms across eight runs with all 16 cores saturated and a concurrent
+/// full fast tier.** The figure is dominated by the fixture's own 50 ms poll
+/// interval and barely moves under load, because the notice is driven by the
+/// child's exit rather than by any timer.
+///
+/// Five seconds is ~46x the slowest figure measured here — room for a CI runner
+/// an order of magnitude slower than this box and then some — while staying 6x
+/// under the 30 s `SESSION_START_WAIT_TIMEOUT` a reverted EOF-driven wait would
+/// cost. It is deliberately not tighter: this is an upper bound on a fast event,
+/// so unlike `orchestration/delegate/010`'s lower bound it IS the load-sensitive
+/// direction, and headroom is the only mitigation available.
+const DEAD_REPLACEMENT_NOTICE_BUDGET: Duration = Duration::from_secs(5);
+
 /// Scenario: start an orchestration whose `clear = true` worker refuses to start
 /// while a marker file sits beside it, drop that marker once the first worker is
 /// confirmed up, then delegate. The replacement dies before it can announce
-/// itself, and the orchestrator must be TOLD — promptly, in its own pane —
-/// instead of being left to wait for a `work-done` that can never arrive.
+/// itself, and the orchestrator must be TOLD — in its own pane, and within five
+/// seconds rather than the thirty a readiness wait would cost — instead of being
+/// left to wait for a `work-done` that can never arrive.
 #[tokio::test(flavor = "multi_thread")]
 #[spec("orchestration/delegate/023")]
 async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() {
@@ -363,7 +390,7 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
     delegate(&fx, "list the files in this directory").await;
 
     // The user's altitude: something visible in the orchestrator's own pane.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + DEAD_REPLACEMENT_NOTICE_BUDGET;
     let mut snapshot;
     loop {
         snapshot = fx
@@ -377,9 +404,11 @@ async fn delegate_023_a_replacement_that_dies_is_reported_to_the_orchestrator() 
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "a `clear = true` delegate whose replacement worker died reported NOTHING to the \
-             orchestrator — the orchestrator is left waiting for a work-done that can never \
-             arrive (#584). orchestrator pane = {:?}",
+            "a `clear = true` delegate whose replacement worker died reported nothing to the \
+             orchestrator within {DEAD_REPLACEMENT_NOTICE_BUDGET:?} — either the notice is gone \
+             entirely, or the readiness wait no longer ends on the replacement's EOF and the \
+             orchestrator is sitting through it (#584; budget re-derived in #243 against a \
+             measured ~0.1 s). orchestrator pane = {:?}",
             text
         );
         tokio::time::sleep(Duration::from_millis(50)).await;

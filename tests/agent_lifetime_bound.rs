@@ -55,15 +55,20 @@ const MAX_LIFETIME_VAR: &str = "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS";
 const UNSET_MARKER: &str = "<unset>";
 
 /// The largest cap a child may **inherit**, mirroring
-/// `child_lifetime_bound::CHILD_MAX_LIFETIME_SECS`. `cargo xtask clean-e2e-tmp`
-/// reaps a dead owner's root at 10 minutes and picks that as 2x this number, so
-/// this is a deletion-safety invariant rather than a preference.
+/// `child_lifetime_bound::CHILD_MAX_LIFETIME_SECS`. Keeping an ambient value
+/// down here is a deletion-safety measure rather than a preference: every cap
+/// is a window in which an orphan may still be writing under a temp root
+/// `cargo xtask clean-e2e-tmp --apply` might reap.
 ///
 /// Inherit, not carry: the clamp bounds *ambient* values only. A harness path
 /// that re-pins the variable after an `env_clear` — `TuiDeck`'s `extra_env`,
 /// applied last — bypasses it deliberately, and #665 uses that to pin 900 on
-/// `orchestration_dispatch_002` (issue #679 tracks the resulting 600-900 s
-/// window against the reaper's floor).
+/// `orchestration_dispatch_002`. What keeps the reaper safe against those
+/// explicit pins is not this ceiling but linkage-check rule 11, which fails the
+/// build when any pin under `tests/` exceeds
+/// `clean_tmp::MAX_PINNED_ORPHAN_CAP_SECS` — the number the reaper's dead-owner
+/// floor is derived from (issue #679, which closed the 600-900 s window this
+/// comment used to point at).
 const MAX_LIFETIME_CEILING_SECS: u64 = 300;
 
 fn write_executable(path: &std::path::Path, contents: &str) {
@@ -159,22 +164,25 @@ fn in_process_registry_spawn_arms_the_wrapped_child_lifetime_bound() {
     );
     // The UPPER bound, which is the half `cargo xtask clean-e2e-tmp` depends on
     // and which "is it positive?" cannot see. That reaper deletes a root whose
-    // owning test process is dead once the root is 10 minutes old, and picks 10
-    // minutes as 2x this cap — so a descendant entitled to keep writing for
-    // longer than 300 s turns the reaper's margin into a deficit. An ambient
-    // `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS=3600` in a developer's shell
-    // reached the child unchallenged before `clamped()` existed, and this run
-    // proves it no longer does. Ambient is the whole scope: this spawn inherits
-    // the test process's environment, so it is the clamped path. A `TuiDeck`
-    // child whose `with_env` re-pins the cap after its `env_clear` is not, by
-    // design — issue #679.
+    // owning test process is dead once the root is 30 minutes old, and picks
+    // that as 2x the LONGEST cap written anywhere under `tests/`
+    // (`clean_tmp::MAX_PINNED_ORPHAN_CAP_SECS`) — so a descendant entitled to
+    // keep writing for longer than that turns the reaper's margin into a
+    // deficit. An ambient `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS=3600` in a
+    // developer's shell reached the child unchallenged before `clamped()`
+    // existed, and this run proves it no longer does. Ambient is the whole
+    // scope: this spawn inherits the test process's environment, so it is the
+    // clamped path. A `TuiDeck` child whose `with_env` re-pins the cap after
+    // its `env_clear` is not, by design — that path is guarded by
+    // linkage-check rule 11 instead (issue #679).
     assert!(
         parsed.is_some_and(|secs| secs <= MAX_LIFETIME_CEILING_SECS),
         "a wrapped agent spawned through the in-process registry carries \
          {MAX_LIFETIME_VAR}={recorded:?}, above the {MAX_LIFETIME_CEILING_SECS} s \
-         ceiling `docs/develop/e2e-temp-dirs.md` sets `clean-e2e-tmp`'s 10-minute \
-         dead-owner floor at 2x. An `--apply` can then delete a root out from \
-         under this child while it is still nominally entitled to write there \
+         ceiling this file mirrors from `child_lifetime_bound`. `--apply` can \
+         then delete a root out from under this child while it is still \
+         nominally entitled to write there — `clean-e2e-tmp`'s dead-owner floor \
+         bounds the caps `tests/` WRITES, not one a shell exports \
          (issue #668)."
     );
 }

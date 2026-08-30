@@ -39,10 +39,30 @@ Persistent panes claim the first slots and are never overwritten. Reactive comma
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `name` | string | yes | — | Display name shown in the tab bar |
+| `agent` | string | no | — | Which agent this mode's **agent pane** runs, when the command you enter for it cannot say so itself — one of `claude`, `opencode`, `pi`, `codex`, `devin`. See [Declaring the agent behind a launcher command](#declaring-the-agent-behind-a-launcher-command). |
 | `init_command` | string | no | — | Setup command run once in every pane before its own command (e.g., `devbox shell`) |
 | `panes` | array | no | `[]` | Persistent pane definitions |
 | `rules` | array | no | `[]` | Reactive command-routing rules |
 | `reactive_panes` | integer | no | `2` | Number of reactive pane slots for command routing |
+
+### Declaring the agent behind a launcher command
+
+A mode tab has one **agent pane** — the pane you type a command into when you open the tab — alongside its persistent and reactive side panes. The deck identifies the agent in that pane by reading the first word of the command you entered, so `claude`, `codex` and `opencode` resolve on their own, while a command that runs the agent through something else does not: `devbox run -- codex`, `mise exec -- codex`, `make codex` or `./run-codex.sh` all name a launcher, and nothing about a launcher says what it will start.
+
+An unidentified agent pane shows **No agent** and no status. For **Codex** it also stays that way until you send it something to do — Codex announces itself only when its first turn begins, and identifying it at launch is what would otherwise let the deck see it earlier.
+
+`agent` answers that, on the mode itself:
+
+```toml
+[[modes]]
+name = "review"
+agent = "codex"
+reactive_panes = 2
+```
+
+The key belongs on `[[modes]]` and not on `[[modes.panes]]`: the side panes run tools, not agents. The command still comes from the new-pane form — `agent` only says what that command ends up launching.
+
+The rules are the same as for an orchestration role, including that an unrecognised name gives you **no agent rather than a guess**, and that omitting the key leaves behaviour exactly as it was. See [Declaring the agent behind a launcher command](orchestration.md#declaring-the-agent-behind-a-launcher-command) for the full list.
 
 ### `[[modes.panes]]`
 

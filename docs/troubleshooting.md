@@ -35,6 +35,20 @@ Hooks are **auto-installed on every startup** — most users never need to think
 
 Auto-install is idempotent and best-effort — if an agent directory is missing the step is silently skipped, and errors are logged without blocking startup.
 
+### A hook fails with `not found` and names a path you never typed
+
+If an agent reports something like `Stop hook error: /bin/sh: 1: /home/you/code/dot-agent-deck-pr-356/target/release/dot-agent-deck: not found`, the hook command in your agent's config points at a **build directory** rather than at your installed deck. Build directories are not durable: `cargo clean` removes them and they disappear entirely when a git worktree is deleted. Older versions of the deck wrote whichever binary was installing the hooks into config, so running the deck once from a checkout was enough to leave every hook pointing at a path that would stop existing later. The install also runs silently on every dashboard launch, which is why the failure tends to surface days after the run that caused it.
+
+Recent versions do not write such a path. A deck running from a checkout resolves your installed deck instead (`~/.local/bin/dot-agent-deck`, or `dot-agent-deck` on your `PATH`), and if it cannot find one, `hooks install` fails with a message telling you what to install and writes nothing rather than leaving a broken command behind. They also repair themselves: on the next launch, a deck-owned hook whose binary is confirmed missing is rewritten to the durable path, for Claude Code's `settings.json`, Codex's `hooks.json` and the OpenCode plugin alike. For **Claude Code and OpenCode**, a hook whose path still works is deliberately left alone even if it differs from what the deck would write — your own wrapper, or a second checkout you are deliberately using, is not something a startup should quietly repoint. **Codex and Devin do not yet keep that promise:** they re-pin their own rules to the resolved durable path on every launch, so a deck-owned Codex or Devin hook pointing at a second, still-valid install is repointed rather than preserved ([#730](https://github.com/vfarcic/dot-agent-deck/issues/730) tracks closing the gap). That is not a harmless one-time correction if you launch the deck from more than one install: two checkouts, or an installed deck and a checkout, resolve *different* durable paths, so the pin never settles — it **flaps** between them, following whichever install you launched last. A hook of your own that merely mentions `dot-agent-deck` is never touched, on any of the four.
+
+To fix it now:
+
+1. **Upgrade the deck**, then start the dashboard once. That is usually the whole fix — the broken entries are repaired on startup.
+2. **Or repair explicitly**, per agent: `dot-agent-deck hooks install`, adding `--agent codex`, `--agent opencode` or `--agent devin` for the others.
+3. **If the install refuses**, it is telling you there is no durable deck on the machine to point at. Install one — `cargo install --path .` from a checkout, or put the release binary on your `PATH` — and run the install again.
+
+You can confirm the result by looking for the path in the config: `grep -o '[^"]*dot-agent-deck' ~/.claude/settings.json | sort -u`. It should name your installed binary, never a `target/debug` or `target/release` directory.
+
 ### Codex events not showing
 
 Codex only runs hooks it *trusts*, and the deck handles that for you: it records trust for its own hook entries — and only those — in your Codex home's `config.toml`. This is independent of how you start Codex, so a launcher (`devbox run codex-big`, a `run_codex_agent.sh`, an alias, a path whose name isn't `codex`) needs **nothing** added to it. Launch Codex however you already do.
@@ -173,6 +187,18 @@ scp ~/Desktop/screenshot.png my-vm:/tmp/
 ```
 
 See [Remote Environments › Getting files to the remote](remote-environments.md#getting-files-to-the-remote) for the full explanation and the ssh-config note.
+
+## A remote will not connect, or an ssh tunnel to it is not working
+
+Ask the deck instead of guessing:
+
+```bash
+dot-agent-deck remote doctor my-vm
+```
+
+It runs a fixed ordered list of read-only checks — ssh reachability and auth, whether the deck is installed on the remote, the forwards `ssh -G` actually resolved, the remote's own `AllowTcpForwarding` and `ClientAliveInterval` from `sshd -T`, and whether a configured forward is really bound — and prints each as PASS / WARN / FAIL / UNKNOWN with the directive and file to change. Three exit codes: `0` clear, `1` a check failed, `2` a check could not be determined — so an incomplete diagnosis never reads as all-clear, and is still distinguishable from a broken one. It writes nothing: not your ssh config, not the remote's `sshd_config`, not the registry, not the remote — and the ssh sessions it opens clear all forwardings, so it does not even create the tunnel it is inspecting.
+
+It earns its keep on one case in particular. `AllowTcpForwarding no` on the remote and a port collision produce **byte-identical** errors from ssh, so no client-side message can separate them; the doctor reads the remote's own sshd policy and tells you which one you have. See [Reverse tunnels › Troubleshooting with `remote doctor`](remote-recipes.md#troubleshooting-with-remote-doctor) for annotated output of every case.
 
 ## The deck is missing cards — a role or session I know is running has no card
 

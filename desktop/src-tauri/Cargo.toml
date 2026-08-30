@@ -1,0 +1,20 @@
+[package]
+name = "dot-agent-deck-desktop"
+version = "0.1.0"
+description = "Opt-in desktop control surface for dot-agent-deck"
+edition = "2024"
+
+[lib]
+name = "dot_agent_deck_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+dot-agent-deck = { path = "../.." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["sync", "time"] }
+

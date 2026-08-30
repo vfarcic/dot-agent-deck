@@ -40,6 +40,12 @@ The consequence worth internalizing: while in `0.x`, a feature-only release is a
 2. Start a daemon from the **previous release** (the last tagged binary), and start an agent under it.
 3. Run the PR-branch **TUI** against that older daemon and confirm the core flows still work end to end: a **delegate** still routes, and **hooks** (work-done, status updates) still arrive.
 
+**Step 2's *"start an agent under it"* is load-bearing, and step 3 has a decline step.** Get either wrong and this gate silently measures nothing:
+
+- **Keep that agent running when the PR-branch TUI starts.** On a `build_version` mismatch with **zero** agents, the newer binary takes `MismatchAction::SilentRestart` (`src/build_version_handshake.rs`, PRD #161): it SIGTERMs the older daemon and lazy-spawns its own, with no prompt and no output, regardless of TTY. Every check then passes against a *new* daemon and you report a clean cross-version gate having actually measured new-against-new — nothing on screen says the daemon was replaced.
+- **Decline the mismatch prompt.** With agents present the handshake asks instead of restarting; press any key other than `S`. Declining returns `HandshakeOutcome::ProceedOnExisting`, which attaches to the older daemon unchanged (PRD #161 D4, the never-strand rule). Accepting restarts the daemon on the new binary and lands you in the same false pass, with the agents stopped as well.
+- **Confirm before trusting the result:** the daemon serving the new TUI should still have the previous release's binary as its `exe`.
+
 If delegate or hooks silently stop flowing, the change broke the contract behind a stable wire — bump `PROTOCOL_VERSION` (if the wire shape moved) and/or add a `.breaking.md` fragment so the release is versioned as a compatibility break. This step is enforced in-repo by **CLAUDE.md permanent instruction 12**, which every agent in this project loads and follows; the canonical `dot-ai-prd-done` skill in the `dot-ai` repo carries the same check, and syncing the vendored copy under `.claude/skills/dot-ai-prd-done/` is a separate follow-up.
 
 ## Where the reported version comes from, and how to inject it

@@ -52,7 +52,7 @@
       # (the same one release.yml uses) and pins the version here. The
       # dot-ai-tag-release skill bumps this line as part of cutting a tag, and
       # release.yml refuses to release when it disagrees with the tag.
-      version = "0.37.2";
+      version = "0.38.0";
 
       # `<version>-g<short-sha>`, the same shape build.rs composes out of git
       # metadata (build_version_resolve.rs:180-196).
@@ -99,6 +99,15 @@
       #     never compiles them. crane needs them for a second reason: it
       #     resolves the workspace once to build `cargoArtifacts`, over a dummy
       #     source it synthesises from these same manifests.
+      #   * `desktop/src-tauri/` (PRD #176), for exactly the same reason as
+      #     `xtask/`: it is a workspace member, so cargo cannot resolve the
+      #     workspace without its manifest, and crane resolves the workspace
+      #     before it builds anything. `-p dot-agent-deck` never compiles it and
+      #     `nix flake check` does not build the GUI. Omitting it is what failed
+      #     CI's `nix` job on PR #416 with `failed to load manifest for
+      #     workspace member .../desktop/src-tauri`, before the crate had ever
+      #     been compiled — a workspace member is a resolution-time dependency
+      #     whether or not it is a build-time one.
       #
       # `tests/` is left out on purpose: `doCheck = false`, so nothing compiles
       # it.
@@ -115,6 +124,7 @@
           ./pi-extension/src
           ./examples
           ./xtask
+          ./desktop/src-tauri
         ];
       };
 

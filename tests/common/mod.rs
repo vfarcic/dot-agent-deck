@@ -489,6 +489,10 @@ impl TuiDeck {
 
         let home = work.join("home");
         std::fs::create_dir_all(&home).expect("create per-test HOME");
+        // PRD #381: the durable-path candidate the deck's hook installers
+        // resolve, pointed at the binary under test. See `seed_durable_binary`.
+        #[cfg(unix)]
+        seed_durable_binary(&home);
 
         // PRD #201: the per-test HOME deliberately starts WITHOUT the bundled Pi
         // extension. Because `TuiDeck` drives the REAL binary, its lazy-spawned
@@ -1580,6 +1584,37 @@ impl TuiDeck {
         }
         None
     }
+
+    /// Poll [`find_in_grid`] until `needle` is on screen, returning its
+    /// 0-based `(col, row)` start cell, or panic (dumping the final grid)
+    /// after [`WAIT_TIMEOUT`].
+    ///
+    /// Prefer this over a bare `find_in_grid(..).expect(..)` whenever the
+    /// lookup follows an input event (a click, a keystroke) rather than a
+    /// wait that already proved the target is painted. A single-shot read
+    /// landing mid-repaint sees a transiently cleared region and the
+    /// `expect` fires — a load-sensitive flake, not a real failure. A
+    /// `wait_for_string` in front narrows that window but does not close
+    /// it: the wait and the subsequent `find_in_grid` take two separate
+    /// snapshots, and the clear can land between them. Polling the lookup
+    /// itself means the coordinates always come from a grid that actually
+    /// contained the needle.
+    pub fn wait_for_in_grid(&self, needle: &str) -> (u16, u16) {
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        loop {
+            if let Some(found) = self.find_in_grid(needle) {
+                return found;
+            }
+            if Instant::now() > deadline {
+                let grid = self.snapshot_grid();
+                panic!(
+                    "did not find {needle:?} in the grid within {WAIT_TIMEOUT:?}.\n\
+                     Final grid:\n{grid}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 impl Drop for TuiDeck {
@@ -2279,6 +2314,41 @@ fn terminal_reached(
     )
 }
 
+/// PRD #381: seed `<home>/.local/bin/dot-agent-deck` as a **symlink to the
+/// binary under test**, so the deck's durable-path resolver lands inside the
+/// sandbox instead of on the host.
+///
+/// Without this, every e2e test that relies on installed hooks would silently
+/// exercise the wrong binary. The resolver refuses to write a
+/// `target/{debug,release}` path into agent config, and under `cargo test-e2e`
+/// the binary under test IS one — so it falls to step 2a
+/// (`$HOME/.local/bin/dot-agent-deck`) and then step 2b (`$PATH`). This harness
+/// passes the HOST `PATH` through (`inherit_pass`, below), and a developer box
+/// commonly has a real installed deck on it: hooks would then point at the
+/// host's deck and the tier would test stale code, while a machine with no
+/// installed deck would get a refusal and no hooks at all. Seeding step 2a
+/// makes the resolution order run for real and land on this build.
+///
+/// A **symlink**, not a copy: the resolver deliberately does not canonicalize
+/// its 2a candidate, so the durable symlink path is what gets written while the
+/// bytes executed are the freshly-built ones. A copy would go stale on the next
+/// `cargo build` and cost the binary's size per test.
+///
+/// `#[cfg(unix)]` because the L2 tier is Unix-only, and best-effort because a
+/// failure here can only degrade a test to the pre-#381 host-`PATH` behaviour,
+/// never corrupt anything.
+#[cfg(unix)]
+fn seed_durable_binary(home: &Path) {
+    let bin_dir = home.join(".local").join("bin");
+    if std::fs::create_dir_all(&bin_dir).is_err() {
+        return;
+    }
+    // `DEFAULT_BINARY_NAME`'s value, spelled out: the resolver looks for the
+    // crate's package name, not whatever the test binary happens to be called.
+    let link = bin_dir.join("dot-agent-deck");
+    let _ = std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_dot-agent-deck"), link);
+}
+
 fn locate_fixture(name: &str) -> PathBuf {
     // CARGO_MANIFEST_DIR is the repo root for integration tests.
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -2746,7 +2816,18 @@ pub const CODEX_TEST_MODEL_ENV: &str = "DOT_AGENT_DECK_CODEX_TEST_MODEL";
 /// SKIPS — a silent no-coverage outcome that reads as a pass.
 ///
 /// A subscription host therefore exports a plain `gpt-5.*` model it *can* reach,
-/// e.g. `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5.4-mini` (verified 2026-08-23).
+/// e.g. `DOT_AGENT_DECK_CODEX_TEST_MODEL=gpt-5.6-luna` (verified 2026-08-26:
+/// `codex exec` answered `CODEX_AUTH_OK`, and codex-cli 0.149.0's interactive TUI
+/// came up on it).
+///
+/// `gpt-5.4-mini` — what this line named until 2026-08-26 — was re-probed the
+/// same day and **also still works**, by both routes. It is named here rather
+/// than silently dropped because the swap is a refresh of a dated claim, not the
+/// retirement of a dead model id: if you are already exporting it, nothing is
+/// wrong. (The probe that appeared to condemn it was measuring its own defect —
+/// a `pty.fork()` left at a 0x0 window size, into which codex-cli paints nothing
+/// whatever the model. Both ids emit the identical 523 bytes of empty repaint at
+/// 0x0 and the identical 2492 bytes ending in `? for shortcuts` at 180x45.)
 ///
 /// **Setting it makes the tests run, not pass.** They then fail on an unrelated
 /// defect: Codex 0.149.0 does not execute the deck's trusted command hooks in
@@ -2795,6 +2876,16 @@ pub fn codex_test_model() -> &'static str {
 /// OpenRouter credit for coverage the subscription already pays for, and made
 /// two OpenCode tests skip whenever that balance ran dry — with a skip reason
 /// naming missing *credentials*, which were present the whole time.
+///
+/// **Probed 2026-08-26** (issue #243 round 3), because this shares a model id
+/// with [`codex_test_model`]'s subscription example and a retirement here would
+/// be worse: `check_opencode_available` runs no model probe at all — it only
+/// looks for an `auth.json` — so an unreachable id would not skip
+/// `orchestration/delegate/015` cleanly, it would fail it somewhere inside the
+/// TUI with no mention of the model. `opencode run --model openai/gpt-5.4-mini`
+/// answered `OPENCODE_MODEL_OK` on the subscription credential these boxes hold.
+/// Note the id reaches the model through OpenCode's own provider layer rather
+/// than through codex-cli, so nothing measured about codex-cli's TUI bears on it.
 const OPENCODE_TEST_MODEL_DEFAULT: &str = "openai/gpt-5.4-mini";
 
 /// Env var that overrides [`opencode_test_model`] on a host whose OpenCode
@@ -2900,7 +2991,7 @@ pub fn check_codex_available() -> Result<(), String> {
             "Codex could not reach model {} with the current authentication — the two auth \
              modes reach different model families, so set {} to one these credentials can \
              reach (API key: e.g. gpt-5-nano or gpt-5.1-codex-mini; ChatGPT subscription: \
-             e.g. gpt-5.4-mini). Run `codex login status` to see which mode is in use",
+             e.g. gpt-5.6-luna). Run `codex login status` to see which mode is in use",
             codex_test_model(),
             CODEX_TEST_MODEL_ENV,
         ));
@@ -3628,6 +3719,10 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<Vec<String>>
 /// Copy only Codex's authentication state into the isolated test HOME and seed
 /// the fixture working directory as trusted. User configuration is deliberately
 /// not imported; real-agent tests pin their model for deterministic behavior.
+///
+/// Issue #243: also seeds `version.json` — see [`codex_update_notice_dismissal`]
+/// for why an isolated HOME without it can wedge a real-agent Codex test in a
+/// way that looks like a delivery failure.
 pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
     let src = host_home().join(".codex").join("auth.json");
     let bytes = read_credential_file_no_symlink(
@@ -3648,7 +3743,47 @@ pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<()> {
             std::io::Error::other("isolated Codex fixture path is not UTF-8")
         })?)
     );
-    write_credential_file_atomic_0o600(&dst.join("config.toml"), config.as_bytes())
+    write_credential_file_atomic_0o600(&dst.join("config.toml"), config.as_bytes())?;
+
+    // Issue #243: dismiss the update notice in the ISOLATED home.
+    //
+    // Everything else here is deliberately minimal — auth plus a trust entry,
+    // nothing else — and `version.json` looks like user state that a test has no
+    // business inheriting. It is not: with the file absent, codex-cli 0.149.0
+    // paints a blocking "✨ Update available! … Press enter to continue"
+    // interstitial INSTEAD of its composer, so the pane looks alive while no
+    // agent is behind it and an injected prompt goes into the interstitial. The
+    // failure surfaces as "the worker never submitted the pointer" — a delivery
+    // symptom with a boot cause, which cost #243's implementer two runs to spot
+    // and would misattribute an `orchestration/delegate/009` red to the readiness
+    // gate. Nobody meets it interactively because the host HOME has the file.
+    //
+    // Best-effort by design: it is an ergonomic, not a credential, and a test
+    // that cannot write it should still run rather than fail with an error about
+    // a notice. The host's own file is not copied — it carries a
+    // `last_checked_at` timestamp and whatever version the developer happens to
+    // be on, neither of which a test wants to inherit.
+    let _ = std::fs::write(dst.join("version.json"), codex_update_notice_dismissal());
+    Ok(())
+}
+
+/// The `version.json` body that suppresses codex-cli's update notice in an
+/// isolated HOME: a `latest_version` BELOW every real release, so there is
+/// nothing newer to announce whatever the CLI is actually running, plus a
+/// matching `dismissed_version` for the same claim by the other route.
+///
+/// `0.0.0` rather than a high sentinel, and that is measured rather than
+/// stylistic: seeding `9999.0.0` (dismissed equal to latest, the shape the host's
+/// own file has) does NOT suppress the notice — codex-cli 0.149.0 rendered
+/// `✨ Update available! 0.149.0 -> 9999.0.0` above its composer on
+/// `orchestration/delegate/009`, i.e. the seed manufactured the very banner it
+/// was meant to remove. Nothing can be newer than what is running if the
+/// recorded latest is `0.0.0`.
+///
+/// `last_checked_at` is far in the future so the CLI has no reason to re-check
+/// and overwrite this, and so a test HOME never depends on the wall clock.
+fn codex_update_notice_dismissal() -> &'static str {
+    r#"{"latest_version":"0.0.0","last_checked_at":"2099-01-01T00:00:00.000000000Z","dismissed_version":"0.0.0"}"#
 }
 
 /// Write a minimal `session.toml` containing exactly one pane that
@@ -5452,6 +5587,9 @@ pub fn spawn_daemon_serve_with_env(
     let work = tempdir.path().to_path_buf();
     let home = work.join("home");
     std::fs::create_dir_all(&home).expect("create per-test HOME");
+    // PRD #381: same durable-path seeding as `TuiDeck` — a `daemon serve` spawns
+    // wrapped agents, and `wrap` runs the Codex hook installer.
+    seed_durable_binary(&home);
     let state_dir = work.join("state");
     let hook_socket = work.join("hook.sock");
     let attach_socket = work.join("attach.sock");
@@ -6040,7 +6178,11 @@ impl EventSub {
                     && event.agent_id.as_deref() == Some(agent_id)
             }) {
                 match event.event_type {
-                    EventType::SessionStart if !event.is_wrapper_fork_session_start() => {
+                    // Issue #243: EITHER wrapper origin is excluded. The wrapper's
+                    // interface-ready start is readiness, but it carries the
+                    // WRAPPER's session id — so accepting it here would hand back
+                    // `wrap-codex-1234` as the pane's live agent session.
+                    EventType::SessionStart if !event.is_wrapper_session_start() => {
                         current_session_id = Some(event.session_id.clone());
                     }
                     EventType::SessionEnd
