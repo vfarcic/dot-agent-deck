@@ -249,7 +249,13 @@ post-steps:
       const memoryRoot = "/tmp/gh-aw/repo-memory/default";
       const baselineRoot = path.join(process.env.RUNNER_TEMP, "gh-aw", "issue-labeler-memory-baseline");
       const allowedFiles = new Set(["feedback-issue.jsonl", "feedback-pull_request.jsonl", "predictions.jsonl"]);
-      const allowedLabels = new Set(["bug", "documentation", "enhancement", "feature", "question", "source", "config", "dependencies", "tests", "ci-cd", "devbox", "priority:high", "priority:medium", "priority:low", "size:high", "size:medium", "size:low", "needs-triage"]);
+      const allowedLabels = new Set(["bug", "documentation", "enhancement", "feature", "question", "source", "config", "dependencies", "tests", "ci-cd", "devbox", "daemon", "tui", "desktop", "priority:high", "priority:medium", "priority:low", "size:high", "size:medium", "size:low", "needs-triage"]);
+      // The cap a *prediction* may carry: keep in step with `add-labels.max`
+      // in the frontmatter above. A *correction* is deliberately bounded by the
+      // whole taxonomy instead (`allowedLabels.size`), because it snapshots
+      // whatever a maintainer left on the item, which may exceed what the
+      // classifier itself is allowed to propose.
+      const maxPredictionLabels = 6;
       const repositorySlug = process.env.GITHUB_REPOSITORY || "";
       const repositoryPattern = repositorySlug.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       if (!repositorySlug) throw new Error("GITHUB_REPOSITORY is unavailable");
@@ -295,7 +301,7 @@ post-steps:
       function predictionValidator(entry, line) {
         const validTarget = entry && ((entry.type === "issue" && issueUrl.test(entry.url)) || (entry.type === "pull_request" && pullUrl.test(entry.url)));
         if (!validTarget || Object.keys(entry).sort().join(",") !== "labels,type,url") throw new Error(`predictions.jsonl:${line}: invalid prediction entry`);
-        validateLabels(entry.labels, 5, "predictions.jsonl", line);
+        validateLabels(entry.labels, maxPredictionLabels, "predictions.jsonl", line);
       }
 
       const validators = {
@@ -342,7 +348,7 @@ post-steps:
         const labels = terminal[0].type === "add_labels"
           ? terminal[0].labels.map(label => typeof label === "string" ? label : label.name).sort()
           : [];
-        validateLabels(labels, 5, "agent_output.json", 1);
+        validateLabels(labels, maxPredictionLabels, "agent_output.json", 1);
         expected["predictions.jsonl"].push({ url, type, labels });
         expected["predictions.jsonl"] = expected["predictions.jsonl"].slice(-2000);
       }
@@ -419,6 +425,7 @@ Use these values wherever they appear below.
 
 - Type, at most one: `bug` for broken behavior; `feature` for new user-visible behavior; `enhancement` for improvements to existing behavior or maintainer tooling; `documentation` for documentation-only work; `question` when the item primarily asks for information.
 - Area, zero or more when explicit: `source`, `config`, `dependencies`, `tests`, `ci-cd`, or `devbox`. Existing deterministic pull request path-labeling may already have applied these.
+- Component, zero or more: `daemon` for the background daemon, `tui` for the terminal front-end, `desktop` for the Tauri GUI under `desktop/`. This is a different axis from Area, not a competing one: Area says what kind of file changed, Component says which of the three shipped surfaces owns it, so a component label sits alongside `source` or `tests` rather than replacing it. Several at once is normal rather than exceptional, because a protocol change is routinely `daemon` plus every client that consumes it. Apply none when the work is genuinely surface-independent.
 - Priority, issues only and exactly one when the impact is clear: `priority:high` for security, data loss, release blockers, or widespread core breakage; `priority:medium` for ordinary actionable work; `priority:low` for polish, narrow edge cases, or non-urgent cleanup.
 - Size, exactly one when estimable: `size:low` for less than a day, `size:medium` for roughly one to three days, and `size:high` for broader architectural or multi-part work.
 - Triage fallback, issues only: use `needs-triage` when the report lacks enough information to choose a type or priority confidently. Do not combine it with speculative labels.
