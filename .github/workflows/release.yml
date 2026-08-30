@@ -677,14 +677,46 @@ jobs:
   # release object exists, rather than racing per matrix leg.
   desktop-publish:
     needs: [prepare, finalize, desktop-bundle]
-    if: ${{ !inputs.skip_desktop }}
+    # `needs` on a MATRIX job resolves to the AGGREGATE result of every leg, so
+    # `needs: desktop-bundle` alone would skip this job the moment ONE platform
+    # failed — discarding the other platform's perfectly good bundle, which is
+    # precisely the outcome `fail-fast: false` above exists to prevent. That
+    # flag stops the sibling leg being *cancelled*; it cannot make the
+    # aggregate succeed. (Greptile P1 on #768.)
+    #
+    # So gate on what actually matters instead: the release object must exist
+    # (`finalize` succeeded) and we must not have been cancelled. Whether there
+    # is anything worth publishing is then a question for the steps below,
+    # which can see the artifacts and say which platforms are missing.
+    if: ${{ !cancelled() && needs.finalize.result == 'success' && !inputs.skip_desktop }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
+        # Tolerated deliberately: with a partial matrix now a legitimate state,
+        # this step's own failure mode (no artifact matches the pattern at all)
+        # is one the guard below reports far better than "Unable to find any
+        # artifacts for the associated workflow" does.
+        continue-on-error: true
         with:
           pattern: desktop-bundle-*
           path: dist-desktop
           merge-multiple: true
+      - name: Check what there is to publish
+        run: |
+          set -eu
+          if [ ! -d dist-desktop ] || [ -z "$(ls -A dist-desktop 2>/dev/null)" ]; then
+            echo "::error::every desktop-bundle leg failed, so there is nothing to publish. The CLI release itself is unaffected and complete."
+            exit 1
+          fi
+          # A partial publish is allowed, but it must never be silent: a
+          # release carrying only one platform should say so in the log rather
+          # than look like a full one.
+          for expected in macos-arm64 linux-amd64; do
+            if ! ls dist-desktop | grep -q -- "-${expected}\."; then
+              echo "::warning::no bundle for ${expected}; that platform's leg failed. Publishing the platforms that did build."
+            fi
+          done
+          ls -la dist-desktop
       - name: Generate desktop checksums
         # Unsigned artifacts make integrity verification more valuable, not
         # less. Kept in their own file so `checksums.txt` stays exactly what it

@@ -198,20 +198,93 @@ fn desktop_artifacts_are_named_outside_the_cli_pattern() {
     );
 }
 
+/// Greptile P1 on #768, and a good catch: `fail-fast: false` on the matrix was
+/// doing less than it looked like. It stops a failing leg from CANCELLING its
+/// sibling, so both legs run and both upload — but `needs:` on a matrix job
+/// resolves to the AGGREGATE result, so a single failed leg still skipped
+/// `desktop-publish` and threw the surviving platform's bundle away. The bundle
+/// was built, uploaded, and then silently discarded.
+///
+/// The fix is to gate `desktop-publish` on the release object existing rather
+/// than on every leg succeeding. This test exists because the original wiring
+/// tests asserted the `needs:` edges and still missed it: the edge was right,
+/// its aggregate semantics were not.
+#[test]
+fn a_failed_platform_leg_still_publishes_the_other() {
+    let all = jobs(&workflow());
+    let publish = job(&all, "desktop-publish");
+
+    let condition = publish
+        .lines()
+        .find(|l| l.trim_start().starts_with("if:"))
+        .unwrap_or_else(|| panic!("desktop-publish has no `if:` condition:\n{publish}"));
+
+    assert!(
+        condition.contains("!cancelled()"),
+        "`desktop-publish` must run with `!cancelled()` rather than inheriting \
+         the aggregate success of the `desktop-bundle` matrix. Without it, one \
+         platform's bundler failure skips publication entirely and discards the \
+         OTHER platform's good bundle — which `fail-fast: false` cannot prevent, \
+         because it governs cancellation, not the aggregate result.\n\
+         Found: {condition}"
+    );
+    assert!(
+        condition.contains("needs.finalize.result == 'success'"),
+        "`desktop-publish` must still require that `finalize` succeeded — there \
+         is no release object to upload to otherwise, and `!cancelled()` alone \
+         would let it try.\nFound: {condition}"
+    );
+}
+
+/// The other half of the same fix: publishing a partial matrix is allowed, but
+/// it must be loud. A release carrying one platform when it should carry two
+/// is not something to discover from a user's bug report.
+#[test]
+fn a_partial_desktop_publish_is_not_silent() {
+    let all = jobs(&workflow());
+    let publish = job(&all, "desktop-publish");
+
+    assert!(
+        publish.contains("::warning::no bundle for"),
+        "`desktop-publish` must warn per missing platform when it publishes a \
+         partial set, and must fail outright when there is nothing to publish."
+    );
+    assert!(
+        publish.contains("::error::every desktop-bundle leg failed"),
+        "`desktop-publish` must fail with an explicit message when no leg \
+         produced an artifact, rather than surfacing download-artifact's \
+         `Unable to find any artifacts` and leaving the cause to be guessed."
+    );
+}
+
 /// A green run with a missing artifact is the failure mode that matters here,
 /// so the desktop jobs must be allowed to go red.
+///
+/// Scoped to JOB-level `continue-on-error`, which is the one that suppresses a
+/// whole job's result. A STEP-level one is a different thing and is legitimate:
+/// `desktop-publish`'s download step carries it precisely so a partial matrix
+/// reaches the guard step that reports which platform is missing, instead of
+/// dying on `download-artifact`'s own less useful error. An earlier version of
+/// this test forbade the string anywhere in the block and so fired on that fix
+/// — right instinct, wrong resolution.
 #[test]
 fn desktop_jobs_do_not_swallow_their_own_failures() {
     let all = jobs(&workflow());
     for name in ["desktop-bundle", "desktop-publish"] {
         let block = job(&all, name);
+        let job_level = block.lines().any(|l| {
+            l.starts_with("    ")
+                && !l.starts_with("     ")
+                && l.trim_start().starts_with("continue-on-error:")
+        });
         assert!(
-            !block.contains("continue-on-error: true"),
-            "`{name}` sets continue-on-error: true. The release is already \
-             protected by the job graph (see finalize_does_not_wait_on_the_\
-             desktop_jobs), so this only hides a failure: the run stays green \
-             and a silently missing artifact becomes indistinguishable from a \
-             healthy release. PRD #740 Decision 4."
+            !job_level,
+            "`{name}` sets a JOB-level continue-on-error. The release is \
+             already protected by the job graph (see \
+             finalize_does_not_wait_on_the_desktop_jobs), so this only hides a \
+             failure: the run stays green and a silently missing artifact \
+             becomes indistinguishable from a healthy release. PRD #740 \
+             Decision 4."
         );
     }
 }
