@@ -156,7 +156,7 @@ Two re-runnable checks guard the tooling locally:
 
 ```sh
 task reel-smoke           # engine: stitch a tiny fixture and assert the MP4 with ffprobe (needs agg+ffmpeg; no network)
-task reel-adapter-test    # adapter: assert manifest order + L1 exclusion + clean-skip (pure shell; CI-safe)
+task reel-adapter-test    # adapter: assert manifest order + L1/unmarked exclusion + both clean-skip messages (no agg/ffmpeg, no network; CI-safe)
 ```
 
 The live YouTube upload cannot be a routine automated test; it is verified by code review of `upload.sh` plus a one-time manual `--publish` run (see the engine SKILL.md).
@@ -170,7 +170,7 @@ The demo reel is **not** built during the pre-PR gate. The casts are *recorded* 
 3. **Build + upload (pre-merge).** Once the PR is green, the adapter (`build.sh --out reel.mp4 --publish`) composes a descriptive title (`<repo> · PRD #<prd> · PR #<pr> — <short desc>`, e.g. `dot-agent-deck · PRD #180 · PR #182 — PRD demo reel`), selects the branch's new/changed e2e tests, builds the manifest, and the engine stitches the reel and uploads it unlisted, returning the watch URL.
 4. **Post the link in three places.** So the reel rides along with both the PR and the release notes, the URL is posted to **(a)** a PR comment, **(b)** the PR description/body, and **(c)** the changelog fragment `changelog.d/<prd>.feature.md` (appended, so it flows into the release notes). Committing the changelog/PR-body change triggers one final quick CI + Greptile pass, which the orchestrator waits on before the merge gate.
 5. **Surface to the human pre-merge.** The orchestrator presents the link at the merge gate: `Demo reel for PRD #NNN: <unlisted YouTube link>. Watch before merging.`
-6. **Clean skip.** If the branch changed **no** e2e tests, the adapter writes no manifest, builds no reel, uploads nothing, and prints `skipped: no e2e tests changed on this branch`. The orchestrator records that there is no reel and why — no URL, no comment, no PR-body edit, no changelog link.
+6. **Clean skip, and which one.** When there is nothing to build the adapter writes no manifest, builds no reel, uploads nothing, and exits 0 — but it says *which* of the two reasons applies, because they call for opposite responses. If the branch changed **no** e2e tests it prints `skipped: no e2e tests changed on this branch` and there is genuinely nothing to do. If e2e tests **did** change and have casts but none carries the opt-in ` [reel]` marker, it instead prints `skipped: N e2e test(s) changed on this branch, but none is reel-eligible — no [reel] marker in tests/CATALOG.md for: <ids>` and names them; that is normally the correct outcome (a stand-in test is deliberately unmarked — see [CLAUDE.md](../../CLAUDE.md) rule 4), and the ids are there so you can confirm the marker is rightly absent rather than go debugging the diff gate. Either way the orchestrator records that there is no reel and why — no URL, no comment, no PR-body edit, no changelog link.
 
 > **The unlisted link is public-by-reach in the release notes.** An unlisted YouTube video is not listed or searchable, but anyone who has the link can watch it — and putting it in the changelog fragment publishes the link into the release notes, so anyone reading those notes can reach the reel. This is intended: the release notes are exactly where a reader wants a "show me what this PRD did" link.
 
