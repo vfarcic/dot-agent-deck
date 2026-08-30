@@ -555,15 +555,28 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-group-count { margin-left: auto; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: 9px; white-space: nowrap; }
 .overview-group-pips { display: flex; flex-wrap: wrap; gap: 4px; }
 
-.overview-rows { margin: 0; padding: 0; list-style: none; }
+/* The rows are a real `<table>` so every cell has a `<th scope="col">`, and the
+   grid layout below is what keeps the columns aligned across group cards. Note
+   that `display: grid` on table elements strips their implicit ARIA semantics
+   in browsers, which is why AgentOverview.tsx restates role="table"/"row"/
+   "columnheader"/"cell" explicitly rather than relying on the element names. */
+.overview-table { width: 100%; display: block; border-collapse: collapse; }
+.overview-rows { display: block; margin: 0; padding: 0; }
+/* The per-group header row: present for a screen reader, invisible on screen,
+   because one visible legend for the whole fleet is the design. `clip-path`
+   rather than `display: none`, which would take it out of the a11y tree too. */
+.overview-sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
 /* One grid template shared by the legend and every row, so the columns line up
    across group cards and the whole fleet reads as one table. */
 .overview-legend, .overview-row { display: grid; grid-template-columns: 10px minmax(0, 1.45fr) 66px 84px minmax(0, 1.5fr) 40px minmax(0, 1.6fr); align-items: center; gap: 10px; }
+.overview-row > td { min-width: 0; padding: 0; }
 .overview-row { min-height: 34px; padding: 5px 11px; border-top: 1px solid #eae7de; }
 .overview-row:first-child { border-top: 0; }
 .overview-row:hover { background: #f7f5ef; }
 .overview-row[data-status="failed"] { background: rgba(161, 62, 56, .05); }
-.overview-row .agent-state-mark { margin: 0; }
+/* Blockified for free while the cells were grid items; now that each cell is
+   a `<td>`, the mark inside one needs to be a block for its 8px box to apply. */
+.overview-row .agent-state-mark { display: block; margin: 0; }
 .overview-agent-name { min-width: 0; display: flex; align-items: baseline; gap: 6px; }
 .overview-agent-name strong { overflow: hidden; font-size: 11px; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
 .overview-role-index { flex: 0 0 auto; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: 9px; font-style: normal; }
@@ -573,7 +586,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    restyle the deck — which PRD #745 iteration 1 must not do. Giving the
    deck's badge a style is a separate change. */
 .overview-row .coordinator-badge { flex: 0 0 auto; padding: 1px 4px; border-radius: 2px; color: var(--teal); background: var(--teal-soft); font-size: 7px; font-weight: 800; letter-spacing: .08em; }
-.overview-row .status-label { justify-self: start; }
+.overview-row .status-label { display: inline-block; justify-self: start; }
 .overview-cli, .overview-cwd, .overview-tool-count { overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .overview-tool-count { justify-self: end; color: var(--faint); }
 .overview-tool { min-width: 0; display: flex; align-items: center; gap: 5px; color: var(--muted); }

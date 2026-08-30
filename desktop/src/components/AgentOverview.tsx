@@ -1,23 +1,28 @@
 import { useMemo, type ReactNode } from "react";
 import { Blocks, Boxes, LayoutList, Layers, Network, RefreshCw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
+import { DISPLAY_LIMITS, displayPath, displayText, displayTitle, shortDaemonLabel } from "../lib/displayText";
 
 /**
  * The honest subset of `AgentSession`: every field a daemon genuinely reports
- * and nothing else. The overview renders from THIS and never from
- * `AgentSession`, so reaching for a value the daemon cannot supply — `model`,
- * `tokens`, `cost`, `contextPercent`, `worktree`, `attempt`, `duration` — is a
- * compile error rather than a thing to remember. The field-by-field reasoning
- * lives on `AgentSession` itself; PRD #745's "Columns" table is the decision.
+ * AND the overview actually renders, and nothing else. The overview renders
+ * from THIS and never from `AgentSession`, so reaching for a value the daemon
+ * cannot supply — `model`, `tokens`, `cost`, `contextPercent`, `worktree`,
+ * `attempt`, `duration` — is a compile error rather than a thing to remember.
+ * `role` is deliberately absent even though it is honest: a row shows
+ * `displayName` and, inside an orchestration, `tab.roleName`, so carrying
+ * `role` here would claim a consumption that does not exist. The field-by-field
+ * reasoning lives on `AgentSession` itself; PRD #745's "Columns" table is the
+ * decision.
  */
 export type OverviewAgent = Pick<
   AgentSession,
-  "id" | "daemonId" | "role" | "displayName" | "cli" | "status" | "cwd" | "activeTool" | "activeToolDetail" | "toolCount" | "tab"
+  "id" | "daemonId" | "displayName" | "cli" | "status" | "cwd" | "activeTool" | "activeToolDetail" | "toolCount" | "tab"
 >;
 
 export function toOverviewAgent(agent: AgentSession): OverviewAgent {
-  const { id, daemonId, role, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab } = agent;
-  return { id, daemonId, role, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab };
+  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab } = agent;
+  return { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab };
 }
 
 /**
@@ -26,6 +31,9 @@ export function toOverviewAgent(agent: AgentSession): OverviewAgent {
  * `"1"` and any bare-id key is wrong the moment #742 connects a second daemon.
  * `encodeURIComponent` escapes `:`, so the join stays unambiguous for a daemon
  * id that is itself a socket path.
+ *
+ * This is built from RAW values, never from the sanitised display copies: two
+ * names that differ only in a stripped character must stay two agents.
  */
 export function agentKey(agent: Pick<OverviewAgent, "daemonId" | "id">): string {
   return `${encodeURIComponent(agent.daemonId)}:${encodeURIComponent(agent.id)}`;
@@ -40,11 +48,14 @@ export interface OverviewGroup {
   /** The orchestration's own name, shown only when `title` is a display title. */
   subtitle?: string;
   /**
-   * Set when every member shares one working directory, which is the common
-   * case for an orchestration. The group then states it once instead of
-   * repeating the same long path down six rows.
+   * The working directory MOST of this group's members share, set only when at
+   * least two of them share it. The group states it once and those rows stay
+   * blank, which turns the column into a differences column: what a row prints
+   * is what makes it unlike its neighbours. A group whose members all differ
+   * has no common value and prints every row; so does a group of one, which
+   * needs no hoist because there is no repetition to remove.
    */
-  sharedCwd?: string;
+  commonCwd?: string;
   agents: OverviewAgent[];
 }
 
@@ -62,7 +73,12 @@ export function groupAgents(agents: OverviewAgent[]): OverviewGroup[] {
 
   for (const agent of agents) {
     if (agent.tab.kind === "orchestration") {
-      const id = agent.tab.orchestrationId ?? agent.tab.name;
+      // `orchestrationId` is optional on the wire. Falling back to the name
+      // would merge two distinct orchestrations that happen to share one into a
+      // single card with colliding role indexes, so an id-less agent gets a key
+      // unique to itself instead: worst case it reads as its own group, which
+      // is honest, rather than as somebody else's role.
+      const id = agent.tab.orchestrationId ?? `agent:${agentKey(agent)}`;
       const group = orchestrations.get(id) ?? {
         id,
         kind: "orchestration" as const,
@@ -90,13 +106,29 @@ export function groupAgents(agents: OverviewAgent[]): OverviewGroup[] {
     ...modes.values(),
     ...(standalone.length ? [{ id: "standalone", kind: "standalone" as const, title: "Standalone agents", agents: standalone }] : []),
   ];
-  for (const group of groups) group.sharedCwd = sharedCwdOf(group.agents);
+  for (const group of groups) group.commonCwd = commonCwdOf(group.agents);
   return groups;
 }
 
-function sharedCwdOf(agents: OverviewAgent[]): string | undefined {
-  const first = agents[0]?.cwd;
-  return first && agents.every((agent) => agent.cwd === first) ? first : undefined;
+/**
+ * The working directory the largest number of members share, or `undefined`
+ * when no two of them share one. Ties go to whichever appears first, so the
+ * answer does not depend on map iteration order.
+ */
+function commonCwdOf(agents: OverviewAgent[]): string | undefined {
+  const counts = new Map<string, number>();
+  for (const agent of agents) {
+    if (agent.cwd) counts.set(agent.cwd, (counts.get(agent.cwd) ?? 0) + 1);
+  }
+  let best: string | undefined;
+  let bestCount = 1;
+  for (const [cwd, count] of counts) {
+    if (count > bestCount) {
+      best = cwd;
+      bestCount = count;
+    }
+  }
+  return best;
 }
 
 function roleIndexOf(agent: OverviewAgent): number {
@@ -124,12 +156,19 @@ const GROUP_ICON: Record<OverviewGroupKind, typeof Network> = {
   standalone: Boxes,
 };
 
+/** The column headers, in grid order. The visible legend mirrors these. */
+const COLUMNS = ["Status", "Agent", "State", "CLI", "Active tool", "Tools", "Working directory"];
+
 /**
  * The fleet at a glance: every agent the desktop can see, grouped the way the
  * daemon groups them, described only by things that are actually true — and
  * with no terminal anywhere on it. "Shows no output" and "opens no PTY" are
  * separate properties (PRD #745); this component owns the first, and mounting
  * no `TerminalViewport` is what its tests assert.
+ *
+ * Every daemon-supplied string on this screen goes through `lib/displayText`
+ * before it reaches React — rendered text and `title` attributes alike — while
+ * grouping, sorting and keys keep the raw values.
  */
 export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeState; onNavigate: (view: DeckView) => void }) {
   const { snapshot, mode } = runtime;
@@ -139,6 +178,8 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
   const counts = useMemo(() => countByStatus(agents), [agents]);
   const countOf = (status: AgentStatus) => counts.find((entry) => entry.status === status)?.count ?? 0;
   const openDeck = () => onNavigate({ kind: "deck" });
+  const socketPath = connection.socketPath;
+  const daemonMessage = connection.message ? displayText(connection.message, DISPLAY_LIMITS.message) : undefined;
 
   return (
     <div className="control-deck overview-screen">
@@ -149,7 +190,7 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
           <OverviewRailButton icon={LayoutList} label="Overview" active onClick={() => onNavigate({ kind: "overview" })} testId="open-overview" />
         </nav>
         <div className="rail-bottom">
-          <span className={`connection-lamp connection-${connection.status}`} title={connection.message} />
+          <span className={`connection-lamp connection-${connection.status}`} title={daemonMessage} />
         </div>
       </aside>
 
@@ -185,14 +226,21 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
             daemon. With one it is minimal chrome; #742's second daemon becomes a
             sibling here and changes no inner component.
           */}
-          <section className="daemon-group" data-testid="daemon-group" data-daemon-id={connection.socketPath ?? ""} aria-labelledby="daemon-group-title">
+          <section className="daemon-group" data-testid="daemon-group" data-daemon-id={socketPath ?? ""} aria-labelledby="daemon-group-title">
             <header className="daemon-group-header">
               <span className={`connection-lamp connection-${connection.status}`} aria-hidden="true" />
               <div className="daemon-identity">
                 <strong id="daemon-group-title">Local daemon</strong>
-                <code>{connection.socketPath ?? "socket path not reported"}</code>
+                {/*
+                  A socket path routinely embeds a uid or a username, so the
+                  header carries a short label and keeps the full path on hover.
+                  `data-daemon-id` above stays the raw identity key.
+                */}
+                <code title={socketPath ? displayTitle(socketPath) : undefined}>
+                  {socketPath ? shortDaemonLabel(socketPath) : "socket path not reported"}
+                </code>
               </div>
-              <p className="daemon-state">{connection.message ?? connection.status}</p>
+              <p className="daemon-state">{daemonMessage ?? connection.status}</p>
               {connection.status === "connected" && agents.length > 0 && (
                 <div className="daemon-pips">{counts.map((entry) => (
                   <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {entry.status}</span>
@@ -205,6 +253,7 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
                 agents={agents}
                 groups={groups}
                 connection={connection}
+                message={daemonMessage}
                 onOpenDeck={openDeck}
                 onReconnect={() => void runtime.reconnect()}
               />
@@ -221,10 +270,11 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
   );
 }
 
-function DaemonBody({ agents, groups, connection, onOpenDeck, onReconnect }: {
+function DaemonBody({ agents, groups, connection, message, onOpenDeck, onReconnect }: {
   agents: OverviewAgent[];
   groups: OverviewGroup[];
   connection: ConnectionView;
+  message?: string;
   onOpenDeck: () => void;
   onReconnect: () => void;
 }) {
@@ -239,7 +289,7 @@ function DaemonBody({ agents, groups, connection, onOpenDeck, onReconnect }: {
   if (connection.status === "disconnected") {
     return (
       <OverviewNote testId="overview-disconnected" icon={<ShieldAlert size={24} />} title="Daemon disconnected">
-        <p>{connection.message ?? "No dot-agent-deck daemon is listening on the configured socket."}</p>
+        <p>{message ?? "No dot-agent-deck daemon is listening on the configured socket."}</p>
         <p className="overview-note-hint">Nothing can be said about the fleet until a daemon answers, so this list is blank rather than stale. Start a daemon from the deck, then reconnect.</p>
         <div>
           <button className="button secondary" onClick={onOpenDeck}><SquareTerminal size={14} /> Open deck</button>
@@ -252,7 +302,7 @@ function DaemonBody({ agents, groups, connection, onOpenDeck, onReconnect }: {
   if (connection.status === "error") {
     return (
       <OverviewNote testId="overview-incompatible" icon={<ShieldAlert size={24} />} title="Incompatible daemon">
-        <p>{connection.message ?? "A daemon answered but this build cannot speak to it."}</p>
+        <p>{message ?? "A daemon answered but this build cannot speak to it."}</p>
         <p className="overview-note-hint">
           {connection.runningAgentCount === undefined
             ? "A daemon answered the handshake, but this build cannot read its agent list. Nothing is listed rather than guessed."
@@ -281,6 +331,12 @@ function DaemonBody({ agents, groups, connection, onOpenDeck, onReconnect }: {
 
   return (
     <>
+      {/*
+        Decoration, not structure: one legend for the whole fleet so the group
+        cards read as one table. The header association a screen reader needs
+        comes from each group's own `<thead>`, which is visually hidden rather
+        than repeated four times down the page.
+      */}
       <div className="overview-legend" aria-hidden="true">
         <span />
         <span>AGENT</span>
@@ -307,52 +363,78 @@ function OverviewGroupCard({ group }: { group: OverviewGroup }) {
         <Icon size={14} aria-hidden="true" />
         <div className="overview-group-identity">
           <span className="section-kicker">{GROUP_KICKER[group.kind]}</span>
-          <h3 id={titleId}>{group.title}</h3>
+          <h3 id={titleId}>{displayText(group.title, DISPLAY_LIMITS.name)}</h3>
         </div>
-        {group.subtitle && <code className="overview-group-subtitle">{group.subtitle}</code>}
-        {group.sharedCwd && <code className="overview-group-cwd" title={`Every agent in this group is working in ${group.sharedCwd}`}>{group.sharedCwd}</code>}
+        {group.subtitle && <code className="overview-group-subtitle">{displayText(group.subtitle, DISPLAY_LIMITS.name)}</code>}
+        {group.commonCwd && (
+          <code className="overview-group-cwd" title={displayText(`Most of this group works in ${group.commonCwd} — a row prints its own directory only when it differs`, DISPLAY_LIMITS.title)}>
+            {displayPath(group.commonCwd)}
+          </code>
+        )}
         <span className="overview-group-count">{group.agents.length} {group.agents.length === 1 ? "agent" : "agents"}</span>
         <div className="overview-group-pips">{counts.map((entry) => (
           <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {entry.status}</span>
         ))}</div>
       </header>
-      <ul className="overview-rows">
-        {group.agents.map((agent) => <OverviewRow key={agentKey(agent)} agent={agent} sharedCwd={group.sharedCwd} />)}
-      </ul>
+      {/*
+        A real `<table>`, because this screen IS a table and `<th scope="col">`
+        is how a cell gets its column header. The grid layout is kept by
+        `display: grid` on the rows, which strips a table's implicit ARIA
+        semantics in browsers — so the roles are restated explicitly rather than
+        left to the element names.
+      */}
+      <table className="overview-table" role="table" aria-labelledby={titleId}>
+        <thead className="overview-sr-only" role="rowgroup">
+          <tr role="row">
+            {COLUMNS.map((column) => <th key={column} role="columnheader" scope="col">{column}</th>)}
+          </tr>
+        </thead>
+        <tbody className="overview-rows" role="rowgroup">
+          {group.agents.map((agent) => <OverviewRow key={agentKey(agent)} agent={agent} commonCwd={group.commonCwd} />)}
+        </tbody>
+      </table>
     </article>
   );
 }
 
-function OverviewRow({ agent, sharedCwd }: { agent: OverviewAgent; sharedCwd?: string }) {
+function OverviewRow({ agent, commonCwd }: { agent: OverviewAgent; commonCwd?: string }) {
   const orchestration = agent.tab.kind === "orchestration" ? agent.tab : undefined;
   // Only an orchestration's role name says something the other columns do not.
-  // Outside one, `role` is derived from the agent type, so showing it here
-  // would just restate the CLI column.
+  // Outside one, the daemon derives the role from the agent type, so showing it
+  // here would just restate the CLI column.
   const roleLabel = orchestration?.roleName;
+  const name = displayText(agent.displayName, DISPLAY_LIMITS.name);
   return (
-    <li className="overview-row" data-testid={`overview-agent-${agentKey(agent)}`} data-status={agent.status}>
-      <span className={`agent-state-mark status-${agent.status}`} aria-hidden="true" />
-      <span className="overview-agent-name">
+    <tr className="overview-row" role="row" data-testid={`overview-agent-${agentKey(agent)}`} data-status={agent.status}>
+      <td role="cell"><span className={`agent-state-mark status-${agent.status}`} aria-hidden="true" /></td>
+      <td className="overview-agent-name" role="cell">
         {orchestration && <em className="overview-role-index" title={`Role ${orchestration.roleIndex} of this orchestration`}>{String(orchestration.roleIndex + 1).padStart(2, "0")}</em>}
-        <strong>{agent.displayName}</strong>
+        <strong>{name}</strong>
         {orchestration?.isStartRole && <span className="coordinator-badge" title="Orchestration start role — the agent an operator messages">COORDINATOR</span>}
-        {roleLabel && roleLabel.toLowerCase() !== agent.displayName.toLowerCase() && <em className="overview-role-name">{roleLabel}</em>}
-      </span>
-      <span className={`status-label status-${agent.status}`}>{agent.status}</span>
-      <span className="overview-cli" title={`Agent type reported by the daemon: ${agent.cli}`}>{agent.cli}</span>
-      <span className="overview-tool">
+        {roleLabel && roleLabel.toLowerCase() !== agent.displayName.toLowerCase() && <em className="overview-role-name">{displayText(roleLabel, DISPLAY_LIMITS.name)}</em>}
+      </td>
+      <td role="cell"><span className={`status-label status-${agent.status}`}>{agent.status}</span></td>
+      <td className="overview-cli" role="cell" title={displayText(`Agent type reported by the daemon: ${agent.cli}`, DISPLAY_LIMITS.title)}>{displayText(agent.cli, DISPLAY_LIMITS.name)}</td>
+      <td className="overview-tool" role="cell">
         {agent.activeTool ? (
           <>
             <Wrench size={11} aria-hidden="true" />
-            <strong>{agent.activeTool}</strong>
-            {agent.activeToolDetail && <em title={agent.activeToolDetail}>{agent.activeToolDetail}</em>}
+            <strong>{displayText(agent.activeTool, DISPLAY_LIMITS.toolName)}</strong>
+            {/*
+              For a shell tool this detail is the command line the agent ran, so
+              it is bounded short: a full command line on a fifteen-row overview
+              is unreadable, and it is the kind of thing that ends up in a
+              screenshot. Bounded, not redacted — a length limit is honest,
+              where a secret-matching heuristic would only look like assurance.
+            */}
+            {agent.activeToolDetail && <em title={displayTitle(agent.activeToolDetail)}>{displayText(agent.activeToolDetail, DISPLAY_LIMITS.toolDetail)}</em>}
           </>
         ) : <span className="overview-tool-idle">no active tool</span>}
-      </span>
-      <span className="overview-tool-count" title={`${agent.toolCount} tool calls reported`}>{agent.toolCount}</span>
-      {/* Stated once in the group header when the whole group shares it. */}
-      <span className="overview-cwd" title={agent.cwd}>{agent.cwd === sharedCwd ? "" : agent.cwd}</span>
-    </li>
+      </td>
+      <td className="overview-tool-count" role="cell" title={`${agent.toolCount} tool calls reported`}>{agent.toolCount}</td>
+      {/* Stated once in the group header for the directory most of the group shares. */}
+      <td className="overview-cwd" role="cell" title={displayTitle(agent.cwd)}>{agent.cwd === commonCwd ? "" : displayPath(agent.cwd)}</td>
+    </tr>
   );
 }
 
