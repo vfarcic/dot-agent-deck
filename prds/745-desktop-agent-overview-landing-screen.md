@@ -1,6 +1,6 @@
 # PRD #745: An agent overview as the desktop app's landing screen
 
-**Status**: Not started
+**Status**: In progress — iteration 1 (fixture only) complete
 **Priority**: Medium
 **Created**: 2026-08-30
 **Issue**: [#745](https://github.com/vfarcic/dot-agent-deck/issues/745)
@@ -213,12 +213,12 @@ The single most valuable test in this PRD is the bridge-level one asserting that
 
 ### Iteration 1 — fixture only (no daemon, no Rust)
 
-- [ ] **M1 — Honest fixture.** Cut the fixture's agent shape down to the columns that genuinely exist, so the design is not settled against data (`model`, `cost`, `tokens`, `contextPercent`, `branch`, `spend`) that vanishes the moment it meets a real daemon. This is the trap iteration 1 exists to avoid, not a tidy-up.
-- [ ] **M2 — Crowded and zero-agent fixture states.** `?fixture=1&state=crowded` with several orchestrations, a mode bucket and standalone agents; and a genuine connected-with-zero-agents state, closing the `state=empty` → disconnected mis-mapping (`desktop/src/data/fixture.ts:264-268`) that currently makes the first-run screen impossible to view.
-- [ ] **M3 — View state and rail entry.** A discriminated view union in `App` above `ControlDeck` (`desktop/src/App.tsx:63-65`), plus one Overview rail button. The deck stays the default.
-- [ ] **M4 — The overview screen.** Daemon group as the outer unit; orchestration / mode / standalone groups inside it; honest columns per the table above. No terminals.
-- [ ] **M5 — Model: daemon identity and tab membership.** `AgentSession` grows a daemon identity and a structured `tab`; the overview keys by `(daemonId, agentId)`.
-- [ ] **M6 — Iteration 1 coverage.** Testing Library tests for grouping, the crowded scenario, and every connection state.
+- [x] **M1 — Honest fixture.** Cut the fixture's agent shape down to the columns that genuinely exist, so the design is not settled against data (`model`, `cost`, `tokens`, `contextPercent`, `branch`, `spend`) that vanishes the moment it meets a real daemon. This is the trap iteration 1 exists to avoid, not a tidy-up.
+- [x] **M2 — Crowded and zero-agent fixture states.** `?fixture=1&state=crowded` with several orchestrations, a mode bucket and standalone agents; and a genuine connected-with-zero-agents state, closing the `state=empty` → disconnected mis-mapping (`desktop/src/data/fixture.ts:264-268`) that currently makes the first-run screen impossible to view.
+- [x] **M3 — View state and rail entry.** A discriminated view union in `App` above `ControlDeck` (`desktop/src/App.tsx:63-65`), plus one Overview rail button. The deck stays the default.
+- [x] **M4 — The overview screen.** Daemon group as the outer unit; orchestration / mode / standalone groups inside it; honest columns per the table above. No terminals.
+- [x] **M5 — Model: daemon identity and tab membership.** `AgentSession` grows a daemon identity and a structured `tab`; the overview keys by `(daemonId, agentId)`.
+- [x] **M6 — Iteration 1 coverage.** Testing Library tests for grouping, the crowded scenario, and every connection state.
 
 ### Iteration 2 — connected
 
@@ -280,3 +280,23 @@ Design review with the user changed the shape of the work substantially. Recorde
 **A new daemon API was considered and rejected.** The question was whether the daemon should grow an endpoint returning "only what the overview needs". It should not: `ListAgents` already returns exactly that, in one call, and the expense is a *separate* per-agent `AttachStream` the desktop opens unconditionally. The daemon's API is correctly factored; the client conflates the two halves. Recorded in [Why no new daemon API](#why-no-new-daemon-api), along with the one case that would genuinely need daemon work — output previews — which is why previews are out of scope.
 
 **Demand-driven attach stays in this PRD rather than becoming its own.** On its own it would be unobservable: today's deck displays every agent with a terminal, so "attach what is shown" and "attach everything" name the same set. It only becomes meaningful next to a screen that shows agents without their output.
+
+### 2026-08-30 — Iteration 1 built (M1–M6)
+
+The overview ships alongside the deck behind one rail button, against the fixture only. No Rust changed, `desktop/src-tauri/` was not touched, `attachAgents` was not touched, and nothing on the screen navigates anywhere — the dead end is intact.
+
+**M1 was decided as annotation rather than amputation, and the constraint that decided it was the deck.** The dishonest fields are not removable without editing the control deck: `AgentTile` renders `model`, `attempt`, `duration`, `tokens`, `cost` and `contextPercent` directly (`desktop/src/components/AgentTile.tsx:121,135-138,146-160`), and the topbar renders `spend`, `branch` and `runId`. Deleting them from `AgentSession` would therefore have meant changing the deck's contents, which this iteration is explicitly forbidden to do, and would have churned the existing suite. So they stay on the type, and honesty is enforced *structurally* instead of by discipline: every `AgentSession` field now carries an `HONEST` or `FIXTURE-ONLY` annotation saying whether a daemon reports it, and `AgentOverview` renders from `OverviewAgent` — a `Pick<>` of the honest subset — so reaching for `model` or `cost` on the overview is a **compile error**, not a review catch. The overview's own test asserts the string `Unavailable` never reaches the screen.
+
+**The crowded fixture carries live mode's placeholders verbatim rather than plausible numbers.** `crowdedAgent` sets `model: "Unavailable"`, `attempt: 1`, `duration: "—"`, `tokens/cost/contextPercent: 0`, `worktree: "Unavailable"` and `transcript: ""` — the exact values `agentFromDto` hardcodes. That makes `?fixture=1&state=crowded` a faithful preview of a real daemon at fifteen agents on *both* screens instead of a demo that flatters the design, which is the risk M1 exists to remove. Agent ids are `"1"`–`"15"` because that is what the daemon mints, and the fifteen are declared deliberately out of role order with `dot-ai`'s start role at `roleIndex` 2 rather than 0, so grouping, ordering and coordinator identification are three separate things the screen has to get right rather than one accident of declaration order. Statuses are restricted to `running`, `waiting` and `failed` — the only three `statusFromDaemon` can produce.
+
+**`state=empty` now means connected-with-zero-agents.** Nothing depended on the old mis-mapping: no test referenced `createFixtureSnapshot("empty")`'s connection at all, and the two callers in `useDeckRuntime.ts:19,38` replace the whole `connection` object with a `loading` one before it is rendered. `health` deliberately stays `idle` for that state so the live-mode seed's honest health is unchanged.
+
+**The overview's shape.** Daemon group as the outer unit (lamp, socket path, status, per-status pips) with the tab-bucket groups nested inside it, one column legend for the whole fleet, and one 34px row per agent on a grid the legend and every card share so fifteen rows read as one table rather than four unrelated lists. An orchestration is a card with a teal left edge, a `01`…`06` role index down its rows, and its coordinator badged wherever in the order it falls. Two per-group decisions came out of reading the rendered result at fifteen agents: the role name is shown only for orchestration members, because outside one `role` is derived from the agent type and merely restates the CLI column; and a working directory shared by every member of a group is stated once in that group's header and left blank in its rows, which turns the column into a *differences* column — the standalone `pi-extension` pane is the only row in the crowded fixture that still prints one, and it is now the thing your eye lands on.
+
+**Open Question 4 answered visually**: the single-daemon group header is a lamp, the socket path, the daemon's own status message and the status pips — enough that a second daemon slots in as a sibling, little enough that it is not chrome around a single item.
+
+**Scope held.** The composite `(daemonId, agentId)` key exists only in the overview; the nine bare-`agentId` maps in the bridge, the deck and the terminal registry are untouched and remain #742's. `DesktopAgentDto.tab` now reuses the model's `AgentTab` rather than duplicating the shape, with a comment naming where a mapping function goes if the IPC shape ever diverges.
+
+**One deliberate omission worth flagging for iteration 2**: the overview's disconnected and incompatible states offer Reconnect and a route to the deck, but not Start daemon or Replace daemon. Both of those are confirmation-gated on the deck (`desktop/src/App.tsx`), and duplicating that machinery onto a fixture-only screen was not worth it. If the overview is ever promoted toward the landing screen, it needs them.
+
+Coverage: 19 new frontend tests (15 in `desktop/src/components/AgentOverview.test.tsx`, 4 in `desktop/src/lib/bridge.test.ts`), taking the suite from 46 to 65. The one that matters most asserts the overview mounts **zero** terminals — spying on the mocked `TerminalViewport` so a mount-then-unmount still trips it — because that is the property the whole design rests on. Per the PRD's own testing note, there is no L2 equivalent for the desktop and none was invented.
