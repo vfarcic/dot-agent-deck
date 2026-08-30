@@ -23,7 +23,7 @@ Users clear the OS trust warning by hand (`xattr -dr com.apple.quarantine` on ma
 ### In Scope
 
 - macOS arm64 (`aarch64-apple-darwin`) `.dmg`, built on `macos-latest`.
-- Linux x86_64 (`x86_64-unknown-linux-gnu`) `.deb` and `.AppImage`, built on `ubuntu-latest`.
+- Linux x86_64 (`x86_64-unknown-linux-gnu`) `.deb`, built on `ubuntu-latest`. (AppImage was planned and dropped on evidence — see Decision 7.)
 - Injecting the real release version into the Tauri bundle, replacing the hardcoded `0.1.0`.
 - New `release.yml` jobs that bundle in parallel with the existing CLI matrix and upload to the release *after* it is created, so `finalize` never waits on them.
 - Asset naming, checksums, and a fixed release-notes section that states plainly that these are unsigned alpha builds and how to clear the OS warning.
@@ -130,9 +130,13 @@ Alpha status is instead carried in three places a user actually looks:
 
 The bundling job therefore renames each artifact to the scheme in Decision 5 before uploading, and stages them in a `dist-desktop/` directory kept separate from `dist/`, so `finalize`'s glob and checksum step never see them at all. Desktop checksums go into their own `checksums-desktop-alpha.txt`; unsigned artifacts make integrity verification more valuable, not less, so this is not the corner to cut.
 
-### Decision 7 — `dmg` for macOS, `deb` and `AppImage` for Linux
+### Decision 7 — `dmg` for macOS, `deb` for Linux (AppImage dropped on evidence)
 
-`--bundles app` produces a **directory**, not a file, so it cannot be a release asset without a zip step. `dmg` is a single file, is the idiomatic macOS delivery, and gives the drag-to-Applications gesture users already know — so it replaces `app` rather than being zipped alongside it. On Linux, `deb` is native for the Debian/Ubuntu machines being dogfooded on and `AppImage` covers everything else without a package manager.
+`--bundles app` produces a **directory**, not a file, so it cannot be a release asset without a zip step. `dmg` is a single file, is the idiomatic macOS delivery, and gives the drag-to-Applications gesture users already know — so it replaces `app` rather than being zipped alongside it. On Linux, `deb` is native for the Debian/Ubuntu machines being dogfooded on.
+
+**AppImage was in this plan and has been removed, on evidence from the first real bundle run.** It failed (`failed to run linuxdeploy`) while the `.deb` from the same invocation succeeded and verified clean. Flakiness alone would only have justified a retry; what justifies removal is what the failure exposed about how that bundler works. Producing an AppImage downloads **five** third-party artifacts at bundle time — `AppRun-x86_64`, `linuxdeploy-x86_64.AppImage`, `linuxdeploy-plugin-appimage-x86_64.AppImage`, and two plugin shell scripts — and the two scripts come from `raw.githubusercontent.com/tauri-apps/…/master/…`, a **mutable ref**. That means a release build executes whatever happens to be on someone else's default branch at tag time, while producing an artifact users install and run. That is a supply-chain property, not a reliability one, and it is the wrong trade for the marginal reach an AppImage buys over a `.deb` on the machines actually being dogfooded.
+
+Re-adding it is one word in the matrix once those inputs are pinned. It should be a deliberate decision with the pinning done, not a default.
 
 Note `bundle.active` is `false` in `desktop/src-tauri/tauri.conf.json:31` and only the bundle overlay flips it to `true`. An invocation that forgets `--config src-tauri/tauri.bundle.conf.json` produces **no bundle at all and still exits 0**, so the job asserts the expected files exist rather than relying on the exit code.
 
@@ -196,19 +200,19 @@ The honest limit: the release workflow itself cannot be tested without cutting a
 
 ## Milestones
 
-- [ ] **M1 — Bundle locally on both platforms.** `tauri build` producing a `.dmg` on macOS arm64 and `.deb` + `.AppImage` on Linux x86_64, from a clean checkout. Settles the two empirical unknowns: whether a `.icns` must be generated, and which bundler packages Linux needs beyond the compile set. Record both answers in the Work Log.
-- [ ] **M2 — Version injection.** The resolved version reaches the bundle; a build asserts it rather than assuming it. Confirms whether stacked `--config` works or the `jq` fallback is needed.
-- [ ] **M3 — `prepare-sidecar.sh` `.exe` groundwork**, covering both the source path and the destination name, plus the fast-tier script tests. No Windows artifact.
-- [ ] **M4 — `release.yml` wiring.** `desktop-bundle` and `desktop-publish` jobs per Decision 4, plus the `skip_desktop` dispatch input, plus the static check that `finalize` stays independent.
-- [ ] **M5 — Asset naming, checksums and release notes.** The rename step, `checksums-desktop-alpha.txt`, and the fixed unsigned-alpha section with the quarantine instructions.
-- [ ] **M6 — Verified by a real run.** A `workflow_dispatch` execution produces downloadable assets; the macOS and Linux bundles are installed and launched on real machines and connect to a daemon. This is the gate that the whole path works.
-- [ ] **M7 — Docs and changelog.** A note in `docs/develop/desktop-gui.md` that packaging now exists, PRD #176's M5.1 amended per Decision 4, and `changelog.d/740.feature.md`. **No published `docs/` page** and no `site/sidebars.js` entry, per Decision 11 — that is [#765](https://github.com/vfarcic/dot-agent-deck/issues/765).
+- [x] **M1 — Bundle locally.** *(Linux DONE and verified — a real `.deb` was produced, inspected and collected. macOS NOT done: no Apple hardware available here, so the `.dmg` path and the `.icns` question remain unverified. See Work Log 2026-08-30 (bundle evidence).)* `tauri build` producing a `.dmg` on macOS arm64 and `.deb` + `.AppImage` on Linux x86_64, from a clean checkout. Settles the two empirical unknowns: whether a `.icns` must be generated, and which bundler packages Linux needs beyond the compile set. Record both answers in the Work Log.
+- [x] **M2 — Version injection.** The resolved version reaches the bundle; a build asserts it rather than assuming it. Confirms whether stacked `--config` works or the `jq` fallback is needed.
+- [x] **M3 — `prepare-sidecar.sh` `.exe` groundwork**, covering both the source path and the destination name, plus the fast-tier script tests. No Windows artifact.
+- [x] **M4 — `release.yml` wiring.** `desktop-bundle` and `desktop-publish` jobs per Decision 4, plus the `skip_desktop` dispatch input, plus the static check that `finalize` stays independent.
+- [x] **M5 — Asset naming, checksums and release notes.** The rename step, `checksums-desktop-alpha.txt`, and the fixed unsigned-alpha section with the quarantine instructions.
+- [ ] **M6 — Verified by a real run.** *(NOT DONE — requires a real `workflow_dispatch` execution and installs on real machines; nothing in this PR proves a bundle builds.)* A `workflow_dispatch` execution produces downloadable assets; the macOS and Linux bundles are installed and launched on real machines and connect to a daemon. This is the gate that the whole path works.
+- [x] **M7 — Docs and changelog.** A note in `docs/develop/desktop-gui.md` that packaging now exists, PRD #176's M5.1 amended per Decision 4, and `changelog.d/740.feature.md`. **No published `docs/` page** and no `site/sidebars.js` entry, per Decision 11 — that is [#765](https://github.com/vfarcic/dot-agent-deck/issues/765).
 
 ## Risks
 
 - **The whole path is only provable by running it.** No test in this repository can observe a GitHub Release. M6 is therefore load-bearing and must not be collapsed into "CI was green" — a green run with an empty `dist-desktop/` is exactly the failure that `bundle.active: false` produces silently.
 - **`.dmg` creation on a headless runner.** Tauri's DMG bundler drives `hdiutil` and, in some versions, AppleScript for window layout, which is the classic thing that behaves differently without a GUI session. If it proves unreliable, the fallback is a zipped `.app` — worse UX, same reachability. Decide on evidence from M1, not in advance.
-- **AppImage's build-time download.** `linuxdeploy` is fetched during the bundle, putting a third-party network dependency inside the release path. Decision 4's topology already contains the blast radius — a failed fetch cannot touch the CLI release — but it will produce intermittent red runs. If it becomes noise, drop AppImage and keep `.deb`.
+- ~~**AppImage's build-time download.**~~ **Materialised, and acted on.** The risk was real and arrived on the first attempt; Decision 7 now drops AppImage rather than carrying it. Decision 4's topology did contain the blast radius exactly as designed — the failure could not have touched a CLI release — but the fix is to not run the code, not to rely on the containment. Worth remembering as a data point that the containment was the thing that made a calm decision possible.
 - **An unsigned alpha is a support surface.** People will hit Gatekeeper and file issues. The docs page and the release-notes section are the mitigation, and they need to be blunt rather than apologetic: this build is unsigned, here is the exact command, #757 is where that gets fixed.
 - **Sidecar/daemon version confusion.** The bundle carries its own daemon and the handshake refuses a build-stamp mismatch. A user with an existing `dot-agent-deck` daemon running from Homebrew at a different version will meet that refusal as their first experience of the app. Worth checking during M6 what that actually looks like, and whether the message names the fix.
 - **Scope creep toward #757.** Every signing question that arises during this work belongs in #757. The moment this PRD starts discussing certificates, it has stopped being the PRD it is.
@@ -261,3 +265,38 @@ He is right about the intent, and the original reason was too absolute. A sideca
 Two things changed as a result. The stated reason is now reachability rather than the sidecar, and the **named dependency moved from #164 to #741** — #164 would only unlock the local Windows story, while the remote shape actually wanted needs #741 and does not need #164 at all. The conclusion is unchanged: Windows is deferred, its `.exe` groundwork still lands.
 
 Surfaced and worth acting on separately: **#741's placeholder body does not mention the Windows transport question**, and its measured evidence is Unix-to-Unix. Whoever writes #741 in full should decide there whether app-managed tunnelling covers Windows named pipes, because that decision — not this PRD — is what gates a Windows GUI.
+
+### 2026-08-30 — Implementation
+
+Built solo rather than through the worker roles: mid-run, `dot-agent-deck delegate` began failing with `the daemon holds no orchestration role for pane …`, so the tester/coder/reviewer/auditor chain the orchestration template calls for was unavailable. Diagnosed separately — the session had moved into a pane orphaned by a deliberate daemon restart on 2026-08-28, and orchestration role state is in-memory only — and that is not a defect in anything this PRD touches.
+
+**What landed.** M3 first, TDD, because it is the only part of this work with a real test seam: `xtask/linkage-check/src/sidecar_staging.rs` drives the actual `prepare-sidecar.sh` under a stubbed `cargo` in a tempdir. The first run failed for a *fixture* reason — PATH narrowed so far that `sh` itself was unreachable — which is exactly the false red the `reproduce-first` skill warns about; after fixing the harness, precisely the three Windows cases failed with the right message while all four controls passed. Both halves of the fix were then confirmed load-bearing by reverting each alone: dropping the source suffix fails on the missing `dot-agent-deck.exe`, dropping the destination suffix fails on the `externalBin` name, and the two produce different messages rather than one indistinguishable red.
+
+M2, M4 and M5 all live in `release.yml`'s two new jobs. The job-graph properties that make them safe are asserted by `xtask/linkage-check/src/release_workflow_wiring.rs`, and each assertion was mutation-tested — coupling `finalize` to `desktop-bundle`, deleting the artifact `pattern`, and pointing `desktop-bundle` at `build` each turn exactly one test red. That matters more here than usual: nothing can execute this workflow outside a tag, so a bad edit is otherwise observable only after a release has already gone out wrong.
+
+Two decisions changed shape while implementing:
+
+- **Version injection uses one merged config, not two stacked `--config` flags.** Decision 3 preferred stacking and named a `jq` rewrite as fallback. Since stacked `--config` could not be verified without running the Tauri CLI, the fallback became the primary: the job merges the version into the bundle overlay with `jq` and passes a single `--config`. Same outcome, no dependency on unverified CLI behaviour. The build then *fails* if no output filename carries the release version, so a bundle labelled `0.1.0` cannot be published.
+- **`finalize`'s artifact download needed a `pattern:`, which Decision 6 did not anticipate.** `merge-multiple: true` flattens every artifact of the run into one directory, so desktop bundles would have raced into `dist/` depending on which job finished first — then been swept into the release by the `dist/dot-agent-deck-*` glob and fed to a `shasum` pipeline that cannot survive the space in `Agent Deck_<version>_amd64.deb`. Fixed by constraining `finalize` to `pattern: dot-agent-deck-*` and naming the desktop *artifacts* `desktop-bundle-*`, while the *files inside* keep the `dot-agent-deck-desktop-alpha-*` names users see.
+
+**What is NOT done, and cannot be from here.** M1 and M6 are both open. This machine has no GTK/WebKit development packages — `glib-2.0.pc` is absent from the host and from `devbox.json` — so no `tauri build` ran, and the two empirical unknowns M1 exists to settle are still unknown: whether `tauri-bundler` synthesizes a missing `.icns` from the PNG, and exactly which Linux bundler packages are required (the job installs `patchelf`, `fakeroot`, `file` and `desktop-file-utils` on reasoning, not on measurement). **No bundle has been produced by this work on any platform.** The first `workflow_dispatch` run is where this is genuinely tested, and it should be treated as the milestone it is rather than as a formality.
+
+Same gap affects the pre-commit gate: CLAUDE.md rule 2's `cargo clippy --workspace --all-targets --features e2e` cannot run here, because `--workspace` includes `dot-agent-deck-desktop`. It was run with `--exclude dot-agent-deck-desktop`, which covers every crate this branch actually changes — no Rust in the desktop crate was touched — but that is a narrower gate than the rule specifies, and CI runs the full one.
+
+### 2026-08-30 — Bundle evidence (M1, Linux)
+
+Installed the GTK/WebKit development packages and ran a real `tauri build` for `x86_64-unknown-linux-gnu`. This moved four things from argued to measured, and changed one decision.
+
+**Version injection works, end to end.** The `jq`-merged config carried `"version": "0.38.1"` alongside the overlay's `bundle.active` and `externalBin`, and it reached the artifact: the file is `Agent Deck_0.38.1_amd64.deb` and `dpkg-deb -f` reports `Package: agent-deck`, `Version: 0.38.1`. The `0.1.0` literal never appears. This is the specific bug Decision 3 exists to prevent, now shown not to happen rather than reasoned about.
+
+**The sidecar is genuinely in the bundle.** `dpkg-deb -c` lists both `usr/bin/dot-agent-deck-desktop` (14.5 MB) and `usr/bin/dot-agent-deck` (19.8 MB) — so an installed GUI carries its own daemon, which is the success criterion that most needed proving.
+
+**The collect-and-rename step survives the space.** Running the workflow step's exact shell against the real output turned `Agent Deck_0.38.1_amd64.deb` into `dot-agent-deck-desktop-alpha-linux-amd64.deb` and produced a valid `checksums-desktop-alpha.txt`. Decision 6 was right that a rename is unavoidable, and the `-print0` handling is doing real work rather than being defensive.
+
+**AppImage failed, and Decision 7 changed as a result** — see that decision for the reasoning. Briefly: the failure prompted looking at *how* the bundler works, which is where the actual objection is (five build-time downloads, two from a mutable `master` ref, executed inside a release pipeline). The `.deb` from the same invocation succeeded, so this is a considered removal rather than a capitulation to a flake.
+
+**One thing only running it could have caught:** the bundle generates `desktop/src-tauri/tauri.release.conf.json` in the working tree. Left untracked and unignored, every local bundle would dirty `git status` and eventually someone commits a version number into a file whose whole point is that it never carries one. Now in `.gitignore` alongside `dist-desktop/`.
+
+**Environment note for anyone reproducing this in a `devbox shell`.** The shell runs under nix's glibc, whose `ld.so.cache` does not exist — `ldconfig -p` returns zero entries — so system libraries are invisible to the loader even once installed. `cargo test-fast` and rule 2's clippy therefore fail with `libgdk-3.so.0: cannot open shared object file` until `LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu` is exported. But that same variable then breaks nix's `node` with `undefined symbol: uv_tcp_keepalive_ex`, because it picks up the system libuv — so the Rust gates and the frontend build cannot both run in one shell that way. Bundle *without* it; the Rust link resolves through pkg-config's `-L` flags. The durable fix is to add the GTK/WebKit packages to `devbox.json` as nix packages so nix's own loader can find them; telling contributors to `apt install` does not work, which is the non-obvious part. Out of scope here, and worth its own issue.
+
+**Still unproven:** everything macOS. No Apple hardware was available, so the `.dmg` path, whether `tauri-bundler` synthesizes a missing `.icns` from the 512×512 PNG, and the drag-to-Applications shape are all untested. M6's real `workflow_dispatch` run remains the gate for that half.

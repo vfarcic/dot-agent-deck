@@ -138,7 +138,7 @@ It does not re-implement the TUI's rendering, does not hold orchestration logic,
 
 ### Phase 5 — Packaging, tests, docs & release gate
 
-- [ ] **M5.1** — Opt-in packaging: a separate build target/artifact, excluded from the default release, labeled preview/opt-in.
+- [ ] **M5.1** — Preview packaging: bundles published on **every** release as clearly-labelled unsigned alpha assets, wired so they can neither delay nor break the CLI release ([#740](https://github.com/vfarcic/dot-agent-deck/issues/740)). This wording replaces "a separate build target/artifact, excluded from the default release". That phrasing was the *mechanism* reached for before anyone had looked at the release job graph; the two properties it was protecting are that the GUI is labelled preview and that it cannot compromise the CLI release. #740's topology delivers both without excluding anything — `desktop-bundle` hangs off `prepare` rather than `build`, and `finalize` does not list it in `needs:`, so a bundler that fails cannot delay a tag or block one. An opt-in trigger was rejected deliberately: something a human must remember to fire gets fired for two releases and then never, which is how an alpha artifact ends up six versions stale and worse than none.
 - [ ] **M5.2** — Tests: `protocol`-crate and core bridge/handshake (Rust); lightweight web component/e2e for chrome + one terminal round-trip; daemon event-emission coverage.
 - [ ] **M5.3** — Docs: developer build/run + toolchain doc under `docs/develop/` (linked from `CONTRIBUTING.md`); user doc once past spike quality; changelog fragment via `dot-ai-changelog-fragment`.
 - [ ] **M5.4** — Pre-PR gate: `cargo test-e2e` green; review (Greptile) settled per CLAUDE.md rule 8.

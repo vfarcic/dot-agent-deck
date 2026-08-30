@@ -91,7 +91,18 @@ mod list_tests;
 /// `scripts/check-pin-lockstep.sh`, which CI's `devbox` job also runs directly.
 #[cfg(all(test, unix))]
 mod pin_lockstep;
+/// PRD #740: the job-graph properties in `release.yml` that keep a desktop
+/// bundler failure off the CLI release. Tests only — nothing can run that
+/// workflow outside a tag, so a bad edit is otherwise observable only after a
+/// release has gone out wrong.
+#[cfg(test)]
+mod release_workflow_wiring;
 mod repo_state;
+/// PRD #740: `desktop/scripts/prepare-sidecar.sh`'s Windows filename rule.
+/// Tests only, and Unix only — the rule lives in the script, which no CI job
+/// runs today because nothing cuts a Tauri bundle yet.
+#[cfg(all(test, unix))]
+mod sidecar_staging;
 /// Issue #521: the `/verify-pr` scripts' `KEY=value` output contract. Tests
 /// only — there is no runtime rule here, the scripts enforce themselves.
 #[cfg(test)]
