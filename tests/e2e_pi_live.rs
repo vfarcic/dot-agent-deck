@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
 //! L2 PTY-attached REAL-`pi` live-pane showcases (PRD #201, CLAUDE.md rule 4 +
 //! demo-reel eligibility per PRD #180). These are the Pi feature's "AS A USER

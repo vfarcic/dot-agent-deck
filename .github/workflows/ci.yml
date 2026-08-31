@@ -202,7 +202,17 @@ jobs:
       # A live `unnecessary_sort_by` had been sitting in its `clean_tmp.rs`
       # unnoticed; it is fixed in the same commit that added this flag, so the
       # widened gate landed green rather than red on its first run.
-      - run: cargo clippy --workspace --all-targets --features e2e -- -D warnings
+      #
+      # `e2e-live` (issue #502): the credentialed subset of the L2 suite now
+      # opens with `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, so
+      # under `--features e2e` alone those 24 files compile to empty crates —
+      # exactly the #407 hole above, reopened for a third of the tier. Measured
+      # the same way #407 was: with an E0308 injected into
+      # tests/e2e_dispatcher_mode.rs, `--features e2e` exited 0 and
+      # `--features e2e,e2e-live` failed with that E0308. This step is still a
+      # type-check and lint only — it runs no test and needs no credential, so
+      # naming `e2e-live` here does not put lane 2 into this job.
+      - run: cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
       - run: cargo build --release
       # `cargo nextest run`, NOT `cargo test` — the same runner as the
       # `cargo test-fast` local gate, and as build-macos/build-windows which

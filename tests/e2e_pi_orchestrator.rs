@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
 //! L2 REAL-`pi` orchestrator proof + scheduled/unattended Pi parity (PRD #201
 //! M4.1 + M4.2, test-plan rows 13-14). This is the flagship: a REAL `pi` agent,

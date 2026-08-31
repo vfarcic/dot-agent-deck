@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
 //! L2 REAL-scenario showcase for GitHub issue-dispatch of an ORCHESTRATION
 //! (PRD #120, CLAUDE.md rule 4 real-scenario policy). This is the heaviest,

@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
 //! PTY-attached coverage for the daemon's delegated-worker detectors. The
 //! synthetic idle case opens the `orch-deck` fixture's live `cat` role panes and

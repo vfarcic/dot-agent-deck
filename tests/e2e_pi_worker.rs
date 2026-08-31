@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
 //! L2 REAL-`pi` WORKER proof (PRD #201 completeness — pi's second role).
 //!

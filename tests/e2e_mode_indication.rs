@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
 //! PTY-attached L2 coverage for PRD #341's command-versus-typing indicators.
 //! Both scenarios drive the real `dot-agent-deck` binary through `TuiDeck` and

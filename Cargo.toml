@@ -153,6 +153,18 @@ libc = "0.2"
 # `#![cfg(feature = "e2e")]`.
 e2e = []
 
+# Issue #502 (decided strategy: three lanes, split by credential need) —
+# selects the credentialed SUBSET of the L2 suite. The 24 `tests/e2e_*.rs`
+# files that need a working agent credential to pass (a `check_*_available`
+# preflight, an imported credentials file, or `ANTHROPIC_API_KEY`) open with
+# `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`; the other 47 keep the
+# bare `#![cfg(feature = "e2e")]` and need no secrets at all. So
+# `cargo test-e2e` is lane 1 (deterministic, every PR) and
+# `cargo test-e2e-live` is lane 1 + lane 2 — enabling both features is a
+# SUPERSET run, not a live-only run. Credential handling for the lane-2 CI job
+# is issue #785.
+e2e-live = []
+
 [[example]]
 name = "send_event"
 path = "examples/send_event.rs"
