@@ -53,18 +53,7 @@ Composition degrades gracefully — a missing repo/PRD/PR drops only its own seg
 
 `select` lists the recording dirs under `.dot-agent-deck/recordings/<id>/` that are **in scope** for this branch's reel. File-level granularity; robustness over cleverness. A dir is in scope **iff all three** hold:
 
-1. **It contains a `full-stream.cast`** — the e2e proxy. The `cargo xtask docs`
-   generator writes a `test.md` for *every* `#[spec]` test but emits a cast only
-   for **L2** tests; **L1** render tests have a `test.md` and **no** cast, so they
-   are excluded by construction (which is also exactly the right "user-journey"
-   subset). Casts are local-only (PRD #77) and only written on failure or under
-   `DOT_AGENT_DECK_RECORD=1`, so the reel step runs the relevant e2e tests with
-   that flag first; without casts, every dir fails this check and the step
-   clean-skips. That run is LOCAL and is not discharged by CI — CI's e2e lanes
-   (CLAUDE.md rule 5) set no such flag and upload no casts — and since issue
-   #502 removed the pre-PR full-tier obligation there is no longer an unfiltered
-   run to piggyback on, so record the tests the branch adds or changes by
-   filter.
+1. **It contains a `full-stream.cast`** — the e2e proxy. The `cargo xtask docs` generator writes a `test.md` for *every* `#[spec]` test but emits a cast only for **L2** tests; **L1** render tests have a `test.md` and **no** cast, so they are excluded by construction (which is also exactly the right "user-journey" subset). Casts are local-only (PRD #77) and only written on failure or under `DOT_AGENT_DECK_RECORD=1`, so the reel step runs the relevant e2e tests with that flag first; without casts, every dir fails this check and the step clean-skips. That run is LOCAL and is not discharged by CI — CI's e2e lanes (CLAUDE.md rule 5) set no such flag and upload no casts — and since issue #502 removed the pre-PR full-tier obligation there is no longer an unfiltered run to piggyback on, so record the tests the branch adds or changes by filter.
 2. **Its catalog entry carries the ` [reel]` eligibility marker** (see
    [Reel-eligibility marker](#reel-eligibility-marker-real-user-facing-usage-only)
    below). Eligibility is **opt-in**: a cast alone means the test is PTY-attached,
