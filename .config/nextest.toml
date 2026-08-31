@@ -35,6 +35,22 @@ fail-fast = false
 # the full failure message), and CI now uploads it per run_attempt so that a
 # job-level re-run cannot erase a failing attempt's evidence the way it erased
 # the first `socket_004` occurrence.
+#
+# TWO THINGS THIS FILE DELIBERATELY DOES NOT DO (issue #785, the credentialed
+# lane-2 job in .github/workflows/e2e-live.yml).
+#
+#   * `store-success-output` stays at its default of FALSE, so a `SKIP: <reason>`
+#     line never reaches the report — a runtime skip is a *successful* test, not
+#     a framework-skipped one. Do not turn it on to make skips visible: that
+#     stores every passing test's raw output in a file CI uploads. The live
+#     workflow gets that evidence from `--success-output=final` plus a run-summary
+#     step instead, where GitHub's secret masking applies.
+#   * `store-failure-output` stays at its default of TRUE, which means the report
+#     DOES carry failed and retried tests' stdout and stderr. That is pure
+#     diagnostic value in the uncredentialed lanes and there is no key to protect
+#     there, so it is not turned off here; the credentialed lane instead strips
+#     its own copy with `scripts/junit-strip-output.py` before uploading it. Any
+#     new job that uploads this file and holds a secret must do the same.
 [profile.default.junit]
 path = "junit.xml"
 

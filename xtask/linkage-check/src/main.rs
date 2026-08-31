@@ -85,6 +85,12 @@ mod clean_tmp;
 /// script under `node`.
 #[cfg(test)]
 mod issue_labeler_memory;
+/// Issue #785: `scripts/junit-strip-output.py`, the stripper that makes the
+/// credentialed `e2e-live` job's uploaded JUnit report structurally incapable of
+/// carrying test output. Tests only — the rule lives in the script, and these
+/// drive the real one under `python3`.
+#[cfg(test)]
+mod junit_strip;
 mod list_tests;
 /// Issue #648: the toolchain pins duplicated between `devbox.json` and
 /// `.github/workflows/`. Tests only, and Unix only — the rule itself lives in

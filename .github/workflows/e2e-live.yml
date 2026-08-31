@@ -70,14 +70,30 @@ permissions:
 
 jobs:
   live:
-    # `push` and `workflow_dispatch` run unconditionally; a `pull_request` runs
-    # only when the label is on it. Written as "not a pull request, OR
-    # labelled" rather than as a list of allowed event names so that a trigger
-    # added later fails OPEN into running, which is visible, rather than
-    # silently never running.
+    # AN ALLOWLIST OF EVENT NAMES, so this job FAILS CLOSED. Each of the three
+    # triggers in the `on:` block above satisfies exactly one clause: a `push`
+    # (already narrowed to `main` there), a `workflow_dispatch`, or a
+    # `pull_request` that carries the label. The label requirement on the PR
+    # path is unchanged.
+    #
+    # This was written the other way round first — `github.event_name !=
+    # 'pull_request' || contains(…)` — on the reasoning that a trigger added
+    # later would then fail OPEN into running, which is visible, rather than
+    # silently never running. That trade is wrong for THIS job specifically,
+    # because this is the one job in the repository that holds an agent
+    # credential: "fails open" here means a `workflow_run`, a `schedule` or a
+    # `repository_dispatch` added by a future maintainer silently opts itself
+    # into a credentialed run, with no edit to this condition and nothing in the
+    # diff to notice. A new trigger that does not run is a missing line in this
+    # list and an obvious one to add; a new trigger that runs with the key is a
+    # security decision nobody made. There is no bypass today — the `on:` block
+    # is exactly these three — so this is hardening, kept in step with the
+    # environment reviewer rather than in place of it.
     if: >-
-      github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'run-live-e2e')
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+      contains(github.event.pull_request.labels.*.name, 'run-live-e2e'))
     runs-on: ubuntu-latest
 
     # #785 decision 2. The environment is what makes a credentialed job on
@@ -109,6 +125,49 @@ jobs:
     timeout-minutes: 90
 
     steps:
+      # FAIL FAST ON AN EMPTY KEY — first step, ahead of the checkout, the
+      # toolchain, the apt install and the two npm agent CLIs.
+      #
+      # GitHub resolves a reference to an unset or empty secret to the EMPTY
+      # STRING, and every credential preflight in this tier treats an empty
+      # ANTHROPIC_API_KEY as an ordinary RUNTIME SKIP: `skip_unless!` prints
+      # `SKIP: <reason>` and RETURNS, which nextest counts as a PASS (see
+      # `_skip_if_err` in tests/common/mod.rs). `cargo test-e2e-live` is also a
+      # SUPERSET run, so lane 1's 47 deterministic files still execute and still
+      # go green. Without this guard the job can therefore report SUCCESS with
+      # not one API-key-backed test having run — the exact silent-degradation
+      # shape CLAUDE.md rule 8 describes for RELEASE_TOKEN, and the reason
+      # release.yml and docs-publish.yml each verify their secret in their FIRST
+      # step. Same shape here, deliberately.
+      #
+      # WHAT IT DOES NOT COVER, stated the way rule 8 states it for
+      # RELEASE_TOKEN: `-z` catches unset and empty, and nothing else. A key
+      # that is present but EXPIRED, REVOKED or over its spend cap passes this
+      # guard and fails later — as real-agent test failures, which are at least
+      # loud rather than vacuous. Probing the key would cost an API call and add
+      # a failure mode of its own to the one credentialed path in the
+      # repository; rule 8 rejects exactly that trade, and it is rejected here
+      # for the same reason. Do not "improve" this into a live probe.
+      #
+      # A FORK `pull_request` now fails HERE rather than going vacuously green.
+      # GitHub withholds non-GITHUB_TOKEN secrets from fork runs, so a
+      # maintainer who labels a fork PR gets an empty key; that run genuinely
+      # cannot exercise lane 2, and this guard says so instead of letting a
+      # green tick stand in for coverage that never happened. Neither lane is a
+      # required check (rule 8), so a red advisory job is the honest outcome.
+      #
+      # The value is never printed: it is bound through `env:` and tested with
+      # `-z`. Nothing here echoes it, and nothing that does should be added.
+      - name: Verify ANTHROPIC_API_KEY is present
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "::error::ANTHROPIC_API_KEY is unset or empty, so no real-agent test in lane 2 can run and a green result here would mean nothing (every credential preflight SKIPS rather than fails, and nextest counts a skip as a pass). Set it as a secret on the \`live-e2e\` GitHub Environment — an environment secret, not a repository secret (issue #785). Note a fork pull request never receives it at all, by design. See docs/develop/e2e-lanes.md and CLAUDE.md rule 5."
+            exit 1
+          fi
+
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@v1
@@ -207,21 +266,132 @@ jobs:
       # spend-capped, and cannot be revoked without logging the owner out
       # everywhere. Nothing in this workflow copies, synthesises or inspects a
       # credentials file, and nothing should be added that does.
+      #
+      # `--success-output=final` is not cosmetic, and it is the same flag
+      # `.claude/skills/verify-pr/checks.sh` passes for the same reason: a test
+      # that cannot run prints `SKIP: <reason>` and returns NORMALLY, so nextest
+      # counts it as PASSED and, with nextest's defaults, suppresses the line
+      # entirely. Under an API key alone most of lane 2 can only skip
+      # (docs/develop/e2e-lanes.md has the per-preflight table), so those lines
+      # are the whole difference between a green run that proved something and a
+      # green run that proved nothing.
+      #
+      # The log goes to RUNNER_TEMP rather than under `target/` for two reasons:
+      # `Swatinem/rust-cache` persists `target/`, and a full-output log is the
+      # last thing to hand to a cross-run cache; and it keeps the file well away
+      # from the path the artifact step reads. It is deliberately NOT uploaded —
+      # GitHub's secret masking covers log RENDERING, not files copied out by
+      # `actions/upload-artifact`, so full test output stays in the masked
+      # surface and only the whitelisted `SKIP:` lines are lifted out of it by
+      # the step below.
       - name: Run the live e2e tier
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: cargo test-e2e-live
+        run: |
+          set -euo pipefail
+          cargo test-e2e-live --success-output=final 2>&1 \
+            | tee "${RUNNER_TEMP}/e2e-live-run.log"
+
+      # THE SKIP EVIDENCE, in the job log and the run summary — deliberately NOT
+      # in the uploaded artifact.
+      #
+      # `.config/nextest.toml` leaves `store-success-output` at its default of
+      # false, and these skips are SUCCESSFUL tests rather than
+      # framework-skipped ones, so the JUnit report never carried them however
+      # it was read. The step above puts them in the log; this step puts a count
+      # and the distinct reasons in the run summary, where they are visible
+      # without opening a 60-minute log.
+      #
+      # Why that grep is a safe WHITELIST and not a filter over arbitrary
+      # output: the only producer of the pattern is `_skip_if_err` in
+      # tests/common/mod.rs, and every reason it can print is a fixed English
+      # string built by a `check_*_available` preflight. They were read for this
+      # change and none interpolates a credential — the three `check_pi_available`
+      # copies in tests/e2e_pi_*.rs test ANTHROPIC_API_KEY for PRESENCE only,
+      # and `check_codex_available`'s model probe puts its model name in the
+      # reason, never the probe's output. Full test output stays in the masked
+      # job log.
+      #
+      # The leading `[[:space:]]*` is load-bearing, not padding: nextest INDENTS
+      # captured output by four spaces under `--success-output=final`, so a
+      # `^SKIP: ` anchored at column 0 matches nothing and reports 0 on a run
+      # that really did skip. That precise mistake is recorded in checks.sh
+      # (issues #452, #490) — keep the two patterns in step.
+      - name: Summarise the runtime skips
+        if: always()
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/e2e-live-run.log"
+          echo "## Lane 2 runtime skips" >>"${GITHUB_STEP_SUMMARY}"
+          echo >>"${GITHUB_STEP_SUMMARY}"
+          if [ ! -f "${log}" ]; then
+            echo "no run log: the test step did not get far enough to produce one"
+            echo "No run log — the test step did not get far enough to produce one." >>"${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          count=$(grep -cE '^[[:space:]]*SKIP: ' "${log}" || true)
+          case "${count}" in '' | *[!0-9]*) count=0 ;; esac
+          echo "runtime skips: ${count}"
+          if [ "${count}" -eq 0 ]; then
+            echo "No test printed \`SKIP:\` — every selected test ran for real." >>"${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          {
+            echo "**${count}** test(s) printed \`SKIP:\` and returned normally, so nextest counted every one of them as a PASS. Read these, not the colour — see docs/develop/e2e-lanes.md."
+            echo
+            echo '```'
+            grep -E '^[[:space:]]*SKIP: ' "${log}" | sed 's/^[[:space:]]*//' | sort | uniq -c | sed 's/^ *//'
+            echo '```'
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+      # Issue #785: the raw JUnit report is a CREDENTIAL SINK, so what gets
+      # uploaded is a metadata-only rebuild of it.
+      #
+      # nextest's JUnit defaults store stdout AND stderr for failed and retried
+      # tests, and this file is written by the cargo process that holds
+      # ANTHROPIC_API_KEY. If a test, an agent CLI, an HTTP error body, a panic
+      # diagnostic or a contributor-authored test emits the key, the raw value
+      # lands in the XML — and GitHub's secret masking does not extend to files
+      # `actions/upload-artifact` copies out. On a PUBLIC repository that
+      # artifact is downloadable by any logged-in reader.
+      #
+      # `scripts/junit-strip-output.py` REBUILDS the document from a per-element
+      # attribute whitelist rather than deleting the output elements from it, so
+      # the result is structurally incapable of carrying free text: no
+      # `<system-out>`, no `<system-err>`, no `<failure>`/`<error>` message or
+      # body, no text node anywhere, and a future nextest element is dropped by
+      # default instead of passed through. Run `--self-test` to see that proved.
+      #
+      # Turning `store-failure-output` off in `.config/nextest.toml` was the
+      # other option and was rejected: that file is shared by every lane and by
+      # `cargo test-fast`, so it would strip failure output out of the
+      # UNCREDENTIALED lanes' artifacts too, where it is pure diagnostic value
+      # and there is no key to protect.
+      - name: Strip test output from the JUnit report
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 scripts/junit-strip-output.py \
+            target/nextest/default/junit.xml \
+            "${RUNNER_TEMP}/junit-metadata.xml"
 
       # Issue #564: keep THIS attempt's results after a job-level re-run
       # overwrites the conclusion. Full rationale on the identical step in
       # ci.yml's `build-macos` job. It matters most here: these are the flakiest
-      # tests in the repository, a re-run is the only remedy on offer
-      # (`retries = 0`), and the JUnit XML carries the per-test wall clock plus
-      # the SKIP-versus-ran distinction that a green summary hides.
+      # tests in the repository and a re-run is the only remedy on offer
+      # (`retries = 0`).
+      #
+      # `path` is the STRIPPED file, and the raw report is never a fallback: if
+      # the step above fails or the tests never produced a report, there is
+      # simply nothing at this path, `if-no-files-found: warn` warns, and the run
+      # keeps its conclusion. What survives the strip is what #564 wants the file
+      # for — test names, outcomes, per-test wall clock, suite counts. The
+      # ran-versus-skipped distinction is NOT in here and never was; the run
+      # summary above is where that lives.
       - name: Preserve this attempt's test results
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: nextest-e2e-live-attempt-${{ github.run_attempt }}
-          path: target/nextest/default/junit.xml
+          path: ${{ runner.temp }}/junit-metadata.xml
           if-no-files-found: warn
