@@ -144,6 +144,31 @@ describe("AgentOverview", () => {
     expect(within(standalone).queryByText("COORDINATOR")).not.toBeInTheDocument();
   });
 
+  /**
+   * Scenario: render the crowded overview and read the group cards in document
+   * order. The standalone card must lead, ahead of both orchestration cards and
+   * the mode card — the pure-function order proves what `groupAgents` returns,
+   * this proves the screen a user actually sees matches it.
+   */
+  it("presents the standalone card first on the screen, not only first in the grouping", () => {
+    renderOverview();
+
+    const cards = screen.getAllByRole("article");
+    expect(cards.map((card) => [card.getAttribute("data-group-kind"), card.getAttribute("data-group-id")])).toEqual([
+      ["standalone", "standalone"],
+      ["orchestration", "orc-745"],
+      ["orchestration", "orc-dot-ai"],
+      ["mode", "review"],
+    ]);
+
+    // Document position, not query order: the leading card genuinely precedes
+    // every other card in the rendered tree.
+    const [leading, ...rest] = cards;
+    for (const card of rest) {
+      expect(leading.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING).toBeGreaterThan(0);
+    }
+  });
+
   it("renders every agent and every group of the crowded scenario", () => {
     const snapshot = createFixtureSnapshot("crowded");
     expect(snapshot.agents).toHaveLength(15);
@@ -480,11 +505,18 @@ describe("AgentOverview", () => {
 describe("groupAgents", () => {
   const crowded = () => createFixtureSnapshot("crowded").agents.map(toOverviewAgent);
 
-  it("puts the standalone bucket last however the agents arrive", () => {
+  /**
+   * Scenario: group the crowded fleet fed in a deliberately reversed arrival
+   * order and read the buckets back. The standalone bucket must come FIRST —
+   * ahead of both orchestrations and the mode — mirroring the TUI, whose
+   * dashboard tab is always the first tab; and it must land there whatever
+   * order the agents arrived in.
+   */
+  it("puts the standalone bucket first however the agents arrive", () => {
     const groups = groupAgents([...crowded()].reverse());
 
-    expect(groups.map((group) => group.kind)).toEqual(["orchestration", "orchestration", "mode", "standalone"]);
-    expect(groups.at(-1)?.id).toBe("standalone");
+    expect(groups.map((group) => group.kind)).toEqual(["standalone", "orchestration", "orchestration", "mode"]);
+    expect(groups[0]?.id).toBe("standalone");
   });
 
   it("omits the standalone bucket when nothing is untabbed", () => {
@@ -533,7 +565,7 @@ describe("groupAgents", () => {
     ]);
 
     expect(new Set(groups.map((group) => group.key)).size).toBe(2);
-    expect(groups.map((group) => group.kind)).toEqual(["mode", "standalone"]);
+    expect(groups.map((group) => group.kind)).toEqual(["standalone", "mode"]);
   });
 
   it("produces a key that is legal as an HTML id whatever the daemon named the group", () => {

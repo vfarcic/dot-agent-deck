@@ -142,6 +142,8 @@ The daemon's `TabMembership` is the grouping key, exactly as the issue suggests:
 - **Mode** — grouped by mode name.
 - **Dashboard** — a standalone bucket for agents belonging to neither.
 
+**Order: standalone first, then orchestrations, then modes.** The reason is TUI parity rather than aesthetics — the TUI's dashboard tab is always the first tab, so the overview leads with the same bucket and a user moving between the two surfaces reads them in one order. Orchestrations and modes follow in first-appearance order, and roles inside an orchestration stay in `role_index` order.
+
 `AgentSession` grows a structured `tab` field so the frontend stops reconstructing membership from a role string. Everything needed is already in `DesktopAgentDto.tab`.
 
 ### Screen and view state
@@ -351,3 +353,11 @@ The screen is now gated to fixture mode at **both** seams — the rail button is
 **The crowded fixture's appearance changed in exactly one way this round**, and only for an agent the fixture does not contain: a row whose `cwd` the daemon did not report now shows an empty Working directory cell rather than `Unavailable`. Every crowded agent has a real cwd, so `?fixture=1&state=crowded` renders identically to round 2. The header counters, the group cards, the cwd hoisting and the table markup are all unchanged there. What *did* change visibly is elsewhere: `state=disconnected` and `state=error` now show `—` in all five instruments instead of a stale `AGENTS 4`, and in live mode the Overview rail button is gone.
 
 Coverage: 12 new frontend tests (11 in `desktop/src/components/AgentOverview.test.tsx`, 1 in `desktop/src/lib/bridge.test.ts`), taking the suite from 88 to **100** across 9 files. Four of the new tests were each verified to fail with only the fix they cover reverted. The Rust count is unchanged at 3472, as it must be — no Rust was touched.
+
+### 2026-08-31 — The standalone bucket moves to the top
+
+**`groupAgents` now emits standalone → orchestrations → modes, where it previously pinned standalone last.** Only that one bucket moved: orchestrations still precede modes, both keep first-appearance order among themselves, roles inside an orchestration still sort by `roleIndex`, and grouping, keying and key namespacing are untouched. The reason is TUI parity — the TUI's dashboard tab is always the first tab, so an overview that buried the same agents at the bottom was describing a different deck than the one sitting next to it. The old doc comment's stated reason ("standalone is always last because it is the bucket of things that belong to nothing") was not merely inverted but retired: the bucket's ordering is now about where the user has already learned to look, not about what its members lack.
+
+**Three tests moved with it — two flipped, one added.** The two existing ordering assertions in `desktop/src/components/AgentOverview.test.tsx` (the reversed-arrival test and the mode-named-`standalone` test, whose real point is still the key-namespacing assertion beside it) now expect the new order. The new test asserts **rendered document order**, which the suite did not assert at all before: it reads `getAllByRole("article")` from the crowded fixture and checks the `(data-group-kind, data-group-id)` pairs in DOM order, then re-confirms the lead card with `compareDocumentPosition`. That gap was worth closing on its own — every prior ordering test read the return value of `groupAgents`, so a component that rendered the groups in some other order would have passed all of them. No production change was needed to make the new assertion expressible; the component already emits both attributes.
+
+**The crowded fixture's appearance changes**: `?fixture=1&state=crowded` now leads with the Standalone agents card, with the two orchestration cards and the mode card below it in their existing relative order. Nothing else on the screen changes — same cards, same counters, same rows, same markup — only their sequence. This is a refinement inside the already-complete M4, not new scope, so no milestone is added or ticked.

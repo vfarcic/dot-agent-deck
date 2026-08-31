@@ -92,9 +92,10 @@ export interface OverviewGroup {
 /**
  * Groups by the daemon's own tab buckets: one group per orchestration with its
  * roles in `roleIndex` order, one per mode name, and one standalone bucket for
- * dashboard panes. Orchestrations and modes keep first-appearance order;
- * standalone is always last because it is the bucket of things that belong to
- * nothing.
+ * dashboard panes. Standalone leads, because the TUI opens on the dashboard tab
+ * and always keeps it first — an overview that buried the same agents at the
+ * bottom would be describing a different deck than the one next to it.
+ * Orchestrations follow, then modes, each in first-appearance order.
  */
 export function groupAgents(agents: OverviewAgent[]): OverviewGroup[] {
   const orchestrations = new Map<string, OverviewGroup>();
@@ -133,9 +134,9 @@ export function groupAgents(agents: OverviewAgent[]): OverviewGroup[] {
   }
 
   const groups = [
+    ...(standalone.length ? [{ id: "standalone", key: groupKey("standalone", "standalone"), kind: "standalone" as const, title: "Standalone agents", agents: standalone }] : []),
     ...orchestrations.values(),
     ...modes.values(),
-    ...(standalone.length ? [{ id: "standalone", key: groupKey("standalone", "standalone"), kind: "standalone" as const, title: "Standalone agents", agents: standalone }] : []),
   ];
   for (const group of groups) group.commonCwd = commonCwdOf(group.agents);
   return groups;
