@@ -64,12 +64,8 @@ Composition degrades gracefully — a missing repo/PRD/PR drops only its own seg
    [Reel-eligibility marker](#reel-eligibility-marker-real-user-facing-usage-only)
    below). Eligibility is **opt-in**: a cast alone means the test is PTY-attached,
    not that it belongs in the reel, so an unmarked test is excluded even with a
-   cast and a changed source. This gate is evaluated **last** even though it is
-   listed second: the three conditions are ANDed, so order cannot change *which*
-   dirs are selected, but checking the marker last means its `excluding '<id>' …
-   has no [reel] marker` diagnostic fires only for a dir that would otherwise
-   have been selected — a genuine near-miss — rather than for every unmarked
-   recording on disk.
+   cast and a changed source.
+   This gate is evaluated **last** even though it is listed second: the three conditions are ANDed, so order cannot change *which* dirs are selected, but checking the marker last means its `excluding '<id>' … has no [reel] marker` diagnostic fires only for a dir that would otherwise have been selected — a genuine near-miss — rather than for every unmarked recording on disk.
 3. **Its source file changed on this branch vs `origin/main`.** Each `test.md`
    carries a `**Source:** `<dir>/<file>::<fn>`` line. The file is matched **by
    basename** against `git diff --name-only origin/main` restricted to `*.rs`.
@@ -157,6 +153,8 @@ Both skips are identical in behaviour — no manifest, no engine, **exit 0** —
 | `skipped: no e2e tests changed on this branch` | Nothing was in scope at all — no changed e2e test with a cast. | Nothing. A reel was never possible on this branch. (If you expected one, check that the e2e suite ran with `DOT_AGENT_DECK_RECORD=1` so the casts exist.) |
 | `skipped: N e2e test(s) …, but none is reel-eligible — no [reel] marker in tests/CATALOG.md for: <ids>` | e2e tests **did** change and have casts; they were dropped by the opt-in marker gate alone. | Read the named ids. Usually **nothing** — an unmarked test is unmarked on purpose. Add the marker only if that test genuinely spins up a **real agent** and shows the feature as a user runs it; a stand-in stays unmarked. |
 
+A hand-written id list can trip **both** gates at once — one id with no cast, another with a cast but no marker — and then the second message carries an extra parenthetical naming the cast-less ids separately, because "none is reel-eligible" is not the reason those were dropped and adding a marker to them would change nothing. Only the standalone `build.sh assemble <id...>` reaches this: the `reel` pipeline's `select` half drops cast-less dirs before `assemble` ever sees them, so its skips always have a single cause.
+
 The second message names the ids because that is what makes it actionable, and because the older generic wording pointed at the wrong gate: a reader who saw "no e2e tests changed" on a branch that *had* changed e2e tests would go debugging the git-diff selection, which was working correctly. The inverse hazard is worth naming too — a message claiming nothing changed invites someone to reach for a ` [reel]` marker to make a reel appear, when the absent marker was the deliberate, correct answer.
 
 ## Environment overrides
@@ -181,7 +179,8 @@ A **re-runnable, pure-shell** test (no `agg`/`ffmpeg`, no git, no network — so
 2. given an empty list — and likewise an L1-only list — it **clean-skips** with
    the `no e2e tests changed` message, while an **unmarked-cast-only** list
    clean-skips with the **eligibility** message naming `delta`, so the two
-   wordings cannot drift back into one;
+   wordings cannot drift back into one — and a **mixed** `gamma delta` list names
+   **both** reasons rather than attributing the whole skip to the marker;
 3. on the **`reel`** path, a branch that changed only the *unmarked* test's
    source skips with that eligibility message (never `no e2e tests changed` —
    the issue #735 defect) and still writes no manifest and invokes no engine,

@@ -16,6 +16,9 @@
 #   (ii-b) an L1-only list CLEAN-SKIPS with that same message;
 #   (ii-c) an unmarked-cast-only list CLEAN-SKIPS just as cleanly but with the
 #         DIFFERENT, reel-eligibility message that NAMES the excluded id;
+#   (ii-d) a MIXED list — one id dropped for having no cast, one for having no
+#         marker — names BOTH reasons rather than attributing the whole skip to
+#         the marker (PR #778 review; reachable only via standalone `assemble`);
 #   (iii) the `reel` path on a branch that DID change an e2e test whose catalog
 #         entry is unmarked skips with that eligibility message too — never the
 #         "no e2e tests changed" one, which is the issue #735 defect;
@@ -137,6 +140,30 @@ if says "$NOTHING_CHANGED" "$out4"; then
   fail "(ii-c) the two skip messages must not collapse back into one (issue #735); got: '$out4'"
 fi
 echo "PASS (ii-c): unmarked-cast-only list clean-skips with the eligibility message, naming delta"
+
+# --- (ii-d) MIXED exclusions -> the skip names BOTH reasons, not just one -------
+# `gamma delta` loses one id to EACH gate: gamma has no cast (never reaches the
+# marker check), delta has a cast but no ` [reel]` marker. The composed reason has
+# to account for both. Before the PR #778 review fix it named only the marker
+# bucket, so "none is reel-eligible" silently scoped over gamma as well and a
+# reader chasing it would have added a marker that changes nothing.
+#
+# Unreachable from the automated `reel` pipeline — `select_ids` filters cast-less
+# dirs out before `assemble` sees them — so this covers the standalone
+# `build.sh assemble <id...>` subcommand, which takes raw ids with no filtering.
+MAN5="$TMP/skip4.json"
+out5="$("$BUILD" assemble --manifest "$MAN5" gamma delta 2>/dev/null)"
+[[ ! -e "$MAN5" ]] || fail "(ii-d) manifest must NOT be written when no id resolves to a clip"
+says "no [reel] marker" "$out5" || fail "(ii-d) skip must still name the marker reason; got: '$out5'"
+says "delta" "$out5" || fail "(ii-d) skip must name the marker-rejected id; got: '$out5'"
+says "no full-stream.cast" "$out5" \
+  || fail "(ii-d) skip must ALSO name the cast-less reason, not attribute the whole skip to markers; got: '$out5'"
+says "gamma" "$out5" \
+  || fail "(ii-d) skip must NAME the cast-less id too — omitting it is the defect this case guards; got: '$out5'"
+if says "$NOTHING_CHANGED" "$out5"; then
+  fail "(ii-d) a marker-rejected id is present, so this must not fall back to the generic message; got: '$out5'"
+fi
+echo "PASS (ii-d): mixed cast-less + unmarked list names BOTH reasons (gamma and delta)"
 
 # --- git-backed sections: the `reel` path (selection + assembly + engine) -------
 if ! command -v git >/dev/null 2>&1; then
