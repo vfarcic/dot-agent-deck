@@ -13229,13 +13229,33 @@ pub fn run_tui(
                     // replay on reconnect) never reaches — so the re-arm
                     // gate could never pass for the exact long-lived,
                     // detach/reattach sessions this feature is meant to
-                    // target. `orchestrator_prompt.is_none()` alone already
-                    // captures "no delivery attempt is in-flight right now"
-                    // for EVERY path — spawn-delivered, reattached (never
-                    // had one), or abandoned — so the only thing still
-                    // needed is excluding "abandoned" explicitly, which
-                    // `orchestration_remit_abandoned` does.
+                    // target.
                     //
+                    // `orchestrator_prompt.is_none()` alone is NOT
+                    // equivalent to "no delivery attempt is in-flight right
+                    // now" under the capability-based confirmation model
+                    // (`src/prompt_delivery.rs`): a write that has LANDED
+                    // (bytes reached the PTY) leaves `orchestrator_prompt`
+                    // `Some` until the agent independently reports having
+                    // submitted it — which, for a producer that never
+                    // reports back (or simply hasn't yet), never happens,
+                    // permanently blocking this gate. A landed-but-unconfirmed
+                    // write must be as eligible for re-arm as no delivery
+                    // ever having started: a compaction is new information
+                    // and an argument for reasserting MORE, not less. Only a
+                    // delivery still probing readiness/backoff BEFORE its
+                    // first write is genuinely in-flight and must keep
+                    // blocking re-arm. `PromptDelivery::attempts > 0` is that
+                    // "a write has landed" witness — see its own doc
+                    // comment: it is set only inside the `Applied`/`Queued`
+                    // arm, so it is zero for exactly the still-probing case
+                    // and nonzero the moment a write lands.
+                    let no_delivery_pending = orchestrator_prompt.is_none()
+                        || ui
+                            .prompt_delivery
+                            .get(start_pane_id.as_str())
+                            .is_some_and(|d| d.attempts > 0);
+
                     // Pi start roles are excluded on purpose (not by
                     // accident of `orchestration_prompted` never being set
                     // for them either): a Pi role's prompt is delivered
@@ -13252,7 +13272,7 @@ pub fn run_tui(
                         .unwrap_or(false);
 
                     if !ui.orchestration_remit_compacting.contains(id)
-                        && orchestrator_prompt.is_none()
+                        && no_delivery_pending
                         && !ui.orchestration_remit_abandoned.contains(id)
                         && !start_role_is_pi
                         // Re-run the spawn-time write-then-point pair
@@ -13265,6 +13285,23 @@ pub fn run_tui(
                         // from wherever it has since `cd`'d to.
                         && let Some(prompt) = prepare_orchestrator_prompt(config, cwd, None)
                     {
+                        // This re-arm may be SUPERSEDING a still-open cycle
+                        // that already landed a write and is only waiting on
+                        // confirmation — possibly holding a spent
+                        // payload-submission budget, a captured delivery
+                        // identity, or a scheduled backoff for it. None of
+                        // that belongs to the NEW cycle this re-arm starts,
+                        // so clear it explicitly rather than let it leak in:
+                        // an inherited `attempts` count would make the new
+                        // cycle's own first write compute as attempt 2+ and
+                        // fall straight to a submit-only probe instead of
+                        // actually retyping the pointer. This is
+                        // deliberately a fresh cycle, not a retry of the old
+                        // one.
+                        ui.send_retry_backoff.remove(start_pane_id.as_str());
+                        ui.prompt_delivery.remove(start_pane_id.as_str());
+                        ui.orchestration_ready_since.remove(id);
+
                         *orchestrator_prompt = Some(prompt);
                         ui.orchestration_prompted.remove(id);
                         // Re-anchor the delivery deadline to NOW:
