@@ -125,49 +125,6 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      # FAIL FAST ON AN EMPTY KEY — first step, ahead of the checkout, the
-      # toolchain, the apt install and the two npm agent CLIs.
-      #
-      # GitHub resolves a reference to an unset or empty secret to the EMPTY
-      # STRING, and every credential preflight in this tier treats an empty
-      # ANTHROPIC_API_KEY as an ordinary RUNTIME SKIP: `skip_unless!` prints
-      # `SKIP: <reason>` and RETURNS, which nextest counts as a PASS (see
-      # `_skip_if_err` in tests/common/mod.rs). `cargo test-e2e-live` is also a
-      # SUPERSET run, so lane 1's 47 deterministic files still execute and still
-      # go green. Without this guard the job can therefore report SUCCESS with
-      # not one API-key-backed test having run — the exact silent-degradation
-      # shape CLAUDE.md rule 8 describes for RELEASE_TOKEN, and the reason
-      # release.yml and docs-publish.yml each verify their secret in their FIRST
-      # step. Same shape here, deliberately.
-      #
-      # WHAT IT DOES NOT COVER, stated the way rule 8 states it for
-      # RELEASE_TOKEN: `-z` catches unset and empty, and nothing else. A key
-      # that is present but EXPIRED, REVOKED or over its spend cap passes this
-      # guard and fails later — as real-agent test failures, which are at least
-      # loud rather than vacuous. Probing the key would cost an API call and add
-      # a failure mode of its own to the one credentialed path in the
-      # repository; rule 8 rejects exactly that trade, and it is rejected here
-      # for the same reason. Do not "improve" this into a live probe.
-      #
-      # A FORK `pull_request` now fails HERE rather than going vacuously green.
-      # GitHub withholds non-GITHUB_TOKEN secrets from fork runs, so a
-      # maintainer who labels a fork PR gets an empty key; that run genuinely
-      # cannot exercise lane 2, and this guard says so instead of letting a
-      # green tick stand in for coverage that never happened. Neither lane is a
-      # required check (rule 8), so a red advisory job is the honest outcome.
-      #
-      # The value is never printed: it is bound through `env:` and tested with
-      # `-z`. Nothing here echoes it, and nothing that does should be added.
-      - name: Verify ANTHROPIC_API_KEY is present
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          set -euo pipefail
-          if [ -z "${ANTHROPIC_API_KEY}" ]; then
-            echo "::error::ANTHROPIC_API_KEY is unset or empty, so no real-agent test in lane 2 can run and a green result here would mean nothing (every credential preflight SKIPS rather than fails, and nextest counts a skip as a pass). Set it as a secret on the \`live-e2e\` GitHub Environment — an environment secret, not a repository secret (issue #785). Note a fork pull request never receives it at all, by design. See docs/develop/e2e-lanes.md and CLAUDE.md rule 5."
-            exit 1
-          fi
-
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@v1
@@ -256,6 +213,88 @@ jobs:
       - name: Build the test binaries (no credential in scope)
         run: cargo nextest list --workspace --features e2e,e2e-live
 
+      # FAIL FAST ON AN EMPTY KEY — deliberately the LAST step before the one
+      # credentialed command, not the first step of the job.
+      #
+      # GitHub resolves a reference to an unset or empty secret to the EMPTY
+      # STRING, and every credential preflight in this tier treats an empty
+      # ANTHROPIC_API_KEY as an ordinary RUNTIME SKIP: `skip_unless!` prints
+      # `SKIP: [e2e] <reason>` and RETURNS, which nextest counts as a PASS (see
+      # `_skip_if_err` in tests/common/mod.rs). `cargo test-e2e-live` is also a
+      # SUPERSET run, so lane 1's 47 deterministic files still execute and still
+      # go green. Without this guard the job can therefore report SUCCESS with
+      # not one API-key-backed test having run — the exact silent-degradation
+      # shape CLAUDE.md rule 8 describes for RELEASE_TOKEN, and the reason
+      # release.yml and docs-publish.yml each verify their secret in their FIRST
+      # step.
+      #
+      # WHY NOT THE FIRST STEP HERE, then. That precedent does not transfer:
+      # rule 8 wants RELEASE_TOKEN checked first because a LATE failure there
+      # leaves a HALF-DONE RELEASE — a commit already pushed to `main`. A test
+      # job has no half-done state, so a late failure costs runner minutes and
+      # nothing else. Against that, step-1 placement had two real costs while
+      # the secret is still unset:
+      #
+      #   * every `run-live-e2e` labeled pre-merge run — the runs whose whole
+      #     purpose is validating this workflow BEFORE it merges — died having
+      #     exercised only this guard and the environment gate, and nothing of
+      #     the checkout, the toolchain, the apt install, the two npm agent
+      #     CLIs, the `cargo nextest list` build of all 71 superset targets, or
+      #     the two `if: always()` steps below;
+      #   * with no checkout, the `Strip test output` step (`if: always()`)
+      #     faulted on a missing `scripts/junit-strip-output.py`, so a keyless
+      #     run emitted a spurious SECOND failure on top of this step's clean
+      #     one — on exactly the run meant to prove the workflow works.
+      #
+      # The safety property is unchanged by the move. The key is bound as a
+      # step-level `env:` on exactly two steps — this one and the run step below
+      # — so it is not in scope for the checkout, the toolchain, the apt
+      # install, the npm install or the build step, and an empty key still
+      # cannot reach a cargo RUN. Keep it a hard `exit 1`: do not make it
+      # advisory, and do not branch it per trigger.
+      #
+      # WHAT IT DOES NOT COVER, stated the way rule 8 states it for
+      # RELEASE_TOKEN: emptiness is all it can check — unset, empty, or
+      # whitespace-only, and nothing else. A key that is present but EXPIRED,
+      # REVOKED or over its spend cap passes this guard and fails later — as
+      # real-agent test failures, which are at least loud rather than vacuous.
+      # Probing the key would cost an API call and add a failure mode of its own
+      # to the one credentialed path in the repository; rule 8 rejects exactly
+      # that trade, and it is rejected here for the same reason. Do not
+      # "improve" this into a live probe.
+      #
+      # A FORK `pull_request` fails HERE rather than going vacuously green.
+      # GitHub withholds non-GITHUB_TOKEN secrets from fork runs, so a
+      # maintainer who labels a fork PR gets an empty key; that run genuinely
+      # cannot exercise lane 2, and this guard says so instead of letting a
+      # green tick stand in for coverage that never happened. Neither lane is a
+      # required check (rule 8), so a red advisory job is the honest outcome.
+      #
+      # WHY THE SUBSTITUTION rather than a bare `-z`. `${VAR//[[:space:]]/}`
+      # deletes every whitespace character, so `-z` on the result is an "empty
+      # AFTER TRIMMING" test. That aligns the guard with the preflights, which
+      # is the whole point: all three `check_pi_available` copies call `.trim()`
+      # and treat a whitespace-only key as ABSENT (tests/e2e_pi_live.rs:110,
+      # tests/e2e_pi_orchestrator.rs:118, tests/e2e_pi_worker.rs:132), so
+      # without it a malformed whitespace-only environment secret passes the
+      # guard and then reproduces the exact lane-1-plus-runtime-skips vacuous
+      # green the guard exists to prevent.
+      #
+      # The value is never printed: it is bound through `env:`, expanded only
+      # inside a `[ -z ]` test, and never assigned to a variable that something
+      # later could echo. Nothing here echoes it, and nothing that does should
+      # be added — note that a TRANSFORMED derivative of the key would not be
+      # covered by GitHub's masking of the registered value even if it were.
+      - name: Verify ANTHROPIC_API_KEY is present
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ANTHROPIC_API_KEY//[[:space:]]/}" ]; then
+            echo "::error::ANTHROPIC_API_KEY is unset, empty or whitespace-only, so no real-agent test in lane 2 can run and a green result here would mean nothing (every credential preflight SKIPS rather than fails, and nextest counts a skip as a pass). Set it as a secret on the \`live-e2e\` GitHub Environment — an environment secret, not a repository secret (issue #785). Note a fork pull request never receives it at all, by design. See docs/develop/e2e-lanes.md and CLAUDE.md rule 5."
+            exit 1
+          fi
+
       # THE ONLY STEP THAT SEES THE KEY. Not a workflow-level `env:`, not a
       # job-level one — a step-level one, so the credential's reach is exactly
       # the command that needs it.
@@ -292,57 +331,87 @@ jobs:
           cargo test-e2e-live --success-output=final 2>&1 \
             | tee "${RUNNER_TEMP}/e2e-live-run.log"
 
-      # THE SKIP EVIDENCE, in the job log and the run summary — deliberately NOT
-      # in the uploaded artifact.
+      # THE SKIP EVIDENCE — a COUNT in the job log and the run summary.
+      # Deliberately not the reasons, and deliberately not in the uploaded
+      # artifact.
       #
       # `.config/nextest.toml` leaves `store-success-output` at its default of
       # false, and these skips are SUCCESSFUL tests rather than
       # framework-skipped ones, so the JUnit report never carried them however
       # it was read. The step above puts them in the log; this step puts a count
-      # and the distinct reasons in the run summary, where they are visible
-      # without opening a 60-minute log.
+      # in the run summary, where it is visible without opening a 60-minute log.
       #
-      # Why that grep is a safe WHITELIST and not a filter over arbitrary
-      # output: the only producer of the pattern is `_skip_if_err` in
-      # tests/common/mod.rs, and every reason it can print is a fixed English
-      # string built by a `check_*_available` preflight. They were read for this
-      # change and none interpolates a credential — the three `check_pi_available`
-      # copies in tests/e2e_pi_*.rs test ANTHROPIC_API_KEY for PRESENCE only,
-      # and `check_codex_available`'s model probe puts its model name in the
-      # reason, never the probe's output. Full test output stays in the masked
-      # job log.
+      # WHY ONLY A COUNT, and why the grep requires an `[e2e]` marker. An
+      # earlier version of this step lifted the distinct SKIP reasons into a
+      # fenced block, on the claim that `^[[:space:]]*SKIP: ` was a closed
+      # whitelist over one producer, `_skip_if_err`. That claim was FALSE in two
+      # separate ways, and both are fixed here rather than merely disclaimed.
+      #
+      #   * `cargo test-e2e-live` is a `--workspace` run, so it also selects
+      #     xtask/ and the root package's unit tests — and several of those
+      #     print `SKIP: ` lines of their own when `python3`, `node`, `jq` or
+      #     `bash` is missing (xtask/linkage-check/src/junit_strip.rs,
+      #     pin_lockstep.rs, verify_pr_stream.rs, issue_labeler_memory.rs,
+      #     clean_tmp.rs, and src/ui.rs). A bare `SKIP: ` count folded every one
+      #     of those into the number a maintainer reads to answer "did any
+      #     API-key-backed test actually run?". `_skip_if_err` now prints
+      #     `SKIP: [e2e] <reason>` and this grep requires the marker, so the
+      #     count is the e2e harness's own runtime skips and nothing else. It is
+      #     still BOTH lanes' skips — this is a superset run, so a lane-1
+      #     host-precondition skip counts here too — and the unmarked remainder
+      #     is reported separately rather than silently absorbed.
+      #   * More fundamentally, a prefix does not PROVE a producer. Any selected
+      #     test can print any line, and `_skip_if_err` takes an arbitrary
+      #     `String`, so the marker narrows the population but authenticates
+      #     nothing. Test output is therefore no longer treated as authenticated
+      #     metadata: a NUMBER is all that crosses into the summary. The reasons
+      #     stay in the masked job log, which is where the `gh run view … | grep`
+      #     in docs/develop/e2e-lanes.md points, and where GitHub's masking of
+      #     the registered secret applies.
+      #
+      # That also retires the injection surface the fenced block had: a matching
+      # line was emitted into a Markdown fence unescaped, so a crafted SKIP line
+      # could close the fence and write arbitrary Markdown into the job summary.
+      # With no test-authored text emitted there is no fence to terminate.
       #
       # The leading `[[:space:]]*` is load-bearing, not padding: nextest INDENTS
       # captured output by four spaces under `--success-output=final`, so a
       # `^SKIP: ` anchored at column 0 matches nothing and reports 0 on a run
       # that really did skip. That precise mistake is recorded in checks.sh
-      # (issues #452, #490) — keep the two patterns in step.
+      # (issues #452, #490). checks.sh deliberately keeps the BROADER,
+      # marker-less pattern — it runs against whatever branch is checked out,
+      # including ones predating the marker, and it writes a local file for a
+      # human rather than a public summary — so the two patterns are related
+      # rather than identical now. Keep the indent handling in step.
       - name: Summarise the runtime skips
         if: always()
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/e2e-live-run.log"
-          echo "## Lane 2 runtime skips" >>"${GITHUB_STEP_SUMMARY}"
+          echo "## e2e runtime skips" >>"${GITHUB_STEP_SUMMARY}"
           echo >>"${GITHUB_STEP_SUMMARY}"
           if [ ! -f "${log}" ]; then
             echo "no run log: the test step did not get far enough to produce one"
             echo "No run log — the test step did not get far enough to produce one." >>"${GITHUB_STEP_SUMMARY}"
             exit 0
           fi
-          count=$(grep -cE '^[[:space:]]*SKIP: ' "${log}" || true)
-          case "${count}" in '' | *[!0-9]*) count=0 ;; esac
-          echo "runtime skips: ${count}"
-          if [ "${count}" -eq 0 ]; then
-            echo "No test printed \`SKIP:\` — every selected test ran for real." >>"${GITHUB_STEP_SUMMARY}"
-            exit 0
+          marked=$(grep -cE '^[[:space:]]*SKIP: \[e2e\] ' "${log}" || true)
+          case "${marked}" in '' | *[!0-9]*) marked=0 ;; esac
+          all=$(grep -cE '^[[:space:]]*SKIP: ' "${log}" || true)
+          case "${all}" in '' | *[!0-9]*) all=0 ;; esac
+          other=$(( all - marked ))
+          echo "e2e runtime skips: ${marked}; other workspace SKIP lines: ${other}"
+          if [ "${marked}" -eq 0 ]; then
+            echo "**0** e2e tests printed a SKIP line, so every selected e2e test ran for real." >>"${GITHUB_STEP_SUMMARY}"
+          else
+            echo "**${marked}** e2e test(s) printed a SKIP line and returned normally, so nextest counted every one of them as a PASS. Read this number, not the colour." >>"${GITHUB_STEP_SUMMARY}"
           fi
-          {
-            echo "**${count}** test(s) printed \`SKIP:\` and returned normally, so nextest counted every one of them as a PASS. Read these, not the colour — see docs/develop/e2e-lanes.md."
-            echo
-            echo '```'
-            grep -E '^[[:space:]]*SKIP: ' "${log}" | sed 's/^[[:space:]]*//' | sort | uniq -c | sed 's/^ *//'
-            echo '```'
-          } >>"${GITHUB_STEP_SUMMARY}"
+          if [ "${other}" -gt 0 ]; then
+            echo >>"${GITHUB_STEP_SUMMARY}"
+            echo "**${other}** further SKIP line(s) came from elsewhere in this --workspace run (xtask and unit tests skipping for a missing python3, node, jq or bash) and are NOT counted above." >>"${GITHUB_STEP_SUMMARY}"
+          fi
+          echo >>"${GITHUB_STEP_SUMMARY}"
+          echo 'Only counts are reported here: test output is not authenticated metadata, so no test-authored text is copied into this summary. The reasons are in the masked job log — read them with `gh run view <run-id> --log | grep -E "^\s*SKIP: \[e2e\] "`, and drop the marker from that pattern to see the rest. See docs/develop/e2e-lanes.md.' >>"${GITHUB_STEP_SUMMARY}"
 
       # Issue #785: the raw JUnit report is a CREDENTIAL SINK, so what gets
       # uploaded is a metadata-only rebuild of it.

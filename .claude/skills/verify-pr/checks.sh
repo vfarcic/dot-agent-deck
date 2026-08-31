@@ -301,6 +301,20 @@ else
     # `|| true`, not `|| echo 0`: grep -c already PRINTS "0" when it matches
     # nothing and only then exits 1, so `|| echo 0` produces "0\n0" and the
     # numeric test below dies with "integer expression expected".
+    #
+    # DELIBERATELY MARKER-LESS, and this is the one place the pattern does NOT
+    # match e2e-live.yml byte for byte. Since #502/#785 `_skip_if_err` in
+    # tests/common/mod.rs prints `SKIP: [e2e] <reason>`, and that workflow's
+    # summary requires the `[e2e]` marker so its count is not polluted by the
+    # xtask and unit-test `SKIP:` lines a `--workspace` run also selects. This
+    # script keeps the broader pattern for two reasons: it runs against whatever
+    # branch a contributor's PR is on, including branches that predate the
+    # marker, where requiring it would silently report 0 and re-open #452/#490;
+    # and its output is a local file for the human running /verify-pr, not a
+    # public job summary, so over-counting here costs a second of reading rather
+    # than a wrong answer on a trusted surface. The consequence to know when
+    # reading the row below: on a workspace missing `bash`, `jq`, `node` or
+    # `python3` this count includes those tools' own skips.
     skips=$(grep -cE '^[[:space:]]*SKIP: ' "$e2e_log" 2>/dev/null || true)
     [[ "$skips" =~ ^[0-9]+$ ]] || skips=0
     emit E2E_RUNTIME_SKIPS "$skips" | tee -a "${out}/env.txt"

@@ -3207,7 +3207,7 @@ fn cli_invocable(bin: &str) -> bool {
 
 /// PRD #126: opt-in switch that turns every runtime skip into a hard failure.
 ///
-/// A runtime skip prints `SKIP: …` and RETURNS NORMALLY, so nextest reports a
+/// A runtime skip prints `SKIP: [e2e] …` and RETURNS NORMALLY, so nextest reports a
 /// skipped real-agent test as **passed**. A pre-PR `cargo test-e2e` can
 /// therefore read fully green while a `[reel]`-marked scenario asserted
 /// nothing at all — and the demo reel then ships with that clip silently
@@ -3231,12 +3231,32 @@ pub fn require_real_e2e() -> bool {
 }
 
 /// Body of the `skip_unless!` early-return: if `result` is `Err`,
-/// print `SKIP: <reason>` to stderr and indicate to the caller it
+/// print `SKIP: [e2e] <reason>` to stderr and indicate to the caller it
 /// should return. Pairs with the `skip_unless!` macro below.
 ///
 /// Under [`REQUIRE_REAL_E2E_ENV`] the same `Err` **panics** instead, carrying
 /// the reason, so an unmet precondition is reported as a failure rather than
 /// disappearing into a green run.
+///
+/// # The `[e2e]` marker is load-bearing (issue #502/#785)
+///
+/// `SKIP: ` on its own does NOT identify this function. Both e2e aliases carry
+/// `--workspace` (issue #489), so a run also selects `xtask/` and the root
+/// package's unit tests, and several of those print their own `SKIP: ` lines
+/// when a tool they drive is absent — `xtask/linkage-check/src/junit_strip.rs`,
+/// `pin_lockstep.rs`, `verify_pr_stream.rs`, `issue_labeler_memory.rs`,
+/// `clean_tmp.rs` and `src/ui.rs`. The credentialed lane-2 workflow
+/// (`.github/workflows/e2e-live.yml`) counts runtime skips into its run summary
+/// to answer "did any API-key-backed test actually run?", and a marker-less
+/// count folds every one of those unrelated skips into that number.
+///
+/// The marker narrows the population; it does not AUTHENTICATE it. Any selected
+/// test can print any line, and this function takes an arbitrary `String`, so
+/// nothing downstream may treat a matching line as trustworthy metadata — which
+/// is why that workflow reports a count and nothing else, leaving the reasons in
+/// the masked job log. `.claude/skills/verify-pr/checks.sh` deliberately keeps
+/// the broader marker-less pattern, because it runs against whatever branch is
+/// checked out, including ones predating this marker.
 #[doc(hidden)]
 pub fn _skip_if_err(result: Result<(), String>) -> bool {
     match result {
@@ -3247,7 +3267,7 @@ pub fn _skip_if_err(result: Result<(), String>) -> bool {
                 "{REQUIRE_REAL_E2E_ENV} is set, so this real-agent test must RUN, not skip: \
                  {reason}"
             );
-            eprintln!("SKIP: {reason}");
+            eprintln!("SKIP: [e2e] {reason}");
             true
         }
     }
@@ -3260,8 +3280,10 @@ pub fn _skip_if_err(result: Result<(), String>) -> bool {
 /// skip_unless!(common::check_claude_available());
 /// ```
 ///
-/// Prints `SKIP: <reason>` to stderr and returns from the calling
-/// function when the environment isn't capable of running the test.
+/// Prints `SKIP: [e2e] <reason>` to stderr and returns from the calling
+/// function when the environment isn't capable of running the test. The `[e2e]`
+/// marker is what separates these from the other `SKIP: ` producers a
+/// `--workspace` run selects — see [`_skip_if_err`].
 #[macro_export]
 macro_rules! skip_unless {
     ($expr:expr) => {
