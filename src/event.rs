@@ -589,7 +589,8 @@ pub const WRAPPER_INTERFACE_SETTLED_SESSION_START_ORIGIN: &str = "wrapper_interf
 /// case, under this key, mirroring the existing narrow-forwarding pattern
 /// [`SESSION_START_ORIGIN_METADATA_KEY`] already uses — one specific key,
 /// one specific value, only on `SessionStart`, not a general `metadata`
-/// passthrough.
+/// passthrough (issue #243's forged-`SessionStart` audit is why that
+/// distinction matters).
 ///
 /// Deliberately distinct from [`SESSION_START_ORIGIN_METADATA_KEY`], which is
 /// an unrelated concern (wrapper-fork boot provenance) — the two must never be
