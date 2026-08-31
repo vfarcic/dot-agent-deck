@@ -128,13 +128,14 @@ fn new_pane_007_schedule_authoring_option_visually_separated() {
 
 /// Scenario: Launch the deck in the `schedule-mode` fixture, open the new-pane
 /// form (Ctrl+n → Space confirms the dir), cycle the Mode field to the built-in
-/// `schedule` authoring option, and submit it. Assert the authoring session
-/// lands as a single-agent DASHBOARD CARD — the dashboard's
-/// `dot-agent-deck — N session(s)` title renders (it shows only on the Dashboard
-/// tab) and no `×` tab-close glyph appears — NOT as a 50/50 mode tab, which would
-/// open a second tab whose strip carries a `×` and hide the dashboard title. RED
-/// today: the `schedule` option opens via `render_mode_tab` as a mode tab, so a
-/// `×` appears and the dashboard title is absent.
+/// `schedule` authoring option, type the stand-in command `cat` into the Command
+/// field (so the spawn never depends on a real agent binary being on PATH), and
+/// submit it. Assert the authoring session lands as a single-agent DASHBOARD
+/// CARD — the dashboard's `dot-agent-deck — N session(s)` title renders (it shows
+/// only on the Dashboard tab) and no `×` tab-close glyph appears — NOT as a 50/50
+/// mode tab, which would open a second tab whose strip carries a `×` and hide the
+/// dashboard title. RED today: the `schedule` option opens via `render_mode_tab`
+/// as a mode tab, so a `×` appears and the dashboard title is absent.
 #[spec("prompt/new-pane/008")]
 #[test]
 fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
@@ -153,11 +154,25 @@ fn new_pane_008_schedule_authoring_opens_as_dashboard_card() {
     deck.send_keys(b"\x1b[D"); // Left ×1 → schedule
     deck.wait_for_string("schedule mode"); // selection landed on the schedule mode
 
+    // Force an EXPLICIT stand-in command instead of letting the blank Command
+    // field fall through to the schedule authoring mode's default (`claude`,
+    // via `resolve_authoring_command`). Issue #502 lane 1 runs on a CI runner
+    // with NO agent CLI on PATH, so that default makes the daemon fail the spawn
+    // ("Unable to spawn claude") and the layout never settles — a dependency on
+    // a real agent binary this test never meant to have. `cat` is a real binary
+    // that blocks on stdin, so the spawn deterministically succeeds; the
+    // card-vs-mode-tab layout renders independent of WHICH command is spawned,
+    // which is exactly what this test asserts. Same drive as
+    // `prompt/new-pane/013` in `e2e_new_pane_seed.rs`.
+    deck.send_keys(b"\r"); // Mode → Name
+    deck.send_keys(b"\r"); // Name → Command
+    // The form has no clear-line key, so any pre-fill is popped with a run of
+    // Backspace (0x7f) bytes; extra pops on an empty field are no-ops.
+    deck.send_keys(&[0x7fu8; 32]); // Backspace ×32 → clear any pre-filled command
+    deck.send_keys(b"cat");
+
     // Submit via the [Submit] button (deterministic — the schedule mode still
-    // shows a Command field, so an Enter-count would be fragile). That field is
-    // empty for the built-in option, which the schedule authoring mode defaults
-    // to `claude`; the card-vs-mode-tab layout renders independent of which
-    // command is spawned, so this assertion holds regardless of the agent.
+    // shows a Command field, so an Enter-count would be fragile).
     let (scol, srow) = deck
         .find_in_grid("[Submit]")
         .expect("the new-pane form should render a [Submit] button");
