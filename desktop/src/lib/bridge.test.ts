@@ -910,4 +910,300 @@ describe("TauriDeckBridge demand-driven attach (PRD #745 M7)", () => {
     expect(invoke).toHaveBeenCalledWith("desktop_terminal_write", { sessionId: `session-agent-1-${reattachGeneration}`, data: [120] });
     await bridge.dispose();
   });
+
+  /**
+   * Scenario: show one terminal, let its attach land, then have the daemon end
+   * that session while the pane is still on screen — `handleTerminalState`
+   * drops it, so input stops reaching the daemon — and fire a
+   * `desktop://snapshot` event. The snapshot must re-assert the invariant
+   * "everything currently shown is attached": a SECOND attach naming that
+   * agent, a live session behind it, and a pane that takes input again.
+   * Deleting the eager attach from the listener removed this healing by
+   * accident, and `ControlDeck`'s effect cannot restore it — a dead session
+   * does not change the derived shown set, so nothing re-fires until the user
+   * toggles a tab.
+   */
+  it("re-attaches a shown terminal whose daemon session ended, on the next snapshot", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    // Whatever attaches below is demand-driven: connect() left nothing behind.
+    expect(attachedAgentIds()).toEqual([]);
+
+    await bridge.setShownTerminals(["agent-1"]);
+    await settle();
+    const firstGeneration = attachCalls().length;
+    expect(attachedAgentIds()).toEqual(["agent-1"]);
+    await expect(bridge.sendTerminalInput("agent-1", "x")).resolves.toBeUndefined();
+
+    // The daemon ends the session under a terminal that is still on screen.
+    listeners.get("desktop://terminal-state")?.({
+      payload: {
+        agentId: "agent-1",
+        sessionId: `session-agent-1-${firstGeneration}`,
+        generation: firstGeneration,
+        state: "end",
+      },
+    });
+    await expect(bridge.sendTerminalInput("agent-1", "x")).rejects.toThrow(/not attached/);
+
+    listeners.get("desktop://snapshot")?.({ payload: fleetSnapshot() });
+
+    // agent-1 already appears once in the attach log from before its session
+    // ended, so the wait has to be for a SECOND attach naming it, not for any —
+    // `toContain` would pass on the dead one and prove nothing.
+    await vi.waitFor(() => expect(attachedAgentIds().filter((agentId) => agentId === "agent-1")).toHaveLength(2));
+    await settle();
+
+    // Usable again, and through the NEW session rather than the dead one.
+    const reattachGeneration = attachCalls().length;
+    await expect(bridge.sendTerminalInput("agent-1", "x")).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("desktop_terminal_write", { sessionId: `session-agent-1-${reattachGeneration}`, data: [120] });
+    // Healing the dead pane must not drag in the eight nobody is looking at.
+    expect(attachedAgentIds()).toEqual(["agent-1", "agent-1"]);
+    await bridge.dispose();
+  });
+
+  /**
+   * Scenario: with one of nine agents shown and its session perfectly healthy,
+   * fire a `desktop://snapshot` event. Re-asserting the invariant re-declares
+   * the SHOWN set and nothing else, so a healthy snapshot costs no attach at
+   * all and the other eight agents stay unattached. The counterpart to the test
+   * above: healing a dead pane on every snapshot must not become the eager
+   * fleet attach this PRD deleted, by the back door.
+   */
+  it("re-declares only the shown set on a snapshot event, never the fleet", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    // Whatever attaches below is demand-driven: connect() left nothing behind.
+    expect(attachedAgentIds()).toEqual([]);
+
+    await bridge.setShownTerminals(["agent-1"]);
+    await settle();
+    const attachesWhileShown = attachCalls().length;
+    expect(attachedAgentIds()).toEqual(["agent-1"]);
+
+    listeners.get("desktop://snapshot")?.({ payload: fleetSnapshot() });
+    await settle();
+
+    expect(attachCalls()).toHaveLength(attachesWhileShown);
+    expect(attachedAgentIds()).toEqual(["agent-1"]);
+    expect(detachCalls()).toHaveLength(0);
+    // Not merely "no attach was invoked": the eight have no session either.
+    for (const agentId of fleetAgentIds().filter((agentId) => agentId !== "agent-1")) {
+      await expect(bridge.sendTerminalInput(agentId, "x")).rejects.toThrow(/not attached/);
+    }
+    await expect(bridge.sendTerminalInput("agent-1", "x")).resolves.toBeUndefined();
+    await bridge.dispose();
+  });
+
+
+  /**
+   * Scenario: show one agent, then show another so the first goes warm — left
+   * behind but still attached — and have the daemon end the warm one's session
+   * while nobody is looking at it. A `desktop://snapshot` must NOT heal it. The
+   * invariant a snapshot re-asserts is "everything SHOWN is attached", never
+   * "everything attached is alive": healing off screen would spend a socket and
+   * a full scrollback replay on a pane nobody can see, and re-declaring the
+   * snapshot's own agents instead of the shown set is exactly how that creeps
+   * back in. Showing it again is what brings it back (PRD #745 M7).
+   */
+  it("leaves a warm terminal whose session ended dead until it is shown again", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    // Whatever attaches below is demand-driven: connect() left nothing behind.
+    expect(attachedAgentIds()).toEqual([]);
+
+    await bridge.setShownTerminals(["agent-1"]);
+    const warmGeneration = attachCalls().length;
+    await bridge.setShownTerminals(["agent-2"]);
+    await settle();
+    expect(attachedAgentIds()).toEqual(["agent-1", "agent-2"]);
+
+    listeners.get("desktop://terminal-state")?.({
+      payload: {
+        agentId: "agent-1",
+        sessionId: `session-agent-1-${warmGeneration}`,
+        generation: warmGeneration,
+        state: "end",
+      },
+    });
+    listeners.get("desktop://snapshot")?.({ payload: fleetSnapshot() });
+    await settle();
+
+    expect(attachedAgentIds()).toEqual(["agent-1", "agent-2"]);
+    await expect(bridge.sendTerminalInput("agent-1", "x")).rejects.toThrow(/not attached/);
+
+    await bridge.setShownTerminals(["agent-1"]);
+    await settle();
+    expect(attachedAgentIds()).toEqual(["agent-1", "agent-2", "agent-1"]);
+    await expect(bridge.sendTerminalInput("agent-1", "x")).resolves.toBeUndefined();
+    await bridge.dispose();
+  });
+  /**
+   * Scenario: hold a shown agent's attach unresolved, re-declare the same shown
+   * set while it is still in flight — the shape a snapshot event takes once it
+   * re-asserts the invariant — and only then let the attach land. Exactly one
+   * attach may reach the daemon and exactly one scrollback may reach the pane:
+   * `attachAgents` marks an agent attached before it invokes, so a pending
+   * attach filters itself out of the next declaration. Without that, re-
+   * asserting the invariant on every snapshot would open a second socket and
+   * replay the same scrollback twice for one terminal.
+   */
+  it("does not attach twice when the shown set is re-declared while an attach is in flight", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const attach = holdableAttach();
+
+    const bridge = new TauriDeckBridge();
+    const output = vi.fn();
+    await bridge.subscribe(vi.fn(), output);
+    await bridge.connect();
+    // Whatever attaches below is demand-driven: connect() left nothing behind.
+    expect(attachedAgentIds()).toEqual([]);
+
+    attach.hold("agent-1");
+    const showing = bridge.setShownTerminals(["agent-1"]);
+    await vi.waitFor(() => expect(attachedAgentIds()).toEqual(["agent-1"]));
+
+    const redeclaring = bridge.setShownTerminals(["agent-1"]);
+    await settle();
+    expect(attachedAgentIds()).toEqual(["agent-1"]);
+
+    attach.release();
+    await Promise.all([showing, redeclaring]);
+    await settle();
+
+    expect(attachedAgentIds()).toEqual(["agent-1"]);
+    expect(detachCalls()).toHaveLength(0);
+    await expect(bridge.sendTerminalInput("agent-1", "x")).resolves.toBeUndefined();
+    const replays = output.mock.calls.filter(([event]) => event.agentId === "agent-1" && event.operation === "replace");
+    expect(replays).toHaveLength(1);
+    await bridge.dispose();
+  });
+
+  /**
+   * Scenario: hold one agent's `desktop_terminal_attach` unresolved, as a
+   * stalled daemon would, then hide and re-show that terminal five times. Each
+   * hide evicts it — eviction deletes `attached` and `pendingAttachments`,
+   * because that marking IS how an in-flight attach is cancelled — so nothing
+   * in the installed state stops the next show from starting a second command.
+   * Exactly one `desktop_terminal_attach` may be outstanding all the same: the
+   * Rust side serialises every agent through one attach gate with no timeout
+   * and no cancellation, so one command per cycle grows a channel, a closure, a
+   * promise and a queued command without bound, and becomes an attach/detach
+   * storm if the daemon ever recovers (PRD #745 M7).
+   */
+  it("starts no second attach while one is still outstanding, however often the terminal is hidden and re-shown", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const attach = holdableAttach();
+
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    // Whatever attaches below is demand-driven: connect() left nothing behind.
+    expect(attachedAgentIds()).toEqual([]);
+
+    attach.hold("agent-1");
+    const showing = bridge.setShownTerminals(["agent-1"]);
+    await vi.waitFor(() => expect(attachedAgentIds()).toEqual(["agent-1"]));
+
+    for (let cycle = 0; cycle < 5; cycle += 1) {
+      await bridge.setShownTerminals([]);
+      await bridge.setShownTerminals(["agent-1"]);
+    }
+    await settle();
+
+    // One command, not six. And no detach either: the evictions found no
+    // session to tear down, so nothing was queued behind the stall in either
+    // direction.
+    expect(attachedAgentIds()).toEqual(["agent-1"]);
+    expect(detachCalls()).toHaveLength(0);
+
+    attach.release();
+    await Promise.allSettled([showing]);
+    await bridge.dispose();
+  });
+
+  /**
+   * Scenario: the counterpart to the test above — the same hide/reshow race,
+   * but the daemon answers. The suppressed declaration must be coalesced rather
+   * than dropped: when the outstanding attach settles it is cancelled (the pane
+   * it belonged to is gone, so it detaches as an orphan), and exactly one
+   * replacement attach follows for the terminal that IS on screen. Suppressing
+   * without replaying would trade an unbounded queue for a dead pane, which is
+   * the same defect the snapshot re-declaration above exists to fix.
+   */
+  it("attaches once more after the outstanding attach settles when the terminal was re-shown meanwhile", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const attach = holdableAttach();
+
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    // Whatever attaches below is demand-driven: connect() left nothing behind.
+    expect(attachedAgentIds()).toEqual([]);
+
+    attach.hold("agent-1");
+    const showing = bridge.setShownTerminals(["agent-1"]);
+    await vi.waitFor(() => expect(attachedAgentIds()).toEqual(["agent-1"]));
+
+    // Away and straight back, faster than the attach round trip.
+    await bridge.setShownTerminals([]);
+    await bridge.setShownTerminals(["agent-1"]);
+    await settle();
+    expect(attachedAgentIds()).toEqual(["agent-1"]);
+
+    attach.release();
+    // The queued declaration is replayed, so a SECOND attach names agent-1.
+    await vi.waitFor(() => expect(attachedAgentIds()).toEqual(["agent-1", "agent-1"]));
+    attach.release();
+    await Promise.allSettled([showing]);
+    await settle();
+
+    // The first session belonged to a pane that had gone; it is detached rather
+    // than installed, and the pane on screen now takes input through the second.
+    expect(detachedSessionIds()).toEqual(["session-agent-1-1"]);
+    await expect(bridge.sendTerminalInput("agent-1", "x")).resolves.toBeUndefined();
+    expect(invoke).toHaveBeenCalledWith("desktop_terminal_write", { sessionId: "session-agent-1-2", data: [120] });
+    await bridge.dispose();
+  });
+
+  /**
+   * Scenario: drive the bridge with no terminal listener installed — no
+   * `subscribe` — so every delivered chunk is buffered in `pendingTerminal`
+   * instead. Show an agent, evict it by showing none, show it again, and only
+   * then subscribe. The drain must replay the LIVE session's scrollback alone:
+   * `evictTerminal` clears every map keyed by agent id, which its own doc
+   * comment claims and `pendingTerminal` used to be the exception to, and a
+   * surviving entry replays a torn-down pane ahead of the one on screen.
+   */
+  it("drops the buffered terminal chunks of an evicted agent", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    await bridge.connect();
+
+    await bridge.setShownTerminals(["agent-1"]);
+    await settle();
+    await bridge.setShownTerminals([]);
+    await settle();
+    await bridge.setShownTerminals(["agent-1"]);
+    await settle();
+
+    const output = vi.fn();
+    await bridge.subscribe(vi.fn(), output);
+
+    const replays = output.mock.calls
+      .map(([event]) => event)
+      .filter((event) => event.agentId === "agent-1" && event.operation === "replace");
+    expect(replays).toHaveLength(1);
+    // The live generation, not the evicted one: agent-1's first attach was
+    // generation 1 and its replacement generation 2.
+    expect(replays[0].generation).toBe(2);
+    await bridge.dispose();
+  });
 });

@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -168,16 +168,32 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
   }, [profileOrder]);
 
   /**
-   * Every tile currently rendering a terminal, joined into one dependency so
-   * the effect below fires when the SET changes rather than on every render
-   * (PRD #745 M7). `AgentTile` mounts a terminal whenever its tab is
-   * `"terminal"`, which is also the default, so the derivation has to repeat
-   * that `?? "terminal"` fallback exactly.
+   * Every tile currently rendering a terminal (PRD #745 M7). `AgentTile` mounts
+   * a terminal whenever its tab is `"terminal"`, which is also the default, so
+   * the derivation has to repeat that `?? "terminal"` fallback exactly.
    */
-  const shownTerminalKey = snapshot.agents
+  const shownTerminals = snapshot.agents
     .filter((agent) => (tabs[agent.id] ?? "terminal") === "terminal")
-    .map((agent) => agent.id)
-    .join("\n");
+    .map((agent) => agent.id);
+
+  /**
+   * The same ids joined into one dependency so the effect below fires when the
+   * SET changes rather than on every render. It is a dependency KEY and nothing
+   * else — never split back apart. Agent ids are raw daemon identities, not
+   * display strings, so an id containing a newline would come back out of a
+   * `split` as two shown agents: two attach paths from one tile, and one
+   * invalid identity turned into several valid-looking ones behind
+   * `validate_agent_id`, which rejects control characters only when it is
+   * handed the id whole.
+   */
+  const shownTerminalKey = shownTerminals.join("\n");
+  /**
+   * The array the effect actually passes on, held in a ref because the effect
+   * must key on the joined string (stable across renders that change nothing)
+   * while carrying the ids themselves (a fresh array every render).
+   */
+  const shownTerminalsRef = useRef(shownTerminals);
+  shownTerminalsRef.current = shownTerminals;
 
   /**
    * ONE call per render commit carrying ALL the shown ids, never one call per
@@ -187,7 +203,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
    * silently leaves the deck with no attached terminals at all.
    */
   useEffect(() => {
-    void setShownTerminals(shownTerminalKey ? shownTerminalKey.split("\n") : []);
+    void setShownTerminals(shownTerminalsRef.current);
   }, [setShownTerminals, shownTerminalKey]);
 
   const orderedStages = snapshot.stages;

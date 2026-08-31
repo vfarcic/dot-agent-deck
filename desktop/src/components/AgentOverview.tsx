@@ -274,10 +274,16 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
   const { snapshot, mode, setShownTerminals } = runtime;
   /**
    * The screen's whole claim, stated to the bridge rather than merely printed in
-   * its own header (PRD #745 M7): this screen shows no terminal, so it holds no
+   * its own header (PRD #745 M7): this screen shows no terminal, so it opens no
    * PTY. Declaring the empty set also flushes the warm set to zero, which is
    * what makes the claim true when you arrive here from a nine-tile deck rather
    * than only on a cold start.
+   *
+   * What it cannot claim is that every socket a previous screen opened is
+   * already gone by the time this renders: the declaration is fire-and-forget,
+   * and an attach command still outstanding is cancelled by marking, so its
+   * daemon-side tear-down completes afterwards. The copy below says exactly
+   * that rather than the stronger thing.
    */
   useEffect(() => {
     void setShownTerminals([]);
@@ -318,7 +324,7 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
         <header className="topbar">
           <div className="repo-context">
             <div className="repo-line"><LayoutList size={15} /><strong>Agent overview</strong></div>
-            <div className="branch-line"><span title="Every agent this desktop can see, grouped the way the daemon groups them.">every agent this desktop can see · no terminals attached</span></div>
+            <div className="branch-line"><span title="Every agent this desktop can see, grouped the way the daemon groups them.">every agent this desktop can see · this screen opens no terminal</span></div>
           </div>
           <div className="run-instruments">
             <OverviewInstrument label="AGENTS" testId="overview-count-agents"><OverviewCount known={connected} value={agents.length} /></OverviewInstrument>
@@ -384,8 +390,10 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
           </section>
 
           <p className="overview-footnote">
-            This screen reads one snapshot and attaches nothing. Model, token, cost, context-window, branch, attempt and duration
-            columns are absent because the daemon does not track them — see PRD #745.
+            This screen reads one snapshot, opens no terminal of its own, and asks the bridge to release the ones the deck left
+            attached — a socket a previous screen opened is torn down as that release lands, not the instant this line renders.
+            Model, token, cost, context-window, branch, attempt and duration columns are absent because the daemon does not
+            track them — see PRD #745.
           </p>
         </section>
       </main>

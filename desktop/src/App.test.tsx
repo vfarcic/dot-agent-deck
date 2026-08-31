@@ -337,6 +337,25 @@ describe("ControlDeck", () => {
    * terminal — omitting the call would leave whatever the previous screen
    * declared attached, which is exactly the leak M7 exists to close.
    */
+  /**
+   * Scenario: the daemon reports one agent whose id contains a newline and the
+   * deck renders its tile on the default terminal tab. Agent ids are raw daemon
+   * identities, so the id has to reach the bridge whole, as ONE shown terminal.
+   * The effect keys on the ids joined by "\n"; reconstructing the array by
+   * splitting that key back apart turns one tile into two attach paths, and
+   * turns one identity `validate_agent_id` rejects for its control character
+   * into two it accepts (PRD #745 M7).
+   */
+  it("declares an agent id containing a newline as one shown terminal", () => {
+    const hostile = createFixtureSnapshot("connected");
+    hostile.agents = [{ ...hostile.agents[0], id: "agent-a\nagent-b" }];
+    const setShownTerminals = vi.fn(async () => undefined);
+    render(<ControlDeck runtime={runtime({ snapshot: hostile, setShownTerminals })} />);
+
+    expect(setShownTerminals).toHaveBeenCalledTimes(1);
+    expect(setShownTerminals).toHaveBeenCalledWith(["agent-a\nagent-b"]);
+  });
+
   it("declares an empty shown set when the daemon owns no agents", () => {
     const empty = createFixtureSnapshot("empty");
     const setShownTerminals = vi.fn(async () => undefined);

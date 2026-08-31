@@ -398,6 +398,28 @@ export class TauriDeckBridge implements DeckBridge {
    * never selected for eviction, and installs itself afterwards past the bound.
    */
   private warm = new Set<string>();
+  /**
+   * Agents with a `desktop_terminal_attach` invocation still outstanding —
+   * added before the invoke, removed when it settles either way. It is what
+   * stops a second invocation from starting behind the first: the Rust side
+   * serialises every agent through one attach gate with no timeout and no
+   * cancellation, so a daemon that never answers would otherwise collect one
+   * more channel, closure, promise and queued command per hide/reshow cycle.
+   *
+   * Deliberately NOT `pendingAttachments`, and deliberately NOT cleared by
+   * `evictTerminal`: eviction cancels an attach by *marking* it (deleting
+   * `pendingAttachments` is what makes the post-await guard fail), and the
+   * backend command it started keeps running whatever the frontend forgets.
+   * A guard that eviction clears re-arms on every cycle and guards nothing.
+   */
+  private attachInvocations = new Set<string>();
+  /**
+   * Agents whose attach the guard above suppressed, coalesced to at most one
+   * request each. Replayed once when the outstanding invocation settles, so a
+   * hide/reshow that raced an attach still ends with a live pane — suppressing
+   * without this would trade an unbounded queue for a dead terminal.
+   */
+  private attachRequested = new Set<string>();
   private terminalListener?: TerminalListener;
   private invoke?: typeof import("@tauri-apps/api/core")["invoke"];
   private lifecycle = 0;
@@ -492,7 +514,11 @@ export class TauriDeckBridge implements DeckBridge {
    * in flight gets cancelled: `attachAgents`' post-await guard then fails and
    * takes the orphan-detach branch instead of installing a session behind a
    * screen that no longer shows it. Cancellation is marking, never awaiting —
-   * one slow attach must not freeze every later terminal switch.
+   * one slow attach must not freeze every later terminal switch. The marking is
+   * also why `attachInvocations` is the ONE agent-keyed set deliberately left
+   * alone here: the Tauri command an evicted attach started is still running,
+   * and forgetting it is what would let a stalled daemon collect one queued
+   * invocation per hide/reshow cycle.
    *
    * Per-agent, and deliberately NOT a `lifecycle` bump: `lifecycle` is a
    * whole-bridge generation, and bumping it here would also void every SHOWN
@@ -506,6 +532,11 @@ export class TauriDeckBridge implements DeckBridge {
     this.attached.delete(agentId);
     this.terminalChannels.delete(agentId);
     this.pendingAttachments.delete(agentId);
+    // Chunks buffered while no listener was installed belong to the session
+    // being torn down here. Keeping them would replay a dead pane's scrollback
+    // ahead of the live one at the next `subscribe` drain.
+    this.pendingTerminal.delete(agentId);
+    this.attachRequested.delete(agentId);
     this.pendingResizes.delete(agentId);
     const frame = this.resizeFrames.get(agentId);
     if (frame !== undefined) {
@@ -530,7 +561,17 @@ export class TauriDeckBridge implements DeckBridge {
     // shown when this call started can have been hidden and evicted while they
     // resolved, and attaching it then would leave a live PTY behind a screen
     // that shows no terminal at all.
-    await Promise.allSettled(agentIds.filter((agentId) => !this.attached.has(agentId) && (this.shown.has(agentId) || this.warm.has(agentId))).map(async (agentId) => {
+    await Promise.allSettled(agentIds.filter((agentId) => {
+      if (this.attached.has(agentId) || !(this.shown.has(agentId) || this.warm.has(agentId))) return false;
+      // One outstanding invocation per agent, whatever the frontend has since
+      // forgotten about it. Queue the declaration instead of starting a second
+      // command — the settling invocation replays it.
+      if (this.attachInvocations.has(agentId)) {
+        this.attachRequested.add(agentId);
+        return false;
+      }
+      return true;
+    }).map(async (agentId) => {
       const lifecycle = expectedLifecycle;
       this.attached.add(agentId);
       const onOutput = new Channel<ArrayBuffer>();
@@ -555,6 +596,7 @@ export class TauriDeckBridge implements DeckBridge {
       };
       this.terminalChannels.set(agentId, onOutput);
       this.pendingAttachments.set(agentId, attempt);
+      this.attachInvocations.add(agentId);
       try {
         const session = await invoke<TerminalAttachResult>("desktop_terminal_attach", { agentId, onOutput });
         if (
@@ -601,6 +643,20 @@ export class TauriDeckBridge implements DeckBridge {
           });
         }
         throw cause;
+      } finally {
+        this.attachInvocations.delete(agentId);
+        // A declaration suppressed while this invocation was outstanding is
+        // coalesced rather than dropped: replay exactly one, and only while the
+        // agent is still wanted and still unattached. A failed attach queues no
+        // request of its own, so this cannot become a retry loop.
+        if (
+          this.attachRequested.delete(agentId)
+          && lifecycle === this.lifecycle
+          && !this.attached.has(agentId)
+          && (this.shown.has(agentId) || this.warm.has(agentId))
+        ) {
+          void this.attachAgents([agentId], lifecycle);
+        }
       }
     }));
   }
@@ -666,8 +722,20 @@ export class TauriDeckBridge implements DeckBridge {
     };
     const stopSnapshot = await listen<DesktopSnapshotDto>("desktop://snapshot", (event) => {
       // PRD #745 M7: a snapshot reports what the daemon owns, which says nothing
-      // about what is on screen. Attach is driven by `setShownTerminals` alone.
+      // about what is on screen — so re-declare the set the UI last declared,
+      // NEVER the fleet the snapshot carries. This re-establishes "everything
+      // shown is attached" after a daemon `end`/`error` state event dropped one
+      // of them, which no re-render can do because a dead session does not
+      // change the derived shown set. It is a no-op whenever the invariant
+      // already holds: `attachAgents` filters on `attached`.
+      //
+      // The invariant is "everything SHOWN is attached", not "everything
+      // attached is alive" — a warm terminal whose session dies stays dead
+      // until it is shown again. Deliberate: nobody is looking at it, and
+      // healing it off screen would spend a socket and a scrollback replay for
+      // nothing.
       emit(event.payload);
+      void this.attachAgents(Array.from(this.shown));
     });
     // The daemon emits a coalesced snapshot after each event, but not every hook
     // event produces one within the coalescing window; republishing the last
