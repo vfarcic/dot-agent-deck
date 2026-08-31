@@ -1,0 +1,227 @@
+name: e2e-live
+
+# Issue #502 lane 2 — the CREDENTIALED half of the L2 e2e tier, and the first
+# job in this repository that has ever held an agent credential.
+#
+# `cargo test-e2e-live` enables BOTH cargo features, so it is a SUPERSET run:
+# all 71 `tests/e2e_*.rs` files, i.e. the 47 deterministic ones the
+# `e2e-deterministic` job in ci.yml already runs PLUS the 24 that need a real
+# agent. There is deliberately no live-ONLY alias — the 24 open with
+# `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, so `e2e-live` without
+# `e2e` compiles every e2e file to an empty crate.
+#
+# The credential threat model is issue #785. Two of its decisions are visible
+# in this file (API key rather than the OAuth credential set; the GitHub
+# Environment on the job below) and one is not, because it is not a workflow
+# property: the secret itself and the environment's required reviewer are set
+# by hand by the repository owner.
+
+on:
+  # The per-merge run. #502 weighed this against nightly and against
+  # release-gating and chose it deliberately. Nightly tests a tree nobody is
+  # shipping and a failure has to be bisected across a day of commits.
+  # Release-gating sounds better — the tested tree is the shipped tree — but
+  # release.yml triggers on TAG PUSH, so the tag already exists by the time the
+  # tests run and a failure costs a deleted remote tag rather than a prevented
+  # release. Per-merge gives exact attribution (one merge per run), and the
+  # release inherits the signal for free: by tag time every commit in the tree
+  # has already been through it.
+  push:
+    branches: [main]
+
+  workflow_dispatch:
+
+  # Label-gated on pull requests. This trigger is load-bearing TWICE, and the
+  # second reason is the one that is easy to drop by accident:
+  #
+  #   1. it is the on-demand run #502 wants for a PR that touches real-agent
+  #      paths, so a change to the spawn/hook/delegate machinery can be
+  #      exercised against real agents before it merges;
+  #   2. it is the ONLY way to validate this workflow at all before it lands,
+  #      because `workflow_dispatch` is not offered until the file is on the
+  #      default branch. Without it, the first execution of a credentialed job
+  #      would be an unreviewable push to `main`.
+  #
+  # `labeled` is in the list so applying the label to an already-open PR starts
+  # a run immediately; `synchronize` keeps a labelled PR re-running as it is
+  # pushed to. The job-level `if:` below is what actually enforces the gate —
+  # these types only decide when GitHub bothers to evaluate it.
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+
+concurrency:
+  # ONE live run at a time across the whole repository — note this is NOT keyed
+  # on `github.ref` the way ci.yml's group is. These runs spend real tokens
+  # against a single Anthropic account, so two overlapping runs race for the
+  # same rate limit and can fail each other for reasons that have nothing to do
+  # with the code.
+  #
+  # `cancel-in-progress: false` because a run that is halfway through has
+  # already spent the money and is already holding the account; cancelling it
+  # buys nothing and loses the result. Let it finish and queue the next.
+  group: e2e-live
+  cancel-in-progress: false
+
+permissions:
+  # Everything this workflow does is read the code and run the tests. It opens
+  # no PR, writes no comment, pushes no commit, and publishes no package.
+  contents: read
+
+jobs:
+  live:
+    # `push` and `workflow_dispatch` run unconditionally; a `pull_request` runs
+    # only when the label is on it. Written as "not a pull request, OR
+    # labelled" rather than as a list of allowed event names so that a trigger
+    # added later fails OPEN into running, which is visible, rather than
+    # silently never running.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'run-live-e2e')
+    runs-on: ubuntu-latest
+
+    # #785 decision 2. The environment is what makes a credentialed job on
+    # freshly-merged code acceptable at all: holding the key as an ENVIRONMENT
+    # secret with a required reviewer means a merge QUEUES this run and waits
+    # for a human click, so merged code never auto-executes with the key.
+    # Environments and their protection rules are free on public repositories.
+    #
+    # Two things about it are deliberate and must not be "tidied up":
+    #
+    #   * NO deployment-branch restriction. Limiting the environment to `main`
+    #     would stop a branch PR exercising the credentialed path, which is
+    #     exactly the validate-before-merge property the label trigger above
+    #     exists for. Explicit constraint from both #502 and #785.
+    #   * the REQUIRED REVIEWER is set on the environment by the repository
+    #     owner, not here. A workflow cannot declare it, and it is the single
+    #     control that addresses the threat directly — an environment with no
+    #     reviewer is an environment-shaped repository secret.
+    environment: live-e2e
+
+    # A superset of the ~25-40 minutes the deterministic lane is budgeted for
+    # (see the `e2e-deterministic` job in ci.yml for how that number was
+    # derived), plus the real-agent files. Those are the slowest tests in the
+    # repository: `.config/nextest.toml` gives `tabs/orchestration/012` a
+    # 9 x 60s = 540s kill window against declared waits of over 500s, and
+    # several others sit at 300-480s. Like lane 1's, this is derived from the
+    # tier's own declared bounds rather than measured on a runner — nothing has
+    # ever run it here. Re-tune once honest runs exist.
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.143
+
+      # The same Tauri Linux deps ci.yml's `build` and `e2e-deterministic` jobs
+      # install, for the same reason: the alias carries `--workspace`, which
+      # includes desktop/src-tauri, and without them that crate does not build
+      # on this runner at all.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # THE AGENT CLIs, and what each one actually buys on a runner.
+      #
+      # Every real-agent test opens with `skip_unless!(check_<agent>_available())`,
+      # which prints `SKIP: <reason>` and RETURNS — nextest reports that as a
+      # pass. So an absent CLI never reddens this job; it silently removes
+      # coverage. That is the failure mode to keep in view when reading a green
+      # run here.
+      #
+      # `pi` is the one agent that genuinely runs on an API key:
+      # `check_pi_available` (defined per-file in tests/e2e_pi_*.rs) wants `pi`
+      # on PATH and a non-empty ANTHROPIC_API_KEY, and nothing else. Five test
+      # functions are gated on it.
+      #
+      # `claude` is installed even though it CANNOT pass its preflight here, and
+      # the reason is diagnostic rather than hopeful. `check_claude_available`
+      # in tests/common/mod.rs wants `claude` on PATH AND a usable
+      # `~/.claude/.credentials.json` (`claudeAiOauth`), with a macOS Keychain
+      # fallback. It does not consult ANTHROPIC_API_KEY at all, so under #785
+      # decision 1 — API key, not the OAuth credential set — all 22
+      # claude-gated tests skip. Installing the CLI makes the log say so: the
+      # SKIP line reads "credentials not found at ~/.claude/.credentials.json"
+      # rather than "CLI not installed", which is what distinguishes a
+      # preflight that needs widening from a runner that needs provisioning.
+      # See the report on #785 before deciding which of those to change.
+      #
+      # `codex`, `opencode` and `devin` are deliberately NOT installed. Their
+      # preflights want their own provider credentials (~/.codex/auth.json plus
+      # a live model probe, an opencode auth.json, a Devin credentials.toml plus
+      # `devin auth status`), none of which an Anthropic API key can satisfy, so
+      # installing them would cost minutes and change nothing but the wording of
+      # eight SKIP lines.
+      #
+      # PINNED, and note what that costs: renovate.json's customManagers cover
+      # `toolchain:` and the nextest pin under .github/workflows, not npm
+      # packages, so nothing bumps these two. They need a deliberate manual
+      # bump, and an agent CLI moves fast.
+      - name: Install the agent CLIs the live tier drives
+        run: |
+          npm install -g \
+            @earendil-works/pi-coding-agent@0.84.4 \
+            @anthropic-ai/claude-code@2.1.251
+          pi --version
+          claude --version
+
+      # BUILD WITH NO SECRET IN THE ENVIRONMENT. This split is the point of
+      # having two steps rather than one, and #785 names why: `build.rs` is
+      # first on its list of surfaces a credentialed job exposes — arbitrary
+      # code at compile time, ahead of any test. Every build script in the
+      # dependency tree runs HERE, where `secrets.ANTHROPIC_API_KEY` is not in
+      # scope for anything.
+      #
+      # `cargo nextest list` rather than `cargo build --tests` because it is
+      # nextest's own build path, so the run step below finds every binary
+      # already fresh and compiles nothing.
+      #
+      # Be precise about what this does and does not guarantee. The run step
+      # still invokes cargo, which re-checks freshness; with nothing changed
+      # between the two steps no build script re-executes, so this is a
+      # freshness guarantee, not a hermetic seal. `cargo nextest archive` plus
+      # `--archive-file` would be one — it separates build from run completely —
+      # at the cost of a workspace-remap round trip that this lane cannot
+      # validate until the secret exists. Worth revisiting then.
+      - name: Build the test binaries (no credential in scope)
+        run: cargo nextest list --workspace --features e2e,e2e-live
+
+      # THE ONLY STEP THAT SEES THE KEY. Not a workflow-level `env:`, not a
+      # job-level one — a step-level one, so the credential's reach is exactly
+      # the command that needs it.
+      #
+      # #785 decision 1: the API key, NOT the OAuth credential set from
+      # `~/.claude/.credentials.json`. That file is an account session carrying
+      # an accessToken AND a refreshToken; it cannot be scoped, cannot be
+      # spend-capped, and cannot be revoked without logging the owner out
+      # everywhere. Nothing in this workflow copies, synthesises or inspects a
+      # credentials file, and nothing should be added that does.
+      - name: Run the live e2e tier
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: cargo test-e2e-live
+
+      # Issue #564: keep THIS attempt's results after a job-level re-run
+      # overwrites the conclusion. Full rationale on the identical step in
+      # ci.yml's `build-macos` job. It matters most here: these are the flakiest
+      # tests in the repository, a re-run is the only remedy on offer
+      # (`retries = 0`), and the JUnit XML carries the per-test wall clock plus
+      # the SKIP-versus-ran distinction that a green summary hides.
+      - name: Preserve this attempt's test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-e2e-live-attempt-${{ github.run_attempt }}
+          path: target/nextest/default/junit.xml
+          if-no-files-found: warn
