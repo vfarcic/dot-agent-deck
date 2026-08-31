@@ -411,6 +411,8 @@ export class TauriDeckBridge implements DeckBridge {
    * `pendingAttachments` is what makes the post-await guard fail), and the
    * backend command it started keeps running whatever the frontend forgets.
    * A guard that eviction clears re-arms on every cycle and guards nothing.
+   * The one place it IS cleared without settling is `clearAttachSuppression`,
+   * so an attach that never answers cannot suppress its agent forever.
    */
   private attachInvocations = new Set<string>();
   /**
@@ -549,6 +551,31 @@ export class TauriDeckBridge implements DeckBridge {
     if (!session) return;
     const invoke = await this.getInvoke();
     await invoke("desktop_terminal_detach", { sessionId: session.sessionId }).catch(() => undefined);
+  }
+
+  /**
+   * Drops the per-agent attach guard and everything queued behind it.
+   *
+   * The guard in `attachAgents` is cleared per invocation by its own `finally`,
+   * which never runs for an attach the daemon accepts and never answers — and
+   * `evictTerminal` deliberately leaves it alone, because forgetting a running
+   * command is what lets a stalled daemon collect one more queued invocation
+   * per hide/reshow cycle. Both are right in the steady state and together they
+   * make one agent PERMANENTLY unattachable: every later declaration for it is
+   * suppressed, while the replay that would undo the suppression is itself
+   * waiting on the invocation that never settles.
+   *
+   * So it is cleared exactly where a whole-bridge restart happens — `connect()`
+   * and `dispose()` — and nowhere else. Both mean the frontend is starting its
+   * relationship with the daemon over, which is the only moment at which
+   * forgetting an outstanding command is a fresh start rather than an
+   * unbounded queue: it costs at most one extra queued command per Reconnect,
+   * bounded by a deliberate user action, against a pane that is otherwise dead
+   * until the app restarts.
+   */
+  private clearAttachSuppression(): void {
+    this.attachInvocations.clear();
+    this.attachRequested.clear();
   }
 
   private async attachAgents(agentIds: string[], expectedLifecycle = this.lifecycle): Promise<void> {
@@ -698,6 +725,11 @@ export class TauriDeckBridge implements DeckBridge {
   }
 
   async connect(): Promise<DeckSnapshot> {
+    // Reconnect is the user's remedy for a wedged control room, so it has to be
+    // able to remedy this too. `useDeckRuntime` memoizes the bridge on `mode`
+    // alone and `reconnect()` calls straight into here, so nothing is disposed
+    // and nothing is recreated in between.
+    this.clearAttachSuppression();
     const invoke = await this.getInvoke();
     const dto = await invoke<DesktopSnapshotDto>("desktop_bootstrap", { options: { startIfMissing: false } });
     // PRD #745 M7: connecting attaches NOTHING. It used to attach every agent
@@ -855,6 +887,7 @@ export class TauriDeckBridge implements DeckBridge {
     this.resizeInFlight.clear();
     this.shown.clear();
     this.warm.clear();
+    this.clearAttachSuppression();
     this.terminalListener = undefined;
     if (!invoke) return;
     await Promise.allSettled(sessions.map((session) => invoke("desktop_terminal_detach", { sessionId: session.sessionId })));

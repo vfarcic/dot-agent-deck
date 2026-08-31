@@ -828,27 +828,41 @@ describe("DeckShell", () => {
   });
 
   /**
-   * The overview is still fixture-only. Demand-driven attach has landed, so the
-   * reason the gate went up — one PTY per agent from `connect()` and from every
-   * snapshot, behind a screen saying nothing was attached — is gone; the gate
-   * itself is lifted one commit later, after this change has been independently
-   * reviewed with the net still up (PRD #745 M7). Both seams are covered,
-   * because either one alone leaves the screen reachable.
+   * The live-mode path through both seams, which is now the product (PRD #745
+   * M7). These two tests are the inverted survivors of the fixture gate: they
+   * asserted the screen was unreachable in live mode, because attach was
+   * snapshot-driven and a live overview would have held one socket and one
+   * scrollback replay per agent behind a screen claiming it held none. Attach
+   * is demand-driven now, so the reason is gone and so is the gate — and the
+   * same two seams still need covering, because either one left alone would
+   * leave the screen half-reachable.
    */
-  it("does not offer the overview in live mode", () => {
+  it("offers the overview in live mode", () => {
     render(<DeckShell runtime={runtime({ mode: "live", snapshot: createFixtureSnapshot("connected") })} />);
 
     expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
-    expect(screen.queryByTestId("open-overview")).not.toBeInTheDocument();
-    // Absent, not disabled: a disabled control advertises the unbuilt feature.
-    expect(screen.queryByRole("button", { name: "Overview" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("open-overview")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Overview" })).toBeVisible();
+
+    terminalMounted.mockClear();
+    fireEvent.click(screen.getByTestId("open-overview"));
+
+    expect(screen.getByTestId("daemon-group")).toBeVisible();
+    expect(screen.queryByTestId("agent-tile-planner")).not.toBeInTheDocument();
+    expect(terminalMounted).not.toHaveBeenCalled();
   });
 
-  it("renders the deck when a live session is already holding an overview view state", () => {
+  /**
+   * The other seam: a live session that already holds an `overview` view state
+   * — restored, or navigated to before a re-render — renders the overview
+   * rather than falling back to the deck.
+   */
+  it("renders the overview when a live session is already holding an overview view state", () => {
     render(<DeckShell runtime={runtime({ mode: "live", snapshot: createFixtureSnapshot("connected") })} initialView={{ kind: "overview" }} />);
 
-    expect(screen.getByTestId("agent-tile-planner")).toBeVisible();
-    expect(screen.queryByTestId("daemon-group")).not.toBeInTheDocument();
+    expect(screen.getByTestId("daemon-group")).toBeVisible();
+    expect(screen.queryByTestId("agent-tile-planner")).not.toBeInTheDocument();
+    expect(terminalMounted).not.toHaveBeenCalled();
   });
 
   it("still honours an overview view state in fixture mode", () => {

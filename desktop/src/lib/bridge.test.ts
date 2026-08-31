@@ -1174,6 +1174,56 @@ describe("TauriDeckBridge demand-driven attach (PRD #745 M7)", () => {
   });
 
   /**
+   * Scenario: hold agent-1's `desktop_terminal_attach` unresolved and never
+   * release it — the daemon accepted the attach and went silent. The guard
+   * above then suppresses every later declaration for that agent, and the
+   * replay that would lift the suppression is itself waiting on the invocation
+   * that never settles, so the pane is dead for the life of the process.
+   * Reconnect must genuinely re-arm it: `useDeckRuntime` memoizes the bridge on
+   * `mode` and `reconnect()` calls `connect()` rather than disposing, so if
+   * `connect()` does not clear the guard the user's only remedy silently does
+   * nothing (PRD #745 M7).
+   */
+  it("re-arms an attach that never settled when the user reconnects", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const attach = holdableAttach();
+
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+
+    attach.hold("agent-1");
+    const showing = bridge.setShownTerminals(["agent-1"]);
+    await vi.waitFor(() => expect(attachedAgentIds()).toEqual(["agent-1"]));
+
+    // Away and back while the daemon stays silent: suppressed, as designed.
+    await bridge.setShownTerminals([]);
+    await bridge.setShownTerminals(["agent-1"]);
+    await settle();
+    expect(attachedAgentIds()).toEqual(["agent-1"]);
+
+    // The first invocation stays outstanding for the whole test — it is the
+    // thing being recovered from. Re-pointing `hold` at an agent that is never
+    // shown only says the NEXT attach is answered, as a daemon that came back
+    // would answer it.
+    attach.hold("agent-2");
+
+    // What the Reconnect button does — no dispose, the same bridge instance.
+    await bridge.connect();
+    // …and what the UI does next: the snapshot handler re-declares the shown
+    // set. A second attach names agent-1, so the pane can come back.
+    listeners.get("desktop://snapshot")?.({ payload: fleetSnapshot() });
+    await vi.waitFor(() => expect(attachedAgentIds()).toEqual(["agent-1", "agent-1"]));
+
+    // The stalled invocation finally answers; its session belongs to a channel
+    // the recovered attach has replaced, so it is detached rather than
+    // installed. Released here only so the pending promise settles.
+    attach.release();
+    await Promise.allSettled([showing]);
+    await bridge.dispose();
+  });
+
+  /**
    * Scenario: drive the bridge with no terminal listener installed — no
    * `subscribe` — so every delivered chunk is buffered in `pendingTerminal`
    * instead. Show an agent, evict it by showing none, show it again, and only
