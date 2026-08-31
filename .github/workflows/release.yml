@@ -578,7 +578,7 @@ jobs:
           version: 10
       # Node 20 and pnpm 10 match ci.yml's `desktop-web` job rather than the
       # devbox pin, so the floor that is tested is the floor that is shipped.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: pnpm
