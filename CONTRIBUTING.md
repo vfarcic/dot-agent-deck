@@ -4,6 +4,8 @@
 
 Enter `devbox shell` for the pinned toolchain — it provides `cargo-nextest` (test runner), `asciinema` (cast replay), and the rest of the project's CLI deps. Outside devbox, install nextest manually with `cargo install cargo-nextest --locked`. The `cargo test-fast` / `cargo test-e2e` aliases in `.cargo/config.toml` resolve through nextest; without it they error with `no such command: nextest`.
 
+Node.js and pnpm are **not** provided by Devbox and must be installed yourself, like the agent CLIs below — install Node.js 24.x and pnpm 11.x to match what CI pins. They are needed for `desktop/`, for the docs site, and for the issue-labeler validator tests in `cargo test-fast`, which print `SKIP: issue-labeler memory validator tests need `node` on PATH` and pass vacuously when Node is absent. Devbox's `init_hook` prepends `$HOME/.local/bin` to `PATH`, so a user-level install there is visible both inside and outside `devbox shell`.
+
 For `cargo test-e2e` chain-smoke tests you also need the agent CLIs (`claude` and `opencode`) installed locally and logged in — the tests skip with a specific reason if either is missing (per Decision 8).
 
 ### Cloning on Windows: turn symlinks on first
