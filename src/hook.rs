@@ -1282,7 +1282,7 @@ mod tests {
     /// ExitCode::SUCCESS`) for all four producer arms. `lenient_string` must
     /// degrade a non-string `source` to `None` instead of dropping the event.
     #[test]
-    fn source_002_non_string_source_does_not_drop_the_event() {
+    fn source_001_non_string_source_does_not_drop_the_event() {
         for (label, source_json) in [
             ("object", r#"{"kind":"clear"}"#),
             ("number", "3"),

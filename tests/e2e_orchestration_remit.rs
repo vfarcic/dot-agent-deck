@@ -97,6 +97,17 @@ fn write_executable(path: &std::path::Path, contents: &str) {
 /// it keeps the real PTY stdin. Mirrors the `emit_target` helper
 /// `tests/e2e_pane_send_result.rs::pane_input_007_orchestrator_prompt_retries_after_non_applied_result`
 /// uses for the identical raw hook-socket `session_start` technique.
+///
+/// **Timing hazard**: this file's log-count assertions on [`DELIVERED_POINTER`]
+/// are only stable while `confirm_submission` completes inside
+/// `unconfirmed_retry_delay(1)` — 500ms (`src/prompt_delivery.rs`) — of the
+/// initial write. `MAX_PAYLOAD_SUBMISSIONS` there is 2, so a delivery still
+/// unconfirmed past that window earns one automatic *replacement* payload
+/// write, appending a second `DELIVERED_POINTER` line to the log with no real
+/// re-assertion behind it — which would read as a false GREEN on any test
+/// here asserting a count of 2. The forked `python3` `confirm_submission`
+/// round-trip normally beats the window comfortably, but nothing enforces
+/// that margin; if these tests start flaking under load, check here first.
 const ORCHESTRATOR_REMIT_SCRIPT: &str = r#"#!/bin/sh
 emit_target() {
     WRITABLE="$1" python3 - <<'PY'
@@ -644,8 +655,9 @@ fn orchestration_remit_005_non_start_role_clear_reasserts_nothing() {
 /// `orchestration_remit_002`/`_005`, this test does not chase the negative
 /// check with a same-pane positive-control injection, because applying a
 /// second `SessionStart` to the SAME pane — even one this guard correctly
-/// filters from re-arming — legitimately advances the daemon's own
-/// generation-tracking bookkeeping and reads the pane as a stale delivery
+/// filters from re-arming — legitimately advances `pane_hook_session`
+/// (`src/state.rs`), the bookkeeping `delivery_target_changed` (`src/ui.rs`)
+/// compares against, and reads the pane as a stale delivery
 /// target after two hops, an artifact of the test's own two-hop injection
 /// shape rather than anything a real pane (whose `agent_type` is fixed for
 /// its whole life) can ever encounter. The "is this harness capable of
