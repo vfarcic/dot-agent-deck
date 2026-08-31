@@ -580,7 +580,7 @@ jobs:
       # devbox pin, so the floor that is tested is the floor that is shipped.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
           cache-dependency-path: desktop/pnpm-lock.yaml
       - name: Install frontend dependencies
