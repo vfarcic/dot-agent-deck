@@ -47,6 +47,41 @@ echo "== desktop gui toolchain =="
 node --version
 pnpm --version
 
+echo "== tauri system libraries =="
+# Issue #771. `desktop/src-tauri` became a workspace member in daf94f0, and both
+# gates CLAUDE.md mandates carry `--workspace`, so `cargo clippy --workspace
+# --all-targets --features e2e` and `cargo test-fast` both build
+# `dot-agent-deck-desktop` — which needs GTK 3, WebKitGTK and glib. devbox.json
+# carried none of them, so BOTH mandated gates were unrunnable in a devbox shell
+# on Linux until the `path:tauri-deps#tauri-deps` entry was added.
+#
+# This job is the only one that can observe that regressing: every other job
+# installs the compile set with apt (ci.yml's `build`) and would stay green with
+# devbox.json empty of GTK.
+#
+# It asserts through pkg-config rather than by looking for files, because
+# pkg-config resolution is exactly what the -sys crates do, and because
+# `PKG_CONFIG_PATH` — set from devbox.json's `env` block, not from `init_hook`,
+# since `devbox run` does not execute the hook — is half of what has to be right.
+#
+# Linux only: macOS builds Tauri against the system WebKit, so the flake yields
+# an empty output there and none of these modules exists.
+if [ "$(uname -s)" = "Linux" ]; then
+  pkg-config --version
+  for mod in glib-2.0 gobject-2.0 gio-2.0 gtk+-3.0 gdk-3.0 gdk-x11-3.0 \
+    webkit2gtk-4.1 javascriptcoregtk-4.1 libsoup-3.0 \
+    ayatana-appindicator3-0.1 dbus-1 librsvg-2.0 libxdo; do
+    # The ASSIGNMENT is what makes this an assertion: `set -e` sees a failed
+    # command substitution in a simple assignment and exits, whereas the same
+    # substitution inside a printf argument would have its status swallowed by
+    # printf's own success.
+    version="$(pkg-config --modversion "$mod")"
+    printf '  %-26s %s\n' "$mod" "$version"
+  done
+else
+  echo "skipped: not Linux"
+fi
+
 echo "== recording toolchain =="
 asciinema --version
 agg --version

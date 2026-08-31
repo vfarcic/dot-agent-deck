@@ -5,7 +5,7 @@ The desktop GUI under `desktop/` is an opt-in Tauri preview for PRD #176. It is 
 ## Prerequisites
 
 - Enter `devbox shell` for the repository's pinned toolchain: Rust 1.97.1, `cargo-nextest`, Clippy, rustfmt, Node.js 24.12.0, and pnpm 10.34.5. Provide equivalent versions yourself if you do not use Devbox — the frontend needs Node.js 20.19 or newer, and pnpm 10.x, which is the line that reads `desktop/pnpm-lock.yaml`'s `lockfileVersion: '9.0'` without rewriting it. CI's `desktop-web` job deliberately runs Node 20 rather than the Devbox pin, so the stated floor stays tested rather than merely claimed.
-- Install the [Tauri 2 system prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform. On macOS this includes the Xcode command-line tools; Linux needs the documented WebKitGTK and related development packages.
+- Install the [Tauri 2 system prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform. On macOS this includes the Xcode command-line tools. On Linux a `devbox shell` already carries them — see [Linux system libraries](#linux-system-libraries) below — and only a non-Devbox Linux setup installs WebKitGTK and the related `-dev` packages by hand.
 - Install the desktop JavaScript dependencies once:
 
 ```sh
@@ -14,6 +14,30 @@ pnpm install
 ```
 
 Agent CLIs and their credentials are needed only for agents you deliberately start through the daemon. The fixture preview does not call an LLM, execute an agent command, or modify project files.
+
+### Linux system libraries
+
+This is not optional reading on Linux, because `desktop/src-tauri` is a **workspace member**: both gates CLAUDE.md mandates carry `--workspace`, so `cargo clippy --workspace --all-targets --features e2e -- -D warnings` and `cargo test-fast` build this crate whether or not you are working on the GUI. Without GTK 3, WebKitGTK and glib they fail — the first at build time (`The system library 'glib-2.0' required by crate 'glib-sys' was not found`), the second at run time (`libgdk-3.so.0: cannot open shared object file`). Issue #771.
+
+**In a `devbox shell` there is nothing to install.** `devbox.json` carries a `path:tauri-deps#tauri-deps` entry; `tauri-deps/flake.nix` builds the transitive pkg-config closure of the same libraries `ci.yml`'s `build` job installs with apt, and `devbox.json`'s `env` block points `PKG_CONFIG_PATH` at it. `pkg-config` itself is pinned there too, so the resolution does not depend on the host having one. That `env` entry **sets** `PKG_CONFIG_PATH` rather than appending to it — devbox's `env` expands only `$PATH` and `$PWD`, so appending is not expressible — which means a value from your login shell does not survive into the devbox shell. That is the wanted behaviour rather than a limitation worked around: a shell that quietly fell back to `/usr/lib`'s `.pc` files would build and then fail at run time, which is the trap described below. Nothing else is exported — in particular `LD_LIBRARY_PATH` stays unset.
+
+**Outside Devbox, on a distribution toolchain, plain apt is enough.** The Debian/Ubuntu set is the one CI installs:
+
+```sh
+sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+  libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+```
+
+**Do not mix the two.** `apt-get install` inside a `devbox shell` looks like it should work and does not, which is what made issue #771 expensive rather than merely annoying:
+
+- A devbox shell runs under **Nix glibc**, whose loader cache does not exist — `ldconfig -p` returns *zero* entries. Libraries under `/usr/lib` are therefore invisible to the dynamic linker no matter what apt put on disk, so `pkg-config` can report `glib-2.0` present, the build can succeed, and the test binary still dies at `libgdk-3.so.0: cannot open shared object file`.
+- The obvious second workaround breaks something else. `export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu` does make both Rust gates pass, and then Nix's own `node` fails with `undefined symbol: uv_tcp_keepalive_ex` because it picks up the system `libuv` ahead of its own. `pnpm install`, `pnpm build` and `pnpm test` are all unusable while that variable is set.
+
+The fix avoids `LD_LIBRARY_PATH` entirely rather than pointing it somewhere safer, and the reason is worth knowing if you touch `tauri-deps/flake.nix`: each `.pc` file names absolute `/nix/store` paths, so the linker is invoked with `-L/nix/store/…-gtk+3-3.24.52/lib`, and Nix's `ld` wrapper turns every in-store `-L` into a matching `-rpath`. The test binary finds its libraries through its own RUNPATH, which is per-binary and cannot leak into `node`. `LD_LIBRARY_PATH` takes precedence over `DT_RUNPATH` for *every* process in the shell, which is the same class of problem in the other direction.
+
+CI's `devbox` job runs `scripts/devbox-smoke.sh`, which resolves each module through `pkg-config` and fails the job if any is missing. It is the only job that can see this regress: every other job installs the compile set with apt and would stay green with `devbox.json` empty of GTK.
+
+Bundling a `.deb` locally needs more than the compile set — `patchelf`, `fakeroot`, `file` and `desktop-file-utils` — which nothing in this repository's gates exercises, so they are deliberately not in `devbox.json`. Install them yourself before `pnpm tauri build`.
 
 ## Fixture preview
 
