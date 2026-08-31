@@ -299,12 +299,22 @@ impl IdleHarness {
             orchestrator_agent_id,
             worker_agent_ids,
         };
-        let ready = harness
-            .wait_for_snapshot(
-                |snapshot| snapshot.contains("ORCH-READY"),
-                Duration::from_secs(5),
+        // Issue #709: every test in this file boots through here, so the flat
+        // 5 s this used to give a freshly spawned `sh` its first `printf` was a
+        // second fixed deadline on `scheduler/idle-worker/008`'s path — and the
+        // one that fires FIRST. Same treatment as the successor wait in `008`:
+        // still condition-driven, but with a ceiling scaled by how contended
+        // the machine is and an early return if the stub dies rather than
+        // prints.
+        let ready = String::from_utf8_lossy(
+            &common::wait_for_child_first_output(
+                &harness.registry,
+                &harness.orchestrator_agent_id,
+                b"ORCH-READY",
             )
-            .await;
+            .await,
+        )
+        .into_owned();
         assert!(
             ready.contains("ORCH-READY"),
             "orchestrator raw-cat stub never became ready; snapshot = {ready:?}"
@@ -953,13 +963,20 @@ fn idle_worker_008_closed_orchestrator_pane_id_reuse_receives_nothing() {
             "SUCCESSOR-READY",
             &harness.cwd_str(),
         );
-        let ready = harness
-            .wait_for_snapshot_of(
-                &successor,
-                |snapshot| snapshot.contains("SUCCESSOR-READY"),
-                Duration::from_secs(5),
-            )
-            .await;
+        // Issue #709: a flat 5 s for a freshly spawned `sh` to reach its
+        // `printf` is an idle-box number, and this test failed on it once in a
+        // 12-run streak on a 16-core box at load average 44. The ceiling is now
+        // scaled by that contention and the wait still ends the instant the
+        // marker lands, so the assertion underneath is unchanged and an idle box
+        // is no slower. The successor's pane id was claimed synchronously by the
+        // spawn above, well before the delegation's deadline — readiness only
+        // has to precede the SNAPSHOT below, which is what makes absence there
+        // evidence.
+        let ready = String::from_utf8_lossy(
+            &common::wait_for_child_first_output(&harness.registry, &successor, b"SUCCESSOR-READY")
+                .await,
+        )
+        .into_owned();
         assert!(
             ready.contains("SUCCESSOR-READY"),
             "the successor agent never became ready, so it could not have observed a stray \

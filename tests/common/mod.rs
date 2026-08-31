@@ -69,6 +69,129 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// legitimately slow run.
 pub const WRAP_TEST_MAX_LIFETIME_SECS: &str = "120";
 
+/// Issue #709: the base ceiling on a wait for a freshly spawned child's FIRST
+/// OUTPUT, before [`load_scaled`] widens it for a contended machine.
+///
+/// This bounds a BOOT, not a behaviour. Nothing a test asserts is derived from
+/// it — the waits it feeds return the instant their condition holds, so on an
+/// idle box a `sh` stand-in satisfies them in single-digit milliseconds and this
+/// number is never reached. It exists so that "the child has not been scheduled
+/// yet" cannot be mistaken for "the child produced the wrong thing", which is
+/// precisely what a 2 s ceiling did on a 16-core box at load average 44.
+pub const CHILD_BOOT_BASE: Duration = Duration::from_secs(8);
+
+/// Issue #709: the 1-minute load average per CPU, or `None` where this platform
+/// does not publish one cheaply.
+///
+/// Linux only, deliberately. `getloadavg(3)` exists on macOS but is not exposed
+/// by the `libc` crate for either `linux-gnu` or `apple` targets, and shelling
+/// out to `sysctl` from a test helper buys a process spawn on every wait to
+/// refine a number that is only ever used to make a ceiling MORE generous.
+/// Elsewhere the answer is `None` and [`load_scaled`] applies the full
+/// multiplier, which is the safe direction: a wider ceiling on a machine whose
+/// contention cannot be measured, paid only when a child is genuinely slow.
+pub fn machine_load_per_cpu() -> Option<f64> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let raw = std::fs::read_to_string("/proc/loadavg").ok()?;
+    let one_minute: f64 = raw.split_whitespace().next()?.parse().ok()?;
+    let cpus = std::thread::available_parallelism().ok()?.get() as f64;
+    if !one_minute.is_finite() || cpus <= 0.0 {
+        return None;
+    }
+    Some(one_minute / cpus)
+}
+
+/// Issue #709: the largest factor [`load_scaled`] will multiply a base ceiling
+/// by, and therefore the ceiling on how long a starved child is waited for.
+///
+/// Six rather than "whatever the load average says": the mapping from load to
+/// scheduling delay is not linear and an unbounded multiplier would let a
+/// runaway load average turn a genuinely hung child into a test that runs until
+/// nextest's own `terminate-after` kill (3 x 60 s by default), which costs the
+/// assertion's diagnostics — the thing every widened wait here exists to
+/// preserve. At the measured failure's load (44 on 16 cores = 2.75) this yields
+/// 22 s against the 2 s that failed; the cap only binds past 6.0.
+const MAX_LOAD_FACTOR: f64 = 6.0;
+
+/// Issue #709: widen a wait ceiling in proportion to how contended the machine
+/// is, so a fast box still fails fast and a loaded one still passes.
+///
+/// Apply this ONLY to a ceiling on something that must HAPPEN, never to a
+/// negative window in which something must NOT happen: the waits it feeds return
+/// the moment their condition holds, so a wider ceiling is free on the happy
+/// path and is paid only where the alternative was a wrong verdict. A negative
+/// window is the opposite — it is always paid in full, and its length is part of
+/// what the test asserts.
+pub fn load_scaled(base: Duration) -> Duration {
+    let factor = machine_load_per_cpu()
+        .unwrap_or(MAX_LOAD_FACTOR)
+        .clamp(1.0, MAX_LOAD_FACTOR);
+    base.mul_f64(factor)
+}
+
+/// Issue #709: [`load_scaled`] applied to [`CHILD_BOOT_BASE`] — the ceiling a
+/// fast-tier test gives a freshly spawned child to produce its first byte.
+pub fn child_boot_budget() -> Duration {
+    load_scaled(CHILD_BOOT_BASE)
+}
+
+/// Issue #709: how long after a child stops being live its output is still
+/// waited for, so a stand-in that printed and then died is not reported as one
+/// that printed nothing.
+///
+/// The bytes a child writes on its way out reach the snapshot through the
+/// detached `pump_reader` OS thread, which is not synchronised with the exit
+/// bookkeeping `agent_is_live` reads — so "no longer live" is a reason to stop
+/// waiting for MORE output, never a reason to trust the snapshot in hand.
+const POST_EXIT_DRAIN: Duration = Duration::from_millis(250);
+
+/// Issue #709: wait for a FRESHLY SPAWNED child's FIRST OUTPUT, returning the
+/// snapshot either way so the caller still asserts on (and prints) it.
+///
+/// The three fast-tier waits this replaces were already condition-driven — they
+/// returned the instant the needle landed — and still failed on a 16-core box at
+/// load average 44, because their ceiling was a flat 2 s or 5 s sized for an idle
+/// machine. The child had not been scheduled at all, so the assertion underneath
+/// reported an EMPTY snapshot and read exactly like a delivery defect. Both ends
+/// of that are fixed here, and neither weakens what the caller asserts:
+///
+/// * the ceiling is [`child_boot_budget`], scaled by how contended the machine
+///   actually is, so an idle box keeps its prompt failure and a loaded one buys
+///   patience it alone pays for; and
+/// * the wait ends early once the child is no longer live, so the failure a
+///   generous ceiling might otherwise have slowed — a stand-in that DIED rather
+///   than printed — still fails about as fast as it did against 2 s.
+///
+/// Use it only for the boot leg. A wait on a BEHAVIOUR the daemon must perform
+/// belongs on that behaviour's own budget, and a negative window in which
+/// something must not happen must not be widened at all — its length is part of
+/// what the test asserts.
+#[allow(dead_code)]
+pub async fn wait_for_child_first_output(
+    registry: &dot_agent_deck::agent_pty::AgentPtyRegistry,
+    agent_id: &str,
+    needle: &[u8],
+) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + child_boot_budget();
+    let mut drain_deadline: Option<tokio::time::Instant> = None;
+    loop {
+        let snapshot = registry.snapshot(agent_id).unwrap_or_default();
+        if snapshot.windows(needle.len()).any(|w| w == needle) {
+            return snapshot;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline || drain_deadline.is_some_and(|drained| now >= drained) {
+            return snapshot;
+        }
+        if drain_deadline.is_none() && !registry.agent_is_live(agent_id) {
+            drain_deadline = Some(now + POST_EXIT_DRAIN);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Decision 20: pinned PTY dimensions for the deck. Resize tests
 /// override via `TuiDeck::resize`.
 const DEFAULT_COLS: u16 = 120;
