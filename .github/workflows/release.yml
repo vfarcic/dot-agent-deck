@@ -573,7 +573,7 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev libxdo-dev \
             patchelf fakeroot file desktop-file-utils
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
       # Node 20 and pnpm 10 match ci.yml's `desktop-web` job rather than the
