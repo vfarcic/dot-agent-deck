@@ -8,6 +8,11 @@ on:
       version:
         description: 'Version to release (e.g. 0.2.0)'
         required: true
+      skip_desktop:
+        description: 'Skip the desktop GUI alpha bundles (use when the bundler is known-broken)'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -426,8 +431,18 @@ jobs:
       - uses: arduino/setup-task@v3.0.0
         with:
           version: 3.x
+      # PRD #740: `pattern` is load-bearing, not tidiness. `merge-multiple`
+      # flattens every artifact of the run into one directory, and the
+      # `desktop-bundle` job uploads into the same run — so without a pattern,
+      # whether a desktop bundle landed in `dist/` would depend on which job
+      # finished first. It would then be swept into the release by the
+      # `dist/dot-agent-deck-*` glob below and fed to `task checksums`, whose
+      # `shasum -a 256 dot-agent-deck-*` cannot cope with the space in Tauri's
+      # `Agent Deck_<version>_amd64.deb` output name. The desktop job therefore
+      # names its artifacts `desktop-bundle-*`, which this pattern excludes.
       - uses: actions/download-artifact@v8
         with:
+          pattern: dot-agent-deck-*
           path: dist
           merge-multiple: true
       - name: Generate checksums
@@ -490,6 +505,258 @@ jobs:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
           CHANNEL_NAME: ${{ steps.channel.outputs.name }}
         run: task scoop-publish "VERSION=v$RELEASE_VERSION" "NAME=$CHANNEL_NAME"
+
+  # PRD #740: bundle the desktop GUI (`desktop/`) as an unsigned alpha artifact.
+  #
+  # The topology is the design. This job hangs off `prepare`, NOT `build`, so it
+  # runs concurrently with the CLI matrix and adds nothing to the critical path;
+  # and `finalize` deliberately does not list it in `needs:`, so the GitHub
+  # Release and its five CLI assets are created on exactly today's path whether
+  # this job succeeds, fails, or is skipped. A broken bundler can therefore
+  # neither slow a tag nor break one.
+  #
+  # A failure turns the run RED while leaving the release green and complete.
+  # That is deliberate: `continue-on-error: true` would keep the run green and
+  # make a silently missing artifact indistinguishable from a healthy release.
+  #
+  # Windows is deliberately absent. A Tauri bundle carries the daemon as a
+  # sidecar; no Windows daemon binary is published (this matrix has no
+  # `*-pc-windows-*` leg either); and a Windows GUI cannot reach a remote Linux
+  # daemon instead, because the IPC transport is a named pipe on Windows and a
+  # Unix socket everywhere else. See PRD #740 Decision 1, and issue #741.
+  desktop-bundle:
+    needs: prepare
+    # `inputs` is empty on a tag push, so this is true and the default is to
+    # bundle on every release. The input is an escape hatch for cutting a
+    # release while the bundler is known-broken, not an opt-in.
+    if: ${{ !inputs.skip_desktop }}
+    strategy:
+      # One platform's bundler breaking must not cancel the other's; a macOS
+      # dmg is still worth publishing when an AppImage fetch times out.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            asset_suffix: macos-arm64
+            bundles: dmg
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            asset_suffix: linux-amd64
+            # `.deb` only. AppImage was in the plan and was dropped on
+            # evidence: it failed on the first real bundle attempt, and more
+            # importantly its bundler downloads FIVE third-party artifacts at
+            # build time -- two of them (`linuxdeploy-plugin-gtk.sh` and
+            # `linuxdeploy-plugin-gstreamer.sh`) from a `master` ref, which is
+            # mutable. Executing whatever sits on someone else's default branch
+            # at tag time, while building an artifact users install, is not a
+            # supply-chain property a release pipeline should have. Re-adding
+            # it is one word here once it is pinned. See PRD #740 Decision 7.
+            bundles: deb
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      # The first five are ci.yml's compile set, needed because this job builds
+      # `dot-agent-deck-desktop`. The rest are needed only by the bundlers:
+      # producing a .deb and an AppImage shells out to them, and ci.yml has
+      # never needed them because it only ever compiles the crate.
+      - name: Install Linux bundle dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev \
+            patchelf fakeroot file desktop-file-utils
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      # Node 20 and pnpm 10 match ci.yml's `desktop-web` job rather than the
+      # devbox pin, so the floor that is tested is the floor that is shipped.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      - name: Install frontend dependencies
+        working-directory: desktop
+        # The bundle config's `beforeBuildCommand` runs `npm run …` inside a
+        # pnpm-installed tree, which works only because node_modules/.bin is
+        # already populated. So this must happen before `tauri build`.
+        run: pnpm install --frozen-lockfile
+      - name: Build the bundle
+        working-directory: desktop
+        env:
+          # The same seam the CLI release uses: build.rs prefers an injected
+          # DAD_VERSION over `git describe`, so the sidecar daemon staged inside
+          # the bundle reports the version actually being released.
+          DAD_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          MATRIX_TARGET: ${{ matrix.target }}
+          MATRIX_BUNDLES: ${{ matrix.bundles }}
+        run: |
+          set -eu
+          # tauri.conf.json hardcodes version "0.1.0", and that value is not
+          # cosmetic: it lands in Info.plist's CFBundleShortVersionString and in
+          # the .deb version field. Merge the real version into the bundle
+          # overlay at build time so no tracked file ever carries a version
+          # number -- the same discipline as Cargo.toml's 0.1.0 placeholder.
+          #
+          # ONE merged --config rather than two stacked ones, so this does not
+          # depend on the Tauri CLI accepting repeated --config arguments.
+          jq --arg v "$RELEASE_VERSION" '. + {version: $v}' \
+            src-tauri/tauri.bundle.conf.json > src-tauri/tauri.release.conf.json
+          pnpm tauri build \
+            --target "$MATRIX_TARGET" \
+            --config src-tauri/tauri.release.conf.json \
+            --bundles "$MATRIX_BUNDLES"
+      - name: Collect and rename the bundle assets
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -eu
+          BUNDLE_DIR="target/${MATRIX_TARGET}/release/bundle"
+          mkdir -p dist-desktop
+          # `bundle.active` is false in the base tauri.conf.json and only the
+          # overlay flips it to true, so an invocation that lost its --config
+          # produces NO bundle and still exits 0. Assert the output exists
+          # rather than trusting the exit code.
+          if [ ! -d "$BUNDLE_DIR" ]; then
+            echo "::error::no bundle directory at ${BUNDLE_DIR}. tauri build exited 0 but produced no bundle -- bundle.active is false unless the overlay config is passed."
+            exit 1
+          fi
+          found=0
+          versioned=0
+          # -print0 because Tauri derives output names from productName, which
+          # is "Agent Deck" -- with a space.
+          # Via a file, not a pipe or a heredoc: a pipe would put the loop in a
+          # subshell and lose the counters, and command substitution in a
+          # heredoc strips the NUL bytes that -print0 exists to emit.
+          find "$BUNDLE_DIR" -type f \
+            \( -name "*.dmg" -o -name "*.deb" -o -name "*.AppImage" \) \
+            -print0 > bundle-files.list
+          while IFS= read -r -d "" src; do
+            ext="${src##*.}"
+            case "$src" in
+              *"$RELEASE_VERSION"*) versioned=1 ;;
+            esac
+            dest="dist-desktop/dot-agent-deck-desktop-alpha-${ASSET_SUFFIX}.${ext}"
+            cp "$src" "$dest"
+            echo "collected: $src -> $dest"
+            found=$((found + 1))
+          done < bundle-files.list
+          rm -f bundle-files.list
+          if [ "$found" -eq 0 ]; then
+            echo "::error::${BUNDLE_DIR} exists but holds no .dmg/.deb/.AppImage."
+            exit 1
+          fi
+          # Tauri names its output "<productName>_<version>_<arch>.<ext>", so a
+          # filename carrying the release version is direct evidence that the
+          # injected version reached the bundle rather than the 0.1.0 literal.
+          # Same discipline as the CLI leg's rodata grep for DAD_VERSION.
+          if [ "$versioned" -ne 1 ]; then
+            echo "::error::no bundle filename contains ${RELEASE_VERSION}; the version injection did not reach the bundle and these artifacts would be labelled 0.1.0."
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          # Deliberately NOT `dot-agent-deck-*`: that is the pattern `finalize`
+          # selects on, and these must stay out of the CLI release's `dist/`.
+          name: desktop-bundle-${{ matrix.asset_suffix }}
+          path: dist-desktop/
+
+  # Attaches the desktop assets to the release that `finalize` already created.
+  # Separated from `desktop-bundle` so the upload happens once, after the
+  # release object exists, rather than racing per matrix leg.
+  desktop-publish:
+    needs: [prepare, finalize, desktop-bundle]
+    # `needs` on a MATRIX job resolves to the AGGREGATE result of every leg, so
+    # `needs: desktop-bundle` alone would skip this job the moment ONE platform
+    # failed — discarding the other platform's perfectly good bundle, which is
+    # precisely the outcome `fail-fast: false` above exists to prevent. That
+    # flag stops the sibling leg being *cancelled*; it cannot make the
+    # aggregate succeed. (Greptile P1 on #768.)
+    #
+    # So gate on what actually matters instead: the release object must exist
+    # (`finalize` succeeded) and we must not have been cancelled. Whether there
+    # is anything worth publishing is then a question for the steps below,
+    # which can see the artifacts and say which platforms are missing.
+    if: ${{ !cancelled() && needs.finalize.result == 'success' && !inputs.skip_desktop }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        # Tolerated deliberately: with a partial matrix now a legitimate state,
+        # this step's own failure mode (no artifact matches the pattern at all)
+        # is one the guard below reports far better than "Unable to find any
+        # artifacts for the associated workflow" does.
+        continue-on-error: true
+        with:
+          pattern: desktop-bundle-*
+          path: dist-desktop
+          merge-multiple: true
+      - name: Check what there is to publish
+        run: |
+          set -eu
+          if [ ! -d dist-desktop ] || [ -z "$(ls -A dist-desktop 2>/dev/null)" ]; then
+            echo "::error::every desktop-bundle leg failed, so there is nothing to publish. The CLI release itself is unaffected and complete."
+            exit 1
+          fi
+          # A partial publish is allowed, but it must never be silent: a
+          # release carrying only one platform should say so in the log rather
+          # than look like a full one.
+          for expected in macos-arm64 linux-amd64; do
+            if ! ls dist-desktop | grep -q -- "-${expected}\."; then
+              echo "::warning::no bundle for ${expected}; that platform's leg failed. Publishing the platforms that did build."
+            fi
+          done
+          ls -la dist-desktop
+      - name: Generate desktop checksums
+        # Unsigned artifacts make integrity verification more valuable, not
+        # less. Kept in their own file so `checksums.txt` stays exactly what it
+        # is today for CLI users.
+        run: |
+          set -eu
+          cd dist-desktop
+          shasum -a 256 dot-agent-deck-desktop-alpha-* > checksums-desktop-alpha.txt
+          cat checksums-desktop-alpha.txt
+      - name: Upload the desktop assets to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: gh release upload "v$RELEASE_VERSION" dist-desktop/* --clobber
+      - name: Note the unsigned alpha in the release body
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        # Appended here rather than assembled in `prepare` so the note appears
+        # only when the assets it describes actually exist -- a release whose
+        # bundler failed must not advertise downloads it does not have.
+        run: |
+          set -eu
+          MARKER="<!-- desktop-alpha -->"
+          BODY=$(gh release view "v$RELEASE_VERSION" --json body -q .body)
+          case "$BODY" in
+            *"$MARKER"*)
+              echo "release body already carries the desktop alpha note; nothing to do"
+              exit 0
+              ;;
+          esac
+          {
+            printf "%s\n\n" "$BODY"
+            printf "%s\n" "$MARKER"
+            printf "### Desktop GUI (alpha, unsigned)\n\n"
+            printf "The \`dot-agent-deck-desktop-alpha-*\` assets are an early preview of the desktop GUI. They are **unsigned**, so your OS will warn you, and they are not covered by the support expectations of the CLI.\n\n"
+            printf "On macOS, clear the quarantine flag after moving the app to /Applications:\n\n"
+            printf "\`\`\`sh\nxattr -dr com.apple.quarantine \"/Applications/Agent Deck.app\"\n\`\`\`\n\n"
+            printf "Signing and notarization are tracked in https://github.com/vfarcic/dot-agent-deck/issues/757. Checksums for these assets are in \`checksums-desktop-alpha.txt\`.\n"
+          } | gh release edit "v$RELEASE_VERSION" --notes-file -
 
   docs:
     needs: [prepare, finalize]

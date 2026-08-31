@@ -20,6 +20,50 @@ Not this skill:
 
 It **never verifies a PR and never addresses feedback itself**. All of that happens inside a dispatched unit, in its own worktree, in its own pane. This skill selects, asks, composes, dispatches, and reports where the work went. If you find yourself running `checks.sh`, reading a diff for a verdict, or replying to a review thread, you have left this skill.
 
+## Step 0 — Fetch, and bring the base up to date
+
+**`dispatch` has no base or branch option.** It runs `git worktree add <dir> -b agent/dispatch-<name>` **in the caller's own working directory and with no start-point** — `ctx.working_dir` in `src/dispatch.rs` feeding `create_worktree` in `src/issue_dispatch_run.rs` — and git resolves an absent start-point to **`HEAD`**. So whatever `HEAD` is at dispatch time is the base every unit in this batch inherits, and no flag anywhere overrides it.
+
+**What a stale base costs here is not the verdict — it is the instructions, which is why this step is easy to think unnecessary.** `/verify-pr`'s `setup.sh` builds its own `../<repo>-pr-<n>` checkout from a fresh `git fetch origin refs/pull/<n>/head` and refreshes `origin/<default-branch>` with an explicit refspec before computing any merge-base, so the *code under review* is current no matter what the dispatch worktree was cut from. What is never re-fetched is the worktree the unit actually sits in — the copy of `CLAUDE.md` whose gate commands it runs, and the copy of `.claude/skills/verify-pr/` it executes as its own instructions, `setup.sh`, `scan.sh` and `checks.sh` included. A stale base hands the unit last week's copy of the very skill it was dispatched to run, and nothing in its output can tell it so.
+
+That is not a theoretical churn rate on this repo. Measured over the 30 days to 2026-08-30: **24** non-merge commits touched `CLAUDE.md` and **13** touched `.claude/skills/verify-pr/`. A base a handful of commits behind is a real chance of running last week's `scan.sh` against this week's rules, and of gating a merge recommendation on a rule that has since changed.
+
+**So bring the base up to date when it is safe to.** Fetch first — this skill selects through `gh` and would otherwise never touch the remote at all — then read the state:
+
+```bash
+git fetch origin --quiet
+git rev-parse --abbrev-ref HEAD                        # the branch every unit is cut from
+git status --porcelain --untracked-files=no            # ANY output means tracked changes
+git rev-list --left-right --count HEAD...origin/main   # "0  6" is 0 ahead, 6 behind
+```
+
+**When `HEAD` is `main`, that status output is empty, and the ahead count is `0`, fast-forward it and say you did.** No prompt, no question — an up-to-date base is the default here, and the runner is told what happened rather than asked to authorise it:
+
+```bash
+git merge --ff-only origin/main
+```
+
+**The sibling skills used to refuse to move the checkout at all, and this step deliberately does not. Read why before restoring that.** The rule they carried was *the runner may have local work, and this skill has no business moving their branch*. That hazard is real and it is kept — it is precisely what the three preconditions test for. What was wrong was the scope: the rule declined every case because it distinguished none of them, and distinguishing them is three commands that cost nothing next to a fetch. Together the preconditions are the statement **there is no local work here to move** — no uncommitted tracked change, no commit that is not already on the remote, and the branch is the one the remote's is. A fast-forward under them rewrites nothing, discards nothing, creates no merge commit, and is undone exactly by `git reset --hard <the sha you printed before moving>`.
+
+**What declining costs was measured on 2026-08-30**, on the sibling PRD queue rather than here: two units were dispatched from a local `main` six commits behind `origin/main`, and one of those six was the commit that introduced the `desktop/` directory both units had been dispatched to work on. They were cut from a tree without it, could not have done anything, and were re-dispatched after a pull with not one original commit between them. **A unit cannot discover this about itself** — and a verifying unit is the worst placed of all to, because its instructions are the thing that is stale, so the check that would have caught it is the check that is out of date.
+
+**`git merge --ff-only origin/main`, never `git pull`, and the difference is not stylistic.** The fetch above already put the ref in the repository, so the merge is purely local: no second network round trip, and nothing for a `pull.rebase` setting to reinterpret into a rebase of the runner's branch. It is also the second of two independent guards — the preconditions decide and `--ff-only` enforces, so if the two ever disagree the merge fails loudly instead of writing a merge commit onto `main`.
+
+**When the base cannot be brought up to date, do not touch the checkout.** Three of the four cases below are precondition failures; the fourth is the merge itself refusing. Say which one it was, in these terms:
+
+- **Tracked changes present** — name the files. They are invisible to the units either way: a unit's copy is made from the last commit ([`docs/dispatcher-mode.md`](../../../docs/dispatcher-mode.md)), so uncommitted work never reaches one. Committing or stashing is therefore the same fix in both directions, and it is the runner's to make rather than yours. **Untracked files are deliberately not a blocker** — `--untracked-files=no` is load-bearing above. A fast-forward that would clobber one fails cleanly by itself, and counting them as dirtiness would refuse on nearly every real checkout, reinstating "never update" by another route.
+- **`HEAD` is not `main`** — every unit is cut from *that* branch, so every unit runs the gates and the skill scripts as they stand on it. Name the branch and its distance from `origin/main`. This is the sharper failure of the three, because nothing about it looks wrong: a feature branch dispatches exactly as smoothly as `main` does, and a unit standing on one will happily verify a PR against instructions from an unmerged branch of the runner's own.
+- **`HEAD` is ahead of `origin/main`** — there is nothing to fast-forward *to*, and the commits that put it ahead are inherited by every unit's branch. Report the count; pushing or moving is the runner's call.
+- **The merge command itself fails despite every precondition passing** — a fast-forward that would clobber a file `origin/main` newly tracks is the concrete case. Treat that failure exactly like the three above: report the git error and do not proceed to dispatch. **Decide on the exit status, never on the output** — git prints `Updating <old>..<new>` *after* `Aborting`, so a refusal ends in a line that reads exactly like a successful fast-forward. `--ff-only` never partially applies, so the checkout is unchanged and there is nothing to undo.
+
+**Do not stop the queue over a refusal.** Nothing in step 1's selection depends on the checkout — it is all `gh` — so carry the refusal forward and put it in front of the runner at the same moment you ask how many to dispatch (step 2), where they are already weighing what the batch costs. Three answers are legitimate and all three are the runner's: dispatch anyway onto the older base, clear the blocker and dispatch after it, or defer the batch. Take their answer rather than picking one, and never clear the blocker on their behalf — committing, stashing or switching branch is precisely the local work this step refuses to touch.
+
+**Resolve it before the first dispatch, never between two.** If the runner clears the blocker, re-read `HEAD` and dispatch. Updating mid-batch splits one batch across two bases, and the units already started keep the old one.
+
+**Then report the base as a distance from `origin/main`, not as a branch name** (step 8). "cut from `main`" reads identically whether `main` is level with the remote or six commits behind it, which is exactly how the 2026-08-30 batch looked fine right up until the units did not.
+
+**If a later step in this file also checks the base, this one supersedes the deciding half of it.** Issue #674 added such a step, written when surfacing was the policy; keep what it says about `dispatch` naming the base in its own success line, since that is a record written *after* the worktree exists and step 8 quotes it, and drop its instruction to surface and ask, which is what this step replaces.
+
 ## Step 1 — Select the queue
 
 Resolve the current user and the repo at runtime. Never hardcode a login: other maintainers run this skill too, and a hardcoded `vfarcic` silently gives them somebody else's queue.
@@ -461,6 +505,8 @@ That is why step 6 defaults to a new name instead of removing anything, and why 
 **`dispatch` is fire-and-forget. There is no return edge.** Results do not come back to this pane, and nothing here will ever notice a unit finishing.
 
 Report, per dispatched unit: the PR number and title, the unit name, the worktree path `../<repo>-dispatch-<name>`, and what that unit is expected to do — verify, address feedback, or both. Then point the user at **each unit's own tab on the deck**; that tab is where the outcome will appear.
+
+Report the base too, as a distance from `origin/main` rather than a branch name: the sha, plus `0 behind` after step 0 fast-forwarded it or `N behind` when step 0 declined to move it, measured at the moment the batch was dispatched rather than now. Report it when the base was already current too — nothing else distinguishes a base that was checked from one nobody looked at, and a bare branch name distinguishes neither. Where `dispatch`'s own success line names the base (`…, cut from main at c701932`), quote that rather than recomputing it, and read a missing clause as an older build or a failed probe rather than as a base that is fine.
 
 Also report, plainly: every PR skipped and why — closed since listing, become someone else's homework, or already under a live unit (name that unit) — every PR excluded at step 1, and the number dispatched against the number the user asked for if they differ.
 

@@ -28,7 +28,7 @@ It **never implements a fix, and never diagnoses beyond what selection requires*
 
 If you see that, stop. Selection still works and is worth reporting, but nothing can be dispatched from here; say so rather than falling back to doing the work yourself.
 
-## Step 0 — Fetch, and never trust the working tree
+## Step 0 — Fetch, verify against `origin/main`, and bring the base up to date
 
 **Run `git fetch origin` before verifying anything, and verify against `origin/main`, not the checkout.**
 
@@ -45,7 +45,44 @@ So verify claims with `git grep` against the remote ref:
 git grep -n "fn shell_foreground_busy_snapshot" origin/main -- src/agent_pty.rs
 ```
 
-Do **not** `git pull` to fix this. The runner may have local work, and this skill has no business moving their branch.
+### Then bring the checkout up to date, because every unit is cut from it
+
+**`dispatch` has no base or branch option.** It runs `git worktree add <dir> -b agent/dispatch-<name>` **in the caller's own working directory and with no start-point** — `ctx.working_dir` in `src/dispatch.rs` feeding `create_worktree` in `src/issue_dispatch_run.rs` — and git resolves an absent start-point to **`HEAD`**. So whatever `HEAD` is at dispatch time is the base every unit in this batch inherits, and no flag anywhere overrides it. The fetch above fixes what you *verify against* and does nothing whatever about what the units are *built on*.
+
+**So bring the base up to date when it is safe to, rather than reporting it stale.** The fetch has already happened, so reading the state costs nothing. Two of the three are new; the third is the same distance read as above, wanted this time for its *left* number as well:
+
+```bash
+git rev-parse --abbrev-ref HEAD                        # the branch every unit is cut from
+git status --porcelain --untracked-files=no            # ANY output means tracked changes
+git rev-list --left-right --count HEAD...origin/main   # "0  6" is 0 ahead, 6 behind
+```
+
+**When `HEAD` is `main`, that status output is empty, and the ahead count is `0`, fast-forward it and say you did.** No prompt, no question — an up-to-date base is the default here, and the runner is told what happened rather than asked to authorise it:
+
+```bash
+git merge --ff-only origin/main
+```
+
+**This reverses the rule that used to stand here, so read why before restoring it.** The old paragraph refused to pull, because *the runner may have local work, and this skill has no business moving their branch*. That hazard is real, and it is kept — it is precisely what the three preconditions test for. What was wrong was the scope: the rule declined every case because it distinguished none of them, and distinguishing them is three commands that cost nothing after a fetch you were already doing. Together those preconditions are the statement **there is no local work here to move** — no uncommitted tracked change, no commit that is not already on the remote, and the branch is the one the remote's is. A fast-forward under them rewrites nothing, discards nothing, creates no merge commit, and is undone exactly by `git reset --hard <the sha you printed before moving>`.
+
+**What declining costs, measured on 2026-08-30.** Two units were dispatched from a local `main` at `820ba40`, six commits behind `origin/main` at `83d9bf3`. One of those six was `daf94f0`, the commit that introduces `desktop/` in the first place — and both units had been dispatched to work on the desktop app. They were cut from a tree with no `desktop/` directory at all, so they could not have done anything; both were stopped and re-dispatched after a pull, with not one original commit between them. **A unit cannot discover this about itself.** It sees a valid checkout, finds the code its issue names missing, and reasonably concludes that the *issue* is stale rather than that its base is.
+
+**`git merge --ff-only origin/main`, never `git pull`, and the difference is not stylistic.** The fetch above already put the ref in the repository, so the merge is purely local: no second network round trip, and nothing for a `pull.rebase` setting to reinterpret into a rebase of the runner's branch. It is also the second of two independent guards — the preconditions decide and `--ff-only` enforces, so if the two ever disagree the merge fails loudly instead of writing a merge commit onto `main`.
+
+**When the base cannot be brought up to date, do not touch the checkout.** Three of the four cases below are precondition failures — the case the old rule was written for, unchanged — and the fourth is the merge itself refusing. Say which one it was, in these terms:
+
+- **Tracked changes present** — name the files. They are invisible to the units either way: a unit's copy is made from the last commit ([`docs/dispatcher-mode.md`](../../../docs/dispatcher-mode.md)), so uncommitted work never reaches one. Committing or stashing is therefore the same fix in both directions, and it is the runner's to make rather than yours. **Untracked files are deliberately not a blocker** — `--untracked-files=no` is load-bearing above. A fast-forward that would clobber one fails cleanly by itself, and counting them as dirtiness would refuse on nearly every real checkout, reinstating "never update" by another route.
+- **`HEAD` is not `main`** — every unit is cut from *that* branch and carries its unmerged work into every PR the batch produces. Name the branch and its distance from `origin/main`. This is the sharper failure of the three, because nothing about it looks wrong: a feature branch dispatches exactly as smoothly as `main` does.
+- **`HEAD` is ahead of `origin/main`** — there is nothing to fast-forward *to*, and the commits that put it ahead are inherited by every unit's branch and turn up in every unit's PR. Report the count; pushing or moving is the runner's call.
+- **The merge command itself fails despite every precondition passing** — a fast-forward that would clobber a file `origin/main` newly tracks is the concrete case. Treat that failure exactly like the three above: report the git error and do not proceed to dispatch. **Decide on the exit status, never on the output** — git prints `Updating <old>..<new>` *after* `Aborting`, so a refusal ends in a line that reads exactly like a successful fast-forward. `--ff-only` never partially applies, so the checkout is unchanged and there is nothing to undo.
+
+**Do not stop the queue over a refusal.** Nothing in selection depends on the checkout — verifying against `origin/main` is exactly what makes that true — so carry the refusal forward and put it in front of the runner at the same moment you ask how many to dispatch (step 5), where they are already weighing what the batch costs. Three answers are legitimate and all three are the runner's: dispatch anyway onto the older base, clear the blocker and dispatch after it, or defer the batch. Take their answer rather than picking one, and never clear the blocker on their behalf — committing, stashing or switching branch is precisely the local work this step refuses to touch.
+
+**Resolve it before the first dispatch, never between two.** If the runner clears the blocker, re-read `HEAD` and dispatch. Updating mid-batch splits one batch across two bases, and the units already started keep the old one.
+
+**Then report the base as a distance from `origin/main`, not as a branch name** (step 9). "cut from `main`" reads identically whether `main` is level with the remote or six commits behind it, which is exactly how the 2026-08-30 batch looked fine right up until the units did not.
+
+**If a later step in this file also checks the base, this one supersedes the deciding half of it.** Issue #674 added such a step, written when surfacing was the policy; keep what it says about `dispatch` naming the base in its own success line, since that is a record written *after* the worktree exists and step 9 quotes it, and drop its instruction to surface and ask, which is what this step replaces.
 
 ## Step 1 — Resolve identity at runtime
 
@@ -313,4 +350,5 @@ Give the runner, per unit: issue number, worktree path as `dispatch` reported it
 
 - **Nothing reports back to this pane.** `dispatch` is fire-and-forget with no return edge. Point at the worktree paths and the units' own tabs; never say results will arrive here.
 - **Anything you excluded, and why** — especially in-flight collisions, duplicates, and any candidate abandoned at step 6 or 8 over an assignee collision or a refused dispatch.
-- **Anything you could not verify**, including a stale local checkout you chose not to move, and any list you could not confirm was untruncated.
+- **The base every unit was cut from, as a distance from `origin/main`** — the sha, plus `0 behind` after step 0 fast-forwarded it or `N behind` when step 0 declined to move it, measured at the moment the batch was dispatched rather than now. Report it when the base was already current too: nothing else distinguishes a base that was checked from one nobody looked at, and a bare branch name distinguishes neither. Where `dispatch`'s own success line names the base (`…, cut from main at c701932`), quote that rather than recomputing it — and read a missing clause as an older build or a failed probe, never as a base that is fine.
+- **Anything you could not verify**, including a checkout step 0 declined to move and which precondition stopped it, and any list you could not confirm was untruncated.
