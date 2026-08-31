@@ -2,7 +2,7 @@ import { useMemo, type ReactNode } from "react";
 import { Blocks, Boxes, LayoutList, Layers, Network, RefreshCw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
 import { UNREPORTED } from "../types";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
-import { DISPLAY_LIMITS, displayPath, displayText, displayTitle, shortDaemonLabel } from "../lib/displayText";
+import { DISPLAY_LIMITS, displayIdentity, displayPath, displayText, displayTitle, domIdentity, rendersBlank, shortDaemonLabel } from "../lib/displayText";
 
 /**
  * The honest subset of `AgentSession`: every field a daemon genuinely reports
@@ -51,6 +51,18 @@ export function agentKey(agent: Pick<OverviewAgent, "daemonId" | "id">): string 
   return `${encodeURIComponent(agent.daemonId)}:${encodeURIComponent(agent.id)}`;
 }
 
+/**
+ * The copy of `agentKey` that reaches React — the row's key and its
+ * `data-testid`. Identical to `agentKey` for anything a healthy daemon reports,
+ * and BOUNDED for anything else: `DesktopAgentDto.id` and `daemonId` carry no
+ * frontend clamp at all, so an unbounded copy in a DOM attribute is a way for a
+ * malformed daemon to freeze the webview. `agentKey` itself stays raw, because
+ * it is the identity two agents must never share.
+ */
+export function agentDomKey(agent: Pick<OverviewAgent, "daemonId" | "id">): string {
+  return domIdentity(agentKey(agent));
+}
+
 export type OverviewGroupKind = "orchestration" | "mode" | "standalone";
 
 export interface OverviewGroup {
@@ -59,8 +71,14 @@ export interface OverviewGroup {
    * id, a mode name, or the literal `"standalone"`. Kept raw because it is the
    * daemon-side identity a future drill-in navigates by; it is never a React
    * key and never a DOM id — see `key`.
+   *
+   * ABSENT for an orchestration whose agents reported no `orchestrationId`,
+   * because there is then no daemon-side identity to carry and inventing one is
+   * the same class of lie as an `Unavailable` cwd: a drill-in would navigate to
+   * a group the daemon has never heard of. Such a group still renders, keyed on
+   * itself — see `anonymousOrchestrationKey`.
    */
-  id: string;
+  id?: string;
   /**
    * Unique across every kind, and safe as an HTML id. Orchestration ids, mode
    * names and the standalone literal shared ONE key space, so a mode named
@@ -71,6 +89,11 @@ export interface OverviewGroup {
    * stops working, with no error anywhere. `encodeURIComponent` leaves no
    * whitespace and escapes the `:` separator, so the join stays unambiguous
    * and the result is always a legal id.
+   *
+   * Bounded, too: it reaches React as a key, a `data-testid`, a DOM `id` and an
+   * `aria-labelledby` IDREF, and a daemon-supplied name has no length limit
+   * below the protocol frame. Bounding happens HERE and never on the grouping
+   * key, so no clamp can merge two groups.
    */
   key: string;
   kind: OverviewGroupKind;
@@ -106,20 +129,23 @@ export function groupAgents(agents: OverviewAgent[]): OverviewGroup[] {
     if (agent.tab.kind === "orchestration") {
       // `orchestrationId` is optional on the wire. Falling back to the name
       // would merge two distinct orchestrations that happen to share one into a
-      // single card with colliding role indexes, so an id-less agent gets a key
-      // unique to itself instead: worst case it reads as its own group, which
-      // is honest, rather than as somebody else's role.
-      const id = agent.tab.orchestrationId ?? `agent:${agentKey(agent)}`;
-      const group = orchestrations.get(id) ?? {
+      // single card with colliding role indexes, so an id-less agent keys on
+      // itself instead: worst case it reads as its own group, which is honest,
+      // rather than as somebody else's role. The two cases are kept in
+      // DISJOINT key spaces — an explicit id can never reach the anonymous one,
+      // whatever string a daemon reports — because they used to share one.
+      const id = agent.tab.orchestrationId;
+      const bucket = id === undefined ? `self:${agentKey(agent)}` : `id:${id}`;
+      const group = orchestrations.get(bucket) ?? {
         id,
-        key: groupKey("orchestration", id),
+        key: id === undefined ? anonymousOrchestrationKey(agent) : groupKey("orchestration", id),
         kind: "orchestration" as const,
         title: agent.tab.displayTitle || agent.tab.name,
         subtitle: agent.tab.displayTitle ? agent.tab.name : undefined,
         agents: [],
       };
       group.agents.push(agent);
-      orchestrations.set(id, group);
+      orchestrations.set(bucket, group);
     } else if (agent.tab.kind === "mode") {
       const group = modes.get(agent.tab.name) ?? { id: agent.tab.name, key: groupKey("mode", agent.tab.name), kind: "mode" as const, title: agent.tab.name, agents: [] };
       group.agents.push(agent);
@@ -143,8 +169,8 @@ export function groupAgents(agents: OverviewAgent[]): OverviewGroup[] {
 }
 
 /**
- * A group's key: its kind and its raw identity, escaped. See `OverviewGroup.key`
- * for why both halves are load-bearing.
+ * A group's key: its kind and its raw identity, escaped and bounded. See
+ * `OverviewGroup.key` for why all three are load-bearing.
  *
  * Note the daemon's PRE-ID orchestration identity is `(name, cwd)`, so a
  * name-only fallback would merge two unrelated orchestrations. `groupAgents`
@@ -152,7 +178,32 @@ export function groupAgents(agents: OverviewAgent[]): OverviewGroup[] {
  * anything that reintroduces one has to carry cwd with the name.
  */
 export function groupKey(kind: OverviewGroupKind, id: string): string {
-  return `${kind}:${encodeURIComponent(id)}`;
+  return domIdentity(`${kind}:${encodeURIComponent(id)}`);
+}
+
+/**
+ * The `orchestration` prefix `groupKey` emits, and the one it CANNOT emit.
+ * They differ at the fourteenth character — `:` against `-` — and
+ * `encodeURIComponent` never produces either from an id, so no orchestration
+ * id a daemon reports can land in the anonymous space or vice versa.
+ */
+const ANONYMOUS_ORCHESTRATION_PREFIX = "orchestration-anonymous:";
+
+/**
+ * The key of an orchestration whose agents reported no `orchestrationId`.
+ *
+ * This used to be `agent:<agentKey>` fed back through the ordinary key space,
+ * with a comment claiming the result was "unique to itself". It was not: a
+ * different orchestration reporting that exact string as its EXPLICIT
+ * `orchestrationId` landed in the same map entry, so the two rendered as one
+ * card whose title came from whichever arrived first, with colliding role
+ * indexes and a misleading agent count — and both halves of the string are
+ * knowable, since it is built from a socket path and a daemon-minted agent id.
+ * Kind-namespacing did not close it, because the collision happened in the map
+ * before `groupKey` was ever applied.
+ */
+export function anonymousOrchestrationKey(agent: Pick<OverviewAgent, "daemonId" | "id">): string {
+  return domIdentity(`${ANONYMOUS_ORCHESTRATION_PREFIX}${agentKey(agent)}`);
 }
 
 /**
@@ -212,8 +263,12 @@ const COLUMNS = ["Status", "Agent", "State", "CLI", "Active tool", "Tools", "Wor
  * no `TerminalViewport` is what its tests assert.
  *
  * Every daemon-supplied string on this screen goes through `lib/displayText`
- * before it reaches React — rendered text and `title` attributes alike — while
- * grouping, sorting and keys keep the raw values.
+ * before it reaches React — rendered text, `title` attributes, and the identity
+ * values behind `data-*`, DOM ids, IDREFs and React keys alike — while
+ * grouping, sorting and the `(daemonId, agentId)` identity keep the raw values.
+ * The identity path goes through `domIdentity` rather than `displayText`,
+ * because bounding is what it needs and truncating a key is not: the raw value
+ * stays the key, and only the copy React sees is clamped.
  */
 export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeState; onNavigate: (view: DeckView) => void }) {
   const { snapshot, mode } = runtime;
@@ -281,7 +336,7 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
             daemon. With one it is minimal chrome; #742's second daemon becomes a
             sibling here and changes no inner component.
           */}
-          <section className="daemon-group" data-testid="daemon-group" data-daemon-id={socketPath ?? ""} aria-labelledby="daemon-group-title">
+          <section className="daemon-group" data-testid="daemon-group" data-daemon-id={socketPath === undefined ? "" : domIdentity(socketPath)} aria-labelledby="daemon-group-title">
             <header className="daemon-group-header">
               <span className={`connection-lamp connection-${connection.status}`} aria-hidden="true" />
               <div className="daemon-identity">
@@ -289,7 +344,10 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
                 {/*
                   A socket path routinely embeds a uid or a username, so the
                   header carries a short label and keeps the full path on hover.
-                  `data-daemon-id` above stays the raw identity key.
+                  `data-daemon-id` above carries the identity, sanitised and
+                  bounded: it is a marker for tests and a future drill-in, not a
+                  key, so nothing depends on it being byte-for-byte raw — and
+                  `daemonId` has no length limit below the protocol frame.
                 */}
                 <code title={socketPath ? displayTitle(socketPath) : undefined}>
                   {socketPath ? shortDaemonLabel(socketPath) : "socket path not reported"}
@@ -412,15 +470,24 @@ function OverviewGroupCard({ group }: { group: OverviewGroup }) {
   const Icon = GROUP_ICON[group.kind];
   const counts = countByStatus(group.agents);
   const titleId = `overview-group-title-${group.key}`;
+  // Shown only when it says something: a subtitle that renders to nothing is an
+  // empty `<code>` chip next to the heading, which reads as a rendering fault.
+  const subtitle = group.subtitle ? displayText(group.subtitle, DISPLAY_LIMITS.name) : undefined;
   return (
-    <article className="overview-group" data-testid={`overview-group-${group.key}`} data-group-id={group.id} data-group-kind={group.kind} aria-labelledby={titleId}>
+    <article
+      className="overview-group"
+      data-testid={`overview-group-${group.key}`}
+      data-group-id={group.id === undefined ? undefined : domIdentity(group.id)}
+      data-group-kind={group.kind}
+      aria-labelledby={titleId}
+    >
       <header className="overview-group-header">
         <Icon size={14} aria-hidden="true" />
         <div className="overview-group-identity">
           <span className="section-kicker">{GROUP_KICKER[group.kind]}</span>
-          <h3 id={titleId}>{displayText(group.title, DISPLAY_LIMITS.name)}</h3>
+          <h3 id={titleId}>{displayIdentity(group.title, DISPLAY_LIMITS.name, unnamedGroupLabel(group))}</h3>
         </div>
-        {group.subtitle && <code className="overview-group-subtitle">{displayText(group.subtitle, DISPLAY_LIMITS.name)}</code>}
+        {subtitle && !rendersBlank(subtitle) && <code className="overview-group-subtitle">{subtitle}</code>}
         {group.commonCwd && (
           <code className="overview-group-cwd" title={displayText(`Most of this group works in ${group.commonCwd} — a row prints its own directory only when it differs`, DISPLAY_LIMITS.title)}>
             {displayPath(group.commonCwd)}
@@ -445,11 +512,33 @@ function OverviewGroupCard({ group }: { group: OverviewGroup }) {
           </tr>
         </thead>
         <tbody className="overview-rows" role="rowgroup">
-          {group.agents.map((agent) => <OverviewRow key={agentKey(agent)} agent={agent} commonCwd={group.commonCwd} />)}
+          {group.agents.map((agent) => <OverviewRow key={agentDomKey(agent)} agent={agent} commonCwd={group.commonCwd} />)}
         </tbody>
       </table>
     </article>
   );
+}
+
+/**
+ * What an identity cell says when the daemon's own value renders as nothing.
+ *
+ * Honest — it does not invent a name — and identifying, which is the property
+ * that matters: two agents whose names are both invisible still read as two
+ * different rows, because the daemon's agent id distinguishes them and is what
+ * every other surface (the TUI, the deck, the CLI) calls them by. The voice
+ * matches the screen's other absences: "no active tool", "socket path not
+ * reported".
+ */
+function unnamedAgentLabel(agent: OverviewAgent): string {
+  const id = displayText(agent.id, DISPLAY_LIMITS.toolName);
+  return rendersBlank(id) ? "unnamed agent" : `unnamed agent ${id}`;
+}
+
+/** The same, for a group whose title renders as nothing. */
+function unnamedGroupLabel(group: OverviewGroup): string {
+  const noun = group.kind === "mode" ? "mode tab" : "orchestration";
+  const id = group.id === undefined ? "" : displayText(group.id, DISPLAY_LIMITS.toolName);
+  return rendersBlank(id) ? `unnamed ${noun}` : `unnamed ${noun} ${id}`;
 }
 
 function OverviewRow({ agent, commonCwd }: { agent: OverviewAgent; commonCwd?: string }) {
@@ -458,15 +547,25 @@ function OverviewRow({ agent, commonCwd }: { agent: OverviewAgent; commonCwd?: s
   // Outside one, the daemon derives the role from the agent type, so showing it
   // here would just restate the CLI column.
   const roleLabel = orchestration?.roleName;
-  const name = displayText(agent.displayName, DISPLAY_LIMITS.name);
+  const roleName = roleLabel ? displayText(roleLabel, DISPLAY_LIMITS.name) : undefined;
+  /*
+    A display name made ENTIRELY of retained default-ignorable characters
+    (`U+200B`, `U+200C`, `U+200D`, `U+FEFF`) renders as a blank cell, and two
+    names differing only by one of them render identically — on the one screen
+    whose entire purpose is telling agents apart. It is not fixed by stripping
+    those characters, which are load-bearing in emoji sequences and in Persian,
+    Arabic and Indic orthography and whose retention this seam shares with
+    `src/untrusted_text.rs`; it is fixed by saying something visible instead.
+  */
+  const name = displayIdentity(agent.displayName, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
   return (
-    <tr className="overview-row" role="row" data-testid={`overview-agent-${agentKey(agent)}`} data-status={agent.status}>
+    <tr className="overview-row" role="row" data-testid={`overview-agent-${agentDomKey(agent)}`} data-status={agent.status}>
       <td role="cell"><span className={`agent-state-mark status-${agent.status}`} aria-hidden="true" /></td>
       <td className="overview-agent-name" role="cell">
         {orchestration && <em className="overview-role-index" title={`Role ${orchestration.roleIndex} of this orchestration`}>{String(orchestration.roleIndex + 1).padStart(2, "0")}</em>}
         <strong>{name}</strong>
         {orchestration?.isStartRole && <span className="coordinator-badge" title="Orchestration start role — the agent an operator messages">COORDINATOR</span>}
-        {roleLabel && roleLabel.toLowerCase() !== agent.displayName.toLowerCase() && <em className="overview-role-name">{displayText(roleLabel, DISPLAY_LIMITS.name)}</em>}
+        {roleName && !rendersBlank(roleName) && roleLabel?.toLowerCase() !== agent.displayName.toLowerCase() && <em className="overview-role-name">{roleName}</em>}
       </td>
       <td role="cell"><span className={`status-label status-${agent.status}`}>{agent.status}</span></td>
       <td className="overview-cli" role="cell" title={displayText(`Agent type reported by the daemon: ${agent.cli}`, DISPLAY_LIMITS.title)}>{displayText(agent.cli, DISPLAY_LIMITS.name)}</td>

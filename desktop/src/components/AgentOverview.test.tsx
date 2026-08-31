@@ -20,7 +20,7 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell } from "../App";
-import { agentKey, AgentOverview, groupAgents, groupKey, type OverviewAgent, type OverviewGroupKind, toOverviewAgent } from "./AgentOverview";
+import { agentDomKey, agentKey, AgentOverview, anonymousOrchestrationKey, groupAgents, groupKey, type OverviewAgent, type OverviewGroupKind, toOverviewAgent } from "./AgentOverview";
 
 /**
  * Every codepoint the render seam must strip, enumerated rather than sampled —
@@ -71,6 +71,22 @@ function rowNames(scope: HTMLElement): (string | null | undefined)[] {
 /** Every `title` a screen renders — the other half of what a reader sees. */
 function titlesOf(container: HTMLElement): string[] {
   return Array.from(container.querySelectorAll("[title]")).map((node) => node.getAttribute("title") ?? "");
+}
+
+/**
+ * The identity-bearing attributes a rendered screen carries. These are the half
+ * of the render seam the text and `title` sweeps never reach, which is how raw,
+ * unbounded daemon strings kept arriving here after both of those were closed.
+ */
+const IDENTITY_ATTRIBUTES = ["id", "data-testid", "data-group-id", "data-daemon-id", "aria-labelledby"];
+
+function identityAttributes(container: HTMLElement): { name: string; value: string }[] {
+  return Array.from(container.querySelectorAll("*")).flatMap((node) =>
+    IDENTITY_ATTRIBUTES.flatMap((name) => {
+      const value = node.getAttribute(name);
+      return value === null ? [] : [{ name, value }];
+    }),
+  );
 }
 
 /** One group's card, addressed exactly the way the component keys it. */
@@ -306,6 +322,132 @@ describe("AgentOverview", () => {
   });
 
   /**
+   * Scenario: render a fleet whose daemon reports a 50 000-character socket
+   * path, agent ids and mode name, then read every identity attribute the
+   * screen produced. Each must be bounded, and the two rows must stay two rows.
+   */
+  it("bounds every identity that reaches a DOM attribute, however long the daemon's is", () => {
+    // `DesktopAgentDto.id` has no frontend validation and no clamp — it is
+    // bounded only by the 16 MiB protocol frame, and `encodeURIComponent`
+    // expands it by up to three — so an unbounded copy in a `data-*`, a DOM id
+    // or a React key lets a malformed daemon freeze the webview on every
+    // snapshot. The text and `title` sweeps do not reach any of these.
+    const long = "y".repeat(50_000);
+    const socketPath = `/tmp/${long}.sock`;
+    const base = createFixtureSnapshot("crowded");
+    const [first] = base.agents;
+    const alpha: AgentSession = { ...(first as AgentSession), id: `${long}-1`, daemonId: socketPath, displayName: "alpha", tab: { kind: "mode", name: `mode-${long}` } };
+    const beta: AgentSession = { ...alpha, id: `${long}-2`, displayName: "beta" };
+    const { container } = renderOverview({ snapshot: { ...base, connection: { ...base.connection, socketPath }, agents: [alpha, beta] } });
+
+    const attributes = identityAttributes(container);
+    // The screen really did render these: an empty sweep would pass while
+    // proving nothing.
+    expect(attributes.length).toBeGreaterThan(5);
+    // The budget, plus the longest fixed prefix the component prepends
+    // (`overview-group-title-`) and the digest suffix an over-budget value
+    // keeps. Against 50 000 the exact slack does not matter; being in the
+    // hundreds rather than the tens of thousands is the whole assertion.
+    const ceiling = DISPLAY_LIMITS.domIdentity + 64;
+    for (const { name, value } of attributes) {
+      expect(Array.from(value).length, `${name} reached the DOM unbounded`).toBeLessThanOrEqual(ceiling);
+    }
+
+    // Bounded, and still two agents: the clamp must not fold two rows whose ids
+    // share a 50 000-character prefix into one.
+    expect(agentDomKey(alpha)).not.toBe(agentDomKey(beta));
+    expect(rows(container)).toHaveLength(2);
+    expect(new Set(rows(container).map((row) => row.getAttribute("data-testid"))).size).toBe(2);
+    expect(rowNames(container)).toEqual(["alpha", "beta"]);
+  });
+
+  it("keeps control and bidi characters out of the identity attributes too", () => {
+    const hostile = HOSTILE_CODEPOINTS.join("");
+    const socketPath = `/tmp/de${hostile}ck.sock`;
+    const base = createFixtureSnapshot("crowded");
+    const [first] = base.agents;
+    const { container } = renderOverview({
+      snapshot: {
+        ...base,
+        connection: { ...base.connection, socketPath },
+        agents: [{ ...(first as AgentSession), daemonId: socketPath, tab: { kind: "mode", name: `re${hostile}view` } }],
+      },
+    });
+
+    const values = identityAttributes(container).map((entry) => entry.value).join(" ~ ");
+    for (const codepoint of HOSTILE_CODEPOINTS) {
+      const name = `U+${codepoint.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`;
+      expect(values.includes(codepoint), `${name} reached a DOM identity attribute`).toBe(false);
+    }
+    expect(screen.getByTestId("daemon-group")).toHaveAttribute("data-daemon-id", "/tmp/deck.sock");
+    expect(groupCard("mode", `re${hostile}view`)).toHaveAttribute("data-group-id", "review");
+  });
+
+  /**
+   * Scenario: render two standalone agents whose display names are made
+   * entirely of retained zero-width characters and differ only by one of them.
+   * Both rows must name themselves visibly, and differently.
+   */
+  it("names an agent whose display name renders as nothing at all", () => {
+    const base = createFixtureSnapshot("crowded");
+    const [first] = base.agents;
+    renderOverview({
+      snapshot: {
+        ...base,
+        agents: [
+          { ...(first as AgentSession), id: "7", displayName: "\u200b\u200d", tab: { kind: "dashboard" } },
+          { ...(first as AgentSession), id: "8", displayName: "\u200b", tab: { kind: "dashboard" } },
+        ],
+      },
+    });
+
+    // Two blank identity cells used to be indistinguishable here, and the other
+    // columns do not rescue them: CSS hides CLI and working directory below
+    // 1180px and the tool columns below 680px. The fallback is deliberately not
+    // a wider strip list — ZWJ and ZWNJ are load-bearing in emoji sequences and
+    // in Persian, Arabic and Indic orthography.
+    expect(rowNames(groupCard("standalone", "standalone"))).toEqual(["unnamed agent 7", "unnamed agent 8"]);
+  });
+
+  it("names a group whose title renders as nothing at all", () => {
+    renderOverview({ snapshot: snapshotWithAgent({ tab: { kind: "orchestration", orchestrationId: "orc-x", name: "\u200b\ufeff", roleName: "writer", roleIndex: 0, isStartRole: true } }) });
+
+    const card = groupCard("orchestration", "orc-x");
+    expect(within(card).getByRole("heading")).toHaveTextContent("unnamed orchestration orc-x");
+  });
+
+  /**
+   * Scenario: render one orchestration agent that reports no `orchestrationId`
+   * alongside another whose EXPLICIT id is the exact string the old code minted
+   * for the first. Two cards, not one.
+   */
+  it("renders an id-less orchestration as its own card when another claims its synthetic key", () => {
+    const base = createFixtureSnapshot("crowded");
+    const [first] = base.agents;
+    const anonymous: AgentSession = { ...(first as AgentSession), id: "1", displayName: "no-id", tab: { kind: "orchestration", name: "alpha", roleName: "writer", roleIndex: 0, isStartRole: true } };
+    // Both halves of this are knowable — a socket path and a daemon-minted
+    // agent id — so a hostile orchestration can report it as its own id.
+    const forged = `agent:${agentKey(anonymous)}`;
+    renderOverview({
+      snapshot: {
+        ...base,
+        agents: [
+          anonymous,
+          { ...(first as AgentSession), id: "2", displayName: "impostor", tab: { kind: "orchestration", orchestrationId: forged, name: "beta", roleName: "writer", roleIndex: 0, isStartRole: true } },
+        ],
+      },
+    });
+
+    expect(screen.getAllByRole("article")).toHaveLength(2);
+    expect(rowNames(groupCard("orchestration", forged))).toEqual(["impostor"]);
+    const own = screen.getByTestId(`overview-group-${anonymousOrchestrationKey(anonymous)}`);
+    expect(rowNames(own)).toEqual(["no-id"]);
+    // And it claims no daemon-side identity, so nothing advertises a drill-in
+    // target the daemon has never heard of.
+    expect(own).not.toHaveAttribute("data-group-id");
+  });
+
+  /**
    * The group heading names its table through `aria-labelledby`, and an IDREF
    * containing a space matches nothing at all — the association just stops,
    * with no error and nothing visibly wrong. A daemon-supplied mode name is
@@ -538,6 +680,47 @@ describe("groupAgents", () => {
 
     expect(groups).toHaveLength(2);
     expect(groups.map((group) => group.agents.length)).toEqual([1, 1]);
+  });
+
+  /**
+   * Scenario: group one id-less orchestration agent together with another whose
+   * explicit `orchestrationId` is the synthetic key the old code minted for the
+   * first. They must stay two groups.
+   */
+  it("keeps an id-less orchestration out of a group that names its synthetic key", () => {
+    const [seed] = crowded();
+    const anonymous: OverviewAgent = { ...seed, id: "1", displayName: "no-id", tab: { kind: "orchestration", name: "alpha", roleName: "writer", roleIndex: 0, isStartRole: true } };
+    // The old fallback was `agent:${agentKey(agent)}`, with a comment claiming
+    // it was "unique to itself". It was not: this string is a socket path and a
+    // daemon-minted agent id, both knowable, and an orchestration reporting it
+    // as its EXPLICIT id landed in the same map entry — one card, one title,
+    // colliding role indexes and a misleading count.
+    const groups = groupAgents([
+      anonymous,
+      { ...seed, id: "2", displayName: "impostor", tab: { kind: "orchestration", orchestrationId: `agent:${agentKey(anonymous)}`, name: "beta", roleName: "writer", roleIndex: 0, isStartRole: true } },
+    ]);
+
+    expect(groups).toHaveLength(2);
+    expect(groups.map((group) => group.agents.map((agent) => agent.displayName))).toEqual([["no-id"], ["impostor"]]);
+    expect(new Set(groups.map((group) => group.key)).size).toBe(2);
+  });
+
+  it("keys an id-less orchestration outside the space any explicit id can reach", () => {
+    const [seed] = crowded();
+    const anonymous: OverviewAgent = { ...seed, id: "1", tab: { kind: "orchestration", name: "alpha", roleName: "writer", roleIndex: 0, isStartRole: true } };
+    const [group] = groupAgents([anonymous]);
+
+    // The disjointness proof, rather than a sample of strings that happen not
+    // to collide: an explicit key always begins `orchestration:` because
+    // `encodeURIComponent` cannot produce that separator, and the anonymous key
+    // never does.
+    for (const id of ["orc-745", `agent:${agentKey(anonymous)}`, "orchestration-anonymous:x", ""]) {
+      expect(groupKey("orchestration", id).startsWith("orchestration:")).toBe(true);
+    }
+    expect(group?.key).toBe(anonymousOrchestrationKey(anonymous));
+    expect(group?.key.startsWith("orchestration:")).toBe(false);
+    // And no daemon-side id is invented: there is none to carry.
+    expect(group?.id).toBeUndefined();
   });
 
   /**

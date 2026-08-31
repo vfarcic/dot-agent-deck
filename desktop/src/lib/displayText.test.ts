@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { clampText, DISPLAY_LIMITS, displayPath, displayText, homeRelative, sanitizeText, shortDaemonLabel } from "./displayText";
+import { clampText, DISPLAY_LIMITS, displayIdentity, displayPath, displayText, domIdentity, homeRelative, rendersBlank, sanitizeText, shortDaemonLabel } from "./displayText";
 
 /**
  * Every bidi formatting and override codepoint the Rust policy names
@@ -97,5 +97,80 @@ describe("shortDaemonLabel", () => {
   it("falls back to the whole value when there is no segment to take", () => {
     expect(shortDaemonLabel("dot-agent-deck.sock")).toBe("dot-agent-deck.sock");
     expect(shortDaemonLabel("/")).toBe("/");
+  });
+});
+
+/**
+ * Characters that survive the sanitiser and render as nothing. Retaining them
+ * is a recorded decision — they are load-bearing in emoji sequences and in
+ * several scripts — so the blank-identity spoof they enable is closed by a
+ * visible fallback rather than by stripping one more codepoint.
+ */
+const INVISIBLE_CODEPOINTS = ["\u200b", "\u200c", "\u200d", "\u2060", "\ufeff", "\u00ad", "\ufe0f"];
+
+/** A ZWJ emoji sequence and a Persian ZWNJ word: invisible characters doing real work. */
+const JOINED_EMOJI = "\u{1f468}\u200d\u{1f4bb}";
+const ZWNJ_WORD = "mi\u200cana";
+
+describe("rendersBlank", () => {
+  it("calls a value blank when nothing in it would be visible", () => {
+    expect(rendersBlank("")).toBe(true);
+    expect(rendersBlank("   ")).toBe(true);
+    for (const codepoint of INVISIBLE_CODEPOINTS) {
+      const name = `U+${codepoint.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`;
+      expect(rendersBlank(codepoint.repeat(4)), `${name} was not recognised as invisible`).toBe(true);
+    }
+    expect(rendersBlank(INVISIBLE_CODEPOINTS.join(""))).toBe(true);
+  });
+
+  it("calls anything with one visible character not blank, however much padding surrounds it", () => {
+    expect(rendersBlank("a")).toBe(false);
+    expect(rendersBlank("\u200b\u200b.\u200b")).toBe(false);
+    expect(rendersBlank(JOINED_EMOJI)).toBe(false);
+    expect(rendersBlank(ZWNJ_WORD)).toBe(false);
+  });
+});
+
+describe("displayIdentity", () => {
+  it("substitutes the fallback for a name that would render as an empty cell", () => {
+    expect(displayIdentity("\u200b\u200c\u200d\ufeff", DISPLAY_LIMITS.name, "unnamed agent 7")).toBe("unnamed agent 7");
+    expect(displayIdentity("", DISPLAY_LIMITS.name, "unnamed agent 7")).toBe("unnamed agent 7");
+    // A name left invisible by the sanitiser rather than born that way counts too.
+    expect(displayIdentity("\u202e", DISPLAY_LIMITS.name, "unnamed agent 7")).toBe("unnamed agent 7");
+  });
+
+  it("judges blankness before the clamp, so an elision marker cannot rescue an invisible name", () => {
+    // `clampText` appends a visible `…`, so a long invisible name would test as
+    // visible if blankness were judged on the clamped copy.
+    expect(displayIdentity("\u200b".repeat(600), DISPLAY_LIMITS.name, "unnamed agent 7")).toBe("unnamed agent 7");
+  });
+
+  it("leaves a name that renders anything at all alone, ZWJ sequences included", () => {
+    expect(displayIdentity("coder", DISPLAY_LIMITS.name, "unnamed agent 7")).toBe("coder");
+    expect(displayIdentity(`team ${JOINED_EMOJI}`, DISPLAY_LIMITS.name, "x")).toBe(`team ${JOINED_EMOJI}`);
+    expect(displayIdentity(ZWNJ_WORD, DISPLAY_LIMITS.name, "x")).toBe(ZWNJ_WORD);
+  });
+});
+
+describe("domIdentity", () => {
+  it("passes anything a healthy daemon reports through byte for byte", () => {
+    expect(domIdentity("orchestration:orc-745")).toBe("orchestration:orc-745");
+    expect(domIdentity("%2Ftmp%2Fdot-agent-deck.sock:12")).toBe("%2Ftmp%2Fdot-agent-deck.sock:12");
+  });
+
+  it("bounds a value the daemon left unbounded", () => {
+    const bounded = domIdentity(`orchestration:${"x".repeat(50_000)}`);
+    expect(Array.from(bounded).length).toBeLessThanOrEqual(DISPLAY_LIMITS.domIdentity + 8);
+    expect(bounded.startsWith("orchestration:")).toBe(true);
+  });
+
+  it("keeps two over-long identities that share a prefix apart", () => {
+    const prefix = "x".repeat(500);
+    expect(domIdentity(`${prefix}a`)).not.toBe(domIdentity(`${prefix}b`));
+  });
+
+  it("strips control and bidi characters, which have no business in a DOM attribute", () => {
+    expect(domIdentity("/tmp/de\u202eck.sock")).toBe("/tmp/deck.sock");
+    expect(domIdentity("/tmp/de\nck.sock")).toBe("/tmp/deck.sock");
   });
 });

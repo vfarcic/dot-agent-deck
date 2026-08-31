@@ -44,8 +44,13 @@
  * data; and widening the policy beyond the Rust one would make the TUI and the
  * desktop disagree about the same daemon string, which is the divergence
  * `untrusted_text.rs` was written to end. The residual — a name made entirely
- * of invisible characters rendering as a blank cell — is bounded by the length
- * clamps below and by the row still carrying status, CLI and tool columns.
+ * of invisible characters rendering as a blank cell — is closed by
+ * `displayIdentity` below, which substitutes a visible label rather than by
+ * stripping one more character. It was previously recorded as bounded by "the
+ * row still carrying status, CLI and tool columns", which is false: CSS hides
+ * the CLI and working-directory columns below 1180px and the tool columns
+ * below 680px, so a narrow window leaves two same-status rows with nothing to
+ * tell them apart.
  */
 const UNSAFE_DISPLAY_CHARS = /[\u0000-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
 
@@ -78,6 +83,16 @@ export const DISPLAY_LIMITS = {
   title: 512,
   /** The daemon's own connection message. */
   message: 240,
+  /**
+   * Identity values that reach a DOM attribute, an IDREF or a React key —
+   * `domIdentity` is the seam. Generous next to the others because these are
+   * percent-encoded composites (`<kind>:<encoded id>`, `<encoded daemonId>:<encoded
+   * agentId>`) and encoding can triple a path: a real socket path plus an agent
+   * id lands around 60 characters, so nothing a healthy daemon reports is ever
+   * clamped here. It exists for the malformed case, where the only bound today
+   * is the 16 MiB protocol frame.
+   */
+  domIdentity: 160,
 } as const;
 
 /** Drop every control and bidi character. Nothing else is touched. */
@@ -141,4 +156,87 @@ export function shortDaemonLabel(socketPath: string): string {
   const trimmed = clean.replace(/[\\/]+$/, "");
   const base = trimmed.slice(Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\")) + 1);
   return clampText(base || clean, DISPLAY_LIMITS.name);
+}
+
+/**
+ * Characters that occupy no visual space when rendered: Unicode whitespace, the
+ * default-ignorable format characters `UNSAFE_DISPLAY_CHARS` deliberately KEEPS
+ * (`U+200B` ZWSP, `U+200C` ZWNJ, `U+200D` ZWJ, `U+2060` WJ, `U+FEFF`), the
+ * variation selectors and the tag block.
+ *
+ * This set is deliberately WIDER than the stripped set, and that is not a
+ * divergence from `src/untrusted_text.rs`: nothing here is removed from what
+ * renders. It only answers "would a reader see anything?", so a character can
+ * be listed as invisible AND still be rendered verbatim — which is exactly what
+ * a ZWJ emoji sequence needs. Widening the *stripped* set is the thing that
+ * would corrupt real names and make the TUI and the desktop disagree.
+ */
+const INVISIBLE_ONLY =
+  /^[\s\u00AD\u034F\u115F\u1160\u17B4\u17B5\u180B-\u180E\u200B-\u200F\u2060-\u206F\u3164\uFE00-\uFE0F\uFEFF\uFFA0\u{E0000}-\u{E0FFF}]*$/u;
+
+/**
+ * True when `value` renders as nothing a reader can see — empty, whitespace, or
+ * made entirely of invisible characters. A string containing ONE visible
+ * character is not blank however much invisible padding surrounds it.
+ */
+export function rendersBlank(value: string): boolean {
+  return INVISIBLE_ONLY.test(value);
+}
+
+/**
+ * The display copy of an IDENTITY string — a display name, a group title —
+ * falling back to `fallback` when the daemon's value renders as nothing at all.
+ *
+ * A name made entirely of retained default-ignorable characters is a spoofing
+ * primitive on a screen whose whole purpose is telling one agent from another:
+ * it renders as a blank cell, and two names differing only by such a character
+ * render identically. The row's other columns do NOT rescue it — CSS hides CLI
+ * and working directory below 1180px and the tool columns below 680px, so a
+ * narrow window can leave two same-status rows genuinely indistinguishable.
+ *
+ * The fix is a visible fallback rather than a wider filter: stripping ZWJ and
+ * ZWNJ would corrupt emoji sequences and Persian, Arabic and Indic
+ * orthography, and would put this module out of step with the Rust policy it
+ * mirrors. Blankness is judged BEFORE the clamp, so a long invisible name is
+ * not rescued into "visible" by the elision marker the clamp appends.
+ */
+export function displayIdentity(value: string, max: number, fallback: string): string {
+  const clean = sanitizeText(value);
+  return rendersBlank(clean) ? fallback : clampText(clean, max);
+}
+
+/**
+ * A 32-bit FNV-1a digest, base 36. Not a security primitive and not required to
+ * be one: its only job is to keep two over-long identities that share a prefix
+ * from collapsing onto one DOM id once they are clamped. Where a hostile daemon
+ * forces a collision it costs a duplicate `data-testid` on a screen already
+ * being lied to; leaving the identities unbounded costs the webview.
+ */
+function digest(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+/**
+ * The bounded copy of an identity that reaches a DOM attribute, an IDREF or a
+ * React key.
+ *
+ * `DesktopAgentDto.id` and `daemonId` carry no frontend validation and no
+ * clamp — they are bounded only by the 16 MiB protocol frame, and
+ * `encodeURIComponent` expands them by up to three — so a malformed daemon
+ * could make React allocate and reconcile enormous keys and attributes on every
+ * snapshot and freeze the webview. Grouping and the composite `(daemonId,
+ * agentId)` identity keep the RAW values, exactly as before; only the copies
+ * that reach React are bounded here, so nothing this does can merge two agents
+ * or two groups. Over-budget values keep a digest of the whole original, so two
+ * identities sharing a prefix stay two DOM ids.
+ */
+export function domIdentity(value: string, max: number = DISPLAY_LIMITS.domIdentity): string {
+  const clean = sanitizeText(value);
+  const chars = Array.from(clean);
+  return chars.length <= max ? clean : `${chars.slice(0, max).join("")}~${digest(value)}`;
 }
