@@ -38,7 +38,7 @@ dot-agent-deck remote remove my-vm         # forget the registry entry (host unt
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--type` | `ssh` | Only `ssh` is implemented today; `kubernetes` is planned in [PRD #81](https://github.com/vfarcic/dot-agent-deck/issues/81). |
+| `--type` | `ssh` | Only `ssh` is implemented today; `kubernetes` is planned — see [issue #81](https://github.com/vfarcic/dot-agent-deck/issues/81). |
 | `--port` | `22` | ssh port. |
 | `--key` | _none_ | Path to an ssh identity file. Forwarded to ssh as `-i`. Omit to use ssh's default key search. |
 | `--version` | client version | Daemon binary version to install on the remote. Usually leave unset. |
@@ -82,8 +82,8 @@ Two distinct user actions; very different consequences.
 
 | Action | What happens | When to use |
 |---|---|---|
-| **Stop** (`Ctrl+W` from command mode, then **Close**) | Sends `StopAgent` to the daemon over the local-on-remote socket; the daemon kills the PTY and removes the agent from the registry. If the daemon reports the agent is already gone, the card is removed anyway rather than wedging on an error you can never clear. | You're done with the agent; want it gone. |
-| **Detach** (Ctrl+C in dashboard, then "Detach" in the dialog) | The TUI sends an explicit `KIND_DETACH` frame to the daemon on its Unix socket, then exits. The daemon records a clean detach and keeps the agents running. The ssh session ends when the TUI exits. | You want to step away and come back later, and want the daemon's logs to show a voluntary detach. |
+| **Stop** (`Ctrl+W` from command mode, then **Close**) | Stops the agent on the remote and removes its card. If the agent had already exited, the card is removed anyway rather than wedging on an error you can never clear. | You're done with the agent; want it gone. |
+| **Detach** (Ctrl+C in dashboard, then "Detach" in the dialog) | The TUI tells the daemon you are leaving deliberately, then exits. The daemon records a clean detach and keeps the agents running. The ssh session ends when the TUI exits. | You want to step away and come back later, and want the daemon's logs to show a voluntary detach. |
 | **Quit** (Ctrl+C in dashboard, then "Quit") | The TUI exits without sending a detach frame. The daemon observes EOF on its socket and treats it the same as detach — agents stay alive. The ssh session ends when the TUI exits. | You're done for the day; don't need the explicit signal. |
 | **Sleep / network drop** (no action) | SSH keepalive detects the dead connection within ~45s and ssh exits; `connect` then re-probes and **reconnects automatically** to the still-running agents, so the session resumes in place. The daemon and agents never stopped. See [Surviving sleep/wake](#surviving-sleepwake). | Implicit; happens automatically when the laptop sleeps or the network drops. |
 
@@ -99,9 +99,9 @@ Quit and Detach both leave agents running. The only difference is that Detach se
 
 ## Reattaching
 
-Run `connect` again. That re-runs `ssh -t` to the remote, which launches a fresh TUI; the TUI calls `list_agents` on the still-running daemon and hydrates one pane per agent (each `AgentRecord` carries the agent's `display_name` and `cwd`, so the dashboard looks the way you left it). Each pane then attaches to the daemon's per-agent stream, and the daemon replays its scrollback snapshot as the first bytes of the new attach so you can see what was happening while you were gone.
+Run `connect` again. That re-runs `ssh -t` to the remote and launches a fresh TUI, which asks the still-running daemon what is going on and rebuilds one pane per agent — with the names and working directories you left, so the dashboard looks the way you remember it. Each pane then replays what the agent printed while you were away, so you can see what happened in your absence.
 
-Per-agent scrollback is a 1 MiB ring buffer (`SCROLLBACK_CAP_BYTES` in `src/agent_pty.rs`): if an agent produced more than 1 MiB since you last attached, the oldest bytes are evicted. This is not a feature ceiling — long-running agent transcripts are best read from the agent's own log file, not the deck's scrollback buffer.
+Each agent's replay buffer holds 1 MiB: if an agent produced more than that since you last attached, the oldest output is dropped. This is not a feature ceiling — long-running agent transcripts are best read from the agent's own log file, not the deck's scrollback buffer.
 
 ## Surviving sleep/wake
 
@@ -173,7 +173,7 @@ SSH forwarding failed for remote 'my-vm': remote port forwarding failed for list
 The remote port may already be bound, or `AllowTcpForwarding` may be disabled on the remote. Run `dot-agent-deck remote doctor my-vm` to distinguish the cause.
 ```
 
-Both causes produce the *same* bytes from ssh, so the client genuinely cannot tell them apart and the message does not pretend to. `remote doctor` reads the remote's own sshd policy and the live bind state, which is what separates them. Before [issue #344](https://github.com/vfarcic/dot-agent-deck/issues/344) this was reported as a host-unreachable failure, which sent people to debug a network path that was never broken.
+Both causes produce the *same* bytes from ssh, so the client genuinely cannot tell them apart and the message does not pretend to. `remote doctor` reads the remote's own sshd policy and the live bind state, which is what separates them.
 
 ### Remote binary missing
 
@@ -234,7 +234,7 @@ It is two steps and a second terminal, which is worse than pasting. It works on 
 
 ## Limitations in v1
 
-- **One transport.** v1 ships ssh only. The daemon protocol is transport-agnostic and a Kubernetes transport is being designed in [PRD #81](https://github.com/vfarcic/dot-agent-deck/issues/81).
+- **One transport.** v1 ships ssh only. A Kubernetes transport is being designed — see [issue #81](https://github.com/vfarcic/dot-agent-deck/issues/81).
 - **No multi-user host isolation.** A remote is assumed to be a single user's host. Sharing one host between multiple unrelated users (each with their own credentials) is not supported in v1.
 - **No bidirectional file sync.** Project files live on the remote; sync via git. The deck does not bundle mutagen/syncthing/sshfs. Moving a one-off file across — a screenshot you want an agent to look at, say — is covered in [Getting files to the remote](#getting-files-to-the-remote).
 - **No laptop-to-remote clipboard or file transfer.** Pasting an image into an agent pane over ssh does not work, and there is no built-in transfer command. Copy the file over with `scp` and reference its path.

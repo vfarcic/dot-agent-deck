@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "desktop/src-tauri",
     "xtask/docs",
     "xtask/linkage-check",
     "xtask/spec",

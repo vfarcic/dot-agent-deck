@@ -1065,6 +1065,7 @@ fn wrap_child_group_backstop_reaps_a_child_stranded_by_a_sigkilled_wrapper() {
 /// descriptor hangs up together when the last master closes — but it is a
 /// read/write terminal capability that outlives the child closing or
 /// redirecting its standard streams, so it is not the child's to keep either.
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct InheritedMasterFds {
     path: &'static str,

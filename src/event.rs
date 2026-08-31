@@ -1085,6 +1085,25 @@ pub enum BroadcastMsg {
     /// [`crate::daemon_protocol::PROTOCOL_VERSION`].
     #[serde(rename = "orchestration_surface")]
     OrchestrationSurface(OrchestrationSurface),
+    /// Issue #717: a dispatched worktree that a tab close LEFT ON DISK, pushed
+    /// to attached TUIs so the user is told their uncommitted work was saved
+    /// and where.
+    ///
+    /// This is the authoritative half of the report, and it has to travel as a
+    /// broadcast because of WHEN it is decided: the cleanup runs detached, after
+    /// `close_agent` reaped the agent and after the pane and its card were
+    /// destroyed. There is no card left to put it on — which is exactly why
+    /// issue #424's `DeliveryNotice` cannot carry it (its pane-ownership guard
+    /// drops a report for an agent that no longer owns the pane) — and no
+    /// request left to answer, since the close was acknowledged long before the
+    /// `git status` finished.
+    ///
+    /// Adding this variant changes the `KIND_EVENT` payload schema, the same
+    /// class of change as `OrchestrationSurface` above, so it rides the same
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`] bump as the request variant
+    /// it ships with.
+    #[serde(rename = "worktree_kept")]
+    WorktreeKept(crate::issue_dispatch_run::KeptWorktree),
 }
 
 /// PRD #120: the structural membership of a daemon-spawned orchestration,

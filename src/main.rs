@@ -1694,6 +1694,13 @@ fn spawn_event_subscriber(
                             Ok(Some(BroadcastMsg::OrchestrationSurface(surface))) => {
                                 state.write().await.queue_orchestration_surface(surface);
                             }
+                            // Issue #717: a close left a dispatched worktree on
+                            // disk. Queue it for the render loop for the same
+                            // reason as the surface above — the status line is
+                            // `UiState`, which this task cannot touch.
+                            Ok(Some(BroadcastMsg::WorktreeKept(kept))) => {
+                                state.write().await.queue_worktree_kept(kept);
+                            }
                             Ok(None) => break,
                             Err(e) => {
                                 tracing::warn!(

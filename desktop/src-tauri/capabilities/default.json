@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core permissions for the local dot-agent-deck desktop window",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
+

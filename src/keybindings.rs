@@ -64,6 +64,11 @@ pub enum Action {
     /// the default 34/66 ratio and a narrower-sidebar 25/75. Global across
     /// orchestration tabs, though only pressable from one.
     ToggleOrchestrationSplit,
+    /// PRD #313: zoom the focused role pane to the whole frame, hiding the
+    /// orchestration sidebar. Per-tab and claimed only on an Orchestration tab
+    /// in command mode (see `scope_zoom`) — the default binding is a plain
+    /// `z`, so off that one combination the character belongs to the agent.
+    ToggleZoom,
     Jump1,
     Jump2,
     Jump3,
@@ -110,7 +115,10 @@ pub struct ActionSpec {
 /// `src/ui.rs` as of this branch:
 /// - global Ctrl+ shortcuts: `Ctrl+d` (dashboard/command mode), `Ctrl+n`
 ///   (new pane), `Ctrl+w` (close pane), `Ctrl+t` (toggle layout), `Ctrl+l`
-///   (toggle orchestration split); `1`..`9` jump to a card. (Quit is
+///   (toggle orchestration split), `Ctrl+z` (PRD #313: zoom the focused pane);
+///   `1`..`9` jump to a card. `Ctrl+z` is claimed ONLY in command mode, so in a
+///   pane it still reaches the agent as `0x1a` job control — the same
+///   command-mode-only narrowing `Ctrl+l` and `Ctrl+w` already use. (Quit is
 ///   deliberately absent — `Ctrl+C` is a hardcoded, non-overridable modal
 ///   trigger, not a remappable action.)
 /// - dashboard Normal-mode keys: `j`/`k`/`h`/`l`, `/`, `r`, `?`, `Enter`,
@@ -158,6 +166,13 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "toggle_orchestration_split",
         default: "Ctrl+l",
         description: "Toggle orchestration split",
+    },
+    ActionSpec {
+        action: Action::ToggleZoom,
+        section: Section::Global,
+        name: "toggle_zoom",
+        default: "Ctrl+z",
+        description: "Zoom focused pane",
     },
     ActionSpec {
         action: Action::Jump1,
@@ -1521,8 +1536,13 @@ toggle_layout = "Banana"
             c.action_for(&ev(KeyCode::Char('n'), KeyModifiers::CONTROL)),
             Some(Action::NewPane)
         );
+        // An UNBOUND chord resolves to nothing. This used to use `Ctrl+z`,
+        // which PRD #313 claimed for `toggle_zoom`; `Ctrl+q` is the stand-in
+        // because no `ActionSpec` names it. If a future PRD binds it, swap in
+        // another free chord rather than deleting the case — the point is that
+        // `action_for` reports `None` rather than a nearest match.
         assert_eq!(
-            c.action_for(&ev(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+            c.action_for(&ev(KeyCode::Char('q'), KeyModifiers::CONTROL)),
             None
         );
     }

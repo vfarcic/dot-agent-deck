@@ -1,10 +1,12 @@
 # PRD #176: Desktop GUI app — alternative front-end to the TUI
 
-**Status**: Not Started
+**Status**: In Progress
 **Priority**: Medium
 **Created**: 2026-06-20
 **GitHub Issue**: [#176](https://github.com/vfarcic/dot-agent-deck/issues/176)
 **Related**: PRD #93 (always-external daemon — the daemon is the single source of truth this whole design depends on), PRD #76 (attach protocol / length-prefixed frames — the wire the GUI consumes), PRD #126 (agent-driven notifications — the daemon-side signal the GUI surfaces as OS-native notifications), PRD #174 (cross-project orchestration dispatch — the relationships the agents-graph must render and the source of the new structured events it needs), PRD #139 (the `experimental` feature flag — explained as N/A here, see Design Decisions)
+
+**Implementation note (2026-08-07)**: The M0/M1 spike directly reuses the root `dot-agent-deck` library before protocol extraction and adds a deterministic fixture plus a thin Tauri daemon/terminal bridge. Protocol extraction, the structured communication graph, and OS-native notifications remain pending.
 
 ## Problem Statement
 
@@ -80,6 +82,7 @@ It does not re-implement the TUI's rendering, does not hold orchestration logic,
 - **1:1 implementation parity.** Only conceptual parity for shared concepts plus net-new GUI-only views. Feature-by-feature mirroring is an explicit non-goal (it is the thing that makes a second front-end a permanent tax).
 - **Non-terminal agent panes / re-rendering agent output as structured GUI.** Panes stay terminals; the agent-interaction surface is intentionally frozen at terminal fidelity for v1.
 - **Mobile/web-hosted (browser) build.** Tauri desktop only for v1; a browser-served variant is a deferred follow-up.
+- **Remote daemons — local only, for now.** Every milestone here assumes the daemon is on the same machine as the GUI. That assumption was never stated and is worth stating: `dot-agent-deck` is routinely used against a remote daemon, and this PRD quietly assigns that case to the TUI (see "does not aim to be runnable over SSH/tmux" above). The transport itself is not the obstacle — a `ssh -L` Unix-socket forward plus `DOT_AGENT_DECK_ATTACH_SOCKET` was measured working end to end, listing a remote deck's agents, streaming their PTYs and their live hook events into the window. What does not cross is **project resolution**: the desktop reads `.dot-agent-deck.toml` and writes the coordinator context on the machine running the GUI, so a remote workflow launch validates against the wrong filesystem and delivers context an agent never sees. That is the same laptop-side-state failure PRD #76 diagnosed and deleted its ssh socket bridge to escape (#76 M2.7). Making remote whole means moving project resolution behind the daemon, which is a protocol change and is tracked separately rather than smuggled in here.
 - **Native code-signing/notarization/auto-update pipeline.** Out for v1 (opt-in local build); revisit if/when the GUI graduates to public distribution.
 - **The `experimental` feature flag (PRD #139).** N/A by construction — see Design Decisions #6. A separate opt-in binary is inherently the opt-in; there is no TUI render/input seam to gate, so no `features.rs` wrapper and no `graduate-` follow-up issue.
 
@@ -135,7 +138,7 @@ It does not re-implement the TUI's rendering, does not hold orchestration logic,
 
 ### Phase 5 — Packaging, tests, docs & release gate
 
-- [ ] **M5.1** — Opt-in packaging: a separate build target/artifact, excluded from the default release, labeled preview/opt-in.
+- [ ] **M5.1** — Preview packaging: bundles published on **every** release as clearly-labelled unsigned alpha assets, wired so they can neither delay nor break the CLI release ([#740](https://github.com/vfarcic/dot-agent-deck/issues/740)). This wording replaces "a separate build target/artifact, excluded from the default release". That phrasing was the *mechanism* reached for before anyone had looked at the release job graph; the two properties it was protecting are that the GUI is labelled preview and that it cannot compromise the CLI release. #740's topology delivers both without excluding anything — `desktop-bundle` hangs off `prepare` rather than `build`, and `finalize` does not list it in `needs:`, so a bundler that fails cannot delay a tag or block one. An opt-in trigger was rejected deliberately: something a human must remember to fire gets fired for two releases and then never, which is how an alpha artifact ends up six versions stale and worse than none.
 - [ ] **M5.2** — Tests: `protocol`-crate and core bridge/handshake (Rust); lightweight web component/e2e for chrome + one terminal round-trip; daemon event-emission coverage.
 - [ ] **M5.3** — Docs: developer build/run + toolchain doc under `docs/develop/` (linked from `CONTRIBUTING.md`); user doc once past spike quality; changelog fragment via `dot-ai-changelog-fragment`.
 - [ ] **M5.4** — Pre-PR gate: `cargo test-e2e` green; review (Greptile) settled per CLAUDE.md rule 8.

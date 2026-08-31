@@ -1,0 +1,9 @@
+{
+  "build": {
+    "beforeBuildCommand": "npm run build && npm run sidecar:prepare"
+  },
+  "bundle": {
+    "active": true,
+    "externalBin": ["binaries/dot-agent-deck"]
+  }
+}

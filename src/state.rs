@@ -1033,6 +1033,14 @@ pub struct AppState {
     /// Empty in the common case; bounded by `MAX_PENDING_ORCHESTRATION_SURFACES`
     /// (L1) so a flood can't grow it unbounded.
     pub pending_orchestration_surfaces: Vec<OrchestrationSurface>,
+    /// Issue #717: dispatched worktrees a close LEFT ON DISK, waiting to be
+    /// reported on the status line. Filled by the event subscriber (which has no
+    /// `UiState`) from [`crate::event::BroadcastMsg::WorktreeKept`] and drained
+    /// by the render loop. Only the LAST one is kept — the status line shows one
+    /// message, so an older keep would only ever be overwritten unseen, and
+    /// holding a queue of them would invite the unbounded growth
+    /// `pending_orchestration_surfaces` needs a cap for.
+    pub pending_worktree_kept: Option<crate::issue_dispatch_run::KeptWorktree>,
     /// PRD #20 R20-003 (finding #4): the DAEMON-AUTHORITATIVE hook session id
     /// (the "generation") currently bound to each pane, keyed by `pane_id`.
     /// Captured from every event's ORIGINAL `session_id` BEFORE the same-agent
@@ -2543,7 +2551,12 @@ async fn wait_for_worker_event(
                     return true;
                 }
             }
-            Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
+            // Issue #717: neither variant is evidence about this pane.
+            // Grouped rather than wildcarded so a future variant still
+            // fails this match and gets considered on its merits.
+            Ok(Ok(BroadcastMsg::OrchestrationSurface(_) | BroadcastMsg::WorktreeKept(_))) => {
+                continue;
+            }
             Ok(Err(broadcast::error::RecvError::Lagged(dropped))) => {
                 warn!(
                     pane_id = %pane_id,
@@ -3451,7 +3464,12 @@ pub(crate) async fn wait_for_session_start(
                 }
             }
             // PRD #120: not a hook event — keep waiting for the SessionStart.
-            Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
+            // Issue #717: neither variant is evidence about this pane.
+            // Grouped rather than wildcarded so a future variant still
+            // fails this match and gets considered on its merits.
+            Ok(Ok(BroadcastMsg::OrchestrationSurface(_) | BroadcastMsg::WorktreeKept(_))) => {
+                continue;
+            }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
             // Issue #243: `Err(_)` is `Elapsed` — the ordinary end of this
             // window, and the arm a provisional weak fact has to be resolved on
@@ -3736,7 +3754,12 @@ pub(crate) async fn wait_for_prompt_submission(
                     }
                 }
             }
-            Ok(Ok(BroadcastMsg::OrchestrationSurface(_))) => continue,
+            // Issue #717: neither variant is evidence about this pane.
+            // Grouped rather than wildcarded so a future variant still
+            // fails this match and gets considered on its merits.
+            Ok(Ok(BroadcastMsg::OrchestrationSurface(_) | BroadcastMsg::WorktreeKept(_))) => {
+                continue;
+            }
             Ok(Err(broadcast::error::RecvError::Lagged(_))) => return PromptWatch::Indeterminate,
             Ok(Err(broadcast::error::RecvError::Closed)) => return PromptWatch::Closed,
             Err(_) => {
@@ -5607,6 +5630,18 @@ impl AppState {
             );
         }
         self.pending_orchestration_surfaces.push(surface);
+    }
+
+    /// Issue #717: record a worktree a close left on disk, for the render loop
+    /// to put on the status line. Last-writer-wins for the reason in the
+    /// field's docs.
+    pub fn queue_worktree_kept(&mut self, kept: crate::issue_dispatch_run::KeptWorktree) {
+        self.pending_worktree_kept = Some(kept);
+    }
+
+    /// Issue #717: take the pending kept-worktree report, if any.
+    pub fn take_worktree_kept(&mut self) -> Option<crate::issue_dispatch_run::KeptWorktree> {
+        self.pending_worktree_kept.take()
     }
 
     /// Create a placeholder session for a newly created pane so it always

@@ -69,6 +69,129 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// legitimately slow run.
 pub const WRAP_TEST_MAX_LIFETIME_SECS: &str = "120";
 
+/// Issue #709: the base ceiling on a wait for a freshly spawned child's FIRST
+/// OUTPUT, before [`load_scaled`] widens it for a contended machine.
+///
+/// This bounds a BOOT, not a behaviour. Nothing a test asserts is derived from
+/// it — the waits it feeds return the instant their condition holds, so on an
+/// idle box a `sh` stand-in satisfies them in single-digit milliseconds and this
+/// number is never reached. It exists so that "the child has not been scheduled
+/// yet" cannot be mistaken for "the child produced the wrong thing", which is
+/// precisely what a 2 s ceiling did on a 16-core box at load average 44.
+pub const CHILD_BOOT_BASE: Duration = Duration::from_secs(8);
+
+/// Issue #709: the 1-minute load average per CPU, or `None` where this platform
+/// does not publish one cheaply.
+///
+/// Linux only, deliberately. `getloadavg(3)` exists on macOS but is not exposed
+/// by the `libc` crate for either `linux-gnu` or `apple` targets, and shelling
+/// out to `sysctl` from a test helper buys a process spawn on every wait to
+/// refine a number that is only ever used to make a ceiling MORE generous.
+/// Elsewhere the answer is `None` and [`load_scaled`] applies the full
+/// multiplier, which is the safe direction: a wider ceiling on a machine whose
+/// contention cannot be measured, paid only when a child is genuinely slow.
+pub fn machine_load_per_cpu() -> Option<f64> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let raw = std::fs::read_to_string("/proc/loadavg").ok()?;
+    let one_minute: f64 = raw.split_whitespace().next()?.parse().ok()?;
+    let cpus = std::thread::available_parallelism().ok()?.get() as f64;
+    if !one_minute.is_finite() || cpus <= 0.0 {
+        return None;
+    }
+    Some(one_minute / cpus)
+}
+
+/// Issue #709: the largest factor [`load_scaled`] will multiply a base ceiling
+/// by, and therefore the ceiling on how long a starved child is waited for.
+///
+/// Six rather than "whatever the load average says": the mapping from load to
+/// scheduling delay is not linear and an unbounded multiplier would let a
+/// runaway load average turn a genuinely hung child into a test that runs until
+/// nextest's own `terminate-after` kill (3 x 60 s by default), which costs the
+/// assertion's diagnostics — the thing every widened wait here exists to
+/// preserve. At the measured failure's load (44 on 16 cores = 2.75) this yields
+/// 22 s against the 2 s that failed; the cap only binds past 6.0.
+const MAX_LOAD_FACTOR: f64 = 6.0;
+
+/// Issue #709: widen a wait ceiling in proportion to how contended the machine
+/// is, so a fast box still fails fast and a loaded one still passes.
+///
+/// Apply this ONLY to a ceiling on something that must HAPPEN, never to a
+/// negative window in which something must NOT happen: the waits it feeds return
+/// the moment their condition holds, so a wider ceiling is free on the happy
+/// path and is paid only where the alternative was a wrong verdict. A negative
+/// window is the opposite — it is always paid in full, and its length is part of
+/// what the test asserts.
+pub fn load_scaled(base: Duration) -> Duration {
+    let factor = machine_load_per_cpu()
+        .unwrap_or(MAX_LOAD_FACTOR)
+        .clamp(1.0, MAX_LOAD_FACTOR);
+    base.mul_f64(factor)
+}
+
+/// Issue #709: [`load_scaled`] applied to [`CHILD_BOOT_BASE`] — the ceiling a
+/// fast-tier test gives a freshly spawned child to produce its first byte.
+pub fn child_boot_budget() -> Duration {
+    load_scaled(CHILD_BOOT_BASE)
+}
+
+/// Issue #709: how long after a child stops being live its output is still
+/// waited for, so a stand-in that printed and then died is not reported as one
+/// that printed nothing.
+///
+/// The bytes a child writes on its way out reach the snapshot through the
+/// detached `pump_reader` OS thread, which is not synchronised with the exit
+/// bookkeeping `agent_is_live` reads — so "no longer live" is a reason to stop
+/// waiting for MORE output, never a reason to trust the snapshot in hand.
+const POST_EXIT_DRAIN: Duration = Duration::from_millis(250);
+
+/// Issue #709: wait for a FRESHLY SPAWNED child's FIRST OUTPUT, returning the
+/// snapshot either way so the caller still asserts on (and prints) it.
+///
+/// The three fast-tier waits this replaces were already condition-driven — they
+/// returned the instant the needle landed — and still failed on a 16-core box at
+/// load average 44, because their ceiling was a flat 2 s or 5 s sized for an idle
+/// machine. The child had not been scheduled at all, so the assertion underneath
+/// reported an EMPTY snapshot and read exactly like a delivery defect. Both ends
+/// of that are fixed here, and neither weakens what the caller asserts:
+///
+/// * the ceiling is [`child_boot_budget`], scaled by how contended the machine
+///   actually is, so an idle box keeps its prompt failure and a loaded one buys
+///   patience it alone pays for; and
+/// * the wait ends early once the child is no longer live, so the failure a
+///   generous ceiling might otherwise have slowed — a stand-in that DIED rather
+///   than printed — still fails about as fast as it did against 2 s.
+///
+/// Use it only for the boot leg. A wait on a BEHAVIOUR the daemon must perform
+/// belongs on that behaviour's own budget, and a negative window in which
+/// something must not happen must not be widened at all — its length is part of
+/// what the test asserts.
+#[allow(dead_code)]
+pub async fn wait_for_child_first_output(
+    registry: &dot_agent_deck::agent_pty::AgentPtyRegistry,
+    agent_id: &str,
+    needle: &[u8],
+) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + child_boot_budget();
+    let mut drain_deadline: Option<tokio::time::Instant> = None;
+    loop {
+        let snapshot = registry.snapshot(agent_id).unwrap_or_default();
+        if snapshot.windows(needle.len()).any(|w| w == needle) {
+            return snapshot;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline || drain_deadline.is_some_and(|drained| now >= drained) {
+            return snapshot;
+        }
+        if drain_deadline.is_none() && !registry.agent_is_live(agent_id) {
+            drain_deadline = Some(now + POST_EXIT_DRAIN);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Decision 20: pinned PTY dimensions for the deck. Resize tests
 /// override via `TuiDeck::resize`.
 const DEFAULT_COLS: u16 = 120;
@@ -2003,12 +2126,14 @@ pub fn joined_rows(buffer: &ratatui::buffer::Buffer) -> String {
 // would have made the next such change a two-site edit where only one site got
 // edited (review of #465, S1/S2).
 
-/// One border weight's corner and vertical glyphs — everything needed to find
-/// a box's span on a row and to recognise its verticals.
+/// One border weight's corner, horizontal and vertical glyphs — everything
+/// needed to find a box's span on a row, to recognise its verticals, and to
+/// bound the title fused into its top edge.
 #[derive(Clone, Copy, Debug)]
 pub struct BorderWeight {
     pub top_left: char,
     pub top_right: char,
+    pub horizontal: char,
     pub vertical: char,
     pub bottom_left: char,
     pub bottom_right: char,
@@ -2032,6 +2157,7 @@ pub const BORDER_WEIGHTS: [BorderWeight; 3] = [
     BorderWeight {
         top_left: '┌',
         top_right: '┐',
+        horizontal: '─',
         vertical: '│',
         bottom_left: '└',
         bottom_right: '┘',
@@ -2039,6 +2165,7 @@ pub const BORDER_WEIGHTS: [BorderWeight; 3] = [
     BorderWeight {
         top_left: '┏',
         top_right: '┓',
+        horizontal: '━',
         vertical: '┃',
         bottom_left: '┗',
         bottom_right: '┛',
@@ -2046,6 +2173,7 @@ pub const BORDER_WEIGHTS: [BorderWeight; 3] = [
     BorderWeight {
         top_left: '╔',
         top_right: '╗',
+        horizontal: '═',
         vertical: '║',
         bottom_left: '╚',
         bottom_right: '╝',
@@ -2057,6 +2185,13 @@ pub const BORDER_WEIGHTS: [BorderWeight; 3] = [
 /// are interposed into every row of text it contains.
 pub fn is_box_vertical(ch: char) -> bool {
     BORDER_WEIGHTS.iter().any(|weight| weight.vertical == ch)
+}
+
+/// Whether `ch` is any border weight's horizontal glyph — the fill a box's top
+/// and bottom edges are drawn with, and therefore what TERMINATES a title fused
+/// into the top edge (`┏orchestrator [Z]━━━…┓`).
+pub fn is_box_horizontal(ch: char) -> bool {
+    BORDER_WEIGHTS.iter().any(|weight| weight.horizontal == ch)
 }
 
 /// Drop every whitespace run and box-drawing vertical from `text`, so a needle
@@ -2132,15 +2267,76 @@ pub fn label_in_box_top_border(grid: &str, label: &str) -> bool {
 /// The returned index counts scalars, which equals the terminal column only
 /// while every cell left of the boundary is width-1. Fixtures keep it so.
 pub fn orchestration_pane_left_edge(grid: &str) -> Option<usize> {
+    role_pane_left_edge(grid, "orchestrator")
+}
+
+/// Column of the role pane box drawn for `role`, in Unicode scalars, or `None`
+/// when no such expanded box is on the grid.
+///
+/// The general form of [`orchestration_pane_left_edge`], which is just this
+/// with `"orchestrator"`. Under `PaneLayout::Stacked` only the FOCUSED role's
+/// pane is drawn, so a test that has jumped focus to a non-start role has no
+/// `orchestrator` box to anchor on and needs to name the role it focused
+/// (PRD #313's zoom coverage does exactly that). Kept as ONE scan rather than a
+/// second copy in a test file, for the reason recorded above the table: the
+/// glyph set has already had to change once, and two copies is one copy too
+/// many for that.
+///
+/// Same two preconditions as the wrapper: the box must be drawn EXPANDED (a
+/// collapsed `Stacked` pane draws no corner glyph at all), and the returned
+/// index counts scalars, which equals the terminal column only while every cell
+/// to its left is width-1.
+pub fn role_pane_left_edge(grid: &str, role: &str) -> Option<usize> {
     grid.lines().find_map(|line| {
         BORDER_WEIGHTS
             .iter()
             .filter_map(|weight| {
-                let header = format!("{}orchestrator", weight.top_left);
+                let header = format!("{}{role}", weight.top_left);
                 line.find(&header)
                     .map(|byte_index| line[..byte_index].chars().count())
             })
             .min()
+    })
+}
+
+/// The title text fused into the TOP BORDER of the expanded box drawn for
+/// `role` — every character on that row between the corner glyph and the first
+/// border-fill glyph. `┏orchestrator [Z]━━━…┓` yields `orchestrator [Z]`.
+/// `None` under the same two preconditions as [`role_pane_left_edge`], whose
+/// scan this shares; when several boxes for `role` are on one row the LEFTMOST
+/// wins, matching that function's `.min()`.
+///
+/// **Why a positional read rather than `grid.contains("[Z]")`.** PRD #313's
+/// zoom indicator is ordinary title text on a rendered grid — a vt100 snapshot
+/// carries characters, not style — and a pane's title is its *display name*,
+/// which is agent-reachable: names arrive over the hook socket and
+/// `sanitize_display_name` strips control characters and bidi overrides but NOT
+/// brackets. So an agent may call itself `worker [Z]`, and that token then sits
+/// on an UNZOOMED pane's border (or, truncated, on a sidebar card) and
+/// satisfies any whole-grid `contains`. Reading the title of the box the
+/// geometry actually expanded is the strongest lever a text-only grid gives:
+/// the marker must ride on the pane zoom widened, not merely appear somewhere
+/// on screen. The remaining case — the focused pane's own display name
+/// spelling the marker — is indistinguishable in text by construction, which
+/// is why the product draws the real marker in its own
+/// `terminal_widget::zoom_marker_style` span; `render/layout/006` asserts that
+/// style side against a real `Buffer`, where the styling survives.
+pub fn role_pane_border_title(grid: &str, role: &str) -> Option<String> {
+    grid.lines().find_map(|line| {
+        BORDER_WEIGHTS
+            .iter()
+            .filter_map(|weight| {
+                let header = format!("{}{role}", weight.top_left);
+                let byte_index = line.find(&header)?;
+                let title: String = line[byte_index..]
+                    .chars()
+                    .skip(1) // the corner glyph the scan anchored on
+                    .take_while(|ch| !is_box_horizontal(*ch) && *ch != weight.top_right)
+                    .collect();
+                Some((line[..byte_index].chars().count(), title))
+            })
+            .min_by_key(|(column, _)| *column)
+            .map(|(_, title)| title)
     })
 }
 
@@ -2153,7 +2349,18 @@ pub fn orchestration_pane_left_edge(grid: &str) -> Option<usize> {
 /// spanning `pane1`+`pane2`. Returns `None` on the same two preconditions as
 /// [`orchestration_pane_left_edge`].
 pub fn orchestration_pane_column(grid: &str) -> Option<String> {
-    let left_edge = orchestration_pane_left_edge(grid)?;
+    role_pane_column(grid, "orchestrator")
+}
+
+/// Crop every row of `grid` to the pane column of the role pane drawn for
+/// `role`, dropping the sidebar to its left. The general form of
+/// [`orchestration_pane_column`], for the same reason
+/// [`role_pane_left_edge`] is the general form of its wrapper: under
+/// `PaneLayout::Stacked` only the FOCUSED role's pane is drawn, so a test that
+/// jumped focus to a non-start role has no `orchestrator` box to crop on.
+/// Returns `None` on the same two preconditions as [`role_pane_left_edge`].
+pub fn role_pane_column(grid: &str, role: &str) -> Option<String> {
+    let left_edge = role_pane_left_edge(grid, role)?;
     Some(
         grid.lines()
             .map(|line| line.chars().skip(left_edge).collect::<String>())

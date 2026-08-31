@@ -33,7 +33,11 @@
 #      silent non-match. That matters because Renovate finds these pins with
 #      the same shape of regex: a site this script cannot read is a site
 #      Renovate cannot bump, which is the "silent rot" failure mode PR #641
-#      named, and it must be loud rather than absent.
+#      named, and it must be loud rather than absent. Symmetrically, a site
+#      Renovate CAN read must be read here too, in either YAML spelling: block
+#      (`toolchain: 1.98.0`) and flow (`with: { toolchain: 1.98.0 }`) are one
+#      mapping, and reading only the first is how issue #710 let a tracked pin
+#      drift under a check reporting `ok`.
 #   2. At least one site exists on each side, so a rename cannot make the whole
 #      check pass vacuously.
 #   3. All sites within a side agree with each other (all seven `toolchain:`
@@ -107,19 +111,65 @@ workflow_files() {
   return 0
 }
 
-# Strip a trailing YAML comment and surrounding whitespace. Quotes are
-# deliberately NOT stripped: renovate.json matches `toolchain:\s*(\d+\.\d+\.\d+)`,
-# i.e. a BARE X.Y.Z, so `toolchain: "1.97.1"` is a pin Renovate cannot read even
-# though YAML gives it the same value. Normalising the quotes away here would
-# hand back a valid-looking version and let that site pass — which is the exact
-# silent-rot case check 1 above exists to catch, so the quotes have to survive
-# into the SEMVER test and fail it.
-trim_value() {
+# The value a pin key carries, given everything on the line AFTER the key —
+# e.g. `" 1.97.1 # note"` from block style, or `" 1.98.0 }"` from flow style.
+#
+# It takes the first TOKEN rather than the rest of the line: leading whitespace
+# is dropped and the value ends at the next whitespace, `,` or `}`. That is what
+# makes flow style readable, and reading it is the point. YAML spells one
+# mapping two ways, and renovate.json's `toolchain:\s*(\d+\.\d+\.\d+)` reads
+# both, so `with: { toolchain: 1.98.0 }` is a pin Renovate tracks and bumps.
+# Rest-of-line trimming yields `1.98.0 }`, which fails the SEMVER test below —
+# so the guard would have called an actively-tracked pin unreadable. A
+# flow-style pin is therefore ACCEPTED and compared, not reported: it is
+# tracked, so it can drift, and comparing pins that can drift is the whole job
+# (issue #710).
+#
+# Ending at whitespace also subsumes the trailing-comment strip this function
+# used to do, because YAML requires whitespace before a `#` comment; `1.97.1#x`
+# is one scalar to a YAML parser and is not a version, so failing it is right.
+#
+# Quotes are deliberately NOT stripped: renovate.json matches a BARE X.Y.Z, so
+# `toolchain: "1.97.1"` is a pin Renovate cannot read even though YAML gives it
+# the same value. Normalising the quotes away here would hand back a
+# valid-looking version and let that site pass — which is the exact silent-rot
+# case check 1 above exists to catch, so the quotes have to survive into the
+# SEMVER test and fail it. Flow style does not weaken that: `{ toolchain:
+# "1.97.1" }` ends at the `}` with its quotes intact and fails just the same.
+pin_value() {
   local s="$1"
-  s="${s%%#*}"
   s="${s#"${s%%[![:space:]]*}"}"
-  s="${s%"${s##*[![:space:]]}"}"
+  s="${s%%[[:space:]]*}"
+  s="${s%%,*}"
+  s="${s%%\}*}"
   printf '%s' "$s"
+}
+
+# The candidate lines for one pin token: `<lineno>:<text>` for every NON-COMMENT
+# line of `$2` that contains `$1` anywhere.
+#
+# Anywhere is the load-bearing word, and it is not a stylistic choice — it is
+# what renovate.json does. Its customManagers are unanchored, so they match
+# their token wherever it appears on a line. `scan_workflow_toolchain` used to
+# anchor at `^[[:space:]]*toolchain:`, i.e. block style only, so a flow-style
+# site (`with: { toolchain: 1.98.0 }`) was a real, Renovate-bumped pin that this
+# guard could not see: it would drift while the check reported `ok` (issue
+# #710). Both scanners share this helper so the two cannot diverge again.
+#
+# The FULL-LINE COMMENT exclusion is the one deliberate divergence from
+# Renovate, and it is why this was not a one-line regex swap. ci.yml's own
+# header reads "match on `toolchain:` and `tool: cargo-nextest@` anywhere under
+# .github/workflows"; un-anchoring without it makes that line a site, `pin_value`
+# yields a backtick, and the guard reports the repository's documentation OF
+# THIS CHECK as an unreadable pin — a false positive on the very file the check
+# exists for. Renovate ignores that line too, for its own reason (no bare X.Y.Z
+# follows the token there), so the exclusion costs nothing as the files stand.
+# What it would cost, if someone wrote a literal version into a full-line
+# comment, is a pin Renovate bumps and this guard never compares — the harmless
+# direction (an upgrade PR nobody asked for, not a drift nobody sees), and the
+# same ci.yml header already says in prose not to write versions there.
+pin_lines() {
+  grep -nE "^[[:space:]]*([^#[:space:]].*)?$1" "$2" || true
 }
 
 # Emits "<file>:<line> <version>" per site. `dtolnay/rust-toolchain`'s input.
@@ -128,7 +178,7 @@ scan_workflow_toolchain() {
   while IFS= read -r f; do
     while IFS= read -r hit; do
       lineno="${hit%%:*}"
-      value="$(trim_value "${hit#*toolchain:}")"
+      value="$(pin_value "${hit#*toolchain:}")"
       # A shell expansion is not a pin. `windows-cross-check` echoes a resolved
       # rustup directory as `toolchain: $WINDOWS_CROSS_CHECK_TOOLCHAIN`, which
       # is diagnostics, not a version — and Renovate's regex skips it for the
@@ -142,7 +192,7 @@ scan_workflow_toolchain() {
         continue
       fi
       printf '%s:%s %s\n' "${f#"$root"/}" "$lineno" "$value"
-    done < <(grep -nE '^[[:space:]]*toolchain:' "$f" || true)
+    done < <(pin_lines 'toolchain:' "$f")
   done < <(workflow_files)
 }
 
@@ -178,10 +228,14 @@ scan_workflow_nextest() {
           continue
         fi
         printf '%s:%s %s\n' "${f#"$root"/}" "$lineno" "$value"
-      done < <(printf '%s' "$rest" | grep -oE "cargo-nextest(@[^[:space:],\"']*)?" || true)
-      # Comment lines are excluded by the grep below, so prose that mentions
-      # `tool: cargo-nextest@` (ci.yml's own header does) is not a site.
-    done < <(grep -nE '^[[:space:]]*[^#[:space:]].*cargo-nextest' "$f" || true)
+      # `}` is in the excluded set for the same reason `pin_value` stops there:
+      # a flow-style `with: {tool: cargo-nextest@0.9.143}` is a pin Renovate
+      # reads, and without it the token would come back as `0.9.143}` and be
+      # reported unreadable (issue #710). Comment lines are excluded by
+      # `pin_lines`, so prose that mentions `tool: cargo-nextest@` — ci.yml's
+      # own header does — is not a site.
+      done < <(printf '%s' "$rest" | grep -oE "cargo-nextest(@[^[:space:],}\"']*)?" || true)
+    done < <(pin_lines 'cargo-nextest' "$f")
   done < <(workflow_files)
 }
 

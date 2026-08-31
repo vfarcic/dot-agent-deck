@@ -124,6 +124,34 @@ jobs:
           echo "devbox_only=$devbox_only" >> "$GITHUB_OUTPUT"
           echo "flake_only=$flake_only" >> "$GITHUB_OUTPUT"
 
+  # PR #416 review M2: the desktop web app's TypeScript tests and type-check
+  # were previously run by no CI job anywhere (~800 lines of vitest invisible
+  # to every gate). This job is the front-end sibling of `build`'s
+  # `--workspace` widening, and deliberately separate from the Rust jobs: it
+  # needs only Node + pnpm, so it starts (and fails) fast.
+  desktop-web:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      # `pnpm build` is tsc --noEmit + vite build: the type gate and the
+      # bundle gate in one step, no Rust or Tauri required.
+      - run: pnpm build
+
   build:
     needs: changes
     if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
@@ -138,6 +166,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.143
+      # Tauri's Linux build deps, needed because clippy/nextest below run with
+      # --workspace, which includes desktop/src-tauri (dot-agent-deck-desktop).
+      # Without them the desktop crate fails to build on this runner at all.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev
       - run: cargo fmt --check
       # Issue #407 — `--all-targets --features e2e`, not the bare `cargo clippy`
       # this used to be. Both flags are load-bearing: without `--all-targets`

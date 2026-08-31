@@ -12,7 +12,7 @@ title: Installation
 | macOS (Intel & Apple Silicon) | Supported |
 | Linux (amd64 & arm64) | Supported |
 | Windows (via WSL) | Supported (runs as Linux) |
-| Windows (native) | Coming soon ([#42](https://github.com/vfarcic/dot-agent-deck/issues/42)) — comment on the issue if you need this! |
+| Windows (native) | Not yet — the daemon still reports `Unsupported` on Windows and there is no `.exe` in the release artifacts. Progress is tracked in [#164](https://github.com/vfarcic/dot-agent-deck/issues/164); comment there if you need this. |
 
 ## Homebrew (macOS / Linux)
 
@@ -283,7 +283,7 @@ dot-agent-deck daemon stop
 ```
 
 - **Idempotent.** If no daemon is running, the command prints `no daemon running` and exits 0.
-- **Data-loss guard.** If managed agents are still alive, the command refuses with a list of agent IDs and exits non-zero — terminating the daemon would kill their PTYs. Detach the agents first (close their panes, or quit the TUI to detach the deck while keeping the agents running), or pass `--force`. Run [`daemon status`](#inspecting-the-local-daemon) first if you want to see what is running before you decide.
+- **Data-loss guard.** If managed agents are still alive, the command refuses with a list of agent IDs and exits non-zero — terminating the daemon would kill those agents. Detach the agents first (close their panes, or quit the TUI to detach the deck while keeping the agents running), or pass `--force`. Run [`daemon status`](#inspecting-the-local-daemon) first if you want to see what is running before you decide.
 - **Grace window.** Sends `SIGTERM` and polls for the socket to disappear for up to 5 seconds. With `--force`, escalates to `SIGKILL` after that window. A `SIGTERM` timeout without `--force` exits non-zero so you can re-run with `--force` consciously.
 
 ```bash

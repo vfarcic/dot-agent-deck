@@ -203,7 +203,28 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// of a mid-session crash. `EventType` now also carries `#[serde(other)]`
 /// (mirroring `AgentType`'s retrofit), so future event-type additions need
 /// no further bump.
-pub const PROTOCOL_VERSION: u32 = 7;
+///
+/// Issue #717 bumped 7 → 8, for TWO changes that the module's own bump policy
+/// above names explicitly and that ship as one decision.
+///
+/// A new REQUEST variant ([`AttachRequest::DispatchWorktreeClosePreview`]) — the
+/// close dialog asking what a confirmed close would leave behind. That break is
+/// one-directional and mild: a NEW client asking an OLD daemon gets a decode
+/// failure, which the call site already treats as "render no warning".
+///
+/// And a new `KIND_EVENT` payload variant
+/// ([`crate::event::BroadcastMsg::WorktreeKept`]) — the daemon reporting what
+/// the close ACTUALLY left behind. This is the harder half, and the same class
+/// as PRD #120's `OrchestrationSurface` above: an older peer has no such `kind`
+/// tag and fails the whole-frame decode, taking its event subscription down with
+/// it rather than skipping one message.
+///
+/// The second is what makes the bump load-bearing rather than bookkeeping. The
+/// constant's job here is to make `probe_remote_protocol` refuse a skewed
+/// `connect` pairing at handshake time instead of letting it surface later as a
+/// dead event stream. The reply's [`AttachResponse::kept_worktree`] field is
+/// additive and would have needed no bump on its own.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
 /// or buggy peer trying to allocate gigabytes off a forged length prefix.
@@ -224,6 +245,25 @@ pub(crate) const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 /// task. 5s is a generous upper bound for "client can't accept a frame";
 /// the client can reattach and replay scrollback.
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Issue #717: how long the close-confirmation preview
+/// ([`AttachRequest::DispatchWorktreeClosePreview`]) may spend on its
+/// `git status --porcelain` before answering conditionally.
+///
+/// This probe is the SAME one `remove_worktree` runs, but on a very different
+/// clock: there it runs detached after the pane is already gone and may take as
+/// long as it needs, while here a human is holding `Ctrl+W` and waiting for a
+/// dialog. So it gets a deadline, and blowing it degrades the wording rather
+/// than dropping the warning (see
+/// [`crate::issue_dispatch_run::kept_worktree_preview`]).
+///
+/// 300 ms against a measured 0–40 ms for `git status --porcelain` on this
+/// repo's own worktree is two orders of magnitude of headroom for a cold page
+/// cache, while keeping the worst-case keystroke stall under the client's own
+/// 500 ms budget — which must be the larger of the two, or the client would
+/// always give up first and the deadline here would never be the one that
+/// mattered.
+const CLOSE_PREVIEW_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
 // ---------------------------------------------------------------------------
 // Wire I/O
@@ -448,6 +488,27 @@ pub enum AttachRequest {
     RunNow {
         name: String,
     },
+    /// Issue #717: would closing these panes leave a dispatched worktree behind?
+    ///
+    /// Asked by the TUI while it arms PRD #241's close-confirmation dialog, so
+    /// the dialog can warn BEFORE the destructive keystroke that uncommitted
+    /// work is about to be kept — and name the path it will be kept at. The
+    /// answer rides back on [`AttachResponse::kept_worktree`].
+    ///
+    /// The daemon is the only process that can answer it. The removal POLICY
+    /// lives in its in-memory `WorktreeRegistry` and nowhere on disk, and in
+    /// remote mode the worktree is not on the client's filesystem at all — so a
+    /// client-side `git status` would be both under-informed and, remotely,
+    /// aimed at the wrong machine.
+    ///
+    /// `pane_ids` is every pane the confirmed close would tear down (one for a
+    /// dashboard card, all of them for a Mode/Orchestration tab), because a
+    /// multi-role orchestration shares ONE worktree across its role panes and
+    /// any of them resolves it. The reply is best-effort: the caller renders no
+    /// warning on any error, which is the same way it treats a down daemon.
+    DispatchWorktreeClosePreview {
+        pane_ids: Vec<String>,
+    },
 }
 
 fn default_rows() -> u16 {
@@ -629,6 +690,15 @@ pub struct AttachResponse {
     /// daemon's `Hello` handler sets it via [`AttachResponse::with_guarded_send`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guarded_send: Option<bool>,
+    /// Issue #717: the answer to
+    /// [`AttachRequest::DispatchWorktreeClosePreview`] — `Some` only when the
+    /// close would leave a dispatched worktree on disk holding uncommitted
+    /// work. `None` on every other response, and on a close that removes
+    /// everything it touches. Additive + optional, so it is the field itself
+    /// that is forward-compatible; the `PROTOCOL_VERSION` bump this shipped
+    /// with is owed to the new REQUEST variant beside it, not to this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_worktree: Option<crate::issue_dispatch_run::KeptWorktree>,
 }
 
 impl AttachResponse {
@@ -1846,6 +1916,14 @@ async fn handle_connection(
                     if let Some(worktree) = dispatched_worktree {
                         let registry = registry.clone();
                         let worktree_registry = worktree_registry.clone();
+                        // Issue #717: the cleanup's verdict is the only
+                        // authoritative one — it is measured with the agent
+                        // already reaped, so nothing can change the tree under
+                        // it — and it lands after the card is gone. Broadcast it
+                        // so attached TUIs can say what actually happened
+                        // instead of leaving the user with the dialog's
+                        // arm-time prediction.
+                        let event_tx = event_tx.clone();
                         tokio::spawn(async move {
                             if !crate::issue_dispatch_run::worktree_still_in_use(
                                 &registry.agent_records(),
@@ -1853,13 +1931,16 @@ async fn handle_connection(
                             ) && let Some(entry) = crate::issue_dispatch_run::take_worktree(
                                 &worktree_registry,
                                 &worktree,
-                            ) {
-                                crate::issue_dispatch_run::remove_worktree(
-                                    &worktree,
-                                    &entry.clone_dir,
-                                    entry.policy,
-                                )
-                                .await;
+                            ) && let Some(kept) = crate::issue_dispatch_run::remove_worktree(
+                                &worktree,
+                                &entry.clone_dir,
+                                entry.policy,
+                            )
+                            .await
+                            {
+                                // Errs only when nothing is subscribed (a
+                                // standalone daemon), which is not a failure.
+                                let _ = event_tx.send(BroadcastMsg::WorktreeKept(kept));
                             }
                         });
                     }
@@ -2163,6 +2244,23 @@ async fn handle_connection(
                 }
                 Err(e) => write_resp(&mut stream, &AttachResponse::err(e.to_string())).await?,
             }
+        }
+        // Issue #717: read-only preview of what a confirmed close would LEAVE
+        // BEHIND, for the close-confirmation dialog. Peeks at the worktree
+        // registry and probes `git status --porcelain`; removes nothing, takes
+        // no registry entry, and answers `ok = true` with `kept_worktree: None`
+        // when the close would leave nothing.
+        AttachRequest::DispatchWorktreeClosePreview { pane_ids } => {
+            let kept = crate::issue_dispatch_run::kept_worktree_preview(
+                &registry.agent_records(),
+                &worktree_registry,
+                &pane_ids,
+                CLOSE_PREVIEW_PROBE_TIMEOUT,
+            )
+            .await;
+            let mut resp = AttachResponse::ok();
+            resp.kept_worktree = kept;
+            write_resp(&mut stream, &resp).await?
         }
     }
     Ok(())
