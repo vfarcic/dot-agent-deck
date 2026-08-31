@@ -1188,10 +1188,15 @@ fn cmd_quote_if_needed(path: &str) -> String {
 ///   the line written here.
 /// - **Claude Code** invokes via the platform's native shell too, which is what
 ///   `hooks_manage`'s `#[cfg(windows)]` quoter has always been for.
-/// - **Devin** cannot be reached on Windows at all:
-///   `devin_hooks_manage::devin_config_dir` returns `None` off Unix, so the
-///   `windows_host` arm here is dead for that writer and its output is
-///   byte-identical to what it has always been.
+/// - **Devin** never sees this selector: `devin_hooks_manage::install_to` asks
+///   `agent_hook_config::build_command` for `HookShell::Posix` outright, so
+///   `windows_host` is not consulted for that writer and its output is
+///   byte-identical to what it has always been on every host. That is a
+///   *deliberate* pin rather than a consequence of
+///   `devin_hooks_manage::devin_config_dir` returning `None` off Unix — the
+///   gate is real, but `install_to` is reachable without passing through it,
+///   so relying on it left the Windows arm live for a writer that should never
+///   take it, and `build-windows` said so.
 ///
 /// So the reachable user-visible change is Codex's, and narrowly: `codex_home`
 /// honours `$CODEX_HOME` on every platform, so a Windows user who sets it got a
