@@ -371,5 +371,12 @@ export interface DeckRuntimeState {
   runAction: (action: DeckAction) => Promise<DeckActionResult>;
   sendTerminalInput: (agentId: string, data: string) => Promise<void>;
   resizeTerminal: (agentId: string, cols: number, rows: number) => Promise<void>;
+  /**
+   * States the whole set of agents whose terminal is on screen (PRD #745 M7).
+   * A screen that mounts terminals calls this once per render commit with every
+   * shown id; a screen that mounts none calls it with `[]`. Attach follows this
+   * and nothing else, so a screen that renders no output opens no PTYs either.
+   */
+  setShownTerminals: (agentIds: string[]) => Promise<void>;
   reconnect: () => Promise<void>;
 }

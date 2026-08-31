@@ -79,14 +79,16 @@ export default function App() {
  */
 export function DeckShell({ runtime, workflowPlatformIssue, initialView = { kind: "deck" } }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; initialView?: DeckView }) {
   const [view, setView] = useState<DeckView>(initialView);
-  // GATE UNTIL M7 (PRD #745). The overview renders no terminal, but attach is
-  // snapshot-driven, not render-driven: `attachAgents` still fires for every
-  // agent from `connect()` and from every `desktop://snapshot` (lib/bridge.ts),
-  // so in LIVE mode the bridge holds one socket, one scrollback replay and one
-  // stream per agent behind a screen whose own copy says nothing is attached.
-  // Iteration 1 is fixture-only by decision, and this is where that boundary is
-  // enforced. M7 makes attach demand-driven; removing this condition, and the
-  // one on the rail button below, is part of M7's definition of done.
+  // GATE, STILL UP (PRD #745 M7). The reason it went up is now fixed: attach is
+  // demand-driven, `attachAgents` no longer fires from `connect()`, from a
+  // `desktop://snapshot` or from `start_daemon`, and this screen declares
+  // `setShownTerminals([])`, which also flushes whatever the deck left warm — so
+  // in live mode it holds no socket, no scrollback replay and no stream. The
+  // gate outlives that fix by ONE step on purpose: it is the safety net for
+  // exactly the defect the fix changes, and lifting it in the same commit would
+  // mean nothing was ever independently verified while the net was up. Removing
+  // this condition, and the one on the rail button below, is M7's final step
+  // once the change has been reviewed and audited.
   if (view.kind === "overview" && showOverview(runtime.mode)) return <AgentOverview runtime={runtime} onNavigate={setView} />;
   return <ControlDeck runtime={runtime} workflowPlatformIssue={workflowPlatformIssue} onNavigate={setView} />;
 }
@@ -101,7 +103,7 @@ export function showOverview(mode: RuntimeMode): boolean {
 }
 
 export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPlatformIssue(), onNavigate }: { runtime: DeckRuntimeState; workflowPlatformIssue?: string; onNavigate?: (view: DeckView) => void }) {
-  const { snapshot, mode } = runtime;
+  const { snapshot, mode, setShownTerminals } = runtime;
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [tabs, setTabs] = useState<Record<string, PanelTab>>({});
   const [selectedEvidenceId, setSelectedEvidenceId] = useState("");
@@ -164,6 +166,29 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
       // Keep the workflow preview usable when storage is unavailable.
     }
   }, [profileOrder]);
+
+  /**
+   * Every tile currently rendering a terminal, joined into one dependency so
+   * the effect below fires when the SET changes rather than on every render
+   * (PRD #745 M7). `AgentTile` mounts a terminal whenever its tab is
+   * `"terminal"`, which is also the default, so the derivation has to repeat
+   * that `?? "terminal"` fallback exactly.
+   */
+  const shownTerminalKey = snapshot.agents
+    .filter((agent) => (tabs[agent.id] ?? "terminal") === "terminal")
+    .map((agent) => agent.id)
+    .join("\n");
+
+  /**
+   * ONE call per render commit carrying ALL the shown ids, never one call per
+   * tile: `setShownTerminals` is declarative, so nine tiles declaring
+   * themselves one at a time would leave eight of the nine in the warm set and
+   * evict five of them. Deleting this effect does not fail a bridge test — it
+   * silently leaves the deck with no attached terminals at all.
+   */
+  useEffect(() => {
+    void setShownTerminals(shownTerminalKey ? shownTerminalKey.split("\n") : []);
+  }, [setShownTerminals, shownTerminalKey]);
 
   const orderedStages = snapshot.stages;
   const selectedAgent = snapshot.agents.find((agent) => agent.id === selectedAgentId);

@@ -1,4 +1,4 @@
-import { useMemo, type ReactNode } from "react";
+import { useEffect, useMemo, type ReactNode } from "react";
 import { Blocks, Boxes, LayoutList, Layers, Network, RefreshCw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
 import { UNREPORTED } from "../types";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
@@ -271,7 +271,17 @@ const COLUMNS = ["Status", "Agent", "State", "CLI", "Active tool", "Tools", "Wor
  * stays the key, and only the copy React sees is clamped.
  */
 export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeState; onNavigate: (view: DeckView) => void }) {
-  const { snapshot, mode } = runtime;
+  const { snapshot, mode, setShownTerminals } = runtime;
+  /**
+   * The screen's whole claim, stated to the bridge rather than merely printed in
+   * its own header (PRD #745 M7): this screen shows no terminal, so it holds no
+   * PTY. Declaring the empty set also flushes the warm set to zero, which is
+   * what makes the claim true when you arrive here from a nine-tile deck rather
+   * than only on a cold start.
+   */
+  useEffect(() => {
+    void setShownTerminals([]);
+  }, [setShownTerminals]);
   const connection = snapshot.connection;
   /**
    * The fleet is only knowable while the daemon is answering. A reconnect

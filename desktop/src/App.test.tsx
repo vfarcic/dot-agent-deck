@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot } from "./data/fixture";
 import { WINDOWS_WORKFLOW_BLOCK_REASON } from "./lib/platform";
@@ -18,6 +18,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     runAction: vi.fn(async () => ({ ok: true }) as import("./types").DeckActionResult),
     sendTerminalInput: vi.fn(async () => undefined),
     resizeTerminal: vi.fn(async () => undefined),
+    setShownTerminals: vi.fn(async () => undefined),
     reconnect: vi.fn(async () => undefined),
     ...overrides,
   };
@@ -293,5 +294,55 @@ describe("ControlDeck", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Evidence" }));
     expect(screen.getByTestId("evidence-drawer")).toBeVisible();
+  });
+
+  /**
+   * Scenario: render the four-agent deck with every tile on its default
+   * terminal tab and watch what the deck tells the bridge. It must declare all
+   * four ids in ONE call, because `setShownTerminals` is declarative: four
+   * single-id calls would leave three of the four in the bridge's warm set and
+   * the bound would start evicting visible panes (PRD #745 M7).
+   *
+   * `TerminalViewport` is mocked in this file, so nothing here can be asserted
+   * from mounted terminals — the bridge call IS the observable.
+   */
+  it("declares every terminal-tab tile to the bridge in a single call", () => {
+    const setShownTerminals = vi.fn(async () => undefined);
+    render(<ControlDeck runtime={runtime({ setShownTerminals })} />);
+
+    expect(setShownTerminals).toHaveBeenCalledTimes(1);
+    expect(setShownTerminals).toHaveBeenCalledWith(["planner", "builder", "reviewer", "tester"]);
+  });
+
+  /**
+   * Scenario: switch one tile off its terminal tab and leave the other three
+   * alone. Exactly that agent leaves the shown set, and the surviving three are
+   * re-declared together in one call — a tile showing a diff is not showing a
+   * terminal, and that is the whole signal the bridge has for letting the PTY
+   * go warm.
+   */
+  it("drops exactly the tile switched away from its terminal tab", () => {
+    const setShownTerminals = vi.fn(async () => undefined);
+    render(<ControlDeck runtime={runtime({ setShownTerminals })} />);
+
+    const tile = screen.getByTestId("agent-tile-builder");
+    fireEvent.click(within(tile).getByRole("tab", { name: "Diff" }));
+
+    expect(setShownTerminals).toHaveBeenCalledTimes(2);
+    expect(setShownTerminals).toHaveBeenLastCalledWith(["planner", "reviewer", "tester"]);
+  });
+
+  /**
+   * Scenario: an empty deck. The deck still has to state that it shows no
+   * terminal — omitting the call would leave whatever the previous screen
+   * declared attached, which is exactly the leak M7 exists to close.
+   */
+  it("declares an empty shown set when the daemon owns no agents", () => {
+    const empty = createFixtureSnapshot("empty");
+    const setShownTerminals = vi.fn(async () => undefined);
+    render(<ControlDeck runtime={runtime({ snapshot: empty, setShownTerminals })} />);
+
+    expect(setShownTerminals).toHaveBeenCalledTimes(1);
+    expect(setShownTerminals).toHaveBeenCalledWith([]);
   });
 });

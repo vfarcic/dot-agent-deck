@@ -46,6 +46,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     runAction: vi.fn(async () => ({ ok: true }) as import("../types").DeckActionResult),
     sendTerminalInput: vi.fn(async () => undefined),
     resizeTerminal: vi.fn(async () => undefined),
+    setShownTerminals: vi.fn(async () => undefined),
     reconnect: vi.fn(async () => undefined),
     ...overrides,
   };
@@ -642,6 +643,23 @@ describe("AgentOverview", () => {
     fireEvent.click(screen.getByTestId("overview-refresh"));
     expect(deck.reconnect).toHaveBeenCalled();
   });
+
+  /**
+   * Scenario: render the overview against the crowded fifteen-agent fleet and
+   * watch what it tells the bridge. Its header claims "no terminals attached",
+   * and this is that claim as an instruction rather than as prose: declaring the
+   * empty shown set is what detaches whatever the deck left warm on the way here
+   * (PRD #745 M7). Rendering no terminal is NOT the same as attaching none —
+   * mounting nothing was already true before M7 and the sockets stayed open.
+   */
+  it("declares an empty shown set so the screen holds no PTY", () => {
+    const setShownTerminals = vi.fn(async () => undefined);
+    renderOverview({ setShownTerminals });
+
+    expect(terminalMounted).not.toHaveBeenCalled();
+    expect(setShownTerminals).toHaveBeenCalledTimes(1);
+    expect(setShownTerminals).toHaveBeenCalledWith([]);
+  });
 });
 
 describe("groupAgents", () => {
@@ -810,11 +828,12 @@ describe("DeckShell", () => {
   });
 
   /**
-   * The overview is fixture-only until M7 makes attach demand-driven. Live mode
-   * still attaches one PTY per agent from `connect()` and from every snapshot,
-   * so a live user reaching this screen would be told nothing is attached while
-   * every socket stayed open. Both seams are covered, because either one alone
-   * leaves the screen reachable.
+   * The overview is still fixture-only. Demand-driven attach has landed, so the
+   * reason the gate went up — one PTY per agent from `connect()` and from every
+   * snapshot, behind a screen saying nothing was attached — is gone; the gate
+   * itself is lifted one commit later, after this change has been independently
+   * reviewed with the net still up (PRD #745 M7). Both seams are covered,
+   * because either one alone leaves the screen reachable.
    */
   it("does not offer the overview in live mode", () => {
     render(<DeckShell runtime={runtime({ mode: "live", snapshot: createFixtureSnapshot("connected") })} />);

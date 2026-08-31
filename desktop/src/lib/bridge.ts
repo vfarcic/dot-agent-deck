@@ -115,6 +115,17 @@ export interface DeckBridge {
   runAction(action: DeckAction): Promise<DeckActionResult>;
   sendTerminalInput(agentId: string, data: string): Promise<void>;
   resizeTerminal(agentId: string, cols: number, rows: number): Promise<void>;
+  /**
+   * States the WHOLE set of agents whose terminal is on screen right now
+   * (PRD #745 M7). Attach follows this and nothing else — not `connect()`, not
+   * a snapshot event — because an attach costs one daemon socket and one full
+   * scrollback replay per agent, and "renders no output" and "opens no PTYs"
+   * are different claims. Declarative, not imperative: the two facts the UI has
+   * to state are "these nine tiles are showing a terminal" and "now none is",
+   * and neither can be expressed by a per-agent show. Call it once per render
+   * commit with every shown id.
+   */
+  setShownTerminals(agentIds: string[]): Promise<void>;
   dispose(): Promise<void>;
 }
 
@@ -338,11 +349,31 @@ class FixtureDeckBridge implements DeckBridge {
     await Promise.resolve();
   }
 
+  /**
+   * Fixture mode owns no PTYs, so there is nothing to attach or evict — but the
+   * seam lives on `DeckBridge` rather than on `TauriDeckBridge` alone, so no
+   * screen ever has to know which bridge it is holding.
+   */
+  async setShownTerminals(): Promise<void> {
+    await Promise.resolve();
+  }
+
   async dispose(): Promise<void> {
     this.snapshotListeners.clear();
     this.terminalListeners.clear();
   }
 }
+
+/**
+ * How many terminals stay attached after you have left them. The bound governs
+ * the WARM set alone — terminals currently on screen are never capped, because
+ * the deck mounts a terminal on every tile and a bound over everything attached
+ * would kill six of nine visible panes. Three keeps bouncing between the
+ * handful of agents you are actually working with free of a scrollback replay
+ * while holding the idle cost of a nine-agent fleet at three sockets instead of
+ * nine (PRD #745 M7).
+ */
+export const MAX_WARM_TERMINALS = 3;
 
 export class TauriDeckBridge implements DeckBridge {
   readonly mode = "live" as const;
@@ -354,6 +385,19 @@ export class TauriDeckBridge implements DeckBridge {
   private pendingResizes = new Map<string, { cols: number; rows: number }>();
   private resizeFrames = new Map<string, number>();
   private resizeInFlight = new Set<string>();
+  /**
+   * Agents whose terminal is on screen right now, as last declared by
+   * `setShownTerminals`. Unbounded, and never an eviction candidate.
+   */
+  private shown = new Set<string>();
+  /**
+   * Agents whose terminal has been left but is still attached, insertion-ordered
+   * least-recently-left first so eviction takes the head. Bounded by
+   * `MAX_WARM_TERMINALS`. Membership is by agent id and does NOT require the
+   * attach to have landed — a pending attach that is never a warm member is
+   * never selected for eviction, and installs itself afterwards past the bound.
+   */
+  private warm = new Set<string>();
   private terminalListener?: TerminalListener;
   private invoke?: typeof import("@tauri-apps/api/core")["invoke"];
   private lifecycle = 0;
@@ -389,15 +433,106 @@ export class TauriDeckBridge implements DeckBridge {
     return this.invoke;
   }
 
-  private async attachAgents(agents: DesktopAgentDto[], expectedLifecycle = this.lifecycle): Promise<void> {
+  /**
+   * The single attach trigger (PRD #745 M7). Takes the whole shown set, diffs it
+   * against the previous one, and does all four things in one pass: attach what
+   * is newly shown, move what is newly hidden into the warm set, evict warm
+   * overflow, and flush the warm set entirely when nothing is shown at all.
+   *
+   * It must be called ONCE per render commit with every shown id, never once
+   * per tile: nine single-id calls would leave eight of the nine warm and evict
+   * five of them, which is the same broken deck the bound exists to avoid.
+   */
+  async setShownTerminals(agentIds: string[]): Promise<void> {
+    const next = new Set(agentIds);
+
+    // Leaving a terminal does not detach it. It moves to the warm set, delete-
+    // then-add so the tail is the most recently left and the head is the LRU.
+    for (const agentId of this.shown) {
+      if (next.has(agentId)) continue;
+      this.warm.delete(agentId);
+      this.warm.add(agentId);
+    }
+    // A shown terminal is never an eviction candidate, so showing a warm one
+    // takes it back out of the warm set. It stays in `attached`, so coming back
+    // costs no attach and produces no replay — the whole point of warm.
+    for (const agentId of next) this.warm.delete(agentId);
+    this.shown = next;
+
+    // Bounded against `warm.size` ALONE — never against the shown or the
+    // attached count, which is what would kill visible panes.
+    const overflow = this.shown.size === 0
+      // Flushed to ZERO rather than down to the bound, so "no terminals
+      // attached" is true however you arrived at a screen that shows none.
+      ? this.warm.size
+      : Math.max(0, this.warm.size - MAX_WARM_TERMINALS);
+    // `evictTerminal` is synchronous up to its `desktop_terminal_detach`, so
+    // every evicted agent is out of `sessions` / `terminalChannels` /
+    // `pendingAttachments` BEFORE the attach below writes its new entries.
+    const evictions = Array.from(this.warm).slice(0, overflow).map((agentId) => this.evictTerminal(agentId));
+
+    // Every shown id, not only the newly shown ones: `attachAgents` filters out
+    // whatever is already attached, so re-declaring an unchanged set is a no-op
+    // except where a shown terminal lost its session to a daemon `end`/`error`
+    // state event and has to be brought back.
+    const attaching = this.shown.size ? this.attachAgents(Array.from(this.shown)) : Promise.resolve();
+    await Promise.all([...evictions, attaching]);
+  }
+
+  /**
+   * Drops one terminal completely — client-side state first, then the daemon.
+   *
+   * Every map keyed by agent id has to be cleared here, not just `sessions`: a
+   * surviving `terminalChannels` entry would leave the dead attach's channel
+   * able to deliver output, and a surviving `pendingResizes` / `resizeFrames`
+   * entry would push a size computed for the old pane at the next session
+   * (`attachAgents` re-schedules a pending resize on re-attach).
+   *
+   * Dropping `pendingAttachments` and `terminalChannels` IS how an attach still
+   * in flight gets cancelled: `attachAgents`' post-await guard then fails and
+   * takes the orphan-detach branch instead of installing a session behind a
+   * screen that no longer shows it. Cancellation is marking, never awaiting —
+   * one slow attach must not freeze every later terminal switch.
+   *
+   * Per-agent, and deliberately NOT a `lifecycle` bump: `lifecycle` is a
+   * whole-bridge generation, and bumping it here would also void every SHOWN
+   * attach still in flight and leak `resizeInFlight` for any agent mid-resize.
+   */
+  private async evictTerminal(agentId: string): Promise<void> {
+    const session = this.sessions.get(agentId);
+    this.shown.delete(agentId);
+    this.warm.delete(agentId);
+    this.sessions.delete(agentId);
+    this.attached.delete(agentId);
+    this.terminalChannels.delete(agentId);
+    this.pendingAttachments.delete(agentId);
+    this.pendingResizes.delete(agentId);
+    const frame = this.resizeFrames.get(agentId);
+    if (frame !== undefined) {
+      window.cancelAnimationFrame(frame);
+      this.resizeFrames.delete(agentId);
+    }
+    this.resizeInFlight.delete(agentId);
+    // Nothing installed yet: the teardown above is the whole cancellation, and
+    // the pending attach detaches its own late-arriving session.
+    if (!session) return;
+    const invoke = await this.getInvoke();
+    await invoke("desktop_terminal_detach", { sessionId: session.sessionId }).catch(() => undefined);
+  }
+
+  private async attachAgents(agentIds: string[], expectedLifecycle = this.lifecycle): Promise<void> {
     if (expectedLifecycle !== this.lifecycle) return;
     const invoke = await this.getInvoke();
     if (expectedLifecycle !== this.lifecycle) return;
     const { Channel } = await import("@tauri-apps/api/core");
     if (expectedLifecycle !== this.lifecycle) return;
-    await Promise.allSettled(agents.filter((agent) => !this.attached.has(agent.id)).map(async (agent) => {
+    // Re-read membership after the dynamic imports, not before them: an agent
+    // shown when this call started can have been hidden and evicted while they
+    // resolved, and attaching it then would leave a live PTY behind a screen
+    // that shows no terminal at all.
+    await Promise.allSettled(agentIds.filter((agentId) => !this.attached.has(agentId) && (this.shown.has(agentId) || this.warm.has(agentId))).map(async (agentId) => {
       const lifecycle = expectedLifecycle;
-      this.attached.add(agent.id);
+      this.attached.add(agentId);
       const onOutput = new Channel<ArrayBuffer>();
       const attempt: PendingTerminalAttachment = {
         lifecycle,
@@ -409,30 +544,30 @@ export class TauriDeckBridge implements DeckBridge {
       onOutput.onmessage = (chunk) => {
         if (
           lifecycle !== this.lifecycle
-          || this.terminalChannels.get(agent.id) !== onOutput
+          || this.terminalChannels.get(agentId) !== onOutput
         ) return;
         const data = new Uint8Array(chunk);
         if (!attempt.activated) {
           attempt.output.push(data);
           return;
         }
-        if (attempt.session) this.deliverOutput(agent.id, data, attempt.session.generation);
+        if (attempt.session) this.deliverOutput(agentId, data, attempt.session.generation);
       };
-      this.terminalChannels.set(agent.id, onOutput);
-      this.pendingAttachments.set(agent.id, attempt);
+      this.terminalChannels.set(agentId, onOutput);
+      this.pendingAttachments.set(agentId, attempt);
       try {
-        const session = await invoke<TerminalAttachResult>("desktop_terminal_attach", { agentId: agent.id, onOutput });
+        const session = await invoke<TerminalAttachResult>("desktop_terminal_attach", { agentId, onOutput });
         if (
           lifecycle !== this.lifecycle
-          || this.terminalChannels.get(agent.id) !== onOutput
-          || this.pendingAttachments.get(agent.id) !== attempt
+          || this.terminalChannels.get(agentId) !== onOutput
+          || this.pendingAttachments.get(agentId) !== attempt
         ) {
           await invoke("desktop_terminal_detach", { sessionId: session.sessionId }).catch(() => undefined);
           return;
         }
         attempt.session = session;
-        this.sessions.set(agent.id, session);
-        this.pendingAttachments.delete(agent.id);
+        this.sessions.set(agentId, session);
+        this.pendingAttachments.delete(agentId);
 
         const replayLength = attempt.output.reduce((total, chunk) => total + chunk.byteLength, 0);
         const replay = new Uint8Array(replayLength);
@@ -443,7 +578,7 @@ export class TauriDeckBridge implements DeckBridge {
         }
         attempt.output = [];
         this.deliverTerminal({
-          agentId: agent.id,
+          agentId,
           data: replay,
           stream: "output",
           operation: "replace",
@@ -451,14 +586,14 @@ export class TauriDeckBridge implements DeckBridge {
         });
         attempt.activated = true;
         attempt.stateEvents.forEach((event) => this.handleTerminalState(event));
-        if (this.pendingResizes.has(agent.id)) this.scheduleResize(agent.id);
+        if (this.pendingResizes.has(agentId)) this.scheduleResize(agentId);
       } catch (cause) {
         if (lifecycle === this.lifecycle) {
-          if (this.pendingAttachments.get(agent.id) === attempt) this.pendingAttachments.delete(agent.id);
-          this.attached.delete(agent.id);
-          if (this.terminalChannels.get(agent.id) === onOutput) this.terminalChannels.delete(agent.id);
+          if (this.pendingAttachments.get(agentId) === attempt) this.pendingAttachments.delete(agentId);
+          this.attached.delete(agentId);
+          if (this.terminalChannels.get(agentId) === onOutput) this.terminalChannels.delete(agentId);
           this.deliverTerminal({
-            agentId: agent.id,
+            agentId,
             data: new Uint8Array(),
             stream: "error",
             operation: "append",
@@ -507,10 +642,12 @@ export class TauriDeckBridge implements DeckBridge {
   }
 
   async connect(): Promise<DeckSnapshot> {
-    const lifecycle = this.lifecycle;
     const invoke = await this.getInvoke();
     const dto = await invoke<DesktopSnapshotDto>("desktop_bootstrap", { options: { startIfMissing: false } });
-    await this.attachAgents(dto.agents, lifecycle);
+    // PRD #745 M7: connecting attaches NOTHING. It used to attach every agent
+    // the daemon owns, so a nine-agent fleet cost nine sockets and nine
+    // scrollback replays before a single terminal was on screen. The UI states
+    // what it shows through `setShownTerminals`, and that is the only trigger.
     const snapshot = mapDesktopSnapshot(dto, undefined, this.evidence, this.handoffs);
     this.agentIndex = snapshot.agents;
     return snapshot;
@@ -528,7 +665,8 @@ export class TauriDeckBridge implements DeckBridge {
       onSnapshot(latest);
     };
     const stopSnapshot = await listen<DesktopSnapshotDto>("desktop://snapshot", (event) => {
-      void this.attachAgents(event.payload.agents);
+      // PRD #745 M7: a snapshot reports what the daemon owns, which says nothing
+      // about what is on screen. Attach is driven by `setShownTerminals` alone.
       emit(event.payload);
     });
     // The daemon emits a coalesced snapshot after each event, but not every hook
@@ -571,6 +709,10 @@ export class TauriDeckBridge implements DeckBridge {
         this.sessions.clear();
         this.attached.clear();
         this.terminalChannels.clear();
+        // Nothing is attached any more, so nothing is warm. `shown` is left
+        // alone on purpose: it mirrors what the UI is displaying, which a
+        // daemon stop does not change, and re-declaring it re-attaches.
+        this.warm.clear();
         this.lifecycle += 1;
       }
       return { ok: result?.ok !== false, sendResult: result?.sendResult, message: result?.message };
@@ -580,7 +722,9 @@ export class TauriDeckBridge implements DeckBridge {
       if (dto.connection.status !== "connected") {
         throw new Error(dto.connection.error ?? "The local daemon did not become connected.");
       }
-      await this.attachAgents(dto.agents);
+      // PRD #745 M7: starting the daemon no longer attaches its whole fleet
+      // either — this was the third eager call site, and the one reachable
+      // without a snapshot event at all.
       return { ok: true };
     }
     throw new Error("This orchestration control is available in the fixture preview but is not yet exposed by the live daemon.");
@@ -641,6 +785,8 @@ export class TauriDeckBridge implements DeckBridge {
     this.pendingResizes.clear();
     this.resizeFrames.clear();
     this.resizeInFlight.clear();
+    this.shown.clear();
+    this.warm.clear();
     this.terminalListener = undefined;
     if (!invoke) return;
     await Promise.allSettled(sessions.map((session) => invoke("desktop_terminal_detach", { sessionId: session.sessionId })));

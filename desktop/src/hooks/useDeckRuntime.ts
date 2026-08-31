@@ -133,6 +133,10 @@ export function useDeckRuntime(): DeckRuntimeState {
 
   const sendTerminalInput = useCallback((agentId: string, data: string) => bridge.sendTerminalInput(agentId, data), [bridge]);
   const resizeTerminal = useCallback((agentId: string, cols: number, rows: number) => bridge.resizeTerminal(agentId, cols, rows), [bridge]);
+  // Stable for the lifetime of the bridge, because the screens declare their
+  // shown set from an effect: an identity that changed every render would fire
+  // that effect every render (PRD #745 M7).
+  const setShownTerminals = useCallback((agentIds: string[]) => bridge.setShownTerminals(agentIds), [bridge]);
 
   return {
     mode,
@@ -143,6 +147,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     runAction,
     sendTerminalInput,
     resizeTerminal,
+    setShownTerminals,
     reconnect,
   };
 }
