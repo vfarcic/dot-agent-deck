@@ -162,6 +162,43 @@ pub fn arm_seed_fallback(
 /// terminal size while still keeping downstream allocations bounded.
 pub const PTY_RESIZE_DIM_MAX: u16 = 4096;
 
+/// Process-wide one-shot guard so the daemon logs a single line the first time
+/// it has to clamp a resize request, rather than one per frame for the whole
+/// life of a very wide terminal. See [`AgentPtyRegistry::resize`].
+static OVERSIZED_RESIZE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Normalize a requested PTY geometry to what the child process will actually
+/// be given: each axis clamped to [`PTY_RESIZE_DIM_MAX`].
+///
+/// **Issue #747 — this is the one place the cap is spelled.** The cap used to
+/// live only at the far end of the resize path ([`AgentPtyRegistry::resize`]),
+/// which clamped silently and returned `Ok`. The client applied no bound at
+/// all, so on a terminal wider than the cap it would parse and render the
+/// agent's output at (say) 4198 columns while the child had been told to wrap
+/// at 4096 — a pane full of rewrapped, misaligned content, with nothing logged
+/// and no error anywhere. Every participant in a resize now normalizes through
+/// this function, so "the width the client parses at" and "the width the child
+/// was given" are the same number by construction:
+///
+/// 1. `FrameLayout::pane_target_dims` (`src/ui.rs`) — the layout-derived target
+///    `resize_panes_to_layout` drives every pane from.
+/// 2. `EmbeddedPaneController::resize_pane_pty` (`src/embedded_pane.rs`) — the
+///    local vt100 parser, and the `(rows, cols)` put on the pane's resize watch
+///    channel and forwarded to the daemon as `AttachRequest::Resize`.
+/// 3. `TerminalWidget::render` (`src/terminal_widget.rs`) — the PRD #84
+///    invariant-3 guard, which compares the parser against the *capped* inner
+///    area so an over-cap pane is not reported as a contract violation.
+/// 4. [`AgentPtyRegistry::resize`] below — still the enforcing boundary, since
+///    a same-uid attach-socket peer is under no obligation to pre-clamp.
+///
+/// A pane whose drawn area exceeds the cap therefore renders the child's full
+/// 4096 columns through `TerminalWidget`'s `min(area, screen)` path and leaves
+/// the remaining columns blank. That is the honest outcome: the child has no
+/// more columns to show.
+pub fn clamp_pty_dims(rows: u16, cols: u16) -> (u16, u16) {
+    (rows.min(PTY_RESIZE_DIM_MAX), cols.min(PTY_RESIZE_DIM_MAX))
+}
+
 /// Maximum byte length the daemon will *retain* for a caller-supplied
 /// `DOT_AGENT_DECK_PANE_ID` value (and the TUI will *reuse* on rehydration).
 /// The agent's child process still receives whatever the caller sent — we
@@ -927,8 +964,9 @@ pub fn spawn(opts: SpawnOptions<'_>) -> Result<AgentPty, AgentPtyError> {
             opts.rows, opts.cols
         )));
     }
-    let rows = opts.rows.min(PTY_RESIZE_DIM_MAX);
-    let cols = opts.cols.min(PTY_RESIZE_DIM_MAX);
+    // Issue #747: through the shared helper, so this stays a mirror of
+    // `resize` by construction rather than by two copies staying in step.
+    let (rows, cols) = clamp_pty_dims(opts.rows, opts.cols);
 
     let pty_system = NativePtySystem::default();
 
@@ -6373,16 +6411,38 @@ impl AgentPtyRegistry {
     /// shape (`PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }`).
     /// Zero rows or cols are rejected up front so a buggy caller can't
     /// quietly produce a 0×0 PTY (which would deadlock any agent that
-    /// reads `TIOCGWINSZ`). Non-zero values are silently clamped down to
+    /// reads `TIOCGWINSZ`). Non-zero values are clamped down to
     /// [`PTY_RESIZE_DIM_MAX`] — see the constant docs for the rationale.
+    ///
+    /// Issue #747: the clamp is no longer *silent*. It stays a clamp rather
+    /// than a rejection — refusing would leave a wide terminal's pane stuck at
+    /// its previous geometry, which is worse than a pane narrower than the
+    /// screen — but it now emits one `warn!` per process. Our own TUI
+    /// pre-clamps through [`clamp_pty_dims`], so after #747 this line firing
+    /// means some *other* peer on the attach socket sent an over-cap request,
+    /// which is precisely the case the cap exists for and worth seeing.
     pub fn resize(&self, id: &str, rows: u16, cols: u16) -> Result<(), AgentPtyError> {
         if rows == 0 || cols == 0 {
             return Err(AgentPtyError::Resize(format!(
                 "rows and cols must be > 0 (got {rows}x{cols})"
             )));
         }
-        let rows = rows.min(PTY_RESIZE_DIM_MAX);
-        let cols = cols.min(PTY_RESIZE_DIM_MAX);
+        let (requested_rows, requested_cols) = (rows, cols);
+        let (rows, cols) = clamp_pty_dims(rows, cols);
+        if (rows, cols) != (requested_rows, requested_cols)
+            && !OVERSIZED_RESIZE_LOGGED.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                agent_id = %id,
+                requested_rows,
+                requested_cols,
+                applied_rows = rows,
+                applied_cols = cols,
+                max = PTY_RESIZE_DIM_MAX,
+                "resize request exceeded PTY_RESIZE_DIM_MAX and was clamped; the child PTY \
+                 is narrower/shorter than the caller asked for (logged once per process)"
+            );
+        }
         let mut inner = self.inner.lock().unwrap();
         let agent = inner
             .agents

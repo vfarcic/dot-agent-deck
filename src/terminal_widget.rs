@@ -7,6 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 
+use crate::agent_pty::clamp_pty_dims;
 use crate::palette;
 use crate::state::SessionStatus;
 
@@ -301,11 +302,23 @@ impl Widget for TerminalWidget {
         // `rows == 0 || cols == 0` guard), so its PTY legitimately keeps its
         // prior size. The `min` fallback below renders nothing into a 0-dim
         // area, so there is nothing to assert.
+        //
+        // Issue #747: the expectation is the inner area CLAMPED to
+        // `PTY_RESIZE_DIM_MAX`, not the raw inner area. A PTY cannot be made
+        // larger than that cap — the daemon refuses on principle (a same-uid
+        // peer could otherwise drive an agent to an absurd geometry) — so on a
+        // terminal wider than the cap `resize_panes_to_layout` deliberately
+        // sizes the pane to the cap and the drawn area is legitimately larger.
+        // Asserting against the raw inner area there would turn a correctly
+        // handled edge into a debug-build panic, and asserting nothing would
+        // give the mismatch back its silence.
         if self.contract_guaranteed && inner.height > 0 && inner.width > 0 {
+            let (expected_rows, expected_cols) = clamp_pty_dims(inner.height, inner.width);
             debug_assert!(
-                (screen_rows, screen_cols) == (inner.height, inner.width),
+                (screen_rows, screen_cols) == (expected_rows, expected_cols),
                 "PRD #84 invariant 3: a layout-sized pane's PTY screen ({screen_rows}x{screen_cols}) \
-                 must equal its inner area ({}x{}); resize_panes_to_layout must size every drawn \
+                 must equal its inner area capped at PTY_RESIZE_DIM_MAX ({expected_rows}x{expected_cols}, \
+                 from a {}x{} inner area); resize_panes_to_layout must size every drawn \
                  pane before render (pane {:?})",
                 inner.height,
                 inner.width,
@@ -313,7 +326,7 @@ impl Widget for TerminalWidget {
             );
             // Release path (the `debug_assert!` above is compiled out): log once
             // so the violation is observable without spamming a line per frame.
-            if (screen_rows, screen_cols) != (inner.height, inner.width)
+            if (screen_rows, screen_cols) != (expected_rows, expected_cols)
                 && !SIZE_MISMATCH_LOGGED.swap(true, Ordering::Relaxed)
             {
                 tracing::warn!(
@@ -321,9 +334,11 @@ impl Widget for TerminalWidget {
                     screen_cols,
                     inner_height = inner.height,
                     inner_width = inner.width,
+                    expected_rows,
+                    expected_cols,
                     pane = %self.title,
-                    "TerminalWidget: PTY screen size != inner area — falling back to min(area, screen); \
-                     see PRD #84 rendering contract (invariant 3)"
+                    "TerminalWidget: PTY screen size != inner area (capped at PTY_RESIZE_DIM_MAX) — \
+                     falling back to min(area, screen); see PRD #84 rendering contract (invariant 3)"
                 );
             }
         }

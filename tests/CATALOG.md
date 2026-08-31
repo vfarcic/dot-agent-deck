@@ -2059,6 +2059,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** which layout is the "default" (already a settled product call).
 - **Platform coverage:** mac+linux.
 
+##### resize/layout/002 — On a terminal wider than `PTY_RESIZE_DIM_MAX`, a pane's local vt100 parser lands on the same capped geometry the daemon gives the child (issue #747).
+- **Layer:** L1 (pure-data `compute_frame_layout` + the real `resize_panes_to_layout` sweep over inert seam panes; no PTY, no subprocess, no daemon). Lives in `src/ui.rs`'s own `#[cfg(test)]` module because `compute_frame_layout`, `FrameLayout::pane_target_dims` and `resize_panes_to_layout` are module-private, and because the public `render_orchestration_frame_to_buffer` seam clamps its width to `RENDER_SEAM_DIM_MAX` (1024) and so cannot reach the threshold at all.
+- **Agent:** none (inert render/scroll seam panes).
+- **Asserts:** at 4200 cols ZOOMED (inner 4198) and at 6400 cols UNZOOMED under the 34/66 split (inner 4222) — the two thresholds issue #747 names — `pane_target_dims` reports the capped 4096 rather than the raw inner width, and after the sweep each pane's vt100 parser sits at exactly `(rows.min(4096), cols.min(4096))`, the geometry `AgentPtyRegistry::resize` applies to the child. The cap is restated inline rather than read from the production helper, so the test states the daemon's rule instead of echoing the code under test. Also drives the `resize_pane_pty` primitive directly, one over-cap axis at a time, since it is a `pub` method whose parser write and wire write must not be able to disagree even from a call site the layout sweep does not own. **Control:** the same sweep at 4200 cols UNZOOMED targets 2770 inner cols, under the cap, and must come through completely untouched — so a regression that clamped every pane rather than only over-cap ones fails here.
+- **Does not assert:** the daemon actually applying the clamp to a real child PTY (covered by `tests/daemon_protocol.rs`'s `assert_resize_clamps`, which reads it back through `stty size`); the rendered cells of an over-cap pane (covered by `render/widget/003`); the once-per-process `warn!` either clamp now emits (observability, not behaviour); any width a real terminal reaches — both fixtures are far past any physical display, which is the point.
+- **Platform coverage:** mac+linux+windows.
+
 #### resize/render
 
 ##### resize/render/001 — Enlarging the outer terminal fills the new width across an embedded pane — no empty band on the right edge.
@@ -2101,6 +2108,13 @@ note).
 - **Platform coverage:** mac+linux.
 - **M1 status (PRD #84):** **Flag / guard (passes today).** Pins the release-path contract M5 must preserve: area > PTY must fall back to `min` and never panic. Current code already does `min` and does not panic, so this is GREEN now and stays GREEN through M5's release fallback. (M5's debug-only `debug_assert!` is explicitly out of scope here — orchestrator brief: "test the release fallback path".)
 - **Post-M5 resolution (PRD #84):** **GREEN (unchanged throughout M1→M5).** M5 preserved the release `min(area, pty)` no-panic fallback (log-once on mismatch) alongside the new debug-build contract `debug_assert!`, so this release-path guard stays green and now pins the fallback the M5 contract intentionally keeps.
+
+##### render/widget/003 — A pane drawn wider than `PTY_RESIZE_DIM_MAX` does not trip the invariant-3 contract guard (issue #747).
+- **Layer:** L1 (in-process `TerminalWidget` rendered into a `ratatui::buffer::Buffer`; no PTY, no subprocess).
+- **Agent:** none.
+- **Asserts:** a vt100 screen at exactly the 4096-col cap — the widest a child PTY can be given — rendered with `contract_guaranteed(true)` into an inner area 2 columns WIDER completes without panicking, which in a debug build is the whole assertion: the PRD #84 invariant-3 `debug_assert!` is live there and compares the parser against the inner area, so it must expect the *capped* inner area or a legitimately over-cap pane becomes a debug-build crash. The child's content still renders from the top-left and the columns past the cap stay blank.
+- **Does not assert:** the release-mode log-once line; the upstream sizing that produces the capped parser (covered by `resize/layout/002`); the general area-larger-than-screen `min` fallback with the guard OFF (covered by `render/widget/002`).
+- **Platform coverage:** mac+linux+windows.
 
 #### render/layout
 

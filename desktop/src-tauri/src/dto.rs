@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dot_agent_deck::agent_pty::{
-    AgentRecord, PTY_RESIZE_DIM_MAX, TabMembership, is_valid_cwd, is_valid_display_name,
+    AgentRecord, TabMembership, clamp_pty_dims, is_valid_cwd, is_valid_display_name,
     is_valid_orchestration_cwd, is_valid_pane_id_env,
 };
 use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
@@ -373,7 +373,10 @@ pub(crate) fn validate_dimensions(rows: u16, cols: u16) -> Result<(u16, u16), St
             "rows and cols must be greater than zero (got {rows}x{cols})"
         ));
     }
-    Ok((rows.min(PTY_RESIZE_DIM_MAX), cols.min(PTY_RESIZE_DIM_MAX)))
+    // Issue #747: through the shared helper rather than a second copy of the
+    // `.min()` pair, so the desktop bridge cannot drift from the TUI and the
+    // daemon about what geometry a resize request actually produces.
+    Ok(clamp_pty_dims(rows, cols))
 }
 
 pub(crate) fn validate_command(command: Option<&str>) -> Result<(), String> {
@@ -500,6 +503,7 @@ pub(crate) fn ensure_desktop_workflow_platform_supported(target_os: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dot_agent_deck::agent_pty::PTY_RESIZE_DIM_MAX;
     use dot_agent_deck::state::{ActiveTool, SessionSnapshot};
 
     fn fixture_record() -> AgentRecord {
