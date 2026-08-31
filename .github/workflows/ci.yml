@@ -183,10 +183,12 @@ jobs:
       # both `cargo clippy` and `cargo clippy --all-targets` reported clean.
       #
       # Until this step existed, e2e code was linted by nothing anywhere and
-      # type-checked only by `cargo test-e2e` — which is not in CI (rule 5: it
-      # spawns binaries and hits LLM APIs). This step is a type-check and lint
-      # only; it runs no test and needs no agent or API key, so it does not
-      # smuggle the e2e tier into CI. It just makes the local rule 2 gate
+      # type-checked only by `cargo test-e2e`, which at the time ran in no
+      # workflow at all. Since issue #502 the tier itself DOES run in CI — see
+      # `e2e-deterministic` below and e2e-live.yml — but this step is still
+      # only a type-check and lint: it runs no test and needs no agent or API
+      # key, so naming the e2e features here neither duplicates those jobs nor
+      # gives this one a credential. It just makes the local rule 2 gate
       # something a contributor cannot forget to run.
       #
       # Linux only. build-windows/build-macos below stay on bare `cargo clippy`
@@ -418,9 +420,17 @@ jobs:
   #     to Unix at the source level (#![cfg(unix)]), so they compile to empty
   #     crates here;
   #   * the L2 PTY e2e suite is excluded because this job runs `cargo nextest
-  #     run` WITHOUT `--features e2e` — all but two `tests/e2e_*.rs` files open
-  #     with a bare `#![cfg(feature = "e2e")]` and carry no Unix gate at all, so
-  #     they are never compiled here rather than compiled-and-emptied.
+  #     run` WITHOUT either e2e feature — every one of the 71 `tests/e2e_*.rs`
+  #     files opens with a `feature = "e2e"` cfg (47 bare, 24 also requiring
+  #     `feature = "e2e-live"` since issue #502), so none of them is compiled
+  #     here at all rather than compiled-and-emptied. Note this is a DIFFERENT
+  #     mechanism from the first bullet even for the six of the 71 that DO
+  #     carry a `unix` term (e2e_hook_binary_path, e2e_remote_doctor,
+  #     e2e_tab_close_regressions, and the live-gated e2e_card_layout,
+  #     e2e_prompt_delivery_confirmation, e2e_shell_activity_real_agent): the
+  #     missing feature already excludes them, so the `unix` term never gets a
+  #     chance to. Nothing about this job changes with #502 — it names no e2e
+  #     feature, so all 71 stay out however they are gated, and that is correct.
   # That second point is why `scripts/windows-cross-check.sh --features e2e` is
   # red locally and is not a gate (issue #368). Porting the harness to Windows
   # named pipes + ConPTY and running full integration/e2e on a Windows VM is

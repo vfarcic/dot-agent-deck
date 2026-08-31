@@ -38,7 +38,7 @@ Do not reverse the order, and do not skip to the fix because the cause looks obv
 
 7. **Watch the same test go green**, then prove each fix is load-bearing: revert one change at a time and confirm the test goes red again. If reverting a change leaves the test green, that change is not part of the fix — take it out or find what it is really doing.
 
-8. **Run the wider tier** before reporting done (`cargo test-fast`; `cargo test-e2e` pre-PR per CLAUDE.md rule 5).
+8. **Run the wider tier** before reporting done: `cargo test-fast`. There is no full-tier obligation before the PR — per CLAUDE.md rule 5 the e2e tier runs in CI, lane 1 on every PR and lane 2 per-merge on `main`. If your reproduction is an e2e test, run it and its module by filter (`cargo test-e2e <filter>`, adding `,e2e-live` via `cargo test-e2e-live <filter>` only when the test needs a real agent credential); do not run either alias unfiltered.
 
 ## The traps that have actually cost time here
 
@@ -61,5 +61,5 @@ Do not reverse the order, and do not skip to the fix because the cause looks obv
 ## Related
 
 - `CONTRIBUTING.md` — the team-facing statement of this norm, and the TDD loop commands.
-- `CLAUDE.md` rule 4 (which test tier a change needs) and rule 5 (fast tier per task, e2e pre-PR).
+- `CLAUDE.md` rule 4 (which test tier a change needs) and rule 5 (fast tier per task; the e2e tier runs in CI as two lanes, not before the PR).
 - `tests/CATALOG.md` — every test's entry records what it does *not* assert; add yours there.

@@ -2,9 +2,9 @@
 
 ## Prerequisites
 
-Enter `devbox shell` for the pinned toolchain — it provides `cargo-nextest` (test runner), `asciinema` (cast replay), and the rest of the project's CLI deps. Outside devbox, install nextest manually with `cargo install cargo-nextest --locked`. The `cargo test-fast` / `cargo test-e2e` aliases in `.cargo/config.toml` resolve through nextest; without it they error with `no such command: nextest`.
+Enter `devbox shell` for the pinned toolchain — it provides `cargo-nextest` (test runner), `asciinema` (cast replay), and the rest of the project's CLI deps. Outside devbox, install nextest manually with `cargo install cargo-nextest --locked`. The `cargo test-fast` / `cargo test-e2e` / `cargo test-e2e-live` aliases in `.cargo/config.toml` resolve through nextest; without it they error with `no such command: nextest`.
 
-For `cargo test-e2e` chain-smoke tests you also need the agent CLIs (`claude` and `opencode`) installed locally and logged in — the tests skip with a specific reason if either is missing (per Decision 8).
+The agent CLIs (`claude`, `opencode`, `codex`, `pi`) installed locally and logged in are needed only for the **live** lane, `cargo test-e2e-live` — the chain-smoke and other real-agent tests skip with a specific reason if the CLI or its credentials are missing. `cargo test-e2e` needs none of them.
 
 ### Cloning on Windows: turn symlinks on first
 
@@ -39,14 +39,24 @@ cargo test-fast lifecycle_001     # filter to one test
 cargo test-fast                   # run the full fast tier
 ```
 
-E2e tier (local-only, pre-PR gate per Decision 8):
+E2e tier — three lanes since issue #502, split by whether a test needs a working agent credential (CLAUDE.md rule 5):
+
+| Lane | Command | Contents | Runs |
+| --- | --- | --- | --- |
+| 1 — deterministic | `cargo test-e2e` | the 47 credential-free `tests/e2e_*.rs` files | in CI, on every PR (the `e2e-deterministic` job) |
+| 2 — real agent | `cargo test-e2e-live` | a **superset**: all 71 files, so lane 1 plus the 24 credentialed ones | in CI, per-merge on `main`, or on demand on a PR via the `run-live-e2e` label |
+| 3 — local | either alias with a filter | the test you are debugging, then its module | your machine |
+
+**There is no obligation to run the full tier before opening a PR.** That mandate was removed with issue #502: CI runs lane 1 on every PR, and every dispatched agent running the whole tier concurrently was itself a source of failures (#415 measured 6-7 of 40 files failing in parallel against 40/40 at `-j 1`). What you run locally is lane 3 — the failing test, then its module:
 
 ```sh
-cargo test-e2e lifecycle_001
-cargo test-e2e
+cargo test-e2e lifecycle_001            # lane 1 needs no credentials
+cargo test-e2e-live claude_001          # lane 2 needs your own agent credentials
 ```
 
-For a watch loop, `bacon test-fast` (or `bacon test-e2e`) reruns on every save; press `f` to filter to currently-failing tests, `esc` to clear. Function names follow Decision 17's `<sub-area>_<NNN>_<suffix>` pattern, so the filter is unique by construction.
+For a watch loop, `bacon test-fast` (or `bacon test-e2e` / `bacon test-e2e-live`) reruns on every save; press `f` to filter to currently-failing tests, `esc` to clear. Function names follow Decision 17's `<sub-area>_<NNN>_<suffix>` pattern, so the filter is unique by construction.
+
+[`docs/develop/e2e-lanes.md`](docs/develop/e2e-lanes.md) covers the operational side: the label, the environment, and why a green lane-2 run can still mean almost nothing.
 
 ## How to add a new test
 
@@ -70,6 +80,7 @@ Maintainer-facing references that are intentionally **not** published to the doc
 - [Agent-driven notifications — retired ntfy dogfood](docs/develop/notifications-dogfood.md) — historical note (retired 2026-07-28): the `scripts/notify.sh` + public-ntfy-topic dogfood that PRD #126 started from, what replaced it (the daemon's idle-worker detector plus an orchestrator-only Telegram recipe in `.dot-agent-deck.toml`, with workers escalating through `work-done` instead of notifying), and where the findings and the user-facing docs now live.
 - [Worktree ownership](docs/develop/worktree-ownership.md) — how the deck proves it created a git worktree before `worktree reclaim` may remove one unattended (issues #422/#425): where the `dot-agent-deck-owner` marker lives and why it is in the worktree's git metadata dir rather than the working tree (an in-tree marker would make every marked worktree permanently *un*reclaimable), which creation paths write it, why the write is best-effort and idempotent, why the gate is an existence check that never parses the marker's content, and the rule that keeps it honest — a worktree that already exists is never adopted, because the marker is a claim consumed by a path that deletes directories.
 - [E2E temp directories](docs/develop/e2e-temp-dirs.md) — how the harness allocates scratch space and why it all nests under one per-process root (issue #322): the `atexit` cleanup and why a `static TempDir` silently leaked one dir per test even on green runs, `cargo xtask clean-e2e-tmp` for reaping what SIGKILLed runs left behind (and why `.tmp*` is opt-in), why the base defaults to a private, UID-scoped `/var/tmp/dad-e2e-<uid>` parent rather than a RAM-backed `/tmp` (and why *not* the repo's own `target/`, which would make every seeded fixture a descendant of the real checkout), the socket-length budget that governs the ladder, why `--root` exists rather than the reaper trusting `DAD_E2E_TMPDIR`, the free-space pre-flight that stops tmpfs exhaustion from masquerading as product regressions, how long a leftover holding real agent credentials should be allowed to live, and the `DAD_E2E_TMPDIR` / `DAD_E2E_MIN_FREE_MB` / `DAD_E2E_IMPORT_CLAUDE_PLUGINS` knobs.
+- [The e2e lanes](docs/develop/e2e-lanes.md) — how to actually drive the two CI lanes issue #502 created: what each one runs and where, how to trigger the credentialed lane on a PR with the `run-live-e2e` label, the `live-e2e` GitHub Environment and its required reviewer, and the three things that decide whether a green lane-2 run means anything — every credential preflight *skips* rather than fails and nextest counts that as a pass, an API key alone leaves most of the lane skipping because `check_claude_available` never consults `ANTHROPIC_API_KEY`, and the two npm agent-CLI pins in the workflow are not tracked by Renovate.
 - [Checking a Windows compile locally](docs/develop/windows-cross-check.md) — `scripts/windows-cross-check.sh` type-checks the workspace *including tests* for `x86_64-pc-windows-msvc` from a Linux host, closing the gap that makes CI's `build-windows` job the first thing to ever compile for Windows. Covers why the devbox toolchain can't do it, the compiler and archiver shims that keep devbox's `CC=gcc`/`AR=ar` from being handed a Windows cross-compile (issue #368), why `--features e2e` is not a gate you can hold yourself to yet, and how to choose between a per-item `#[cfg(unix)]` and a file-level `#![cfg(unix)]` when it finds a break.
 - [The tracked symlinks, and what a Windows clone does to them](docs/develop/windows-symlinks.md) — why `AGENTS.md`, the 33 entries under `.agents/skills/` and `docs/img` are symlinks, what git does to them when `core.symlinks` is off (writes each as a plain text file containing the target path, silently), how to set a Windows clone up so it does not happen and how to repair one that already did, what `scripts/check-symlinks.sh` asserts and how its `--self-test` keeps a green run from being vacuous, and why the CI step on `windows-latest` is a regression guard on the runner image rather than a way to see a contributor's own broken clone.
 - [Governance: maintainers and the protected `main`](docs/develop/governance.md) — how changes reach `main` and who approves them: the `main-protected` ruleset, why the `RELEASE_TOKEN` PAT must exist *before* the gate goes up (release.yml and docs-publish.yml push directly to `main`, and `GH006` is what killed v0.35.6), why the maintainer set is just the collaborator list (GitHub counts approvals only from write/admin accounts, so there is deliberately no `CODEOWNERS`), why a one-collaborator repo cannot satisfy its own review requirement, the sequenced rollout, and the stricter GitHub-App variant that makes the gate bind the owner too. Who the maintainers are is listed in [`MAINTAINERS.md`](MAINTAINERS.md).

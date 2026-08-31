@@ -136,10 +136,10 @@ Also gate before commit (per `CLAUDE.md`):
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets --features e2e -- -D warnings
+cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
 ```
 
-`--features e2e` is not optional (issue #407): without it every `tests/e2e_*.rs` compiles to an empty crate, so clippy reports clean over code it never saw.
+Every flag is load-bearing and CLAUDE.md rule 2 is the authority. `--all-targets --features e2e` per issue #407 and `e2e-live` per issue #502: without them the 71 `tests/e2e_*.rs` files compile to empty crates (all of them without `e2e`, the 24 credentialed ones without `e2e-live`), so clippy reports clean over code it never saw. `--workspace` per issue #436, or the `xtask/*` members are linted by nothing.
 
 ## Gotchas
 

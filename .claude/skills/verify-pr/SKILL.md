@@ -1,6 +1,6 @@
 ---
 name: verify-pr
-description: Deeply verify a pull request written by someone else and end with an explicit merge recommendation. Safety-scans the diff, checks the PR out into its own worktree, runs every automated gate including the e2e tier, reviews the code against this repo's rules, and reports a verdict. Use when asked to review, verify, audit, or decide whether to merge a PR from a contributor, from Renovate, or from another agent.
+description: Deeply verify a pull request written by someone else and end with an explicit merge recommendation. Safety-scans the diff, checks the PR out into its own worktree, runs every automated gate including lane 1 of the e2e tier, reviews the code against this repo's rules, and reports a verdict. Use when asked to review, verify, audit, or decide whether to merge a PR from a contributor, from Renovate, or from another agent.
 user-invocable: true
 ---
 
@@ -121,14 +121,18 @@ bash .claude/skills/verify-pr/checks.sh --dir ../dot-agent-deck-pr-<n>
 
 **Run this in the background** (`run_in_background: true`) — the suite runs far longer than a foreground tool call allows. It appends a row to `<worktree>/target/verify-pr/summary.tsv` as each step finishes and writes `DONE` at the end, so poll those instead of blocking. Logs land per step under `target/verify-pr/logs/`.
 
-Steps, cheapest first: `fmt`, `clippy` (both rule 2), `build --release`, `test-fast` (rule 5's fast tier), `linkage-check` (rule 7), `windows-cross`, `audit`, then `e2e`. It does not stop at the first failure — a review needs the whole picture. If the build fails, the test steps are marked `BLOCKED` rather than burning minutes restating it.
+Steps, cheapest first: `fmt`, `clippy` (both rule 2 — note clippy carries **both** e2e features, so it type-checks lane 2's files even though nothing here runs them), `build --release`, `test-fast` (rule 5's fast tier), `linkage-check` (rule 7), `windows-cross`, `audit`, then `e2e` (rule 5's **lane 1** — the 47 deterministic files, `--features e2e`). It does not stop at the first failure — a review needs the whole picture. If the build fails, the test steps are marked `BLOCKED` rather than burning minutes restating it.
 
-Two things to tell the user **before** starting the run: the e2e tier spawns real binaries and hits real LLM APIs, so it costs real money and tens of minutes, and per rule 5 it needs the `claude` / `opencode` CLIs installed and logged in. `env.txt` records which agent CLIs were found. Run inside `devbox shell` if `cargo-nextest` is missing.
+Tell the user **before** starting the run that the `e2e` step spawns real binaries and PTYs and takes tens of minutes. It needs **no** agent credential: since issue #502 this skill runs lane 1 only, and lane 1's 47 files are exactly the ones that need none. `env.txt` still records which agent CLIs were found, because a stray `claude` on PATH changes what a couple of lane-1 tests do. Run inside `devbox shell` if `cargo-nextest` is missing.
 
-**The `e2e-real-coverage` row matters more than the `e2e` row.** A real-agent test that cannot run prints `SKIP: <reason>` and *returns normally*, so nextest counts it as **passed** — a green e2e run that proved nothing. `checks.sh` passes `--success-output=final` specifically to make those lines visible, counts them, and writes them to `e2e-skips.txt`. If any skipped test covers the surface this PR changes, rerun it with the skip-to-failure switch:
+**This skill does not run lane 2, and that is a deliberate gap you must state in the report.** The 24 credentialed files are exercised by `.github/workflows/e2e-live.yml`, not here — running them locally would need the reviewer's own agent credentials and spend real tokens on the flakiest tests in the repo. If the PR under review touches real-agent paths (spawn, hooks, delegate, the adapters), apply the `run-live-e2e` label to it and read that workflow's run instead; [`docs/develop/e2e-lanes.md`](../../../docs/develop/e2e-lanes.md) covers how, and why a green lane-2 run can still mean almost nothing. Where the label was not applied, say plainly that lane 2 is UNVERIFIED for this PR rather than letting a green lane-1 row stand in for it.
+
+**The `e2e-real-coverage` row matters more than the `e2e` row.** A test that cannot run prints `SKIP: <reason>` and *returns normally*, so nextest counts it as **passed** — a green run that proved nothing. In lane 1 a skip means a missing local tool or an unmet host precondition rather than an absent credential, which makes it more interesting rather than less: CI's `e2e-deterministic` job is supposed to run every one of these for real. `checks.sh` passes `--success-output=final` specifically to make those lines visible, counts them, and writes them to `e2e-skips.txt`. If any skipped test covers the surface this PR changes, rerun it with the skip-to-failure switch:
 
 ```bash
 cd ../dot-agent-deck-pr-<n> && DOT_AGENT_DECK_REQUIRE_REAL_E2E=1 cargo nextest run --features e2e <test-filter>
+# add `,e2e-live` to the feature list only if the filter names a lane-2 test
+# AND you have your own agent credentials — see docs/develop/e2e-lanes.md
 ```
 
 If it still cannot run, that surface is **UNVERIFIED**. Never green.
@@ -172,7 +176,7 @@ git -C ../dot-agent-deck-pr-<n>-base reset --hard origin/main
 
 Do **not** hand-roll a worktree under the scratchpad to get a second baseline. A cargo `target/` is multi-GB and the scratchpad is typically a tmpfs, so the build dies at link time with a misleading `linking with 'cc' failed`, and the space it does consume comes out of the RAM the compile needs (CLAUDE.md rule 14). Every worktree belongs at a disk-backed `../<repo>-<suffix>` sibling.
 
-**Flakes.** The e2e tier is flaky-tolerant by design (rule 5), and timing-sensitive tests here have failed on one platform and passed on two others in the same run. Per rule 6, rerun the single failing test in isolation first:
+**Flakes.** The e2e tier is flaky-tolerant by design — which is why rule 5 makes lane 2 advisory and per-merge rather than a per-PR gate — and timing-sensitive tests here have failed on one platform and passed on two others in the same run. Per rule 6, rerun the single failing test in isolation first:
 
 ```bash
 cd ../dot-agent-deck-pr-<n> && cargo nextest run --features e2e <test-name>

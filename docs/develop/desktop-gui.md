@@ -123,14 +123,15 @@ cargo clippy -p dot-agent-deck-desktop --all-targets -- -D warnings
 Run the repository-wide required fast gates from the repository root:
 
 ```sh
-cargo clippy -- -D warnings
+cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
 cargo test-fast
 ```
 
-Before a PR, run the local-only PTY/real-agent tier once, after the fast gates are green:
+There is no full-tier obligation before a PR — CI runs the e2e tier as two lanes (CLAUDE.md rule 5, [`e2e-lanes.md`](e2e-lanes.md)). Where a desktop change touches a PTY or real-agent path, run those tests by filter:
 
 ```sh
-cargo test-e2e
+cargo test-e2e <filter>        # lane 1, no credentials needed
+cargo test-e2e-live <filter>   # lane 2, needs your own agent credentials
 ```
 
 The live manual smoke check is: build the matching CLI, launch `pnpm tauri dev`, use **Start daemon** if needed, launch the configured live loop against a disposable project/worktree, confirm every role hydrates under one orchestration, interact with a real agent in an embedded terminal, resize the window and terminal, reconnect without duplicated output, and stop only a disposable agent through the confirmation dialog. Do not treat the fixture as proof that a real agent or daemon path works.
