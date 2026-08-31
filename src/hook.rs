@@ -1275,6 +1275,44 @@ mod tests {
         assert!(prompt.ends_with('…'));
     }
 
+    /// `source` degrades the same way an unexpected-shape field elsewhere in
+    /// this struct already does: a strict `Option<String>` would fail the
+    /// WHOLE decode on a non-string `source` (object, number, bool, array),
+    /// and `handle_hook` swallows that error silently (`Err(_) => return
+    /// ExitCode::SUCCESS`) for all four producer arms. `lenient_string` must
+    /// degrade a non-string `source` to `None` instead of dropping the event.
+    #[test]
+    fn source_002_non_string_source_does_not_drop_the_event() {
+        for (label, source_json) in [
+            ("object", r#"{"kind":"clear"}"#),
+            ("number", "3"),
+            ("bool", "true"),
+            ("array", r#"["clear"]"#),
+        ] {
+            let payload = format!(
+                r#"{{"session_id":"test-123","hook_event_name":"SessionStart","source":{source_json}}}"#
+            );
+            let hook_input: ClaudeCodeHookInput =
+                serde_json::from_str(&payload).unwrap_or_else(|e| {
+                    panic!("a non-string ({label}) source must not fail the whole decode: {e}")
+                });
+            assert!(
+                hook_input.source.is_none(),
+                "a non-string ({label}) source must degrade to None, not a decode error"
+            );
+            let event = build_event(hook_input)
+                .expect("the rest of the event must survive a non-string source");
+            assert_eq!(event.session_id, "test-123");
+            assert_eq!(event.event_type, EventType::SessionStart);
+        }
+
+        // `null` already works and must keep working.
+        let payload = r#"{"session_id":"test-123","hook_event_name":"SessionStart","source":null}"#;
+        let hook_input: ClaudeCodeHookInput =
+            serde_json::from_str(payload).expect("a null source must decode fine");
+        assert!(hook_input.source.is_none());
+    }
+
     #[test]
     fn send_to_missing_socket_returns_none() {
         // With no daemon running, send should silently fail
@@ -2089,6 +2127,98 @@ mod tests {
         })
         .expect("SessionStart maps to an event");
         assert!(!genuine.is_wrapper_fork_session_start());
+    }
+
+    /// `ClaudeCodeHookInput.source == "clear"` on a `SessionStart` must
+    /// forward `CLEAR_SESSION_START_METADATA_KEY` / `CLEAR_SESSION_START_METADATA_VALUE`
+    /// into `AgentEvent.metadata` — narrowly, mirroring
+    /// `session_start_origin_survives_the_claude_hook_builder` above for the
+    /// sibling `SESSION_START_ORIGIN_METADATA_KEY` forwarding. Also covers a
+    /// non-`ClaudeCode` `agent_type` (built via `build_event_typed` directly,
+    /// since `build_event` hardcodes `ClaudeCode`) not forwarding the key
+    /// even when `source == "clear"`.
+    #[test]
+    fn clear_session_start_source_forwards_narrowly() {
+        let payload = |event: &str, source: Option<&str>| ClaudeCodeHookInput {
+            session_id: "clear-pane-1".into(),
+            hook_event_name: event.into(),
+            cwd: None,
+            tool_name: None,
+            tool_input: None,
+            tool_use_id: None,
+            prompt: None,
+            source: source.map(str::to_string),
+            _extra: HashMap::new(),
+        };
+
+        // A `SessionStart` with `source: "clear"` forwards the key.
+        let cleared = build_event(payload("SessionStart", Some("clear")))
+            .expect("SessionStart maps to an event");
+        assert_eq!(
+            cleared
+                .metadata
+                .get(crate::event::CLEAR_SESSION_START_METADATA_KEY)
+                .map(String::as_str),
+            Some(crate::event::CLEAR_SESSION_START_METADATA_VALUE),
+            "a `/clear`-originated SessionStart must forward the metadata key: {:?}",
+            cleared.metadata
+        );
+
+        // A `SessionStart` with a different (or missing) `source` does NOT
+        // forward the key — only the literal `"clear"` value is narrow-cased.
+        let startup = build_event(payload("SessionStart", Some("startup")))
+            .expect("SessionStart maps to an event");
+        assert!(
+            !startup
+                .metadata
+                .contains_key(crate::event::CLEAR_SESSION_START_METADATA_KEY),
+            "source: \"startup\" must not forward the clear-session-start key: {:?}",
+            startup.metadata
+        );
+
+        let missing_source =
+            build_event(payload("SessionStart", None)).expect("SessionStart maps to an event");
+        assert!(
+            !missing_source
+                .metadata
+                .contains_key(crate::event::CLEAR_SESSION_START_METADATA_KEY),
+            "a SessionStart with no source field must not forward the clear-session-start \
+             key: {:?}",
+            missing_source.metadata
+        );
+
+        // A non-SessionStart event carrying source: "clear" does NOT forward
+        // the key either — proves the narrowing is on event_type too, not
+        // just on the source value.
+        let wrong_event = build_event(payload("UserPromptSubmit", Some("clear")))
+            .expect("UserPromptSubmit maps to an event");
+        assert!(
+            !wrong_event
+                .metadata
+                .contains_key(crate::event::CLEAR_SESSION_START_METADATA_KEY),
+            "a non-SessionStart event must not forward the clear-session-start key even \
+             when source is \"clear\": {:?}",
+            wrong_event.metadata
+        );
+
+        // This feature is Claude-Code only — a `SessionStart` with
+        // `source: "clear"` stamped with a non-`ClaudeCode` agent_type must
+        // NOT forward the key, even though every other condition is met.
+        // Goes through `build_event_typed` directly (not the `build_event`
+        // convenience wrapper, which hardcodes `AgentType::ClaudeCode`) so
+        // this actually exercises the `agent_type == AgentType::ClaudeCode`
+        // gate — deleting that condition would break no other test.
+        let non_claude_code =
+            build_event_typed(payload("SessionStart", Some("clear")), AgentType::Codex)
+                .expect("SessionStart maps to an event");
+        assert!(
+            !non_claude_code
+                .metadata
+                .contains_key(crate::event::CLEAR_SESSION_START_METADATA_KEY),
+            "a non-ClaudeCode agent_type must not forward the clear-session-start key even \
+             when source is \"clear\": {:?}",
+            non_claude_code.metadata
+        );
     }
 
     #[test]
