@@ -169,15 +169,14 @@ fn widget_002_area_larger_than_pty_falls_back_to_min_no_panic() {
     );
 }
 
-/// Scenario: Issue #747 — a pane drawn on a terminal wider than
-/// `PTY_RESIZE_DIM_MAX`. Build a vt100 screen at exactly the cap (the widest a
-/// child PTY can be given) and render it, with `contract_guaranteed(true)`,
-/// into a pane whose inner area is 2 columns WIDER than that. The
-/// invariant-3 guard must treat the capped inner area as the expectation, so
-/// this renders cleanly instead of tripping the `debug_assert!` — the assert is
-/// live in this (debug) test build, so reaching past the render call at all is
-/// the assertion. The child's full width lands at the top-left and the columns
-/// past the cap stay blank, because the child has no more columns to show.
+/// Scenario: Issue #747 — build a vt100 screen at exactly `PTY_RESIZE_DIM_MAX`
+/// (the widest a child PTY can be given) and render it, with
+/// `contract_guaranteed(true)`, into a pane whose inner area is 2 columns WIDER
+/// than that. The invariant-3 `debug_assert!` is live in this debug test build
+/// and must expect the CAPPED inner area, so reaching past the render call at
+/// all is the assertion. The child's full width then lands at the top-left and
+/// the columns past the cap stay blank, because the child has no more columns
+/// to show.
 #[spec("render/widget/003")]
 #[test]
 fn widget_003_over_cap_inner_area_does_not_trip_the_contract_guard() {
