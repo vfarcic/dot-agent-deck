@@ -4,7 +4,7 @@ use std::io::Write as _;
 use std::process::ExitCode;
 
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
@@ -20,8 +20,29 @@ struct ClaudeCodeHookInput {
     tool_input: Option<Value>,
     tool_use_id: Option<String>,
     prompt: Option<String>,
+    // Claude Code's native `SessionStart` hook carries a `source` field
+    // (`"startup"`/`"resume"`/`"compact"`/`"clear"`) that today is silently
+    // absorbed into `_extra` and never read. A NAMED field, not routed
+    // through `_extra`/`metadata` — see `build_event_typed`'s narrow
+    // forwarding of it below.
+    //
+    // `lenient_string` degrades a non-string shape (object, number, bool,
+    // array) to `None` instead of failing the whole payload decode: `handle_hook`
+    // swallows a decode error silently (`Err(_) => return ExitCode::SUCCESS`),
+    // so a strict `Option<String>` would blackout the WHOLE event over an
+    // unexpected `source` shape, not just lose the field.
+    #[serde(default, deserialize_with = "lenient_string")]
+    source: Option<String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
+}
+
+/// A non-string value (object, number, bool, array) degrades to `None` rather
+/// than failing the whole payload decode. `null` and a missing key already
+/// decode to `None` via `#[serde(default)]`; this only widens the tolerance
+/// to non-string, non-null shapes. See [`ClaudeCodeHookInput::source`].
+fn lenient_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<Value>::deserialize(d)?.and_then(|v| v.as_str().map(str::to_owned)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -306,6 +327,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         tool_input,
         tool_use_id,
         prompt,
+        source,
         _extra: extra,
     } = input;
 
@@ -391,6 +413,32 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         metadata.insert(
             crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
             crate::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+        );
+    }
+
+    // Forward "this SessionStart came from `/clear`", same deliberately
+    // narrow shape as the boot-provenance forwarding just above — one key,
+    // one value, only on `SessionStart`. Distinct from
+    // `SESSION_START_ORIGIN_METADATA_KEY`: that key is wrapper-fork boot
+    // provenance, an unrelated concern; this one is Claude Code's own
+    // `source` field on its native `SessionStart` hook
+    // (`"startup"`/`"resume"`/`"compact"`/`"clear"`), and only the `"clear"`
+    // value is ever forwarded — every other `source` value stays dropped.
+    //
+    // Also gated on `agent_type == AgentType::ClaudeCode`, since this
+    // builder is shared by the Codex/Devin/default hook arms (all decode
+    // the same `ClaudeCodeHookInput`) and this feature is Claude-Code only.
+    // Defense-in-depth: the consumer-side check in
+    // `orchestrator_remit_pane_latest_clear_session_start` (`src/ui.rs`) is
+    // what actually enforces the scope for a raw `AgentEvent` injected
+    // straight onto the hook socket, which bypasses this builder entirely.
+    if event_type == EventType::SessionStart
+        && agent_type == AgentType::ClaudeCode
+        && source.as_deref() == Some(crate::event::CLEAR_SESSION_START_METADATA_VALUE)
+    {
+        metadata.insert(
+            crate::event::CLEAR_SESSION_START_METADATA_KEY.to_string(),
+            crate::event::CLEAR_SESSION_START_METADATA_VALUE.to_string(),
         );
     }
 
@@ -1143,6 +1191,7 @@ mod tests {
             tool_input: None,
             tool_use_id: None,
             prompt: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1163,6 +1212,7 @@ mod tests {
             tool_input: Some(serde_json::json!({"file_path": "/src/main.rs"})),
             tool_use_id: None,
             prompt: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1181,6 +1231,7 @@ mod tests {
             tool_input: None,
             tool_use_id: None,
             prompt: None,
+            source: None,
             _extra: HashMap::new(),
         };
         assert!(build_event(input).is_none());
@@ -1196,6 +1247,7 @@ mod tests {
             tool_input: None,
             tool_use_id: None,
             prompt: Some("fix the login bug".into()),
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1214,6 +1266,7 @@ mod tests {
             tool_input: None,
             tool_use_id: None,
             prompt: Some(long_prompt),
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1990,6 +2043,7 @@ mod tests {
                 tool_input: None,
                 tool_use_id: None,
                 prompt: None,
+                source: None,
                 _extra: extra,
             }
         };
@@ -2030,6 +2084,7 @@ mod tests {
             tool_input: None,
             tool_use_id: None,
             prompt: None,
+            source: None,
             _extra: HashMap::new(),
         })
         .expect("SessionStart maps to an event");
@@ -2051,6 +2106,7 @@ mod tests {
             tool_input: None,
             tool_use_id: None,
             prompt: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -2103,6 +2159,7 @@ mod tests {
             tool_input: Some(serde_json::json!({"command": full_cmd})),
             tool_use_id: None,
             prompt: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -2127,6 +2184,7 @@ mod tests {
             tool_input: Some(serde_json::json!({"file_path": "/src/main.rs"})),
             tool_use_id: None,
             prompt: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -2143,6 +2201,7 @@ mod tests {
             tool_input: Some(serde_json::json!({"command": "ls -la"})),
             tool_use_id: None,
             prompt: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
