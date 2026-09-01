@@ -935,6 +935,53 @@ describe("AgentOverview", () => {
     expect(screen.queryByTestId("overview-connect-anyway")).not.toBeInTheDocument();
   });
 
+  /**
+   * Issue #801. Two builds from different commits that name the same release
+   * are compatible by this project's own bump policy, so the overview shows the
+   * fleet and says nothing: no incompatible note, no Connect anyway, no second
+   * banner recreating the noise this removed. The stamps are still reachable —
+   * on the state line's `title`, which is a hover and not an alert.
+   */
+  it("shows the fleet with no alert when the differing stamps name the same release", () => {
+    const snapshot = createFixtureSnapshot("crowded");
+    snapshot.connection = {
+      ...snapshot.connection,
+      status: "connected",
+      message: "Daemon responding",
+      daemonDetected: true,
+      runningAgentCount: 9,
+      buildStampMismatchOnly: false,
+      clientBuildVersion: "0.39.0-49-ga0165f8",
+      daemonBuildVersion: "0.39.0-g1ea0fe7",
+    };
+    render(<AgentOverview runtime={runtime({ mode: "live", snapshot })} onNavigate={vi.fn()} />);
+
+    expect(screen.queryByTestId("overview-incompatible")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("overview-connect-anyway")).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Incompatible daemon" })).not.toBeInTheDocument();
+    expect(rows(document.body).length).toBeGreaterThan(0);
+
+    const state = screen.getByTestId("daemon-state");
+    expect(state).toHaveTextContent("Daemon responding");
+    expect(state).toHaveAttribute("title", "Built from different commits — desktop 0.39.0-49-ga0165f8, daemon 0.39.0-g1ea0fe7.");
+  });
+
+  /** Matching stamps have nothing to disclose, so the hover is absent entirely. */
+  it("leaves the daemon state line untitled when both builds report the same stamp", () => {
+    const snapshot = createFixtureSnapshot("crowded");
+    snapshot.connection = {
+      ...snapshot.connection,
+      status: "connected",
+      message: "Daemon responding",
+      daemonDetected: true,
+      clientBuildVersion: "0.39.0-g1ea0fe7",
+      daemonBuildVersion: "0.39.0-g1ea0fe7",
+    };
+    render(<AgentOverview runtime={runtime({ mode: "live", snapshot })} onNavigate={vi.fn()} />);
+
+    expect(screen.getByTestId("daemon-state")).not.toHaveAttribute("title");
+  });
+
   it("reconnects on demand", () => {
     const deck = runtime();
     render(<AgentOverview runtime={deck} onNavigate={vi.fn()} />);

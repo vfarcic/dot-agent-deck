@@ -355,6 +355,35 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * Issue #801. The new ordinary case: two builds from different commits that
+   * name the SAME release. The crate connects with no error at all, so nothing
+   * downstream may invent one — no override flag, and the healthy fallback
+   * message rather than a mismatch note. Both stamps still ride along so the
+   * difference stays discoverable on hover.
+   */
+  it("maps a same-release stamp difference as an ordinary healthy connection", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const sameRelease = structuredClone(snapshot);
+    sameRelease.connection.status = "connected";
+    sameRelease.connection.clientBuildVersion = "0.39.0-49-ga0165f8";
+    sameRelease.connection.daemonBuildVersion = "0.39.0-g1ea0fe7";
+    sameRelease.connection.buildStampMismatchOnly = false;
+    delete sameRelease.connection.error;
+
+    const mapped = mapDesktopSnapshot(sameRelease);
+
+    expect(mapped.connection).toMatchObject({
+      status: "connected",
+      message: "Daemon responding",
+      buildStampMismatchOnly: false,
+      clientBuildVersion: "0.39.0-49-ga0165f8",
+      daemonBuildVersion: "0.39.0-g1ea0fe7",
+    });
+    expect(mapped.connection.message).not.toContain("mismatch");
+    expect(mapped.health).toBe("healthy");
+  });
+
+  /**
    * The whole point of the override: connected, and STILL saying so. The crate
    * keeps the mismatch in `error` on the bypass path, and this mapping is what
    * would drop it — a `connected` status used to be enough to reach for the

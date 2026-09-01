@@ -27,8 +27,10 @@ struct HandshakeInfo {
     daemon_build_version: Option<String>,
     daemon_version: Option<String>,
     running_agent_count: Option<usize>,
-    /// The protocol agreed and only the build stamp differed, so an override is
-    /// legitimate. Never set when the wire itself is incompatible.
+    /// The protocol agreed and the two builds' release versions still disagreed
+    /// (or one of them could not be read), so an override is legitimate. Never
+    /// set when the wire itself is incompatible, and no longer set by a stamp
+    /// difference *within* one release — see [`release_versions_are_compatible`].
     build_stamp_mismatch_only: bool,
 }
 
@@ -123,6 +125,83 @@ fn build_mismatch_allowance() -> BuildMismatchAllowance {
     }
 }
 
+/// The `MAJOR.MINOR.PATCH` a build stamp opens with, or `None` when it does not
+/// open with one.
+///
+/// A stamp is `<version>-g<short-sha>` with an optional commit distance and an
+/// optional `-dirty` suffix — `0.39.0-g1ea0fe7`, `0.39.0-49-ga0165f8`,
+/// `0.39.0-g1ea0fe7-dirty` — and `<version>` may itself carry a SemVer
+/// prerelease or build-metadata suffix (`0.25.0-alpha.0-g1ea0fe7`). Everything
+/// from the first `-` or `+` onward is therefore discarded and only the three
+/// core digits are read. A leading `v` is tolerated because that is the shape a
+/// git tag has, even though `DAD_BUILD_ID` strips it.
+fn release_core(stamp: &str) -> Option<(u64, u64, u64)> {
+    fn field(text: &str) -> Option<u64> {
+        // `u64::from_str` accepts a leading `+`; the explicit digit test keeps
+        // the accepted set to exactly what a version field can look like.
+        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        text.parse().ok()
+    }
+
+    let stamp = stamp.trim();
+    let stamp = stamp.strip_prefix(['v', 'V']).unwrap_or(stamp);
+    let core = stamp.split(['-', '+']).next()?;
+    let mut fields = core.split('.');
+    let (major, minor, patch) = (fields.next()?, fields.next()?, fields.next()?);
+    if fields.next().is_some() {
+        return None;
+    }
+    Some((field(major)?, field(minor)?, field(patch)?))
+}
+
+/// The digits of a release version that move when a compatibility break is
+/// declared, per `docs/develop/versioning.md`.
+///
+/// While the major version is `0` the bump rules are deliberately shifted down
+/// one level from standard SemVer, so a protocol/handler break bumps the
+/// **minor** while a feature or a bugfix bumps the patch: the key is
+/// `0.MINOR`. From `1.0` onward the rules are standard and only the **major**
+/// moves on a break, so the minor is dropped from the key rather than left in
+/// it. Both arms are encoded because a hardcoded `major.minor` would silently
+/// start refusing compatible peers the day this repo ships `1.0`.
+fn compatibility_key(stamp: &str) -> Option<(u64, u64)> {
+    let (major, minor, _patch) = release_core(stamp)?;
+    Some(if major == 0 { (0, minor) } else { (major, 0) })
+}
+
+/// Whether the two builds' *release versions* declare them compatible.
+///
+/// `false` unless BOTH stamps parsed and their keys matched, so an absent,
+/// truncated or otherwise unreadable stamp on either side falls back to the
+/// prompt. Silent connection is the permissive answer and is reached only on
+/// positive evidence — the fail-safe direction is what the tests below pin.
+///
+/// **The residual this does not close, and must not be read as closing.** A
+/// development build's `git describe` names the LAST release, so a branch
+/// carrying an *unreleased* semantic break describes as the release it was cut
+/// from and reads as compatible with it. Nothing in a build stamp can see that
+/// break: the whole point of the `.breaking.md` discipline is that a same-wire,
+/// different-meaning change is not mechanically detectable. It is backstopped
+/// by CLAUDE.md rule 12's cross-version manual test — run against the previous
+/// release before such a change merges — and by the fragment that test's
+/// outcome demands, which is what turns the break into a minor bump this
+/// function can then see. This reads released versions; it says nothing about
+/// unreleased ones.
+fn release_versions_are_compatible(client_build: &str, daemon_build: Option<&str>) -> bool {
+    let Some(daemon_build) = daemon_build else {
+        return false;
+    };
+    match (
+        compatibility_key(client_build),
+        compatibility_key(daemon_build),
+    ) {
+        (Some(client), Some(daemon)) => client == daemon,
+        _ => false,
+    }
+}
+
 fn classify_handshake(
     response: &AttachResponse,
     client_build: &str,
@@ -155,10 +234,16 @@ fn classify_handshake(
                 .map(|version| version.to_string())
                 .unwrap_or_else(|| "no version".into())
         ))
-    } else if daemon_build_version.as_deref() != Some(client_build) {
+    } else if daemon_build_version.as_deref() != Some(client_build)
+        && !release_versions_are_compatible(client_build, daemon_build_version.as_deref())
+    {
         // Reached only AFTER the protocol check above returned equal, so the
-        // wire shape is already agreed and what differs is the git-describe
-        // stamp alone. That is exactly the mismatch an override may relax.
+        // wire shape is already agreed. Two builds get here: ones whose release
+        // versions declare a compatibility break between them, and ones where a
+        // stamp could not be read at all — the fail-safe fallback. A stamp
+        // difference WITHIN one release falls through to the silent arm below,
+        // because by this project's own bump policy nothing incompatible sits
+        // between two builds that share a compatibility key (issue #801).
         build_stamp_mismatch_only = true;
         let stamps = format!(
             "build mismatch: desktop is {client_build}, daemon is {}",
@@ -419,6 +504,16 @@ mod tests {
         // so no other thread in this process is reading the environment here.
         unsafe { std::env::remove_var(BUILD_MISMATCH_BYPASS_ENV) };
         set_session_build_mismatch_allowance(false);
+    }
+
+    /// A Hello that agreed on the protocol and reports `stamp` as its build.
+    /// The zero-agent summary is there so the refusal path renders its full
+    /// recovery sentence rather than the could-not-report one.
+    fn hello_with_build(stamp: Option<&str>) -> AttachResponse {
+        let mut response = AttachResponse::hello(PROTOCOL_VERSION)
+            .with_running_agents(RunningAgentsSummary::default());
+        response.build_version = stamp.map(str::to_string);
+        response
     }
 
     fn set_bypass_env(value: Option<&str>) {
@@ -715,5 +810,171 @@ mod tests {
                 .expect("the caveat must survive the override")
                 .contains("build mismatch")
         );
+    }
+
+    /// The case issue #801 was filed about. A released daemon and a branch
+    /// desktop that describe as the same release: the protocol agreed, and by
+    /// this project's bump policy a compatibility break would have moved the
+    /// minor, so nothing incompatible sits between them. Connect, silently —
+    /// under EVERY allowance, because this must be the ordinary verdict and not
+    /// something an override rescues.
+    #[test]
+    fn a_stamp_difference_within_one_release_connects_silently() {
+        for (desktop, daemon) in [
+            ("0.39.0-ga0165f8", "0.39.0-g1ea0fe7"),
+            ("0.39.0-49-ga0165f8", "0.39.0-g1ea0fe7"),
+            ("0.39.0-49-ga0165f8-dirty", "0.39.0-g1ea0fe7"),
+            // The patch digit tracks features and bugfixes while the major is
+            // `0`, so it is deliberately not part of the compatibility key.
+            ("0.39.2-ga0165f8", "0.39.0-g1ea0fe7"),
+        ] {
+            for allowance in [
+                BuildMismatchAllowance::Refuse,
+                BuildMismatchAllowance::Env,
+                BuildMismatchAllowance::Session,
+            ] {
+                let case = format!("{desktop} vs {daemon} under {allowance:?}");
+                let info = classify_handshake(&hello_with_build(Some(daemon)), desktop, allowance);
+                assert_eq!(info.status, ConnectionStatus::Connected, "{case}");
+                assert!(!info.build_stamp_mismatch_only, "{case}");
+                assert!(info.error.is_none(), "{case}: {:?}", info.error);
+            }
+        }
+    }
+
+    /// A minor bump while the major is `0` IS the declared compatibility break,
+    /// so this is the pair that must keep prompting — and must keep offering
+    /// the override, because the wire itself still agreed.
+    #[test]
+    fn a_differing_minor_while_zerover_still_prompts_with_an_override() {
+        let info = classify_handshake(
+            &hello_with_build(Some("0.40.0-g1ea0fe7")),
+            "0.39.0-ga0165f8",
+            BuildMismatchAllowance::Refuse,
+        );
+        assert_eq!(info.status, ConnectionStatus::Incompatible);
+        assert!(info.build_stamp_mismatch_only);
+        let error = info.error.unwrap();
+        assert!(error.contains("build mismatch"), "{error}");
+        assert!(error.contains("Connect anyway"), "{error}");
+    }
+
+    /// The failure direction that matters. Silent connection is the permissive
+    /// answer, so it is reached only on positive evidence that BOTH stamps
+    /// parsed and their keys matched; anything unreadable on either side falls
+    /// back to the prompt rather than through it.
+    #[test]
+    fn an_unreadable_stamp_on_either_side_falls_back_to_the_prompt() {
+        for (desktop, daemon) in [
+            ("0.39.0-ga0165f8", Some("nightly")),
+            ("nightly", Some("0.39.0-g1ea0fe7")),
+            ("0.39-ga0165f8", Some("0.39.0-g1ea0fe7")),
+            ("0.39.0.1-ga0165f8", Some("0.39.0-g1ea0fe7")),
+            ("", Some("0.39.0-g1ea0fe7")),
+            // The daemon reported no stamp at all, which is the least that can
+            // be known about a peer and so the least it may be trusted with.
+            ("0.39.0-ga0165f8", None),
+        ] {
+            let case = format!("{desktop} vs {daemon:?}");
+            let info = classify_handshake(
+                &hello_with_build(daemon),
+                desktop,
+                BuildMismatchAllowance::Refuse,
+            );
+            assert_eq!(info.status, ConnectionStatus::Incompatible, "{case}");
+            assert!(info.build_stamp_mismatch_only, "{case}");
+        }
+    }
+
+    /// Every stamp form the build script can emit reduces to its release core,
+    /// and everything else reduces to nothing.
+    #[test]
+    fn stamp_forms_parse_down_to_their_release_core() {
+        assert_eq!(release_core("0.39.0-g1ea0fe7"), Some((0, 39, 0)));
+        assert_eq!(release_core("0.39.0-49-ga0165f8"), Some((0, 39, 0)));
+        assert_eq!(release_core("0.39.0-g1ea0fe7-dirty"), Some((0, 39, 0)));
+        assert_eq!(release_core("0.25.0-alpha.0-g1ea0fe7"), Some((0, 25, 0)));
+        assert_eq!(release_core("1.2.3+meta-g1ea0fe7"), Some((1, 2, 3)));
+        assert_eq!(release_core("0.1.0-unknown"), Some((0, 1, 0)));
+        assert_eq!(release_core("v1.2.3"), Some((1, 2, 3)));
+        for unreadable in [
+            "", "nightly", "1.2", "1.2.3.4", "1.2.x", "-1.2.3", "1.-2.3", "+1.2.3",
+        ] {
+            assert_eq!(release_core(unreadable), None, "{unreadable}");
+        }
+    }
+
+    /// Both arms of the bump policy, at the key rather than at the handshake.
+    #[test]
+    fn the_compatibility_key_tracks_the_minor_while_zerover_and_the_major_after() {
+        // While `0.x` the minor is the compatibility digit and the patch is not.
+        assert_eq!(
+            compatibility_key("0.39.0-ga0"),
+            compatibility_key("0.39.7-g1e")
+        );
+        assert_ne!(
+            compatibility_key("0.39.0-ga0"),
+            compatibility_key("0.40.0-g1e")
+        );
+        // From `1.0` the rules are standard SemVer and only the major moves.
+        assert_eq!(
+            compatibility_key("1.4.0-ga0"),
+            compatibility_key("1.9.2-g1e")
+        );
+        assert_ne!(
+            compatibility_key("1.9.2-ga0"),
+            compatibility_key("2.0.0-g1e")
+        );
+        // Dropping the minor on the `1.x` arm must not let the two arms collide.
+        assert_ne!(
+            compatibility_key("0.1.0-ga0"),
+            compatibility_key("1.0.0-g1e")
+        );
+    }
+
+    /// The `1.x` arm end to end. This repo has not shipped `1.0` yet; the arm
+    /// exists so that the day it does, a differing minor stops being a refusal
+    /// without anyone having to remember to come back here.
+    #[test]
+    fn from_one_zero_onward_only_a_differing_major_refuses() {
+        let compatible = classify_handshake(
+            &hello_with_build(Some("1.9.2-g1ea0fe7")),
+            "1.4.0-ga0165f8",
+            BuildMismatchAllowance::Refuse,
+        );
+        assert_eq!(compatible.status, ConnectionStatus::Connected);
+        assert!(!compatible.build_stamp_mismatch_only);
+        assert!(compatible.error.is_none(), "{:?}", compatible.error);
+
+        let broken = classify_handshake(
+            &hello_with_build(Some("2.0.0-g1ea0fe7")),
+            "1.9.2-ga0165f8",
+            BuildMismatchAllowance::Refuse,
+        );
+        assert_eq!(broken.status, ConnectionStatus::Incompatible);
+        assert!(broken.build_stamp_mismatch_only);
+    }
+
+    /// The load-bearing property, re-pinned at the new boundary: relaxing the
+    /// STAMP comparison must not relax the WIRE check. A pair the release check
+    /// would wave through is still refused, with no override advertised, for
+    /// every allowance value.
+    #[test]
+    fn protocol_mismatch_still_refuses_a_release_compatible_pair() {
+        let mut response = hello_with_build(Some("0.39.0-g1ea0fe7"));
+        response.server_version = Some(PROTOCOL_VERSION + 1);
+        for allowance in [
+            BuildMismatchAllowance::Refuse,
+            BuildMismatchAllowance::Env,
+            BuildMismatchAllowance::Session,
+        ] {
+            let info = classify_handshake(&response, "0.39.0-ga0165f8", allowance);
+            assert_eq!(info.status, ConnectionStatus::Incompatible, "{allowance:?}");
+            assert!(!info.build_stamp_mismatch_only, "{allowance:?}");
+            assert!(
+                info.error.unwrap().contains("protocol mismatch"),
+                "{allowance:?}"
+            );
+        }
     }
 }

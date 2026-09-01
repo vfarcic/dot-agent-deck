@@ -44,6 +44,18 @@ export interface ConnectionView {
    * offer a button for it.
    */
   buildStampMismatchOnly?: boolean;
+  /**
+   * The two git-describe stamps, carried so the fact that the builds differ
+   * stays DISCOVERABLE without being an alert.
+   *
+   * Since issue #801 the crate connects silently when both stamps name the same
+   * release, because by this project's bump policy no compatibility break sits
+   * between them — so there is no banner and no message to read. These two are
+   * what a hover can still show. Absent in fixture mode, and the daemon's is
+   * absent whenever it reported none.
+   */
+  clientBuildVersion?: string;
+  daemonBuildVersion?: string;
 }
 
 export interface DeckProject {

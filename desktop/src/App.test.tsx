@@ -339,6 +339,29 @@ describe("ControlDeck", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
+  /**
+   * Issue #801, the case that used to prompt every day. The stamps differ but
+   * name the same release, so the crate connected silently — and the deck must
+   * stay silent too: no banner, and no Connect anyway to press. The complement
+   * of the differing-minor test above, which still gets both.
+   */
+  it("shows no banner when the differing stamps name the same release", () => {
+    const connected = createFixtureSnapshot("connected");
+    connected.connection = {
+      status: "connected",
+      message: "Daemon responding",
+      daemonDetected: true,
+      runningAgentCount: 9,
+      buildStampMismatchOnly: false,
+      clientBuildVersion: "0.39.0-49-ga0165f8",
+      daemonBuildVersion: "0.39.0-g1ea0fe7",
+    };
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: connected })} />);
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("connect-anyway")).not.toBeInTheDocument();
+  });
+
   it("does not offer daemon replacement while an incompatible daemon reports live agents", () => {
     const incompatible = createFixtureSnapshot("error");
     incompatible.agents = [];

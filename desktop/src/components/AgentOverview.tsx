@@ -386,6 +386,18 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
   const openDeck = () => onNavigate({ kind: "deck" });
   const socketPath = connection.socketPath;
   const daemonMessage = connection.message ? displayText(connection.message, DISPLAY_LIMITS.message) : undefined;
+  /**
+   * Issue #801. Since the crate stopped refusing a daemon that names the same
+   * release, the ordinary case is two builds from different commits connecting
+   * with nothing on screen — which is the point, but it also means the
+   * difference had nowhere left to be seen. A `title` is the whole trace:
+   * available on hover, absent from the layout, and deliberately NOT an alert.
+   * A real compatibility break still gets the banner and Connect anyway.
+   */
+  const buildStampsTitle = connection.clientBuildVersion && connection.daemonBuildVersion
+    && connection.clientBuildVersion !== connection.daemonBuildVersion
+    ? displayTitle(`Built from different commits — desktop ${connection.clientBuildVersion}, daemon ${connection.daemonBuildVersion}.`)
+    : undefined;
   const [confirm, setConfirm] = useState<ConfirmState>();
   const [overrideError, setOverrideError] = useState<string>();
   /**
@@ -479,7 +491,7 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
                   {socketPath ? shortDaemonLabel(socketPath) : "socket path not reported"}
                 </code>
               </div>
-              <p className="daemon-state">{daemonMessage ?? connection.status}</p>
+              <p className="daemon-state" data-testid="daemon-state" title={buildStampsTitle}>{daemonMessage ?? connection.status}</p>
               {connected && agents.length > 0 && (
                 <div className="daemon-pips">{counts.map((entry) => (
                   <span className={`status-label status-${entry.status}`} key={entry.status}>{entry.count} {entry.status}</span>

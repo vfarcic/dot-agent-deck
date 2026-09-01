@@ -349,6 +349,8 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       daemonDetected: dto.connection.status === "connected" || dto.connection.status === "incompatible",
       runningAgentCount: dto.connection.runningAgentCount,
       buildStampMismatchOnly: dto.connection.buildStampMismatchOnly,
+      clientBuildVersion: dto.connection.clientBuildVersion,
+      daemonBuildVersion: dto.connection.daemonBuildVersion,
     },
     health: dto.connection.status === "incompatible" ? "failed" : dto.connection.status === "disconnected" ? "idle" : agents.some((agent) => agent.status === "failed") ? "failed" : "healthy",
     elapsed: previous?.elapsed ?? "—",
