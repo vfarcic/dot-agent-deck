@@ -27,7 +27,9 @@ use dot_agent_deck::ui::{describe_send_result, is_terminal_send_result, send_ret
 use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager, State, Webview};
 
-use crate::daemon_bridge::{bootstrap, get_snapshot, trusted_daemon};
+use crate::daemon_bridge::{
+    allow_build_mismatch_this_session, bootstrap, get_snapshot, trusted_daemon,
+};
 use crate::dto::{
     BootstrapOptions, COMMAND_MAX_BYTES, ConnectionStatus, DesktopAction, DesktopActionResult,
     DesktopSnapshot, TerminalAttachResult, WorkflowRoleInput,
@@ -903,6 +905,19 @@ async fn desktop_run_action(
                 message: Some("Daemon replaced with the desktop's matching bundled build.".into()),
                 snapshot,
             });
+        }
+        DesktopAction::AllowBuildMismatch => {
+            // Session-scoped and nothing else: no daemon call, no persistence,
+            // no restart. The refusal it lifts is the desktop's own stamp
+            // comparison, so the whole act is setting a process flag and
+            // classifying the handshake again — which the `refresh_and_emit`
+            // at the tail of this function does unconditionally, and which is
+            // why nothing here may cache a verdict.
+            allow_build_mismatch_this_session();
+            result_message = Some(
+                "Build-stamp mismatch accepted for this session; the caveat stays in the connection banner."
+                    .into(),
+            );
         }
         DesktopAction::RenameAgent {
             agent_id,

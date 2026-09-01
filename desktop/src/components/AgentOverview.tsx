@@ -1,7 +1,8 @@
-import { useEffect, useMemo, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Blocks, Boxes, LayoutList, Layers, Network, RefreshCw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
 import { UNREPORTED } from "../types";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
+import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { DISPLAY_LIMITS, displayIdentity, displayPath, displayText, displayTitle, domIdentity, rendersBlank, shortDaemonLabel } from "../lib/displayText";
 
 /**
@@ -306,6 +307,36 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
   const openDeck = () => onNavigate({ kind: "deck" });
   const socketPath = connection.socketPath;
   const daemonMessage = connection.message ? displayText(connection.message, DISPLAY_LIMITS.message) : undefined;
+  const [confirm, setConfirm] = useState<ConfirmState>();
+  const [overrideError, setOverrideError] = useState<string>();
+  /**
+   * Issue #801. Daemon LIFECYCLE actions still live on the deck — this starts,
+   * stops and replaces nothing. It relaxes this app's own build-stamp
+   * comparison for this session, which is a judgement about what the user is
+   * looking at, so it belongs on the screen that is refusing to show it. Gated
+   * on `buildStampMismatchOnly`, so a genuine protocol mismatch never offers
+   * it.
+   */
+  const requestConnectAnyway = () => {
+    if (mode !== "live" || !connection.buildStampMismatchOnly) return;
+    setConfirm({
+      title: "Connect to a differently-built daemon?",
+      body: "The wire protocol matched on both sides, so this daemon and this app agree on the shape of everything they exchange. They were built from different commits, and a stamp difference can still mean divergent behaviour behind an identical wire — a field whose meaning changed while its shape did not. Agent Deck will connect and keep the mismatch on screen for the rest of this session; nothing is remembered after you quit the app.",
+      label: "Connect anyway",
+      busyLabel: "Connecting…",
+      action: async () => {
+        setOverrideError(undefined);
+        try {
+          await runtime.runAction({ type: "allow_build_mismatch" });
+          // The allowance is read by the NEXT handshake, so the reconnect is
+          // what actually connects; the crate caches no verdict.
+          await runtime.reconnect();
+        } catch (cause) {
+          setOverrideError(cause instanceof Error ? cause.message : String(cause));
+        }
+      },
+    });
+  };
 
   return (
     <div className="control-deck overview-screen">
@@ -383,8 +414,10 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
                 groups={groups}
                 connection={connection}
                 message={daemonMessage}
+                overrideError={overrideError}
                 onOpenDeck={openDeck}
                 onReconnect={() => void runtime.reconnect()}
+                onConnectAnyway={mode === "live" && connection.buildStampMismatchOnly ? requestConnectAnyway : undefined}
               />
             </div>
           </section>
@@ -397,17 +430,21 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
           </p>
         </section>
       </main>
+      {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
     </div>
   );
 }
 
-function DaemonBody({ agents, groups, connection, message, onOpenDeck, onReconnect }: {
+function DaemonBody({ agents, groups, connection, message, overrideError, onOpenDeck, onReconnect, onConnectAnyway }: {
   agents: OverviewAgent[];
   groups: OverviewGroup[];
   connection: ConnectionView;
   message?: string;
+  overrideError?: string;
   onOpenDeck: () => void;
   onReconnect: () => void;
+  /** Absent unless the mismatch is stamp-only — see `requestConnectAnyway`. */
+  onConnectAnyway?: () => void;
 }) {
   if (connection.status === "loading") {
     return (
@@ -439,9 +476,12 @@ function DaemonBody({ agents, groups, connection, message, onOpenDeck, onReconne
             ? "A daemon answered the handshake, but this build cannot read its agent list. Nothing is listed rather than guessed."
             : `A daemon answered the handshake and reports ${connection.runningAgentCount} running ${connection.runningAgentCount === 1 ? "agent" : "agents"}, but this build cannot read them. Nothing is listed rather than guessed.`}
           {" "}Daemon lifecycle actions live on the deck.
+          {onConnectAnyway && " Only the build stamps differ — the wire protocol agreed — so you can connect to this daemon as it is."}
         </p>
+        {overrideError && <p className="overview-note-hint" data-testid="overview-connect-anyway-error">{overrideError}</p>}
         <div>
           <button className="button secondary" onClick={onOpenDeck}><SquareTerminal size={14} /> Open deck</button>
+          {onConnectAnyway && <button className="button primary" data-testid="overview-connect-anyway" onClick={onConnectAnyway}><ShieldAlert size={14} /> Connect anyway</button>}
           <button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button>
         </div>
       </OverviewNote>

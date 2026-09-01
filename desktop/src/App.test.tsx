@@ -242,6 +242,103 @@ describe("ControlDeck", () => {
     expect(screen.getByText("Matching daemon started and reconnected.")).toBeVisible();
   });
 
+  /**
+   * Issue #801. The scenario the app had no answer for: a daemon that agrees on
+   * the wire, differs only in its build stamp, and owns live agents — so
+   * Replace daemon is correctly refused and used to be the only thing offered.
+   */
+  it("offers Connect anyway for a stamp-only mismatch even while agents are live", async () => {
+    const incompatible = createFixtureSnapshot("error");
+    incompatible.agents = [];
+    incompatible.stages = [];
+    incompatible.evidence = [];
+    incompatible.connection = {
+      status: "error",
+      socketPath: "/tmp/dot-agent-deck.sock",
+      message: "build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0. The daemon reports 9 live agents; stop them individually before replacing the daemon, or Connect anyway to keep this one.",
+      daemonDetected: true,
+      runningAgentCount: 9,
+      buildStampMismatchOnly: true,
+    };
+    const runAction = vi.fn(async () => ({ ok: true }) as import("./types").DeckActionResult);
+    const reconnect = vi.fn(async () => undefined);
+    const live = runtime({ mode: "live", snapshot: incompatible, runAction, reconnect });
+    render(<ControlDeck runtime={live} />);
+
+    // Replacement stays refused: it is the one that would kill nine agents.
+    expect(screen.queryByTestId("replace-daemon")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("connect-anyway"));
+    expect(runAction).not.toHaveBeenCalled();
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("The wire protocol matched on both sides");
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("a stamp difference can still mean divergent behaviour behind an identical wire");
+    fireEvent.click(screen.getAllByRole("button", { name: "Connect anyway" }).at(-1)!);
+
+    await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch" }));
+    // The allowance is only read by the NEXT handshake, so the reconnect is
+    // what actually connects.
+    await waitFor(() => expect(reconnect).toHaveBeenCalled());
+    expect(screen.getByText("Connected to the differently-built daemon. The mismatch stays in the connection banner for this session.")).toBeVisible();
+  });
+
+  /**
+   * The load-bearing negative. The protocol check runs first in the desktop
+   * crate and is never overridable, so a screen must not put a button on it —
+   * pressing one would be refused again and would teach the user that the wire
+   * check is negotiable.
+   */
+  it("never offers Connect anyway for a protocol mismatch", () => {
+    const incompatible = createFixtureSnapshot("error");
+    incompatible.agents = [];
+    incompatible.connection = {
+      status: "error",
+      message: "protocol mismatch: desktop expects 8, daemon reports 7",
+      daemonDetected: true,
+      runningAgentCount: 0,
+      buildStampMismatchOnly: false,
+    };
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: incompatible })} />);
+
+    expect(screen.queryByTestId("connect-anyway")).not.toBeInTheDocument();
+    expect(screen.getByTestId("replace-daemon")).toBeVisible();
+  });
+
+  /**
+   * The caveat is the price of the override, so it stays on screen: the crate
+   * keeps the mismatch in the connection message after connecting, and the
+   * banner renders whatever that message says.
+   */
+  it("keeps the build-mismatch caveat in the banner after connecting anyway", () => {
+    const connected = createFixtureSnapshot("connected");
+    connected.connection = {
+      status: "connected",
+      message: "build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0. Connected anyway for this session; protocol 8 matched on both sides.",
+      daemonDetected: true,
+      runningAgentCount: 9,
+      buildStampMismatchOnly: true,
+    };
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: connected })} />);
+
+    const banner = screen.getByRole("alert");
+    expect(banner).toHaveTextContent("Connected to a differently-built daemon");
+    expect(banner).toHaveTextContent("Connected anyway for this session");
+    // Accepted, not re-offered: the override is already in force.
+    expect(screen.queryByTestId("connect-anyway")).not.toBeInTheDocument();
+  });
+
+  /**
+   * The complement, and the reason the banner cannot simply key on
+   * `buildStampMismatchOnly` being defined: an ordinary healthy connection
+   * still shows no banner at all.
+   */
+  it("shows no connection banner for a healthy matching daemon", () => {
+    const connected = createFixtureSnapshot("connected");
+    connected.connection = { status: "connected", message: "Daemon responding", daemonDetected: true, runningAgentCount: 4, buildStampMismatchOnly: false };
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: connected })} />);
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("does not offer daemon replacement while an incompatible daemon reports live agents", () => {
     const incompatible = createFixtureSnapshot("error");
     incompatible.agents = [];

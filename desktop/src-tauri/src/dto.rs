@@ -45,6 +45,16 @@ pub struct DesktopConnection {
     pub daemon_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub running_agent_count: Option<usize>,
+    /// True when the ONLY thing that failed the handshake is the git-describe
+    /// build stamp — the protocol version agreed on both sides — so the webview
+    /// may offer Connect anyway (issue #801).
+    ///
+    /// Always emitted, including as `false`, because the webview branches on it
+    /// to decide whether an override exists: an absent field and an incompatible
+    /// wire must not look the same. A protocol mismatch never sets it, which is
+    /// what keeps the wire check unoverridable from the UI as well as from the
+    /// bypass itself.
+    pub build_stamp_mismatch_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -147,6 +157,12 @@ pub enum DesktopAction {
         force: bool,
     },
     RestartDaemon,
+    /// Relax the build-stamp comparison for the rest of this app session and
+    /// hand back a freshly classified snapshot (issue #801). Carries no
+    /// payload: it is an assertion by the user, not a parameter, and it can
+    /// only ever relax the stamp check — the protocol check runs first and is
+    /// never bypassed.
+    AllowBuildMismatch,
     RenameAgent {
         agent_id: String,
         #[serde(alias = "name")]
@@ -347,6 +363,7 @@ pub(crate) fn disconnected_snapshot(error: impl AsRef<str>) -> DesktopSnapshot {
             daemon_build_version: None,
             daemon_version: None,
             running_agent_count: None,
+            build_stamp_mismatch_only: false,
         },
         agents: Vec::new(),
         project_cwd: desktop_project_cwd(),
@@ -608,6 +625,15 @@ mod tests {
     }
 
     #[test]
+    fn allow_build_mismatch_action_carries_no_payload() {
+        let action: DesktopAction = serde_json::from_value(serde_json::json!({
+            "type": "allow_build_mismatch"
+        }))
+        .unwrap();
+        assert!(matches!(action, DesktopAction::AllowBuildMismatch));
+    }
+
+    #[test]
     fn disconnected_snapshot_is_fixture_safe_and_sanitized() {
         let snapshot = disconnected_snapshot("offline\u{1b}[31m");
         assert_eq!(snapshot.connection.status, ConnectionStatus::Disconnected);
@@ -616,6 +642,10 @@ mod tests {
         let value = serde_json::to_value(snapshot).unwrap();
         assert_eq!(value["connection"]["status"], "disconnected");
         assert_eq!(value["source"], "daemon");
+        // No daemon answered, so there is no stamp-only mismatch to override —
+        // and the field is PRESENT rather than absent, because the webview
+        // branches on it (issue #801).
+        assert_eq!(value["connection"]["buildStampMismatchOnly"], false);
     }
 
     #[test]

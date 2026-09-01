@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "../data/fixture";
 import { DISPLAY_LIMITS } from "../lib/displayText";
@@ -634,6 +634,74 @@ describe("AgentOverview", () => {
     // where "cannot read them" would be contradicted by a number.
     expect(snapshot.agents.length).toBeGreaterThan(0);
     expect(counterText()).toEqual(["—", "—", "—", "—", "—"]);
+  });
+
+  /**
+   * Issue #801. The overview is the screen a user lands on to see the fleet, so
+   * a daemon it refuses for a stamp difference alone has to offer the same way
+   * out the deck does — not a pointer to another screen.
+   */
+  it("offers Connect anyway on the overview when only the build stamps differ", async () => {
+    const snapshot = createFixtureSnapshot("error");
+    snapshot.connection = {
+      ...snapshot.connection,
+      daemonDetected: true,
+      runningAgentCount: 9,
+      message: "build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0. The daemon reports 9 live agents; stop them individually before replacing the daemon, or Connect anyway to keep this one.",
+      buildStampMismatchOnly: true,
+    };
+    const runAction = vi.fn(async () => ({ ok: true }) as import("../types").DeckActionResult);
+    const reconnect = vi.fn(async () => undefined);
+    const deck = runtime({ mode: "live", snapshot, runAction, reconnect });
+    render(<AgentOverview runtime={deck} onNavigate={vi.fn()} />);
+
+    expect(screen.getByTestId("overview-incompatible")).toBeVisible();
+    fireEvent.click(screen.getByTestId("overview-connect-anyway"));
+    expect(runAction).not.toHaveBeenCalled();
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("The wire protocol matched on both sides");
+    fireEvent.click(screen.getAllByRole("button", { name: "Connect anyway" }).at(-1)!);
+
+    await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "allow_build_mismatch" }));
+    await waitFor(() => expect(reconnect).toHaveBeenCalled());
+  });
+
+  /** The same load-bearing negative as on the deck: the wire check is not negotiable. */
+  it("never offers Connect anyway on the overview for a protocol mismatch", () => {
+    const snapshot = createFixtureSnapshot("error");
+    snapshot.connection = {
+      ...snapshot.connection,
+      daemonDetected: true,
+      runningAgentCount: 3,
+      message: "protocol mismatch: desktop expects 8, daemon reports 7",
+      buildStampMismatchOnly: false,
+    };
+    render(<AgentOverview runtime={runtime({ mode: "live", snapshot })} onNavigate={vi.fn()} />);
+
+    expect(screen.getByTestId("overview-incompatible")).toBeVisible();
+    expect(screen.queryByTestId("overview-connect-anyway")).not.toBeInTheDocument();
+  });
+
+  /**
+   * The caveat outlives the override here too. The overview has no banner of
+   * its own — the daemon card's state line is where the connection message
+   * lives, and it renders whatever the crate kept in it.
+   */
+  it("keeps the build-mismatch caveat on the daemon card after connecting anyway", () => {
+    const snapshot = createFixtureSnapshot("crowded");
+    snapshot.connection = {
+      ...snapshot.connection,
+      status: "connected",
+      daemonDetected: true,
+      runningAgentCount: 9,
+      message: "build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0. Connected anyway for this session; protocol 8 matched on both sides.",
+      buildStampMismatchOnly: true,
+    };
+    render(<AgentOverview runtime={runtime({ mode: "live", snapshot })} onNavigate={vi.fn()} />);
+
+    expect(document.querySelector(".daemon-state")).toHaveTextContent("Connected anyway for this session");
+    // Connected means the fleet is readable again, so it is listed.
+    expect(rows(document.body).length).toBeGreaterThan(0);
+    expect(screen.queryByTestId("overview-connect-anyway")).not.toBeInTheDocument();
   });
 
   it("reconnects on demand", () => {

@@ -28,6 +28,15 @@ export interface ConnectionView {
   daemonDetected?: boolean;
   /** Honest count reported by Hello; undefined when the daemon could not report it. */
   runningAgentCount?: number;
+  /**
+   * True when the ONLY thing that failed the handshake is the git-describe build
+   * stamp: the wire protocol agreed on both sides, so proceeding is a judgement
+   * the user may legitimately make and **Connect anyway** is offered (issue
+   * #801). A protocol mismatch never sets it — that check runs first in the
+   * desktop crate and is not overridable from anywhere, so a screen must never
+   * offer a button for it.
+   */
+  buildStampMismatchOnly?: boolean;
 }
 
 export interface DeckProject {
@@ -271,6 +280,7 @@ export type DeckAction =
   | { type: "start_daemon" }
   | { type: "stop_daemon"; force?: boolean }
   | { type: "restart_daemon" }
+  | { type: "allow_build_mismatch" }
   | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: WorkflowLaunchRole[]; rows: number; cols: number }
   | { type: "retry_stage"; stageId: string }
   | { type: "stop_agent"; agentId: string }

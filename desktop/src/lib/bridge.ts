@@ -26,6 +26,12 @@ export interface DesktopSnapshotDto {
     daemonBuildVersion?: string;
     daemonVersion?: string;
     runningAgentCount?: number;
+    /**
+     * Always emitted by the desktop crate, including as `false`. Optional here
+     * only so a DTO literal in a test need not restate the common case; read it
+     * as "an override exists", never as "something is wrong".
+     */
+    buildStampMismatchOnly?: boolean;
   };
   agents: DesktopAgentDto[];
   projectCwd?: string;
@@ -93,7 +99,8 @@ export type DesktopRunActionDto =
   | { type: "submit_text"; agentId: string; text: string }
   | { type: "start_workflow"; name: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number }
   | { type: "stop_daemon"; force?: boolean }
-  | { type: "restart_daemon" };
+  | { type: "restart_daemon" }
+  | { type: "allow_build_mismatch" };
 
 type SnapshotListener = (snapshot: DeckSnapshot) => void;
 type TerminalListener = (event: TerminalChunk) => void;
@@ -217,6 +224,23 @@ export function modeScopedKey(base: string): string {
   return `${base}.${selectRuntimeMode()}`;
 }
 
+/**
+ * The message shown when the desktop crate sent none. It always does today, so
+ * this is a belt-and-braces path — but it used to hardcode `Protocol mismatch`
+ * for EVERY incompatible status, which is wrong for the far more common
+ * build-stamp case and would have told a user to look at a protocol version
+ * that matched (issue #801). It now says which of the two checks failed, using
+ * the same flag the Connect anyway affordance is gated on.
+ */
+function fallbackConnectionMessage(connection: DesktopSnapshotDto["connection"]): string {
+  if (connection.status === "connected") return "Daemon responding";
+  if (connection.status !== "incompatible") return "Daemon unavailable";
+  if (connection.buildStampMismatchOnly) {
+    return `Build mismatch: desktop is ${connection.clientBuildVersion}, daemon is ${connection.daemonBuildVersion ?? "unreported"}.`;
+  }
+  return `Protocol mismatch: desktop v${connection.clientProtocolVersion}, daemon v${connection.serverProtocolVersion ?? "unknown"}`;
+}
+
 export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnapshot, evidence?: EvidenceItem[], handoffs?: HandoffEdge[]): DeckSnapshot {
   // The socket path is the only per-daemon identity the handshake gives us, and
   // it is exactly what distinguishes one local daemon from another (PRD #745,
@@ -245,9 +269,10 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     connection: {
       status: dto.connection.status === "incompatible" ? "error" : dto.connection.status,
       socketPath: dto.connection.socketPath,
-      message: dto.connection.error ?? (dto.connection.status === "connected" ? "Daemon responding" : dto.connection.status === "incompatible" ? `Protocol mismatch: desktop v${dto.connection.clientProtocolVersion}, daemon v${dto.connection.serverProtocolVersion ?? "unknown"}` : "Daemon unavailable"),
+      message: dto.connection.error ?? fallbackConnectionMessage(dto.connection),
       daemonDetected: dto.connection.status === "connected" || dto.connection.status === "incompatible",
       runningAgentCount: dto.connection.runningAgentCount,
+      buildStampMismatchOnly: dto.connection.buildStampMismatchOnly,
     },
     health: dto.connection.status === "incompatible" ? "failed" : dto.connection.status === "disconnected" ? "idle" : agents.some((agent) => agent.status === "failed") ? "failed" : "healthy",
     elapsed: previous?.elapsed ?? "—",
@@ -801,7 +826,7 @@ export class TauriDeckBridge implements DeckBridge {
 
   async runAction(action: DeckAction): Promise<DeckActionResult> {
     const invoke = await this.getInvoke();
-    if (action.type === "stop_agent" || action.type === "rename_agent" || action.type === "submit_text" || action.type === "start_workflow" || action.type === "stop_daemon" || action.type === "restart_daemon") {
+    if (action.type === "stop_agent" || action.type === "rename_agent" || action.type === "submit_text" || action.type === "start_workflow" || action.type === "stop_daemon" || action.type === "restart_daemon" || action.type === "allow_build_mismatch") {
       // `desktop_run_action` resolves with `ok: false` for a non-delivered
       // send rather than raising, so the result must be returned, not dropped.
       const result = await invoke<DesktopActionResultDto>("desktop_run_action", { action: action satisfies DesktopRunActionDto });

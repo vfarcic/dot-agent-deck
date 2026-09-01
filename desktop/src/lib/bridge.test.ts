@@ -318,6 +318,84 @@ describe("TauriDeckBridge", () => {
     expect(mapDesktopSnapshot(future).agents[0]?.status).toBe("waiting");
   });
 
+  it("sends allow_build_mismatch through the live bridge", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+
+    await bridge.runAction({ type: "allow_build_mismatch" });
+
+    expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action: { type: "allow_build_mismatch" } });
+    await bridge.dispose();
+  });
+
+  /**
+   * Issue #801. The webview cannot tell a stamp mismatch from a protocol
+   * mismatch by reading the message, so the crate says which it is and the flag
+   * has to survive the mapping — every Connect anyway affordance is gated on it.
+   */
+  it("carries the stamp-only mismatch flag through to the connection view", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+
+    const stampOnly = structuredClone(snapshot);
+    stampOnly.connection.status = "incompatible";
+    stampOnly.connection.error = "build mismatch: desktop is a, daemon is b. Connect anyway to keep this one.";
+    stampOnly.connection.buildStampMismatchOnly = true;
+    expect(mapDesktopSnapshot(stampOnly).connection).toMatchObject({ status: "error", buildStampMismatchOnly: true });
+
+    const protocolMismatch = structuredClone(snapshot);
+    protocolMismatch.connection.status = "incompatible";
+    protocolMismatch.connection.error = "protocol mismatch: desktop expects 8, daemon reports 7";
+    protocolMismatch.connection.buildStampMismatchOnly = false;
+    expect(mapDesktopSnapshot(protocolMismatch).connection.buildStampMismatchOnly).toBe(false);
+  });
+
+  /**
+   * The whole point of the override: connected, and STILL saying so. The crate
+   * keeps the mismatch in `error` on the bypass path, and this mapping is what
+   * would drop it — a `connected` status used to be enough to reach for the
+   * "Daemon responding" fallback, which would have made the caveat invisible
+   * the moment it mattered.
+   */
+  it("keeps the build-mismatch caveat visible after connecting anyway", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const overridden = structuredClone(snapshot);
+    overridden.connection.status = "connected";
+    overridden.connection.daemonBuildVersion = "v0.39.0";
+    overridden.connection.buildStampMismatchOnly = true;
+    overridden.connection.error = "build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0. Connected anyway for this session; protocol 8 matched on both sides.";
+
+    const mapped = mapDesktopSnapshot(overridden);
+
+    expect(mapped.connection.status).toBe("connected");
+    expect(mapped.connection.message).toContain("build mismatch");
+    expect(mapped.connection.message).toContain("Connected anyway for this session");
+    expect(mapped.health).toBe("healthy");
+  });
+
+  /**
+   * The fallback the crate never actually triggers today. It used to hardcode
+   * `Protocol mismatch` for every incompatible status, so the first caller to
+   * make it reachable would have been told to compare protocol versions that
+   * matched (issue #801).
+   */
+  it("names the check that actually failed when the crate sent no message", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+
+    const stampOnly = structuredClone(snapshot);
+    stampOnly.connection.status = "incompatible";
+    stampOnly.connection.clientBuildVersion = "v0.38.0-50-gf118e99";
+    stampOnly.connection.daemonBuildVersion = "v0.39.0";
+    stampOnly.connection.buildStampMismatchOnly = true;
+    delete stampOnly.connection.error;
+    expect(mapDesktopSnapshot(stampOnly).connection.message).toBe("Build mismatch: desktop is v0.38.0-50-gf118e99, daemon is v0.39.0.");
+
+    const protocolMismatch = structuredClone(snapshot);
+    protocolMismatch.connection.status = "incompatible";
+    protocolMismatch.connection.serverProtocolVersion = 7;
+    delete protocolMismatch.connection.error;
+    expect(mapDesktopSnapshot(protocolMismatch).connection.message).toBe("Protocol mismatch: desktop v6, daemon v7");
+  });
+
   it("carries the daemon identity and the daemon's own tab membership onto the agent model", async () => {
     const { mapDesktopSnapshot } = await import("./bridge");
 
