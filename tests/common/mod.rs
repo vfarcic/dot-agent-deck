@@ -890,10 +890,8 @@ impl TuiDeck {
         // inherited environment rather than clearing it (src/agent_pty.rs), so
         // those children get the marker from the test process for free. This
         // line is the one place it would otherwise be lost.
-        let inherit_pass = ["PATH", ANTHROPIC_API_KEY_ENV];
-
         let mut final_env: HashMap<String, String> = HashMap::new();
-        for k in inherit_pass {
+        for k in INHERIT_PASS {
             if let Ok(v) = std::env::var(k) {
                 final_env.insert(k.into(), v);
             }
@@ -3260,6 +3258,28 @@ fn anthropic_api_key() -> Option<String> {
 /// value that IS ambient on a developer's machine is registered for redaction
 /// alongside the copy the auth document carries.
 pub const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
+
+/// Issue #785 blocker B: the non-secret, run-scoped label CI sets on the live
+/// tier's test step purely so its purge step can find every process the run
+/// started, by inheritance rather than by matching command lines.
+///
+/// It is NOT a credential and must never be treated as one — it is a run id and
+/// an attempt number, it is printed in the workflow file, and it is deliberately
+/// never registered for redaction, because redacting it would defeat the one
+/// thing it is for. The harness only forwards it; nothing reads its value.
+const E2E_RUN_MARKER_ENV: &str = "DAD_E2E_RUN_MARKER";
+
+/// The HOST variables that cross `launch_with_fixture`'s `env_clear` into every
+/// deck — and therefore into every daemon it lazy-spawns and every agent those
+/// daemons spawn.
+///
+/// Module-level and named so it can be asserted on: the marker's presence here
+/// is what makes `e2e-live.yml`'s purge step able to SEE a deck subtree at all,
+/// and losing it fails in the unsafe direction (the purge finds nothing,
+/// reports a clean containment, and deletes the harness temp roots out from
+/// under a live daemon that still holds the key). The reasoning for each entry
+/// is at the use site.
+const INHERIT_PASS: [&str; 3] = ["PATH", ANTHROPIC_API_KEY_ENV, E2E_RUN_MARKER_ENV];
 
 /// The ambient OpenAI API key, or `None` when unset, empty or whitespace-only.
 /// Same trim rule and same secret discipline as [`anthropic_api_key`]: returned
@@ -11039,6 +11059,69 @@ mod harness_unit_tests {
             redacted.contains("|pane\n"),
             "the bytes between the fragments must be preserved: {redacted}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #502/#785 blocker B — containing the run's credential-bearing
+    // processes
+    // -----------------------------------------------------------------------
+
+    /// Scenario: The CI run marker is on the list of variables that cross the
+    /// harness's `env_clear`, so a deck — and the daemon it `setsid`s away and
+    /// the agents that daemon spawns — inherits it.
+    ///
+    /// Pinned rather than reviewed because the failure is silent AND in the
+    /// unsafe direction: with the marker missing, `e2e-live.yml`'s purge step
+    /// enumerates nothing, concludes the run left nothing alive, and deletes the
+    /// harness temp roots out from under a live process that still holds the
+    /// Anthropic key — the exact hazard CLAUDE.md rule 14's dead-PID floor
+    /// exists to prevent.
+    #[test]
+    fn the_run_marker_crosses_the_harness_env_clear() {
+        assert!(
+            INHERIT_PASS.contains(&E2E_RUN_MARKER_ENV),
+            "{E2E_RUN_MARKER_ENV} no longer crosses `env_clear`, so no deck-spawned \
+             process carries it and the live lane's purge step can no longer find \
+             any of them: {INHERIT_PASS:?}"
+        );
+        assert!(
+            INHERIT_PASS.contains(&ANTHROPIC_API_KEY_ENV),
+            "the credential the marker exists to chase no longer reaches a deck \
+             either: {INHERIT_PASS:?}"
+        );
+    }
+
+    /// Scenario: The marker name the harness forwards is the same one
+    /// `e2e-live.yml` sets on its run step and greps for in its purge step. The
+    /// three live in two files with nothing but this test connecting them.
+    ///
+    /// A rename on any one side does not break a build and does not fail a test
+    /// — it just makes the purge step's `grep` match nothing, which it reports
+    /// as a successful containment before deleting the temp roots. Same reason
+    /// `xtask/linkage-check`'s `junit_strip.rs` reads this workflow: the
+    /// coupling IS the rule.
+    #[test]
+    fn the_workflow_sets_and_greps_the_marker_the_harness_forwards() {
+        let workflow = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".github")
+            .join("workflows")
+            .join("e2e-live.yml");
+        let src = std::fs::read_to_string(&workflow).expect("read .github/workflows/e2e-live.yml");
+        let set_on_the_run_step = format!("{E2E_RUN_MARKER_ENV}: e2e-live-");
+        assert!(
+            src.contains(&set_on_the_run_step),
+            "the live workflow no longer sets `{set_on_the_run_step}…` on its run \
+             step, so nothing the tier spawns carries the marker the purge step \
+             looks for"
+        );
+        let grepped_by_the_purge_step = format!("needle=\"{E2E_RUN_MARKER_ENV}=");
+        assert!(
+            src.contains(&grepped_by_the_purge_step),
+            "the live workflow's purge step no longer greps for \
+             `{E2E_RUN_MARKER_ENV}=…`, so its containment check matches nothing \
+             and then reports success"
+        );
+        assert!(INHERIT_PASS.contains(&E2E_RUN_MARKER_ENV));
     }
 
     // -----------------------------------------------------------------------
