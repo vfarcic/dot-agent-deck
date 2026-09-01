@@ -5,7 +5,7 @@ The desktop GUI under `desktop/` is an opt-in Tauri preview for PRD #176. It is 
 ## Prerequisites
 
 - Enter `devbox shell` for the repository's pinned toolchain: Rust 1.97.1, `cargo-nextest`, Clippy, rustfmt, Node.js 24.12.0, and pnpm 10.34.5. Provide equivalent versions yourself if you do not use Devbox — the frontend needs Node.js 20.19 or newer, and pnpm 10.x, which is the line that reads `desktop/pnpm-lock.yaml`'s `lockfileVersion: '9.0'` without rewriting it. CI's `desktop-web` job deliberately runs Node 20 rather than the Devbox pin, so the stated floor stays tested rather than merely claimed.
-- Install the [Tauri 2 system prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform. On macOS this includes the Xcode command-line tools; Linux needs the documented WebKitGTK and related development packages.
+- Install the [Tauri 2 system prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform. On macOS this includes the Xcode command-line tools. On Linux they are **not optional and not only for building the GUI** — the repository's per-task gates need them too. See [Linux: the workspace gates need the Tauri packages](#linux-the-workspace-gates-need-the-tauri-packages) below for the exact command and for the failure mode a contributor who has never opened the GUI actually hits.
 - Install the desktop JavaScript dependencies once:
 
 ```sh
@@ -14,6 +14,37 @@ pnpm install
 ```
 
 Agent CLIs and their credentials are needed only for agents you deliberately start through the daemon. The fixture preview does not call an LLM, execute an agent command, or modify project files.
+
+### Linux: the workspace gates need the Tauri packages
+
+This is not a GUI-only prerequisite, which is the part that surprises people. `desktop/src-tauri` is the workspace member `dot-agent-deck-desktop`, and both of the repository's per-task gates run `--workspace`: `cargo test-fast` (an alias for `cargo nextest run --workspace`) and `CLAUDE.md` rule 2's `cargo clippy --workspace --all-targets --features e2e -- -D warnings`. So a Linux contributor who has never opened the desktop app still meets the desktop crate on their first commit attempt, and without these packages `pkg-config` fails the build with `gobject-2.0 was not found` and nothing points at this page.
+
+Install them with the same line CI runs, copied verbatim from `.github/workflows/ci.yml`:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+  libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+```
+
+#### Issue #771 is a runtime loader failure, not an absent library
+
+Worth stating separately, because it presents with the same "GTK is missing" shape and is a different problem with a different fix. This distinction corrected a wrong belief twice during PRD #745, whose Work Log twice recorded that the desktop crate's tests simply could not run on a Devbox box. They can.
+
+With the apt packages installed, inside `devbox shell` on a Debian/Ubuntu x86_64 box, the desktop crate **builds and lints clean and then fails to run**:
+
+- `cargo clippy --workspace --all-targets --features e2e -- -D warnings` passes with **no exclusion and no environment variable**. It only type-checks and links; it executes nothing it produces, so a loader problem is invisible to it.
+- `cargo test-fast` fails before a single test runs. Nextest reports `creating test list failed` with exit code 127 for `dot-agent-deck-desktop`, and the test binary itself says `error while loading shared libraries: libgdk-3.so.0: cannot open shared object file: No such file or directory`.
+
+The `.so` files are present throughout. `ldd` on that test binary lists fourteen not-found libraries — `libgdk-3.so.0`, `libgtk-3.so.0`, `libwebkit2gtk-4.1.so.0`, `libjavascriptcoregtk-4.1.so.0`, `libsoup-3.0.so.0`, `libglib-2.0.so.0` and the rest — and every one of them exists in `/usr/lib/x86_64-linux-gnu`. The binary is linked by Devbox's Nix toolchain, so its ELF interpreter is the Nix store's `ld-linux-x86-64.so.2` and its `RUNPATH` names only Nix store paths; the system multiarch directory is never searched. Point the loader at it:
+
+```sh
+LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu cargo test-fast
+```
+
+Measured on this box: **3487** tests pass, **49** of them in `dot-agent-deck-desktop`. Without the variable that binary exits 127 before listing a single test.
+
+`--exclude dot-agent-deck-desktop` is therefore the honest default for anyone who has not set the variable — but know exactly what it buys. It skips the desktop crate's 49 Rust tests silently, and that is precisely where a desktop change's Rust coverage lives, so a green run can have exercised none of the code the change touched. Use the `LD_LIBRARY_PATH` form whenever you have edited anything under `desktop/src-tauri/`. The variable is a **Devbox/Nix** remedy specifically: CI's Linux `build` job installs the same apt packages against a distro-native toolchain and then runs both gates with neither the variable nor the exclusion, which is the standing evidence that a non-Nix toolchain finds these libraries by itself.
 
 ## Fixture preview
 
@@ -24,7 +55,7 @@ cd desktop
 pnpm dev
 ```
 
-Open `http://localhost:1420/`. A normal browser defaults to fixture transport; `http://localhost:1420/?fixture=1` selects it explicitly. Use `state=disconnected`, `state=error`, or `state=empty` to inspect failure and empty states, for example `http://localhost:1420/?fixture=1&state=disconnected`.
+Open `http://localhost:1420/`. A normal browser defaults to fixture transport; `http://localhost:1420/?fixture=1` selects it explicitly. `?state=` picks the scenario, and the five it accepts are `connected` (the default four-agent deck), `crowded`, `empty`, `disconnected` and `error` — for example `http://localhost:1420/?fixture=1&state=disconnected`. An unrecognised value falls back to `connected` rather than failing. See [The four connection states](#the-four-connection-states) for what each one is for.
 
 The fixture's **Advance fixture** control walks a fixed review → test → human-approval sequence. Terminal input, pause/resume, retry, approval, workflow ordering, and agent-profile editing affect fixture or browser-local state only.
 
@@ -79,6 +110,72 @@ Live workflow launch from the desktop preview is currently supported on macOS an
 
 Whole-run pause, fixture advancement, approval, and retry are not sent to the daemon. Workflow ordering remains a local preview and the live launch follows the role order in `.dot-agent-deck.toml`; command overrides apply to that launch only and do not rewrite project configuration.
 
+## The agent overview
+
+PRD #745 adds the app's second screen: a fleet overview of every agent the daemon owns, with **no terminal anywhere on it**. It lives in `desktop/src/components/AgentOverview.tsx`, is reached from the **Overview** button in the left rail, and works in both fixture and live mode. It renders *instead of* the deck rather than as an overlay sheet, so the view state lives in `App` above `ControlDeck` as a discriminated union (`DeckView`) carrying `deck` and `overview` — a union from the start, even at two values, so later destinations arrive as added variants rather than as a refactor of a boolean. The deck is still the screen the app opens on; the overview is not yet the landing screen, because there is nowhere to drill in to yet (see [Current milestone limits](#current-milestone-limits)).
+
+### What it shows, and why not more
+
+Nine columns, in this order: status mark, agent, state, last activity, CLI, active tool, tools, working directory, last prompt. Every one is a value the daemon genuinely reports, and there is no `Unavailable` anywhere on the screen. Model, tokens, cost, context window, git branch, attempt count and session duration are **absent rather than shown as unavailable**, because none of them exists in daemon state at all — not on the wire, not in `RunningAgent` (`src/agent_pty.rs`), not in `SessionState` (`src/state.rs`). Inventing a source of truth for them is [PRD #633](https://github.com/vfarcic/dot-agent-deck/issues/633)'s discovery work, not this screen's.
+
+That decision is enforced by the compiler rather than by review. The screen renders from `OverviewAgent`, a `Pick<>` projection of `AgentSession`, and never from `AgentSession` itself — so reaching for `model`, `cost`, `tokens`, `contextPercent`, `worktree`, `attempt` or `duration` on this screen is a **compile error** rather than something to remember. Two fields are widened past the raw `Pick<>` for the same reason a `Pick<>` exists: it closes dishonest field *names* but cannot close a dishonest *sentinel* inside an allowed one. `cwd` is optional here so a directory the daemon did not report travels as absence the whole way, and `writeLease`'s `"unknown"` sentinel is reversed to absent at this boundary. A cell with nothing to say renders blank — not a dash, and not a placeholder.
+
+Sanitisation is a property of the screen rather than of individual cells: every daemon-supplied string passes through `desktop/src/lib/displayText.ts` before React sees it — rendered text, `title` attributes, and the copies behind `data-*`, DOM ids, IDREFs and React keys — while grouping, sorting and the `(daemonId, agentId)` identity keep the raw values. An agent whose reported display name consists entirely of invisible characters renders as `unnamed agent <id>` rather than as a blank cell, on the one screen whose whole job is telling agents apart.
+
+Two fabricated values on the **deck** were withdrawn by the same principle, since a fabricated value is worse than an absent one — it looks like data. Every tile printed `ATT 01` and the top bar printed `ATTEMPT 01`, both read from a hardcoded `1`, and no daemon tracks a retry count anywhere; the branch line printed a literal `Unavailable` where a branch name belongs, and no daemon tracks a per-agent branch either. In live mode the attempt readouts now show the deck's established em dash and the branch chip is simply absent until something reports a branch. The deterministic fixture keeps its own attempt counts and branch, which are legitimately fixture data.
+
+### Grouping
+
+The daemon's own `TabMembership` is the grouping key, so the overview groups agents exactly as the deck's tabs already do: one group per orchestration, one per mode name, and one standalone bucket for dashboard panes. **Standalone leads, then orchestrations, then modes.** That order is TUI parity rather than aesthetics — the TUI's dashboard tab is always first, so an overview that buried the same agents at the bottom would describe a different deck than the one running beside it. Orchestrations and modes follow in first-appearance order; roles inside an orchestration are sorted by `roleIndex`, and the start role carries a `COORDINATOR` badge.
+
+The outermost unit is a **daemon group**, not an agent group, even though there is exactly one daemon today — with one it renders as minimal chrome (a connection lamp, a shortened socket label with the full path on hover, and the connection message). Agents are keyed by the composite `(daemonId, agentId)` from day one, because agent ids are per-daemon monotonic integers starting at 1 and two daemons both mint `"1"`. Both decisions cost nothing now and are what stop [#742](https://github.com/vfarcic/dot-agent-deck/issues/742) from being a rewrite: a second daemon becomes a sibling group and changes no inner component.
+
+### Last activity
+
+The **Last activity** column is the one thing on the screen that needed a daemon-side change. `last_activity_ms` was added to `SessionSnapshot` as an additive optional field tagged `#[serde(default, skip_serializing_if = "Option::is_none")]`, which `src/daemon_protocol.rs`'s own policy names as an explicit do-not-bump case, so `PROTOCOL_VERSION` stays 8 and older and newer peers interoperate in both directions — a new app against an older daemon simply shows an empty column. It crosses the wire as epoch milliseconds rather than a formatted string, so the relative wording stays the webview's decision, and it carries its unit in its name because a bare integer invites the seconds-versus-milliseconds mistake that turns every reading into fifty-seven years.
+
+It is on the screen where a session duration is not, and the line between them is honesty rather than taste. `SessionState.started_at` is invented as `Utc::now()` on hydration, so a duration resets under a restarted daemon and silently lies about long-running work. `last_activity` is a high-water mark of observed event timestamps, advanced only when a newer frame arrives, so an agent quiet for an hour snapshots as quiet for an hour. And the daemon-restart case resolves to **absence** rather than to a lie, for free: the daemon persists no `AppState`, so a restarted daemon has no sessions at all, `AgentRecord.live` is `None`, the field never reaches the wire, and every cell renders empty. A duration had no absent state to fall back to, because `started_at` is always populated with *something*.
+
+`displayActivity` in `desktop/src/lib/displayText.ts` renders one unit, largest that fits, floored — `just now`, `34m ago`, `2h ago`, `3d ago` — with the exact UTC instant on hover. It renders **nothing at all**, with no hover, for every value it cannot express honestly: absent, non-finite, outside `Date`'s ±100,000,000-day range, or more than a minute in the future. That last one is the clock-skew rule. The instant is stamped by whichever hook process emitted the event rather than by the daemon, so a small positive skew is the ordinary case and one minute of it reads `just now`; beyond that the value is deliberately *not* rewritten into `just now`, because a cheerful `just now` for a stamp ten years out is the same fabrication as the duration column this screen refuses, and a negative `-60m ago` is merely the more obvious bug of the two. Note the desktop is **stricter than the TUI** here, whose `format_elapsed` clamps unconditionally to `0s`; the divergence is intentional and one-directional, since the TUI never renders a negative either.
+
+One consequence is deliberately left alone: the TUI's reconnect hydration does not overlay `last_activity` from the snapshot, so a reconnected TUI card's `Last:` readout still resets. That is a pre-existing inaccuracy which this field has made *fixable* rather than fixed — `last_activity` is the ordering evidence `supersedes_generation` weighs and the key the `ListAgents` newest-wins join selects on, so seeding it belongs in its own change with its own tests.
+
+### The attach model
+
+This is the least obvious part of the desktop client and the easiest to break, so it is written out in full.
+
+**"Shows no output" and "opens no PTY" are separate properties, and only the first comes free.** Attaching a PTY was never tied to rendering one. `attachAgents` used to fire from `connect()`, from every `desktop://snapshot` event, and from the `start_daemon` action, attaching every agent in the snapshot regardless of what was on screen — filtered on an `attached` set rather than on anything mounted, and `TerminalViewport` triggered nothing at all. Each attach opens a real daemon `AttachStream` socket, and an `AttachStream` replays the full scrollback before it starts streaming, so a nine-agent fleet cost nine sockets and nine replays behind a screen displaying none of them.
+
+Attach is now driven by one declaration, `DeckBridge.setShownTerminals(agentIds)` — real on `TauriDeckBridge`, a genuine no-op on `FixtureDeckBridge`, which owns no PTYs. It is the only attach trigger left. Its semantics, in the order they matter:
+
+- **Shown terminals are always attached, and are never capped.** This is the constraint that shaped everything else: the deck mounts a terminal on every tile, so a bound applied over everything *attached* would kill six of nine visible panes the moment a nine-agent fleet is displayed.
+- **Leaving a terminal does not detach it.** It moves into a bounded **warm** set, still attached, so bouncing between the handful of agents you are actually working with costs no scrollback replay.
+- **The warm set alone is bounded**, by `MAX_WARM_TERMINALS` (`3`, exported from `desktop/src/lib/bridge.ts`), least-recently-left evicted first. Eviction is a full client-side teardown before the daemon is told: every map keyed by agent id — sessions, terminal channels, pending attachments, pending resizes, resize frames — is cleared, and only then does `desktop_terminal_detach` go out. A surviving channel entry would let a dead attach keep delivering output, and a surviving resize entry would push a size computed for the old pane at the next session.
+- **An empty shown set flushes warm to zero**, not down to the bound. That is what makes the overview's "no terminals attached" true when you arrive from a nine-tile deck, rather than true only on a cold start.
+
+**`setShownTerminals` is declarative, and must be called once per render commit with the whole set — never once per tile.** Nine single-id calls would leave eight of the nine warm and evict five of them, which is the same broken deck the bound exists to avoid. The deck does this in `desktop/src/App.tsx`, deriving the shown ids from the tiles whose tab is `"terminal"` (repeating `AgentTile`'s `?? "terminal"` default exactly) and keying one effect on those ids joined with a newline. That joined string is a dependency key and nothing else — never split it back apart, since a raw agent id containing a newline would come back out as two shown agents. The overview declares the empty set the same way, from a `useEffect` at the top of `AgentOverview`.
+
+What the overview does **not** claim is that every socket a previous screen opened is already gone by the time it renders. The declaration is fire-and-forget, and an attach still in flight is cancelled by *marking* rather than by awaiting — one slow attach must not freeze every later terminal switch — so its daemon-side tear-down lands shortly afterwards. The screen's own footnote says exactly that rather than the stronger thing.
+
+The property is pinned at the bridge level rather than by inspection. `desktop/src/lib/bridge.test.ts` drives `TauriDeckBridge` directly — the live bridge, the only one that owns a PTY at all — and asserts that a nine-agent snapshot attaches zero terminals while nothing is shown, and that `connect()` alone attaches nothing. Note the asymmetry when you touch this code: deleting the deck's effect fails no bridge test, because the bridge is behaving correctly; it silently leaves the deck with no attached terminals at all.
+
+### The four connection states
+
+The overview owns four states, and every one of them is reachable in the fixture without a daemon:
+
+| State | What the screen says | Fixture URL |
+|---|---|---|
+| Connected | The fleet, grouped. `state=crowded` is fifteen agents across two orchestrations, a mode bucket and standalone panes — a four-agent fixture cannot answer a question about many agents | `?fixture=1&state=crowded`, or `?fixture=1` for the default four |
+| Connected, zero agents | "No agents are running yet" — the first-run screen, stated explicitly as what a fresh install looks like rather than as a failure, with what to do next | `?fixture=1&state=empty` |
+| Disconnected | Nothing can be said about the fleet until a daemon answers, so the list is blank rather than stale | `?fixture=1&state=disconnected` |
+| Incompatible | A daemon answered the handshake but this build cannot read its agent list, with its reported running-agent count when it gave one | `?fixture=1&state=error` |
+
+A fifth, `loading`, is the initial seed and is not selectable from the URL.
+
+The header instruments read `—` rather than `0` in the three non-connected states. This is not decoration: a reconnect failure replaces the connection but *keeps* the previous snapshot's agents, and both the `disconnected` and `error` fixtures ship the default four, so deriving the counts unconditionally printed `AGENTS 4 · GROUPS 1` above a body correctly saying the fleet could not be read. "No agents" and "we cannot see the agents" are different statements and only one of them is true there.
+
+The overview offers no daemon lifecycle action — Start daemon, Replace daemon and Stop all stay on the deck, and the incompatible note says so. The one exception is **Connect anyway**, which is not a lifecycle action: it changes this app's own classification of a handshake it already performed, so it belongs on the screen that is refusing to show you the fleet. It appears on the overview's incompatible note under exactly the conditions described in [Attaching across a build stamp difference](#attaching-across-a-build-stamp-difference-development-only) — live mode, and a mismatch the desktop crate reports as stamp-only.
+
 ## Security and ownership model
 
 The daemon remains the single source of truth for agent lifecycle, PTYs, hooks, and orchestration. The desktop opens no HTTP API or TCP listener: the Rust core connects to the same per-user local IPC endpoint as the TUI, verifies the endpoint's ownership/permissions, performs the existing `Hello` protocol and build handshake, and then bridges typed snapshots and bounded terminal chunks through Tauri IPC. PTY output travels daemon → Tauri channel → xterm.js; focused terminal input and resize requests travel in the opposite direction.
@@ -93,7 +190,7 @@ The fixture seeds an orchestrator and release profile using Claude and coder, re
 
 For OpenAI, Anthropic, and OpenCode profiles, the launch command is generated from the current provider, CLI, model, reasoning-effort, and permission fields. The generated command is a read-only preview; on macOS and Linux, values are POSIX-quoted as individual shell words and invalid, NUL-containing, blank, or oversized commands block launch. An **advanced custom command override** is available for unusual CLIs, but it is explicitly labeled as an exact shell command that bypasses the structured fields. Its permissions are unmanaged by the profile UI, may be arbitrary, and must be encoded and reviewed in the command itself. Custom roles are excluded from structured full-access counts, and a custom override does not bypass the Windows platform guard. The launch confirmation distinguishes custom-command risk from permission claims made only for generated roles. The submitted command overrides the matching project role for that launch only; format-preserving profile write-back is not implemented.
 
-Live sessions continue to use the commands and models that created them through the daemon. The current daemon snapshot exposes agent type but not a reliable model identifier, so the live UI labels model, cost, token, branch, and lease fields as unavailable instead of guessing.
+Live sessions continue to use the commands and models that created them through the daemon. The current daemon snapshot exposes agent type but not a reliable model identifier, so the deck's live tiles still label model, cost, token and lease as unavailable instead of guessing. Two of that set have since moved: the branch chip and the attempt readouts are **gone** rather than labelled, because a fabricated `ATT 01` reads as data in a way an explicit "unavailable" does not (see [What it shows, and why not more](#what-it-shows-and-why-not-more)), and the write lease is genuinely reported on the [agent overview](#the-agent-overview), which reads it from `SessionSnapshot` rather than from the deck's fixture-shaped model.
 
 ## Current milestone limits
 
@@ -106,6 +203,8 @@ Live sessions continue to use the commands and models that created them through 
 - Pi coordinator launch is blocked in the desktop preview pending an acknowledged native seed-delivery protocol; Pi may still be used for non-start worker roles.
 - Daemon startup is an explicit user action; visual rename and standalone start-agent flows are not exposed by the current frontend.
 - Multi-pane throughput still needs the explicit M1.3 stress qualification, and a real-agent terminal session still needs the PRD's pre-release end-to-end gate.
+- **The agent overview is not the landing screen, and has no drill-in.** The deck is still what the app opens on, and the overview's only exits are back to the deck. A group view (the deck filtered to one tab bucket) and a single-agent view are deferred; promoting the overview before they exist would land users somewhere they cannot leave.
+- **There is no end-to-end harness for the real Tauri window.** No Playwright, no WebdriverIO, no `tauri-driver`; nothing drives the real window, real IPC, real xterm or real WebKitGTK. Coverage is vitest + Testing Library against a hand-built runtime, plus the desktop crate's Rust tests, plus the manual smoke check below — which is the compensating control rather than parity with `CLAUDE.md` rule 4's L2 tier.
 
 ## Verification commands
 
@@ -124,12 +223,15 @@ cargo fmt --check
 cargo clippy -p dot-agent-deck-desktop --all-targets -- -D warnings
 ```
 
-Run the repository-wide required fast gates from the repository root:
+Run the repository-wide required fast gates from the repository root. Both flags on the clippy line and `--workspace` on the test alias are load-bearing — `CLAUDE.md` rules 2 and 5 explain each of them:
 
 ```sh
-cargo clippy -- -D warnings
+cargo fmt --check
+cargo clippy --workspace --all-targets --features e2e -- -D warnings
 cargo test-fast
 ```
+
+On Linux, `cargo test-fast` needs the Tauri system packages and, inside `devbox shell`, `LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu` in front of it — see [Linux: the workspace gates need the Tauri packages](#linux-the-workspace-gates-need-the-tauri-packages).
 
 Before a PR, run the local-only PTY/real-agent tier once, after the fast gates are green:
 
@@ -138,3 +240,11 @@ cargo test-e2e
 ```
 
 The live manual smoke check is: build the matching CLI, launch `pnpm tauri dev`, use **Start daemon** if needed, launch the configured live loop against a disposable project/worktree, confirm every role hydrates under one orchestration, interact with a real agent in an embedded terminal, resize the window and terminal, reconnect without duplicated output, and stop only a disposable agent through the confirmation dialog. Do not treat the fixture as proof that a real agent or daemon path works.
+
+Then, with that same live daemon still owning those agents, extend it over the overview. This half is the only check that exercises the attach model against real sockets, since no automated harness drives the real window:
+
+1. **Land on the overview.** Click **Overview** in the rail. Confirm the fleet renders grouped — standalone panes first, then the orchestration you launched as one card with its roles in role order and its coordinator badged — and that the counts in the header are real numbers rather than `—`.
+2. **Confirm zero terminals stay attached while it is up.** The app has no readout for this, so observe it from outside: the desktop process's open connections to the attach socket (`DOT_AGENT_DECK_ATTACH_SOCKET`, via `lsof -p <desktop pid>`) should fall to zero. Arriving here from a deck full of tiles is the case that matters — the warm set flushes to zero rather than down to `MAX_WARM_TERMINALS`, so a lingering three would be a regression rather than by design. Give the fire-and-forget declaration a moment to land before concluding anything.
+3. **Read the honest columns.** Active tool and tool count should move as a real agent works. **Last activity** should read `just now` for the agent you are driving and a real age for one you left alone — never `just now` for all of them at once. A blank cell means the daemon reported no live session for that agent at all (`AgentRecord.live` absent), which is expected for one that has not yet emitted a hook event and is *not* the same thing as an agent that has been quiet.
+4. **Drill back to the deck with terminals still working.** Click **Open deck**, confirm every tile re-attaches and streams, and type into one to see it reach the agent. Coming back from the overview costs a replay **by design** — the empty declaration flushed the warm set to zero — so do not read that as a regression. The warm set is exercised without leaving the deck: switch one tile off its terminal tab and back, and it must return with no scrollback replay; do that for more tiles than `MAX_WARM_TERMINALS` and the least-recently-left one pays a replay when it is evicted.
+5. **Stop the daemon under a live app** (`dot-agent-deck daemon stop`, from a shell — the app exposes no such action). The overview must switch to the disconnected note with the list blank rather than stale, and the header instruments must read `—` rather than `0` — the app keeps the previous snapshot's agents, so a `0` there is a regression. Reconnect and confirm the fleet comes back. A daemon's agents are its own children and it persists no session state, so a *restarted* daemon owns nothing and correctly lands on the zero-agent first-run screen rather than on a fleet with blank activity cells.
