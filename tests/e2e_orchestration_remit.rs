@@ -19,7 +19,7 @@
 //! `pane_input_007`'s `orchestrator-prompt.log` technique,
 //! `tests/e2e_pane_send_result.rs`) AND a script capable of toggling its own
 //! declared liveness live -> history-only -> live on cue from the test
-//! driver (needed only by `orchestration/remit/003`; `001`/`002`/`004`-`006`
+//! driver (needed only by `orchestration/remit/003`; `001`/`002`/`004`-`007`
 //! simply never trigger that phase).
 //!
 //! `orchestration/remit/003` deliberately asserts only on the RENDERED GRID
@@ -693,5 +693,79 @@ fn orchestration_remit_006_non_claude_agent_type_clear_reasserts_nothing() {
          scope is Claude Code only); the start role's delivery log reached a second \
          `{DELIVERED_POINTER}` line anyway.\nFinal grid:\n{}",
         deck.snapshot_grid()
+    );
+}
+
+/// The closing sentence `prepare_orchestrator_prompt` (`src/orchestrator_context.rs`)
+/// emits only when a task is present — its ABSENCE from a re-assertion is what
+/// `007` below exists to catch.
+const CARRY_OUT_TASK_POINTER: &str = "Then carry out that task";
+
+/// Scenario: Regression for the maintainer review on the fork's upstream PR
+/// #789 ("Required 1"). Before this fix, both re-arm sites called
+/// `prepare_orchestrator_prompt(config, cwd, None)` directly, which
+/// unconditionally rewrote `.dot-agent-deck/orchestrator-context.md` with no
+/// `## Your task` section and delivered the no-task "wait for instructions"
+/// pointer — silently deleting a dispatched orchestration's task from disk on
+/// every compaction, on exactly the long-running `dispatch --task` path this
+/// feature exists to serve. This test seeds the context file with a `## Your
+/// task` section the way `src/spawn.rs`'s dispatch path does at spawn, then
+/// confirms a compaction re-assertion both re-delivers the TASK-CARRYING
+/// pointer variant (not the wait-for-instructions one) and leaves the task
+/// itself intact on disk.
+#[spec("orchestration/remit/007")]
+#[test]
+#[cfg(unix)]
+fn orchestration_remit_007_compaction_reassertion_preserves_a_dispatched_task() {
+    let deck = TuiDeck::launch_with_fixture("remit-reassert-orchestration");
+    let (socket, pane_id, agent_id, log) = open_and_confirm_initial_delivery(&deck);
+
+    // Seed a `## Your task` section onto the context file the interactive
+    // spawn path (`open_orchestration`) just wrote with none — reproducing,
+    // byte-for-byte, the shape `prepare_orchestrator_prompt(config, cwd,
+    // Some(task))` leaves on disk for a `dispatch --task` orchestration
+    // (`src/spawn.rs`), without needing a second, separately-launched fixture
+    // for the daemon dispatch path.
+    const TASK_SENTINEL: &str = "SENTINEL-TASK-remit007: verify PR #500 and report.";
+    let context_path = deck
+        .workdir()
+        .join(".dot-agent-deck")
+        .join("orchestrator-context.md");
+    let mut seeded =
+        std::fs::read_to_string(&context_path).expect("read the spawn-written context file");
+    seeded.push_str("\n## Your task\n\n");
+    seeded.push_str(TASK_SENTINEL);
+    seeded.push('\n');
+    std::fs::write(&context_path, &seeded).expect("seed a dispatched task onto the context file");
+
+    inject_compacting(
+        &deck,
+        &socket,
+        &pane_id,
+        &agent_id,
+        &format!("{agent_id}-remit007-session"),
+    );
+
+    let reasserted_with_task = common::wait_for_file_substr_count(
+        &log,
+        CARRY_OUT_TASK_POINTER,
+        1,
+        Duration::from_secs(10),
+    );
+    assert!(
+        reasserted_with_task,
+        "a compaction re-assertion on a start role whose context file carries a `## Your \
+         task` section must re-deliver the TASK-CARRYING pointer (containing \
+         `{CARRY_OUT_TASK_POINTER}`), not the no-task \"wait for instructions\" variant; \
+         the log never shows it within 10s.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    let after_reassert = std::fs::read_to_string(&context_path)
+        .expect("read the context file after the re-assertion rewrite");
+    assert!(
+        after_reassert.contains(TASK_SENTINEL),
+        "the dispatched task must survive a compaction re-assertion rather than being wiped \
+         by the no-task rewrite; context file after re-assertion:\n{after_reassert}"
     );
 }

@@ -3162,7 +3162,7 @@ fn filter_sessions<'a>(state: &'a AppState, ui: &UiState) -> Vec<(&'a String, &'
 // path needs the same composition, and two copies is what left a
 // daemon-started orchestration without its delegation protocol. Imported below
 // so this module's call site and tests are unchanged.
-use crate::orchestrator_context::prepare_orchestrator_prompt;
+use crate::orchestrator_context::{prepare_orchestrator_prompt, reassert_orchestrator_prompt};
 // ---------------------------------------------------------------------------
 // PRD #76 M2.12: hydration partition
 // ---------------------------------------------------------------------------
@@ -13283,7 +13283,18 @@ pub fn run_tui(
                         // trusting a file some other process may have
                         // pruned or a relative path the agent will resolve
                         // from wherever it has since `cd`'d to.
-                        && let Some(prompt) = prepare_orchestrator_prompt(config, cwd, None)
+                        //
+                        // `reassert_orchestrator_prompt`, not
+                        // `prepare_orchestrator_prompt(config, cwd, None)`
+                        // directly: the latter unconditionally wipes any `##
+                        // Your task` section already on disk, which for a
+                        // `dispatch --task` orchestration (`src/spawn.rs`)
+                        // deleted an in-progress task on every compaction and
+                        // told the orchestrator to wait rather than continue.
+                        // The former reads that section back off the existing
+                        // file first and carries it forward, falling back to
+                        // today's no-task behavior when there is none.
+                        && let Some(prompt) = reassert_orchestrator_prompt(config, cwd)
                     {
                         // This re-arm may be SUPERSEDING a still-open cycle
                         // that already landed a write and is only waiting on
@@ -13429,7 +13440,13 @@ pub fn run_tui(
 
                     if no_delivery_pending && !permanently_excluded && retry_floor_ok {
                         ui.orchestration_remit_clear_retry_at.insert(*id, orch_now);
-                        if let Some(prompt) = prepare_orchestrator_prompt(config, cwd, None) {
+                        // See the compaction re-arm's identical comment above:
+                        // `reassert_orchestrator_prompt` reads any existing
+                        // `## Your task` section back off disk before
+                        // rewriting, so a dispatched orchestration's task
+                        // survives a `/clear` re-assertion instead of being
+                        // silently replaced with the no-task pointer.
+                        if let Some(prompt) = reassert_orchestrator_prompt(config, cwd) {
                             ui.send_retry_backoff.remove(start_pane_id.as_str());
                             ui.prompt_delivery.remove(start_pane_id.as_str());
                             ui.orchestration_ready_since.remove(id);

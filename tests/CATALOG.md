@@ -2903,6 +2903,13 @@ without depending on the config struct API.
 - **Does not assert:** the pane-identity scope guard, covered by `005`; the readiness-gating/delivery-confirmation discipline of the re-assertion itself, covered by `003`.
 - **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `001`/`004`/`005`).
 
+##### orchestration/remit/007 — A compaction re-assertion on a start role whose context file already carries a `## Your task` section re-delivers the TASK-CARRYING pointer variant and leaves the task itself intact on disk, rather than silently replacing both with the no-task "wait for instructions" form.
+- **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness).
+- **Agent:** none (`remit-reassert-orchestration` fixture, as `001`).
+- **Asserts:** after the spawn-time remit pointer delivers once, a `## Your task` section carrying a sentinel is seeded onto `.dot-agent-deck/orchestrator-context.md` — reproducing byte-for-byte the shape `prepare_orchestrator_prompt(config, cwd, Some(task))` leaves on disk for a `dispatch --task` orchestration (`src/spawn.rs`) — without launching a second, separately-dispatched fixture. Injecting `Compacting` for the start role's own identity then causes the delivery log to show the task-carrying pointer (containing "Then carry out that task") within 10s, and the context file on disk still contains the sentinel afterward. Regression coverage for the maintainer review on the fork's upstream PR #789 ("Required 1"): before the fix, the re-arm called `prepare_orchestrator_prompt(config, cwd, None)` directly, which wiped the `## Your task` section and delivered the no-task pointer instead, silently discarding a dispatched orchestration's task on every compaction.
+- **Does not assert:** the daemon dispatch path (`src/spawn.rs`) itself producing that seeded shape at spawn (covered by unit tests in `src/orchestrator_context.rs`: `reassert_preserves_an_existing_dispatched_task`, `reassert_with_no_prior_task_reproduces_no_task_behavior`, `reassert_with_no_existing_file_falls_back_to_no_task`); the equivalent guard on the `/clear` re-arm site, which shares the same `reassert_orchestrator_prompt` helper and is therefore covered by the same unit tests rather than a second, near-identical L2 case.
+- **Platform coverage:** mac+linux (`#[cfg(unix)]`, matching `001`/`004`/`005`/`006`).
+
 #### orchestration/layout
 
 ##### orchestration/layout/001 — Seven decks fit the single-column orchestration card area without scrolling (PRD #147).
