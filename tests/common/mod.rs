@@ -2527,10 +2527,11 @@ fn redact_cast_events(events: &[CastEvent], credentials: &[String]) -> Vec<Vec<u
 // incompatible with a future Claude Code version, the prompt paints the suffix
 // onto the grid — AND the agent then sits on the prompt forever, so the test
 // dies at a PTY wait whose panic interpolates that same grid. The leak path and
-// the panic path are one path. nextest writes that panic into the run log
-// (which `--success-output=final` and failure output both surface) and into the
-// raw JUnit report. Both are LOCAL files on the developer's machine — lane 2
-// runs on no runner — so there is no masking layer downstream, and the one that
+// the panic path are one path. nextest renders that panic to the live console
+// (which `--success-output=final` and failure output both surface) and stores it
+// in the raw JUnit report — the first landing in the developer's own terminal
+// scrollback, the second a file on that same machine, because lane 2 runs on no
+// runner. So there is no masking layer downstream of either, and the one that
 // exists where logs are rendered covers a registered secret's exact value,
 // never a 20-character substring of it.
 //
@@ -4476,9 +4477,12 @@ pub fn require_real_e2e() -> bool {
 /// checked out, including ones predating this marker.
 #[doc(hidden)]
 pub fn _skip_if_err(result: Result<(), String>) -> bool {
-    // Issue #502/#785 audit S1. The narrowest choke point that covers EVERY
-    // credentialed test: `skip_unless!` is the first line of all 33 of them, and
-    // it is the only one some of them share with the harness at all.
+    // Issue #502/#785 audit S1. The narrowest choke point that covers every
+    // runtime credential preflight: `skip_unless!` is what wraps each
+    // `check_*_available` call, so a test that gates on a credential passes
+    // through here whatever else it shares with the harness — for most of them,
+    // as the first statement in the test body — and for some it is the ONLY
+    // thing they share with the harness at all.
     // `e2e_pi_worker.rs` is the case that made this necessary — it defines its
     // own file-local `check_pi_available`, never calls a `common::check_*` or an
     // importer, drives an IN-PROCESS daemon (so no `TuiDeckBuilder::launch`),
@@ -5095,7 +5099,7 @@ pub fn seed_claude_worker_home(home: &Path, trust_paths: &[String]) -> std::io::
     // The returned values are discarded rather than ignored: this route has no
     // `TuiDeck` and so no recording to redact, and the importer registers what
     // it copied for DIAGNOSTIC redaction itself (PR #805 audit blocker 2), which
-    // is the only sink these callers have.
+    // is the only redaction these callers get.
     import_claude_credentials(home)?;
     // Same order as the builder's, so both routes record and then read one
     // decision rather than two (see [`CLAUDE_OAUTH_SEEDED`]). The identity
@@ -12168,12 +12172,13 @@ mod harness_unit_tests {
     ///
     /// This is issue #785 blocker A stated as a test. The whole credential was
     /// reconstructable out of a panic grid while both registered patterns
-    /// matched nothing, and a panic grid goes to nextest's run log and to the
-    /// raw JUnit report. Since #502 both are LOCAL files on the developer's
-    /// machine — lane 2 runs on no runner — so nothing downstream masks
-    /// anything, and the masking that does exist where logs are rendered covers
-    /// a registered secret's exact value rather than reassembling line-wrapped
-    /// fragments of it.
+    /// matched nothing, and a panic grid goes two places: nextest's live console
+    /// output, which lands in the developer's own terminal scrollback, and the
+    /// raw JUnit report, which is a file on that same machine. Since #502 lane 2
+    /// runs on no runner, so neither passes through a masking layer, and the
+    /// masking that does exist where logs are rendered covers a registered
+    /// secret's exact value rather than reassembling line-wrapped fragments of
+    /// it.
     #[test]
     fn a_credential_wrapped_across_grid_rows_is_redacted_from_every_sink() {
         let key = WRAPPING_FAKE_KEY;
@@ -12507,8 +12512,9 @@ mod harness_unit_tests {
     /// this a hard panic there before the test reaches what it is testing.
     /// Measured on `build-windows` for PR #805: 11 binaries failed on `HOME is
     /// set on the host`. Gating rather than teaching `host_home()` about
-    /// `USERPROFILE`, because the whole credentialed tier is Unix-only
-    /// (CLAUDE.md rule 5) and inventing a Windows credential path to satisfy a
+    /// `USERPROFILE`, because the L2 tier is Unix-only in practice (CLAUDE.md
+    /// rule 2, which is where that is recorded — rule 5 does not say it) and
+    /// inventing a Windows credential path to satisfy a
     /// test would be a fiction. The seam ITSELF is platform-independent and
     /// stays covered everywhere by
     /// `a_panic_message_is_redacted_without_losing_its_diagnostic_shape` and by

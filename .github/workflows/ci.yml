@@ -291,14 +291,28 @@ jobs:
   # test reaches a real agent in CI. `docs/develop/e2e-lanes.md` records why,
   # and CLAUDE.md rule 5 is the policy.
   #
-  # NO SECRETS IN THIS JOB, and that is the property the entire lane rests on
-  # rather than a detail: it declares no `environment:`, no job-level `env:`
-  # reading `secrets.*`, and passes no ANTHROPIC_API_KEY. No other job in
-  # `ci.yml` does either, and no workflow anywhere registers a TEST credential —
-  # which is the point, because a test credential in a public repository's CI is
-  # a vulnerability that running it less often does not remove. If a test here
-  # ever fails for want of a credential then the test is in the wrong lane:
-  # re-gate its file into `e2e-live`. DO NOT add a key here to make it pass.
+  # NO AGENT OR TEST CREDENTIAL REACHES THIS JOB, and that is the property the
+  # lane rests on rather than a detail: no ANTHROPIC_API_KEY, no OPENAI_API_KEY,
+  # no agent CLI credential. It declares no `environment:` and no job-level
+  # `env:` reading `secrets.*`, no other job in `ci.yml` does either, and no
+  # workflow anywhere registers a TEST credential — which is the point, because
+  # a test credential in a public repository's CI is a vulnerability that
+  # running it less often does not remove. If a test here ever fails for want of
+  # a credential then the test is in the wrong lane: re-gate its file into
+  # `e2e-live`. DO NOT add a key here to make it pass.
+  #
+  # That is NOT the same as "no secrets in this job", which this comment used to
+  # claim and which is false. The unqualified `actions/checkout@v7` below
+  # receives the automatic `GITHUB_TOKEN` as its default `token:` input, and
+  # `persist-credentials` defaults to true, so the token is written into
+  # `.git/config` as an auth header for the life of the job — reachable by any
+  # contributor-authored test code this lane runs. What bounds it is SCOPE, not
+  # absence: this workflow's top-level `permissions:` block grants
+  # `contents: read` and `pull-requests: read` and nothing else, and a fork
+  # `pull_request` run gets a read-only token whatever the block says (see
+  # `.claude/skills/verify-pr/SKILL.md`). Setting `persist-credentials: false`
+  # on that checkout would remove even that, and is worth doing as its own
+  # change rather than folded into a prose pass.
   #
   # That is deliberately NOT the wider claim "no agent credential reaches this
   # repository's CI", which is false: the Codex issue-labeler
@@ -440,8 +454,10 @@ jobs:
   #     crates here;
   #   * the L2 PTY e2e suite is excluded because this job runs `cargo nextest
   #     run` WITHOUT either e2e feature — every one of the 71 `tests/e2e_*.rs`
-  #     files opens with a `feature = "e2e"` cfg (47 bare, 24 also requiring
-  #     `feature = "e2e-live"` since issue #502), so none of them is compiled
+  #     files opens with a `feature = "e2e"` cfg (47 in lane 1 — 44 exactly
+  #     that attribute, three adding a `unix` term — and 24 in lane 2, which
+  #     also require `feature = "e2e-live"` since issue #502, 21 exactly and
+  #     three adding `unix`), so none of them is compiled
   #     here at all rather than compiled-and-emptied. Note this is a DIFFERENT
   #     mechanism from the first bullet even for the six of the 71 that DO
   #     carry a `unix` term (e2e_hook_binary_path, e2e_remote_doctor,

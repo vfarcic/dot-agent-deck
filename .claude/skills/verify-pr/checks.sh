@@ -198,10 +198,12 @@ wanted fmt && { run_step fmt "cargo fmt --check" || true; } || skip fmt "not in 
 # files, which open with
 # `#![cfg(all(feature = "e2e", feature = "e2e-live"))]` and are empty crates
 # under `--features e2e` alone. This gate is where a reviewer catches a break in
-# them, and it is the ONLY place anyone will: those 24 run in no CI job — no
-# test that reaches a real agent does — and the e2e step below runs lane 1 only
-# even when it is turned on. Without this second feature a PR touching a
-# real-agent test is reviewed against no compilation of it at all.
+# them, and CI-side it is the only compilation of those 24 there is: they run
+# in no CI job — no test that reaches a real agent does — and the e2e step below
+# runs lane 1 only even when it is turned on. Locally a developer can still
+# compile them with `cargo test-e2e-live` or `bacon clippy`; this gate is what
+# makes that unnecessary for a reviewer. Without this second feature a PR
+# touching a real-agent test is reviewed against no compilation of it at all.
 #
 # This is a type-check and lint, so naming `e2e-live` costs no credential and
 # runs no live test. build-windows/build-macos still run bare `cargo clippy`

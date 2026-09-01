@@ -96,9 +96,9 @@ const NEXTEST_FAILURE_REPORT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 "#;
 
 /// The script's own `--self-test` must pass. Since #502 removed the
-/// credentialed workflow, `docs/develop/e2e-lanes.md` is the only place left
-/// that tells a reader to run it, so a self-test that has rotted is worse than
-/// none.
+/// credentialed workflow, the only places that tell a reader to run it are
+/// prose — `docs/develop/e2e-lanes.md` and the script's own usage block — so a
+/// self-test that has rotted is worse than none.
 #[test]
 fn junit_strip_self_test_passes() {
     if !python_present() {
