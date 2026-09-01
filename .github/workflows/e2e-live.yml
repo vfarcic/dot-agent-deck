@@ -479,6 +479,102 @@ jobs:
             -E 'not (test(=devin_live_001_real_interactive_turn_drives_the_card_live) or test(=dispatch_013_orchestration_surfaces_and_delegates))' \
             2>&1 | tee "${RUNNER_TEMP}/e2e-live-run.log"
 
+      # PURGE THE RUN'S CREDENTIALS FROM THE RUNNER — issue #785 audit S2.
+      #
+      # THE POSITION IS THE POINT. It sits immediately after the test command
+      # and before every post-processing step, every `actions/upload-artifact`,
+      # and the `Swatinem/rust-cache` post-action — all of which run as this
+      # same user. A cleanup step that runs after those is worth much less.
+      # `if: always()` because a FAILED run is exactly when a credential is most
+      # likely to still be lying around.
+      #
+      # THREE SINKS, all real, none consumed by anything in this file today.
+      # The runner is ephemeral, so this is defence in depth rather than an
+      # incident fix — what it actually buys is that "step-level `env:`" stops
+      # being an accurate description of either credential's lifetime the moment
+      # its step ends, and that a step added below this one cannot silently
+      # inherit either.
+      #
+      #   1. `~/.codex/auth.json` holds the RAW OpenAI key, written by the
+      #      provisioning step above from `OPENAI_API_KEY`. Mode 0600 protects
+      #      it from other OS users. It protects it from nothing running as the
+      #      runner user, which is everything after this point.
+      #   2. `ANTHROPIC_API_KEY` survives in the ENVIRONMENT of every detached
+      #      daemon the harness started, and of every agent those daemons
+      #      spawned. `TuiDeck::drop` explicitly cannot kill them (the daemon
+      #      `setsid`s into its own session — tests/common/mod.rs), and
+      #      `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` only bounds them at 300
+      #      seconds, a window the steps below overlap. This closes the window
+      #      by stopping the processes; it deliberately does NOT raise or weaken
+      #      that cap, which is load-bearing elsewhere (CLAUDE.md rule 14 — the
+      #      temp-dir reaper derives its dead-PID floor from the longest cap
+      #      `tests/` pins).
+      #   3. The harness's per-process temp roots under `/var/tmp/dad-e2e-<uid>`.
+      #      `import_codex_credentials` copies sink 1's bytes into the isolated
+      #      `$HOME/.codex/auth.json` of EVERY codex test, and the seeding writes
+      #      the Anthropic key's 20-character response id into each isolated
+      #      `.claude.json`. A passing test's `TempDir` removes its own root on
+      #      drop — but a test killed by a timeout, or a run cancelled mid-flight,
+      #      does not, and a failed run is exactly when this step matters.
+      #
+      # Nothing here may fail the job for a normal outcome: a run that left no
+      # daemon behind is the expected case, so every `pkill` is `|| true`, and an
+      # absent temp root is the ordinary state rather than a problem. The one
+      # hard failure is a credential FILE still being there after its removal,
+      # which would mean the removal silently did not work — the exact shape of
+      # failure this step exists to prevent.
+      #
+      # The kill patterns are broad on purpose and safe because of where they
+      # run: a single-purpose ephemeral runner whose remaining steps are `grep`,
+      # `python3` and an artifact upload, none of which match them. `codex`,
+      # `claude`, `opencode` and `pi` are killed alongside the decks because
+      # each inherited the key from the deck that spawned it, so a surviving
+      # agent is a surviving copy of the credential. A pattern that over-matched
+      # would kill a runner process and fail the job LOUDLY; one that
+      # under-matched would leave a credential behind quietly, so the bias is
+      # deliberately toward over-matching.
+      #
+      # `${RUNNER_TEMP}/e2e-live-run.log` is deliberately NOT removed here: the
+      # next step reads it, it is never uploaded, and since issue #785's
+      # diagnostic redaction seam a rendered credential cannot reach it anyway.
+      - name: Purge the run's credentials from the runner
+        if: always()
+        run: |
+          set -uo pipefail
+          for pattern in dot-agent-deck claude opencode codex; do
+            pkill -f -- "${pattern}" || true
+          done
+          pkill -x -- pi || true
+          sleep 2
+          for pattern in dot-agent-deck claude opencode codex; do
+            pkill -KILL -f -- "${pattern}" || true
+          done
+          pkill -KILL -x -- pi || true
+
+          rm -rf -- "${HOME}/.codex"
+          if [ -e "${HOME}/.codex/auth.json" ]; then
+            echo "::error::~/.codex/auth.json still exists after removal, so the raw OPENAI_API_KEY is still on this runner where every later step, upload and post-action runs as the same user."
+            exit 1
+          fi
+
+          # Only AFTER the SIGKILL pass above: CLAUDE.md rule 14 is explicit
+          # that handing `rm -rf` a root a live daemon is still writing under is
+          # the one thing the reaper's dead-PID floor exists to prevent. Nothing
+          # of ours is still running by this line, and the job is over.
+          #
+          # Both rungs `choose_temp_base` can land on, because only the first is
+          # likely and only the second would be silent: the private parent it
+          # prefers, and the `dad-tests-*` roots it falls back to directly under
+          # the system temp dir when that parent could not be created.
+          harness_root="/var/tmp/dad-e2e-$(id -u)"
+          rm -rf -- "${harness_root}" || true
+          find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'dad-tests-*' -exec rm -rf -- {} + 2>/dev/null || true
+          if [ -d "${harness_root}" ]; then
+            echo "::warning::${harness_root} survived removal; an isolated test HOME under it may still hold a copy of ~/.codex/auth.json."
+          fi
+
+          echo "purged: ~/.codex removed, harness temp roots removed, harness daemons and agents signalled"
+
       # THE SKIP EVIDENCE — a COUNT in the job log and the run summary.
       # Deliberately not the reasons, and deliberately not in the uploaded
       # artifact.
