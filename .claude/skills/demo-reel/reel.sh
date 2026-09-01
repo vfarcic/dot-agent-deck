@@ -200,8 +200,9 @@ Options:
                   Default: the basename of --out without its extension
                   (e.g. "reel" for reel.mp4).
   --publish       Upload the MP4 PRIVATE to YouTube and print the URL, so
-                  nothing is third-party-visible until a human deliberately
-                  flips it. Requires ${CRED_VARS[*]} in the environment.
+                  only the channel owner, and any account they deliberately
+                  share it with, can watch it until a human flips it.
+                  Requires ${CRED_VARS[*]} in the environment.
   -h, --help      Show this help and exit.
 
 Examples:
@@ -717,6 +718,6 @@ if [[ "$PUBLISH" -eq 1 ]]; then
     reel_desc="$(jq -r 'map("• " + .title) | join("\n")' "$MANIFEST")"
     url="$("$UPLOAD_SCRIPT" "$OUT" "$reel_title" "$reel_desc")"
     echo "$url"
-    note "published PRIVATE (only the channel owner can watch it; flipping it to unlisted keeps this link): $url"
+    note "published PRIVATE (only the channel owner, and any account they deliberately share it with, can watch it; flipping it to unlisted keeps this link): $url"
   fi
 fi

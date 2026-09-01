@@ -62,9 +62,10 @@ fn harness_clears_inherited_deck_endpoints() {
 // and `.claude/skills/demo-reel-adapter` selects a cast on path existence alone.
 // A cast from a revision predating the redaction fixes could therefore be
 // stitched into a video and uploaded to YouTube with its link in the PR body and
-// the public release notes. (The upload is private by default now, so the flip
-// that makes such a video third-party-visible is a human step — that bounds the
-// blast radius; it does not make a stale cast correct.)
+// the public release notes. (The upload is private by default now, so widening
+// it beyond the channel owner and the accounts they deliberately share it with
+// is a human step — that bounds the blast radius; it does not make a stale cast
+// correct.)
 //
 // Both call sites of the discard are covered here: the runtime-skip one by
 // actually taking it, and the launch one by a source guard, because observing it

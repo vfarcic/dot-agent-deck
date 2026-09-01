@@ -17,9 +17,10 @@
 # URL with no human in between. Private means only the channel owner (and
 # accounts they name) can watch it — the owner can always watch their OWN private
 # videos, so an unattended agent still uploads and still hands over a working
-# link; nothing is third-party-visible until a human deliberately flips it. The
-# video id survives a private -> unlisted flip, so the link already in the PR and
-# the changelog starts working with no re-upload.
+# link; beyond that owner and the accounts they deliberately share it with,
+# nothing is visible until a human flips it. The video id survives a private ->
+# unlisted flip, so the link already in the PR and the changelog starts working
+# with no re-upload.
 #
 # What private does NOT do: the upload has already happened, so the bytes are on
 # Google's servers either way. Private CONTAINS a leak to the owner's own

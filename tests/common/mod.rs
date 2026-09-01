@@ -3364,9 +3364,9 @@ const RECORDING_ARTIFACTS: [&str; 4] = [
 /// written by a revision that predates the redaction fixes could survive an
 /// interrupted current run and still be stitched into a video and uploaded to
 /// YouTube with its link in the PR body and the public release notes. (The
-/// upload is PRIVATE by default now, so the flip that makes such a video
-/// third-party-visible is a human step — that reduces the blast radius, it does
-/// not make a stale cast correct.)
+/// upload is PRIVATE by default now, so widening it beyond the channel owner
+/// and the accounts they deliberately share it with is a human step — that
+/// reduces the blast radius, it does not make a stale cast correct.)
 ///
 /// Clearing at launch kills that at the source: after this call the artifact
 /// either belongs to the current run or does not exist. **It is the cheap half,

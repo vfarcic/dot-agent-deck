@@ -189,7 +189,7 @@ The live YouTube upload cannot be a routine automated test, so it is verified by
 .claude/skills/demo-reel/reel.sh some-manifest.json --out reel.mp4 --publish
 ```
 
-and confirm it prints an `https://youtu.be/<id>` URL that opens a **private** video — signed in as the channel owner it plays normally and shows a *Private* badge; signed out, or as anyone else, it is unavailable. That asymmetry is the point (see **Privacy** below). All hosting lives in `upload.sh` alone, so swapping hosts later does not touch the rest of the engine.
+and confirm it prints an `https://youtu.be/<id>` URL that opens a **private** video — signed in as the channel owner it plays normally and shows a *Private* badge; signed out, or as any account the owner has not deliberately shared it with, it is unavailable. That asymmetry is the point (see **Privacy** below). All hosting lives in `upload.sh` alone, so swapping hosts later does not touch the rest of the engine.
 
 ## Failure behavior
 
