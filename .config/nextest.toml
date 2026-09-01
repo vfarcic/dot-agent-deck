@@ -37,8 +37,11 @@ fail-fast = false
 # the first `socket_004` occurrence.
 #
 # TWO THINGS THIS FILE DELIBERATELY DOES NOT DO (issue #785). No credentialed
-# job exists any more — issue #502 took lane 2 out of CI entirely — so the run
-# that can write a credential into this report is a LOCAL `cargo test-e2e-live`.
+# e2e job exists any more — issue #502 took lane 2 out of CI entirely — so the
+# run that can write a credential into this report is a LOCAL
+# `cargo test-e2e-live`. (Other workflows do hold secrets; the Codex
+# issue-labeler even reaches a real agent. None of them runs nextest or writes
+# this file.)
 #
 #   * `store-success-output` stays at its default of FALSE, so a `SKIP: <reason>`
 #     line never reaches the report — a runtime skip is a *successful* test, not

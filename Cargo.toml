@@ -170,12 +170,15 @@ e2e = []
 # SUPERSET run, not a live-only run.
 #
 # NOTHING IN CI ENABLES THIS FEATURE'S TESTS TO RUN, and that is the decision
-# rather than an omission: no test that reaches a real agent runs in CI, so no
-# agent credential is registered on this repository. The line the feature draws
-# is exactly "reaches a real agent", which is wider than "reads a key" — on a
-# developer box the agent CLIs are pre-authenticated, so spawning `claude`
-# spends a credential with no environment variable involved. Credential
-# handling for a LOCAL lane-2 run is issue #785.
+# rather than an omission: no e2e test reaches a real agent in CI, so no TEST
+# credential is registered on this repository. (Narrow claim on purpose — the
+# Codex issue-labeler is a separately credentialed workflow that does put a
+# repository secret on a runner and does reach a real agent; see
+# `docs/develop/issue-labeling.md`. It is out of scope for the e2e tier.) The
+# line the feature draws is exactly "reaches a real agent", which is wider than
+# "reads a key" — on a developer box the agent CLIs are pre-authenticated, so
+# spawning `claude` spends a credential with no environment variable
+# involved. Credential handling for a LOCAL lane-2 run is issue #785.
 #
 # One CI job does still compile these 24 files, and it is the only one: rule 2's
 # `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D

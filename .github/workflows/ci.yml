@@ -216,10 +216,13 @@ jobs:
       # naming `e2e-live` here does not put lane 2 into this job.
       #
       # THAT FLAG NOW CARRIES THE WHOLE WEIGHT. Lane 2 does not run in CI at
-      # all — no test that reaches a real agent does, so no agent credential
-      # exists on this repository — which makes this step the ONLY thing in CI
-      # that compiles those 24 files. Drop `e2e-live` from this line and they
-      # go back to being checked by nothing until a developer runs them.
+      # all — no e2e test reaches a real agent there, so no TEST credential is
+      # registered on this repository (the separately credentialed Codex
+      # issue-labeler is out of scope; see the e2e-deterministic job's comment
+      # and docs/develop/issue-labeling.md) — which makes this step the ONLY
+      # thing in CI that compiles those 24 files. Drop `e2e-live` from this
+      # line and they go back to being checked by nothing until a developer
+      # runs them.
       - run: cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
       - run: cargo build --release
       # `cargo nextest run`, NOT `cargo test` — the same runner as the
@@ -284,17 +287,26 @@ jobs:
   # agent credential; the other 24 open with
   # `#![cfg(all(feature = "e2e", feature = "e2e-live"))]` and compile to empty
   # crates here, so they are never even built into this job. The credentialed
-  # superset is lane 2, and lane 2 runs ONLY on a developer's machine — no test
-  # that reaches a real agent runs in CI. `docs/develop/e2e-lanes.md` records
-  # why, and CLAUDE.md rule 5 is the policy.
+  # superset is lane 2, and lane 2 runs ONLY on a developer's machine — no e2e
+  # test reaches a real agent in CI. `docs/develop/e2e-lanes.md` records why,
+  # and CLAUDE.md rule 5 is the policy.
   #
-  # NO SECRETS, and that is the property the entire lane rests on rather than a
-  # detail: this job declares no `environment:`, no job-level `env:` reading
-  # `secrets.*`, and passes no ANTHROPIC_API_KEY. Nor does any other job in this
-  # repository, which is the point — a credential in a public repository's CI is
+  # NO SECRETS IN THIS JOB, and that is the property the entire lane rests on
+  # rather than a detail: it declares no `environment:`, no job-level `env:`
+  # reading `secrets.*`, and passes no ANTHROPIC_API_KEY. No other job in
+  # `ci.yml` does either, and no workflow anywhere registers a TEST credential —
+  # which is the point, because a test credential in a public repository's CI is
   # a vulnerability that running it less often does not remove. If a test here
   # ever fails for want of a credential then the test is in the wrong lane:
   # re-gate its file into `e2e-live`. DO NOT add a key here to make it pass.
+  #
+  # That is deliberately NOT the wider claim "no agent credential reaches this
+  # repository's CI", which is false: the Codex issue-labeler
+  # (`issue-labeler.md`, `issue-labeler.lock.yml`, `issue-labeler-batch.yml`)
+  # passes the repository secret OPENAI_API_KEY into a `codex exec` step and
+  # genuinely reaches a real agent. That is a separate feature with its own
+  # threat model — `docs/develop/issue-labeling.md` — and out of scope for the
+  # e2e lanes. Do not cite it as precedent for putting a test key here.
   #
   # NO AGENT CLI is installed either, and that is deliberate rather than merely
   # unnecessary. `scheduler/cli/002` in tests/e2e_scheduler_cli.rs writes a
