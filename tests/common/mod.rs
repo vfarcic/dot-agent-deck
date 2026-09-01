@@ -3281,6 +3281,29 @@ const E2E_RUN_MARKER_ENV: &str = "DAD_E2E_RUN_MARKER";
 /// is at the use site.
 const INHERIT_PASS: [&str; 3] = ["PATH", ANTHROPIC_API_KEY_ENV, E2E_RUN_MARKER_ENV];
 
+/// Forward the containment marker onto an environment some other harness path
+/// is rebuilding from scratch after its own `env_clear`.
+///
+/// `INHERIT_PASS` covers `TuiDeck` and nothing else, and `TuiDeck` is not the
+/// only path in this harness that clears and rebuilds. `spawn_daemon_serve_with_env`
+/// has its OWN `env_clear` and its own explicit list, and credential-bearing
+/// live tests use it — `e2e_pi_orchestrator.rs`'s `scheduler_pi_001` pushes
+/// `ANTHROPIC_API_KEY` through its `extra_env` so a scheduler-spawned `pi`
+/// inherits it. Without this, that daemon and every agent under it held the key
+/// while carrying no marker, so `e2e-live.yml`'s purge would enumerate nothing,
+/// report a clean containment and delete the harness roots out from under them.
+/// Found by Greptile on PR #805; the omission was real.
+///
+/// Unset locally, so nothing is pushed and no test sees a new variable. The
+/// three `DaemonProc` helpers that shell out (`run_schedule_cli`,
+/// `run_schedule_cli_from`, `run_agent_event`) rebuild from the same `env`
+/// vector, so they inherit this for free.
+fn push_containment_env(env: &mut Vec<(String, String)>) {
+    if let Ok(marker) = std::env::var(E2E_RUN_MARKER_ENV) {
+        env.push((E2E_RUN_MARKER_ENV.into(), marker));
+    }
+}
+
 /// The ambient OpenAI API key, or `None` when unset, empty or whitespace-only.
 /// Same trim rule and same secret discipline as [`anthropic_api_key`]: returned
 /// only to be registered for redaction, never printed or written anywhere.
@@ -6839,6 +6862,10 @@ pub fn spawn_daemon_serve_with_env(
     if let Ok(p) = std::env::var("PATH") {
         env.push(("PATH".into(), p));
     }
+    // Before `extra_env` below, which is where a credential-bearing live test
+    // pushes `ANTHROPIC_API_KEY`: this daemon and everything it spawns must be
+    // findable by the live lane's purge step. See `push_containment_env`.
+    push_containment_env(&mut env);
     env.push(("HOME".into(), home.to_string_lossy().into_owned()));
     env.push(("TERM".into(), "xterm-256color".into()));
     env.push((
@@ -11091,6 +11118,64 @@ mod harness_unit_tests {
         );
     }
 
+    /// Scenario: Every `env_clear` in this harness is accounted for by one of
+    /// the two mechanisms that forward the containment marker. Pinned as a
+    /// COUNT, so adding a third environment-rebuilding spawn path fails here and
+    /// makes its author decide whether the marker has to reach it.
+    ///
+    /// This is the guard for a real omission, not a hypothetical.
+    /// `INHERIT_PASS` covers `TuiDeck` and only `TuiDeck`, and
+    /// `spawn_daemon_serve_with_env` has its own `env_clear` and its own
+    /// explicit list — so a credential-bearing `daemon serve` and every agent
+    /// under it carried the Anthropic key with no marker, and the live lane's
+    /// purge would have enumerated nothing, reported a clean containment and
+    /// deleted the harness roots out from under them. Caught by Greptile on
+    /// PR #805 after the first version of this work shipped `INHERIT_PASS`
+    /// alone.
+    ///
+    /// The needle is assembled with `concat!` so this scan does not count its
+    /// own source, which is also why it is not spelled out here.
+    #[test]
+    fn every_harness_env_clear_forwards_the_containment_marker() {
+        let src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("common")
+                .join("mod.rs"),
+        )
+        .expect("read tests/common/mod.rs");
+        let sites = src.matches(concat!("cmd.env_", "clear();")).count();
+        assert_eq!(
+            sites, 4,
+            "the number of environment-rebuilding spawn paths in this harness \
+             changed. Each one must forward {E2E_RUN_MARKER_ENV}, or the process \
+             it spawns is invisible to `e2e-live.yml`'s purge — which then \
+             reports a clean containment and DELETES the harness temp roots \
+             while a credential-bearing process is still writing under them. \
+             The four accounted for are: `TuiDeck::launch` (via INHERIT_PASS), \
+             `spawn_daemon_serve_with_env` (via push_containment_env), and \
+             `run_schedule_cli_from` + `run_agent_event` (which replay that same \
+             vector). Add the forwarding, then update this count."
+        );
+        // Both needles are assembled with `concat!` for the same reason the
+        // count's is. Spelled out as plain literals they appear in THIS
+        // function's source, which is the file being scanned — so each
+        // assertion satisfies itself and passes while the call site it is
+        // guarding is gone. Measured: with the daemon-serve forwarding deleted,
+        // the literal version of this test still passed.
+        assert!(
+            src.contains(concat!("for k in ", "INHERIT_PASS")),
+            "the TuiDeck path no longer forwards its inherited variables, so no \
+             deck-spawned process carries {E2E_RUN_MARKER_ENV}"
+        );
+        assert!(
+            src.contains(concat!("push_containment_env(", "&mut env);")),
+            "the daemon-serve path no longer forwards the containment marker, so \
+             a credential-bearing `daemon serve` and every agent under it are \
+             invisible to the live lane's purge"
+        );
+    }
+
     /// Scenario: The marker name the harness forwards is the same one
     /// `e2e-live.yml` sets on its run step and greps for in its purge step. The
     /// three live in two files with nothing but this test connecting them.
@@ -11131,10 +11216,12 @@ mod harness_unit_tests {
     /// Marker the child half below puts in its panic message so the parent can
     /// tell "the child panicked where it was supposed to" apart from "the child
     /// died on the way there".
+    #[cfg(unix)]
     const PANIC_SEAM_MARKER: &str = "harness-panic-seam-reached";
     /// Set by the parent on the child it spawns. Without it the child half is a
     /// no-op, so the test is inert under `--run-ignored all`, under a plain
     /// `cargo test`, and anywhere else it is selected on its own.
+    #[cfg(unix)]
     const PANIC_SEAM_CHILD_ENV: &str = "DAD_TEST_PANIC_SEAM_CHILD";
     /// Deliberately fake, and deliberately the REAL length of an Anthropic key
     /// so the child below can render both shapes that reach a panic message: the
@@ -11142,6 +11229,7 @@ mod harness_unit_tests {
     /// broken across two 120-column rows. Never a real key: proving the seam
     /// must not require writing a live credential into any captured output,
     /// even a passing one.
+    #[cfg(unix)]
     const PANIC_SEAM_FAKE_KEY: &str = WRAPPING_FAKE_KEY;
 
     /// Scenario: Formatting a panic message that carries a registered
@@ -11184,6 +11272,20 @@ mod harness_unit_tests {
     /// under test is the WIRING — that a real harness entry point reads the key
     /// out of the environment and installs the seam before any diagnostic can
     /// carry it.
+    ///
+    /// UNIX-ONLY, and the reason is the entry point rather than the seam.
+    /// `seed_claude_worker_home` imports the host's Claude credentials, so it
+    /// resolves `host_home()` from `HOME` — which Windows does not set, making
+    /// this a hard panic there before the test reaches what it is testing.
+    /// Measured on `build-windows` for PR #805: 11 binaries failed on `HOME is
+    /// set on the host`. Gating rather than teaching `host_home()` about
+    /// `USERPROFILE`, because the whole credentialed tier is Unix-only
+    /// (CLAUDE.md rule 5) and inventing a Windows credential path to satisfy a
+    /// test would be a fiction. The seam ITSELF is platform-independent and
+    /// stays covered everywhere by
+    /// `a_panic_message_is_redacted_without_losing_its_diagnostic_shape` and by
+    /// the four wrapped-credential tests above, none of which touch `HOME`.
+    #[cfg(unix)]
     #[test]
     fn a_rendered_credential_reaches_a_panic_message_only_redacted() {
         if std::env::var_os(PANIC_SEAM_CHILD_ENV).is_none() {
@@ -11227,6 +11329,13 @@ mod harness_unit_tests {
     /// A fresh process is what makes this a test of the wiring rather than of
     /// the redactor: the environment read, the hook installation and the panic
     /// all happen in a process that started with nothing registered.
+    ///
+    /// Gated with its child for one further reason beyond the child's own: with
+    /// only the child gated, the `--exact` filter here would match no test on
+    /// Windows and this half would fail on its own non-vacuity assertion,
+    /// reporting "the child never reached its panic" for a child that was never
+    /// compiled.
+    #[cfg(unix)]
     #[test]
     fn the_panic_seam_redacts_a_key_this_process_read_from_the_environment() {
         // This test's OWN assertion messages interpolate the child's captured
