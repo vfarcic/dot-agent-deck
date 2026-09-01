@@ -658,7 +658,7 @@ impl TuiDeck {
                 }
                 // Issue #502/#785 audit S2: the Codex importer now returns
                 // redactions like the OpenCode and Devin ones. It used to
-                // return none at all — and since `e2e-live.yml` provisions
+                // return none at all — and since a key-only host provisions
                 // `~/.codex/auth.json` FROM the raw OPENAI_API_KEY, and this
                 // importer copies those bytes into every isolated Codex HOME,
                 // anything that rendered codex's auth state put the raw key
@@ -876,20 +876,6 @@ impl TuiDeck {
         // exactly this reason — so no other provider variable would be used by
         // anything the deck spawns, and each one added is another secret in the
         // recorded PTY's environment for no gain.
-        // DAD_E2E_RUN_MARKER (issue #785 blocker B) is a NON-SECRET, run-scoped
-        // label `e2e-live.yml` sets on the test step so its purge step can
-        // enumerate every process this run started — including a daemon that
-        // `setsid`s into its own session and an agent's Bash-tool shell that
-        // outlives its agent, neither of which a name-matching `pkill` reaches.
-        // It works by INHERITANCE, so it has to cross `env_clear` here or the
-        // whole deck subtree becomes invisible to it. Locally it is unset and
-        // nothing is inserted.
-        //
-        // The in-process-daemon spawns do not need it threaded through their
-        // hand-built `SpawnOptions.env`: `spawn_agent` OVERLAYS that onto the
-        // inherited environment rather than clearing it (src/agent_pty.rs), so
-        // those children get the marker from the test process for free. This
-        // line is the one place it would otherwise be lost.
         let mut final_env: HashMap<String, String> = HashMap::new();
         for k in INHERIT_PASS {
             if let Ok(v) = std::env::var(k) {
@@ -3313,12 +3299,11 @@ pub fn check_claude_available() -> Result<(), String> {
                 // would authenticate.
                 //
                 // `require_real_e2e()` is the override, and it is the right
-                // one: `e2e-live.yml` sets it unconditionally on the run step,
-                // so a runner is unaffected, and a runner has a fresh HOME with
-                // no stored answer to inherit in the first place. Without it,
-                // this is a clean skip that NAMES the reason instead of a
-                // silent bill or a PTY wait that times out on a prompt whose
-                // recorded answer is "No".
+                // one: setting it IS a statement that this run must reach a
+                // real agent, so it is the caller asking rather than the
+                // harness deciding. Without it, this is a clean skip that NAMES
+                // the reason instead of a silent bill or a PTY wait that times
+                // out on a prompt whose recorded answer is "No".
                 if host_claude_api_key_rejected(&key) && !require_real_e2e() {
                     return Err(format!(
                         "this machine's ~/.claude.json records {ANTHROPIC_API_KEY_ENV} as \
@@ -3349,8 +3334,7 @@ pub const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 /// whitespace-only.
 ///
 /// Presence is decided on the TRIMMED value — the same rule all three
-/// `check_pi_available` copies apply, and the same rule `e2e-live.yml`'s guard
-/// step applies with `${VAR//[[:space:]]/}` — but the value comes back
+/// `check_pi_available` copies apply — but the value comes back
 /// VERBATIM, because verbatim is what a spawned agent receives and therefore
 /// what it derives [`claude_api_key_response_id`] from.
 ///
@@ -3363,7 +3347,7 @@ fn anthropic_api_key() -> Option<String> {
         .filter(|key| !key.trim().is_empty())
 }
 
-/// Issue #502/#785: the OpenAI key `e2e-live.yml` derives `~/.codex/auth.json`
+/// Issue #502/#785: the OpenAI key a key-only host derives `~/.codex/auth.json`
 /// from. Nothing in the harness authenticates from it directly — codex reads
 /// the FILE, never the variable (measured: `codex exec` with the variable
 /// ambient and an empty `CODEX_HOME` answers 401) — so this exists only so a
@@ -3371,50 +3355,15 @@ fn anthropic_api_key() -> Option<String> {
 /// alongside the copy the auth document carries.
 pub const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 
-/// Issue #785 blocker B: the non-secret, run-scoped label CI sets on the live
-/// tier's test step purely so its purge step can find every process the run
-/// started, by inheritance rather than by matching command lines.
-///
-/// It is NOT a credential and must never be treated as one — it is a run id and
-/// an attempt number, it is printed in the workflow file, and it is deliberately
-/// never registered for redaction, because redacting it would defeat the one
-/// thing it is for. The harness only forwards it; nothing reads its value.
-const E2E_RUN_MARKER_ENV: &str = "DAD_E2E_RUN_MARKER";
-
 /// The HOST variables that cross `launch_with_fixture`'s `env_clear` into every
 /// deck — and therefore into every daemon it lazy-spawns and every agent those
 /// daemons spawn.
 ///
-/// Module-level and named so it can be asserted on: the marker's presence here
-/// is what makes `e2e-live.yml`'s purge step able to SEE a deck subtree at all,
-/// and losing it fails in the unsafe direction (the purge finds nothing,
-/// reports a clean containment, and deletes the harness temp roots out from
-/// under a live daemon that still holds the key). The reasoning for each entry
-/// is at the use site.
-const INHERIT_PASS: [&str; 3] = ["PATH", ANTHROPIC_API_KEY_ENV, E2E_RUN_MARKER_ENV];
-
-/// Forward the containment marker onto an environment some other harness path
-/// is rebuilding from scratch after its own `env_clear`.
-///
-/// `INHERIT_PASS` covers `TuiDeck` and nothing else, and `TuiDeck` is not the
-/// only path in this harness that clears and rebuilds. `spawn_daemon_serve_with_env`
-/// has its OWN `env_clear` and its own explicit list, and credential-bearing
-/// live tests use it — `e2e_pi_orchestrator.rs`'s `scheduler_pi_001` pushes
-/// `ANTHROPIC_API_KEY` through its `extra_env` so a scheduler-spawned `pi`
-/// inherits it. Without this, that daemon and every agent under it held the key
-/// while carrying no marker, so `e2e-live.yml`'s purge would enumerate nothing,
-/// report a clean containment and delete the harness roots out from under them.
-/// Found by Greptile on PR #805; the omission was real.
-///
-/// Unset locally, so nothing is pushed and no test sees a new variable. The
-/// three `DaemonProc` helpers that shell out (`run_schedule_cli`,
-/// `run_schedule_cli_from`, `run_agent_event`) rebuild from the same `env`
-/// vector, so they inherit this for free.
-fn push_containment_env(env: &mut Vec<(String, String)>) {
-    if let Ok(marker) = std::env::var(E2E_RUN_MARKER_ENV) {
-        env.push((E2E_RUN_MARKER_ENV.into(), marker));
-    }
-}
+/// Module-level and named so it can be asserted on: `ANTHROPIC_API_KEY` is here
+/// because a live test's credential has to reach the process that needs it, and
+/// the deck lazy-spawns the daemon that spawns the agent. The reasoning for each
+/// entry is at the use site.
+const INHERIT_PASS: [&str; 2] = ["PATH", ANTHROPIC_API_KEY_ENV];
 
 /// The ambient OpenAI API key, or `None` when unset, empty or whitespace-only.
 /// Same trim rule and same secret discipline as [`anthropic_api_key`]: returned
@@ -4209,16 +4158,15 @@ pub fn require_real_e2e() -> bool {
 /// package's unit tests, and several of those print their own `SKIP: ` lines
 /// when a tool they drive is absent — `xtask/linkage-check/src/junit_strip.rs`,
 /// `pin_lockstep.rs`, `verify_pr_stream.rs`, `issue_labeler_memory.rs`,
-/// `clean_tmp.rs` and `src/ui.rs`. The credentialed lane-2 workflow
-/// (`.github/workflows/e2e-live.yml`) counts runtime skips into its run summary
-/// to answer "did any API-key-backed test actually run?", and a marker-less
-/// count folds every one of those unrelated skips into that number.
+/// `clean_tmp.rs` and `src/ui.rs`. Anyone counting runtime skips to answer "did
+/// any real-agent test actually run?" — the grep in `docs/develop/e2e-lanes.md`
+/// is the canonical one — folds every one of those unrelated skips into the
+/// number without the marker.
 ///
 /// The marker narrows the population; it does not AUTHENTICATE it. Any selected
 /// test can print any line, and this function takes an arbitrary `String`, so
-/// nothing downstream may treat a matching line as trustworthy metadata — which
-/// is why that workflow reports a count and nothing else, leaving the reasons in
-/// the masked job log. `.claude/skills/verify-pr/checks.sh` deliberately keeps
+/// nothing downstream may treat a matching line as trustworthy metadata.
+/// `.claude/skills/verify-pr/checks.sh` deliberately keeps
 /// the broader marker-less pattern, because it runs against whatever branch is
 /// checked out, including ones predating this marker.
 #[doc(hidden)]
@@ -4482,10 +4430,10 @@ fn import_claude_plugins_enabled() -> bool {
 ///     real, deliberate human decision. Ambient key presence is not consent
 ///     either; this repository's dev environment loads API keys automatically.
 ///     [`REQUIRE_REAL_E2E_ENV`] is the authorisation, and it is exactly the
-///     right one: `e2e-live.yml` sets it unconditionally on the run step, so CI
-///     overrides as before, while a developer who answered "No" gets a clean
-///     preflight skip from [`check_claude_available`] naming the reason instead
-///     of a silent bill.
+///     right one: setting it IS a statement that this run must reach a real
+///     agent, so a caller who wants the override asks for it, while a developer
+///     who answered "No" gets a clean preflight skip from
+///     [`check_claude_available`] naming the reason instead of a silent bill.
 ///
 /// A response the host already recorded for a key that is not the ambient one
 /// is left untouched in every branch.
@@ -5057,7 +5005,8 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<Vec<String>>
 ///
 /// It used to return nothing, which was survivable while `~/.codex/auth.json`
 /// was only ever a developer's own ChatGPT session. It stopped being survivable
-/// when `e2e-live.yml` began PRODUCING that file from the raw `OPENAI_API_KEY`:
+/// once that file could be PRODUCED from the raw `OPENAI_API_KEY` on a key-only
+/// host:
 /// this function copies those bytes verbatim into every isolated Codex HOME, so
 /// anything that renders codex's auth state — codex itself, an API error body,
 /// a test dumping the file — puts the raw key into `final-grid.*` and
@@ -6974,10 +6923,6 @@ pub fn spawn_daemon_serve_with_env(
     if let Ok(p) = std::env::var("PATH") {
         env.push(("PATH".into(), p));
     }
-    // Before `extra_env` below, which is where a credential-bearing live test
-    // pushes `ANTHROPIC_API_KEY`: this daemon and everything it spawns must be
-    // findable by the live lane's purge step. See `push_containment_env`.
-    push_containment_env(&mut env);
     env.push(("HOME".into(), home.to_string_lossy().into_owned()));
     env.push(("TERM".into(), "xterm-256color".into()));
     env.push((
@@ -11274,124 +11219,25 @@ mod harness_unit_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Issue #502/#785 blocker B — containing the run's credential-bearing
-    // processes
+    // Issue #502 — the credential reaches the agent that needs it
     // -----------------------------------------------------------------------
 
-    /// Scenario: The CI run marker is on the list of variables that cross the
-    /// harness's `env_clear`, so a deck — and the daemon it `setsid`s away and
-    /// the agents that daemon spawns — inherits it.
+    /// Scenario: The Anthropic API key is on the list of variables that cross
+    /// the harness's `env_clear`, so a deck — and the daemon it `setsid`s away
+    /// and the agents that daemon spawns — inherits it.
     ///
-    /// Pinned rather than reviewed because the failure is silent AND in the
-    /// unsafe direction: with the marker missing, `e2e-live.yml`'s purge step
-    /// enumerates nothing, concludes the run left nothing alive, and deletes the
-    /// harness temp roots out from under a live process that still holds the
-    /// Anthropic key — the exact hazard CLAUDE.md rule 14's dead-PID floor
-    /// exists to prevent.
+    /// Pinned rather than reviewed because the failure is silent and in the
+    /// direction that erases coverage: without it, `check_claude_available`'s
+    /// API-key path passes a gate the spawned agent then cannot satisfy, so a
+    /// key-authenticated lane-2 run stalls in a PTY wait instead of saying what
+    /// is missing.
     #[test]
-    fn the_run_marker_crosses_the_harness_env_clear() {
-        assert!(
-            INHERIT_PASS.contains(&E2E_RUN_MARKER_ENV),
-            "{E2E_RUN_MARKER_ENV} no longer crosses `env_clear`, so no deck-spawned \
-             process carries it and the live lane's purge step can no longer find \
-             any of them: {INHERIT_PASS:?}"
-        );
+    fn the_credential_crosses_the_harness_env_clear() {
         assert!(
             INHERIT_PASS.contains(&ANTHROPIC_API_KEY_ENV),
-            "the credential the marker exists to chase no longer reaches a deck \
-             either: {INHERIT_PASS:?}"
+            "the credential a key-authorised lane-2 run depends on no longer \
+             reaches a deck-spawned agent: {INHERIT_PASS:?}"
         );
-    }
-
-    /// Scenario: Every `env_clear` in this harness is accounted for by one of
-    /// the two mechanisms that forward the containment marker. Pinned as a
-    /// COUNT, so adding a third environment-rebuilding spawn path fails here and
-    /// makes its author decide whether the marker has to reach it.
-    ///
-    /// This is the guard for a real omission, not a hypothetical.
-    /// `INHERIT_PASS` covers `TuiDeck` and only `TuiDeck`, and
-    /// `spawn_daemon_serve_with_env` has its own `env_clear` and its own
-    /// explicit list — so a credential-bearing `daemon serve` and every agent
-    /// under it carried the Anthropic key with no marker, and the live lane's
-    /// purge would have enumerated nothing, reported a clean containment and
-    /// deleted the harness roots out from under them. Caught by Greptile on
-    /// PR #805 after the first version of this work shipped `INHERIT_PASS`
-    /// alone.
-    ///
-    /// The needle is assembled with `concat!` so this scan does not count its
-    /// own source, which is also why it is not spelled out here.
-    #[test]
-    fn every_harness_env_clear_forwards_the_containment_marker() {
-        let src = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests")
-                .join("common")
-                .join("mod.rs"),
-        )
-        .expect("read tests/common/mod.rs");
-        let sites = src.matches(concat!("cmd.env_", "clear();")).count();
-        assert_eq!(
-            sites, 4,
-            "the number of environment-rebuilding spawn paths in this harness \
-             changed. Each one must forward {E2E_RUN_MARKER_ENV}, or the process \
-             it spawns is invisible to `e2e-live.yml`'s purge — which then \
-             reports a clean containment and DELETES the harness temp roots \
-             while a credential-bearing process is still writing under them. \
-             The four accounted for are: `TuiDeck::launch` (via INHERIT_PASS), \
-             `spawn_daemon_serve_with_env` (via push_containment_env), and \
-             `run_schedule_cli_from` + `run_agent_event` (which replay that same \
-             vector). Add the forwarding, then update this count."
-        );
-        // Both needles are assembled with `concat!` for the same reason the
-        // count's is. Spelled out as plain literals they appear in THIS
-        // function's source, which is the file being scanned — so each
-        // assertion satisfies itself and passes while the call site it is
-        // guarding is gone. Measured: with the daemon-serve forwarding deleted,
-        // the literal version of this test still passed.
-        assert!(
-            src.contains(concat!("for k in ", "INHERIT_PASS")),
-            "the TuiDeck path no longer forwards its inherited variables, so no \
-             deck-spawned process carries {E2E_RUN_MARKER_ENV}"
-        );
-        assert!(
-            src.contains(concat!("push_containment_env(", "&mut env);")),
-            "the daemon-serve path no longer forwards the containment marker, so \
-             a credential-bearing `daemon serve` and every agent under it are \
-             invisible to the live lane's purge"
-        );
-    }
-
-    /// Scenario: The marker name the harness forwards is the same one
-    /// `e2e-live.yml` sets on its run step and greps for in its purge step. The
-    /// three live in two files with nothing but this test connecting them.
-    ///
-    /// A rename on any one side does not break a build and does not fail a test
-    /// — it just makes the purge step's `grep` match nothing, which it reports
-    /// as a successful containment before deleting the temp roots. Same reason
-    /// `xtask/linkage-check`'s `junit_strip.rs` reads this workflow: the
-    /// coupling IS the rule.
-    #[test]
-    fn the_workflow_sets_and_greps_the_marker_the_harness_forwards() {
-        let workflow = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(".github")
-            .join("workflows")
-            .join("e2e-live.yml");
-        let src = std::fs::read_to_string(&workflow).expect("read .github/workflows/e2e-live.yml");
-        let set_on_the_run_step = format!("{E2E_RUN_MARKER_ENV}: e2e-live-");
-        assert!(
-            src.contains(&set_on_the_run_step),
-            "the live workflow no longer sets `{set_on_the_run_step}…` on its run \
-             step, so nothing the tier spawns carries the marker the purge step \
-             looks for"
-        );
-        let grepped_by_the_purge_step = format!("needle=\"{E2E_RUN_MARKER_ENV}=");
-        assert!(
-            src.contains(&grepped_by_the_purge_step),
-            "the live workflow's purge step no longer greps for \
-             `{E2E_RUN_MARKER_ENV}=…`, so its containment check matches nothing \
-             and then reports success"
-        );
-        assert!(INHERIT_PASS.contains(&E2E_RUN_MARKER_ENV));
     }
 
     // -----------------------------------------------------------------------
@@ -12017,10 +11863,9 @@ mod harness_unit_tests {
     }
 
     /// Scenario: The same stored refusal, but the run carries the explicit
-    /// require-real authorisation `e2e-live.yml` sets unconditionally. The
-    /// refusal is overridden and the key approved — the CI behaviour is
-    /// unchanged, and the override is now something a caller asked for rather
-    /// than something the harness did on its own.
+    /// require-real authorisation. The refusal is overridden and the key
+    /// approved — the override is something a caller asked for rather than
+    /// something the harness did on its own.
     #[test]
     fn an_authorised_run_overrides_a_stored_refusal() {
         let key = "sk-ant-api03-not-a-real-key-DEADBEEFCAFEBABE0123";
@@ -12151,8 +11996,8 @@ mod harness_unit_tests {
 
     /// Scenario: Ask whether an ambient API key is usable. Unset, empty and
     /// whitespace-only all mean absent — the same rule the three
-    /// `check_pi_available` copies apply and the same rule `e2e-live.yml`'s
-    /// guard step applies — while a real value comes back VERBATIM, because
+    /// `check_pi_available` copies apply — while a real value comes back
+    /// VERBATIM, because
     /// verbatim is what the spawned agent receives.
     #[test]
     fn an_empty_or_whitespace_only_api_key_counts_as_absent() {
