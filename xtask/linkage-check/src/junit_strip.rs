@@ -95,9 +95,10 @@ const NEXTEST_FAILURE_REPORT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 </testsuites>
 "#;
 
-/// The script's own `--self-test` must pass. It is what the workflow comment
-/// and `docs/develop/e2e-lanes.md` both tell a reader to run, so a self-test
-/// that has rotted is worse than none.
+/// The script's own `--self-test` must pass. Since #502 removed the
+/// credentialed workflow, `docs/develop/e2e-lanes.md` is the only place left
+/// that tells a reader to run it, so a self-test that has rotted is worse than
+/// none.
 #[test]
 fn junit_strip_self_test_passes() {
     if !python_present() {
@@ -181,10 +182,11 @@ fn a_real_failure_report_loses_every_output_surface() {
     }
 }
 
-/// A missing input is a no-op, not an error. The workflow step runs under
-/// `if: always()` and is reached on paths where the tests never produced a
-/// report; failing there would redden a job for a non-problem, and writing a
-/// file anyway would upload something meaningless.
+/// A missing input is a no-op, not an error. The `if: always()` workflow step
+/// this was written for went with the credentialed lane in #502, and the
+/// property outlives it: the caller is now a human pointing the stripper at a
+/// local report, and a run that never produced one should exit clean rather
+/// than error or write a meaningless file.
 #[test]
 fn a_missing_report_is_a_no_op() {
     if !python_present() {

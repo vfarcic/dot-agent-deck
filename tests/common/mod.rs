@@ -3519,9 +3519,11 @@ fn render_grid_to_svg(grid: &str, cols: u16, rows: u16) -> String {
 /// working). The file check therefore falls back to a Keychain probe instead
 /// of reporting "not found". Without that fallback EVERY real-agent test in
 /// this suite silently self-skips on macOS and reports PASS — and that is
-/// exactly the tier CLAUDE.md rule 5 exception (a) says must be run locally
-/// BECAUSE CI has no credentials to run it, so both sides would be green while
-/// proving nothing.
+/// exactly the tier CLAUDE.md rule 5 now calls lane 2: the one that runs on a
+/// developer's machine and in no CI job, BECAUSE CI has no credentials to run
+/// it, so both sides would be green while proving nothing. (Rule 5 carries no
+/// lettered exceptions any more; this used to cite an "exception (a)" the rule
+/// no longer contains.)
 ///
 /// Issue #502/#785: there is now a THIRD path — a non-empty
 /// `ANTHROPIC_API_KEY`, consulted last, after both credential stores have come
@@ -3760,8 +3762,11 @@ fn host_claude_oauth_usable() -> bool {
 /// one answer per process, produced by the code that acted on it, rather than
 /// two reads that are equal only if nothing changed in between.
 ///
-/// A fresh key-only CI runner never reached the failing interleaving, which is
-/// why this was not a blocker; a developer machine mid-`claude login` is.
+/// A fresh key-only host never reaches the failing interleaving — there is no
+/// credential set for a rotation to land in — which is why this was not a
+/// blocker; a developer machine mid-`claude login` is. (This used to name a
+/// "fresh key-only CI runner". Since #502 there is no such host: lane 2 runs
+/// in no CI job.)
 static CLAUDE_OAUTH_SEEDED: OnceLock<bool> = OnceLock::new();
 
 /// The seeding's view of "was this run authorised by OAuth?" — the import's own
@@ -3909,8 +3914,11 @@ fn claude_keychain_credentials_present() -> bool {
 }
 
 /// Non-macOS hosts keep the file-only behaviour unchanged: Linux Claude Code
-/// still writes `~/.claude/.credentials.json`, and CI — which has no
-/// credentials either way — must keep skipping.
+/// still writes `~/.claude/.credentials.json`, so there is no second store to
+/// probe and [`check_claude_available`] falls back to the file — or, since
+/// #502/#785, to an ambient `ANTHROPIC_API_KEY`. No CI claim belongs here:
+/// lane 2 runs on a developer's machine and in no CI job, so there is no CI
+/// skip for this arm to preserve.
 #[cfg(not(target_os = "macos"))]
 fn claude_keychain_credentials_present() -> bool {
     false
@@ -4618,8 +4626,10 @@ fn import_claude_credentials(test_home: &Path) -> std::io::Result<Vec<String>> {
     // is `try_launch_with_fixture(…).unwrap_or_else(|e| panic!(…))`, so an
     // `Err` here is a PANIC rather than a skip. Widening the gate without
     // widening this converts 22 silent skips into 22 hard panics on any host
-    // that has a key and no credential set — which is precisely the state a CI
-    // runner is in. The two changes are one change.
+    // that has a key and no credential set — which since #502 is a developer
+    // machine that has never run `claude login`, or whose credential set has
+    // expired, and never a CI runner: no test credential is registered on this
+    // repository and lane 2 runs in no CI job. The two changes are one change.
     //
     // So: when NEITHER store is usable but a key is present, the correct
     // credential set to seed is NO credential set. Claude Code then
@@ -12159,8 +12169,11 @@ mod harness_unit_tests {
     /// This is issue #785 blocker A stated as a test. The whole credential was
     /// reconstructable out of a panic grid while both registered patterns
     /// matched nothing, and a panic grid goes to nextest's run log and to the
-    /// raw JUnit report, where GitHub's masking of the exact secret does not
-    /// reassemble line-wrapped fragments.
+    /// raw JUnit report. Since #502 both are LOCAL files on the developer's
+    /// machine — lane 2 runs on no runner — so nothing downstream masks
+    /// anything, and the masking that does exist where logs are rendered covers
+    /// a registered secret's exact value rather than reassembling line-wrapped
+    /// fragments of it.
     #[test]
     fn a_credential_wrapped_across_grid_rows_is_redacted_from_every_sink() {
         let key = WRAPPING_FAKE_KEY;
