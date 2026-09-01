@@ -132,9 +132,14 @@ export function AgentTile({
             )}
           </div>
         </div>
-        <div className="agent-attempt" title="Current attempt">
+        {/*
+          PRD #745 M8: an em dash — this deck's established "not known" — when
+          no attempt was reported. Live mode used to hardcode `1`, so every tile
+          printed `ATT 01` as if the daemon tracked retries; it tracks none.
+        */}
+        <div className="agent-attempt" title={agent.attempt === undefined ? "No attempt count is reported by the daemon" : "Current attempt"}>
           <span>ATT</span>
-          <strong>{agent.attempt.toString().padStart(2, "0")}</strong>
+          <strong>{agent.attempt === undefined ? "—" : agent.attempt.toString().padStart(2, "0")}</strong>
         </div>
       </header>
 

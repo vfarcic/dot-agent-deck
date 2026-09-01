@@ -7,7 +7,7 @@ use dot_agent_deck::agent_pty::{
     is_valid_orchestration_cwd, is_valid_pane_id_env,
 };
 use dot_agent_deck::daemon_protocol::PROTOCOL_VERSION;
-use dot_agent_deck::event::{AgentType, SendResult};
+use dot_agent_deck::event::{AgentType, SendResult, Writable};
 use dot_agent_deck::state::SessionStatus;
 use serde::{Deserialize, Serialize};
 use tauri::ipc::JavaScriptChannelId;
@@ -82,6 +82,32 @@ pub struct DesktopAgent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tool: Option<DesktopActiveTool>,
     pub tool_count: u32,
+    /// The daemon's `SessionSnapshot.last_user_prompt` (PRD #745 M8) — the most
+    /// recent prompt the operator sent this agent, and the honest answer to
+    /// "what was this one asked to do".
+    ///
+    /// Absent, never a placeholder: an agent that has emitted no prompt event,
+    /// a record with no `live` snapshot, and an older daemon all yield `None`,
+    /// and `skip_serializing_if` keeps the key off the wire so the webview sees
+    /// absence rather than an empty string it would have to special-case. The
+    /// value is already control-stripped and byte-bounded by
+    /// `daemon_client::sanitize_record_tab_membership`; the webview bounds and
+    /// sanitises its own DISPLAY copy again at the render seam, because that
+    /// scrub covers category `Cc` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_user_prompt: Option<String>,
+    /// Whether the daemon can deliver input to this agent right now, projected
+    /// from `SessionSnapshot.live_target.writable` (PRD #745 M8). Replaces the
+    /// webview's hardcoded `"unknown"`.
+    ///
+    /// Only the `writable` half is surfaced: the deck's model speaks
+    /// read/write/none, and `TargetKind` (pty / tmux / sdk / process) is a
+    /// daemon-side implementation detail no desktop surface consumes. Absent
+    /// when the daemon declared no live target at all — which the TUI reads as
+    /// the legacy live default, so the desktop must NOT read absence as
+    /// "read-only".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_lease: Option<&'static str>,
     pub tab: DesktopTab,
 }
 
@@ -109,6 +135,15 @@ pub enum DesktopTab {
         role_index: usize,
         role_name: String,
         is_start_role: bool,
+        /// The orchestration TAB's own working directory
+        /// (`TabMembership::orchestration_cwd`), shared by every role pane in
+        /// the tab and distinct from each pane's own `cwd` — an orchestrator
+        /// and its workers may sit in different per-pane directories while
+        /// belonging to one orchestration (PRD #745 M8). The overview states it
+        /// once in the group header, which is what turns the per-row column
+        /// into a differences column. `None` when the daemon reported none.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         display_title: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -258,6 +293,12 @@ fn session_status_name(status: &SessionStatus) -> &'static str {
     }
 }
 
+/// The orchestration arm deliberately binds EVERY field rather than ending in a
+/// `..` rest pattern. The rest pattern is what silently swallowed
+/// `orchestration_cwd` for as long as this function has existed (PRD #745 M8):
+/// the daemon sent it, the desktop parsed it, and nothing here copied it out.
+/// Binding them all makes the next field added to `TabMembership` a compile
+/// error at this seam instead of another quietly dropped column.
 fn map_tab(tab: Option<&TabMembership>) -> DesktopTab {
     match tab {
         None => DesktopTab::Dashboard,
@@ -267,17 +308,33 @@ fn map_tab(tab: Option<&TabMembership>) -> DesktopTab {
             role_index,
             role_name,
             is_start_role,
+            orchestration_cwd,
             display_title,
             orchestration_id,
-            ..
         }) => DesktopTab::Orchestration {
             name: name.clone(),
             role_index: *role_index,
             role_name: role_name.clone(),
             is_start_role: *is_start_role,
+            cwd: orchestration_cwd.clone(),
             display_title: display_title.clone(),
             orchestration_id: orchestration_id.clone(),
         },
+    }
+}
+
+/// The webview's read/write/none vocabulary for a daemon `LiveTarget`.
+///
+/// Only [`Writable`] is consulted — it is the half that answers "can the deck
+/// type into this pane right now". `Writable::None` is also serde's
+/// forward-compat catch-all, so a `writable` value a future daemon invents
+/// lands on the SAFE, non-writable answer rather than being dressed up as a
+/// live target.
+fn write_lease_name(writable: &Writable) -> &'static str {
+    match writable {
+        Writable::Live => "write",
+        Writable::HistoryOnly => "read",
+        Writable::None => "none",
     }
 }
 
@@ -300,6 +357,10 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
             detail: tool.detail.clone(),
         });
     let tool_count = live.map(|snapshot| snapshot.tool_count).unwrap_or(0);
+    let last_user_prompt = live.and_then(|snapshot| snapshot.last_user_prompt.clone());
+    let write_lease = live
+        .and_then(|snapshot| snapshot.live_target.as_ref())
+        .map(|target| write_lease_name(&target.writable));
     let tab = map_tab(record.tab_membership.as_ref());
 
     DesktopAgent {
@@ -313,6 +374,8 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         status,
         active_tool,
         tool_count,
+        last_user_prompt,
+        write_lease,
         tab,
     }
 }
@@ -517,6 +580,7 @@ pub(crate) fn ensure_desktop_workflow_platform_supported(target_os: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dot_agent_deck::event::{LiveTarget, TargetKind};
     use dot_agent_deck::state::{ActiveTool, SessionSnapshot};
 
     fn fixture_record() -> AgentRecord {
@@ -565,6 +629,86 @@ mod tests {
         assert_eq!(mapped.status, "running");
         assert_eq!(mapped.tool_count, 0);
         assert!(mapped.active_tool.is_none());
+        // PRD #745 M8: no live snapshot means no prompt and no lease to report.
+        // Absent, not blank — the webview must be able to tell "nothing to say"
+        // from "the daemon said the empty string".
+        assert!(mapped.last_user_prompt.is_none());
+        assert!(mapped.write_lease.is_none());
+    }
+
+    /// PRD #745 M8: the two `SessionSnapshot` fields the desktop's own DTO used
+    /// to drop even though the daemon sends them and the desktop parses them.
+    #[test]
+    fn agent_mapping_surfaces_the_last_prompt_and_the_write_lease() {
+        let mut record = fixture_record();
+        let live = record.live.as_mut().unwrap();
+        live.last_user_prompt = Some("ship the overview".into());
+        live.live_target = Some(LiveTarget {
+            kind: TargetKind::Pty,
+            writable: Writable::Live,
+        });
+
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(value["lastUserPrompt"], "ship the overview");
+        assert_eq!(value["writeLease"], "write");
+    }
+
+    /// The absent case for both, pinned in the SERIALIZED shape: the keys are
+    /// missing from the JSON the webview receives rather than present and null,
+    /// so `agent.lastUserPrompt` is `undefined` there and absence survives the
+    /// boundary.
+    #[test]
+    fn absent_prompt_and_lease_are_omitted_from_the_frontend_shape() {
+        let value = serde_json::to_value(map_agent(fixture_record())).unwrap();
+        assert!(value.get("lastUserPrompt").is_none());
+        assert!(value.get("writeLease").is_none());
+    }
+
+    /// Only `Writable` decides the lease, and its `#[serde(other)]` catch-all
+    /// means an unknown future value arrives as `None` — so the non-writable
+    /// answer is what a daemon this build does not understand produces.
+    #[test]
+    fn write_lease_projects_every_writable_value() {
+        let lease = |writable| {
+            let mut record = fixture_record();
+            record.live.as_mut().unwrap().live_target = Some(LiveTarget {
+                kind: TargetKind::Tmux,
+                writable,
+            });
+            map_agent(record).write_lease
+        };
+        assert_eq!(lease(Writable::Live), Some("write"));
+        assert_eq!(lease(Writable::HistoryOnly), Some("read"));
+        assert_eq!(lease(Writable::None), Some("none"));
+    }
+
+    /// PRD #745 M8: the orchestration tab's own cwd, which the `..` rest
+    /// pattern in `map_tab` used to swallow.
+    #[test]
+    fn orchestration_tab_carries_the_orchestration_cwd() {
+        let tab = |orchestration_cwd| {
+            serde_json::to_value(map_tab(Some(&TabMembership::Orchestration {
+                name: "dot-agent-deck".into(),
+                role_index: 1,
+                role_name: "coder".into(),
+                is_start_role: false,
+                orchestration_cwd,
+                display_title: Some("PRD #745".into()),
+                orchestration_id: Some("orc-745".into()),
+            })))
+            .unwrap()
+        };
+
+        let reported = tab(Some("/home/dev/code/dot-agent-deck".into()));
+        assert_eq!(reported["kind"], "orchestration");
+        assert_eq!(reported["cwd"], "/home/dev/code/dot-agent-deck");
+        assert_eq!(reported["roleName"], "coder");
+        assert_eq!(reported["orchestrationId"], "orc-745");
+
+        // Absent stays absent: an orchestration whose cwd the daemon did not
+        // report has no key at all, so the group header states nothing rather
+        // than a placeholder.
+        assert!(tab(None).get("cwd").is_none());
     }
 
     #[test]

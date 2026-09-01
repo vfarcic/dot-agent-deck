@@ -400,12 +400,19 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
         <header className="topbar">
           <div className="repo-context">
             <div className="repo-line"><FolderGit2 size={15} /><strong>{activeProject?.name || snapshot.repo}</strong><ChevronRight size={13} /><span>{snapshot.runId}</span></div>
-            <div className="branch-line"><GitBranch size={12} /><span>{snapshot.branch}</span><i /> <span title={activeProject?.cwd || snapshot.worktree}>{activeProject?.cwd || snapshot.worktree}</span></div>
+            {/*
+              PRD #745 M8: the branch chip appears only when there IS a branch.
+              Nothing daemon-side tracks one, so live mode reports none and the
+              line carries the working directory alone rather than printing the
+              literal "Unavailable" where a branch name belongs.
+            */}
+            <div className="branch-line">{snapshot.branch && <><GitBranch size={12} /><span>{snapshot.branch}</span><i /> </>}<span title={activeProject?.cwd || snapshot.worktree}>{activeProject?.cwd || snapshot.worktree}</span></div>
           </div>
           <div className="run-instruments">
             <Instrument label="HEALTH" testId="run-health"><span className={`health-value health-${snapshot.health}`}><i />{snapshot.health}</span></Instrument>
             <Instrument label="NODE"><strong>{String(snapshot.currentNode).padStart(2, "0")}<em>/{String(snapshot.totalNodes).padStart(2, "0")}</em></strong></Instrument>
-            <Instrument label="ATTEMPT"><strong>{String(snapshot.currentAttempt).padStart(2, "0")}</strong></Instrument>
+            {/* Em dash, this deck's established "not known": no daemon tracks an attempt count (PRD #745 M8). */}
+            <Instrument label="ATTEMPT"><strong>{snapshot.currentAttempt === undefined ? "—" : String(snapshot.currentAttempt).padStart(2, "0")}</strong></Instrument>
             <Instrument label="ELAPSED"><strong>{snapshot.elapsed}</strong></Instrument>
             <Instrument label="SPEND"><strong>{mode === "fixture" ? `$${snapshot.spend.toFixed(2)}` : "—"}</strong></Instrument>
           </div>
@@ -459,7 +466,7 @@ export function ControlDeck({ runtime, workflowPlatformIssue = desktopWorkflowPl
             {orderedStages.length ? orderedStages.map((stage, index) => (
               <div className={`workflow-node node-${stage.status} ${stage.enabled ? "" : "is-disabled"}`} key={stage.id} data-testid={`workflow-node-${stage.id}`}>
                 <div className="node-glyph">{stage.status === "passed" ? <Check size={14} /> : stage.status === "failed" ? <X size={14} /> : <span>{String(index + 1).padStart(2, "0")}</span>}</div>
-                <div><strong>{stage.label}</strong><small>{stage.enabled ? `${stage.status} · att ${stage.attempt}` : "skipped"}</small></div>
+                <div><strong>{stage.label}</strong><small>{stage.enabled ? (stage.attempt === undefined ? stage.status : `${stage.status} · att ${stage.attempt}`) : "skipped"}</small></div>
                 {index < orderedStages.length - 1 && <i className="workflow-link" aria-hidden="true" />}
               </div>
             )) : <div className="workflow-empty">No workflow nodes reported. Open <button onClick={() => setWorkflowOpen(true)}>Edit loop</button> to inspect configuration.</div>}

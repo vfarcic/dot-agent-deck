@@ -292,6 +292,18 @@ interface CrowdedSeed {
   activeTool?: string;
   activeToolDetail?: string;
   toolCount: number;
+  /**
+   * `SessionSnapshot.last_user_prompt`, which live mode reports as of M8.
+   * Deliberately absent on some seeds: an agent that has emitted no prompt
+   * event is the ordinary case, and the screen has to look right for it.
+   */
+  lastUserPrompt?: string;
+  /**
+   * `SessionSnapshot.live_target`, likewise reported as of M8. Omitted where
+   * the daemon would declare no live target — which the fixture keeps as
+   * `"unknown"`, the same sentinel `agentFromDto` writes.
+   */
+  writeLease?: AgentSession["writeLease"];
 }
 
 /**
@@ -311,17 +323,20 @@ function crowdedAgent(seed: CrowdedSeed): AgentSession {
     cli: seed.cli,
     model: "Unavailable",
     status: seed.status,
-    task: seed.activeTool
-      ? `Active tool: ${seed.activeTool}${seed.activeToolDetail ? ` · ${seed.activeToolDetail}` : ""}`
-      : "Task metadata unavailable from daemon",
+    task: seed.lastUserPrompt
+      ?? (seed.activeTool
+        ? `Active tool: ${seed.activeTool}${seed.activeToolDetail ? ` · ${seed.activeToolDetail}` : ""}`
+        : "Task metadata unavailable from daemon"),
     cwd: seed.cwd,
-    attempt: 1,
+    // No attempt: live mode reports none, and the crowded scenario is meant to
+    // be a faithful preview of a real daemon (PRD #745 M8).
     duration: "—",
     tokens: 0,
     cost: 0,
     contextPercent: 0,
     worktree: "Unavailable",
-    writeLease: "unknown",
+    writeLease: seed.writeLease ?? "unknown",
+    lastUserPrompt: seed.lastUserPrompt,
     rows: 40,
     cols: 132,
     activeTool: seed.activeTool,
@@ -338,8 +353,8 @@ function crowdedAgent(seed: CrowdedSeed): AgentSession {
   };
 }
 
-function orchestrationTab(orchestrationId: string, name: string, displayTitle: string, roleName: string, roleIndex: number, isStartRole = false): AgentTab {
-  return { kind: "orchestration", orchestrationId, name, displayTitle, roleName, roleIndex, isStartRole };
+function orchestrationTab(orchestrationId: string, name: string, displayTitle: string, roleName: string, roleIndex: number, isStartRole = false, cwd?: string): AgentTab {
+  return { kind: "orchestration", orchestrationId, name, displayTitle, roleName, roleIndex, isStartRole, cwd };
 }
 
 /*
@@ -364,20 +379,25 @@ const PRD_CWD = "/home/dev/code/dot-agent-deck-dispatch-prd-745";
  * right rather than one accident of declaration order.
  */
 const crowdedAgents: AgentSession[] = [
-  crowdedAgent({ id: "2", displayName: "coder", role: "Coder", cli: "claude_code", status: "running", cwd: PRD_CWD, toolCount: 132, activeTool: "edit", activeToolDetail: "desktop/src/components/AgentOverview.tsx", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD #745 · agent overview", "coder", 1) }),
-  crowdedAgent({ id: "7", displayName: "writer", role: "Writer", cli: "claude_code", status: "running", cwd: DECK_CWD, toolCount: 19, activeTool: "write", activeToolDetail: "docs/develop/desktop-gui.md", tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "writer", 0) }),
+  crowdedAgent({ id: "2", displayName: "coder", role: "Coder", cli: "claude_code", status: "running", cwd: PRD_CWD, toolCount: 132, activeTool: "edit", activeToolDetail: "desktop/src/components/AgentOverview.tsx", writeLease: "write", lastUserPrompt: "Surface the honest fields and stop presenting attempt and branch as facts.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD #745 · agent overview", "coder", 1, false, PRD_CWD) }),
+  crowdedAgent({ id: "7", displayName: "writer", role: "Writer", cli: "claude_code", status: "running", cwd: DECK_CWD, toolCount: 19, activeTool: "write", activeToolDetail: "docs/develop/desktop-gui.md", writeLease: "write", lastUserPrompt: "Document the overview screen and the demand-driven attach model.", tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "writer", 0, false, DECK_CWD) }),
+  // No prompt and no lease: a pane the daemon adopted but that has emitted no
+  // prompt event yet. Both columns stay blank, which is the case the screen has
+  // to look right for.
   crowdedAgent({ id: "13", displayName: "Scratch shell", role: "Codex", cli: "codex", status: "waiting", cwd: DECK_CWD, toolCount: 2, tab: { kind: "dashboard" } }),
-  crowdedAgent({ id: "1", displayName: "orchestrator", role: "Orchestrator", cli: "claude_code", status: "running", cwd: PRD_CWD, toolCount: 47, activeTool: "read", activeToolDetail: "prds/745-desktop-agent-overview-landing-screen.md", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD #745 · agent overview", "orchestrator", 0, true) }),
-  crowdedAgent({ id: "11", displayName: "Second opinion", role: "Open code", cli: "open_code", status: "running", cwd: DECK_CWD, toolCount: 33, activeTool: "read", activeToolDetail: "src/state.rs", tab: { kind: "mode", name: "review" } }),
-  crowdedAgent({ id: "5", displayName: "docs", role: "Docs", cli: "codex", status: "waiting", cwd: PRD_CWD, toolCount: 0, tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD #745 · agent overview", "docs", 4) }),
-  crowdedAgent({ id: "9", displayName: "orchestrator", role: "Orchestrator", cli: "claude_code", status: "waiting", cwd: DECK_CWD, toolCount: 12, tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "orchestrator", 2, true) }),
-  crowdedAgent({ id: "4", displayName: "reviewer", role: "Reviewer", cli: "codex", status: "running", cwd: PRD_CWD, toolCount: 24, activeTool: "grep", activeToolDetail: "attachAgents", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD #745 · agent overview", "reviewer", 3) }),
-  crowdedAgent({ id: "14", displayName: "Changelog sweep", role: "Claude code", cli: "claude_code", status: "running", cwd: DECK_CWD, toolCount: 15, activeTool: "bash", activeToolDetail: "git log --oneline -20", tab: { kind: "dashboard" } }),
-  crowdedAgent({ id: "6", displayName: "release", role: "Release", cli: "claude_code", status: "failed", cwd: PRD_CWD, toolCount: 8, activeTool: "bash", activeToolDetail: "cargo test-fast", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD #745 · agent overview", "release", 5) }),
-  crowdedAgent({ id: "3", displayName: "tester", role: "Tester", cli: "codex", status: "waiting", cwd: PRD_CWD, toolCount: 61, tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD #745 · agent overview", "tester", 2) }),
-  crowdedAgent({ id: "10", displayName: "publisher", role: "Publisher", cli: "codex", status: "waiting", cwd: DECK_CWD, toolCount: 0, tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "publisher", 3) }),
-  crowdedAgent({ id: "15", displayName: "pi-extension spike", role: "Pi", cli: "pi", status: "waiting", cwd: `${DECK_CWD}/pi-extension`, toolCount: 0, tab: { kind: "dashboard" } }),
-  crowdedAgent({ id: "8", displayName: "reviewer", role: "Reviewer", cli: "codex", status: "waiting", cwd: DECK_CWD, toolCount: 5, tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "reviewer", 1) }),
+  crowdedAgent({ id: "1", displayName: "orchestrator", role: "Orchestrator", cli: "claude_code", status: "running", cwd: PRD_CWD, toolCount: 47, activeTool: "read", activeToolDetail: "prds/745-desktop-agent-overview-landing-screen.md", writeLease: "write", lastUserPrompt: "Run PRD #745 to done: delegate each milestone and verify the gates yourself.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD #745 · agent overview", "orchestrator", 0, true, PRD_CWD) }),
+  // History-only: a wrapped session the deck can replay but cannot type into.
+  crowdedAgent({ id: "11", displayName: "Second opinion", role: "Open code", cli: "open_code", status: "running", cwd: DECK_CWD, toolCount: 33, activeTool: "read", activeToolDetail: "src/state.rs", writeLease: "read", lastUserPrompt: "Read the daemon state module and tell me which fields never reach the desktop.", tab: { kind: "mode", name: "review" } }),
+  crowdedAgent({ id: "5", displayName: "docs", role: "Docs", cli: "codex", status: "waiting", cwd: PRD_CWD, toolCount: 0, writeLease: "write", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD #745 · agent overview", "docs", 4, false, PRD_CWD) }),
+  crowdedAgent({ id: "9", displayName: "orchestrator", role: "Orchestrator", cli: "claude_code", status: "waiting", cwd: DECK_CWD, toolCount: 12, writeLease: "write", lastUserPrompt: "Refresh the docs set for the release and hand each page to a reviewer.", tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "orchestrator", 2, true, DECK_CWD) }),
+  crowdedAgent({ id: "4", displayName: "reviewer", role: "Reviewer", cli: "codex", status: "running", cwd: PRD_CWD, toolCount: 24, activeTool: "grep", activeToolDetail: "attachAgents", writeLease: "write", lastUserPrompt: "Audit the attach path: prove the overview opens no socket, report findings only.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD #745 · agent overview", "reviewer", 3, false, PRD_CWD) }),
+  crowdedAgent({ id: "14", displayName: "Changelog sweep", role: "Claude code", cli: "claude_code", status: "running", cwd: DECK_CWD, toolCount: 15, activeTool: "bash", activeToolDetail: "git log --oneline -20", writeLease: "write", lastUserPrompt: "Collect every changelog fragment merged since the last tag and group them.", tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "6", displayName: "release", role: "Release", cli: "claude_code", status: "failed", cwd: PRD_CWD, toolCount: 8, activeTool: "bash", activeToolDetail: "cargo test-fast", writeLease: "write", lastUserPrompt: "Cut the release once the fast tier is green.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD #745 · agent overview", "release", 5, false, PRD_CWD) }),
+  crowdedAgent({ id: "3", displayName: "tester", role: "Tester", cli: "codex", status: "waiting", cwd: PRD_CWD, toolCount: 61, writeLease: "write", lastUserPrompt: "Write the failing test first, then hand it back without fixing it.", tab: orchestrationTab("orc-745", "dot-agent-deck", "PRD #745 · agent overview", "tester", 2, false, PRD_CWD) }),
+  crowdedAgent({ id: "10", displayName: "publisher", role: "Publisher", cli: "codex", status: "waiting", cwd: DECK_CWD, toolCount: 0, tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "publisher", 3, false, DECK_CWD) }),
+  // View-only: the daemon knows the session but holds nothing it can write to.
+  crowdedAgent({ id: "15", displayName: "pi-extension spike", role: "Pi", cli: "pi", status: "waiting", cwd: `${DECK_CWD}/pi-extension`, toolCount: 0, writeLease: "none", tab: { kind: "dashboard" } }),
+  crowdedAgent({ id: "8", displayName: "reviewer", role: "Reviewer", cli: "codex", status: "waiting", cwd: DECK_CWD, toolCount: 5, writeLease: "write", lastUserPrompt: "Review the docs refresh for accuracy against the current CLI flags.", tab: orchestrationTab("orc-dot-ai", "dot-ai", "dot-ai · docs refresh", "reviewer", 1, false, DECK_CWD) }),
   crowdedAgent({ id: "12", displayName: "Security pass", role: "Claude code", cli: "claude_code", status: "waiting", cwd: DECK_CWD, toolCount: 7, tab: { kind: "mode", name: "review" } }),
 ];
 

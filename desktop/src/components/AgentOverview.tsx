@@ -19,7 +19,7 @@ import { DISPLAY_LIMITS, displayIdentity, displayPath, displayText, displayTitle
  */
 export type OverviewAgent = Pick<
   AgentSession,
-  "id" | "daemonId" | "displayName" | "cli" | "status" | "activeTool" | "activeToolDetail" | "toolCount" | "tab"
+  "id" | "daemonId" | "displayName" | "cli" | "status" | "activeTool" | "activeToolDetail" | "toolCount" | "tab" | "lastUserPrompt"
 > & {
   /**
    * HONEST, and OPTIONAL where `AgentSession.cwd` is not. The `Pick<>` above
@@ -31,11 +31,32 @@ export type OverviewAgent = Pick<
    * dash, which would be one more thing to read that says less than blank.
    */
   cwd?: string;
+  /**
+   * HONEST as of M8, and the second field whose deck-side sentinel is reversed
+   * here rather than carried onto the screen: `AgentSession.writeLease` says
+   * `"unknown"` when the daemon declared no live target, exactly as `cwd` says
+   * `UNREPORTED`. One sentinel, one reversal, in one place — a second spelling
+   * of "absent" is what let a placeholder reach this screen once already.
+   */
+  writeLease?: "read" | "write" | "none";
 };
 
 export function toOverviewAgent(agent: AgentSession): OverviewAgent {
-  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab } = agent;
-  return { id, daemonId, displayName, cli, status, cwd: cwd === UNREPORTED ? undefined : cwd, activeTool, activeToolDetail, toolCount, tab };
+  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, writeLease } = agent;
+  return {
+    id,
+    daemonId,
+    displayName,
+    cli,
+    status,
+    cwd: cwd === UNREPORTED ? undefined : cwd,
+    activeTool,
+    activeToolDetail,
+    toolCount,
+    tab,
+    lastUserPrompt,
+    writeLease: writeLease === "unknown" ? undefined : writeLease,
+  };
 }
 
 /**
@@ -110,7 +131,26 @@ export interface OverviewGroup {
    * needs no hoist because there is no repetition to remove.
    */
   commonCwd?: string;
+  /**
+   * The orchestration TAB's own directory, as the daemon states it on every
+   * role pane's membership (`AgentTab.cwd`, PRD #745 M8) — not derived from the
+   * members the way `commonCwd` is, and preferred over it when both exist. The
+   * two differ in kind: a stated tab cwd is true of the orchestration even when
+   * no two role panes share a per-pane directory, and it is what a role pane
+   * that sits somewhere else is a difference FROM. Only orchestration groups
+   * ever have one, and only when the daemon reported it.
+   */
+  orchestrationCwd?: string;
   agents: OverviewAgent[];
+}
+
+/**
+ * The one directory a group states in its header. Rows print their own only
+ * when they differ from this, so the per-row column stays a differences column
+ * whichever of the two sources answered.
+ */
+export function hoistedCwdOf(group: Pick<OverviewGroup, "orchestrationCwd" | "commonCwd">): string | undefined {
+  return group.orchestrationCwd ?? group.commonCwd;
 }
 
 /**
@@ -165,7 +205,10 @@ export function groupAgents(agents: OverviewAgent[]): OverviewGroup[] {
     ...orchestrations.values(),
     ...modes.values(),
   ];
-  for (const group of groups) group.commonCwd = commonCwdOf(group.agents);
+  for (const group of groups) {
+    group.orchestrationCwd = statedOrchestrationCwdOf(group.agents);
+    group.commonCwd = commonCwdOf(group.agents);
+  }
   return groups;
 }
 
@@ -212,6 +255,18 @@ export function anonymousOrchestrationKey(agent: Pick<OverviewAgent, "daemonId" 
  * when no two of them share one. Ties go to whichever appears first, so the
  * answer does not depend on map iteration order.
  */
+/**
+ * The orchestration cwd the daemon stated on this group's memberships. Every
+ * role pane of one tab carries the same value, so the first one that reports it
+ * answers for the group; a group with no orchestration members has none.
+ */
+function statedOrchestrationCwdOf(agents: OverviewAgent[]): string | undefined {
+  for (const agent of agents) {
+    if (agent.tab.kind === "orchestration" && agent.tab.cwd) return agent.tab.cwd;
+  }
+  return undefined;
+}
+
 function commonCwdOf(agents: OverviewAgent[]): string | undefined {
   const counts = new Map<string, number>();
   for (const agent of agents) {
@@ -254,7 +309,14 @@ const GROUP_ICON: Record<OverviewGroupKind, typeof Network> = {
 };
 
 /** The column headers, in grid order. The visible legend mirrors these. */
-const COLUMNS = ["Status", "Agent", "State", "CLI", "Active tool", "Tools", "Working directory"];
+const COLUMNS = ["Status", "Agent", "State", "CLI", "Active tool", "Tools", "Working directory", "Last prompt"];
+
+/** What a reported write lease says on hover, in the daemon's own terms. */
+const WRITE_LEASE_TITLE: Record<"read" | "write" | "none", string> = {
+  write: "The daemon holds a live, writable target for this agent — input typed on the deck reaches it.",
+  read: "History-only: the daemon can replay this session but cannot deliver input to it.",
+  none: "View-only: the daemon has no handle it can write to or resume.",
+};
 
 /**
  * The fleet at a glance: every agent the desktop can see, grouped the way the
@@ -516,6 +578,7 @@ function DaemonBody({ agents, groups, connection, message, overrideError, onOpen
         <span>ACTIVE TOOL</span>
         <span>TOOLS</span>
         <span>WORKING DIRECTORY</span>
+        <span>LAST PROMPT</span>
       </div>
       <div className="overview-groups">
         {groups.map((group) => <OverviewGroupCard key={group.key} group={group} />)}
@@ -528,6 +591,7 @@ function OverviewGroupCard({ group }: { group: OverviewGroup }) {
   const Icon = GROUP_ICON[group.kind];
   const counts = countByStatus(group.agents);
   const titleId = `overview-group-title-${group.key}`;
+  const hoistedCwd = hoistedCwdOf(group);
   // Shown only when it says something: a subtitle that renders to nothing is an
   // empty `<code>` chip next to the heading, which reads as a rendering fault.
   const subtitle = group.subtitle ? displayText(group.subtitle, DISPLAY_LIMITS.name) : undefined;
@@ -546,9 +610,21 @@ function OverviewGroupCard({ group }: { group: OverviewGroup }) {
           <h3 id={titleId}>{displayIdentity(group.title, DISPLAY_LIMITS.name, unnamedGroupLabel(group))}</h3>
         </div>
         {subtitle && !rendersBlank(subtitle) && <code className="overview-group-subtitle">{subtitle}</code>}
-        {group.commonCwd && (
-          <code className="overview-group-cwd" title={displayText(`Most of this group works in ${group.commonCwd} — a row prints its own directory only when it differs`, DISPLAY_LIMITS.title)}>
-            {displayPath(group.commonCwd)}
+        {hoistedCwd && (
+          <code
+            className="overview-group-cwd"
+            data-cwd-source={group.orchestrationCwd ? "orchestration" : "shared"}
+            title={displayText(
+              group.orchestrationCwd
+                // Stated by the daemon rather than inferred, so the hover says
+                // so: this is the orchestration's own directory, and a role
+                // pane elsewhere is a genuine difference from it.
+                ? `This orchestration runs in ${group.orchestrationCwd} — a row prints its own directory only when it differs`
+                : `Most of this group works in ${hoistedCwd} — a row prints its own directory only when it differs`,
+              DISPLAY_LIMITS.title,
+            )}
+          >
+            {displayPath(hoistedCwd)}
           </code>
         )}
         <span className="overview-group-count">{group.agents.length} {group.agents.length === 1 ? "agent" : "agents"}</span>
@@ -570,7 +646,7 @@ function OverviewGroupCard({ group }: { group: OverviewGroup }) {
           </tr>
         </thead>
         <tbody className="overview-rows" role="rowgroup">
-          {group.agents.map((agent) => <OverviewRow key={agentDomKey(agent)} agent={agent} commonCwd={group.commonCwd} />)}
+          {group.agents.map((agent) => <OverviewRow key={agentDomKey(agent)} agent={agent} hoistedCwd={hoistedCwd} />)}
         </tbody>
       </table>
     </article>
@@ -599,7 +675,7 @@ function unnamedGroupLabel(group: OverviewGroup): string {
   return rendersBlank(id) ? `unnamed ${noun}` : `unnamed ${noun} ${id}`;
 }
 
-function OverviewRow({ agent, commonCwd }: { agent: OverviewAgent; commonCwd?: string }) {
+function OverviewRow({ agent, hoistedCwd }: { agent: OverviewAgent; hoistedCwd?: string }) {
   const orchestration = agent.tab.kind === "orchestration" ? agent.tab : undefined;
   // Only an orchestration's role name says something the other columns do not.
   // Outside one, the daemon derives the role from the agent type, so showing it
@@ -623,6 +699,16 @@ function OverviewRow({ agent, commonCwd }: { agent: OverviewAgent; commonCwd?: s
         {orchestration && <em className="overview-role-index" title={`Role ${orchestration.roleIndex} of this orchestration`}>{String(orchestration.roleIndex + 1).padStart(2, "0")}</em>}
         <strong>{name}</strong>
         {orchestration?.isStartRole && <span className="coordinator-badge" title="Orchestration start role — the agent an operator messages">COORDINATOR</span>}
+        {/*
+          The write lease the daemon reported (PRD #745 M8). Shown whenever it
+          IS reported, including the ordinary writable case, so the rule a
+          reader learns is the simple one — a chip means the daemon said
+          something — rather than "no chip means writable, unless it means the
+          daemon said nothing". A daemon that declared no live target renders
+          nothing here: `toOverviewAgent` reversed its sentinel to absent, and
+          absence is NOT read as read-only.
+        */}
+        {agent.writeLease && <span className={`overview-lease lease-${agent.writeLease}`} title={WRITE_LEASE_TITLE[agent.writeLease]}>{agent.writeLease}</span>}
         {roleName && !rendersBlank(roleName) && roleLabel?.toLowerCase() !== agent.displayName.toLowerCase() && <em className="overview-role-name">{roleName}</em>}
       </td>
       <td role="cell"><span className={`status-label status-${agent.status}`}>{agent.status}</span></td>
@@ -649,7 +735,23 @@ function OverviewRow({ agent, commonCwd }: { agent: OverviewAgent; commonCwd?: s
         when the daemon reported none — an empty cell says "nothing to add
         here" in both cases, which is exactly what is true.
       */}
-      <td className="overview-cwd" role="cell" title={agent.cwd ? displayTitle(agent.cwd) : undefined}>{!agent.cwd || agent.cwd === commonCwd ? "" : displayPath(agent.cwd)}</td>
+      <td className="overview-cwd" role="cell" title={agent.cwd ? displayTitle(agent.cwd) : undefined}>{!agent.cwd || agent.cwd === hoistedCwd ? "" : displayPath(agent.cwd)}</td>
+      {/*
+        The last prompt the operator sent this agent — the daemon's own answer
+        to what it was asked to do, and the honest replacement for the
+        placeholder live mode used to print. Blank when the daemon reported
+        none, with no hover either: there is nothing to say, and a dash would be
+        one more thing to read that says less.
+
+        The most attacker-shaped string on this screen — free-form text an
+        agent's own output can steer — so it is sanitised and clamped to
+        `DISPLAY_LIMITS.prompt` before React sees it, and pinned to one line by
+        `.overview-prompt` so no length or content can push a row taller than
+        its neighbours.
+      */}
+      <td className="overview-prompt" role="cell" title={agent.lastUserPrompt ? displayTitle(agent.lastUserPrompt) : undefined}>
+        {agent.lastUserPrompt ? displayText(agent.lastUserPrompt, DISPLAY_LIMITS.prompt) : ""}
+      </td>
     </tr>
   );
 }

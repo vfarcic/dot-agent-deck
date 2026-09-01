@@ -51,6 +51,19 @@ export interface DesktopAgentDto {
   activeTool?: { name: string; detail?: string };
   toolCount: number;
   /**
+   * `SessionSnapshot.last_user_prompt`, surfaced by the desktop crate in M8.
+   * Absent — the key is omitted, never null — when the agent has emitted no
+   * prompt, when the record carries no live snapshot, or when the daemon
+   * predates the field.
+   */
+  lastUserPrompt?: string;
+  /**
+   * `SessionSnapshot.live_target.writable`, projected by the desktop crate into
+   * the deck's own vocabulary. Absent when the daemon declared no live target,
+   * which is NOT the same as declaring a non-writable one.
+   */
+  writeLease?: "read" | "write" | "none";
+  /**
    * The desktop crate's `DesktopTab` is structurally identical to the app
    * model's `AgentTab`, so the DTO reuses it and `agentFromDto` copies the
    * value through rather than flattening it to a role string. If the IPC shape
@@ -189,15 +202,24 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     cli: agent.agentType || "agent",
     model: UNREPORTED,
     status,
-    task: agent.activeTool ? `Active tool: ${agent.activeTool.name}${agent.activeTool.detail ? ` · ${agent.activeTool.detail}` : ""}` : "Task metadata unavailable from daemon",
+    // PRD #745 M8: the daemon's own last user prompt is the honest answer to
+    // "what is this agent doing", so it leads. The active-tool restatement is
+    // the fallback it always was, and the placeholder is now only reached when
+    // the daemon reported neither.
+    task: agent.lastUserPrompt
+      ?? (agent.activeTool ? `Active tool: ${agent.activeTool.name}${agent.activeTool.detail ? ` · ${agent.activeTool.detail}` : ""}` : "Task metadata unavailable from daemon"),
     cwd: agent.cwd ?? UNREPORTED,
-    attempt: 1,
+    // No `attempt`: the daemon has no retry counter, and live mode used to
+    // hardcode `1` here, which every tile then printed as `ATT 01` (PRD #745 M8).
     duration: "—",
     tokens: 0,
     cost: 0,
     contextPercent: 0,
     worktree: UNREPORTED,
-    writeLease: "unknown",
+    // `"unknown"` is this field's absence sentinel, not a third lease state:
+    // the daemon declared no live target. `toOverviewAgent` reverses it.
+    writeLease: agent.writeLease ?? "unknown",
+    lastUserPrompt: agent.lastUserPrompt,
     rows: agent.rows,
     cols: agent.cols,
     activeTool: agent.activeTool?.name,
@@ -257,14 +279,17 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     label: agent.role,
     agentId: agent.id,
     status: agent.status === "running" ? "active" : agent.status === "passed" ? "passed" : agent.status === "failed" ? "failed" : "queued",
-    attempt: agent.attempt,
+    // No attempt: it was read straight off the hardcoded per-agent one, so
+    // every live node claimed a retry count no daemon tracks (PRD #745 M8).
     enabled: true,
   }));
 
   return {
     runId: previous?.runId ?? "live-daemon",
     repo,
-    branch: previous?.branch ?? "Unavailable",
+    // No branch: nothing daemon-side tracks one, and the literal "Unavailable"
+    // this used to carry was a placeholder the topbar printed as if it were the
+    // checked-out branch (PRD #745 M8).
     worktree: cwd,
     connection: {
       status: dto.connection.status === "incompatible" ? "error" : dto.connection.status,
@@ -279,7 +304,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     spend: previous?.spend ?? 0,
     currentNode: Math.max(1, agents.findIndex((agent) => agent.status === "running") + 1),
     totalNodes: agents.length,
-    currentAttempt: 1,
+    // No currentAttempt, for the same reason as the per-agent one.
     paused: false,
     stages,
     agents: agents.map((agent) => {
@@ -339,7 +364,10 @@ class FixtureDeckBridge implements DeckBridge {
       this.snapshot.stages = this.snapshot.stages.map((stage) => stage.id === "approve" ? { ...stage, status: "passed" } : stage);
       this.snapshot.health = "healthy";
     } else if (action.type === "retry_stage") {
-      this.snapshot.stages = this.snapshot.stages.map((stage) => stage.id === action.stageId ? { ...stage, status: "active", attempt: stage.attempt + 1 } : stage);
+      // Counting up from an absent attempt would invent one, so a stage with no
+      // count keeps none. Every fixture stage has one; live mode has no retry
+      // action at all (PRD #745 M8).
+      this.snapshot.stages = this.snapshot.stages.map((stage) => stage.id === action.stageId ? { ...stage, status: "active", attempt: stage.attempt === undefined ? undefined : stage.attempt + 1 } : stage);
     } else if (action.type === "stop_agent") {
       this.snapshot.agents = this.snapshot.agents.map((agent) => agent.id === action.agentId ? { ...agent, status: "stopped" } : agent);
     } else if (action.type === "rename_agent") {

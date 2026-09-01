@@ -20,7 +20,7 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell } from "../App";
-import { agentDomKey, agentKey, AgentOverview, anonymousOrchestrationKey, groupAgents, groupKey, type OverviewAgent, type OverviewGroupKind, toOverviewAgent } from "./AgentOverview";
+import { agentDomKey, agentKey, AgentOverview, anonymousOrchestrationKey, groupAgents, groupKey, hoistedCwdOf, type OverviewAgent, type OverviewGroupKind, toOverviewAgent } from "./AgentOverview";
 
 /**
  * Every codepoint the render seam must strip, enumerated rather than sampled —
@@ -489,11 +489,141 @@ describe("AgentOverview", () => {
     const prd = groupCard("orchestration", "orc-745");
     const table = within(prd).getByRole("table");
     expect(within(table).getAllByRole("columnheader").map((header) => header.textContent))
-      .toEqual(["Status", "Agent", "State", "CLI", "Active tool", "Tools", "Working directory"]);
-    for (const row of rows(prd)) expect(within(row).getAllByRole("cell")).toHaveLength(7);
+      .toEqual(["Status", "Agent", "State", "CLI", "Active tool", "Tools", "Working directory", "Last prompt"]);
+    for (const row of rows(prd)) expect(within(row).getAllByRole("cell")).toHaveLength(8);
     // The visible legend is decoration for the shared grid and stays out of the
     // accessibility tree, so the columns are not announced twice.
     expect(document.querySelector(".overview-legend")).toHaveAttribute("aria-hidden", "true");
+  });
+
+  /**
+   * Scenario: render one agent whose daemon reported a last user prompt, then
+   * the same agent with none. The prompt cell prints what the daemon said, with
+   * the full value on hover; with no prompt the cell is empty and carries no
+   * hover text at all (PRD #745 M8).
+   */
+  it("prints the daemon's last user prompt, and nothing at all when there is none", () => {
+    const { unmount } = renderOverview({
+      snapshot: snapshotWithAgent({ lastUserPrompt: "Fix the flaky attach test and report back.", tab: { kind: "dashboard" } }),
+    });
+
+    const cell = document.querySelector(".overview-prompt");
+    expect(cell).toHaveTextContent("Fix the flaky attach test and report back.");
+    expect(cell).toHaveAttribute("title", "Fix the flaky attach test and report back.");
+    unmount();
+
+    renderOverview({ snapshot: snapshotWithAgent({ lastUserPrompt: undefined, tab: { kind: "dashboard" } }) });
+    const blank = document.querySelector(".overview-prompt");
+    // Blank, and no hover either — not a placeholder, and not a dash.
+    expect(blank?.textContent).toBe("");
+    expect(blank).not.toHaveAttribute("title");
+  });
+
+  /**
+   * Scenario: render an agent for each write lease the daemon can report, then
+   * one whose lease is the deck's `"unknown"` sentinel. The three reported
+   * values print; the sentinel prints nothing, and in particular does not print
+   * the word "unknown" on a screen that promises no placeholders.
+   */
+  it("prints a reported write lease and nothing for the absent one", () => {
+    for (const lease of ["write", "read", "none"] as const) {
+      const { unmount } = renderOverview({ snapshot: snapshotWithAgent({ writeLease: lease, tab: { kind: "dashboard" } }) });
+      expect(document.querySelector(".overview-lease")).toHaveTextContent(lease);
+      unmount();
+    }
+
+    const { container } = renderOverview({ snapshot: snapshotWithAgent({ writeLease: "unknown", tab: { kind: "dashboard" } }) });
+    expect(document.querySelector(".overview-lease")).toBeNull();
+    expect([container.textContent ?? "", ...titlesOf(container)].join(" ~ ")).not.toContain("unknown");
+  });
+
+  /**
+   * Scenario: `toOverviewAgent` is the boundary that reverses the deck's
+   * sentinels. A `"unknown"` lease becomes absent exactly as an `UNREPORTED`
+   * cwd does, so no screen rendering from the honest projection can print
+   * either one.
+   */
+  it("reverses the write-lease sentinel at the same boundary as the cwd one", () => {
+    const [agent] = createFixtureSnapshot("crowded").agents;
+    expect(toOverviewAgent({ ...(agent as AgentSession), writeLease: "unknown", cwd: UNREPORTED }))
+      .toMatchObject({ writeLease: undefined, cwd: undefined });
+    expect(toOverviewAgent({ ...(agent as AgentSession), writeLease: "read", cwd: "/tmp/project" }))
+      .toMatchObject({ writeLease: "read", cwd: "/tmp/project" });
+  });
+
+  /**
+   * Scenario: an orchestration whose roles work in three different directories,
+   * but whose tab cwd the daemon states. The header states the daemon's value
+   * rather than falling back to "no two members agree, print every row", and
+   * the row that happens to match it stays blank.
+   */
+  it("states the orchestration's own directory in the header, in preference to a derived one", () => {
+    const base = createFixtureSnapshot("crowded");
+    const [seed] = base.agents;
+    const inOrchestration = (id: string, cwd: string, roleIndex: number): AgentSession => ({
+      ...(seed as AgentSession),
+      id,
+      cwd,
+      displayName: `role-${roleIndex}`,
+      tab: { kind: "orchestration", orchestrationId: "orc-1", name: "deck", roleName: `role-${roleIndex}`, roleIndex, isStartRole: false, cwd: "/work/deck" },
+    });
+    const agents = [inOrchestration("1", "/work/deck", 0), inOrchestration("2", "/work/other", 1), inOrchestration("3", "/work/third", 2)];
+
+    const [group] = groupAgents(agents.map(toOverviewAgent));
+    // No two members share a directory, so the derived answer is nothing — and
+    // the stated one is what the header uses.
+    expect(group?.commonCwd).toBeUndefined();
+    expect(group?.orchestrationCwd).toBe("/work/deck");
+    expect(hoistedCwdOf(group as NonNullable<typeof group>)).toBe("/work/deck");
+
+    renderOverview({ snapshot: { ...base, agents } });
+    const card = groupCard("orchestration", "orc-1");
+    expect(card.querySelector(".overview-group-cwd")).toHaveTextContent("/work/deck");
+    expect(card.querySelector(".overview-group-cwd")).toHaveAttribute("data-cwd-source", "orchestration");
+    expect(rows(card).map((row) => row.querySelector(".overview-cwd")?.textContent))
+      .toEqual(["", "/work/other", "/work/third"]);
+  });
+
+  /**
+   * Scenario: a group with no stated orchestration cwd keeps the derived
+   * behaviour exactly — the majority directory is hoisted and marked as the
+   * shared one, not as something the daemon stated.
+   */
+  it("falls back to the shared directory when the daemon stated no orchestration cwd", () => {
+    renderOverview();
+
+    const standalone = groupCard("standalone", "standalone");
+    const cwd = standalone.querySelector(".overview-group-cwd");
+    expect(cwd).toHaveTextContent("~/code/dot-agent-deck");
+    expect(cwd).toHaveAttribute("data-cwd-source", "shared");
+  });
+
+  /**
+   * Scenario: a hostile prompt — every stripped codepoint, then far more text
+   * than the budget allows. The rendered copy carries no control or bidi
+   * character, is clamped to `DISPLAY_LIMITS.prompt` plus the elision marker,
+   * and the row it sits in is exactly as tall as one with no prompt at all.
+   */
+  it("sanitises and bounds the last prompt, which is the most attacker-shaped string on the screen", () => {
+    const hostile = `${HOSTILE_CODEPOINTS.join("")}${"p".repeat(DISPLAY_LIMITS.prompt * 4)}`;
+    const { container } = renderOverview({ snapshot: snapshotWithAgent({ lastUserPrompt: hostile, tab: { kind: "dashboard" } }) });
+
+    const cell = container.querySelector(".overview-prompt");
+    const text = cell?.textContent ?? "";
+    for (const codepoint of HOSTILE_CODEPOINTS) expect(text).not.toContain(codepoint);
+    expect(Array.from(text).length).toBe(DISPLAY_LIMITS.prompt + 1);
+    // And the budget is a bound in its own right, not merely "whatever the
+    // constant happens to say": a prompt cell allowed to print several hundred
+    // characters would dominate every row and every screenshot, while one much
+    // shorter than the column can show would truncate a real first clause. The
+    // exact number stays a design choice inside this range.
+    expect(DISPLAY_LIMITS.prompt).toBeGreaterThanOrEqual(80);
+    expect(DISPLAY_LIMITS.prompt).toBeLessThanOrEqual(DISPLAY_LIMITS.message);
+    // The hover copy is bounded too, by the title budget rather than this one.
+    expect(Array.from(cell?.getAttribute("title") ?? "").length).toBe(DISPLAY_LIMITS.title + 1);
+    // One line, whatever the daemon sent: the cell never wraps, so no prompt
+    // can push its row taller than its neighbours.
+    expect(cell).toHaveClass("overview-prompt");
   });
 
   it("leaves the working directory blank when the daemon reported none", () => {

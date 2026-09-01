@@ -59,7 +59,12 @@ export interface WorkflowStage {
   label: string;
   agentId?: string;
   status: StageStatus;
-  attempt: number;
+  /**
+   * FIXTURE-ONLY, and optional for the same reason as `AgentSession.attempt`:
+   * live mode derived it from that hardcoded `1`, so every node claimed an
+   * attempt count no daemon tracks (PRD #745 M8).
+   */
+  attempt?: number;
   enabled: boolean;
 }
 
@@ -98,7 +103,14 @@ export type DeckView =
 export type AgentTab =
   | { kind: "dashboard" }
   | { kind: "mode"; name: string }
-  | { kind: "orchestration"; name: string; roleIndex: number; roleName: string; isStartRole: boolean; displayTitle?: string; orchestrationId?: string };
+  /**
+   * `cwd` is the ORCHESTRATION TAB's own directory, shared by every role pane
+   * in the tab and distinct from each pane's `AgentSession.cwd` — an
+   * orchestrator and its workers may sit in different per-pane directories
+   * while belonging to one orchestration. Optional because the daemon reports
+   * it only when the tab declared one (PRD #745 M8).
+   */
+  | { kind: "orchestration"; name: string; roleIndex: number; roleName: string; isStartRole: boolean; cwd?: string; displayTitle?: string; orchestrationId?: string };
 
 /**
  * A pane the deck knows about.
@@ -139,8 +151,13 @@ export interface AgentSession {
    * `toOverviewAgent` is the one that does. NOT a worktree.
    */
   cwd: string;
-  /** FIXTURE-ONLY — no retry counter exists anywhere in the daemon. */
-  attempt: number;
+  /**
+   * FIXTURE-ONLY — no retry counter exists anywhere in the daemon, so live mode
+   * reports NOTHING here rather than the `1` it used to hardcode: every tile
+   * read `ATT 01` as if it were a fact (PRD #745 M8). Optional, so a surface
+   * that renders it has to decide what absence looks like.
+   */
+  attempt?: number;
   /** FIXTURE-ONLY — `started_at` is invented on hydration, so a duration lies across a daemon restart. */
   duration: string;
   /** FIXTURE-ONLY — no token accounting in daemon state. */
@@ -152,13 +169,29 @@ export interface AgentSession {
   /** FIXTURE-ONLY — the daemon has no per-agent worktree or branch field. */
   worktree: string;
   /**
-   * FIXTURE-ONLY (until M8 surfaces `live_target`). The value IS on the wire —
-   * `SessionSnapshot.live_target` — but the desktop's own DTO drops it and
-   * `agentFromDto` hardcodes `"unknown"`, so today it reports nothing about the
-   * write lease. Unmarked it would read as honest, which is the failure the
-   * annotation scheme exists to prevent.
+   * HONEST as of M8: live mode projects it from `SessionSnapshot.live_target`'s
+   * `writable` half, which the desktop's own DTO used to drop.
+   *
+   * `"unknown"` is this field's sentinel for "the daemon declared no live
+   * target", exactly as {@link UNREPORTED} is `cwd`'s — the deck's model has no
+   * way to say "absent" — and it is reversed to `undefined` at the honest
+   * projection (`toOverviewAgent`) so no screen that promises no placeholders
+   * can print it. Absence must NOT be read as read-only: the TUI treats a
+   * missing `live_target` as the legacy live default.
    */
   writeLease: "read" | "write" | "none" | "unknown";
+  /**
+   * HONEST. The most recent prompt the operator sent this agent
+   * (`SessionSnapshot.last_user_prompt`), surfaced by M8 — the honest
+   * replacement for live mode's hardcoded "Task metadata unavailable from
+   * daemon". Optional rather than sentinel-bearing: a NEW field can represent
+   * absence directly, so there is nothing here for a screen to leak.
+   *
+   * Free-form, agent-influenced text and the most attacker-shaped string the
+   * overview renders, so every display copy goes through `displayText` with
+   * `DISPLAY_LIMITS.prompt`.
+   */
+  lastUserPrompt?: string;
   /** HONEST. */
   rows: number;
   /** HONEST. */
@@ -235,7 +268,15 @@ export interface AgentProfile {
 export interface DeckSnapshot {
   runId: string;
   repo: string;
-  branch: string;
+  /**
+   * FIXTURE-ONLY. Nothing tracks a per-agent or per-run git branch daemon-side
+   * — the only `git branch` calls in `src/` are deletions in the dispatch flows
+   * — so live mode reports nothing here instead of the literal `"Unavailable"`
+   * it used to put in the topbar (PRD #745 M8). Reconstructing it would mean a
+   * subprocess per agent cwd on the daemon or a desktop-side git call that
+   * breaks the local-daemons-only boundary; both are out of scope.
+   */
+  branch?: string;
   worktree: string;
   connection: ConnectionView;
   health: RunHealth;
@@ -243,7 +284,8 @@ export interface DeckSnapshot {
   spend: number;
   currentNode: number;
   totalNodes: number;
-  currentAttempt: number;
+  /** FIXTURE-ONLY — see `AgentSession.attempt`. Absent in live mode. */
+  currentAttempt?: number;
   paused: boolean;
   stages: WorkflowStage[];
   agents: AgentSession[];

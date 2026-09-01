@@ -79,6 +79,24 @@ export const DISPLAY_LIMITS = {
    * fifteen rows. Short on purpose; the full value is one hover away.
    */
   toolDetail: 60,
+  /**
+   * The last user prompt (PRD #745 M8). Free-form operator text an agent's own
+   * output can influence, and the longest thing on the screen: the daemon
+   * bounds it at 64 KiB per agent (`daemon_client.rs`'s `MAX_FIRST_PROMPT_BYTES`),
+   * which at fifteen rows is a megabyte of DOM text for a cell a reader sees
+   * about sixty characters of.
+   *
+   * 160 is chosen against what the column can actually show. The prompt track
+   * is the widest on the row and still fits roughly sixty characters at its
+   * rendered size, so the ellipsis a reader sees is CSS's, not the clamp's —
+   * the clamp exists for the pathological value, not the ordinary one. It sits
+   * below `message` (240, which appears once per screen) because a prompt
+   * appears on every row of a fifteen-row table, and well above `toolDetail`
+   * (60) because a prompt is a sentence rather than an identifier and its first
+   * clause is the part worth reading. The full value stays one hover away under
+   * the `title` budget.
+   */
+  prompt: 160,
   /** Any `title` attribute: generous, because hover is where the full value lives. */
   title: 512,
   /** The daemon's own connection message. */

@@ -461,4 +461,50 @@ describe("ControlDeck", () => {
     expect(setShownTerminals).toHaveBeenCalledTimes(1);
     expect(setShownTerminals).toHaveBeenCalledWith([]);
   });
+
+  /**
+   * Scenario: render the deck against a snapshot mapped from a real daemon DTO
+   * — the live path, not the fixture. Every place the deck used to assert an
+   * attempt count now shows the em dash it shows for anything else the daemon
+   * does not report, and the branch chip is gone rather than printing the
+   * literal "Unavailable" where a branch name belongs (PRD #745 M8).
+   */
+  it("asserts no attempt count and no branch in live mode", async () => {
+    const { mapDesktopSnapshot } = await import("./lib/bridge");
+    const snapshot = mapDesktopSnapshot({
+      connection: { status: "connected", socketPath: "/tmp/deck.sock", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
+      agents: [{ id: "7", displayName: "Coder", cwd: "/tmp/project", rows: 32, cols: 120, agentType: "claude_code", status: "working", toolCount: 3, tab: { kind: "dashboard" } }],
+      protocolVersion: 8,
+      source: "daemon",
+    });
+    const { container } = render(<ControlDeck runtime={runtime({ mode: "live", snapshot })} />);
+
+    // The topbar instrument, the run-graph node and the tile — the three places
+    // the fabricated `1` used to surface.
+    expect(screen.getByText("ATTEMPT").parentElement).toHaveTextContent("—");
+    expect(screen.getByTestId("workflow-node-agent-7")).not.toHaveTextContent("att");
+    expect(container.querySelector(".agent-attempt strong")?.textContent).toBe("—");
+    expect(container.querySelector(".agent-attempt")).toHaveAttribute("title", "No attempt count is reported by the daemon");
+
+    // No branch chip at all, and nothing standing in for one.
+    expect(container.querySelector(".branch-line svg")).toBeNull();
+    expect(container.querySelector(".branch-line")?.textContent).toBe("/tmp/project");
+    // Scoped to the branch line on purpose: the deck still prints its own
+    // "Unavailable" for `model` and for the lease footer, which have no daemon
+    // source and are not M8's to change. The branch is the one that used to.
+    expect(container.querySelector(".repo-context")?.textContent ?? "").not.toContain("Unavailable");
+  });
+
+  /**
+   * The fixture keeps its own attempt counts: they are legitimate fixture data,
+   * and M8's claim is about what LIVE mode presents as fact.
+   */
+  it("still shows the fixture's own attempt counts", () => {
+    const { container } = render(<ControlDeck runtime={runtime()} />);
+
+    expect(screen.getByText("ATTEMPT").parentElement).toHaveTextContent("01");
+    expect(container.querySelector(".agent-attempt strong")?.textContent).toBe("01");
+    expect(screen.getByTestId("workflow-node-build")).toHaveTextContent("att 2");
+    expect(container.querySelector(".branch-line")).toHaveTextContent("codex/visual-control-deck");
+  });
 });

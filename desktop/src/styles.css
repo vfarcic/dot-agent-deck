@@ -568,7 +568,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
 /* One grid template shared by the legend and every row, so the columns line up
    across group cards and the whole fleet reads as one table. */
-.overview-legend, .overview-row { display: grid; grid-template-columns: 10px minmax(0, 1.45fr) 66px 84px minmax(0, 1.5fr) 40px minmax(0, 1.6fr); align-items: center; gap: 10px; }
+.overview-legend, .overview-row { display: grid; grid-template-columns: 10px minmax(0, 1.3fr) 66px 78px minmax(0, 1.3fr) 40px minmax(0, 1.3fr) minmax(0, 1.7fr); align-items: center; gap: 10px; }
 .overview-row > td { min-width: 0; padding: 0; }
 .overview-row { min-height: 34px; padding: 5px 11px; border-top: 1px solid #eae7de; }
 .overview-row:first-child { border-top: 0; }
@@ -593,6 +593,15 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-tool strong { flex: 0 0 auto; font-family: "JetBrains Mono", monospace; font-size: 9.5px; font-weight: 650; }
 .overview-tool em { overflow: hidden; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: 9px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
 .overview-tool-idle { color: #a7ada9; font-size: 9px; font-style: italic; }
+/* The last user prompt: one line, always, whatever the daemon sent. `min-width:
+   0` plus the nowrap/ellipsis trio is what keeps a 64 KiB prompt from widening
+   its grid track or pushing its row taller than its neighbours — the render
+   seam's character clamp bounds the DOM, this bounds the layout. */
+.overview-prompt { min-width: 0; overflow: hidden; color: var(--muted); font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
+/* The daemon-reported write lease, next to the agent's name. Muted and small:
+   it is a qualifier on the row, not a status. */
+.overview-lease { flex: 0 0 auto; padding: 1px 4px; border-radius: 2px; color: var(--faint); background: rgba(0, 0, 0, .04); font-family: "JetBrains Mono", monospace; font-size: 7px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.overview-lease.lease-read, .overview-lease.lease-none { color: var(--amber); background: rgba(176, 122, 42, .1); }
 
 .overview-note { min-height: 260px; padding: 30px; display: flex; flex-direction: column; align-items: center; justify-content: center; border: 1px dashed var(--line-strong); border-radius: var(--radius); color: var(--muted); background: rgba(248, 246, 240, .55); text-align: center; }
 .overview-note h3 { margin: 11px 0 5px; color: var(--ink); font-size: 14px; }
@@ -608,8 +617,11 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-screen .count-unknown { color: var(--faint); }
 
 @media (max-width: 1180px) {
-  .overview-legend, .overview-row { grid-template-columns: 10px minmax(0, 1.5fr) 66px minmax(0, 1.4fr) 40px; }
+  .overview-legend, .overview-row { grid-template-columns: 10px minmax(0, 1.3fr) 66px minmax(0, 1.2fr) 40px minmax(0, 1.5fr); }
   .overview-legend span:nth-child(4), .overview-row .overview-cli { display: none; }
+  /* The working directory goes before the prompt does: a group states its
+     directory once in the header, so a row's own is already the exception —
+     while the prompt is the only per-row answer to what the agent is doing. */
   .overview-legend span:nth-child(7), .overview-row .overview-cwd { display: none; }
 }
 
@@ -619,5 +631,6 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
   .overview-legend, .overview-row { grid-template-columns: 10px minmax(0, 1fr) 66px; }
   .overview-legend span:nth-child(5), .overview-row .overview-tool { display: none; }
   .overview-legend span:nth-child(6), .overview-row .overview-tool-count { display: none; }
+  .overview-legend span:nth-child(8), .overview-row .overview-prompt { display: none; }
   .daemon-pips, .overview-group-pips { display: none; }
 }

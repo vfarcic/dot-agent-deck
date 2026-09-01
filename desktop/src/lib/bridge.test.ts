@@ -410,6 +410,69 @@ describe("TauriDeckBridge", () => {
       tab: { kind: "orchestration", name: "dot-agent-deck", roleIndex: 1, roleName: "coder", isStartRole: false, displayTitle: "dot-agent-deck" },
     });
   });
+
+  /**
+   * PRD #745 M8. The three fields the daemon has always sent and the desktop
+   * has always dropped: the last user prompt (which also replaces the
+   * hardcoded task placeholder), the write lease, and the orchestration tab's
+   * own cwd.
+   */
+  it("carries the daemon's last prompt, write lease and orchestration cwd onto the agent model", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const reported = structuredClone(snapshot);
+    reported.agents[0].lastUserPrompt = "Surface the honest fields.";
+    reported.agents[0].writeLease = "read";
+    reported.agents[0].tab = { kind: "orchestration", name: "dot-agent-deck", roleIndex: 1, roleName: "coder", isStartRole: false, displayTitle: "dot-agent-deck", cwd: "/work/deck" };
+
+    const mapped = mapDesktopSnapshot(reported);
+
+    expect(mapped.agents[0]).toMatchObject({
+      lastUserPrompt: "Surface the honest fields.",
+      writeLease: "read",
+      // The prompt is the honest answer to "what was this asked to do", so it
+      // leads the deck's assignment line ahead of the active-tool restatement.
+      task: "Surface the honest fields.",
+      tab: { kind: "orchestration", cwd: "/work/deck" },
+    });
+  });
+
+  /**
+   * The absent case for all three. Absence stays absent — `"unknown"` is the
+   * lease's sentinel, reversed at the overview's own boundary — and the task
+   * line falls back to the active tool exactly as it always did.
+   */
+  it("reports no prompt, no lease and no orchestration cwd when the daemon sent none", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+
+    const mapped = mapDesktopSnapshot(structuredClone(snapshot));
+
+    expect(mapped.agents[0]?.lastUserPrompt).toBeUndefined();
+    expect(mapped.agents[0]?.writeLease).toBe("unknown");
+    expect(mapped.agents[0]?.task).toBe("Active tool: apply_patch · desktop/src/App.tsx");
+    expect(mapped.agents[0]?.tab).toMatchObject({ kind: "orchestration" });
+    expect((mapped.agents[0]?.tab as { cwd?: string }).cwd).toBeUndefined();
+  });
+
+  /**
+   * PRD #745 M8. No daemon tracks a retry count or a per-agent git branch, so
+   * live mode now reports neither instead of the `1` every tile printed as
+   * `ATT 01` and the literal "Unavailable" the topbar printed as a branch.
+   */
+  it("fabricates no attempt count and no branch in live mode", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+
+    const mapped = mapDesktopSnapshot(structuredClone(snapshot));
+
+    expect(mapped.agents[0]?.attempt).toBeUndefined();
+    expect(mapped.stages[0]?.attempt).toBeUndefined();
+    expect(mapped.currentAttempt).toBeUndefined();
+    expect(mapped.branch).toBeUndefined();
+    // And a previous snapshot cannot smuggle one back in: the field is not
+    // carried forward, so a fixture-shaped value can never become live data.
+    const carried = mapDesktopSnapshot(structuredClone(snapshot), { ...mapped, branch: "main", currentAttempt: 3 });
+    expect(carried.branch).toBeUndefined();
+    expect(carried.currentAttempt).toBeUndefined();
+  });
 });
 
 describe("FixtureDeckBridge scenarios", () => {
