@@ -553,6 +553,11 @@ impl TuiDeck {
 
     fn try_launch_inner(builder: TuiDeckBuilder, fixture_name: &str) -> Result<Self, String> {
         let test_name = current_test_name();
+        // PR #805 audit blocker 3, and it comes before every side effect on
+        // purpose: from here on the run can be killed at any instant, and
+        // whatever it does not overwrite is what a later reel build picks up.
+        // See [`discard_previous_recording`].
+        discard_previous_recording(&test_name);
 
         // M2.1 auditor S1 + M3.1 auditor S4: create the per-test
         // tempdir with mode 0o700 atomically. `harness_tempdir()`
@@ -3190,6 +3195,74 @@ fn workspace_recordings_root() -> PathBuf {
         .join("recordings")
 }
 
+/// The recordings directory for the test running on this thread — the exact
+/// path [`TuiDeck::dump_recordings`] writes into and
+/// [`discard_previous_recording`] clears.
+#[allow(dead_code)]
+pub fn current_test_recordings_dir() -> PathBuf {
+    workspace_recordings_root().join(sanitize_test_name(&current_test_name()))
+}
+
+/// Every artifact [`TuiDeck::dump_recordings`] writes, as one list, so the dump
+/// and the discard below cannot drift apart. The paired `test.md` is
+/// deliberately absent: it is regenerated from the test source rather than
+/// captured from a run, so it carries no credential and no run identity, and a
+/// developer browsing it should not have it deleted under them.
+const RECORDING_ARTIFACTS: [&str; 4] = [
+    "final-grid.txt",
+    "final-grid.svg",
+    "full-stream.cast",
+    "fixture.toml",
+];
+
+/// Delete the artifacts a PREVIOUS run of `test_name` left in its recordings
+/// directory, before this run can produce any of its own.
+///
+/// # Why this exists (PR #805 audit blocker 3)
+///
+/// `TuiDeck` keeps its cast in memory and writes artifacts only from `Drop`, and
+/// only when the test panicked or `DOT_AGENT_DECK_RECORD` is set. Nothing used
+/// to remove the previous run's files at launch, so every route that ends a run
+/// without reaching `Drop` — a `SIGKILL`, a nextest timeout, a Ctrl-C, a
+/// runtime skip before launch, a re-recording that failed — left the OLD
+/// `full-stream.cast` sitting there. `.claude/skills/demo-reel-adapter` then
+/// selects a cast on **path existence** plus branch scope and a `[reel]` marker;
+/// it records no run identity, no commit, no timestamp and no proof that the
+/// test passed, and the engine performs no redaction of its own. So a cast
+/// written by a revision that predates the redaction fixes could survive an
+/// interrupted current run and still be stitched into a video and uploaded
+/// unlisted to YouTube with its link in the public release notes.
+///
+/// Clearing at launch kills that at the source: after this call the artifact
+/// either belongs to the current run or does not exist. **It is the cheap half.**
+/// The other half — the adapter verifying provenance (run identity, commit, and
+/// that the cast came from a test that actually PASSED in the current run)
+/// rather than trusting `test -f` — is issue #808 and is deliberately not built
+/// here. A filtered run still leaves an unselected test's older cast in place,
+/// which is exactly the case only provenance can catch.
+///
+/// Best-effort, but not silently so: a `NotFound` is the ordinary case and says
+/// nothing, while any other error means a stale artifact may have SURVIVED, which
+/// is the failure this function exists to prevent — so it is reported to stderr
+/// rather than swallowed. It is not made fatal, because a harness that refuses to
+/// start over an unwritable gitignored directory would be worse than one that
+/// says so.
+fn discard_previous_recording(test_name: &str) {
+    let dir = workspace_recordings_root().join(sanitize_test_name(test_name));
+    for name in RECORDING_ARTIFACTS {
+        let path = dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!(
+                "[tui-harness] could not discard the previous recording at {}: {error} — \
+                 a STALE artifact may survive this run; delete it before building a demo reel",
+                path.display()
+            ),
+        }
+    }
+}
+
 /// Atomic file write: stage `bytes` in a sibling tempfile under
 /// `dst.parent()` and then `persist(dst)` so the rename is atomic on
 /// Unix (same filesystem). Concurrent writers see either the
@@ -4237,6 +4310,13 @@ pub fn _skip_if_err(result: Result<(), String>) -> bool {
     match result {
         Ok(()) => false,
         Err(reason) => {
+            // PR #805 audit blocker 3: a runtime skip is one of the routes that
+            // used to leave the previous run's `full-stream.cast` in place while
+            // nextest reported the test as PASSED — the worst shape of the
+            // problem, because "it passed" and "it recorded nothing" look
+            // identical. Discarded before the require-real assertion so the
+            // stale artifact goes whichever way that assertion falls.
+            discard_previous_recording(&current_test_name());
             assert!(
                 !require_real_e2e(),
                 "{REQUIRE_REAL_E2E_ENV} is set, so this real-agent test must RUN, not skip: \
