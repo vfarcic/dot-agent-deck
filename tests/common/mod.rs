@@ -696,14 +696,23 @@ impl TuiDeck {
         //     prompt renders exactly that (see `seed_claude_project_trust`), so
         //     any run where the approval seeding is wrong or has not happened
         //     yet paints a derivative of the secret straight into the recording
-        //     — and from there into nextest's captured output, which lane 2
-        //     lifts into the job log with `--success-output=final`. GitHub masks
-        //     a registered secret's exact value in a rendered log; a substring
-        //     of it is not covered.
+        //     — and from there into nextest's captured output, which
+        //     `--success-output=final` prints. Both sinks are LOCAL, because
+        //     lane 2 runs on a developer's machine and nowhere in CI: what is
+        //     at stake is that developer's terminal and scrollback, the `.cast`
+        //     the demo reel publishes, and whatever they paste onward. Nothing
+        //     downstream masks anything — and a log-masking layer covers a
+        //     registered secret's exact value, never a 20-character derivative
+        //     of it, which is why this suffix is registered in its own right.
         //
         // Registered unconditionally rather than only on a claude import: the
-        // key reaches the deck either way, and a redaction for a string that
-        // never appears costs one failed substring search per artifact.
+        // key reaches the deck either way. A value that never appears is not
+        // free — this used to say it costs one failed substring search, and the
+        // matcher can instead drive repeated bounded continuation scans
+        // wherever the value shares a prefix with rendered bytes. Realistic
+        // artifacts stay in the hundreds of milliseconds; the adversarial shape
+        // measured in `docs/develop/e2e-lanes.md` is ~25 s for 1.6 MB, and
+        // #810 carries the indexed rewrite and the fail-closed cost budget.
         if let Some(key) = anthropic_api_key() {
             recording_redactions.extend(api_key_recording_redactions(&key));
         }
@@ -1930,9 +1939,36 @@ impl TuiDeck {
     /// the panic seam and never the `.cast`. That is backwards: the `.cast` is
     /// the artifact the demo reel publishes. Every value in the global store is
     /// a credential or identity value some harness path registered, and the
-    /// per-deck set is already a subset of it in practice, so the union can only
-    /// add redactions; the cost is one failed substring search per artifact for
-    /// a value that never appears.
+    /// per-deck set is already a subset of it in practice.
+    ///
+    /// **Enlarging the set is NOT monotonic, and this comment used to claim it
+    /// was.** "The union can only add redactions" is false under the first of
+    /// the two matcher gaps tracked in
+    /// [#810](https://github.com/vfarcic/dot-agent-deck/issues/810). Put a
+    /// value whose start lies INSIDE an earlier value in the per-deck set, and
+    /// only that earlier value in the global store: with the deck value alone
+    /// the scan reaches its start and redacts it, but once the union adds the
+    /// earlier value the greedy scan matches that one first, resumes at the end
+    /// of its first fragment, steps over the deck value's interior start, and
+    /// leaves the deck value's tail in the artifact. So adding a pattern can
+    /// REMOVE a redaction until the matcher is replaced — #810 now carries
+    /// monotonicity (adding a pattern must never remove a redaction) as a
+    /// required property of the rewrite. Nextest's process-per-test model
+    /// bounds the blast radius to one test, since no other test's store can
+    /// reach this artifact, but it does not bound two credential or identity
+    /// paths interacting INSIDE the same test — which, with nine live tests
+    /// registering identity after launch, is exactly the shape this union
+    /// creates. It is kept anyway: the alternative is the silent drift it was
+    /// added to close, where a post-launch registration reached the panic seam
+    /// and never the `.cast`.
+    ///
+    /// The cost is not one failed substring search per artifact either. A value
+    /// that never appears can still drive repeated bounded continuation scans
+    /// wherever it shares a prefix with rendered bytes, and the union enlarges
+    /// the set that can do so; `docs/develop/e2e-lanes.md` records the measured
+    /// adversarial case (~25 s for 1.6 MB of repeated shared prefixes) against
+    /// ~162 ms for a realistic 2.1 MB artifact. #810's indexed rewrite and
+    /// fail-closed budget carry that too.
     fn artifact_redactions(&self) -> Vec<String> {
         let mut values = self.recording_redactions.clone();
         values.extend(lock_diagnostic_redactions().iter().cloned());
@@ -2493,8 +2529,10 @@ fn redact_cast_events(events: &[CastEvent], credentials: &[String]) -> Vec<Vec<u
 // dies at a PTY wait whose panic interpolates that same grid. The leak path and
 // the panic path are one path. nextest writes that panic into the run log
 // (which `--success-output=final` and failure output both surface) and into the
-// raw JUnit report, and GitHub masks a registered secret's exact value in a
-// rendered log, never a 20-character substring of it.
+// raw JUnit report. Both are LOCAL files on the developer's machine — lane 2
+// runs on no runner — so there is no masking layer downstream, and the one that
+// exists where logs are rendered covers a registered secret's exact value,
+// never a 20-character substring of it.
 //
 // WHY A PROCESS-GLOBAL PANIC HOOK rather than redaction on the accessors.
 //
@@ -3487,9 +3525,13 @@ fn render_grid_to_svg(grid: &str, cols: u16, rows: u16) -> String {
 ///
 /// Issue #502/#785: there is now a THIRD path — a non-empty
 /// `ANTHROPIC_API_KEY`, consulted last, after both credential stores have come
-/// up empty. That is what lets lane 2 run the claude-gated tests on a GitHub
-/// runner from a scopable, revocable, spend-cappable key instead of the owner's
-/// account session. See the comment on that branch, and note it is coupled to
+/// up empty. That is what lets a developer run the claude-gated tests LOCALLY
+/// from a key alone — on a host that has never run `claude login`, or whose
+/// credential set has expired — instead of needing an account session in one of
+/// the two credential stores. It buys nothing in CI and is not there for CI:
+/// lane 2 runs on a developer's machine and NOWHERE on a runner, and this
+/// repository registers no test credential (CLAUDE.md rule 5). See the comment
+/// on that branch, and note it is coupled to
 /// [`seed_claude_project_trust`]: an interactive agent authenticated by key
 /// also needs the API-key approval recorded in `~/.claude.json`, or it stops on
 /// a prompt that defaults to "No".
@@ -3527,14 +3569,18 @@ pub fn check_claude_available() -> Result<(), String> {
             // the two are coupled: widening this check without it just moves
             // the failure later.
             //
-            // This is what lets lane 2 run the 22 claude-gated tests on a
-            // GitHub runner under #785 decision 1 — a scopable, spend-cappable,
+            // This is what lets a developer run the 22 claude-gated tests
+            // LOCALLY from a key alone — a scopable, spend-cappable,
             // independently revocable API key rather than the owner's account
-            // session. The key is only tested for presence here; it is never
-            // printed, and no probe request is made (same trade as the file
-            // path: a live round trip would spend tokens on every e2e run, so
-            // a revoked key remains an accepted false-positive that fails
-            // loudly later).
+            // session. #785 decision 1 originally wrote it for a credentialed
+            // CI lane; #502 removed that lane, so the only host this branch
+            // now serves is a key-only developer machine. The key reaching an
+            // agent is therefore always the developer's own.
+            //
+            // The key is only tested for presence here; it is never printed,
+            // and no probe request is made (same trade as the file path: a live
+            // round trip would spend tokens on every e2e run, so a revoked key
+            // remains an accepted false-positive that fails loudly later).
             if let Some(key) = anthropic_api_key() {
                 // Issue #502/#785 audit follow-up: one case where a present key
                 // is NOT an authorisation. If the host `~/.claude.json` already
@@ -3573,9 +3619,12 @@ pub fn check_claude_available() -> Result<(), String> {
 }
 
 /// Issue #502/#785: the environment variable Claude Code, OpenCode and `pi` all
-/// read an Anthropic API key from, and the only agent credential lane 2 holds in
-/// CI. Named here so the harness, the gates and the redaction agree on one
-/// spelling.
+/// read an Anthropic API key from, and the credential a key-only host runs
+/// lane 2 from. It is NOT a CI credential and must not be made one on the
+/// strength of this constant existing: lane 2 reaches no runner and this
+/// repository registers no test secret (CLAUDE.md rule 5), so every value this
+/// name ever holds here is a developer's own. Named so the harness, the gates
+/// and the redaction agree on one spelling.
 pub const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 
 /// The ambient Anthropic API key, or `None` when it is unset, empty or
@@ -4785,7 +4834,8 @@ fn import_claude_plugins_enabled() -> bool {
 ///     it here would newly bill a developer for a test run they did not ask to
 ///     pay for; overriding it costs them nothing, since the OAuth set the
 ///     harness just imported is what runs instead.
-///   * **OAuth unusable** (a CI runner, or a key-only developer host): record it
+///   * **OAuth unusable** (a key-only developer host — since #502 the only
+///     shape that reaches this, because lane 2 runs on no runner): record it
 ///     as APPROVED — the key is the only way in — UNLESS the host config
 ///     already records a REJECTION for this exact key and nothing authorises
 ///     overriding it. That carve-out replaced an unconditional
@@ -4892,6 +4942,18 @@ const CLAUDE_IDENTITY_KEY_FRAGMENTS: [&str; 3] = ["uuid", "email", "name"];
 /// contain them. No account uuid or email is that short; a display name can be,
 /// and is then left alone rather than allowed to wreck the artifacts, with the
 /// uuid and email still covering the account.
+///
+/// **Two gaps, both accepted rather than unnoticed.** The floor above leaves a
+/// short display, full or organisation name visible. And the rule is keyed to
+/// the schema as MEASURED: a future identity field named `handle`, `login`,
+/// `subject` or `userId` contains none of the three fragments and would be
+/// registered by nothing, silently, with no test failing — the substrings are a
+/// snapshot of one vendor's JSON, not a definition of identity. Both are PII
+/// exposure rather than credential exposure, which is why they are recorded
+/// here instead of blocking; reassess them against the schema rather than
+/// against the matcher, because `oauthAccount` is a trusted location that
+/// supplies far stronger identity context than an arbitrary rendered string
+/// does.
 fn claude_identity_redactions(cfg: &serde_json::Value) -> Vec<String> {
     let Some(account) = cfg.get("oauthAccount").and_then(|v| v.as_object()) else {
         return Vec::new();
@@ -5322,10 +5384,26 @@ enum CredentialScope {
     /// The floor is what keeps that from being a disaster: `NO_COLOR=1`,
     /// `RUST_LOG=debug` and `TERM=xterm` would otherwise be registered, and
     /// registering a two-byte value replaces those bytes wherever they occur in
-    /// every artifact. Sixteen is the same bound the auth documents use and no
-    /// credential worth protecting is shorter. Not depth-anchored to the
-    /// top-level `env` on purpose — a nested `env` map is env material too, and
-    /// being wrong in the over-registering direction is the safe one here.
+    /// every artifact. Sixteen is the same bound the auth documents use.
+    ///
+    /// **It is a trade, not a completeness boundary, and this comment used to
+    /// deny the residual by claiming no credential worth protecting is shorter
+    /// than sixteen bytes.** A short password under an ordinary provider
+    /// variable — the audit's counterexample is `REDISCLI_AUTH` — matches no
+    /// sensitive-name rule, and a value below sixteen bytes then falls under
+    /// the floor too, so it is registered by nothing and redacted from nothing.
+    /// The floor stays anyway, because removing it gouges `NO_COLOR`-sized
+    /// values out of every artifact a developer reads, which is a certain harm
+    /// against a narrow one; the residual is real and is covered by the
+    /// blocklist framing in
+    /// `docs/develop/e2e-lanes.md` rather than argued away. The way out, if it
+    /// is ever worth taking, is to widen the high-confidence name fragments or
+    /// to treat short values exact-only when the surrounding context is strong
+    /// — not to drop the floor globally.
+    ///
+    /// Not depth-anchored to the top-level `env` on purpose — a nested `env`
+    /// map is env material too, and being wrong in the over-registering
+    /// direction is the safe one here.
     ConfigDocument,
 }
 
@@ -5509,9 +5587,9 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<Vec<String>>
         // `import_claude_credentials`: this runs inside the `launch_with_fixture`
         // path that panics on `Err`, so `check_opencode_available` accepting an
         // env key without this would turn two clean skips into two panics on a
-        // runner. There is no auth file to copy and that is the AUTHORISED
-        // state, not a failure — the isolated config is still written, so the
-        // host's plugins and MCP commands stay out either way.
+        // key-only host. There is no auth file to copy and that is the
+        // AUTHORISED state, not a failure — the isolated config is still
+        // written, so the host's plugins and MCP commands stay out either way.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound && opencode_env_key_authorises() => {
             write_minimal_opencode_config(test_home)?;
             Ok(Vec::new())
@@ -11399,10 +11477,11 @@ mod harness_unit_tests {
     /// Scenario: Register an API key for recording redaction and then render
     /// both the key and the 20-character suffix Claude Code's approval prompt
     /// paints on the terminal into a grid. Neither survives into the artifact.
-    /// The suffix half is the one that matters: GitHub masks a registered
-    /// secret's exact value in a rendered log, never a derivative of it, and the
-    /// prompt renders exactly this derivative whenever the approval seeding is
-    /// missing or wrong.
+    /// The suffix half is the one that matters: a derivative is what no
+    /// masking layer covers even where one exists, these artifacts are local
+    /// files with no such layer downstream at all, and the prompt renders
+    /// exactly this derivative whenever the approval seeding is missing or
+    /// wrong.
     #[test]
     fn the_api_key_and_its_rendered_suffix_are_both_redacted_from_recordings() {
         let key = "sk-ant-api03-not-a-real-key-DEADBEEFCAFEBABE0123";
@@ -12929,9 +13008,10 @@ mod harness_unit_tests {
 
     /// Scenario: Seed Claude Code's API-key approval into a config on a host
     /// whose OAuth credential set is UNUSABLE and that records NO answer for
-    /// this key — a CI runner, whose HOME is fresh. The key is approved,
-    /// because it is the only way in and there is no stored decision to
-    /// respect.
+    /// this key — a key-only host with a fresh HOME, which since #502 means a
+    /// developer machine that has never run `claude login` rather than a
+    /// runner. The key is approved, because it is the only way in and there is
+    /// no stored decision to respect.
     #[test]
     fn a_key_authorised_run_approves_a_key_the_host_never_answered_for() {
         let key = "sk-ant-api03-not-a-real-key-DEADBEEFCAFEBABE0123";
