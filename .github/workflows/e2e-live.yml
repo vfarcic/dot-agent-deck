@@ -1,0 +1,627 @@
+name: e2e-live
+
+# Issue #502 lane 2 — the CREDENTIALED half of the L2 e2e tier, and the first
+# job in this repository that has ever held an agent credential.
+#
+# `cargo test-e2e-live` enables BOTH cargo features, so it is a SUPERSET run:
+# all 71 `tests/e2e_*.rs` files, i.e. the 47 deterministic ones the
+# `e2e-deterministic` job in ci.yml already runs PLUS the 24 that need a real
+# agent. There is deliberately no live-ONLY alias — the 24 open with
+# `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, so `e2e-live` without
+# `e2e` compiles every e2e file to an empty crate.
+#
+# The credential threat model is issue #785. Two of its decisions are visible
+# in this file (API keys rather than the OAuth credential set; the GitHub
+# Environment on the job below) and one is not, because it is not a workflow
+# property: the two secrets themselves (ANTHROPIC_API_KEY and OPENAI_API_KEY)
+# and the environment's required reviewer are set by hand by the repository
+# owner.
+#
+# Since issue #502/#785 this job runs REAL agents and PROVES it. All four
+# drivable agent CLIs authenticate from an API key — claude, opencode and pi
+# from ANTHROPIC_API_KEY directly, codex from a ~/.codex/auth.json the
+# provisioning step derives from OPENAI_API_KEY — and the run step sets
+# DOT_AGENT_DECK_REQUIRE_REAL_E2E, which turns every runtime skip into a
+# failure. 31 of the tier's 33 gated tests are selected and must run; the other
+# two are excluded BY NAME on the run step, with the reasons there.
+
+on:
+  # The per-merge run. #502 weighed this against nightly and against
+  # release-gating and chose it deliberately. Nightly tests a tree nobody is
+  # shipping and a failure has to be bisected across a day of commits.
+  # Release-gating sounds better — the tested tree is the shipped tree — but
+  # release.yml triggers on TAG PUSH, so the tag already exists by the time the
+  # tests run and a failure costs a deleted remote tag rather than a prevented
+  # release. Per-merge gives exact attribution (one merge per run), and the
+  # release inherits the signal for free: by tag time every commit in the tree
+  # has already been through it.
+  push:
+    branches: [main]
+
+  workflow_dispatch:
+
+  # Label-gated on pull requests. This trigger is load-bearing TWICE, and the
+  # second reason is the one that is easy to drop by accident:
+  #
+  #   1. it is the on-demand run #502 wants for a PR that touches real-agent
+  #      paths, so a change to the spawn/hook/delegate machinery can be
+  #      exercised against real agents before it merges;
+  #   2. it is the ONLY way to validate this workflow at all before it lands,
+  #      because `workflow_dispatch` is not offered until the file is on the
+  #      default branch. Without it, the first execution of a credentialed job
+  #      would be an unreviewable push to `main`.
+  #
+  # `labeled` is in the list so applying the label to an already-open PR starts
+  # a run immediately; `synchronize` keeps a labelled PR re-running as it is
+  # pushed to. The job-level `if:` below is what actually enforces the gate —
+  # these types only decide when GitHub bothers to evaluate it.
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+
+concurrency:
+  # ONE live run at a time across the whole repository — note this is NOT keyed
+  # on `github.ref` the way ci.yml's group is. These runs spend real tokens
+  # against a single Anthropic account, so two overlapping runs race for the
+  # same rate limit and can fail each other for reasons that have nothing to do
+  # with the code.
+  #
+  # `cancel-in-progress: false` because a run that is halfway through has
+  # already spent the money and is already holding the account; cancelling it
+  # buys nothing and loses the result. Let it finish and queue the next.
+  group: e2e-live
+  cancel-in-progress: false
+
+permissions:
+  # Everything this workflow does is read the code and run the tests. It opens
+  # no PR, writes no comment, pushes no commit, and publishes no package.
+  contents: read
+
+jobs:
+  live:
+    # AN ALLOWLIST OF EVENT NAMES, so this job FAILS CLOSED. Each of the three
+    # triggers in the `on:` block above satisfies exactly one clause: a `push`
+    # (already narrowed to `main` there), a `workflow_dispatch`, or a
+    # `pull_request` that carries the label. The label requirement on the PR
+    # path is unchanged.
+    #
+    # This was written the other way round first — `github.event_name !=
+    # 'pull_request' || contains(…)` — on the reasoning that a trigger added
+    # later would then fail OPEN into running, which is visible, rather than
+    # silently never running. That trade is wrong for THIS job specifically,
+    # because this is the one job in the repository that holds an agent
+    # credential: "fails open" here means a `workflow_run`, a `schedule` or a
+    # `repository_dispatch` added by a future maintainer silently opts itself
+    # into a credentialed run, with no edit to this condition and nothing in the
+    # diff to notice. A new trigger that does not run is a missing line in this
+    # list and an obvious one to add; a new trigger that runs with the key is a
+    # security decision nobody made. There is no bypass today — the `on:` block
+    # is exactly these three — so this is hardening, kept in step with the
+    # environment reviewer rather than in place of it.
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+      contains(github.event.pull_request.labels.*.name, 'run-live-e2e'))
+    runs-on: ubuntu-latest
+
+    # #785 decision 2. The environment is what makes a credentialed job on
+    # freshly-merged code acceptable at all: holding the key as an ENVIRONMENT
+    # secret with a required reviewer means a merge QUEUES this run and waits
+    # for a human click, so merged code never auto-executes with the key.
+    # Environments and their protection rules are free on public repositories.
+    #
+    # Two things about it are deliberate and must not be "tidied up":
+    #
+    #   * NO deployment-branch restriction. Limiting the environment to `main`
+    #     would stop a branch PR exercising the credentialed path, which is
+    #     exactly the validate-before-merge property the label trigger above
+    #     exists for. Explicit constraint from both #502 and #785.
+    #   * the REQUIRED REVIEWER is set on the environment by the repository
+    #     owner, not here. A workflow cannot declare it, and it is the single
+    #     control that addresses the threat directly — an environment with no
+    #     reviewer is an environment-shaped repository secret.
+    environment: live-e2e
+
+    # A superset of the ~25-40 minutes the deterministic lane is budgeted for
+    # (see the `e2e-deterministic` job in ci.yml for how that number was
+    # derived), plus the real-agent files. Those are the slowest tests in the
+    # repository: `.config/nextest.toml` gives `tabs/orchestration/012` a
+    # 9 x 60s = 540s kill window against declared waits of over 500s, and
+    # several others sit at 300-480s. Like lane 1's, this is derived from the
+    # tier's own declared bounds rather than measured on a runner — nothing has
+    # ever run it here. Re-tune once honest runs exist.
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.143
+
+      # The same Tauri Linux deps ci.yml's `build` and `e2e-deterministic` jobs
+      # install, for the same reason: the alias carries `--workspace`, which
+      # includes desktop/src-tauri, and without them that crate does not build
+      # on this runner at all.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      # THE AGENT CLIs, and what each one actually buys on a runner.
+      #
+      # Every real-agent test opens with `skip_unless!(check_<agent>_available())`,
+      # which prints `SKIP: [e2e] <reason>` and RETURNS — nextest reports that as
+      # a pass. So an absent CLI never reddens this job; it silently removes
+      # coverage. That is why the run step below sets
+      # DOT_AGENT_DECK_REQUIRE_REAL_E2E, which converts every one of those skips
+      # into a hard failure: with it, an agent CLI that is missing or cannot
+      # authenticate is loud rather than invisible.
+      #
+      # ALL FOUR of the CLIs the tier can actually drive are installed, because
+      # since issue #502/#785 all four can authenticate from an API key:
+      #
+      #   * `pi` — `check_pi_available` (defined per-file in tests/e2e_pi_*.rs)
+      #     wants `pi` on PATH and a non-empty ANTHROPIC_API_KEY, and nothing
+      #     else. It has always worked this way. 5 test functions.
+      #   * `claude` — `check_claude_available` now accepts a non-empty
+      #     ANTHROPIC_API_KEY as a third path beside the credentials file and
+      #     the macOS Keychain, and the harness pre-answers Claude Code's
+      #     API-key approval prompt in the per-test `~/.claude.json` so an
+      #     interactive agent does not stall on it. 22 test functions — the bulk
+      #     of the tier. Measured on a virgin HOME with no credentials file at
+      #     any point: an interactive, tool-using Haiku agent, API-key
+      #     authenticated.
+      #   * `opencode` — same third path, offered only for an `anthropic/…`
+      #     test model, which is why the run step pins
+      #     DOT_AGENT_DECK_OPENCODE_TEST_MODEL. 2 test functions.
+      #   * `codex` — the one that genuinely needs a FILE: codex 0.149 answers
+      #     `401 Unauthorized` from an env key alone and reads its credential
+      #     from ~/.codex/auth.json. That file is produced non-interactively
+      #     from OPENAI_API_KEY by the provisioning step below, so the gate is
+      #     unchanged and its live model probe stays as the real proof of
+      #     reachability. 5 test functions.
+      #
+      # `devin` is deliberately NOT installed, and that is permanent rather than
+      # pending: `devin auth login` offers only a browser redirect or a manual
+      # paste-a-token flow, so there is no API-key path at all, and the
+      # credential would be a personal Cognition account session. Devin also
+      # bills every inference call. Its one test is excluded by name on the run
+      # step. See docs/develop/e2e-lanes.md.
+      #
+      # PINNED, and note what that costs: renovate.json's customManagers cover
+      # `toolchain:` and the nextest pin under .github/workflows, not npm
+      # packages, so nothing bumps these four. They need a deliberate manual
+      # bump, and an agent CLI moves fast. The claude and opencode pins are the
+      # exact versions the API-key path was measured against (2.1.252 and
+      # 1.18.25); the codex pin is the version `codex login --with-api-key` was
+      # measured against (0.149.0), deliberately not the newer 0.151.0, because
+      # nothing has yet exercised that command on a runner at all.
+      - name: Install the agent CLIs the live tier drives
+        run: |
+          npm install -g \
+            @earendil-works/pi-coding-agent@0.84.4 \
+            @anthropic-ai/claude-code@2.1.252 \
+            opencode-ai@1.18.25 \
+            @openai/codex@0.149.0
+          pi --version
+          claude --version
+          opencode --version
+          codex --version
+
+      # BUILD WITH NO SECRET IN THE ENVIRONMENT. This split is the point of
+      # having two steps rather than one, and #785 names why: `build.rs` is
+      # first on its list of surfaces a credentialed job exposes — arbitrary
+      # code at compile time, ahead of any test. Every build script in the
+      # dependency tree runs HERE, where `secrets.ANTHROPIC_API_KEY` is not in
+      # scope for anything.
+      #
+      # `cargo nextest list` rather than `cargo build --tests` because it is
+      # nextest's own build path, so the run step below finds every binary
+      # already fresh and compiles nothing.
+      #
+      # Be precise about what this does and does not guarantee. The run step
+      # still invokes cargo, which re-checks freshness; with nothing changed
+      # between the two steps no build script re-executes, so this is a
+      # freshness guarantee, not a hermetic seal. `cargo nextest archive` plus
+      # `--archive-file` would be one — it separates build from run completely —
+      # at the cost of a workspace-remap round trip that this lane cannot
+      # validate until the secret exists. Worth revisiting then.
+      - name: Build the test binaries (no credential in scope)
+        run: cargo nextest list --workspace --features e2e,e2e-live
+
+      # FAIL FAST ON AN EMPTY KEY — deliberately the LAST step before the
+      # credentialed ones, not the first step of the job.
+      #
+      # GitHub resolves a reference to an unset or empty secret to the EMPTY
+      # STRING, and every credential preflight in this tier treats an empty
+      # ANTHROPIC_API_KEY as an ordinary RUNTIME SKIP: `skip_unless!` prints
+      # `SKIP: [e2e] <reason>` and RETURNS, which nextest counts as a PASS (see
+      # `_skip_if_err` in tests/common/mod.rs). `cargo test-e2e-live` is also a
+      # SUPERSET run, so lane 1's 47 deterministic files still execute and still
+      # go green. Without this guard the job could therefore report SUCCESS with
+      # not one API-key-backed test having run — the exact silent-degradation
+      # shape CLAUDE.md rule 8 describes for RELEASE_TOKEN, and the reason
+      # release.yml and docs-publish.yml each verify their secret in their FIRST
+      # step.
+      #
+      # The run step's DOT_AGENT_DECK_REQUIRE_REAL_E2E now closes that same hole
+      # from the other side — a skip becomes a failure, so a keyless run cannot
+      # go green whether or not this guard exists. This guard is still worth
+      # keeping, and not merely for defence in depth: without it a missing
+      # secret is reported as 26 separate preflight failures deep in a 90-minute
+      # test run, and with it the job stops in seconds saying which secret to
+      # set and where.
+      #
+      # WHY NOT THE FIRST STEP HERE, then. That precedent does not transfer:
+      # rule 8 wants RELEASE_TOKEN checked first because a LATE failure there
+      # leaves a HALF-DONE RELEASE — a commit already pushed to `main`. A test
+      # job has no half-done state, so a late failure costs runner minutes and
+      # nothing else. Against that, step-1 placement had two real costs while
+      # the secret is still unset:
+      #
+      #   * every `run-live-e2e` labeled pre-merge run — the runs whose whole
+      #     purpose is validating this workflow BEFORE it merges — died having
+      #     exercised only this guard and the environment gate, and nothing of
+      #     the checkout, the toolchain, the apt install, the four npm agent
+      #     CLIs, the `cargo nextest list` build of all 71 superset targets, or
+      #     the two `if: always()` steps below;
+      #   * with no checkout, the `Strip test output` step (`if: always()`)
+      #     faulted on a missing `scripts/junit-strip-output.py`, so a keyless
+      #     run emitted a spurious SECOND failure on top of this step's clean
+      #     one — on exactly the run meant to prove the workflow works.
+      #
+      # The safety property is unchanged by the move. Each key is bound as a
+      # step-level `env:` on exactly the steps that need it — ANTHROPIC_API_KEY
+      # on this one and the run step, OPENAI_API_KEY on this one and the codex
+      # provisioning step — so neither is in scope for the checkout, the
+      # toolchain, the apt install, the npm install or the build step, and an
+      # empty key still cannot reach a cargo RUN. Keep both a hard `exit 1`: do
+      # not make either advisory, and do not branch either per trigger.
+      #
+      # WHAT IT DOES NOT COVER, stated the way rule 8 states it for
+      # RELEASE_TOKEN: emptiness is all it can check — unset, empty, or
+      # whitespace-only, and nothing else. A key that is present but EXPIRED,
+      # REVOKED or over its spend cap passes this guard and fails later — as
+      # real-agent test failures, which are at least loud rather than vacuous.
+      # Probing the key would cost an API call and add a failure mode of its own
+      # to the one credentialed path in the repository; rule 8 rejects exactly
+      # that trade, and it is rejected here for the same reason. Do not
+      # "improve" this into a live probe.
+      #
+      # A FORK `pull_request` fails HERE rather than going vacuously green.
+      # GitHub withholds non-GITHUB_TOKEN secrets from fork runs, so a
+      # maintainer who labels a fork PR gets an empty key; that run genuinely
+      # cannot exercise lane 2, and this guard says so instead of letting a
+      # green tick stand in for coverage that never happened. Neither lane is a
+      # required check (rule 8), so a red advisory job is the honest outcome.
+      #
+      # WHY THE SUBSTITUTION rather than a bare `-z`. `${VAR//[[:space:]]/}`
+      # deletes every whitespace character, so `-z` on the result is an "empty
+      # AFTER TRIMMING" test. That aligns the guard with the preflights, which
+      # is the whole point: all three `check_pi_available` copies call `.trim()`
+      # and treat a whitespace-only key as ABSENT (tests/e2e_pi_live.rs:110,
+      # tests/e2e_pi_orchestrator.rs:118, tests/e2e_pi_worker.rs:132), and
+      # `common::anthropic_api_key` — which `check_claude_available` and
+      # `check_opencode_available` now share — applies the same `.trim()` rule.
+      # Without it a malformed whitespace-only environment secret passes the
+      # guard and then fails 29 preflights instead of naming the secret.
+      #
+      # Neither value is printed: each is bound through `env:`, expanded only
+      # inside a `[ -z ]` test, and never assigned to a variable that something
+      # later could echo. Nothing here echoes them, and nothing that does should
+      # be added — note that a TRANSFORMED derivative of a key would not be
+      # covered by GitHub's masking of the registered value even if it were.
+      # That is not hypothetical for ANTHROPIC_API_KEY: Claude Code's API-key
+      # approval prompt renders the key's last 20 characters, so the test
+      # harness registers both the key and that suffix for recording redaction
+      # (`api_key_recording_redactions` in tests/common/mod.rs).
+      #
+      # BOTH KEYS ARE CHECKED, and both are hard failures. OPENAI_API_KEY was
+      # added with the codex provisioning step below: an empty value there does
+      # not fail `codex login --with-api-key` loudly enough to be safe to rely
+      # on, and even where it did, the failure would name the login rather than
+      # the missing secret. The two checks are deliberately identical in form
+      # (same trim, same hard `exit 1`) so neither can drift into being the
+      # lenient one, and each names its own consequence.
+      - name: Verify the API keys are present
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ANTHROPIC_API_KEY//[[:space:]]/}" ]; then
+            echo "::error::ANTHROPIC_API_KEY is unset, empty or whitespace-only, so the claude, opencode and pi halves of lane 2 (26 of the 31 gated tests this job selects) cannot run. The run step sets DOT_AGENT_DECK_REQUIRE_REAL_E2E, so those would now fail loudly rather than skip into a vacuous green — but they would fail 26 times over, naming the preflight rather than the missing secret. Set it as a secret on the \`live-e2e\` GitHub Environment — an environment secret, not a repository secret (issue #785). Note a fork pull request never receives it at all, by design. See docs/develop/e2e-lanes.md and CLAUDE.md rule 5."
+            exit 1
+          fi
+          if [ -z "${OPENAI_API_KEY//[[:space:]]/}" ]; then
+            echo "::error::OPENAI_API_KEY is unset, empty or whitespace-only, so the codex credential cannot be provisioned and the 5 codex-gated tests cannot run. Set it as a secret on the \`live-e2e\` GitHub Environment — an environment secret, not a repository secret (issue #785). Note a fork pull request never receives it at all, by design. See docs/develop/e2e-lanes.md and CLAUDE.md rule 5."
+            exit 1
+          fi
+
+      # THE ONLY STEP THAT SEES OPENAI_API_KEY, and the one place in this
+      # repository where a credential FILE is written.
+      #
+      # codex is the single agent in the tier that cannot run from an
+      # environment variable: measured on codex 0.149, `codex exec` with
+      # OPENAI_API_KEY ambient and an empty CODEX_HOME answers `401
+      # Unauthorized: Missing bearer or basic authentication in header`, and
+      # `codex login status` prints `Not logged in`. It reads its credential
+      # from ~/.codex/auth.json, which is where `check_codex_available` and
+      # `import_codex_credentials` both look (`host_home()`).
+      #
+      # That file is producible from the key in one non-interactive command, so
+      # this stays Path A — an API key — rather than becoming a second
+      # provisioned account session. `codex login --with-api-key` reads the key
+      # from STDIN; the resulting file is mode 0600 and contains exactly
+      # `{"auth_mode": "apikey", "OPENAI_API_KEY": "<key>"}`. Verified locally
+      # with a deliberately fake key.
+      #
+      # `printenv | pipe` rather than `codex login --with-api-key "$KEY"` or a
+      # heredoc: the value never becomes an argv element, so it cannot appear in
+      # `ps` output for any process on the runner, and it is never echoed.
+      #
+      # THE GATE IS DELIBERATELY NOT WIDENED to accept OPENAI_API_KEY the way
+      # `check_claude_available` was widened for ANTHROPIC_API_KEY.
+      # `check_codex_available` ends in a LIVE MODEL PROBE — one minimal
+      # `codex exec` that must write CODEX_AUTH_OK — and that probe is the real
+      # proof the credential can reach the model. Provisioning the file leaves
+      # it intact; widening the gate would replace a measurement with an
+      # assumption.
+      #
+      # WHAT THIS DOES NOT SETTLE, stated plainly: whether THIS repository's
+      # OPENAI_API_KEY can reach `gpt-5.1-codex-mini` (CODEX_TEST_MODEL_DEFAULT)
+      # is UNDETERMINED and cannot be determined off a runner — confirming it
+      # requires writing the real key into an auth.json, and the dev box this
+      # was written on has a ChatGPT-subscription auth.json, which that model
+      # family refuses. If the probe fails, the run step's
+      # DOT_AGENT_DECK_REQUIRE_REAL_E2E turns the five codex tests' skips into
+      # loud failures naming the probe — which is the honest way to find out.
+      # The remedy is then DOT_AGENT_DECK_CODEX_TEST_MODEL on the run step, not
+      # removing the flag.
+      - name: Provision the codex API-key credential
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: printenv OPENAI_API_KEY | codex login --with-api-key
+
+      # THE ONLY STEP THAT SEES ANTHROPIC_API_KEY. Not a workflow-level `env:`,
+      # not a job-level one — a step-level one, so the credential's reach is
+      # exactly the command that needs it.
+      #
+      # #785 decision 1: the API key, NOT the OAuth credential set from
+      # `~/.claude/.credentials.json`. That file is an account session carrying
+      # an accessToken AND a refreshToken; it cannot be scoped, cannot be
+      # spend-capped, and cannot be revoked without logging the owner out
+      # everywhere. Nothing in this workflow copies, synthesises or inspects an
+      # OAuth credential file, and nothing should be added that does. The one
+      # file the step above writes is a derivative of an API KEY, not a session:
+      # revoking that key kills it and logs nobody out of anything.
+      #
+      # DOT_AGENT_DECK_REQUIRE_REAL_E2E IS THE MOST IMPORTANT LINE IN THIS FILE.
+      # `REQUIRE_REAL_E2E_ENV` in tests/common/mod.rs turns every runtime skip
+      # into a PANIC. Without it, "the job passed" and "no agent ran" are the
+      # same observation, because every credential preflight skips into a pass
+      # and lane 1's 47 deterministic files carry the run green on their own.
+      # With it, a green lane 2 is PROOF that every selected real-agent test
+      # actually spawned an agent and did work.
+      #
+      # It is set UNCONDITIONALLY and there is deliberately NO escape hatch —
+      # no `if:`, no per-trigger branch, no repository variable that can turn it
+      # off. An off-switch on this flag is exactly the mechanism by which the
+      # vacuous green comes back, and it would come back silently: the job would
+      # still be green, and nothing in the run would say that the meaning of
+      # that green had changed. The escape hatch that IS needed is a different
+      # shape — a NAMED, reviewable exclusion of the tests that genuinely cannot
+      # run here, which is the `-E` filterset below. That names what is not
+      # covered, in the diff, where a reviewer sees it; a global off-switch
+      # names nothing.
+      #
+      # THE EXCLUSIONS, and why each is excluded rather than left to skip:
+      #
+      #   * `devin_live_001…` — devin is not installed and never will be here.
+      #     `devin auth login` offers only a browser redirect or a manual
+      #     paste-a-token flow, so there is no API-key path at all; the
+      #     credential would be a personal Cognition account session on a public
+      #     repo, and Devin bills every inference call. A deliberate PERMANENT
+      #     skip, recorded in docs/develop/e2e-lanes.md.
+      #   * `dispatch_013…` — additionally requires a non-empty GITHUB_TOKEN,
+      #     and it drives a LIVE GitHub fixture repository (clone, per-issue
+      #     worktree, remote-write leak assertions). Handing a credentialed job
+      #     a repository token is a #785 decision in its own right and has not
+      #     been taken; including it would fail this job on a secret nobody
+      #     deliberately granted. Enabling it is a separate, deliberate act.
+      #
+      # Nothing else is excluded. In particular the five codex tests are NOT:
+      # if this repository's OPENAI_API_KEY cannot reach the default codex
+      # model, they must go RED and say so, not skip.
+      #
+      # `--success-output=final` is not cosmetic, and it is the same flag
+      # `.claude/skills/verify-pr/checks.sh` passes for the same reason: a test
+      # that cannot run prints `SKIP: [e2e] <reason>` and returns NORMALLY, so
+      # nextest counts it as PASSED and, with nextest's defaults, suppresses the
+      # line entirely. That is now a panic rather than a pass, but the flag
+      # stays: the `Summarise the runtime skips` step below reads its count out
+      # of this log, and a lane-1 host-precondition skip is still worth seeing.
+      #
+      # DOT_AGENT_DECK_OPENCODE_TEST_MODEL is pinned to an ANTHROPIC model
+      # because the compiled-in default is `openai/gpt-5.4-mini`, which this
+      # runner has no OpenCode credential for — and `check_opencode_available`
+      # only offers its env-key path for an `anthropic/…` model, precisely so a
+      # mismatch skips honestly instead of failing deep in a PTY wait. Measured:
+      # `opencode run --model anthropic/claude-haiku-4-5` does real tool-using
+      # work in a virgin HOME from ANTHROPIC_API_KEY alone, writing no auth.json.
+      #
+      # The log goes to RUNNER_TEMP rather than under `target/` for two reasons:
+      # `Swatinem/rust-cache` persists `target/`, and a full-output log is the
+      # last thing to hand to a cross-run cache; and it keeps the file well away
+      # from the path the artifact step reads. It is deliberately NOT uploaded —
+      # GitHub's secret masking covers log RENDERING, not files copied out by
+      # `actions/upload-artifact`, so full test output stays in the masked
+      # surface and only the whitelisted `SKIP:` lines are lifted out of it by
+      # the step below.
+      - name: Run the live e2e tier
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DOT_AGENT_DECK_REQUIRE_REAL_E2E: "1"
+          DOT_AGENT_DECK_OPENCODE_TEST_MODEL: anthropic/claude-haiku-4-5
+        run: |
+          set -euo pipefail
+          cargo test-e2e-live --success-output=final \
+            -E 'not (test(=devin_live_001_real_interactive_turn_drives_the_card_live) or test(=dispatch_013_orchestration_surfaces_and_delegates))' \
+            2>&1 | tee "${RUNNER_TEMP}/e2e-live-run.log"
+
+      # THE SKIP EVIDENCE — a COUNT in the job log and the run summary.
+      # Deliberately not the reasons, and deliberately not in the uploaded
+      # artifact.
+      #
+      # READ THIS FIRST, because the run step's DOT_AGENT_DECK_REQUIRE_REAL_E2E
+      # changed what the number means. `_skip_if_err` asserts BEFORE it prints,
+      # so under that flag an unmet precondition panics and never emits a
+      # `SKIP: [e2e]` line at all. On a run that reaches this step having
+      # PASSED, the marked count is therefore 0 by construction — it is a
+      # consistency check on the flag, not independent evidence that agents ran.
+      # The evidence for that is now the job's own colour. The step keeps
+      # earning its place three ways: it reports the OTHER count (the xtask and
+      # unit-test skips a `--workspace` run legitimately produces, which the
+      # flag does not touch), it says so out loud when the test step never
+      # produced a log, and it is what would catch the flag silently going
+      # missing — a non-zero marked count on a green run means exactly that.
+      #
+      # `.config/nextest.toml` leaves `store-success-output` at its default of
+      # false, and these skips are SUCCESSFUL tests rather than
+      # framework-skipped ones, so the JUnit report never carried them however
+      # it was read. The step above puts them in the log; this step puts a count
+      # in the run summary, where it is visible without opening a 60-minute log.
+      #
+      # WHY ONLY A COUNT, and why the grep requires an `[e2e]` marker. An
+      # earlier version of this step lifted the distinct SKIP reasons into a
+      # fenced block, on the claim that `^[[:space:]]*SKIP: ` was a closed
+      # whitelist over one producer, `_skip_if_err`. That claim was FALSE in two
+      # separate ways, and both are fixed here rather than merely disclaimed.
+      #
+      #   * `cargo test-e2e-live` is a `--workspace` run, so it also selects
+      #     xtask/ and the root package's unit tests — and several of those
+      #     print `SKIP: ` lines of their own when `python3`, `node`, `jq` or
+      #     `bash` is missing (xtask/linkage-check/src/junit_strip.rs,
+      #     pin_lockstep.rs, verify_pr_stream.rs, issue_labeler_memory.rs,
+      #     clean_tmp.rs, and src/ui.rs). A bare `SKIP: ` count folded every one
+      #     of those into the number a maintainer reads to answer "did any
+      #     API-key-backed test actually run?". `_skip_if_err` now prints
+      #     `SKIP: [e2e] <reason>` and this grep requires the marker, so the
+      #     count is the e2e harness's own runtime skips and nothing else. It is
+      #     still BOTH lanes' skips — this is a superset run, so a lane-1
+      #     host-precondition skip counts here too — and the unmarked remainder
+      #     is reported separately rather than silently absorbed.
+      #   * More fundamentally, a prefix does not PROVE a producer. Any selected
+      #     test can print any line, and `_skip_if_err` takes an arbitrary
+      #     `String`, so the marker narrows the population but authenticates
+      #     nothing. Test output is therefore no longer treated as authenticated
+      #     metadata: a NUMBER is all that crosses into the summary. The reasons
+      #     stay in the masked job log, which is where the `gh run view … | grep`
+      #     in docs/develop/e2e-lanes.md points, and where GitHub's masking of
+      #     the registered secret applies.
+      #
+      # That also retires the injection surface the fenced block had: a matching
+      # line was emitted into a Markdown fence unescaped, so a crafted SKIP line
+      # could close the fence and write arbitrary Markdown into the job summary.
+      # With no test-authored text emitted there is no fence to terminate.
+      #
+      # The leading `[[:space:]]*` is load-bearing, not padding: nextest INDENTS
+      # captured output by four spaces under `--success-output=final`, so a
+      # `^SKIP: ` anchored at column 0 matches nothing and reports 0 on a run
+      # that really did skip. That precise mistake is recorded in checks.sh
+      # (issues #452, #490). checks.sh deliberately keeps the BROADER,
+      # marker-less pattern — it runs against whatever branch is checked out,
+      # including ones predating the marker, and it writes a local file for a
+      # human rather than a public summary — so the two patterns are related
+      # rather than identical now. Keep the indent handling in step.
+      - name: Summarise the runtime skips
+        if: always()
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/e2e-live-run.log"
+          echo "## e2e runtime skips" >>"${GITHUB_STEP_SUMMARY}"
+          echo >>"${GITHUB_STEP_SUMMARY}"
+          if [ ! -f "${log}" ]; then
+            echo "no run log: the test step did not get far enough to produce one"
+            echo "No run log — the test step did not get far enough to produce one." >>"${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          marked=$(grep -cE '^[[:space:]]*SKIP: \[e2e\] ' "${log}" || true)
+          case "${marked}" in '' | *[!0-9]*) marked=0 ;; esac
+          all=$(grep -cE '^[[:space:]]*SKIP: ' "${log}" || true)
+          case "${all}" in '' | *[!0-9]*) all=0 ;; esac
+          other=$(( all - marked ))
+          echo "e2e runtime skips: ${marked}; other workspace SKIP lines: ${other}"
+          if [ "${marked}" -eq 0 ]; then
+            echo "**0** e2e tests printed a SKIP line. This run sets \`DOT_AGENT_DECK_REQUIRE_REAL_E2E\`, under which an unmet credential precondition PANICS instead of skipping, so 0 is the expected reading and the job's colour is what carries the evidence that real agents ran." >>"${GITHUB_STEP_SUMMARY}"
+          else
+            echo "**${marked}** e2e test(s) printed a SKIP line and returned normally, so nextest counted every one of them as a PASS. That should be impossible on this workflow — \`DOT_AGENT_DECK_REQUIRE_REAL_E2E\` on the run step turns every such skip into a failure — so a non-zero count here means the flag is no longer reaching the tests. Read this number, not the colour." >>"${GITHUB_STEP_SUMMARY}"
+          fi
+          if [ "${other}" -gt 0 ]; then
+            echo >>"${GITHUB_STEP_SUMMARY}"
+            echo "**${other}** further SKIP line(s) came from elsewhere in this --workspace run (xtask and unit tests skipping for a missing python3, node, jq or bash) and are NOT counted above." >>"${GITHUB_STEP_SUMMARY}"
+          fi
+          echo >>"${GITHUB_STEP_SUMMARY}"
+          echo 'Only counts are reported here: test output is not authenticated metadata, so no test-authored text is copied into this summary. The reasons are in the masked job log — read them with `gh run view <run-id> --log | grep -E "^\s*SKIP: \[e2e\] "`, and drop the marker from that pattern to see the rest. See docs/develop/e2e-lanes.md.' >>"${GITHUB_STEP_SUMMARY}"
+
+      # Issue #785: the raw JUnit report is a CREDENTIAL SINK, so what gets
+      # uploaded is a metadata-only rebuild of it.
+      #
+      # nextest's JUnit defaults store stdout AND stderr for failed and retried
+      # tests, and this file is written by the cargo process that holds
+      # ANTHROPIC_API_KEY. If a test, an agent CLI, an HTTP error body, a panic
+      # diagnostic or a contributor-authored test emits the key, the raw value
+      # lands in the XML — and GitHub's secret masking does not extend to files
+      # `actions/upload-artifact` copies out. On a PUBLIC repository that
+      # artifact is downloadable by any logged-in reader.
+      #
+      # `scripts/junit-strip-output.py` REBUILDS the document from a per-element
+      # attribute whitelist rather than deleting the output elements from it, so
+      # the result is structurally incapable of carrying free text: no
+      # `<system-out>`, no `<system-err>`, no `<failure>`/`<error>` message or
+      # body, no text node anywhere, and a future nextest element is dropped by
+      # default instead of passed through. Run `--self-test` to see that proved.
+      #
+      # Turning `store-failure-output` off in `.config/nextest.toml` was the
+      # other option and was rejected: that file is shared by every lane and by
+      # `cargo test-fast`, so it would strip failure output out of the
+      # UNCREDENTIALED lanes' artifacts too, where it is pure diagnostic value
+      # and there is no key to protect.
+      - name: Strip test output from the JUnit report
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 scripts/junit-strip-output.py \
+            target/nextest/default/junit.xml \
+            "${RUNNER_TEMP}/junit-metadata.xml"
+
+      # Issue #564: keep THIS attempt's results after a job-level re-run
+      # overwrites the conclusion. Full rationale on the identical step in
+      # ci.yml's `build-macos` job. It matters most here: these are the flakiest
+      # tests in the repository and a re-run is the only remedy on offer
+      # (`retries = 0`).
+      #
+      # `path` is the STRIPPED file, and the raw report is never a fallback: if
+      # the step above fails or the tests never produced a report, there is
+      # simply nothing at this path, `if-no-files-found: warn` warns, and the run
+      # keeps its conclusion. What survives the strip is what #564 wants the file
+      # for — test names, outcomes, per-test wall clock, suite counts. The
+      # ran-versus-skipped distinction is NOT in here and never was; the run
+      # summary above is where that lives.
+      - name: Preserve this attempt's test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-e2e-live-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/junit-metadata.xml
+          if-no-files-found: warn

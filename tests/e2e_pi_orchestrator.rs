@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
 //! L2 REAL-`pi` orchestrator proof + scheduled/unattended Pi parity (PRD #201
 //! M4.1 + M4.2, test-plan rows 13-14). This is the flagship: a REAL `pi` agent,
@@ -129,38 +129,17 @@ fn check_pi_available() -> Result<(), String> {
 /// rather than being consumed answering the dialog. The returned TempDir must be
 /// kept alive for the worker's lifetime. Ported from
 /// `e2e_delegate_work_done_chain.rs::prepare_claude_home`.
+///
+/// Issue #502/#785: was a byte-for-byte copy of
+/// `e2e_delegate_work_done_chain.rs`'s version of the same helper, including its
+/// unconditional `fs::copy` of the host credentials file — a panic on any host
+/// authorised by an `ANTHROPIC_API_KEY`. Both now defer to the harness's own
+/// import + trust pair, which also pre-answers Claude Code's API-key approval
+/// prompt (`common::seed_claude_worker_home`).
 fn prepare_claude_home(worker_cwd: &str) -> TempDir {
-    let host_home = std::env::var("HOME").expect("HOME is set");
     let home = common::race_safe_tempdir();
-
-    std::fs::create_dir_all(home.path().join(".claude")).expect("mk .claude");
-    std::fs::copy(
-        Path::new(&host_home)
-            .join(".claude")
-            .join(".credentials.json"),
-        home.path().join(".claude").join(".credentials.json"),
-    )
-    .expect("copy claude credentials");
-
-    let host_cfg_path = Path::new(&host_home).join(".claude.json");
-    let mut cfg: serde_json::Value = std::fs::read_to_string(&host_cfg_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({ "hasCompletedOnboarding": true }));
-    if !cfg["projects"].is_object() {
-        cfg["projects"] = serde_json::json!({});
-    }
-    cfg["projects"][worker_cwd] = serde_json::json!({
-        "hasTrustDialogAccepted": true,
-        "hasCompletedProjectOnboarding": true,
-        "projectOnboardingSeenCount": 1,
-    });
-    std::fs::write(
-        home.path().join(".claude.json"),
-        serde_json::to_string(&cfg).expect("serialize .claude.json"),
-    )
-    .expect("write isolated .claude.json");
-
+    common::seed_claude_worker_home(home.path(), &[worker_cwd.to_string()])
+        .expect("seed the isolated Claude worker HOME");
     home
 }
 
@@ -328,7 +307,12 @@ async fn chain_smoke_pi_001_orchestrator_delegates_to_real_worker_inner() {
     // session_start (→ finished/Idle) status report can't be missed.
     let event_log = common::BroadcastEventLog::start(&daemon.event_tx);
 
-    // CRITICAL (harness caveat): explicitly propagate ANTHROPIC_API_KEY + HOME
+    // CRITICAL (harness caveat), and STILL required after issue #502/#785:
+    // that change forwards ANTHROPIC_API_KEY through `TuiDeckBuilder::launch`'s
+    // `inherit_pass`, and this spawn does not go through it — it builds
+    // `SpawnOptions.env` for an in-process daemon. Do not delete this as a
+    // duplicate of that.
+    // Explicitly propagate ANTHROPIC_API_KEY + HOME
     // (+ pane/socket/PATH) into the pi child. Never print the key.
     let anthropic_key =
         std::env::var("ANTHROPIC_API_KEY").expect("checked non-empty by check_pi_available");

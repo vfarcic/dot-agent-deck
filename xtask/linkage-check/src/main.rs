@@ -85,13 +85,30 @@ mod clean_tmp;
 /// script under `node`.
 #[cfg(test)]
 mod issue_labeler_memory;
+/// Issue #785: `scripts/junit-strip-output.py`, the stripper that makes the
+/// credentialed `e2e-live` job's uploaded JUnit report structurally incapable of
+/// carrying test output. Tests only — the rule lives in the script, and these
+/// drive the real one under `python3`.
+#[cfg(test)]
+mod junit_strip;
 mod list_tests;
 /// Issue #648: the toolchain pins duplicated between `devbox.json` and
 /// `.github/workflows/`. Tests only, and Unix only — the rule itself lives in
 /// `scripts/check-pin-lockstep.sh`, which CI's `devbox` job also runs directly.
 #[cfg(all(test, unix))]
 mod pin_lockstep;
+/// PRD #740: the job-graph properties in `release.yml` that keep a desktop
+/// bundler failure off the CLI release. Tests only — nothing can run that
+/// workflow outside a tag, so a bad edit is otherwise observable only after a
+/// release has gone out wrong.
+#[cfg(test)]
+mod release_workflow_wiring;
 mod repo_state;
+/// PRD #740: `desktop/scripts/prepare-sidecar.sh`'s Windows filename rule.
+/// Tests only, and Unix only — the rule lives in the script, which no CI job
+/// runs today because nothing cuts a Tauri bundle yet.
+#[cfg(all(test, unix))]
+mod sidecar_staging;
 /// Issue #521: the `/verify-pr` scripts' `KEY=value` output contract. Tests
 /// only — there is no runtime rule here, the scripts enforce themselves.
 #[cfg(test)]

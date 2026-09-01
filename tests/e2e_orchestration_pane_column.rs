@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
 //! PRD #311 — L2 (real-binary PTY) coverage for the Orchestration tab's
 //! `PaneLayout::Stacked` pane column: removing the non-focused roles'

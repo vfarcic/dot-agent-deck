@@ -1,10 +1,18 @@
 default_job = "test-fast"
 
-# These two mirror the `test-fast` / `test-e2e` aliases in .cargo/config.toml
-# and must keep doing so — a watch loop that runs a narrower tier than the
-# per-task gate is worse than no watch loop. `--workspace` in particular
-# (issue #489): without it cargo selects the root package alone and the
-# `xtask/*` members' tests never run.
+# These three mirror the `test-fast` / `test-e2e` / `test-e2e-live` aliases in
+# .cargo/config.toml and must keep doing so — a watch loop that runs a narrower
+# tier than the per-task gate is worse than no watch loop. `--workspace` in
+# particular (issue #489): without it cargo selects the root package alone and
+# the `xtask/*` members' tests never run.
+#
+# `test-fast` is the per-task gate (CLAUDE.md rule 5) and is the default job
+# above. The other two are the e2e tier's lanes: `test-e2e` is lane 1, the 47
+# `tests/e2e_*.rs` files needing no agent credential, and `test-e2e-live` is the
+# SUPERSET — all 71, so it needs a working agent credential. Since issue #502
+# neither is a pre-PR obligation; CI runs lane 1 on every PR and lane 2
+# per-merge on `main`. In a watch loop you almost always want one of these with
+# a filter appended (`bacon test-e2e -- lifecycle_001`), which is rule 6.
 [jobs.test-fast]
 command = ["cargo", "nextest", "run", "--workspace"]
 need_stdout = true
@@ -13,8 +21,49 @@ need_stdout = true
 command = ["cargo", "nextest", "run", "--workspace", "--features", "e2e"]
 need_stdout = true
 
+[jobs.test-e2e-live]
+command = ["cargo", "nextest", "run", "--workspace", "--features", "e2e,e2e-live"]
+need_stdout = true
+
+# The AUTHORITATIVE clippy gate, spelled exactly as CLAUDE.md rule 2, the
+# ci.yml `build` job and `.claude/skills/verify-pr/checks.sh` spell it. All four
+# flags are load-bearing (#407 `--all-targets --features e2e`, #436
+# `--workspace`, #502 `e2e-live`), and this was the ONE spelling in the
+# repository that carried none of them — a watch loop reporting green while the
+# real gate fails, which is the same hole class those three issues each closed in
+# their own corner, reopened in the place a contributor stares at all day.
+#
+# WHAT IT COSTS, measured rather than assumed, because rule 2's "~0.2s warm"
+# figure does NOT reproduce as an absolute cost on this checkout. Warm and back
+# to back on a 16-core box: the old bare command 3.8-4.4s, this one 9.3-10.4s.
+# So roughly +5.5s per watch-loop iteration, and neither command ever reaches a
+# no-op — both print `Compiling dot-agent-deck` every time, because build.rs
+# watches `.git/index` (PRD #103's build-id freshness rule) and that file moves
+# constantly. On top of that always-dirty root crate, the extra 5.5s is
+# re-linting the 71 `tests/e2e_*.rs` targets `--all-targets --features e2e` adds.
+#
+# The part of rule 2's claim that DOES hold is the one that matters here:
+# alternating does not invalidate anything. Run straight after
+# `cargo nextest list --workspace` this costs 10.4s against its own 9.5s floor,
+# not a full re-check, because cargo keeps the feature-on and feature-off
+# fingerprints side by side.
+#
+# Accepted deliberately: a watch loop whose clippy job is a weaker command than
+# the gate is a watch loop that lies, and 10s is a usable inner loop. For a
+# tighter one while iterating on `src/`, pass a filter to the test jobs above
+# (rule 6) rather than narrowing this command.
 [jobs.clippy]
-command = ["cargo", "clippy", "--", "-D", "warnings"]
+command = [
+    "cargo",
+    "clippy",
+    "--workspace",
+    "--all-targets",
+    "--features",
+    "e2e,e2e-live",
+    "--",
+    "-D",
+    "warnings",
+]
 need_stdout = false
 
 [jobs.fmt]

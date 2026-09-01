@@ -56,6 +56,17 @@ const WORKER_RESPONSE_TIMEOUT_ENV: &str = "DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOU
 const DELEGATE_READINESS_BUFFER_MS: u64 = 1000;
 const SLOW_STUB_NOT_READY_MS: u64 = 650;
 
+/// Issue #709: how long past its configured readiness buffer the slow-readiness
+/// fixture keeps looking for the delegate pointer.
+///
+/// Extracted from the `buffer_ms + 1200` this used to inline, because the two
+/// arms of `orchestration/delegate/012` now spend it differently and the
+/// difference is the point: the zero-buffer control pays it in full as a
+/// negative window and must NOT have it widened, while the buffered arm scales
+/// it with machine load because its wait ends the moment the pointer lands.
+#[cfg(unix)]
+const POINTER_DELIVERY_SLACK: Duration = Duration::from_millis(1200);
+
 /// How long `orchestration/delegate/010` waits for the pointer AFTER the
 /// replacement worker's matching `SessionStart` before calling it undelivered.
 ///
@@ -447,11 +458,17 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
         .await;
     let new_agent_id =
         wait_for_replacement_agent(&daemon.registry, WORKER_PANE, &old_agent_id).await;
-    let raw_ready = wait_for_snapshot_needle(
+    // Issue #709: THE wait this issue measured failing — a flat 2 s for a
+    // freshly spawned Python stand-in's very first byte, which on a 16-core box
+    // at load average 44 expired before the interpreter had been scheduled at
+    // all, so the assertion below reported `snapshot = ""` and read as a
+    // delivery defect rather than as starvation. `wait_for_child_first_output`
+    // keeps the condition and replaces the clock: a load-scaled ceiling, and an
+    // early return if the stand-in dies rather than prints.
+    let raw_ready = common::wait_for_child_first_output(
         &daemon.registry,
         &new_agent_id,
         b"DELEGATE-STUB-RAW-READY",
-        Duration::from_secs(2),
     )
     .await;
     assert!(
@@ -467,11 +484,17 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
         &serde_json::to_string(&event).expect("serialize slow-stub SessionStart"),
     )
     .expect("write slow-stub SessionStart");
+    // Issue #709: NOT a boot wait — the stub has already printed — but still a
+    // wait on something that must happen, so it gets the same load scaling. The
+    // band assertion on `measured_readiness_window` below is the real bound
+    // here; widening this ceiling only decides WHICH assertion reports a slow
+    // observation, and the band prints the measured figure while this one would
+    // print a misleading "never became input-aware".
     let cat_ready = wait_for_snapshot_needle(
         &daemon.registry,
         &new_agent_id,
         b"DELEGATE-STUB-CAT-READY",
-        Duration::from_secs(2),
+        common::load_scaled(Duration::from_secs(2)),
     )
     .await;
     let measured_readiness_window = session_start_at.elapsed();
@@ -483,11 +506,27 @@ async fn run_slow_readiness_delegate(buffer_ms: u64) -> SlowReadinessResult {
 
     let mut submitted_pointer = POINTER.to_vec();
     submitted_pointer.push(b'\r');
+    // Issue #709: the delegate's own delivery, and the one wait in this fixture
+    // whose length is part of what the caller asserts — so the two arms are
+    // budgeted differently ON PURPOSE.
+    //
+    // The zero-buffer CONTROL arm expects NOTHING to arrive, which makes this a
+    // NEGATIVE window: it is always paid in full, and stretching it would buy
+    // runtime rather than confidence. It keeps its fixed
+    // `POINTER_DELIVERY_SLACK` exactly as before. The buffered arm expects the
+    // pointer, so its wait returns the instant the needle lands and a
+    // load-scaled ceiling costs an idle box nothing while giving a contended one
+    // room to actually get there.
+    let pointer_wait = if buffer_ms == 0 {
+        POINTER_DELIVERY_SLACK
+    } else {
+        Duration::from_millis(buffer_ms) + common::load_scaled(POINTER_DELIVERY_SLACK)
+    };
     let snapshot = wait_for_snapshot_needle(
         &daemon.registry,
         &new_agent_id,
         &submitted_pointer,
-        Duration::from_millis(buffer_ms + 1200),
+        pointer_wait,
     )
     .await;
     SlowReadinessResult {
@@ -502,7 +541,11 @@ async fn wait_for_replacement_agent(
     pane_id: &str,
     old_agent_id: &str,
 ) -> String {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // Issue #709: a boot wait — the respawn has to fork and exec before the
+    // record exists — so it takes the load-scaled ceiling every boot leg in this
+    // file now takes. Condition-driven either way: it returns the instant the
+    // new record appears, so an idle box is not slowed by the wider ceiling.
+    let deadline = tokio::time::Instant::now() + common::child_boot_budget();
     loop {
         if let Some(record) = registry.agent_records().into_iter().find(|record| {
             record.pane_id_env.as_deref() == Some(pane_id) && record.id != old_agent_id

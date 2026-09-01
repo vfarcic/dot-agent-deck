@@ -24,6 +24,22 @@ test-fast = "nextest run --workspace"
 # declares. Timeout carve-outs therefore belong under
 # `[[profile.default.overrides]]`.
 test-e2e = "nextest run --workspace --features e2e"
+# Issue #502 lane 2. NOTE THE SHAPE: enabling BOTH features is a SUPERSET run
+# — all 71 `tests/e2e_*.rs` files, i.e. the 47 deterministic ones `test-e2e`
+# already runs PLUS the 24 credentialed ones. It is NOT a live-only run, and
+# there is deliberately no alias that selects the live subset alone: the 24
+# files open with `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, so
+# `e2e-live` without `e2e` compiles every e2e file to an empty crate.
+#
+# So the three lanes are: `test-fast` (fast tier), `test-e2e` (lane 1 — needs
+# no agent credentials, safe to run on every PR with no secrets present) and
+# `test-e2e-live` (lane 1 + lane 2 — needs a working agent credential;
+# credential handling is issue #785).
+#
+# `--workspace` for the same reason as the two aliases above (issue #489):
+# without it cargo selects the root package alone and every test in
+# `xtask/linkage-check` and `xtask/docs` drops out of the gate.
+test-e2e-live = "nextest run --workspace --features e2e,e2e-live"
 # PRD #77 Decision 7: `cargo xtask linkage-check` enforces catalog↔test
 # linkage. Args after the alias pass through to the binary.
 xtask = "run --quiet --package xtask-linkage-check --"

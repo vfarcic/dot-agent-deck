@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
 //! L2 PTY-attached REAL-agent test for PRD #227 M4 — Shift+Enter in an embedded
 //! agent pane inserts a NEWLINE instead of submitting the draft.

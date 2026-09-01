@@ -69,6 +69,16 @@ use serde_json::{Value, json};
 /// in this exact suffix is deck-owned.
 const HOOK_COMMAND_SUFFIX: &str = "hook --agent devin";
 
+/// The interpreter every Devin hook command is quoted for, and the reason it
+/// is a constant rather than the host: `devin_config_dir` returns `None` off
+/// Unix, so a Devin config can only ever be read where a POSIX shell runs it.
+///
+/// Named so the choice is assertable on Linux. Its two spellings produce
+/// byte-identical output on a POSIX host, so a regression back to
+/// `HookShell::Native` here is invisible to every test this project can run
+/// locally — which is exactly how it reached `build-windows` last time.
+const HOOK_SHELL: crate::agent_hook_config::HookShell = crate::agent_hook_config::HookShell::Posix;
+
 /// Serializes the read-modify-write of Devin's user config across concurrent
 /// in-process installs (the TUI's startup install racing a `daemon serve` one).
 /// Combined with the atomic temp-file+rename publish, this closes the
@@ -120,10 +130,15 @@ const DEVIN_HOOK_EVENTS: &[&str] = &[
 /// the path we would have to guess belongs to a *third-party* tool, and Devin —
 /// not this project — decides where its config lives on Windows. Writing hooks
 /// into a location Devin does not read would look like success while delivering
-/// nothing, and the POSIX quoting [`crate::platform::paths::shell_quote_if_needed`]
-/// applies to the hook command is not what Windows command parsing expects either. Native Windows
-/// support for the deck is itself still open (#42); today Windows users run
-/// under WSL, where the Unix branch below is the correct one.
+/// nothing. (The second reason this used to give — that the hook command came
+/// out POSIX-quoted, which is not what Windows command parsing expects — has
+/// stopped being a reason in either direction as of #734, which made the
+/// quoting follow the *interpreter*: `install_to` below asks
+/// `agent_hook_config::build_command` for `HookShell::Posix` unconditionally,
+/// precisely because this function is what confines Devin to Unix. The reason
+/// above is the one that stands, and it is sufficient on its own.) Native
+/// Windows support for the deck is itself still open (#42); today Windows users
+/// run under WSL, where the Unix branch below is the correct one.
 ///
 /// Returns `None` when no real home resolves, so a guarded caller never writes
 /// into a throwaway `/tmp` config.
@@ -365,7 +380,8 @@ pub fn install_to(config_dir: &Path, binary_path: &str) -> io::Result<()> {
     let mut root = read_config(&path)?;
     validate_structure(&root)?;
 
-    let command = crate::agent_hook_config::build_command(binary_path, HOOK_COMMAND_SUFFIX);
+    let command =
+        crate::agent_hook_config::build_command(binary_path, HOOK_COMMAND_SUFFIX, HOOK_SHELL);
     install_impl(&mut root, &command);
     let contents = serde_json::to_string_pretty(&root)?;
     crate::agent_hook_config::write_atomic(config_dir, &path, contents.as_bytes())
@@ -669,6 +685,26 @@ mod tests {
         );
     }
 
+    /// Devin's hook commands are quoted for a POSIX shell on EVERY host, not
+    /// for the host's own shell.
+    ///
+    /// `install_to` writes a Devin config without passing through
+    /// `devin_config_dir()`, the gate that confines Devin to Unix, so taking the
+    /// dialect from `cfg!(windows)` produced `cmd.exe` quoting on a Windows
+    /// runner and turned `build-windows` red (PR #782). The constant is asserted
+    /// directly because on this POSIX host the two spellings emit identical
+    /// bytes: `install_quotes_a_binary_path_with_spaces` below would stay green
+    /// through the regression, and only a Windows runner would notice.
+    #[test]
+    fn hook_commands_are_quoted_for_a_posix_shell_on_every_host() {
+        assert_eq!(
+            HOOK_SHELL,
+            crate::agent_hook_config::HookShell::Posix,
+            "Devin runs only where a POSIX shell does, so its hook command must \
+             never be quoted for the host's shell"
+        );
+    }
+
     /// A path with whitespace is quoted so Devin parses the intended argv, and
     /// the resulting command is still recognized as deck-owned.
     #[test]
@@ -897,15 +933,15 @@ mod tests {
         }
         let root = read_back(&config_dir);
         // Compared against the writer's OWN command builder rather than a
-        // hand-spelled `<path> <suffix>`: `build_command` quotes through
-        // `platform::paths::shell_quote_if_needed`, which is POSIX-only on every
-        // platform, so a Windows path (backslashes are outside its safe set)
-        // comes back single-quoted. The value under test here is the PATH the
-        // resolver produced, not the quoting, and this way the assertion stays
+        // hand-spelled `<path> <suffix>`: this writer asks for `HookShell::Posix`,
+        // so a Windows path (backslashes are outside the POSIX safe set) comes
+        // back single-quoted on every host. The value under test here is the PATH
+        // the resolver produced, not the quoting, and this way the assertion stays
         // exact on both platforms instead of pinning one platform's spelling.
         let expected = crate::agent_hook_config::build_command(
             durable.to_str().expect("durable is UTF-8"),
             HOOK_COMMAND_SUFFIX,
+            HOOK_SHELL,
         );
         for &event in DEVIN_HOOK_EVENTS {
             let commands = deck_commands_for(&root, event);

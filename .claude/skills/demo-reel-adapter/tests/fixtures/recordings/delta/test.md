@@ -1,6 +1,6 @@
 # mouse/button/004 — Delta renders its label.
 
-**Source:** `tests/e2e_mouse_button.rs::delta`
+**Source:** `tests/e2e_mouse_delta.rs::delta`
 **Catalog:** tests/CATALOG.md
 **Cast:** `full-stream.cast`
 

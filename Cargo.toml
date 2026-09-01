@@ -148,10 +148,29 @@ libc = "0.2"
 
 [features]
 # PRD #77 Decision 6: `cargo test-e2e` (alias) enables this feature so
-# the L2 PTY suite compiles in. CI runs `cargo test-fast` only and never
-# sees these tests. Each `tests/e2e_*.rs` file opens with
-# `#![cfg(feature = "e2e")]`.
+# the L2 PTY suite compiles in. Every one of the 71 `tests/e2e_*.rs` files
+# opens with a `feature = "e2e"` cfg — 47 with a bare
+# `#![cfg(feature = "e2e")]`, and 24 also requiring `e2e-live` below.
+#
+# The original comment here said "CI runs `cargo test-fast` only and never
+# sees these tests". That has been false twice over. Issue #407 put
+# `--all-targets --features e2e` on the `build` job's clippy step, so CI has
+# COMPILED them since then; and issue #502 added the `e2e-deterministic` job,
+# so CI now RUNS the 47 deterministic ones on every PR, with the other 24
+# running from e2e-live.yml. CLAUDE.md rule 5 has the three lanes.
 e2e = []
+
+# Issue #502 (decided strategy: three lanes, split by credential need) —
+# selects the credentialed SUBSET of the L2 suite. The 24 `tests/e2e_*.rs`
+# files that need a working agent credential to pass (a `check_*_available`
+# preflight, an imported credentials file, or `ANTHROPIC_API_KEY`) open with
+# `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`; the other 47 keep the
+# bare `#![cfg(feature = "e2e")]` and need no secrets at all. So
+# `cargo test-e2e` is lane 1 (deterministic, every PR) and
+# `cargo test-e2e-live` is lane 1 + lane 2 — enabling both features is a
+# SUPERSET run, not a live-only run. Credential handling for the lane-2 CI job
+# is issue #785.
+e2e-live = []
 
 [[example]]
 name = "send_event"

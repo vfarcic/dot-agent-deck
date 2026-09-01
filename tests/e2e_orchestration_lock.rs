@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
 //! L2 end-to-end coverage for the command-entry lock on Orchestration tabs.
 //!

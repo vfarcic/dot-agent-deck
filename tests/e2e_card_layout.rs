@@ -1,4 +1,4 @@
-#![cfg(all(feature = "e2e", unix))]
+#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]
 
 //! Reel-eligible PTY coverage for the dashboard card width contract. The test
 //! drives a genuine interactive Claude Code turn through one client while a

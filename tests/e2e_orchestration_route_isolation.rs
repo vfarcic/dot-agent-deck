@@ -1,4 +1,4 @@
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
 //! L2 PTY-attached, REAL-agent proof that two tabs of the SAME orchestration in
 //! the SAME directory do NOT cross-deliver delegate / work-done (PRD #140 M5.1,

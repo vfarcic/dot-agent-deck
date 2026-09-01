@@ -7,8 +7,9 @@
 # Usage: checks.sh [--dir <worktree>] [--no-e2e] [--only <a,b,c>] [--filter <expr>]
 #
 #   --dir     worktree to run in (default: current directory)
-#   --no-e2e  skip the e2e tier (CLAUDE.md rule 5's expensive tier: spawns real
-#             binaries and hits real LLM APIs, so it costs money and minutes)
+#   --no-e2e  skip lane 1 of the e2e tier (CLAUDE.md rule 5). Lane 1 needs no
+#             credentials, but it still spawns real binaries and PTYs, so it
+#             costs minutes
 #   --only    comma-separated subset of: fmt,clippy,build,test-fast,
 #             linkage-check,windows-cross,audit,e2e
 #   --filter  test-name filter passed to the test steps, for rule 6's
@@ -161,7 +162,7 @@ build_ok=true
 wanted fmt && { run_step fmt "cargo fmt --check" || true; } || skip fmt "not in --only"
 
 # CLAUDE.md rule 2, and the Linux `build` job in ci.yml matches this exactly.
-# All three flags matter. Both of #407's: without `--all-targets` no test
+# All four flags matter. Both of #407's: without `--all-targets` no test
 # target is built at all, and without `--features e2e` every `tests/e2e_*.rs`
 # compiles to an empty crate — so the bare `cargo clippy` this used to run
 # reported clean over a build that never contained the e2e code under review.
@@ -170,12 +171,19 @@ wanted fmt && { run_step fmt "cargo fmt --check" || true; } || skip fmt "not in 
 # touching only `xtask/*` — linkage-check, the docs generator, the `spec`
 # macro — was reviewed against a lint that never read a line of it.
 #
-# The e2e step further down still runs the tier itself; this one only
-# type-checks and lints it, in seconds, before the expensive steps start.
+# `e2e-live` (issue #502) is the same hole reopened for the 24 credentialed
+# files, which now open with
+# `#![cfg(all(feature = "e2e", feature = "e2e-live"))]` and are empty crates
+# under `--features e2e` alone. This gate is where a reviewer catches a break
+# in them: the e2e step below runs LANE 1 only, so without this second feature
+# a PR touching a real-agent test would be reviewed against no compilation of
+# it at all.
 #
-# build-windows/build-macos still run bare `cargo clippy` (the L2 tier is
-# Unix-only), so a Linux-only lint here is expected and correct.
-wanted clippy && { run_step clippy "cargo clippy --workspace --all-targets --features e2e -- -D warnings" || true; } || skip clippy "not in --only"
+# This is a type-check and lint, so naming `e2e-live` costs no credential and
+# runs no live test. build-windows/build-macos still run bare `cargo clippy`
+# (the L2 tier is Unix-only), so a Linux-only lint here is expected and
+# correct.
+wanted clippy && { run_step clippy "cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings" || true; } || skip clippy "not in --only"
 
 if wanted build; then
   run_step build "cargo build --release" || build_ok=false
@@ -241,7 +249,18 @@ else
   skip audit "not in --only"
 fi
 
-# --- e2e: the tier that actually exercises the product -------------------
+# --- e2e lane 1: the deterministic tier that exercises the product -------
+#
+# LANE 1 ONLY (issue #502, CLAUDE.md rule 5). This step runs `--features e2e`,
+# i.e. the 47 `tests/e2e_*.rs` files that need no agent credential. The other
+# 24 need one and are lane 2, which runs from `.github/workflows/e2e-live.yml`
+# — per-merge on `main`, on `workflow_dispatch`, and on a PR when the
+# `run-live-e2e` label is applied. This skill deliberately does NOT run lane 2:
+# a reviewer's machine would need its own agent credentials, the run costs real
+# tokens, and those tests are the flakiest signal in the repo. If the PR under
+# review touches real-agent paths, label it `run-live-e2e` and read that
+# workflow's run rather than running it here — docs/develop/e2e-lanes.md has
+# the how, including why a GREEN lane-2 run can still mean almost nothing.
 
 if [ "$run_e2e" != true ]; then
   skip e2e "--no-e2e was passed — SAY SO in the report; do not present the run as complete"
@@ -252,14 +271,19 @@ elif [ "$build_ok" != true ]; then
 elif [ "$have_nextest" != true ]; then
   record e2e BLOCKED 0 - "cargo-nextest missing"
 else
-  # `--success-output=final` is NOT cosmetic. Real-agent tests that cannot run
-  # (agent CLI absent, credentials expired) print `SKIP: <reason>` and return
-  # NORMALLY, so nextest counts them as PASSED. Without this flag nextest
-  # suppresses passing tests' output and those skips are invisible — a green
-  # e2e run that proved nothing. See `REQUIRE_REAL_E2E_ENV` in tests/common/mod.rs.
+  # `--success-output=final` is NOT cosmetic. Tests that cannot run print
+  # `SKIP: <reason>` and return NORMALLY, so nextest counts them as PASSED.
+  # Without this flag nextest suppresses passing tests' output and those skips
+  # are invisible — a green run that proved nothing. See `REQUIRE_REAL_E2E_ENV`
+  # in tests/common/mod.rs. Lane 1 needs no credentials, so a SKIP here is a
+  # missing local tool or an unmet host precondition rather than an absent key —
+  # which makes it MORE interesting, not less: CI's `e2e-deterministic` job is
+  # expected to run these for real.
   # `--workspace` (issue #489): same reason as the test-fast step above — keep
-  # this in lockstep with the `test-e2e` alias in .cargo/config.toml.
-  run_step e2e "cargo nextest run --workspace --features e2e --success-output=final${test_filter}" "rule 5 e2e tier" || true
+  # this in lockstep with the `test-e2e` alias in .cargo/config.toml. Note that
+  # alias is lane 1 exactly; `test-e2e-live` is the superset and is not run
+  # here.
+  run_step e2e "cargo nextest run --workspace --features e2e --success-output=final${test_filter}" "rule 5 lane 1 (deterministic e2e)" || true
 
   e2e_log="${logs}/e2e.log"
   if [ -f "$e2e_log" ]; then
@@ -277,6 +301,20 @@ else
     # `|| true`, not `|| echo 0`: grep -c already PRINTS "0" when it matches
     # nothing and only then exits 1, so `|| echo 0` produces "0\n0" and the
     # numeric test below dies with "integer expression expected".
+    #
+    # DELIBERATELY MARKER-LESS, and this is the one place the pattern does NOT
+    # match e2e-live.yml byte for byte. Since #502/#785 `_skip_if_err` in
+    # tests/common/mod.rs prints `SKIP: [e2e] <reason>`, and that workflow's
+    # summary requires the `[e2e]` marker so its count is not polluted by the
+    # xtask and unit-test `SKIP:` lines a `--workspace` run also selects. This
+    # script keeps the broader pattern for two reasons: it runs against whatever
+    # branch a contributor's PR is on, including branches that predate the
+    # marker, where requiring it would silently report 0 and re-open #452/#490;
+    # and its output is a local file for the human running /verify-pr, not a
+    # public job summary, so over-counting here costs a second of reading rather
+    # than a wrong answer on a trusted surface. The consequence to know when
+    # reading the row below: on a workspace missing `bash`, `jq`, `node` or
+    # `python3` this count includes those tools' own skips.
     skips=$(grep -cE '^[[:space:]]*SKIP: ' "$e2e_log" 2>/dev/null || true)
     [[ "$skips" =~ ^[0-9]+$ ]] || skips=0
     emit E2E_RUNTIME_SKIPS "$skips" | tee -a "${out}/env.txt"

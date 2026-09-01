@@ -14309,6 +14309,47 @@ enum FrameContent {
     },
 }
 
+/// Process-wide one-shot guard for the [`clamp_pane_target_dims`] notice: a
+/// terminal wider than the cap stays wide, so without this the line would be
+/// emitted once per pane per frame forever.
+static PANE_TARGET_CLAMPED_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Issue #747 — bound a layout-derived PTY target to the geometry the daemon
+/// will actually apply to the child ([`crate::agent_pty::PTY_RESIZE_DIM_MAX`]).
+///
+/// `pane_target_dims` is the single source `resize_panes_to_layout` drives
+/// every pane from, so clamping HERE is what makes all four participants in a
+/// resize agree: the layout target, the local vt100 parser, the
+/// `AttachRequest::Resize` on the wire, and the child PTY. Clamping only
+/// further downstream would also break `resize_panes_to_layout`'s
+/// "commit only a real delta" check, which compares this target against the
+/// pane's current parser size — an unclamped target could never equal a
+/// clamped parser, so a very wide terminal would re-send a resize every frame.
+///
+/// The clamp is deliberately **not** a refusal: a terminal wider than the cap
+/// gets a pane that fills 4096 of its columns (the rest rendered blank by
+/// `TerminalWidget`'s `min(area, screen)` fallback), which is strictly better
+/// than a pane frozen at its previous geometry. It is also no longer silent —
+/// one `warn!` per process says why the pane stops short of the screen edge.
+fn clamp_pane_target_dims(rows: u16, cols: u16) -> (u16, u16) {
+    let clamped = crate::agent_pty::clamp_pty_dims(rows, cols);
+    if clamped != (rows, cols)
+        && !PANE_TARGET_CLAMPED_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(
+            target_rows = rows,
+            target_cols = cols,
+            applied_rows = clamped.0,
+            applied_cols = clamped.1,
+            max = crate::agent_pty::PTY_RESIZE_DIM_MAX,
+            "pane is larger than the maximum PTY geometry: the agent runs at the capped size \
+             and the remaining rows/columns of the pane render blank (logged once per process)"
+        );
+    }
+    clamped
+}
+
 impl FrameLayout {
     /// PRD #84 M4 — every local terminal pane's target PTY size `(rows, cols)`
     /// keyed by pane id, derived from its layout rect: the bordered
@@ -14327,8 +14368,12 @@ impl FrameLayout {
     /// actually expanded this frame). `Tiled` is untouched: a zero-height
     /// `Tiled` rect is a genuine "no room" case, not an undrawn pane.
     fn pane_target_dims(&self) -> Vec<(&str, u16, u16)> {
-        // Inner area of a bordered pane = outer minus 1 cell on each side.
-        let dims = |rect: Rect| (rect.height.saturating_sub(2), rect.width.saturating_sub(2));
+        // Inner area of a bordered pane = outer minus 1 cell on each side,
+        // then bounded by what the daemon will actually give the child
+        // (issue #747 — see `clamp_pane_target_dims`).
+        let dims = |rect: Rect| {
+            clamp_pane_target_dims(rect.height.saturating_sub(2), rect.width.saturating_sub(2))
+        };
         let mut out = Vec::new();
         match &self.content {
             FrameContent::Cards {
@@ -23424,6 +23469,171 @@ mod tests {
                 unzoomed.iter().map(|(_, r, _)| *r).collect::<Vec<_>>(),
                 "zooming must not change the pane row budget — it hides the \
                  sidebar and the non-focused panes, nothing else"
+            );
+        }
+    }
+
+    /// Scenario: Issue #747 — lay out an orchestration tab on a terminal far
+    /// wider than `PTY_RESIZE_DIM_MAX` (4200 cols zoomed, 6400 cols unzoomed),
+    /// run the real per-frame `resize_panes_to_layout` sweep over inert panes,
+    /// then read each pane's local vt100 parser back. The daemon clamps every
+    /// axis of a resize request to the cap before it reaches the child PTY, so
+    /// the client's parser must land on that SAME capped geometry — otherwise
+    /// the pane parses the agent's output at one width while the child wraps it
+    /// at another and the content renders rewrapped. The control is the same
+    /// sweep at an ordinary 4200-col unzoomed width, whose 2770-col target is
+    /// under the cap and must therefore be left exactly alone.
+    #[spec("resize/layout/002")]
+    #[test]
+    fn resize_layout_002_over_cap_pane_targets_the_geometry_the_child_gets() {
+        use crate::agent_pty::PTY_RESIZE_DIM_MAX;
+
+        let role_pane_ids = vec!["r0".to_string(), "r1".to_string()];
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["wide-tab".into()],
+            active_index: 0,
+            orchestration_statuses: vec![Some(vec![])],
+        };
+
+        // Drive the production chain the main loop runs: one layout pass, then
+        // the PTY-sizing sweep over it. Returns, per pane, the dims the layout
+        // asked for and the geometry the local parser actually ended up at.
+        let sweep = |width: u16, zoomed: bool| -> Vec<(u16, u16, u16, u16)> {
+            let ctrl = EmbeddedPaneController::for_render_seam_with_focused_pane("r0", 24, 80, b"");
+            // Held for the life of the sweep: dropping a pane's child-input
+            // receiver closes its channel, a state this seam has no reason to pose.
+            let _child_inputs: Vec<_> = role_pane_ids
+                .iter()
+                .skip(1)
+                .map(|id| ctrl.add_scroll_seam_pane(id, 24, 80, b""))
+                .collect();
+
+            let tab_view = ActiveTabView::Orchestration {
+                role_pane_ids: role_pane_ids.clone(),
+                split_narrow: false,
+                zoomed,
+            };
+            let layout = compute_frame_layout(
+                Rect::new(0, 0, width, 40),
+                &tab_view,
+                &tab_bar,
+                &role_pane_ids,
+                PaneLayout::Stacked,
+                Some("r0"),
+                1,
+            );
+            let targets: Vec<(String, u16, u16)> = layout
+                .pane_target_dims()
+                .into_iter()
+                .map(|(id, rows, cols)| (id.to_string(), rows, cols))
+                .collect();
+            resize_panes_to_layout(&layout, &ctrl);
+            targets
+                .into_iter()
+                .map(|(id, rows, cols)| {
+                    let (parser_rows, parser_cols) = ctrl
+                        .get_screen(&id)
+                        .expect("every laid-out pane must be registered on the seam controller")
+                        .lock()
+                        .expect("the seam parser lock must stay healthy")
+                        .screen()
+                        .size();
+                    (rows, cols, parser_rows, parser_cols)
+                })
+                .collect()
+        };
+
+        // What `AgentPtyRegistry::resize` will actually hand the child, spelled
+        // out here rather than borrowed from the production helper so the test
+        // restates the daemon's rule instead of echoing it.
+        let child_geometry =
+            |rows: u16, cols: u16| (rows.min(PTY_RESIZE_DIM_MAX), cols.min(PTY_RESIZE_DIM_MAX));
+
+        // --- Control: 4200 cols unzoomed. The 66% column is 2770 inner cols,
+        // comfortably under the cap, so nothing may be clamped here. ---
+        for (target_rows, target_cols, parser_rows, parser_cols) in sweep(4200, false) {
+            assert_eq!(
+                (target_rows, target_cols),
+                (36, 2770),
+                "control: an under-cap pane must target its full inner rect"
+            );
+            assert_eq!(
+                (parser_rows, parser_cols),
+                (36, 2770),
+                "control: an under-cap pane's parser must be left at its full \
+                 inner rect — the cap may not narrow an ordinary pane"
+            );
+        }
+
+        // --- Zoomed at 4200 cols: the pane column is the whole frame, so the
+        // inner width is 4198 — over the cap, which is the PRD #313 threshold. ---
+        // --- Unzoomed at 6400 cols: the 66% column is 4222 inner cols — over
+        // the cap too, which is the pre-existing, layout-independent threshold. ---
+        for (width, zoomed, raw_cols) in [(4200u16, true, 4198u16), (6400, false, 4222)] {
+            assert!(
+                raw_cols > PTY_RESIZE_DIM_MAX,
+                "fixture must actually exceed the cap ({raw_cols} vs {PTY_RESIZE_DIM_MAX})"
+            );
+            for (target_rows, target_cols, parser_rows, parser_cols) in sweep(width, zoomed) {
+                assert_eq!(
+                    (target_rows, target_cols),
+                    child_geometry(36, raw_cols),
+                    "at {width} cols (zoomed={zoomed}) the layout's PTY target must \
+                     already be the capped geometry — it is the single source \
+                     `resize_panes_to_layout` drives every pane from, so an \
+                     over-cap value here reaches the wire and the local parser \
+                     while the child gets something narrower"
+                );
+                assert_eq!(
+                    (parser_rows, parser_cols),
+                    child_geometry(36, raw_cols),
+                    "at {width} cols (zoomed={zoomed}) the local vt100 parser must \
+                     sit at the SAME geometry the daemon hands the child \
+                     ({PTY_RESIZE_DIM_MAX} cols max); parsing the agent's output \
+                     at {parser_cols} cols while the child wraps it at \
+                     {PTY_RESIZE_DIM_MAX} is issue #747's rewrapped pane"
+                );
+            }
+        }
+
+        // --- The resize PRIMITIVE, not just the layout that drives it. The
+        // layout sweep above is the only production caller today, but
+        // `resize_pane_pty` is a `pub` method whose two halves must not be able
+        // to disagree: whatever it hands `set_size` is also what it puts on the
+        // watch channel bound for `AttachRequest::Resize`. Bounding only the
+        // layout would leave the divergence one new call site away. ---
+        // One over-cap axis at a time, each paired with a small one: a parser
+        // that is over-cap on BOTH axes is 16.7M cells, which is real time and
+        // real memory to buy no extra coverage of a per-axis `min`.
+        let ctrl = EmbeddedPaneController::for_render_seam_with_focused_pane("wide", 24, 80, b"");
+        let _tall_input = ctrl.add_scroll_seam_pane("tall", 24, 80, b"");
+        for (pane_id, req, want) in [
+            (
+                "wide",
+                (24, PTY_RESIZE_DIM_MAX + 200),
+                (24, PTY_RESIZE_DIM_MAX),
+            ),
+            (
+                "tall",
+                (PTY_RESIZE_DIM_MAX + 1, 80),
+                (PTY_RESIZE_DIM_MAX, 80),
+            ),
+        ] {
+            ctrl.resize_pane_pty(pane_id, req.0, req.1)
+                .expect("resizing a registered seam pane must succeed");
+            let got = ctrl
+                .get_screen(pane_id)
+                .expect("the seam controller must register its panes")
+                .lock()
+                .expect("the seam parser lock must stay healthy")
+                .screen()
+                .size();
+            assert_eq!(
+                got, want,
+                "resize_pane_pty({}x{}) must clamp before touching the parser, so the \
+                 parser can never be told a geometry the daemon would narrow behind it",
+                req.0, req.1
             );
         }
     }

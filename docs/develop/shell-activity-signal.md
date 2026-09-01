@@ -54,9 +54,11 @@ The assumption that nothing else detaches was measured **once, on one machine, w
 
 ## How rot is detected in practice — and when it is not
 
-Both canaries are **real-agent e2e tests**. They need Claude credentials, and **CI has none**, so both self-skip there and report green. They only ever fire when someone runs the e2e tier locally (`cargo test-e2e shell_activity_005` / `…_007`, CLAUDE.md rule 5 exception (a)).
+Both canaries are **real-agent e2e tests**. They live in `tests/e2e_shell_activity_real_agent.rs`, which since issue #502 is gated `#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — so they are lane 2, and lane 1 (the job that runs on every PR) does not compile them at all.
 
-The practical consequence: **a green CI run says nothing at all about whether this signal still works.** Rot is caught at the pre-PR local e2e run, or not at all. If you are touching the scan, the monitor, or the pane primitive, run those two tests locally — that is the only place the coupling is checked against reality.
+Lane 2 *does* run in CI, per-merge on `main`, and since issue #502/#785 that is no longer a formality: both open with `skip_unless!(common::check_claude_available())`, which now accepts a non-empty `ANTHROPIC_API_KEY` as a third path beside `~/.claude/.credentials.json` and the macOS Keychain — so both genuinely run there against a real Haiku agent. That lane also sets `DOT_AGENT_DECK_REQUIRE_REAL_E2E`, which turns a runtime skip into a failure rather than the **pass** nextest would otherwise count it as. See [`e2e-lanes.md`](e2e-lanes.md).
+
+The practical consequence is unchanged and worth stating in the strong form: **a green CI run — either lane — says nothing at all about whether this signal still works.** Rot is caught by running these two locally, or not at all. If you are touching the scan, the monitor, or the pane primitive, run `cargo test-e2e-live shell_activity_005` and `…_007` on a machine with real Claude credentials, ideally under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` so a missing credential fails instead of silently passing.
 
 ## What is measured and what is inference
 

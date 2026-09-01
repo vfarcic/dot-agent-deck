@@ -49,6 +49,11 @@ const ORCHESTRATION: &str = "recovery-orchestration";
 const ORCHESTRATION_ID: &str = "recovery-instance-1";
 const POINTER: &[u8] = b"Read .dot-agent-deck/worker-task-coder.md for your task.";
 
+/// Issue #709: what the SIGTERM-ignoring stand-in prints once — and only once —
+/// its `trap '' TERM` is installed, so `delegate/022` can wait for the state its
+/// scenario depends on instead of guessing at how long a `sh` takes to boot.
+const STUBBORN_WORKER_ARMED: &[u8] = b"STUBBORN-WORKER-ARMED";
+
 fn config(worker_command: &str) -> String {
     format!(
         "[[orchestrations]]\nname = \"{ORCHESTRATION}\"\n\n\
@@ -89,6 +94,41 @@ async fn wait_for_pane_needle(
             return snapshot;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Issue #709: wait until `pane_id`'s close has OBSERVABLY entered its grace
+/// window, so a delegate aimed at that window lands inside it rather than at a
+/// guessed offset from when the close was asked for.
+///
+/// Bounded by [`common::child_boot_budget`] for the same reason the boot waits
+/// are: the quantity being waited on is a freshly scheduled task getting its
+/// turn, so the ceiling has to follow how contended the machine is. It returns
+/// the instant the window opens, so an idle box pays nothing for the headroom.
+async fn wait_for_close_in_flight<T>(
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    request: &tokio::task::JoinHandle<T>,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + common::child_boot_budget();
+    loop {
+        if registry.pane_close_in_flight(pane_id) {
+            return true;
+        }
+        // The `StopAgent` request returns only once the close has run to
+        // completion (measured: `is_finished` flips in the same 100 ms tick that
+        // `pane_close_in_flight` goes back to false), so a finished request with
+        // no window ever observed means there is nothing left to wait for — the
+        // request failed, or the pane was never closed at all. Ending here turns
+        // that into a prompt, legible failure instead of one that spends the
+        // whole budget and then reports the wrong cause.
+        if request.is_finished() {
+            return false;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
@@ -220,12 +260,13 @@ async fn delegate(fx: &Fixture, task: &str) {
         .await;
 }
 
-/// Scenario: start an orchestration whose `coder` role is `clear = true`, close
-/// the worker's pane through the daemon's real `StopAgent` path, and 200 ms
-/// later — while that close is still spending its termination grace — delegate
-/// to `coder`. The worker role must come back: a live agent on its pane that
-/// physically receives the task pointer, and a role registration that still
-/// routes the NEXT delegate.
+/// Scenario: start an orchestration whose `coder` role is `clear = true`, wait
+/// for its SIGTERM-ignoring stand-in to print the marker that proves its
+/// `trap '' TERM` is installed, close the worker's pane through the daemon's
+/// real `StopAgent` path, and — as soon as that close is observably in flight,
+/// still spending its termination grace — delegate to `coder`. The worker role must come back:
+/// a live agent on its pane that physically receives the task pointer, and a
+/// role registration that still routes the NEXT delegate.
 #[tokio::test(flavor = "multi_thread")]
 #[spec("orchestration/delegate/022")]
 async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() {
@@ -240,8 +281,16 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
     // echoes what the daemon writes into it.
     let fx = fixture(|dir| {
         let script = dir.join("stubborn-worker.sh");
-        std::fs::write(&script, "#!/bin/sh\ntrap '' TERM\nexec cat\n")
-            .expect("write SIGTERM-ignoring worker stand-in");
+        // Issue #709: the marker is printed AFTER the trap and BEFORE the exec,
+        // so seeing it is proof the disposition is already `SIG_IGN` — the one
+        // fact this scenario cannot proceed without. `exec` carries it across
+        // `execve`, so it still holds for the `cat` that replaces the shell.
+        let marker = String::from_utf8_lossy(STUBBORN_WORKER_ARMED).into_owned();
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntrap '' TERM\nprintf '{marker}'\nexec cat\n"),
+        )
+        .expect("write SIGTERM-ignoring worker stand-in");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
             .expect("chmod SIGTERM-ignoring worker stand-in");
         script.to_string_lossy().into_owned()
@@ -249,27 +298,81 @@ async fn delegate_022_delegate_during_an_in_flight_close_brings_the_role_back() 
     .await;
     let client = dot_agent_deck::daemon_client::DaemonClient::new(fx.daemon.attach_path.clone());
 
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Issue #709: this was a flat 400 ms sleep, and it was the load-sensitive
+    // seam of the whole test. What the scenario needs is not "400 ms have
+    // passed" but "the stand-in has installed its `trap '' TERM`" — and on a
+    // loaded box a freshly forked `sh` has not necessarily run its first line
+    // inside 400 ms. When it has not, the `StopAgent` below kills it on the
+    // first signal, the close is over in milliseconds, and the test fails at the
+    // in-flight precondition further down: a starvation failure wearing the
+    // costume of a #606 regression. Waiting for the marker asserts the fact
+    // directly, and cannot pass before it is true.
+    let armed = common::wait_for_child_first_output(
+        &fx.daemon.registry,
+        &fx.worker_agent_id,
+        STUBBORN_WORKER_ARMED,
+    )
+    .await;
+    assert!(
+        snapshot_contains(&armed, STUBBORN_WORKER_ARMED),
+        "precondition: the worker stand-in never got as far as installing its `trap '' TERM`, so \
+         the close below would be an ordinary fast termination rather than the grace-period \
+         window #606 is about; snapshot = {:?}",
+        String::from_utf8_lossy(&armed)
+    );
     assert_eq!(
         fx.daemon
             .registry
             .pane_current_agent_id(WORKER_PANE)
             .as_deref(),
         Some(fx.worker_agent_id.as_str()),
-        "precondition: the worker stand-in must still be alive before the close"
+        "precondition: the worker stand-in must still own its pane before the close"
+    );
+    // Issue #709: the assertion above says "still alive" but only ever checked
+    // REGISTRATION, and the difference is the whole scenario. `close_agent`
+    // spends `AGENT_TERMINATE_GRACE` only while the child is still running —
+    // against an already-dead one it returns at once, the close transition opens
+    // and shuts inside a few milliseconds, and the grace window this test needs
+    // to deliver into never observably exists. That reads downstream as "the
+    // close was not in flight", which is true and useless. Check the fact the
+    // sentence always meant.
+    assert!(
+        fx.daemon.registry.agent_is_live(&fx.worker_agent_id),
+        "precondition: the worker stand-in is registered but no longer running, so the close \
+         below would finish instantly instead of spending its termination grace"
     );
 
     let closing_id = fx.worker_agent_id.clone();
     let closing = tokio::spawn(async move { client.stop_agent(&closing_id).await });
 
-    // The reporter's own interval. Inside it the pane is marked closing, its
-    // registry entry is already gone, and its role is still registered — the
-    // exact window a `clear = true` respawn used to fail `NotFound` in.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Issue #709: this was a flat `sleep(200 ms)` — the reporter's own interval
+    // — followed by the assertion below, and it was the SECOND fixed deadline in
+    // this test. The 200 ms was standing in for "the close has entered its grace
+    // window", but `stop_agent` is driven by a spawned task and a socket round
+    // trip, so on a loaded box neither had necessarily reached
+    // `begin_pane_close` yet when the sleep expired. The assertion then fired
+    // saying the close was not in flight — and it was right, for the opposite of
+    // the reason it names: not "the close already finished" but "the close had
+    // not started". Measured on this branch at load 78 on 16 cores, in a
+    // full-tier run whose whole failing case took 0.98 s, so nothing had
+    // overshot anything.
+    //
+    // `pane_close_in_flight` is exactly the state the 200 ms was approximating —
+    // it is true from the moment the cleanup hold and the closing mark go up,
+    // which is also the moment the pane's registry entry is gone and its role is
+    // still registered: the window a `clear = true` respawn used to fail
+    // `NotFound` in. Waiting for it puts the delegate inside that window by
+    // construction rather than by arithmetic, and it cannot report a window that
+    // has not opened as one that has closed.
+    let entered_grace = wait_for_close_in_flight(&fx.daemon.registry, WORKER_PANE, &closing).await;
     assert!(
-        fx.daemon.registry.pane_close_in_flight(WORKER_PANE),
-        "precondition: the close must still be in flight when the delegate lands, or this test \
-         is measuring an ordinary post-close delegate instead of #606's race"
+        entered_grace,
+        "precondition: the close never entered its grace window, so the delegate below would be \
+         an ordinary post-close delegate instead of #606's race; stop_agent finished = {}, \
+         stand-in still live = {}, records = {:?}",
+        closing.is_finished(),
+        fx.daemon.registry.agent_is_live(&fx.worker_agent_id),
+        fx.daemon.registry.agent_records()
     );
     delegate(&fx, "list the files in this directory").await;
 

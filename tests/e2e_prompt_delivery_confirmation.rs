@@ -1,4 +1,4 @@
-#![cfg(all(feature = "e2e", unix))]
+#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]
 
 //! L2 regressions for spawn-time prompt confirmation. The synthetic scenario
 //! covers both a one-write swallow and a two-stage boot that destroys both

@@ -1,4 +1,4 @@
-#![cfg(all(feature = "e2e", unix))]
+#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]
 
 //! L2 PTY-attached real-agent rot canary for PRD #386's descendant-scan
 //! shell-activity signal (M6a, catalog `status/shell-activity/005`).

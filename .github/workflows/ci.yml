@@ -138,12 +138,12 @@ jobs:
         working-directory: desktop
     steps:
       - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
-          version: 10
+          version: 11
       - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
           cache-dependency-path: desktop/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
@@ -183,10 +183,12 @@ jobs:
       # both `cargo clippy` and `cargo clippy --all-targets` reported clean.
       #
       # Until this step existed, e2e code was linted by nothing anywhere and
-      # type-checked only by `cargo test-e2e` — which is not in CI (rule 5: it
-      # spawns binaries and hits LLM APIs). This step is a type-check and lint
-      # only; it runs no test and needs no agent or API key, so it does not
-      # smuggle the e2e tier into CI. It just makes the local rule 2 gate
+      # type-checked only by `cargo test-e2e`, which at the time ran in no
+      # workflow at all. Since issue #502 the tier itself DOES run in CI — see
+      # `e2e-deterministic` below and e2e-live.yml — but this step is still
+      # only a type-check and lint: it runs no test and needs no agent or API
+      # key, so naming the e2e features here neither duplicates those jobs nor
+      # gives this one a credential. It just makes the local rule 2 gate
       # something a contributor cannot forget to run.
       #
       # Linux only. build-windows/build-macos below stay on bare `cargo clippy`
@@ -202,7 +204,17 @@ jobs:
       # A live `unnecessary_sort_by` had been sitting in its `clean_tmp.rs`
       # unnoticed; it is fixed in the same commit that added this flag, so the
       # widened gate landed green rather than red on its first run.
-      - run: cargo clippy --workspace --all-targets --features e2e -- -D warnings
+      #
+      # `e2e-live` (issue #502): the credentialed subset of the L2 suite now
+      # opens with `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, so
+      # under `--features e2e` alone those 24 files compile to empty crates —
+      # exactly the #407 hole above, reopened for a third of the tier. Measured
+      # the same way #407 was: with an E0308 injected into
+      # tests/e2e_dispatcher_mode.rs, `--features e2e` exited 0 and
+      # `--features e2e,e2e-live` failed with that E0308. This step is still a
+      # type-check and lint only — it runs no test and needs no credential, so
+      # naming `e2e-live` here does not put lane 2 into this job.
+      - run: cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings
       - run: cargo build --release
       # `cargo nextest run`, NOT `cargo test` — the same runner as the
       # `cargo test-fast` local gate, and as build-macos/build-windows which
@@ -254,6 +266,99 @@ jobs:
       # orphaned: linkage-check was failing on main and no gate noticed, because
       # it only ever ran when somebody invoked it by hand.
       - run: cargo xtask linkage-check
+
+  # Issue #502 lane 1 — the DETERMINISTIC two thirds of the L2 e2e tier, run on
+  # every PR. This is the first job in this repository that has ever executed
+  # the e2e tier: until now `tests/e2e_*.rs` was type-checked by the `build`
+  # job's clippy step and run by nothing anywhere, which is what let #460 sit
+  # broken on main across 12 commits.
+  #
+  # `cargo test-e2e` is the alias in `.cargo/config.toml`. It enables the `e2e`
+  # cargo feature ALONE, which selects the 47 `tests/e2e_*.rs` files needing no
+  # agent credential; the other 24 open with
+  # `#![cfg(all(feature = "e2e", feature = "e2e-live"))]` and compile to empty
+  # crates here, so they are never even built into this job. The credentialed
+  # superset is lane 2, in .github/workflows/e2e-live.yml.
+  #
+  # NO SECRETS, and that is the property the entire lane rests on rather than a
+  # detail: this job declares no `environment:`, no job-level `env:` reading
+  # `secrets.*`, and passes no ANTHROPIC_API_KEY. That is what makes it safe on
+  # a fork PR — where GitHub withholds secrets anyway — and what keeps the
+  # post-merge "pwn request" surface #785 describes off the per-PR path
+  # entirely. If a test here ever fails for want of a credential then the test
+  # is in the wrong lane: re-gate its file into `e2e-live`. DO NOT add a key
+  # here to make it pass.
+  #
+  # NO AGENT CLI is installed either, and that is deliberate rather than merely
+  # unnecessary. `scheduler/cli/002` in tests/e2e_scheduler_cli.rs writes a
+  # schedule whose `--command` is the literal string `claude` on a
+  # `*/5 * * * * *` cron. It asserts nothing about an agent and cannot fail for
+  # want of a credential, but with a real `claude` on PATH a mid-test firing
+  # would spawn one inside the test's isolated HOME. With none installed the
+  # spawn just fails into a pane nothing looks at, which is the behaviour this
+  # lane was classified against.
+  #
+  # NOT one of the four required checks. The required set is a repository
+  # ruleset (CLAUDE.md rule 8) and widening it is a separate, deliberate act —
+  # worth revisiting only once this job has enough honest runs to show whether
+  # the tier is stable on a runner at all.
+  e2e-deterministic:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    runs-on: ubuntu-latest
+    # HOW THIS NUMBER WAS PICKED, and what it is not. It is NOT a measured
+    # runner wall clock: nobody has ever run this tier on a GitHub runner, so
+    # this job's own first run is the first measurement. It is derived from the
+    # bounds the tier already declares:
+    #
+    #   * `lifecycle/version/001` is in THIS lane and carries the largest kill
+    #     window in .config/nextest.toml — 120s x 10 = 20 minutes — because it
+    #     runs a nested `cargo build` into its own CARGO_TARGET_DIR and pays a
+    #     cold ~10-minute dependency build on a machine that has never run it.
+    #     Every fresh runner is exactly that machine.
+    #   * the tier compiles 47 test binaries on top of what `build` compiles.
+    #   * the remaining PTY scenarios sit at the default 3 x 60s kill window,
+    #     and they contend with each other on 4 vCPUs.
+    #
+    # 60 minutes leaves generous margin over the ~25-40 minutes those add up to
+    # while still capping a wedged PTY test at a sixth of the 6-hour runner
+    # default. Re-tune it downward once a few honest runs exist; do not raise it
+    # to paper over a hang.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.143
+      # The same Tauri Linux deps the `build` job installs, for the same reason:
+      # the alias carries `--workspace`, which includes desktop/src-tauri
+      # (dot-agent-deck-desktop), and without them that crate does not build on
+      # this runner at all. Locally the devbox shell lacks them too, which is
+      # issue #771 and why a local run needs `--exclude dot-agent-deck-desktop`;
+      # installing them here is the fix rather than narrowing the CI gate.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+      - run: cargo test-e2e
+      # Issue #564: keep THIS attempt's results after a job-level re-run
+      # overwrites the conclusion. Full rationale on the identical step in
+      # `build-macos`. It matters more here than anywhere else in this file:
+      # the e2e tier is the flakiest signal in the repository, a re-run is the
+      # only remedy on offer (`retries = 0`), and the JUnit XML carries the
+      # per-test wall clock that is the only way to tell a timing blip from a
+      # real regression.
+      - name: Preserve this attempt's test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-e2e-attempt-${{ github.run_attempt }}
+          path: target/nextest/default/junit.xml
+          if-no-files-found: warn
 
   # Issue #368 — run the LOCAL Windows pre-PR gate in CI, for one reason only:
   # so that it cannot rot again. `scripts/windows-cross-check.sh` had been
@@ -315,9 +420,17 @@ jobs:
   #     to Unix at the source level (#![cfg(unix)]), so they compile to empty
   #     crates here;
   #   * the L2 PTY e2e suite is excluded because this job runs `cargo nextest
-  #     run` WITHOUT `--features e2e` — all but two `tests/e2e_*.rs` files open
-  #     with a bare `#![cfg(feature = "e2e")]` and carry no Unix gate at all, so
-  #     they are never compiled here rather than compiled-and-emptied.
+  #     run` WITHOUT either e2e feature — every one of the 71 `tests/e2e_*.rs`
+  #     files opens with a `feature = "e2e"` cfg (47 bare, 24 also requiring
+  #     `feature = "e2e-live"` since issue #502), so none of them is compiled
+  #     here at all rather than compiled-and-emptied. Note this is a DIFFERENT
+  #     mechanism from the first bullet even for the six of the 71 that DO
+  #     carry a `unix` term (e2e_hook_binary_path, e2e_remote_doctor,
+  #     e2e_tab_close_regressions, and the live-gated e2e_card_layout,
+  #     e2e_prompt_delivery_confirmation, e2e_shell_activity_real_agent): the
+  #     missing feature already excludes them, so the `unix` term never gets a
+  #     chance to. Nothing about this job changes with #502 — it names no e2e
+  #     feature, so all 71 stay out however they are gated, and that is correct.
   # That second point is why `scripts/windows-cross-check.sh --features e2e` is
   # red locally and is not a gate (issue #368). Porting the harness to Windows
   # named pipes + ConPTY and running full integration/e2e on a Windows VM is
