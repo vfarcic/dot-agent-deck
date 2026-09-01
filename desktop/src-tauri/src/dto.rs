@@ -108,6 +108,24 @@ pub struct DesktopAgent {
     /// "read-only".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub write_lease: Option<&'static str>,
+    /// When the daemon last saw this agent do anything, as epoch milliseconds
+    /// (`SessionSnapshot.last_activity_ms`, PRD #745 M9). Copied through
+    /// unchanged: the daemon owns the instant, the webview owns the wording.
+    ///
+    /// Absent when the record carries no `live` snapshot — a daemon that
+    /// restarted has no sessions, so it reports no activity times rather than
+    /// resetting them all to "just now" — and absent from an older daemon that
+    /// predates the field. Absence renders as nothing, never a placeholder.
+    ///
+    /// NOT clamped here. The daemon's value is producer-supplied and can land
+    /// in the future, and the only seam that can decide what to do about that
+    /// is the one that owns the OTHER clock: the webview compares it against
+    /// its own `Date.now()`, absorbs ordinary skew, and refuses to relativise
+    /// anything beyond it. Clamping here against the desktop process's clock
+    /// would silently move a value the daemon reported, using a third clock
+    /// that is not the one the comparison is made on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity_ms: Option<i64>,
     pub tab: DesktopTab,
 }
 
@@ -361,6 +379,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
     let write_lease = live
         .and_then(|snapshot| snapshot.live_target.as_ref())
         .map(|target| write_lease_name(&target.writable));
+    let last_activity_ms = live.and_then(|snapshot| snapshot.last_activity_ms);
     let tab = map_tab(record.tab_membership.as_ref());
 
     DesktopAgent {
@@ -376,6 +395,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         tool_count,
         last_user_prompt,
         write_lease,
+        last_activity_ms,
         tab,
     }
 }
@@ -606,6 +626,7 @@ mod tests {
                 first_prompts: Vec::new(),
                 last_user_prompt: None,
                 live_target: None,
+                last_activity_ms: None,
             }),
         }
     }
@@ -634,6 +655,13 @@ mod tests {
         // from "the daemon said the empty string".
         assert!(mapped.last_user_prompt.is_none());
         assert!(mapped.write_lease.is_none());
+        // PRD #745 M9: nor an activity time. This is the case a RESTARTED
+        // daemon produces for every agent — it persists no `AppState`, so it
+        // has no sessions to snapshot — and it is exactly why this field could
+        // be shipped where session duration could not: the honest answer to
+        // "when did this last do something" after a restart is "I do not
+        // know", and absence says that.
+        assert!(mapped.last_activity_ms.is_none());
     }
 
     /// PRD #745 M8: the two `SessionSnapshot` fields the desktop's own DTO used
@@ -653,6 +681,37 @@ mod tests {
         assert_eq!(value["writeLease"], "write");
     }
 
+    /// PRD #745 M9: the daemon's `last_activity_ms` reaches the webview as the
+    /// same integer, under `lastActivityMs`, with no reformatting and no clamp.
+    ///
+    /// Pinned on the SERIALIZED value because a `serde_json` number is where a
+    /// silent unit change would show up — seconds instead of milliseconds
+    /// divides it by a thousand and every relative time on the overview becomes
+    /// fifty-seven years, which is why the field carries its unit in its name.
+    #[test]
+    fn agent_mapping_surfaces_the_last_activity_instant_unchanged() {
+        let mut record = fixture_record();
+        record.live.as_mut().unwrap().last_activity_ms = Some(1_756_684_800_123);
+
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(value["lastActivityMs"], 1_756_684_800_123i64);
+    }
+
+    /// The value is NOT clamped or validated here, deliberately: the daemon's
+    /// `last_activity` is producer-supplied and can land in the future, and the
+    /// only seam that can judge that is the one holding the other clock. A
+    /// far-future instant therefore crosses this boundary intact, and the
+    /// webview is what refuses to relativise it.
+    #[test]
+    fn a_future_last_activity_crosses_the_dto_boundary_intact() {
+        let far_future = 4_102_444_800_000i64; // 2100-01-01T00:00:00Z
+        let mut record = fixture_record();
+        record.live.as_mut().unwrap().last_activity_ms = Some(far_future);
+
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(value["lastActivityMs"], far_future);
+    }
+
     /// The absent case for both, pinned in the SERIALIZED shape: the keys are
     /// missing from the JSON the webview receives rather than present and null,
     /// so `agent.lastUserPrompt` is `undefined` there and absence survives the
@@ -662,6 +721,9 @@ mod tests {
         let value = serde_json::to_value(map_agent(fixture_record())).unwrap();
         assert!(value.get("lastUserPrompt").is_none());
         assert!(value.get("writeLease").is_none());
+        // PRD #745 M9, same rule: no key at all, so `agent.lastActivityMs` is
+        // `undefined` in the webview and the column renders nothing.
+        assert!(value.get("lastActivityMs").is_none());
     }
 
     /// Only `Writable` decides the lease, and its `#[serde(other)]` catch-all

@@ -65,6 +65,19 @@ export interface DesktopAgentDto {
    */
   writeLease?: "read" | "write" | "none";
   /**
+   * `SessionSnapshot.last_activity_ms` (PRD #745 M9): when the daemon last saw
+   * this agent do anything, as epoch milliseconds. Epoch milliseconds and not a
+   * formatted string, so the relative wording stays a webview decision — see
+   * `displayActivity` in `lib/displayText`, which also owns the clock-skew rule.
+   *
+   * Absent from a daemon that has no live session for the agent (a restarted
+   * daemon has none at all) and from one that predates the field. A TYPE
+   * ASSERTION, not a validated value: the DTO cannot stop a malformed daemon
+   * sending a non-finite or out-of-range number, which is why the render seam
+   * checks rather than trusts.
+   */
+  lastActivityMs?: number;
+  /**
    * The desktop crate's `DesktopTab` is structurally identical to the app
    * model's `AgentTab`, so the DTO reuses it and `agentFromDto` copies the
    * value through rather than flattening it to a role string. If the IPC shape
@@ -257,6 +270,7 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     // the daemon declared no live target. `toOverviewAgent` reverses it.
     writeLease: agent.writeLease ?? "unknown",
     lastUserPrompt: agent.lastUserPrompt,
+    lastActivityMs: agent.lastActivityMs,
     rows: agent.rows,
     cols: agent.cols,
     activeTool: agent.activeTool?.name,

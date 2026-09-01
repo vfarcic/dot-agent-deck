@@ -567,8 +567,13 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    rather than `display: none`, which would take it out of the a11y tree too. */
 .overview-sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
 /* One grid template shared by the legend and every row, so the columns line up
-   across group cards and the whole fleet reads as one table. */
-.overview-legend, .overview-row { display: grid; grid-template-columns: 10px minmax(0, 1.3fr) 66px 78px minmax(0, 1.3fr) 40px minmax(0, 1.3fr) minmax(0, 1.7fr); align-items: center; gap: 10px; }
+   across group cards and the whole fleet reads as one table. NINE tracks, in
+   `COLUMNS` order: status mark, agent, state, last activity, CLI, active tool,
+   tools, working directory, last prompt. The `nth-child` rules in the two media
+   queries below are indexed against THIS order, so inserting a column means
+   renumbering them — the legend's spans, each row's `<td>`s, `COLUMNS` and every
+   track count here have to move together. */
+.overview-legend, .overview-row { display: grid; grid-template-columns: 10px minmax(0, 1.3fr) 66px 58px 78px minmax(0, 1.3fr) 40px minmax(0, 1.3fr) minmax(0, 1.7fr); align-items: center; gap: 10px; }
 .overview-row > td { min-width: 0; padding: 0; }
 .overview-row { min-height: 34px; padding: 5px 11px; border-top: 1px solid #eae7de; }
 .overview-row:first-child { border-top: 0; }
@@ -588,6 +593,11 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-row .coordinator-badge { flex: 0 0 auto; padding: 1px 4px; border-radius: 2px; color: var(--teal); background: var(--teal-soft); font-size: 7px; font-weight: 800; letter-spacing: .08em; }
 .overview-row .status-label { display: inline-block; justify-self: start; }
 .overview-cli, .overview-cwd, .overview-tool-count { overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+/* Last activity: a fixed 58px track, so "just now" and "2760d ago" occupy the
+   same width and the column reads as one scannable strip rather than a ragged
+   one. Muted, because it qualifies the state beside it rather than competing
+   with it, and nowrap so no value can push a row taller than its neighbours. */
+.overview-activity { overflow: hidden; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .overview-tool-count { justify-self: end; color: var(--faint); }
 .overview-tool { min-width: 0; display: flex; align-items: center; gap: 5px; color: var(--muted); }
 .overview-tool strong { flex: 0 0 auto; font-family: "JetBrains Mono", monospace; font-size: 9.5px; font-weight: 650; }
@@ -617,20 +627,27 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-screen .count-unknown { color: var(--faint); }
 
 @media (max-width: 1180px) {
-  .overview-legend, .overview-row { grid-template-columns: 10px minmax(0, 1.3fr) 66px minmax(0, 1.2fr) 40px minmax(0, 1.5fr); }
-  .overview-legend span:nth-child(4), .overview-row .overview-cli { display: none; }
+  /* Seven tracks: status, agent, state, last activity, active tool, tools,
+     prompt. Last activity survives this breakpoint — it is 58px and it is the
+     column that distinguishes a waiting agent from a stalled one. */
+  .overview-legend, .overview-row { grid-template-columns: 10px minmax(0, 1.3fr) 66px 58px minmax(0, 1.2fr) 40px minmax(0, 1.5fr); }
+  .overview-legend span:nth-child(5), .overview-row .overview-cli { display: none; }
   /* The working directory goes before the prompt does: a group states its
      directory once in the header, so a row's own is already the exception —
      while the prompt is the only per-row answer to what the agent is doing. */
-  .overview-legend span:nth-child(7), .overview-row .overview-cwd { display: none; }
+  .overview-legend span:nth-child(8), .overview-row .overview-cwd { display: none; }
 }
 
 @media (max-width: 680px) {
   .overview-body { padding: 8px; }
   .daemon-group-body { padding: 8px; }
-  .overview-legend, .overview-row { grid-template-columns: 10px minmax(0, 1fr) 66px; }
-  .overview-legend span:nth-child(5), .overview-row .overview-tool { display: none; }
-  .overview-legend span:nth-child(6), .overview-row .overview-tool-count { display: none; }
-  .overview-legend span:nth-child(8), .overview-row .overview-prompt { display: none; }
+  /* Four tracks. This query also matches below 1180px, so the CLI and
+     working-directory columns hidden there are still hidden here; what is left
+     is the narrow-width triage question — which agent, what state, and how long
+     since it did anything. */
+  .overview-legend, .overview-row { grid-template-columns: 10px minmax(0, 1fr) 66px 58px; }
+  .overview-legend span:nth-child(6), .overview-row .overview-tool { display: none; }
+  .overview-legend span:nth-child(7), .overview-row .overview-tool-count { display: none; }
+  .overview-legend span:nth-child(9), .overview-row .overview-prompt { display: none; }
   .daemon-pips, .overview-group-pips { display: none; }
 }

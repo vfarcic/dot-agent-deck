@@ -3224,6 +3224,13 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Does not assert:** active-tool restoration (`session/live/006` covers a `Working` snapshot with a tool); real LLM behavior; scheduler/dispatch spawning (`scheduler/spawn/007`).
 - **Platform coverage:** mac+linux.
 
+##### session/live/013 — `SessionSnapshot.last_activity_ms` reports the session's own recorded instant and is additive in both directions (PRD #745 M9).
+- **Layer:** pure-data (serde round-trip plus one `SessionState::live_snapshot` call; no daemon/TUI harness; runs in the fast tier).
+- **Agent:** none.
+- **Asserts:** a `SessionState` whose `last_activity` is an hour old snapshots as that hour-old instant in epoch milliseconds, not as a timestamp minted at snapshot time (the honesty property that separated `last_activity` from the rejected session duration, whose `started_at` IS invented on hydration); the integer round-trips exactly; an absent activity time has no key in the JSON at all rather than a null; an older peer's snapshot payload lacking the key decodes via `#[serde(default)]` to `None` with every other field intact; and a newer peer's payload carrying the key decodes without disturbing the fields an older reader understands — which is the proof behind the do-not-bump decision (`PROTOCOL_VERSION` stays 8).
+- **Does not assert:** the desktop DTO projection or the webview's relative-time wording and clock-skew rule (both covered by the desktop crate's `dto.rs` tests and `AgentOverview.test.tsx`); the `ListAgents` join that carries the snapshot (`session/live/002`, `session/live/003`); the TUI-side seeding of the field, which `seed_hydrated_session` deliberately does not overlay.
+- **Platform coverage:** mac+linux+windows.
+
 ### Session save (snapshot freshness, PRD #89 Phase 1)
 
 These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept continuously fresh — written on meaningful TUI state changes and on detach — not only at clean teardown/quit.

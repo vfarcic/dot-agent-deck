@@ -498,11 +498,71 @@ describe("AgentOverview", () => {
     const prd = groupCard("orchestration", "orc-745");
     const table = within(prd).getByRole("table");
     expect(within(table).getAllByRole("columnheader").map((header) => header.textContent))
-      .toEqual(["Status", "Agent", "State", "CLI", "Active tool", "Tools", "Working directory", "Last prompt"]);
-    for (const row of rows(prd)) expect(within(row).getAllByRole("cell")).toHaveLength(8);
+      .toEqual(["Status", "Agent", "State", "Last activity", "CLI", "Active tool", "Tools", "Working directory", "Last prompt"]);
+    /*
+      Nine cells per row, and the count is the point rather than a formality:
+      the responsive rules in `styles.css` hide columns by `nth-child` INDEX, so
+      a row that has drifted out of step with `COLUMNS` hides the wrong ones at
+      a narrow window and nothing else notices. The legend's own span count is
+      checked with it, since it shares the grid template and the same indices.
+    */
+    for (const row of rows(prd)) expect(within(row).getAllByRole("cell")).toHaveLength(9);
+    expect(document.querySelectorAll(".overview-legend > span")).toHaveLength(9);
     // The visible legend is decoration for the shared grid and stays out of the
     // accessibility tree, so the columns are not announced twice.
     expect(document.querySelector(".overview-legend")).toHaveAttribute("aria-hidden", "true");
+  });
+
+  /**
+   * Scenario: render one agent the daemon last saw working two hours ago, then
+   * the same agent with no reported activity time at all. The cell prints one
+   * relative unit with the exact UTC instant on hover; with nothing reported it
+   * is empty and carries no hover text — not a dash, not a placeholder, the
+   * same rule every other honest column follows (PRD #745 M9).
+   */
+  it("prints how long ago the daemon last saw the agent, and nothing at all when it reported no time", () => {
+    const twoHours = Date.now() - 2 * 60 * 60_000;
+    const { unmount } = renderOverview({
+      snapshot: snapshotWithAgent({ lastActivityMs: twoHours, tab: { kind: "dashboard" } }),
+    });
+
+    const cell = document.querySelector(".overview-activity");
+    expect(cell).toHaveTextContent("2h ago");
+    expect(cell?.getAttribute("title")).toBe(`Last activity reported by the daemon: ${new Date(twoHours).toISOString()}`);
+    unmount();
+
+    // The RESTARTED-daemon case, and the one that made this field shippable
+    // where session duration was not: the daemon persists no session state, so
+    // it reports no activity time rather than resetting every agent to "just
+    // now". Blank says "I do not know", which is what is true.
+    renderOverview({ snapshot: snapshotWithAgent({ lastActivityMs: undefined, tab: { kind: "dashboard" } }) });
+    const blank = document.querySelector(".overview-activity");
+    expect(blank?.textContent).toBe("");
+    expect(blank).not.toHaveAttribute("title");
+  });
+
+  /**
+   * Scenario: render one agent whose reported instant is a second in the future
+   * and one whose instant is an hour in the future. The first is ordinary clock
+   * skew between the hook process that stamped the event and the webview, and
+   * reads "just now"; the second is beyond anything skew explains, so the cell
+   * renders NOTHING rather than a negative "ago" or a fabricated "just now"
+   * (PRD #745 M9).
+   */
+  it("reads a slightly-future instant as just now and renders nothing for one the clock cannot explain", () => {
+    const { unmount } = renderOverview({
+      snapshot: snapshotWithAgent({ lastActivityMs: Date.now() + 1_000, tab: { kind: "dashboard" } }),
+    });
+    expect(document.querySelector(".overview-activity")).toHaveTextContent("just now");
+    unmount();
+
+    renderOverview({ snapshot: snapshotWithAgent({ lastActivityMs: Date.now() + 60 * 60_000, tab: { kind: "dashboard" } }) });
+    const refused = document.querySelector(".overview-activity");
+    // No "-60m ago", and no "just now" either: the daemon does not clamp this
+    // value (it is the ordering evidence `supersedes_generation` weighs), so
+    // the render seam declines to relativise it at all.
+    expect(refused?.textContent).toBe("");
+    expect(refused).not.toHaveAttribute("title");
   });
 
   /**

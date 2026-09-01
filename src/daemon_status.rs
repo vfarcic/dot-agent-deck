@@ -245,6 +245,7 @@ mod tests {
             first_prompts: Vec::new(),
             last_user_prompt: None,
             live_target: None,
+            last_activity_ms: None,
         }
     }
 

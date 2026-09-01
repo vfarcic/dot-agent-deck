@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { clampText, DISPLAY_LIMITS, displayIdentity, displayPath, displayText, domIdentity, homeRelative, rendersBlank, sanitizeText, shortDaemonLabel } from "./displayText";
+import { clampText, CLOCK_SKEW_TOLERANCE_MS, DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayText, domIdentity, homeRelative, rendersBlank, sanitizeText, shortDaemonLabel } from "./displayText";
 
 /**
  * Every bidi formatting and override codepoint the Rust policy names
@@ -172,5 +172,80 @@ describe("domIdentity", () => {
   it("strips control and bidi characters, which have no business in a DOM attribute", () => {
     expect(domIdentity("/tmp/de\u202eck.sock")).toBe("/tmp/deck.sock");
     expect(domIdentity("/tmp/de\nck.sock")).toBe("/tmp/deck.sock");
+  });
+});
+
+describe("displayActivity", () => {
+  /** A fixed "now", so every case below is arithmetic rather than a race. */
+  const NOW = Date.parse("2026-09-01T12:00:00.000Z");
+  const ago = (ms: number) => displayActivity(NOW - ms, NOW);
+
+  it("names one unit, the largest that fits, floored", () => {
+    expect(ago(0)?.label).toBe("just now");
+    expect(ago(59_999)?.label).toBe("just now");
+    expect(ago(60_000)?.label).toBe("1m ago");
+    expect(ago(119_999)?.label).toBe("1m ago");
+    expect(ago(59 * 60_000)?.label).toBe("59m ago");
+    expect(ago(60 * 60_000)?.label).toBe("1h ago");
+    expect(ago(23.9 * 60 * 60_000)?.label).toBe("23h ago");
+    expect(ago(24 * 60 * 60_000)?.label).toBe("1d ago");
+    expect(ago(46 * 60 * 60_000)?.label).toBe("1d ago");
+    expect(ago(3650 * 24 * 60 * 60_000)?.label).toBe("3650d ago");
+  });
+
+  it("carries the exact UTC instant for the hover, so nothing is hidden behind the rounding", () => {
+    expect(ago(90 * 60_000)).toEqual({ label: "1h ago", title: "2026-09-01T10:30:00.000Z" });
+  });
+
+  /**
+   * The daemon reported no instant. Every agent under a RESTARTED daemon is
+   * this case — it persists no session state, so `AgentRecord.live` is absent
+   * and there is no activity time to report rather than a set of freshly minted
+   * ones. Nothing to render, and nothing is what the column shows.
+   */
+  it("renders nothing when the daemon reported no instant", () => {
+    expect(displayActivity(undefined, NOW)).toBeUndefined();
+  });
+
+  /**
+   * `DesktopAgentDto` is a TypeScript assertion about a shape, not a validated
+   * value, so a malformed daemon can put anything here. None of it may reach
+   * the DOM as `NaN ago` or throw out of `toISOString`.
+   */
+  it("renders nothing for a value that is not a usable instant", () => {
+    expect(displayActivity(Number.NaN, NOW)).toBeUndefined();
+    expect(displayActivity(Number.POSITIVE_INFINITY, NOW)).toBeUndefined();
+    expect(displayActivity(Number.NEGATIVE_INFINITY, NOW)).toBeUndefined();
+    // Outside `Date`'s ±100,000,000-day range, where `toISOString()` throws.
+    // An `i64` reaches nine orders of magnitude further than a `Date` does.
+    expect(displayActivity(8.65e15, NOW)).toBeUndefined();
+    expect(displayActivity(-8.65e15, NOW)).toBeUndefined();
+    expect(displayActivity(Number.MAX_SAFE_INTEGER, NOW)).toBeUndefined();
+  });
+
+  /**
+   * The clock-skew decision, both halves of it.
+   *
+   * The instant is stamped by whichever hook process emitted the event, not by
+   * the daemon and not by the webview, so a small positive skew is ordinary and
+   * reads "just now". A NEGATIVE "ago" is never rendered — but nor is a stamp
+   * genuinely ahead of the webview's clock quietly rewritten into "just now":
+   * `last_activity` is producer-supplied and deliberately unclamped daemon-side
+   * (it is the ordering evidence `supersedes_generation` weighs, and the daemon
+   * has a test for a report stamped ten years out), so calling a far-future
+   * value "just now" would be exactly the fabricated reading PRD #745 refuses.
+   * Beyond the tolerance the webview does not know, and says nothing.
+   */
+  it("absorbs ordinary clock skew and refuses to relativise anything beyond it", () => {
+    expect(displayActivity(NOW + 1, NOW)?.label).toBe("just now");
+    expect(displayActivity(NOW + CLOCK_SKEW_TOLERANCE_MS, NOW)?.label).toBe("just now");
+    expect(displayActivity(NOW + CLOCK_SKEW_TOLERANCE_MS + 1, NOW)).toBeUndefined();
+    // An hour, a day and ten years ahead are all the same answer: nothing.
+    expect(displayActivity(NOW + 60 * 60_000, NOW)).toBeUndefined();
+    expect(displayActivity(NOW + 3650 * 24 * 60 * 60_000, NOW)).toBeUndefined();
+  });
+
+  it("defaults `now` to the real clock, so callers need not pass one", () => {
+    expect(displayActivity(Date.now())?.label).toBe("just now");
   });
 });

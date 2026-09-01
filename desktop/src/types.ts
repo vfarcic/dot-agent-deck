@@ -217,6 +217,25 @@ export interface AgentSession {
    * `DISPLAY_LIMITS.prompt`.
    */
   lastUserPrompt?: string;
+  /**
+   * HONEST, and the only field on this interface the daemon did not already
+   * send before PRD #745: M9 added `last_activity_ms` to `SessionSnapshot`.
+   * Epoch milliseconds — when the daemon last saw this agent do anything.
+   *
+   * It is here where `duration` is FIXTURE-ONLY, and the difference is the
+   * whole reason one shipped and the other did not. `started_at` is invented as
+   * `now` on hydration, so a duration built from it resets and lies about
+   * long-running work. `last_activity` is a high-water mark of real observed
+   * event timestamps that the daemon never re-mints, and when the daemon cannot
+   * vouch for it — it persists no session state, so a restart leaves it with
+   * none — it is simply ABSENT and every surface renders nothing.
+   *
+   * Optional rather than sentinel-bearing, like `lastUserPrompt`. Rendering
+   * goes through `displayActivity`, which owns the relative wording and refuses
+   * to relativise an instant more than a minute in the future rather than
+   * printing a negative "ago".
+   */
+  lastActivityMs?: number;
   /** HONEST. */
   rows: number;
   /** HONEST. */

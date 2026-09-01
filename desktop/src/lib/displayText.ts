@@ -17,6 +17,12 @@
  * The policy mirrors `src/untrusted_text.rs::strip_control_and_bidi`
  * character for character. Keep it that way: that module's own header records
  * that the bug class came from two copies of the policy drifting apart.
+ *
+ * `displayActivity` at the bottom of the file is the same seam for a
+ * daemon-supplied INSTANT rather than a string (PRD #745 M9): the daemon sends
+ * epoch milliseconds and the webview decides how they read, so the relative
+ * wording, the rounding and the clock-skew rule all live here and none of them
+ * is baked into the daemon's contract.
  */
 
 /**
@@ -257,4 +263,94 @@ export function domIdentity(value: string, max: number = DISPLAY_LIMITS.domIdent
   const clean = sanitizeText(value);
   const chars = Array.from(clean);
   return chars.length <= max ? clean : `${chars.slice(0, max).join("")}~${digest(value)}`;
+}
+
+/**
+ * How far the daemon's clock may run ahead of the webview's before this module
+ * stops trying to say how long ago something happened.
+ *
+ * The two clocks are genuinely different clocks. `SessionSnapshot.last_activity_ms`
+ * is a high-water mark of `AgentEvent.timestamp`s, and those are stamped by
+ * whichever hook process emitted the event (`src/hook.rs`) — not by the daemon,
+ * and certainly not by the webview. So a small positive skew is the ordinary
+ * case, not a fault, and one minute absorbs it comfortably: NTP-synced hosts sit
+ * inside a few milliseconds, and a container with a lazily-stepped clock inside
+ * a second or two.
+ */
+export const CLOCK_SKEW_TOLERANCE_MS = 60_000;
+
+/** A minute, an hour and a day in milliseconds — the buckets below. */
+const MINUTE_MS = 60_000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
+/**
+ * The widest instant a JavaScript `Date` can represent (±100,000,000 days from
+ * the epoch). The daemon's field is an `i64`, whose range is nine orders of
+ * magnitude wider, so a malformed or hostile value can sit outside this — and
+ * `new Date(x).toISOString()` throws `RangeError` for one that does.
+ */
+const MAX_DATE_MS = 8.64e15;
+
+/** What the last-activity column renders: a short label, and the exact instant on hover. */
+export interface ActivityDisplay {
+  label: string;
+  title: string;
+}
+
+/**
+ * The last-activity column's display copy: how long ago the daemon last saw
+ * this agent do something, plus the exact UTC instant for the hover.
+ *
+ * Returns `undefined` for everything this cannot honestly express, and the
+ * column renders **nothing at all** for that — no dash, no placeholder,
+ * consistent with every other honest column on the overview (PRD #745 M9).
+ * Three cases reach it:
+ *
+ * 1. **The daemon reported no instant.** A record with no live snapshot, and in
+ *    particular every agent under a daemon that has restarted — it persists no
+ *    session state, so it has no activity times rather than a set of freshly
+ *    minted ones. "I do not know" is the honest answer and blank is how the
+ *    screen says it.
+ * 2. **The value is not a finite number**, which a TypeScript DTO cannot rule
+ *    out: `DesktopAgentDto` is an assertion about a shape, not a validated one.
+ * 3. **The instant is in the future by more than {@link CLOCK_SKEW_TOLERANCE_MS}.**
+ *    This is the clock-skew decision, and it is deliberate in both directions.
+ *    A negative "ago" is a bug a user sees, so it is never rendered. But nor is
+ *    a future stamp quietly rewritten to "just now": `last_activity` is
+ *    PRODUCER-supplied and unclamped by design — it is the ordering evidence
+ *    `AppState::supersedes_generation` weighs, and the daemon has a test for a
+ *    report stamped ten years out
+ *    (`a_disowned_generations_far_future_session_cannot_pin_its_pane`) — so
+ *    "just now" for a value hours or years ahead would be exactly the fabricated
+ *    reading this PRD refuses. Within the tolerance the skew is ordinary and
+ *    "just now" is true; beyond it, the webview does not know and says nothing.
+ *
+ * `now` is injectable so the buckets and the skew rule are testable without a
+ * fake timer.
+ */
+export function displayActivity(lastActivityMs: number | undefined, now: number = Date.now()): ActivityDisplay | undefined {
+  if (lastActivityMs === undefined || !Number.isFinite(lastActivityMs)) return undefined;
+  // Outside `Date`'s range there is no instant to show and `toISOString()`
+  // would throw, so there is nothing honest to render.
+  if (Math.abs(lastActivityMs) > MAX_DATE_MS) return undefined;
+  const elapsed = now - lastActivityMs;
+  if (elapsed < -CLOCK_SKEW_TOLERANCE_MS) return undefined;
+  return { label: elapsedLabel(elapsed), title: new Date(lastActivityMs).toISOString() };
+}
+
+/**
+ * One unit, largest that fits, floored — the reading a fleet overview wants is
+ * "quiet for a while" versus "moving", not a precise interval. Floored rather
+ * than rounded so the label never claims more elapsed time than has actually
+ * passed.
+ *
+ * A tolerated negative elapsed (the ordinary-skew band) lands in the first
+ * bucket, so it reads `just now` rather than as a negative count.
+ */
+function elapsedLabel(elapsed: number): string {
+  if (elapsed < MINUTE_MS) return "just now";
+  if (elapsed < HOUR_MS) return `${Math.floor(elapsed / MINUTE_MS)}m ago`;
+  if (elapsed < DAY_MS) return `${Math.floor(elapsed / HOUR_MS)}h ago`;
+  return `${Math.floor(elapsed / DAY_MS)}d ago`;
 }

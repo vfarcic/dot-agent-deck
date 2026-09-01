@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Blocks, Boxes, LayoutList, Layers, Network, RefreshCw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
-import { DISPLAY_LIMITS, displayIdentity, displayPath, displayText, displayTitle, domIdentity, rendersBlank, shortDaemonLabel } from "../lib/displayText";
+import { DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayText, displayTitle, domIdentity, rendersBlank, shortDaemonLabel } from "../lib/displayText";
 
 /**
  * The honest subset of `AgentSession`: every field a daemon genuinely reports
@@ -10,6 +10,11 @@ import { DISPLAY_LIMITS, displayIdentity, displayPath, displayText, displayTitle
  * from THIS and never from `AgentSession`, so reaching for a value the daemon
  * cannot supply — `model`, `tokens`, `cost`, `contextPercent`, `worktree`,
  * `attempt`, `duration` — is a compile error rather than a thing to remember.
+ * `duration` stays out while `lastActivityMs` is in, and the line between them
+ * is honesty rather than taste: `started_at` is invented as `now` on hydration
+ * so a duration resets under a restarted daemon, whereas `last_activity` is a
+ * high-water mark of observed event timestamps and reads ABSENT when the daemon
+ * cannot vouch for it (PRD #745 M9).
  * `role` is deliberately absent even though it is honest: a row shows
  * `displayName` and, inside an orchestration, `tab.roleName`, so carrying
  * `role` here would claim a consumption that does not exist. The field-by-field
@@ -18,7 +23,7 @@ import { DISPLAY_LIMITS, displayIdentity, displayPath, displayText, displayTitle
  */
 export type OverviewAgent = Pick<
   AgentSession,
-  "id" | "daemonId" | "displayName" | "cli" | "status" | "activeTool" | "activeToolDetail" | "toolCount" | "tab" | "lastUserPrompt"
+  "id" | "daemonId" | "displayName" | "cli" | "status" | "activeTool" | "activeToolDetail" | "toolCount" | "tab" | "lastUserPrompt" | "lastActivityMs"
 > & {
   /**
    * HONEST, and optional exactly as `AgentSession.cwd` is. It was optional here
@@ -45,7 +50,7 @@ export type OverviewAgent = Pick<
 };
 
 export function toOverviewAgent(agent: AgentSession): OverviewAgent {
-  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, writeLease } = agent;
+  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, writeLease } = agent;
   return {
     id,
     daemonId,
@@ -58,6 +63,7 @@ export function toOverviewAgent(agent: AgentSession): OverviewAgent {
     toolCount,
     tab,
     lastUserPrompt,
+    lastActivityMs,
     writeLease: writeLease === "unknown" ? undefined : writeLease,
   };
 }
@@ -311,8 +317,16 @@ const GROUP_ICON: Record<OverviewGroupKind, typeof Network> = {
   standalone: Boxes,
 };
 
-/** The column headers, in grid order. The visible legend mirrors these. */
-const COLUMNS = ["Status", "Agent", "State", "CLI", "Active tool", "Tools", "Working directory", "Last prompt"];
+/**
+ * The column headers, in grid order. The visible legend mirrors these, and so do
+ * the `nth-child` rules in `styles.css`'s two overview media queries — which are
+ * INDEX-SENSITIVE, so inserting a column here means renumbering them. Nine
+ * columns as of PRD #745 M9, which put Last activity fourth: it is read
+ * alongside State, because "waiting" and "waiting, and quiet for two hours" are
+ * different situations and a reader should not have to scan across the row to
+ * tell them apart.
+ */
+const COLUMNS = ["Status", "Agent", "State", "Last activity", "CLI", "Active tool", "Tools", "Working directory", "Last prompt"];
 
 /** What a reported write lease says on hover, in the daemon's own terms. */
 const WRITE_LEASE_TITLE: Record<"read" | "write" | "none", string> = {
@@ -577,6 +591,7 @@ function DaemonBody({ agents, groups, connection, message, overrideError, onOpen
         <span />
         <span>AGENT</span>
         <span>STATE</span>
+        <span>LAST ACTIVITY</span>
         <span>CLI</span>
         <span>ACTIVE TOOL</span>
         <span>TOOLS</span>
@@ -695,6 +710,9 @@ function OverviewRow({ agent, hoistedCwd }: { agent: OverviewAgent; hoistedCwd?:
     `src/untrusted_text.rs`; it is fixed by saying something visible instead.
   */
   const name = displayIdentity(agent.displayName, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
+  // Read once per render against ONE `Date.now()`, so every row on a repaint is
+  // relative to the same moment rather than to fifteen slightly different ones.
+  const activity = displayActivity(agent.lastActivityMs);
   return (
     <tr className="overview-row" role="row" data-testid={`overview-agent-${agentDomKey(agent)}`} data-status={agent.status}>
       <td role="cell"><span className={`agent-state-mark status-${agent.status}`} aria-hidden="true" /></td>
@@ -715,6 +733,20 @@ function OverviewRow({ agent, hoistedCwd }: { agent: OverviewAgent; hoistedCwd?:
         {roleName && !rendersBlank(roleName) && roleLabel?.toLowerCase() !== agent.displayName.toLowerCase() && <em className="overview-role-name">{roleName}</em>}
       </td>
       <td role="cell"><span className={`status-label status-${agent.status}`}>{agent.status}</span></td>
+      {/*
+        How long ago the daemon last saw this one do anything (PRD #745 M9).
+        Blank — no dash, no placeholder — for every case `displayActivity`
+        cannot honestly express: the daemon reported no instant (which is every
+        agent under a restarted daemon, since it keeps no session state), the
+        value is not a finite number, or it sits more than a minute in the
+        future. That last one is the clock-skew rule: the instant comes from
+        whichever hook process stamped the event, so ordinary skew reads "just
+        now", while a stamp genuinely ahead of the webview's clock is not
+        rewritten into one — a negative "ago" is a bug a user sees, and a
+        fabricated "just now" for a far-future stamp is the same lie in nicer
+        clothes.
+      */}
+      <td className="overview-activity" role="cell" title={activity && `Last activity reported by the daemon: ${activity.title}`}>{activity?.label ?? ""}</td>
       <td className="overview-cli" role="cell" title={displayText(`Agent type reported by the daemon: ${agent.cli}`, DISPLAY_LIMITS.title)}>{displayText(agent.cli, DISPLAY_LIMITS.name)}</td>
       <td className="overview-tool" role="cell">
         {agent.activeTool ? (

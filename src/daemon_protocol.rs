@@ -3856,6 +3856,7 @@ mod tests {
                 first_prompts: vec!["build the feature".into()],
                 last_user_prompt: Some("build the feature".into()),
                 live_target: None,
+                last_activity_ms: None,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
             let back: SessionSnapshot =
@@ -3890,6 +3891,7 @@ mod tests {
                 first_prompts: Vec::new(),
                 last_user_prompt: None,
                 live_target: None,
+                last_activity_ms: None,
             }),
         };
         let json = serde_json::to_string(&rec).expect("AgentRecord serializes");
@@ -3915,6 +3917,105 @@ mod tests {
             old.live.is_none(),
             "older AgentRecord without a live field must decode as None"
         );
+    }
+
+    /// Scenario: Build a live `SessionState` whose `last_activity` is an hour
+    /// in the past, snapshot it, and assert the wire carries THAT instant as
+    /// epoch milliseconds rather than anything resembling `now` — the honesty
+    /// property that separates `last_activity` from the rejected session
+    /// duration. Then serialize a snapshot with no activity time and confirm
+    /// the key is absent from the JSON entirely, and decode an older peer's
+    /// payload that predates the field and confirm it arrives as `None`
+    /// (additive optional — no `PROTOCOL_VERSION` bump).
+    #[spec("session/live/013")]
+    #[test]
+    fn live_013_last_activity_is_event_derived_and_additive() {
+        use crate::event::AgentType;
+        use crate::state::{SessionSnapshot, SessionState, SessionStatus};
+        use std::collections::VecDeque;
+
+        // (a) POPULATED, and populated from the session's OWN recorded instant.
+        //
+        // This is the check that decided the milestone. `SessionState.started_at`
+        // was rejected as a column because the hydration path invents it as
+        // `now`, so a duration resets under a restarted daemon and silently
+        // lies about long-running work. `last_activity` does not have that
+        // defect: `apply_event` sets it from the observed `AgentEvent.timestamp`
+        // and only ever advances it, so an agent quiet for an hour snapshots as
+        // quiet for an hour. Pinning an hour-old instant is what would fail if
+        // anyone ever "helpfully" stamped this at snapshot time.
+        let quiet_since = chrono::Utc::now() - chrono::Duration::hours(1);
+        let session = SessionState {
+            session_id: "sess-745".into(),
+            agent_type: AgentType::ClaudeCode,
+            cwd: None,
+            status: SessionStatus::Idle,
+            active_tool: None,
+            started_at: quiet_since,
+            last_activity: quiet_since,
+            recent_events: VecDeque::new(),
+            tool_count: 0,
+            last_user_prompt: None,
+            first_prompts: Vec::new(),
+            pane_id: Some("pane-745".into()),
+            agent_id: Some("agent-745".into()),
+            display_name: None,
+            shell_synthetic_working: false,
+        };
+        let snap = session.live_snapshot();
+        assert_eq!(
+            snap.last_activity_ms,
+            Some(quiet_since.timestamp_millis()),
+            "the snapshot must carry the session's own last_activity, not a \
+             timestamp minted when the snapshot was taken"
+        );
+
+        // Round-trips as an exact integer: epoch milliseconds is the wire
+        // representation precisely so there is no format to lose anything to.
+        let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
+        let back: SessionSnapshot = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.last_activity_ms, snap.last_activity_ms);
+
+        // (b) OMITTED when absent. `skip_serializing_if` keeps the key off the
+        // wire, so a peer sees absence rather than a null it would have to
+        // special-case — and the overview renders nothing at all for it.
+        let mut absent = snap.clone();
+        absent.last_activity_ms = None;
+        let json = serde_json::to_string(&absent).expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("is JSON");
+        assert!(
+            value.get("last_activity_ms").is_none(),
+            "an absent activity time must have no key at all; got {json}"
+        );
+
+        // (c) FORWARD-COMPATIBLE with an older peer, which is the entire basis
+        // of the do-not-bump decision — proven rather than asserted. An older
+        // daemon's snapshot payload has no `last_activity_ms` key, and it must
+        // decode via `#[serde(default)]` with every other field intact.
+        let legacy = r#"{
+            "status": "Working",
+            "agent_type": "claude_code",
+            "tool_count": 7
+        }"#;
+        let old: SessionSnapshot = serde_json::from_str(legacy)
+            .expect("an older peer's snapshot must decode via #[serde(default)]");
+        assert!(
+            old.last_activity_ms.is_none(),
+            "an older peer reports no activity time, which must read as absent"
+        );
+        assert_eq!(old.status, SessionStatus::Working);
+        assert_eq!(old.tool_count, 7);
+
+        // And the other direction: a NEWER peer's payload carrying the key must
+        // not disturb the fields an older reader does understand.
+        let newer = r#"{
+            "status": "Idle",
+            "tool_count": 0,
+            "last_activity_ms": 1756684800123
+        }"#;
+        let forward: SessionSnapshot =
+            serde_json::from_str(newer).expect("a newer peer's snapshot must decode");
+        assert_eq!(forward.last_activity_ms, Some(1_756_684_800_123));
     }
 
     /// Scenario: A newer daemon advertises an `AgentRecord` whose `live.status`
