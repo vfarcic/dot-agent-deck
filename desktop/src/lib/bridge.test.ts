@@ -64,11 +64,16 @@ describe("TauriDeckBridge", () => {
     delete incompatible.agents[0].cwd;
     delete incompatible.agents[0].displayName;
     delete incompatible.agents[0].activeTool;
-    expect(mapDesktopSnapshot(incompatible)).toMatchObject({
+    const mappedIncompatible = mapDesktopSnapshot(incompatible);
+    expect(mappedIncompatible).toMatchObject({
       health: "failed",
       connection: { status: "error", daemonDetected: true, runningAgentCount: 1 },
-      agents: [{ displayName: "Coder", cwd: "Unavailable", model: "Unavailable", task: "Task metadata unavailable from daemon" }],
+      agents: [{ displayName: "Coder", model: "Unavailable", task: "Task metadata unavailable from daemon" }],
     });
+    // An unreported cwd is ABSENT on the model, not the deck's stand-in word:
+    // that word is a directory name the daemon can legitimately report, so a
+    // sentinel spelled in it is one an agent can forge (M8 audit).
+    expect(mappedIncompatible.agents[0]?.cwd).toBeUndefined();
 
     const bridge = new TauriDeckBridge();
     const output = vi.fn();
@@ -451,6 +456,58 @@ describe("TauriDeckBridge", () => {
     expect(mapped.agents[0]?.task).toBe("Active tool: apply_patch · desktop/src/App.tsx");
     expect(mapped.agents[0]?.tab).toMatchObject({ kind: "orchestration" });
     expect((mapped.agents[0]?.tab as { cwd?: string }).cwd).toBeUndefined();
+  });
+
+  /**
+   * The M8 audit's cwd finding. `src/agent_pty.rs` accepts any non-empty,
+   * bounded, control-free working directory, so `"Unavailable"` — the deck's
+   * own stand-in word — is a directory an agent can genuinely be launched in.
+   * While the bridge wrote that word for ABSENCE, such an agent had its real,
+   * reported directory erased at the overview's boundary into a blank cell with
+   * no hover text. The reported value now survives, and it is a candidate for
+   * the snapshot's repo directory like any other.
+   */
+  it("does not erase a reported working directory that spells the deck's stand-in word", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const collides = structuredClone(snapshot);
+    collides.agents[0].cwd = "Unavailable";
+
+    const mapped = mapDesktopSnapshot(collides);
+
+    expect(mapped.agents[0]?.cwd).toBe("Unavailable");
+    expect(mapped.worktree).toBe("Unavailable");
+  });
+
+  /**
+   * The M8 audit's prompt finding, at the seam that closes it. The deck renders
+   * `task` straight into a DOM text node, so the bridge — not the tile — makes
+   * it a display copy: sanitised of controls and bidi overrides, and clamped to
+   * the prompt budget, whatever the daemon sent. The active-tool restatement
+   * goes through the same seam.
+   */
+  it("projects the assignment line as a bounded, sanitised display copy of the prompt", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const { DISPLAY_LIMITS } = await import("./displayText");
+    const hostile = structuredClone(snapshot);
+    hostile.agents[0].lastUserPrompt = `\u202eEVIL\u0007${"p".repeat(70_000)}`;
+
+    const mapped = mapDesktopSnapshot(hostile);
+
+    const task = mapped.agents[0]?.task ?? "";
+    expect(task).not.toContain("\u202e");
+    expect(task).not.toContain("\u0007");
+    expect(Array.from(task).length).toBe(DISPLAY_LIMITS.prompt + 1);
+    // The RAW prompt stays on its own field: the overview applies its own
+    // budgets to it, including the longer one for the hover copy.
+    expect(mapped.agents[0]?.lastUserPrompt).toBe(hostile.agents[0].lastUserPrompt);
+
+    // And the fallback branch is bounded too — a tool detail is the agent's own
+    // command line, and was equally raw on this path before M8 touched it.
+    const tooling = structuredClone(snapshot);
+    tooling.agents[0].activeTool = { name: "bash", detail: `\u202erm -rf ${"x".repeat(1_000)}` };
+    const toolTask = mapDesktopSnapshot(tooling).agents[0]?.task ?? "";
+    expect(toolTask).not.toContain("\u202e");
+    expect(Array.from(toolTask).length).toBe(DISPLAY_LIMITS.prompt + 1);
   });
 
   /**

@@ -13,6 +13,7 @@ import {
   SquareTerminal,
   X,
 } from "lucide-react";
+import { UNREPORTED } from "../types";
 import type { AgentSession, DeckActionResult, DeckPrompt, EvidenceItem, PanelTab, RuntimeMode, TerminalFeed } from "../types";
 import { AgentComposer } from "./AgentComposer";
 import { OutputReader } from "./OutputReader";
@@ -252,7 +253,15 @@ export function AgentTile({
 
       <footer className="agent-footer">
         <span>{fixture ? `LEASE · ${agent.writeLease.toUpperCase()}` : "LEASE · UNAVAILABLE"}</span>
-        <span title={agent.cwd}>{fixture ? agent.worktree : agent.cwd}</span>
+        {/*
+          The deck's own word for a working directory the daemon did not report.
+          The model says `undefined` rather than carrying the word, because the
+          daemon can legitimately report a directory NAMED "Unavailable" and a
+          sentinel it can spell is one it can forge (M8 audit); the substitution
+          lives here, where it is printed, so nothing matches on it. No `title`
+          in that case — there is no path to put in one.
+        */}
+        <span title={agent.cwd}>{fixture ? agent.worktree : agent.cwd ?? UNREPORTED}</span>
         {agent.activeTool && <strong>{agent.activeTool}</strong>}
       </footer>
     </article>

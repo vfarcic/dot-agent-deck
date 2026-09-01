@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Blocks, Boxes, LayoutList, Layers, Network, RefreshCw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
-import { UNREPORTED } from "../types";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { DISPLAY_LIMITS, displayIdentity, displayPath, displayText, displayTitle, domIdentity, rendersBlank, shortDaemonLabel } from "../lib/displayText";
@@ -22,21 +21,25 @@ export type OverviewAgent = Pick<
   "id" | "daemonId" | "displayName" | "cli" | "status" | "activeTool" | "activeToolDetail" | "toolCount" | "tab" | "lastUserPrompt"
 > & {
   /**
-   * HONEST, and OPTIONAL where `AgentSession.cwd` is not. The `Pick<>` above
-   * closes dishonest field NAMES but cannot close a dishonest sentinel inside
-   * an allowed one: `agentFromDto` substitutes `UNREPORTED` for a `cwd` the
-   * daemon did not report, so the screen's guarantee that nothing on it reads
-   * "Unavailable" was violable through this very field. Absence is preserved
-   * here and rendered as nothing at all — not as a placeholder, and not as a
+   * HONEST, and optional exactly as `AgentSession.cwd` is. It was optional here
+   * FIRST, because the `Pick<>` above closes dishonest field NAMES but cannot
+   * close a dishonest sentinel inside an allowed one: `agentFromDto` used to
+   * substitute `UNREPORTED` for a `cwd` the daemon did not report, so the
+   * screen's guarantee that nothing on it reads "Unavailable" was violable
+   * through this very field, and this boundary reversed the substitution. The
+   * M8 audit found the reversal erasing a REAL directory called "Unavailable",
+   * so absence now travels as absence the whole way and there is nothing left
+   * to reverse. Rendered as nothing at all — not as a placeholder, and not as a
    * dash, which would be one more thing to read that says less than blank.
    */
   cwd?: string;
   /**
-   * HONEST as of M8, and the second field whose deck-side sentinel is reversed
-   * here rather than carried onto the screen: `AgentSession.writeLease` says
-   * `"unknown"` when the daemon declared no live target, exactly as `cwd` says
-   * `UNREPORTED`. One sentinel, one reversal, in one place — a second spelling
-   * of "absent" is what let a placeholder reach this screen once already.
+   * HONEST as of M8, and now the ONLY field whose deck-side sentinel is
+   * reversed here rather than carried onto the screen: `AgentSession.writeLease`
+   * says `"unknown"` when the daemon declared no live target. Unlike the `cwd`
+   * sentinel it retired, this one cannot collide with daemon data — the desktop
+   * crate emits only the three mapped strings or omits the key — so reversing
+   * it can only ever remove a placeholder, never a fact.
    */
   writeLease?: "read" | "write" | "none";
 };
@@ -49,7 +52,7 @@ export function toOverviewAgent(agent: AgentSession): OverviewAgent {
     displayName,
     cli,
     status,
-    cwd: cwd === UNREPORTED ? undefined : cwd,
+    cwd,
     activeTool,
     activeToolDetail,
     toolCount,

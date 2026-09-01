@@ -2,14 +2,21 @@ export type RuntimeMode = "fixture" | "live";
 
 /**
  * The control deck's legacy stand-in for a value the daemon did not report.
- * The deck renders it as text AND matches on it (`mapDesktopSnapshot` picks a
- * repo directory by skipping agents whose `cwd` is this), so it cannot simply
- * be dropped; M8 is where live mode stops presenting these as facts.
  *
- * It is exported so the two sides of that substitution — the one that writes
- * it in `agentFromDto` and the one that reverses it in `toOverviewAgent` —
- * cannot drift apart into a placeholder leaking onto a screen that promises
- * none. An agent's `cwd` is an absolute path, so this can never be one.
+ * It is a WORD A SCREEN PRINTS, never a value the model carries for `cwd`. It
+ * was both until the M8 audit: `agentFromDto` substituted it for an unreported
+ * `cwd` and `toOverviewAgent` reversed it, which made the two sides agree with
+ * each other but not with the daemon — `src/agent_pty.rs` accepts any
+ * non-empty, bounded, control-free `cwd`, so `"Unavailable"` is a perfectly
+ * legal directory name, and an agent launched in one had its real, reported
+ * directory silently erased into a blank cell with no hover text. A sentinel
+ * spelled in the same alphabet as the data can always be spelled BY the data;
+ * `cwd` is optional now, and absence is the thing that cannot be spelled.
+ *
+ * What remains here is the two FIXTURE-ONLY fields live mode has no source for
+ * at all — `model` and `worktree` — plus `AgentTile`'s own footer, which turns
+ * an absent `cwd` back into this word at the moment it prints it. No surface
+ * matches on it any more.
  */
 export const UNREPORTED = "Unavailable";
 
@@ -119,7 +126,7 @@ export type AgentTab =
  * than cosmetic. The fields marked HONEST are ones the daemon genuinely
  * reports, so a screen may present them as fact. The fields marked
  * FIXTURE-ONLY have no source in daemon state at all — live mode hardcodes
- * them in `agentFromDto` to `"Unavailable"` / `0` / `1` / `"—"` — and they
+ * them in `agentFromDto` to `"Unavailable"` / `0` / `"—"` — and they
  * exist solely because the existing control deck already renders them for the
  * deterministic fixture. **No new surface may read a FIXTURE-ONLY field**: a
  * design settled against one goes half-empty the moment it meets a real
@@ -141,16 +148,32 @@ export interface AgentSession {
   model: string;
   /** HONEST. */
   status: AgentStatus;
-  /** HONEST only in so far as it restates `activeTool`; otherwise a placeholder. */
+  /**
+   * HONEST — the daemon's `lastUserPrompt`, else a restatement of `activeTool`,
+   * else a placeholder saying the daemon reported neither.
+   *
+   * A DISPLAY COPY, sanitised and clamped to `DISPLAY_LIMITS.prompt` by
+   * `agentFromDto`'s `taskLine`, because `AgentTile` prints it straight into a
+   * DOM text node and the deck is the screen the app opens on. Bounding it at
+   * the projection rather than at that one tile is deliberate: nothing sorts,
+   * groups or keys on this field, so making it a display copy costs nothing and
+   * makes every consumer of it safe by construction rather than by memory.
+   * The raw prompt is on {@link AgentSession.lastUserPrompt} for surfaces that
+   * want their own budget.
+   */
   task: string;
   /**
-   * HONEST when the daemon reported one — but the deck's model has no way to
-   * say "absent", so `agentFromDto` substitutes {@link UNREPORTED} and the deck
-   * both prints and pattern-matches that sentinel. Any surface that must not
-   * show a placeholder has to reverse the substitution at its own boundary;
-   * `toOverviewAgent` is the one that does. NOT a worktree.
+   * HONEST, and ABSENT when the daemon reported none. NOT a worktree.
+   *
+   * Optional rather than sentinel-bearing since the M8 audit: it used to carry
+   * {@link UNREPORTED}, which the daemon itself can legitimately report as a
+   * directory name, so an agent could make its real working directory look
+   * unreported by choosing the sentinel's spelling. Absence has no spelling and
+   * so cannot be forged. Every surface decides for itself what absence looks
+   * like — the overview renders nothing at all, the deck's tile prints
+   * {@link UNREPORTED} at its own render seam.
    */
-  cwd: string;
+  cwd?: string;
   /**
    * FIXTURE-ONLY — no retry counter exists anywhere in the daemon, so live mode
    * reports NOTHING here rather than the `1` it used to hardcode: every tile
@@ -173,11 +196,13 @@ export interface AgentSession {
    * `writable` half, which the desktop's own DTO used to drop.
    *
    * `"unknown"` is this field's sentinel for "the daemon declared no live
-   * target", exactly as {@link UNREPORTED} is `cwd`'s — the deck's model has no
-   * way to say "absent" — and it is reversed to `undefined` at the honest
-   * projection (`toOverviewAgent`) so no screen that promises no placeholders
-   * can print it. Absence must NOT be read as read-only: the TUI treats a
-   * missing `live_target` as the legacy live default.
+   * target". Unlike the `cwd` sentinel this one CANNOT collide with daemon
+   * data — the desktop crate emits only the three mapped strings or omits the
+   * key, so no daemon value spells `"unknown"` — and it is reversed to
+   * `undefined` at the honest projection (`toOverviewAgent`) so no screen that
+   * promises no placeholders can print it. Absence must NOT be read as
+   * read-only: the TUI treats a missing `live_target` as the legacy live
+   * default.
    */
   writeLease: "read" | "write" | "none" | "unknown";
   /**

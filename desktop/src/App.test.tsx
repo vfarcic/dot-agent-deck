@@ -496,6 +496,77 @@ describe("ControlDeck", () => {
   });
 
   /**
+   * Scenario: a daemon reports a prompt built to attack the screen — every
+   * control and bidi codepoint the render seam strips, then 64 KiB of text,
+   * which is the per-prompt ceiling `daemon_client.rs` enforces. The snapshot
+   * is mapped by the LIVE path and rendered on the deck, which is the screen
+   * the app opens on and the one that renders the prompt through
+   * `AgentSession.task`. Nothing raw reaches the DOM: no stripped codepoint in
+   * any text node or `title`, and no run of prompt text longer than the budget
+   * anywhere on the screen.
+   *
+   * The M8 audit's first finding. The overview's own hostile-prompt test covers
+   * only the overview; this is the default screen, and it was rendering
+   * `agent.task` — which M8 had just changed from a hardcoded placeholder into
+   * the daemon's free-form prompt — straight into a text node.
+   */
+  it("puts no raw daemon prompt in the deck's DOM, however hostile the prompt", async () => {
+    const { mapDesktopSnapshot } = await import("./lib/bridge");
+    const { DISPLAY_LIMITS } = await import("./lib/displayText");
+    const stripped = [
+      "\u001b", "\u0000", "\u0007", "\n", "\r", "\u007f", "\u0085", "\u009b",
+      "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",
+      "\u2066", "\u2067", "\u2068", "\u2069",
+      "\u200e", "\u200f", "\u061c",
+    ];
+    // 64 KiB, the daemon's own per-prompt ceiling — the whole of which used to
+    // become one DOM text node, once per agent, on every refreshed snapshot.
+    const hostile = `${stripped.join("")}${"p".repeat(64 * 1024)}`;
+    const snapshot = mapDesktopSnapshot({
+      connection: { status: "connected", socketPath: "/tmp/deck.sock", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
+      agents: [{ id: "7", displayName: "Coder", cwd: "/tmp/project", rows: 32, cols: 120, agentType: "claude_code", status: "working", toolCount: 3, lastUserPrompt: hostile, tab: { kind: "dashboard" } }],
+      protocolVersion: 8,
+      source: "daemon",
+    });
+
+    const { container } = render(<ControlDeck runtime={runtime({ mode: "live", snapshot })} />);
+
+    const assignment = container.querySelector(".agent-assignment p");
+    expect(Array.from(assignment?.textContent ?? "").length).toBe(DISPLAY_LIMITS.prompt + 1);
+    // Every rendered surface of the screen, text and hover alike: the `title`
+    // half is where a bounded text node has hidden an unbounded copy before.
+    const rendered = [container.textContent ?? "", ...Array.from(container.querySelectorAll("[title]")).map((node) => node.getAttribute("title") ?? "")].join(" ~ ");
+    for (const codepoint of stripped) expect(rendered).not.toContain(codepoint);
+    // A run one longer than the budget can only come from an unclamped copy —
+    // the clamp itself can never produce one, wherever on the screen it sits.
+    expect(rendered).not.toContain("p".repeat(DISPLAY_LIMITS.prompt + 1));
+  });
+
+  /**
+   * Scenario: the daemon reports no working directory. The deck's footer still
+   * prints its own legacy stand-in word, exactly as before — the M8 audit's cwd
+   * fix moved that substitution off the model and onto this render seam, so
+   * that a daemon reporting a directory genuinely NAMED "Unavailable" is no
+   * longer indistinguishable from one reporting nothing. Nothing the user sees
+   * on the deck changed.
+   */
+  it("prints the deck's own stand-in for a working directory the daemon did not report", async () => {
+    const { mapDesktopSnapshot } = await import("./lib/bridge");
+    const agent = { id: "7", displayName: "Coder", rows: 32, cols: 120, agentType: "claude_code" as const, status: "working" as const, toolCount: 3, tab: { kind: "dashboard" as const } };
+    const connection = { status: "connected" as const, socketPath: "/tmp/deck.sock", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" };
+
+    const absent = render(<ControlDeck runtime={runtime({ mode: "live", snapshot: mapDesktopSnapshot({ connection, agents: [agent], protocolVersion: 8, source: "daemon" }) })} />);
+    expect(absent.container.querySelector(".agent-footer span:nth-child(2)")?.textContent).toBe("Unavailable");
+    expect(absent.container.querySelector(".agent-footer span:nth-child(2)")).not.toHaveAttribute("title");
+    absent.unmount();
+
+    // And the collision case the sentinel used to swallow: a real directory of
+    // that name reaches the footer as the reported path it is, hover included.
+    const reported = render(<ControlDeck runtime={runtime({ mode: "live", snapshot: mapDesktopSnapshot({ connection, agents: [{ ...agent, cwd: "Unavailable" }], protocolVersion: 8, source: "daemon" }) })} />);
+    expect(reported.container.querySelector(".agent-footer span:nth-child(2)")).toHaveAttribute("title", "Unavailable");
+  });
+
+  /**
    * The fixture keeps its own attempt counts: they are legitimate fixture data,
    * and M8's claim is about what LIVE mode presents as fact.
    */

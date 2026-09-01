@@ -1,5 +1,6 @@
 import { createFixtureSnapshot, DEFAULT_PROFILES, type FixtureState } from "../data/fixture";
 import { applyHandoffEvent, mapDaemonEvent, MAX_LIVE_EVIDENCE } from "./daemonEvents";
+import { DISPLAY_LIMITS, displayText } from "./displayText";
 import { UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentSession,
@@ -189,6 +190,40 @@ function roleFromAgent(agent: DesktopAgentDto, index: number): string {
   return value ? value.charAt(0).toUpperCase() + value.slice(1) : `Agent ${index + 1}`;
 }
 
+/**
+ * The deck's assignment line, as a DISPLAY COPY — sanitised and clamped here
+ * rather than at the tile that prints it.
+ *
+ * PRD #745 M8 made this line carry `lastUserPrompt`, which is free-form,
+ * agent-influenceable text bounded only by the daemon's 64 KiB per-prompt
+ * ceiling; before that it carried a hardcoded placeholder or a restatement of
+ * the active tool. `AgentTile` renders `agent.task` straight into a DOM text
+ * node and the deck is the screen the app opens on, so a `U+202E` in a prompt
+ * reversed the assignment line — the daemon-side scrub removes category `Cc`
+ * and bidi formatting characters are `Cf` — and fifteen agents put about a
+ * megabyte of prompt text in the deck's DOM on every refreshed snapshot.
+ *
+ * Bounding it at the projection rather than at the tile is what makes the
+ * property structural: `task` is display-only — nothing sorts, groups or keys
+ * on it — so every consumer of it, present and future, gets the bounded copy
+ * and no raw daemon text reaches a deck DOM node through this field at all.
+ * The raw prompt stays on `lastUserPrompt` for the surfaces that need more of
+ * it, each of which passes it through this same seam with its own budget.
+ *
+ * The active-tool restatement goes through it too, which closes the same hole
+ * one field over: a tool detail is the agent's own command line and was never
+ * sanitised on this path either.
+ */
+function taskLine(agent: DesktopAgentDto): string {
+  // The daemon's own last user prompt is the honest answer to "what is this
+  // agent doing", so it leads. The active-tool restatement is the fallback it
+  // always was, and the placeholder is reached only when the daemon reported
+  // neither (PRD #745 M8).
+  const reported = agent.lastUserPrompt
+    ?? (agent.activeTool ? `Active tool: ${agent.activeTool.name}${agent.activeTool.detail ? ` · ${agent.activeTool.detail}` : ""}` : undefined);
+  return reported === undefined ? "Task metadata unavailable from daemon" : displayText(reported, DISPLAY_LIMITS.prompt);
+}
+
 function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): AgentSession {
   const status = statusFromDaemon(agent.status);
   const role = roleFromAgent(agent, index);
@@ -202,13 +237,15 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     cli: agent.agentType || "agent",
     model: UNREPORTED,
     status,
-    // PRD #745 M8: the daemon's own last user prompt is the honest answer to
-    // "what is this agent doing", so it leads. The active-tool restatement is
-    // the fallback it always was, and the placeholder is now only reached when
-    // the daemon reported neither.
-    task: agent.lastUserPrompt
-      ?? (agent.activeTool ? `Active tool: ${agent.activeTool.name}${agent.activeTool.detail ? ` · ${agent.activeTool.detail}` : ""}` : "Task metadata unavailable from daemon"),
-    cwd: agent.cwd ?? UNREPORTED,
+    task: taskLine(agent),
+    // Absent, not sentinel-encoded. The deck's own stand-in word is a legal
+    // working directory (`src/agent_pty.rs` accepts any non-empty, bounded,
+    // control-free `cwd`), so writing it here let an agent launched in a
+    // directory called "Unavailable" have its real, reported directory erased
+    // by `toOverviewAgent`'s reversal. Absence that cannot be spelled by the
+    // daemon cannot collide with it; the one surface that still wants a word
+    // for it supplies its own at its own render seam (`AgentTile`).
+    cwd: agent.cwd,
     // No `attempt`: the daemon has no retry counter, and live mode used to
     // hardcode `1` here, which every tile then printed as `ATT 01` (PRD #745 M8).
     duration: "—",
@@ -269,7 +306,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
   // ahead of #742).
   const daemonId = dto.connection.socketPath;
   const agents = dto.agents.map((agent, index) => agentFromDto(agent, index, daemonId));
-  const cwd = agents.find((agent) => agent.cwd !== UNREPORTED)?.cwd
+  const cwd = agents.find((agent) => agent.cwd)?.cwd
     ?? dto.projectCwd
     ?? (previous?.worktree?.startsWith("/") ? previous.worktree : undefined)
     ?? "No active project";

@@ -1,4 +1,13 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+/*
+  The shipped stylesheet, loaded so the assertions below can read COMPUTED
+  declarations rather than only class names. Vitest's `css: true` hands it to
+  JSDOM, which applies the cascade — so a cell's `white-space` here is the one
+  `styles.css` really gives it, and deleting the rule fails the test. JSDOM
+  still performs no LAYOUT: nothing in this file measures a height, and no
+  assertion pretends to.
+*/
+import "../styles.css";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "../data/fixture";
 import { DISPLAY_LIMITS } from "../lib/displayText";
@@ -538,17 +547,35 @@ describe("AgentOverview", () => {
   });
 
   /**
-   * Scenario: `toOverviewAgent` is the boundary that reverses the deck's
-   * sentinels. A `"unknown"` lease becomes absent exactly as an `UNREPORTED`
-   * cwd does, so no screen rendering from the honest projection can print
-   * either one.
+   * Scenario: `toOverviewAgent` is the boundary that reverses the deck's one
+   * remaining sentinel. A `"unknown"` lease becomes absent — no daemon value
+   * spells it, so the reversal can only ever remove a placeholder — while an
+   * absent cwd arrives absent and needs no reversal at all.
    */
-  it("reverses the write-lease sentinel at the same boundary as the cwd one", () => {
+  it("reverses the write-lease sentinel, which is now the only one this boundary reverses", () => {
     const [agent] = createFixtureSnapshot("crowded").agents;
-    expect(toOverviewAgent({ ...(agent as AgentSession), writeLease: "unknown", cwd: UNREPORTED }))
+    expect(toOverviewAgent({ ...(agent as AgentSession), writeLease: "unknown", cwd: undefined }))
       .toMatchObject({ writeLease: undefined, cwd: undefined });
     expect(toOverviewAgent({ ...(agent as AgentSession), writeLease: "read", cwd: "/tmp/project" }))
       .toMatchObject({ writeLease: "read", cwd: "/tmp/project" });
+  });
+
+  /**
+   * Scenario: the daemon reports a working directory whose name is the deck's
+   * own stand-in word. `src/agent_pty.rs` accepts any non-empty, bounded,
+   * control-free cwd, so that is a real directory and not an absence — and this
+   * boundary, which used to reverse the word into `undefined`, now carries it
+   * through to a cell with the path in it and a hover to match.
+   */
+  it("keeps a reported working directory that happens to spell the deck's stand-in word", () => {
+    expect(toOverviewAgent({ ...(createFixtureSnapshot("crowded").agents[0] as AgentSession), cwd: UNREPORTED }))
+      .toMatchObject({ cwd: UNREPORTED });
+
+    renderOverview({ snapshot: snapshotWithAgent({ cwd: UNREPORTED, tab: { kind: "dashboard" } }) });
+
+    const cell = document.querySelector(".overview-cwd");
+    expect(cell).toHaveTextContent(UNREPORTED);
+    expect(cell).toHaveAttribute("title", UNREPORTED);
   });
 
   /**
@@ -602,7 +629,14 @@ describe("AgentOverview", () => {
    * Scenario: a hostile prompt — every stripped codepoint, then far more text
    * than the budget allows. The rendered copy carries no control or bidi
    * character, is clamped to `DISPLAY_LIMITS.prompt` plus the elision marker,
-   * and the row it sits in is exactly as tall as one with no prompt at all.
+   * and the cell carries the class whose shipped rule pins it to one line.
+   *
+   * That last assertion is over the cell's COMPUTED DECLARATIONS, not over its
+   * geometry, and the distinction is the point: JSDOM performs no layout, so
+   * nothing here can measure a row's height. Asserting only that the cell
+   * carries `overview-prompt` would have passed with the clipping rule deleted
+   * — a test claiming to see something it cannot — so the rule that makes the
+   * class mean anything is asserted too.
    */
   it("sanitises and bounds the last prompt, which is the most attacker-shaped string on the screen", () => {
     const hostile = `${HOSTILE_CODEPOINTS.join("")}${"p".repeat(DISPLAY_LIMITS.prompt * 4)}`;
@@ -622,13 +656,19 @@ describe("AgentOverview", () => {
     // The hover copy is bounded too, by the title budget rather than this one.
     expect(Array.from(cell?.getAttribute("title") ?? "").length).toBe(DISPLAY_LIMITS.title + 1);
     // One line, whatever the daemon sent: the cell never wraps, so no prompt
-    // can push its row taller than its neighbours.
+    // can push its row taller than its neighbours. Both halves are needed —
+    // the class on the cell, AND the rule that makes the class mean anything.
     expect(cell).toHaveClass("overview-prompt");
+    const computed = getComputedStyle(cell as HTMLElement);
+    expect(computed.whiteSpace).toBe("nowrap");
+    expect(computed.overflow).toBe("hidden");
+    expect(computed.textOverflow).toBe("ellipsis");
   });
 
   it("leaves the working directory blank when the daemon reported none", () => {
-    // What `agentFromDto` produces for an agent whose `cwd` the daemon omitted.
-    renderOverview({ snapshot: snapshotWithAgent({ cwd: UNREPORTED, tab: { kind: "dashboard" } }) });
+    // What `agentFromDto` produces for an agent whose `cwd` the daemon omitted:
+    // absence itself, which is the one thing a daemon string cannot imitate.
+    renderOverview({ snapshot: snapshotWithAgent({ cwd: undefined, tab: { kind: "dashboard" } }) });
 
     const cell = document.querySelector(".overview-cwd");
     // Blank, and no hover text either — a `title` is the other half of what a
@@ -646,9 +686,10 @@ describe("AgentOverview", () => {
     expect(snapshot.agents[0]?.model).toBe(UNREPORTED);
     expect(snapshot.agents[0]?.worktree).toBe(UNREPORTED);
     // And one agent whose cwd is absent too: the `Pick<>` closes dishonest
-    // field names but cannot close a sentinel inside an allowed field, so the
-    // path the honesty claim was actually violable through is in this fleet.
-    snapshot.agents = [...snapshot.agents, { ...(snapshot.agents[0] as AgentSession), id: "99", displayName: "no-cwd", cwd: UNREPORTED, tab: { kind: "dashboard" } }];
+    // field names but cannot close a placeholder inside an allowed field, so
+    // the path the honesty claim was actually violable through is in this
+    // fleet.
+    snapshot.agents = [...snapshot.agents, { ...(snapshot.agents[0] as AgentSession), id: "99", displayName: "no-cwd", cwd: undefined, tab: { kind: "dashboard" } }];
 
     const { container } = renderOverview({ snapshot });
     const text = [container.textContent ?? "", ...titlesOf(container)].join(" ~ ");
