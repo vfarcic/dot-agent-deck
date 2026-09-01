@@ -736,7 +736,14 @@ impl TuiDeck {
             }
         }
         if !claude_trust_paths.is_empty() {
-            seed_claude_project_trust(&home, &claude_trust_paths).map_err(|e| e.to_string())?;
+            // PR #805 audit P2: the `~/.claude.json` this writes carries the
+            // host `oauthAccount`, and its identity fields are redacted out of
+            // the recordings as well as the diagnostics — see
+            // [`claude_identity_redactions`].
+            recording_redactions.extend(
+                seed_claude_project_trust(&home, &claude_trust_paths).map_err(|e| e.to_string())?,
+            );
+            normalise_redactions(&mut recording_redactions);
         }
 
         // Write the saved-session file the deck auto-restores on startup
@@ -1912,8 +1919,30 @@ fn regenerate_paired_doc(test_name: &str) {
 }
 
 impl TuiDeck {
+    /// The values the persisted artifacts are redacted against: this deck's own
+    /// set UNION the process-global diagnostic store.
+    ///
+    /// The union exists because the two sets drifted, and the drift was silent
+    /// in the direction that matters. `recording_redactions` is assembled once,
+    /// during `try_launch_inner`, so anything registered AFTER the launch — and
+    /// `seed_claude_trust_in_home` is called after the launch by nine live tests,
+    /// deliberately, because the trusted directory is only known then — reached
+    /// the panic seam and never the `.cast`. That is backwards: the `.cast` is
+    /// the artifact the demo reel publishes. Every value in the global store is
+    /// a credential or identity value some harness path registered, and the
+    /// per-deck set is already a subset of it in practice, so the union can only
+    /// add redactions; the cost is one failed substring search per artifact for
+    /// a value that never appears.
+    fn artifact_redactions(&self) -> Vec<String> {
+        let mut values = self.recording_redactions.clone();
+        values.extend(lock_diagnostic_redactions().iter().cloned());
+        normalise_redactions(&mut values);
+        values
+    }
+
     fn dump_recordings(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
+        let redactions = self.artifact_redactions();
 
         // M4.3: atomic writes for every artifact in the per-test
         // dir. Two `cargo test-e2e` runs on the same checkout (or one
@@ -1924,7 +1953,7 @@ impl TuiDeck {
         // half-written.
 
         // final-grid.txt
-        let grid = redact_known_credentials_text(&self.snapshot_grid(), &self.recording_redactions);
+        let grid = redact_known_credentials_text(&self.snapshot_grid(), &redactions);
         atomic_write(&dir.join("final-grid.txt"), grid.as_bytes())?;
 
         // final-grid.svg — minimal monospace render. Not pixel-perfect,
@@ -1934,7 +1963,7 @@ impl TuiDeck {
 
         // full-stream.cast — asciinema v2 format (header + one JSON
         // array per event). Inline encoder, ~20 lines.
-        let cast = self.encode_asciinema_cast();
+        let cast = self.encode_asciinema_cast(&redactions);
         atomic_write(&dir.join("full-stream.cast"), cast.as_bytes())?;
 
         // fixture.toml — copy of the deck's .dot-agent-deck.toml so a
@@ -1942,13 +1971,13 @@ impl TuiDeck {
         let fixture_src = self.fixture_path.join(".dot-agent-deck.toml");
         if fixture_src.exists() {
             let bytes = std::fs::read(&fixture_src)?;
-            let redacted = redact_known_credentials_bytes(&bytes, &self.recording_redactions);
+            let redacted = redact_known_credentials_bytes(&bytes, &redactions);
             atomic_write(&dir.join("fixture.toml"), &redacted)?;
         }
         Ok(())
     }
 
-    fn encode_asciinema_cast(&self) -> String {
+    fn encode_asciinema_cast(&self, redactions: &[String]) -> String {
         let mut s = String::new();
         // Header — minimum required fields for asciinema v2.
         let header = serde_json::json!({
@@ -1962,7 +1991,7 @@ impl TuiDeck {
         s.push_str(&header.to_string());
         s.push('\n');
         let events = self.cast_events.lock().unwrap();
-        let redacted_events = redact_cast_events(&events, &self.recording_redactions);
+        let redacted_events = redact_cast_events(&events, redactions);
         for (ev, redacted) in events.iter().zip(redacted_events) {
             // Lossy UTF-8 decoding is what asciinema players expect:
             // raw bytes that are valid UTF-8 round-trip, invalid bytes
@@ -2020,15 +2049,63 @@ const RECORDING_CREDENTIAL_REDACTION: &[u8] = b"[REDACTED-CREDENTIAL]";
 // may look. A contiguous occurrence still produces exactly one range, so this is
 // a strict superset of the byte-exact matcher it replaces.
 //
-// WHAT THIS DOES NOT CLAIM. `MIN_WRAP_FRAGMENT` is a floor on evidence, so a
-// run of credential bytes SHORTER than it can survive: the six-byte remainder
-// of a 102 / 6 break stays in the artifact when a coincidence elsewhere on the
-// row took the chain. Six bytes is below the bar this matcher states for
-// evidence everywhere else, which is the reason the floor is where it is rather
-// than an exception to it. In the other direction the floor over-redacts, and
-// `collect_credential_values` widens that surface by registering every
-// auth-document string of 16 characters or more even when its field name is not
-// sensitive — see the note on `MIN_WRAP_FRAGMENT` below.
+// WHAT THIS DOES NOT CLAIM, AND IT IS MORE THAN THE FLOOR. Start with the
+// framing, because every doc that described this as "the last thing between a
+// key and a published video" was overstating it: **this is a BLOCKLIST and it is
+// best-effort.** It can only remove values something registered, and the scan
+// that finds them is greedy left-to-right with a single committed continuation
+// chain. It has been point-fixed four times (contiguous-only matching; skipping
+// the bytes a fragmented match preserved; redacting only the first place a hop
+// could resume; keeping one match per position by length) and PR #805's second
+// security audit reproduced TWO more leaks in the code as it stands, with
+// fabricated values:
+//
+//   1. A registered value that STARTS INSIDE an earlier match survives. The scan
+//      resumes at the smallest first-fragment end among the matches at a
+//      position, which still skips every offset inside that fragment — so
+//      `first-value-ABCDEFGH` and `ABCDEFGH-second-value-tail`, scanned over
+//      their concatenation, leave `[REDACTED-CREDENTIAL]-second-value-tail`.
+//   2. A DECOY continuation suppresses a real one and then nothing is redacted
+//      at all. `credential_fragments_at` follows `candidates.first()` and returns
+//      `None` if that path dead-ends, so a value whose genuine continuation
+//      appears after a decoy is left entirely in place.
+//
+// Both are issue #810, which carries the design: a bounded
+// dynamic-programming/NFA search over deduplicated continuation states emitting
+// ranges only from COMPLETE paths, exact occurrences from an overlap-preserving
+// multi-pattern scan, and a cost budget that fails closed by replacing the whole
+// artifact rather than writing unscanned bytes. Do not add a fifth point fix
+// here: each of the four closed a real leak and each was followed by another of
+// the same ordering-dependent shape. What actually stands between a credential
+// and a public URL is the demo reel's private-by-default upload plus the owner's
+// review before flipping it — see `docs/develop/demo-reel.md`.
+//
+// WHAT IT DOES GUARANTEE, verified rather than argued. Every range constructed
+// here reproduces registered credential bytes exactly — the first is a common
+// prefix, chained ranges are common prefixes of the remaining credential,
+// alternates are exact candidate runs — and `merge_redaction_ranges` merges only
+// strict overlaps and never fills gaps. So it OVER-redacts rather than
+// mis-redacts: it can obscure a coincidental fragment of a panic, it cannot
+// replace arbitrary bytes it did not match. And it removes the realistic
+// geometries a terminal produces, which is what it was built for.
+//
+// THE FLOOR, which is the narrower claim this paragraph used to be about.
+// `MIN_WRAP_FRAGMENT` is a floor on evidence, so a run of credential bytes
+// SHORTER than it can survive: the six-byte remainder of a 102 / 6 break stays
+// in the artifact when a coincidence elsewhere on the row took the chain. Six
+// bytes is below the bar this matcher states for evidence everywhere else, which
+// is the reason the floor is where it is rather than an exception to it. In the
+// other direction the floor over-redacts, and `collect_credential_values` widens
+// that surface by registering every auth-document string of 16 characters or
+// more even when its field name is not sensitive — see the note on
+// `MIN_WRAP_FRAGMENT` below.
+//
+// COST has an adversarial tail, and it is part of #810 too: a realistic 2.1 MB
+// artifact holding one rendered credential document scans in ~162 ms, while
+// 1.6 MB of repeated shared prefixes takes ~25 SECONDS, because each occurrence
+// of a shared eight-byte prefix can trigger two full `MAX_WRAP_GAP` candidate
+// scans whether or not a range is kept — and `.cast` history is not
+// size-bounded.
 
 /// The shortest run of credential bytes a wrapped match accepts as a fragment,
 /// other than the final one.
@@ -2171,6 +2248,14 @@ struct CredentialMatch {
 ///
 /// A contiguous occurrence comes back as exactly one range, which is what makes
 /// this a strict superset of byte-exact matching.
+///
+/// **KNOWN LEAK (issue #810): the chain commits to `candidates.first()` and
+/// returns `None` if that path dead-ends.** Every candidate is recorded, but one
+/// candidate still decides whether any result exists at all, so a decoy
+/// continuation suppresses a valid later one and the value is left entirely
+/// unredacted. Reproduced by PR #805's second audit with fabricated values.
+/// Collecting candidates is not the same as searching exhaustively; the fix is
+/// the all-match search in #810, not a different choice of candidate here.
 fn credential_fragments_at(
     data: &[u8],
     start: usize,
@@ -2289,6 +2374,14 @@ fn merge_redaction_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)
 /// every occurrence of that prefix pays a full `MAX_WRAP_GAP` candidate sweep
 /// twice. A real artifact renders the document once or twice, which is the
 /// realistic row.
+///
+/// **KNOWN LEAK (issue #810): the outer scan skips every offset INSIDE a match's
+/// first fragment.** Resuming at the smallest `first_fragment_end` is what keeps
+/// the bytes a match preserved readable to the scan, but a registered value that
+/// begins inside that fragment and extends past it is still never looked for —
+/// reproduced by PR #805's second audit with `first-value-ABCDEFGH` and
+/// `ABCDEFGH-second-value-tail`. At minimum the scan must examine every byte
+/// offset; the design that does it without the cost is #810.
 fn credential_redaction_ranges(data: &[u8], credentials: &[String]) -> Vec<(usize, usize)> {
     let patterns: Vec<&[u8]> = credentials
         .iter()
@@ -3230,33 +3323,65 @@ const RECORDING_ARTIFACTS: [&str; 4] = [
 /// it records no run identity, no commit, no timestamp and no proof that the
 /// test passed, and the engine performs no redaction of its own. So a cast
 /// written by a revision that predates the redaction fixes could survive an
-/// interrupted current run and still be stitched into a video and uploaded
-/// unlisted to YouTube with its link in the public release notes.
+/// interrupted current run and still be stitched into a video and uploaded to
+/// YouTube with its link in the PR body and the public release notes. (The
+/// upload is PRIVATE by default now, so the flip that makes such a video
+/// third-party-visible is a human step — that reduces the blast radius, it does
+/// not make a stale cast correct.)
 ///
 /// Clearing at launch kills that at the source: after this call the artifact
-/// either belongs to the current run or does not exist. **It is the cheap half.**
-/// The other half — the adapter verifying provenance (run identity, commit, and
-/// that the cast came from a test that actually PASSED in the current run)
-/// rather than trusting `test -f` — is issue #808 and is deliberately not built
-/// here. A filtered run still leaves an unselected test's older cast in place,
-/// which is exactly the case only provenance can catch.
+/// either belongs to the current run or does not exist. **It is the cheap half,
+/// and it does not close the case.** The other half — the adapter verifying
+/// provenance (run identity, commit, and that the cast came from a test that
+/// actually PASSED in the current run) rather than trusting `test -f` — is issue
+/// #808 and is deliberately not built here. TWO residual routes still leave a
+/// stale artifact in place, and both want provenance rather than another
+/// discard:
 ///
-/// Best-effort, but not silently so: a `NotFound` is the ordinary case and says
-/// nothing, while any other error means a stale artifact may have SURVIVED, which
-/// is the failure this function exists to prevent — so it is reported to stderr
-/// rather than swallowed. It is not made fatal, because a harness that refuses to
-/// start over an unwritable gitignored directory would be worse than one that
-/// says so.
+///   1. A **filtered** run never selects the test at all, so nothing on this
+///      path executes and an unselected test's older cast is untouched.
+///   2. The **preflight expression** of `skip_unless!` is evaluated before
+///      `_skip_if_err` is entered — `skip_unless!(check_claude_available())`
+///      calls the check first and only then hands the `Result` over — so a kill
+///      or an abort inside a `check_*_available`, or inside an importer it calls,
+///      happens BEFORE the skip-path discard runs.
+///
+/// A third route — a deletion that FAILS — used to be a way for a stale artifact
+/// to survive this function itself, and is closed by the panic below.
+///
+/// **It fails CLOSED.** A `NotFound` is the ordinary case and says nothing; any
+/// OTHER error means a stale artifact may have SURVIVED, which is the exact
+/// failure this function exists to prevent, so it PANICS and the test fails.
+///
+/// That reverses the original stance, which warned to stderr and continued on
+/// the ground that "a harness that refuses to start over an unwritable
+/// gitignored directory would be worse than one that says so". PR #805's second
+/// security audit named that a fail-open and it was right. A warning only helps
+/// if somebody reads it; the run that printed it continues to completion, gets
+/// reported as PASSED, and the artifact it could not remove still satisfies the
+/// adapter's `test -f` — so the stale cast is published exactly as if nothing had
+/// been attempted. Failing to remove a stale credential-bearing artifact is
+/// precisely the case where continuing is wrong. The cost is a harness that
+/// refuses to start over an unwritable `.dot-agent-deck/recordings/<test>/`,
+/// which is a trivially fixable state and, unlike the warning, never a silent
+/// one.
 fn discard_previous_recording(test_name: &str) {
+    // The panic below is the failure mode of this function, so it has to reach
+    // the redacting output seam like every other harness panic. Cheap (a
+    // `Once`), and this is the earliest thing `try_launch_inner` does.
+    install_credential_redaction();
     let dir = workspace_recordings_root().join(sanitize_test_name(test_name));
     for name in RECORDING_ARTIFACTS {
         let path = dir.join(name);
         match std::fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => eprintln!(
-                "[tui-harness] could not discard the previous recording at {}: {error} — \
-                 a STALE artifact may survive this run; delete it before building a demo reel",
+            Err(error) => panic!(
+                "could not discard the previous recording at {}: {error} — refusing \
+                 to run, because a STALE artifact that survives this run still \
+                 satisfies the demo-reel adapter's existence check and can be \
+                 published. Delete it (or fix the directory's permissions) and \
+                 re-run",
                 path.display()
             ),
         }
@@ -4377,9 +4502,12 @@ fn host_home() -> PathBuf {
 /// the Codex importer's own rationale already treats exactly that ("a test
 /// dumping the file") as a sink. The same reasoning applies here, and the stakes
 /// are higher rather than lower: reel-eligible tests deliberately drive real
-/// agents and publish their terminal capture to an unlisted YouTube URL linked
-/// from the public release notes, and most of them take the ordinary
-/// OAuth-backed Claude route — precisely the one that had no registration.
+/// agents and publish their terminal capture to a YouTube URL linked from the
+/// public release notes, and most of them take the ordinary OAuth-backed Claude
+/// route — precisely the one that had no registration. (That upload is private by
+/// default since PR #805, so a human flip stands between such a video and a
+/// third party; this registration is what keeps the credential out of the bytes
+/// in the first place, and the two are not substitutes.)
 ///
 /// Both copied documents go through [`collect_credential_values`], at DIFFERENT
 /// widths (see [`CredentialScope`]): the OAuth credential set is an auth
@@ -4393,14 +4521,16 @@ fn host_home() -> PathBuf {
 /// — are covered without having to remember to, and so the panic seam and the
 /// raw JUnit report inherit it alongside `full-stream.cast` and `final-grid.*`.
 ///
-/// Deliberately NOT registered: the `~/.claude.json` that
+/// Deliberately NOT registered by THIS importer: the `~/.claude.json` that
 /// [`seed_claude_project_trust`] writes. It carries the host `oauthAccount`,
 /// which is account IDENTITY (a uuid, an email, an organisation name) and not a
-/// credential, and `collect_credential_values`' 16-byte floor would sweep all of
-/// it up — trading credential coverage for the readability of every grid a
-/// developer reads. The one credential derivative it does hold, the API key's
+/// credential, and `collect_credential_values`' 16-byte floor would sweep the
+/// whole file up — trading credential coverage for the readability of every grid
+/// a developer reads. The one credential derivative it does hold, the API key's
 /// 20-character approval suffix, is registered by
-/// [`api_key_recording_redactions`] whenever a key is present.
+/// [`api_key_recording_redactions`] whenever a key is present. Its identity
+/// fields are registered separately and by NAME, where they are written — see
+/// [`claude_identity_redactions`] (PR #805 audit P2).
 fn import_claude_credentials(test_home: &Path) -> std::io::Result<Vec<String>> {
     // The ambient API key this import defers to is rendered through the
     // approval prompt's 20-character suffix, and the documents copied below are
@@ -4587,7 +4717,7 @@ fn claude_recording_redactions(
         ))
     })?;
     let mut values = Vec::new();
-    collect_credential_values(&document, None, scope, &mut values);
+    collect_credential_values(&document, None, scope, false, &mut values);
     normalise_redactions(&mut values);
     Ok(values)
 }
@@ -4674,7 +4804,10 @@ fn import_claude_plugins_enabled() -> bool {
 ///
 /// A response the host already recorded for a key that is not the ambient one
 /// is left untouched in every branch.
-fn seed_claude_project_trust(test_home: &Path, trust_paths: &[String]) -> std::io::Result<()> {
+fn seed_claude_project_trust(
+    test_home: &Path,
+    trust_paths: &[String],
+) -> std::io::Result<Vec<String>> {
     install_credential_redaction();
     let host_cfg_path = host_home().join(".claude.json");
     let mut cfg: serde_json::Value = std::fs::read_to_string(&host_cfg_path)
@@ -4710,7 +4843,72 @@ fn seed_claude_project_trust(test_home: &Path, trust_paths: &[String]) -> std::i
     }
     let bytes = serde_json::to_vec(&cfg)
         .map_err(|e| std::io::Error::other(format!("serialize .claude.json: {e}")))?;
-    write_credential_file_atomic_0o600(&test_home.join(".claude.json"), &bytes)
+    write_credential_file_atomic_0o600(&test_home.join(".claude.json"), &bytes)?;
+    // Registered from `cfg` — the document actually written — rather than from a
+    // second read of the host, the same rule the credential importers follow.
+    let identity = claude_identity_redactions(&cfg);
+    register_diagnostic_redactions(identity.clone());
+    Ok(identity)
+}
+
+/// Field names inside `oauthAccount` whose values IDENTIFY the developer rather
+/// than authenticate them. Matched case-insensitively as substrings of the key,
+/// which on a real `~/.claude.json` selects `accountUuid`, `organizationUuid`,
+/// `emailAddress`, `displayName`, `fullName` and `organizationName`, and leaves
+/// the descriptive neighbours alone (`billingType`, `seatTier`,
+/// `organizationRole`, `organizationRateLimitTier`, the trial flags and the
+/// timestamps) — those are not identity and registering a value like `admin` or
+/// `max` would replace those bytes wherever they occurred in an artifact.
+const CLAUDE_IDENTITY_KEY_FRAGMENTS: [&str; 3] = ["uuid", "email", "name"];
+
+/// The IDENTITY values inside the `~/.claude.json` this harness writes, for
+/// redaction out of the artifacts (PR #805 audit P2).
+///
+/// The classification is unchanged and the audit agreed with it: an account
+/// uuid, an email address and an organisation name are identity, not
+/// authentication material — nothing in that file authorises an API call, and
+/// the one credential DERIVATIVE it carries (the key's 20-character approval
+/// suffix) is registered by [`api_key_recording_redactions`] instead. What
+/// changed is the consequence. This document is copied into every isolated HOME
+/// of every real-agent test, an interactive `claude` renders the account line
+/// into the pane, and that pane is what `full-stream.cast` captures and the demo
+/// reel publishes. Private-by-default upload drops that exposure a long way (see
+/// `docs/develop/demo-reel.md`), but "a human has to flip it before strangers can
+/// watch" is not a reason to leave a developer's email in the artifact when the
+/// alternative is a handful of field names.
+///
+/// Deliberately NOT the [`CredentialScope::AuthDocument`] treatment. That would
+/// register every string of 16 bytes or more in the file — which here is mostly
+/// timestamps, tiers, trial flags and, at the top level, the whole `projects` map
+/// of paths this run just trusted — and would cost the readability of every grid
+/// a developer reads, which is the trade the original decision correctly refused.
+/// This is the targeted third option: the identity fields by name, at the top
+/// level of `oauthAccount` only.
+///
+/// The [`MIN_WRAP_FRAGMENT`] floor is the one guard: a value shorter than eight
+/// bytes cannot be told apart from ordinary rendered text — that is exactly what
+/// the floor means everywhere else in this seam — so registering a three-letter
+/// display name would gouge those letters out of every artifact that happens to
+/// contain them. No account uuid or email is that short; a display name can be,
+/// and is then left alone rather than allowed to wreck the artifacts, with the
+/// uuid and email still covering the account.
+fn claude_identity_redactions(cfg: &serde_json::Value) -> Vec<String> {
+    let Some(account) = cfg.get("oauthAccount").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let mut values: Vec<String> = Vec::new();
+    for (key, value) in account {
+        let Some(text) = value.as_str() else { continue };
+        let lowered = key.to_ascii_lowercase();
+        let identifying = CLAUDE_IDENTITY_KEY_FRAGMENTS
+            .iter()
+            .any(|fragment| lowered.contains(fragment));
+        if identifying && text.len() >= MIN_WRAP_FRAGMENT {
+            values.push(text.to_string());
+        }
+    }
+    normalise_redactions(&mut values);
+    values
 }
 
 /// Pre-answer Claude Code's "Detected a custom API key in your environment"
@@ -4792,7 +4990,11 @@ fn set_response_membership(cfg: &mut serde_json::Value, field: &str, id: &str, w
 /// has to beat the spawn, not the launch.
 #[allow(dead_code)]
 pub fn seed_claude_trust_in_home(home: &Path, trust_paths: &[String]) -> std::io::Result<()> {
-    seed_claude_project_trust(home, trust_paths)
+    // The identity values are registered process-globally by the callee, and
+    // `TuiDeck::dump_recordings` reads that store too (see
+    // [`TuiDeck::artifact_redactions`]), so a post-launch caller's recordings are
+    // covered without threading a value back through nine call sites.
+    seed_claude_project_trust(home, trust_paths).map(|_| ())
 }
 
 /// Seed a HOME for a Claude Code worker the test spawns ITSELF, outside the
@@ -4824,8 +5026,11 @@ pub fn seed_claude_worker_home(home: &Path, trust_paths: &[String]) -> std::io::
     // is the only sink these callers have.
     import_claude_credentials(home)?;
     // Same order as the builder's, so both routes record and then read one
-    // decision rather than two (see [`CLAUDE_OAUTH_SEEDED`]).
-    seed_claude_project_trust(home, trust_paths)
+    // decision rather than two (see [`CLAUDE_OAUTH_SEEDED`]). The identity
+    // values it returns are discarded for the same reason the importer's are:
+    // this route has no `TuiDeck` and no recording, and the callee registered
+    // them for the diagnostic sink itself.
+    seed_claude_project_trust(home, trust_paths).map(|_| ())
 }
 
 /// Strip the top-level `hooks` key from a Claude Code settings.json.
@@ -5091,33 +5296,70 @@ enum CredentialScope {
     /// does not know. It over-redacts on purpose; the reasoning is in the
     /// `MIN_WRAP_FRAGMENT` note above.
     AuthDocument,
-    /// Only strings under a sensitive KEY NAME, with no length floor at all.
-    /// Right for a CONFIGURATION document — `~/.claude/settings.json` — where the
-    /// floor would be actively harmful: a real one carries dozens of long
-    /// strings that are not secrets (`permissions.allow` rules, a model id, a
-    /// `statusLine` command), and registering those costs a full scan pass over
-    /// every artifact for each one AND redacts them out of the grids a developer
-    /// reads. What is left still covers the fields that hold a credential —
-    /// `apiKeyHelper`, an `env` entry named `ANTHROPIC_AUTH_TOKEN`, anything
-    /// matching the sensitive-name list.
+    /// Strings under a sensitive KEY NAME with no length floor at all, PLUS
+    /// every string of 16 bytes or more anywhere below an `env` object.
+    /// Right for a CONFIGURATION document — `~/.claude/settings.json` — where a
+    /// document-wide floor would be actively harmful: a real one carries dozens
+    /// of long strings that are not secrets (`permissions.allow` rules, a model
+    /// id, a `statusLine` command), and registering those costs a full scan pass
+    /// over every artifact for each one AND redacts them out of the grids a
+    /// developer reads.
+    ///
+    /// **The `env` map is the exception, and PR #805's second audit was right to
+    /// call the key-name rule alone a leak there.** Claude Code copies
+    /// `settings.json` into the isolated HOME and exports everything under `env`
+    /// into the agent's environment, and the names in that map are ARBITRARY —
+    /// the recursion keeps only the innermost key, so a variable is judged purely
+    /// on what the developer happened to call it. `ANTHROPIC_AUTH_TOKEN` matches
+    /// the sensitive-name list; `DATABASE_URL`, `HTTP_PROXY`, `NPM_CONFIG__AUTH`,
+    /// `COOKIE`, `CREDENTIAL` and `PAT` do not, and a database or proxy URL
+    /// carrying user-info is a complete password-bearing credential rather than
+    /// hypothetical configuration syntax. So inside `env` the policy flips to the
+    /// auth-document one: the variable's NAME stops being evidence and the value
+    /// gets the same 16-byte floor, because an `env` entry is exactly the shape
+    /// of thing that holds a credential under a name this code cannot predict.
+    ///
+    /// The floor is what keeps that from being a disaster: `NO_COLOR=1`,
+    /// `RUST_LOG=debug` and `TERM=xterm` would otherwise be registered, and
+    /// registering a two-byte value replaces those bytes wherever they occur in
+    /// every artifact. Sixteen is the same bound the auth documents use and no
+    /// credential worth protecting is shorter. Not depth-anchored to the
+    /// top-level `env` on purpose — a nested `env` map is env material too, and
+    /// being wrong in the over-registering direction is the safe one here.
     ConfigDocument,
 }
 
+/// The length at which a string is treated as credential-shaped on its own, with
+/// no sensitive name to vouch for it: [`CredentialScope::AuthDocument`]
+/// everywhere, and [`CredentialScope::ConfigDocument`] inside an `env` map.
+/// See the `MIN_WRAP_FRAGMENT` note for why over-registering is the safe
+/// direction and the floor is what bounds the cost of it.
+const MIN_UNNAMED_CREDENTIAL: usize = 16;
+
+/// `in_env` says whether this value sits anywhere below a key named `env`. It is
+/// the ancestry the plain `key` parameter throws away: the recursion replaces the
+/// parent context with each child key, so by the time an `env` entry's string is
+/// examined, "it was under `env`" is not recoverable from `key` alone — and for a
+/// map of arbitrarily-named environment variables that is the only thing that
+/// distinguishes a credential from a setting. Set once on the way down and never
+/// cleared, so it survives arrays and nested objects.
 fn collect_credential_values(
     value: &serde_json::Value,
     key: Option<&str>,
     scope: CredentialScope,
+    in_env: bool,
     out: &mut Vec<String>,
 ) {
     match value {
         serde_json::Value::Object(map) => {
             for (child_key, child) in map {
-                collect_credential_values(child, Some(child_key), scope, out);
+                let child_in_env = in_env || child_key.eq_ignore_ascii_case("env");
+                collect_credential_values(child, Some(child_key), scope, child_in_env, out);
             }
         }
         serde_json::Value::Array(values) => {
             for child in values {
-                collect_credential_values(child, key, scope, out);
+                collect_credential_values(child, key, scope, in_env, out);
             }
         }
         serde_json::Value::String(value) => {
@@ -5132,8 +5374,11 @@ fn collect_credential_values(
                 || key.contains("api_key")
                 || key.contains("apikey");
             let long_enough = match scope {
-                CredentialScope::AuthDocument => value.len() >= 16,
-                CredentialScope::ConfigDocument => false,
+                CredentialScope::AuthDocument => value.len() >= MIN_UNNAMED_CREDENTIAL,
+                // Not "no floor anywhere" any more: inside `env` the variable
+                // name is not evidence of anything, so the value is judged the
+                // way an auth document's is. See [`CredentialScope`].
+                CredentialScope::ConfigDocument => in_env && value.len() >= MIN_UNNAMED_CREDENTIAL,
             };
             if !value.is_empty() && (sensitive_key || long_enough) {
                 out.push(value.clone());
@@ -5153,7 +5398,13 @@ fn opencode_recording_redactions(
         ))
     })?;
     let mut values = Vec::new();
-    collect_credential_values(&auth, None, CredentialScope::AuthDocument, &mut values);
+    collect_credential_values(
+        &auth,
+        None,
+        CredentialScope::AuthDocument,
+        false,
+        &mut values,
+    );
     normalise_redactions(&mut values);
     Ok(values)
 }
@@ -5359,7 +5610,13 @@ fn codex_recording_redactions(
         ))
     })?;
     let mut values = Vec::new();
-    collect_credential_values(&auth, None, CredentialScope::AuthDocument, &mut values);
+    collect_credential_values(
+        &auth,
+        None,
+        CredentialScope::AuthDocument,
+        false,
+        &mut values,
+    );
     normalise_redactions(&mut values);
     Ok(values)
 }
@@ -11218,7 +11475,9 @@ mod harness_unit_tests {
         "  \"model\": \"claude-haiku-4-5-20251001\",\n",
         "  \"permissions\": { \"allow\": [\"Bash(cargo nextest run:*)\"] },\n",
         "  \"env\": {\n",
-        "    \"ANTHROPIC_AUTH_TOKEN\": \"sk-ant-atk01-FAKE-KkOo01rEP45I6HlP5N8Gu9RHECs8ROetAtHF5dVM3VRB02r7uJWRph3du4sn5eVxhPuXpGruawHQtJ\"\n",
+        "    \"ANTHROPIC_AUTH_TOKEN\": \"sk-ant-atk01-FAKE-KkOo01rEP45I6HlP5N8Gu9RHECs8ROetAtHF5dVM3VRB02r7uJWRph3du4sn5eVxhPuXpGruawHQtJ\",\n",
+        "    \"DATABASE_URL\": \"postgres://svc:FAKE-Xy7Qm2Vb9Lr4Ts8Wn3Hd@db.invalid:5432/app\",\n",
+        "    \"NO_COLOR\": \"1\"\n",
         "  }\n",
         "}\n",
     );
@@ -11226,14 +11485,25 @@ mod harness_unit_tests {
     /// The auth token inside [`FABRICATED_CLAUDE_SETTINGS`].
     const FABRICATED_CLAUDE_SETTINGS_TOKEN: &str = "sk-ant-atk01-FAKE-KkOo01rEP45I6HlP5N8Gu9RHECs8ROetAtHF5dVM3VRB02r7uJWRph3du4sn5eVxhPuXpGruawHQtJ";
 
-    /// Scenario: Collect redactions from a fabricated `~/.claude/.credentials.json`
-    /// and a fabricated hook-stripped `settings.json` exactly as
-    /// `import_claude_credentials` now does, then render both documents onto a
-    /// real 120-column vt100 grid the way a `cat` of the imported file inside a
-    /// pane would, and push that grid through every sink the harness persists or
-    /// prints: `final-grid.txt`, the SVG rendered from it, `full-stream.cast`,
-    /// and the panic message the diagnostic seam renders. No eight-character
-    /// fragment of any token survives into any of them.
+    /// A credential-bearing `env` entry under a name the sensitive-key list does
+    /// NOT match — PR #805 audit P1. A `postgres://user:password@host/db` is a
+    /// complete password-bearing credential and `DATABASE_URL` looks like
+    /// ordinary configuration, which is exactly the combination the key-name rule
+    /// used to copy into the isolated HOME unregistered.
+    const FABRICATED_CLAUDE_SETTINGS_DATABASE_URL: &str =
+        "postgres://svc:FAKE-Xy7Qm2Vb9Lr4Ts8Wn3Hd@db.invalid:5432/app";
+
+    /// Scenario: Point `HOME` at a fabricated host home holding a
+    /// `~/.claude/.credentials.json` and a `~/.claude/settings.json`, run the
+    /// REAL `import_claude_credentials` against a fresh isolated HOME, and then:
+    /// assert it returned every credential value in those documents, assert the
+    /// bytes it actually wrote into the isolated HOME still hold them, assert it
+    /// self-registered them process-globally, and finally render the written
+    /// bytes onto a real 120-column vt100 grid the way a `cat` of the imported
+    /// file inside a pane would and push that grid through every sink the harness
+    /// persists or prints — `final-grid.txt`, the SVG rendered from it,
+    /// `full-stream.cast`, and the panic message the diagnostic seam renders. No
+    /// eight-character fragment of any token survives into any of them.
     ///
     /// This is PR #805's audit blocker 2 stated as a test. The Claude importer
     /// was the one of four that registered NOTHING from the documents it copies,
@@ -11241,28 +11511,121 @@ mod harness_unit_tests {
     /// convention rather than a structural property — an agent command, a
     /// contributor-authored test, an auth diagnostic or an accidental file dump
     /// paints it onto the terminal — and it is the route most reel clips take,
-    /// which is the route whose `.cast` is published unlisted to YouTube and
-    /// linked from the public release notes.
+    /// which is the route whose `.cast` the demo reel publishes.
+    ///
+    /// **It drives the importer because the first version of it did not, and the
+    /// second PR #805 audit caught that.** It called `claude_recording_redactions`
+    /// directly, so deleting either importer call site, or the importer's
+    /// `register_diagnostic_redactions`, left it green while claiming to be the
+    /// regression test for exactly those lines — the third vacuous guard in this
+    /// work. Every assertion above the render is now anchored on the importer's
+    /// own return value, the files it wrote, or the global store it registered
+    /// into, and each of those three sites was broken in turn and watched to fail.
     #[test]
     fn a_rendered_imported_claude_credential_document_survives_into_no_sink() {
-        let mut redactions = claude_recording_redactions(
-            FABRICATED_CLAUDE_CREDENTIALS.as_bytes(),
-            "~/.claude/.credentials.json",
-            CredentialScope::AuthDocument,
+        // A fabricated HOST home, so the importer's `host_home()` reads these
+        // documents rather than the developer's. Both API keys are cleared: with
+        // one set, `import_claude_credentials` takes its key-authorises branch
+        // and `install_credential_redaction` seeds the global store with an
+        // ambient value, either of which would make the assertions below depend
+        // on the machine.
+        // SAFETY: single-threaded test body, and nextest gives each test its own
+        // process, so nothing else in this process observes the change.
+        unsafe {
+            std::env::remove_var(ANTHROPIC_API_KEY_ENV);
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+        let source_home = harness_tempdir().expect("fabricated host home");
+        let source_claude = source_home.path().join(".claude");
+        std::fs::create_dir_all(&source_claude).expect("create the fabricated ~/.claude");
+        std::fs::write(
+            source_claude.join(".credentials.json"),
+            FABRICATED_CLAUDE_CREDENTIALS,
         )
-        .expect("the fabricated credential document parses");
-        redactions.extend(
-            claude_recording_redactions(
-                FABRICATED_CLAUDE_SETTINGS.as_bytes(),
-                "~/.claude/settings.json",
-                CredentialScope::ConfigDocument,
-            )
-            .expect("the fabricated settings document parses"),
-        );
-        normalise_redactions(&mut redactions);
+        .expect("write the fabricated credential document");
+        std::fs::write(
+            source_claude.join("settings.json"),
+            FABRICATED_CLAUDE_SETTINGS,
+        )
+        .expect("write the fabricated settings document");
+        let restore_home = std::env::var_os("HOME");
+        // SAFETY: as above.
+        unsafe { std::env::set_var("HOME", source_home.path()) };
 
-        // Non-vacuity of the REGISTRATION itself: this is the assertion that
-        // fails on the pre-fix importer, which returned an empty vector.
+        let test_home = harness_tempdir().expect("isolated test HOME");
+        let imported = import_claude_credentials(test_home.path());
+        // SAFETY: as above. Restored before the assertions so a failure does not
+        // leave the process pointing at the fixture.
+        unsafe {
+            match &restore_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let redactions = imported.expect("the fabricated documents import cleanly");
+
+        // The bytes the importer actually WROTE, which is what an agent reads and
+        // what a `cat` in a pane paints. Read back rather than assumed: the
+        // credential set is copied verbatim while the settings are re-serialised
+        // from the parsed document, so only one of the two is byte-identical to
+        // its source.
+        let written_credentials =
+            std::fs::read_to_string(test_home.path().join(".claude").join(".credentials.json"))
+                .expect("the importer wrote the credential document into the isolated HOME");
+        let written_settings =
+            std::fs::read_to_string(test_home.path().join(".claude").join("settings.json"))
+                .expect("the importer wrote the settings document into the isolated HOME");
+
+        // Non-vacuity of the REGISTRATION, anchored on the importer's own return
+        // value: deleting either `claude_recording_redactions` call in
+        // `import_claude_credentials` fails here. Each value is checked to be in
+        // the isolated HOME too, so "registered" and "present on disk" cannot
+        // drift apart.
+        for (what, value, written) in [
+            (
+                "accessToken",
+                FABRICATED_CLAUDE_ACCESS_TOKEN,
+                &written_credentials,
+            ),
+            (
+                "refreshToken",
+                FABRICATED_CLAUDE_REFRESH_TOKEN,
+                &written_credentials,
+            ),
+            (
+                "settings.json's ANTHROPIC_AUTH_TOKEN",
+                FABRICATED_CLAUDE_SETTINGS_TOKEN,
+                &written_settings,
+            ),
+            (
+                "settings.json's DATABASE_URL",
+                FABRICATED_CLAUDE_SETTINGS_DATABASE_URL,
+                &written_settings,
+            ),
+        ] {
+            assert!(
+                written.contains(value),
+                "{what} is not in the document the importer wrote into the \
+                 isolated HOME, so this fixture proves nothing:\n{written}"
+            );
+            assert!(
+                redactions.iter().any(|r| r == value),
+                "{what} was not returned by import_claude_credentials, so it is \
+                 copied into the isolated HOME unredactable: {redactions:?}"
+            );
+        }
+
+        // Non-vacuity of the SELF-REGISTRATION: `redact_credentials_for_output`
+        // reads the process-global store and nothing else, so this is green only
+        // because the importer called `register_diagnostic_redactions` itself.
+        // Deleting that call fails here. It is the route the tests with no
+        // `TuiDeck` depend on entirely.
+        let globally = redact_credentials_for_output(&format!(
+            "accessToken={FABRICATED_CLAUDE_ACCESS_TOKEN} \
+             refreshToken={FABRICATED_CLAUDE_REFRESH_TOKEN} \
+             ANTHROPIC_AUTH_TOKEN={FABRICATED_CLAUDE_SETTINGS_TOKEN} \
+             DATABASE_URL={FABRICATED_CLAUDE_SETTINGS_DATABASE_URL}"
+        ));
         for (what, value) in [
             ("accessToken", FABRICATED_CLAUDE_ACCESS_TOKEN),
             ("refreshToken", FABRICATED_CLAUDE_REFRESH_TOKEN),
@@ -11270,19 +11633,29 @@ mod harness_unit_tests {
                 "settings.json's ANTHROPIC_AUTH_TOKEN",
                 FABRICATED_CLAUDE_SETTINGS_TOKEN,
             ),
+            (
+                "settings.json's DATABASE_URL",
+                FABRICATED_CLAUDE_SETTINGS_DATABASE_URL,
+            ),
         ] {
             assert!(
-                redactions.iter().any(|r| r == value),
-                "{what} was not registered for redaction, so nothing below can \
-                 prove anything: {redactions:?}"
+                !globally.contains(value),
+                "{what} was not self-registered by the importer, so every route \
+                 with no `TuiDeck` renders it raw: {globally}"
             );
         }
 
         // And the configuration document's long NON-secrets are left alone, or
         // a developer's `permissions.allow` rules and model id disappear out of
         // every grid they read and each one costs a scan pass over every
-        // artifact. This is what `CredentialScope::ConfigDocument` buys.
-        for innocuous in ["Bash(cargo nextest run:*)", "claude-haiku-4-5-20251001"] {
+        // artifact. This is what `CredentialScope::ConfigDocument` buys. `1` is
+        // the `env` floor's half of the same trade: registering a two-byte
+        // environment value would replace those bytes everywhere they occur.
+        for innocuous in [
+            "Bash(cargo nextest run:*)",
+            "claude-haiku-4-5-20251001",
+            "1",
+        ] {
             assert!(
                 !redactions.iter().any(|r| r == innocuous),
                 "`{innocuous}` is not a credential and must not be registered \
@@ -11290,12 +11663,12 @@ mod harness_unit_tests {
             );
         }
 
-        // Both documents painted into one grid, row by row the way ratatui
-        // paints, so a value too long for the width breaks across rows exactly
-        // as it does in a real pane.
+        // Both written documents painted into one grid, row by row the way
+        // ratatui paints, so a value too long for the width breaks across rows
+        // exactly as it does in a real pane.
         let dump = format!(
-            "$ cat ~/.claude/.credentials.json\n{FABRICATED_CLAUDE_CREDENTIALS}\
-             $ cat ~/.claude/settings.json\n{FABRICATED_CLAUDE_SETTINGS}"
+            "$ cat ~/.claude/.credentials.json\n{written_credentials}\n\
+             $ cat ~/.claude/settings.json\n{written_settings}\n"
         );
         let rows: Vec<String> = dump
             .lines()
@@ -11330,6 +11703,10 @@ mod harness_unit_tests {
             (
                 "settings.json's ANTHROPIC_AUTH_TOKEN",
                 FABRICATED_CLAUDE_SETTINGS_TOKEN,
+            ),
+            (
+                "settings.json's DATABASE_URL",
+                FABRICATED_CLAUDE_SETTINGS_DATABASE_URL,
             ),
         ] {
             assert_no_fragment_survives(&redacted, value, &format!("final-grid.txt / {what}"));
@@ -11376,10 +11753,9 @@ mod harness_unit_tests {
 
         // Sink 4 — the diagnostic seam, which is what carries a grid into
         // nextest's captured output, the raw JUnit report and whatever a
-        // developer pastes. `register_diagnostic_redactions` is what
-        // `import_claude_credentials` now calls itself, so the routes with no
-        // `TuiDeck` are covered too.
-        register_diagnostic_redactions(redactions.clone());
+        // developer pastes. Nothing registers anything here: the store already
+        // holds these values because `import_claude_credentials` registered them
+        // itself, which the global-store assertion above proves.
         let panic_text = format_redacted_panic(
             "deck",
             "tests/common/mod.rs:1:1",
@@ -11391,6 +11767,10 @@ mod harness_unit_tests {
             (
                 "settings.json's ANTHROPIC_AUTH_TOKEN",
                 FABRICATED_CLAUDE_SETTINGS_TOKEN,
+            ),
+            (
+                "settings.json's DATABASE_URL",
+                FABRICATED_CLAUDE_SETTINGS_DATABASE_URL,
             ),
         ] {
             assert_no_fragment_survives(&panic_text, value, &format!("the panic seam / {what}"));
@@ -11429,6 +11809,195 @@ mod harness_unit_tests {
             !message.contains("NOT-A-JSON-DOCUMENT"),
             "the refusal must not quote the document body back: {message}"
         );
+    }
+
+    /// Scenario: Hand the credential collector a `settings.json` whose `env` map
+    /// carries credentials under ordinary variable names — a `DATABASE_URL` with
+    /// user-info, an authenticated `HTTP_PROXY`, a `COOKIE`, a `PAT` — plus the
+    /// short settings a real one is full of. Every credential-length value under
+    /// `env` is registered whatever it is called, the two-byte ones are not, and
+    /// a long string OUTSIDE `env` under a non-sensitive name still is not.
+    ///
+    /// PR #805 audit P1. The recursion keeps only the innermost key, so an `env`
+    /// entry used to be judged purely on what the developer named it:
+    /// `ANTHROPIC_AUTH_TOKEN` matched the sensitive-name list and everything else
+    /// was copied into the isolated HOME unregistered. A
+    /// `postgres://user:password@host/db` is a complete credential.
+    #[test]
+    fn a_credential_under_an_ordinary_env_variable_name_is_registered() {
+        let settings = serde_json::json!({
+            "model": "claude-haiku-4-5-20251001",
+            "permissions": { "allow": ["Bash(cargo nextest run:*)"] },
+            "statusLine": { "command": "printf '%s' \"$PWD\" | sed 's|/home/dev||'" },
+            "env": {
+                "DATABASE_URL": "postgres://svc:FAKE-Xy7Qm2Vb9Lr4@db.invalid:5432/app",
+                "HTTP_PROXY": "http://dev:FAKE-Pw9Kt3Zc7Qm@proxy.invalid:3128",
+                "NPM_CONFIG__AUTH": "FAKE-bnBtLXRva2VuLXZhbHVlLWhlcmU=",
+                "COOKIE": "session=FAKE-9d41c0b2e7f84a1c6b3d",
+                "PAT": "FAKE-ghp-4KqR7wZ2mN8xT1vB6yH3jL5s",
+                "NO_COLOR": "1",
+                "TERM": "xterm",
+            },
+        });
+        let mut values = Vec::new();
+        collect_credential_values(
+            &settings,
+            None,
+            CredentialScope::ConfigDocument,
+            false,
+            &mut values,
+        );
+
+        for (what, value) in [
+            (
+                "DATABASE_URL",
+                "postgres://svc:FAKE-Xy7Qm2Vb9Lr4@db.invalid:5432/app",
+            ),
+            (
+                "HTTP_PROXY",
+                "http://dev:FAKE-Pw9Kt3Zc7Qm@proxy.invalid:3128",
+            ),
+            ("NPM_CONFIG__AUTH", "FAKE-bnBtLXRva2VuLXZhbHVlLWhlcmU="),
+            ("COOKIE", "session=FAKE-9d41c0b2e7f84a1c6b3d"),
+            ("PAT", "FAKE-ghp-4KqR7wZ2mN8xT1vB6yH3jL5s"),
+        ] {
+            assert!(
+                values.iter().any(|v| v == value),
+                "an `env` entry named {what} holds a credential and was not \
+                 registered, so it is copied into the isolated HOME and rendered \
+                 raw: {values:?}"
+            );
+        }
+
+        // The floor, which is what keeps this from wrecking every artifact: a
+        // registered two-byte value would replace those bytes wherever they
+        // occur.
+        for short in ["1", "xterm"] {
+            assert!(
+                !values.iter().any(|v| v == short),
+                "`{short}` is a setting, not a credential, and registering it \
+                 would gouge those bytes out of every artifact: {values:?}"
+            );
+        }
+
+        // And OUTSIDE `env` the sensitive-key rule still governs, or a real
+        // settings.json's long non-secrets disappear out of every grid.
+        for innocuous in [
+            "claude-haiku-4-5-20251001",
+            "Bash(cargo nextest run:*)",
+            "printf '%s' \"$PWD\" | sed 's|/home/dev||'",
+        ] {
+            assert!(
+                !values.iter().any(|v| v == innocuous),
+                "`{innocuous}` is not under `env` and not under a sensitive key, \
+                 so a CONFIGURATION document must leave it alone: {values:?}"
+            );
+        }
+    }
+
+    /// Scenario: Point `HOME` at a fabricated host home whose `~/.claude.json`
+    /// carries an `oauthAccount`, run the real `seed_claude_project_trust`
+    /// against a fresh isolated HOME, and check the three things that matter: the
+    /// identity fields it copied come back for the recordings to redact, they are
+    /// registered process-globally for the diagnostics, and the descriptive
+    /// neighbours (`organizationRole`, `seatTier`) and a too-short display name
+    /// are left alone.
+    ///
+    /// PR #805 audit P2. The classification stands — a uuid, an email and an
+    /// organisation name identify rather than authenticate — but this file is
+    /// copied into every real-agent test's HOME, an interactive `claude` paints
+    /// the account line into the pane, and that pane is what the demo reel
+    /// publishes. Three field names is cheaper than accepting that.
+    #[test]
+    fn the_seeded_claude_json_registers_its_account_identity_fields() {
+        // SAFETY: single-threaded test body in its own nextest process.
+        unsafe {
+            std::env::remove_var(ANTHROPIC_API_KEY_ENV);
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+        let uuid = "6f1c9e02-FAKE-4b77-9d31-2a8e5c40b913";
+        let email = "fabricated.developer@example.invalid";
+        let organisation = "Fabricated Example Organisation";
+        let source_home = harness_tempdir().expect("fabricated host home");
+        std::fs::write(
+            source_home.path().join(".claude.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "hasCompletedOnboarding": true,
+                "oauthAccount": {
+                    "accountUuid": uuid,
+                    "emailAddress": email,
+                    "organizationName": organisation,
+                    "organizationRole": "admin",
+                    "seatTier": "max",
+                    "displayName": "Ab",
+                },
+            }))
+            .expect("serialize the fabricated ~/.claude.json"),
+        )
+        .expect("write the fabricated ~/.claude.json");
+        let restore_home = std::env::var_os("HOME");
+        // SAFETY: as above.
+        unsafe { std::env::set_var("HOME", source_home.path()) };
+
+        let test_home = harness_tempdir().expect("isolated test HOME");
+        let seeded = seed_claude_project_trust(
+            test_home.path(),
+            &[test_home.path().to_string_lossy().into_owned()],
+        );
+        // SAFETY: as above.
+        unsafe {
+            match &restore_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let identity = seeded.expect("the fabricated ~/.claude.json seeds cleanly");
+
+        let written = std::fs::read_to_string(test_home.path().join(".claude.json"))
+            .expect("the seeding wrote a ~/.claude.json into the isolated HOME");
+        for (what, value) in [
+            ("accountUuid", uuid),
+            ("emailAddress", email),
+            ("organizationName", organisation),
+        ] {
+            assert!(
+                written.contains(value),
+                "{what} is not in the document the seeding wrote, so this fixture \
+                 proves nothing:\n{written}"
+            );
+            assert!(
+                identity.iter().any(|v| v == value),
+                "{what} was not returned for redaction, so it reaches the cast \
+                 the demo reel publishes: {identity:?}"
+            );
+        }
+
+        // Self-registration, for the routes with no `TuiDeck` and for a caller
+        // that seeds AFTER the launch (`seed_claude_trust_in_home`).
+        let globally =
+            redact_credentials_for_output(&format!("account {uuid} <{email}> at {organisation}"));
+        for (what, value) in [
+            ("accountUuid", uuid),
+            ("emailAddress", email),
+            ("organizationName", organisation),
+        ] {
+            assert!(
+                !globally.contains(value),
+                "{what} was not registered process-globally: {globally}"
+            );
+        }
+
+        // Descriptive neighbours are not identity, and registering one would
+        // replace `admin` or `max` wherever they occurred. `Ab` is the floor:
+        // below eight bytes a value cannot be told apart from ordinary rendered
+        // text, which is what `MIN_WRAP_FRAGMENT` means everywhere else here.
+        for left_alone in ["admin", "max", "Ab"] {
+            assert!(
+                !identity.iter().any(|v| v == left_alone),
+                "`{left_alone}` must not be registered — it is not identity, or \
+                 it is too short to tell apart from rendered text: {identity:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

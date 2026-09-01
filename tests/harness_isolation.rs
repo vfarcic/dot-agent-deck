@@ -61,8 +61,10 @@ fn harness_clears_inherited_deck_endpoints() {
 // re-recording — used to leave the PREVIOUS run's `full-stream.cast` in place,
 // and `.claude/skills/demo-reel-adapter` selects a cast on path existence alone.
 // A cast from a revision predating the redaction fixes could therefore be
-// stitched into a video and uploaded unlisted to YouTube with its link in the
-// public release notes.
+// stitched into a video and uploaded to YouTube with its link in the PR body and
+// the public release notes. (The upload is private by default now, so the flip
+// that makes such a video third-party-visible is a human step — that bounds the
+// blast radius; it does not make a stale cast correct.)
 //
 // Both call sites of the discard are covered here: the runtime-skip one by
 // actually taking it, and the launch one by a source guard, because observing it
@@ -134,6 +136,54 @@ fn a_runtime_skip_discards_the_previous_recording() {
     // This test's recordings directory is its own fixture, so it takes it away
     // again — but only on success, so a failure leaves the evidence in place.
     std::fs::remove_dir_all(&dir).expect("remove this test's fixture recordings dir");
+}
+
+/// Scenario: Plant a stale recording artifact the discard CANNOT delete — a
+/// directory where `full-stream.cast` should be — and take the runtime-skip path.
+/// The harness panics instead of warning and carrying on, so the test fails
+/// rather than running to a green finish with an artifact it did not produce.
+///
+/// PR #805's second audit named the old warn-and-continue a fail-open and it was
+/// right: a warning only helps if somebody reads it, the run that printed it was
+/// still reported as PASSED, and the artifact it could not remove still satisfies
+/// the demo-reel adapter's existence check. Unix-only, because "a deletion that
+/// fails for a reason other than NotFound" is arranged here through `EISDIR`.
+#[cfg(unix)]
+#[test]
+fn a_discard_that_cannot_delete_a_stale_artifact_fails_the_run() {
+    // SAFETY: single-threaded test body; nextest gives each test its own process.
+    unsafe { std::env::remove_var("DOT_AGENT_DECK_REQUIRE_REAL_E2E") };
+
+    let dir = common::current_test_recordings_dir();
+    std::fs::create_dir_all(&dir).expect("create this test's recordings dir");
+    // `remove_file` on a directory is EISDIR, not NotFound — an undeletable
+    // stale artifact, without having to make the tree unwritable (which would
+    // also stop the harness from cleaning up after itself).
+    let undeletable = dir.join("full-stream.cast");
+    std::fs::create_dir_all(&undeletable).expect("plant an undeletable stale artifact");
+
+    let outcome =
+        std::panic::catch_unwind(|| common::_skip_if_err(Err("no credential".to_string())));
+
+    // Cleaned up before the assertions, so a failure does not leave a directory
+    // named `full-stream.cast` behind to break every later run of this test.
+    std::fs::remove_dir_all(&dir).expect("remove this test's fixture recordings dir");
+
+    let payload = outcome.expect_err(
+        "the discard must FAIL the run when it cannot remove a stale artifact — a \
+         warning leaves the run green with a recording it did not produce, which \
+         is exactly what the demo-reel adapter then publishes",
+    );
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_default();
+    assert!(
+        message.contains("could not discard the previous recording")
+            && message.contains("full-stream.cast"),
+        "the panic must name the artifact it could not remove: {message}"
+    );
 }
 
 /// Scenario: Read the harness source and assert that `TuiDeck::try_launch_inner`
