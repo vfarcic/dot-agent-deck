@@ -647,6 +647,9 @@ impl TuiDeck {
         for kind in &builder.credential_imports {
             match kind {
                 CredentialImport::ClaudeCode => {
+                    // The bool is the run's credential source, recorded in
+                    // `CLAUDE_OAUTH_SEEDED` for `seed_claude_project_trust`
+                    // below rather than threaded through every builder field.
                     import_claude_credentials(&home).map_err(|e| e.to_string())?;
                 }
                 CredentialImport::OpenCode => {
@@ -873,6 +876,20 @@ impl TuiDeck {
         // exactly this reason — so no other provider variable would be used by
         // anything the deck spawns, and each one added is another secret in the
         // recorded PTY's environment for no gain.
+        // DAD_E2E_RUN_MARKER (issue #785 blocker B) is a NON-SECRET, run-scoped
+        // label `e2e-live.yml` sets on the test step so its purge step can
+        // enumerate every process this run started — including a daemon that
+        // `setsid`s into its own session and an agent's Bash-tool shell that
+        // outlives its agent, neither of which a name-matching `pkill` reaches.
+        // It works by INHERITANCE, so it has to cross `env_clear` here or the
+        // whole deck subtree becomes invisible to it. Locally it is unset and
+        // nothing is inserted.
+        //
+        // The in-process-daemon spawns do not need it threaded through their
+        // hand-built `SpawnOptions.env`: `spawn_agent` OVERLAYS that onto the
+        // inherited environment rather than clearing it (src/agent_pty.rs), so
+        // those children get the marker from the test process for free. This
+        // line is the one place it would otherwise be lost.
         let inherit_pass = ["PATH", ANTHROPIC_API_KEY_ENV];
 
         let mut final_env: HashMap<String, String> = HashMap::new();
@@ -1966,9 +1983,156 @@ impl TuiDeck {
 
 const RECORDING_CREDENTIAL_REDACTION: &[u8] = b"[REDACTED-CREDENTIAL]";
 
-/// Locate non-overlapping credential occurrences, preferring the longest value
-/// at a shared start. Matching bytes before JSON/asciinema encoding also catches
-/// secrets that contain characters the artifact format would escape.
+// ---------------------------------------------------------------------------
+// Matching a credential a TERMINAL WRAPPED (issue #502/#785 blocker A)
+// ---------------------------------------------------------------------------
+//
+// Byte-exact matching is not enough, and the arithmetic says so precisely. An
+// Anthropic API key is 108 characters. The harness renders at 120 columns. An
+// `ANTHROPIC_API_KEY=` line therefore starts the value at column 19 and breaks
+// it 102 / 6 — and the key's last-20 response id, the derivative Claude Code's
+// approval prompt paints and the one GitHub's masking never covers, is itself
+// split 14 / 6. Neither registered pattern matches either piece, while the whole
+// value is sitting there in two adjacent rows for anyone to concatenate.
+//
+// It is not the grid alone. The same value is split the same way in
+// `full-stream.cast`, one layer lower: what separates two rows there is the
+// deck's own cursor-position escape, not a newline. And it is not always as
+// tidy as one newline in between — a deck grid has a pane border and usually a
+// neighbouring column, so the bytes between two fragments of one wrapped value
+// are arbitrary rendered content, not padding.
+//
+// So the matcher bridges GAPS. Every hop has to cross a row transition and then
+// reproduce `MIN_WRAP_FRAGMENT` more bytes of the value exactly; the bytes in
+// between are left in place, because they are the newline, the border and the
+// neighbouring column that make the artifact readable at all.
+//
+// WHY THIS IS NOT A SUBSEQUENCE SEARCH, which is the failure mode a naive
+// version of this has: "match, skip anything, match again" finds almost any
+// string in almost any text. The two constants below are what keep it honest —
+// a minimum of eight exact bytes per hop, and a hard ceiling on how far one hop
+// may look. A contiguous occurrence still produces exactly one range, so this is
+// a strict superset of the byte-exact matcher it replaces.
+
+/// The shortest run of credential bytes a wrapped match accepts as a fragment,
+/// other than the final one.
+///
+/// This is the whole safety bound. A false positive would need eight
+/// consecutive bytes of a real credential to appear by chance AND then chain
+/// into the rest of it across a row transition, which is not something that
+/// happens to base64-shaped secrets.
+///
+/// The final fragment is exempt because the tail is exactly what wrapping
+/// leaves short — the 102 / 6 break above. By the time the matcher is looking at
+/// those six bytes it has already reproduced 102, so the coincidence argument is
+/// already spent.
+const MIN_WRAP_FRAGMENT: usize = 8;
+
+/// The longest run of bytes one hop will bridge, and therefore the bound on how
+/// far this scan can wander.
+///
+/// One hop is "the rest of this row, plus the next row up to where the value
+/// resumes" — at most two rows. Four kibibytes covers two rows of a 500-column
+/// terminal even when every cell is a three-byte box-drawing character, and one
+/// frame's worth of the deck's escape traffic in a `.cast`. It is a bound rather
+/// than a measurement: the point is that the scan cannot go quadratic on a
+/// multi-megabyte stream.
+const MAX_WRAP_GAP: usize = 4096;
+
+/// Bytes that mean "the writer moved to another row" — the only thing that
+/// licenses bridging a gap at all.
+///
+/// `\n` is the grid case. `vt100::Screen::contents()` joins rows with it EXCEPT
+/// for a row the terminal itself auto-wrapped, which it deliberately leaves
+/// unbroken — and that exception is why this is needed rather than why it is
+/// not. ratatui never lets a terminal auto-wrap; it positions the cursor per
+/// row. Measured both ways at 120 columns: an auto-wrapped render leaves a
+/// 108-character key contiguous, and the same content painted row by row, the
+/// way the deck paints it, splits it 102 / 6.
+///
+/// `0x1b` is that same event one layer down, in `full-stream.cast`, where the
+/// row change is a cursor-position CSI.
+fn is_row_transition(byte: u8) -> bool {
+    matches!(byte, b'\n' | b'\r' | 0x1b)
+}
+
+/// How many leading bytes of `wanted` `data[cursor..]` reproduces.
+fn common_prefix_len(data: &[u8], cursor: usize, wanted: &[u8]) -> usize {
+    let limit = data.len().saturating_sub(cursor).min(wanted.len());
+    (0..limit)
+        .take_while(|index| data[cursor + index] == wanted[*index])
+        .count()
+}
+
+/// Where the next fragment of `remaining` resumes after a row transition, or
+/// `None` if it does not resume within [`MAX_WRAP_GAP`].
+///
+/// Deliberately FIRST-MATCH and non-backtracking. A candidate has to reproduce
+/// [`MIN_WRAP_FRAGMENT`] bytes exactly — or everything that is left, when less
+/// than that remains — which makes a wrong first candidate a coincidence rather
+/// than a likelihood, and it pins the cost of a hop at
+/// `MAX_WRAP_GAP * MIN_WRAP_FRAGMENT` instead of letting it grow exponentially
+/// in the number of hops. The failure mode of the simplification is a missed
+/// redaction in a contrived case, never a hang.
+fn next_fragment_start(data: &[u8], gap_start: usize, remaining: &[u8]) -> Option<usize> {
+    let need = &remaining[..remaining.len().min(MIN_WRAP_FRAGMENT)];
+    let limit = data.len().min(gap_start.saturating_add(MAX_WRAP_GAP));
+    let mut crossed_a_row = false;
+    for index in gap_start..limit {
+        if is_row_transition(data[index]) {
+            crossed_a_row = true;
+        } else if crossed_a_row && common_prefix_len(data, index, need) == need.len() {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Match `credential` starting at `start`, allowing a TUI to have painted it
+/// across several rows, and return the byte ranges that carry it.
+///
+/// A contiguous occurrence comes back as exactly one range, which is what makes
+/// this a strict superset of byte-exact matching.
+fn credential_fragments_at(
+    data: &[u8],
+    start: usize,
+    credential: &[u8],
+) -> Option<Vec<(usize, usize)>> {
+    let mut consumed = common_prefix_len(data, start, credential);
+    if consumed == 0 {
+        return None;
+    }
+    // Cheap rejection BEFORE anything is allocated: on a large stream this is
+    // reached once per occurrence of the credential's first byte.
+    if consumed < credential.len() && consumed < MIN_WRAP_FRAGMENT {
+        return None;
+    }
+    let mut cursor = start + consumed;
+    let mut fragments = vec![(start, cursor)];
+    while consumed < credential.len() {
+        let resume = next_fragment_start(data, cursor, &credential[consumed..])?;
+        // Never zero: `next_fragment_start` only returns a position that already
+        // reproduces at least one byte, so this loop always advances.
+        let run = common_prefix_len(data, resume, &credential[consumed..]);
+        consumed += run;
+        cursor = resume + run;
+        if consumed < credential.len() && run < MIN_WRAP_FRAGMENT {
+            return None;
+        }
+        fragments.push((resume, cursor));
+    }
+    Some(fragments)
+}
+
+/// Locate the byte ranges to replace, preferring the longest value at a shared
+/// start. Matching bytes before JSON/asciinema encoding also catches secrets
+/// that contain characters the artifact format would escape.
+///
+/// One credential can contribute SEVERAL ranges — see the block above. The bytes
+/// between them are deliberately left alone: in a grid they are the newline, the
+/// pane border and the neighbouring column, and in a `.cast` they are the escape
+/// sequences that keep it replayable. The ranges come back ascending and
+/// non-overlapping, which is what both consumers rely on.
 fn credential_redaction_ranges(data: &[u8], credentials: &[String]) -> Vec<(usize, usize)> {
     let patterns: Vec<&[u8]> = credentials
         .iter()
@@ -1980,13 +2144,20 @@ fn credential_redaction_ranges(data: &[u8], credentials: &[String]) -> Vec<(usiz
     while offset < data.len() {
         let matched = patterns
             .iter()
-            .filter(|pattern| data[offset..].starts_with(pattern))
-            .max_by_key(|pattern| pattern.len());
-        if let Some(pattern) = matched {
-            ranges.push((offset, offset + pattern.len()));
-            offset += pattern.len();
-        } else {
-            offset += 1;
+            .filter_map(|pattern| {
+                credential_fragments_at(data, offset, pattern)
+                    .map(|fragments| (pattern.len(), fragments))
+            })
+            .max_by_key(|(length, _)| *length);
+        match matched {
+            Some((_, fragments)) => {
+                let end = fragments.last().map_or(offset, |(_, end)| *end);
+                ranges.extend(fragments);
+                // `.max()` rather than a bare assignment so a degenerate match
+                // can never fail to advance the scan.
+                offset = end.max(offset + 1);
+            }
+            None => offset += 1,
         }
     }
     ranges
@@ -2121,10 +2292,17 @@ fn redact_cast_events(events: &[CastEvent], credentials: &[String]) -> Vec<Vec<u
 // [`redact_credentials_for_output`] as the remedy for the day one legitimately
 // needs to. It cannot cover a credential the harness never learns about: only
 // values registered here are redacted, which is why every importer registers
-// what it copied. And a value the vt100 grid WRAPPED across a line boundary is
-// two substrings rather than one, so it is not matched — the same limit the
-// recording redaction has always had, and the reason the cast redaction works on
-// the concatenated stream instead.
+// what it copied.
+//
+// A value the vt100 grid WRAPPED across a row boundary USED to be outside it
+// too, on the reasoning that two substrings are not one. That was measured
+// wrong for the case that matters and is fixed: at 120 columns an
+// `ANTHROPIC_API_KEY=` line breaks a 108-character key 102 / 6 and its response
+// id 14 / 6, so the whole credential was reconstructable out of a panic grid
+// while neither registered pattern matched. `credential_redaction_ranges` now
+// bridges row transitions — see the block above it — and the same change covers
+// `final-grid.txt`, its SVG and `full-stream.cast`, because all three go through
+// that one function.
 
 /// Every credential value this test PROCESS could render, in the exact form it
 /// would be rendered in. Process-global because the sinks it protects are
@@ -3157,8 +3335,44 @@ fn host_claude_api_key_rejected(key: &str) -> bool {
 /// false. If the two ever disagree, an agent gets an OAuth file it cannot use,
 /// or an approved key it did not need — and the second of those silently moves
 /// a developer's local run off their subscription and onto metered API billing.
+///
+/// The two no longer arrive at that answer independently: the import RECORDS
+/// what it seeded in [`CLAUDE_OAUTH_SEEDED`] and the seeding reads it back
+/// through [`claude_run_is_oauth_backed`], so a credential rotation landing
+/// between them cannot make them disagree. This function is still the source of
+/// the answer — it is now consulted once instead of twice.
 fn host_claude_oauth_usable() -> bool {
     check_claude_credentials_file().is_ok() || claude_keychain_credentials_present()
+}
+
+/// What [`import_claude_credentials`] ACTUALLY seeded, the first time it ran in
+/// this process: `true` if it wrote a credential set into a test HOME, `false`
+/// if it deliberately wrote none because an API key authorises the run.
+///
+/// Issue #785 audit, the non-blocking TOCTOU. The import and
+/// [`seed_claude_project_trust`] used to derive that answer INDEPENDENTLY, each
+/// re-reading the host's credential stores. A rotation landing between the two
+/// reads makes them disagree, and the disagreement is not symmetric: an agent
+/// handed an OAuth file it cannot use merely fails, while an approved key it did
+/// not need silently moves a developer's run off their subscription and onto
+/// metered API billing. Recording the decision makes the invariant structural —
+/// one answer per process, produced by the code that acted on it, rather than
+/// two reads that are equal only if nothing changed in between.
+///
+/// A fresh key-only CI runner never reached the failing interleaving, which is
+/// why this was not a blocker; a developer machine mid-`claude login` is.
+static CLAUDE_OAUTH_SEEDED: OnceLock<bool> = OnceLock::new();
+
+/// The seeding's view of "was this run authorised by OAuth?" — the import's own
+/// answer when this process has one, otherwise a fresh read.
+///
+/// The fallback is not a hole. It is reached only when no import has run in this
+/// process, and with no import there is no second decision to disagree with.
+fn claude_run_is_oauth_backed() -> bool {
+    CLAUDE_OAUTH_SEEDED
+        .get()
+        .copied()
+        .unwrap_or_else(host_claude_oauth_usable)
 }
 
 /// The file half of [`check_claude_available`]: `~/.claude/.credentials.json`
@@ -3916,7 +4130,7 @@ fn host_home() -> PathBuf {
 /// in place would invoke the developer's real hook commands inside
 /// the test). M3.1 auditor S2 + S3: write the destination with mode
 /// 0o600 atomically; refuse source files that are symlinks.
-fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
+fn import_claude_credentials(test_home: &Path) -> std::io::Result<bool> {
     // The Claude credential set itself is never rendered (it is a file the
     // agent reads), but the ambient API key this import defers to IS — through
     // the approval prompt's 20-character suffix. Installing here registers both
@@ -3989,6 +4203,12 @@ fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
             None => return Err(file_err),
         },
     };
+    // Recorded BEFORE the rest of the import, and returned below, so the
+    // approval decision in `seed_claude_project_trust` is taken from what was
+    // actually written rather than from a second read of the host — see
+    // [`CLAUDE_OAUTH_SEEDED`].
+    let seeded_oauth = creds_bytes.is_some();
+    let _ = CLAUDE_OAUTH_SEEDED.set(seeded_oauth);
     if let Some(bytes) = creds_bytes {
         write_credential_file_atomic_0o600(&dst_root.join(".credentials.json"), &bytes)?;
     }
@@ -4029,7 +4249,7 @@ fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
         require_regular_dir_no_symlink(&src_plugins, "~/.claude/plugins")?;
         copy_dir_recursively(&src_plugins, &dst_root.join("plugins"))?;
     }
-    Ok(())
+    Ok(seeded_oauth)
 }
 
 /// Whether to copy the host's `~/.claude/plugins` into each seeded HOME.
@@ -4144,7 +4364,7 @@ fn seed_claude_project_trust(test_home: &Path, trust_paths: &[String]) -> std::i
         seed_claude_api_key_response(
             &mut cfg,
             &key,
-            host_claude_oauth_usable(),
+            claude_run_is_oauth_backed(),
             require_real_e2e(),
         );
     }
@@ -4259,6 +4479,8 @@ pub fn seed_claude_worker_home(home: &Path, trust_paths: &[String]) -> std::io::
     // harness timeout. The process-global store is what covers both.
     install_credential_redaction();
     import_claude_credentials(home)?;
+    // Same order as the builder's, so both routes record and then read one
+    // decision rather than two (see [`CLAUDE_OAUTH_SEEDED`]).
     seed_claude_project_trust(home, trust_paths)
 }
 
@@ -10570,6 +10792,256 @@ mod harness_unit_tests {
     }
 
     // -----------------------------------------------------------------------
+    // Issue #502/#785 blocker A — a credential the TERMINAL WRAPPED
+    // -----------------------------------------------------------------------
+
+    /// A fake Anthropic key of the REAL length — 108 characters — because the
+    /// length is the whole point: it is what makes the value wrap at 120
+    /// columns, and a shorter stand-in would render on one row and prove
+    /// nothing.
+    ///
+    /// The body is deterministic pseudo-random rather than a repeated
+    /// character so that no eight-character window of it occurs twice, which is
+    /// what lets [`assert_no_fragment_survives`] treat any surviving window as
+    /// evidence rather than as a coincidence. Never a real key.
+    const WRAPPING_FAKE_KEY: &str = "sk-ant-api03-FAKE-at88unjrP0OqBDXjbB87XI4kBCwkHjpvXQJBVsvFVWYuS6kfhXAxGYQJntl73YD1xRekgbsGPDiVfdPg7RMSHYKnu8";
+
+    /// The width the harness renders at, and the width the arithmetic in
+    /// `credential_redaction_ranges`' comment is stated for.
+    const GRID_COLS: u16 = 120;
+
+    /// Paint `rows` into a REAL vt100 screen the way ratatui paints — one
+    /// explicit cursor move per row, never relying on the terminal's own
+    /// auto-wrap — and return exactly what [`TuiDeck::snapshot_grid`] returns.
+    ///
+    /// That distinction is load-bearing, not pedantry. `vt100` suppresses the
+    /// row separator for a row the TERMINAL wrapped itself, so a test that
+    /// wrote a long line and let the terminal wrap it would get the value back
+    /// CONTIGUOUS from `contents()`, pass against the byte-exact matcher, and
+    /// prove nothing at all. ratatui positions the cursor per row, so the deck's
+    /// grid always takes the separator path — measured both ways before this
+    /// test was written.
+    fn render_like_ratatui(cols: u16, rows: &[String]) -> String {
+        let height = u16::try_from(rows.len().max(1)).expect("test grid height");
+        let mut parser = vt100::Parser::new(height, cols, 0);
+        for (index, row) in rows.iter().enumerate() {
+            parser.process(format!("\x1b[{};1H{row}", index + 1).as_bytes());
+        }
+        parser.screen().contents()
+    }
+
+    /// Split `text` into rows of at most `width` CHARACTERS, the way a terminal
+    /// breaks a line that does not fit.
+    fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
+        text.chars()
+            .collect::<Vec<char>>()
+            .chunks(width)
+            .map(|chunk| chunk.iter().collect())
+            .collect()
+    }
+
+    /// Every [`MIN_WRAP_FRAGMENT`]-character window of `secret` must be gone
+    /// from `text`.
+    ///
+    /// Stronger than `!text.contains(secret)` on purpose: the failure this
+    /// guards is precisely that the value survives in PIECES, so asserting on
+    /// the whole value is the assertion that already passed vacuously while the
+    /// credential sat on screen in two rows. The window is the matcher's own
+    /// minimum fragment, so anything at least this long is something the
+    /// matcher was supposed to have caught.
+    fn assert_no_fragment_survives(text: &str, secret: &str, what: &str) {
+        for window in secret.as_bytes().windows(MIN_WRAP_FRAGMENT) {
+            let fragment = std::str::from_utf8(window).expect("the fixtures are ASCII");
+            assert!(
+                !text.contains(fragment),
+                "{what}: a fragment of {MIN_WRAP_FRAGMENT} credential characters survived \
+                 redaction, so the wrapped value is still reconstructable from this text:\n{text}"
+            );
+        }
+    }
+
+    /// Scenario: Render `ANTHROPIC_API_KEY=<108-character key>` into a real
+    /// 120-column vt100 screen painted row by row, the way the deck paints, so
+    /// the key breaks 102 / 6 and its 20-character response id breaks 14 / 6.
+    /// Confirm the raw grid really is split that way — neither registered
+    /// pattern occurs in it — and then confirm that no eight-character piece of
+    /// the key survives redaction into `final-grid.txt`, into the SVG rendered
+    /// from it, or into a panic message.
+    ///
+    /// This is issue #785 blocker A stated as a test. The whole credential was
+    /// reconstructable out of a panic grid while both registered patterns
+    /// matched nothing, and a panic grid goes to nextest's run log and to the
+    /// raw JUnit report, where GitHub's masking of the exact secret does not
+    /// reassemble line-wrapped fragments.
+    #[test]
+    fn a_credential_wrapped_across_grid_rows_is_redacted_from_every_sink() {
+        let key = WRAPPING_FAKE_KEY;
+        assert_eq!(key.chars().count(), 108, "the fixture must be key-length");
+        let id = claude_api_key_response_id(key);
+        let redactions = api_key_recording_redactions(key);
+
+        let rows = wrap_to_width(&format!("ANTHROPIC_API_KEY={key}"), GRID_COLS as usize);
+        let grid = render_like_ratatui(GRID_COLS, &rows);
+
+        // Non-vacuity, and the arithmetic itself: 120 columns less an
+        // 18-character label leaves 102 of the key on the first row and 6 on
+        // the second, which splits the response id 14 / 6.
+        assert_eq!(rows.len(), 2, "the fixture must occupy exactly two rows");
+        assert!(
+            grid.contains(&key[..102]) && grid.contains(&key[102..]),
+            "the render did not break the key 102 / 6, so this test is not \
+             reproducing the reported shape:\n{grid}"
+        );
+        assert!(
+            !grid.contains(key) && !grid.contains(&id),
+            "the raw grid still carries a contiguous credential, so byte-exact \
+             matching would already have caught it and this proves nothing:\n{grid}"
+        );
+
+        // The recording sink — `final-grid.txt` and the SVG rendered from it.
+        let redacted = redact_known_credentials_text(&grid, &redactions);
+        assert_no_fragment_survives(&redacted, key, "final-grid.txt");
+        assert!(redacted.contains("[REDACTED-CREDENTIAL]"));
+        let svg = render_grid_to_svg(&redacted, GRID_COLS, u16::try_from(rows.len()).unwrap());
+        assert_no_fragment_survives(&svg, key, "final-grid.svg");
+
+        // The diagnostic sink — the panic message the seam renders.
+        register_diagnostic_redactions(redactions.clone());
+        let panic_text = format_redacted_panic(
+            "deck",
+            "tests/common/mod.rs:1:1",
+            &format!("did not see \"ready\" within 30s.\nFinal grid:\n{grid}"),
+        );
+        assert_no_fragment_survives(&panic_text, key, "the panic seam");
+        assert!(
+            panic_text.contains("did not see \"ready\" within 30s."),
+            "the panic kept none of its diagnostic shape:\n{panic_text}"
+        );
+    }
+
+    /// Scenario: The same 108-character key, but rendered the way the deck
+    /// actually renders — a sidebar column, a pane border, the value wrapped
+    /// inside the pane — so the bytes between two fragments of the credential
+    /// are somebody else's rendered content rather than a bare newline. It is
+    /// still redacted.
+    ///
+    /// This is why the matcher bridges ARBITRARY bytes after a row transition
+    /// instead of a whitelist of frame characters. A whitelist would cover a
+    /// full-width dump and quietly miss the layout the deck spends most of its
+    /// time in, which is the one a panicking test screenshots.
+    #[test]
+    fn a_credential_wrapped_inside_a_bordered_pane_is_redacted_too() {
+        let key = WRAPPING_FAKE_KEY;
+        let redactions = api_key_recording_redactions(key);
+
+        // 8-column sidebar + border + 110-column pane + border = 120.
+        const INNER: usize = 110;
+        let sidebar = ["worker-1", "worker-2", "orch    "];
+        let pane = wrap_to_width(&format!("ANTHROPIC_API_KEY={key}"), INNER);
+        assert_eq!(pane.len(), 2, "the value must wrap inside the pane");
+        let rows: Vec<String> = pane
+            .iter()
+            .enumerate()
+            .map(|(index, content)| {
+                format!("{:<8}\u{2502}{content:<INNER$}\u{2502}", sidebar[index])
+            })
+            .collect();
+        let grid = render_like_ratatui(GRID_COLS, &rows);
+
+        assert!(
+            !grid.contains(key),
+            "the raw grid still carries the key contiguously:\n{grid}"
+        );
+        assert!(
+            grid.lines()
+                .nth(1)
+                .is_some_and(|row| row.starts_with("worker-2")),
+            "the second row must OPEN with the sidebar, so the bytes between the \
+             two fragments of the credential are somebody else's rendered content \
+             rather than padding — otherwise this test is not about the gap it \
+             claims to be about:\n{grid}"
+        );
+
+        let redacted = redact_known_credentials_text(&grid, &redactions);
+        assert_no_fragment_survives(&redacted, key, "a bordered pane's grid");
+        assert!(redacted.contains("[REDACTED-CREDENTIAL]"));
+        // The layout survives: the redaction replaces the credential runs and
+        // leaves the border, the sidebar and the row separator in place.
+        assert!(
+            redacted.contains("worker-1") && redacted.contains("worker-2"),
+            "redaction ate the surrounding render:\n{redacted}"
+        );
+    }
+
+    /// Scenario: A value split across two `.cast` events by the deck's own
+    /// cursor-position escape — the same wrap, one layer below the grid — is
+    /// redacted out of `full-stream.cast`.
+    ///
+    /// `redact_cast_events` already concatenated the stream before matching, so
+    /// a value split across two PTY READS was covered. A value the deck itself
+    /// painted onto two rows was not: what sits between the fragments there is
+    /// an escape sequence, which is why [`is_row_transition`] counts `0x1b`.
+    #[test]
+    fn a_credential_painted_onto_two_cast_rows_is_redacted() {
+        let key = WRAPPING_FAKE_KEY;
+        let events = vec![
+            CastEvent {
+                offset_secs: 0.1,
+                data: format!("\x1b[1;1HANTHROPIC_API_KEY={}", &key[..102]).into_bytes(),
+            },
+            CastEvent {
+                offset_secs: 0.2,
+                data: format!("\x1b[2;1H{} \x1b[K", &key[102..]).into_bytes(),
+            },
+        ];
+        let joined: Vec<u8> = redact_cast_events(&events, &api_key_recording_redactions(key))
+            .into_iter()
+            .flatten()
+            .collect();
+        let text = String::from_utf8_lossy(&joined).into_owned();
+        assert_no_fragment_survives(&text, key, "full-stream.cast");
+        assert!(text.contains("[REDACTED-CREDENTIAL]"));
+        assert!(
+            text.contains("\x1b[2;1H"),
+            "the escape that separates the rows must survive, or the cast stops \
+             replaying:\n{text:?}"
+        );
+    }
+
+    /// Scenario: Ask the matcher to bridge a gap it must NOT bridge. Two
+    /// unrelated four-character runs that happen to concatenate into a
+    /// registered value are left alone, because every hop has to reproduce at
+    /// least [`MIN_WRAP_FRAGMENT`] bytes.
+    ///
+    /// The bound is what stops "match, skip, match again" from degenerating
+    /// into a subsequence search, and a subsequence search over a terminal grid
+    /// would redact arbitrary unrelated text.
+    #[test]
+    fn gap_bridging_does_not_degenerate_into_a_subsequence_search() {
+        let credential = "abcdefghijklmnop".to_string();
+        let registered = std::slice::from_ref(&credential);
+        // Every fragment here is four bytes, half the minimum.
+        let text = "abcd|xxxx\nefgh|xxxx\nijkl|xxxx\nmnop";
+        assert_eq!(
+            redact_known_credentials_text(text, registered),
+            text,
+            "four-byte fragments were chained into a match"
+        );
+        // The same value split at the minimum IS matched, so the bound is a
+        // threshold rather than a refusal to bridge at all.
+        let wrapped = "abcdefgh|pane\nijklmnop";
+        let redacted = redact_known_credentials_text(wrapped, registered);
+        assert!(
+            !redacted.contains("abcdefgh") && !redacted.contains("ijklmnop"),
+            "{redacted}"
+        );
+        assert!(
+            redacted.contains("|pane\n"),
+            "the bytes between the fragments must be preserved: {redacted}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Issue #502/#785 audit S1 — the DIAGNOSTIC redaction seam
     // -----------------------------------------------------------------------
 
@@ -10581,10 +11053,13 @@ mod harness_unit_tests {
     /// no-op, so the test is inert under `--run-ignored all`, under a plain
     /// `cargo test`, and anywhere else it is selected on its own.
     const PANIC_SEAM_CHILD_ENV: &str = "DAD_TEST_PANIC_SEAM_CHILD";
-    /// Deliberately fake and deliberately long enough to have a strict 20-char
-    /// suffix. Never a real key: proving the seam must not require writing a
-    /// live credential into any captured output, even a passing one.
-    const PANIC_SEAM_FAKE_KEY: &str = "sk-ant-api03-FAKE-seam-key-not-real-0123456789ABCDEFGHIJ";
+    /// Deliberately fake, and deliberately the REAL length of an Anthropic key
+    /// so the child below can render both shapes that reach a panic message: the
+    /// approval prompt's contiguous 20-character response id, and the same key
+    /// broken across two 120-column rows. Never a real key: proving the seam
+    /// must not require writing a live credential into any captured output,
+    /// even a passing one.
+    const PANIC_SEAM_FAKE_KEY: &str = WRAPPING_FAKE_KEY;
 
     /// Scenario: Formatting a panic message that carries a registered
     /// credential redacts it, while leaving the rest of the message — the
@@ -10638,12 +11113,25 @@ mod harness_unit_tests {
             .expect("seed the isolated worker HOME");
 
         let key = std::env::var(ANTHROPIC_API_KEY_ENV).expect("the parent set a key");
-        let grid = format!(
-            "Detected a custom API key in your environment\n  \
-             ANTHROPIC_API_KEY: sk-ant-...{}\n  Do you want to use this API key?\n   \
-             Yes\n > No (recommended)\n",
-            claude_api_key_response_id(&key)
-        );
+        // A REAL 120-column vt100 render, painted row by row the way ratatui
+        // paints, carrying both shapes: the approval prompt's contiguous
+        // response id, and an `ANTHROPIC_API_KEY=` line that the width breaks
+        // 102 / 6 (issue #785 blocker A). Neither may reach captured output.
+        let mut rows = vec![
+            "Detected a custom API key in your environment".to_string(),
+            format!(
+                "  ANTHROPIC_API_KEY: sk-ant-...{}",
+                claude_api_key_response_id(&key)
+            ),
+            "  Do you want to use this API key?".to_string(),
+            "   Yes".to_string(),
+            " > No (recommended)".to_string(),
+        ];
+        rows.extend(wrap_to_width(
+            &format!("ANTHROPIC_API_KEY={key}"),
+            GRID_COLS as usize,
+        ));
+        let grid = render_like_ratatui(GRID_COLS, &rows);
         panic!("did not see \"ready\" within 30s. {PANIC_SEAM_MARKER}\nFinal grid:\n{grid}");
     }
 
@@ -10707,10 +11195,27 @@ mod harness_unit_tests {
             !captured.contains(PANIC_SEAM_FAKE_KEY),
             "the key itself reached captured test output\n{captured}"
         );
+        // Issue #785 blocker A: the child's grid also carries the key BROKEN
+        // 102 / 6 across two 120-column rows, and neither of the two assertions
+        // above can see that — they look for contiguous values. This one is the
+        // one that fails if the wrapped half regresses. nextest writes exactly
+        // these bytes into the raw JUnit report's captured-output element, so
+        // this covers that sink and the run log with one assertion.
+        assert_no_fragment_survives(
+            &captured,
+            PANIC_SEAM_FAKE_KEY,
+            "the child's captured output",
+        );
+        // Non-vacuity, and specifically that the WRAPPED half was exercised:
+        // one marker for the prompt's contiguous response id, and one per row
+        // of the broken key.
+        let markers = captured.matches("[REDACTED-CREDENTIAL]").count();
         assert!(
-            captured.contains("[REDACTED-CREDENTIAL]"),
-            "nothing was redacted, so the grid never carried the suffix and the \
-             assertions above passed vacuously\n{captured}"
+            markers >= 3,
+            "expected at least three redactions — the prompt's response id plus \
+             one per row of the wrapped key — but found {markers}, so the grid \
+             never carried what this test is about and the assertions above \
+             passed vacuously\n{captured}"
         );
     }
 
@@ -10721,11 +11226,143 @@ mod harness_unit_tests {
     const TERMINAL_CONTENT_ACCESSORS: [&str; 3] =
         ["snapshot_grid", "stream_text", "registry.snapshot"];
 
+    /// Whether `haystack` mentions `ident` as a whole identifier — not inside
+    /// `grid_lines`, and not as the method in `sock.as_os_str().len()`, which is
+    /// why a leading `.` disqualifies a hit as firmly as a letter does.
+    fn mentions_ident(haystack: &str, ident: &str) -> bool {
+        let mut from = 0;
+        while let Some(found) = haystack[from..].find(ident) {
+            let start = from + found;
+            from = start + ident.len();
+            let before = |c: char| !c.is_alphanumeric() && c != '_' && c != '.';
+            let after = |c: char| !c.is_alphanumeric() && c != '_';
+            if haystack[..start].chars().next_back().is_none_or(before)
+                && haystack[from..].chars().next().is_none_or(after)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The parts of a macro argument that carry CODE rather than prose: every
+    /// `{…}` placeholder, plus everything outside the string literals.
+    ///
+    /// Matching a binding name against the whole argument reads the format
+    /// string's English too, and `"… seen live on grid = {saw_sentinel_grid}"`
+    /// in `e2e_pi_live.rs` is then reported for the word "grid" in a sentence.
+    /// Splitting the argument first is what keeps the binding arm precise enough
+    /// to be worth having. `{{` is skipped because it is an escaped brace, and a
+    /// `\'"\'` char literal inside a print argument would confuse the string
+    /// tracking — neither occurs in this suite.
+    fn interpolated_regions(arg: &str) -> Vec<&str> {
+        let bytes = arg.as_bytes();
+        let mut regions = Vec::new();
+        let (mut index, mut in_string, mut escaped, mut outside_start) = (0usize, false, false, 0);
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                    outside_start = index + 1;
+                } else if byte == b'{' {
+                    if bytes.get(index + 1) == Some(&b'{') {
+                        index += 2;
+                        continue;
+                    }
+                    if let Some(close) = arg[index + 1..].find('}') {
+                        regions.push(&arg[index + 1..index + 1 + close]);
+                        index += 1 + close;
+                    }
+                }
+            } else if byte == b'"' {
+                regions.push(&arg[outside_start..index]);
+                in_string = true;
+            }
+            index += 1;
+        }
+        regions.push(&arg[outside_start.min(arg.len())..]);
+        regions
+    }
+
+    /// The local bindings in `src` whose initialiser reads terminal content —
+    /// `let grid = deck.snapshot_grid();` and its variants.
+    ///
+    /// Without this the scan below sees only what is written INSIDE the macro
+    /// call, and `let grid = deck.snapshot_grid(); eprintln!("{grid}");` walks
+    /// straight past it. Binding first is not a contrived way to write it; it
+    /// is how every wait helper in this harness already holds a grid before
+    /// interpolating it, so the gap sat exactly where the real code lives.
+    ///
+    /// Names are collected per FILE rather than per function, which can only
+    /// over-report — and the remedy for a false positive is the same wrap the
+    /// true positive needs, so over-reporting costs nothing but a rename.
+    fn terminal_content_bindings(src: &str) -> Vec<String> {
+        let mut bound: Vec<String> = Vec::new();
+        let mut from = 0;
+        while let Some(found) = src[from..].find("let ") {
+            let start = from + found;
+            from = start + "let ".len();
+            // A `let` that starts a word, not the tail of an identifier.
+            if src[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            let mut rest = src[from..].trim_start();
+            if let Some(stripped) = rest.strip_prefix("mut ") {
+                rest = stripped.trim_start();
+            }
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            // Destructuring patterns and `let else` are deliberately skipped:
+            // neither binds a single name this scan could then look for.
+            if name.is_empty() || name == "else" {
+                continue;
+            }
+            let Some(end) = rest[name.len()..].find(';') else {
+                continue;
+            };
+            let initialiser = &rest[name.len()..name.len() + end];
+            if initialiser.contains("redact_credentials_for_output") {
+                continue;
+            }
+            // A LENGTH is not content. `let len = registry.snapshot(id).map(|s|
+            // s.len()).unwrap_or(0)` mentions an accessor and holds a number,
+            // and tainting `len` file-wide reports every unrelated `{}` that
+            // interpolates one. The cost of the shortcut is a binding that both
+            // reduces to a scalar and keeps the content — none exists here, and
+            // the accessor arm still covers an accessor written in the macro.
+            if initialiser.contains(".len()") || initialiser.contains(".count()") {
+                continue;
+            }
+            if TERMINAL_CONTENT_ACCESSORS
+                .iter()
+                .any(|accessor| initialiser.contains(accessor))
+            {
+                bound.push(name);
+            }
+        }
+        bound.sort();
+        bound.dedup();
+        bound
+    }
+
     /// Scenario: Scan every test source for a `print!`/`println!`/`eprint!`/
-    /// `eprintln!` that renders terminal content. The redacting panic hook
-    /// covers panics and assertion failures — every diagnostic this suite
-    /// actually produces — but it cannot cover a direct write to stdout, so
-    /// this keeps the invariant it relies on true as the suite grows.
+    /// `eprintln!` that renders terminal content — either by calling an
+    /// accessor inside the macro, or by interpolating a local the file bound
+    /// from one. The redacting panic hook covers panics and assertion failures
+    /// — every diagnostic this suite actually produces — but it cannot cover a
+    /// direct write to stdout, so this keeps the invariant it relies on true as
+    /// the suite grows.
     ///
     /// The remedy is named in the failure message rather than left to be
     /// guessed: wrap the argument in `common::redact_credentials_for_output`,
@@ -10790,6 +11427,7 @@ mod harness_unit_tests {
         let mut offenders = Vec::new();
         for path in &sources {
             let src = std::fs::read_to_string(path).expect("read a test source");
+            let bindings = terminal_content_bindings(&src);
             for name in ["println!", "eprintln!", "print!", "eprint!"] {
                 let mut from = 0;
                 while let Some(found) = src[from..].find(name) {
@@ -10805,6 +11443,16 @@ mod harness_unit_tests {
                     {
                         continue;
                     }
+                    // A macro named inside a LINE COMMENT executes nothing, and
+                    // the doc comment on `terminal_content_bindings` above spells
+                    // out the exact pattern this scan looks for — so without this
+                    // the scanner reports its own documentation. Line comments
+                    // only: a block comment would need real lexing, and none in
+                    // this suite contains a print macro.
+                    let line_start = src[..start].rfind('\n').map_or(0, |at| at + 1);
+                    if src[line_start..start].contains("//") {
+                        continue;
+                    }
                     // Only the invocation whose `(` follows the macro name.
                     let Some(open) = src[from..]
                         .find('(')
@@ -10816,15 +11464,23 @@ mod harness_unit_tests {
                     if arg.contains("redact_credentials_for_output") {
                         continue;
                     }
-                    if let Some(accessor) = TERMINAL_CONTENT_ACCESSORS
+                    let rendered = TERMINAL_CONTENT_ACCESSORS
                         .iter()
                         .find(|accessor| arg.contains(**accessor))
-                    {
+                        .map(|accessor| (*accessor).to_string())
+                        .or_else(|| {
+                            let regions = interpolated_regions(arg);
+                            bindings
+                                .iter()
+                                .find(|binding| {
+                                    regions.iter().any(|region| mentions_ident(region, binding))
+                                })
+                                .map(|binding| format!("`{binding}`, bound from terminal content"))
+                        });
+                    if let Some(what) = rendered {
                         let line = src[..start].matches('\n').count() + 1;
-                        offenders.push(format!(
-                            "{}:{line} — {name} renders `{accessor}`",
-                            path.display()
-                        ));
+                        offenders
+                            .push(format!("{}:{line} — {name} renders {what}", path.display()));
                     }
                 }
             }
@@ -10849,16 +11505,28 @@ mod harness_unit_tests {
     /// its own source, which is also why neither appears spelled out anywhere
     /// in this function.
     ///
+    /// They match the CALL rather than a `panic::`-qualified path, because an
+    /// IMPORTED symbol installs a hook just as thoroughly as a qualified one and
+    /// a path-shaped needle never saw it — `use std::panic::set_hook;` followed
+    /// by a bare call was invisible to the predecessor of this scan. Matching on
+    /// the trailing `(` is what keeps a prose mention of the function in a
+    /// comment from being reported, and it is also why
+    /// `registry.set_hook_socket(…)` in `tests/daemon_protocol.rs` is correctly
+    /// ignored. The `use` arm is separate because an import has no call
+    /// parentheses to match on.
+    ///
     /// `src/` is deliberately not scanned: those hooks (`src/ui.rs`'s terminal
     /// restore, and two in-crate unit tests) live in the deck BINARY or in the
     /// lib's own test target, neither of which shares a process with this
     /// harness.
     #[test]
     fn no_test_installs_a_competing_panic_hook() {
-        let needles = [
-            concat!("panic::", "set_hook"),
-            concat!("panic::", "take_hook"),
-        ];
+        let calls = [concat!("set_", "hook("), concat!("take_", "hook(")];
+        let imported = |line: &str| {
+            line.trim_start().starts_with("use ")
+                && (line.contains(concat!("set_", "hook"))
+                    || line.contains(concat!("take_", "hook")))
+        };
         let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
         let mut sources: Vec<PathBuf> = std::fs::read_dir(&tests_dir)
             .expect("read tests/")
@@ -10876,7 +11544,7 @@ mod harness_unit_tests {
         for path in &sources {
             let src = std::fs::read_to_string(path).expect("read a test source");
             for (line_no, line) in src.lines().enumerate() {
-                if !needles.iter().any(|needle| line.contains(needle)) {
+                if !calls.iter().any(|needle| line.contains(needle)) && !imported(line) {
                     continue;
                 }
                 // The seam's own installation is the one legitimate site.
@@ -10908,6 +11576,27 @@ mod harness_unit_tests {
             "expected to find exactly the seam's own hook installation; the scanner has drifted \
              away from what it is meant to be guarding"
         );
+    }
+
+    /// Scenario: The approval decision reads the credential source the IMPORT
+    /// recorded, and that record cannot be revised once set — so one process
+    /// has one answer however the host changes underneath it.
+    ///
+    /// Issue #785's non-blocking TOCTOU. The import and the seeding used to
+    /// re-derive the answer independently; a rotation landing between the two
+    /// reads made them disagree, and one direction of that disagreement moves a
+    /// developer's run off their subscription and onto metered billing.
+    #[test]
+    fn the_seeding_reads_the_credential_source_the_import_recorded() {
+        // Order-independent: whichever value this process settled on first is
+        // the one both halves must keep seeing.
+        let recorded = *CLAUDE_OAUTH_SEEDED.get_or_init(|| false);
+        assert_eq!(claude_run_is_oauth_backed(), recorded);
+        assert!(
+            CLAUDE_OAUTH_SEEDED.set(!recorded).is_err(),
+            "the recorded credential source must not be revisable"
+        );
+        assert_eq!(claude_run_is_oauth_backed(), recorded);
     }
 
     /// Scenario: Seed Claude Code's API-key approval into a config on a host
