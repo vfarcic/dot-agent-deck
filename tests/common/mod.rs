@@ -539,6 +539,29 @@ impl TuiDeck {
                 }
             }
         }
+        // Issue #502/#785 — the API-key sink, closed the same way the OpenCode
+        // and Devin ones are. Two strings, both registered whenever a key is
+        // present, because `inherit_pass` now puts the key into every deck this
+        // harness spawns:
+        //
+        //   * the KEY itself, since anything in the pane that echoes its
+        //     environment renders it into the vt100 grid, and the grid is
+        //     persisted as `full-stream.cast` / `final-grid.txt`;
+        //   * its 20-character SUFFIX, because Claude Code's API-key approval
+        //     prompt renders exactly that (see `seed_claude_project_trust`), so
+        //     any run where the approval seeding is wrong or has not happened
+        //     yet paints a derivative of the secret straight into the recording
+        //     — and from there into nextest's captured output, which lane 2
+        //     lifts into the job log with `--success-output=final`. GitHub masks
+        //     a registered secret's exact value in a rendered log; a substring
+        //     of it is not covered.
+        //
+        // Registered unconditionally rather than only on a claude import: the
+        // key reaches the deck either way, and a redaction for a string that
+        // never appears costs one failed substring search per artifact.
+        if let Some(key) = anthropic_api_key() {
+            recording_redactions.extend(api_key_recording_redactions(&key));
+        }
         recording_redactions.sort_by_key(|value| std::cmp::Reverse(value.len()));
         recording_redactions.dedup();
 
@@ -695,7 +718,24 @@ impl TuiDeck {
         // PATH is required for the deck to spawn its own daemon
         // subcommand (it shells out via `current_exe`, but lookups like
         // git still need PATH).
-        let inherit_pass = ["PATH"];
+        //
+        // ANTHROPIC_API_KEY (issue #502/#785) has to cross `env_clear` too, or
+        // the credential the run was authorised on never reaches the process
+        // that needs it: the deck lazy-spawns the daemon, the daemon spawns the
+        // agent, and each inherits this environment. Before this, only the pi
+        // tests got a key at all — by threading it through `with_env`
+        // themselves — so a `check_claude_available` widened to accept a key
+        // would have passed a gate the agent could not then satisfy.
+        //
+        // Deliberately ANTHROPIC_API_KEY alone, not "every *_API_KEY". Codex
+        // reads its credential from `~/.codex/auth.json`, which
+        // `import_codex_credentials` copies into the test HOME (measured: codex
+        // 0.149 answers 401 from an env key alone), and `check_opencode_available`
+        // only offers its env-key path for an `anthropic/…` test model for
+        // exactly this reason — so no other provider variable would be used by
+        // anything the deck spawns, and each one added is another secret in the
+        // recorded PTY's environment for no gain.
+        let inherit_pass = ["PATH", ANTHROPIC_API_KEY_ENV];
 
         let mut final_env: HashMap<String, String> = HashMap::new();
         for k in inherit_pass {
@@ -2579,6 +2619,15 @@ fn render_grid_to_svg(grid: &str, cols: u16, rows: u16) -> String {
 /// exactly the tier CLAUDE.md rule 5 exception (a) says must be run locally
 /// BECAUSE CI has no credentials to run it, so both sides would be green while
 /// proving nothing.
+///
+/// Issue #502/#785: there is now a THIRD path — a non-empty
+/// `ANTHROPIC_API_KEY`, consulted last, after both credential stores have come
+/// up empty. That is what lets lane 2 run the claude-gated tests on a GitHub
+/// runner from a scopable, revocable, spend-cappable key instead of the owner's
+/// account session. See the comment on that branch, and note it is coupled to
+/// [`seed_claude_project_trust`]: an interactive agent authenticated by key
+/// also needs the API-key approval recorded in `~/.claude.json`, or it stops on
+/// a prompt that defaults to "No".
 pub fn check_claude_available() -> Result<(), String> {
     if !cli_invocable("claude") {
         return Err("Claude Code CLI not installed (could not invoke `claude --version`)".into());
@@ -2593,12 +2642,118 @@ pub fn check_claude_available() -> Result<(), String> {
         // never writes.
         Err(file_reason) => {
             if claude_keychain_credentials_present() {
-                Ok(())
-            } else {
-                Err(format!("{file_reason}{CLAUDE_KEYCHAIN_HINT}"))
+                return Ok(());
             }
+            // Issue #502/#785: a non-empty ANTHROPIC_API_KEY is a THIRD auth
+            // path, not a replacement for the other two — note it is consulted
+            // last, so a host with a usable file or Keychain item still
+            // authenticates exactly the way it did before this existed.
+            //
+            // Claude Code genuinely runs from the key alone: measured on a
+            // virgin HOME with no `.credentials.json` at any point, both in
+            // print mode and interactively under a PTY, doing real tool-using
+            // work and reporting "API Usage Billing". The one extra thing an
+            // INTERACTIVE agent needs is the API-key approval recorded in
+            // `~/.claude.json` — without it Claude Code stops on a prompt that
+            // defaults to "No" and the test dies at a PTY wait, which is the
+            // confusing-timeout failure class this whole gate exists to
+            // prevent. `seed_claude_project_trust` writes that approval, and
+            // the two are coupled: widening this check without it just moves
+            // the failure later.
+            //
+            // This is what lets lane 2 run the 22 claude-gated tests on a
+            // GitHub runner under #785 decision 1 — a scopable, spend-cappable,
+            // independently revocable API key rather than the owner's account
+            // session. The key is only tested for presence here; it is never
+            // printed, and no probe request is made (same trade as the file
+            // path: a live round trip would spend tokens on every e2e run, so
+            // a revoked key remains an accepted false-positive that fails
+            // loudly later).
+            if anthropic_api_key().is_some() {
+                return Ok(());
+            }
+            Err(format!(
+                "{file_reason}{CLAUDE_KEYCHAIN_HINT} (and {ANTHROPIC_API_KEY_ENV} is unset, \
+                 empty or whitespace-only, which is the third way this check can be satisfied)"
+            ))
         }
     }
+}
+
+/// Issue #502/#785: the environment variable Claude Code, OpenCode and `pi` all
+/// read an Anthropic API key from, and the only agent credential lane 2 holds in
+/// CI. Named here so the harness, the gates and the redaction agree on one
+/// spelling.
+pub const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+
+/// The ambient Anthropic API key, or `None` when it is unset, empty or
+/// whitespace-only.
+///
+/// Presence is decided on the TRIMMED value — the same rule all three
+/// `check_pi_available` copies apply, and the same rule `e2e-live.yml`'s guard
+/// step applies with `${VAR//[[:space:]]/}` — but the value comes back
+/// VERBATIM, because verbatim is what a spawned agent receives and therefore
+/// what it derives [`claude_api_key_response_id`] from.
+///
+/// This is a secret. It is returned only to be threaded into a child process's
+/// environment and to be registered for recording redaction; it is never
+/// printed, never formatted into an error and never written to an artifact.
+fn anthropic_api_key() -> Option<String> {
+    std::env::var(ANTHROPIC_API_KEY_ENV)
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+}
+
+/// The identifier Claude Code files an API key under in `~/.claude.json`'s
+/// `customApiKeyResponses` — the key's **last 20 characters**.
+///
+/// Measured twice: the interactive "Detected a custom API key in your
+/// environment" prompt renders exactly this suffix and answering it records
+/// exactly this string, and every entry already present in this repo's dev-box
+/// `~/.claude.json` is 20 characters long.
+///
+/// Counted in `char`s rather than bytes so a non-ASCII value cannot panic on a
+/// split landing mid-code-point. Real keys are ASCII, where the two agree.
+///
+/// The result is a DERIVATIVE of the secret and must be treated as one: GitHub
+/// masks a registered secret's exact value in a rendered log, not a substring of
+/// it, which is why [`TuiDeckBuilder::launch`] registers this string for
+/// recording redaction rather than relying on masking.
+fn claude_api_key_response_id(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    let start = chars.len().saturating_sub(20);
+    chars[start..].iter().collect()
+}
+
+/// Everything about an Anthropic API key that must never survive into a
+/// `.cast`, a `final-grid.txt` or a copied `fixture.toml`: the key, and the
+/// 20-character derivative Claude Code's approval prompt paints on the terminal.
+///
+/// Longest first, because [`credential_redaction_ranges`] prefers the longest
+/// value at a shared start — the two do not share one, but the list is sorted
+/// that way by its consumer anyway and this keeps the intent local.
+///
+/// Pure in the key so the redaction it produces is covered by a unit test on
+/// the fast tier rather than only by the credentialed lane. The env read stays
+/// at the one call site in [`TuiDeckBuilder::launch`].
+fn api_key_recording_redactions(key: &str) -> Vec<String> {
+    vec![key.to_string(), claude_api_key_response_id(key)]
+}
+
+/// Whether the HOST carries an OAuth credential set the gate accepts — the file
+/// first, then the macOS Keychain. Exactly the pair [`check_claude_available`]
+/// consulted before the API key became a third path, so "was this run
+/// authorised by OAuth?" has ONE answer that the gate, the import and the
+/// `~/.claude.json` seeding all read.
+///
+/// Keep it that way. [`import_claude_credentials`] writes a credentials file
+/// into the test HOME if and only if this is true, and
+/// [`seed_claude_project_trust`] approves the API key if and only if it is
+/// false. If the two ever disagree, an agent gets an OAuth file it cannot use,
+/// or an approved key it did not need — and the second of those silently moves
+/// a developer's local run off their subscription and onto metered API billing.
+fn host_claude_oauth_usable() -> bool {
+    check_claude_credentials_file().is_ok() || claude_keychain_credentials_present()
 }
 
 /// The file half of [`check_claude_available`]: `~/.claude/.credentials.json`
@@ -2851,6 +3006,21 @@ pub fn claude_oauth_usable(oauth: &serde_json::Value, now_ms: i64) -> Result<(),
 /// [`check_claude_available`] — checks for the CLI on PATH and an
 /// OpenCode auth.json (or analogous credential the user logged in
 /// with).
+///
+/// Issue #502/#785 adds the same third path [`check_claude_available`] grew, and
+/// measured the same way: `opencode run --model anthropic/claude-haiku-4-5` did
+/// real tool-using work in a virgin HOME from `ANTHROPIC_API_KEY` alone, writing
+/// no `auth.json` anywhere. The file requirement was therefore strictly
+/// stricter than the CLI, exactly as claude's was.
+///
+/// It is offered ONLY for an `anthropic/…` test model, and that restriction is
+/// load-bearing rather than cautious. [`opencode_test_model`] is configurable
+/// and defaults to `openai/gpt-5.4-mini`; `inherit_pass` forwards
+/// `ANTHROPIC_API_KEY` and nothing else, so accepting an Anthropic key for an
+/// OpenAI-backed model would open the gate on a credential the spawned agent
+/// could not use — turning a clean skip into a failure deep in a PTY wait,
+/// which is the outcome this whole family of checks exists to prevent. For any
+/// other provider the gate is unchanged and still wants an `auth.json`.
 pub fn check_opencode_available() -> Result<(), String> {
     if !cli_invocable("opencode") {
         return Err("OpenCode CLI not installed (could not invoke `opencode --version`)".into());
@@ -2867,12 +3037,28 @@ pub fn check_opencode_available() -> Result<(), String> {
     if candidates.iter().any(|p| p.exists()) {
         return Ok(());
     }
+    if opencode_env_key_authorises() {
+        return Ok(());
+    }
     // M3.1 auditor S1: redact $HOME in the surfaced path.
-    Err(
+    Err(format!(
         "OpenCode credentials not found at ~/.local/share/opencode/auth.json — \
-         log in with `opencode auth login`"
-            .into(),
-    )
+         log in with `opencode auth login` (or, for an `anthropic/…` \
+         {OPENCODE_TEST_MODEL_ENV}, set {ANTHROPIC_API_KEY_ENV}; the model here \
+         is `{}`)",
+        opencode_test_model()
+    ))
+}
+
+/// Whether an ambient `ANTHROPIC_API_KEY` is enough to run the OpenCode tests —
+/// true only when [`opencode_test_model`] names the `anthropic` provider, so the
+/// key the harness forwards is the one the model needs. See
+/// [`check_opencode_available`] for why the provider match is required.
+fn opencode_env_key_authorises() -> bool {
+    opencode_test_model()
+        .split_once('/')
+        .is_some_and(|(provider, _)| provider == "anthropic")
+        && anthropic_api_key().is_some()
 }
 
 /// Compiled-in default cheap model for Codex availability probes and real-agent
@@ -3334,18 +3520,51 @@ fn import_claude_credentials(test_home: &Path) -> std::io::Result<()> {
     // host that is genuinely logged in. Same rule, same order, as the gate:
     // a usable file wins, else the Keychain, else copy what we have and let it
     // fail loudly rather than silently importing nothing.
+    //
+    // Issue #502/#785, and this half is NOT optional once `check_claude_available`
+    // accepts an API key. This function runs inside `launch_with_fixture`, which
+    // is `try_launch_with_fixture(…).unwrap_or_else(|e| panic!(…))`, so an
+    // `Err` here is a PANIC rather than a skip. Widening the gate without
+    // widening this converts 22 silent skips into 22 hard panics on any host
+    // that has a key and no credential set — which is precisely the state a CI
+    // runner is in. The two changes are one change.
+    //
+    // So: when NEITHER store is usable but a key is present, the correct
+    // credential set to seed is NO credential set. Claude Code then
+    // authenticates from `ANTHROPIC_API_KEY` (which reaches it through the
+    // deck's env — see `inherit_pass`), exactly as it does in a virgin HOME.
+    // Writing a spent or malformed file beside an authorising key would only
+    // make the agent's choice of credential ambiguous.
     let src_creds = src_root.join(".credentials.json");
+    let key_authorises = anthropic_api_key().is_some();
     let creds_bytes = match read_credential_file_no_symlink(
         &src_creds,
         "Claude Code credentials not found at ~/.claude/.credentials.json \
-         nor in the macOS login Keychain — log in with `claude login`",
+         nor in the macOS login Keychain, and no usable ANTHROPIC_API_KEY — \
+         log in with `claude login`",
         "~/.claude/.credentials.json",
     ) {
-        Ok(bytes) if claude_credential_document_usable(&bytes) => bytes,
-        Ok(bytes) => claude_keychain_credentials_export().unwrap_or(bytes),
-        Err(file_err) => claude_keychain_credentials_export().ok_or(file_err)?,
+        Ok(bytes) if claude_credential_document_usable(&bytes) => Some(bytes),
+        Ok(bytes) => match claude_keychain_credentials_export() {
+            Some(keychain) => Some(keychain),
+            None if key_authorises => None,
+            // Unchanged: copy what we have and let it fail loudly rather than
+            // silently importing nothing.
+            None => Some(bytes),
+        },
+        // A symlinked or unreadable source lands here too, and falls through to
+        // the same alternatives the absent-file case does — the same posture the
+        // Keychain fallback has always had: refuse to IMPORT it, then use
+        // another source.
+        Err(file_err) => match claude_keychain_credentials_export() {
+            Some(keychain) => Some(keychain),
+            None if key_authorises => None,
+            None => return Err(file_err),
+        },
     };
-    write_credential_file_atomic_0o600(&dst_root.join(".credentials.json"), &creds_bytes)?;
+    if let Some(bytes) = creds_bytes {
+        write_credential_file_atomic_0o600(&dst_root.join(".credentials.json"), &bytes)?;
+    }
 
     // settings.json: copy if present, with `hooks` stripped. Claude's
     // settings.json is JSONC (line + block comments) — M3.1 auditor
@@ -3408,6 +3627,41 @@ fn import_claude_plugins_enabled() -> bool {
 /// destination is written atomically with mode 0o600 — `.claude.json` carries
 /// the host `oauthAccount` (M3.1 auditor S2, same stance as the other imported
 /// credential files).
+///
+/// Issue #502/#785 adds a THIRD gate to clear, and it only exists once
+/// `ANTHROPIC_API_KEY` reaches the agent (which it now always does — see
+/// `inherit_pass`). With a key in its environment, an interactive Claude Code
+/// stops on:
+///
+/// ```text
+/// Detected a custom API key in your environment
+/// ANTHROPIC_API_KEY: sk-ant-...<last 20 chars>
+/// Do you want to use this API key?
+///    Yes
+///  > No (recommended)
+/// ```
+///
+/// It DEFAULTS TO "No", so an unattended agent stalls there forever instead of
+/// failing fast, and every claude-gated test dies at a PTY wait with a
+/// confusing timeout. [`claude_api_key_response_id`] is what the answer is
+/// recorded under, so the answer can be pre-seeded without a round trip.
+///
+/// WHICH answer is seeded is decided by [`host_claude_oauth_usable`], and the
+/// asymmetry is the point:
+///
+///   * **OAuth usable** (a developer's machine): record the key as REJECTED, so
+///     the prompt is silent and the agent keeps authenticating from the
+///     imported credential set exactly as it did before this change. Approving
+///     it here would quietly move a local run off the developer's subscription
+///     and onto metered API billing.
+///   * **OAuth unusable** (a CI runner): record it as APPROVED, and drop any
+///     inherited `rejected` entry for it — the host config is copied wholesale,
+///     so a developer who once answered "No" to this very key would otherwise
+///     export that refusal to a runner where the key is the ONLY way in.
+///
+/// A response the host already recorded for a key that is not the ambient one
+/// is left untouched, and so is an existing response for the ambient key on an
+/// OAuth host: that is the developer's own answer, and it already says "No".
 fn seed_claude_project_trust(test_home: &Path, trust_paths: &[String]) -> std::io::Result<()> {
     let host_cfg_path = host_home().join(".claude.json");
     let mut cfg: serde_json::Value = std::fs::read_to_string(&host_cfg_path)
@@ -3424,9 +3678,61 @@ fn seed_claude_project_trust(test_home: &Path, trust_paths: &[String]) -> std::i
             "projectOnboardingSeenCount": 1,
         });
     }
+    if let Some(key) = anthropic_api_key() {
+        seed_claude_api_key_response(&mut cfg, &key, host_claude_oauth_usable());
+    }
     let bytes = serde_json::to_vec(&cfg)
         .map_err(|e| std::io::Error::other(format!("serialize .claude.json: {e}")))?;
     write_credential_file_atomic_0o600(&test_home.join(".claude.json"), &bytes)
+}
+
+/// Pre-answer Claude Code's "Detected a custom API key in your environment"
+/// prompt inside a `~/.claude.json` document. Split out as a pure mutation of
+/// the parsed config so the branch table above is covered by unit tests instead
+/// of by argument, and so `oauth_usable` is an explicit input rather than an
+/// ambient read.
+///
+/// Only ever handles [`claude_api_key_response_id`] — the 20-character
+/// derivative — never the key itself, which does not appear in this file.
+fn seed_claude_api_key_response(cfg: &mut serde_json::Value, key: &str, oauth_usable: bool) {
+    let id = claude_api_key_response_id(key);
+    if !cfg["customApiKeyResponses"].is_object() {
+        cfg["customApiKeyResponses"] = serde_json::json!({});
+    }
+    if oauth_usable {
+        // The imported credential set is authoritative. Answer "No" for the
+        // ambient key ONLY if the host has not already answered — an existing
+        // `approved` entry is a deliberate developer choice and stays.
+        if !response_list_contains(cfg, "approved", &id) {
+            set_response_membership(cfg, "rejected", &id, true);
+        }
+    } else {
+        set_response_membership(cfg, "approved", &id, true);
+        set_response_membership(cfg, "rejected", &id, false);
+    }
+}
+
+/// Whether `customApiKeyResponses.<field>` already lists `id`.
+fn response_list_contains(cfg: &serde_json::Value, field: &str, id: &str) -> bool {
+    cfg["customApiKeyResponses"][field]
+        .as_array()
+        .is_some_and(|list| list.iter().any(|v| v.as_str() == Some(id)))
+}
+
+/// Add or remove `id` from `customApiKeyResponses.<field>`, creating the list
+/// when a host config carries none (or carries a non-array there).
+fn set_response_membership(cfg: &mut serde_json::Value, field: &str, id: &str, want: bool) {
+    let responses = &mut cfg["customApiKeyResponses"];
+    if !responses[field].is_array() {
+        responses[field] = serde_json::json!([]);
+    }
+    let list = responses[field].as_array_mut().expect("array just ensured");
+    let present = list.iter().any(|v| v.as_str() == Some(id));
+    match (want, present) {
+        (true, false) => list.push(serde_json::Value::String(id.to_string())),
+        (false, true) => list.retain(|v| v.as_str() != Some(id)),
+        _ => {}
+    }
 }
 
 /// Public wrapper over [`seed_claude_project_trust`] for tests whose trusted
@@ -3438,6 +3744,27 @@ fn seed_claude_project_trust(test_home: &Path, trust_paths: &[String]) -> std::i
 /// has to beat the spawn, not the launch.
 #[allow(dead_code)]
 pub fn seed_claude_trust_in_home(home: &Path, trust_paths: &[String]) -> std::io::Result<()> {
+    seed_claude_project_trust(home, trust_paths)
+}
+
+/// Seed a HOME for a Claude Code worker the test spawns ITSELF, outside the
+/// `TuiDeck` builder — an in-process-daemon `spawn_agent` whose `env` pins
+/// `HOME` to a tempdir. Does exactly what the builder's
+/// `with_imported_claude_credentials` + `with_claude_project_trust` pair does
+/// for a deck-spawned agent, so the two routes cannot drift.
+///
+/// Issue #502/#785: it exists because they HAD drifted.
+/// `e2e_pi_orchestrator.rs` and `e2e_delegate_work_done_chain.rs` each carried a
+/// hand-rolled `prepare_claude_home` that opened with
+/// `fs::copy(host ~/.claude/.credentials.json, …).expect("copy claude
+/// credentials")`. That is an unconditional panic on any host authorised by an
+/// API key — the third panic site of the same shape as the two inside
+/// `launch_with_fixture`, and the one a grep for `import_claude_credentials`
+/// does not find. Neither copy seeded the API-key approval either, so both
+/// would have stalled on the prompt even if the copy had been made optional.
+#[allow(dead_code)]
+pub fn seed_claude_worker_home(home: &Path, trust_paths: &[String]) -> std::io::Result<()> {
+    import_claude_credentials(home)?;
     seed_claude_project_trust(home, trust_paths)
 }
 
@@ -3802,24 +4129,50 @@ fn import_opencode_credentials_from(
     }
 
     if !imported_auth {
-        return Err(std::io::Error::other(
+        // `NotFound` rather than `other` so the one caller that is allowed to
+        // continue without an auth file can tell THIS refusal apart from the
+        // symlink / not-a-regular-file ones, which must stay fatal. Every other
+        // error out of this function is `ErrorKind::Other` (see
+        // `read_credential_file_no_symlink`), so the discrimination is exact.
+        // The message is unchanged.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
             "OpenCode credentials not found at ~/.local/share/opencode/auth.json, \
              ~/.opencode/auth.json, or ~/.config/opencode/auth.json — log in with \
              `opencode auth login`"
                 .to_string(),
         ));
     }
-    let dst_cfg_dir = test_home.join(".config").join("opencode");
-    std::fs::create_dir_all(&dst_cfg_dir)?;
-    std::fs::write(dst_cfg_dir.join("opencode.json"), MINIMAL_OPENCODE_CONFIG)?;
+    write_minimal_opencode_config(test_home)?;
 
     recording_redactions.sort_by_key(|value| std::cmp::Reverse(value.len()));
     recording_redactions.dedup();
     Ok(recording_redactions)
 }
 
+/// The isolated OpenCode config every seeded HOME gets: empty, so no host
+/// plugin, MCP command or provider block can follow the credentials in.
+fn write_minimal_opencode_config(test_home: &Path) -> std::io::Result<()> {
+    let dst_cfg_dir = test_home.join(".config").join("opencode");
+    std::fs::create_dir_all(&dst_cfg_dir)?;
+    std::fs::write(dst_cfg_dir.join("opencode.json"), MINIMAL_OPENCODE_CONFIG)
+}
+
 fn import_opencode_credentials(test_home: &Path) -> std::io::Result<Vec<String>> {
-    import_opencode_credentials_from(&host_home(), test_home)
+    match import_opencode_credentials_from(&host_home(), test_home) {
+        // Issue #502/#785, the OpenCode half of the coupling described on
+        // `import_claude_credentials`: this runs inside the `launch_with_fixture`
+        // path that panics on `Err`, so `check_opencode_available` accepting an
+        // env key without this would turn two clean skips into two panics on a
+        // runner. There is no auth file to copy and that is the AUTHORISED
+        // state, not a failure — the isolated config is still written, so the
+        // host's plugins and MCP commands stay out either way.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && opencode_env_key_authorises() => {
+            write_minimal_opencode_config(test_home)?;
+            Ok(Vec::new())
+        }
+        other => other,
+    }
 }
 
 /// Copy only Codex's authentication state into the isolated test HOME and seed
@@ -9625,5 +9978,187 @@ mod harness_unit_tests {
             "the split credential survived recording redaction: {:?}",
             String::from_utf8_lossy(&joined)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #502/#785 — authorising a real-agent run from an API key
+    // -----------------------------------------------------------------------
+
+    /// Scenario: Ask for the identifier Claude Code files an API key under. It
+    /// is the last 20 characters, it is counted in characters rather than bytes
+    /// so a non-ASCII value cannot panic on a split code point, and a key
+    /// shorter than 20 characters comes back whole instead of being padded or
+    /// truncated.
+    #[test]
+    fn the_api_key_response_id_is_the_last_twenty_characters() {
+        let key = "sk-ant-api03-0123456789abcdefghijklmnopqrstuvwxyz";
+        let id = claude_api_key_response_id(key);
+        assert_eq!(id.chars().count(), 20);
+        assert!(key.ends_with(&id));
+        assert_eq!(claude_api_key_response_id("short"), "short");
+        // Multi-byte characters: 20 CHARS, and the result stays valid UTF-8.
+        let unicode: String = std::iter::repeat_n('é', 25).collect();
+        assert_eq!(claude_api_key_response_id(&unicode).chars().count(), 20);
+    }
+
+    /// Scenario: Register an API key for recording redaction and then render
+    /// both the key and the 20-character suffix Claude Code's approval prompt
+    /// paints on the terminal into a grid. Neither survives into the artifact.
+    /// The suffix half is the one that matters: GitHub masks a registered
+    /// secret's exact value in a rendered log, never a derivative of it, and the
+    /// prompt renders exactly this derivative whenever the approval seeding is
+    /// missing or wrong.
+    #[test]
+    fn the_api_key_and_its_rendered_suffix_are_both_redacted_from_recordings() {
+        let key = "sk-ant-api03-not-a-real-key-DEADBEEFCAFEBABE0123";
+        let redactions = api_key_recording_redactions(key);
+        let suffix = claude_api_key_response_id(key);
+
+        let prompt_grid = format!(
+            "Detected a custom API key in your environment\n  ANTHROPIC_API_KEY: sk-ant-...{suffix}\n  Do you want to use this API key?\n"
+        );
+        let redacted = redact_known_credentials_text(&prompt_grid, &redactions);
+        assert!(
+            !redacted.contains(&suffix),
+            "the rendered key suffix survived redaction: {redacted}"
+        );
+        assert!(redacted.contains("[REDACTED-CREDENTIAL]"));
+
+        let env_dump = format!("$ env | grep ANTHROPIC\nANTHROPIC_API_KEY={key}\n");
+        let redacted = redact_known_credentials_bytes(env_dump.as_bytes(), &redactions);
+        let redacted = String::from_utf8_lossy(&redacted);
+        assert!(
+            !redacted.contains(key) && !redacted.contains(suffix.as_str()),
+            "the key survived redaction: {redacted}"
+        );
+    }
+
+    /// Scenario: Seed Claude Code's API-key approval into a config on a host
+    /// whose OAuth credential set is UNUSABLE — a CI runner. The key is
+    /// approved, and a `rejected` entry inherited from the host config is
+    /// dropped, because the host copy is taken wholesale and a developer who
+    /// once answered "No" to this key would otherwise export that refusal to a
+    /// runner where the key is the only way in.
+    #[test]
+    fn a_key_authorised_run_approves_the_key_and_drops_an_inherited_refusal() {
+        let key = "sk-ant-api03-not-a-real-key-DEADBEEFCAFEBABE0123";
+        let id = claude_api_key_response_id(key);
+        let mut cfg = serde_json::json!({
+            "hasCompletedOnboarding": true,
+            "customApiKeyResponses": { "approved": [], "rejected": [id.clone()] },
+        });
+        seed_claude_api_key_response(&mut cfg, key, false);
+        assert!(response_list_contains(&cfg, "approved", &id));
+        assert!(!response_list_contains(&cfg, "rejected", &id));
+    }
+
+    /// Scenario: Seed the same answer on a host whose OAuth credential set IS
+    /// usable — a developer's machine. The key is REJECTED rather than
+    /// approved, so the imported credential set stays authoritative and the run
+    /// does not quietly move off the developer's subscription onto metered API
+    /// billing. Measured: with the key rejected and no credential file, Claude
+    /// Code declines the key and falls through to its login prompt, so on an
+    /// OAuth host it authenticates exactly as it did before this existed.
+    #[test]
+    fn an_oauth_authorised_run_rejects_the_ambient_key_instead_of_approving_it() {
+        let key = "sk-ant-api03-not-a-real-key-DEADBEEFCAFEBABE0123";
+        let id = claude_api_key_response_id(key);
+        let mut cfg = serde_json::json!({ "hasCompletedOnboarding": true });
+        seed_claude_api_key_response(&mut cfg, key, true);
+        assert!(response_list_contains(&cfg, "rejected", &id));
+        assert!(!response_list_contains(&cfg, "approved", &id));
+    }
+
+    /// Scenario: The host config already approves this key and the host also has
+    /// a usable OAuth credential set. That approval is the developer's own
+    /// deliberate answer, so the seeding leaves it alone rather than overriding
+    /// it with a refusal.
+    #[test]
+    fn a_deliberate_host_approval_survives_the_oauth_branch() {
+        let key = "sk-ant-api03-not-a-real-key-DEADBEEFCAFEBABE0123";
+        let id = claude_api_key_response_id(key);
+        let mut cfg = serde_json::json!({
+            "customApiKeyResponses": { "approved": [id.clone()], "rejected": [] },
+        });
+        seed_claude_api_key_response(&mut cfg, key, true);
+        assert!(response_list_contains(&cfg, "approved", &id));
+        assert!(!response_list_contains(&cfg, "rejected", &id));
+    }
+
+    /// Scenario: Seed into a host config whose `customApiKeyResponses` is
+    /// missing entirely, or is present but the wrong JSON type. Neither shape
+    /// may panic or silently drop the answer — a config Claude Code has never
+    /// written the key into is the ordinary first-run case.
+    #[test]
+    fn a_missing_or_malformed_response_block_is_rebuilt_rather_than_trusted() {
+        let key = "sk-ant-api03-not-a-real-key-DEADBEEFCAFEBABE0123";
+        let id = claude_api_key_response_id(key);
+        for hostile in [
+            serde_json::json!({}),
+            serde_json::json!({ "customApiKeyResponses": 7 }),
+            serde_json::json!({ "customApiKeyResponses": { "approved": "not-a-list" } }),
+        ] {
+            let mut cfg = hostile;
+            seed_claude_api_key_response(&mut cfg, key, false);
+            assert!(
+                response_list_contains(&cfg, "approved", &id),
+                "the approval was lost: {cfg}"
+            );
+        }
+    }
+
+    /// Scenario: Ask whether an ambient API key is usable. Unset, empty and
+    /// whitespace-only all mean absent — the same rule the three
+    /// `check_pi_available` copies apply and the same rule `e2e-live.yml`'s
+    /// guard step applies — while a real value comes back VERBATIM, because
+    /// verbatim is what the spawned agent receives.
+    #[test]
+    fn an_empty_or_whitespace_only_api_key_counts_as_absent() {
+        let prev = std::env::var_os(ANTHROPIC_API_KEY_ENV);
+        // SAFETY: nextest runs one test per process, so this is single-threaded;
+        // the var is restored before returning.
+        unsafe { std::env::remove_var(ANTHROPIC_API_KEY_ENV) };
+        assert!(anthropic_api_key().is_none(), "unset must read as absent");
+        unsafe { std::env::set_var(ANTHROPIC_API_KEY_ENV, "") };
+        assert!(anthropic_api_key().is_none(), "empty must read as absent");
+        unsafe { std::env::set_var(ANTHROPIC_API_KEY_ENV, " \t\n") };
+        assert!(
+            anthropic_api_key().is_none(),
+            "whitespace-only must read as absent"
+        );
+        unsafe { std::env::set_var(ANTHROPIC_API_KEY_ENV, "sk-ant-fake") };
+        assert_eq!(anthropic_api_key().as_deref(), Some("sk-ant-fake"));
+        match prev {
+            Some(value) => unsafe { std::env::set_var(ANTHROPIC_API_KEY_ENV, value) },
+            None => unsafe { std::env::remove_var(ANTHROPIC_API_KEY_ENV) },
+        }
+    }
+
+    /// Scenario: Ask whether an ambient Anthropic key is enough to run the
+    /// OpenCode tests. It is only enough when the configured test model names
+    /// the `anthropic` provider — the harness forwards that key and no other,
+    /// so opening the gate for an `openai/...` model would turn a clean skip
+    /// into a failure deep in a PTY wait.
+    #[test]
+    fn the_opencode_env_key_path_is_offered_only_for_an_anthropic_model() {
+        assert_eq!(
+            OPENCODE_TEST_MODEL_DEFAULT.split_once('/').map(|(p, _)| p),
+            Some("openai"),
+            "the default model is the case the provider match exists to exclude"
+        );
+        // `opencode_test_model` memoises, so drive the pure predicate the gate
+        // uses rather than the OnceLock: provider match AND key presence.
+        for (model, provider_matches) in [
+            ("anthropic/claude-haiku-4-5", true),
+            ("openai/gpt-5.4-mini", false),
+            ("openrouter/anthropic/claude-haiku-4-5", false),
+            ("no-slash-at-all", false),
+        ] {
+            assert_eq!(
+                model.split_once('/').is_some_and(|(p, _)| p == "anthropic"),
+                provider_matches,
+                "provider match for {model}"
+            );
+        }
     }
 }
