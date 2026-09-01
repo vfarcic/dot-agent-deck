@@ -2005,12 +2005,33 @@ const RECORDING_CREDENTIAL_REDACTION: &[u8] = b"[REDACTED-CREDENTIAL]";
 // between are left in place, because they are the newline, the border and the
 // neighbouring column that make the artifact readable at all.
 //
+// AND THEN IT READS THEM ANYWAY. Left in place is a statement about the OUTPUT,
+// not about what the scan looked at, and conflating the two is what issue #785
+// had to be reopened for. A gap is arbitrary rendered content, so on a real
+// grid it holds whatever else was on screen — including the other registered
+// value, because the key and the response id Claude Code's approval prompt
+// paints are always registered together and the id is a suffix of the key. The
+// scan therefore resumes at the end of a match's FIRST fragment, never past the
+// last, and every alternate place a hop could have resumed is redacted along
+// with the one it took. `credential_redaction_ranges` and `fragment_candidates`
+// carry the measured cases.
+//
 // WHY THIS IS NOT A SUBSEQUENCE SEARCH, which is the failure mode a naive
 // version of this has: "match, skip anything, match again" finds almost any
 // string in almost any text. The two constants below are what keep it honest —
 // a minimum of eight exact bytes per hop, and a hard ceiling on how far one hop
 // may look. A contiguous occurrence still produces exactly one range, so this is
 // a strict superset of the byte-exact matcher it replaces.
+//
+// WHAT THIS DOES NOT CLAIM. `MIN_WRAP_FRAGMENT` is a floor on evidence, so a
+// run of credential bytes SHORTER than it can survive: the six-byte remainder
+// of a 102 / 6 break stays in the artifact when a coincidence elsewhere on the
+// row took the chain. Six bytes is below the bar this matcher states for
+// evidence everywhere else, which is the reason the floor is where it is rather
+// than an exception to it. In the other direction the floor over-redacts, and
+// `collect_credential_values` widens that surface by registering every
+// auth-document string of 16 characters or more even when its field name is not
+// sensitive — see the note on `MIN_WRAP_FRAGMENT` below.
 
 /// The shortest run of credential bytes a wrapped match accepts as a fragment,
 /// other than the final one.
@@ -2024,6 +2045,21 @@ const RECORDING_CREDENTIAL_REDACTION: &[u8] = b"[REDACTED-CREDENTIAL]";
 /// leaves short — the 102 / 6 break above. By the time the matcher is looking at
 /// those six bytes it has already reproduced 102, so the coincidence argument is
 /// already spent.
+///
+/// "Base64-shaped secrets" is the honest scope of that argument, and the
+/// registered population is wider than that. [`collect_credential_values`]
+/// registers every auth-document string of 16 characters or more, sensitive
+/// field name or not, so human-readable values — a URL, an account label, a
+/// model name — are registered too, and those genuinely can share an eight-byte
+/// prefix with unrelated rendered text. Kept at eight deliberately: the cost of
+/// the false positive is bounded and diagnostic-only, because the matcher
+/// replaces the matching runs and leaves the layout between them, so the damage
+/// is an obscured fragment of a panic rather than a destroyed one — whereas the
+/// cost of raising the floor is a missed 102 / 6 tail, which is the leak this
+/// whole seam exists to stop. Narrowing what `collect_credential_values`
+/// registers would be the fix if this ever bites; it is deliberately not made
+/// here, because a registered value that stops being registered stops being
+/// redacted, and that trade wants a measurement rather than a guess.
 const MIN_WRAP_FRAGMENT: usize = 8;
 
 /// The longest run of bytes one hop will bridge, and therefore the bound on how
@@ -2062,28 +2098,69 @@ fn common_prefix_len(data: &[u8], cursor: usize, wanted: &[u8]) -> usize {
         .count()
 }
 
-/// Where the next fragment of `remaining` resumes after a row transition, or
-/// `None` if it does not resume within [`MAX_WRAP_GAP`].
+/// Every place after a row transition, within [`MAX_WRAP_GAP`], where
+/// `remaining` resumes — as `(position, run length)`, ascending.
 ///
-/// Deliberately FIRST-MATCH and non-backtracking. A candidate has to reproduce
-/// [`MIN_WRAP_FRAGMENT`] bytes exactly — or everything that is left, when less
-/// than that remains — which makes a wrong first candidate a coincidence rather
-/// than a likelihood, and it pins the cost of a hop at
-/// `MAX_WRAP_GAP * MIN_WRAP_FRAGMENT` instead of letting it grow exponentially
-/// in the number of hops. The failure mode of the simplification is a missed
-/// redaction in a contrived case, never a hang.
-fn next_fragment_start(data: &[u8], gap_start: usize, remaining: &[u8]) -> Option<usize> {
+/// The chain still follows the FIRST one and never backtracks. The rest are why
+/// this returns a list instead of a position, and the reason is a property of
+/// the registered set rather than a hypothetical: a registered value can be a
+/// SUFFIX of another registered value. An Anthropic key and the 20-character
+/// response id Claude Code's approval prompt paints are exactly that pair, and
+/// [`api_key_recording_redactions`] always registers them together — so the run
+/// that resumes the key on the next row ALSO occurs, a few characters earlier,
+/// inside a response id rendered on that row. Following the first candidate is
+/// then following the coincidence, and the real continuation is left sitting
+/// there. It is a whole 16 characters of key material when the value wraps
+/// 92 / 16 inside a pane.
+///
+/// Whichever one the chain follows, both are runs that reproduce credential
+/// bytes exactly, so both are redacted. There is no way to tell them apart and
+/// no need to.
+///
+/// A candidate is recorded only when it reproduces a FULL
+/// [`MIN_WRAP_FRAGMENT`]. A shorter tail is exempt for the CHAIN — the 102 / 6
+/// break's six-byte remainder, whose coincidence argument was already spent on
+/// the 102 bytes before it — but it is not evidence on its own, and redacting
+/// every place a six- or one-byte tail happens to occur would be over-redaction
+/// with nothing behind it. So a short tail stops at the one candidate the chain
+/// takes, exactly as before.
+///
+/// Cost is unchanged in the bound and only in the bound: one pass over at most
+/// [`MAX_WRAP_GAP`] positions comparing at most [`MIN_WRAP_FRAGMENT`] bytes at
+/// each. That was already what a gap containing no candidate cost; it is now
+/// what every hop with a full-length tail costs. Still linear in the input for
+/// a fixed credential set, still no backtracking, still no growth in the number
+/// of hops.
+fn fragment_candidates(data: &[u8], gap_start: usize, remaining: &[u8]) -> Vec<(usize, usize)> {
     let need = &remaining[..remaining.len().min(MIN_WRAP_FRAGMENT)];
+    let alternates_are_evidence = need.len() == MIN_WRAP_FRAGMENT;
     let limit = data.len().min(gap_start.saturating_add(MAX_WRAP_GAP));
+    let mut found = Vec::new();
     let mut crossed_a_row = false;
     for index in gap_start..limit {
         if is_row_transition(data[index]) {
             crossed_a_row = true;
         } else if crossed_a_row && common_prefix_len(data, index, need) == need.len() {
-            return Some(index);
+            found.push((index, common_prefix_len(data, index, remaining)));
+            if !alternates_are_evidence {
+                break;
+            }
         }
     }
-    None
+    found
+}
+
+/// One occurrence of one credential, as the ranges that carry it.
+struct CredentialMatch {
+    /// Every range that carries credential bytes: the chained fragments, plus
+    /// every alternate candidate [`fragment_candidates`] found in a bridged
+    /// gap. The chain's own fragments ascend; the alternates do not interleave
+    /// with them in order, which is why [`credential_redaction_ranges`] sorts
+    /// and coalesces before returning.
+    ranges: Vec<(usize, usize)>,
+    /// End of the FIRST fragment — where the outer scan resumes, so that every
+    /// byte this match PRESERVED is still examined for another credential.
+    first_fragment_end: usize,
 }
 
 /// Match `credential` starting at `start`, allowing a TUI to have painted it
@@ -2095,7 +2172,7 @@ fn credential_fragments_at(
     data: &[u8],
     start: usize,
     credential: &[u8],
-) -> Option<Vec<(usize, usize)>> {
+) -> Option<CredentialMatch> {
     let mut consumed = common_prefix_len(data, start, credential);
     if consumed == 0 {
         return None;
@@ -2106,20 +2183,47 @@ fn credential_fragments_at(
         return None;
     }
     let mut cursor = start + consumed;
-    let mut fragments = vec![(start, cursor)];
+    let first_fragment_end = cursor;
+    let mut ranges = vec![(start, cursor)];
     while consumed < credential.len() {
-        let resume = next_fragment_start(data, cursor, &credential[consumed..])?;
-        // Never zero: `next_fragment_start` only returns a position that already
-        // reproduces at least one byte, so this loop always advances.
-        let run = common_prefix_len(data, resume, &credential[consumed..]);
+        let candidates = fragment_candidates(data, cursor, &credential[consumed..]);
+        // Never zero-length: a candidate reproduces at least one byte, so this
+        // loop always advances.
+        let (resume, run) = *candidates.first()?;
         consumed += run;
         cursor = resume + run;
         if consumed < credential.len() && run < MIN_WRAP_FRAGMENT {
             return None;
         }
-        fragments.push((resume, cursor));
+        ranges.push((resume, cursor));
+        // The chain took the first candidate; the others reproduce the same
+        // credential bytes and are redacted too — see `fragment_candidates`.
+        ranges.extend(candidates[1..].iter().map(|(at, run)| (*at, at + run)));
     }
-    Some(fragments)
+    Some(CredentialMatch {
+        ranges,
+        first_fragment_end,
+    })
+}
+
+/// Sort and coalesce, so the ranges come back ascending and non-overlapping —
+/// what both consumers rely on.
+///
+/// Overlaps are ordinary now rather than a defect: the same bytes can be
+/// claimed both by a fragmented match's alternate candidate and by the
+/// registered value that candidate sits inside. Strictly overlapping ranges
+/// coalesce; two that merely TOUCH are left as two, which is what a scan that
+/// found two adjacent credentials always produced.
+fn merge_redaction_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start < last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
 }
 
 /// Locate the byte ranges to replace, preferring the longest value at a shared
@@ -2127,10 +2231,20 @@ fn credential_fragments_at(
 /// that contain characters the artifact format would escape.
 ///
 /// One credential can contribute SEVERAL ranges — see the block above. The bytes
-/// between them are deliberately left alone: in a grid they are the newline, the
-/// pane border and the neighbouring column, and in a `.cast` they are the escape
-/// sequences that keep it replayable. The ranges come back ascending and
-/// non-overlapping, which is what both consumers rely on.
+/// between them are deliberately left in the artifact: in a grid they are the
+/// newline, the pane border and the neighbouring column, and in a `.cast` they
+/// are the escape sequences that keep it replayable.
+///
+/// LEFT IN THE ARTIFACT IS NOT LEFT UNREAD. That distinction is the whole of
+/// issue #785's second round. The first version of this scan jumped `offset` to
+/// the END of a fragmented match, so every byte it had preserved was skipped —
+/// and those bytes are arbitrary rendered content, which on a real grid
+/// includes the OTHER registered value. Measured with the pair the live lane
+/// actually registers: a 108-character key wrapped 102 / 6 with its
+/// 20-character response id painted on the next row ahead of the continuation
+/// left 14 characters of that id intact, and the whole derivative was
+/// reconstructable. So the scan resumes at the end of the FIRST fragment and
+/// reads the gap like any other bytes.
 fn credential_redaction_ranges(data: &[u8], credentials: &[String]) -> Vec<(usize, usize)> {
     let patterns: Vec<&[u8]> = credentials
         .iter()
@@ -2143,22 +2257,20 @@ fn credential_redaction_ranges(data: &[u8], credentials: &[String]) -> Vec<(usiz
         let matched = patterns
             .iter()
             .filter_map(|pattern| {
-                credential_fragments_at(data, offset, pattern)
-                    .map(|fragments| (pattern.len(), fragments))
+                credential_fragments_at(data, offset, pattern).map(|found| (pattern.len(), found))
             })
             .max_by_key(|(length, _)| *length);
         match matched {
-            Some((_, fragments)) => {
-                let end = fragments.last().map_or(offset, |(_, end)| *end);
-                ranges.extend(fragments);
+            Some((_, found)) => {
+                ranges.extend(found.ranges);
                 // `.max()` rather than a bare assignment so a degenerate match
                 // can never fail to advance the scan.
-                offset = end.max(offset + 1);
+                offset = found.first_fragment_end.max(offset + 1);
             }
             None => offset += 1,
         }
     }
-    ranges
+    merge_redaction_ranges(ranges)
 }
 
 fn redact_known_credentials_bytes(data: &[u8], credentials: &[String]) -> Vec<u8> {
@@ -11086,6 +11198,79 @@ mod harness_unit_tests {
             redacted.contains("|pane\n"),
             "the bytes between the fragments must be preserved: {redacted}"
         );
+    }
+
+    /// Scenario: The 108-character key wrapped 102 / 6 the way the deck paints
+    /// it, with its OWN registered 20-character response id painted on the next
+    /// row AHEAD of the key's six-character continuation. Then the same
+    /// interleaving inside a bordered pane, where the width breaks the key
+    /// 92 / 16 so the continuation is long enough to be evidence on its own.
+    /// Neither registered value may survive either grid.
+    ///
+    /// This is the hole the first version of this matcher left. The two values
+    /// are ALWAYS registered together (`api_key_recording_redactions`), and the
+    /// response id is a suffix of the key — so the run that resumes the key on
+    /// the next row also occurs inside the response id, a few characters
+    /// earlier. The matcher chained through that earlier occurrence, then
+    /// advanced past the whole match, and the bytes it had preserved in between
+    /// — which held the rest of the response id — were never scanned again. The
+    /// derivative stayed reconstructable while every contiguous assertion
+    /// passed.
+    ///
+    /// The 92 / 16 half is the one that needs the alternate candidates: there
+    /// the run the chain consumed inside the response id is sixteen characters,
+    /// so the REAL continuation left behind is sixteen characters of key
+    /// material, well over [`MIN_WRAP_FRAGMENT`].
+    #[test]
+    fn two_registered_values_interleaved_across_rows_are_both_redacted() {
+        let key = WRAPPING_FAKE_KEY;
+        let redactions = api_key_recording_redactions(key);
+        let id = claude_api_key_response_id(key);
+
+        // The response id is a suffix of the key, which is exactly why the
+        // key's continuation also occurs inside it. Pinned, because if that
+        // ever stopped holding this test would still pass and prove nothing.
+        assert!(key.ends_with(&id) && id.chars().count() == 20);
+
+        for (label, label_width, continuation_at) in [
+            ("a full-width grid", GRID_COLS as usize, 102usize),
+            ("a bordered pane", 110, 92),
+        ] {
+            let head = &key[..continuation_at];
+            let tail = &key[continuation_at..];
+            let rows = wrap_to_width(&format!("ANTHROPIC_API_KEY={key}"), label_width);
+            assert_eq!(rows.len(), 2, "{label}: the fixture must occupy two rows");
+            assert_eq!(rows[1], tail, "{label}: the break is not where claimed");
+
+            // Row two carries the approval prompt's response id first and the
+            // wrapped value's continuation second, separated by a pane border —
+            // the interleaving the matcher has to survive.
+            let grid = render_like_ratatui(
+                GRID_COLS,
+                &[
+                    rows[0].clone(),
+                    format!("use this key? ...{id} \u{2502}{tail}"),
+                ],
+            );
+
+            // Non-vacuity: the key really is broken, and the response id really
+            // is present whole, so it is a value the matcher is obliged to find
+            // rather than one this test smuggled past it.
+            assert!(
+                !grid.contains(key) && grid.contains(head) && grid.contains(&id),
+                "{label}: the fixture does not carry the reported shape:\n{grid}"
+            );
+
+            let redacted = redact_known_credentials_text(&grid, &redactions);
+            assert_no_fragment_survives(&redacted, key, label);
+            assert_no_fragment_survives(&redacted, &id, label);
+            // And the layout between the fragments is still there — the point
+            // of fragment-aware matching is that a panic stays readable.
+            assert!(
+                redacted.contains("use this key? ") && redacted.contains('\u{2502}'),
+                "{label}: redaction ate the surrounding render:\n{redacted}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
