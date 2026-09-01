@@ -75,7 +75,10 @@ async fn codex_worker_001_inner() {
     .expect("write Codex worker orchestration config");
 
     let codex_home = cwd.path().join("codex-home");
-    common::import_codex_credentials(&codex_home)
+    // Issue #502/#785: the importer registers what it copied for DIAGNOSTIC
+    // redaction itself, so this in-process worker path is covered without a
+    // `TuiDeck` to hold a recording set — which it has none of, and never will.
+    let _codex_redactions = common::import_codex_credentials(&codex_home)
         .expect("copy Codex credentials and trust worker cwd");
     let worker_agent_id = daemon
         .registry
