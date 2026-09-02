@@ -747,6 +747,42 @@ fn sources(root: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
+/// A path as the report should print it: `/`-separated on every platform.
+///
+/// [`Path::display`] emits the **native** separator, so on Windows a finding
+/// read `desktop/src/c\Tile.tsx` — the literal prefix forward-slashed and the
+/// walked tail back-slashed, which is not a path anything in this repository
+/// prints. That string is not just a test fixture: it is what a developer reads
+/// in the guard's failure message and what they paste or click. `git`, every CI
+/// log and every other path written here use `/`, so a Windows contributor and
+/// a Linux contributor debugging the same violation have to see the same text.
+///
+/// Hence normalising here, where the path is built, rather than teaching each
+/// assertion to accept either separator — that would leave the tests asserting
+/// something weaker than the property that matters, and would leave the message
+/// platform-variant for no gain.
+///
+/// Walks components rather than replacing `\` blindly, because on Unix a
+/// backslash is a legal character **in a file name** and rewriting it would
+/// report a path that does not exist.
+fn slash_path(path: &Path) -> String {
+    let mut out = String::new();
+    for component in path.components() {
+        if component == std::path::Component::RootDir {
+            // The leading separator itself; `as_os_str` here is the native one.
+            if !out.ends_with('/') {
+                out.push('/');
+            }
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with('/') {
+            out.push('/');
+        }
+        out.push_str(&component.as_os_str().to_string_lossy());
+    }
+    out
+}
+
 /// Scan a `desktop/src` tree. Fails closed on any traversal or read error —
 /// see [`sources`].
 fn scan_tree(src_root: &Path) -> Result<Vec<Finding>, String> {
@@ -759,16 +795,20 @@ fn scan_tree(src_root: &Path) -> Result<Vec<Finding>, String> {
     for path in sources(src_root)? {
         let text = fs::read_to_string(&path)
             .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-        let rel = path
-            .strip_prefix(src_root)
-            .unwrap_or(&path)
-            .display()
-            .to_string();
+        let rel = slash_path(path.strip_prefix(src_root).unwrap_or(&path));
         let is_css = path.extension().is_some_and(|e| e == "css");
         findings.extend(scan_text(
             &format!("desktop/src/{rel}"),
             &text,
             is_css,
+            // Path equality compares **components**, not printed forms, so this
+            // is already separator-insensitive: on Windows the walked
+            // `…\\desktop/src\\styles.css` and `palette_path` compare equal
+            // even though `display()` disagrees with the literal above. Do not
+            // turn it into a comparison of `rel` against a string — that would
+            // be the same defect as the one `slash_path` fixes, except it would
+            // silently *disable* the palette exemption on Windows rather than
+            // printing an odd path, and no test here would notice.
             path == palette_path,
         ));
     }
@@ -1271,6 +1311,63 @@ mod tests {
         assert_eq!(findings.len(), 1, "{findings:#?}");
         assert_eq!(findings[0].file, "desktop/src/themes/styles.css");
         assert_eq!(findings[0].literal, "#5e9c90");
+    }
+
+    /// The Windows failure that `slash_path` exists for, pinned directly rather
+    /// than inferred from two tests that happen to compare whole path strings.
+    ///
+    /// The joins matter: `Path::join` uses the **native** separator, so on
+    /// Windows these inputs really are `themes\styles.css` and
+    /// `c\ui\Tile.tsx`, and `display()` — what this used to call — returns
+    /// them with those backslashes intact. On Unix the assertion is true either
+    /// way; it is a tripwire for the platform where it can fail, which is the
+    /// most a Linux host can offer for a Windows-only path defect.
+    #[test]
+    fn a_reported_path_is_forward_slashed_whatever_the_native_separator_is() {
+        assert_eq!(
+            slash_path(&Path::new("themes").join("styles.css")),
+            "themes/styles.css"
+        );
+        assert_eq!(
+            slash_path(&Path::new("c").join("ui").join("Tile.tsx")),
+            "c/ui/Tile.tsx"
+        );
+        assert_eq!(slash_path(Path::new("styles.css")), "styles.css");
+        assert!(
+            !slash_path(&Path::new("a").join("b")).contains(std::path::MAIN_SEPARATOR)
+                || std::path::MAIN_SEPARATOR == '/'
+        );
+    }
+
+    /// And it is a component walk rather than a blind `\` → `/` replacement,
+    /// which this host *can* prove: on Unix a backslash is a legal character in
+    /// a file name, so rewriting one would report a path that does not exist.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_inside_a_unix_file_name_is_not_a_separator() {
+        assert_eq!(slash_path(Path::new(r"a\b.tsx")), r"a\b.tsx");
+        assert_eq!(slash_path(Path::new("/abs/x.tsx")), "/abs/x.tsx");
+    }
+
+    /// The palette exemption is a **path** comparison, so it survives a root
+    /// spelled differently from the paths the walk builds out of it. That is
+    /// the property that keeps it working on Windows, where the root carries
+    /// one separator and the walked tail another; a `.` component is the
+    /// equivalent divergence this host can construct.
+    ///
+    /// Worth pinning because the failure mode is silent in the dangerous
+    /// direction: the palette would stop being exempt and its own tokens would
+    /// be reported as hard-coded colours.
+    #[test]
+    fn the_palette_exemption_survives_a_root_spelled_differently_from_the_walk() {
+        let dir = tree(&[
+            ("styles.css", PALETTE),
+            ("themes/styles.css", ":root { --sneaky: #5e9c90; }\n"),
+        ]);
+        let root = dir.path().join(".");
+        let findings = scan_tree(&root).expect("the fixture tree must be fully readable");
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0].file, "desktop/src/themes/styles.css");
     }
 
     /// Fail closed: a directory the walk cannot list used to take every file
