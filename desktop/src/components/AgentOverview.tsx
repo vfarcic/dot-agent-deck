@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { Blocks, Boxes, LayoutList, Layers, Network, RefreshCw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
+import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import { Blocks, Boxes, Columns3, LayoutList, Layers, Network, RefreshCw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
+import { modeScopedKey } from "../lib/bridge";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank, shortDaemonLabel } from "../lib/displayText";
 
@@ -321,18 +322,159 @@ const GROUP_ICON: Record<OverviewGroupKind, typeof Network> = {
 };
 
 /**
- * The column headers, in grid order. The visible legend mirrors these, and so do
- * the `nth-child` rules in `styles.css`'s two overview media queries — which are
- * INDEX-SENSITIVE, so inserting a column here means renumbering them. TEN
- * columns as of PRD #745 M11, which put Uptime fifth, immediately after Last
- * activity: the two temporal columns answer one question between them — how
- * long this agent has been alive, and how much of that it has spent doing
- * nothing — and reading them apart is the whole point of putting them together.
- * Both sit beside State, because "waiting" and "waiting, and quiet for two of
- * its three hours" are different situations and a reader should not have to
- * scan across the row to tell them apart.
+ * Every column this screen can show, in grid order, **keyed by the
+ * `OverviewAgent` field it renders** (PRD #745 M12).
+ *
+ * The key is the honesty guarantee, not a naming convention. `OverviewAgent` is
+ * a `Pick<>` of the fields a daemon genuinely reports, so `satisfies readonly
+ * (keyof OverviewAgent)[]` makes a column named `model`, `cost`, `tokens`,
+ * `contextPercent`, `worktree`, `attempt` or `duration` a **compile error** —
+ * the picker below derives its options from this list and therefore inherits
+ * the guarantee, and can never offer a column the daemon cannot fill. That is
+ * the whole reason the ids are field names rather than free-form slugs.
+ *
+ * The order here is the order columns appear on screen, whatever order the user
+ * selected them in: a stored set is rendered through {@link orderedColumns},
+ * so the layout is a property of the screen rather than of a click sequence.
+ * Uptime sits immediately after Last activity because the two temporal columns
+ * answer one question between them — how long this agent has been alive, and
+ * how much of that it has spent doing nothing — and reading them apart is the
+ * point of putting them together.
+ *
+ * **`status` is ONE column, not the two this screen used to carry.** There was
+ * a coloured status mark in the first track and a textual State column in the
+ * third, both rendered from `agent.status` and neither saying anything the
+ * other did not. Two picker entries for one field would have been a question
+ * with no right answer, so the mark and the label now share one cell: the
+ * colour is still the thing you scan and the word is still the thing you read.
+ * Row-level status signalling is unaffected either way — `data-status` on the
+ * `<tr>` is what tints a failed row, and it is not a column.
  */
-const COLUMNS = ["Status", "Agent", "State", "Last activity", "Uptime", "CLI", "Active tool", "Tools", "Working directory", "Last prompt"];
+const COLUMN_FIELDS = [
+  "status",
+  "displayName",
+  "lastActivityMs",
+  "spawnedAtMs",
+  "cli",
+  "activeTool",
+  "toolCount",
+  "cwd",
+  "lastUserPrompt",
+] as const satisfies readonly (keyof OverviewAgent)[];
+
+export type OverviewColumnId = (typeof COLUMN_FIELDS)[number];
+
+/** Every column, in grid order — the picker's option list. */
+export const ALL_OVERVIEW_COLUMNS: readonly OverviewColumnId[] = COLUMN_FIELDS;
+
+interface OverviewColumnSpec {
+  /** The `<th scope="col">` a screen reader announces, and the picker's label. */
+  label: string;
+  /** The visible legend's own short form. */
+  legend: string;
+  /**
+   * This column's grid track. Every flexible track carries a fixed px MINIMUM
+   * rather than `minmax(0, …)`, which is what makes the table region
+   * horizontally scrollable at all: the grid's min-content width is then the
+   * sum of these minimums, so `min-width: min-content` on the scroll track
+   * gives a real overflow instead of columns crushed to nothing. A `minmax(0,
+   * …)` track would shrink to zero and the scrollbar would never appear.
+   */
+  track: string;
+}
+
+const OVERVIEW_COLUMNS: Record<OverviewColumnId, OverviewColumnSpec> = {
+  status: { label: "Status", legend: "STATUS", track: "82px" },
+  displayName: { label: "Agent", legend: "AGENT", track: "minmax(150px, 1.3fr)" },
+  lastActivityMs: { label: "Last activity", legend: "LAST ACTIVITY", track: "58px" },
+  spawnedAtMs: { label: "Uptime", legend: "UPTIME", track: "48px" },
+  cli: { label: "CLI", legend: "CLI", track: "78px" },
+  activeTool: { label: "Active tool", legend: "ACTIVE TOOL", track: "minmax(130px, 1.3fr)" },
+  toolCount: { label: "Tools", legend: "TOOLS", track: "40px" },
+  cwd: { label: "Working directory", legend: "WORKING DIRECTORY", track: "minmax(130px, 1.3fr)" },
+  lastUserPrompt: { label: "Last prompt", legend: "LAST PROMPT", track: "minmax(150px, 1.7fr)" },
+};
+
+/**
+ * The one column that cannot be removed. A row with no name is not a shorter
+ * row, it is an anonymous one — on the screen whose whole job is telling agents
+ * apart — so the picker renders its checkbox permanently checked and disabled,
+ * and {@link orderedColumns} puts it back whatever a stored value says.
+ */
+export const PERMANENT_COLUMN: OverviewColumnId = "displayName";
+
+/**
+ * What the screen shows before anyone chooses: name, status, working directory
+ * and uptime — who it is, whether it is healthy, where it is working, and how
+ * long it has been at it. Everything else is one click away and remembered.
+ */
+export const DEFAULT_OVERVIEW_COLUMNS: readonly OverviewColumnId[] = ["status", "displayName", "spawnedAtMs", "cwd"];
+
+/**
+ * A chosen set, rendered in grid order and never without the permanent column.
+ * Selection is a SET and the layout is a property of this list, so the columns
+ * do not reshuffle according to the order somebody happened to tick them.
+ */
+export function orderedColumns(selected: Iterable<OverviewColumnId>): OverviewColumnId[] {
+  const chosen = new Set(selected);
+  chosen.add(PERMANENT_COLUMN);
+  return COLUMN_FIELDS.filter((column) => chosen.has(column));
+}
+
+/** The `grid-template-columns` a selection produces — one template, shared. */
+export function gridTemplateFor(columns: readonly OverviewColumnId[]): string {
+  return columns.map((column) => OVERVIEW_COLUMNS[column].track).join(" ");
+}
+
+function isOverviewColumnId(value: unknown): value is OverviewColumnId {
+  return typeof value === "string" && (COLUMN_FIELDS as readonly string[]).includes(value);
+}
+
+/**
+ * Where the column choice is remembered. Mode-scoped for the reason every
+ * persisted key on this app is (`modeScopedKey`): a fixture visit must not
+ * hand live mode a layout, and a live layout must not follow you into the
+ * demo data.
+ */
+export const OVERVIEW_COLUMNS_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.overview-columns.v1");
+
+/**
+ * The columns a stored value asks for, or the defaults when it cannot ask for
+ * anything usable.
+ *
+ * Everything here is about a value written by an OLDER build of this app, which
+ * is the case that breaks silently a release later rather than loudly today:
+ *
+ * - **Absent, unparseable, or not the shape we wrote** — including a bare
+ *   string, a number, or an object with no `columns` array — falls back to the
+ *   defaults. There is nothing to salvage and a thrown `SyntaxError` on mount
+ *   would take the whole screen down.
+ * - **A column that no longer exists is DROPPED**, not carried through. A
+ *   renamed or retired id would otherwise render as a `<th>` with no cell under
+ *   it and one dead grid track down every card — the kind of fault that looks
+ *   like a layout bug and is really a migration one.
+ * - **Nothing recognisable left** — every stored id unknown, or an empty array
+ *   — is indistinguishable from garbage, so it takes the defaults rather than
+ *   collapsing the screen to the single permanent column. A user cannot reach
+ *   that state by unticking, because the permanent column has no checkbox to
+ *   untick.
+ *
+ * Whatever survives goes through {@link orderedColumns}, so the permanent
+ * column is present and the order is the screen's rather than the file's.
+ */
+export function readStoredColumns(raw: string | null): OverviewColumnId[] {
+  let stored: unknown;
+  try {
+    stored = JSON.parse(raw ?? "null");
+  } catch {
+    return [...DEFAULT_OVERVIEW_COLUMNS];
+  }
+  const columns = (stored as { columns?: unknown } | null | undefined)?.columns;
+  if (!Array.isArray(columns)) return [...DEFAULT_OVERVIEW_COLUMNS];
+  const known = columns.filter(isOverviewColumnId);
+  if (!known.length) return [...DEFAULT_OVERVIEW_COLUMNS];
+  return orderedColumns(known);
+}
 
 /**
  * How often the screen re-reads the clock so its two relative-time columns keep
@@ -467,6 +609,21 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
     events. It re-renders and refetches nothing — see `useOverviewClock`.
   */
   const now = useOverviewClock();
+  /**
+   * The columns this operator chose, restored from the last visit (PRD #745
+   * M12). Read once, through `readStoredColumns`, which is where every way a
+   * stored value can be unusable is turned back into the defaults.
+   */
+  const [columns, setColumns] = useState<OverviewColumnId[]>(() => readStoredColumns(readColumnsStorage()));
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, JSON.stringify({ columns }));
+    } catch {
+      // Storage can be unavailable or full. The screen keeps working; the
+      // choice simply does not outlive the session, which is the right way
+      // round for a display preference.
+    }
+  }, [columns]);
   const agents = useMemo(() => snapshot.agents.map(toOverviewAgent), [snapshot.agents]);
   const groups = useMemo(() => groupAgents(agents), [agents]);
   const counts = useMemo(() => countByStatus(agents), [agents]);
@@ -545,6 +702,7 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
           </div>
           <div className="top-actions">
             <button className="button secondary compact" data-testid="overview-open-deck" onClick={openDeck}><SquareTerminal size={14} /><span>Open deck</span></button>
+            <OverviewColumnPicker columns={columns} onChange={setColumns} />
             <button className="button secondary compact" data-testid="overview-refresh" onClick={() => void runtime.reconnect()}><RefreshCw size={14} /><span>Refresh</span></button>
           </div>
         </header>
@@ -592,6 +750,7 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
                 agents={agents}
                 groups={groups}
                 now={now}
+                columns={columns}
                 connection={connection}
                 message={daemonMessage}
                 overrideError={overrideError}
@@ -605,8 +764,9 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
           <p className="overview-footnote">
             This screen reads one snapshot, opens no terminal of its own, and asks the bridge to release the ones the deck left
             attached — a socket a previous screen opened is torn down as that release lands, not the instant this line renders.
-            Model, token, cost, context-window, branch, attempt and duration columns are absent because the daemon does not
-            track them — see PRD #745.
+            Columns are yours to choose and are remembered for next time; the picker lists every column the daemon reports
+            and there is nothing else to add. Model, token, cost, context-window, branch and attempt columns are absent
+            because the daemon does not track them at all — see PRD #745.
           </p>
         </section>
       </main>
@@ -615,11 +775,13 @@ export function AgentOverview({ runtime, onNavigate }: { runtime: DeckRuntimeSta
   );
 }
 
-function DaemonBody({ agents, groups, now, connection, message, overrideError, onOpenDeck, onReconnect, onConnectAnyway }: {
+function DaemonBody({ agents, groups, now, columns, connection, message, overrideError, onOpenDeck, onReconnect, onConnectAnyway }: {
   agents: OverviewAgent[];
   groups: OverviewGroup[];
   /** The one instant every relative cell on this screen is measured against. */
   now: number;
+  /** The chosen columns, in grid order — one list for every card. */
+  columns: OverviewColumnId[];
   connection: ConnectionView;
   message?: string;
   overrideError?: string;
@@ -683,33 +845,111 @@ function DaemonBody({ agents, groups, now, connection, message, overrideError, o
   }
 
   return (
-    <>
-      {/*
-        Decoration, not structure: one legend for the whole fleet so the group
-        cards read as one table. The header association a screen reader needs
-        comes from each group's own `<thead>`, which is visually hidden rather
-        than repeated four times down the page.
-      */}
-      <div className="overview-legend" aria-hidden="true">
-        <span />
-        <span>AGENT</span>
-        <span>STATE</span>
-        <span>LAST ACTIVITY</span>
-        <span>UPTIME</span>
-        <span>CLI</span>
-        <span>ACTIVE TOOL</span>
-        <span>TOOLS</span>
-        <span>WORKING DIRECTORY</span>
-        <span>LAST PROMPT</span>
+    /*
+      ONE scroll region for the legend and every group card together, and that
+      is a correctness property rather than a layout preference (PRD #745 M12).
+      All the cards share one `grid-template-columns`, which is what makes the
+      whole fleet read as a single table across card boundaries; scrolling them
+      individually would let two cards sit at different horizontal offsets and
+      the columns would stop lining up — visibly, and only once the chosen set
+      is wide enough to overflow, which is exactly when a reader is relying on
+      the alignment. The template is published once here as a custom property
+      and inherited by the legend and every row inside.
+    */
+    <div className="overview-table-region" data-testid="overview-table-region">
+      <div className="overview-table-track" style={{ "--overview-grid": gridTemplateFor(columns) } as CSSProperties}>
+        {/*
+          Decoration, not structure: one legend for the whole fleet so the group
+          cards read as one table. The header association a screen reader needs
+          comes from each group's own `<thead>`, which is visually hidden rather
+          than repeated four times down the page.
+        */}
+        <div className="overview-legend" aria-hidden="true">
+          {columns.map((column) => <span key={column}>{OVERVIEW_COLUMNS[column].legend}</span>)}
+        </div>
+        <div className="overview-groups">
+          {groups.map((group) => <OverviewGroupCard key={group.key} group={group} now={now} columns={columns} />)}
+        </div>
       </div>
-      <div className="overview-groups">
-        {groups.map((group) => <OverviewGroupCard key={group.key} group={group} now={now} />)}
-      </div>
-    </>
+    </div>
   );
 }
 
-function OverviewGroupCard({ group, now }: { group: OverviewGroup; now: number }) {
+/**
+ * The column picker: what the screen shows, chosen from what the daemon
+ * reports and nothing else (PRD #745 M12).
+ *
+ * The options come from {@link ALL_OVERVIEW_COLUMNS}, whose ids are
+ * `OverviewAgent` field names — so this list cannot offer `model`, `cost` or
+ * `tokens` even by mistake, because those are not fields of `OverviewAgent` and
+ * naming one would not compile. The picker inherits the screen's honesty
+ * guarantee rather than restating it.
+ *
+ * It lives in the top bar, so choosing columns never leaves the overview.
+ */
+function OverviewColumnPicker({ columns, onChange }: { columns: OverviewColumnId[]; onChange: (columns: OverviewColumnId[]) => void }) {
+  const [open, setOpen] = useState(false);
+  const chosen = new Set(columns);
+  const toggle = (column: OverviewColumnId) => {
+    const next = new Set(chosen);
+    if (next.has(column)) next.delete(column);
+    else next.add(column);
+    onChange(orderedColumns(next));
+  };
+  return (
+    <div
+      className="overview-columns-picker"
+      onKeyDown={(event) => {
+        if (event.key !== "Escape") return;
+        setOpen(false);
+        event.stopPropagation();
+      }}
+    >
+      <button
+        className="button secondary compact"
+        data-testid="overview-columns-toggle"
+        aria-expanded={open}
+        aria-haspopup="true"
+        title="Choose which columns this screen shows. Your choice is remembered."
+        onClick={() => setOpen((wasOpen) => !wasOpen)}
+      >
+        <Columns3 size={14} /><span>Columns</span>
+      </button>
+      {open && (
+        <div className="overview-columns-menu" data-testid="overview-columns-menu" role="group" aria-label="Columns">
+          <p>Every column the daemon reports. There is nothing else to show.</p>
+          {ALL_OVERVIEW_COLUMNS.map((column) => {
+            const permanent = column === PERMANENT_COLUMN;
+            return (
+              <label key={column} className={permanent ? "is-permanent" : undefined}>
+                <input
+                  type="checkbox"
+                  data-testid={`overview-column-${column}`}
+                  checked={chosen.has(column)}
+                  disabled={permanent}
+                  onChange={() => toggle(column)}
+                />
+                <span>{OVERVIEW_COLUMNS[column].label}</span>
+                {permanent && <em title="A row with no name is not a shorter row, it is an anonymous one.">always</em>}
+              </label>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The stored column choice, or `null` when storage cannot be read at all. */
+function readColumnsStorage(): string | null {
+  try {
+    return window.localStorage.getItem(OVERVIEW_COLUMNS_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function OverviewGroupCard({ group, now, columns }: { group: OverviewGroup; now: number; columns: OverviewColumnId[] }) {
   const Icon = GROUP_ICON[group.kind];
   const counts = countByStatus(group.agents);
   const titleId = `overview-group-title-${group.key}`;
@@ -764,11 +1004,11 @@ function OverviewGroupCard({ group, now }: { group: OverviewGroup; now: number }
       <table className="overview-table" role="table" aria-labelledby={titleId}>
         <thead className="overview-sr-only" role="rowgroup">
           <tr role="row">
-            {COLUMNS.map((column) => <th key={column} role="columnheader" scope="col">{column}</th>)}
+            {columns.map((column) => <th key={column} role="columnheader" scope="col">{OVERVIEW_COLUMNS[column].label}</th>)}
           </tr>
         </thead>
         <tbody className="overview-rows" role="rowgroup">
-          {group.agents.map((agent) => <OverviewRow key={agentDomKey(agent)} agent={agent} hoistedCwd={hoistedCwd} now={now} />)}
+          {group.agents.map((agent) => <OverviewRow key={agentDomKey(agent)} agent={agent} hoistedCwd={hoistedCwd} now={now} columns={columns} />)}
         </tbody>
       </table>
     </article>
@@ -797,7 +1037,7 @@ function unnamedGroupLabel(group: OverviewGroup): string {
   return rendersBlank(id) ? `unnamed ${noun}` : `unnamed ${noun} ${id}`;
 }
 
-function OverviewRow({ agent, hoistedCwd, now }: { agent: OverviewAgent; hoistedCwd?: string; now: number }) {
+function OverviewRow({ agent, hoistedCwd, now, columns }: { agent: OverviewAgent; hoistedCwd?: string; now: number; columns: OverviewColumnId[] }) {
   const orchestration = agent.tab.kind === "orchestration" ? agent.tab : undefined;
   // Only an orchestration's role name says something the other columns do not.
   // Outside one, the daemon derives the role from the agent type, so showing it
@@ -820,94 +1060,134 @@ function OverviewRow({ agent, hoistedCwd, now }: { agent: OverviewAgent; hoisted
   // to fifteen slightly different ones.
   const activity = displayActivity(agent.lastActivityMs, now);
   const uptime = displayUptime(agent.spawnedAtMs, now);
+  /**
+   * One cell, built only if its column is on screen. A `switch` rather than a
+   * record of every cell, because two of them sanitise and clamp a string the
+   * daemon supplies with no length limit below the protocol frame — building a
+   * 64 KiB prompt cell for a column nobody selected would be work done fifteen
+   * times a row and repeated on every clock tick. The `never` arm is what makes
+   * adding a column to `COLUMN_FIELDS` without a cell a compile error.
+   */
+  const cell = (column: OverviewColumnId): ReactNode => {
+    switch (column) {
+      case "status":
+        // The mark and the word, in ONE cell: they render the same field, and
+        // splitting them across two columns would have made the picker ask a
+        // question with no right answer (see `COLUMN_FIELDS`). The mark stays
+        // `aria-hidden` — the label beside it is already the readable value.
+        return (
+          <td className="overview-state" role="cell" key={column}>
+            <span className={`agent-state-mark status-${agent.status}`} aria-hidden="true" />
+            <span className={`status-label status-${agent.status}`}>{agent.status}</span>
+          </td>
+        );
+      case "displayName":
+        return (
+          <td className="overview-agent-name" role="cell" key={column}>
+            {orchestration && <em className="overview-role-index" title={`Role ${orchestration.roleIndex} of this orchestration`}>{String(orchestration.roleIndex + 1).padStart(2, "0")}</em>}
+            <strong>{name}</strong>
+            {orchestration?.isStartRole && <span className="coordinator-badge" title="Orchestration start role — the agent an operator messages">COORDINATOR</span>}
+            {/*
+              The write lease the daemon reported (PRD #745 M8). Shown whenever it
+              IS reported, including the ordinary writable case, so the rule a
+              reader learns is the simple one — a chip means the daemon said
+              something — rather than "no chip means writable, unless it means the
+              daemon said nothing". A daemon that declared no live target renders
+              nothing here: `toOverviewAgent` reversed its sentinel to absent, and
+              absence is NOT read as read-only.
+            */}
+            {agent.writeLease && <span className={`overview-lease lease-${agent.writeLease}`} title={WRITE_LEASE_TITLE[agent.writeLease]}>{agent.writeLease}</span>}
+            {roleName && !rendersBlank(roleName) && roleLabel?.toLowerCase() !== agent.displayName.toLowerCase() && <em className="overview-role-name">{roleName}</em>}
+          </td>
+        );
+      case "lastActivityMs":
+        /*
+          How long ago the daemon last saw this one do anything (PRD #745 M9).
+          Blank — no dash, no placeholder — for every case `displayActivity`
+          cannot honestly express: the daemon reported no instant (which is every
+          agent under a restarted daemon, since it keeps no session state), the
+          value is not a finite number, or it sits more than a minute in the
+          future. That last one is the clock-skew rule: the instant comes from
+          whichever hook process stamped the event, so ordinary skew reads "just
+          now", while a stamp genuinely ahead of the webview's clock is not
+          rewritten into one — a negative "ago" is a bug a user sees, and a
+          fabricated "just now" for a far-future stamp is the same lie in nicer
+          clothes.
+        */
+        return <td className="overview-activity" role="cell" key={column} title={activity && `Last activity reported by the daemon: ${activity.title}`}>{activity?.label ?? ""}</td>;
+      case "spawnedAtMs":
+        /*
+          How long this agent's process has been running (PRD #745 M11) — the
+          daemon's own spawn instant, not a session start, so it is present for an
+          agent that has never emitted a hook event. Blank on exactly the same
+          terms as Last activity beside it: `displayUptime` shares that column's
+          clock-skew and usability policy and forks only the wording, so the one
+          rule a reader learns holds for both cells.
+
+          What the number MEANS needs no flag. A restarted orchestration worker is
+          a fresh spawn with a fresh registry record, so it reads as the age of
+          its current iteration; a role nobody has restarted keeps its original
+          record, so it reads as its whole lifetime.
+        */
+        return <td className="overview-uptime" role="cell" key={column} title={uptime && `Spawned by the daemon at: ${uptime.title}`}>{uptime?.label ?? ""}</td>;
+      case "cli":
+        return <td className="overview-cli" role="cell" key={column} title={displayText(`Agent type reported by the daemon: ${agent.cli}`, DISPLAY_LIMITS.title)}>{displayText(agent.cli, DISPLAY_LIMITS.name)}</td>;
+      case "activeTool":
+        return (
+          <td className="overview-tool" role="cell" key={column}>
+            {agent.activeTool ? (
+              <>
+                <Wrench size={11} aria-hidden="true" />
+                <strong>{displayText(agent.activeTool, DISPLAY_LIMITS.toolName)}</strong>
+                {/*
+                  For a shell tool this detail is the command line the agent ran, so
+                  it is bounded short: a full command line on a fifteen-row overview
+                  is unreadable, and it is the kind of thing that ends up in a
+                  screenshot. Bounded, not redacted — a length limit is honest,
+                  where a secret-matching heuristic would only look like assurance.
+                */}
+                {agent.activeToolDetail && <em title={displayTitle(agent.activeToolDetail)}>{displayText(agent.activeToolDetail, DISPLAY_LIMITS.toolDetail)}</em>}
+              </>
+            ) : <span className="overview-tool-idle">no active tool</span>}
+          </td>
+        );
+      case "toolCount":
+        return <td className="overview-tool-count" role="cell" key={column} title={`${agent.toolCount} tool calls reported`}>{agent.toolCount}</td>;
+      case "cwd":
+        /*
+          Blank for a directory the group header already states, and blank again
+          when the daemon reported none — an empty cell says "nothing to add
+          here" in both cases, which is exactly what is true.
+        */
+        return <td className="overview-cwd" role="cell" key={column} title={agent.cwd ? displayTitle(agent.cwd) : undefined}>{!agent.cwd || agent.cwd === hoistedCwd ? "" : displayPath(agent.cwd)}</td>;
+      case "lastUserPrompt":
+        /*
+          The last prompt the operator sent this agent — the daemon's own answer
+          to what it was asked to do, and the honest replacement for the
+          placeholder live mode used to print. Blank when the daemon reported
+          none, with no hover either: there is nothing to say, and a dash would be
+          one more thing to read that says less.
+
+          The most attacker-shaped string on this screen — free-form text an
+          agent's own output can steer — so it is sanitised and clamped to
+          `DISPLAY_LIMITS.prompt` before React sees it, and pinned to one line by
+          `.overview-prompt` so no length or content can push a row taller than
+          its neighbours.
+        */
+        return (
+          <td className="overview-prompt" role="cell" key={column} title={agent.lastUserPrompt ? displayTitle(agent.lastUserPrompt) : undefined}>
+            {agent.lastUserPrompt ? displayText(agent.lastUserPrompt, DISPLAY_LIMITS.prompt) : ""}
+          </td>
+        );
+      default: {
+        const unreachable: never = column;
+        return unreachable;
+      }
+    }
+  };
   return (
     <tr className="overview-row" role="row" data-testid={`overview-agent-${agentDomKey(agent)}`} data-status={agent.status}>
-      <td role="cell"><span className={`agent-state-mark status-${agent.status}`} aria-hidden="true" /></td>
-      <td className="overview-agent-name" role="cell">
-        {orchestration && <em className="overview-role-index" title={`Role ${orchestration.roleIndex} of this orchestration`}>{String(orchestration.roleIndex + 1).padStart(2, "0")}</em>}
-        <strong>{name}</strong>
-        {orchestration?.isStartRole && <span className="coordinator-badge" title="Orchestration start role — the agent an operator messages">COORDINATOR</span>}
-        {/*
-          The write lease the daemon reported (PRD #745 M8). Shown whenever it
-          IS reported, including the ordinary writable case, so the rule a
-          reader learns is the simple one — a chip means the daemon said
-          something — rather than "no chip means writable, unless it means the
-          daemon said nothing". A daemon that declared no live target renders
-          nothing here: `toOverviewAgent` reversed its sentinel to absent, and
-          absence is NOT read as read-only.
-        */}
-        {agent.writeLease && <span className={`overview-lease lease-${agent.writeLease}`} title={WRITE_LEASE_TITLE[agent.writeLease]}>{agent.writeLease}</span>}
-        {roleName && !rendersBlank(roleName) && roleLabel?.toLowerCase() !== agent.displayName.toLowerCase() && <em className="overview-role-name">{roleName}</em>}
-      </td>
-      <td role="cell"><span className={`status-label status-${agent.status}`}>{agent.status}</span></td>
-      {/*
-        How long ago the daemon last saw this one do anything (PRD #745 M9).
-        Blank — no dash, no placeholder — for every case `displayActivity`
-        cannot honestly express: the daemon reported no instant (which is every
-        agent under a restarted daemon, since it keeps no session state), the
-        value is not a finite number, or it sits more than a minute in the
-        future. That last one is the clock-skew rule: the instant comes from
-        whichever hook process stamped the event, so ordinary skew reads "just
-        now", while a stamp genuinely ahead of the webview's clock is not
-        rewritten into one — a negative "ago" is a bug a user sees, and a
-        fabricated "just now" for a far-future stamp is the same lie in nicer
-        clothes.
-      */}
-      <td className="overview-activity" role="cell" title={activity && `Last activity reported by the daemon: ${activity.title}`}>{activity?.label ?? ""}</td>
-      {/*
-        How long this agent's process has been running (PRD #745 M11) — the
-        daemon's own spawn instant, not a session start, so it is present for an
-        agent that has never emitted a hook event. Blank on exactly the same
-        terms as Last activity beside it: `displayUptime` shares that column's
-        clock-skew and usability policy and forks only the wording, so the one
-        rule a reader learns holds for both cells.
-
-        What the number MEANS needs no flag. A restarted orchestration worker is
-        a fresh spawn with a fresh registry record, so it reads as the age of
-        its current iteration; a role nobody has restarted keeps its original
-        record, so it reads as its whole lifetime.
-      */}
-      <td className="overview-uptime" role="cell" title={uptime && `Spawned by the daemon at: ${uptime.title}`}>{uptime?.label ?? ""}</td>
-      <td className="overview-cli" role="cell" title={displayText(`Agent type reported by the daemon: ${agent.cli}`, DISPLAY_LIMITS.title)}>{displayText(agent.cli, DISPLAY_LIMITS.name)}</td>
-      <td className="overview-tool" role="cell">
-        {agent.activeTool ? (
-          <>
-            <Wrench size={11} aria-hidden="true" />
-            <strong>{displayText(agent.activeTool, DISPLAY_LIMITS.toolName)}</strong>
-            {/*
-              For a shell tool this detail is the command line the agent ran, so
-              it is bounded short: a full command line on a fifteen-row overview
-              is unreadable, and it is the kind of thing that ends up in a
-              screenshot. Bounded, not redacted — a length limit is honest,
-              where a secret-matching heuristic would only look like assurance.
-            */}
-            {agent.activeToolDetail && <em title={displayTitle(agent.activeToolDetail)}>{displayText(agent.activeToolDetail, DISPLAY_LIMITS.toolDetail)}</em>}
-          </>
-        ) : <span className="overview-tool-idle">no active tool</span>}
-      </td>
-      <td className="overview-tool-count" role="cell" title={`${agent.toolCount} tool calls reported`}>{agent.toolCount}</td>
-      {/*
-        Blank for a directory the group header already states, and blank again
-        when the daemon reported none — an empty cell says "nothing to add
-        here" in both cases, which is exactly what is true.
-      */}
-      <td className="overview-cwd" role="cell" title={agent.cwd ? displayTitle(agent.cwd) : undefined}>{!agent.cwd || agent.cwd === hoistedCwd ? "" : displayPath(agent.cwd)}</td>
-      {/*
-        The last prompt the operator sent this agent — the daemon's own answer
-        to what it was asked to do, and the honest replacement for the
-        placeholder live mode used to print. Blank when the daemon reported
-        none, with no hover either: there is nothing to say, and a dash would be
-        one more thing to read that says less.
-
-        The most attacker-shaped string on this screen — free-form text an
-        agent's own output can steer — so it is sanitised and clamped to
-        `DISPLAY_LIMITS.prompt` before React sees it, and pinned to one line by
-        `.overview-prompt` so no length or content can push a row taller than
-        its neighbours.
-      */}
-      <td className="overview-prompt" role="cell" title={agent.lastUserPrompt ? displayTitle(agent.lastUserPrompt) : undefined}>
-        {agent.lastUserPrompt ? displayText(agent.lastUserPrompt, DISPLAY_LIMITS.prompt) : ""}
-      </td>
+      {columns.map(cell)}
     </tr>
   );
 }

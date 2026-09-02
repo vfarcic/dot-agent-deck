@@ -566,21 +566,40 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    because one visible legend for the whole fleet is the design. `clip-path`
    rather than `display: none`, which would take it out of the a11y tree too. */
 .overview-sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
-/* One grid template shared by the legend and every row, so the columns line up
-   across group cards and the whole fleet reads as one table. TEN tracks, in
-   `COLUMNS` order: status mark, agent, state, last activity, uptime, CLI,
-   active tool, tools, working directory, last prompt. The `nth-child` rules in
-   the two media queries below are indexed against THIS order, so inserting a
-   column means renumbering them — the legend's spans, each row's `<td>`s,
-   `COLUMNS` and every track count here have to move together. */
-.overview-legend, .overview-row { display: grid; grid-template-columns: 10px minmax(0, 1.3fr) 66px 58px 48px 78px minmax(0, 1.3fr) 40px minmax(0, 1.3fr) minmax(0, 1.7fr); align-items: center; gap: 10px; }
+/* ONE scroll region for the legend and every group card together, never one
+   per card (PRD #745 M12). All the cards share a single grid template, which is
+   what makes the fleet read as one table across card boundaries; scrolling them
+   individually would let two cards sit at different horizontal offsets and the
+   columns would stop lining up — exactly when the chosen set is wide enough to
+   overflow, which is exactly when a reader depends on that alignment.
+
+   `min-width: min-content` on the track is what produces a scrollbar at all.
+   Every flexible column's track is `minmax(<px>, <n>fr)` rather than
+   `minmax(0, <n>fr)`, so the grid's min-content width is the SUM OF THOSE
+   MINIMUMS — a fixed, content-independent number — instead of either zero
+   (tracks crushed to nothing, no overflow, no scrollbar) or the width of the
+   longest prompt on screen (a `max-content` track, which one 64 KiB prompt
+   would blow to an unusable width). */
+.overview-table-region { overflow-x: auto; }
+.overview-table-track { min-width: min-content; }
+/* One grid template shared by the legend and every row, published once by
+   `AgentOverview` as a custom property on the track above and inherited from
+   there. It is GENERATED from the columns the operator chose, so there is no
+   index-sensitivity left anywhere: adding a column is one entry in
+   `COLUMN_FIELDS`, not a renumbering of `nth-child` rules in two media queries
+   (which is what this was until M12, and what made column four a five-rule
+   edit). */
+.overview-legend, .overview-row { display: grid; grid-template-columns: var(--overview-grid); align-items: center; gap: 10px; }
 .overview-row > td { min-width: 0; padding: 0; }
 .overview-row { min-height: 34px; padding: 5px 11px; border-top: 1px solid #eae7de; }
 .overview-row:first-child { border-top: 0; }
 .overview-row:hover { background: #f7f5ef; }
 .overview-row[data-status="failed"] { background: rgba(161, 62, 56, .05); }
-/* Blockified for free while the cells were grid items; now that each cell is
-   a `<td>`, the mark inside one needs to be a block for its 8px box to apply. */
+/* The status cell carries BOTH the mark and the word, because they render the
+   same field and two columns for one datum is what the column picker made
+   absurd (PRD #745 M12). The mark needs to be a block for its 8px box to apply
+   now that it is not a grid item in its own right. */
+.overview-state { min-width: 0; display: flex; align-items: center; gap: 6px; }
 .overview-row .agent-state-mark { display: block; margin: 0; }
 .overview-agent-name { min-width: 0; display: flex; align-items: baseline; gap: 6px; }
 .overview-agent-name strong { overflow: hidden; font-size: 11px; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
@@ -591,16 +610,19 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    restyle the deck — which PRD #745 iteration 1 must not do. Giving the
    deck's badge a style is a separate change. */
 .overview-row .coordinator-badge { flex: 0 0 auto; padding: 1px 4px; border-radius: 2px; color: var(--teal); background: var(--teal-soft); font-size: 7px; font-weight: 800; letter-spacing: .08em; }
-.overview-row .status-label { display: inline-block; justify-self: start; }
+.overview-row .status-label { flex: 0 0 auto; display: inline-block; }
 .overview-cli, .overview-cwd, .overview-tool-count { overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
-/* Last activity: a fixed 58px track, so "just now" and "2760d ago" occupy the
-   same width and the column reads as one scannable strip rather than a ragged
-   one. Muted, because it qualifies the state beside it rather than competing
-   with it, and nowrap so no value can push a row taller than its neighbours. */
+/* Last activity: a fixed track (58px, declared with the column in
+   `OVERVIEW_COLUMNS` since M12 moved the templates into TypeScript), so "just
+   now" and "2760d ago" occupy the same width and the column reads as one
+   scannable strip rather than a ragged one. Muted, because it qualifies the
+   state beside it rather than competing with it, and nowrap so no value can
+   push a row taller than its neighbours. */
 .overview-activity { overflow: hidden; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 /* Uptime: the same treatment as Last activity beside it, on a narrower fixed
-   track — its labels carry no `ago`, so `<1m` through `2760d` fit in 48px. The
-   two read as one strip because they answer one question between them. */
+   track — its labels carry no `ago`, so `<1m` through `2760d` fit in 48px (also
+   declared in `OVERVIEW_COLUMNS`). The two read as one strip because they
+   answer one question between them. */
 .overview-uptime { overflow: hidden; color: var(--faint); font-family: "JetBrains Mono", monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .overview-tool-count { justify-self: end; color: var(--faint); }
 .overview-tool { min-width: 0; display: flex; align-items: center; gap: 5px; color: var(--muted); }
@@ -630,32 +652,26 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 /* An unreadable fleet is not an empty one: the em dash says so and stays muted. */
 .overview-screen .count-unknown { color: var(--faint); }
 
-@media (max-width: 1180px) {
-  /* Seven tracks: status, agent, state, last activity, active tool, tools,
-     prompt. Last activity survives this breakpoint — it is 58px and it is the
-     column that distinguishes a waiting agent from a stalled one. Uptime does
-     NOT: of the two temporal columns it is the one that answers a question a
-     reader asks second, and keeping both here would cost a track the prompt
-     needs more. */
-  .overview-legend, .overview-row { grid-template-columns: 10px minmax(0, 1.3fr) 66px 58px minmax(0, 1.2fr) 40px minmax(0, 1.5fr); }
-  .overview-legend span:nth-child(5), .overview-row .overview-uptime { display: none; }
-  .overview-legend span:nth-child(6), .overview-row .overview-cli { display: none; }
-  /* The working directory goes before the prompt does: a group states its
-     directory once in the header, so a row's own is already the exception —
-     while the prompt is the only per-row answer to what the agent is doing. */
-  .overview-legend span:nth-child(9), .overview-row .overview-cwd { display: none; }
-}
-
+/* NO COLUMN IS HIDDEN BY VIEWPORT (PRD #745 M12). Two media queries used to
+   drop uptime, CLI and the working directory below 1180px and the active tool,
+   tool count and prompt below 680px, by `nth-child` index. Once the operator
+   picks the columns, hiding one by window width fights them: they asked for it
+   and the screen silently disagreed, with nothing on screen saying so. The
+   narrow case is now a horizontal scroll of the whole table region, which is
+   what `.overview-table-region` above is for. What survives here is padding and
+   the decorative status pips, none of which is a column. */
 @media (max-width: 680px) {
   .overview-body { padding: 8px; }
   .daemon-group-body { padding: 8px; }
-  /* Four tracks. This query also matches below 1180px, so the uptime, CLI and
-     working-directory columns hidden there are still hidden here; what is left
-     is the narrow-width triage question — which agent, what state, and how long
-     since it did anything. */
-  .overview-legend, .overview-row { grid-template-columns: 10px minmax(0, 1fr) 66px 58px; }
-  .overview-legend span:nth-child(7), .overview-row .overview-tool { display: none; }
-  .overview-legend span:nth-child(8), .overview-row .overview-tool-count { display: none; }
-  .overview-legend span:nth-child(10), .overview-row .overview-prompt { display: none; }
   .daemon-pips, .overview-group-pips { display: none; }
 }
+
+/* The column picker, in the top bar so choosing columns never leaves the
+   overview (PRD #745 M12). */
+.overview-columns-picker { position: relative; }
+.overview-columns-menu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 30; min-width: 196px; padding: 8px; display: flex; flex-direction: column; gap: 1px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--paper); box-shadow: 0 10px 26px rgba(0, 0, 0, .13); }
+.overview-columns-menu p { margin: 0 0 6px; color: var(--faint); font-size: 9px; line-height: 1.45; }
+.overview-columns-menu label { display: flex; align-items: center; gap: 6px; padding: 3px 4px; border-radius: 3px; color: var(--ink); font-size: 10px; cursor: pointer; }
+.overview-columns-menu label:hover { background: var(--paper-strong); }
+.overview-columns-menu label.is-permanent { color: var(--muted); cursor: default; }
+.overview-columns-menu em { margin-left: auto; color: var(--faint); font-size: 8px; font-style: normal; letter-spacing: .06em; text-transform: uppercase; }

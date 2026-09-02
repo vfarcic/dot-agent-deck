@@ -8,6 +8,13 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
   assertion pretends to.
 */
 import "../styles.css";
+/*
+  The same stylesheet as SOURCE, for the one assertion JSDOM cannot make: it
+  does not evaluate media queries at all, so a `display: none` inside one is
+  invisible to `getComputedStyle` and the only way to see it is to read the
+  rules.
+*/
+import stylesheetSource from "../styles.css?raw";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "../data/fixture";
 import { DISPLAY_LIMITS } from "../lib/displayText";
@@ -29,7 +36,7 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell } from "../App";
-import { agentDomKey, agentKey, AgentOverview, anonymousOrchestrationKey, groupAgents, groupKey, hoistedCwdOf, type OverviewAgent, type OverviewGroupKind, toOverviewAgent } from "./AgentOverview";
+import { agentDomKey, agentKey, AgentOverview, ALL_OVERVIEW_COLUMNS, OVERVIEW_CLOCK_TICK_MS, anonymousOrchestrationKey, DEFAULT_OVERVIEW_COLUMNS, gridTemplateFor, groupAgents, groupKey, hoistedCwdOf, orderedColumns, OVERVIEW_COLUMNS_STORAGE_KEY, PERMANENT_COLUMN, readStoredColumns, type OverviewAgent, type OverviewColumnId, type OverviewGroupKind, toOverviewAgent } from "./AgentOverview";
 
 /**
  * Every codepoint the render seam must strip, enumerated rather than sampled —
@@ -61,8 +68,41 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
   };
 }
 
+/**
+ * The overview with EVERY column on screen, which is what most of this file is
+ * about: what a cell says, not which cells are chosen. The choice is seeded
+ * through the same `localStorage` key a user's own click lands in, so this is a
+ * real state of the screen rather than a test-only path — and it keeps these
+ * tests honest about the one thing that changed under them in M12, which is the
+ * DEFAULT set and not any cell's content.
+ *
+ * Tests about the defaults, the picker and persistence use
+ * `renderOverviewWithStoredColumns` instead.
+ */
 function renderOverview(overrides: Partial<DeckRuntimeState> = {}) {
+  window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, JSON.stringify({ columns: ALL_OVERVIEW_COLUMNS }));
   return render(<AgentOverview runtime={runtime(overrides)} onNavigate={vi.fn()} />);
+}
+
+/**
+ * The overview against a literal stored value — `undefined` for a first visit
+ * with nothing stored at all, and otherwise exactly the bytes an older build,
+ * or something else entirely, left in that key.
+ */
+function renderOverviewWithStoredColumns(stored: string | undefined, overrides: Partial<DeckRuntimeState> = {}) {
+  if (stored === undefined) window.localStorage.removeItem(OVERVIEW_COLUMNS_STORAGE_KEY);
+  else window.localStorage.setItem(OVERVIEW_COLUMNS_STORAGE_KEY, stored);
+  return render(<AgentOverview runtime={runtime(overrides)} onNavigate={vi.fn()} />);
+}
+
+/** The legend's labels, which is the columns as a reader sees them named. */
+function legendLabels(): (string | null)[] {
+  return Array.from(document.querySelectorAll(".overview-legend > span")).map((span) => span.textContent);
+}
+
+/** The column headers of one group card, which is what a screen reader gets. */
+function headerLabels(scope: HTMLElement): (string | null)[] {
+  return within(scope).getAllByRole("columnheader").map((header) => header.textContent);
 }
 
 /**
@@ -496,21 +536,201 @@ describe("AgentOverview", () => {
     renderOverview();
 
     const prd = groupCard("orchestration", "orc-745");
-    const table = within(prd).getByRole("table");
-    expect(within(table).getAllByRole("columnheader").map((header) => header.textContent))
-      .toEqual(["Status", "Agent", "State", "Last activity", "Uptime", "CLI", "Active tool", "Tools", "Working directory", "Last prompt"]);
+    expect(headerLabels(prd))
+      .toEqual(["Status", "Agent", "Last activity", "Uptime", "CLI", "Active tool", "Tools", "Working directory", "Last prompt"]);
     /*
-      Ten cells per row, and the count is the point rather than a formality:
-      the responsive rules in `styles.css` hide columns by `nth-child` INDEX, so
-      a row that has drifted out of step with `COLUMNS` hides the wrong ones at
-      a narrow window and nothing else notices. The legend's own span count is
-      checked with it, since it shares the grid template and the same indices.
+      One cell per chosen column, and the count is the point rather than a
+      formality: the legend, the `<thead>` and every row are generated from ONE
+      list, so a row out of step with it would put a header over the wrong cell
+      on the screen whose whole job is being readable at a glance. The legend's
+      own span count is checked with it, since it shares the grid template.
     */
-    for (const row of rows(prd)) expect(within(row).getAllByRole("cell")).toHaveLength(10);
-    expect(document.querySelectorAll(".overview-legend > span")).toHaveLength(10);
+    for (const row of rows(prd)) expect(within(row).getAllByRole("cell")).toHaveLength(ALL_OVERVIEW_COLUMNS.length);
+    expect(document.querySelectorAll(".overview-legend > span")).toHaveLength(ALL_OVERVIEW_COLUMNS.length);
     // The visible legend is decoration for the shared grid and stays out of the
     // accessibility tree, so the columns are not announced twice.
     expect(document.querySelector(".overview-legend")).toHaveAttribute("aria-hidden", "true");
+  });
+
+  /**
+   * Scenario: open the overview for the first time, with nothing stored. Four
+   * columns are on screen — the agent's name, its status, where it is working
+   * and how long it has been running — and the five the daemon can also fill
+   * are absent until asked for (PRD #745 M12).
+   */
+  it("opens on the four default columns and nothing else", () => {
+    renderOverviewWithStoredColumns(undefined);
+
+    expect(legendLabels()).toEqual(["STATUS", "AGENT", "UPTIME", "WORKING DIRECTORY"]);
+    const prd = groupCard("orchestration", "orc-745");
+    expect(headerLabels(prd)).toEqual(["Status", "Agent", "Uptime", "Working directory"]);
+    for (const row of rows(prd)) expect(within(row).getAllByRole("cell")).toHaveLength(4);
+    // The five that exist and were not chosen render no cell at all — not an
+    // empty one, which would still occupy a grid track.
+    expect(document.querySelector(".overview-activity")).toBeNull();
+    expect(document.querySelector(".overview-cli")).toBeNull();
+    expect(document.querySelector(".overview-tool")).toBeNull();
+    expect(document.querySelector(".overview-tool-count")).toBeNull();
+    expect(document.querySelector(".overview-prompt")).toBeNull();
+  });
+
+  /**
+   * Scenario: with the defaults on screen, open the Columns menu and tick
+   * `Last prompt`, then untick `Working directory`. Each lands immediately, and
+   * the column appears in the screen's own order rather than at the end of the
+   * click sequence (PRD #745 M12).
+   */
+  it("adds and removes a column from the picker, without leaving the overview", () => {
+    renderOverviewWithStoredColumns(undefined);
+
+    expect(screen.queryByTestId("overview-columns-menu")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("overview-columns-toggle"));
+    expect(screen.getByTestId("overview-columns-toggle")).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(screen.getByTestId("overview-column-lastUserPrompt"));
+    expect(legendLabels()).toEqual(["STATUS", "AGENT", "UPTIME", "WORKING DIRECTORY", "LAST PROMPT"]);
+
+    fireEvent.click(screen.getByTestId("overview-column-cwd"));
+    expect(legendLabels()).toEqual(["STATUS", "AGENT", "UPTIME", "LAST PROMPT"]);
+    expect(document.querySelector(".overview-cwd")).toBeNull();
+
+    // The deck is still one click away — the picker never took over the screen.
+    expect(screen.getByTestId("overview-open-deck")).toBeVisible();
+  });
+
+  /**
+   * Scenario: open the picker and try to remove the agent's name. Its checkbox
+   * is checked and disabled, so there is nothing to click — a row with no name
+   * is not a shorter row, it is an anonymous one, on the screen whose whole job
+   * is telling agents apart (PRD #745 M12).
+   */
+  it("will not let the name column be removed", () => {
+    renderOverviewWithStoredColumns(undefined);
+    fireEvent.click(screen.getByTestId("overview-columns-toggle"));
+
+    const name = screen.getByTestId(`overview-column-${PERMANENT_COLUMN}`);
+    expect(name).toBeChecked();
+    expect(name).toBeDisabled();
+
+    fireEvent.click(name);
+    expect(legendLabels()).toContain("AGENT");
+    // And it comes back whatever a stored value asks for, which is the half a
+    // disabled checkbox cannot enforce.
+    expect(orderedColumns([])).toEqual([PERMANENT_COLUMN]);
+    expect(readStoredColumns(JSON.stringify({ columns: ["cli"] }))).toEqual(["displayName", "cli"]);
+  });
+
+  /**
+   * Scenario: choose a column, leave the screen, and come back. The choice is
+   * still there — it is written to a mode-scoped `localStorage` key, so a
+   * fixture visit and a live session never share one (PRD #745 M12).
+   */
+  it("remembers the chosen columns across a remount, under a mode-scoped key", () => {
+    const { unmount } = renderOverviewWithStoredColumns(undefined);
+    fireEvent.click(screen.getByTestId("overview-columns-toggle"));
+    fireEvent.click(screen.getByTestId("overview-column-cli"));
+    expect(legendLabels()).toContain("CLI");
+    unmount();
+
+    expect(OVERVIEW_COLUMNS_STORAGE_KEY).toBe("dot-agent-deck.desktop.overview-columns.v1.fixture");
+    expect(JSON.parse(window.localStorage.getItem(OVERVIEW_COLUMNS_STORAGE_KEY) ?? "null"))
+      .toEqual({ columns: ["status", "displayName", "spawnedAtMs", "cli", "cwd"] });
+
+    render(<AgentOverview runtime={runtime()} onNavigate={vi.fn()} />);
+    expect(legendLabels()).toEqual(["STATUS", "AGENT", "UPTIME", "CLI", "WORKING DIRECTORY"]);
+  });
+
+  /**
+   * Scenario: start with each of the ways a stored value can be unusable —
+   * unparseable bytes, a value of the wrong shape, and one naming only columns
+   * that no longer exist — and confirm the screen opens on the defaults every
+   * time rather than throwing or rendering a dead track. This is the case that
+   * breaks silently a release later, when an older build's value meets a newer
+   * column set (PRD #745 M12).
+   */
+  it("falls back to the defaults for a stored value it cannot use", () => {
+    for (const stored of ["{not json", "null", '"columns"', "42", "{}", '{"columns":"cli"}', '{"columns":[]}', '{"columns":["model","cost","tokens"]}']) {
+      const { unmount } = renderOverviewWithStoredColumns(stored);
+      expect(legendLabels()).toEqual(["STATUS", "AGENT", "UPTIME", "WORKING DIRECTORY"]);
+      unmount();
+    }
+    // And the normalised value is written back, so the next visit reads a
+    // stored value this build understands rather than the same rubbish again.
+    renderOverviewWithStoredColumns("{not json");
+    expect(JSON.parse(window.localStorage.getItem(OVERVIEW_COLUMNS_STORAGE_KEY) ?? "null"))
+      .toEqual({ columns: [...DEFAULT_OVERVIEW_COLUMNS] });
+  });
+
+  /**
+   * Scenario: a stored value naming one real column and one that no longer
+   * exists. The real one survives and the stale one is DROPPED — carried
+   * through it would be a `<th>` with no cell under it and one dead grid track
+   * down every card, which reads as a layout bug and is really a migration one
+   * (PRD #745 M12).
+   */
+  it("drops a stored column that no longer exists and keeps the rest", () => {
+    renderOverviewWithStoredColumns(JSON.stringify({ columns: ["cli", "contextPercent", "lastUserPrompt"] }));
+
+    expect(legendLabels()).toEqual(["AGENT", "CLI", "LAST PROMPT"]);
+    const prd = groupCard("orchestration", "orc-745");
+    expect(headerLabels(prd)).toEqual(["Agent", "CLI", "Last prompt"]);
+    for (const row of rows(prd)) expect(within(row).getAllByRole("cell")).toHaveLength(3);
+  });
+
+  /**
+   * Scenario: check the grid template the chosen columns produce. Every group
+   * card shares ONE template, published as a custom property on the single
+   * scroll region that holds the legend and all the cards — which is what keeps
+   * rows lining up across card boundaries when the table is wider than the
+   * window (PRD #745 M12).
+   */
+  it("generates one grid template from the selection and scrolls the whole table region", () => {
+    renderOverviewWithStoredColumns(JSON.stringify({ columns: ["displayName", "cli", "toolCount"] }));
+
+    const region = screen.getByTestId("overview-table-region");
+    const track = region.querySelector(".overview-table-track") as HTMLElement;
+    expect(track.style.getPropertyValue("--overview-grid")).toBe("minmax(150px, 1.3fr) 78px 40px");
+    expect(gridTemplateFor(["displayName", "cli", "toolCount"])).toBe("minmax(150px, 1.3fr) 78px 40px");
+
+    // The scroll is on the region, not on a card: per-card scrolling would let
+    // two cards sit at different offsets and the columns would desynchronise.
+    expect(getComputedStyle(region).overflowX).toBe("auto");
+    expect(getComputedStyle(track).minWidth).toBe("min-content");
+    for (const card of screen.getAllByRole("article")) {
+      expect(track).toContainElement(card);
+      expect(getComputedStyle(card).overflowX).not.toBe("auto");
+    }
+    // Every flexible track carries a fixed px minimum rather than `minmax(0,
+    // …)`, which is what gives the grid a min-content width to scroll past.
+    expect(gridTemplateFor([...ALL_OVERVIEW_COLUMNS])).not.toContain("minmax(0");
+  });
+
+  /**
+   * Scenario: read the shipped stylesheet and confirm no rule hides an overview
+   * column by viewport. Two media queries used to drop three columns below
+   * 1180px and three more below 680px, by `nth-child` index. Once the operator
+   * picks the columns, hiding one by window width fights them silently — and
+   * the index-sensitivity made adding a column a five-rule renumbering
+   * (PRD #745 M12).
+   *
+   * Read from the file rather than from JSDOM's cascade on purpose: JSDOM does
+   * not evaluate media queries at all, so a `display: none` inside one is
+   * invisible to `getComputedStyle` and this is the only place it can be seen.
+   */
+  it("hides no column by viewport any more", () => {
+    const stylesheet = stylesheetSource;
+
+    // No `nth-child` anywhere: the index-sensitivity is what made adding a
+    // column a five-rule renumbering, and it is gone with the templates.
+    expect(stylesheet).not.toMatch(/\.overview-\w+[^{]*:nth-child/);
+    // And no media query mentions a column at all — not to hide one, not to
+    // re-template the grid. What is left in one is padding and the decorative
+    // status pips, neither of which is a column.
+    for (const block of stylesheet.match(/@media[^{]*\{[\s\S]*?\n\}/g) ?? []) {
+      for (const selector of [".overview-legend", ".overview-row", ".overview-state", ".overview-agent-name", ".overview-activity", ".overview-uptime", ".overview-cli", ".overview-tool", ".overview-tool-count", ".overview-cwd", ".overview-prompt"]) {
+        expect(block).not.toContain(selector);
+      }
+    }
   });
 
   /**
@@ -675,16 +895,25 @@ describe("AgentOverview", () => {
    * interval must be gone — a ticker that outlives its component keeps
    * repainting a tree nobody is looking at, for as long as the app runs.
    */
-  it("stops ticking when the screen is left", () => {
+  it("ticks once every ten seconds and stops when the screen is left", () => {
     vi.useFakeTimers();
+    const started = vi.spyOn(window, "setInterval");
+    const stopped = vi.spyOn(window, "clearInterval");
     try {
       vi.setSystemTime(new Date("2026-09-02T09:00:00.000Z").getTime());
       const { unmount } = renderOverview({ snapshot: snapshotWithAgent({ tab: { kind: "dashboard" } }) });
-      expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+      // One interval for the whole screen, at the cadence the columns need —
+      // both round to the minute above their sub-minute bucket, so anything
+      // faster is repaints that change no label.
+      expect(started).toHaveBeenCalledTimes(1);
+      expect(started).toHaveBeenCalledWith(expect.any(Function), OVERVIEW_CLOCK_TICK_MS);
 
       unmount();
 
-      expect(vi.getTimerCount()).toBe(0);
+      // A ticker that outlives its component keeps repainting a tree nobody is
+      // looking at, for as long as the app runs.
+      expect(stopped).toHaveBeenCalledWith(started.mock.results[0]?.value);
     } finally {
       vi.useRealTimers();
     }
@@ -700,6 +929,8 @@ describe("AgentOverview", () => {
    */
   it("pauses while the document is hidden and catches up the moment it comes back", () => {
     vi.useFakeTimers();
+    const started = vi.spyOn(window, "setInterval");
+    const stopped = vi.spyOn(window, "clearInterval");
     const visibility = (state: DocumentVisibilityState) => {
       Object.defineProperty(document, "visibilityState", { value: state, configurable: true });
       act(() => void document.dispatchEvent(new Event("visibilitychange")));
@@ -708,11 +939,10 @@ describe("AgentOverview", () => {
       const start = new Date("2026-09-02T09:00:00.000Z").getTime();
       vi.setSystemTime(start);
       renderOverview({ snapshot: snapshotWithAgent({ lastActivityMs: start, tab: { kind: "dashboard" } }) });
-      const ticking = vi.getTimerCount();
-      expect(ticking).toBeGreaterThan(0);
+      expect(started).toHaveBeenCalledTimes(1);
 
       visibility("hidden");
-      expect(vi.getTimerCount()).toBe(ticking - 1);
+      expect(stopped).toHaveBeenCalledWith(started.mock.results[0]?.value);
 
       act(() => void vi.advanceTimersByTime(45 * 60_000));
       // Still the pre-hide reading: nothing ticked, which is the point.
@@ -720,7 +950,7 @@ describe("AgentOverview", () => {
 
       visibility("visible");
       expect(document.querySelector(".overview-activity")).toHaveTextContent("45m ago");
-      expect(vi.getTimerCount()).toBe(ticking);
+      expect(started).toHaveBeenCalledTimes(2);
     } finally {
       // @ts-expect-error — removing the own property restores the prototype getter.
       delete document.visibilityState;
