@@ -4,7 +4,7 @@ use std::io::Write as _;
 use std::process::ExitCode;
 
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
@@ -20,8 +20,29 @@ struct ClaudeCodeHookInput {
     tool_input: Option<Value>,
     tool_use_id: Option<String>,
     prompt: Option<String>,
+    // Claude Code's native `SessionStart` hook carries a `source` field
+    // (`"startup"`/`"resume"`/`"compact"`/`"clear"`) that today is silently
+    // absorbed into `_extra` and never read. A NAMED field, not routed
+    // through `_extra`/`metadata` — see `build_event_typed`'s narrow
+    // forwarding of it below.
+    //
+    // `lenient_string` degrades a non-string shape (object, number, bool,
+    // array) to `None` instead of failing the whole payload decode: `handle_hook`
+    // swallows a decode error silently (`Err(_) => return ExitCode::SUCCESS`),
+    // so a strict `Option<String>` would blackout the WHOLE event over an
+    // unexpected `source` shape, not just lose the field.
+    #[serde(default, deserialize_with = "lenient_string")]
+    source: Option<String>,
     #[serde(flatten)]
     _extra: HashMap<String, Value>,
+}
+
+/// A non-string value (object, number, bool, array) degrades to `None` rather
+/// than failing the whole payload decode. `null` and a missing key already
+/// decode to `None` via `#[serde(default)]`; this only widens the tolerance
+/// to non-string, non-null shapes. See [`ClaudeCodeHookInput::source`].
+fn lenient_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<Value>::deserialize(d)?.and_then(|v| v.as_str().map(str::to_owned)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -306,6 +327,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         tool_input,
         tool_use_id,
         prompt,
+        source,
         _extra: extra,
     } = input;
 
@@ -391,6 +413,32 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         metadata.insert(
             crate::event::SESSION_START_ORIGIN_METADATA_KEY.to_string(),
             crate::event::WRAPPER_FORK_SESSION_START_ORIGIN.to_string(),
+        );
+    }
+
+    // Forward "this SessionStart came from `/clear`", same deliberately
+    // narrow shape as the boot-provenance forwarding just above — one key,
+    // one value, only on `SessionStart`. Distinct from
+    // `SESSION_START_ORIGIN_METADATA_KEY`: that key is wrapper-fork boot
+    // provenance, an unrelated concern; this one is Claude Code's own
+    // `source` field on its native `SessionStart` hook
+    // (`"startup"`/`"resume"`/`"compact"`/`"clear"`), and only the `"clear"`
+    // value is ever forwarded — every other `source` value stays dropped.
+    //
+    // Also gated on `agent_type == AgentType::ClaudeCode`, since this
+    // builder is shared by the Codex/Devin/default hook arms (all decode
+    // the same `ClaudeCodeHookInput`) and this feature is Claude-Code only.
+    // Defense-in-depth: the consumer-side check in
+    // `orchestrator_remit_pane_latest_clear_session_start` (`src/ui.rs`) is
+    // what actually enforces the scope for a raw `AgentEvent` injected
+    // straight onto the hook socket, which bypasses this builder entirely.
+    if event_type == EventType::SessionStart
+        && agent_type == AgentType::ClaudeCode
+        && source.as_deref() == Some(crate::event::CLEAR_SESSION_START_METADATA_VALUE)
+    {
+        metadata.insert(
+            crate::event::CLEAR_SESSION_START_METADATA_KEY.to_string(),
+            crate::event::CLEAR_SESSION_START_METADATA_VALUE.to_string(),
         );
     }
 
@@ -1143,6 +1191,7 @@ mod tests {
             tool_input: None,
             tool_use_id: None,
             prompt: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1163,6 +1212,7 @@ mod tests {
             tool_input: Some(serde_json::json!({"file_path": "/src/main.rs"})),
             tool_use_id: None,
             prompt: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1181,6 +1231,7 @@ mod tests {
             tool_input: None,
             tool_use_id: None,
             prompt: None,
+            source: None,
             _extra: HashMap::new(),
         };
         assert!(build_event(input).is_none());
@@ -1196,6 +1247,7 @@ mod tests {
             tool_input: None,
             tool_use_id: None,
             prompt: Some("fix the login bug".into()),
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -1214,12 +1266,51 @@ mod tests {
             tool_input: None,
             tool_use_id: None,
             prompt: Some(long_prompt),
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
         let prompt = event.user_prompt.unwrap();
         assert!(prompt.len() <= 204); // 200 + "…" (3 bytes)
         assert!(prompt.ends_with('…'));
+    }
+
+    /// `source` degrades the same way an unexpected-shape field elsewhere in
+    /// this struct already does: a strict `Option<String>` would fail the
+    /// WHOLE decode on a non-string `source` (object, number, bool, array),
+    /// and `handle_hook` swallows that error silently (`Err(_) => return
+    /// ExitCode::SUCCESS`) for all four producer arms. `lenient_string` must
+    /// degrade a non-string `source` to `None` instead of dropping the event.
+    #[test]
+    fn source_001_non_string_source_does_not_drop_the_event() {
+        for (label, source_json) in [
+            ("object", r#"{"kind":"clear"}"#),
+            ("number", "3"),
+            ("bool", "true"),
+            ("array", r#"["clear"]"#),
+        ] {
+            let payload = format!(
+                r#"{{"session_id":"test-123","hook_event_name":"SessionStart","source":{source_json}}}"#
+            );
+            let hook_input: ClaudeCodeHookInput =
+                serde_json::from_str(&payload).unwrap_or_else(|e| {
+                    panic!("a non-string ({label}) source must not fail the whole decode: {e}")
+                });
+            assert!(
+                hook_input.source.is_none(),
+                "a non-string ({label}) source must degrade to None, not a decode error"
+            );
+            let event = build_event(hook_input)
+                .expect("the rest of the event must survive a non-string source");
+            assert_eq!(event.session_id, "test-123");
+            assert_eq!(event.event_type, EventType::SessionStart);
+        }
+
+        // `null` already works and must keep working.
+        let payload = r#"{"session_id":"test-123","hook_event_name":"SessionStart","source":null}"#;
+        let hook_input: ClaudeCodeHookInput =
+            serde_json::from_str(payload).expect("a null source must decode fine");
+        assert!(hook_input.source.is_none());
     }
 
     #[test]
@@ -1990,6 +2081,7 @@ mod tests {
                 tool_input: None,
                 tool_use_id: None,
                 prompt: None,
+                source: None,
                 _extra: extra,
             }
         };
@@ -2030,10 +2122,103 @@ mod tests {
             tool_input: None,
             tool_use_id: None,
             prompt: None,
+            source: None,
             _extra: HashMap::new(),
         })
         .expect("SessionStart maps to an event");
         assert!(!genuine.is_wrapper_fork_session_start());
+    }
+
+    /// `ClaudeCodeHookInput.source == "clear"` on a `SessionStart` must
+    /// forward `CLEAR_SESSION_START_METADATA_KEY` / `CLEAR_SESSION_START_METADATA_VALUE`
+    /// into `AgentEvent.metadata` — narrowly, mirroring
+    /// `session_start_origin_survives_the_claude_hook_builder` above for the
+    /// sibling `SESSION_START_ORIGIN_METADATA_KEY` forwarding. Also covers a
+    /// non-`ClaudeCode` `agent_type` (built via `build_event_typed` directly,
+    /// since `build_event` hardcodes `ClaudeCode`) not forwarding the key
+    /// even when `source == "clear"`.
+    #[test]
+    fn clear_session_start_source_forwards_narrowly() {
+        let payload = |event: &str, source: Option<&str>| ClaudeCodeHookInput {
+            session_id: "clear-pane-1".into(),
+            hook_event_name: event.into(),
+            cwd: None,
+            tool_name: None,
+            tool_input: None,
+            tool_use_id: None,
+            prompt: None,
+            source: source.map(str::to_string),
+            _extra: HashMap::new(),
+        };
+
+        // A `SessionStart` with `source: "clear"` forwards the key.
+        let cleared = build_event(payload("SessionStart", Some("clear")))
+            .expect("SessionStart maps to an event");
+        assert_eq!(
+            cleared
+                .metadata
+                .get(crate::event::CLEAR_SESSION_START_METADATA_KEY)
+                .map(String::as_str),
+            Some(crate::event::CLEAR_SESSION_START_METADATA_VALUE),
+            "a `/clear`-originated SessionStart must forward the metadata key: {:?}",
+            cleared.metadata
+        );
+
+        // A `SessionStart` with a different (or missing) `source` does NOT
+        // forward the key — only the literal `"clear"` value is narrow-cased.
+        let startup = build_event(payload("SessionStart", Some("startup")))
+            .expect("SessionStart maps to an event");
+        assert!(
+            !startup
+                .metadata
+                .contains_key(crate::event::CLEAR_SESSION_START_METADATA_KEY),
+            "source: \"startup\" must not forward the clear-session-start key: {:?}",
+            startup.metadata
+        );
+
+        let missing_source =
+            build_event(payload("SessionStart", None)).expect("SessionStart maps to an event");
+        assert!(
+            !missing_source
+                .metadata
+                .contains_key(crate::event::CLEAR_SESSION_START_METADATA_KEY),
+            "a SessionStart with no source field must not forward the clear-session-start \
+             key: {:?}",
+            missing_source.metadata
+        );
+
+        // A non-SessionStart event carrying source: "clear" does NOT forward
+        // the key either — proves the narrowing is on event_type too, not
+        // just on the source value.
+        let wrong_event = build_event(payload("UserPromptSubmit", Some("clear")))
+            .expect("UserPromptSubmit maps to an event");
+        assert!(
+            !wrong_event
+                .metadata
+                .contains_key(crate::event::CLEAR_SESSION_START_METADATA_KEY),
+            "a non-SessionStart event must not forward the clear-session-start key even \
+             when source is \"clear\": {:?}",
+            wrong_event.metadata
+        );
+
+        // This feature is Claude-Code only — a `SessionStart` with
+        // `source: "clear"` stamped with a non-`ClaudeCode` agent_type must
+        // NOT forward the key, even though every other condition is met.
+        // Goes through `build_event_typed` directly (not the `build_event`
+        // convenience wrapper, which hardcodes `AgentType::ClaudeCode`) so
+        // this actually exercises the `agent_type == AgentType::ClaudeCode`
+        // gate — deleting that condition would break no other test.
+        let non_claude_code =
+            build_event_typed(payload("SessionStart", Some("clear")), AgentType::Codex)
+                .expect("SessionStart maps to an event");
+        assert!(
+            !non_claude_code
+                .metadata
+                .contains_key(crate::event::CLEAR_SESSION_START_METADATA_KEY),
+            "a non-ClaudeCode agent_type must not forward the clear-session-start key even \
+             when source is \"clear\": {:?}",
+            non_claude_code.metadata
+        );
     }
 
     #[test]
@@ -2051,6 +2236,7 @@ mod tests {
             tool_input: None,
             tool_use_id: None,
             prompt: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -2103,6 +2289,7 @@ mod tests {
             tool_input: Some(serde_json::json!({"command": full_cmd})),
             tool_use_id: None,
             prompt: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -2127,6 +2314,7 @@ mod tests {
             tool_input: Some(serde_json::json!({"file_path": "/src/main.rs"})),
             tool_use_id: None,
             prompt: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();
@@ -2143,6 +2331,7 @@ mod tests {
             tool_input: Some(serde_json::json!({"command": "ls -la"})),
             tool_use_id: None,
             prompt: None,
+            source: None,
             _extra: HashMap::new(),
         };
         let event = build_event(input).unwrap();

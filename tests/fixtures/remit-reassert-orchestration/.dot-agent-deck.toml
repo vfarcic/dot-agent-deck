@@ -1,0 +1,23 @@
+# Fixture for the orchestrator remit re-assertion L2 coverage
+# (orchestration/remit/001-006, tests/e2e_orchestration_remit.rs). The
+# orchestrator role runs a synthetic script (written by the test into this
+# fixture's workdir before the tab opens) that declares itself live at boot
+# via a raw hook-socket `session_start`, so the spawn-time remit pointer
+# delivers fast and deterministically, then tees its stdin to
+# orchestrator-prompt.log so re-delivery is observable as a second matching
+# line, and reports each delivered line back over the hook socket as a
+# `user_prompt`-carrying confirmation so the delivery finalizes instead of
+# earning an automatic, unconfirmed second write. The worker role is a plain
+# `cat` stub (no LLM tokens spent) used only as a non-start-role target to
+# prove re-assertion does not leak onto it.
+[[orchestrations]]
+name = "remit-reassert"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "./orchestrator-remit.sh"
+start = true
+
+[[orchestrations.roles]]
+name = "worker"
+command = "cat"
