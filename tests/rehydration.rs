@@ -2532,6 +2532,7 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         live_target: None,
                         last_activity_ms: None,
                     }),
+                    spawned_at_ms: None,
                 };
                 let resp = AttachResponse {
                     ok: true,

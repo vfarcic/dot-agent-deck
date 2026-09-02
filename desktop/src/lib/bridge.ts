@@ -78,6 +78,21 @@ export interface DesktopAgentDto {
    */
   lastActivityMs?: number;
   /**
+   * `AgentRecord.spawned_at_ms` (PRD #745 M11): when the daemon forked this
+   * agent's process, as epoch milliseconds. Epoch milliseconds and not a
+   * formatted string for the same reason `lastActivityMs` is — see
+   * `displayUptime` in `lib/displayText`, which owns the wording and shares the
+   * clock-skew rule.
+   *
+   * It comes off the registry RECORD rather than a live session, so unlike
+   * `lastActivityMs` it is present for an agent that has never emitted a hook
+   * event. Absent from a daemon that did not spawn the agent (an id-only
+   * `ListAgents` reply) and from one that predates the field. A TYPE ASSERTION,
+   * not a validated value, exactly like `lastActivityMs`: the render seam
+   * checks rather than trusts.
+   */
+  spawnedAtMs?: number;
+  /**
    * The desktop crate's `DesktopTab` is structurally identical to the app
    * model's `AgentTab`, so the DTO reuses it and `agentFromDto` copies the
    * value through rather than flattening it to a role string. If the IPC shape
@@ -271,6 +286,7 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     writeLease: agent.writeLease ?? "unknown",
     lastUserPrompt: agent.lastUserPrompt,
     lastActivityMs: agent.lastActivityMs,
+    spawnedAtMs: agent.spawnedAtMs,
     rows: agent.rows,
     cols: agent.cols,
     activeTool: agent.activeTool?.name,

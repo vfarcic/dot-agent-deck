@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Blocks, Boxes, LayoutList, Layers, Network, RefreshCw, ShieldAlert, Sparkles, SquareTerminal, Wrench } from "lucide-react";
 import type { AgentSession, AgentStatus, ConnectionView, DeckRuntimeState, DeckView } from "../types";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
-import { DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayText, displayTitle, domIdentity, rendersBlank, shortDaemonLabel } from "../lib/displayText";
+import { DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayText, displayTitle, displayUptime, domIdentity, rendersBlank, shortDaemonLabel } from "../lib/displayText";
 
 /**
  * The honest subset of `AgentSession`: every field a daemon genuinely reports
@@ -10,11 +10,13 @@ import { DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayT
  * from THIS and never from `AgentSession`, so reaching for a value the daemon
  * cannot supply — `model`, `tokens`, `cost`, `contextPercent`, `worktree`,
  * `attempt`, `duration` — is a compile error rather than a thing to remember.
- * `duration` stays out while `lastActivityMs` is in, and the line between them
- * is honesty rather than taste: `started_at` is invented as `now` on hydration
- * so a duration resets under a restarted daemon, whereas `last_activity` is a
- * high-water mark of observed event timestamps and reads ABSENT when the daemon
- * cannot vouch for it (PRD #745 M9).
+ * `duration` stays out while `lastActivityMs` and `spawnedAtMs` are in, and the
+ * line between them is honesty rather than taste. `duration` is a fixture
+ * string; the two instants are daemon observations that read ABSENT when the
+ * daemon cannot vouch for them (PRD #745 M9, M11). Note the screen DOES show a
+ * duration now — it is computed here from `spawnedAtMs`, the instant the daemon
+ * forked the process, rather than from `SessionState.started_at`, which is
+ * event-derived and invented as `now` on hydration.
  * `role` is deliberately absent even though it is honest: a row shows
  * `displayName` and, inside an orchestration, `tab.roleName`, so carrying
  * `role` here would claim a consumption that does not exist. The field-by-field
@@ -23,7 +25,7 @@ import { DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayT
  */
 export type OverviewAgent = Pick<
   AgentSession,
-  "id" | "daemonId" | "displayName" | "cli" | "status" | "activeTool" | "activeToolDetail" | "toolCount" | "tab" | "lastUserPrompt" | "lastActivityMs"
+  "id" | "daemonId" | "displayName" | "cli" | "status" | "activeTool" | "activeToolDetail" | "toolCount" | "tab" | "lastUserPrompt" | "lastActivityMs" | "spawnedAtMs"
 > & {
   /**
    * HONEST, and optional exactly as `AgentSession.cwd` is. It was optional here
@@ -50,7 +52,7 @@ export type OverviewAgent = Pick<
 };
 
 export function toOverviewAgent(agent: AgentSession): OverviewAgent {
-  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, writeLease } = agent;
+  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease } = agent;
   return {
     id,
     daemonId,
@@ -64,6 +66,7 @@ export function toOverviewAgent(agent: AgentSession): OverviewAgent {
     tab,
     lastUserPrompt,
     lastActivityMs,
+    spawnedAtMs,
     writeLease: writeLease === "unknown" ? undefined : writeLease,
   };
 }
@@ -320,13 +323,16 @@ const GROUP_ICON: Record<OverviewGroupKind, typeof Network> = {
 /**
  * The column headers, in grid order. The visible legend mirrors these, and so do
  * the `nth-child` rules in `styles.css`'s two overview media queries — which are
- * INDEX-SENSITIVE, so inserting a column here means renumbering them. Nine
- * columns as of PRD #745 M9, which put Last activity fourth: it is read
- * alongside State, because "waiting" and "waiting, and quiet for two hours" are
- * different situations and a reader should not have to scan across the row to
- * tell them apart.
+ * INDEX-SENSITIVE, so inserting a column here means renumbering them. TEN
+ * columns as of PRD #745 M11, which put Uptime fifth, immediately after Last
+ * activity: the two temporal columns answer one question between them — how
+ * long this agent has been alive, and how much of that it has spent doing
+ * nothing — and reading them apart is the whole point of putting them together.
+ * Both sit beside State, because "waiting" and "waiting, and quiet for two of
+ * its three hours" are different situations and a reader should not have to
+ * scan across the row to tell them apart.
  */
-const COLUMNS = ["Status", "Agent", "State", "Last activity", "CLI", "Active tool", "Tools", "Working directory", "Last prompt"];
+const COLUMNS = ["Status", "Agent", "State", "Last activity", "Uptime", "CLI", "Active tool", "Tools", "Working directory", "Last prompt"];
 
 /** What a reported write lease says on hover, in the daemon's own terms. */
 const WRITE_LEASE_TITLE: Record<"read" | "write" | "none", string> = {
@@ -604,6 +610,7 @@ function DaemonBody({ agents, groups, connection, message, overrideError, onOpen
         <span>AGENT</span>
         <span>STATE</span>
         <span>LAST ACTIVITY</span>
+        <span>UPTIME</span>
         <span>CLI</span>
         <span>ACTIVE TOOL</span>
         <span>TOOLS</span>
@@ -724,7 +731,9 @@ function OverviewRow({ agent, hoistedCwd }: { agent: OverviewAgent; hoistedCwd?:
   const name = displayIdentity(agent.displayName, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
   // Read once per render against ONE `Date.now()`, so every row on a repaint is
   // relative to the same moment rather than to fifteen slightly different ones.
-  const activity = displayActivity(agent.lastActivityMs);
+  const now = Date.now();
+  const activity = displayActivity(agent.lastActivityMs, now);
+  const uptime = displayUptime(agent.spawnedAtMs, now);
   return (
     <tr className="overview-row" role="row" data-testid={`overview-agent-${agentDomKey(agent)}`} data-status={agent.status}>
       <td role="cell"><span className={`agent-state-mark status-${agent.status}`} aria-hidden="true" /></td>
@@ -759,6 +768,20 @@ function OverviewRow({ agent, hoistedCwd }: { agent: OverviewAgent; hoistedCwd?:
         clothes.
       */}
       <td className="overview-activity" role="cell" title={activity && `Last activity reported by the daemon: ${activity.title}`}>{activity?.label ?? ""}</td>
+      {/*
+        How long this agent's process has been running (PRD #745 M11) — the
+        daemon's own spawn instant, not a session start, so it is present for an
+        agent that has never emitted a hook event. Blank on exactly the same
+        terms as Last activity beside it: `displayUptime` shares that column's
+        clock-skew and usability policy and forks only the wording, so the one
+        rule a reader learns holds for both cells.
+
+        What the number MEANS needs no flag. A restarted orchestration worker is
+        a fresh spawn with a fresh registry record, so it reads as the age of
+        its current iteration; a role nobody has restarted keeps its original
+        record, so it reads as its whole lifetime.
+      */}
+      <td className="overview-uptime" role="cell" title={uptime && `Spawned by the daemon at: ${uptime.title}`}>{uptime?.label ?? ""}</td>
       <td className="overview-cli" role="cell" title={displayText(`Agent type reported by the daemon: ${agent.cli}`, DISPLAY_LIMITS.title)}>{displayText(agent.cli, DISPLAY_LIMITS.name)}</td>
       <td className="overview-tool" role="cell">
         {agent.activeTool ? (

@@ -3298,6 +3298,13 @@ These entries cover PRD #162: on TUI reconnect the daemon's `ListAgents` must at
 - **Does not assert:** the desktop DTO projection or the webview's relative-time wording and clock-skew rule (both covered by the desktop crate's `dto.rs` tests and `AgentOverview.test.tsx`); the `ListAgents` join that carries the snapshot (`session/live/002`, `session/live/003`); the TUI-side seeding of the field, which `seed_hydrated_session` deliberately does not overlay.
 - **Platform coverage:** mac+linux+windows.
 
+##### session/live/014 — `AgentRecord.spawned_at_ms` reports when the daemon forked the child, is absent when it did not, and is additive in both directions (PRD #745 M11).
+- **Layer:** mixed pure-data / real-PTY (one real `AgentPtyRegistry::spawn_agent` plus serde round-trips; no daemon socket, no TUI harness; runs in the fast tier).
+- **Agent:** none (the spawned pane is the default shell; no LLM).
+- **Asserts:** an agent spawned through the registry reports a spawn instant that lies inside the spawn call itself, bracketed by `Utc::now()` either side, so a value minted at snapshot time or copied from a session would fail; the integer round-trips exactly; an agent the registry did NOT fork reports no spawn time and has no key in the JSON at all rather than a null; an older peer's `AgentRecord` payload lacking the key decodes via `#[serde(default)]` to `None` with every other field intact; and a newer peer's payload carrying the key decodes without disturbing the fields an older reader understands — which is the proof behind the do-not-bump decision (`PROTOCOL_VERSION` stays 8).
+- **Does not assert:** that a respawn mints a fresh instant (structural — `respawn_agent_for_pane_declared` removes the record and `spawn_agent` is the only writer, and the registry's respawn behaviour is covered by `orchestration/delegate/*`); the desktop DTO projection or the webview's uptime wording and clock-skew rule (the desktop crate's `dto.rs` tests and `AgentOverview.test.tsx`); the `ListAgents` handler (`session/live/002`, `session/live/003`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Session save (snapshot freshness, PRD #89 Phase 1)
 
 These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept continuously fresh — written on meaningful TUI state changes and on detach — not only at clean teardown/quit.

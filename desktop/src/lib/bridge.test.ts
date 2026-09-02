@@ -504,6 +504,20 @@ describe("TauriDeckBridge", () => {
   });
 
   /**
+   * PRD #745 M11, the same contract for the spawn instant: the same integer
+   * through to the agent model, and absence as absence — which is what a daemon
+   * that did not spawn the agent, and one predating the field, both produce.
+   */
+  it("carries the daemon's spawn instant through unchanged, and absence as absence", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const reported = structuredClone(snapshot);
+    reported.agents[0].spawnedAtMs = 1_756_684_800_123;
+
+    expect(mapDesktopSnapshot(reported).agents[0]?.spawnedAtMs).toBe(1_756_684_800_123);
+    expect(mapDesktopSnapshot(structuredClone(snapshot)).agents[0]?.spawnedAtMs).toBeUndefined();
+  });
+
+  /**
    * The M8 audit's cwd finding. `src/agent_pty.rs` accepts any non-empty,
    * bounded, control-free working directory, so `"Unavailable"` — the deck's
    * own stand-in word — is a directory an agent can genuinely be launched in.

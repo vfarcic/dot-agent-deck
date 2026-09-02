@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { clampText, CLOCK_SKEW_TOLERANCE_MS, DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayText, domIdentity, homeRelative, rendersBlank, sanitizeText, shortDaemonLabel } from "./displayText";
+import { clampText, CLOCK_SKEW_TOLERANCE_MS, DISPLAY_LIMITS, displayActivity, displayIdentity, displayPath, displayText, displayUptime, domIdentity, homeRelative, rendersBlank, sanitizeText, shortDaemonLabel } from "./displayText";
 
 /**
  * Every bidi formatting and override codepoint the Rust policy names
@@ -247,5 +247,80 @@ describe("displayActivity", () => {
 
   it("defaults `now` to the real clock, so callers need not pass one", () => {
     expect(displayActivity(Date.now())?.label).toBe("just now");
+  });
+});
+
+describe("displayUptime", () => {
+  /** A fixed "now", so every case below is arithmetic rather than a race. */
+  const NOW = Date.parse("2026-09-01T12:00:00.000Z");
+  const upFor = (ms: number) => displayUptime(NOW - ms, NOW);
+
+  /**
+   * The same buckets `displayActivity` uses, worded as a SPAN. No "ago",
+   * because the interval named is still running — an uptime that read "3h ago"
+   * would be a different and wrong claim about the same number.
+   */
+  it("names one unit, the largest that fits, floored, with no `ago`", () => {
+    expect(upFor(0)?.label).toBe("<1m");
+    expect(upFor(59_999)?.label).toBe("<1m");
+    expect(upFor(60_000)?.label).toBe("1m");
+    expect(upFor(119_999)?.label).toBe("1m");
+    expect(upFor(59 * 60_000)?.label).toBe("59m");
+    expect(upFor(60 * 60_000)?.label).toBe("1h");
+    expect(upFor(23.9 * 60 * 60_000)?.label).toBe("23h");
+    expect(upFor(24 * 60 * 60_000)?.label).toBe("1d");
+    expect(upFor(46 * 60 * 60_000)?.label).toBe("1d");
+    expect(upFor(3650 * 24 * 60 * 60_000)?.label).toBe("3650d");
+  });
+
+  it("carries the exact UTC spawn instant for the hover, so the rounding hides nothing", () => {
+    expect(upFor(90 * 60_000)).toEqual({ label: "1h", title: "2026-09-01T10:30:00.000Z" });
+  });
+
+  /**
+   * The daemon reported no spawn instant: it did not spawn this agent (an
+   * id-only `ListAgents` reply from an older daemon) or it predates the field.
+   * Nothing to render, and nothing is what the column shows — there is no
+   * `Date.now()` fallback anywhere on this path, which is precisely the
+   * fabrication the PRD's original duration rejection was about.
+   */
+  it("renders nothing when the daemon reported no spawn instant", () => {
+    expect(displayUptime(undefined, NOW)).toBeUndefined();
+  });
+
+  /**
+   * `DesktopAgentDto` is a TypeScript assertion about a shape, not a validated
+   * value, so the same unusable values `displayActivity` refuses are refused
+   * here — because both go through ONE shared guard rather than two copies of
+   * one policy.
+   */
+  it("renders nothing for a value that is not a usable instant", () => {
+    expect(displayUptime(Number.NaN, NOW)).toBeUndefined();
+    expect(displayUptime(Number.POSITIVE_INFINITY, NOW)).toBeUndefined();
+    expect(displayUptime(Number.NEGATIVE_INFINITY, NOW)).toBeUndefined();
+    // Outside `Date`'s ±100,000,000-day range, where `toISOString()` throws.
+    expect(displayUptime(8.65e15, NOW)).toBeUndefined();
+    expect(displayUptime(-8.65e15, NOW)).toBeUndefined();
+    expect(displayUptime(Number.MAX_SAFE_INTEGER, NOW)).toBeUndefined();
+  });
+
+  /**
+   * The identical clock-skew rule, on the identical boundary — pinned here as
+   * well as on `displayActivity` so a future edit that forks the policy fails
+   * rather than quietly leaving the two columns disagreeing about the same
+   * skew. A spawn instant is stamped by the daemon itself rather than by a hook
+   * process, so it is skewed by one clock rather than two; that is a narrower
+   * gap inside the same tolerance, not a reason for a second policy.
+   */
+  it("absorbs ordinary clock skew and refuses to relativise anything beyond it", () => {
+    expect(displayUptime(NOW + 1, NOW)?.label).toBe("<1m");
+    expect(displayUptime(NOW + CLOCK_SKEW_TOLERANCE_MS, NOW)?.label).toBe("<1m");
+    expect(displayUptime(NOW + CLOCK_SKEW_TOLERANCE_MS + 1, NOW)).toBeUndefined();
+    expect(displayUptime(NOW + 60 * 60_000, NOW)).toBeUndefined();
+    expect(displayUptime(NOW + 3650 * 24 * 60 * 60_000, NOW)).toBeUndefined();
+  });
+
+  it("defaults `now` to the real clock, so callers need not pass one", () => {
+    expect(displayUptime(Date.now())?.label).toBe("<1m");
   });
 });

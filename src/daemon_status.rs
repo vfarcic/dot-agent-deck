@@ -233,6 +233,7 @@ mod tests {
             rows: 0,
             cols: 0,
             live,
+            spawned_at_ms: None,
         }
     }
 

@@ -18,11 +18,11 @@
  * character for character. Keep it that way: that module's own header records
  * that the bug class came from two copies of the policy drifting apart.
  *
- * `displayActivity` at the bottom of the file is the same seam for a
- * daemon-supplied INSTANT rather than a string (PRD #745 M9): the daemon sends
- * epoch milliseconds and the webview decides how they read, so the relative
- * wording, the rounding and the clock-skew rule all live here and none of them
- * is baked into the daemon's contract.
+ * `displayActivity` and `displayUptime` at the bottom of the file are the same
+ * seam for a daemon-supplied INSTANT rather than a string (PRD #745 M9, M11):
+ * the daemon sends epoch milliseconds and the webview decides how they read, so
+ * the relative wording, the rounding and the clock-skew rule all live here and
+ * none of them is baked into the daemon's contract.
  */
 
 /**
@@ -54,9 +54,9 @@
  * `displayIdentity` below, which substitutes a visible label rather than by
  * stripping one more character. It was previously recorded as bounded by "the
  * row still carrying status, CLI and tool columns", which is false: CSS hides
- * the CLI and working-directory columns below 1180px and the tool columns
- * below 680px, so a narrow window leaves two same-status rows with nothing to
- * tell them apart.
+ * the uptime, CLI and working-directory columns below 1180px and the tool
+ * columns below 680px, so a narrow window leaves two same-status rows with
+ * nothing to tell them apart.
  */
 const UNSAFE_DISPLAY_CHARS = /[\u0000-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
 
@@ -214,9 +214,10 @@ export function rendersBlank(value: string): boolean {
  * A name made entirely of retained default-ignorable characters is a spoofing
  * primitive on a screen whose whole purpose is telling one agent from another:
  * it renders as a blank cell, and two names differing only by such a character
- * render identically. The row's other columns do NOT rescue it — CSS hides CLI
- * and working directory below 1180px and the tool columns below 680px, so a
- * narrow window can leave two same-status rows genuinely indistinguishable.
+ * render identically. The row's other columns do NOT rescue it — CSS hides
+ * uptime, CLI and working directory below 1180px and the tool columns below
+ * 680px, so a narrow window can leave two same-status rows genuinely
+ * indistinguishable.
  *
  * The fix is a visible fallback rather than a wider filter: stripping ZWJ and
  * ZWNJ would corrupt emoji sequences and Persian, Arabic and Indic
@@ -266,8 +267,8 @@ export function domIdentity(value: string, max: number = DISPLAY_LIMITS.domIdent
 }
 
 /**
- * How far the daemon's clock may run ahead of the webview's before this module
- * stops trying to say how long ago something happened.
+ * How far a daemon-supplied instant may run ahead of the webview's clock before
+ * this module stops trying to say how long ago it was.
  *
  * The two clocks are genuinely different clocks. `SessionSnapshot.last_activity_ms`
  * is a high-water mark of `AgentEvent.timestamp`s, and those are stamped by
@@ -276,6 +277,13 @@ export function domIdentity(value: string, max: number = DISPLAY_LIMITS.domIdent
  * case, not a fault, and one minute absorbs it comfortably: NTP-synced hosts sit
  * inside a few milliseconds, and a container with a lazily-stepped clock inside
  * a second or two.
+ *
+ * `AgentRecord.spawned_at_ms` (M11) is stamped by the daemon itself rather than
+ * by a hook process, so it is skewed against the webview by one clock rather
+ * than two — a strictly narrower gap, comfortably inside the same tolerance.
+ * ONE tolerance for both is deliberate: a second policy would be a second thing
+ * to keep true, and the interesting cases (a daemon on another host, a
+ * container whose clock steps) move both instants together.
  */
 export const CLOCK_SKEW_TOLERANCE_MS = 60_000;
 
@@ -330,13 +338,69 @@ export interface ActivityDisplay {
  * fake timer.
  */
 export function displayActivity(lastActivityMs: number | undefined, now: number = Date.now()): ActivityDisplay | undefined {
-  if (lastActivityMs === undefined || !Number.isFinite(lastActivityMs)) return undefined;
+  const usable = relativeTo(lastActivityMs, now);
+  return usable && { label: elapsedLabel(usable.elapsed), title: usable.title };
+}
+
+/**
+ * ONE clock-skew and usability policy, shared by every daemon-supplied instant
+ * this module relativises — `undefined` for anything it cannot honestly express,
+ * and otherwise the milliseconds elapsed plus the exact instant for the hover.
+ *
+ * It is factored out rather than copied because the three refusals ARE the
+ * policy, and a second copy of them is a second thing to keep true: the daemon
+ * reported nothing; the value is not a finite number (a TypeScript DTO is an
+ * assertion about a shape, not a validated one); or the instant is ahead of the
+ * webview's clock by more than {@link CLOCK_SKEW_TOLERANCE_MS}, where a
+ * negative "ago" is a bug a user sees and a fabricated "just now" is the same
+ * lie in nicer clothes. The out-of-`Date`-range guard sits here too: the
+ * daemon's fields are `i64`s, whose range reaches nine orders of magnitude
+ * further than a `Date`'s, and `toISOString()` throws for one that does.
+ *
+ * What is deliberately NOT shared is the WORDING. `displayActivity` says "3m
+ * ago" because it names a moment in the past; `displayUptime` says "3m" because
+ * it names a span still running, and "3m ago" would be a different and wrong
+ * claim about it. Sharing the policy and forking the vocabulary is the split
+ * the two functions exist to make.
+ */
+function relativeTo(instantMs: number | undefined, now: number): { elapsed: number; title: string } | undefined {
+  if (instantMs === undefined || !Number.isFinite(instantMs)) return undefined;
   // Outside `Date`'s range there is no instant to show and `toISOString()`
   // would throw, so there is nothing honest to render.
-  if (Math.abs(lastActivityMs) > MAX_DATE_MS) return undefined;
-  const elapsed = now - lastActivityMs;
+  if (Math.abs(instantMs) > MAX_DATE_MS) return undefined;
+  const elapsed = now - instantMs;
   if (elapsed < -CLOCK_SKEW_TOLERANCE_MS) return undefined;
-  return { label: elapsedLabel(elapsed), title: new Date(lastActivityMs).toISOString() };
+  // The hover's ISO string is built HERE, inside the guard that makes it safe:
+  // the range check above is the only thing standing between this call and a
+  // `RangeError`, so keeping the two together means neither caller can hold one
+  // without the other.
+  return { elapsed, title: new Date(instantMs).toISOString() };
+}
+
+/**
+ * The uptime column's display copy: how long this agent's process has been
+ * running, plus the exact UTC spawn instant for the hover (PRD #745 M11).
+ *
+ * The instant is `AgentRecord.spawned_at_ms` — when the daemon forked the
+ * child, which is an observation rather than an inference, and unlike
+ * `SessionState.started_at` it exists for an agent that has never emitted a
+ * hook event. Absence renders NOTHING, exactly as `displayActivity`'s does, and
+ * for the same three reasons {@link relativeTo} enumerates. There is no
+ * fallback anywhere on this path: a daemon that did not spawn the agent has no
+ * uptime to report, and inventing one is the failure the PRD's original
+ * duration rejection was about.
+ *
+ * **What the number MEANS follows from where it comes from, with no flag
+ * needed.** A restarted orchestration worker is a fresh spawn with a fresh
+ * record, so it reads as the age of its current iteration; a role nobody has
+ * restarted keeps its original record, so it reads as its whole lifetime.
+ *
+ * `now` is injectable so the buckets and the skew rule are testable without a
+ * fake timer.
+ */
+export function displayUptime(spawnedAtMs: number | undefined, now: number = Date.now()): ActivityDisplay | undefined {
+  const usable = relativeTo(spawnedAtMs, now);
+  return usable && { label: uptimeLabel(usable.elapsed), title: usable.title };
 }
 
 /**
@@ -353,4 +417,24 @@ function elapsedLabel(elapsed: number): string {
   if (elapsed < HOUR_MS) return `${Math.floor(elapsed / MINUTE_MS)}m ago`;
   if (elapsed < DAY_MS) return `${Math.floor(elapsed / HOUR_MS)}h ago`;
   return `${Math.floor(elapsed / DAY_MS)}d ago`;
+}
+
+/**
+ * The same buckets as {@link elapsedLabel}, worded as a SPAN rather than as a
+ * point in the past: `5m`, `2h`, `3d`. No `ago`, because the interval named is
+ * still running.
+ *
+ * Under a minute reads `<1m` rather than `just now`, and the difference is not
+ * decoration. `just now` says when something happened; this column says how
+ * long something has been going, and "just now" is not an answer to that. `<1m`
+ * is, and it is honest about the floor rather than rounding a forty-second
+ * process up to a minute. A tolerated negative elapsed (the ordinary-skew band)
+ * lands in it too, so a slightly-future spawn stamp reads `<1m` rather than as
+ * a negative count.
+ */
+function uptimeLabel(elapsed: number): string {
+  if (elapsed < MINUTE_MS) return "<1m";
+  if (elapsed < HOUR_MS) return `${Math.floor(elapsed / MINUTE_MS)}m`;
+  if (elapsed < DAY_MS) return `${Math.floor(elapsed / HOUR_MS)}h`;
+  return `${Math.floor(elapsed / DAY_MS)}d`;
 }

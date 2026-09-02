@@ -3713,6 +3713,7 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -3731,6 +3732,7 @@ mod tests {
             rows: 0,
             cols: 0,
             live: None,
+            spawned_at_ms: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -3893,6 +3895,7 @@ mod tests {
                 live_target: None,
                 last_activity_ms: None,
             }),
+            spawned_at_ms: None,
         };
         let json = serde_json::to_string(&rec).expect("AgentRecord serializes");
         let back: AgentRecord = serde_json::from_str(&json).expect("AgentRecord deserializes");
@@ -4016,6 +4019,138 @@ mod tests {
         let forward: SessionSnapshot =
             serde_json::from_str(newer).expect("a newer peer's snapshot must decode");
         assert_eq!(forward.last_activity_ms, Some(1_756_684_800_123));
+    }
+
+    /// Scenario: Spawn a real agent through the registry, read it back out of
+    /// `agent_records()`, and assert the wire carries the instant the daemon
+    /// forked that child — bracketed by two `Utc::now()` readings taken either
+    /// side of the spawn, so a value minted at snapshot time or copied from a
+    /// session would fall outside. Then register an agent the registry did NOT
+    /// spawn and confirm its record reports no spawn time at all and omits the
+    /// key from the JSON entirely, and decode an older peer's `AgentRecord`
+    /// payload that predates the field and confirm it arrives as `None` with
+    /// every other field intact (additive optional — no `PROTOCOL_VERSION`
+    /// bump).
+    #[spec("session/live/014")]
+    #[test]
+    fn live_014_spawn_time_is_observed_and_additive() {
+        use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
+        use portable_pty::{CommandBuilder, PtySize, PtySystem};
+
+        // (a) RECORDED, and recorded as an OBSERVATION of our own fork.
+        //
+        // This is the property that made a duration shippable where the PRD had
+        // rejected one. `SessionState.started_at` is event-derived — a session
+        // exists only once a hook event has arrived, and the hydration path
+        // invents it as `Utc::now()` when `pane_started_at` has no entry — so an
+        // agent that has never emitted an event has no start instant at all.
+        // A spawn is something the daemon DID, so it needs no signal and no
+        // inference. Bracketing the spawn is what would fail if anyone ever
+        // "helpfully" stamped this at snapshot time instead.
+        let before = chrono::Utc::now().timestamp_millis();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions::default())
+            .expect("spawn should succeed");
+        let after = chrono::Utc::now().timestamp_millis();
+
+        let records = registry.agent_records();
+        let rec = records.iter().find(|r| r.id == id).expect("agent missing");
+        let spawned_at_ms = rec
+            .spawned_at_ms
+            .expect("the daemon forked this child, so it must report when");
+        assert!(
+            (before..=after).contains(&spawned_at_ms),
+            "the spawn instant must lie inside the spawn call itself \
+             ({before} ..= {after}), got {spawned_at_ms}"
+        );
+
+        // And it does not MOVE. The bracket above already rules out a value
+        // minted at snapshot time, but only to the resolution of a millisecond
+        // on a fast machine; reading the same record again a few milliseconds
+        // later settles it outright — a `Utc::now()` anywhere on the read path
+        // reports a different number here, whatever the clock's granularity.
+        std::thread::sleep(Duration::from_millis(5));
+        let again = registry.agent_records();
+        let again = again.iter().find(|r| r.id == id).expect("agent missing");
+        assert_eq!(
+            again.spawned_at_ms,
+            Some(spawned_at_ms),
+            "the spawn instant is recorded once and read back, never recomputed"
+        );
+
+        // Round-trips as an exact integer: epoch milliseconds is the wire
+        // representation precisely so there is no format to lose anything to.
+        let json = serde_json::to_string(rec).expect("AgentRecord serializes");
+        let back: AgentRecord = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.spawned_at_ms, Some(spawned_at_ms));
+        registry.shutdown_all();
+
+        // (b) ABSENT when this registry did not do the spawning, and omitted
+        // from the wire entirely rather than sent as a null. There is no
+        // `Utc::now()` fallback anywhere on this path — an invented value is
+        // exactly the failure the PRD's original duration rejection was about.
+        let adopted = Arc::new(AgentPtyRegistry::new());
+        let pair = portable_pty::NativePtySystem::default()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let child = pair
+            .slave
+            .spawn_command(CommandBuilder::new("sleep"))
+            .expect("spawn a child the registry did not fork");
+        let adopted_id = adopted.insert_test_agent(child);
+        let adopted_records = adopted.agent_records();
+        let adopted_rec = adopted_records
+            .iter()
+            .find(|r| r.id == adopted_id)
+            .expect("adopted agent missing");
+        assert!(
+            adopted_rec.spawned_at_ms.is_none(),
+            "a child this registry did not fork has no spawn time to report"
+        );
+        let json = serde_json::to_string(adopted_rec).expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("is JSON");
+        assert!(
+            value.get("spawned_at_ms").is_none(),
+            "an absent spawn time must have no key at all; got {json}"
+        );
+        adopted.shutdown_all();
+
+        // (c) FORWARD-COMPATIBLE with an older peer, which is the entire basis
+        // of the do-not-bump decision — proven rather than asserted. An older
+        // daemon's `AgentRecord` has no `spawned_at_ms` key, and it must decode
+        // via `#[serde(default)]` with every other field intact.
+        let legacy = r#"{
+            "id": "3",
+            "pane_id_env": "pane-3",
+            "display_name": "coder"
+        }"#;
+        let old: AgentRecord = serde_json::from_str(legacy)
+            .expect("an older peer's record must decode via #[serde(default)]");
+        assert!(
+            old.spawned_at_ms.is_none(),
+            "an older peer reports no spawn time, which must read as absent"
+        );
+        assert_eq!(old.id, "3");
+        assert_eq!(old.pane_id_env.as_deref(), Some("pane-3"));
+        assert_eq!(old.display_name.as_deref(), Some("coder"));
+
+        // And the other direction: a NEWER peer's payload carrying the key must
+        // not disturb the fields an older reader does understand.
+        let newer = r#"{
+            "id": "4",
+            "pane_id_env": "pane-4",
+            "spawned_at_ms": 1756684800123
+        }"#;
+        let forward: AgentRecord =
+            serde_json::from_str(newer).expect("a newer peer's record must decode");
+        assert_eq!(forward.spawned_at_ms, Some(1_756_684_800_123));
+        assert_eq!(forward.pane_id_env.as_deref(), Some("pane-4"));
     }
 
     /// Scenario: A newer daemon advertises an `AgentRecord` whose `live.status`

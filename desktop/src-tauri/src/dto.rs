@@ -126,6 +126,24 @@ pub struct DesktopAgent {
     /// that is not the one the comparison is made on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_activity_ms: Option<i64>,
+    /// When the daemon spawned this agent's process, as epoch milliseconds
+    /// (`AgentRecord.spawned_at_ms`, PRD #745 M11). Copied through unchanged,
+    /// same split as `last_activity_ms`: the daemon owns the instant, the
+    /// webview owns the wording.
+    ///
+    /// It comes off the REGISTRY record rather than the live session, which is
+    /// what makes it answer a question `last_activity_ms` cannot: a session
+    /// exists only once a hook event has arrived, so an agent that has never
+    /// emitted one still reports a spawn time. Absent when the daemon did not
+    /// spawn the process it is describing (an id-only reply from an older
+    /// daemon) or predates the field — and absent means the column renders
+    /// nothing, never a placeholder.
+    ///
+    /// NOT clamped here, for the reason spelled out on `last_activity_ms`: the
+    /// desktop process holds a third clock, and the seam that owns the one the
+    /// comparison is actually made against is the webview.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawned_at_ms: Option<i64>,
     pub tab: DesktopTab,
 }
 
@@ -380,6 +398,10 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         .and_then(|snapshot| snapshot.live_target.as_ref())
         .map(|target| write_lease_name(&target.writable));
     let last_activity_ms = live.and_then(|snapshot| snapshot.last_activity_ms);
+    // PRD #745 M11: off the RECORD, not the live snapshot — the daemon knows
+    // when it spawned a process whether or not that process has ever emitted an
+    // event.
+    let spawned_at_ms = record.spawned_at_ms;
     let tab = map_tab(record.tab_membership.as_ref());
 
     DesktopAgent {
@@ -396,6 +418,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         last_user_prompt,
         write_lease,
         last_activity_ms,
+        spawned_at_ms,
         tab,
     }
 }
@@ -632,6 +655,7 @@ mod tests {
                 live_target: None,
                 last_activity_ms: None,
             }),
+            spawned_at_ms: None,
         }
     }
 
@@ -666,6 +690,12 @@ mod tests {
         // "when did this last do something" after a restart is "I do not
         // know", and absence says that.
         assert!(mapped.last_activity_ms.is_none());
+        // PRD #745 M11: the spawn time is INDEPENDENT of `live`, so removing
+        // the snapshot must not be what makes it absent — this fixture is
+        // absent because the record itself reports no spawn (see
+        // `agent_mapping_surfaces_the_spawn_instant_unchanged` for the present
+        // case, which keeps `live` untouched).
+        assert!(mapped.spawned_at_ms.is_none());
     }
 
     /// PRD #745 M8: the two `SessionSnapshot` fields the desktop's own DTO used
@@ -716,6 +746,33 @@ mod tests {
         assert_eq!(value["lastActivityMs"], far_future);
     }
 
+    /// PRD #745 M11: the daemon's `spawned_at_ms` reaches the webview as the
+    /// same integer, under `spawnedAtMs`, with no reformatting and no clamp —
+    /// and it comes off the RECORD, so it survives a record carrying no live
+    /// session at all.
+    ///
+    /// That last half is the whole reason spawn time beats
+    /// `SessionState.started_at`: a session exists only once a hook event has
+    /// arrived, so an agent that has never emitted one has no start instant —
+    /// and it is exactly the agent whose uptime a reader most wants. Pinned on
+    /// the SERIALIZED value for the same reason M9's is: a seconds/milliseconds
+    /// slip is a ×1000 error, which is why the unit is in the name.
+    #[test]
+    fn agent_mapping_surfaces_the_spawn_instant_unchanged() {
+        let mut record = fixture_record();
+        record.spawned_at_ms = Some(1_756_684_800_123);
+
+        let value = serde_json::to_value(map_agent(record.clone())).unwrap();
+        assert_eq!(value["spawnedAtMs"], 1_756_684_800_123i64);
+
+        // No live snapshot, same answer: the daemon knows when it forked a
+        // process whether or not that process has ever reported anything.
+        record.live = None;
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(value["spawnedAtMs"], 1_756_684_800_123i64);
+        assert!(value.get("lastActivityMs").is_none());
+    }
+
     /// The absent case for both, pinned in the SERIALIZED shape: the keys are
     /// missing from the JSON the webview receives rather than present and null,
     /// so `agent.lastUserPrompt` is `undefined` there and absence survives the
@@ -728,6 +785,10 @@ mod tests {
         // PRD #745 M9, same rule: no key at all, so `agent.lastActivityMs` is
         // `undefined` in the webview and the column renders nothing.
         assert!(value.get("lastActivityMs").is_none());
+        // PRD #745 M11, same rule again: a daemon that did not spawn the agent
+        // — or one predating the field — sends no key, and the uptime column
+        // renders nothing rather than a fabricated age.
+        assert!(value.get("spawnedAtMs").is_none());
     }
 
     /// Only `Writable` decides the lease, and its `#[serde(other)]` catch-all

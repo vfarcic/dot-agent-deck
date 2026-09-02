@@ -498,16 +498,16 @@ describe("AgentOverview", () => {
     const prd = groupCard("orchestration", "orc-745");
     const table = within(prd).getByRole("table");
     expect(within(table).getAllByRole("columnheader").map((header) => header.textContent))
-      .toEqual(["Status", "Agent", "State", "Last activity", "CLI", "Active tool", "Tools", "Working directory", "Last prompt"]);
+      .toEqual(["Status", "Agent", "State", "Last activity", "Uptime", "CLI", "Active tool", "Tools", "Working directory", "Last prompt"]);
     /*
-      Nine cells per row, and the count is the point rather than a formality:
+      Ten cells per row, and the count is the point rather than a formality:
       the responsive rules in `styles.css` hide columns by `nth-child` INDEX, so
       a row that has drifted out of step with `COLUMNS` hides the wrong ones at
       a narrow window and nothing else notices. The legend's own span count is
       checked with it, since it shares the grid template and the same indices.
     */
-    for (const row of rows(prd)) expect(within(row).getAllByRole("cell")).toHaveLength(9);
-    expect(document.querySelectorAll(".overview-legend > span")).toHaveLength(9);
+    for (const row of rows(prd)) expect(within(row).getAllByRole("cell")).toHaveLength(10);
+    expect(document.querySelectorAll(".overview-legend > span")).toHaveLength(10);
     // The visible legend is decoration for the shared grid and stays out of the
     // accessibility tree, so the columns are not announced twice.
     expect(document.querySelector(".overview-legend")).toHaveAttribute("aria-hidden", "true");
@@ -563,6 +563,77 @@ describe("AgentOverview", () => {
     // the render seam declines to relativise it at all.
     expect(refused?.textContent).toBe("");
     expect(refused).not.toHaveAttribute("title");
+  });
+
+  /**
+   * Scenario: render one agent the daemon spawned three hours ago, then the
+   * same agent with no reported spawn time at all. The uptime cell prints one
+   * relative unit with NO "ago" — it names a span still running, not a moment
+   * past — and carries the exact UTC spawn instant on hover; with nothing
+   * reported it is empty and carries no hover text (PRD #745 M11).
+   */
+  it("prints how long the daemon has had the agent running, and nothing at all when it reported no spawn time", () => {
+    const threeHours = Date.now() - 3 * 60 * 60_000;
+    const { unmount } = renderOverview({
+      snapshot: snapshotWithAgent({ spawnedAtMs: threeHours, tab: { kind: "dashboard" } }),
+    });
+
+    const cell = document.querySelector(".overview-uptime");
+    expect(cell).toHaveTextContent("3h");
+    expect(cell?.textContent).not.toContain("ago");
+    expect(cell?.getAttribute("title")).toBe(`Spawned by the daemon at: ${new Date(threeHours).toISOString()}`);
+    unmount();
+
+    // The case a daemon that did not spawn the agent produces — an id-only
+    // `ListAgents` reply, or a peer predating the field. Blank says "I do not
+    // know", which is what is true; there is no `Date.now()` fallback anywhere
+    // on this path, which is the failure the PRD's original duration rejection
+    // was about.
+    renderOverview({ snapshot: snapshotWithAgent({ spawnedAtMs: undefined, tab: { kind: "dashboard" } }) });
+    const blank = document.querySelector(".overview-uptime");
+    expect(blank?.textContent).toBe("");
+    expect(blank).not.toHaveAttribute("title");
+  });
+
+  /**
+   * Scenario: render one agent whose spawn instant is a second in the future
+   * and one whose spawn instant is an hour in the future. The uptime column
+   * obeys the SAME clock-skew rule as Last activity beside it — ordinary skew
+   * reads as the sub-minute bucket, and anything beyond it renders nothing
+   * rather than a negative duration (PRD #745 M11).
+   */
+  it("applies the same clock-skew rule to uptime as to last activity", () => {
+    const { unmount } = renderOverview({
+      snapshot: snapshotWithAgent({ spawnedAtMs: Date.now() + 1_000, tab: { kind: "dashboard" } }),
+    });
+    expect(document.querySelector(".overview-uptime")).toHaveTextContent("<1m");
+    unmount();
+
+    renderOverview({ snapshot: snapshotWithAgent({ spawnedAtMs: Date.now() + 60 * 60_000, tab: { kind: "dashboard" } }) });
+    const refused = document.querySelector(".overview-uptime");
+    expect(refused?.textContent).toBe("");
+    expect(refused).not.toHaveAttribute("title");
+  });
+
+  /**
+   * Scenario: render one agent the daemon spawned two hours ago that has never
+   * reported any activity. Uptime prints; Last activity stays blank. This is
+   * the case that decided the field's SOURCE — a session exists only once a
+   * hook event has arrived, so `SessionState.started_at` has nothing to say
+   * about exactly the agent whose uptime a reader most wants, while the daemon
+   * knows perfectly well when it forked the process (PRD #745 M11).
+   */
+  it("reports uptime for an agent that has never emitted an event", () => {
+    renderOverview({
+      snapshot: snapshotWithAgent({
+        spawnedAtMs: Date.now() - 2 * 60 * 60_000,
+        lastActivityMs: undefined,
+        tab: { kind: "dashboard" },
+      }),
+    });
+
+    expect(document.querySelector(".overview-uptime")).toHaveTextContent("2h");
+    expect(document.querySelector(".overview-activity")?.textContent).toBe("");
   });
 
   /**

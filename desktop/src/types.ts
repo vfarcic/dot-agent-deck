@@ -248,6 +248,26 @@ export interface AgentSession {
    * printing a negative "ago".
    */
   lastActivityMs?: number;
+  /**
+   * HONEST. When the daemon spawned this agent's process
+   * (`AgentRecord.spawned_at_ms`, PRD #745 M11), as epoch milliseconds.
+   *
+   * This is the honest replacement for the FIXTURE-ONLY `duration` above, and
+   * the reason one exists while the other never crossed the wire. The PRD
+   * originally rejected a duration because `SessionState.started_at` is
+   * invented as `now` on hydration; the deeper problem is that `started_at` is
+   * EVENT-derived at all, so an agent that has never emitted a hook event has
+   * no start instant — exactly the agent whose uptime a reader most wants. A
+   * spawn is something the daemon DID, so it needs no signal and is never
+   * inferred, and when the daemon cannot vouch for one it is simply ABSENT and
+   * every surface renders nothing.
+   *
+   * A restarted worker gets a fresh record and so reads as its CURRENT
+   * iteration; a role nobody restarted reads as its whole lifetime. Rendering
+   * goes through `displayUptime`, which shares `displayActivity`'s clock-skew
+   * rule and forks only the wording.
+   */
+  spawnedAtMs?: number;
   /** HONEST. */
   rows: number;
   /** HONEST. */
