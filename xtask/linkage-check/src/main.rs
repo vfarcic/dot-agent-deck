@@ -80,6 +80,12 @@
 //! Exits 0 on success, 1 on any failure with a per-finding summary.
 
 mod clean_tmp;
+/// PRD #743: no hard-coded colour under `desktop/src` outside the `:root`
+/// palette, so the desktop app's light/dark appearance cannot rot by attrition.
+/// Tests only — the rule and its scanner both live in the module, and nothing
+/// renders dark mode in CI, so this is the only thing that sees the decay.
+#[cfg(test)]
+mod desktop_palette;
 /// Issue #603: the adaptive issue labeler's post-agent memory validator. Tests
 /// only — the rule lives in the agentic workflow, and these drive the real
 /// script under `node`.
