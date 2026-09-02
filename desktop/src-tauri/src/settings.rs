@@ -27,6 +27,12 @@
 //! then a rename; mode 0o600 on Unix. Modelled on
 //! `dot_agent_deck::schedule_cli::write_atomic`.
 //!
+//! **Writing also preserves what it does not understand.** The save merges the
+//! serialised struct into the document already on disk rather than replacing
+//! it, so an older build cannot delete a section a newer one wrote. See
+//! [`merged_document`] — this is the one place where `#[serde(default)]`
+//! genuinely does not give what it looks like it gives.
+//!
 //! # Adding a setting
 //!
 //! Add a field to your feature's section struct, or add a new section struct
@@ -268,8 +274,7 @@ pub fn save_to(path: &Path, settings: &DesktopSettings) -> Result<(), SettingsWr
     fsperm::create_owner_only_dir(parent)
         .map_err(|error| write_error("could not create the directory for", path, error))?;
 
-    let contents = toml::to_string_pretty(settings)
-        .map_err(|error| write_error("could not serialize", path, error))?;
+    let contents = merged_document(path, settings)?;
 
     let (mut file, tmp) = create_temp(parent, path)?;
     let published = (|| {
@@ -288,6 +293,67 @@ pub fn save_to(path: &Path, settings: &DesktopSettings) -> Result<(), SettingsWr
         return Err(write_error("could not write", path, error));
     }
     Ok(())
+}
+
+/// Serialise `settings` over whatever the document at `path` already holds,
+/// preserving every table and field this build does not know about.
+///
+/// **`#[serde(default)]` without `deny_unknown_fields` means *ignore*, not
+/// *retain*.** It covers reading — an older build loads a newer build's
+/// `[voice]` section without error — but the unknown table is dropped on the
+/// way in, so serialising the struct straight out would delete it on the next
+/// save. That is exactly the `DashboardConfig::save()` failure mode PRD #803
+/// rejects sharing `config.toml` for, reproduced in our own file, and it would
+/// break the container's central promise: that a feature can add a section and
+/// trust an older build not to eat it.
+///
+/// The document is re-read **here** rather than carried along from the load, so
+/// a section another process wrote between this app's read and its write
+/// survives as well. The cost is one small read per save, on a file the app
+/// writes only when a user changes a setting.
+///
+/// An unparseable or non-table document is treated as empty. Nothing can be
+/// preserved out of bytes that are not TOML, and refusing the save instead
+/// would leave a user whose file got corrupted unable to change a setting from
+/// inside the app — the same call [`load_from`] already makes in the other
+/// direction.
+fn merged_document(path: &Path, settings: &DesktopSettings) -> Result<String, SettingsWriteError> {
+    // `toml::from_str`, not `str::parse` — `Value`'s `FromStr` parses a single
+    // TOML *value* expression, so a whole document fails it on the first key.
+    let mut document = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
+        .unwrap_or_default();
+    let owned = toml::Table::try_from(settings)
+        .map_err(|error| write_error("could not serialize", path, error))?;
+    merge_tables(&mut document, owned);
+    toml::to_string_pretty(&document)
+        .map_err(|error| write_error("could not serialize", path, error))
+}
+
+/// Deep-merge `incoming` into `base`: two tables merge key by key, anything
+/// else replaces outright.
+///
+/// So a field the struct owns always wins over whatever the file held — the
+/// struct is the authority on its own schema — while a key only the file has is
+/// left exactly as it was, down to a field nested inside a section this build
+/// *does* know.
+///
+/// An existing entry is edited **in place** rather than removed and
+/// re-inserted, so every key keeps its position even if some dependency turns
+/// on toml's `preserve_order` feature and the table stops being sorted.
+fn merge_tables(base: &mut toml::Table, incoming: toml::Table) {
+    for (key, value) in incoming {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(existing)), toml::Value::Table(incoming)) => {
+                merge_tables(existing, incoming);
+            }
+            (Some(existing), value) => *existing = value,
+            (None, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
 }
 
 /// Exclusively create a fresh temp file next to `dest`, redrawing the name on
@@ -475,6 +541,145 @@ mod tests {
         assert_eq!(loaded.version, 1);
     }
 
+    /// The property the merge exists for: an older build saving must not eat a
+    /// newer build's section. Without it `#[serde(default)]` drops `[voice]` on
+    /// the way in and the next save writes the struct straight over it.
+    ///
+    /// The unknown section is pinned **byte for byte** here, which is the
+    /// strongest form of the guarantee and the one PRD #803 states. Note what
+    /// that does and does not mean — see
+    /// [`tests::an_unknown_section_keeps_its_data_but_not_its_formatting`].
+    #[test]
+    fn an_unknown_section_survives_a_load_modify_save_round_trip() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        let voice = "[voice]\nbackend = \"whisper\"\nlocal = true\nretries = 3\n";
+        std::fs::write(
+            &path,
+            format!("version = 1\n\n[appearance]\nmode = \"light\"\n\n{voice}"),
+        )
+        .unwrap();
+
+        let mut loaded = load_from(&path);
+        assert_eq!(loaded.appearance.mode, AppearanceMode::Light);
+        loaded.appearance.mode = AppearanceMode::Dark;
+        save_to(&path, &loaded).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains(voice),
+            "the [voice] section did not survive byte for byte: {raw}"
+        );
+        // And the change the user actually made is on disk.
+        assert_eq!(load_from(&path).appearance.mode, AppearanceMode::Dark);
+    }
+
+    /// The limit of "byte for byte", pinned so it is a known property rather
+    /// than a surprise.
+    ///
+    /// The merge round-trips through `toml::Table`, which models *data*, so a
+    /// save re-renders the whole document in the serializer's own canonical
+    /// form. No unknown **data** is ever lost — every key, value and type comes
+    /// back — but a comment is dropped and an inline array is re-flowed across
+    /// lines. Preserving those needs a format-preserving parser (`toml_edit`),
+    /// a dependency this does not carry.
+    ///
+    /// The practical consequence is worth knowing before someone reports it as
+    /// a bug: a user who hand-annotates `desktop.toml` loses the annotations
+    /// the next time the app writes a setting.
+    #[test]
+    fn an_unknown_section_keeps_its_data_but_not_its_formatting() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n\
+             # which speech-to-text backend #802 picked\n\
+             [voice]\n\
+             backend = \"whisper\"\n\
+             stages = [\"stt\", \"intent\"]\n",
+        )
+        .unwrap();
+
+        save_to(&path, &dark()).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+
+        // The data is all there, with its types intact.
+        let reparsed = toml::from_str::<toml::Table>(&raw).unwrap();
+        let voice = reparsed["voice"].as_table().unwrap();
+        assert_eq!(voice["backend"].as_str(), Some("whisper"));
+        assert_eq!(
+            voice["stages"].as_array().unwrap().len(),
+            2,
+            "unexpected document: {raw}"
+        );
+
+        // The formatting is not: the comment is gone and the array is re-flowed.
+        assert!(!raw.contains("# which"), "comments survived: {raw}");
+        assert!(
+            !raw.contains("[\"stt\", \"intent\"]"),
+            "the inline array survived: {raw}"
+        );
+    }
+
+    /// The same property one level down: an unknown *field* inside a section
+    /// this build does own. A section-granular merge would silently drop this.
+    #[test]
+    fn an_unknown_field_inside_a_known_section_survives_a_save() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 1\n\n[appearance]\nmode = \"light\"\nterminal = \"follow\"\n",
+        )
+        .unwrap();
+
+        save_to(&path, &dark()).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("terminal = \"follow\""),
+            "the unknown appearance field was dropped: {raw}"
+        );
+    }
+
+    /// The other half of the merge: preserving unknown keys must not make the
+    /// file authoritative over the struct for a field the struct owns.
+    #[test]
+    fn a_known_field_the_struct_owns_wins_over_the_file() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            "version = 99\n\n[appearance]\nmode = \"light\"\n\n[voice]\nbackend = \"whisper\"\n",
+        )
+        .unwrap();
+
+        save_to(&path, &dark()).unwrap();
+
+        let reloaded = load_from(&path);
+        assert_eq!(reloaded.appearance.mode, AppearanceMode::Dark);
+        assert_eq!(reloaded.version, SETTINGS_VERSION);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("99"), "the stale version survived: {raw}");
+        assert!(raw.contains("[voice]"), "the merge lost [voice]: {raw}");
+    }
+
+    /// A corrupt document cannot be merged into, and refusing the save would
+    /// lock the user out of their own settings from inside the app. It is
+    /// replaced instead — the same call `load_from` makes in the other
+    /// direction.
+    #[test]
+    fn an_unparseable_document_is_replaced_rather_than_failing_the_save() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(&path, "this is not [ valid toml\n").unwrap();
+
+        save_to(&path, &dark()).unwrap();
+
+        assert_eq!(load_from(&path), dark());
+    }
+
     #[test]
     fn the_path_resolves_to_a_sibling_of_the_tui_config_and_honours_the_override() {
         let _guard = ENV_TEST_LOCK
@@ -650,8 +855,18 @@ mod tests {
     /// than discovered by the feature that inherits it.
     #[test]
     fn default_document_shape_is_pinned() {
+        const FRESH: &str = "version = 1\n\n[appearance]\nmode = \"system\"\n";
         let rendered = toml::to_string_pretty(&DesktopSettings::default()).unwrap();
-        assert_eq!(rendered, "version = 1\n\n[appearance]\nmode = \"system\"\n");
+        assert_eq!(rendered, FRESH);
+
+        // The same bytes must come out of `save_to`, which no longer serializes
+        // the struct directly — it merges the struct into the document already
+        // on disk. Against **no** existing document that merge has to be a
+        // no-op, or this pin would describe a shape the app never writes.
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        save_to(&path, &DesktopSettings::default()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FRESH);
 
         // The same struct crosses the Tauri IPC, so its JSON shape is the
         // frontend's contract and is pinned with it.
