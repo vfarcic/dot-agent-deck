@@ -50,7 +50,7 @@ pnpm --version
 echo "== tauri system libraries =="
 # Issue #771. `desktop/src-tauri` became a workspace member in daf94f0, and both
 # gates CLAUDE.md mandates carry `--workspace`, so `cargo clippy --workspace
-# --all-targets --features e2e` and `cargo test-fast` both build
+# --all-targets --features e2e,e2e-live` and `cargo test-fast` both build
 # `dot-agent-deck-desktop` — which needs GTK 3, WebKitGTK and glib. devbox.json
 # carried none of them, so BOTH mandated gates were unrunnable in a devbox shell
 # on Linux until the `path:tauri-deps#tauri-deps` entry was added.
@@ -59,28 +59,23 @@ echo "== tauri system libraries =="
 # installs the compile set with apt (ci.yml's `build`) and would stay green with
 # devbox.json empty of GTK.
 #
-# It asserts through pkg-config rather than by looking for files, because
-# pkg-config resolution is exactly what the -sys crates do, and because
-# `PKG_CONFIG_PATH` — set from devbox.json's `env` block, not from `init_hook`,
-# since `devbox run` does not execute the hook — is half of what has to be right.
+# The assertion lives in its own script so it can be TESTED. Issue #815: what
+# used to be here resolved each module with `pkg-config --modversion` and
+# printed the result, which passes just as happily against the host's
+# `/usr/lib/pkgconfig` as against the store — so the one failure mode that
+# actually shipped was invisible to it. `devbox-check-gtk.sh` asserts the
+# resolved `libdir` is under /nix/store instead, and
+# `xtask/linkage-check/src/devbox_gtk_origin.rs` drives it under a stubbed
+# pkg-config to prove it still rejects a `/usr/lib` answer.
 #
-# Linux only: macOS builds Tauri against the system WebKit, so the flake yields
-# an empty output there and none of these modules exists.
-if [ "$(uname -s)" = "Linux" ]; then
-  pkg-config --version
-  for mod in glib-2.0 gobject-2.0 gio-2.0 gtk+-3.0 gdk-3.0 gdk-x11-3.0 \
-    webkit2gtk-4.1 javascriptcoregtk-4.1 libsoup-3.0 \
-    ayatana-appindicator3-0.1 dbus-1 librsvg-2.0 libxdo; do
-    # The ASSIGNMENT is what makes this an assertion: `set -e` sees a failed
-    # command substitution in a simple assignment and exits, whereas the same
-    # substitution inside a printf argument would have its status swallowed by
-    # printf's own success.
-    version="$(pkg-config --modversion "$mod")"
-    printf '  %-26s %s\n' "$mod" "$version"
-  done
-else
-  echo "skipped: not Linux"
-fi
+# Note what does NOT have to be right for this to pass, contrary to what this
+# comment claimed before #815: `PKG_CONFIG_PATH`. Nix's pkg-config WRAPPER —
+# which is what `pkg-config@0.29.2` puts on PATH — discards the caller's
+# `PKG_CONFIG_PATH` outright and rebuilds it from the role-mangled
+# `PKG_CONFIG_PATH_FOR_TARGET` that its own setup hook populates from the
+# profile. devbox.json's `env` block is a fallback for a non-wrapper
+# pkg-config, not the mechanism; the load-bearing part is the package entry.
+bash "$(dirname "$0")/devbox-check-gtk.sh"
 
 echo "== recording toolchain =="
 asciinema --version

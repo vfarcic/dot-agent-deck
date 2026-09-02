@@ -80,6 +80,12 @@
 //! Exits 0 on success, 1 on any failure with a per-finding summary.
 
 mod clean_tmp;
+/// Issue #815: `scripts/devbox-check-gtk.sh`, which asserts that pkg-config
+/// resolves Tauri's GTK stack to Nix's copy rather than the host's. Tests only,
+/// and Linux only — the rule lives in the script, which CI's `devbox` job runs
+/// through `scripts/devbox-smoke.sh`.
+#[cfg(all(test, target_os = "linux"))]
+mod devbox_gtk_origin;
 /// Issue #603: the adaptive issue labeler's post-agent memory validator. Tests
 /// only — the rule lives in the agentic workflow, and these drive the real
 /// script under `node`.
