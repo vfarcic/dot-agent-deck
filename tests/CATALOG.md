@@ -2168,6 +2168,15 @@ note).
 - **Does not assert:** the geometry arithmetic itself (covered by `orchestration/layout/008`); the PTY dims the same layout drives (covered by `orchestration/layout/010`); the live rendered grid and the key that produces it (covered by the PTY-attached `tabs/orchestration/011`).
 - **Platform coverage:** mac+linux+windows.
 
+#### render/seam-bound
+
+##### render/seam-bound/001 — Every exported `*_to_buffer` render seam bounds its caller-given dimensions instead of allocating them (issue #748).
+- **Layer:** L1 (in-process `TestBackend` through the exported seams themselves; no PTY, no subprocess).
+- **Agent:** none (one synthetic `SessionState` fixture shared by the card seams; the command-banner seam renders an inert pane).
+- **Asserts:** twelve exported seams — covering both shared helpers (`draw_to_buffer`, `render_overlay_to_buffer`) and every seam that builds its own `TestBackend` — return a buffer whose `area` is the requested size when it is in range, and `RENDER_SEAM_DIM_MAX` (1024) once the request exceeds it: on the width axis alone at `u16::MAX`, on the height axis alone at `u16::MAX`, on both axes at `RENDER_SEAM_DIM_MAX + 1`, and finally on both axes at `u16::MAX` — the ~4.3-billion-cell request that is an OOM/abort without the bound. `render_dashboard_cards_to_buffer` is asserted separately because its height is derived from the card count rather than passed.
+- **Does not assert:** what the seams *draw* at the cap (every other `render/*` and `dashboard/*` entry pins content at real terminal sizes); the orchestration frame's own bound and degenerate-input guard, which are inline and predate this (`render/layout/006`); the daemon-side PTY sibling `PTY_RESIZE_DIM_MAX` (`render/widget/003`, `resize/layout/002`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Keybindings (PRD #40)
 
 Keybindings resolve **client-side**: the config file lives on the machine
