@@ -38,6 +38,11 @@ export interface SettingsPanelProps {
    *
    * Send the whole document — spread `settings` and replace your own section —
    * so a save can never drop a section this build's UI has not loaded.
+   *
+   * Saves are serialised inside `useDesktopSettings` and a superseded response
+   * is dropped, so two rapid calls reach the disk in the order they were made
+   * and a stale reply cannot overwrite newer state. Two *processes* racing on
+   * the same field is a different problem, not handled, tracked as #828.
    */
   onSave: (next: DesktopSettingsDto) => void;
   /**

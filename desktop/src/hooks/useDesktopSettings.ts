@@ -36,6 +36,17 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
   // the document that was on disk when the app started — the change appears to
   // take, then reverts a moment later.
   const edited = useRef(false);
+  // Saves run one at a time, and only the newest one's outcome is applied.
+  //
+  // Without this, two rapid choices both went out at once: they could reach the
+  // disk in either order, and whichever *response* arrived last replaced React
+  // state — so a stale document could win twice over. Today the only
+  // consequence is a stale appearance choice; it matters more once the document
+  // holds a daemon endpoint (#741) or a backend selection (#802). The
+  // cross-process half of the same problem — two app windows racing on one
+  // field — is #828, and is not something a hook can fix.
+  const queue = useRef<Promise<void>>(Promise.resolve());
+  const newest = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -61,14 +72,29 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
     edited.current = true;
     setSettings(next);
     setSaveError(undefined);
-    void saveSettings(next)
-      .then((written) => setSettings(written))
+
+    const ticket = newest.current + 1;
+    newest.current = ticket;
+    // Chained rather than fired: the next write starts only once this one has
+    // settled, so the last choice made is the last one on disk. The inner
+    // handlers never reject, so one failed save cannot break the chain for
+    // every save after it.
+    queue.current = queue.current.then(() => saveSettings(next)
+      .then((written) => {
+        // A superseded response is dropped rather than applied — it is an
+        // older document, and the user has already moved past it.
+        if (newest.current === ticket) setSettings(written);
+      })
       .catch((cause: unknown) => {
         // Deliberately NOT reverted. The user asked for this and can see it;
         // what failed is making it survive a restart, and saying so is more
         // use than silently undoing a choice they just made.
+        //
+        // Superseded failures are dropped for the same reason as superseded
+        // successes: the message would be about a choice no longer on screen.
+        if (newest.current !== ticket) return;
         setSaveError(cause instanceof Error ? cause.message : String(cause));
-      });
+      }));
   }, [saveSettings]);
 
   return { settings, path, loaded, saveError, save };
