@@ -54,9 +54,18 @@
 //!    The document may hold a non-secret *reference* — which backend holds the
 //!    key, or a boolean saying one is stored — and nothing more. A real
 //!    credential belongs behind the `SecretStore` seam (PRD #803 M5), whose
-//!    intended implementation is the OS keychain. The guard test
-//!    [`tests::no_settings_key_may_look_like_a_secret`] fails the build rather
-//!    than leaving this to a reviewer.
+//!    intended implementation is the OS keychain.
+//!
+//!    [`tests::no_settings_key_name_trips_the_credential_tripwire`] fails the
+//!    build on a credential-shaped key **name**, and it is a **naming tripwire,
+//!    not a security boundary** — the distinction matters enough that the test,
+//!    its failure message and the developer docs all say it in those words. It
+//!    reads key names in the serialised default document and nothing else, so a
+//!    field called `endpoint` holding a token passes, a serde-omitted field is
+//!    invisible to it, and the TypeScript DTO is outside it entirely. Read a
+//!    pass as "nobody named a field like a credential", never as "a credential
+//!    cannot get in here". Issue #827 carries the checks #802 actually needs
+//!    before it stores a real key.
 //! 2. **Field names stay `snake_case`, and single-word where it is natural.**
 //!    The same struct is serialised to TOML (which a user hand-edits, and where
 //!    `snake_case` is this repo's convention) *and* to JSON for the webview
@@ -1382,80 +1391,193 @@ mod tests {
         }
     }
 
-    /// Substrings that make a key name look like it holds a credential.
-    const SECRETISH: [&str; 5] = ["key", "token", "secret", "password", "credential"];
-
-    /// Key names that legitimately contain one of [`SECRETISH`] because they
-    /// are a *reference to* a credential rather than the credential itself —
-    /// the one carve-out PRD #803 allows. Keep this list short, and add to it
-    /// only with a reviewer who has read the rule below.
-    const SECRETISH_ALLOWED: [&str; 2] = [
-        // "which backend holds the key" — a name, not a secret.
-        "secret_backend",
-        // "a boolean saying one is stored" — presence, not the value.
-        "has_api_key",
+    /// Substrings that make a key **name** look like it holds a credential.
+    ///
+    /// `apikey` and `api_key` need no row of their own — `key` already matches
+    /// both — so the auditor's fourth example is covered by the first entry
+    /// rather than by a redundant one that would read as if it mattered.
+    const SECRETISH: [&str; 8] = [
+        "key",
+        "token",
+        "secret",
+        "password",
+        "credential",
+        "authorization",
+        "bearer",
+        "passphrase",
     ];
 
+    /// Full key **paths** (`section.field`) that legitimately contain one of
+    /// [`SECRETISH`] because they are a *reference to* a credential rather than
+    /// the credential itself — the one carve-out PRD #803 allows.
+    ///
+    /// Empty, because nothing in today's schema needs an exception. It holds
+    /// paths and not bare names deliberately: `secret_backend` as a bare name
+    /// would exempt a field of that name in **every** section, including one
+    /// added later by someone who never read this rule, which is precisely the
+    /// silent-widening this list must not do.
+    ///
+    /// The form to add is one line — `"voice.secret_backend"` — with a comment
+    /// saying which of the two allowed shapes it is: the *name of the backend*
+    /// holding the credential, or a *boolean* saying one is stored. Nothing
+    /// else.
+    const SECRETISH_ALLOWED: [&str; 0] = [];
+
     const SECRET_RULE: &str = "\
-PRD #803 sets one hard rule about credentials: a secret NEVER goes in \
-desktop.toml and NEVER in localStorage. This document is world-visible to \
-anyone with the user's disk, is synced by whatever backs up ~/.config, and is \
-handed to the webview verbatim.\n\n\
-The document may hold a non-secret REFERENCE — which backend holds the key, or \
-a boolean saying one is stored — and nothing more. A real credential belongs \
+WHAT THIS CHECK IS: a NAMING TRIPWIRE, not a security boundary. It reads the \
+key NAMES of the serialised default document and nothing else. It therefore \
+cannot see any of the following, and none of them is hypothetical:\n\
+  - a field whose name says nothing -- `endpoint`, `authorization`, `value` -- \
+whose VALUE is a token;\n\
+  - a field serde omits from the default document, which is invisible to the \
+scan because the scan is of that document;\n\
+  - anything the TypeScript DTO carries that the Rust schema does not, which \
+is outside this test entirely;\n\
+  - any value, ever.\n\
+Read a pass as \"nobody named a field like a credential\", never as \"a \
+credential cannot get in here\". If you are about to store real credential \
+material, this check will not stop you and is not the control you need.\n\n\
+THE RULE IT WATCHES: PRD #803 sets one hard rule about credentials -- a secret \
+NEVER goes in desktop.toml and NEVER in localStorage. This document is visible \
+to anyone with the user's disk, is synced by whatever backs up ~/.config, and \
+is handed to the webview verbatim.\n\n\
+The document may hold a non-secret REFERENCE -- which backend holds the key, or \
+a boolean saying one is stored -- and nothing more. A real credential belongs \
 behind the SecretStore seam (PRD #803 M5): store/load/delete keyed by a stable \
 identifier, with the OS keychain as the intended implementation.\n\n\
 If the name that tripped this really is a reference and not a credential, add \
-it to SECRETISH_ALLOWED with a comment saying which of those two forms it is.";
+its FULL PATH to SECRETISH_ALLOWED with a comment saying which of those two \
+forms it is.";
 
-    /// Every key name in a serialised document, including nested tables.
-    fn key_names(value: &toml::Value, into: &mut Vec<String>) {
+    /// Every key path in a serialised document, dotted, including nested
+    /// tables. Both the section (`voice`) and each field under it
+    /// (`voice.backend`) are emitted, because either can be named badly.
+    fn key_paths(value: &toml::Value, prefix: &str, into: &mut Vec<String>) {
         if let toml::Value::Table(table) = value {
             for (key, nested) in table {
-                into.push(key.clone());
-                key_names(nested, into);
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                into.push(path.clone());
+                key_paths(nested, &path, into);
             }
         }
     }
 
-    fn secretish_keys(value: &toml::Value) -> Vec<String> {
-        let mut names = Vec::new();
-        key_names(value, &mut names);
-        names.retain(|name| {
-            let lowered = name.to_ascii_lowercase();
-            SECRETISH.iter().any(|pattern| lowered.contains(pattern))
-                && !SECRETISH_ALLOWED.contains(&lowered.as_str())
+    /// The paths whose **leaf** name looks credential-shaped and whose full
+    /// path is not in `allowed`.
+    ///
+    /// The match is on the leaf because that is the field's own name; the
+    /// exemption is on the full path so it cannot travel to a same-named field
+    /// in another section.
+    fn secretish_paths(value: &toml::Value, allowed: &[&str]) -> Vec<String> {
+        let mut paths = Vec::new();
+        key_paths(value, "", &mut paths);
+        paths.retain(|path| {
+            let leaf = path.rsplit('.').next().unwrap_or(path).to_ascii_lowercase();
+            SECRETISH.iter().any(|pattern| leaf.contains(pattern))
+                && !allowed
+                    .iter()
+                    .any(|exception| exception.eq_ignore_ascii_case(path))
         });
-        names
+        paths
     }
 
+    /// The tripwire itself. Read [`SECRET_RULE`] before concluding anything
+    /// from it passing — it is a naming check, not a security boundary.
     #[test]
-    fn no_settings_key_may_look_like_a_secret() {
+    fn no_settings_key_name_trips_the_credential_tripwire() {
         let document = toml::Value::try_from(DesktopSettings::default()).unwrap();
-        let offenders = secretish_keys(&document);
+        let offenders = secretish_paths(&document, &SECRETISH_ALLOWED);
         assert!(
             offenders.is_empty(),
-            "the desktop settings document has key(s) that look like credentials: {}\n\n{SECRET_RULE}",
+            "the desktop settings document has key(s) named like credentials: {}\n\n{SECRET_RULE}",
             offenders.join(", ")
         );
     }
 
+    /// The tripwire's own logic, proven rather than assumed — an empty result
+    /// on the real document is only meaningful if a bad name would be caught —
+    /// plus the property that makes the allowlist safe: an exception applies to
+    /// one path and not to a same-named field elsewhere.
     #[test]
-    fn the_secret_guard_catches_a_credential_shaped_key() {
-        // The guard's own logic, proven rather than assumed — an empty result
-        // on the real document is only meaningful if a bad key would be caught.
+    fn the_credential_tripwire_matches_by_path_and_catches_the_names_it_claims_to() {
         let bad = toml::from_str::<toml::Value>(
-            "version = 1\n\n[voice]\napi_key = \"sk-live-nope\"\n\n[voice.remote]\nauth_token = \"t\"\n",
+            "version = 1\n\n\
+             [voice]\n\
+             api_key = \"sk-live-nope\"\n\
+             apikey = \"sk-live-nope\"\n\
+             authorization = \"Bearer nope\"\n\
+             bearer = \"nope\"\n\
+             passphrase = \"nope\"\n\
+             password = \"nope\"\n\
+             credential = \"nope\"\n\n\
+             [voice.remote]\n\
+             auth_token = \"t\"\n",
         )
         .unwrap();
-        let mut offenders = secretish_keys(&bad);
+        let mut offenders = secretish_paths(&bad, &SECRETISH_ALLOWED);
         offenders.sort();
-        assert_eq!(offenders, ["api_key", "auth_token"]);
+        assert_eq!(
+            offenders,
+            [
+                "voice.api_key",
+                "voice.apikey",
+                "voice.authorization",
+                "voice.bearer",
+                "voice.credential",
+                "voice.passphrase",
+                "voice.password",
+                "voice.remote.auth_token",
+            ]
+        );
 
+        // An exception is a path, so it exempts exactly one field. The same
+        // name in another section is still caught — which is the whole reason
+        // the allowlist stopped being bare names.
         let referenced = toml::from_str::<toml::Value>(
-            "[voice]\nsecret_backend = \"keychain\"\nhas_api_key = true\n",
+            "[voice]\n\
+             secret_backend = \"keychain\"\n\
+             has_api_key = true\n\n\
+             [endpoints]\n\
+             secret_backend = \"somewhere else entirely\"\n",
         )
         .unwrap();
-        assert!(secretish_keys(&referenced).is_empty());
+        let allowed = ["voice.secret_backend", "voice.has_api_key"];
+        assert_eq!(
+            secretish_paths(&referenced, &allowed),
+            ["endpoints.secret_backend"]
+        );
+    }
+
+    /// What the tripwire cannot see, pinned so the limitation is a known
+    /// property rather than a discovery.
+    ///
+    /// #802 will store a real API key and **must not trust this control**. Each
+    /// case below passes the tripwire while carrying credential material, and
+    /// the fix for all of them is the same: the value never enters this
+    /// document. The full pre-#802 checklist is issue #827.
+    #[test]
+    fn the_credential_tripwire_is_blind_to_values_and_to_innocent_names() {
+        // A token under a name that says nothing. This is the case that
+        // matters: it is exactly how a credential arrives in practice.
+        let innocent = toml::from_str::<toml::Value>(
+            "[voice]\nendpoint = \"https://api.example.test?auth=sk-live-nope\"\nvalue = \"sk-live-nope\"\n",
+        )
+        .unwrap();
+        assert!(
+            secretish_paths(&innocent, &SECRETISH_ALLOWED).is_empty(),
+            "the tripwire is a NAMING check; if this starts failing, the doc \
+             comments claiming otherwise need updating too"
+        );
+
+        // And a field name is judged on its own, never on its value.
+        let named = toml::from_str::<toml::Value>("[voice]\napi_key = false\n").unwrap();
+        assert_eq!(
+            secretish_paths(&named, &SECRETISH_ALLOWED),
+            ["voice.api_key"]
+        );
     }
 }

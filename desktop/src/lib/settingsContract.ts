@@ -19,7 +19,11 @@
  *
  * Secrets never travel through here. A settings document may hold a non-secret
  * *reference* — which backend holds the key, or a boolean saying one is stored —
- * and nothing more; the Rust-side guard fails the build otherwise.
+ * and nothing more. The Rust-side check that pins this is a **naming tripwire,
+ * not a security boundary**: it reads key names in the serialised document and
+ * nothing else, so a field called `endpoint` holding a token passes it, and
+ * nothing on this side of the bridge is scanned at all. Issue #827 carries the
+ * checks #802 needs before it stores a real key.
  */
 import type { ComponentType } from "react";
 import type { DesktopSettingsDto } from "./bridge";
