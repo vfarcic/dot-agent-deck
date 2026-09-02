@@ -6,13 +6,15 @@
  * this is about themes, and this file does not know how the document is stored.
  *
  * It is also the worked example of the density rule in
- * `docs/develop/desktop-gui.md`: **one setting is one row**, its label on the
- * left and its control on the right. This was three full-width cards carrying a
- * sentence of hint each — 195px of a ~700px panel for a single setting, against
- * 27px as one row — and the hints were close to tautological ("Always light,
- * whatever this machine is set to." restates *Light*). Whatever density this
- * first panel establishes is the one #741 and #802 will copy, so it establishes
- * the tight one.
+ * `docs/develop/desktop-gui.md`: **one setting is one row**, laid out as two
+ * columns — a 132px label column, then the control immediately beside it. This
+ * was three full-width cards carrying a sentence of hint each — 195px of a
+ * ~700px panel for a single setting, against 27px as one row — and the hints
+ * were close to tautological ("Always light, whatever this machine is set to."
+ * restates *Light*). Whatever density this first panel establishes is the one
+ * #741 and #802 will copy, so it establishes the tight one — and that now
+ * includes the label's 13px sub-header size and the width of the column it
+ * sits in, both of which are the document's, not this panel's.
  *
  * It is the worked example of that document's text rule too, by subtraction: it
  * used to carry a paragraph explaining *why* the agent terminals stay dark in
@@ -49,9 +51,10 @@ export function AppearancePanel({ settings, onSave, saveError }: SettingsPanelPr
           one `name` buys arrow-key navigation and a single tab stop for free,
           and the legend names the group for a screen reader without a visible
           heading having to do that job. The legend is also the row's visible
-          label — see the `float` note on `.settings-row > legend` in
-          `styles.css` for why that works, and it is why deleting the heading
-          above it took no label with it. */}
+          label, sitting in the grid's first column — see the `float` note on
+          `.settings-row > legend` in `styles.css` for why a legend can be a
+          grid item at all, and it is why deleting the heading above it took no
+          label with it. */}
       <fieldset className="settings-row">
         <legend>Appearance</legend>
         <div className="segmented">

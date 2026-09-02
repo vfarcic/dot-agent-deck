@@ -703,16 +703,28 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .settings-footer > span { display: flex; align-items: center; gap: 7px; }
 .settings-footer code { color: var(--muted); font-size: 8px; }
 
-/* One setting, one row: label on the left, control on the right (PRD #803's
-   density rule — docs/develop/desktop-gui.md). The sheet is 780px wide and full
-   height, so vertical space is what every section is competing for.
+/* One setting, one row: a two-column grid — a label column, a gutter, then the
+   control immediately beside it (PRD #803's density rule —
+   docs/develop/desktop-gui.md). The sheet is 780px wide and full height, so
+   vertical space is what every section is competing for.
+
+   The label column is a fixed 132px, not `auto`, and that is the whole reason
+   this is a grid: every row's control starts at the same x, so a panel of ten
+   settings reads as two columns instead of a ragged stack. 132px fits a
+   two-word label at the size below without wrapping, and it is the widest
+   column that still leaves the control looking attached to its label — the
+   control used to sit at the row's right edge, half a panel away from the word
+   naming it, which is what a flush-right control does to a row this wide.
 
    `float: left` on the legend is load-bearing, not a leftover. A floated legend
-   stops being the fieldset's *rendered* legend, which is the only way it joins
-   the flex row instead of being laid out above it on a line of its own — and
-   the row has to stay a fieldset so the group keeps its accessible name. */
-.settings-row { margin: 0; padding: 0; display: flex; align-items: center; gap: 14px; border: 0; }
-.settings-row > legend { float: left; margin-right: auto; padding: 0; color: var(--ink); font-size: 11px; }
+   stops being the fieldset's *rendered* legend, which is the only way it
+   becomes an ordinary box among the fieldset's contents — here the grid item in
+   column one — instead of being laid out above them on a line of its own. The
+   float itself is then ignored, as it is on any grid item; the disqualification
+   is what does the work, and the row has to stay a fieldset so the group keeps
+   its accessible name. */
+.settings-row { margin: 0; padding: 0; display: grid; grid-template-columns: 132px minmax(0, 1fr); align-items: center; justify-items: start; gap: 16px; border: 0; }
+.settings-row > legend { float: left; padding: 0; color: var(--ink); font-size: 13px; font-weight: 650; }
 
 /* A segmented control: up to about four exclusive options with short labels,
    joined into one row. Still a real radio group — one name gives arrow-key
@@ -858,6 +870,21 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
   .workflow-editor-row > svg { display: none; }
   .loading-grid { grid-template-columns: 1fr; }
   .loading-grid > div:not(:first-child) { display: none; }
+}
+
+/* Below this the two-column settings row stops fitting and stacks: the label
+   column plus its gutter plus a segmented control is 322px, and the sheet goes
+   full-bleed under 680px, so a viewport of 359px is the floor for the columns.
+   Left as a fixed column it does not degrade gracefully — the control keeps its
+   intrinsic 174px, starts at the same x, and simply runs out past the panel's
+   right edge (measured: at a 290px sheet the control's right edge lands 51px
+   outside the body). The breakpoint is 420px rather than 360px so a control
+   wider than Appearance's three options — a fourth segment, a select — has room
+   before the fallback rather than after it. Stacking costs the row height it
+   saves on the desktop sheet, which is the right trade at a phone width and the
+   wrong one at 780px, so it lives here and not in the rule above. */
+@media (max-width: 420px) {
+  .settings-row { grid-template-columns: minmax(0, 1fr); gap: 6px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
