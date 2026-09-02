@@ -1,5 +1,6 @@
 mod daemon_bridge;
 mod dto;
+mod settings;
 mod terminal;
 
 use std::collections::{HashMap, HashSet};
@@ -34,6 +35,7 @@ use crate::dto::{
     ensure_desktop_workflow_platform_supported, mint_desktop_pane_id, safe_message,
     validate_agent_id, validate_start_fields, validate_workflow_shape,
 };
+use crate::settings::DesktopSettings;
 use crate::terminal::DesktopState;
 
 const WATCH_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -745,6 +747,41 @@ async fn desktop_terminal_detach(
     terminal::detach(&state, &session_id).await
 }
 
+/// Read the desktop app's own settings document (PRD #803).
+///
+/// A standalone command rather than a `DesktopAction`, for the same reason the
+/// terminal commands are: every `DesktopAction` ends in `refresh_and_emit`, so
+/// routing a settings read through it would make reading a local TOML file cost
+/// a `ListAgents` round-trip over the daemon socket — at launch, before the
+/// daemon is necessarily up — and return the answer inside a snapshot that has
+/// nowhere to put it. Settings are client-owned; nothing here touches the
+/// daemon.
+#[tauri::command]
+async fn desktop_get_settings(webview: Webview) -> Result<DesktopSettings, String> {
+    ensure_main_webview(&webview)?;
+    Ok(settings::load())
+}
+
+/// Persist the desktop app's settings document and echo back what was written.
+///
+/// The whole document crosses the bridge, so the webview's read-modify-write is
+/// one round trip and the file on disk is always a document this build's schema
+/// produced.
+#[tauri::command]
+async fn desktop_set_settings(
+    webview: Webview,
+    settings: DesktopSettings,
+) -> Result<DesktopSettings, String> {
+    ensure_main_webview(&webview)?;
+    crate::settings::save(&settings).map_err(|error| {
+        // The detail names the path and belongs in the app's own log; the
+        // webview gets the sanitized half, the way connection errors already do.
+        eprintln!("{}", error.detail());
+        safe_message(error.public())
+    })?;
+    Ok(settings)
+}
+
 #[tauri::command]
 async fn desktop_run_action(
     app: AppHandle,
@@ -1002,6 +1039,8 @@ pub fn run() {
             desktop_terminal_write,
             desktop_terminal_resize,
             desktop_terminal_detach,
+            desktop_get_settings,
+            desktop_set_settings,
             desktop_run_action,
         ])
         .build(tauri::generate_context!())

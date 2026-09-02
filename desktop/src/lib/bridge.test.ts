@@ -261,3 +261,80 @@ describe("TauriDeckBridge", () => {
     await bridge.dispose();
   });
 });
+
+describe("desktop settings (PRD 803)", () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    window.localStorage.clear();
+  });
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("reads and writes the Rust-owned document through the live bridge", async () => {
+    const { TauriDeckBridge, DEFAULT_DESKTOP_SETTINGS } = await import("./bridge");
+    const stored = { version: 1, appearance: { mode: "dark" as const } };
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_get_settings") return DEFAULT_DESKTOP_SETTINGS;
+      if (command === "desktop_set_settings") return stored;
+      return { ok: true };
+    });
+
+    const bridge = new TauriDeckBridge();
+    expect(await bridge.getSettings()).toEqual(DEFAULT_DESKTOP_SETTINGS);
+    expect(invoke).toHaveBeenCalledWith("desktop_get_settings");
+
+    expect(await bridge.saveSettings(stored)).toEqual(stored);
+    expect(invoke).toHaveBeenCalledWith("desktop_set_settings", { settings: stored });
+    await bridge.dispose();
+  });
+
+  it("falls back to defaults when the settings IPC fails, but surfaces a failed save", async () => {
+    const { TauriDeckBridge, DEFAULT_DESKTOP_SETTINGS } = await import("./bridge");
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_get_settings" || command === "desktop_set_settings") {
+        throw new Error("could not write the desktop settings file: Permission denied");
+      }
+      return { ok: true };
+    });
+
+    const bridge = new TauriDeckBridge();
+    expect(await bridge.getSettings()).toEqual(DEFAULT_DESKTOP_SETTINGS);
+    await expect(bridge.saveSettings(DEFAULT_DESKTOP_SETTINGS)).rejects.toThrow("Permission denied");
+    await bridge.dispose();
+  });
+
+  it("keeps fixture settings in unscoped localStorage and never invokes Tauri", async () => {
+    const { createDeckBridge, DEFAULT_DESKTOP_SETTINGS, FIXTURE_SETTINGS_KEY, modeScopedKey } = await import("./bridge");
+    const bridge = createDeckBridge("fixture");
+
+    expect(await bridge.getSettings()).toEqual(DEFAULT_DESKTOP_SETTINGS);
+    const light = { version: 1, appearance: { mode: "light" as const } };
+    expect(await bridge.saveSettings(light)).toEqual(light);
+
+    // A theme choice is global: the key must NOT carry the `.fixture`/`.live`
+    // suffix every project-draft key does.
+    expect(window.localStorage.getItem(FIXTURE_SETTINGS_KEY)).toBe(JSON.stringify(light));
+    expect(FIXTURE_SETTINGS_KEY).not.toBe(modeScopedKey(FIXTURE_SETTINGS_KEY));
+    expect(window.localStorage.getItem(modeScopedKey(FIXTURE_SETTINGS_KEY))).toBeNull();
+
+    // The fixture preview can never reach the real desktop.toml: it holds no
+    // Tauri handle at all.
+    expect(invoke).not.toHaveBeenCalled();
+
+    // A fresh bridge (a page reload) reads the choice back.
+    expect(await createDeckBridge("fixture").getSettings()).toEqual(light);
+    await bridge.dispose();
+  });
+
+  it("coerces an unreadable stored document back to defaults", async () => {
+    const { createDeckBridge, DEFAULT_DESKTOP_SETTINGS, FIXTURE_SETTINGS_KEY, normalizeDesktopSettings } = await import("./bridge");
+    window.localStorage.setItem(FIXTURE_SETTINGS_KEY, "{not json");
+    expect(await createDeckBridge("fixture").getSettings()).toEqual(DEFAULT_DESKTOP_SETTINGS);
+
+    window.localStorage.setItem(FIXTURE_SETTINGS_KEY, JSON.stringify({ version: 9, appearance: { mode: "solarized" } }));
+    expect(await createDeckBridge("fixture").getSettings()).toEqual({ version: 9, appearance: { mode: "system" } });
+
+    expect(normalizeDesktopSettings(undefined)).toEqual(DEFAULT_DESKTOP_SETTINGS);
+    expect(normalizeDesktopSettings({ appearance: { mode: "dark" } })).toEqual({ version: 1, appearance: { mode: "dark" } });
+  });
+});
