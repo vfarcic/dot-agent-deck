@@ -3430,6 +3430,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** exact agent-forwarding advisory prose or any real ssh-agent interaction.
 - **Platform coverage:** mac+linux (Unix-only `sh` + `PATH` executable seam).
 
+##### remote/doctor/012 — A remote reporting a different attach protocol version is not a fault (issue #491).
+- **Layer:** L2 (real-binary subprocess spawn; the synthetic `ssh` answers `daemon hello` with a `server_version` one below and one above this binary's own).
+- **Agent:** none.
+- **Asserts:** `ProtocolCompatible` is `PASS` and the run exits 0 in **both** skew directions, and no report quotes a laptop-side protocol version at the user. Pins the removal of the laptop↔remote comparison: `connect` ssh's in and runs the *remote* binary's TUI against the *remote* daemon, so those two constants never share a wire and a difference between them was never evidence of a fault.
+- **Does not assert:** anything about a remote that cannot answer `daemon hello` at all — that floor is kept and is unit-covered by `connect::tests::unanswerable_handshake_stays_fatal_without_naming_versions`.
+- **Platform coverage:** mac+linux (Unix-only `sh` + `PATH` executable seam).
+
 ### Fresh-start escape hatch (PRD #89 Phase 4)
 
 These entries cover PRD #89 Phase 4: with auto-restore now the default, a user who wants to start clean has one obvious action — `dot-agent-deck snapshot clear` (M4.2) — because the snapshot is a single GLOBAL file. `dot-agent-deck remote remove <name>` (M4.1) is registry-only and intentionally does NOT touch the snapshot (decided Option 1); there is no per-deck saved state to clear.

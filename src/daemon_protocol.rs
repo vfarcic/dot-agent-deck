@@ -168,10 +168,11 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// pre-Pi reader has neither the `Pi` variant NOR (before this PRD) a
 /// `#[serde(other)]` catch-all, so `agent_type = "pi"` fails its whole-response
 /// / whole-frame decode — a non-forward-compatible payload-schema change, the
-/// same class as #120's new enum variant. The bump makes the exact-match attach
-/// handshake ([`crate::connect::probe_remote_protocol`]) refuse the
-/// old-reader/new-daemon pairing at connect time (a clean `ProtocolMismatch`)
-/// instead of letting it reach a mid-session deserialize crash. `AgentType`
+/// same class as #120's new enum variant. The bump marks the break so the
+/// old-reader/new-daemon pairing is detectable at handshake time rather than
+/// arriving as a mid-session deserialize crash; when this was written
+/// `crate::connect::probe_remote_protocol` also *refused* on it, which it no
+/// longer does — see the enforcement note below. `AgentType`
 /// now also carries `#[serde(other)]` so THIS build and every future one
 /// degrade an unknown agent type to the neutral `None` placeholder rather than
 /// erroring — future agent-type additions therefore need no further bump — but
@@ -198,9 +199,10 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// is running" signal), following the exact precedent PRD #201 set for
 /// `AgentType::Pi` above — a pre-#370 reader has neither variant nor a
 /// `#[serde(other)]` catch-all, so a `KIND_EVENT` frame carrying one fails
-/// its whole-frame decode. The bump forces `probe_remote_protocol` to refuse
-/// the old-reader/new-daemon pairing with a clean `ProtocolMismatch` instead
-/// of a mid-session crash. `EventType` now also carries `#[serde(other)]`
+/// its whole-frame decode. The bump marks the old-reader/new-daemon pairing as
+/// skewed at handshake time instead of letting it land as a mid-session crash;
+/// the enforcement note below records where that is acted on today.
+/// `EventType` now also carries `#[serde(other)]`
 /// (mirroring `AgentType`'s retrofit), so future event-type additions need
 /// no further bump.
 ///
@@ -220,10 +222,40 @@ pub const KIND_STREAM_REJECT: u8 = 0x17;
 /// it rather than skipping one message.
 ///
 /// The second is what makes the bump load-bearing rather than bookkeeping. The
-/// constant's job here is to make `probe_remote_protocol` refuse a skewed
-/// `connect` pairing at handshake time instead of letting it surface later as a
-/// dead event stream. The reply's [`AttachResponse::kept_worktree`] field is
-/// additive and would have needed no bump on its own.
+/// constant's job here is to make a skewed pairing *identifiable* at handshake
+/// time instead of letting it surface later as a dead event stream. The reply's
+/// [`AttachResponse::kept_worktree`] field is additive and would have needed no
+/// bump on its own.
+///
+/// # Where this constant is enforced
+///
+/// **No call site refuses on it today, and that is issue #405.** The bump
+/// rationales above were written while
+/// [`crate::connect::probe_remote_protocol`] compared the remote's
+/// `server_version` against the laptop's and hard-failed on a difference, and
+/// each one named that refusal as the payoff.
+///
+/// Issue #491 removed the comparison, because it could not fail for a real
+/// reason: `connect` is an `ssh -t` wrapper that runs the *remote* binary's TUI
+/// against the *remote* daemon, so the laptop's constant was never a party to
+/// that attach conversation and the check could only refuse remotes whose two
+/// ends already agreed by construction. The probe still refuses a remote that
+/// cannot answer `daemon hello` at all — an install floor, not a version
+/// verdict.
+///
+/// The local same-machine TUI↔daemon pairing is the one place a wire-shape skew
+/// can actually happen (the binary upgraded on disk under a still-running
+/// daemon), and it is guarded by [`crate::build_version_handshake`]'s
+/// `DAD_BUILD_ID` comparison rather than by this constant. Build-id equality is
+/// strictly stronger than protocol equality when it *matches* — same build
+/// implies same protocol — but declining its restart prompt (the right choice
+/// when live agents would die with the daemon) attaches anyway with no version
+/// check of any kind. Issue #405 tracks closing that.
+///
+/// Keep bumping this on every wire-shape break regardless. The bump is what
+/// makes a skew *nameable* — it is the number the handshake reports, what
+/// `daemon hello` prints, and the input any future compatibility gate will
+/// read; #405 is what will make it *refused*.
 pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Hard cap on a single frame's payload length. Defends against a malicious
@@ -461,9 +493,10 @@ pub enum AttachRequest {
     /// PRD #76 M2.21: protocol-version handshake. Client sends its
     /// [`PROTOCOL_VERSION`]; server replies with its own in
     /// [`AttachResponse::server_version`]. The daemon never rejects on
-    /// `client_version` — only the client decides whether to fail (the
-    /// `connect` strict path) or continue (call sites that have no version
-    /// dependency).
+    /// `client_version`, and since issue #491 no client rejects on
+    /// `server_version` either — `connect`'s strict comparison was the last
+    /// one, and the local attach path never had one (issue #405). See the
+    /// enforcement note on [`PROTOCOL_VERSION`].
     ///
     /// PRD #103 M1.2: optional `client_build_version` carries the client's
     /// compiled-in `DAD_BUILD_ID`. The daemon logs it but never rejects on
