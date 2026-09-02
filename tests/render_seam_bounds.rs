@@ -1,7 +1,7 @@
 //! L1 guards on the allocation bound the exported `*_to_buffer` render seams
-//! apply to their caller-given dimensions (issue #748).
+//! with TWO caller-controlled axes apply to their dimensions (issue #748).
 //!
-//! `src/lib.rs` is `pub mod ui;`, so every one of these seams is reachable as
+//! `src/lib.rs` is `pub mod ui;`, so each of these seams is reachable as
 //! `dot_agent_deck::ui::render_*_to_buffer` by anything that depends on the
 //! crate — and half of them carry no `#[doc(hidden)]` at all. Each builds a
 //! `ratatui::backend::TestBackend`, which allocates exactly one cell per
@@ -9,6 +9,13 @@
 //! asked for ~4.3 BILLION cells: a process abort rather than an error a caller
 //! could handle. These tests assert the bound, in-process, through the real
 //! exported entry points.
+//!
+//! **The two-axis qualifier is the scope, and the last test pins the other
+//! side of it.** Four exported seams pass a literal `1` as their height, so
+//! their worst case is 65,535 cells and issue #748 deliberately left them
+//! unbounded; `seam_bound_001_one_row_seams_are_deliberately_unbounded` asserts
+//! that, so "not bounded" stays a recorded decision instead of decaying into an
+//! oversight nobody can tell from a bug.
 
 use std::collections::VecDeque;
 
@@ -17,12 +24,13 @@ use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::state::{DashboardStats, SessionState, SessionStatus};
 use dot_agent_deck::ui::{
     CardDensityKind, CommandBannerVisibility, RENDER_SEAM_DIM_MAX, UiMode,
-    render_button_bar_for_mode_to_buffer, render_button_bar_with_bindings_to_buffer,
-    render_card_grid_to_buffer, render_card_to_buffer, render_card_with_declared_agent_to_buffer,
-    render_command_banner_pane_to_buffer, render_dashboard_cards_to_buffer,
-    render_help_overlay_to_buffer, render_help_overlay_with_bindings_to_buffer,
-    render_hints_bar_for_mode_to_buffer, render_hints_bar_to_buffer, render_quit_confirm_to_buffer,
-    render_stats_bar_to_buffer,
+    render_button_bar_for_mode_to_buffer, render_button_bar_to_buffer,
+    render_button_bar_with_bindings_to_buffer, render_card_grid_to_buffer, render_card_to_buffer,
+    render_card_with_declared_agent_to_buffer, render_command_banner_pane_to_buffer,
+    render_dashboard_cards_to_buffer, render_filter_bar_to_buffer, render_help_overlay_to_buffer,
+    render_help_overlay_with_bindings_to_buffer, render_hints_bar_for_mode_to_buffer,
+    render_hints_bar_to_buffer, render_quit_confirm_to_buffer, render_rename_bar_to_buffer,
+    render_stats_bar_to_buffer, render_tab_bar_to_buffer,
 };
 use spec::spec;
 
@@ -49,6 +57,15 @@ fn fixture_session() -> SessionState {
         shell_synthetic_working: false,
     }
 }
+
+/// The size of a rendered buffer, as `(width, height)`.
+fn dims(buffer: &ratatui::buffer::Buffer) -> (u16, u16) {
+    (buffer.area().width, buffer.area().height)
+}
+
+/// One exported one-row bar seam: a width in, the rendered `(width, height)`
+/// out. Named because `clippy::type_complexity` refuses the tuple inline.
+type OneRowSeam = (&'static str, Box<dyn Fn(u16) -> (u16, u16)>);
 
 /// One exported seam, reduced to "given these dimensions, what size buffer did
 /// you actually hand back".
@@ -82,32 +99,32 @@ fn bounded_seams() -> Vec<Seam> {
         seam("render_stats_bar_to_buffer", |w, h| {
             let stats = DashboardStats::default();
             let buffer = render_stats_bar_to_buffer(&stats, None, w, h);
-            (buffer.area().width, buffer.area().height)
+            dims(&buffer)
         }),
         seam("render_quit_confirm_to_buffer", |w, h| {
             let buffer = render_quit_confirm_to_buffer(0, w, h);
-            (buffer.area().width, buffer.area().height)
+            dims(&buffer)
         }),
         // Group B — through the shared `render_overlay_to_buffer` helper.
         seam("render_help_overlay_to_buffer", |w, h| {
             let buffer = render_help_overlay_to_buffer(w, h);
-            (buffer.area().width, buffer.area().height)
+            dims(&buffer)
         }),
         // Group C — seams that build their own `TestBackend`.
         seam("render_help_overlay_with_bindings_to_buffer", |w, h| {
             let keybindings = KeybindingConfig::default();
             let buffer = render_help_overlay_with_bindings_to_buffer(&keybindings, None, w, h);
-            (buffer.area().width, buffer.area().height)
+            dims(&buffer)
         }),
         seam("render_hints_bar_to_buffer", |w, h| {
             let keybindings = KeybindingConfig::default();
             let buffer = render_hints_bar_to_buffer(&keybindings, w, h);
-            (buffer.area().width, buffer.area().height)
+            dims(&buffer)
         }),
         seam("render_hints_bar_for_mode_to_buffer", |w, h| {
             let keybindings = KeybindingConfig::default();
             let buffer = render_hints_bar_for_mode_to_buffer(&keybindings, UiMode::PaneInput, w, h);
-            (buffer.area().width, buffer.area().height)
+            dims(&buffer)
         }),
         seam("render_card_to_buffer", |w, h| {
             let session = fixture_session();
@@ -121,7 +138,7 @@ fn bounded_seams() -> Vec<Seam> {
                 w,
                 h,
             );
-            (buffer.area().width, buffer.area().height)
+            dims(&buffer)
         }),
         seam("render_card_with_declared_agent_to_buffer", |w, h| {
             let session = fixture_session();
@@ -137,23 +154,23 @@ fn bounded_seams() -> Vec<Seam> {
                 w,
                 h,
             );
-            (buffer.area().width, buffer.area().height)
+            dims(&buffer)
         }),
         seam("render_card_grid_to_buffer", |w, h| {
             let session = fixture_session();
             let cards = [(&session, None)];
             let (buffer, _probe) = render_card_grid_to_buffer(&cards, Some(0), 0, w, h);
-            (buffer.area().width, buffer.area().height)
+            dims(&buffer)
         }),
         seam("render_button_bar_with_bindings_to_buffer", |w, h| {
             let keybindings = KeybindingConfig::default();
             let buffer = render_button_bar_with_bindings_to_buffer(&keybindings, w, h);
-            (buffer.area().width, buffer.area().height)
+            dims(&buffer)
         }),
         seam("render_button_bar_for_mode_to_buffer", |w, h| {
             let keybindings = KeybindingConfig::default();
             let buffer = render_button_bar_for_mode_to_buffer(&keybindings, UiMode::Normal, w, h);
-            (buffer.area().width, buffer.area().height)
+            dims(&buffer)
         }),
         seam("render_command_banner_pane_to_buffer", |w, h| {
             let buffer = render_command_banner_pane_to_buffer(
@@ -164,16 +181,16 @@ fn bounded_seams() -> Vec<Seam> {
                 w,
                 h,
             );
-            (buffer.area().width, buffer.area().height)
+            dims(&buffer)
         }),
     ]
 }
 
-/// Scenario: Call every exported `*_to_buffer` render seam with dimensions no
-/// terminal could have — `u16::MAX` on one axis, then on both — and read the
-/// size of the buffer each one hands back. Each must come back bounded to
-/// `RENDER_SEAM_DIM_MAX` on the oversized axes and untouched on the in-range
-/// ones, rather than trying to allocate the request and aborting the process.
+/// Scenario: Call twelve exported two-axis `*_to_buffer` render seams with
+/// dimensions no terminal could have — `u16::MAX` on one axis, then on both —
+/// and read the size of the buffer each one hands back. Each must come back
+/// bounded to `RENDER_SEAM_DIM_MAX` on the oversized axes and untouched on the
+/// in-range ones, rather than trying to allocate the request and aborting.
 #[spec("render/seam-bound/001")]
 #[test]
 fn seam_bound_001_exported_seams_clamp_absurd_dimensions() {
@@ -270,7 +287,7 @@ fn seam_bound_001_dashboard_cards_clamps_derived_height() {
     let one = [(&session, None)];
     let buffer = render_dashboard_cards_to_buffer(&one, Some(0), density, 0, 80);
     assert_eq!(
-        (buffer.area().width, buffer.area().height),
+        dims(&buffer),
         (80, density.rendered_height()),
         "an in-range single-card render must be honoured exactly"
     );
@@ -279,7 +296,7 @@ fn seam_bound_001_dashboard_cards_clamps_derived_height() {
     // missing clamp fails the assertion rather than the allocator.
     let buffer = render_dashboard_cards_to_buffer(&one, Some(0), density, 0, u16::MAX);
     assert_eq!(
-        (buffer.area().width, buffer.area().height),
+        dims(&buffer),
         (cap, density.rendered_height()),
         "an absurd width must be bounded to {cap} and the derived height left alone"
     );
@@ -294,7 +311,7 @@ fn seam_bound_001_dashboard_cards_clamps_derived_height() {
         (0..over_cap).map(|_| (&session, None)).collect();
     let buffer = render_dashboard_cards_to_buffer(&cards, Some(0), density, 0, 24);
     assert_eq!(
-        (buffer.area().width, buffer.area().height),
+        dims(&buffer),
         (24, cap),
         "a card count past the cap must bound the derived height to {cap}"
     );
@@ -306,8 +323,62 @@ fn seam_bound_001_dashboard_cards_clamps_derived_height() {
     // regression is diagnosed by an assertion above, never by the allocator.
     let buffer = render_dashboard_cards_to_buffer(&cards, Some(0), density, 0, u16::MAX);
     assert_eq!(
-        (buffer.area().width, buffer.area().height),
+        dims(&buffer),
         (cap, cap),
         "an absurd width and a card count past the cap must both be bounded to {cap}"
     );
+}
+
+/// Scenario: Call the four exported one-row bar seams at `u16::MAX` columns and
+/// confirm each returns a buffer that wide and exactly one row tall. They are
+/// deliberately outside the `RENDER_SEAM_DIM_MAX` bound, and this pins that as a
+/// decision: 65,535 cells is not an allocation concern, and a cap here would
+/// silently truncate a legitimately wide bar.
+#[spec("render/seam-bound/001")]
+#[test]
+fn seam_bound_001_one_row_seams_are_deliberately_unbounded() {
+    // `u16::MAX * 1` = 65,535 cells, ~2 MB — the measurement issue #748 scoped
+    // these out on, and the reason this test is cheap enough to make the
+    // exclusion executable rather than leaving it as prose. Greptile flagged the
+    // asymmetry on PR #841; the answer is that the bound is a two-axis rule, and
+    // the way to keep that honest is to assert it in both directions.
+    const WIDE: u16 = u16::MAX;
+
+    let seams: [OneRowSeam; 4] = [
+        (
+            "render_button_bar_to_buffer",
+            Box::new(|w| dims(&render_button_bar_to_buffer(w))),
+        ),
+        (
+            "render_filter_bar_to_buffer",
+            Box::new(|w| dims(&render_filter_bar_to_buffer("needle", w))),
+        ),
+        (
+            "render_rename_bar_to_buffer",
+            Box::new(|w| dims(&render_rename_bar_to_buffer("new-name", w))),
+        ),
+        (
+            "render_tab_bar_to_buffer",
+            Box::new(|w| {
+                dims(&render_tab_bar_to_buffer(
+                    &["dashboard"],
+                    &[false],
+                    0,
+                    w,
+                    &[None],
+                ))
+            }),
+        ),
+    ];
+
+    for (name, render) in seams {
+        assert_eq!(
+            render(WIDE),
+            (WIDE, 1),
+            "{name}: a one-row seam honours its width verbatim and is NOT capped \
+             at RENDER_SEAM_DIM_MAX ({RENDER_SEAM_DIM_MAX}) — if this now fails \
+             because the seam was capped, that is a deliberate scope change and \
+             RENDER_SEAM_DIM_MAX's doc comment has to move with it"
+        );
+    }
 }

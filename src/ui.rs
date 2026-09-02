@@ -20463,7 +20463,8 @@ pub fn render_card_grid_to_buffer(
     (terminal.backend().buffer().clone(), probe)
 }
 
-/// Largest dimension any exported `*_to_buffer` render seam will render.
+/// Largest dimension an exported `*_to_buffer` render seam with TWO
+/// caller-controlled axes will render.
 ///
 /// Those seams are library API: `src/lib.rs` is `pub mod ui;`, half of them
 /// carry no `#[doc(hidden)]` at all, and `#[doc(hidden)]` hides an item from
@@ -20473,6 +20474,18 @@ pub fn render_card_grid_to_buffer(
 /// cells: an OOM/abort, not an error a caller can handle. 1024 x 1024 is ~1M
 /// cells — comfortably above any real terminal and comfortably below that.
 /// Apply it with [`clamp_render_seam_dims`] (issue #748).
+///
+/// **The two-axis qualifier is load-bearing, not hedging.** Four exported seams
+/// are deliberately NOT bounded by this, because they pass a literal `1` as the
+/// height: [`render_button_bar_to_buffer`], [`render_filter_bar_to_buffer`],
+/// [`render_rename_bar_to_buffer`] and [`render_tab_bar_to_buffer`] each render
+/// a single row, so their worst case is `u16::MAX * 1` = 65,535 cells (~2 MB) —
+/// not an allocation concern, and capping it would silently truncate a
+/// legitimately wide bar. Issue #748 measured that and scoped them out; the
+/// `seam_bound_001_one_row_seams_are_deliberately_unbounded` test pins the
+/// exclusion so it stays a decision rather than an oversight. So do not write
+/// "every exported seam is bounded" — write this. If a fifth one-row seam ever
+/// gains a caller-controlled height, it joins the list above instead.
 #[doc(hidden)]
 pub const RENDER_SEAM_DIM_MAX: u16 = 1024;
 
@@ -20497,12 +20510,13 @@ pub const RENDER_SEAM_ROLES_MAX: usize = 64;
 /// size, so the bound is observable in the value the seam already hands back.
 ///
 /// **Why one shared rule** — issue #747 is about the damage done when one side
-/// of a resize clamps and another does not, so the whole family goes through
-/// this function, at the same cap, and the daemon-side sibling
-/// [`crate::agent_pty::PTY_RESIZE_DIM_MAX`] clamps the same way.
-/// [`render_orchestration_frame_to_buffer`] applies `RENDER_SEAM_DIM_MAX`
-/// inline instead, because it pairs it with a role-count bound and a
-/// degenerate-input guard.
+/// of a resize clamps and another does not, so this function is the single place
+/// the cap is applied, and the daemon-side sibling
+/// [`crate::agent_pty::PTY_RESIZE_DIM_MAX`] clamps the same way. Of the 25
+/// exported two-axis seams, 24 route through here; the 25th,
+/// [`render_orchestration_frame_to_buffer`], applies `RENDER_SEAM_DIM_MAX`
+/// inline because it pairs it with a role-count bound and a degenerate-input
+/// guard.
 fn clamp_render_seam_dims(width: u16, height: u16) -> (u16, u16) {
     (
         width.min(RENDER_SEAM_DIM_MAX),
