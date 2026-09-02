@@ -1,6 +1,6 @@
 # PRD #803: A settings surface for the desktop app
 
-**Status**: Planning — awaiting confirmation of the plan
+**Status**: In progress — implemented alongside [PRD #743](743-desktop-light-dark-appearance.md) in one PR
 **Priority**: High (three PRDs are blocked on it)
 **Created**: 2026-09-02
 
@@ -28,7 +28,9 @@ It is the only one of the six rail buttons with no `active` prop and no `testId`
 
 A per-installation settings store owned by the desktop app's Rust core, and a Settings surface that renders sections contributed by features.
 
-This PRD defines **where settings live, how they persist, and how a feature registers one — and stops there.** It ships no opinion about what a daemon endpoint, an appearance override or a voice backend should be; those belong to #741, #743 and #802 respectively. A container that grows opinions about its contents blocks all three of them, which is the outcome this document is written to avoid.
+This PRD defines **where settings live, how they persist, and how a feature registers one — and stops there.** It ships no opinion about what a daemon endpoint or a voice backend should be; those belong to #741 and #802.
+
+**One exception, decided with the user on 2026-09-02: [PRD #743](743-desktop-light-dark-appearance.md)'s appearance override ships in the same pull request, and is the settings page's only section for now.** The two are mutually blocking in practice — #743 needs somewhere for an override to live, and a container with no tenant is proven only by its own tests, leaving the first real consumer to discover the gaps. The boundary between them stays sharp even though the PR is shared: **#803 owns the store, the sheet, the section registry and the contract; #743 owns the Appearance panel and everything the choice actually does.** If that line blurs during implementation, this PRD has failed at the thing it exists to do.
 
 The spine is not a screen. It is an **ownership rule**, recorded in #741 on 2026-09-02 and adopted here as the criterion every future setting is tested against:
 
@@ -45,11 +47,12 @@ The spine is not a screen. It is an **ownership rule**, recorded in #741 on 2026
 - **A Settings surface** reachable from the existing rail stub, the command palette and Escape, rendering a registry of feature-contributed sections.
 - **The registration contract**: what a feature adds — and where — to acquire a setting, documented well enough that #741, #743 and #802 each implement theirs without consulting this PRD's author.
 - **A named approach for credential storage**, with the one hard rule this PRD sets and a guard that enforces it. The backend implementation is #802's.
-- **One container-owned preference**, end to end, so the contract is proven by a real consumer rather than only by tests (see Open Question 2).
+- **The `[appearance]` section as the container's first real tenant**, implemented per PRD #743 and shipped in the same PR. This PRD provides the section slot, the persistence and the panel's place in the registry; #743 provides what goes in it.
 
 ### Out of Scope
 
-- **Every setting the three dependents need.** Daemon endpoints are #741's, the appearance override is #743's, the voice backends and the API key are #802's. This PRD gives each a place to land and a contract to follow; it does not define, design, or pre-create their sections.
+- **The settings the other two dependents need.** Daemon endpoints are #741's; the voice backends, the API key and the model management are #802's. This PRD gives each a place to land and a contract to follow; it does not define, design, or pre-create their sections.
+- **Anything about how appearance works.** The palette, the dark values, the media query, the override attribute and the terminals' treatment are all #743's, documented in its own PRD. #803's involvement ends at "there is a section, and its value persists".
 - **Model downloads** — progress, retry, disk-usage visibility and removal. They are #802's, and the reason is concrete rather than a boundary preference: the webview's CSP is `connect-src ipc: http://ipc.localhost` (`desktop/src-tauri/tauri.conf.json:25`) and nothing else, so a download cannot be initiated frontend-side at all. It has to be Rust-side work in the feature that needs it, and the settings screen is where its *controls* are rendered, not where the download lives.
 - **Migrating the four existing `localStorage` keys.** They hold projects, agent profiles, prompts and workflow order — per-project draft content, not per-installation preference. Under the boundary rule they belong daemon-side ([#819](https://github.com/vfarcic/dot-agent-deck/issues/819)), and moving them into the settings store now would entrench them on the wrong side. Named explicitly because it is a tempting and wrong move.
 - **Syncing settings between machines.** Everything here is deliberately per-machine (see Technical Approach).
@@ -99,7 +102,9 @@ A serde struct with one nested struct per feature section, `#[serde(default)]` t
 
 **Writing is atomic and owner-only** — temp file in the same directory, then rename, with mode `0o600` on Unix. The repo has precedent for the permission assertion (`src/codex_hooks_manage.rs:1023`, "a deck-created config.toml must be owner-only").
 
-Unlike `DashboardConfig::save()`, the writer must not be able to drop a table it does not know about. The struct owns every section, so within one build that cannot happen; across builds the serde defaults cover it. A **pinned-shape test** in the idiom of `agent_mapping_is_frontend_stable` (`desktop/src-tauri/src/dto.rs:639-647`) asserts the exact serialised document, so adding a field is a deliberate act that shows up in a diff and forces the ownership question to be answered in review.
+Unlike `DashboardConfig::save()`, the writer must not be able to drop a table it does not know about. **The serde defaults do not give this, and the first draft of this PRD wrongly claimed they did** — they cover *reading*, so an older build loads a newer build's `[voice]` section without error, but `#[serde(default)]` without `deny_unknown_fields` means *ignore*, not *retain*. The unknown table is dropped at load, and the next save serialises the struct over it. That is exactly the `DashboardConfig::save()` failure mode this PRD rejects `config.toml` for, two paragraphs earlier, reproduced in our own file. So the save path **merges the serialised struct into the parsed document** rather than replacing it, and a round-trip test pins an unknown section surviving a load-modify-save. **That survival is of data, not of the document**: the merge round-trips through `toml::Table`, which models data, so an unknown section comes back byte for byte only where its content was already in the serializer's canonical form. Comments, inline-array and inline-table formatting, key order and blank-line grouping are lost to the canonical re-render — tracked as [#825](https://github.com/vfarcic/dot-agent-deck/issues/825), whose fix is `toml_edit` and a new dependency deliberately not taken here. Found during implementation and closed before it shipped; the reasoning is in the Work Log.
+
+A **pinned-shape test** in the idiom of `agent_mapping_is_frontend_stable` (`desktop/src-tauri/src/dto.rs:536-545`) asserts the exact serialised document, so adding a field is a deliberate act that shows up in a diff and forces the ownership question to be answered in review.
 
 ### How a feature registers a setting
 
@@ -169,12 +174,12 @@ Two things #779 adds should be built **on** rather than duplicated once it lands
 
 ## Milestones
 
-- [ ] **M1 — The ownership boundary, written down and applicable.** The client-owned/daemon-owned lists and the criterion, recorded here and in `docs/develop/desktop-gui.md`. Doc-only, and deliberately first: it is what unblocks the three dependents, and it is useful before any code lands.
-- [ ] **M2 — The settings document.** `desktop/src-tauri/src/settings.rs`: typed sections, serde defaults, unknown-key tolerance, path resolution with the `DOT_AGENT_DECK_DESKTOP_CONFIG` override, load-never-fails, atomic `0o600` write, and the two Tauri commands. Rust tests including the pinned-shape test.
-- [ ] **M3 — The Settings surface.** The rail stub becomes a real `config-sheet`; the section registry; Escape, palette and backdrop wiring; frontend read/write through the bridge; a General section showing where settings are stored and offering a reset routed through the existing confirmation. Vitest coverage for each.
-- [ ] **M4 — One real preference, end to end.** The proving consumer, so the contract is exercised by something other than a test (see Open Question 2).
-- [ ] **M5 — The secret seam, named and pinned.** The `SecretStore` trait and the "never in the document, never in localStorage" rule, with the guard test. No backend implementation — #802 picks one.
-- [ ] **M6 — The registration contract documented.** `docs/develop/desktop-gui.md` gains an "Adding a setting" section: the three steps, the ownership criterion, the secret rule, and the manual smoke extension. Changelog fragment.
+- [x] **M1 — The ownership boundary, written down and applicable.** The client-owned/daemon-owned lists and the criterion, recorded here and in `docs/develop/desktop-gui.md`. Doc-only, and deliberately first: it is what unblocks the three dependents, and it is useful before any code lands.
+- [x] **M2 — The settings document.** `desktop/src-tauri/src/settings.rs`: typed sections, serde defaults, unknown-key tolerance, path resolution with the `DOT_AGENT_DECK_DESKTOP_CONFIG` override, load-never-fails, atomic `0o600` write, and the two Tauri commands. Rust tests including the pinned-shape test. — `ba00f12`, plus the unknown-section-preservation fix that followed.
+- [x] **M3 — The Settings surface.** The rail stub becomes a real `config-sheet`; the section registry; Escape, palette and backdrop wiring; frontend read/write through the bridge; the settings file's path shown as a footer line so "where did that go?" is answerable without documentation — and, in fixture mode, a footer that says there is **no** file rather than printing one, since the browser preview keeps settings in `localStorage` and structurally cannot reach a filesystem. Vitest coverage for each. No General section — the page has exactly one section, and it is #743's.
+- [x] **M4 — The first real tenant, end to end.** The Appearance section, per PRD #743, so the contract is exercised by something a user can actually change rather than only by a test. #743's own milestones carry what the choice does; #803's obligation here is that the section registers, renders and persists through the contract above with no special-casing.
+- [x] **M5 — The secret seam, named and pinned.** The `SecretStore` trait and the "never in the document, never in localStorage" rule, with the guard test. No backend implementation — #802 picks one.
+- [x] **M6 — The registration contract documented.** `docs/develop/desktop-gui.md` gains an "Adding a setting" section: the three steps, the ownership criterion, the secret rule, and the manual smoke extension. Changelog fragment.
 
 ## Risks
 
@@ -186,13 +191,50 @@ Two things #779 adds should be built **on** rather than duplicated once it lands
 
 ## Open Questions
 
-1. **Does this ship behind the `experimental` flag (CLAUDE.md rule 9)?** The recommendation is **no**, and it is not a fresh judgement: `prds/176-desktop-gui.md` decision 6 already recorded that the flag does not apply to this binary — "a separate GUI binary has no such seam — the act of building/running it is the opt-in", with maturity handled by packaging. The mechanics confirm it and go further than #176 did: the flag does not reach the desktop app by **any** route. Nothing under `desktop/` mentions it, it is not on the daemon protocol, and the desktop crate never calls `features::init_and_watch` — whose only callers are `src/main.rs:1509` and `:2075` — so `experimental_enabled()` would read the `false` default forever regardless of TOML or env. Gating this surface would mean **building the flag's Tauri delivery mechanism as part of this PRD**, which is new work in service of a switch, and it would raise "against which project directory?" — a question the desktop app has no good answer to for a packaged build.
-2. **Does M4 ship, or does the container ship with no preference of its own?** The recommendation is that it ships, with **"restore the window's size and position on launch"** as the proving preference: it is genuinely container-owned (#741's principle names window size as client-owned presentational state), it belongs to none of the three dependents, and it exercises the whole path — a default, a toggle written from the UI, state written from Rust, and a read at startup before the webview exists. The disciplined alternative is a container with zero settings whose round-trip is proven only by tests, which is more scope-pure and leaves the first real consumer to discover the gaps.
-3. **macOS: `~/.config/dot-agent-deck` or `~/Library/Application Support/dot-agent-deck`?** Leaning `~/.config` for consistency with the TUI on the same machine, accepting that it is not the platform convention. `dirs` is already a root-crate dependency if a macOS-specific root is ever wanted.
-4. **Does the document carry an explicit schema version field now, or rely on serde defaults alone?** Leaning yes — a `version` integer is cheap insurance and impossible to add retroactively without a heuristic.
-5. **Should the four existing `localStorage` keys eventually move, and to where?** Not in this PRD. They are project-draft content and #819's daemon-side project resolution is the plausible home; worth a follow-up issue so the question is tracked rather than rediscovered.
+**Questions 1 and 2 were decided by the user on 2026-09-02; 3 to 5 were delegated to implementation judgement in the same conversation, with the standing instruction that a call made and recorded beats a call deferred. Each remains cheap to reverse.**
+
+1. **Does this ship behind the `experimental` flag (CLAUDE.md rule 9)? — DECIDED: no.** The recommendation was no and the user confirmed it. The reasoning is not a fresh judgement: `prds/176-desktop-gui.md` decision 6 already recorded that the flag does not apply to this binary — "a separate GUI binary has no such seam — the act of building/running it is the opt-in", with maturity handled by packaging. The mechanics confirm it and go further than #176 did: the flag does not reach the desktop app by **any** route. Nothing under `desktop/` mentions it, it is not on the daemon protocol, and the desktop crate never calls `features::init_and_watch` — whose only callers are `src/main.rs:1509` and `:2075` — so `experimental_enabled()` would read the `false` default forever regardless of TOML or env. Gating this surface would mean **building the flag's Tauri delivery mechanism as part of this PRD**, which is new work in service of a switch, and it would raise "against which project directory?" — a question the desktop app has no good answer to for a packaged build.
+2. **Does M4 ship, or does the container ship with no preference of its own? — DECIDED: it ships, and the tenant is #743's appearance override rather than the window-restore preference originally proposed.** The window-restore toggle was a stand-in chosen because it belonged to no dependent; the user's alternative is better on every axis — it is a setting people actually want, it exercises the same path, and it means the settings page opens with a reason to exist. Window restore is dropped, not deferred: it was never wanted for itself.
+3. **macOS: `~/.config/dot-agent-deck` or `~/Library/Application Support/dot-agent-deck`? — DECIDED: `~/.config`.** Consistency with the TUI on the same machine wins: a user running both front-ends finds both configs in one directory, and the divergence from the platform convention is one the TUI already made deliberately. `dirs` is already a root-crate dependency if a macOS-specific root is wanted later; moving then is a one-time migration, which is the cost this defers rather than avoids.
+4. **Does the document carry an explicit schema version field now, or rely on serde defaults alone? — DECIDED: yes, a `version` integer.** Cheap insurance, and impossible to add retroactively without a heuristic for "documents written before the field existed".
+5. **Should the four existing `localStorage` keys eventually move, and to where? — DECIDED: not here, and tracked rather than left implicit.** They are project-draft content and #819's daemon-side project resolution is the plausible home. A follow-up issue is filed so the question is not rediscovered by whoever next wonders why the app has two persistence mechanisms.
 
 ## Work Log
+
+### 2026-09-02 — M2 landed, and implementation found a real defect in this PRD
+
+`ba00f12`. The document on disk is four lines:
+
+```toml
+version = 1
+
+[appearance]
+mode = "system"
+```
+
+at `config_dir()/desktop.toml`, with `DOT_AGENT_DECK_DESKTOP_CONFIG` overriding the whole path. Sixteen Rust tests, running in `cargo test-fast` and therefore in the required `build` check.
+
+**The defect: this PRD claimed "across builds the serde defaults cover it" about the writer dropping unknown tables, and that was wrong.** Serde defaults cover reading, not writing — no `deny_unknown_fields` means *ignore*, not *retain*, so an unknown `[voice]` section is discarded at load and deleted by the next save. That is the identical failure this PRD cites, two paragraphs earlier, as the reason not to share the TUI's `config.toml`. It is being closed rather than accepted: the save path merges into the parsed document instead of replacing it. The exposure was genuinely small today — one app owns the file, and reaching the bug needs a user alternating two desktop builds against one config directory — but it becomes likely the moment #802 lands a section, and a container whose central promise is "add a section and trust it to survive" cannot ship with it. The implementation deliberately built it as specified and reported it rather than silently working around it, which is why it was visible at all.
+
+Three smaller corrections. **Standalone Tauri commands rather than `DesktopAction` variants**, and the reasoning is better than the PRD's silence on it: every `DesktopAction` arm falls through to `refresh_and_emit`, a `ListAgents` round-trip over the daemon socket, so routing a settings read through it would make reading a local TOML file cost a daemon RPC — at launch, before the daemon is necessarily up. Settings should not be able to fail because the daemon is down, which is the ownership boundary asserting itself in the IPC design. **No capability change was needed** — app commands from `generate_handler!` are not ACL-gated in Tauri v2, only `core:` and plugin commands are, so the crate still has zero plugins and `["core:default"]`. And a **line reference in this PRD had drifted**: `agent_mapping_is_frontend_stable` is at `dto.rs:536-545`, not `:639-647`; the idiom cited was right, the coordinates were stale. Corrected above.
+
+One cross-PRD interaction worth recording, because it will recur: **#743's colour guard fires on `#803` inside a string literal**, since `803` is three valid hex digits. The guard masks comments but deliberately not string contents, because `"#141817"` is exactly what it hunts. That is correct behaviour, not a guard bug, and the fix is to rename the string. It will keep happening as more strings are written under `desktop/src`, and the failure reads as a colour problem rather than a naming one.
+
+### 2026-09-02 — Scope settled with the user: #743 ships in the same PR
+
+Four decisions, taken at the plan gate.
+
+**No experimental flag**, confirming Open Question 1's recommendation and `prds/176-desktop-gui.md` decision 6.
+
+**PRD #743 is merged into this PR and becomes the settings page's only section.** The user's reasoning, and it is better than the alternatives offered: the container needs a first tenant or it is proven only by its own tests, and #743 needs somewhere to put an override — so running them separately means two reviews to arrive at one working page. The proposed window-restore preference is dropped; it existed only to be a tenant, and a real one is available.
+
+**The terminals stay dark and unchanged in both themes.** Raised by the user directly, after being shown that we control the xterm background but not what an agent emits into the pane — dim greys tuned for black, and truecolor SGR that bypasses the 16-slot palette entirely. This removes the whole xterm-theming problem from the combined scope. Recorded in #743's Open Questions 1 and 2.
+
+**The hex-literal cleanup is in scope**, and re-measuring it changed the plan. The reconnaissance had quoted four literals as examples and this PRD repeated them as if they were the set; the actual count is **150 occurrences across ~105 distinct values** in `styles.css`, plus 27 in `.ts`/`.tsx`. That moves the tokenising pass from a tidy-up to the largest single piece of the combined work, and it is why #743's M1 isolates it in one commit with a "light mode is visually unchanged" property — 105 colour decisions cannot be verified by reading a diff, but they can be verified by opening the app.
+
+**PRD #745's overview screen is deliberately excluded** until [PR #779](https://github.com/vfarcic/dot-agent-deck/pull/779) merges to `main`, at which point this branch merges `main` and themes that screen. It is not on this branch and cannot be themed from here.
+
+The user went offline after this conversation with the standing instruction to make remaining calls rather than defer them, and to correct anything wrong the next day. Open Questions 3 to 5 were decided on that basis and each records its reasoning.
 
 ### 2026-09-02 — Created
 
