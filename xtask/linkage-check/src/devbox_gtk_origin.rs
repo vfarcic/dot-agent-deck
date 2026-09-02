@@ -205,6 +205,27 @@ fn devbox_gtk_origin_requires_nix_store_as_a_prefix_not_a_substring() {
     );
 }
 
+/// Does this shell script body actually RUN `devbox-check-gtk.sh`, as opposed to
+/// merely mentioning it?
+///
+/// Comment lines are excluded deliberately, and that is the whole point of the
+/// function existing rather than a `body.contains(…)` at the call site. The
+/// `== tauri system libraries ==` section's explanatory comment names the script
+/// too, so a substring test over the whole file stays green after the
+/// invocation itself has been deleted — a guard that asserts nothing, which is
+/// the exact shape of hole this file exists to close. Caught by Greptile on
+/// PR #816 as a P2; [`comment_mention_alone_does_not_count`] pins it.
+///
+/// Matched loosely within a non-comment line rather than against the exact
+/// current text, so reformatting the call (`"${0%/*}"` for `$(dirname "$0")`,
+/// say) does not fail the build for no reason.
+fn invokes_gtk_check(body: &str) -> bool {
+    body.lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .any(|line| line.contains("devbox-check-gtk.sh"))
+}
+
 /// The coupling that undoes all of the above in one line: `devbox-smoke.sh` is
 /// what CI's `devbox` job actually runs, so a check it no longer invokes is a
 /// check that runs nowhere.
@@ -213,9 +234,34 @@ fn devbox_smoke_still_invokes_the_gtk_origin_check() {
     let smoke = repo_root().join("scripts/devbox-smoke.sh");
     let body = std::fs::read_to_string(&smoke).expect("read scripts/devbox-smoke.sh");
     assert!(
-        body.contains("devbox-check-gtk.sh"),
-        "scripts/devbox-smoke.sh must invoke scripts/devbox-check-gtk.sh — it is the \
-         only job in CI that can observe a devbox.json GTK regression, so inlining \
-         or dropping the call removes the #815 guard from CI entirely."
+        invokes_gtk_check(&body),
+        "scripts/devbox-smoke.sh must invoke scripts/devbox-check-gtk.sh on a \
+         non-comment line — it is the only job in CI that can observe a devbox.json \
+         GTK regression, so inlining or dropping the call removes the #815 guard \
+         from CI entirely."
+    );
+}
+
+/// The predicate above must not be satisfied by prose. Without this, the fix for
+/// Greptile's P2 could itself regress to a substring test unnoticed.
+#[test]
+fn comment_mention_alone_does_not_count() {
+    let commented_out = "\
+echo '== tauri system libraries =='\n\
+# devbox-check-gtk.sh asserts the resolved libdir is under /nix/store.\n\
+#bash \"$(dirname \"$0\")/devbox-check-gtk.sh\"\n";
+    assert!(
+        !invokes_gtk_check(commented_out),
+        "a commented-out call and a comment naming the script must both fail the \
+         coupling check, or it is back to asserting nothing"
+    );
+
+    let real = "\
+echo '== tauri system libraries =='\n\
+# devbox-check-gtk.sh asserts the resolved libdir is under /nix/store.\n\
+bash \"$(dirname \"$0\")/devbox-check-gtk.sh\"\n";
+    assert!(
+        invokes_gtk_check(real),
+        "a real invocation alongside the comment must pass"
     );
 }
