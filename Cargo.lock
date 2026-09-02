@@ -1059,6 +1059,7 @@ name = "dot-agent-deck-desktop"
 version = "0.1.0"
 dependencies = [
  "dot-agent-deck",
+ "libc",
  "serde",
  "serde_json",
  "tauri",

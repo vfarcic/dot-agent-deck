@@ -19,13 +19,21 @@
 //! # Failure behaviour
 //!
 //! **Loading never fails.** A missing file, an unparseable file, an unreadable
-//! file and an unknown enum value all yield defaults — exactly as
-//! `DashboardConfig::load()` does. A settings file is not worth failing an app
-//! launch over, so the failure is logged and never propagated.
+//! file, an unusable path and an unknown enum value all yield defaults —
+//! exactly as `DashboardConfig::load()` does. A settings file is not worth
+//! failing an app launch over, so the failure is logged and never propagated.
 //!
-//! **Writing is atomic and owner-only.** A temp file in the same directory,
-//! then a rename; mode 0o600 on Unix. Modelled on
-//! `dot_agent_deck::schedule_cli::write_atomic`.
+//! **The path is vetted and the read is bounded.** [`read_document`] requires
+//! an absolute path with a file name whose target is absent or a regular file,
+//! and reads at most [`MAX_SETTINGS_BYTES`]. That is not a privilege boundary —
+//! anyone who can set [`SETTINGS_PATH_ENV`] can already run code as this user —
+//! it is there because an app that hangs forever on a FIFO or dies on
+//! `/dev/zero` is a miserable thing to debug.
+//!
+//! **Writing is atomic and owner-only.** A temp file in the same directory
+//! under an unpredictable name, then a rename; mode 0o600 on Unix, a protected
+//! DACL on Windows. Modelled on `dot_agent_deck::schedule_cli::write_atomic`.
+//! [`save_to`] records what that deliberately does *not* defend against.
 //!
 //! **Writing also preserves what it does not understand.** The save merges the
 //! serialised struct into the document already on disk rather than replacing
@@ -239,6 +247,163 @@ fn write_error(what: &str, path: &Path, cause: impl std::fmt::Display) -> Settin
     }
 }
 
+/// A path that cannot be a settings document at all, split the same way
+/// [`write_error`] is so the reason crosses the bridge and the path does not.
+fn path_error(reason: &str, path: &Path) -> SettingsWriteError {
+    SettingsWriteError {
+        detail: format!(
+            "unusable desktop settings path {}: {reason}",
+            path.display()
+        ),
+        public: format!("the desktop settings path is unusable: {reason}"),
+    }
+}
+
+/// The largest settings document this build will read.
+///
+/// `desktop.toml` is a hand-edited preferences file: today's default document
+/// is 40 bytes, and #741's endpoint list plus #802's model configuration are
+/// kilobytes at the very outside. 256 KiB leaves about four orders of magnitude
+/// of headroom over anything the schema can plausibly grow into, while turning
+/// "the app read a multi-gigabyte file into memory because a path pointed at
+/// one" into a named error instead of an out-of-memory kill.
+pub const MAX_SETTINGS_BYTES: u64 = 256 * 1024;
+
+/// Vet `path` as the settings document and read it, bounded.
+///
+/// `Ok(None)` is the ordinary first-run case: nothing is there yet. `Err` means
+/// the path cannot be a settings document at all — [`load_from`] logs it and
+/// falls back to defaults, and [`save_to`] refuses rather than writing over
+/// whatever is actually at that name.
+///
+/// # This is about misconfiguration, not privilege
+///
+/// [`SETTINGS_PATH_ENV`] used to accept any non-empty string, and both load and
+/// save then went straight to an unbounded `read_to_string`. Anyone who can set
+/// this process's environment can already run code as this user, so none of
+/// this is a privilege boundary. It is here because the *misconfiguration*
+/// failures are miserable to debug: a FIFO blocks the app forever with no
+/// message at all, `/dev/zero` exhausts memory, a large regular file is read
+/// whole, and a relative path resolves against whatever directory the app
+/// happened to be launched from — even though [`DesktopSettingsSnapshot`]
+/// documents the path it reports as absolute.
+///
+/// So the target must be absolute, must have a file name, and must be either
+/// **absent** or a **regular file**. The check is `symlink_metadata`, which does
+/// not follow a link at the final component, so a symlink is rejected as a
+/// symlink rather than quietly resolved to something else. Then at most
+/// [`MAX_SETTINGS_BYTES`] are read.
+///
+/// One residual is accepted: a target swapped between the check and the open —
+/// a regular file replaced by a FIFO in that window — still blocks. Closing it
+/// means an `openat`-anchored read, which is the same complexity [`save_to`]
+/// declines for the same reason, and it is written down there rather than
+/// repeated here.
+fn read_document(path: &Path) -> Result<Option<String>, SettingsWriteError> {
+    if !path.is_absolute() {
+        return Err(path_error("it is not an absolute path", path));
+    }
+    if path.file_name().is_none() {
+        return Err(path_error("it names no file", path));
+    }
+
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            // `io::Error`'s own `Display` carries no path — `std` does not add
+            // that context — so the cause is safe to put in the public half.
+            return Err(path_error(
+                &format!("it cannot be inspected: {error}"),
+                path,
+            ));
+        }
+    };
+    if let Some(kind) = unusable_kind(&meta) {
+        return Err(path_error(
+            &format!("it is {kind}, and the settings document must be a regular file"),
+            path,
+        ));
+    }
+    if meta.len() > MAX_SETTINGS_BYTES {
+        return Err(oversized(path));
+    }
+
+    read_bounded(path)
+}
+
+fn oversized(path: &Path) -> SettingsWriteError {
+    path_error(
+        &format!("it is larger than the {MAX_SETTINGS_BYTES}-byte settings limit"),
+        path,
+    )
+}
+
+/// What `meta` describes, when it is not a plain regular file. `None` means it
+/// is one.
+fn unusable_kind(meta: &std::fs::Metadata) -> Option<&'static str> {
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        return Some("a symlink");
+    }
+    #[cfg(windows)]
+    {
+        // `is_symlink` covers a symlink reparse point but not a junction or a
+        // mount point, and following one of those lands somewhere the user
+        // never named.
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Some("a reparse point");
+        }
+    }
+    if kind.is_dir() {
+        return Some("a directory");
+    }
+    if kind.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        if kind.is_fifo() {
+            return Some("a FIFO");
+        }
+        if kind.is_socket() {
+            return Some("a socket");
+        }
+        if kind.is_block_device() {
+            return Some("a block device");
+        }
+        if kind.is_char_device() {
+            return Some("a character device");
+        }
+    }
+    Some("of an unrecognised type")
+}
+
+/// Read an already-vetted regular file, refusing anything past
+/// [`MAX_SETTINGS_BYTES`].
+///
+/// The bound is re-applied to the bytes actually read, not just to the size the
+/// vet saw: the file can grow — or be replaced by a larger one — between the
+/// two, and a limit that only consults `stat` would not be a limit.
+fn read_bounded(path: &Path) -> Result<Option<String>, SettingsWriteError> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)
+        .map_err(|error| path_error(&format!("it cannot be read: {error}"), path))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SETTINGS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| path_error(&format!("it cannot be read: {error}"), path))?;
+    if bytes.len() as u64 > MAX_SETTINGS_BYTES {
+        return Err(oversized(path));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| path_error("it is not valid UTF-8", path))
+}
+
 /// The resolved path of the settings document.
 ///
 /// [`SETTINGS_PATH_ENV`] wins when it is set and non-empty. An empty value is
@@ -258,8 +423,9 @@ pub fn settings_path() -> PathBuf {
 /// and every test passes one explicitly so none of them depends on
 /// process-global environment state.
 pub fn load_from(path: &Path) -> DesktopSettings {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => match toml::from_str(&contents) {
+    match read_document(path) {
+        Ok(None) => DesktopSettings::default(),
+        Ok(Some(contents)) => match toml::from_str(&contents) {
             Ok(settings) => settings,
             Err(error) => {
                 eprintln!(
@@ -269,12 +435,10 @@ pub fn load_from(path: &Path) -> DesktopSettings {
                 DesktopSettings::default()
             }
         },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DesktopSettings::default(),
         Err(error) => {
-            eprintln!(
-                "Failed to read desktop settings at {}: {error}; using defaults",
-                path.display()
-            );
+            // The detail names the path and this is the app's own log, which is
+            // the half of the split that is allowed to.
+            eprintln!("{}; using defaults", error.detail());
             DesktopSettings::default()
         }
     }
@@ -299,7 +463,42 @@ const TEMP_NAME_ATTEMPTS: usize = 8;
 /// one exactly where it was. The temp file is created with `create_new`
 /// (`O_CREAT|O_EXCL`, which cannot follow a symlink someone planted at that
 /// name) at owner-only mode, so the document is never briefly world-readable.
+///
+/// The path is vetted first — see [`read_document`] — so a save never creates a
+/// directory for, or writes over, something that is not a settings document.
+///
+/// # What this deliberately does not defend against
+///
+/// An audit of this path recommended two further steps: rejecting a symlinked
+/// or non-user-owned **parent** directory, and anchoring both the create and
+/// the publish to one verified directory handle (`openat`/`renameat`-style) so
+/// no name is resolved twice. Both are declined on purpose, and the reasoning
+/// is here so the next auditor finds it rather than re-deriving it.
+///
+/// The destination is the **per-user config directory**. Any actor who can win
+/// the temp-swap race in it can already write `desktop.toml` directly, so the
+/// race buys an attacker nothing they do not already have — and
+/// directory-handle anchoring is real work and real complexity to spend on a
+/// preferences file. If this document ever holds something security-relevant —
+/// a daemon endpoint under #741, a secret *reference* under #802 — that
+/// calculus changes and the anchoring should be revisited.
+///
+/// Two residual **reliability** properties come with that, both accepted, both
+/// worth knowing before either is reported as a bug:
+///
+/// - abrupt process death between [`create_temp`] and the rename leaves an
+///   owner-only `.desktop.toml.tmp.*` file behind. Nothing reads it, and the
+///   next save simply draws a different name — which is what
+///   [`TEMP_NAME_ATTEMPTS`] is for;
+/// - the parent directory is **not** fsync'd after the rename. The write is
+///   therefore atomic to every live observer but not fully crash-durable: a
+///   power loss immediately after a save can leave the previous document in
+///   place.
 pub fn save_to(path: &Path, settings: &DesktopSettings) -> Result<(), SettingsWriteError> {
+    // Before anything is created: a rejected path must not leave a directory
+    // behind, and an unreadable or over-limit document must not be replaced.
+    let existing = read_document(path)?;
+
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -307,7 +506,7 @@ pub fn save_to(path: &Path, settings: &DesktopSettings) -> Result<(), SettingsWr
     fsperm::create_owner_only_dir(parent)
         .map_err(|error| write_error("could not create the directory for", path, error))?;
 
-    let contents = merged_document(path, settings)?;
+    let contents = merged_document(path, existing.as_deref(), settings)?;
 
     let (mut file, tmp) = create_temp(parent, path)?;
     let published = (|| {
@@ -340,22 +539,35 @@ pub fn save_to(path: &Path, settings: &DesktopSettings) -> Result<(), SettingsWr
 /// break the container's central promise: that a feature can add a section and
 /// trust an older build not to eat it.
 ///
-/// The document is re-read **here** rather than carried along from the load, so
-/// a section another process wrote between this app's read and its write
-/// survives as well. The cost is one small read per save, on a file the app
-/// writes only when a user changes a setting.
+/// `existing` is what [`save_to`] just read off disk, **not** what the frontend
+/// loaded at startup: re-reading at save time is what lets a section another
+/// process wrote between this app's read and its write survive as well. The
+/// cost is one small read per save, on a file the app writes only when a user
+/// changes a setting.
 ///
-/// An unparseable or non-table document is treated as empty. Nothing can be
-/// preserved out of bytes that are not TOML, and refusing the save instead
-/// would leave a user whose file got corrupted unable to change a setting from
-/// inside the app — the same call [`load_from`] already makes in the other
-/// direction.
-fn merged_document(path: &Path, settings: &DesktopSettings) -> Result<String, SettingsWriteError> {
+/// An unparseable or non-table document is treated as empty and therefore
+/// replaced. Nothing can be preserved out of bytes that are not TOML, and
+/// refusing the save instead would leave a user whose file got corrupted unable
+/// to change a setting from inside the app — the same call [`load_from`]
+/// already makes in the other direction.
+///
+/// **"Unparseable" means unparseable by *this* build**, which is a wider set
+/// than "corrupt". A document a *newer* build wrote in a syntax this one does
+/// not accept lands on the same path and is replaced, taking that build's
+/// sections with it — the one case where the unknown-section preservation this
+/// function exists for does not apply. Nothing in the schema can produce such a
+/// document today (it is TOML written by `toml::to_string_pretty` either way),
+/// so this is a property to know rather than a hazard to design around; it
+/// becomes one the moment the format itself changes.
+fn merged_document(
+    path: &Path,
+    existing: Option<&str>,
+    settings: &DesktopSettings,
+) -> Result<String, SettingsWriteError> {
     // `toml::from_str`, not `str::parse` — `Value`'s `FromStr` parses a single
     // TOML *value* expression, so a whole document fails it on the first key.
-    let mut document = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
+    let mut document = existing
+        .and_then(|contents| toml::from_str::<toml::Table>(contents).ok())
         .unwrap_or_default();
     let owned = toml::Table::try_from(settings)
         .map_err(|error| write_error("could not serialize", path, error))?;
@@ -391,18 +603,32 @@ fn merge_tables(base: &mut toml::Table, incoming: toml::Table) {
 
 /// Exclusively create a fresh temp file next to `dest`, redrawing the name on
 /// collision. Returns the open file and its path.
+///
+/// The suffix is **random** rather than the old `<pid>.<counter>`, which any
+/// other process could compute. `create_new` (`O_CREAT|O_EXCL`) already means a
+/// planted name costs a failed save rather than a write through someone else's
+/// symlink, so the guessable form was a nuisance rather than a hole — but an
+/// unpredictable name costs one hash and removes the question.
 fn create_temp(parent: &Path, dest: &Path) -> Result<(std::fs::File, PathBuf), SettingsWriteError> {
-    static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
     let mut last = None;
     for _ in 0..TEMP_NAME_ATTEMPTS {
         let tmp = parent.join(format!(
-            ".{SETTINGS_FILE_NAME}.tmp.{}.{}",
-            std::process::id(),
-            WRITE_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ".{SETTINGS_FILE_NAME}.tmp.{:016x}",
+            unpredictable_suffix()
         ));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         fsperm::set_create_mode_owner_only(&mut options);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            // Deny every other principal an open handle for the lifetime of
+            // ours, so nobody can be holding one across the DACL tightening
+            // `set_file_owner_only` performs on the handle a moment later. The
+            // rename happens after the handle is dropped, so this costs
+            // nothing.
+            options.share_mode(0);
+        }
         match options.open(&tmp) {
             Ok(file) => return Ok((file, tmp)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => last = Some(error),
@@ -423,6 +649,30 @@ fn create_temp(parent: &Path, dest: &Path) -> Result<(std::fs::File, PathBuf), S
         dest,
         cause,
     ))
+}
+
+/// A temp-name suffix an outside observer cannot predict, with no new
+/// dependency.
+///
+/// `RandomState` is seeded from the operating system, so hashing a
+/// monotonically increasing counter and the current time under it gives a value
+/// that is unique within the process and unguessable outside it. This names a
+/// scratch file for a few milliseconds; it is not, and must not be used as,
+/// a source of cryptographic randomness.
+fn unpredictable_suffix() -> u64 {
+    use std::hash::{BuildHasher as _, Hash as _, Hasher as _};
+
+    static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    WRITE_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .hash(&mut hasher);
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -813,25 +1063,29 @@ mod tests {
         assert_eq!(load_from(&path), dark());
     }
 
+    /// A directory at the destination used to be caught by the rename failing.
+    /// It is now caught before anything is created at all, which is the point
+    /// of vetting the path — but the property that mattered is the same one:
+    /// a refused save leaves nothing behind.
     #[test]
-    fn a_failed_publish_reports_an_error_and_removes_its_temp_file() {
+    fn a_directory_at_the_destination_is_refused_before_anything_is_written() {
         let dir = tempdir();
-        // A directory at the destination makes the rename fail for every user,
-        // privileged or not — it is a type error, not a permission one.
         let path = dir.path().join(SETTINGS_FILE_NAME);
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("occupied"), b"x").unwrap();
 
         let error = save_to(&path, &dark()).unwrap_err();
         assert!(
-            error.detail().contains("could not write"),
+            error.detail().contains("a directory"),
             "unexpected error: {error}"
         );
         assert_eq!(
             entries(dir.path()),
             vec![SETTINGS_FILE_NAME.to_string()],
-            "a failed publish must not leave a temp file behind"
+            "a refused save must not leave a temp file behind"
         );
+        // And the thing that was really there is untouched.
+        assert_eq!(entries(&path), vec!["occupied".to_string()]);
     }
 
     #[cfg(unix)]
@@ -909,6 +1163,184 @@ mod tests {
             "the webview-facing message must not leak a file name: {}",
             error.public()
         );
+    }
+
+    /// Every way a settings path can be refused, and the two properties that
+    /// have to hold for all of them: **load never fails** (it logs and falls
+    /// back to defaults) and **save refuses with a path-free public message**.
+    ///
+    /// Each kind is built rather than asserted about, because the whole value
+    /// of the guard is that it recognises the real thing. The Unix-only kinds
+    /// live in the test below.
+    #[test]
+    fn every_portable_path_rejection_is_refused_without_leaking_the_path() {
+        let dir = tempdir();
+        let a_directory = dir.path().join("as-a-directory");
+        std::fs::create_dir(&a_directory).unwrap();
+
+        let oversized = dir.path().join("oversized.toml");
+        std::fs::write(&oversized, "#".repeat(MAX_SETTINGS_BYTES as usize + 1)).unwrap();
+        assert!(std::fs::metadata(&oversized).unwrap().len() > MAX_SETTINGS_BYTES);
+
+        // A root with no final component. `/` is not absolute on Windows, so
+        // the two platforms need different spellings of the same idea.
+        #[cfg(unix)]
+        let no_file_name = PathBuf::from("/");
+        #[cfg(windows)]
+        let no_file_name = PathBuf::from(r"C:\");
+
+        let cases: Vec<(&str, PathBuf, &str)> = vec![
+            (
+                "a relative path",
+                PathBuf::from("desktop.toml"),
+                "not an absolute path",
+            ),
+            ("a path with no file name", no_file_name, "names no file"),
+            ("a directory", a_directory, "a directory"),
+            ("an over-limit document", oversized, "settings limit"),
+        ];
+
+        for (what, path, expected) in cases {
+            assert_reject(what, &path, expected);
+        }
+    }
+
+    /// Both halves of a rejected path, for one kind: the load falls back to
+    /// defaults, and the save refuses with the reason in the log detail and no
+    /// path in the public message.
+    fn assert_reject(what: &str, path: &Path, expected: &str) {
+        assert_eq!(
+            load_from(path),
+            DesktopSettings::default(),
+            "loading from {what} must fall back to defaults"
+        );
+
+        let error = match save_to(path, &dark()) {
+            Err(error) => error,
+            Ok(()) => panic!("saving to {what} must be refused"),
+        };
+        assert!(
+            error.detail().contains(expected),
+            "{what}: unexpected error: {error}"
+        );
+        assert!(
+            !error.public().contains(&path.display().to_string()),
+            "{what}: the public message leaked the path: {}",
+            error.public()
+        );
+    }
+
+    /// The kinds that only exist on Unix, and the two that motivated the guard
+    /// in the first place: a **FIFO** blocked the app forever with no message,
+    /// and a **character device** like `/dev/zero` exhausted memory. Neither is
+    /// opened at all now — the rejection is on `lstat`, so this test cannot
+    /// hang even if the guard regresses to following the final component.
+    #[cfg(unix)]
+    #[test]
+    fn every_unix_only_path_rejection_is_refused_without_leaking_the_path() {
+        let dir = tempdir();
+
+        // A symlink at the final component, pointing at a perfectly good
+        // document. The target must come back untouched: rejecting a symlink is
+        // only meaningful if nothing was written through it.
+        let target = dir.path().join("target.toml");
+        save_to(&target, &DesktopSettings::default()).unwrap();
+        let before = std::fs::read_to_string(&target).unwrap();
+        let link = dir.path().join("as-a-symlink.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_reject("a symlink", &link, "a symlink");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            before,
+            "nothing may be written through a rejected symlink"
+        );
+
+        // A socket, which `std` can bind without help.
+        let socket_path = dir.path().join("as-a-socket");
+        let _socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        assert_reject("a socket", &socket_path, "a socket");
+
+        // A FIFO, which it cannot.
+        let fifo = dir.path().join("as-a-fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_path` is a NUL-terminated path inside this test's own temp
+        // directory and outlives the call; `mkfifo` reads it and returns.
+        let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(
+            made,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_reject("a FIFO", &fifo, "a FIFO");
+
+        // And a character device, if this machine has the usual one.
+        let zero = Path::new("/dev/zero");
+        if zero.exists() {
+            assert_reject("a character device", zero, "a character device");
+        } else {
+            eprintln!("SKIP: no /dev/zero on this machine");
+        }
+    }
+
+    /// The limit is a limit: exactly [`MAX_SETTINGS_BYTES`] loads, one byte
+    /// more is refused.
+    ///
+    /// [`read_bounded`] re-applies the bound to the bytes actually read, which
+    /// covers a document that grows between the `stat` and the read. That race
+    /// is not constructible deterministically, so it is asserted by the code
+    /// rather than by a test — but the boundary itself is pinned here, and it
+    /// is the boundary a hand-edited file can actually reach.
+    #[test]
+    fn the_byte_limit_admits_a_document_at_the_limit_and_refuses_one_past_it() {
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(&path, "version = 1\n").unwrap();
+        assert_eq!(load_from(&path).version, 1);
+
+        // Exactly at the limit is fine; one byte over is not.
+        let mut at_limit = "version = 1\n".to_string();
+        at_limit.push_str(&"#".repeat(MAX_SETTINGS_BYTES as usize - at_limit.len()));
+        assert_eq!(at_limit.len() as u64, MAX_SETTINGS_BYTES);
+        std::fs::write(&path, &at_limit).unwrap();
+        assert_eq!(
+            load_from(&path).version,
+            1,
+            "a document at the limit must load"
+        );
+
+        std::fs::write(&path, format!("{at_limit}#")).unwrap();
+        assert_reject("an over-limit document", &path, "settings limit");
+    }
+
+    /// The temp name is unpredictable rather than `<pid>.<counter>`.
+    ///
+    /// A guessable name is one another process can plant first. `create_new`
+    /// means the cost of that is a failed save rather than a write through
+    /// someone else's symlink, so this is closing a nuisance rather than a
+    /// hole — but the nuisance is free to close.
+    #[test]
+    fn temp_names_are_unpredictable_rather_than_the_pid_and_a_counter() {
+        let dir = tempdir();
+        let dest = dir.path().join(SETTINGS_FILE_NAME);
+
+        let mut names = std::collections::BTreeSet::new();
+        for _ in 0..16 {
+            let (file, tmp) = create_temp(dir.path(), &dest).unwrap();
+            drop(file);
+            let name = tmp.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                !name.contains(&std::process::id().to_string()),
+                "the temp name still carries the pid: {name}"
+            );
+            assert!(
+                name.starts_with(&format!(".{SETTINGS_FILE_NAME}.tmp.")),
+                "unexpected temp name: {name}"
+            );
+            names.insert(name);
+            std::fs::remove_file(&tmp).unwrap();
+        }
+        assert_eq!(names.len(), 16, "temp names repeated: {names:?}");
     }
 
     /// The pinned shape of the default document, in the idiom of

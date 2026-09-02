@@ -26,3 +26,8 @@ tokio = { version = "1", features = ["sync", "time"] }
 # none of them can touch the developer's real ~/.config/dot-agent-deck.
 tempfile = "3"
 
+# PRD #803: the settings-path guard rejects a FIFO, and `mkfifo(3)` is the only
+# way to build one to prove it. Tests only — nothing under `src/` uses libc.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
